@@ -423,19 +423,25 @@ class StatisticsPlotWidget(QWidget):
                         ax.plot(x, y, color=colour, linewidth=2, label=sample)
                         ax.fill_between(x, y, color=colour, alpha=0.3)
 
-                    [minor_ticks, major_ticks] = transformation.ticks()
-                    major_tick_values = [val for (val, name) in major_ticks]
-                    major_tick_labels = [name for (val, name) in major_ticks]
-                    minor_tick_values = [val for (val, name) in minor_ticks]
-                    ax.xaxis.set_major_locator(ticker.FixedLocator(major_tick_values))
-                    ax.xaxis.set_major_formatter(ticker.FixedFormatter(major_tick_labels))
-                    ax.xaxis.set_minor_locator(ticker.FixedLocator(minor_tick_values))
+                    # Some transforms (e.g. the default transform used for the
+                    # Time channel) have no custom tick scheme and return None
+                    # from ticks(). Fall back to matplotlib's default ticks in
+                    # that case instead of crashing on unpacking None.
+                    ticks = transformation.ticks()
+                    if ticks is not None:
+                        [minor_ticks, major_ticks] = ticks
+                        major_tick_values = [val for (val, name) in major_ticks]
+                        major_tick_labels = [name for (val, name) in major_ticks]
+                        minor_tick_values = [val for (val, name) in minor_ticks]
+                        ax.xaxis.set_major_locator(ticker.FixedLocator(major_tick_values))
+                        ax.xaxis.set_major_formatter(ticker.FixedFormatter(major_tick_labels))
+                        ax.xaxis.set_minor_locator(ticker.FixedLocator(minor_tick_values))
 
-                    ax.tick_params(axis='x', which='major', length=10, width=2, color='black')
-                    ax.tick_params(axis='x', which='minor', length=5, width=1, color='gray')
+                        ax.tick_params(axis='x', which='major', length=10, width=2, color='black')
+                        ax.tick_params(axis='x', which='minor', length=5, width=1, color='gray')
 
-                    ax.grid(which='major', linestyle='-', alpha=0.8)
-                    ax.grid(which='minor', linestyle='-', alpha=0.4)
+                        ax.grid(which='major', linestyle='-', alpha=0.8)
+                        ax.grid(which='minor', linestyle='-', alpha=0.4)
                     ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
                     ax.set_xlabel(self.statistics_comparison['statistic'])
                     ax.set_ylabel('Count')
