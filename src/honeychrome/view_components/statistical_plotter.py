@@ -222,6 +222,7 @@ class StatisticalComparisonWidget(QWidget):
             self.plot_type_combo.addItem("Bar Chart")
             self.plot_type_combo.addItem("Box and Whisker Chart")
             self.plot_type_combo.addItem("1D Histogram Overlay")
+            self.plot_type_combo.addItem("Heatmap")
             self.plot_type_combo.setVisible(True)
         else:
             self.plot_type_combo.setVisible(False)
@@ -249,6 +250,14 @@ class StatisticalComparisonWidget(QWidget):
                 self.statistic_combo.addItem("Intensity")
                 self.on_statistic_selected('Intensity')
                 self.statistic_combo.setVisible(False)
+            elif self.plot_type_combo.currentText() == 'Heatmap':
+                # Heatmap shows the median intensity of every marker (columns)
+                # for each sample (rows) on the selected gate. No per-channel
+                # selection is needed, so go straight to the Calculate button.
+                self.statistic_combo.addItem("Median Intensity")
+                self.statistic_combo.setVisible(False)
+                self.channel_combo.setVisible(False)
+                self.create_button.setVisible(True)
             else:
                 self.statistic_combo.addItem("Select Statistic:")  # placeholder for "no selection"
                 self.statistic_combo.addItem("% Total Events")
@@ -448,6 +457,22 @@ class StatisticsPlotWidget(QWidget):
                     ax.set_xlim([transformation.step_scale[0], transformation.step_scale[-1]])
                 else:
                     ax.text(0,0, f"Error: transform missing for {self.statistics_comparison['channel']}. \nHas it been deleted from the spectral model?")
+            elif self.statistics_comparison['plot_type'] == 'Heatmap':
+                import pandas as pd
+                data = self.statistics_comparison['data']
+                samples = data.get('Sample', [])
+                markers = [k for k in data.keys() if k not in ('Sample', 'Group', 'Category')]
+                if samples and markers:
+                    matrix = pd.DataFrame({marker: data[marker] for marker in markers}, index=samples)
+                    sns.heatmap(
+                        matrix, ax=ax, cmap='viridis',
+                        cbar_kws={'label': self.statistics_comparison['statistic']},
+                    )
+                    ax.set_xlabel('Marker')
+                    ax.set_ylabel('Sample')
+                    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+                else:
+                    ax.text(0.5, 0.5, 'Heatmap: no marker data available.', ha='center', va='center')
             else:
                 if self.statistics_comparison['depth'] == 3:
                     x = 'Category'

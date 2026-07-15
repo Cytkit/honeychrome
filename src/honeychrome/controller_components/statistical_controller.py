@@ -87,7 +87,21 @@ class StatisticsCalculator(QObject):
                         gate_name = statistics_comparison['gate']
                         statistic = statistics_comparison['statistic']
                         if gate_name in sample_statistics:
-                            if statistic == "% Total Events":
+                            if statistics_comparison['plot_type'] == 'Heatmap':
+                                # Median (display-scale) intensity of every marker
+                                # on this gate. Channels without a display
+                                # transform (e.g. Time) are skipped so the colour
+                                # scale stays comparable across markers.
+                                gate_membership = data_for_statistics_comparison['gate_membership'][gate_name]
+                                value = {}
+                                for ch_pnn, ch_label in data_for_statistics_comparison['pnn_labels'].items():
+                                    transform = data_for_statistics_comparison['transformations'].get(ch_pnn)
+                                    if transform is None or transform.xform is None:
+                                        continue
+                                    channel_index = data_for_statistics_comparison['pnn'].index(ch_pnn)
+                                    channel_values = data_for_statistics_comparison['event_data'][gate_membership, channel_index]
+                                    value[ch_label] = float(np.median(transform.xform.apply(channel_values))) if channel_values.size else float('nan')
+                            elif statistic == "% Total Events":
                                 value = sample_statistics[gate_name]['p_gate_total'] * 100
                             elif statistic == "% Parent":
                                 value = sample_statistics[gate_name]['p_gate_parent'] * 100
@@ -120,6 +134,22 @@ class StatisticsCalculator(QObject):
 
             # assemble the data into experiment statistics data table
             for m, statistics_comparison in enumerate(experiment_statistics):
+                if statistics_comparison['plot_type'] == 'Heatmap':
+                    # Heatmap data is a sample x marker table: one 'Sample' list
+                    # plus one list per marker column.
+                    key = (statistics_comparison['gate'], statistics_comparison['statistic'])
+                    samples_list = []
+                    marker_columns = {}
+                    for sample in samples_by_set[sample_sets[m]]:
+                        row = data_by_sample[sample]['Statistics'].get(key, {})
+                        samples_list.append(data_by_sample[sample]['Sample'])
+                        for marker, marker_value in row.items():
+                            marker_columns.setdefault(marker, []).append(marker_value)
+                    heatmap_data = {'Sample': samples_list}
+                    heatmap_data.update(marker_columns)
+                    statistics_comparison['data'] = heatmap_data if samples_list else {}
+                    statistics_comparison['depth'] = 1
+                    continue
                 data_list = []
                 for sample in samples_by_set[sample_sets[m]]:
                     key = (statistics_comparison['gate'], statistics_comparison['statistic'])
