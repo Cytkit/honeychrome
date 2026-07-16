@@ -150,6 +150,10 @@ n_fluorophore_channels = len(fluorescence_channel_ids)
 
 width_ceiling = 50_000 # nanoseconds
 default_ceiling = 60
+# Max bins for the 'default' (Time) transform. Time can span tens of thousands
+# of units; a per-unit grid makes a Time gate's 2D lookup table huge and slow to
+# rebuild per sample. A few thousand bins is plenty for the histogram and gating.
+default_time_max_bins = 2048
 magnitude_ceiling = 2**18 # according to convention
 magnitude_ceilings = ['2**18 = 262144', '2**22 = 4194304', '2**24 = 16777216'] # 2**16 = 65536, 2**18 = 262144, 2**22 = 4194304, 2**24 = 16777216
 magnitude_ceilings_int = [262144, 4194304, 16777216]

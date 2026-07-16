@@ -834,7 +834,14 @@ def apply_gates_in_place(data_for_cytometry_plots, gates_to_calculate=None):
                     scale_x = transform_x.scale
                     indices_x_data_searchsorted = np.searchsorted(scale_x, x) - 2
                     if len(scale_x) > len(lookup_tables[gate_id[0]]):
-                        indices_x_data_searchsorted[indices_x_data_searchsorted >= len(lookup_tables[gate_id[0]])] = len(lookup_tables[gate_id[0]]) - 1 #todo temporary solution until we implement custom sample gates for time
+                        # Clamp the top edge into the last table bin. `scale` carries
+                        # two ±inf sentinels so it's normally exactly one longer than
+                        # the table (harmless). For a *dynamic* (per-sample) Time gate
+                        # the table is rebuilt on load at this sample's own scale, so
+                        # only this one-bin edge is clamped; a *non-dynamic* Time gate
+                        # keeps a shared table built at a different scale, so this also
+                        # guards the larger mismatch (see apply_dynamic_gate_dimensions).
+                        indices_x_data_searchsorted[indices_x_data_searchsorted >= len(lookup_tables[gate_id[0]])] = len(lookup_tables[gate_id[0]]) - 1
                     indices_data_digitized_flattened = indices_x_data_searchsorted
 
                 else:#len(channels) == 2:
@@ -854,20 +861,37 @@ def apply_gates_in_place(data_for_cytometry_plots, gates_to_calculate=None):
                     scale_y = transform_y.scale
                     indices_x_data_searchsorted = np.searchsorted(scale_x, x) - 2
                     indices_y_data_searchsorted = np.searchsorted(scale_y, y) - 2
-                    hist_bins_x = transform_x.scale_bins + 1
-                    indices_data_digitized_flattened = indices_x_data_searchsorted * hist_bins_x + indices_y_data_searchsorted
+                    # The lookup table is a row-major flatten of shape
+                    # (x_bins+1, y_bins+1): element (i, j) lives at i*(y_bins+1)+j.
+                    # So the row stride is the NUMBER OF Y BINS, not x. This only
+                    # matters when x and y have different bin counts (e.g. a
+                    # Time x fluorescence gate — Time has far more bins); for equal
+                    # bin counts (the usual case) it's the same either way.
+                    row_stride = transform_y.scale_bins + 1
+                    indices_data_digitized_flattened = indices_x_data_searchsorted * row_stride + indices_y_data_searchsorted
 
                 if gate.gate_type == 'QuadrantGate':
                     quadrant_names = gate.quadrants.keys()
                     for name in quadrant_names:
                         if name not in lookup_tables: # guard: lookup table may not exist yet if called before calculate_lookup_tables
                             continue
-                        mask = lookup_tables[name][indices_data_digitized_flattened]
+                        table = lookup_tables[name]
+                        idx = indices_data_digitized_flattened
+                        # Safety clamp: a transient template/transform scale
+                        # mismatch can produce out-of-range indices; clamp so we
+                        # never IndexError (correct values follow on next recalc).
+                        if idx.size and (idx.max() >= len(table) or idx.min() < 0):
+                            idx = np.clip(idx, 0, len(table) - 1)
+                        mask = table[idx]
                         gate_membership[name] = mask * gate_membership[parent_id[0]]
                 else:
                     if gate_id[0] not in lookup_tables:
                         continue
-                    mask = lookup_tables[gate_id[0]][indices_data_digitized_flattened]
+                    table = lookup_tables[gate_id[0]]
+                    idx = indices_data_digitized_flattened
+                    if idx.size and (idx.max() >= len(table) or idx.min() < 0):
+                        idx = np.clip(idx, 0, len(table) - 1)
+                    mask = table[idx]
                     gate_membership[gate_id[0]] = mask * gate_membership[parent_id[0]]
 
     # return gate_membership

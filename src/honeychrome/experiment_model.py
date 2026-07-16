@@ -45,6 +45,7 @@ from typing import Optional
 
 from honeychrome.controller_components.functions import generate_transformations, assign_default_transforms
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import to_gml
+from honeychrome.controller_components.gating_templates import migrate_cytometry_templates, migrate_scoped_gating_templates
 from honeychrome.settings import settings_default, samples_default, process_default, cytometry_default, sample_name_source
 
 import logging
@@ -159,6 +160,11 @@ class ExperimentModel:
         self.cytometry['raw_gating'] = to_gml(raw_gating)
         self.cytometry['raw_plots'] = raw_plots
 
+        ### per-sample gating: ensure template fields exist (backward compatible) ###
+        self.cytometry['gating_templates'] = migrate_cytometry_templates(self.cytometry)
+        migrate_scoped_gating_templates(self.cytometry)
+        self.samples.setdefault('sample_template_assignments', {})
+
         ### save ###
         self.save()
 
@@ -173,6 +179,12 @@ class ExperimentModel:
         self.samples.setdefault('unstained_samples', [])  # not present in older .kit files
         self.cytometry = file_data['cytometry']
         self.statistics = file_data['statistics']
+
+        # per-sample gating (backward compatible): synthesise a default template
+        # from legacy raw_gating/gating when older .kit files lack these fields.
+        self.cytometry['gating_templates'] = migrate_cytometry_templates(self.cytometry)
+        migrate_scoped_gating_templates(self.cytometry)
+        self.samples.setdefault('sample_template_assignments', {})
 
     def save(self):
         if self.experiment_path is None:

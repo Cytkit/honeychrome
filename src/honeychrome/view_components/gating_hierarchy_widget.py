@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence, QClipboard
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QWidget, QVBoxLayout, QHeaderView, QMenu,
-                               QMessageBox)
+                               QMessageBox, QComboBox, QHBoxLayout, QToolButton, QLabel, QInputDialog)
 from PySide6.QtCore import Qt, QAbstractItemModel, QModelIndex, Slot, QMimeData
 
 import logging
@@ -298,9 +298,14 @@ class GatingHierarchyWidget(QWidget):
         self.tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.show_context_menu)
 
+        # Template picker bar (per-sample gating). Choosing a template both shows
+        # its gates and assigns the current sample to it; ＋ makes a new template.
+        self.template_bar = self._build_template_bar()
+
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        layout.addWidget(self.template_bar)
         layout.addWidget(self.tree_view)
         self.setLayout(layout)
 
@@ -327,9 +332,80 @@ class GatingHierarchyWidget(QWidget):
         if self.bus is not None:
             self.bus.changedGatingHierarchy.connect(self.update_hierarchy)
             self.bus.histsStatsRecalculated.connect(self.update_data)
+            self.bus.templatesChanged.connect(self.populate_templates)
 
         # Install event filter on tree view
         self.tree_view.installEventFilter(self)
+
+    def _build_template_bar(self):
+        """A compact row above the tree: '<Raw|Unmixed> template: [combo ▼] [＋] [✎]'.
+
+        The combo lists this scope's gating templates (raw and unmixed have
+        independent lists); picking one selects it for the current sample. ＋
+        creates a new (empty) template and selects it; ✎ renames the current one.
+        """
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(4, 2, 4, 2)
+        row.setSpacing(4)
+
+        scope_label = 'Unmixed' if self.mode == 'unmixed' else 'Raw'
+        row.addWidget(QLabel(f"{scope_label} template:"))
+
+        self.template_combo = QComboBox()
+        self.template_combo.setToolTip(
+            "Gating template for the current sample. Picking a template applies its "
+            "gates to this sample; Time gates auto-scale to each sample."
+        )
+        self.template_combo.textActivated.connect(self._on_template_activated)
+        row.addWidget(self.template_combo, 1)
+
+        self.new_template_button = QToolButton()
+        self.new_template_button.setText("＋")
+        self.new_template_button.setToolTip("Create a new empty template (root only, no plots) and assign this sample to it")
+        self.new_template_button.clicked.connect(self._on_new_template)
+        row.addWidget(self.new_template_button)
+
+        self.rename_template_button = QToolButton()
+        self.rename_template_button.setText("✎")
+        self.rename_template_button.setToolTip("Rename the current template")
+        self.rename_template_button.clicked.connect(self._on_rename_template)
+        row.addWidget(self.rename_template_button)
+
+        return bar
+
+    @Slot(str, list, str)
+    def populate_templates(self, scope, names, active):
+        """Refresh the template combo (controller -> UI) for this tree's scope.
+        Ignores other scopes. Signals are blocked so this programmatic update
+        never looks like a user selection."""
+        if scope != self.mode:
+            return
+        self.template_combo.blockSignals(True)
+        self.template_combo.clear()
+        self.template_combo.addItems(names)
+        if active in names:
+            self.template_combo.setCurrentText(active)
+        self.template_combo.blockSignals(False)
+
+    def _on_template_activated(self, name):
+        if self.bus is not None and name:
+            self.bus.selectTemplateRequested.emit(self.mode, name)
+
+    def _on_new_template(self):
+        name, ok = QInputDialog.getText(self, "New template", "New empty template name:")
+        name = (name or "").strip()
+        if ok and name and self.bus is not None:
+            self.bus.createTemplateRequested.emit(self.mode, name)
+
+    def _on_rename_template(self):
+        old = self.template_combo.currentText()
+        if not old:
+            return
+        new, ok = QInputDialog.getText(self, "Rename template", "New name:", text=old)
+        new = (new or "").strip()
+        if ok and new and new != old and self.bus is not None:
+            self.bus.renameTemplateRequested.emit(self.mode, old, new)
 
     def eventFilter(self, obj, event):
         if obj == self.tree_view and event.type() == event.Type.KeyPress:

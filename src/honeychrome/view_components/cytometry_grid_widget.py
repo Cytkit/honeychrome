@@ -162,6 +162,10 @@ class CytometryGridWidget(QScrollArea):
                 self.bus.plotChangeRequested.emit(self.mode, n_in_plot_sequence)
 
     def show_new_plot_widget(self):
+        # Ensure the column layout exists (empty grids compute n_columns lazily),
+        # otherwise place_tile would crash with n_columns is None.
+        if self.n_columns is None:
+            self.init_grid()
         new_plot_widget = NewPlotWidget(bus=self.bus, mode=self.mode, data_for_cytometry_plots=self.data_for_cytometry_plots)
         self.place_tile(new_plot_widget, 1, 1)
         self.debounce_timer.start(300)
@@ -232,7 +236,13 @@ class CytometryGridWidget(QScrollArea):
                     data_for_cytometry_plots=self.data_for_cytometry_plots, parent=self.container)
                 self.plot_widgets.append(new_widget)
 
-            self.debounce_timer.start(300)
+        # Lay the tiles out NOW (synchronously) so that when this is a template
+        # switch, the plots are in the layout before histograms are (re)emitted —
+        # otherwise a fresh widget receives its data before it is placed and
+        # renders blank. The debounce re-runs init_grid after the widget settles
+        # to its final size (correct column count).
+        self.init_grid()
+        self.debounce_timer.start(300)
 
     def resizeEvent(self, event: QResizeEvent):
         super().resizeEvent(event)
@@ -244,47 +254,49 @@ class CytometryGridWidget(QScrollArea):
     def init_grid(self):
         if self.data_for_cytometry_plots is None:
             return
-        # called every time width changes
+        # called every time width changes. Establish the column layout even when
+        # there are no plots (e.g. a brand-new empty template) so the first
+        # Add Plot can place a tile — otherwise n_columns stays None and
+        # place_tile crashes.
+        old_n_columns = self.n_columns
+        self.n_columns = max([self.width() // settings.cytometry_plot_width_target_retrieved, 1])
+        self.cytometry_plot_real_width = (self.width() - 45)// self.n_columns
+        for n in range(self.n_columns):
+            self.layout.setColumnMinimumWidth(n, self.cytometry_plot_real_width)
+
+        self.occupied = []
+        self.row = 0
+        self.last_row = 0
+        if self.n_columns < 1:
+            self.n_columns = 1
+        elif self.n_columns > 10:
+            self.n_columns = 10
+
+        logger.info(f'Cytometry Grid Widget: setting width to {self.n_columns} columns')
+
+        # Place each plot as a plot_widget
         if self.data_for_cytometry_plots['plots']:
-            old_n_columns = self.n_columns
-            self.n_columns = max([self.width() // settings.cytometry_plot_width_target_retrieved, 1])
-            self.cytometry_plot_real_width = (self.width() - 45)// self.n_columns
-            for n in range(self.n_columns):
-                self.layout.setColumnMinimumWidth(n, self.cytometry_plot_real_width)
+            for n, plot in enumerate(self.data_for_cytometry_plots['plots']):
 
-            if True: # old_n_columns != self.n_columns:
-                self.occupied = []
-                self.row = 0
-                self.last_row = 0
-                if self.n_columns < 1:
-                    self.n_columns = 1
-                elif self.n_columns > 10:
-                    self.n_columns = 10
+                # set width to 3 if plot is ribbon and width not set
+                if plot['type'] == 'ribbon' and 'width' not in plot.keys():
+                    plot['width'] = 3
 
-                logger.info(f'Cytometry Grid Widget: setting width to {self.n_columns} columns')
+                # set tile to 1x1 if width/height not previously set
+                w = min([plot.get("width", 1), self.n_columns])
+                h = plot.get("height", 1)
+                # Create tile widget
+                plot_widget = self.plot_widgets[n]
 
-                # # Create container widget
-                # if self.container is not None:
-                #     self.container.deleteLater()
-                #     self.container = None
-                # self.container = QWidget(parent=self)
-                # self.layout = QGridLayout(self.container)  # Layout assigned to container
+                self.place_tile(plot_widget, w, h)
+                plot_widget.n_in_plot_sequence = n
 
-                # Place each plot as a plot_widget
-                for n, plot in enumerate(self.data_for_cytometry_plots['plots']):
-
-                    # set width to 3 if plot is ribbon and width not set
-                    if plot['type'] == 'ribbon' and 'width' not in plot.keys():
-                        plot['width'] = 3
-
-                    # set tile to 1x1 if width/height not previously set
-                    w = min([plot.get("width", 1), self.n_columns])
-                    h = plot.get("height", 1)
-                    # Create tile widget
-                    plot_widget = self.plot_widgets[n]
-
-                    self.place_tile(plot_widget, w, h)
-                    plot_widget.n_in_plot_sequence = n
+                # Draw the tile's current data as soon as it's placed. A grid
+                # (re)build — e.g. a template switch — otherwise relies on a
+                # separately-timed histsStatsRecalculated signal that a freshly
+                # built widget can miss, leaving the plot blank. Drawing here is
+                # idempotent and cheap (reads already-computed histograms).
+                plot_widget.update_axes_stats_hist(self.mode)
 
                     # print(self.n_columns)
                     # print(n, w, h, self.data_for_cytometry_plots['plots'])
