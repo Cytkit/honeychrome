@@ -150,7 +150,7 @@ class View(QObject):
         self.bus.selectTemplateRequested.connect(self.controller.select_template)
         self.bus.createTemplateRequested.connect(self.controller.create_and_select_template)
         self.bus.renameTemplateRequested.connect(self.controller.rename_template)
-        self.bus.templateApplied.connect(self.init_plot_grids_and_gating_trees)
+        self.bus.templateApplied.connect(self.on_template_applied)
 
         # change spectral model, unmix!, change fine tuning matrix
         self.bus.spectralModelUpdated.connect(self.controller.refresh_spectral_process)
@@ -244,6 +244,17 @@ class View(QObject):
     def set_main_window_title(self, title):
         if self.main_window:
             self.main_window.setWindowTitle(f'Honeychrome by Cytkit: {title}')
+
+    @Slot(str)
+    def on_template_applied(self, scope):
+        """Rebuild the grid + gating tree for a template switch, then guarantee a
+        stats refresh. A template switch during a sample load runs on a worker
+        thread (with_busy_cursor); the tree's stat update can be queued and only
+        land on the next event-loop spin — leaving gate % blank until the next
+        click. Re-emitting the stats signal via singleShot(0) forces the gating
+        tree to refresh its % on the very next main-loop iteration."""
+        self.init_plot_grids_and_gating_trees(scope)
+        QTimer.singleShot(0, lambda: self.bus.histsStatsRecalculated.emit(scope, []))
 
     @Slot(str)
     def init_plot_grids_and_gating_trees(self, scope=''):
