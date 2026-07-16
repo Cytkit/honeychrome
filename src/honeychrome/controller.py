@@ -597,6 +597,20 @@ class Controller(QObject):
         key = 'default_raw_template_name' if scope == 'raw' else 'default_unmixed_template_name'
         return self.experiment.cytometry.get(key, DEFAULT_TEMPLATE_NAME)
 
+    def _resolve_default_template(self, scope):
+        """The scope's default/primary template name that ACTUALLY exists.
+
+        Follows a rename via the stored pointer, then falls back to ``default``,
+        then to the first available template — so a renamed default never dangles
+        (which used to leave unassigned samples pointing at a missing 'default')."""
+        templates = self._scoped_templates(scope)
+        name = self._default_template_name(scope)
+        if name in templates:
+            return name
+        if DEFAULT_TEMPLATE_NAME in templates:
+            return DEFAULT_TEMPLATE_NAME
+        return next(iter(templates), DEFAULT_TEMPLATE_NAME)
+
     def rename_template(self, scope, old, new):
         """Rename a template within a scope (e.g. raw ``default`` -> ``QC``)."""
         new = (new or '').strip()
@@ -701,6 +715,8 @@ class Controller(QObject):
             return
         for scope in ('raw', 'unmixed'):
             desired = scoped_template_for_sample(scope, self.current_sample_path, self.experiment.samples)
+            if desired not in self._scoped_templates(scope):
+                desired = self._resolve_default_template(scope)
             if desired != self.active_template.get(scope) and desired in self._scoped_templates(scope):
                 self._load_gating_from_template(scope, desired)
 
@@ -745,6 +761,12 @@ class Controller(QObject):
         if scope is None:
             scope = ['raw', 'unmixed']
             self.flush_ephemeral_data()
+
+        # Resolve each scope's active template to its ACTUAL default (which may
+        # have been renamed) so the picker, gating and plots all use the right
+        # one; before a sample is loaded there is no assignment to go on.
+        for _scope in scope:
+            self.active_template[_scope] = self._resolve_default_template(_scope)
 
         # Per-sample gating: point the plot lists at the active templates' plots,
         # so plots travel with each scope's template (and edits persist into it).
