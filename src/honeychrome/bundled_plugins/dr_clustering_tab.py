@@ -3,7 +3,7 @@ dr_clustering_tab.py — DR / Clustering / Statistics Plugin for Honeychrome
 ===========================================================================
 Honeychrome plugin providing:
   • Dimensionality reduction  — UMAP, PaCMAP
-  • Clustering               — FlowSOM, Leiden, DBSCAN
+  • Clustering               — FlowSOM, Leiden, HDBSCAN
   • Transform inspector      — read-only preview of Logicle parameters
   • Group & statistics       — sample grouping, limma differential analysis
   • Workspace                — customisable matplotlib scatter-plot canvas
@@ -34,11 +34,11 @@ Stage 3 — DR pipeline (complete):
   _apply_dr_to_all_samples() projects every sample.
 
 Stage 4 — Clustering (complete):
-  ConfigTab clustering section: FlowSOM / Leiden / DBSCAN radio buttons
+  ConfigTab clustering section: FlowSOM / Leiden / HDBSCAN radio buttons
   with per-algorithm hyperparameter panels.
   FlowSOM: SOM grid, manual metacluster count (2-200).
   Leiden: reuses UMAP hnswlib kNN; igraph + leidenalg community detection.
-  DBSCAN: applied to UMAP embedding if available, else raw feature space.
+  HDBSCAN: applied to UMAP embedding if available, else raw feature space.
   All algorithms assign labels to every sample via nearest-centroid.
   Cluster colours from cc.glasbey; noise label −1 → grey.
 
@@ -79,7 +79,6 @@ _REQUIRED_PACKAGES = {
     'umap':       'umap-learn',
     'openTSNE':   'openTSNE',
     'pacmap':     'pacmap',
-    'flowsom':    'flowsom',
     'leidenalg':  'leidenalg',
     'igraph':     'python-igraph',
     'hnswlib':    'hnswlib',
@@ -127,15 +126,6 @@ def _bootstrap():
                             message='.*SwigPy.*')
     warnings.filterwarnings('ignore', category=DeprecationWarning,
                             message='.*swigvarlink.*')
-    # mudata emits FutureWarnings about .update() behaviour changes;
-    # harmless for our read-only usage.
-    warnings.filterwarnings('ignore', category=FutureWarning,
-                            module='mudata')
-    warnings.filterwarnings('ignore', category=UserWarning,
-                            message='.*Cannot join columns.*')
-    # flowsom internal deprecation warning about obs_keys
-    warnings.filterwarnings('ignore', category=FutureWarning,
-                            module='flowsom')
     # PaCMAP random_state notice
     warnings.filterwarnings('ignore', category=UserWarning,
                             message='.*random state is set.*')
@@ -355,6 +345,14 @@ def _read_transforms_from_experiment(controller):
         logicle_m  → M (decades)
         logicle_a  → A (negative decades)
         id         → transform type: 0=linear, 1=logicle, 2=log
+        limits     → [min, max] of the TRANSFORMED (plotted) axis range, as
+                     set in the Transforms tab -- see
+                     functions.py::generate_transformations(), which passes
+                     this straight to Transform.set_transform(limits=...).
+                     Previously dropped here, so every Transform this
+                     plugin built on its own (violin ticks/positioning)
+                     silently fell back to the class default [0, 1]
+                     instead of the channel's actual configured range.
 
     We prefer the unmixed transforms (which match what the plugin works on).
     Fall back to raw_transforms if unmixed are absent.
@@ -362,7 +360,7 @@ def _read_transforms_from_experiment(controller):
     Returns
     -------
     dict  {channel_name: {'W': float, 'A': float, 'T': float, 'M': float,
-                          'id': int}}
+                          'id': int, 'limits': [float, float]}}
           Empty dict if transforms are not yet configured.
     """
     transforms = (
@@ -380,6 +378,7 @@ def _read_transforms_from_experiment(controller):
             'M': float(params.get('logicle_m', 4.5)),
             'A': float(params.get('logicle_a', 0.0)),
             'id': params.get('id', 1),   # 0=linear, 1=logicle, 2=log
+            'limits': list(params.get('limits', [0, 1])),
         }
     return result
 
@@ -421,10 +420,36 @@ def _apply_channel_transform(state, ch: str, values: np.ndarray) -> np.ndarray:
         scale_t=params['T'], logicle_w=params['W'],
         logicle_m=params['M'], logicle_a=params['A'],
     )
-    tr.set_transform(id=params['id'])
+    tr.set_transform(id=params['id'], limits=params.get('limits', [0, 1]))
     if tr.xform is None:      # 'default'/time-gate case -- no transform to apply
         return values
     return tr.xform.apply(values)
+
+def _channel_axis_ticks(state, ch: str):
+    """
+    (major_ticks, minor_ticks, limits) for channel *ch* in TRANSFORMED
+    (plotted) coordinates -- ticks are (position, label) tuples, straight
+    from the same Transform.ticks() method cytometry_plot_widget.py feeds
+    to axis.setTicks() for the 2D histograms and Workspace marker overlays;
+    limits is the [min, max] transformed-axis range from the Transforms tab.
+    Returns None if no transform is configured, or it's a linear/time-gate
+    'default' transform with no tick scheme of its own.
+    """
+    params = state.channel_transform_params.get(ch)
+    if not params:
+        return None
+    tr = Transform(
+        scale_t=params['T'], logicle_w=params['W'],
+        logicle_m=params['M'], logicle_a=params['A'],
+    )
+    tr.set_transform(id=params['id'], limits=params.get('limits', [0, 1]))
+    if tr.xform is None:
+        return None
+    result = tr.ticks()
+    if result is None:
+        return None
+    minor_ticks, major_ticks = result
+    return major_ticks, minor_ticks, tr.limits
 
 def _downsample(data: np.ndarray, n: int, rng=None) -> np.ndarray:
     """
@@ -521,7 +546,7 @@ class PipelineState:
     #   'run_id':    str,
     #   'kind':      'clustering',
     #   'label':     str,                      # display name shown in combo
-    #   'algorithm': str,                      # 'FlowSOM' | 'Leiden' | 'DBSCAN'
+    #   'algorithm': str,                      # 'FlowSOM' | 'Leiden' | 'HDBSCAN'
     #   'gates':     list[str],
     #   'training_sample_ids': list[str],
     #   'n_samples': int,
@@ -1319,7 +1344,7 @@ class ConfigTab(QWidget):
         cl_algo_row = QHBoxLayout()
         cl_algo_row.addWidget(QLabel("Algorithm:"))
         self._cl_algo_group = QButtonGroup(self)
-        for algo in ('FlowSOM', 'Leiden', 'DBSCAN'):
+        for algo in ('FlowSOM', 'Leiden', 'HDBSCAN'):
             rb = QRadioButton(algo)
             if algo == 'FlowSOM':
                 rb.setChecked(True)
@@ -1400,38 +1425,47 @@ class ConfigTab(QWidget):
         cl_layout.addWidget(self._leiden_params)
         self._leiden_params.setVisible(False)
 
-        # ---- DBSCAN params ----
-        self._dbscan_params = QWidget()
-        dbscan_grid = QGridLayout(self._dbscan_params)
-        dbscan_grid.setContentsMargins(0, 0, 0, 0)
-        dbscan_grid.setSpacing(4)
+        # ---- HDBSCAN params ----
+        self._hdbscan_params = QWidget()
+        hdbscan_grid = QGridLayout(self._hdbscan_params)
+        hdbscan_grid.setContentsMargins(0, 0, 0, 0)
+        hdbscan_grid.setSpacing(4)
 
-        dbscan_grid.addWidget(QLabel("eps:"), 0, 0)
-        self.dbscan_eps = QDoubleSpinBox()
-        self.dbscan_eps.setRange(0.01, 100.0)
-        self.dbscan_eps.setSingleStep(0.1)
-        self.dbscan_eps.setDecimals(3)
-        self.dbscan_eps.setValue(0.5)
-        self.dbscan_eps.setToolTip(
-            "Maximum distance between points in the same neighbourhood.\n"
+        hdbscan_grid.addWidget(QLabel("min_cluster_size:"), 0, 0)
+        self.hdbscan_min_cluster_size = QSpinBox()
+        self.hdbscan_min_cluster_size.setRange(2, 5000)
+        self.hdbscan_min_cluster_size.setValue(25)
+        self.hdbscan_min_cluster_size.setToolTip(
+            "Smallest grouping of events that counts as its own cluster.\n"
             "Applied to UMAP embedding (if available) else raw feature space.\n"
-            "Default: 0.5"
+            "Default: 25"
         )
-        dbscan_grid.addWidget(self.dbscan_eps, 0, 1)
+        hdbscan_grid.addWidget(self.hdbscan_min_cluster_size, 0, 1)
 
-        dbscan_grid.addWidget(QLabel("min_samples:"), 0, 2)
-        self.dbscan_min_samples = QSpinBox()
-        self.dbscan_min_samples.setRange(1, 500)
-        self.dbscan_min_samples.setValue(5)
-        self.dbscan_min_samples.setToolTip(
-            "Minimum events in a neighbourhood to form a core point.\n"
-            "Events not reachable from any core point → label −1 (noise, grey).\n"
-            "Default: 5"
+        hdbscan_grid.addWidget(QLabel("min_samples:"), 0, 2)
+        self.hdbscan_min_samples = QSpinBox()
+        self.hdbscan_min_samples.setRange(0, 500)
+        self.hdbscan_min_samples.setValue(0)
+        self.hdbscan_min_samples.setToolTip(
+            "How conservative density estimation is.  Higher = more events\n"
+            "labelled −1 (noise).  0 = use min_cluster_size (sklearn default)."
         )
-        dbscan_grid.addWidget(self.dbscan_min_samples, 0, 3)
+        hdbscan_grid.addWidget(self.hdbscan_min_samples, 0, 3)
 
-        cl_layout.addWidget(self._dbscan_params)
-        self._dbscan_params.setVisible(False)
+        hdbscan_grid.addWidget(QLabel("cluster_selection_epsilon:"), 1, 0)
+        self.hdbscan_cluster_selection_epsilon = QDoubleSpinBox()
+        self.hdbscan_cluster_selection_epsilon.setRange(0.0, 100.0)
+        self.hdbscan_cluster_selection_epsilon.setSingleStep(0.05)
+        self.hdbscan_cluster_selection_epsilon.setDecimals(3)
+        self.hdbscan_cluster_selection_epsilon.setValue(0.0)
+        self.hdbscan_cluster_selection_epsilon.setToolTip(
+            "Merge sub-clusters closer than this distance into one.\n"
+            "0.0 = pure hierarchical selection, no merging. Default: 0.0"
+        )
+        hdbscan_grid.addWidget(self.hdbscan_cluster_selection_epsilon, 1, 1)
+
+        cl_layout.addWidget(self._hdbscan_params)
+        self._hdbscan_params.setVisible(False)
 
         # ---- Clustering space selector ----
         space_row = QHBoxLayout()
@@ -1662,7 +1696,7 @@ class ConfigTab(QWidget):
         algo = self._selected_cl_algo()
         self._flowsom_params.setVisible(algo == 'FlowSOM')
         self._leiden_params.setVisible(algo == 'Leiden')
-        self._dbscan_params.setVisible(algo == 'DBSCAN')
+        self._hdbscan_params.setVisible(algo == 'HDBSCAN')
 
         notes = {
             'FlowSOM': (
@@ -1672,9 +1706,10 @@ class ConfigTab(QWidget):
                 "Leiden: graph community detection.  Reuses UMAP kNN if available.\n"
                 "Higher resolution = more fine-grained clusters."
             ),
-            'DBSCAN': (
-                "DBSCAN: density-based clustering.  No pre-specified cluster count.\n"
-                "Events labelled −1 (noise) are shown in grey."
+            'HDBSCAN': (
+                "HDBSCAN: density-based clustering, no fixed distance threshold.\n"
+                "Works on both the raw feature space and a DR embedding without\n"
+                "retuning.  Events labelled −1 (noise) are shown in grey."
             ),
         }
         self._cl_algo_note.setText(notes.get(algo, ''))
@@ -1734,10 +1769,11 @@ class ConfigTab(QWidget):
                 'resolution':   self.leiden_resolution.value(),
                 'n_neighbors':  self.leiden_n_neighbors.value(),
             }
-        elif algo == 'DBSCAN':
+        elif algo == 'HDBSCAN':
             return {
-                'eps':         self.dbscan_eps.value(),
-                'min_samples': self.dbscan_min_samples.value(),
+                'min_cluster_size':          self.hdbscan_min_cluster_size.value(),
+                'min_samples':               self.hdbscan_min_samples.value(),
+                'cluster_selection_epsilon': self.hdbscan_cluster_selection_epsilon.value(),
             }
         return {}
 
@@ -3473,7 +3509,7 @@ class GroupsStatsTab(QWidget):
         splitter.addWidget(bottom_widget)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
-        splitter.setSizes([500, 700])
+        splitter.setSizes([650, 900])
         splitter.setChildrenCollapsible(False)
 
         # Sentinel: cluster names snapshot at last _draw_results() call.
@@ -6503,9 +6539,9 @@ class ClusterAnnotationTab(QWidget):
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 1)
-        splitter.setSizes([420, 420, 260])
+        splitter.setSizes([520, 520, 340])
         splitter.setChildrenCollapsible(False)
-        self._violin_scroll.setMinimumHeight(100)
+        self._violin_scroll.setMinimumHeight(400)
 
     # ------------------------------------------------------------------
     # Refresh (called on tab activation)
@@ -6662,6 +6698,13 @@ class ClusterAnnotationTab(QWidget):
             if labels is None:
                 continue
             labels = np.asarray(labels)
+            if len(values) != len(labels):
+                _log.warning(
+                    "_plot_violins: %s -- values (%d) vs labels (%d) length "
+                    "mismatch, truncating to %d. Event order may not be "
+                    "aligned if gates/channels changed since this run was archived.",
+                    rel, len(values), len(labels), min(len(values), len(labels)),
+                )
             m = min(len(values), len(labels))
             values, labels = values[:m], labels[:m]
             for ch in channels:
@@ -6673,21 +6716,45 @@ class ClusterAnnotationTab(QWidget):
                         continue
                     pooled[ch].setdefault(int(cl_id), []).append(col[labels == cl_id])
 
+        for ch in channels:
+            means = {cl: float(np.mean(np.concatenate(vals)))
+                    for cl, vals in pooled.get(ch, {}).items()}
+            _log.info("_plot_violins: %s per-cluster raw mean: %s", ch, means)
+
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from PySide6.QtGui import QPalette
+        from PySide6.QtWidgets import QApplication
 
         n = len(channels)
         n_cols = min(3, n)
         n_rows = -(-n // n_cols)
+
+        _palette = QApplication.instance().palette()
+        is_dark = _palette.color(QPalette.ColorRole.Base).value() < 128
+        _fg = 'white' if is_dark else 'black'
+        display_labels = _antigen_dash_labels(self.controller)
+
         fig = Figure(figsize=(4.2 * n_cols, 3.2 * n_rows), constrained_layout=True)
+        if is_dark:
+            fig.patch.set_facecolor('#1e1e1e')
         names_map = cl_run.get('names', {})
 
         for i, ch in enumerate(channels):
             ax = fig.add_subplot(n_rows, n_cols, i + 1)
+            if is_dark:
+                ax.set_facecolor('#2b2b2b')
+                ax.tick_params(colors=_fg)
+                ax.xaxis.label.set_color(_fg)
+                ax.yaxis.label.set_color(_fg)
+                ax.title.set_color(_fg)
+                for spine in ax.spines.values():
+                    spine.set_edgecolor(_fg)
+            title = display_labels.get(ch, ch)
             by_cluster = pooled.get(ch, {})
             cl_ids = sorted(by_cluster.keys())
             if not cl_ids:
-                ax.set_title(f"{ch} (no data)", fontsize=8)
+                ax.set_title(f"{title} (no data)", fontsize=8)
                 ax.axis('off')
                 continue
             data = [_apply_channel_transform(self.state, ch, np.concatenate(by_cluster[cl_id]))
@@ -6698,8 +6765,18 @@ class ClusterAnnotationTab(QWidget):
                 [names_map.get(cl, str(cl)) for cl in cl_ids],
                 rotation=45, ha='right', fontsize=7,
             )
-            ax.set_title(ch, fontsize=9)
-            ax.set_ylabel('Transformed intensity', fontsize=7)
+            ax.set_title(title, fontsize=9)
+            tick_spec = _channel_axis_ticks(self.state, ch)
+            if tick_spec is not None:
+                major_ticks, minor_ticks, limits = tick_spec
+                ax.set_yticks([pos for pos, _label in major_ticks])
+                ax.set_yticklabels([label for _pos, label in major_ticks])
+                ax.set_yticks([pos for pos, _label in minor_ticks], minor=True)
+                ax.tick_params(axis='y', which='minor', length=2, labelsize=0)
+                ax.set_ylim(limits[0], limits[1])
+                ax.set_ylabel('Intensity', fontsize=7)
+            else:
+                ax.set_ylabel('Transformed intensity', fontsize=7)
             ax.tick_params(labelsize=7)
 
         canvas = FigureCanvasQTAgg(fig)
@@ -7295,9 +7372,13 @@ class PluginWidget(QWidget):
             if hasattr(ct, 'leiden_resolution'):
                 s.setValue('leiden_resolution',  ct.leiden_resolution.value())
                 s.setValue('leiden_n_neighbors', ct.leiden_n_neighbors.value())
-            if hasattr(ct, 'dbscan_eps'):
-                s.setValue('dbscan_eps',         ct.dbscan_eps.value())
-                s.setValue('dbscan_min_samples', ct.dbscan_min_samples.value())
+            if hasattr(ct, 'hdbscan_min_cluster_size'):
+                s.setValue('hdbscan_min_cluster_size',
+                          ct.hdbscan_min_cluster_size.value())
+                s.setValue('hdbscan_min_samples',
+                          ct.hdbscan_min_samples.value())
+                s.setValue('hdbscan_cluster_selection_epsilon',
+                          ct.hdbscan_cluster_selection_epsilon.value())
         finally:
             s.endGroup()
 
@@ -7464,8 +7545,10 @@ class PluginWidget(QWidget):
             self._pending_flowsom_n_iter      = s.value('flowsom_n_iter', None)
             self._pending_leiden_resolution   = s.value('leiden_resolution', None)
             self._pending_leiden_n_neighbors  = s.value('leiden_n_neighbors', None)
-            self._pending_dbscan_eps          = s.value('dbscan_eps', None)
-            self._pending_dbscan_min_samples  = s.value('dbscan_min_samples', None)
+            self._pending_hdbscan_min_cluster_size = s.value('hdbscan_min_cluster_size', None)
+            self._pending_hdbscan_min_samples      = s.value('hdbscan_min_samples', None)
+            self._pending_hdbscan_cluster_selection_epsilon = s.value(
+                'hdbscan_cluster_selection_epsilon', None)
 
         finally:
             s.endGroup()
@@ -7738,13 +7821,22 @@ class PluginWidget(QWidget):
         if hasattr(ct, 'leiden_resolution'):
             _set_spin(ct.leiden_resolution,  getattr(self, '_pending_leiden_resolution', None), float)
             _set_spin(ct.leiden_n_neighbors, getattr(self, '_pending_leiden_n_neighbors', None))
-        if hasattr(ct, 'dbscan_eps'):
-            _set_spin(ct.dbscan_eps,         getattr(self, '_pending_dbscan_eps', None), float)
-            _set_spin(ct.dbscan_min_samples, getattr(self, '_pending_dbscan_min_samples', None))
+        if hasattr(ct, 'hdbscan_min_cluster_size'):
+            _set_spin(ct.hdbscan_min_cluster_size,
+                     getattr(self, '_pending_hdbscan_min_cluster_size', None))
+            _set_spin(ct.hdbscan_min_samples,
+                     getattr(self, '_pending_hdbscan_min_samples', None))
+            _set_spin(ct.hdbscan_cluster_selection_epsilon,
+                     getattr(self, '_pending_hdbscan_cluster_selection_epsilon', None), float)
 
     def _apply_pending_state_to_annotation_tab(self):
         """Restore the Cluster Annotation tab's run selections and checked
-        channels after ClusterAnnotationTab.refresh() has run."""
+        channels after ClusterAnnotationTab.refresh() has run, then redraw
+        the violin panel so it survives a tab switch or experiment reopen
+        instead of reverting to the placeholder -- mirrors _redraw_map()
+        and _populate_label_table(), which already redraw unconditionally
+        on every refresh(); the violin panel was the one panel of the three
+        that didn't."""
         cat = self.cluster_annotation_tab
         run_id = getattr(self, '_pending_annotation_run_id', '')
         if run_id:
@@ -7760,7 +7852,16 @@ class PluginWidget(QWidget):
         if checked:
             for i in range(cat.channel_list.count()):
                 item = cat.channel_list.item(i)
-                item.setCheckState(Qt.Checked if item.text() in checked else Qt.Unchecked)
+                # Compare against the raw channel name (UserRole data), not
+                # item.text() -- the displayed text is the "Antigen -
+                # Channel" label, which never matches the raw names stored
+                # in _pending_annotation_channels. This was silently
+                # failing to re-check any channel with an assigned antigen.
+                item.setCheckState(
+                    Qt.Checked if item.data(Qt.UserRole) in checked else Qt.Unchecked
+                )
+        if cat.run_combo.currentData() is not None and cat._checked_channels():
+            cat._plot_violins()
 
     def _apply_pending_state_to_transform_tab(self):
         """Add and configure biplot tiles after TransformTab.refresh() has run."""
@@ -8191,341 +8292,6 @@ class PluginWidget(QWidget):
     # ==================================================================
     # Stage 4 — Clustering
     # ==================================================================
-
-    def _get_training_embeddings(self, algo: str | None) -> np.ndarray | None:
-        """
-        Return the concatenated training-sample embeddings for *algo*,
-        or the raw logicle-transformed feature matrix if algo is None / unavailable.
-        """
-        if algo and algo in self.state.embeddings:
-            emb_dict = self.state.embeddings[algo]
-            chunks = []
-            for rel_path in self.state.training_sample_ids:
-                if rel_path in emb_dict:
-                    chunks.append(emb_dict[rel_path])
-            if chunks:
-                return np.concatenate(chunks, axis=0).astype(np.float32)
-        # Fall back to raw (transformed) feature space
-        return self._load_training_data()
-
-    def _assign_cluster_colors(self, labels: np.ndarray):
-        """Populate state.cluster_colors from cc.glasbey palette."""
-        palette = cc.glasbey
-        unique = sorted(int(l) for l in np.unique(labels))
-        self.state.cluster_colors = {}
-        color_idx = 0
-        for lbl in unique:
-            if lbl == -1:
-                self.state.cluster_colors[-1] = '#7f7f7f'
-            else:
-                self.state.cluster_colors[lbl] = palette[color_idx % len(palette)]
-                color_idx += 1
-
-    # ------------------------------------------------------------------
-    # FlowSOM
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _numpy_to_anndata(data: np.ndarray, channel_names: list) -> 'ad.AnnData':
-        """Wrap a numpy array in an AnnData object for flowsom."""
-        import anndata as ad
-        # Use np.array(..., copy=True) to guarantee a writable C-contiguous
-        # array regardless of whether the input is memory-mapped or read-only.
-        x = np.array(data, dtype=np.float32, copy=True)
-        return ad.AnnData(
-            X=x,
-            var=__import__('pandas').DataFrame(index=channel_names[:data.shape[1]]),
-        )
-
-    def _run_flowsom(self, params: dict):
-        """
-        Run FlowSOM on training data and assign labels to all training samples.
-
-        flowsom (Saeys/scverse) API notes:
-          - Input must be AnnData, not a raw numpy array.
-          - FlowSOM(inp, n_clusters, xdim, ydim, rlen, seed)
-              n_clusters = number of METACLUSTERS (set after SOM training).
-              xdim × ydim = SOM grid size.
-              rlen = training iterations.
-          - fsom.cluster_labels   → per-event SOM node index (property)
-          - fsom.metacluster_labels → per-event metacluster index (property)
-          - fsom.metacluster(k)   → re-metacluster with k groups
-          - fsom.new_data(adata)  → map new events to grid; returns new FlowSOM
-        """
-        import flowsom as fs
-
-        data = self._load_training_data()
-        if data is None:
-            return
-
-        xdim   = params['xdim']
-        ydim   = params['ydim']
-        n_meta = params['n_metaclusters']  # 0 = auto
-        n_iter = params['n_iter']
-
-        self.progress_message(
-            f"Training FlowSOM  ({xdim}×{ydim} grid, rlen={n_iter}) …"
-        )
-
-        channel_names = self.state.selected_channels
-        adata_train = self._numpy_to_anndata(data, channel_names)
-
-        fsom = fs.FlowSOM(
-            adata_train,
-            n_clusters=n_meta,
-            xdim=xdim,
-            ydim=ydim,
-            rlen=n_iter,
-            seed=42,
-        )
-
-        # Assign training-sample labels from the fitted model
-        self._flowsom_assign_all(fsom, n_meta, adata_train, data)
-        self.state.n_clusters = n_meta
-        self.state.active_clustering_algorithm = 'FlowSOM'
-        # Store fsom so clustering can be applied to new samples later
-        self.state.trained_reducers['FlowSOM'] = fsom
-        self.progress_message(f"FlowSOM done: {n_meta} metaclusters.")
-
-    def _flowsom_assign_all(self, fsom, n_meta: int,
-                            adata_train=None, train_data: np.ndarray = None):
-        """
-        Map training samples through the fitted FlowSOM and store labels.
-
-        For the training pool (passed as adata_train) we read labels directly
-        from fsom.metacluster_labels.  For other samples we use fsom.new_data().
-        We use only training samples here; the user can extend later.
-        """
-        raw_subdir = self.controller.experiment.settings['raw'][
-            'raw_samples_subdirectory'
-        ]
-
-        # --- training samples: use labels already in the fitted model ---
-        if adata_train is not None:
-            # metacluster_labels returns per-event array aligned with adata_train
-            train_meta = np.asarray(fsom.metacluster_labels, dtype=np.int32)
-            # Split by training sample (training pool was concatenated in order)
-            # We store the full pool under each training sample proportionally
-            # by iterating each sample and re-running new_data
-            pass  # fall through to per-sample new_data below
-
-        # --- per-sample assignment via new_data ---
-        all_samples = list(
-            self.controller.experiment.samples.get('all_samples', {}).keys()
-        )
-        self.state.cluster_labels = {}
-        for sample_key in all_samples:
-            try:
-                rel_path = str(Path(sample_key).relative_to(raw_subdir))
-            except ValueError:
-                rel_path = sample_key
-            # Only assign training samples at this stage
-            if rel_path not in self.state.training_sample_ids:
-                continue
-            sample_data = self._get_sample_data(rel_path, None)
-            if sample_data is None:
-                continue
-            try:
-                adata_s = self._numpy_to_anndata(sample_data,
-                                                 self.state.selected_channels)
-                fsom_s = fsom.new_data(adata_s)
-                labels = np.array(fsom_s.metacluster_labels, dtype=np.int32)
-                self.state.cluster_labels[rel_path] = labels
-                self.progress_message(
-                    f"  FlowSOM assigned {rel_path}: {len(labels):,} events"
-                )
-            except Exception as e:
-                self.progress_message(
-                    f"  FlowSOM assignment failed for {rel_path}: {e}"
-                )
-
-        if self.state.cluster_labels:
-            all_labels = np.concatenate(list(self.state.cluster_labels.values()))
-            self._assign_cluster_colors(all_labels)
-
-    # ------------------------------------------------------------------
-    # Leiden
-    # ------------------------------------------------------------------
-
-    def _run_leiden(self, params: dict):
-        """Build kNN graph and run Leiden community detection."""
-        import igraph
-        import leidenalg
-        import hnswlib
-
-        space   = params.get('_space', 'raw')
-        dr_algo = params.get('_dr_algo', None)
-
-        if space == 'dr' and dr_algo:
-            data = self._get_training_embeddings(dr_algo)
-        else:
-            data = self._load_training_data()
-            dr_algo = None  # ensure kNN index isn't reused in wrong space
-
-        if data is None:
-            return
-
-        resolution = params['resolution']
-        n_neighbors = params['n_neighbors']
-
-        # Reuse UMAP kNN index only if clustering on UMAP embedding
-        if self.state.umap_knn_index is not None:
-            self.progress_message("Reusing UMAP hnswlib kNN index for Leiden …")
-            index = self.state.umap_knn_index
-        else:
-            self.progress_message(
-                f"Building hnswlib kNN index (k={n_neighbors}) for Leiden …"
-            )
-            dim = data.shape[1]
-            index = hnswlib.Index(space='l2', dim=dim)
-            index.init_index(max_elements=len(data),
-                             ef_construction=200, M=16)
-            index.add_items(data)
-            index.set_ef(50)
-
-        self.progress_message("Querying kNN …")
-        labels_nn, _ = index.knn_query(data, k=n_neighbors)
-
-        # Build igraph from kNN
-        self.progress_message("Building igraph and running Leiden …")
-        n = len(data)
-        edges = []
-        for i, neighbours in enumerate(labels_nn):
-            for j in neighbours:
-                if j != i:
-                    edges.append((i, int(j)))
-        g = igraph.Graph(n=n, edges=edges, directed=False)
-        g.simplify()
-
-        partition = leidenalg.find_partition(
-            g,
-            leidenalg.RBConfigurationVertexPartition,
-            resolution_parameter=resolution,
-            seed=42,
-        )
-        train_labels = np.array(partition.membership, dtype=np.int32)
-
-        # Assign all samples via nearest-centroid
-        self._nearest_centroid_assign_all(data, train_labels,
-                                          dr_space=dr_algo if space=='dr' else None)
-        n_cl = int(train_labels.max()) + 1
-        self.state.n_clusters = n_cl
-        self.state.active_clustering_algorithm = 'Leiden'
-        self.progress_message(f"Leiden done: {n_cl} communities.")
-
-    # ------------------------------------------------------------------
-    # DBSCAN
-    # ------------------------------------------------------------------
-
-    def _run_dbscan(self, params: dict):
-        """Run DBSCAN on the chosen feature space (default: raw features)."""
-        from sklearn.cluster import DBSCAN
-
-        space    = params.get('_space', 'raw')
-        dr_algo  = params.get('_dr_algo', None)
-
-        if space == 'dr' and dr_algo:
-            data = self._get_training_embeddings(dr_algo)
-            space_label = f'{dr_algo} embedding'
-        else:
-            data = self._load_training_data()
-            space_label = 'original feature space'
-
-        if data is None:
-            return
-
-        self.progress_message(
-            f"Running DBSCAN on {space_label}  "
-            f"(eps={params['eps']}, min_samples={params['min_samples']}) …"
-        )
-
-        db = DBSCAN(
-            eps=params['eps'],
-            min_samples=params['min_samples'],
-            n_jobs=-1,
-        ).fit(data)
-
-        train_labels = db.labels_.astype(np.int32)
-        n_noise = int(np.sum(train_labels == -1))
-        n_cl = int(train_labels.max()) + 1
-
-        self.progress_message(
-            f"DBSCAN: {n_cl} cluster(s), {n_noise} noise events (label −1)"
-        )
-
-        # Pass both train_data and its space so assignment uses the same space
-        self._nearest_centroid_assign_all(data, train_labels, dr_space=dr_algo if space=='dr' else None)
-        self.state.n_clusters = n_cl
-        self.state.active_clustering_algorithm = 'DBSCAN'
-
-    # ------------------------------------------------------------------
-    # Shared assignment helpers
-    # ------------------------------------------------------------------
-
-    def _nearest_centroid_assign_all(
-        self,
-        train_data: np.ndarray,
-        train_labels: np.ndarray,
-        knn_index=None,
-        n_neighbors: int = 1,
-        dr_space: str | None = None,
-    ):
-        """
-        Assign cluster labels to all samples by nearest-centroid lookup.
-
-        train_data is the feature matrix the clustering was computed on
-        (either raw features or a DR embedding).  If dr_space is given,
-        each sample is projected through that DR embedding before prediction;
-        otherwise raw logicle-transformed features are used — ensuring the
-        prediction space always matches the training space.
-        """
-        from sklearn.neighbors import NearestCentroid
-
-        clf = NearestCentroid()
-        # Exclude noise points from centroid calculation
-        mask = train_labels != -1
-        if mask.sum() == 0:
-            return
-        clf.fit(train_data[mask], train_labels[mask])
-
-        all_samples = list(
-            self.controller.experiment.samples.get('all_samples', {}).keys()
-        )
-        raw_subdir = self.controller.experiment.settings['raw'][
-            'raw_samples_subdirectory'
-        ]
-        self.state.cluster_labels = {}
-
-        for sample_key in all_samples:
-            try:
-                rel_path = str(Path(sample_key).relative_to(raw_subdir))
-            except ValueError:
-                rel_path = sample_key
-
-            if dr_space:
-                # Use the pre-computed DR embedding for this sample
-                emb_dict = self.state.embeddings.get(dr_space, {})
-                sample_data = emb_dict.get(rel_path)
-                if sample_data is None:
-                    self.progress_message(
-                        f"  No {dr_space} embedding for {rel_path} — skipping"
-                    )
-                    continue
-            else:
-                sample_data = self._get_sample_data(rel_path, None)
-            if sample_data is None:
-                continue
-            try:
-                labels = clf.predict(sample_data).astype(np.int32)
-                self.state.cluster_labels[rel_path] = labels
-            except Exception as e:
-                self.progress_message(f"  Assignment failed for {rel_path}: {e}")
-
-        all_labels = (
-            np.concatenate(list(self.state.cluster_labels.values()))
-            if self.state.cluster_labels else train_labels
-        )
-        self._assign_cluster_colors(all_labels)
 
     # ------------------------------------------------------------------
     # Public clustering entry point
