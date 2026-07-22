@@ -11,8 +11,8 @@ instrumentation.
 FlowSOM uses ``flowsom_consensus`` (pyFlowSOM + our own consensus
 hierarchical metaclustering) rather than ``saeyslab/flowsom`` — the latter's
 internal AnnData/MuData mutation is incompatible with pandas 3.0's
-Copy-on-Write. All cluster labels (FlowSOM/Leiden/DBSCAN) are 0-based with
-−1 reserved for noise, matching Leiden/DBSCAN and the stats ``range(n_clusters)``
+Copy-on-Write. All cluster labels (FlowSOM/Leiden/HDBSCAN) are 0-based with
+−1 reserved for noise, matching Leiden/HDBSCAN and the stats ``range(n_clusters)``
 loop by construction — no post-hoc index shift needed for FlowSOM anymore.
 """
 
@@ -99,6 +99,9 @@ def run_flowsom(controller, state, params: dict, progress=None):
 
     _progress(progress, f"Consensus metaclustering ({k} metaclusters) …")
     node_to_meta = flowsom_consensus.consensus_metacluster(node_weights, k)
+    meta_ids, node_counts = np.unique(node_to_meta, return_counts=True)
+    log.info("run_flowsom: SOM nodes per metacluster: %s",
+             dict(zip(meta_ids.tolist(), node_counts.tolist())))
 
     flowsom_assign_all(controller, state, node_weights, node_to_meta, progress)
     state.n_clusters = k
@@ -218,11 +221,20 @@ def run_leiden(controller, state, params: dict, progress=None) -> None:
 # DBSCAN
 # ---------------------------------------------------------------------------
 
-def run_dbscan(controller, state, params: dict, progress=None) -> None:
-    """Run DBSCAN on the chosen feature space (default: transformed features)."""
-    from sklearn.cluster import DBSCAN
+def run_hdbscan(controller, state, params: dict, progress=None) -> None:
+    """
+    Run HDBSCAN on the chosen feature space (default: transformed features).
 
-    log_stage(log, "DBSCAN")
+    Replaces plain DBSCAN: a single global `eps` doesn't transfer between a
+    2D DR embedding and the full multichannel feature space (distances
+    behave very differently as dimensionality changes), so eps tuned for
+    one silently fails on the other. HDBSCAN selects cluster density
+    per-branch of its own hierarchy instead of one fixed global threshold,
+    so it works across both spaces without retuning.
+    """
+    from sklearn.cluster import HDBSCAN
+
+    log_stage(log, "HDBSCAN")
     space = params.get('_space', 'raw')
     dr_algo = params.get('_dr_algo', None)
 
@@ -233,23 +245,34 @@ def run_dbscan(controller, state, params: dict, progress=None) -> None:
         data = drc_pipeline.load_training_pool(controller, state)
         space_label = 'transformed feature space'
     if data is None:
-        _progress(progress, "DBSCAN: no training data.")
+        _progress(progress, "HDBSCAN: no training data.")
         return
-    log_array(log, "dbscan_input", data)
+    log_array(log, "hdbscan_input", data)
 
-    _progress(progress, f"Running DBSCAN on {space_label} "
-                        f"(eps={params['eps']}, min_samples={params['min_samples']}) …")
-    db = DBSCAN(eps=params['eps'], min_samples=params['min_samples'], n_jobs=-1).fit(data)
-    train_labels = db.labels_.astype(np.int32)
+    min_cluster_size = params['min_cluster_size']
+    min_samples = params['min_samples'] or None       # 0 = sklearn default (None)
+    cluster_selection_epsilon = params['cluster_selection_epsilon']
+
+    _progress(progress, f"Running HDBSCAN on {space_label} "
+                        f"(min_cluster_size={min_cluster_size}, "
+                        f"min_samples={min_samples}, "
+                        f"cluster_selection_epsilon={cluster_selection_epsilon}) …")
+    hdb = HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        n_jobs=-1,
+    ).fit(data)
+    train_labels = hdb.labels_.astype(np.int32)
     n_noise = int(np.sum(train_labels == -1))
     n_cl = int(train_labels.max()) + 1
-    _progress(progress, f"DBSCAN: {n_cl} cluster(s), {n_noise} noise events (label −1)")
+    _progress(progress, f"HDBSCAN: {n_cl} cluster(s), {n_noise} noise events (label −1)")
 
     nearest_centroid_assign_all(controller, state, data, train_labels,
                                 dr_space=dr_algo if space == 'dr' else None,
                                 progress=progress)
     state.n_clusters = n_cl
-    state.active_clustering_algorithm = 'DBSCAN'
+    state.active_clustering_algorithm = 'HDBSCAN'
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +289,9 @@ def nearest_centroid_assign_all(controller, state, train_data, train_labels,
     if mask.sum() == 0:
         _progress(progress, "  All training points are noise — nothing to assign.")
         return
+    train_ids, train_counts = np.unique(train_labels[mask], return_counts=True)
+    log.info("nearest_centroid_assign_all: training label distribution: %s",
+             dict(zip(train_ids.tolist(), train_counts.tolist())))
     clf = NearestCentroid().fit(train_data[mask], train_labels[mask])
 
     all_samples = list(controller.experiment.samples.get('all_samples', {}).keys())
@@ -300,6 +326,9 @@ def nearest_centroid_assign_all(controller, state, train_data, train_labels,
 
     all_labels = (np.concatenate(list(state.cluster_labels.values()))
                   if state.cluster_labels else train_labels)
+    final_ids, final_counts = np.unique(all_labels, return_counts=True)
+    log.info("nearest_centroid_assign_all: FULL assigned label distribution: %s",
+             dict(zip(final_ids.tolist(), final_counts.tolist())))
     assign_cluster_colors(state, all_labels)
     log.info("assigned labels to %d samples", len(state.cluster_labels))
 
@@ -315,7 +344,7 @@ def run_clustering(controller, state, algo: str, params: dict,
         run_flowsom(controller, state, params, progress)
     elif algo == 'Leiden':
         run_leiden(controller, state, params, progress)
-    elif algo == 'DBSCAN':
-        run_dbscan(controller, state, params, progress)
+    elif algo == 'HDBSCAN':
+        run_hdbscan(controller, state, params, progress)
     else:
         raise ValueError(f"Unknown clustering algorithm: {algo}")
