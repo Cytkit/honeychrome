@@ -269,7 +269,7 @@ def select_untransformed_channels(controller, state, gated_data: np.ndarray) -> 
 # Per-sample loading
 # ---------------------------------------------------------------------------
 
-def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray) -> np.ndarray:
+def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray, af_state=None) -> np.ndarray:
     """
     Unmix *raw_event_data*, using AF correction if the controller currently
     has AF matrices set for the active sample — mirroring the branching in
@@ -288,8 +288,27 @@ def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray) -> np.ndarra
     the main window.  This is a local, side-effect-free copy of the same
     branching logic instead — keeps the plugin's "no side effects on main
     app" design principle intact.
+
+    af_state: optional (transfer_matrix, af_precomputed, af_spectra) snapshot
+        captured on the main thread BEFORE a background worker starts.
+        Background callers (DR/clustering/stats worker threads) MUST pass
+        this — reading controller.transfer_matrix/af_precomputed/af_spectra
+        live races against the main thread's controller.load_sample()/
+        initialise_af_matrices(), which reassign these same attributes
+        whenever the user loads/reloads a sample in the main window while
+        the worker is still running. The AF kernel operates on raw pointers
+        into these arrays (af_kernel_wrapper.py), so a concurrent
+        reassignment/GC of an array the worker is mid-read on is a memory-
+        corruption hazard, not just a stale-data one.
     """
-    if controller.af_precomputed is not None and controller.af_spectra is not None:
+    if af_state is not None:
+        transfer_matrix, af_precomputed, af_spectra = af_state
+    else:
+        transfer_matrix = controller.transfer_matrix
+        af_precomputed = controller.af_precomputed
+        af_spectra = controller.af_spectra
+
+    if af_precomputed is not None and af_spectra is not None:
         raw_settings = controller.experiment.settings['raw']
         pnn_raw = raw_settings.get('whitelisted_pnn') or raw_settings['event_channels_pnn']
         full_pnn_raw = raw_settings['event_channels_pnn']
@@ -299,18 +318,18 @@ def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray) -> np.ndarra
         ]
         result = apply_af_transfer(
             raw_event_data,
-            controller.transfer_matrix,
-            controller.af_precomputed,
-            controller.af_spectra,
+            transfer_matrix,
+            af_precomputed,
+            af_spectra,
             controller.experiment.settings,
             filtered_fl_ids_raw=fl_ids_remapped,
             spillover=controller.experiment.process.get('spillover'),
         )
         return result['unmixed']
-    return apply_transfer_matrix(controller.transfer_matrix, raw_event_data)
+    return apply_transfer_matrix(transfer_matrix, raw_event_data)
 
 
-def load_unmixed_gated(controller, state, abs_path) -> np.ndarray:
+def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray:
     """
     Load one FCS file, unmix it with the transfer matrix, and apply the
     selected gate(s).  Returns the UNTRANSFORMED unmixed gated matrix with
@@ -320,13 +339,19 @@ def load_unmixed_gated(controller, state, abs_path) -> np.ndarray:
     matrix identity).  This is the single most expensive step in the
     Workspace Marker-colour path — without caching it re-reads and
     re-unmixes the FCS file from disk on every PlotCard refresh.
+
+    af_state: optional (transfer_matrix, af_precomputed, af_spectra) snapshot —
+        see apply_unmixing_af_aware() docstring. Pass this from any
+        background worker thread; leave as None only for main-thread callers.
     """
     from copy import deepcopy
+
+    transfer_matrix = af_state[0] if af_state is not None else controller.transfer_matrix
 
     cache_key = (
         str(abs_path),
         tuple(sorted(state.selected_gates)),
-        id(controller.transfer_matrix),
+        id(transfer_matrix),
     )
     cached = state.gated_data_cache.get(cache_key)
     if cached is not None:
@@ -352,7 +377,7 @@ def load_unmixed_gated(controller, state, abs_path) -> np.ndarray:
         "loaded %s: %d raw events × %d raw channels",
         getattr(abs_path, 'name', abs_path), raw.shape[0], raw.shape[1],
     )
-    unmixed = apply_unmixing_af_aware(controller, raw)
+    unmixed = apply_unmixing_af_aware(controller, raw, af_state=af_state)
     log.debug(
         "  unmixed → %d events × %d channels (gates=%r)",
         unmixed.shape[0], unmixed.shape[1], state.selected_gates,
@@ -373,28 +398,32 @@ def sample_abs_path(controller, rel_path) -> "object":
     return controller.experiment_dir / raw_subdir / rel_path
 
 
-def load_sample_features(controller, state, rel_path) -> np.ndarray | None:
+def load_sample_features(controller, state, rel_path, af_state=None) -> np.ndarray | None:
     """
     Full pipeline for ONE sample → transformed feature matrix for the selected
     channels (all gated events, no downsampling).  Used during 'Apply to All
     Samples' and per-sample cluster assignment.
+
+    af_state: optional AF snapshot — see apply_unmixing_af_aware() docstring.
     """
     log.debug("LOAD SAMPLE FEATURES — %s", rel_path)
     try:
-        gated = load_unmixed_gated(controller, state, sample_abs_path(controller, rel_path))
+        gated = load_unmixed_gated(controller, state, sample_abs_path(controller, rel_path), af_state=af_state)
         return transform_selected_channels(controller, state, gated)
     except Exception as exc:
         log.exception("could not load features for %s: %s", rel_path, exc)
         return None
 
 
-def load_sample_marker_values(controller, state, rel_path) -> tuple[np.ndarray, list[str]] | None:
+def load_sample_marker_values(controller, state, rel_path, af_state=None) -> tuple[np.ndarray, list[str]] | None:
     """
     Full pipeline for ONE sample → UNTRANSFORMED selected-channel values, for
     Workspace Marker colouring.  Returns ``(values, channel_names)`` or None.
+
+    af_state: optional AF snapshot — see apply_unmixing_af_aware() docstring.
     """
     try:
-        gated = load_unmixed_gated(controller, state, sample_abs_path(controller, rel_path))
+        gated = load_unmixed_gated(controller, state, sample_abs_path(controller, rel_path), af_state=af_state)
         return select_untransformed_channels(controller, state, gated)
     except Exception as exc:
         log.exception("could not load marker values for %s: %s", rel_path, exc)
@@ -408,10 +437,14 @@ def _downsample(data: np.ndarray, n: int, rng) -> np.ndarray:
     return data[idx]
 
 
-def load_training_pool(controller, state, seed: int = 42) -> np.ndarray | None:
+def load_training_pool(controller, state, seed: int = 42, af_state=None) -> np.ndarray | None:
     """
     Pool transformed, gated, downsampled events across all training samples.
     Returns ``(total_events, n_selected_channels)`` float32, or None on error.
+
+    af_state: optional (transfer_matrix, af_precomputed, af_spectra) snapshot —
+        see apply_unmixing_af_aware() docstring. Pass this from any
+        background worker thread; leave as None only for main-thread callers.
     """
     log_stage(log, "LOAD TRAINING POOL")
     if not state.training_sample_ids:
@@ -430,7 +463,7 @@ def load_training_pool(controller, state, seed: int = 42) -> np.ndarray | None:
     rng = np.random.default_rng(seed)
     chunks = []
     for rel_path in state.training_sample_ids:
-        feats = load_sample_features(controller, state, rel_path)
+        feats = load_sample_features(controller, state, rel_path, af_state=af_state)
         if feats is None or feats.shape[0] == 0:
             log.warning("  %s contributed no events", rel_path)
             continue

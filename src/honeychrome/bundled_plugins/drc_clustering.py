@@ -64,7 +64,7 @@ def assign_cluster_colors(state, labels: np.ndarray) -> None:
 # FlowSOM
 # ---------------------------------------------------------------------------
 
-def run_flowsom(controller, state, params: dict, progress=None):
+def run_flowsom(controller, state, params: dict, progress=None, af_state=None):
     """Train a SOM (pyFlowSOM) and consensus-metacluster its nodes, then
     assign 0-based metacluster labels to every training sample.
 
@@ -74,9 +74,12 @@ def run_flowsom(controller, state, params: dict, progress=None):
     metaclustering is our own consensus-hierarchical implementation in
     flowsom_consensus.py, matching the R algorithm's ConsensusClusterPlus
     step rather than a single hierarchical cut.
+
+    af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()
+        docstring. Must be passed when called from a background worker thread.
     """
     log_stage(log, "FLOWSOM")
-    data = drc_pipeline.load_training_pool(controller, state)
+    data = drc_pipeline.load_training_pool(controller, state, af_state=af_state)
     if data is None:
         _progress(progress, "FlowSOM: no training data.")
         return
@@ -103,7 +106,7 @@ def run_flowsom(controller, state, params: dict, progress=None):
     log.info("run_flowsom: SOM nodes per metacluster: %s",
              dict(zip(meta_ids.tolist(), node_counts.tolist())))
 
-    flowsom_assign_all(controller, state, node_weights, node_to_meta, progress)
+    flowsom_assign_all(controller, state, node_weights, node_to_meta, progress, af_state=af_state)
     state.n_clusters = k
     state.active_clustering_algorithm = 'FlowSOM'
     state.trained_reducers['FlowSOM'] = {
@@ -114,8 +117,13 @@ def run_flowsom(controller, state, params: dict, progress=None):
     _progress(progress, f"FlowSOM done: {k} metaclusters.")
 
 
-def flowsom_assign_all(controller, state, node_weights, node_to_meta, progress=None) -> None:
-    """Map each training sample's events to SOM nodes, then to metaclusters."""
+def flowsom_assign_all(controller, state, node_weights, node_to_meta, progress=None,
+                       af_state=None) -> None:
+    """Map each training sample's events to SOM nodes, then to metaclusters.
+
+    af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()
+        docstring. Must be passed when called from a background worker thread.
+    """
     raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
     all_samples = list(controller.experiment.samples.get('all_samples', {}).keys())
 
@@ -127,7 +135,7 @@ def flowsom_assign_all(controller, state, node_weights, node_to_meta, progress=N
             rel_path = sample_key
         if rel_path not in state.training_sample_ids:
             continue
-        sample_data = drc_pipeline.load_sample_features(controller, state, rel_path)
+        sample_data = drc_pipeline.load_sample_features(controller, state, rel_path, af_state=af_state)
         if sample_data is None:
             continue
         try:
@@ -148,19 +156,27 @@ def flowsom_assign_all(controller, state, node_weights, node_to_meta, progress=N
 # Leiden
 # ---------------------------------------------------------------------------
 
-def get_training_embeddings(controller, state, algo: str | None) -> np.ndarray | None:
+def get_training_embeddings(controller, state, algo: str | None, af_state=None) -> np.ndarray | None:
     """Concatenated training-sample embeddings for *algo*, or the transformed
-    feature matrix if algo is None/unavailable."""
+    feature matrix if algo is None/unavailable.
+
+    af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()
+        docstring. Only used on the load_training_pool fallback path.
+    """
     if algo and algo in state.embeddings:
         emb_dict = state.embeddings[algo]
         chunks = [emb_dict[r] for r in state.training_sample_ids if r in emb_dict]
         if chunks:
             return np.concatenate(chunks, axis=0).astype(np.float32)
-    return drc_pipeline.load_training_pool(controller, state)
+    return drc_pipeline.load_training_pool(controller, state, af_state=af_state)
 
 
-def run_leiden(controller, state, params: dict, progress=None) -> None:
-    """Build a kNN graph and run Leiden community detection."""
+def run_leiden(controller, state, params: dict, progress=None, af_state=None) -> None:
+    """Build a kNN graph and run Leiden community detection.
+
+    af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()
+        docstring. Must be passed when called from a background worker thread.
+    """
     import igraph
     import leidenalg
     import hnswlib
@@ -170,9 +186,9 @@ def run_leiden(controller, state, params: dict, progress=None) -> None:
     dr_algo = params.get('_dr_algo', None)
 
     if space == 'dr' and dr_algo:
-        data = get_training_embeddings(controller, state, dr_algo)
+        data = get_training_embeddings(controller, state, dr_algo, af_state=af_state)
     else:
-        data = drc_pipeline.load_training_pool(controller, state)
+        data = drc_pipeline.load_training_pool(controller, state, af_state=af_state)
         dr_algo = None
     if data is None:
         _progress(progress, "Leiden: no training data.")
@@ -210,7 +226,7 @@ def run_leiden(controller, state, params: dict, progress=None) -> None:
 
     nearest_centroid_assign_all(controller, state, data, train_labels,
                                 dr_space=dr_algo if space == 'dr' else None,
-                                progress=progress)
+                                progress=progress, af_state=af_state)
     n_cl = int(train_labels.max()) + 1
     state.n_clusters = n_cl
     state.active_clustering_algorithm = 'Leiden'
@@ -221,7 +237,7 @@ def run_leiden(controller, state, params: dict, progress=None) -> None:
 # DBSCAN
 # ---------------------------------------------------------------------------
 
-def run_hdbscan(controller, state, params: dict, progress=None) -> None:
+def run_hdbscan(controller, state, params: dict, progress=None, af_state=None) -> None:
     """
     Run HDBSCAN on the chosen feature space (default: transformed features).
 
@@ -231,6 +247,9 @@ def run_hdbscan(controller, state, params: dict, progress=None) -> None:
     one silently fails on the other. HDBSCAN selects cluster density
     per-branch of its own hierarchy instead of one fixed global threshold,
     so it works across both spaces without retuning.
+
+    af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()
+        docstring. Must be passed when called from a background worker thread.
     """
     from sklearn.cluster import HDBSCAN
 
@@ -239,10 +258,10 @@ def run_hdbscan(controller, state, params: dict, progress=None) -> None:
     dr_algo = params.get('_dr_algo', None)
 
     if space == 'dr' and dr_algo:
-        data = get_training_embeddings(controller, state, dr_algo)
+        data = get_training_embeddings(controller, state, dr_algo, af_state=af_state)
         space_label = f'{dr_algo} embedding'
     else:
-        data = drc_pipeline.load_training_pool(controller, state)
+        data = drc_pipeline.load_training_pool(controller, state, af_state=af_state)
         space_label = 'transformed feature space'
     if data is None:
         _progress(progress, "HDBSCAN: no training data.")
@@ -262,6 +281,7 @@ def run_hdbscan(controller, state, params: dict, progress=None) -> None:
         min_samples=min_samples,
         cluster_selection_epsilon=cluster_selection_epsilon,
         n_jobs=-1,
+        copy=True,   # data is reused by nearest_centroid_assign_all() below
     ).fit(data)
     train_labels = hdb.labels_.astype(np.int32)
     n_noise = int(np.sum(train_labels == -1))
@@ -270,7 +290,7 @@ def run_hdbscan(controller, state, params: dict, progress=None) -> None:
 
     nearest_centroid_assign_all(controller, state, data, train_labels,
                                 dr_space=dr_algo if space == 'dr' else None,
-                                progress=progress)
+                                progress=progress, af_state=af_state)
     state.n_clusters = n_cl
     state.active_clustering_algorithm = 'HDBSCAN'
 
@@ -280,9 +300,14 @@ def run_hdbscan(controller, state, params: dict, progress=None) -> None:
 # ---------------------------------------------------------------------------
 
 def nearest_centroid_assign_all(controller, state, train_data, train_labels,
-                                dr_space: str | None = None, progress=None) -> None:
+                                dr_space: str | None = None, progress=None,
+                                af_state=None) -> None:
     """Assign cluster labels to all samples by nearest-centroid in the SAME
-    space the clustering was computed in (DR embedding or transformed features)."""
+    space the clustering was computed in (DR embedding or transformed features).
+
+    af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()
+        docstring. Only used on the non-DR (raw feature space) path.
+    """
     from sklearn.neighbors import NearestCentroid
 
     mask = train_labels != -1
@@ -315,7 +340,7 @@ def nearest_centroid_assign_all(controller, state, train_data, train_labels,
                 _progress(progress, f"  No {dr_space} embedding for {rel_path} — skipping")
                 continue
         else:
-            sample_data = drc_pipeline.load_sample_features(controller, state, rel_path)
+            sample_data = drc_pipeline.load_sample_features(controller, state, rel_path, af_state=af_state)
         if sample_data is None:
             continue
         try:
@@ -338,13 +363,18 @@ def nearest_centroid_assign_all(controller, state, train_data, train_labels,
 # ---------------------------------------------------------------------------
 
 def run_clustering(controller, state, algo: str, params: dict,
-                   progress=None) -> None:
-    """Run the selected clustering algorithm (called from the worker thread)."""
+                   progress=None, af_state=None) -> None:
+    """Run the selected clustering algorithm (called from the worker thread).
+
+    af_state: optional (transfer_matrix, af_precomputed, af_spectra) snapshot,
+        captured on the main thread before the worker started — see
+        drc_pipeline.apply_unmixing_af_aware() docstring.
+    """
     if algo == 'FlowSOM':
-        run_flowsom(controller, state, params, progress)
+        run_flowsom(controller, state, params, progress, af_state=af_state)
     elif algo == 'Leiden':
-        run_leiden(controller, state, params, progress)
+        run_leiden(controller, state, params, progress, af_state=af_state)
     elif algo == 'HDBSCAN':
-        run_hdbscan(controller, state, params, progress)
+        run_hdbscan(controller, state, params, progress, af_state=af_state)
     else:
         raise ValueError(f"Unknown clustering algorithm: {algo}")

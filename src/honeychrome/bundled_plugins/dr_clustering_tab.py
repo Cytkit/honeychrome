@@ -573,6 +573,11 @@ class PipelineState:
     # limma output for cluster frequencies
     freq_df: pd.DataFrame | None = None
     # raw (samples × clusters) frequency matrix
+    counts_results: pd.DataFrame | None = None
+    # negative-binomial GLM output for cluster raw counts (Item 14) —
+    # a parallel abundance test alongside freq_results, not a replacement.
+    counts_df: pd.DataFrame | None = None
+    # raw (samples × clusters) count matrix
     mfi_results: pd.DataFrame | None = None
     # limma output for per-cluster marker MFIs
     mfi_df: pd.DataFrame | None = None
@@ -3178,8 +3183,8 @@ class GroupsStatsTab(QWidget):
       • Sample-to-group assignment table with combo boxes
       • Covariate entry (arbitrary named columns)
       • CSV import / export
-      • Statistics controls: cluster frequencies and/or MFIs, p-value and
-        log2FC thresholds
+      • Statistics controls: cluster frequencies (limma), cluster counts
+        (GLM, Item 14), and/or MFIs, p-value and log2FC thresholds
       • Background limma statistics via inmoose
       • Results: heatmap+dendrogram and volcano plot, CSV export
     """
@@ -3360,13 +3365,21 @@ class GroupsStatsTab(QWidget):
         # Config row: what to test
         config_row = QHBoxLayout()
         config_row.addWidget(QLabel("Test:"))
-        self.chk_freq = QCheckBox("Cluster Frequencies")
+        self.chk_freq = QCheckBox("Cluster Frequencies (limma)")
         self.chk_freq.setChecked(True)
         self.chk_freq.setToolTip("% events per cluster per sample → limma lmFit + eBayes")
+        self.chk_counts = QCheckBox("Cluster Counts (GLM)")
+        self.chk_counts.setChecked(False)
+        self.chk_counts.setToolTip(
+            "Item 14 — raw event counts per cluster per sample → negative-"
+            "binomial GLM.\nParallel option to the Frequency test, not a "
+            "replacement — run both to compare on the same data."
+        )
         self.chk_mfi = QCheckBox("Cluster MFIs")
         self.chk_mfi.setChecked(True)
         self.chk_mfi.setToolTip("Mean channel intensity per cluster per sample → limma")
         config_row.addWidget(self.chk_freq)
+        config_row.addWidget(self.chk_counts)
         config_row.addWidget(self.chk_mfi)
         config_row.addSpacing(20)
 
@@ -3714,7 +3727,8 @@ class GroupsStatsTab(QWidget):
         # Redraw plots if results are present and haven't been rendered yet
         # (_last_drawn_cluster_names == {} after load_state resets it) or if
         # cluster names changed since last draw (e.g. after a rename).
-        if (self.state.freq_results is not None or self.state.mfi_results is not None):
+        if (self.state.freq_results is not None or self.state.mfi_results is not None
+                or self.state.counts_results is not None):
             if (not self._last_drawn_cluster_names or
                     dict(self.state.cluster_names) != self._last_drawn_cluster_names):
                 self._draw_results()
@@ -3949,7 +3963,8 @@ class GroupsStatsTab(QWidget):
             return
         if run_id == self.state.stats_run_id:
             # Matches stored results — redraw if needed.
-            if (self.state.freq_results is not None or self.state.mfi_results is not None):
+            if (self.state.freq_results is not None or self.state.mfi_results is not None
+                    or self.state.counts_results is not None):
                 self._draw_results()
             return
         # Different run — clear stored results and prompt re-run.
@@ -3957,6 +3972,8 @@ class GroupsStatsTab(QWidget):
         self.state.mfi_results  = None
         self.state.freq_df      = None
         self.state.mfi_df       = None
+        self.state.counts_results = None
+        self.state.counts_df      = None
         self.state.stats_all_rel  = []
         self.state.stats_group_vec = []
         self._last_stats_data_key = None
@@ -4081,10 +4098,10 @@ class GroupsStatsTab(QWidget):
 
     def _run_statistics(self):
         """
-        Launch background limma statistics via inmoose — or, if the same
-        run and group assignment already produced results and only the
+        Launch background limma/GLM statistics — or, if the same run and
+        group assignment already produced results and only the
         significance thresholds changed, just re-flag significance and
-        replot without re-running the (intensive) limma call.
+        replot without re-running the (intensive) limma/GLM calls.
         """
         if self._stats_worker is not None and self._stats_worker.isRunning():
             return
@@ -4094,9 +4111,10 @@ class GroupsStatsTab(QWidget):
             return
         labels_for_stats, run_label, run_id, names_for_stats = resolved
 
-        run_freq = self.chk_freq.isChecked()
-        run_mfi  = self.chk_mfi.isChecked()
-        if not run_freq and not run_mfi:
+        run_freq   = self.chk_freq.isChecked()
+        run_counts = self.chk_counts.isChecked()
+        run_mfi    = self.chk_mfi.isChecked()
+        if not run_freq and not run_counts and not run_mfi:
             QMessageBox.warning(self, "Nothing Selected",
                                 "Select at least one statistic to compute.")
             return
@@ -4107,9 +4125,10 @@ class GroupsStatsTab(QWidget):
         include_type_markers = self.chk_include_type_markers.isChecked()
         groups_fingerprint = tuple(sorted(self.state.sample_groups.items()))
         roles_fingerprint  = tuple(sorted(self.state.marker_roles.items()))
-        data_key = (run_id, run_freq, run_mfi, groups_fingerprint,
+        data_key = (run_id, run_freq, run_counts, run_mfi, groups_fingerprint,
                    include_type_markers, roles_fingerprint)
         have_results = (not run_freq or self.state.freq_results is not None) and \
+                       (not run_counts or self.state.counts_results is not None) and \
                        (not run_mfi or self.state.mfi_results is not None)
 
         self.state.stats_run_label = run_label
@@ -4118,7 +4137,7 @@ class GroupsStatsTab(QWidget):
         if data_key == self._last_stats_data_key and have_results:
             # Same run, same groups, same tests already computed — only the
             # thresholds may have changed. Re-flag significance in place
-            # and replot instead of re-running limma.
+            # and replot instead of re-running limma/GLM.
             self._apply_significance_thresholds(pval_threshold, fc_threshold)
             self.stats_status_label.setText("✓ Statistics complete (replotted — run unchanged).")
             self.stats_status_label.setStyleSheet("color: green;")
@@ -4131,20 +4150,37 @@ class GroupsStatsTab(QWidget):
         self.stats_status_label.setStyleSheet("color: orange;")
 
         plugin_ref = self
+        # Snapshot AF/transfer-matrix state HERE, on the main thread, before
+        # the worker starts. compute_mfis() reads these via
+        # drc_pipeline.apply_unmixing_af_aware(); the live controller
+        # attributes are reassigned in place by controller.load_sample() /
+        # initialise_af_matrices() whenever the user loads a different
+        # sample in the main window. Without this snapshot the background
+        # worker and a main-window sample load race on the same mutable
+        # numpy arrays — and the AF kernel touches them via raw C pointers
+        # (af_kernel_wrapper.py), so a concurrent reassignment is a
+        # memory-corruption/crash hazard, not just stale data.
+        af_state = (
+            self.controller.transfer_matrix,
+            self.controller.af_precomputed,
+            self.controller.af_spectra,
+        )
 
         class _StatsWorker(QThread):
             finished = Signal(bool, str)
             progress = Signal(str)
 
             def __init__(self_, run_freq, run_mfi, group_names, labels_override,
-                        include_type_markers, names_override):
+                        include_type_markers, names_override, run_counts, af_state):
                 super().__init__()
                 self_._run_freq = run_freq
                 self_._run_mfi  = run_mfi
+                self_._run_counts = run_counts
                 self_._group_names = group_names
                 self_._labels_override = labels_override
                 self_._include_type_markers = include_type_markers
                 self_._names_override = names_override
+                self_._af_state = af_state
 
             def run(self_):
                 try:
@@ -4155,21 +4191,25 @@ class GroupsStatsTab(QWidget):
                     self_.finished.emit(False, str(exc))
 
             def _do_stats(self_):
-                freq, mfi = drc_stats.run_statistics(
+                freq, mfi, counts = drc_stats.run_statistics(
                     plugin_ref.controller, plugin_ref.state,
                     self_._run_freq, self_._run_mfi,
                     pval_threshold, fc_threshold,
                     cluster_labels_override=self_._labels_override,
                     include_type_markers=self_._include_type_markers,
                     names_override=self_._names_override,
+                    run_counts=self_._run_counts,
+                    af_state=self_._af_state,
                 )
                 if freq is not None:
                     self_.progress.emit(f"Frequency limma: {len(freq)} clusters tested.")
+                if counts is not None:
+                    self_.progress.emit(f"Counts GLM: {len(counts)} clusters tested.")
                 if mfi is not None:
                     self_.progress.emit(f"MFI limma: {len(mfi)} features tested.")
 
         worker = _StatsWorker(run_freq, run_mfi, list(self._group_names), labels_for_stats,
-                             include_type_markers, names_for_stats)
+                             include_type_markers, names_for_stats, run_counts, af_state)
         worker.progress.connect(lambda msg: print(f"[DR Stats] {msg}"))
         worker.finished.connect(lambda success, err, key=data_key: self._on_stats_finished(success, err, key))
         self._stats_worker = worker
@@ -4177,12 +4217,12 @@ class GroupsStatsTab(QWidget):
 
     def _apply_significance_thresholds(self, pval_threshold: float, fc_threshold: float):
         """
-        Recompute the 'significant' column on already-computed freq/mfi
-        results in place, without re-running limma. logFC/p-values are
-        threshold-independent, so this is all that's needed when only the
-        thresholds changed since the last run.
+        Recompute the 'significant' column on already-computed freq/counts/
+        mfi results in place, without re-running limma/GLM. logFC/p-values
+        are threshold-independent, so this is all that's needed when only
+        the thresholds changed since the last run.
         """
-        for attr in ('freq_results', 'mfi_results'):
+        for attr in ('freq_results', 'counts_results', 'mfi_results'):
             df = getattr(self.state, attr)
             if df is None or 'logFC' not in df.columns:
                 continue
@@ -4629,7 +4669,8 @@ class GroupsStatsTab(QWidget):
         self._last_drawn_cluster_names = dict(self.state.cluster_names)
         # Remove only this method's own tabs (by key) — leaves Confusion
         # Matrix / Composition Barplot (and anything else) untouched.
-        for key in ('freq_heatmap', 'freq_volcano', 'mfi_heatmap', 'mfi_volcano'):
+        for key in ('freq_heatmap', 'freq_volcano', 'counts_heatmap', 'counts_volcano',
+                   'mfi_heatmap', 'mfi_volcano'):
             self._remove_results_tab_by_key(key)
 
         name_a = self._group_names[0]
@@ -4682,6 +4723,53 @@ class GroupsStatsTab(QWidget):
                 tab.setStyleSheet("color: red;")
                 tab.setProperty('_tab_key', 'freq_volcano')
                 self._results_tabs.addTab(tab, "Freq Volcano")
+
+        if self.state.counts_results is not None:
+            try:
+                fig_c = self._make_heatmap_figure(
+                    self.state.counts_results,
+                    self.state.counts_df,
+                    title=f"Cluster Counts: {name_a} vs {name_b}",
+                    run_label=run_label,
+                )
+                self._add_results_tab(fig_c, "Counts Heatmap", "counts_heatmap",
+                         maker=self._make_heatmap_figure,
+                         maker_kwargs=dict(
+                             results_df=self.state.counts_results,
+                             sample_df=self.state.counts_df,
+                             title=f"Cluster Counts: {name_a} vs {name_b}",
+                             run_label=run_label,
+                         ),
+                         key="counts_heatmap")
+            except Exception as e:
+                tab = QLabel(f"Counts heatmap error: {e}")
+                tab.setStyleSheet("color: red;")
+                tab.setProperty('_tab_key', 'counts_heatmap')
+                self._results_tabs.addTab(tab, "Counts Heatmap")
+
+            try:
+                fig_cv = self._make_volcano_figure(
+                    self.state.counts_results,
+                    title=f"Cluster Counts Volcano: {name_a} vs {name_b}",
+                    pval_threshold=self.pval_spin.value(),
+                    fc_threshold=self.fc_spin.value(),
+                    run_label=run_label,
+                )
+                self._add_results_tab(fig_cv, "Counts Volcano", "counts_volcano",
+                         maker=self._make_volcano_figure,
+                         maker_kwargs=dict(
+                             results_df=self.state.counts_results,
+                             title=f"Cluster Counts Volcano: {name_a} vs {name_b}",
+                             pval_threshold=self.pval_spin.value(),
+                             fc_threshold=self.fc_spin.value(),
+                             run_label=run_label,
+                         ),
+                         key="counts_volcano")
+            except Exception as e:
+                tab = QLabel(f"Counts volcano error: {e}")
+                tab.setStyleSheet("color: red;")
+                tab.setProperty('_tab_key', 'counts_volcano')
+                self._results_tabs.addTab(tab, "Counts Volcano")
 
         if self.state.mfi_results is not None:
             try:
@@ -4937,7 +5025,13 @@ class GroupsStatsTab(QWidget):
         ax_cb = fig.add_subplot(gs[2, 2])
         cb = fig.colorbar(im, cax=ax_cb)
         cb.ax.tick_params(labelsize=7)
-        cb.set_label('log1p-MFI' if 'MFI' in title else '% frequency', fontsize=7)
+        if 'MFI' in title:
+            cb_label = 'log1p-MFI'
+        elif 'Counts' in title:
+            cb_label = 'Event count'
+        else:
+            cb_label = '% frequency'
+        cb.set_label(cb_label, fontsize=7)
 
         self._stamp_run_label(fig, run_label)
         return fig
@@ -5016,6 +5110,8 @@ class GroupsStatsTab(QWidget):
             frames = {}
             if self.state.freq_results is not None:
                 frames['Frequencies'] = self.state.freq_results
+            if self.state.counts_results is not None:
+                frames['Counts (GLM)'] = self.state.counts_results
             if self.state.mfi_results is not None:
                 frames['MFIs'] = self.state.mfi_results
 
@@ -6183,7 +6279,7 @@ class _DrWorker(QThread):
     progress_value = Signal(int, int)   # (current, total) — 0,0 = indeterminate
 
     def __init__(self, task: str, plugin, algo: str, params: dict,
-                 training_only: bool = True, parent=None):
+                 training_only: bool = True, parent=None, af_state=None):
         super().__init__(parent)
         self._task = task
         self._plugin = plugin
@@ -6191,6 +6287,10 @@ class _DrWorker(QThread):
         self._params = params
         self._training_only = training_only
         self._cancelled = False
+        # Snapshot captured on the main thread before start() — see
+        # drc_pipeline.apply_unmixing_af_aware() docstring for why this
+        # must not be read live off the controller from this thread.
+        self._af_state = af_state
 
     def cancel(self):
         self._cancelled = True
@@ -6218,7 +6318,7 @@ class _DrWorker(QThread):
         plugin = self._plugin
         algo = self._algo
 
-        training_data = plugin._load_training_data()
+        training_data = plugin._load_training_data(af_state=self._af_state)
         if training_data is None:
             self.finished.emit(False, "No training data could be loaded.")
             return
@@ -6303,7 +6403,7 @@ class _DrWorker(QThread):
                 return
             self._emit(f"  Embedding {__import__('pathlib').Path(rel_path).name} …")
             self._emit_progress(i, n_total)
-            sample_data = plugin._get_sample_data(rel_path, algo)
+            sample_data = plugin._get_sample_data(rel_path, algo, af_state=self._af_state)
             if sample_data is None:
                 continue
             try:
@@ -7563,7 +7663,8 @@ class PluginWidget(QWidget):
         # and back.
         if hasattr(self, 'groups_stats_tab'):
             self.groups_stats_tab._update_run_button()
-            if (self.state.freq_results is not None or self.state.mfi_results is not None):
+            if (self.state.freq_results is not None or self.state.mfi_results is not None
+                    or self.state.counts_results is not None):
                 self.groups_stats_tab.export_results_btn.setEnabled(True)
                 # Reset the guard so refresh() redraws on first tab switch.
                 self.groups_stats_tab._last_drawn_cluster_names = {}
@@ -7604,8 +7705,10 @@ class PluginWidget(QWidget):
             ('cluster_labels',    self.state.cluster_labels),
             ('trex_scores',       self.state.trex_scores),
             ('freq_results',      self.state.freq_results),
+            ('counts_results',    self.state.counts_results),
             ('mfi_results',       self.state.mfi_results),
             ('freq_df',           self.state.freq_df),
+            ('counts_df',         self.state.counts_df),
             ('mfi_df',            self.state.mfi_df),
             ('stats_all_rel',     self.state.stats_all_rel),
             ('stats_group_vec',   self.state.stats_group_vec),
@@ -7680,10 +7783,14 @@ class PluginWidget(QWidget):
                 self.state.trex_scores = payload['trex_scores']
             if isinstance(payload.get('freq_results'), pd.DataFrame):
                 self.state.freq_results = payload['freq_results']
+            if isinstance(payload.get('counts_results'), pd.DataFrame):
+                self.state.counts_results = payload['counts_results']
             if isinstance(payload.get('mfi_results'), pd.DataFrame):
                 self.state.mfi_results = payload['mfi_results']
             if isinstance(payload.get('freq_df'), pd.DataFrame):
                 self.state.freq_df = payload['freq_df']
+            if isinstance(payload.get('counts_df'), pd.DataFrame):
+                self.state.counts_df = payload['counts_df']
             if isinstance(payload.get('mfi_df'), pd.DataFrame):
                 self.state.mfi_df = payload['mfi_df']
             if isinstance(payload.get('stats_all_rel'), list):
@@ -7959,7 +8066,7 @@ class PluginWidget(QWidget):
     # Stage 3 — Dimensionality Reduction
     # ==================================================================
 
-    def _load_training_data(self) -> np.ndarray | None:
+    def _load_training_data(self, af_state=None) -> np.ndarray | None:
         """
         Pool transformed, gated, downsampled events from all training samples.
         Delegates to drc_pipeline.load_training_pool (correct channel alignment,
@@ -7968,8 +8075,11 @@ class PluginWidget(QWidget):
         Must be callable from a background thread — contains no Qt GUI calls.
         Pre-flight validation (empty samples / channels / gate) is performed
         by the caller (_run_dr) on the main thread before the worker starts.
+
+        af_state: optional AF snapshot captured on the main thread before the
+        worker started — see drc_pipeline.apply_unmixing_af_aware() docstring.
         """
-        result = drc_pipeline.load_training_pool(self.controller, self.state)
+        result = drc_pipeline.load_training_pool(self.controller, self.state, af_state=af_state)
         return result
 
     def _logicle_transform_array(self, data: np.ndarray, sample=None) -> np.ndarray:
@@ -7985,12 +8095,15 @@ class PluginWidget(QWidget):
             self.controller, self.state, data
         )
 
-    def _get_sample_data(self, rel_path: str, algo: str) -> np.ndarray | None:
+    def _get_sample_data(self, rel_path: str, algo: str, af_state=None) -> np.ndarray | None:
         """
         Load + unmix + gate + transform ONE sample → (n_events, n_selected).
         Used during 'Apply to All Samples' and per-sample cluster assignment.
+
+        af_state: optional AF snapshot captured on the main thread before the
+        worker started — see drc_pipeline.apply_unmixing_af_aware() docstring.
         """
-        return drc_pipeline.load_sample_features(self.controller, self.state, rel_path)
+        return drc_pipeline.load_sample_features(self.controller, self.state, rel_path, af_state=af_state)
 
     # ------------------------------------------------------------------
     # UMAP
@@ -8146,7 +8259,15 @@ class PluginWidget(QWidget):
         self.state.dr_status[algo] = 'running'
         self._set_dr_buttons_running(True)
 
-        worker = _DrWorker('train', self, algo, params, training_only=True)
+        # Snapshot AF/transfer-matrix state on the main thread before the
+        # worker starts — see apply_unmixing_af_aware() docstring.
+        af_state = (
+            self.controller.transfer_matrix,
+            self.controller.af_precomputed,
+            self.controller.af_spectra,
+        )
+
+        worker = _DrWorker('train', self, algo, params, training_only=True, af_state=af_state)
         worker.progress.connect(self.progress_message)
         worker.progress_value.connect(
             lambda cur, tot: self._on_dr_progress(cur, tot))
@@ -8168,7 +8289,14 @@ class PluginWidget(QWidget):
             return
 
         self._set_dr_buttons_running(True)
-        worker = _DrWorker('apply', self, algo, {}, training_only=False)
+        # Snapshot AF/transfer-matrix state on the main thread before the
+        # worker starts — see apply_unmixing_af_aware() docstring.
+        af_state = (
+            self.controller.transfer_matrix,
+            self.controller.af_precomputed,
+            self.controller.af_spectra,
+        )
+        worker = _DrWorker('apply', self, algo, {}, training_only=False, af_state=af_state)
         worker.progress.connect(self.progress_message)
         worker.progress_value.connect(
             lambda cur, tot: self._on_dr_progress(cur, tot))
@@ -8331,6 +8459,14 @@ class PluginWidget(QWidget):
                 bar.setTextVisible(False)
                 bar.setVisible(True)
 
+        # Snapshot AF/transfer-matrix state on the main thread before the
+        # worker starts — see drc_pipeline.apply_unmixing_af_aware() docstring.
+        af_state = (
+            self.controller.transfer_matrix,
+            self.controller.af_precomputed,
+            self.controller.af_spectra,
+        )
+
         class _ClWorker(QThread):
             finished = Signal(bool, str)
             progress = Signal(str)
@@ -8349,6 +8485,7 @@ class PluginWidget(QWidget):
             drc_clustering.run_clustering(
                 self.controller, self.state, algo, params,
                 progress=self.progress_message,
+                af_state=af_state,
             )
 
         def _on_cl_done(ok, err):
@@ -8427,10 +8564,21 @@ class PluginWidget(QWidget):
         self.progress_message("Building T-REX kNN index …")
 
         plugin_ref = self
+        # Snapshot AF/transfer-matrix state on the main thread before the
+        # worker starts — see drc_pipeline.apply_unmixing_af_aware() docstring.
+        af_state = (
+            self.controller.transfer_matrix,
+            self.controller.af_precomputed,
+            self.controller.af_spectra,
+        )
 
         class _TrexWorker(QThread):
             finished = Signal(bool, str)
             progress = Signal(str)
+
+            def __init__(self_, af_state):
+                super().__init__()
+                self_._af_state = af_state
 
             def run(self_):
                 try:
@@ -8461,7 +8609,7 @@ class PluginWidget(QWidget):
                 def _load_features(rel_list):
                     chunks = []
                     for rel in rel_list:
-                        d = plugin_ref._get_sample_data(rel, None)
+                        d = plugin_ref._get_sample_data(rel, None, af_state=self_._af_state)
                         if d is not None:
                             chunks.append(d)
                     return np.concatenate(chunks, axis=0) if chunks else None
@@ -8492,7 +8640,7 @@ class PluginWidget(QWidget):
                 all_rels = a_rels + b_rels
                 state.trex_scores = {}
                 for rel in all_rels:
-                    sample_data = plugin_ref._get_sample_data(rel, None)
+                    sample_data = plugin_ref._get_sample_data(rel, None, af_state=self_._af_state)
                     if sample_data is None:
                         continue
                     sample_data = sample_data.astype(np.float32)
@@ -8511,7 +8659,7 @@ class PluginWidget(QWidget):
 
                 self_.progress.emit(f"T-REX complete: scored {len(state.trex_scores)} samples.")
 
-        self._trex_worker = _TrexWorker()
+        self._trex_worker = _TrexWorker(af_state)
         self._trex_worker.progress.connect(self.progress_message)
         self._trex_worker.finished.connect(self._on_trex_finished)
         self._trex_worker.start()
