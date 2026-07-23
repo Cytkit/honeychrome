@@ -402,6 +402,22 @@ def run_limma(data_df: pd.DataFrame, group_vec: list[str],
     expr = data_df.values.T.astype(float)        # (features, samples) — lmFit orientation
     n_features = expr.shape[0]
 
+    if n_features < 3:
+        # inmoose's eBayes moderated-variance shrinkage (squeezeVar/fitFDist)
+        # is built to borrow strength across many features and degenerates at
+        # very low feature counts: an internal per-feature boolean array
+        # ("Infdf") collapses to a scalar bool, so `~Infdf` bitwise-inverts a
+        # Python bool (~True == -2) instead of negating a mask, and the
+        # resulting `t2[-2]` column lookup raises a bare KeyError deep inside
+        # the library. Fail clearly here instead of crashing inside inmoose.
+        raise RuntimeError(
+            f"Only {n_features} feature(s) to test (need >= 3) — this usually "
+            "means the current clustering run produced too few clusters for "
+            "differential testing. Increase clustering granularity (e.g. lower "
+            "HDBSCAN's min_cluster_size) and re-run, or test a space/run with "
+            "more clusters."
+        )
+
     fit = eBayes(lmFit(expr, design=design))
     tt = topTable(fit, coef='column1', number=np.inf, adjust_method='fdr_bh')
 
