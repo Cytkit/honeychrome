@@ -255,11 +255,24 @@ def update_dr_run_embeddings(controller, state, run_id: str, embeddings: dict,
 def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
                             colors, names, n_clusters, gates,
                             training_sample_ids, channels, params,
-                            n_events, label=None) -> dict:
+                            n_events, label=None,
+                            marker_values=None, dr_positions=None) -> dict:
     """
     Archive a completed clustering run.  Same file/manifest layout as
     archive_dr_run(), with 'labels' (per-sample label arrays), 'colors' and
     'names' as the heavy payload and n_clusters recorded in the manifest.
+
+    marker_values: optional {sample_path: (raw_values, channel_names)},
+        snapshotted at classification time (see drc_clustering.py's
+        _snapshot_marker_values) -- guaranteed row-for-row aligned to
+        cluster_labels regardless of any gate/channel edits made later.
+        Lets Cluster Annotation's violin plots read directly from this
+        instead of re-deriving alignment from live (re-gate-able) data.
+    dr_positions: optional {sample_path: np.ndarray}, the exact DR-embedding
+        rows a DR-space run assigned labels against -- only present when
+        the run was clustered in DR-embedding space. Lets the cluster map
+        plot correct positions even if state.embeddings for that algorithm
+        have since been overwritten by a later DR run.
     """
     log_stage(log, "ARCHIVE CLUSTERING RUN")
     run_id = _new_run_id()
@@ -270,6 +283,8 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
         'labels': cluster_labels,
         'colors': colors,
         'names': names,
+        'marker_values': marker_values or {},
+        'dr_positions': dr_positions or {},
     })
 
     entry = _manifest_entry(
@@ -284,6 +299,8 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
     full_entry['labels'] = cluster_labels
     full_entry['colors'] = colors
     full_entry['names'] = names
+    full_entry['marker_values'] = marker_values or {}
+    full_entry['dr_positions'] = dr_positions or {}
     state.clustering_runs.append(full_entry)
     log.info("archived clustering run %r (run_id=%s, %s cluster(s))",
              run_label, run_id, n_clusters)
@@ -378,4 +395,6 @@ def hydrate_run(controller, entry: dict) -> dict:
         entry['labels'] = payload.get('labels', {})
         entry['colors'] = payload.get('colors', {})
         entry['names'] = payload.get('names', {})
+        entry['marker_values'] = payload.get('marker_values', {})
+        entry['dr_positions'] = payload.get('dr_positions', {})
     return entry

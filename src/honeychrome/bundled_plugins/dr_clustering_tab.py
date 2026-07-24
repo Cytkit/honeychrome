@@ -580,6 +580,19 @@ class PipelineState:
     # {cluster_id: hex colour string}
     cluster_names: dict[int, str] = field(default_factory=dict)
     # {cluster_id: display label — defaults to str(id) if absent}
+    cluster_marker_values: dict[str, tuple] = field(default_factory=dict)
+    # {sample_path: (raw_values: np.ndarray, channel_names: list[str])} --
+    # snapshotted at the SAME instant labels are assigned (see
+    # drc_clustering.py's _snapshot_marker_values), so guaranteed
+    # row-for-row aligned to cluster_labels even if gates/channels are
+    # edited later. Archived into clustering_runs['marker_values'].
+    cluster_dr_positions: dict[str, np.ndarray] = field(default_factory=dict)
+    # {sample_path: np.ndarray} -- the exact DR-embedding rows a DR-space
+    # clustering run assigned labels against. Only populated when
+    # clustering ran in DR-embedding space. Archived into
+    # clustering_runs['dr_positions'] so the Cluster Annotation map can
+    # still plot correct positions even if the live state.embeddings for
+    # that algorithm have since been overwritten by a later DR run.
     n_clusters: int | None = None
     active_clustering_algorithm: str | None = None
     clustering_runs: list[dict] = field(default_factory=list)
@@ -7430,13 +7443,22 @@ class ClusterAnnotationTab(QWidget):
 
         ch_row = QHBoxLayout()
         ch_row.addWidget(QLabel("Channels:"))
-        self.channel_list = QListWidget()
-        self.channel_list.setFlow(QListView.LeftToRight)
-        self.channel_list.setWrapping(True)
-        self.channel_list.setResizeMode(QListView.Adjust)
-        self.channel_list.setMinimumHeight(70)
-        self.channel_list.setSelectionMode(QAbstractItemView.NoSelection)
-        ch_row.addWidget(self.channel_list, stretch=1)
+
+        # Grid of individually-labelled checkboxes -- same pattern as
+        # GroupsStatsTab's "Marker Roles -- MFI Testing" list (see
+        # _populate_marker_roles_list) -- instead of a QListWidget, so full
+        # channel labels are always readable rather than wrapped/elided
+        # list items.
+        self._channel_scroll = QScrollArea()
+        self._channel_scroll.setWidgetResizable(True)
+        self._channel_scroll.setMinimumHeight(70)
+        self._channel_scroll.setMaximumHeight(140)
+        self.channel_list_widget = QWidget()
+        self.channel_grid = QGridLayout(self.channel_list_widget)
+        self.channel_grid.setSpacing(4)
+        self.channel_checkboxes: dict[str, QCheckBox] = {}
+        self._channel_scroll.setWidget(self.channel_list_widget)
+        ch_row.addWidget(self._channel_scroll, stretch=1)
 
         ch_btn_col = QVBoxLayout()
         self.select_all_channels_btn = QPushButton("All")
@@ -7551,7 +7573,6 @@ class ClusterAnnotationTab(QWidget):
 
     def refresh(self):
         self._populate_run_combo()
-        self._populate_trex_dr_combo()
         self._populate_dr_run_combo()
         self._populate_channel_list()
         self._update_compat_warning()
@@ -7640,31 +7661,33 @@ class ClusterAnnotationTab(QWidget):
     # ------------------------------------------------------------------
 
     def _populate_channel_list(self):
-        """Rebuild the checkable channel list from state.selected_channels.
+        """Rebuild the checkable channel grid from state.selected_channels.
         Preserves the current check state for channels still present."""
-        previously_checked = set(self._checked_channels()) if self.channel_list.count() else set()
+        previously_checked = set(self._checked_channels())
         channels = [c for c in self.state.selected_channels
                    if c not in drc_pipeline.META_CHANNELS]
         labels = _antigen_dash_labels(self.controller)
-        self.channel_list.clear()
-        for ch in channels:
-            item = QListWidgetItem(labels.get(ch, ch))
-            item.setData(Qt.UserRole, ch)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if ch in previously_checked else Qt.Unchecked)
-            self.channel_list.addItem(item)
+
+        while self.channel_grid.count():
+            grid_item = self.channel_grid.takeAt(0)
+            w = grid_item.widget()
+            if w is not None:
+                w.deleteLater()
+        self.channel_checkboxes.clear()
+
+        for grid_idx, ch in enumerate(channels):
+            cb = QCheckBox(labels.get(ch, ch))
+            cb.setChecked(ch in previously_checked)
+            self.channel_checkboxes[ch] = cb
+            row, col = divmod(grid_idx, 4)
+            self.channel_grid.addWidget(cb, row, col)
 
     def _set_all_channels(self, checked: bool):
-        state_ = Qt.Checked if checked else Qt.Unchecked
-        for i in range(self.channel_list.count()):
-            self.channel_list.item(i).setCheckState(state_)
+        for cb in self.channel_checkboxes.values():
+            cb.setChecked(checked)
 
     def _checked_channels(self) -> list[str]:
-        return [
-            self.channel_list.item(i).data(Qt.UserRole)
-            for i in range(self.channel_list.count())
-            if self.channel_list.item(i).checkState() == Qt.Checked
-        ]
+        return [ch for ch, cb in self.channel_checkboxes.items() if cb.isChecked()]
 
     def _show_violin_placeholder(self, text: str):
         self._violin_placeholder = QLabel(text)
@@ -7674,10 +7697,13 @@ class ClusterAnnotationTab(QWidget):
 
     def _plot_violins(self):
         """
-        Pool untransformed marker values across the SELECTED run's own
-        training samples (drc_pipeline.load_sample_marker_values — correct
-        channel→column alignment), split by that run's own per-sample
-        label arrays, and draw one violin subplot per checked channel.
+        Split by the SELECTED run's own per-sample label arrays and draw
+        one violin subplot per checked channel. Prefers the run's own
+        'marker_values' snapshot (frozen at classification time -- see
+        drc_clustering.py's _snapshot_marker_values -- guaranteed
+        row-for-row aligned to 'labels' regardless of gate/channel edits
+        made since). Falls back to live-reloading + truncating for runs
+        archived before that snapshot existed.
         """
         cl_run = self._selected_cluster_run()
         if cl_run is None:
@@ -7689,27 +7715,43 @@ class ClusterAnnotationTab(QWidget):
             return
 
         labels_dict = cl_run.get('labels', {}) or {}
+        snapshot_dict = cl_run.get('marker_values', {}) or {}
         training_samples = cl_run.get('training_sample_ids', [])
         pooled: dict[str, dict[int, list]] = {ch: {} for ch in channels}
 
         for rel in training_samples:
-            mv = drc_pipeline.load_sample_marker_values(self.controller, self.state, rel)
-            if mv is None:
-                continue
-            values, names = mv
             labels = labels_dict.get(rel)
             if labels is None:
                 continue
             labels = np.asarray(labels)
-            if len(values) != len(labels):
-                _log.warning(
-                    "_plot_violins: %s -- values (%d) vs labels (%d) length "
-                    "mismatch, truncating to %d. Event order may not be "
-                    "aligned if gates/channels changed since this run was archived.",
-                    rel, len(values), len(labels), min(len(values), len(labels)),
-                )
-            m = min(len(values), len(labels))
-            values, labels = values[:m], labels[:m]
+
+            snap = snapshot_dict.get(rel)
+            if snap is not None:
+                values, names = snap
+                values = np.asarray(values)
+                if len(values) != len(labels):
+                    _log.warning(
+                        "_plot_violins: %s -- snapshot (%d) vs labels (%d) "
+                        "length mismatch, skipping sample.",
+                        rel, len(values), len(labels),
+                    )
+                    continue
+            else:
+                mv = drc_pipeline.load_sample_marker_values(self.controller, self.state, rel)
+                if mv is None:
+                    continue
+                values, names = mv
+                if len(values) != len(labels):
+                    _log.warning(
+                        "_plot_violins: %s -- values (%d) vs labels (%d) length "
+                        "mismatch, truncating to %d. This run predates the "
+                        "marker-value snapshot fix -- re-run clustering for "
+                        "guaranteed alignment.",
+                        rel, len(values), len(labels), min(len(values), len(labels)),
+                    )
+                m = min(len(values), len(labels))
+                values, labels = values[:m], labels[:m]
+
             for ch in channels:
                 if ch not in names:
                     continue
@@ -7736,6 +7778,8 @@ class ClusterAnnotationTab(QWidget):
         _palette = QApplication.instance().palette()
         is_dark = _palette.color(QPalette.ColorRole.Base).value() < 128
         _fg = 'white' if is_dark else 'black'
+        _violin_color = '#5dade2' if is_dark else '#2e6da4'
+        _mean_color = '#ffd54f' if is_dark else '#c0392b'
         display_labels = _antigen_dash_labels(self.controller)
 
         fig = Figure(figsize=(4.2 * n_cols, 3.2 * n_rows), constrained_layout=True)
@@ -7753,6 +7797,13 @@ class ClusterAnnotationTab(QWidget):
                 ax.title.set_color(_fg)
                 for spine in ax.spines.values():
                     spine.set_edgecolor(_fg)
+            # Explicit grid, drawn UNDER the data and deliberately faint --
+            # otherwise this inherits whatever global style is active (see
+            # the "suppress inherited seaborn 'whitegrid'" comments
+            # elsewhere in this file), which draws full-strength gridlines
+            # on TOP of the violins.
+            ax.set_axisbelow(True)
+            ax.grid(True, axis='y', linewidth=0.4, alpha=0.15, color=_fg)
             title = display_labels.get(ch, ch)
             by_cluster = pooled.get(ch, {})
             cl_ids = sorted(by_cluster.keys())
@@ -7762,7 +7813,14 @@ class ClusterAnnotationTab(QWidget):
                 continue
             data = [_apply_channel_transform(self.state, ch, np.concatenate(by_cluster[cl_id]))
                    for cl_id in cl_ids]
-            ax.violinplot(data, showmeans=True, showextrema=False)
+            parts = ax.violinplot(data, showmeans=True, showextrema=False)
+            for body in parts['bodies']:
+                body.set_facecolor(_violin_color)
+                body.set_edgecolor(_violin_color)
+                body.set_alpha(0.75)
+            if 'cmeans' in parts:
+                parts['cmeans'].set_color(_mean_color)
+                parts['cmeans'].set_linewidth(1.5)
             ax.set_xticks(range(1, len(cl_ids) + 1))
             ax.set_xticklabels(
                 [names_map.get(cl, str(cl)) for cl in cl_ids],
@@ -7816,15 +7874,32 @@ class ClusterAnnotationTab(QWidget):
             return
 
         labels_dict = cl_run.get('labels', {}) if cl_run else {}
+        own_positions = (cl_run.get('dr_positions', {}) if cl_run else {}) or {}
+        cl_params = (cl_run.get('params', {}) if cl_run else {}) or {}
+        # Only trust the run's own frozen positions as a substitute when
+        # they're nominally the SAME embedding space as what's on screen --
+        # mixing two different algorithms' coordinates would be meaningless.
+        same_algo = bool(cl_params.get('_dr_algo')) and \
+            cl_params.get('_dr_algo') == (dr_run.get('algorithm') or '')
         xys, labs = [], []
         for rel, emb in emb_dict.items():
             n = len(emb)
-            xys.append(emb)
             lbl = labels_dict.get(rel)
-            if lbl is None or len(lbl) != n:
-                labs.append(np.full(n, -1, dtype=np.int32))
-            else:
+            if lbl is not None and len(lbl) == n:
+                xys.append(emb)
                 labs.append(lbl)
+            elif lbl is not None and same_algo and rel in own_positions \
+                    and len(own_positions[rel]) == len(lbl):
+                # The selected DR run's live embeddings for this sample no
+                # longer match this clustering run's labels (e.g. DR was
+                # retrained for this algorithm since archiving) -- fall
+                # back to the exact positions this run actually classified
+                # against instead of greying the sample out.
+                xys.append(own_positions[rel])
+                labs.append(lbl)
+            else:
+                xys.append(emb)
+                labs.append(np.full(n, -1, dtype=np.int32))
         xy = np.concatenate(xys, axis=0)
         lab = np.concatenate(labs, axis=0)
 
@@ -8063,8 +8138,8 @@ class PluginWidget(QWidget):
         # Outer layout: disabled label + scrollable content
         # ------------------------------------------------------------------
         self.label_disabled = QLabel(
-            f"{plugin_name}: unmixed data not available.  "
-            "Set up the spectral model first."
+            f"{plugin_name}: loading...  "
+            "Set up the spectral model first if you have not done so."
         )
         self.label_disabled.setWordWrap(True)
         self.label_disabled.setStyleSheet(
@@ -8927,16 +9002,8 @@ class PluginWidget(QWidget):
                 cat.dr_run_combo.setCurrentIndex(idx)
         checked = getattr(self, '_pending_annotation_channels', [])
         if checked:
-            for i in range(cat.channel_list.count()):
-                item = cat.channel_list.item(i)
-                # Compare against the raw channel name (UserRole data), not
-                # item.text() -- the displayed text is the "Antigen -
-                # Channel" label, which never matches the raw names stored
-                # in _pending_annotation_channels. This was silently
-                # failing to re-check any channel with an assigned antigen.
-                item.setCheckState(
-                    Qt.Checked if item.data(Qt.UserRole) in checked else Qt.Unchecked
-                )
+            for ch, cb in cat.channel_checkboxes.items():
+                cb.setChecked(ch in checked)
         if cat.run_combo.currentData() is not None and cat._checked_channels():
             cat._plot_violins()
 
@@ -9490,6 +9557,8 @@ class PluginWidget(QWidget):
                         channels=channels,
                         params=dict(params),
                         n_events=n_events,
+                        marker_values=dict(self.state.cluster_marker_values),
+                        dr_positions=dict(self.state.cluster_dr_positions),
                     )
                     self.progress_message(
                         f"Run archived as \"{entry['label']}\""

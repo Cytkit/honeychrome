@@ -60,6 +60,32 @@ def assign_cluster_colors(state, labels: np.ndarray) -> None:
              len(state.cluster_colors), unique[:20])
 
 
+def _snapshot_marker_values(controller, state, rel_path: str, labels: np.ndarray,
+                            af_state=None) -> None:
+    """
+    Load UNTRANSFORMED marker values for *rel_path* right now -- the same
+    instant *labels* was computed -- and cache them in
+    state.cluster_marker_values, guaranteed row-for-row aligned to *labels*
+    since nothing about gates/channels can have changed in between. Cached
+    for archiving into the clustering run (see archive_clustering_run's
+    marker_values payload); skipped (with a log warning) if lengths still
+    don't match, which should only happen if two loads of the exact same
+    sample somehow disagree.
+    """
+    mv = drc_pipeline.load_sample_marker_values(controller, state, rel_path, af_state=af_state)
+    if mv is None:
+        return
+    values, names = mv
+    if len(values) != len(labels):
+        log.warning(
+            "_snapshot_marker_values: %s -- marker values (%d) vs labels (%d) "
+            "length mismatch even at classification time -- skipping snapshot.",
+            rel_path, len(values), len(labels),
+        )
+        return
+    state.cluster_marker_values[rel_path] = (values, names)
+
+
 # ---------------------------------------------------------------------------
 # FlowSOM
 # ---------------------------------------------------------------------------
@@ -128,6 +154,7 @@ def flowsom_assign_all(controller, state, node_weights, node_to_meta, progress=N
     all_samples = list(controller.experiment.samples.get('all_samples', {}).keys())
 
     state.cluster_labels = {}
+    state.cluster_marker_values = {}
     for sample_key in all_samples:
         try:
             rel_path = str(Path(sample_key).relative_to(raw_subdir))
@@ -142,6 +169,7 @@ def flowsom_assign_all(controller, state, node_weights, node_to_meta, progress=N
             node_ids = flowsom_consensus.assign_to_nodes(node_weights, sample_data)
             labels = node_to_meta[node_ids].astype(np.int32)
             state.cluster_labels[rel_path] = labels
+            _snapshot_marker_values(controller, state, rel_path, labels, af_state=af_state)
             _progress(progress, f"  FlowSOM assigned {rel_path}: {len(labels):,} events "
                                 f"({len(np.unique(labels))} metaclusters)")
         except Exception as e:
@@ -322,6 +350,8 @@ def nearest_centroid_assign_all(controller, state, train_data, train_labels,
     all_samples = list(controller.experiment.samples.get('all_samples', {}).keys())
     raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
     state.cluster_labels = {}
+    state.cluster_marker_values = {}
+    state.cluster_dr_positions = {}
 
     for sample_key in all_samples:
         try:
@@ -346,6 +376,9 @@ def nearest_centroid_assign_all(controller, state, train_data, train_labels,
         try:
             labels = clf.predict(sample_data).astype(np.int32)
             state.cluster_labels[rel_path] = labels
+            _snapshot_marker_values(controller, state, rel_path, labels, af_state=af_state)
+            if dr_space:
+                state.cluster_dr_positions[rel_path] = np.asarray(sample_data)
         except Exception as e:
             _progress(progress, f"  Assignment failed for {rel_path}: {e}")
 
