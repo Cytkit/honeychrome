@@ -294,6 +294,55 @@ def compute_mfis(controller, state, all_rel, n_clusters,
     return full
 
 
+def compute_sample_mfis(controller, state, all_rel, channels=None,
+                        af_state=None) -> pd.DataFrame | None:
+    """
+    Per-sample mean intensity of each selected channel across the WHOLE
+    sample (every gated event), independent of cluster assignment.
+
+    Companion to compute_mfis() (cluster x channel, for the per-cluster
+    differential MFI test / Volcano) — that granularity isn't right for a
+    heatmap: with dozens of clusters it either needs one heatmap per
+    cluster or collapses to whichever single cluster happens to pass
+    significance, and a cluster with zero cells in one group produces a
+    fabricated near-zero MFI there rather than a real biological zero.
+    This is the plain sample-level view for the MFI Heatmap instead:
+    no cluster breakdown, no significance filtering.
+
+    Returns (n_samples x n_channels), NaN where a sample has no events for
+    a channel (rather than a fabricated 0).
+    """
+    log_stage(log, "SAMPLE MFI MATRIX")
+    if channels is None:
+        channels = [c for c in state.selected_channels if c not in drc_pipeline.META_CHANNELS]
+    if not channels:
+        log.warning("no sample-level MFI features could be built")
+        return None
+
+    sample_vals = {}
+    for rel in all_rel:
+        mv = drc_pipeline.load_sample_marker_values(controller, state, rel, af_state=af_state)
+        if mv is not None:
+            sample_vals[rel] = mv
+
+    mfi_mat = np.full((len(all_rel), len(channels)), np.nan, dtype=float)
+    for j, ch in enumerate(channels):
+        for i, rel in enumerate(all_rel):
+            mv = sample_vals.get(rel)
+            if mv is None:
+                continue
+            values, names = mv
+            if ch not in names:
+                continue
+            col = values[:, names.index(ch)]
+            if len(col):
+                mfi_mat[i, j] = float(np.mean(np.log1p(np.maximum(col, 0.0))))
+
+    df = pd.DataFrame(mfi_mat, index=all_rel, columns=list(channels))
+    log.info("sample MFI matrix: %s", df.shape)
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Composition views (Items 10 & 12 — CyCONDOR comparison, §5)
 # ---------------------------------------------------------------------------
@@ -826,5 +875,9 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
                                     pval_threshold, fc_threshold, pairing_vec=pairing_vec)
             state.mfi_results = mfi_results
             state.mfi_df = mfi_df        # raw (samples × features) matrix
+
+        state.mfi_sample_df = compute_sample_mfis(
+            controller, state, all_rel, channels=mfi_channels, af_state=af_state,
+        )
 
     return freq_results, mfi_results, counts_results
