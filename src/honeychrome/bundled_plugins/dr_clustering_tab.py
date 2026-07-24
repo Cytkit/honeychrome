@@ -3340,9 +3340,6 @@ class GroupsStatsTab(QWidget):
         content_layout.setContentsMargins(8, 8, 8, 8)
         content_layout.setSpacing(8)
 
-        splitter = QSplitter(Qt.Vertical)
-        content_layout.addWidget(splitter)
-
         # ============================================================
         # Top panel: group definitions + sample assignment table
         # ============================================================
@@ -3443,7 +3440,7 @@ class GroupsStatsTab(QWidget):
         table_box_layout.addWidget(self.table)
 
         top_layout.addWidget(table_box, stretch=1)
-        splitter.addWidget(top_widget)
+        content_layout.addWidget(top_widget)
 
         # ============================================================
         # Bottom panel: statistics controls + results
@@ -3634,24 +3631,27 @@ class GroupsStatsTab(QWidget):
         roles_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
         roles_layout.addWidget(roles_hint)
 
-        roles_row = QHBoxLayout()
-        self.marker_roles_list = QListWidget()
-        self.marker_roles_list.setFixedHeight(90)
-        self.marker_roles_list.setSelectionMode(QAbstractItemView.NoSelection)
-        self.marker_roles_list.itemChanged.connect(self._on_marker_role_changed)
-        roles_row.addWidget(self.marker_roles_list, stretch=1)
-
-        roles_btn_col = QVBoxLayout()
-        self.reset_roles_btn = QPushButton("Reset all to\nActivation")
+        roles_btn_row = QHBoxLayout()
+        self.reset_roles_btn = QPushButton("Reset all to Activation")
         self.reset_roles_btn.setToolTip(
             "Set every selected channel back to 'state' (activation) -- "
             "overwrites any per-channel overrides made above."
         )
         self.reset_roles_btn.clicked.connect(self._reset_marker_roles_to_defaults)
-        roles_btn_col.addWidget(self.reset_roles_btn)
-        roles_btn_col.addStretch()
-        roles_row.addLayout(roles_btn_col)
-        roles_layout.addLayout(roles_row)
+        roles_btn_row.addWidget(self.reset_roles_btn)
+        roles_btn_row.addStretch()
+        roles_layout.addLayout(roles_btn_row)
+
+        # Channel checkboxes laid out in a grid (same pattern as
+        # ConfigTab.channel_layout) instead of a single fixed-height
+        # column -- grows to fit however many channels are selected;
+        # this tab's own outer QScrollArea (see top of _build_ui) scrolls
+        # the whole page if that makes it taller than the viewport.
+        self.marker_roles_widget = QWidget()
+        self.marker_roles_grid = QGridLayout(self.marker_roles_widget)
+        self.marker_roles_grid.setSpacing(4)
+        self.marker_roles_checkboxes: dict[str, QCheckBox] = {}
+        roles_layout.addWidget(self.marker_roles_widget)
 
         self.chk_include_type_markers = QCheckBox(
             "Include clustering (type) markers in MFI testing"
@@ -3750,14 +3750,10 @@ class GroupsStatsTab(QWidget):
         self._results_tabs = QTabWidget()
         self._results_tabs.setTabsClosable(True)
         self._results_tabs.tabCloseRequested.connect(self._on_results_tab_close_requested)
-        self._results_tabs.setMinimumHeight(200)
+        self._results_tabs.setMinimumHeight(700)
         bottom_layout.addWidget(self._results_tabs, stretch=1)
 
-        splitter.addWidget(bottom_widget)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([3000, 900])
-        splitter.setChildrenCollapsible(False)
+        content_layout.addWidget(bottom_widget, stretch=1)
 
         # Sentinel: cluster names snapshot at last _draw_results() call.
         self._last_drawn_cluster_names: dict[int, str] = {}
@@ -4273,11 +4269,13 @@ class GroupsStatsTab(QWidget):
                 )
                 self.table.setCellWidget(row, 2 + c, edit)
 
-        # Size close to fitting every row up front (capped so it doesn't
-        # take over the whole tab on very large experiments) -- draggable
-        # via the splitter from there.
+        # Size to fit every row -- no splitter/drag-handle in this tab, so
+        # the table just grows to hold its full content; this tab's own
+        # outer QScrollArea (see _build_ui) scrolls the whole page if that
+        # makes it taller than the viewport, instead of nesting a second
+        # scrollbar inside this one.
         n_rows = self.table.rowCount()
-        self.table.setMinimumHeight(min(900, 28 * n_rows + 40))
+        self.table.setMinimumHeight(28 * n_rows + 40)
         self._update_group_count_label()
 
     def _add_covariate_column(self):
@@ -4531,7 +4529,7 @@ class GroupsStatsTab(QWidget):
 
     def _populate_marker_roles_list(self):
         """
-        Rebuild the marker-role checklist from state.selected_channels.
+        Rebuild the marker-role checkboxes from state.selected_channels.
         A channel with no entry yet in state.marker_roles defaults to
         'state' ("activation") for every channel — there is no automatic
         categorisation yet (a marker_database.csv-style table is planned
@@ -4542,22 +4540,30 @@ class GroupsStatsTab(QWidget):
         channels = [c for c in self.state.selected_channels
                    if c not in drc_pipeline.META_CHANNELS]
 
-        self.marker_roles_list.blockSignals(True)
-        self.marker_roles_list.clear()
-        for ch in channels:
+        # Rebuild from scratch each time -- channel selection can change
+        # between refreshes (Configuration tab), so stale checkboxes for
+        # channels no longer selected need to be dropped, not just added to.
+        while self.marker_roles_grid.count():
+            grid_item = self.marker_roles_grid.takeAt(0)
+            w = grid_item.widget()
+            if w is not None:
+                w.deleteLater()
+        self.marker_roles_checkboxes.clear()
+
+        for grid_idx, ch in enumerate(channels):
             role = self.state.marker_roles.get(ch)
             if role is None:
                 role = 'state'
                 self.state.marker_roles[ch] = role
-            item = QListWidgetItem(ch)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if role == 'type' else Qt.Unchecked)
-            self.marker_roles_list.addItem(item)
-        self.marker_roles_list.blockSignals(False)
+            cb = QCheckBox(ch)
+            cb.setChecked(role == 'type')
+            cb.toggled.connect(lambda checked, c=ch: self._on_marker_role_changed(c, checked))
+            self.marker_roles_checkboxes[ch] = cb
+            row, col = divmod(grid_idx, 4)
+            self.marker_roles_grid.addWidget(cb, row, col)
 
-    def _on_marker_role_changed(self, item: QListWidgetItem):
-        ch = item.text()
-        self.state.marker_roles[ch] = 'type' if item.checkState() == Qt.Checked else 'state'
+    def _on_marker_role_changed(self, ch: str, checked: bool):
+        self.state.marker_roles[ch] = 'type' if checked else 'state'
 
     def _reset_marker_roles_to_defaults(self):
         """
@@ -5180,10 +5186,11 @@ class GroupsStatsTab(QWidget):
         scroll = QScrollArea()
         scroll.setWidget(canvas)
         scroll.setWidgetResizable(True)
-        # Adaptive display box: grows with the actual figure height (at
-        # least double the old implicit default), capped so one very tall
-        # plot can't blow out the window — it scrolls past the cap instead.
-        scroll.setMinimumHeight(min(h_px + 40, 1200))
+        # Grows to the actual figure height -- no cap. This tab's own
+        # outer QScrollArea (GroupsStatsTab._build_ui) scrolls the whole
+        # page if that makes it taller than the viewport, rather than
+        # nesting a second scrollbar inside this one.
+        scroll.setMinimumHeight(h_px + 40)
 
         # Placeholder shown while plot is popped out
         placeholder = QLabel(f'"{tab_title}" is open in a separate window.\nClose that window to restore it here.')
