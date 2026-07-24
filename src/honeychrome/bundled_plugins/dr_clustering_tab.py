@@ -562,11 +562,49 @@ class PipelineState:
 
     # --- Groups and covariates ---
     sample_groups: dict[str, str] = field(default_factory=dict)
-    # {sample_path: 'A' | 'B' | 'Unassigned'}
-    _group_names: list[str] = field(default_factory=lambda: ['A', 'B'])
-    # Display names for groups A and B (user-editable; used by GroupsStatsTab)
+    # {sample_path: group_name | 'Unassigned'} — Item 13: group_name is a
+    # free-form, user-defined string (there is no longer a fixed 'A'/'B'
+    # slot; the group's NAME is the value directly). 'Unassigned' is a
+    # reserved sentinel and can never itself be added as a group name.
+    group_names: list[str] = field(default_factory=lambda: ['A', 'B'])
+    # Ordered list of currently-defined group names (Item 13 — replaces the
+    # old fixed two-slot model). Display order in the UI == this order.
+    group_patterns: dict[str, str] = field(default_factory=dict)
+    # {group_name: filename regex} for "Auto-assign by pattern" (Item 13 —
+    # replaces the old group_a_pattern/group_b_pattern QLineEdit pair).
+    compare_group_a: str = ''
+    compare_group_b: str = ''
+    # Item 13 — T-REX's own two-group pair (its neighbour-fraction score is
+    # only defined for two conditions, so it never grew past Phase 1 — see
+    # §0.2 point 2). Run Statistics/Confusion Matrix/Composition-by-group
+    # use testing_group_selection below instead, as of Phase 2.
     covariates: pd.DataFrame | None = None
-    # rows = samples, columns = covariate names, all values str
+    # rows = samples (rel-path index), columns = covariate names, all
+    # values str. Item 13 phase 2: now actually populated by CSV import
+    # (see _import_csv) — previously defined but never written to.
+
+    # --- Item 13 phase 2: N-group testing ---
+    testing_group_selection: list[str] = field(default_factory=list)
+    # Which defined groups participate in Frequency/Counts/MFI testing,
+    # Confusion Matrix, and Composition-by-group. Empty means "not yet
+    # chosen" -- the UI defaults every currently-defined group to checked.
+    contrast_mode: str = 'reference'
+    # 'reference' -- one joint fit; every other selected group vs
+    #   reference_group.
+    # 'pairwise'  -- every unique pair among selected groups, each its own
+    #   independent fit.
+    reference_group: str = ''
+    # Baseline group for 'reference' mode.
+    paired: bool = False
+    pairing_variable: str = ''
+    # Column name in state.covariates used as a fixed-effect blocking term
+    # when paired=True (e.g. donor ID).
+    stats_comparisons: list[tuple[str, str]] = field(default_factory=list)
+    # (baseline, other) pairs actually tested by the last Run Statistics
+    # call, aligned 1:1 with the unique values of freq_results/mfi_results/
+    # counts_results' 'comparison' column, in the same order. Lets the tab
+    # recover which two groups a comparison belongs to without parsing the
+    # display string.
 
     # --- Statistics ---
     freq_results: pd.DataFrame | None = None
@@ -647,17 +685,36 @@ class PipelineState:
     # ------------------------------------------------------------------
 
     def stats_runnable(self) -> bool:
-        """Return True if ≥ 3 samples are assigned to each group."""
-        a = sum(1 for g in self.sample_groups.values() if g == 'A')
-        b = sum(1 for g in self.sample_groups.values() if g == 'B')
-        return a >= 3 and b >= 3
+        """
+        Return True if the two selected "Compare" groups (Item 13) are
+        distinct and each has >= 3 assigned samples.
+        """
+        if not self.compare_group_a or not self.compare_group_b or \
+                self.compare_group_a == self.compare_group_b:
+            return False
+        counts = self.n_per_group()
+        return (counts.get(self.compare_group_a, 0) >= 3 and
+                counts.get(self.compare_group_b, 0) >= 3)
 
     def n_per_group(self) -> dict[str, int]:
-        """Return {'A': n, 'B': m} counts."""
-        return {
-            'A': sum(1 for g in self.sample_groups.values() if g == 'A'),
-            'B': sum(1 for g in self.sample_groups.values() if g == 'B'),
-        }
+        """Return {group_name: assigned_sample_count} for every defined group."""
+        counts = {name: 0 for name in self.group_names}
+        for g in self.sample_groups.values():
+            if g in counts:
+                counts[g] += 1
+        return counts
+
+    def n_group_stats_runnable(self) -> bool:
+        """
+        Item 13 phase 2. True if at least 2 of the checked 'Groups to Test'
+        each have >= 3 assigned samples. Governs Run Statistics/Confusion
+        Matrix/Composition-by-group -- separate from stats_runnable(),
+        which still gates T-REX's fixed Compare pair.
+        """
+        selection = self.testing_group_selection or self.group_names
+        counts = self.n_per_group()
+        qualifying = sum(1 for name in selection if counts.get(name, 0) >= 3)
+        return qualifying >= 2
 
     def available_algorithms(self) -> list[str]:
         """Return list of DR algorithms that have completed training."""
@@ -3189,16 +3246,15 @@ class GroupsStatsTab(QWidget):
       • Results: heatmap+dendrogram and volcano plot, CSV export
     """
 
-    _DEFAULT_GROUPS = ['Unassigned', 'A', 'B']
-
     def __init__(self, state: PipelineState, bus, controller, parent=None):
         super().__init__(parent)
         self.state = state
         self.bus = bus
         self.controller = controller
-        # Named groups registry:  {group_name: str}  (order: A, B, Unassigned always present)
-        # The _group_names list controls the combo box options and maps names → slots
-        self._group_names: list[str] = ['A', 'B']   # user-editable display names for groups
+        # Item 13: group names/patterns/compare-selection all live directly
+        # on state now (state.group_names / state.group_patterns /
+        # state.compare_group_a / state.compare_group_b) — no local mirror
+        # to keep in sync.
         self._stats_worker = None
         # (run_id, run_freq, run_mfi, groups_fingerprint) for the last
         # successfully computed Run Statistics — lets _run_statistics
@@ -3244,58 +3300,50 @@ class GroupsStatsTab(QWidget):
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(6)
 
-        # ---- Group name editor ----
+        # ---- Group management (Item 13 — arbitrary N named groups) ----
         group_box = QGroupBox("Comparison Groups")
         group_box_layout = QVBoxLayout(group_box)
 
         name_hint = QLabel(
-            "Set a display name for each group, and a filename regex used to "
-            "auto-assign samples to that group."
+            "Define one or more comparison groups. Double-click a group's "
+            "name or match pattern below to edit it in place. Assign "
+            "samples to a group in the table beneath, or set a match "
+            "pattern per group and use 'Auto-assign by pattern'."
         )
         name_hint.setWordWrap(True)
         name_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
         group_box_layout.addWidget(name_hint)
 
-        names_row = QHBoxLayout()
-        names_row.addWidget(QLabel("Group A name:"))
-        self.group_a_name = QLineEdit(self._group_names[0])
-        self.group_a_name.setPlaceholderText("e.g. Spleen")
-        self.group_a_name.setFixedWidth(140)
-        self.group_a_name.textChanged.connect(lambda t: self._on_group_name_changed(0, t))
-        names_row.addWidget(self.group_a_name)
+        self.groups_table = QTableWidget(0, 2)
+        self.groups_table.setHorizontalHeaderLabels(['Group Name', 'Match Pattern (regex)'])
+        self.groups_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.groups_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.groups_table.verticalHeader().setVisible(False)
+        self.groups_table.setEditTriggers(QAbstractItemView.DoubleClicked)
+        self.groups_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.groups_table.setMaximumHeight(120)
+        self.groups_table.itemChanged.connect(self._on_groups_table_item_changed)
+        group_box_layout.addWidget(self.groups_table)
 
-        names_row.addSpacing(16)
-        names_row.addWidget(QLabel("Group B name:"))
-        self.group_b_name = QLineEdit(self._group_names[1])
-        self.group_b_name.setPlaceholderText("e.g. Liver")
-        self.group_b_name.setFixedWidth(140)
-        self.group_b_name.textChanged.connect(lambda t: self._on_group_name_changed(1, t))
-        names_row.addWidget(self.group_b_name)
-        names_row.addStretch()
-        group_box_layout.addLayout(names_row)
-
-        # Dedicated regex match patterns (separate from display names) so a
-        # group named 'A' doesn't match every filename (bug R1).
-        pat_row = QHBoxLayout()
-        pat_row.addWidget(QLabel("Group A match:"))
-        self.group_a_pattern = QLineEdit()
-        self.group_a_pattern.setPlaceholderText("filename regex, e.g. ctrl|baseline")
-        pat_row.addWidget(self.group_a_pattern)
-        pat_row.addSpacing(16)
-        pat_row.addWidget(QLabel("Group B match:"))
-        self.group_b_pattern = QLineEdit()
-        self.group_b_pattern.setPlaceholderText("filename regex, e.g. treated|day7")
-        pat_row.addWidget(self.group_b_pattern)
+        groups_btn_row = QHBoxLayout()
+        self.add_group_btn = QPushButton("Add Group")
+        self.add_group_btn.clicked.connect(self._add_group)
+        groups_btn_row.addWidget(self.add_group_btn)
+        self.remove_group_btn = QPushButton("Remove Selected Group")
+        self.remove_group_btn.clicked.connect(self._remove_selected_group)
+        groups_btn_row.addWidget(self.remove_group_btn)
+        groups_btn_row.addStretch()
 
         self.auto_assign_btn = QPushButton("Auto-assign by pattern")
         self.auto_assign_btn.setToolTip(
-            "Regex-match the patterns above against sample filenames and assign "
-            "groups automatically.\n"
+            "Regex-match each group's pattern (above) against sample "
+            "filenames and assign groups automatically. First matching "
+            "pattern wins (in the order shown above).\n"
             "Only currently-Unassigned, on-screen samples are affected."
         )
         self.auto_assign_btn.clicked.connect(self._auto_assign_by_name)
-        pat_row.addWidget(self.auto_assign_btn)
-        group_box_layout.addLayout(pat_row)
+        groups_btn_row.addWidget(self.auto_assign_btn)
+        group_box_layout.addLayout(groups_btn_row)
         top_layout.addWidget(group_box)
 
         # ---- Sample assignment table ----
@@ -3361,6 +3409,89 @@ class GroupsStatsTab(QWidget):
         run_sel_row.addStretch()
         stats_layout.addLayout(run_sel_row)
         self._run_combo.currentIndexChanged.connect(self._on_run_combo_changed)
+
+        # ---- Groups to Test + contrast mode + pairing (Item 13 phase 2) ----
+        test_groups_box = QGroupBox("Groups to Test")
+        test_groups_layout = QVBoxLayout(test_groups_box)
+
+        test_groups_hint = QLabel(
+            "Check every group to include in Frequency/Counts/MFI testing, "
+            "Confusion Matrix, and Composition-by-group."
+        )
+        test_groups_hint.setWordWrap(True)
+        test_groups_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
+        test_groups_layout.addWidget(test_groups_hint)
+
+        self.test_groups_list = QListWidget()
+        self.test_groups_list.setFixedHeight(90)
+        self.test_groups_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.test_groups_list.itemChanged.connect(self._on_test_group_checked_changed)
+        test_groups_layout.addWidget(self.test_groups_list)
+
+        contrast_row = QHBoxLayout()
+        self.contrast_mode_group = QButtonGroup(self)
+        self.radio_reference = QRadioButton("Reference group")
+        self.radio_pairwise = QRadioButton("All pairwise")
+        self.radio_reference.setChecked(True)
+        self.contrast_mode_group.addButton(self.radio_reference)
+        self.contrast_mode_group.addButton(self.radio_pairwise)
+        self.radio_reference.toggled.connect(self._on_contrast_mode_changed)
+        contrast_row.addWidget(self.radio_reference)
+        contrast_row.addWidget(self.radio_pairwise)
+        contrast_row.addSpacing(12)
+        contrast_row.addWidget(QLabel("Reference:"))
+        self.reference_group_combo = QComboBox()
+        self.reference_group_combo.setMinimumWidth(140)
+        self.reference_group_combo.currentTextChanged.connect(self._on_reference_group_changed)
+        contrast_row.addWidget(self.reference_group_combo)
+        contrast_row.addStretch()
+        test_groups_layout.addLayout(contrast_row)
+
+        paired_row = QHBoxLayout()
+        self.chk_paired = QCheckBox("Paired design")
+        self.chk_paired.setToolTip(
+            "Add the pairing variable below as a fixed-effect blocking "
+            "term (e.g. donor ID). InMoose has no duplicateCorrelation-"
+            "style random-effect blocking documented -- this is a fixed-"
+            "effect term, which needs a full-rank design (each pairing "
+            "level shouldn't be unique to one group)."
+        )
+        self.chk_paired.toggled.connect(self._on_paired_toggled)
+        paired_row.addWidget(self.chk_paired)
+        paired_row.addWidget(QLabel("Pairing variable:"))
+        self.pairing_variable_combo = QComboBox()
+        self.pairing_variable_combo.setMinimumWidth(140)
+        self.pairing_variable_combo.setEnabled(False)
+        self.pairing_variable_combo.currentTextChanged.connect(self._on_pairing_variable_changed)
+        paired_row.addWidget(self.pairing_variable_combo)
+        paired_row.addStretch()
+        test_groups_layout.addLayout(paired_row)
+
+        stats_layout.addWidget(test_groups_box)
+
+        # ---- T-REX Compare selector (Item 13 — pairwise only, see §0.2) ----
+        compare_row = QHBoxLayout()
+        compare_row.addWidget(QLabel("T-REX Compare:"))
+        self.compare_group_a_combo = QComboBox()
+        self.compare_group_a_combo.setMinimumWidth(140)
+        compare_row.addWidget(self.compare_group_a_combo)
+        compare_row.addWidget(QLabel("vs"))
+        self.compare_group_b_combo = QComboBox()
+        self.compare_group_b_combo.setMinimumWidth(140)
+        compare_row.addWidget(self.compare_group_b_combo)
+        compare_row.addStretch()
+        stats_layout.addLayout(compare_row)
+        self.compare_group_a_combo.currentTextChanged.connect(self._on_compare_group_changed)
+        self.compare_group_b_combo.currentTextChanged.connect(self._on_compare_group_changed)
+
+        compare_hint = QLabel(
+            "T-REX's neighbour-fraction score only works for exactly two "
+            "conditions, so it uses this dedicated pair regardless of how "
+            "many groups are checked above."
+        )
+        compare_hint.setWordWrap(True)
+        compare_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
+        stats_layout.addWidget(compare_hint)
 
         # Config row: what to test
         config_row = QHBoxLayout()
@@ -3510,6 +3641,23 @@ class GroupsStatsTab(QWidget):
         run_row.addWidget(self.export_results_btn)
         stats_layout.addLayout(run_row)
 
+        # ---- Viewing comparison (Item 13 phase 2) ----
+        viewing_row = QHBoxLayout()
+        viewing_row.addWidget(QLabel("Viewing comparison:"))
+        self.viewing_comparison_combo = QComboBox()
+        self.viewing_comparison_combo.setMinimumWidth(200)
+        self.viewing_comparison_combo.setToolTip(
+            "A single Run Statistics click can test several group "
+            "comparisons at once. Freq/Counts/MFI Heatmap and Volcano "
+            "each show one comparison at a time -- pick which here."
+        )
+        self.viewing_comparison_combo.currentIndexChanged.connect(
+            self._on_viewing_comparison_changed
+        )
+        viewing_row.addWidget(self.viewing_comparison_combo)
+        viewing_row.addStretch()
+        stats_layout.addLayout(viewing_row)
+
         bottom_layout.addWidget(stats_box)
 
         # Results area: one tab per plot
@@ -3529,65 +3677,263 @@ class GroupsStatsTab(QWidget):
         self._last_drawn_cluster_names: dict[int, str] = {}
 
     # ------------------------------------------------------------------
-    # Group name management
+    # Group management (Item 13 — arbitrary N named groups)
     # ------------------------------------------------------------------
 
-    def _on_group_name_changed(self, idx: int, new_name: str):
-        """
-        Update the DISPLAY name for group A/B only.
+    def _group_options(self) -> list[str]:
+        """Return the full list of group options for the per-sample combos."""
+        return ['Unassigned'] + list(self.state.group_names)
 
-        sample_groups stores slot keys ('A' / 'B' / 'Unassigned'), NOT display
-        names, so this must never rewrite sample_groups — doing so corrupted the
-        slot encoding and emptied the groups handed to inmoose (bug S3).
+    def _populate_groups_table(self):
+        """Rebuild the Group Name / Match Pattern management table from state."""
+        self.groups_table.blockSignals(True)
+        self.groups_table.setRowCount(0)
+        for name in self.state.group_names:
+            row = self.groups_table.rowCount()
+            self.groups_table.insertRow(row)
+            self.groups_table.setItem(row, 0, QTableWidgetItem(name))
+            self.groups_table.setItem(
+                row, 1, QTableWidgetItem(self.state.group_patterns.get(name, ''))
+            )
+        self.groups_table.blockSignals(False)
+
+    def _on_groups_table_item_changed(self, item: QTableWidgetItem):
         """
-        name = new_name.strip()
-        if not name:
+        Handle an in-place edit of a group's name (col 0) or match pattern
+        (col 1). A name edit is a REAL rename now — sample_groups values
+        ARE group names (no slot indirection left, see §0.2) — so every
+        sample currently assigned to the old name is rewritten to the new
+        one in the same operation.
+        """
+        row, col = item.row(), item.column()
+        if row >= len(self.state.group_names):
             return
-        self._group_names[idx] = name
-        self.state._group_names = list(self._group_names)   # persist for save_state
+        old_name = self.state.group_names[row]
+
+        if col == 0:
+            new_name = item.text().strip()
+            if not new_name or new_name == 'Unassigned':
+                QMessageBox.warning(self, "Invalid Group Name",
+                                    "Group name cannot be blank or 'Unassigned'.")
+                self._populate_groups_table()
+                return
+            if new_name != old_name and new_name in self.state.group_names:
+                QMessageBox.warning(self, "Duplicate Group Name",
+                                    f"A group named '{new_name}' already exists.")
+                self._populate_groups_table()
+                return
+            if new_name != old_name:
+                for sp, g in self.state.sample_groups.items():
+                    if g == old_name:
+                        self.state.sample_groups[sp] = new_name
+                if old_name in self.state.group_patterns:
+                    self.state.group_patterns[new_name] = self.state.group_patterns.pop(old_name)
+                if self.state.compare_group_a == old_name:
+                    self.state.compare_group_a = new_name
+                if self.state.compare_group_b == old_name:
+                    self.state.compare_group_b = new_name
+                self.state.group_names[row] = new_name
+                self.state.invalidate_trex()
+                self._populate_table()
+                self._refresh_compare_combos()
+                self._update_group_count_label()
+        else:
+            self.state.group_patterns[old_name] = item.text().strip()
+
+    def _add_group(self):
+        from PySide6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "Add Group", "Group name:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name or name == 'Unassigned':
+            QMessageBox.warning(self, "Invalid Group Name",
+                                "Group name cannot be blank or 'Unassigned'.")
+            return
+        if name in self.state.group_names:
+            QMessageBox.warning(self, "Duplicate Group Name",
+                                f"A group named '{name}' already exists.")
+            return
+        self.state.group_names.append(name)
+        self._populate_groups_table()
         self._refresh_group_combos()
+        self._refresh_compare_combos()
         self._update_group_count_label()
 
-    def _group_options(self) -> list[str]:
-        """Return the full list of group options for combos."""
-        return ['Unassigned'] + self._group_names
+    def _remove_selected_group(self):
+        row = self.groups_table.currentRow()
+        if row < 0 or row >= len(self.state.group_names):
+            return
+        name = self.state.group_names[row]
+        n_assigned = sum(1 for g in self.state.sample_groups.values() if g == name)
+        reply = QMessageBox.question(
+            self, "Remove Group",
+            f"Remove group '{name}'? {n_assigned} assigned sample(s) will "
+            "become Unassigned.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        for sp, g in list(self.state.sample_groups.items()):
+            if g == name:
+                self.state.sample_groups[sp] = 'Unassigned'
+        self.state.group_names.pop(row)
+        self.state.group_patterns.pop(name, None)
+        if self.state.compare_group_a == name:
+            self.state.compare_group_a = ''
+        if self.state.compare_group_b == name:
+            self.state.compare_group_b = ''
+        self.state.invalidate_trex()
+        self._populate_groups_table()
+        self._populate_table()
+        self._refresh_compare_combos()
+        self._update_run_button()
 
     def _refresh_group_combos(self):
-        """Update all combo boxes in the table after a group rename."""
+        """Update every per-sample combo box in the assignment table (e.g.
+        after a group is renamed/added/removed) without rebuilding rows."""
         opts = self._group_options()
         for row in range(self.table.rowCount()):
             combo = self.table.cellWidget(row, 1)
             if combo is None:
                 continue
-            sp = self.table.item(row, 0)
-            if sp is None:
+            sp_item = self.table.item(row, 0)
+            if sp_item is None:
                 continue
-            sp = sp.data(Qt.UserRole)
+            sp = sp_item.data(Qt.UserRole)
             current = self.state.sample_groups.get(sp, 'Unassigned')
             combo.blockSignals(True)
             combo.clear()
             combo.addItems(opts)
-            # Map 'A'/'B' slot names to display names
-            display = self._slot_to_display(current)
-            idx = combo.findText(display)
+            idx = combo.findText(current)
             combo.setCurrentIndex(max(0, idx))
             combo.blockSignals(False)
 
-    def _slot_to_display(self, slot: str) -> str:
-        """Convert internal slot ('A', 'B', 'Unassigned') to display name."""
-        if slot == 'A':
-            return self._group_names[0]
-        if slot == 'B':
-            return self._group_names[1]
-        return 'Unassigned'
+    def _refresh_compare_combos(self):
+        """Repopulate the Compare: selector from state.group_names, trying
+        to preserve the current selection; falls back to the first two
+        defined groups."""
+        names = list(self.state.group_names)
+        for combo in (self.compare_group_a_combo, self.compare_group_b_combo):
+            combo.blockSignals(True)
+        prev_a, prev_b = self.state.compare_group_a, self.state.compare_group_b
+        self.compare_group_a_combo.clear()
+        self.compare_group_a_combo.addItems(names)
+        self.compare_group_b_combo.clear()
+        self.compare_group_b_combo.addItems(names)
+        idx_a = self.compare_group_a_combo.findText(prev_a)
+        idx_b = self.compare_group_b_combo.findText(prev_b)
+        self.compare_group_a_combo.setCurrentIndex(idx_a if idx_a >= 0 else 0)
+        default_b = 1 if len(names) > 1 else 0
+        self.compare_group_b_combo.setCurrentIndex(idx_b if idx_b >= 0 else default_b)
+        for combo in (self.compare_group_a_combo, self.compare_group_b_combo):
+            combo.blockSignals(False)
+        self.state.compare_group_a = self.compare_group_a_combo.currentText()
+        self.state.compare_group_b = self.compare_group_b_combo.currentText()
 
-    def _display_to_slot(self, display: str) -> str:
-        """Convert display name back to internal slot."""
-        if display == self._group_names[0]:
-            return 'A'
-        if display == self._group_names[1]:
-            return 'B'
-        return 'Unassigned'
+    def _on_compare_group_changed(self, _text: str):
+        self.state.compare_group_a = self.compare_group_a_combo.currentText()
+        self.state.compare_group_b = self.compare_group_b_combo.currentText()
+        self.state.invalidate_trex()
+        self._update_run_button()
+        self._update_group_count_label()
+
+    # ------------------------------------------------------------------
+    # Groups to Test / contrast mode / pairing (Item 13 phase 2)
+    # ------------------------------------------------------------------
+
+    def _populate_test_groups_list(self):
+        """Rebuild the Groups-to-Test checklist from state.group_names,
+        defaulting every group to checked the first time (empty selection)."""
+        default_all = not self.state.testing_group_selection
+        selection = (set(self.state.group_names) if default_all
+                    else set(self.state.testing_group_selection))
+
+        self.test_groups_list.blockSignals(True)
+        self.test_groups_list.clear()
+        for name in self.state.group_names:
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if name in selection else Qt.Unchecked)
+            self.test_groups_list.addItem(item)
+        self.test_groups_list.blockSignals(False)
+
+        if default_all:
+            self.state.testing_group_selection = list(self.state.group_names)
+
+        self._refresh_reference_group_combo()
+
+    def _on_test_group_checked_changed(self, _item: QListWidgetItem):
+        self.state.testing_group_selection = [
+            self.test_groups_list.item(i).text()
+            for i in range(self.test_groups_list.count())
+            if self.test_groups_list.item(i).checkState() == Qt.Checked
+        ]
+        self._last_stats_data_key = None
+        self._refresh_reference_group_combo()
+        self._update_run_button()
+
+    def _refresh_reference_group_combo(self):
+        """Populate the Reference combo from the currently checked test
+        groups only -- a reference must itself be one of the groups in play."""
+        checked = self.state.testing_group_selection or list(self.state.group_names)
+        self.reference_group_combo.blockSignals(True)
+        prev = self.state.reference_group
+        self.reference_group_combo.clear()
+        self.reference_group_combo.addItems(checked)
+        idx = self.reference_group_combo.findText(prev)
+        self.reference_group_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.reference_group_combo.blockSignals(False)
+        self.state.reference_group = self.reference_group_combo.currentText()
+        self.reference_group_combo.setEnabled(self.radio_reference.isChecked())
+
+    def _on_contrast_mode_changed(self, _checked: bool):
+        self.state.contrast_mode = 'reference' if self.radio_reference.isChecked() else 'pairwise'
+        self.reference_group_combo.setEnabled(self.radio_reference.isChecked())
+        self._last_stats_data_key = None
+        self._update_run_button()
+
+    def _on_reference_group_changed(self, text: str):
+        self.state.reference_group = text
+        self._last_stats_data_key = None
+
+    def _on_paired_toggled(self, checked: bool):
+        self.state.paired = checked
+        self.pairing_variable_combo.setEnabled(checked)
+        self._last_stats_data_key = None
+        self._update_run_button()
+
+    def _populate_pairing_variable_combo(self):
+        cols = list(self.state.covariates.columns) if self.state.covariates is not None else []
+        self.pairing_variable_combo.blockSignals(True)
+        prev = self.state.pairing_variable
+        self.pairing_variable_combo.clear()
+        self.pairing_variable_combo.addItems(cols)
+        idx = self.pairing_variable_combo.findText(prev)
+        self.pairing_variable_combo.setCurrentIndex(max(0, idx))
+        self.pairing_variable_combo.blockSignals(False)
+        self.state.pairing_variable = self.pairing_variable_combo.currentText()
+
+    def _on_pairing_variable_changed(self, text: str):
+        self.state.pairing_variable = text
+        self._last_stats_data_key = None
+
+    def _refresh_viewing_comparison_combo(self):
+        """Populate 'Viewing comparison:' from state.stats_comparisons,
+        set by the last Run Statistics call."""
+        self.viewing_comparison_combo.blockSignals(True)
+        prev = self.viewing_comparison_combo.currentText()
+        self.viewing_comparison_combo.clear()
+        labels = [f"{other} vs {base}" for base, other in self.state.stats_comparisons]
+        self.viewing_comparison_combo.addItems(labels)
+        idx = self.viewing_comparison_combo.findText(prev)
+        self.viewing_comparison_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.viewing_comparison_combo.blockSignals(False)
+
+    def _on_viewing_comparison_changed(self, _index: int):
+        if (self.state.freq_results is not None or self.state.mfi_results is not None
+                or self.state.counts_results is not None):
+            self._draw_results()
 
     # ------------------------------------------------------------------
     # Auto-assign by name (regex matching)
@@ -3595,23 +3941,28 @@ class GroupsStatsTab(QWidget):
 
     def _auto_assign_by_name(self):
         """
-        Regex-match the dedicated patterns against the filenames of the samples
-        currently shown in the table, assigning only Unassigned ones. Patterns
-        are separate from display names so a group named 'A' can't match every
-        file (bug R1), and only on-screen samples are touched (bug R2).
+        Regex-match each defined group's pattern against the filenames of
+        the samples currently shown in the table, assigning only Unassigned
+        ones. First matching pattern wins, in state.group_names order.
+        Patterns are separate from group names so a group named 'A' can't
+        match every file (bug R1), and only on-screen samples are touched
+        (bug R2) — Item 13 generalizes this from a fixed A/B pair to
+        however many groups are defined.
         """
-        pat_a = self.group_a_pattern.text().strip()
-        pat_b = self.group_b_pattern.text().strip()
-        _log.info("auto-assign: pat_a=%r  pat_b=%r", pat_a, pat_b)
-        if not pat_a and not pat_b:
+        patterns = {}
+        for name in self.state.group_names:
+            pat = self.state.group_patterns.get(name, '').strip()
+            if not pat:
+                continue
+            try:
+                patterns[name] = re.compile(pat, re.IGNORECASE)
+            except re.error as e:
+                QMessageBox.warning(self, "Invalid Regex", f"{name}: {e}")
+                return
+        _log.info("auto-assign: patterns=%r", {k: p.pattern for k, p in patterns.items()})
+        if not patterns:
             QMessageBox.information(self, "Auto-assign",
                 "Enter a filename match pattern for at least one group.")
-            return
-        try:
-            rx_a = re.compile(pat_a, re.IGNORECASE) if pat_a else None
-            rx_b = re.compile(pat_b, re.IGNORECASE) if pat_b else None
-        except re.error as e:
-            QMessageBox.warning(self, "Invalid Regex", str(e))
             return
 
         # Only the samples currently in the table (the training-filtered view).
@@ -3624,31 +3975,27 @@ class GroupsStatsTab(QWidget):
             _log.info("  sample key=%r  filename=%r  current=%r",
                       sp, Path(sp).name, self.state.sample_groups.get(sp, 'Unassigned'))
 
-        assigned_a = assigned_b = 0
+        assigned_counts = {name: 0 for name in patterns}
         for sp in shown:
             current = self.state.sample_groups.get(sp, 'Unassigned')
             if current != 'Unassigned':
                 _log.info("  skip %r (already %r)", Path(sp).name, current)
                 continue
             fn = Path(sp).name
-            if rx_a and rx_a.search(fn):
-                self.state.sample_groups[sp] = 'A'
-                assigned_a += 1
-                _log.info("  → A: %r", fn)
-            elif rx_b and rx_b.search(fn):
-                self.state.sample_groups[sp] = 'B'
-                assigned_b += 1
-                _log.info("  → B: %r", fn)
+            for name, rx in patterns.items():
+                if rx.search(fn):
+                    self.state.sample_groups[sp] = name
+                    assigned_counts[name] += 1
+                    _log.info("  → %s: %r", name, fn)
+                    break
             else:
                 _log.info("  no match: %r", fn)
 
         self.state.invalidate_trex()
         self.refresh()                  # repopulate the SAME (training) view
         self._update_run_button()
-        self.stats_status_label.setText(
-            f"Auto-assigned {assigned_a} → {self._group_names[0]}, "
-            f"{assigned_b} → {self._group_names[1]}."
-        )
+        summary = ", ".join(f"{n} → {name}" for name, n in assigned_counts.items())
+        self.stats_status_label.setText(f"Auto-assigned {summary}.")
 
     # ------------------------------------------------------------------
     # Refresh
@@ -3658,19 +4005,28 @@ class GroupsStatsTab(QWidget):
         """
         Rebuild the sample table showing only the training samples selected
         in Configuration.  Falls back to all samples if none are selected.
-        Syncs group name fields from state if names were persisted.
         """
-        # Sync name fields from persisted names
-        if hasattr(self.state, '_group_names') and self.state._group_names:
-            names = self.state._group_names
-            if len(names) >= 2:
-                self._group_names = list(names[:2])
-                self.group_a_name.blockSignals(True)
-                self.group_b_name.blockSignals(True)
-                self.group_a_name.setText(self._group_names[0])
-                self.group_b_name.setText(self._group_names[1])
-                self.group_a_name.blockSignals(False)
-                self.group_b_name.blockSignals(False)
+        # Item 13: group names/patterns/compare-selection live on state
+        # directly now — just repopulate the management widgets from it.
+        self._populate_groups_table()
+        self._refresh_compare_combos()
+
+        # Item 13 phase 2: Groups-to-Test / contrast mode / pairing widgets.
+        self._populate_test_groups_list()
+        self._populate_pairing_variable_combo()
+        self.chk_paired.blockSignals(True)
+        self.chk_paired.setChecked(self.state.paired)
+        self.chk_paired.blockSignals(False)
+        self.pairing_variable_combo.setEnabled(self.state.paired)
+        self.radio_reference.blockSignals(True)
+        self.radio_pairwise.blockSignals(True)
+        if self.state.contrast_mode == 'pairwise':
+            self.radio_pairwise.setChecked(True)
+        else:
+            self.radio_reference.setChecked(True)
+        self.radio_reference.blockSignals(False)
+        self.radio_pairwise.blockSignals(False)
+        self.reference_group_combo.setEnabled(self.radio_reference.isChecked())
 
         training = self.state.training_sample_ids
         if training:
@@ -3788,8 +4144,7 @@ class GroupsStatsTab(QWidget):
 
             combo = QComboBox()
             combo.addItems(opts)
-            display = self._slot_to_display(group)
-            idx = combo.findText(display)
+            idx = combo.findText(group)
             combo.setCurrentIndex(max(0, idx))
             combo.currentTextChanged.connect(
                 lambda text, sp=sample_path: self._on_group_changed(sp, text)
@@ -3798,22 +4153,18 @@ class GroupsStatsTab(QWidget):
 
         self._update_group_count_label()
 
-    def _on_group_changed(self, sample_path: str, display_name: str):
-        slot = self._display_to_slot(display_name)
-        self.state.sample_groups[sample_path] = slot
+    def _on_group_changed(self, sample_path: str, group_name: str):
+        self.state.sample_groups[sample_path] = group_name
         self.state.invalidate_trex()
         self._update_run_button()
         self._update_group_count_label()
 
     def _update_group_count_label(self):
         counts = self.state.n_per_group()
-        na, nb = counts.get('A', 0), counts.get('B', 0)
+        parts = [f"{name}: {counts.get(name, 0)}" for name in self.state.group_names]
         unassigned = sum(1 for g in self.state.sample_groups.values() if g == 'Unassigned')
-        name_a = self._group_names[0]
-        name_b = self._group_names[1]
-        self._group_count_label.setText(
-            f"{name_a}: {na}  |  {name_b}: {nb}  |  Unassigned: {unassigned}"
-        )
+        parts.append(f"Unassigned: {unassigned}")
+        self._group_count_label.setText("  |  ".join(parts))
 
     def _selected_run_kind(self) -> str | None:
         """Return 'dr' / 'clustering' for the current combo selection, or
@@ -3834,12 +4185,12 @@ class GroupsStatsTab(QWidget):
     def _update_run_button(self):
         any_clustering = bool(self.state.clustering_runs) or bool(self.state.cluster_labels)
         dr_only_selected = self._selected_run_kind() == 'dr'
-        runnable = self.state.stats_runnable() and any_clustering and not dr_only_selected
+        n_group_ok = self.state.n_group_stats_runnable()
+        runnable = n_group_ok and any_clustering and not dr_only_selected
         self.run_stats_btn.setEnabled(runnable)
         self.run_trex_btn.setEnabled(self.state.stats_runnable())
         self.confusion_btn.setEnabled(runnable)
         self.composition_btn.setEnabled(runnable)
-        counts = self.state.n_per_group()
         if dr_only_selected:
             self.run_stats_btn.setToolTip(
                 "This is a DR run — it has no cluster labels.  Select or "
@@ -3847,11 +4198,13 @@ class GroupsStatsTab(QWidget):
             )
         elif not any_clustering:
             self.run_stats_btn.setToolTip("Run clustering first.")
-        elif not self.state.stats_runnable():
+        elif not n_group_ok:
+            counts = self.state.n_per_group()
+            selection = self.state.testing_group_selection or self.state.group_names
+            detail = ", ".join(f"{name}={counts.get(name, 0)}" for name in selection)
             self.run_stats_btn.setToolTip(
-                f"Requires ≥ 3 samples per group.  "
-                f"Currently: {self._group_names[0]}={counts['A']}, "
-                f"{self._group_names[1]}={counts['B']}."
+                f"Requires ≥ 3 samples in at least two checked 'Groups to "
+                f"Test'.  Currently: {detail}."
             )
         else:
             self.run_stats_btn.setToolTip("")
@@ -3878,7 +4231,7 @@ class GroupsStatsTab(QWidget):
         unique, so text-matching would be fragile.
         """
         assigned = {sp for sp, g in self.state.sample_groups.items()
-                    if g in ('A', 'B')}
+                    if g != 'Unassigned'}
 
         try:
             raw_subdir = self.controller.experiment.settings['raw'][
@@ -4049,25 +4402,59 @@ class GroupsStatsTab(QWidget):
                     "CSV must contain 'sample' and 'group' columns."
                 )
                 return
-            valid_slots = {'A', 'B', 'Unassigned',
-                           self._group_names[0], self._group_names[1]}
+            valid = set(self.state.group_names) | {'Unassigned'}
+            unknown_names = set()
+            # Item 13 phase 2: any column beyond sample/group/full_path is a
+            # covariate (e.g. donor ID for paired testing) -- the CSV
+            # import tooltip already promised this; it just wasn't wired
+            # up until now.
+            covariate_cols = [c for c in df.columns if c not in ('sample', 'group', 'full_path')]
+            try:
+                raw_subdir = self.controller.experiment.settings['raw'][
+                    'raw_samples_subdirectory'
+                ]
+            except (KeyError, AttributeError):
+                raw_subdir = None
+            cov_rows = {}
             for _, row in df.iterrows():
                 sample = str(row['sample'])
-                raw_group = str(row['group'])
-                # Accept both slot names ('A','B') and display names
-                slot = self._display_to_slot(raw_group) if raw_group in (
-                    self._group_names[0], self._group_names[1]
-                ) else raw_group
+                group = str(row['group']).strip()
                 match = next(
                     (sp for sp in self.state.sample_groups
                      if Path(sp).name == sample or sp == sample),
                     None
                 )
-                if match and slot in {'A', 'B', 'Unassigned'}:
-                    self.state.sample_groups[match] = slot
+                if match is None:
+                    continue
+                if group not in valid:
+                    unknown_names.add(group)
+                else:
+                    self.state.sample_groups[match] = group
+                if covariate_cols:
+                    rel = match
+                    if raw_subdir:
+                        try:
+                            rel = str(Path(match).relative_to(raw_subdir))
+                        except ValueError:
+                            pass
+                    cov_rows[rel] = {c: str(row[c]) for c in covariate_cols}
+            if cov_rows:
+                new_cov = pd.DataFrame.from_dict(cov_rows, orient='index')
+                self.state.covariates = (
+                    new_cov if self.state.covariates is None
+                    else self.state.covariates.combine_first(new_cov).astype(str)
+                )
+                self._populate_pairing_variable_combo()
             self.state.invalidate_trex()
             self._populate_table()
             self._update_run_button()
+            if unknown_names:
+                QMessageBox.warning(
+                    self, "Unrecognised Groups",
+                    "These group names in the CSV don't match a defined "
+                    "group and were skipped (add the group first, then "
+                    "re-import): " + ", ".join(sorted(unknown_names))
+                )
         except Exception as e:
             QMessageBox.warning(self, "Import Error", str(e))
 
@@ -4078,15 +4465,24 @@ class GroupsStatsTab(QWidget):
         if not path:
             return
         try:
-            rows = [
-                {
-                    'sample': Path(sp).name,
-                    'full_path': sp,
-                    'group': self._slot_to_display(grp),
-                    'group_slot': grp,
-                }
-                for sp, grp in self.state.sample_groups.items()
-            ]
+            try:
+                raw_subdir = self.controller.experiment.settings['raw'][
+                    'raw_samples_subdirectory'
+                ]
+            except (KeyError, AttributeError):
+                raw_subdir = None
+            rows = []
+            for sp, grp in self.state.sample_groups.items():
+                rel = sp
+                if raw_subdir:
+                    try:
+                        rel = str(Path(sp).relative_to(raw_subdir))
+                    except ValueError:
+                        pass
+                row = {'sample': Path(sp).name, 'full_path': sp, 'group': grp}
+                if self.state.covariates is not None and rel in self.state.covariates.index:
+                    row.update(self.state.covariates.loc[rel].to_dict())
+                rows.append(row)
             pd.DataFrame(rows).to_csv(path, index=False)
             QMessageBox.information(self, "Exported", f"Saved to {path}")
         except Exception as e:
@@ -4124,9 +4520,13 @@ class GroupsStatsTab(QWidget):
 
         include_type_markers = self.chk_include_type_markers.isChecked()
         groups_fingerprint = tuple(sorted(self.state.sample_groups.items()))
+        test_fingerprint = (
+            tuple(self.state.testing_group_selection), self.state.contrast_mode,
+            self.state.reference_group, self.state.paired, self.state.pairing_variable,
+        )
         roles_fingerprint  = tuple(sorted(self.state.marker_roles.items()))
         data_key = (run_id, run_freq, run_counts, run_mfi, groups_fingerprint,
-                   include_type_markers, roles_fingerprint)
+                   test_fingerprint, include_type_markers, roles_fingerprint)
         have_results = (not run_freq or self.state.freq_results is not None) and \
                        (not run_counts or self.state.counts_results is not None) and \
                        (not run_mfi or self.state.mfi_results is not None)
@@ -4208,7 +4608,7 @@ class GroupsStatsTab(QWidget):
                 if mfi is not None:
                     self_.progress.emit(f"MFI limma: {len(mfi)} features tested.")
 
-        worker = _StatsWorker(run_freq, run_mfi, list(self._group_names), labels_for_stats,
+        worker = _StatsWorker(run_freq, run_mfi, list(self.state.group_names), labels_for_stats,
                              include_type_markers, names_for_stats, run_counts, af_state)
         worker.progress.connect(lambda msg: print(f"[DR Stats] {msg}"))
         worker.finished.connect(lambda success, err, key=data_key: self._on_stats_finished(success, err, key))
@@ -4226,7 +4626,18 @@ class GroupsStatsTab(QWidget):
             df = getattr(self.state, attr)
             if df is None or 'logFC' not in df.columns:
                 continue
-            pval_col = 'adj.P.Val' if 'adj.P.Val' in df.columns else 'P.Value'
+            # Item 13 phase 2 addendum (§2.7): prefer the global (all-
+            # contrasts-pooled) correction, matching run_limma()/
+            # run_glm_counts()'s own default. The plain-adj.P.Val/P.Value
+            # fallbacks only matter for results computed before this fix
+            # landed (results aren't persisted across sessions, so this is
+            # just a same-session safety net, not a migration path).
+            if 'adj.P.Val.global' in df.columns:
+                pval_col = 'adj.P.Val.global'
+            elif 'adj.P.Val' in df.columns:
+                pval_col = 'adj.P.Val'
+            else:
+                pval_col = 'P.Value'
             df['significant'] = (
                 (df[pval_col] <= pval_threshold) &
                 (df['logFC'].abs() >= fc_threshold)
@@ -4250,13 +4661,13 @@ class GroupsStatsTab(QWidget):
         if run_entry is None and not self.state.cluster_labels:
             QMessageBox.warning(self, "No Clustering", "Run clustering first.")
             return None
-        if not self.state.stats_runnable():
+        if not self.state.n_group_stats_runnable():
             counts = self.state.n_per_group()
+            selection = self.state.testing_group_selection or self.state.group_names
+            detail = ", ".join(f"{name}: {counts.get(name, 0)}" for name in selection)
             QMessageBox.warning(
                 self, "Insufficient Groups",
-                f"Need ≥ 3 samples per group.\n"
-                f"{self._group_names[0]}: {counts['A']}, "
-                f"{self._group_names[1]}: {counts['B']}"
+                f"Need ≥ 3 samples in at least two checked 'Groups to Test'.\n{detail}"
             )
             return None
 
@@ -4307,9 +4718,6 @@ class GroupsStatsTab(QWidget):
         """
         from matplotlib.figure import Figure
 
-        name_a = self._group_names[0]
-        name_b = self._group_names[1]
-
         if conf_df.empty:
             fig = Figure(figsize=(5, 2), constrained_layout=True)
             ax = fig.add_subplot(111)
@@ -4319,7 +4727,9 @@ class GroupsStatsTab(QWidget):
             self._stamp_run_label(fig, run_label)
             return fig
 
-        disp_df = conf_df.rename(columns={'A': name_a, 'B': name_b})
+        # Item 13: drc_stats.compute_confusion_matrix() now returns the
+        # real selected group names as columns directly — no rename needed.
+        disp_df = conf_df
         n_clusters = len(disp_df)
 
         fig_w = max(4.0, 1.2 + len(disp_df.columns) * 1.2)
@@ -4418,6 +4828,8 @@ class GroupsStatsTab(QWidget):
         names = names if names is not None else {}
         label_to_cluster_id = {v: k for k, v in names.items()}
         cl_run = self._selected_run_entry()
+        if cl_run is not None and cl_run.get('kind') != 'clustering':
+            cl_run = None
         colors = cl_run.get('colors', {}) if cl_run else self.state.cluster_colors
         for col in comp_df.columns:
             cl_id = label_to_cluster_id.get(col)
@@ -4665,7 +5077,12 @@ class GroupsStatsTab(QWidget):
                 return
 
     def _draw_results(self):
-        """Render heatmap and volcano into per-plot tabs."""
+        """
+        Render heatmap and volcano into per-plot tabs, for the currently
+        selected 'Viewing comparison' (Item 13 phase 2 — a single Run
+        Statistics call can now produce several comparisons; each plot
+        still shows exactly one at a time — see §2.4 of the change doc).
+        """
         self._last_drawn_cluster_names = dict(self.state.cluster_names)
         # Remove only this method's own tabs (by key) — leaves Confusion
         # Matrix / Composition Barplot (and anything else) untouched.
@@ -4673,24 +5090,58 @@ class GroupsStatsTab(QWidget):
                    'mfi_heatmap', 'mfi_volcano'):
             self._remove_results_tab_by_key(key)
 
-        name_a = self._group_names[0]
-        name_b = self._group_names[1]
+        self._refresh_viewing_comparison_combo()
+        if not self.state.stats_comparisons:
+            return
+        view_idx = max(0, self.viewing_comparison_combo.currentIndex())
+        name_a, name_b = self.state.stats_comparisons[view_idx]
+        comparison_label = f"{name_b} vs {name_a}"
         run_label = self.state.stats_run_label or 'Active (unsaved)'
 
-        if self.state.freq_results is not None:
+        # Samples outside this specific comparison aren't part of what it
+        # tested (pairwise mode fits each pair on just its own samples;
+        # reference mode's joint fit still only makes sense to *display*
+        # two groups at a time here).
+        relevant_rel = {
+            rel for rel, g in zip(self.state.stats_all_rel, self.state.stats_group_vec)
+            if g in (name_a, name_b)
+        }
+
+        def _view_results(results_df):
+            if results_df is None or 'comparison' not in results_df.columns:
+                return results_df
+            return (results_df[results_df['comparison'] == comparison_label]
+                    .drop(columns=['comparison']).reset_index(drop=True))
+
+        def _view_samples(sample_df):
+            if sample_df is None:
+                return sample_df
+            keep = [r for r in sample_df.index if r in relevant_rel]
+            return sample_df.loc[keep]
+
+        freq_results_view    = _view_results(self.state.freq_results)
+        freq_df_view         = _view_samples(self.state.freq_df)
+        counts_results_view  = _view_results(self.state.counts_results)
+        counts_df_view       = _view_samples(self.state.counts_df)
+        mfi_results_view     = _view_results(self.state.mfi_results)
+        mfi_df_view          = _view_samples(self.state.mfi_df)
+
+        if freq_results_view is not None:
             try:
                 fig = self._make_heatmap_figure(
-                    self.state.freq_results,
-                    self.state.freq_df,
-                    title=f"Cluster Frequencies: {name_a} vs {name_b}",
+                    freq_results_view,
+                    freq_df_view,
+                    title=f"Cluster Frequencies: {name_b} vs {name_a}",
+                    group_a=name_a, group_b=name_b,
                     run_label=run_label,
                 )
                 self._add_results_tab(fig, "Freq Heatmap", "freq_heatmap",
                          maker=self._make_heatmap_figure,
                          maker_kwargs=dict(
-                             results_df=self.state.freq_results,
-                             sample_df=self.state.freq_df,
-                             title=f"Cluster Frequencies: {name_a} vs {name_b}",
+                             results_df=freq_results_view,
+                             sample_df=freq_df_view,
+                             title=f"Cluster Frequencies: {name_b} vs {name_a}",
+                             group_a=name_a, group_b=name_b,
                              run_label=run_label,
                          ),
                          key="freq_heatmap")
@@ -4702,8 +5153,8 @@ class GroupsStatsTab(QWidget):
 
             try:
                 fig_v = self._make_volcano_figure(
-                    self.state.freq_results,
-                    title=f"Cluster Frequency Volcano: {name_a} vs {name_b}",
+                    freq_results_view,
+                    title=f"Cluster Frequency Volcano: {name_b} vs {name_a}",
                     pval_threshold=self.pval_spin.value(),
                     fc_threshold=self.fc_spin.value(),
                     run_label=run_label,
@@ -4711,8 +5162,8 @@ class GroupsStatsTab(QWidget):
                 self._add_results_tab(fig_v, "Freq Volcano", "freq_volcano",
                          maker=self._make_volcano_figure,
                          maker_kwargs=dict(
-                             results_df=self.state.freq_results,
-                             title=f"Cluster Frequency Volcano: {name_a} vs {name_b}",
+                             results_df=freq_results_view,
+                             title=f"Cluster Frequency Volcano: {name_b} vs {name_a}",
                              pval_threshold=self.pval_spin.value(),
                              fc_threshold=self.fc_spin.value(),
                              run_label=run_label,
@@ -4724,20 +5175,22 @@ class GroupsStatsTab(QWidget):
                 tab.setProperty('_tab_key', 'freq_volcano')
                 self._results_tabs.addTab(tab, "Freq Volcano")
 
-        if self.state.counts_results is not None:
+        if counts_results_view is not None:
             try:
                 fig_c = self._make_heatmap_figure(
-                    self.state.counts_results,
-                    self.state.counts_df,
-                    title=f"Cluster Counts: {name_a} vs {name_b}",
+                    counts_results_view,
+                    counts_df_view,
+                    title=f"Cluster Counts: {name_b} vs {name_a}",
+                    group_a=name_a, group_b=name_b,
                     run_label=run_label,
                 )
                 self._add_results_tab(fig_c, "Counts Heatmap", "counts_heatmap",
                          maker=self._make_heatmap_figure,
                          maker_kwargs=dict(
-                             results_df=self.state.counts_results,
-                             sample_df=self.state.counts_df,
-                             title=f"Cluster Counts: {name_a} vs {name_b}",
+                             results_df=counts_results_view,
+                             sample_df=counts_df_view,
+                             title=f"Cluster Counts: {name_b} vs {name_a}",
+                             group_a=name_a, group_b=name_b,
                              run_label=run_label,
                          ),
                          key="counts_heatmap")
@@ -4749,8 +5202,8 @@ class GroupsStatsTab(QWidget):
 
             try:
                 fig_cv = self._make_volcano_figure(
-                    self.state.counts_results,
-                    title=f"Cluster Counts Volcano: {name_a} vs {name_b}",
+                    counts_results_view,
+                    title=f"Cluster Counts Volcano: {name_b} vs {name_a}",
                     pval_threshold=self.pval_spin.value(),
                     fc_threshold=self.fc_spin.value(),
                     run_label=run_label,
@@ -4758,8 +5211,8 @@ class GroupsStatsTab(QWidget):
                 self._add_results_tab(fig_cv, "Counts Volcano", "counts_volcano",
                          maker=self._make_volcano_figure,
                          maker_kwargs=dict(
-                             results_df=self.state.counts_results,
-                             title=f"Cluster Counts Volcano: {name_a} vs {name_b}",
+                             results_df=counts_results_view,
+                             title=f"Cluster Counts Volcano: {name_b} vs {name_a}",
                              pval_threshold=self.pval_spin.value(),
                              fc_threshold=self.fc_spin.value(),
                              run_label=run_label,
@@ -4771,20 +5224,22 @@ class GroupsStatsTab(QWidget):
                 tab.setProperty('_tab_key', 'counts_volcano')
                 self._results_tabs.addTab(tab, "Counts Volcano")
 
-        if self.state.mfi_results is not None:
+        if mfi_results_view is not None:
             try:
                 fig_m = self._make_heatmap_figure(
-                    self.state.mfi_results,
-                    self.state.mfi_df,
-                    title=f"Cluster MFIs: {name_a} vs {name_b}",
+                    mfi_results_view,
+                    mfi_df_view,
+                    title=f"Cluster MFIs: {name_b} vs {name_a}",
+                    group_a=name_a, group_b=name_b,
                     run_label=run_label,
                 )
                 self._add_results_tab(fig_m, "MFI Heatmap", "mfi_heatmap",
                          maker=self._make_heatmap_figure,
                          maker_kwargs=dict(
-                             results_df=self.state.mfi_results,
-                             sample_df=self.state.mfi_df,
-                             title=f"Cluster MFIs: {name_a} vs {name_b}",
+                             results_df=mfi_results_view,
+                             sample_df=mfi_df_view,
+                             title=f"Cluster MFIs: {name_b} vs {name_a}",
+                             group_a=name_a, group_b=name_b,
                              run_label=run_label,
                          ),
                          key="mfi_heatmap")
@@ -4796,8 +5251,8 @@ class GroupsStatsTab(QWidget):
 
             try:
                 fig_mv = self._make_volcano_figure(
-                    self.state.mfi_results,
-                    title=f"Cluster MFI Volcano: {name_a} vs {name_b}",
+                    mfi_results_view,
+                    title=f"Cluster MFI Volcano: {name_b} vs {name_a}",
                     pval_threshold=self.pval_spin.value(),
                     fc_threshold=self.fc_spin.value(),
                     run_label=run_label,
@@ -4805,8 +5260,8 @@ class GroupsStatsTab(QWidget):
                 self._add_results_tab(fig_mv, "MFI Volcano", "mfi_volcano",
                          maker=self._make_volcano_figure,
                          maker_kwargs=dict(
-                             results_df=self.state.mfi_results,
-                             title=f"Cluster MFI Volcano: {name_a} vs {name_b}",
+                             results_df=mfi_results_view,
+                             title=f"Cluster MFI Volcano: {name_b} vs {name_a}",
                              pval_threshold=self.pval_spin.value(),
                              fc_threshold=self.fc_spin.value(),
                              run_label=run_label,
@@ -4833,12 +5288,22 @@ class GroupsStatsTab(QWidget):
                       edgecolor='#cccccc', alpha=0.85),
         )
 
-    def _make_heatmap_figure(self, results_df, sample_df, title: str, run_label: str = ''):
+    def _make_heatmap_figure(self, results_df, sample_df, title: str,
+                             group_a: str = '', group_b: str = '', run_label: str = ''):
         """
         Per-sample heatmap with row + column dendrograms.
 
-        results_df : limma output (feature, logFC, significant, …)
-        sample_df  : raw feature matrix (rows=samples, cols=features), index=rel-paths
+        results_df : limma/GLM output for ONE comparison (feature, logFC,
+                     significant, …) — Item 13 phase 2: the caller has
+                     already filtered a multi-comparison result down to a
+                     single comparison's rows before calling this.
+        sample_df  : raw feature matrix for that SAME comparison's samples
+                     only (rows=samples, cols=features), index=rel-paths.
+        group_a/group_b : the two group names this comparison represents
+                     (Item 13 phase 2 — passed explicitly rather than read
+                     from state.compare_group_a/b, since that pair now
+                     belongs to T-REX and may be completely unrelated to
+                     whichever comparison is being drawn here).
         run_label  : stamped in the upper-left corner (plot provenance)
         """
         from matplotlib.figure import Figure
@@ -4846,8 +5311,8 @@ class GroupsStatsTab(QWidget):
         from scipy.cluster.hierarchy import linkage, dendrogram
         from scipy.spatial.distance import pdist
 
-        name_a = self._group_names[0]
-        name_b = self._group_names[1]
+        name_a = group_a
+        name_b = group_b
         COLOR_A = '#4477AA'
         COLOR_B = '#EE6677'
 
@@ -4905,7 +5370,7 @@ class GroupsStatsTab(QWidget):
         mat_ord     = mat[:, row_order][col_order, :].T   # (n_features, n_samples)
         feat_labels = [cols_present[i] for i in row_order]
         samp_labels = [sample_labels[i] for i in col_order]
-        grp_ord     = [rel_to_group.get(sample_labels[i], 'A') for i in col_order]
+        grp_ord     = [rel_to_group.get(sample_labels[i], name_a) for i in col_order]
 
         # Remap MFI feature labels: replace channel suffix with antigen display label.
         if 'MFI' in title:
@@ -4971,7 +5436,7 @@ class GroupsStatsTab(QWidget):
         ax_grp.set_ylim(0, 1)
         ax_grp.axis('off')
         for xi, grp in enumerate(grp_ord):
-            color = COLOR_A if grp == 'A' else COLOR_B
+            color = COLOR_A if grp == name_a else COLOR_B
             ax_grp.add_patch(
                 __import__('matplotlib.patches', fromlist=['Rectangle']).Rectangle(
                     (xi, 0), 1, 1, color=color, transform=ax_grp.transData
@@ -5836,7 +6301,7 @@ class PlotCard(QFrame):
             self._draw_marker_scatter(ax, xy_disp, origin_disp,
                                       disp_idx, sample_row_offsets, run)
         elif colour_mode == 'T-REX':
-            self._draw_trex_scatter(ax, xy_disp, lab_disp, emb_dict)
+            self._draw_trex_scatter(ax, xy_disp, lab_disp, emb_dict, run)
 
         # Apply label colour to colourbar (Marker / T-REX) and title.
         lc = self._label_color
@@ -5932,12 +6397,24 @@ class PlotCard(QFrame):
         self._figure.colorbar(sc, ax=ax, shrink=0.6, label=f"{ch} (raw)")
         ax.set_title(f"Marker: {ch}", fontsize=8)
 
-    def _draw_trex_scatter(self, ax, xy, labels, emb_dict: dict):
+    def _draw_trex_scatter(self, ax, xy, labels, emb_dict: dict, run: dict):
         """Colour by T-REX score using a red-blue diverging colourmap."""
         # Build T-REX scores lazily if not yet computed
         if not self.state.trex_scores:
             ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.4)
             ax.set_title("T-REX: assign groups and run T-REX first", fontsize=7)
+            return
+
+        run_gates = run.get('gates')
+        if run_gates is not None and sorted(run_gates) != sorted(self.state.selected_gates):
+            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.3)
+            ax.set_title(f"{run.get('label', '')}: gate changed since training — retrain DR",
+                        fontsize=7)
+            _log.warning(
+                "trex scatter: gate selection changed since run %r was trained "
+                "(trained on %r, now %r) — embeddings are stale",
+                run.get('label'), run_gates, self.state.selected_gates,
+            )
             return
 
         # Pool T-REX scores from all available samples
@@ -7306,9 +7783,6 @@ class PluginWidget(QWidget):
                                 wt._plot_cards[-1].apply_config(cfg)
                     if hasattr(self, 'groups_stats_tab'):
                         gst = self.groups_stats_tab
-                        if hasattr(gst, 'group_a_pattern'):
-                            gst.group_a_pattern.setText(getattr(self, '_pending_group_a_pattern', ''))
-                            gst.group_b_pattern.setText(getattr(self, '_pending_group_b_pattern', ''))
                         if hasattr(gst, 'chk_include_type_markers'):
                             gst.chk_include_type_markers.setChecked(
                                 bool(getattr(self, '_pending_include_type_markers', False))
@@ -7379,7 +7853,19 @@ class PluginWidget(QWidget):
             s.setValue('n_training_events', self.state.n_training_events)
             s.setValue('training_samples',  self.state.training_sample_ids)
             s.setValue('sample_groups',     repr(self.state.sample_groups))
-            s.setValue('group_names',       self.state._group_names)
+            s.setValue('group_names',       list(self.state.group_names))
+            s.setValue('group_patterns',    repr(self.state.group_patterns))
+            s.setValue('compare_group_a',   self.state.compare_group_a)
+            s.setValue('compare_group_b',   self.state.compare_group_b)
+            # Item 13 phase 2
+            s.setValue('testing_group_selection', list(self.state.testing_group_selection))
+            s.setValue('contrast_mode',     self.state.contrast_mode)
+            s.setValue('reference_group',   self.state.reference_group)
+            s.setValue('paired',            self.state.paired)
+            s.setValue('pairing_variable',  self.state.pairing_variable)
+            s.setValue('covariates',
+                      repr(self.state.covariates.to_dict(orient='index'))
+                      if self.state.covariates is not None else '')
             # DR / clustering status (lightweight — no arrays)
             s.setValue('dr_status',         repr(self.state.dr_status))
             s.setValue('dr_timestamps',     repr(self.state.dr_timestamps))
@@ -7406,12 +7892,12 @@ class PluginWidget(QWidget):
                 s.setValue('annotation_run_id', cat.run_combo.currentData() or '')
                 s.setValue('annotation_dr_run_id', cat.dr_run_combo.currentData() or '')
                 s.setValue('annotation_channels_checked', cat._checked_channels())
-            # Groups tab: regex patterns
+            # Groups tab: include-type-markers checkbox (patterns are
+            # already saved directly from state.group_patterns above —
+            # Item 13 removed the group_a_pattern/group_b_pattern QLineEdits
+            # this block used to read from).
             if hasattr(self, 'groups_stats_tab'):
                 gst = self.groups_stats_tab
-                if hasattr(gst, 'group_a_pattern'):
-                    s.setValue('group_a_pattern', gst.group_a_pattern.text())
-                    s.setValue('group_b_pattern', gst.group_b_pattern.text())
                 if hasattr(gst, 'chk_include_type_markers'):
                     s.setValue('include_type_markers',
                               gst.chk_include_type_markers.isChecked())
@@ -7520,24 +8006,85 @@ class PluginWidget(QWidget):
                 self.state.training_sample_ids = list(training)
 
             groups_repr = s.value('sample_groups', '')
+            group_names_stored = list(s.value('group_names', []))
+            loaded_groups = None
             if groups_repr:
                 try:
-                    loaded = eval(groups_repr)  # noqa: S307
-                    _VALID_SLOTS = {'A', 'B', 'Unassigned'}
-                    self.state.sample_groups = {
-                        sp: (g if g in _VALID_SLOTS else 'Unassigned')
-                        for sp, g in loaded.items()
-                    }
-                    bad = [sp for sp, g in loaded.items() if g not in _VALID_SLOTS]
-                    if bad:
-                        _log.warning("sample_groups: reset %d corrupted slot values to 'Unassigned': %s",
-                                     len(bad), bad)
+                    loaded_groups = eval(groups_repr)  # noqa: S307
                 except Exception:
-                    pass
+                    loaded_groups = None
 
-            group_names = s.value('group_names', [])
-            if group_names and len(group_names) >= 2:
-                self.state._group_names = list(group_names[:2])
+            # Item 13: detect the pre-Item-13 session shape (exactly 2
+            # stored names, every sample_groups value restricted to the old
+            # 'A'/'B'/'Unassigned' slots) and migrate transparently — 'A' /
+            # 'B' become that session's own custom names, one-time, with no
+            # user action needed.
+            is_legacy = (
+                loaded_groups is not None
+                and len(group_names_stored) == 2
+                and all(g in ('A', 'B', 'Unassigned') for g in loaded_groups.values())
+            )
+
+            if is_legacy:
+                name_a, name_b = group_names_stored
+                slot_to_name = {'A': name_a, 'B': name_b}
+                self.state.sample_groups = {
+                    sp: slot_to_name.get(g, 'Unassigned') for sp, g in loaded_groups.items()
+                }
+                self.state.group_names = [name_a, name_b]
+                legacy_pat_a = s.value('group_a_pattern', '')
+                legacy_pat_b = s.value('group_b_pattern', '')
+                self.state.group_patterns = {
+                    k: v for k, v in ((name_a, legacy_pat_a), (name_b, legacy_pat_b)) if v
+                }
+                self.state.compare_group_a, self.state.compare_group_b = name_a, name_b
+                _log.info(
+                    "sample_groups: migrated %d entries from legacy A/B slot "
+                    "format to named groups %r", len(loaded_groups), self.state.group_names
+                )
+            elif loaded_groups is not None:
+                if group_names_stored:
+                    self.state.group_names = group_names_stored
+                valid = set(self.state.group_names) | {'Unassigned'}
+                self.state.sample_groups = {
+                    sp: (g if g in valid else 'Unassigned') for sp, g in loaded_groups.items()
+                }
+                bad = [sp for sp, g in loaded_groups.items() if g not in valid]
+                if bad:
+                    _log.warning(
+                        "sample_groups: reset %d entries with an unrecognised "
+                        "group name to 'Unassigned': %s", len(bad), bad
+                    )
+                patterns_repr = s.value('group_patterns', '')
+                if patterns_repr:
+                    try:
+                        self.state.group_patterns = eval(patterns_repr)  # noqa: S307
+                    except Exception:
+                        pass
+                self.state.compare_group_a = s.value('compare_group_a', '') or (
+                    self.state.group_names[0] if self.state.group_names else '')
+                self.state.compare_group_b = s.value('compare_group_b', '') or (
+                    self.state.group_names[1] if len(self.state.group_names) > 1 else '')
+
+            # Item 13 phase 2 (restored regardless of the legacy/normal
+            # branch above -- these are new fields with no pre-Phase-2
+            # equivalent to migrate from).
+            selection = s.value('testing_group_selection', [])
+            self.state.testing_group_selection = list(selection) if selection else []
+            self.state.contrast_mode = s.value('contrast_mode', 'reference') or 'reference'
+            self.state.reference_group = s.value('reference_group', '')
+            paired_val = s.value('paired', False)
+            self.state.paired = paired_val in (True, 'true', 'True', 1, '1')
+            self.state.pairing_variable = s.value('pairing_variable', '')
+            cov_repr = s.value('covariates', '')
+            if cov_repr:
+                try:
+                    loaded_cov = eval(cov_repr)  # noqa: S307
+                    self.state.covariates = (
+                        pd.DataFrame.from_dict(loaded_cov, orient='index') if loaded_cov else None
+                    )
+                except Exception:
+                    self.state.covariates = None
 
             # DR / clustering status metadata
             dr_status_repr = s.value('dr_status', '')
@@ -7603,8 +8150,6 @@ class PluginWidget(QWidget):
             # session, so _populate_marker_roles_list() always applies the
             # current 'state'-by-default policy.
 
-            self._pending_group_a_pattern = s.value('group_a_pattern', '')
-            self._pending_group_b_pattern = s.value('group_b_pattern', '')
             self._pending_include_type_markers = s.value('include_type_markers', False)
             self._pending_annotation_run_id = s.value('annotation_run_id', '')
             self._pending_annotation_dr_run_id = s.value('annotation_dr_run_id', '')
@@ -8600,10 +9145,15 @@ class PluginWidget(QWidget):
                     except ValueError:
                         return sp
 
+                # Item 13: T-REX's neighbour-fraction score is only defined
+                # for exactly two conditions, so it uses the same
+                # Compare-selector pair as Run Statistics rather than a
+                # fixed 'A'/'B' — see §0.2 point 2 in the change doc.
+                cmp_a, cmp_b = state.compare_group_a, state.compare_group_b
                 a_rels = [_to_rel(sp) for sp, g in state.sample_groups.items()
-                          if g == 'A' and _to_rel(sp) in state.cluster_labels]
+                          if g == cmp_a and _to_rel(sp) in state.cluster_labels]
                 b_rels = [_to_rel(sp) for sp, g in state.sample_groups.items()
-                          if g == 'B' and _to_rel(sp) in state.cluster_labels]
+                          if g == cmp_b and _to_rel(sp) in state.cluster_labels]
 
                 # Load feature data for all A and B samples
                 def _load_features(rel_list):
@@ -8624,7 +9174,7 @@ class PluginWidget(QWidget):
 
                 n_a, n_b = len(a_data), len(b_data)
                 pooled = np.concatenate([a_data, b_data], axis=0).astype(np.float32)
-                group_labels = np.array(['A'] * n_a + ['B'] * n_b)
+                group_labels = np.array([cmp_a] * n_a + [cmp_b] * n_b)
 
                 self_.progress.emit(f"Building hnswlib T-REX index ({len(pooled):,} events) …")
                 dim = pooled.shape[1]
@@ -8647,8 +9197,8 @@ class PluginWidget(QWidget):
                     nn_labels, _ = idx_h.knn_query(sample_data, k=min(k, len(pooled)))
                     scores = np.zeros(len(sample_data), dtype=np.float32)
                     for i, neighbours in enumerate(nn_labels):
-                        n_a_nb = np.sum(group_labels[neighbours] == 'A')
-                        n_b_nb = np.sum(group_labels[neighbours] == 'B')
+                        n_a_nb = np.sum(group_labels[neighbours] == cmp_a)
+                        n_b_nb = np.sum(group_labels[neighbours] == cmp_b)
                         score = (n_a_nb / max(n_a, 1)) - (n_b_nb / max(n_b, 1))
                         scores[i] = score
                     # Normalise to [-1, +1]
