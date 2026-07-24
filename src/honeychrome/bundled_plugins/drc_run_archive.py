@@ -184,12 +184,19 @@ def delete_run_payload(controller, run_id: str) -> None:
 
 def archive_dr_run(controller, state, *, algorithm, reducer, embeddings,
                     gates, training_sample_ids, channels, params,
-                    n_events, label=None) -> dict:
+                    n_events, label=None, embedding_features=None) -> dict:
     """
     Archive a completed DR training run: pickle the reducer + embeddings to
     ``cache/dr_clustering/runs/<run_id>.pkl``, append a lightweight entry to
     ``manifest.json``, and append the full (manifest fields + heavy payload)
     entry to ``state.dr_runs``.  Returns the in-memory entry.
+
+    embedding_features: optional {sample_path: np.ndarray} of the ORIGINAL
+        high-dimensional feature vectors each embedding row came from (same
+        feature space the reducer was fit on). Lets consumers like T-REX
+        compute true marker-space neighbours with guaranteed row-for-row
+        alignment to what's plotted, without re-deriving anything from live
+        (re-gate-able) data. Optional for callers that don't have it.
     """
     log_stage(log, "ARCHIVE DR RUN")
     run_id = _new_run_id()
@@ -199,6 +206,7 @@ def archive_dr_run(controller, state, *, algorithm, reducer, embeddings,
     save_run_payload(controller, run_id, {
         'reducer': reducer,
         'embeddings': embeddings,
+        'embedding_features': embedding_features or {},
     })
 
     entry = _manifest_entry(
@@ -212,25 +220,35 @@ def archive_dr_run(controller, state, *, algorithm, reducer, embeddings,
     full_entry = dict(entry)
     full_entry['reducer'] = reducer
     full_entry['embeddings'] = embeddings
+    full_entry['embedding_features'] = embedding_features or {}
     state.dr_runs.append(full_entry)
     log.info("archived DR run %r (run_id=%s, %d embedded sample(s))",
              run_label, run_id, len(embeddings))
     return full_entry
 
 
-def update_dr_run_embeddings(controller, state, run_id: str, embeddings: dict) -> None:
+def update_dr_run_embeddings(controller, state, run_id: str, embeddings: dict,
+                              embedding_features: dict | None = None) -> None:
     """
     Refresh the pickled payload and in-memory entry for an already-archived
     DR run after 'Apply to All Samples' embeds additional samples under the
     same trained model.  Does NOT create a new manifest entry or run_id —
     it is still the same run, just covering more samples.
+
+    embedding_features: see archive_dr_run(). Optional so a caller that
+    hasn't been updated to pass it doesn't wipe out an existing cache with
+    an empty one; only overwritten when actually supplied.
     """
     payload = load_run_payload(controller, run_id) or {}
     payload['embeddings'] = embeddings
+    if embedding_features is not None:
+        payload['embedding_features'] = embedding_features
     save_run_payload(controller, run_id, payload)
     for entry in state.dr_runs:
         if entry.get('run_id') == run_id:
             entry['embeddings'] = embeddings
+            if embedding_features is not None:
+                entry['embedding_features'] = embedding_features
             break
 
 
@@ -354,6 +372,7 @@ def hydrate_run(controller, entry: dict) -> dict:
         payload = load_run_payload(controller, entry['run_id']) or {}
         entry['reducer'] = payload.get('reducer')
         entry['embeddings'] = payload.get('embeddings', {})
+        entry['embedding_features'] = payload.get('embedding_features', {})
     elif kind == 'clustering' and 'labels' not in entry:
         payload = load_run_payload(controller, entry['run_id']) or {}
         entry['labels'] = payload.get('labels', {})
