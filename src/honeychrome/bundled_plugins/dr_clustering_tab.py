@@ -451,6 +451,43 @@ def _channel_axis_ticks(state, ch: str):
     minor_ticks, major_ticks = result
     return major_ticks, minor_ticks, tr.limits
 
+def _log1p_powers_of_ten_ticks(vmax_raw: float):
+    """
+    Tick (position, label) pairs for a log1p-scaled colourbar: positions
+    sit at log1p(10**n) so the mapping is log1p, but the LABEL shown is
+    the raw value at that power of ten -- same '10' + unicode-superscript
+    convention Honeychrome's 2D histogram axes use (see transform.py),
+    just for log1p rather than the full logicle transform.
+    """
+    superscripts = {'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+                    '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹'}
+    def to_superscript(n):
+        return "".join(superscripts.get(c, c) for c in str(n))
+
+    if vmax_raw <= 0:
+        return [0.0], ['0']
+    max_power = int(np.floor(np.log10(max(vmax_raw, 1.0))))
+    positions, labels = [0.0], ['0']
+    for p in range(0, max_power + 1):
+        raw = 10.0 ** p
+        positions.append(float(np.log1p(raw)))
+        labels.append(f"10{to_superscript(p)}")
+    return positions, labels
+
+
+def _non_control_sample_paths(controller) -> list[str]:
+    """
+    Every experiment sample path, excluding single-stain and unstained
+    controls -- those are spectral/AutoSpectral reference samples, never
+    biological samples to assign to test groups.
+    """
+    samples = controller.experiment.samples
+    all_samples = list(samples.get('all_samples', {}).keys())
+    excluded = set(samples.get('single_stain_controls', []) or []) \
+             | set(samples.get('unstained_samples', []) or [])
+    return [sp for sp in all_samples if sp not in excluded]
+
+
 def _downsample(data: np.ndarray, n: int, rng=None) -> np.ndarray:
     """
     Return a random subset of *n* rows from *data*.
@@ -513,6 +550,12 @@ class PipelineState:
     # {algorithm_name: ISO timestamp string}
     embeddings: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
     # {algorithm_name: {sample_path: np.ndarray shape (n_events, 2)}} — current/most-recent only
+    embedding_features: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    # {algorithm_name: {sample_path: np.ndarray shape (n_events, n_channels)}} —
+    # the ORIGINAL high-dimensional feature vectors each embedding row came
+    # from (same feature space the reducer was fit on). Cached alongside
+    # embeddings precisely so T-REX (or anything else needing true
+    # marker-space neighbours) never has to re-derive them from live data.
     umap_knn_index: Any | None = None
     # hnswlib index built during UMAP training; reused by Leiden and T-REX
     dr_runs: list[dict] = field(default_factory=list)
@@ -620,6 +663,11 @@ class PipelineState:
     # limma output for per-cluster marker MFIs
     mfi_df: pd.DataFrame | None = None
     # raw (samples × cluster·channel) log1p-MFI matrix
+    mfi_sample_df: pd.DataFrame | None = None
+    # raw (samples × channel) log1p-MFI matrix, whole-sample aggregate —
+    # what the MFI Heatmap actually draws (no cluster breakdown, no
+    # significance filter). mfi_df/mfi_results stay cluster-level, for
+    # the MFI Volcano.
 
     # Confusion Matrix / Composition Barplot (Items 10 & 12) — independent
     # of Run Statistics, so persisted separately so they survive reopen
@@ -662,6 +710,9 @@ class PipelineState:
     trex_scores: dict[str, np.ndarray] = field(default_factory=dict)
     # {sample_path: np.ndarray float32 in [-1, +1]}
     trex_k: int = 30
+    trex_dr_run_id: str = ''
+    # Which archived DR run's embeddings trex_scores was computed against --
+    # T-REX can only ever be plotted against THIS run's events.
 
     # --- Workspace ---
     plot_configs: list[dict] = field(default_factory=list)
@@ -3359,8 +3410,17 @@ class GroupsStatsTab(QWidget):
         self.import_csv_btn.clicked.connect(self._import_csv)
         self.export_csv_btn = QPushButton("Export CSV")
         self.export_csv_btn.clicked.connect(self._export_csv)
+        self.add_column_btn = QPushButton("+ Add Column")
+        self.add_column_btn.setToolTip(
+            "Add a new covariate column to the table (e.g. 'donor', "
+            "'batch') -- fill it in per sample below, then pick it as "
+            "the 'Pairing variable' further down to use it for paired "
+            "testing."
+        )
+        self.add_column_btn.clicked.connect(self._add_covariate_column)
         csv_row.addWidget(self.import_csv_btn)
         csv_row.addWidget(self.export_csv_btn)
+        csv_row.addWidget(self.add_column_btn)
         csv_row.addStretch()
 
         self._group_count_label = QLabel()
@@ -3368,7 +3428,10 @@ class GroupsStatsTab(QWidget):
         csv_row.addWidget(self._group_count_label)
         table_box_layout.addLayout(csv_row)
 
-        # Table: Sample | Group | [covariate columns…]
+        # Table: Sample | Group | [covariate columns...] -- column count is
+        # dynamic (one per state.covariates column, added via '+ Add
+        # Column' or CSV import). Never includes single-stain/unstained
+        # controls (see _non_control_sample_paths).
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(['Sample', 'Group'])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
@@ -3462,6 +3525,11 @@ class GroupsStatsTab(QWidget):
         self.pairing_variable_combo = QComboBox()
         self.pairing_variable_combo.setMinimumWidth(140)
         self.pairing_variable_combo.setEnabled(False)
+        self.pairing_variable_combo.setToolTip(
+            "Which covariate column (added via '+ Add Column' on the table "
+            "above, or imported via CSV) to use as the pairing/blocking "
+            "variable."
+        )
         self.pairing_variable_combo.currentTextChanged.connect(self._on_pairing_variable_changed)
         paired_row.addWidget(self.pairing_variable_combo)
         paired_row.addStretch()
@@ -3492,6 +3560,24 @@ class GroupsStatsTab(QWidget):
         compare_hint.setWordWrap(True)
         compare_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
         stats_layout.addWidget(compare_hint)
+
+        # ---- T-REX DR run selector ----
+        # T-REX can only ever be plotted against the events a specific DR
+        # run actually embedded -- it must be scored against exactly that
+        # run's event set, not freshly re-gated data that may have since
+        # drifted in size.
+        trex_dr_row = QHBoxLayout()
+        trex_dr_row.addWidget(QLabel("T-REX DR run:"))
+        self.trex_dr_run_combo = QComboBox()
+        self.trex_dr_run_combo.setMinimumWidth(160)
+        self.trex_dr_run_combo.setToolTip(
+            "The archived DR run T-REX will score against. Only events "
+            "that run actually embedded can be plotted with a T-REX score."
+        )
+        self.trex_dr_run_combo.currentIndexChanged.connect(self._on_trex_dr_run_changed)
+        trex_dr_row.addWidget(self.trex_dr_run_combo)
+        trex_dr_row.addStretch()
+        stats_layout.addLayout(trex_dr_row)
 
         # Config row: what to test
         config_row = QHBoxLayout()
@@ -3670,7 +3756,7 @@ class GroupsStatsTab(QWidget):
         splitter.addWidget(bottom_widget)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
-        splitter.setSizes([650, 900])
+        splitter.setSizes([3000, 900])
         splitter.setChildrenCollapsible(False)
 
         # Sentinel: cluster names snapshot at last _draw_results() call.
@@ -4063,20 +4149,17 @@ class GroupsStatsTab(QWidget):
 
             if not matched:
                 # No training samples matched — show all
-                all_samples = list(
-                    self.controller.experiment.samples.get('all_samples', {}).keys()
-                )
+                all_samples = _non_control_sample_paths(self.controller)
                 self.state.initialise_sample_groups(all_samples)
                 matched = self.state.sample_groups
         else:
-            all_samples = list(
-                self.controller.experiment.samples.get('all_samples', {}).keys()
-            )
+            all_samples = _non_control_sample_paths(self.controller)
             self.state.initialise_sample_groups(all_samples)
             matched = self.state.sample_groups
 
         self._populate_table(matched)
         self._populate_run_combo()
+        self._populate_trex_dr_combo()
         self._populate_marker_roles_list()
         self._update_run_button()
 
@@ -4109,6 +4192,7 @@ class GroupsStatsTab(QWidget):
             fig = self._make_composition_figure(
                 self.state.composition_df, as_pct=self.state.composition_as_pct,
                 run_label=self.state.composition_run_label, names=self.state.composition_names,
+                group_var=self.state.composition_group_var,
             )
             self._add_results_tab(
                 fig, "Composition", "composition_barplot",
@@ -4116,7 +4200,8 @@ class GroupsStatsTab(QWidget):
                 maker_kwargs=dict(comp_df=self.state.composition_df,
                                   as_pct=self.state.composition_as_pct,
                                   run_label=self.state.composition_run_label,
-                                  names=self.state.composition_names),
+                                  names=self.state.composition_names,
+                                  group_var=self.state.composition_group_var),
                 key="composition_barplot",
             )
 
@@ -4125,9 +4210,36 @@ class GroupsStatsTab(QWidget):
     # ------------------------------------------------------------------
 
     def _populate_table(self, sample_groups: dict | None = None):
-        """Rebuild table rows from the supplied sample_groups dict."""
+        """Rebuild table rows AND covariate columns from sample_groups.
+        Column count is dynamic -- one per state.covariates column, so
+        this must rebuild the header every call, not just the rows."""
         if sample_groups is None:
             sample_groups = self.state.sample_groups
+
+        try:
+            raw_subdir = self.controller.experiment.settings['raw'][
+                'raw_samples_subdirectory'
+            ]
+        except (KeyError, AttributeError):
+            raw_subdir = None
+
+        def _to_rel(sp):
+            if raw_subdir:
+                try:
+                    return str(Path(sp).relative_to(raw_subdir))
+                except ValueError:
+                    pass
+            return sp
+
+        covariate_cols = (
+            list(self.state.covariates.columns) if self.state.covariates is not None else []
+        )
+        self.table.setColumnCount(2 + len(covariate_cols))
+        self.table.setHorizontalHeaderLabels(['Sample', 'Group'] + covariate_cols)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        for c in range(2, 2 + len(covariate_cols)):
+            self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
 
         opts = self._group_options()
         self.table.setRowCount(0)
@@ -4151,7 +4263,50 @@ class GroupsStatsTab(QWidget):
             )
             self.table.setCellWidget(row, 1, combo)
 
+            rel = _to_rel(sample_path)
+            for c, col_name in enumerate(covariate_cols):
+                edit = QLineEdit()
+                if self.state.covariates is not None and rel in self.state.covariates.index:
+                    edit.setText(str(self.state.covariates.loc[rel, col_name]))
+                edit.editingFinished.connect(
+                    lambda le=edit, r=rel, cn=col_name: self._on_covariate_edited(r, cn, le.text())
+                )
+                self.table.setCellWidget(row, 2 + c, edit)
+
+        # Size close to fitting every row up front (capped so it doesn't
+        # take over the whole tab on very large experiments) -- draggable
+        # via the splitter from there.
+        n_rows = self.table.rowCount()
+        self.table.setMinimumHeight(min(900, 28 * n_rows + 40))
         self._update_group_count_label()
+
+    def _add_covariate_column(self):
+        """Add a new covariate/pairing column directly in-app -- fill it
+        in per sample below, then select it as 'Pairing variable'."""
+        from PySide6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "Add Column", "Column name (e.g. 'donor'):")
+        name = name.strip()
+        if not ok or not name:
+            return
+        if self.state.covariates is not None and name in self.state.covariates.columns:
+            QMessageBox.warning(self, "Add Column", f"A column named '{name}' already exists.")
+            return
+        if self.state.covariates is None:
+            self.state.covariates = pd.DataFrame(index=pd.Index([], dtype=str))
+        self.state.covariates[name] = ''
+        self._populate_table()
+        self._populate_pairing_variable_combo()
+
+    def _on_covariate_edited(self, rel: str, col_name: str, value: str):
+        """Write one sample's value for one covariate column directly."""
+        if self.state.covariates is None:
+            self.state.covariates = pd.DataFrame(index=pd.Index([], dtype=str))
+        if col_name not in self.state.covariates.columns:
+            self.state.covariates[col_name] = ''
+        if rel not in self.state.covariates.index:
+            self.state.covariates.loc[rel] = ''
+        self.state.covariates.loc[rel, col_name] = value
+        self._last_stats_data_key = None
 
     def _on_group_changed(self, sample_path: str, group_name: str):
         self.state.sample_groups[sample_path] = group_name
@@ -4281,6 +4436,38 @@ class GroupsStatsTab(QWidget):
 
         self._run_combo.blockSignals(False)
 
+    def _populate_trex_dr_combo(self):
+        """T-REX needs its own DR-run selector (distinct from the Stats
+        run combo, which is clustering-only, and from Workspace's own
+        dr_combo, a different widget) -- see state.trex_dr_run_id."""
+        self.trex_dr_run_combo.blockSignals(True)
+        prev_run_id = self.trex_dr_run_combo.currentData()
+        self.trex_dr_run_combo.clear()
+        for entry in self.state.dr_runs:
+            self.trex_dr_run_combo.addItem(entry.get('label', ''), entry.get('run_id'))
+        if self.trex_dr_run_combo.count() == 0:
+            self.trex_dr_run_combo.addItem("(no DR runs yet)", None)
+        preferred_id = self.state.trex_dr_run_id or prev_run_id
+        idx = self.trex_dr_run_combo.findData(preferred_id) if preferred_id else -1
+        if idx >= 0:
+            self.trex_dr_run_combo.setCurrentIndex(idx)
+        else:
+            self.trex_dr_run_combo.setCurrentIndex(self.trex_dr_run_combo.count() - 1)
+        self.trex_dr_run_combo.blockSignals(False)
+        self.state.trex_dr_run_id = self.trex_dr_run_combo.currentData()
+
+    def _on_trex_dr_run_changed(self, _index=None):
+        self.state.trex_dr_run_id = self.trex_dr_run_combo.currentData()
+
+    def _selected_trex_dr_run(self) -> dict | None:
+        run_id = self.trex_dr_run_combo.currentData()
+        if run_id is None:
+            return None
+        for entry in self.state.dr_runs:
+            if entry.get('run_id') == run_id:
+                return drc_run_archive.hydrate_run(self.controller, entry)
+        return None
+
     def _selected_run_entry(self) -> dict | None:
         """
         Return the (hydrated) run entry for the current combo selection —
@@ -4325,6 +4512,7 @@ class GroupsStatsTab(QWidget):
         self.state.mfi_results  = None
         self.state.freq_df      = None
         self.state.mfi_df       = None
+        self.state.mfi_sample_df = None
         self.state.counts_results = None
         self.state.counts_df      = None
         self.state.stats_all_rel  = []
@@ -4514,6 +4702,36 @@ class GroupsStatsTab(QWidget):
             QMessageBox.warning(self, "Nothing Selected",
                                 "Select at least one statistic to compute.")
             return
+
+        if self.state.paired and self.state.pairing_variable:
+            pv = self.state.pairing_variable
+            try:
+                group_rel = drc_stats.resolve_test_groups(
+                    self.controller, self.state, cluster_labels_override=labels_for_stats
+                )
+            except Exception:
+                group_rel = {}
+            qualifying = [g for g in (self.state.testing_group_selection or self.state.group_names)
+                         if g in group_rel]
+            all_rel = [rel for g in qualifying for rel in group_rel[g]]
+            missing = [
+                rel for rel in all_rel
+                if self.state.covariates is None
+                or pv not in self.state.covariates.columns
+                or rel not in self.state.covariates.index
+                or not str(self.state.covariates.loc[rel, pv]).strip()
+            ]
+            if missing:
+                names = "\n".join(Path(r).stem for r in missing[:15])
+                more = "\n…" if len(missing) > 15 else ""
+                QMessageBox.warning(
+                    self, "Missing Pairing Values",
+                    f"'Paired design' is checked, but {len(missing)} sample(s) "
+                    f"have no value for pairing variable '{pv}':\n\n{names}{more}\n\n"
+                    "Fill these in on the Sample Group Assignment table, or "
+                    "uncheck 'Paired design'."
+                )
+                return
 
         pval_threshold = self.pval_spin.value()
         fc_threshold   = self.fc_spin.value()
@@ -4742,6 +4960,11 @@ class GroupsStatsTab(QWidget):
         ax.set_xticklabels(disp_df.columns, rotation=0)
         ax.set_yticks(range(n_clusters))
         ax.set_yticklabels(disp_df.index)
+        ax.grid(False)   # suppress inherited seaborn 'whitegrid' (draws through tick/cell centres)
+        ax.set_xticks(np.arange(-0.5, len(disp_df.columns), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, n_clusters, 1), minor=True)
+        ax.grid(which='minor', color='white', linestyle='-', linewidth=0.6)
+        ax.tick_params(which='minor', bottom=False, left=False)
         ax.set_title("Cluster Composition by Group\n(normalized per-group event count)",
                     fontsize=10)
 
@@ -4790,17 +5013,18 @@ class GroupsStatsTab(QWidget):
         self.state.composition_names = dict(names_for_stats)
 
         fig = self._make_composition_figure(comp_df, as_pct=as_pct, run_label=run_label,
-                                            names=names_for_stats)
+                                            names=names_for_stats, group_var=group_var)
         self._add_results_tab(
             fig, "Composition", "composition_barplot",
             maker=self._make_composition_figure,
             maker_kwargs=dict(comp_df=comp_df, as_pct=as_pct, run_label=run_label,
-                              names=names_for_stats),
+                              names=names_for_stats, group_var=group_var),
             key="composition_barplot",
         )
 
     def _make_composition_figure(self, comp_df: 'pd.DataFrame', as_pct: bool,
-                                 run_label: str = '', names: dict | None = None):
+                                 run_label: str = '', names: dict | None = None,
+                                 group_var: str = 'sample'):
         """
         Stacked bar: x-axis = sample or group (comp_df.index), segments =
         clusters, coloured via the SELECTED run's own colours (not the
@@ -4825,21 +5049,22 @@ class GroupsStatsTab(QWidget):
 
         x = np.arange(n_rows)
         bottom = np.zeros(n_rows)
-        names = names if names is not None else {}
-        label_to_cluster_id = {v: k for k, v in names.items()}
         cl_run = self._selected_run_entry()
         if cl_run is not None and cl_run.get('kind') != 'clustering':
             cl_run = None
         colors = cl_run.get('colors', {}) if cl_run else self.state.cluster_colors
-        for col in comp_df.columns:
-            cl_id = label_to_cluster_id.get(col)
-            color = colors.get(cl_id, '#888888') if cl_id is not None else '#888888'
+        for cl_id, col in enumerate(comp_df.columns):
+            color = colors.get(cl_id, '#888888')
             vals = comp_df[col].values.astype(float)
             ax.bar(x, vals, bottom=bottom, width=0.7, color=color, label=col)
             bottom += vals
 
         ax.set_xticks(x)
-        ax.set_xticklabels(comp_df.index, rotation=45, ha='right', fontsize=8)
+        if group_var == 'sample':
+            xtick_labels = [Path(s).stem for s in comp_df.index]
+        else:
+            xtick_labels = list(comp_df.index)
+        ax.set_xticklabels(xtick_labels, rotation=45, ha='right', fontsize=8)
         ax.set_ylabel('% of events' if as_pct else 'Event count')
         ax.set_title('Cluster Composition', fontsize=10)
         ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), fontsize=8,
@@ -5125,13 +5350,14 @@ class GroupsStatsTab(QWidget):
         counts_df_view       = _view_samples(self.state.counts_df)
         mfi_results_view     = _view_results(self.state.mfi_results)
         mfi_df_view          = _view_samples(self.state.mfi_df)
+        mfi_sample_df_view   = _view_samples(self.state.mfi_sample_df)
 
         if freq_results_view is not None:
             try:
                 fig = self._make_heatmap_figure(
                     freq_results_view,
                     freq_df_view,
-                    title=f"Cluster Frequencies: {name_b} vs {name_a}",
+                    title=f"Significantly Different Cluster Frequencies: {name_b} vs {name_a}",
                     group_a=name_a, group_b=name_b,
                     run_label=run_label,
                 )
@@ -5140,7 +5366,7 @@ class GroupsStatsTab(QWidget):
                          maker_kwargs=dict(
                              results_df=freq_results_view,
                              sample_df=freq_df_view,
-                             title=f"Cluster Frequencies: {name_b} vs {name_a}",
+                             title=f"Significantly Different Cluster Frequencies: {name_b} vs {name_a}",
                              group_a=name_a, group_b=name_b,
                              run_label=run_label,
                          ),
@@ -5224,21 +5450,17 @@ class GroupsStatsTab(QWidget):
                 tab.setProperty('_tab_key', 'counts_volcano')
                 self._results_tabs.addTab(tab, "Counts Volcano")
 
-        if mfi_results_view is not None:
+        if mfi_sample_df_view is not None:
             try:
-                fig_m = self._make_heatmap_figure(
-                    mfi_results_view,
-                    mfi_df_view,
-                    title=f"Cluster MFIs: {name_b} vs {name_a}",
+                fig_m = self._make_sample_mfi_heatmap_figure(
+                    mfi_sample_df_view,
                     group_a=name_a, group_b=name_b,
                     run_label=run_label,
                 )
                 self._add_results_tab(fig_m, "MFI Heatmap", "mfi_heatmap",
-                         maker=self._make_heatmap_figure,
+                         maker=self._make_sample_mfi_heatmap_figure,
                          maker_kwargs=dict(
-                             results_df=mfi_results_view,
-                             sample_df=mfi_df_view,
-                             title=f"Cluster MFIs: {name_b} vs {name_a}",
+                             mfi_sample_df=mfi_sample_df_view,
                              group_a=name_a, group_b=name_b,
                              run_label=run_label,
                          ),
@@ -5287,6 +5509,150 @@ class GroupsStatsTab(QWidget):
             bbox=dict(boxstyle='round,pad=0.25', facecolor='white',
                       edgecolor='#cccccc', alpha=0.85),
         )
+
+    def _make_sample_mfi_heatmap_figure(self, mfi_sample_df, group_a: str = '',
+                                        group_b: str = '', run_label: str = ''):
+        """
+        Sample-level MFI heatmap: rows = channels, columns = samples. No
+        cluster breakdown, no significance filter (shows every requested
+        channel) — see compute_sample_mfis()'s docstring for why the
+        per-cluster version doesn't work for this view.
+        """
+        from matplotlib.figure import Figure
+        from matplotlib.gridspec import GridSpec
+        from scipy.cluster.hierarchy import linkage, dendrogram
+        from scipy.spatial.distance import pdist
+        import matplotlib.patches as mpatches
+
+        name_a, name_b = group_a, group_b
+        COLOR_A = '#4477AA'
+        COLOR_B = '#EE6677'
+
+        if mfi_sample_df is None or mfi_sample_df.empty:
+            fig = Figure(figsize=(5, 2), constrained_layout=True)
+            ax = fig.add_subplot(111)
+            ax.axis('off')
+            ax.text(0.5, 0.5, 'No data to display',
+                    ha='center', va='center', fontsize=10, transform=ax.transAxes)
+            self._stamp_run_label(fig, run_label)
+            return fig
+
+        mat = mfi_sample_df.values.astype(float)      # (n_samples, n_channels)
+        sample_labels = list(mfi_sample_df.index)
+        feat_labels_raw = list(mfi_sample_df.columns)
+        n_samples, n_features = mat.shape
+
+        rel_to_group: dict[str, str] = {
+            rel: grp
+            for rel, grp in zip(self.state.stats_all_rel, self.state.stats_group_vec)
+        }
+
+        def _hclust(data):
+            filled = np.nan_to_num(data, nan=0.0)
+            if filled.shape[0] < 2:
+                return list(range(filled.shape[0]))
+            try:
+                Z = linkage(pdist(filled, metric='euclidean'), method='ward')
+                return dendrogram(Z, no_plot=True)['leaves']
+            except Exception:
+                return list(range(filled.shape[0]))
+
+        row_order = _hclust(mat.T)
+        col_order = _hclust(mat)
+
+        mat_ord = mat[:, row_order][col_order, :].T   # (n_features, n_samples)
+        feat_labels = [feat_labels_raw[i] for i in row_order]
+        samp_labels = [sample_labels[i] for i in col_order]
+        grp_ord = [rel_to_group.get(sample_labels[i], name_a) for i in col_order]
+
+        # Same antigen display-label remap the per-cluster MFI heatmap uses.
+        from honeychrome.controller_components.functions import build_display_label_map
+        unmixed_pnn = self.controller.experiment.settings.get('unmixed', {}).get(
+            'event_channels_pnn') or []
+        spectral_model = self.controller.experiment.process.get('spectral_model') or []
+        disp_map = build_display_label_map(unmixed_pnn, spectral_model)
+        feat_labels = [disp_map.get(f, f) for f in feat_labels]
+
+        col_w, row_h, dend_h, grp_h, xlabel_h = 0.55, 0.30, 1.2, 0.18, 0.8
+        label_w = max(len(f) for f in feat_labels) * 0.07 + 0.3
+        cbar_w = 0.5
+        fig_w = max(5.0, n_samples * col_w + label_w + cbar_w + 1.2)
+        fig_h = max(4.0, n_features * row_h + dend_h + grp_h + xlabel_h + 1.5)
+
+        fig = Figure(figsize=(fig_w, fig_h), layout='constrained')
+        gs = GridSpec(
+            4, 3, figure=fig,
+            height_ratios=[dend_h, grp_h, n_features * row_h, xlabel_h],
+            width_ratios=[label_w, n_samples * col_w, cbar_w],
+            hspace=0.02, wspace=0.02,
+        )
+
+        ax_cdend = fig.add_subplot(gs[0, 1])
+        ax_cdend.axis('off')
+        if n_samples > 1:
+            try:
+                Zc = linkage(pdist(np.nan_to_num(mat, nan=0.0), metric='euclidean'), method='ward')
+                dendrogram(Zc, ax=ax_cdend, color_threshold=0,
+                           above_threshold_color='#555555',
+                           link_color_func=lambda _: '#555555', no_labels=True)
+                ax_cdend.set_xlim(-0.5, n_samples * 10 - 0.5)
+            except Exception:
+                pass
+        ax_cdend.set_title('Sample MFI', fontsize=10, pad=4)
+
+        ax_grp = fig.add_subplot(gs[1, 1])
+        ax_grp.set_xlim(0, n_samples)
+        ax_grp.set_ylim(0, 1)
+        ax_grp.axis('off')
+        for xi, grp in enumerate(grp_ord):
+            color = COLOR_A if grp == name_a else COLOR_B
+            ax_grp.add_patch(mpatches.Rectangle((xi, 0), 1, 1, color=color, transform=ax_grp.transData))
+        handles = [mpatches.Patch(color=COLOR_A, label=name_a),
+                   mpatches.Patch(color=COLOR_B, label=name_b)]
+        ax_cdend.legend(handles=handles, loc='lower right', fontsize=7, frameon=True, ncol=2)
+
+        ax_rdend = fig.add_subplot(gs[2, 0])
+        ax_rdend.axis('off')
+        if n_features > 1:
+            try:
+                Zr = linkage(pdist(np.nan_to_num(mat.T, nan=0.0), metric='euclidean'), method='ward')
+                dendrogram(Zr, ax=ax_rdend, orientation='left', color_threshold=0,
+                           above_threshold_color='#555555',
+                           link_color_func=lambda _: '#555555', no_labels=True)
+            except Exception:
+                pass
+
+        ax_hm = fig.add_subplot(gs[2, 1])
+        finite_vals = mat_ord[np.isfinite(mat_ord)]
+        if finite_vals.size:
+            vmin = float(np.percentile(finite_vals, 5))
+            vmax = max(float(np.percentile(finite_vals, 95)), vmin + 0.01)
+        else:
+            vmin, vmax = 0.0, 1.0
+        im = ax_hm.imshow(
+            np.nan_to_num(mat_ord, nan=vmin),
+            aspect='auto', cmap='viridis', vmin=vmin, vmax=vmax,
+            interpolation='nearest',
+        )
+        ax_hm.set_xticks(range(n_samples))
+        ax_hm.set_xticklabels([Path(s).stem for s in samp_labels], rotation=45, ha='right', fontsize=7)
+        ax_hm.set_yticks(range(n_features))
+        ax_hm.set_yticklabels(feat_labels, fontsize=7)
+        ax_hm.yaxis.set_label_position('right')
+        ax_hm.yaxis.tick_right()
+        ax_hm.grid(False)   # suppress inherited seaborn 'whitegrid' (draws through tick/cell centres)
+        ax_hm.set_xticks(np.arange(-0.5, n_samples, 1), minor=True)
+        ax_hm.set_yticks(np.arange(-0.5, n_features, 1), minor=True)
+        ax_hm.grid(which='minor', color='white', linestyle='-', linewidth=0.6)
+        ax_hm.tick_params(which='minor', bottom=False, left=False, right=False)
+
+        ax_cb = fig.add_subplot(gs[2, 2])
+        cb = fig.colorbar(im, cax=ax_cb)
+        cb.ax.tick_params(labelsize=7)
+        cb.set_label('log1p-MFI', fontsize=7)
+
+        self._stamp_run_label(fig, run_label)
+        return fig
 
     def _make_heatmap_figure(self, results_df, sample_df, title: str,
                              group_a: str = '', group_b: str = '', run_label: str = ''):
@@ -5467,13 +5833,17 @@ class GroupsStatsTab(QWidget):
 
         # ---- Heatmap (main-centre) ----
         ax_hm = fig.add_subplot(gs[2, 1])
-        abs_vals = np.abs(mat_ord)
-        vmax = max(float(np.percentile(abs_vals, 95)), 0.01)
+        # Raw per-sample values (log1p-MFI / % / counts) — always non-negative,
+        # never a delta, so normalize from the data's own range rather than
+        # forcing a zero-centered diverging scale (that's what was washing
+        # out low-value samples like the reference group).
+        vmin = float(np.percentile(mat_ord, 5))
+        vmax = max(float(np.percentile(mat_ord, 95)), vmin + 0.01)
         im = ax_hm.imshow(
             mat_ord,
             aspect='auto',
-            cmap='RdBu_r',
-            vmin=-vmax, vmax=vmax,
+            cmap='viridis',
+            vmin=vmin, vmax=vmax,
             interpolation='nearest',
         )
         ax_hm.set_xticks(range(n_samples))
@@ -5485,6 +5855,11 @@ class GroupsStatsTab(QWidget):
         ax_hm.set_yticklabels(feat_labels, fontsize=7)
         ax_hm.yaxis.set_label_position('right')
         ax_hm.yaxis.tick_right()
+        ax_hm.grid(False)   # suppress inherited seaborn 'whitegrid' (draws through tick/cell centres)
+        ax_hm.set_xticks(np.arange(-0.5, n_samples, 1), minor=True)
+        ax_hm.set_yticks(np.arange(-0.5, n_features, 1), minor=True)
+        ax_hm.grid(which='minor', color='white', linestyle='-', linewidth=0.6)
+        ax_hm.tick_params(which='minor', bottom=False, left=False, right=False)
 
         # ---- Colorbar (main-right) ----
         ax_cb = fig.add_subplot(gs[2, 2])
@@ -6301,7 +6676,7 @@ class PlotCard(QFrame):
             self._draw_marker_scatter(ax, xy_disp, origin_disp,
                                       disp_idx, sample_row_offsets, run)
         elif colour_mode == 'T-REX':
-            self._draw_trex_scatter(ax, xy_disp, lab_disp, emb_dict, run)
+            self._draw_trex_scatter(ax, xy_disp, lab_disp, emb_dict, run, origin_disp)
 
         # Apply label colour to colourbar (Marker / T-REX) and title.
         lc = self._label_color
@@ -6363,14 +6738,22 @@ class PlotCard(QFrame):
             if disp_idx is not None and rel in sample_row_offsets:
                 # Recover which rows within this sample survived global downsampling.
                 start, end = sample_row_offsets[rel]
-                # disp_idx entries in [start, end) are this sample's kept rows
+                # The embedding's row range for this sample must match its
+                # CURRENT re-gated event count exactly, or positional
+                # indexing below is meaningless (not just out-of-range —
+                # in-range-but-wrong is possible too, and silent). Check the
+                # count up front rather than only catching an overflow
+                # after the fact.
+                if (end - start) != len(full_col):
+                    _log.warning(
+                        "marker %s: %s embedding has %d points but current "
+                        "gating yields %d events — stale embedding for this "
+                        "sample, skipped (retrain DR to refresh)",
+                        ch, rel, end - start, len(full_col))
+                    continue
                 kept_global = disp_idx[mask]          # global indices of kept rows
                 within_sample = kept_global - start   # row indices inside full_col
-                if within_sample.max() < len(full_col):
-                    values[mask] = full_col[within_sample]
-                else:
-                    _log.warning("marker %s: %s index out of range (%d events)",
-                                 ch, rel, len(full_col))
+                values[mask] = full_col[within_sample]
             else:
                 # No downsampling or no offset info — direct assignment
                 if int(mask.sum()) == len(full_col):
@@ -6386,23 +6769,44 @@ class PlotCard(QFrame):
             ax.set_title(f"Marker {ch}: no data", fontsize=8)
             return
 
-        # Robust full-scale colour limits = real untransformed intensities.
-        vmin = float(np.nanpercentile(values, 1))
-        vmax = float(np.nanpercentile(values, 99))
-        _log.debug("marker %s: vmin=%.4g vmax=%.4g over %d points",
+        # Plot on log1p(raw) so the display isn't dominated by the extreme
+        # top-end fuzz, but label the colourbar in raw units at powers of
+        # ten -- same convention as Honeychrome's 2D histogram axes
+        # (transform.py), just log1p instead of the full logicle transform.
+        log_values = np.log1p(np.maximum(values, 0.0))
+        vmin = float(np.nanpercentile(log_values[finite], 1))
+        vmax = float(np.nanpercentile(log_values[finite], 99))
+        _log.debug("marker %s: vmin=%.4g vmax=%.4g (log1p) over %d points",
                    ch, vmin, vmax, int(finite.sum()))
         sc = ax.scatter(xy[finite, 0], xy[finite, 1], s=1,
-                        c=values[finite], cmap='viridis',
+                        c=log_values[finite], cmap='viridis',
                         vmin=vmin, vmax=vmax, alpha=0.6, linewidths=0)
-        self._figure.colorbar(sc, ax=ax, shrink=0.6, label=f"{ch} (raw)")
+        cb = self._figure.colorbar(sc, ax=ax, shrink=0.6)
+        tick_pos, tick_lab = _log1p_powers_of_ten_ticks(float(np.expm1(vmax)))
+        keep = [(p, l) for p, l in zip(tick_pos, tick_lab) if vmin <= p <= vmax]
+        if keep:
+            cb.set_ticks([p for p, l in keep])
+            cb.set_ticklabels([l for p, l in keep])
+        cb.set_label(ch, fontsize=8)
         ax.set_title(f"Marker: {ch}", fontsize=8)
 
-    def _draw_trex_scatter(self, ax, xy, labels, emb_dict: dict, run: dict):
-        """Colour by T-REX score using a red-blue diverging colourmap."""
-        # Build T-REX scores lazily if not yet computed
+    def _draw_trex_scatter(self, ax, xy, labels, emb_dict: dict, run: dict, origin):
+        """Colour by T-REX score using a red-blue diverging colourmap.
+        Aligned per-sample via origin (like _draw_marker_scatter) — T-REX
+        only scores samples in its Compare pair, which is often a SUBSET
+        of the samples in the current DR embedding, so a blanket total-
+        length comparison against all pooled samples was always going to
+        fail whenever other groups were also in the embedding."""
         if not self.state.trex_scores:
             ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.4)
             ax.set_title("T-REX: assign groups and run T-REX first", fontsize=7)
+            return
+
+        if self.state.trex_dr_run_id and run.get('run_id') != self.state.trex_dr_run_id:
+            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.3)
+            ax.set_title("T-REX was scored against a different DR run — "
+                        "switch to that run, or re-run T-REX for this one",
+                        fontsize=7)
             return
 
         run_gates = run.get('gates')
@@ -6417,29 +6821,36 @@ class PlotCard(QFrame):
             )
             return
 
-        # Pool T-REX scores from all available samples
-        sample_data_item = self.sample_combo.currentData()
-        if sample_data_item:
-            scores = self.state.trex_scores.get(sample_data_item)
-        else:
-            score_list = []
-            for rel in emb_dict.keys():
-                s = self.state.trex_scores.get(rel)
-                if s is not None:
-                    score_list.append(s)
-            scores = np.concatenate(score_list) if score_list else None
+        scores = np.full(len(xy), np.nan, dtype=np.float32)
+        for rel in np.unique(origin):
+            s = self.state.trex_scores.get(str(rel))
+            if s is None:
+                continue          # sample wasn't part of T-REX's Compare pair
+            mask = origin == rel
+            if int(mask.sum()) == len(s):
+                scores[mask] = s
+            else:
+                _log.warning(
+                    "trex scatter: %s has %d T-REX scores but %d displayed "
+                    "points — skipped", rel, len(s), int(mask.sum()))
 
-        if scores is None or len(scores) != len(xy):
+        finite = np.isfinite(scores)
+        if not finite.any():
             ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.4)
-            ax.set_title("T-REX: score length mismatch — re-run T-REX", fontsize=7)
+            ax.set_title("T-REX: no scored samples in current view "
+                         "(check the Compare pair)", fontsize=7)
             return
 
+        if (~finite).any():
+            ax.scatter(xy[~finite, 0], xy[~finite, 1], s=1, c='#cccccc',
+                      alpha=0.2, linewidths=0)
         sc = ax.scatter(
-            xy[:, 0], xy[:, 1],
-            s=1, c=scores, cmap='RdBu_r', vmin=-1, vmax=1, alpha=0.5, linewidths=0
+            xy[finite, 0], xy[finite, 1],
+            s=1, c=scores[finite], cmap='RdBu_r', vmin=-1, vmax=1, alpha=0.5, linewidths=0
         )
         self._figure.colorbar(sc, ax=ax, shrink=0.6, label='T-REX score')
-        ax.set_title("T-REX enrichment (red=A, blue=B)", fontsize=8)
+        ax.set_title("T-REX enrichment (red=A, blue=B) — grey = not in Compare pair",
+                    fontsize=8)
 
     def _show_placeholder(self, text: str):
         self._figure.clear()
@@ -6835,6 +7246,7 @@ class _DrWorker(QThread):
         # before repopulating, or leftover keys from an earlier (possibly
         # larger) sample set inflate the "embeddings: N sample(s)" count.
         plugin.state.embeddings[algo] = {}
+        plugin.state.embedding_features[algo] = {}
 
         self._emit(f"{algo} training complete.  Embedding training samples …")
         self._do_apply(training_only=True)
@@ -6872,6 +7284,8 @@ class _DrWorker(QThread):
 
         if algo not in plugin.state.embeddings:
             plugin.state.embeddings[algo] = {}
+        if algo not in plugin.state.embedding_features:
+            plugin.state.embedding_features[algo] = {}
 
         n_total = len(all_sample_keys)
         for i, (abs_key, rel_path) in enumerate(all_sample_keys):
@@ -6895,6 +7309,10 @@ class _DrWorker(QThread):
                 else:
                     continue
                 plugin.state.embeddings[algo][rel_path] = emb.astype(np.float32)
+                # Same feature vectors that produced this embedding --
+                # cached so T-REX can align to them row-for-row later,
+                # with no live re-gating step in between.
+                plugin.state.embedding_features[algo][rel_path] = sample_data.astype(np.float32)
             except Exception as e:
                 self._emit(f"    Could not embed {rel_path}: {e}")
 
@@ -7126,6 +7544,7 @@ class ClusterAnnotationTab(QWidget):
 
     def refresh(self):
         self._populate_run_combo()
+        self._populate_trex_dr_combo()
         self._populate_dr_run_combo()
         self._populate_channel_list()
         self._update_compat_warning()
@@ -7721,6 +8140,7 @@ class PluginWidget(QWidget):
         """
         if hasattr(self, 'groups_stats_tab'):
             self.groups_stats_tab._populate_run_combo()
+            self.groups_stats_tab._populate_trex_dr_combo()
             self.groups_stats_tab._update_run_button()
         if hasattr(self, 'workspace_tab'):
             for card in self.workspace_tab._plot_cards:
@@ -7753,9 +8173,7 @@ class PluginWidget(QWidget):
             # Sync state with current experiment
             self._loading = True
             try:
-                all_samples = list(
-                    self.controller.experiment.samples.get('all_samples', {}).keys()
-                )
+                all_samples = _non_control_sample_paths(self.controller)
                 self.state.initialise_sample_groups(all_samples)
                 self.state.channel_transform_params = _read_transforms_from_experiment(
                     self.controller
@@ -8915,6 +9333,7 @@ class PluginWidget(QWidget):
         """Archive a freshly completed DR training run (§0.2)."""
         reducer = self.state.trained_reducers.get(algo)
         embeddings = self.state.embeddings.get(algo, {})
+        embedding_features = self.state.embedding_features.get(algo, {})
         if reducer is None:
             return
         channels = [c for c in self.state.selected_channels
@@ -8926,6 +9345,7 @@ class PluginWidget(QWidget):
                 algorithm=algo,
                 reducer=reducer,
                 embeddings=dict(embeddings),
+                embedding_features=dict(embedding_features),
                 gates=list(self.state.selected_gates),
                 training_sample_ids=list(self.state.training_sample_ids),
                 channels=channels,
@@ -8955,8 +9375,9 @@ class PluginWidget(QWidget):
         if not run_id:
             return
         embeddings = dict(self.state.embeddings.get(algo, {}))
+        embedding_features = dict(self.state.embedding_features.get(algo, {}))
         drc_run_archive.update_dr_run_embeddings(
-            self.controller, self.state, run_id, embeddings
+            self.controller, self.state, run_id, embeddings, embedding_features
         )
         if hasattr(self, 'config_tab'):
             self.config_tab.run_table.refresh()
@@ -9090,6 +9511,11 @@ class PluginWidget(QWidget):
         Build a T-REX kNN index over pooled Group A + B events and score all
         samples.  Results stored in state.trex_scores.
 
+        Only events belonging to the selected T-REX DR run's OWN embedding
+        can ever be plotted with a score, so scoring is restricted to that
+        run's event set from the start -- rather than freshly re-gating
+        live data and hoping it still lines up with whatever's on screen.
+
         Algorithm (Irish lab, DOI 10.1016/j.cels.2020.11.009):
           1. Pool all gated events from Group A samples.
           2. Pool all gated events from Group B samples.
@@ -9106,24 +9532,42 @@ class PluginWidget(QWidget):
             )
             return
 
+        dr_run = self.groups_stats_tab._selected_trex_dr_run()
+        if dr_run is None:
+            QMessageBox.warning(
+                self, "T-REX",
+                "Select a DR run for T-REX to score against first "
+                "('T-REX DR run' above the Run T-REX button)."
+            )
+            return
+        emb_dict = dr_run.get('embeddings', {}) or {}
+        if not emb_dict:
+            QMessageBox.warning(
+                self, "T-REX",
+                f"\"{dr_run.get('label', '')}\" has no embeddings yet -- "
+                "run 'Apply to All Samples' for it first."
+            )
+            return
+        if not (dr_run.get('embedding_features') or {}):
+            QMessageBox.warning(
+                self, "T-REX",
+                f"\"{dr_run.get('label', '')}\" was archived before T-REX's "
+                "marker-space feature cache was added -- re-run 'Apply to "
+                "All Samples' for it (or retrain) to enable T-REX."
+            )
+            return
+
         self.progress_message("Building T-REX kNN index …")
 
         plugin_ref = self
-        # Snapshot AF/transfer-matrix state on the main thread before the
-        # worker starts — see drc_pipeline.apply_unmixing_af_aware() docstring.
-        af_state = (
-            self.controller.transfer_matrix,
-            self.controller.af_precomputed,
-            self.controller.af_spectra,
-        )
 
         class _TrexWorker(QThread):
             finished = Signal(bool, str)
             progress = Signal(str)
 
-            def __init__(self_, af_state):
+            def __init__(self_, dr_run):
                 super().__init__()
-                self_._af_state = af_state
+                self_._dr_run = dr_run
 
             def run(self_):
                 try:
@@ -9138,6 +9582,8 @@ class PluginWidget(QWidget):
 
                 state = plugin_ref.state
                 raw_subdir = plugin_ref.controller.experiment.settings['raw']['raw_samples_subdirectory']
+                emb_dict = self_._dr_run.get('embeddings', {}) or {}
+                feat_dict = self_._dr_run.get('embedding_features', {}) or {}
 
                 def _to_rel(sp):
                     try:
@@ -9145,32 +9591,30 @@ class PluginWidget(QWidget):
                     except ValueError:
                         return sp
 
-                # Item 13: T-REX's neighbour-fraction score is only defined
-                # for exactly two conditions, so it uses the same
-                # Compare-selector pair as Run Statistics rather than a
-                # fixed 'A'/'B' — see §0.2 point 2 in the change doc.
+                # kNN runs in the ORIGINAL marker-feature space (feat_dict),
+                # not the 2D embedding -- true T-REX neighbours, per the
+                # published algorithm. feat_dict and emb_dict were cached
+                # together, row-for-row, at embedding time (_DrWorker), so
+                # scoring here still lines up exactly with what's plotted,
+                # with no live re-gating step involved anywhere.
                 cmp_a, cmp_b = state.compare_group_a, state.compare_group_b
                 a_rels = [_to_rel(sp) for sp, g in state.sample_groups.items()
-                          if g == cmp_a and _to_rel(sp) in state.cluster_labels]
+                          if g == cmp_a and _to_rel(sp) in feat_dict]
                 b_rels = [_to_rel(sp) for sp, g in state.sample_groups.items()
-                          if g == cmp_b and _to_rel(sp) in state.cluster_labels]
+                          if g == cmp_b and _to_rel(sp) in feat_dict]
 
-                # Load feature data for all A and B samples
-                def _load_features(rel_list):
-                    chunks = []
-                    for rel in rel_list:
-                        d = plugin_ref._get_sample_data(rel, None, af_state=self_._af_state)
-                        if d is not None:
-                            chunks.append(d)
-                    return np.concatenate(chunks, axis=0) if chunks else None
-
-                self_.progress.emit("Loading Group A data for T-REX …")
-                a_data = _load_features(a_rels)
-                self_.progress.emit("Loading Group B data for T-REX …")
-                b_data = _load_features(b_rels)
+                self_.progress.emit("Pooling Group A features for T-REX …")
+                a_data = np.concatenate([feat_dict[rel] for rel in a_rels], axis=0) if a_rels else None
+                self_.progress.emit("Pooling Group B features for T-REX …")
+                b_data = np.concatenate([feat_dict[rel] for rel in b_rels], axis=0) if b_rels else None
 
                 if a_data is None or b_data is None:
-                    raise RuntimeError("Could not load feature data for one or both groups.")
+                    raise RuntimeError(
+                        "Neither group has any samples with cached "
+                        "marker-space features in the selected DR run — "
+                        "check the T-REX DR run selection and the Compare "
+                        "pair."
+                    )
 
                 n_a, n_b = len(a_data), len(b_data)
                 pooled = np.concatenate([a_data, b_data], axis=0).astype(np.float32)
@@ -9186,14 +9630,10 @@ class PluginWidget(QWidget):
                 state.trex_knn_group_labels = group_labels
 
                 k = state.trex_k
-                # Score each sample
                 all_rels = a_rels + b_rels
                 state.trex_scores = {}
                 for rel in all_rels:
-                    sample_data = plugin_ref._get_sample_data(rel, None, af_state=self_._af_state)
-                    if sample_data is None:
-                        continue
-                    sample_data = sample_data.astype(np.float32)
+                    sample_data = feat_dict[rel].astype(np.float32)
                     nn_labels, _ = idx_h.knn_query(sample_data, k=min(k, len(pooled)))
                     scores = np.zeros(len(sample_data), dtype=np.float32)
                     for i, neighbours in enumerate(nn_labels):
@@ -9201,15 +9641,15 @@ class PluginWidget(QWidget):
                         n_b_nb = np.sum(group_labels[neighbours] == cmp_b)
                         score = (n_a_nb / max(n_a, 1)) - (n_b_nb / max(n_b, 1))
                         scores[i] = score
-                    # Normalise to [-1, +1]
                     mx = max(abs(scores).max(), 1e-9)
                     scores = scores / mx
                     state.trex_scores[rel] = scores
                     self_.progress.emit(f"  T-REX scored {rel}: {len(scores):,} events")
 
+                state.trex_dr_run_id = self_._dr_run.get('run_id')
                 self_.progress.emit(f"T-REX complete: scored {len(state.trex_scores)} samples.")
 
-        self._trex_worker = _TrexWorker(af_state)
+        self._trex_worker = _TrexWorker(dr_run)
         self._trex_worker.progress.connect(self.progress_message)
         self._trex_worker.finished.connect(self._on_trex_finished)
         self._trex_worker.start()
