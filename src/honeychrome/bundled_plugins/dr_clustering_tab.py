@@ -83,6 +83,7 @@ _REQUIRED_PACKAGES = {
     'igraph':     'python-igraph',
     'hnswlib':    'hnswlib',
     'inmoose':    'inmoose',
+    'adjustText': 'adjustText',
 }
 
 
@@ -180,18 +181,18 @@ import traceback
 import numpy as np
 import pandas as pd
 
-from PySide6.QtCore import Qt, QTimer, QSettings, QEvent, QRectF, QThread, Signal
-from PySide6.QtGui import QPen, QColor
+from PySide6.QtCore import Qt, QTimer, QSettings, QEvent, QRectF, QThread, Signal, QSize
+from PySide6.QtGui import QPen, QColor, QPalette
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
     QPushButton, QLabel, QComboBox, QGroupBox,
     QCheckBox, QSpinBox, QDoubleSpinBox, QRadioButton,
     QButtonGroup, QListWidget, QListWidgetItem, QListView,
-    QAbstractItemView, QSplitter, QFrame, QGridLayout,
+    QAbstractItemView, QSplitter, QFrame, QGridLayout, QDoubleSpinBox,
     QLineEdit, QFileDialog, QMessageBox, QSizePolicy,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QColorDialog, QProgressBar,
-    QDialog, QTextEdit,
+    QDialog, QTextEdit, QApplication,
 )
 
 from honeychrome.controller_components.functions import (
@@ -403,6 +404,169 @@ def _antigen_dash_labels(controller) -> dict[str, str]:
         antigen = label_to_antigen.get(ch, '')
         result[ch] = f'{antigen} - {ch}' if antigen else ch
     return result
+
+def _resolve_is_dark(state: 'PipelineState') -> bool:
+    """
+    Whether plots should render with dark styling, given the Workspace
+    theme toggle (Item 1). 'auto' mirrors the live app palette — the only
+    behaviour that existed before; 'light'/'dark' force it regardless,
+    replacing what used to be three separate ad hoc
+    QApplication.palette() checks scattered across this file.
+    """
+    theme = getattr(state, 'plot_theme', 'auto')
+    if theme == 'dark':
+        return True
+    if theme == 'light':
+        return False
+    app = QApplication.instance()
+    palette = app.palette() if app is not None else QPalette()
+    return palette.color(QPalette.ColorRole.Base).value() < 128
+
+
+def _style_figure_theme(fig, is_dark: bool, axes=None) -> str:
+    """
+    Apply Honeychrome's dark/light figure background styling in one place
+    (Item 1) — single source of truth instead of every figure-maker
+    duplicating its own is_dark branch (which is exactly why several
+    figures had no dark-mode handling at all). Returns the foreground
+    colour string so callers can reuse it (e.g. for violin means).
+
+    axes defaults to fig.axes (every subplot, including dendrogram /
+    colourbar / legend axes for the multi-panel heatmaps) so this is safe
+    to call once per figure regardless of how many axes it has.
+    """
+    if axes is None:
+        axes = fig.axes
+    if is_dark:
+        fig.patch.set_facecolor('#1e1e1e')
+        fg, bg = 'white', '#2b2b2b'
+    else:
+        fig.patch.set_facecolor('white')
+        fg, bg = 'black', 'white'
+    for ax in axes:
+        ax.set_facecolor(bg)
+        ax.tick_params(colors=fg)
+        ax.xaxis.label.set_color(fg)
+        ax.yaxis.label.set_color(fg)
+        ax.title.set_color(fg)
+        for spine in ax.spines.values():
+            spine.set_edgecolor(fg)
+    return fg
+
+
+def _style_combo_popup(combo: 'QComboBox'):
+    """
+    Force readable dropdown-list colours on a QComboBox (Item 2). Row
+    labels already flip white/black automatically via QPalette, but the
+    popup's item view doesn't reliably inherit that on every platform —
+    left alone, items render in black text regardless of theme, which is
+    unreadable against a dark popup. Keyed off the live app palette (same
+    check as PlotCard's "Label colour" button), not state.plot_theme,
+    since that flag only affects matplotlib figure colours.
+    """
+    app = QApplication.instance()
+    is_dark = bool(app) and app.palette().color(QPalette.ColorRole.Base).value() < 128
+    if is_dark:
+        combo.setStyleSheet(
+            "QComboBox QAbstractItemView { color: white; background-color: #2b2b2b; "
+            "selection-background-color: #505050; selection-color: white; }"
+        )
+    else:
+        combo.setStyleSheet(
+            "QComboBox QAbstractItemView { color: black; background-color: white; "
+            "selection-background-color: #d0d0d0; selection-color: black; }"
+        )
+
+
+def _contrasting_text_color(hex_color: str) -> str:
+    """Return 'black' or 'white' -- whichever reads better against the
+    given hex background (Item 5). Used for swatch-style buttons whose
+    background is a user-chosen colour, so it can't be assumed to already
+    contrast with the app's own light/dark theme."""
+    c = QColor(hex_color)
+    luminance = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+    return 'black' if luminance > 140 else 'white'
+
+
+def _new_scrollable_canvas(fig):
+    """
+    FigureCanvasQTAgg subclass that ignores wheel events (Item 2) so
+    mouse-scroll passes through to an enclosing QScrollArea instead of
+    being swallowed by matplotlib's Qt backend, which unconditionally
+    accept()s wheel events for its own (unused, in this plugin) scroll-
+    to-zoom. Same 'ev.ignore() to bubble to the parent scroll area'
+    convention TransparentGraphicsLayoutWidget already uses for
+    pyqtgraph elsewhere in the app.
+
+    FigureCanvasQTAgg is imported locally here (not hoisted to module
+    level) to match this file's existing convention of importing it
+    inside each function that needs it.
+    """
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+
+    class _ScrollableFigureCanvas(FigureCanvasQTAgg):
+        def wheelEvent(self, ev):
+            ev.ignore()
+
+    return _ScrollableFigureCanvas(fig)
+
+
+class _AspectCanvasHolder(QWidget):
+    """
+    Pins a single child widget to a top-left rectangle that preserves a
+    configurable aspect ratio (height / width), maximised within the
+    holder's own size (Item 4 — PlotCard's DR plot canvas; Item 9 —
+    adjustable Plot W / Plot H in Appearance).
+
+    The shared `_SquareWidget` pattern used elsewhere in this file (a plain
+    QVBoxLayout plus a resizeEvent hack that calls setFixedHeight once it
+    notices height != width) depends on first receiving an oversized
+    resize so it has a mismatch to correct — reliable when the widget sits
+    directly in a QVBoxLayout with a stretch factor, but not once nested
+    differently or given an explicit QHBoxLayout alignment flag (both no
+    longer feed it that oversized resize). Managing the child's geometry
+    directly here removes that dependency entirely, and as a side effect
+    keeps the canvas's top flush with the legend's top: both start at y=0
+    within plot_row's row, since any leftover space appears to the right
+    or below the fitted rectangle, never above or split around it.
+    """
+    def __init__(self, child: QWidget, aspect_ratio: float = 1.0, parent=None):
+        super().__init__(parent)
+        self._child = child
+        child.setParent(self)
+        self._aspect_ratio = aspect_ratio  # height / width
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_aspect_ratio(self, ratio: float):
+        self._aspect_ratio = max(float(ratio), 1e-6)
+        self._apply_geometry()
+
+    def _apply_geometry(self):
+        avail_w, avail_h = self.width(), self.height()
+        if avail_w <= 0 or avail_h <= 0:
+            return
+        if avail_h / avail_w > self._aspect_ratio:
+            w, h = avail_w, int(avail_w * self._aspect_ratio)
+        else:
+            h, w = avail_h, int(avail_h / self._aspect_ratio)
+        self._child.setGeometry(0, 0, w, h)
+
+    def resizeEvent(self, event):
+        self._apply_geometry()
+        super().resizeEvent(event)
+
+
+class _FrozenScrollArea(QScrollArea):
+    """
+    QScrollArea that never scrolls itself on mouse wheel. Used for the
+    Marker Heatmap's frozen row/column header strips -- their own
+    scrollbars are hidden and only ever moved in code (mirroring the
+    main heatmap's scrollbars), so a wheel event over a header shouldn't
+    scroll the header out of sync with the data it's labelling.
+    """
+    def wheelEvent(self, event):
+        event.ignore()
+
 
 def _apply_channel_transform(state, ch: str, values: np.ndarray) -> np.ndarray:
     """
@@ -743,40 +907,56 @@ class PipelineState:
     # entry is simply never looked up again once its key's inputs change.
     # Holds a copied PlotCard display config for magic-wand paste
     workspace_n_columns: int = 3
+    plot_theme: str = 'auto'
+    # 'auto' | 'light' | 'dark' — Item 1's Workspace toggle. 'auto' mirrors
+    # the live app palette (the previous, only, behaviour); 'light'/'dark'
+    # force every plot in this plugin regardless of the app's own setting.
 
     # ------------------------------------------------------------------
     # Convenience helpers
     # ------------------------------------------------------------------
 
-    def stats_runnable(self) -> bool:
+    def stats_runnable(self, sample_keys: set[str] | None = None) -> bool:
         """
         Return True if the two selected "Compare" groups (Item 13) are
-        distinct and each has >= 3 assigned samples.
+        distinct and each has >= 3 assigned samples. Pass sample_keys to
+        restrict the count to a specific run's samples (see n_per_group);
+        omitting it counts across the whole experiment.
         """
         if not self.compare_group_a or not self.compare_group_b or \
                 self.compare_group_a == self.compare_group_b:
             return False
-        counts = self.n_per_group()
+        counts = self.n_per_group(sample_keys)
         return (counts.get(self.compare_group_a, 0) >= 3 and
                 counts.get(self.compare_group_b, 0) >= 3)
 
-    def n_per_group(self) -> dict[str, int]:
-        """Return {group_name: assigned_sample_count} for every defined group."""
+    def n_per_group(self, sample_keys: set[str] | None = None) -> dict[str, int]:
+        """Return {group_name: assigned_sample_count} for every defined
+        group. Pass sample_keys (e.g. GroupsStatsTab._table_sample_paths())
+        to restrict the count to a specific run's samples; omitting it
+        counts every sample_groups entry ever tracked, which can include
+        other runs and stale/removed samples."""
         counts = {name: 0 for name in self.group_names}
-        for g in self.sample_groups.values():
+        items = (
+            self.sample_groups.items() if sample_keys is None
+            else ((sp, g) for sp, g in self.sample_groups.items() if sp in sample_keys)
+        )
+        for _, g in items:
             if g in counts:
                 counts[g] += 1
         return counts
 
-    def n_group_stats_runnable(self) -> bool:
+    def n_group_stats_runnable(self, sample_keys: set[str] | None = None) -> bool:
         """
         Item 13 phase 2. True if at least 2 of the checked 'Groups to Test'
         each have >= 3 assigned samples. Governs Run Statistics/Confusion
         Matrix/Composition-by-group -- separate from stats_runnable(),
-        which still gates T-REX's fixed Compare pair.
+        which still gates T-REX's fixed Compare pair. Pass sample_keys to
+        restrict the count to a specific run's samples (see n_per_group);
+        omitting it counts across the whole experiment.
         """
         selection = self.testing_group_selection or self.group_names
-        counts = self.n_per_group()
+        counts = self.n_per_group(sample_keys)
         qualifying = sum(1 for name in selection if counts.get(name, 0) >= 3)
         return qualifying >= 2
 
@@ -2453,7 +2633,16 @@ class TransformTab(QWidget):
         # Restore any previously computed auto-transform W values
         self._load_computed_transforms()
         skip = {'ribbon', 'Time', 'event_id'}
-        all_channels = [ch for ch in self._transforms if ch not in skip]
+        # Item 8: order by the cytometer's own PNN order (self._pnn, set
+        # just above) -- the same order the Spectral Process tab uses --
+        # rather than self._transforms' dict order, which reflects
+        # however the experiment file happened to store the transforms
+        # and can drift out of PNN order. Anything in self._transforms
+        # but not in self._pnn (shouldn't normally happen) is appended at
+        # the end rather than silently dropped.
+        pnn_order = [ch for ch in self._pnn if ch in self._transforms and ch not in skip]
+        remaining = [ch for ch in self._transforms if ch not in skip and ch not in pnn_order]
+        all_channels = pnn_order + remaining
         # Transforms tab always shows every channel — channel selection
         # for DR/clustering happens later, in Configuration.
         channels = all_channels
@@ -3400,7 +3589,8 @@ class GroupsStatsTab(QWidget):
             "Regex-match each group's pattern (above) against sample "
             "filenames and assign groups automatically. First matching "
             "pattern wins (in the order shown above).\n"
-            "Only currently-Unassigned, on-screen samples are affected."
+            "This overwrites every on-screen sample's current group, "
+            "including manual selections -- re-run any time patterns change."
         )
         self.auto_assign_btn.clicked.connect(self._auto_assign_by_name)
         groups_btn_row.addWidget(self.auto_assign_btn)
@@ -3548,6 +3738,12 @@ class GroupsStatsTab(QWidget):
         stats_layout.addWidget(test_groups_box)
 
         # ---- T-REX Compare selector (Item 13 — pairwise only, see §0.2) ----
+        # Walled off from the user for now (see CLAUDE.md session notes) --
+        # containers below are hidden but left fully wired so this can be
+        # re-enabled later just by removing the setVisible(False) calls.
+        self.trex_compare_container = QWidget()
+        compare_container_layout = QVBoxLayout(self.trex_compare_container)
+        compare_container_layout.setContentsMargins(0, 0, 0, 0)
         compare_row = QHBoxLayout()
         compare_row.addWidget(QLabel("T-REX Compare:"))
         self.compare_group_a_combo = QComboBox()
@@ -3558,7 +3754,7 @@ class GroupsStatsTab(QWidget):
         self.compare_group_b_combo.setMinimumWidth(140)
         compare_row.addWidget(self.compare_group_b_combo)
         compare_row.addStretch()
-        stats_layout.addLayout(compare_row)
+        compare_container_layout.addLayout(compare_row)
         self.compare_group_a_combo.currentTextChanged.connect(self._on_compare_group_changed)
         self.compare_group_b_combo.currentTextChanged.connect(self._on_compare_group_changed)
 
@@ -3569,14 +3765,18 @@ class GroupsStatsTab(QWidget):
         )
         compare_hint.setWordWrap(True)
         compare_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
-        stats_layout.addWidget(compare_hint)
+        compare_container_layout.addWidget(compare_hint)
+        stats_layout.addWidget(self.trex_compare_container)
+        self.trex_compare_container.setVisible(False)
 
         # ---- T-REX DR run selector ----
         # T-REX can only ever be plotted against the events a specific DR
         # run actually embedded -- it must be scored against exactly that
         # run's event set, not freshly re-gated data that may have since
         # drifted in size.
-        trex_dr_row = QHBoxLayout()
+        self.trex_dr_container = QWidget()
+        trex_dr_row = QHBoxLayout(self.trex_dr_container)
+        trex_dr_row.setContentsMargins(0, 0, 0, 0)
         trex_dr_row.addWidget(QLabel("T-REX DR run:"))
         self.trex_dr_run_combo = QComboBox()
         self.trex_dr_run_combo.setMinimumWidth(160)
@@ -3587,7 +3787,8 @@ class GroupsStatsTab(QWidget):
         self.trex_dr_run_combo.currentIndexChanged.connect(self._on_trex_dr_run_changed)
         trex_dr_row.addWidget(self.trex_dr_run_combo)
         trex_dr_row.addStretch()
-        stats_layout.addLayout(trex_dr_row)
+        stats_layout.addWidget(self.trex_dr_container)
+        self.trex_dr_container.setVisible(False)
 
         # Config row: what to test
         config_row = QHBoxLayout()
@@ -3695,6 +3896,7 @@ class GroupsStatsTab(QWidget):
         )
         self.run_trex_btn.clicked.connect(self._run_trex)
         run_row.addWidget(self.run_trex_btn)
+        self.run_trex_btn.setVisible(False)  # walled off
 
         self.confusion_btn = QPushButton("Confusion Matrix")
         self.confusion_btn.setEnabled(False)
@@ -4037,12 +4239,16 @@ class GroupsStatsTab(QWidget):
     def _auto_assign_by_name(self):
         """
         Regex-match each defined group's pattern against the filenames of
-        the samples currently shown in the table, assigning only Unassigned
-        ones. First matching pattern wins, in state.group_names order.
-        Patterns are separate from group names so a group named 'A' can't
-        match every file (bug R1), and only on-screen samples are touched
-        (bug R2) — Item 13 generalizes this from a fixed A/B pair to
-        however many groups are defined.
+        the samples currently shown in the table. First matching pattern
+        wins, in state.group_names order. This OVERWRITES every on-screen
+        sample's current group (including manual picks and prior
+        auto-assign results) so a re-run is always a clean, deterministic
+        pass over the current patterns -- nothing about a sample's history
+        can leave it stuck on a stale value. Patterns are separate from
+        group names so a group named 'A' can't match every file (bug R1),
+        and only on-screen samples are touched (bug R2) — Item 13
+        generalizes this from a fixed A/B pair to however many groups are
+        defined.
         """
         patterns = {}
         for name in self.state.group_names:
@@ -4060,10 +4266,8 @@ class GroupsStatsTab(QWidget):
                 "Enter a filename match pattern for at least one group.")
             return
 
-        # Only the samples currently in the table (the training-filtered view).
-        shown = [self.table.item(r, 0).data(Qt.UserRole)
-                 for r in range(self.table.rowCount())
-                 if self.table.item(r, 0) is not None]
+        # Only the samples currently in the table (the run-scoped view).
+        shown = self._table_sample_paths()
 
         _log.info("auto-assign: table rows=%d, shown=%d", self.table.rowCount(), len(shown))
         for sp in shown:
@@ -4072,11 +4276,8 @@ class GroupsStatsTab(QWidget):
 
         assigned_counts = {name: 0 for name in patterns}
         for sp in shown:
-            current = self.state.sample_groups.get(sp, 'Unassigned')
-            if current != 'Unassigned':
-                _log.info("  skip %r (already %r)", Path(sp).name, current)
-                continue
             fn = Path(sp).name
+            self.state.sample_groups[sp] = 'Unassigned'
             for name, rx in patterns.items():
                 if rx.search(fn):
                     self.state.sample_groups[sp] = name
@@ -4092,38 +4293,28 @@ class GroupsStatsTab(QWidget):
         summary = ", ".join(f"{n} → {name}" for name, n in assigned_counts.items())
         self.stats_status_label.setText(f"Auto-assigned {summary}.")
 
-    # ------------------------------------------------------------------
-    # Refresh
-    # ------------------------------------------------------------------
-
-    def refresh(self):
+    def _scoped_sample_groups(self) -> dict:
         """
-        Rebuild the sample table showing only the training samples selected
-        in Configuration.  Falls back to all samples if none are selected.
+        Return the {sample_path: group} mapping restricted to the samples
+        belonging to the currently-selected run in the Stats run combo
+        (its own archived 'training_sample_ids'), falling back to
+        Configuration's live training-sample selection if no run is
+        selected yet, and to all samples if that's empty too. This is the
+        single source of truth for "which samples are in scope right now"
+        -- refresh() uses it to build the table, and _populate_table()
+        defaults to it so every no-argument caller (rename, remove group,
+        Add Column, CSV import) stays scoped the same way instead of
+        silently falling back to the whole experiment.
         """
-        # Item 13: group names/patterns/compare-selection live on state
-        # directly now — just repopulate the management widgets from it.
-        self._populate_groups_table()
-        self._refresh_compare_combos()
+        selected_run_id = self._run_combo.currentData() or self.state.stats_run_id
+        run_training_ids = None
+        if selected_run_id:
+            for entry in list(self.state.dr_runs) + list(self.state.clustering_runs):
+                if entry.get('run_id') == selected_run_id:
+                    run_training_ids = entry.get('training_sample_ids')
+                    break
 
-        # Item 13 phase 2: Groups-to-Test / contrast mode / pairing widgets.
-        self._populate_test_groups_list()
-        self._populate_pairing_variable_combo()
-        self.chk_paired.blockSignals(True)
-        self.chk_paired.setChecked(self.state.paired)
-        self.chk_paired.blockSignals(False)
-        self.pairing_variable_combo.setEnabled(self.state.paired)
-        self.radio_reference.blockSignals(True)
-        self.radio_pairwise.blockSignals(True)
-        if self.state.contrast_mode == 'pairwise':
-            self.radio_pairwise.setChecked(True)
-        else:
-            self.radio_reference.setChecked(True)
-        self.radio_reference.blockSignals(False)
-        self.radio_pairwise.blockSignals(False)
-        self.reference_group_combo.setEnabled(self.radio_reference.isChecked())
-
-        training = self.state.training_sample_ids
+        training = run_training_ids if run_training_ids else self.state.training_sample_ids
         if training:
             # training_sample_ids are relative paths; sample_groups keys may be
             # absolute paths.  Normalise by comparing Path.name and suffix matches.
@@ -4166,6 +4357,45 @@ class GroupsStatsTab(QWidget):
             self.state.initialise_sample_groups(all_samples)
             matched = self.state.sample_groups
 
+        return matched
+    
+    # ------------------------------------------------------------------
+    # Refresh
+    # ------------------------------------------------------------------
+
+    def refresh(self):
+        """
+        Rebuild the sample table showing only the samples belonging to the
+        currently-selected run in the Stats run combo (its own archived
+        'training_sample_ids' -- fixed at the time that run was computed),
+        so the table always matches what Run Statistics/Auto-assign will
+        actually operate on. Falls back to Configuration's live
+        training-sample selection if no run is selected yet, and to all
+        samples if that's empty too.
+        """
+        # Item 13: group names/patterns/compare-selection live on state
+        # directly now — just repopulate the management widgets from it.
+        self._populate_groups_table()
+        self._refresh_compare_combos()
+
+        # Item 13 phase 2: Groups-to-Test / contrast mode / pairing widgets.
+        self._populate_test_groups_list()
+        self._populate_pairing_variable_combo()
+        self.chk_paired.blockSignals(True)
+        self.chk_paired.setChecked(self.state.paired)
+        self.chk_paired.blockSignals(False)
+        self.pairing_variable_combo.setEnabled(self.state.paired)
+        self.radio_reference.blockSignals(True)
+        self.radio_pairwise.blockSignals(True)
+        if self.state.contrast_mode == 'pairwise':
+            self.radio_pairwise.setChecked(True)
+        else:
+            self.radio_reference.setChecked(True)
+        self.radio_reference.blockSignals(False)
+        self.radio_pairwise.blockSignals(False)
+        self.reference_group_combo.setEnabled(self.radio_reference.isChecked())
+
+        matched = self._scoped_sample_groups()
         self._populate_table(matched)
         self._populate_run_combo()
         self._populate_trex_dr_combo()
@@ -4221,9 +4451,13 @@ class GroupsStatsTab(QWidget):
     def _populate_table(self, sample_groups: dict | None = None):
         """Rebuild table rows AND covariate columns from sample_groups.
         Column count is dynamic -- one per state.covariates column, so
-        this must rebuild the header every call, not just the rows."""
+        this must rebuild the header every call, not just the rows.
+        Defaults to the run-scoped set (_scoped_sample_groups()), NOT the
+        raw state.sample_groups, so every no-argument caller (rename,
+        remove group, Add Column, CSV import) stays consistent with what
+        refresh() itself shows."""
         if sample_groups is None:
-            sample_groups = self.state.sample_groups
+            sample_groups = self._scoped_sample_groups()
 
         try:
             raw_subdir = self.controller.experiment.settings['raw'][
@@ -4246,11 +4480,21 @@ class GroupsStatsTab(QWidget):
         self.table.setColumnCount(2 + len(covariate_cols))
         self.table.setHorizontalHeaderLabels(['Sample', 'Group'] + covariate_cols)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        # ResizeToContents both locks the column against manual drag and
+        # sizes off each QComboBox's sizeHint(), which is only measured
+        # once on first show -- so it can end up narrower than the longest
+        # group name, and shrinks further on every rebuild (e.g. after
+        # auto-assign). Size it explicitly from font metrics instead, then
+        # leave it Interactive so it stops auto-shrinking and the user can
+        # still drag it themselves.
+        opts = self._group_options()
+        fm = self.table.fontMetrics()
+        longest_opt_width = max((fm.horizontalAdvance(o) for o in opts), default=0)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        self.table.setColumnWidth(1, longest_opt_width + 40)  # padding for combo chrome/arrow
         for c in range(2, 2 + len(covariate_cols)):
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
 
-        opts = self._group_options()
         self.table.setRowCount(0)
         for sample_path, group in sorted(
             sample_groups.items(), key=lambda kv: Path(kv[0]).name.lower()
@@ -4325,10 +4569,27 @@ class GroupsStatsTab(QWidget):
         self._update_run_button()
         self._update_group_count_label()
 
+    def _table_sample_paths(self) -> list[str]:
+        """Return the sample_groups keys for every row currently shown in
+        the Sample Group Assignment table -- i.e. the samples belonging to
+        whichever run the table is presently scoped to (see refresh()).
+        This is deliberately NOT all of state.sample_groups, which can
+        carry entries for other runs and stale/removed samples."""
+        return [self.table.item(r, 0).data(Qt.UserRole)
+                for r in range(self.table.rowCount())
+                if self.table.item(r, 0) is not None]
+
     def _update_group_count_label(self):
-        counts = self.state.n_per_group()
+        shown = self._table_sample_paths()
+        counts = {name: 0 for name in self.state.group_names}
+        unassigned = 0
+        for sp in shown:
+            g = self.state.sample_groups.get(sp, 'Unassigned')
+            if g in counts:
+                counts[g] += 1
+            else:
+                unassigned += 1
         parts = [f"{name}: {counts.get(name, 0)}" for name in self.state.group_names]
-        unassigned = sum(1 for g in self.state.sample_groups.values() if g == 'Unassigned')
         parts.append(f"Unassigned: {unassigned}")
         self._group_count_label.setText("  |  ".join(parts))
 
@@ -4349,12 +4610,13 @@ class GroupsStatsTab(QWidget):
         return None
 
     def _update_run_button(self):
+        shown = set(self._table_sample_paths())
         any_clustering = bool(self.state.clustering_runs) or bool(self.state.cluster_labels)
         dr_only_selected = self._selected_run_kind() == 'dr'
-        n_group_ok = self.state.n_group_stats_runnable()
+        n_group_ok = self.state.n_group_stats_runnable(shown)
         runnable = n_group_ok and any_clustering and not dr_only_selected
         self.run_stats_btn.setEnabled(runnable)
-        self.run_trex_btn.setEnabled(self.state.stats_runnable())
+        self.run_trex_btn.setEnabled(self.state.stats_runnable(shown))
         self.confusion_btn.setEnabled(runnable)
         self.composition_btn.setEnabled(runnable)
         if dr_only_selected:
@@ -4365,7 +4627,7 @@ class GroupsStatsTab(QWidget):
         elif not any_clustering:
             self.run_stats_btn.setToolTip("Run clustering first.")
         elif not n_group_ok:
-            counts = self.state.n_per_group()
+            counts = self.state.n_per_group(shown)
             selection = self.state.testing_group_selection or self.state.group_names
             detail = ", ".join(f"{name}={counts.get(name, 0)}" for name in selection)
             self.run_stats_btn.setToolTip(
@@ -4563,12 +4825,13 @@ class GroupsStatsTab(QWidget):
                 w.deleteLater()
         self.marker_roles_checkboxes.clear()
 
+        labels = _antigen_dash_labels(self.controller)
         for grid_idx, ch in enumerate(channels):
             role = self.state.marker_roles.get(ch)
             if role is None:
                 role = 'state'
                 self.state.marker_roles[ch] = role
-            cb = QCheckBox(ch)
+            cb = QCheckBox(labels.get(ch, ch))
             cb.setChecked(role == 'type')
             cb.toggled.connect(lambda checked, c=ch: self._on_marker_role_changed(c, checked))
             self.marker_roles_checkboxes[ch] = cb
@@ -4898,8 +5161,9 @@ class GroupsStatsTab(QWidget):
         if run_entry is None and not self.state.cluster_labels:
             QMessageBox.warning(self, "No Clustering", "Run clustering first.")
             return None
-        if not self.state.n_group_stats_runnable():
-            counts = self.state.n_per_group()
+        shown = set(self._table_sample_paths())
+        if not self.state.n_group_stats_runnable(shown):
+            counts = self.state.n_per_group(shown)
             selection = self.state.testing_group_selection or self.state.group_names
             detail = ", ".join(f"{name}: {counts.get(name, 0)}" for name in selection)
             QMessageBox.warning(
@@ -4955,12 +5219,15 @@ class GroupsStatsTab(QWidget):
         """
         from matplotlib.figure import Figure
 
+        is_dark = _resolve_is_dark(self.state)
+
         if conf_df.empty:
             fig = Figure(figsize=(5, 2), constrained_layout=True)
             ax = fig.add_subplot(111)
             ax.axis('off')
             ax.text(0.5, 0.5, 'No clusters to display',
                     ha='center', va='center', fontsize=10, transform=ax.transAxes)
+            _style_figure_theme(fig, is_dark)
             self._stamp_run_label(fig, run_label)
             return fig
 
@@ -4996,6 +5263,7 @@ class GroupsStatsTab(QWidget):
                         fontsize=8)
 
         fig.colorbar(im, ax=ax, shrink=0.7, label='Normalized events')
+        _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
         return fig
 
@@ -5053,12 +5321,15 @@ class GroupsStatsTab(QWidget):
         """
         from matplotlib.figure import Figure
 
+        is_dark = _resolve_is_dark(self.state)
+
         if comp_df.empty:
             fig = Figure(figsize=(5, 2), constrained_layout=True)
             ax = fig.add_subplot(111)
             ax.axis('off')
             ax.text(0.5, 0.5, 'No data to display',
                     ha='center', va='center', fontsize=10, transform=ax.transAxes)
+            _style_figure_theme(fig, is_dark)
             return fig
 
         n_rows = len(comp_df)
@@ -5086,8 +5357,15 @@ class GroupsStatsTab(QWidget):
         ax.set_xticklabels(xtick_labels, rotation=45, ha='right', fontsize=8)
         ax.set_ylabel('% of events' if as_pct else 'Event count')
         ax.set_title('Cluster Composition', fontsize=10)
-        ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), fontsize=8,
-                  title='Cluster', frameon=False)
+        legend = ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), fontsize=8,
+                           title='Cluster', frameon=False)
+        fg = _style_figure_theme(fig, is_dark)
+        # _style_figure_theme only touches tick/axis-label/title/spine
+        # colours -- legend text is a separate artist it doesn't walk,
+        # so it stayed black (invisible in dark mode) without this.
+        for text in legend.get_texts():
+            text.set_color(fg)
+        legend.get_title().set_color(fg)
         self._stamp_run_label(fig, run_label)
         return fig
 
@@ -5171,7 +5449,6 @@ class GroupsStatsTab(QWidget):
         Composition) outside of _draw_results, using the same pop-out/
         export machinery as the heatmap/volcano tabs.
         """
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
         from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
         from PySide6.QtWidgets import QDialog
 
@@ -5187,7 +5464,7 @@ class GroupsStatsTab(QWidget):
         w_px = int(fig.get_figwidth()  * dpi)
         h_px = int(fig.get_figheight() * dpi)
 
-        canvas = FigureCanvasQTAgg(fig)
+        canvas = _new_scrollable_canvas(fig)
         canvas.setMinimumSize(w_px, h_px)
         canvas.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -5223,7 +5500,7 @@ class GroupsStatsTab(QWidget):
             dlg_w_px = int(dlg_fig.get_figwidth()  * dlg_dpi)
             dlg_h_px = int(dlg_fig.get_figheight() * dlg_dpi)
 
-            dlg_canvas  = FigureCanvasQTAgg(dlg_fig)
+            dlg_canvas  = _new_scrollable_canvas(dlg_fig)
             dlg_canvas.setSizePolicy(
                 QSizePolicy.Policy.Expanding,
                 QSizePolicy.Policy.Expanding,
@@ -5307,6 +5584,44 @@ class GroupsStatsTab(QWidget):
             if widget is not None and widget.property('_tab_key') == key:
                 return True
         return False
+
+    def refresh_theme_dependent_result_tabs(self):
+        """
+        Confusion Matrix / Composition Barplot aren't tied to a single
+        cached 'last drawn from' call the way Stats' Freq/MFI/Counts
+        results are (_draw_results), so a plain theme change wouldn't
+        otherwise touch them. Re-render each in place, using exactly the
+        same persisted state (state.confusion_df / state.composition_df,
+        etc.) the startup tab-restore logic already uses, only if that
+        tab is actually currently open.
+        """
+        if self.state.confusion_df is not None and self._has_results_tab('confusion_matrix'):
+            fig_cm = self._make_confusion_matrix_figure(
+                self.state.confusion_df, run_label=self.state.confusion_run_label,
+            )
+            self._add_results_tab(
+                fig_cm, "Confusion Matrix", "confusion_matrix",
+                maker=self._make_confusion_matrix_figure,
+                maker_kwargs=dict(conf_df=self.state.confusion_df,
+                                  run_label=self.state.confusion_run_label),
+                key="confusion_matrix",
+            )
+        if self.state.composition_df is not None and self._has_results_tab('composition_barplot'):
+            fig_comp = self._make_composition_figure(
+                self.state.composition_df, as_pct=self.state.composition_as_pct,
+                run_label=self.state.composition_run_label, names=self.state.composition_names,
+                group_var=self.state.composition_group_var,
+            )
+            self._add_results_tab(
+                fig_comp, "Composition", "composition_barplot",
+                maker=self._make_composition_figure,
+                maker_kwargs=dict(comp_df=self.state.composition_df,
+                                  as_pct=self.state.composition_as_pct,
+                                  run_label=self.state.composition_run_label,
+                                  names=self.state.composition_names,
+                                  group_var=self.state.composition_group_var),
+                key="composition_barplot",
+            )
 
     def _remove_results_tab_by_key(self, key: str):
         """Remove the results tab whose container carries this key, if
@@ -5548,12 +5863,15 @@ class GroupsStatsTab(QWidget):
         COLOR_A = '#4477AA'
         COLOR_B = '#EE6677'
 
+        is_dark = _resolve_is_dark(self.state)
+
         if mfi_sample_df is None or mfi_sample_df.empty:
             fig = Figure(figsize=(5, 2), constrained_layout=True)
             ax = fig.add_subplot(111)
             ax.axis('off')
             ax.text(0.5, 0.5, 'No data to display',
                     ha='center', va='center', fontsize=10, transform=ax.transAxes)
+            _style_figure_theme(fig, is_dark)
             self._stamp_run_label(fig, run_label)
             return fig
 
@@ -5671,6 +5989,7 @@ class GroupsStatsTab(QWidget):
         cb.ax.tick_params(labelsize=7)
         cb.set_label('log1p-MFI', fontsize=7)
 
+        _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
         return fig
 
@@ -5702,6 +6021,8 @@ class GroupsStatsTab(QWidget):
         COLOR_A = '#4477AA'
         COLOR_B = '#EE6677'
 
+        is_dark = _resolve_is_dark(self.state)
+
         # ---- Select significant features ----
         sig = results_df[results_df['significant']].copy() if 'significant' in results_df.columns else pd.DataFrame()
         if sig.empty:
@@ -5711,6 +6032,7 @@ class GroupsStatsTab(QWidget):
             ax.text(0.5, 0.5, 'No significant features at current thresholds',
                     ha='center', va='center', fontsize=10, transform=ax.transAxes)
             ax.set_title(title, fontsize=10)
+            _style_figure_theme(fig, is_dark)
             self._stamp_run_label(fig, run_label)
             return fig
 
@@ -5725,6 +6047,7 @@ class GroupsStatsTab(QWidget):
             ax.text(0.5, 0.5, 'Feature columns not found in sample matrix',
                     ha='center', va='center', fontsize=10, transform=ax.transAxes)
             ax.set_title(title, fontsize=10)
+            _style_figure_theme(fig, is_dark)
             self._stamp_run_label(fig, run_label)
             return fig
 
@@ -5893,15 +6216,21 @@ class GroupsStatsTab(QWidget):
             cb_label = '% frequency'
         cb.set_label(cb_label, fontsize=7)
 
+        _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
         return fig
 
     def _make_volcano_figure(self, results_df, title: str,
                               pval_threshold: float, fc_threshold: float,
                               run_label: str = ''):
-        """Volcano plot: x=logFC, y=-log10(adj.P.Val), coloured by significance.
-        run_label is stamped in the upper-left corner (plot provenance)."""
+        """Volcano plot: x=logFC, y=-log10(adj.P.Val). Significant points
+        are coloured via viridis, scaled by -log10(adj. P-value) (Item
+        11 -- previously flat red for every significant point); non-
+        significant points stay flat grey. run_label is stamped in the
+        upper-left corner (plot provenance)."""
         from matplotlib.figure import Figure
+
+        is_dark = _resolve_is_dark(self.state)
 
         pval_col = 'adj.P.Val' if 'adj.P.Val' in results_df.columns else 'P.Value'
         logfc  = results_df['logFC'].values.astype(float)
@@ -5913,19 +6242,41 @@ class GroupsStatsTab(QWidget):
 
         fig = Figure(figsize=(5, 5), constrained_layout=True)
         ax  = fig.add_subplot(111)
+        fg = 'white' if is_dark else 'black'
 
-        colors = ['#e74c3c' if s else '#aaaaaa' for s in sig]
-        ax.scatter(logfc, neg_lp, c=colors, s=25, alpha=0.8, linewidths=0)
+        non_sig = ~sig
+        ax.scatter(logfc[non_sig], neg_lp[non_sig], c='#aaaaaa', s=25, alpha=0.8, linewidths=0)
+        if sig.any():
+            sc = ax.scatter(logfc[sig], neg_lp[sig], c=neg_lp[sig], cmap='viridis',
+                            s=25, alpha=0.9, linewidths=0)
+            fig.colorbar(sc, ax=ax, shrink=0.7, label='-log10(adj. P-value)')
 
         ax.axhline(-np.log10(pval_threshold), color='grey', linestyle='--', linewidth=0.8)
         ax.axvline( fc_threshold,              color='grey', linestyle='--', linewidth=0.8)
         ax.axvline(-fc_threshold,              color='grey', linestyle='--', linewidth=0.8)
 
-        # Label significant features
-        for fc_val, nlp_val, label, is_sig in zip(logfc, neg_lp, features, sig):
-            if is_sig:
-                ax.annotate(label, (fc_val, nlp_val), fontsize=6,
-                            textcoords='offset points', xytext=(3, 3))
+        # Label significant features -- colour now follows the theme
+        # (was always black, invisible in dark mode), and labels are
+        # spread apart with adjustText instead of a fixed (3, 3) point
+        # offset for every one, which stacked labels directly on top of
+        # each other whenever several significant points landed close
+        # together.
+        sig_x = logfc[sig]
+        sig_y = neg_lp[sig]
+        sig_labels = [lbl for lbl, is_pt_sig in zip(features, sig) if is_pt_sig]
+        texts = [ax.text(x_val, y_val, lbl, fontsize=6, color=fg)
+                for x_val, y_val, lbl in zip(sig_x, sig_y, sig_labels)]
+        if texts:
+            try:
+                from adjustText import adjust_text
+                adjust_text(texts, x=sig_x, y=sig_y, ax=ax,
+                            arrowprops=dict(arrowstyle='-', color=fg, lw=0.5))
+            except ImportError:
+                # adjustText not yet installed into this plugin's bundled
+                # environment (see _REQUIRED_PACKAGES / _bootstrap above)
+                # -- labels stay at their point, un-de-overlapped, until
+                # the plugin re-bootstraps and picks it up.
+                pass
 
         x_lim = max(np.abs(logfc).max() * 1.05, fc_threshold * 1.5)
         ax.set_xlim(-x_lim, x_lim)
@@ -5933,6 +6284,7 @@ class GroupsStatsTab(QWidget):
         ax.set_xlabel("log2 Fold Change")
         ax.set_ylabel("-log10(adj. P-value)")
         ax.set_title(title, fontsize=10)
+        _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
         return fig
 
@@ -5997,12 +6349,12 @@ class WorkspaceTab(QWidget):
     Each PlotCard supports:
       • DR algorithm selector
       • Sample selector (single sample or all pooled)
-      • Colour mode: Clusters | Marker intensity | T-REX
+      • Colour mode: Clusters | Marker intensity
       • Per-cluster colour pickers (right-click)
       • Magic-wand display-config copy/paste
       • PNG/PDF export
 
-    Stage 7: T-REX colouring, marker intensity, magic-wand, PDF export.
+    marker intensity, magic-wand, PDF export.
     """
 
     plots_changed = Signal()  # emitted whenever a card is added or removed
@@ -6034,7 +6386,21 @@ class WorkspaceTab(QWidget):
         self.col_combo.setCurrentText(str(self.state.workspace_n_columns))
         self.col_combo.setFixedWidth(55)
         self.col_combo.currentTextChanged.connect(self._on_column_count_changed)
+        _style_combo_popup(self.col_combo)
         tb_layout.addWidget(self.col_combo)
+
+        tb_layout.addWidget(QLabel("Theme:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Auto", "Light", "Dark"])
+        self.theme_combo.setToolTip(
+            "Plot background for every plot in this plugin. Auto mirrors "
+            "the app's own light/dark setting; Light/Dark forces it."
+        )
+        self.theme_combo.setCurrentText(self.state.plot_theme.capitalize())
+        self.theme_combo.setFixedWidth(80)
+        self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
+        _style_combo_popup(self.theme_combo)
+        tb_layout.addWidget(self.theme_combo)
 
         tb_layout.addStretch()
 
@@ -6132,6 +6498,19 @@ class WorkspaceTab(QWidget):
             pass
         self._relayout()
 
+    def _on_theme_changed(self, text: str):
+        """Walk up to PluginWidget (same pattern GroupsStatsTab._run_trex
+        uses) so a Workspace-toggle change immediately redraws every
+        currently-visible plot in the other tabs too, rather than only
+        taking effect the next time each one happens to redraw on its own."""
+        self.state.plot_theme = text.lower()
+        parent = self.parent()
+        while parent is not None:
+            if hasattr(parent, 'refresh_plot_theme'):
+                parent.refresh_plot_theme()
+                return
+            parent = parent.parent()
+
     def _relayout(self):
         """Re-arrange all PlotCards after a column-count change."""
         for card in self._plot_cards:
@@ -6175,7 +6554,7 @@ class PlotCard(QFrame):
     Controls (top toolbar):
       • DR algorithm selector
       • Sample selector (All Samples pooled, or individual)
-      • Colour mode: Clusters | Marker | T-REX
+      • Colour mode: Clusters | Marker (T-REX walled off, see _COLOUR_MODES)
       • Marker channel selector (visible in Marker mode)
       • Magic wand (copy) and paste buttons
       • Close button
@@ -6191,7 +6570,7 @@ class PlotCard(QFrame):
     workspace  Parent WorkspaceTab (for remove_card / magic-wand).
     """
 
-    _COLOUR_MODES = ['Clusters', 'Marker', 'T-REX']
+    _COLOUR_MODES = ['Clusters', 'Marker']
 
     def __init__(self, plot_id: str, state: PipelineState, bus, controller,
                  workspace: 'WorkspaceTab', parent=None):
@@ -6222,7 +6601,7 @@ class PlotCard(QFrame):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
-        # ---- Toolbar row 1: DR run | sample | colour mode | overlay ----
+        # ---- Toolbar row 1: DR run | sample | colour mode | marker ----
         row1 = QHBoxLayout()
         row1.setSpacing(4)
 
@@ -6231,6 +6610,7 @@ class PlotCard(QFrame):
         self.dr_combo.setFixedWidth(120)
         self.dr_combo.setToolTip("Archived DR run to display")
         self.dr_combo.currentIndexChanged.connect(self._on_dr_run_changed)
+        _style_combo_popup(self.dr_combo)
         row1.addWidget(self.dr_combo)
 
         row1.addWidget(QLabel("Sample:"))
@@ -6238,6 +6618,7 @@ class PlotCard(QFrame):
         self.sample_combo.setFixedWidth(130)
         self.sample_combo.setToolTip("Sample to display (or all pooled)")
         self.sample_combo.currentTextChanged.connect(self._schedule_refresh)
+        _style_combo_popup(self.sample_combo)
         row1.addWidget(self.sample_combo)
 
         row1.addWidget(QLabel("Colour:"))
@@ -6245,6 +6626,7 @@ class PlotCard(QFrame):
         self.colour_mode_combo.addItems(self._COLOUR_MODES)
         self.colour_mode_combo.setFixedWidth(85)
         self.colour_mode_combo.currentTextChanged.connect(self._on_colour_mode_changed)
+        _style_combo_popup(self.colour_mode_combo)
         row1.addWidget(self.colour_mode_combo)
 
         self.marker_combo = QComboBox()
@@ -6252,59 +6634,69 @@ class PlotCard(QFrame):
         self.marker_combo.setToolTip("Channel to colour by (Marker mode)")
         self.marker_combo.currentTextChanged.connect(self._schedule_refresh)
         self.marker_combo.setVisible(False)
+        _style_combo_popup(self.marker_combo)
         row1.addWidget(self.marker_combo)
+
+        row1.addStretch()
+
+        layout.addLayout(row1)
+
+        # ---- Toolbar row 2: overlay selector | warning | actions ----
+        row2 = QHBoxLayout()
+        row2.setSpacing(4)
 
         # Clustering-run overlay selector — only meaningful in Clusters mode
         # (Item 6: each card independently picks which archived clustering
         # run's labels to overlay on the chosen DR run's embedding).
         self.cluster_run_label = QLabel("Overlay:")
         self.cluster_run_label.setVisible(False)
-        row1.addWidget(self.cluster_run_label)
+        row2.addWidget(self.cluster_run_label)
         self.cluster_run_combo = QComboBox()
         self.cluster_run_combo.setFixedWidth(120)
         self.cluster_run_combo.setToolTip("Archived clustering run to overlay")
         self.cluster_run_combo.currentIndexChanged.connect(self._on_cluster_run_changed)
         self.cluster_run_combo.setVisible(False)
-        row1.addWidget(self.cluster_run_combo)
+        _style_combo_popup(self.cluster_run_combo)
+        row2.addWidget(self.cluster_run_combo)
 
         # Compatibility warning — shown when the selected DR run's and
         # clustering run's gate/sample sets don't line up.
         self._compat_warning = QLabel("⚠")
         self._compat_warning.setStyleSheet("color: #d9822b; font-weight: bold;")
         self._compat_warning.setVisible(False)
-        row1.addWidget(self._compat_warning)
+        row2.addWidget(self._compat_warning)
 
-        row1.addStretch()
+        row2.addStretch()
 
         # Magic wand (copy) button
         self.wand_btn = QPushButton("🪄")
         self.wand_btn.setFixedSize(26, 26)
         self.wand_btn.setToolTip("Copy display config (magic wand)")
         self.wand_btn.clicked.connect(self._copy_display_config)
-        row1.addWidget(self.wand_btn)
+        row2.addWidget(self.wand_btn)
 
         # Paste button
         self.paste_btn = QPushButton("📋")
         self.paste_btn.setFixedSize(26, 26)
         self.paste_btn.setToolTip("Paste display config from magic wand")
         self.paste_btn.clicked.connect(self._paste_display_config)
-        row1.addWidget(self.paste_btn)
+        row2.addWidget(self.paste_btn)
 
         # Export PNG
         self.png_btn = QPushButton("PNG")
         self.png_btn.setFixedSize(36, 26)
         self.png_btn.setToolTip("Export this plot as PNG")
         self.png_btn.clicked.connect(self._export_png)
-        row1.addWidget(self.png_btn)
+        row2.addWidget(self.png_btn)
 
         # Close
         self.close_btn = QPushButton("✕")
         self.close_btn.setFixedSize(26, 26)
         self.close_btn.setToolTip("Remove this plot")
         self.close_btn.clicked.connect(lambda: self.workspace.remove_card(self))
-        row1.addWidget(self.close_btn)
+        row2.addWidget(self.close_btn)
 
-        layout.addLayout(row1)
+        layout.addLayout(row2)
 
         # ---- Appearance controls row ----
         self._appearance_box = QGroupBox("Appearance")
@@ -6339,13 +6731,14 @@ class PlotCard(QFrame):
         self._show_axis_labels.stateChanged.connect(self._schedule_refresh)
         app_inner_layout.addWidget(self._show_axis_labels)
 
-        app_inner_layout.addWidget(QLabel("Title font:"))
-        self._title_font_spin = QSpinBox()
-        self._title_font_spin.setRange(6, 24)
-        self._title_font_spin.setValue(8)
-        self._title_font_spin.setFixedWidth(48)
-        self._title_font_spin.valueChanged.connect(self._schedule_refresh)
-        app_inner_layout.addWidget(self._title_font_spin)
+        app_inner_layout.addWidget(QLabel("Legend font:"))
+        self._legend_font_spin = QSpinBox()
+        self._legend_font_spin.setRange(6, 24)
+        self._legend_font_spin.setValue(9)
+        self._legend_font_spin.setFixedWidth(48)
+        self._legend_font_spin.setToolTip("Font size for cluster legend labels")
+        self._legend_font_spin.valueChanged.connect(self._schedule_refresh)
+        app_inner_layout.addWidget(self._legend_font_spin)
 
         app_inner_layout.addWidget(QLabel("Axis font:"))
         self._axis_font_spin = QSpinBox()
@@ -6354,6 +6747,30 @@ class PlotCard(QFrame):
         self._axis_font_spin.setFixedWidth(48)
         self._axis_font_spin.valueChanged.connect(self._schedule_refresh)
         app_inner_layout.addWidget(self._axis_font_spin)
+
+        # Plot width/height in inches (Item 9) -- drives both the
+        # matplotlib figure's own size and _AspectCanvasHolder's ratio, so
+        # the rendered plot's proportions actually change rather than
+        # just the figure's internal DPI scaling.
+        app_inner_layout.addWidget(QLabel("Plot W:"))
+        self._plot_w_spin = QDoubleSpinBox()
+        self._plot_w_spin.setRange(2.0, 10.0)
+        self._plot_w_spin.setSingleStep(0.5)
+        self._plot_w_spin.setValue(4.0)
+        self._plot_w_spin.setFixedWidth(55)
+        self._plot_w_spin.setToolTip("Plot width (inches)")
+        self._plot_w_spin.valueChanged.connect(self._on_plot_dims_changed)
+        app_inner_layout.addWidget(self._plot_w_spin)
+
+        app_inner_layout.addWidget(QLabel("Plot H:"))
+        self._plot_h_spin = QDoubleSpinBox()
+        self._plot_h_spin.setRange(2.0, 10.0)
+        self._plot_h_spin.setSingleStep(0.5)
+        self._plot_h_spin.setValue(4.0)
+        self._plot_h_spin.setFixedWidth(55)
+        self._plot_h_spin.setToolTip("Plot height (inches)")
+        self._plot_h_spin.valueChanged.connect(self._on_plot_dims_changed)
+        app_inner_layout.addWidget(self._plot_h_spin)
 
         from PySide6.QtGui import QPalette
         from PySide6.QtWidgets import QApplication
@@ -6364,7 +6781,7 @@ class PlotCard(QFrame):
         self._label_color = _default_label_color
         self._label_color_btn = QPushButton("Label colour")
         self._label_color_btn.setFixedHeight(22)
-        self._label_color_btn.setToolTip("Colour for colourbar and title text")
+        self._label_color_btn.setToolTip("Colour for colourbar, title, and axis label text")
         self._label_color_btn.clicked.connect(self._pick_label_color)
         app_inner_layout.addWidget(self._label_color_btn)
         self._update_label_color_btn()
@@ -6377,16 +6794,20 @@ class PlotCard(QFrame):
 
         layout.addWidget(self._appearance_box)
 
-        # ---- Matplotlib canvas (square container enforces equal width/height) ----
-        self._figure = Figure(figsize=(4, 4), constrained_layout=True)
-        self._canvas = FigureCanvasQTAgg(self._figure)
+        # ---- Matplotlib canvas (aspect-ratio container, adjustable via Appearance) ----
+        self._plot_w_in = 4.0
+        self._plot_h_in = 4.0
+        self._figure = Figure(figsize=(self._plot_w_in, self._plot_h_in), layout='compressed')
+        self._canvas = _new_scrollable_canvas(self._figure)
         self._canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self._canvas_container = _SquareWidget()
-        sq_layout = QVBoxLayout(self._canvas_container)
-        sq_layout.setContentsMargins(0, 0, 0, 0)
-        sq_layout.addWidget(self._canvas)
-        self._canvas_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        layout.addWidget(self._canvas_container, stretch=1)
+        # _AspectCanvasHolder (Item 4) pins the canvas to a top-left
+        # rectangle itself, rather than relying on QHBoxLayout cross-axis
+        # alignment + a resizeEvent hack to produce one as a side effect —
+        # see the class docstring for why that combination turned out to
+        # be fragile. Ratio starts at 1:1 (square) and follows Plot W/H.
+        self._canvas_container = _AspectCanvasHolder(
+            self._canvas, aspect_ratio=self._plot_h_in / self._plot_w_in
+        )
 
         # ---- Plot area: square canvas + right legend panel ----
         plot_row = QHBoxLayout()
@@ -6641,26 +7062,16 @@ class PlotCard(QFrame):
 
         colour_mode = self.colour_mode_combo.currentText()
 
-        from PySide6.QtGui import QPalette
-        from PySide6.QtWidgets import QApplication
-        _palette = QApplication.instance().palette()
-        is_dark = _palette.color(QPalette.ColorRole.Base).value() < 128
+        is_dark = _resolve_is_dark(self.state)
 
         self._figure.clear()
-        if is_dark:
-            self._figure.patch.set_facecolor('#1e1e1e')
-            ax = self._figure.add_subplot(111)
-            ax.set_facecolor('#2b2b2b')
-            _fg = 'white'
-            ax.tick_params(colors=_fg)
-            ax.xaxis.label.set_color(_fg)
-            ax.yaxis.label.set_color(_fg)
-            for spine in ax.spines.values():
-                spine.set_edgecolor(_fg)
-        else:
-            ax = self._figure.add_subplot(111)
-        ax.set_aspect('equal', adjustable='datalim')
-        _tf = self._title_font_spin.value()
+        # Always reserve the same narrow column for a colourbar
+        gs = self._figure.add_gridspec(1, 2, width_ratios=[20, 1], wspace=0.35)
+        ax = self._figure.add_subplot(gs[0, 0])
+        self._cbar_ax = self._figure.add_subplot(gs[0, 1])
+        self._cbar_ax.set_visible(False)
+        _style_figure_theme(self._figure, is_dark, axes=[ax])
+        ax.set_aspect('equal', adjustable='box')
         _af = self._axis_font_spin.value()
         if self._show_axis_labels.isChecked():
             ax.set_xlabel(f"{algo} 1", fontsize=_af)
@@ -6698,9 +7109,12 @@ class PlotCard(QFrame):
         elif colour_mode == 'T-REX':
             self._draw_trex_scatter(ax, xy_disp, lab_disp, emb_dict, run, origin_disp)
 
-        # Apply label colour to colourbar (Marker / T-REX) and title.
+        # Apply label colour to colourbar (Marker / T-REX), title, and axis
+        # labels (Item 7 — previously only covered title + colourbar).
         lc = self._label_color
         ax.title.set_color(lc)
+        ax.xaxis.label.set_color(lc)
+        ax.yaxis.label.set_color(lc)
         for cb_ax in self._figure.axes:
             if cb_ax is not ax:
                 cb_ax.tick_params(colors=lc)
@@ -6783,10 +7197,11 @@ class PlotCard(QFrame):
                                  ch, rel, len(full_col), int(mask.sum()))
 
         finite = np.isfinite(values)
+        display_label = _antigen_dash_labels(self.controller).get(ch, ch)
         if not finite.any():
             _log.warning("marker %s: no values could be loaded", ch)
             ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.4)
-            ax.set_title(f"Marker {ch}: no data", fontsize=8)
+            ax.set_title(f"Marker {display_label}: no data", fontsize=8)
             return
 
         # Plot on log1p(raw) so the display isn't dominated by the extreme
@@ -6801,14 +7216,19 @@ class PlotCard(QFrame):
         sc = ax.scatter(xy[finite, 0], xy[finite, 1], s=1,
                         c=log_values[finite], cmap='viridis',
                         vmin=vmin, vmax=vmax, alpha=0.6, linewidths=0)
-        cb = self._figure.colorbar(sc, ax=ax, shrink=0.6)
+        self._cbar_ax.set_visible(True)
+        cb = self._figure.colorbar(sc, cax=self._cbar_ax)
         tick_pos, tick_lab = _log1p_powers_of_ten_ticks(float(np.expm1(vmax)))
         keep = [(p, l) for p, l in zip(tick_pos, tick_lab) if vmin <= p <= vmax]
         if keep:
             cb.set_ticks([p for p, l in keep])
             cb.set_ticklabels([l for p, l in keep])
-        cb.set_label(ch, fontsize=8)
-        ax.set_title(f"Marker: {ch}", fontsize=8)
+        # "Legend font" (Item 8) now sizes the Marker colourbar's label and
+        # tick text too, not just the Clusters-mode swatch legend.
+        _lf = self._legend_font_spin.value()
+        cb.set_label(display_label, fontsize=_lf)
+        cb.ax.tick_params(labelsize=_lf)
+        ax.set_title(f"Marker: {display_label}", fontsize=8)
 
     def _draw_trex_scatter(self, ax, xy, labels, emb_dict: dict, run: dict, origin):
         """Colour by T-REX score using a red-blue diverging colourmap.
@@ -6868,7 +7288,8 @@ class PlotCard(QFrame):
             xy[finite, 0], xy[finite, 1],
             s=1, c=scores[finite], cmap='RdBu_r', vmin=-1, vmax=1, alpha=0.5, linewidths=0
         )
-        self._figure.colorbar(sc, ax=ax, shrink=0.6, label='T-REX score')
+        self._cbar_ax.set_visible(True)
+        self._figure.colorbar(sc, cax=self._cbar_ax, label='T-REX score')
         ax.set_title("T-REX enrichment (red=A, blue=B) — grey = not in Compare pair",
                     fontsize=8)
 
@@ -6926,7 +7347,7 @@ class PlotCard(QFrame):
             row.addWidget(swatch)
 
             name_lbl = QLabel(name)
-            name_lbl.setStyleSheet("font-size: 9px;")
+            name_lbl.setStyleSheet(f"font-size: {self._legend_font_spin.value()}px;")
             name_lbl.setToolTip("Double-click to rename")
             name_lbl.mouseDoubleClickEvent = lambda e, l=lbl: self._rename_cluster(l)
             row.addWidget(name_lbl, stretch=1)
@@ -6972,6 +7393,18 @@ class PlotCard(QFrame):
         if drc_scatter.rename_cluster(self.controller, cl_run, label, new_name.strip(), self):
             self._rebuild_legend()
     
+    def _on_plot_dims_changed(self):
+        """Plot W/H changed (Item 9) — resize the actual figure and update
+        the holder's aspect ratio so both the matplotlib canvas and the Qt
+        widget wrapping it agree on the new proportions."""
+        w = self._plot_w_spin.value()
+        h = self._plot_h_spin.value()
+        self._plot_w_in = w
+        self._plot_h_in = h
+        self._figure.set_size_inches(w, h)
+        self._canvas_container.set_aspect_ratio(h / w)
+        self._schedule_refresh()
+
     def _pick_label_color(self):
         """Open colour dialog to set colourbar / title text colour."""
         colour = QColorDialog.getColor(QColor(self._label_color), self, "Label colour")
@@ -6981,9 +7414,12 @@ class PlotCard(QFrame):
             self._schedule_refresh()
 
     def _update_label_color_btn(self):
-        """Update the button background to preview the chosen colour."""
+        """Update the button background to preview the chosen colour, with
+        contrasting text so the button stays legible regardless of which
+        colour is picked or the app's light/dark theme (Item 5)."""
+        text_color = _contrasting_text_color(self._label_color)
         self._label_color_btn.setStyleSheet(
-            f"background-color: {self._label_color};"
+            f"background-color: {self._label_color}; color: {text_color};"
         )
 
     # ------------------------------------------------------------------
@@ -7000,9 +7436,11 @@ class PlotCard(QFrame):
             'show_grid':      self._show_grid.isChecked(),
             'show_ticks':     self._show_ticks.isChecked(),
             'show_axis_labels': self._show_axis_labels.isChecked(),
-            'title_font':     self._title_font_spin.value(),
+            'title_font':     self._legend_font_spin.value(),  # key kept for backward-compat with saved layouts
             'axis_font':      self._axis_font_spin.value(),
             'label_color':    self._label_color,
+            'plot_w':         self._plot_w_spin.value(),
+            'plot_h':         self._plot_h_spin.value(),
         }
 
     def apply_config(self, config: dict):
@@ -7045,12 +7483,18 @@ class PlotCard(QFrame):
         if 'show_axis_labels' in config:
             self._show_axis_labels.setChecked(config['show_axis_labels'])
         if 'title_font' in config:
-            self._title_font_spin.setValue(int(config['title_font']))
+            self._legend_font_spin.setValue(int(config['title_font']))
         if 'axis_font' in config:
             self._axis_font_spin.setValue(int(config['axis_font']))
         if 'label_color' in config:
             self._label_color = config['label_color']
             self._update_label_color_btn()
+        if 'plot_w' in config or 'plot_h' in config:
+            self._plot_w_spin.setValue(float(config.get('plot_w', self._plot_w_spin.value())))
+            self._plot_h_spin.setValue(float(config.get('plot_h', self._plot_h_spin.value())))
+            # setValue's valueChanged already triggers _on_plot_dims_changed,
+            # which calls _schedule_refresh() itself -- no need to also
+            # fall through to the refresh call below for this one.
         self._schedule_refresh()
 
     def _copy_display_config(self):
@@ -7364,6 +7808,63 @@ class _SquareContainer(QWidget):
         self._child.setGeometry(x, y, side, side)
         super().resizeEvent(event)
 
+
+class _WrappingLegendWidget(QWidget):
+    """
+    Cluster-swatch legend for the Cluster Map panel. Instead of a single
+    column that scrolls taller than the plot next to it, entries fill
+    top-to-bottom then wrap into a new column -- so the legend's height
+    tracks the plot's height, and only very long cluster lists need a
+    (horizontal) scrollbar.
+    """
+    ROW_HEIGHT = 20
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._entries: list[QWidget] = []
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(2, 2, 2, 2)
+        self._grid.setSpacing(4)
+        self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+    def set_entries(self, entries: list[QWidget]):
+        """Replace the displayed rows and re-flow into columns."""
+        for w in self._entries:
+            self._grid.removeWidget(w)
+            w.deleteLater()
+        self._entries = entries
+        for w in entries:
+            w.setParent(self)
+        self._reflow()
+
+    def sizeHint(self):
+        return QSize(90, self.ROW_HEIGHT)
+
+    def minimumSizeHint(self):
+        # Deliberately NOT derived from the grid layout's own minimum --
+        # if it were, the widget's reported minimum would grow to fit
+        # whatever column count it currently has, the scroll area would
+        # honour that minimum, and self.height() would echo it straight
+        # back, so a single tall column could never be forced to wrap.
+        # Returning a small constant lets the scroll area's viewport
+        # (the real, external constraint) drive our actual height.
+        return QSize(60, self.ROW_HEIGHT)
+
+    def resizeEvent(self, event):
+        self._reflow()
+        super().resizeEvent(event)
+
+    def _reflow(self):
+        if not self._entries:
+            return
+        for w in self._entries:
+            self._grid.removeWidget(w)
+        rows_per_col = max(1, self.height() // self.ROW_HEIGHT)
+        for i, w in enumerate(self._entries):
+            col, row = divmod(i, rows_per_col)
+            self._grid.addWidget(w, row, col)
+
+
 class ClusterAnnotationTab(QWidget):
     """
     Tab 5 — Cluster Annotation (Item 8)
@@ -7392,6 +7893,18 @@ class ClusterAnnotationTab(QWidget):
         self.state = state
         self.bus = bus
         self.controller = controller
+        # {run_id: {'pooled': {ch: {cl_id: [arrays]}}, 'channels': [...],
+        #  'names_map': {...}}} — Item 9: cached per clustering run so
+        # switching FlowSOM -> Leiden -> FlowSOM redraws the FlowSOM
+        # violin instantly instead of reverting to the placeholder.
+        self._violin_cache: dict[str, dict] = {}
+        # Debounced auto-recompute (Item 3's "auto-plot all") — avoids
+        # recomputing on every single checkbox click while the user is
+        # still adjusting the checked set.
+        self._violin_recompute_timer = QTimer(self)
+        self._violin_recompute_timer.setSingleShot(True)
+        self._violin_recompute_timer.setInterval(400)
+        self._violin_recompute_timer.timeout.connect(self._recompute_violins)
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -7421,7 +7934,7 @@ class ClusterAnnotationTab(QWidget):
         content_layout.setContentsMargins(8, 8, 8, 8)
         content_layout.setSpacing(8)
 
-        # ---- Clustering run selector ----
+        # ---- Clustering run selector (shared by both sub-tabs below) ----
         run_row = QHBoxLayout()
         run_row.addWidget(QLabel("Clustering run:"))
         self.run_combo = QComboBox()
@@ -7432,8 +7945,17 @@ class ClusterAnnotationTab(QWidget):
         run_row.addStretch()
         content_layout.addLayout(run_row)
 
+        self.annotation_sub_tabs = QTabWidget()
+        self.annotation_sub_tabs.setDocumentMode(True)
+        self.annotation_sub_tabs.currentChanged.connect(self._on_annotation_sub_tab_changed)
+        content_layout.addWidget(self.annotation_sub_tabs, stretch=1)
+
+        annotation_page = QWidget()
+        annotation_page_layout = QVBoxLayout(annotation_page)
+        annotation_page_layout.setContentsMargins(0, 0, 0, 0)
         splitter = QSplitter(Qt.Vertical)
-        content_layout.addWidget(splitter, stretch=1)
+        annotation_page_layout.addWidget(splitter)
+        self.annotation_sub_tabs.addTab(annotation_page, "Annotation")
 
         # ============================================================
         # Panel 1 — Per-marker violin plots
@@ -7473,9 +7995,25 @@ class ClusterAnnotationTab(QWidget):
         ch_row.addLayout(ch_btn_col)
         violin_layout.addLayout(ch_row)
 
-        self.plot_violins_btn = QPushButton("▶  Plot Violins")
-        self.plot_violins_btn.clicked.connect(self._plot_violins)
-        violin_layout.addWidget(self.plot_violins_btn)
+        viewing_row = QHBoxLayout()
+        viewing_row.addWidget(QLabel("Viewing:"))
+        self.violin_channel_combo = QComboBox()
+        self.violin_channel_combo.setMinimumWidth(200)
+        self.violin_channel_combo.setToolTip(
+            "Which checked channel's violin plot is currently shown."
+        )
+        self.violin_channel_combo.currentIndexChanged.connect(self._draw_current_violin)
+        viewing_row.addWidget(self.violin_channel_combo)
+        viewing_row.addStretch()
+
+        self.plot_violins_btn = QPushButton("⟳  Recompute Violins")
+        self.plot_violins_btn.setToolTip(
+            "Checked channels plot automatically. Use this if underlying "
+            "gate/transform data changed without touching the checkboxes."
+        )
+        self.plot_violins_btn.clicked.connect(self._recompute_violins)
+        viewing_row.addWidget(self.plot_violins_btn)
+        violin_layout.addLayout(viewing_row)
 
         self._violin_scroll = QScrollArea()
         self._violin_scroll.setWidgetResizable(True)
@@ -7509,31 +8047,30 @@ class ClusterAnnotationTab(QWidget):
         self._compat_warning.setVisible(False)
         map_row.addWidget(self._compat_warning)
         map_row.addStretch()
+        self.map_popout_btn = QPushButton("⤢ Pop Out")
+        self.map_popout_btn.setToolTip("Open the cluster map in a larger window.")
+        self.map_popout_btn.clicked.connect(self._pop_out_map)
+        map_row.addWidget(self.map_popout_btn)
         map_layout.addLayout(map_row)
 
         map_plot_row = QHBoxLayout()
         from matplotlib.figure import Figure
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
         self._map_figure = Figure(figsize=(4, 4), constrained_layout=True)
-        self._map_canvas = FigureCanvasQTAgg(self._map_figure)
-        self._map_canvas.setMinimumSize(200, 200)
+        self._map_canvas = _new_scrollable_canvas(self._map_figure)
         self._map_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._map_square = _SquareContainer(self._map_canvas)
-        self._map_square.setMinimumSize(200, 200)
         self._map_square.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         map_plot_row.addWidget(self._map_square, stretch=1)
 
         legend_scroll = QScrollArea()
         legend_scroll.setWidgetResizable(True)
-        legend_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        legend_scroll.setFixedWidth(140)
+        legend_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        legend_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        legend_scroll.setMinimumWidth(110)
         legend_scroll.setFrameShape(QFrame.NoFrame)
-        self._legend_widget = QWidget()
-        self._legend_layout = QVBoxLayout(self._legend_widget)
-        self._legend_layout.setContentsMargins(2, 2, 2, 2)
-        self._legend_layout.setSpacing(2)
-        self._legend_layout.setAlignment(Qt.AlignTop)
+        self._legend_widget = _WrappingLegendWidget()
         legend_scroll.setWidget(self._legend_widget)
+        self._legend_scroll = legend_scroll
         map_plot_row.addWidget(legend_scroll)
 
         map_layout.addLayout(map_plot_row, stretch=1)
@@ -7560,12 +8097,137 @@ class ClusterAnnotationTab(QWidget):
         table_layout.addWidget(self.label_table)
         splitter.addWidget(table_box)
 
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
         splitter.setStretchFactor(2, 1)
-        splitter.setSizes([520, 520, 340])
+        splitter.setSizes([780, 1040, 340])
         splitter.setChildrenCollapsible(False)
-        self._violin_scroll.setMinimumHeight(400)
+        splitter.setMinimumHeight(2160)
+
+        # ============================================================
+        # Sub-tab 2 — Marker Heatmap & Ridgelines (Items 4 & 5)
+        # ============================================================
+        self._build_marker_summary_ui()
+
+    def _build_marker_summary_ui(self):
+        """
+        Sub-tab 2: mean-MFI heatmap (Item 4) and marker ridgeline grid
+        (Item 5), both keyed off the SAME clustering run selected at the
+        top of this tab, both cached per run_id (Item 9's pattern)
+        so switching runs doesn't discard an already-computed summary.
+        """
+        self._marker_summary_cache: dict[str, dict] = {}
+        # (run_id, is_dark) last actually rendered -- lets _draw_marker_summary
+        # skip rebuilding both figures from scratch on every sub-tab visit
+        # when nothing has changed since the last render.
+        self._marker_summary_last_drawn: tuple | None = None
+
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(4, 4, 4, 4)
+
+        btn_row = QHBoxLayout()
+        self.marker_summary_recompute_btn = QPushButton("⟳  Recompute Marker Summary")
+        self.marker_summary_recompute_btn.setToolTip(
+            "Uses every channel currently selected in the Configuration tab."
+        )
+        self.marker_summary_recompute_btn.clicked.connect(self._recompute_marker_summary)
+        btn_row.addWidget(self.marker_summary_recompute_btn)
+        btn_row.addStretch()
+        page_layout.addLayout(btn_row)
+
+        self._summary_splitter = QSplitter(Qt.Vertical)
+        page_layout.addWidget(self._summary_splitter, stretch=1)
+
+        heatmap_box = QGroupBox("Median MFI per Cluster (Transformed)")
+        heatmap_outer_layout = QVBoxLayout(heatmap_box)
+
+        # Frozen-header grid: (0,0) corner spacer, (0,1) marker-name
+        # header (scrolls horizontally in lock-step), (1,0) cluster-name
+        # header (scrolls vertically in lock-step), (1,1) the heatmap
+        # itself (scrolls both ways -- the only one with real scrollbars).
+        heatmap_grid = QGridLayout()
+        heatmap_grid.setContentsMargins(0, 0, 0, 0)
+        heatmap_grid.setSpacing(0)
+
+        self._heatmap_corner = QWidget()
+        heatmap_grid.addWidget(self._heatmap_corner, 0, 0)
+
+        self._heatmap_col_header_scroll = _FrozenScrollArea()
+        self._heatmap_col_header_scroll.setWidgetResizable(True)
+        self._heatmap_col_header_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._heatmap_col_header_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._heatmap_col_header_scroll.setFrameShape(QFrame.NoFrame)
+        heatmap_grid.addWidget(self._heatmap_col_header_scroll, 0, 1)
+
+        self._heatmap_row_header_scroll = _FrozenScrollArea()
+        self._heatmap_row_header_scroll.setWidgetResizable(True)
+        self._heatmap_row_header_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._heatmap_row_header_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._heatmap_row_header_scroll.setFrameShape(QFrame.NoFrame)
+        heatmap_grid.addWidget(self._heatmap_row_header_scroll, 1, 0)
+
+        self._heatmap_scroll = QScrollArea()
+        self._heatmap_scroll.setWidgetResizable(True)
+        self._heatmap_placeholder = QLabel(
+            "Select a clustering run, then click 'Recompute Marker Summary'."
+        )
+        self._heatmap_placeholder.setStyleSheet("color: grey; font-style: italic;")
+        self._heatmap_placeholder.setAlignment(Qt.AlignCenter)
+        self._heatmap_scroll.setWidget(self._heatmap_placeholder)
+        heatmap_grid.addWidget(self._heatmap_scroll, 1, 1)
+
+        heatmap_grid.setColumnStretch(1, 1)
+        heatmap_grid.setRowStretch(1, 1)
+
+        # The headers never scroll themselves (see _FrozenScrollArea) --
+        # they're driven entirely by the main heatmap's own scrollbars.
+        self._heatmap_scroll.horizontalScrollBar().valueChanged.connect(
+            self._heatmap_col_header_scroll.horizontalScrollBar().setValue
+        )
+        self._heatmap_scroll.verticalScrollBar().valueChanged.connect(
+            self._heatmap_row_header_scroll.verticalScrollBar().setValue
+        )
+
+        heatmap_outer_layout.addLayout(heatmap_grid)
+
+        # Colour scale -- kept separate from the (now full-bleed, label-
+        # free) heatmap figure so it doesn't need to scroll with anything.
+        self._heatmap_colorbar_scroll = QScrollArea()
+        self._heatmap_colorbar_scroll.setWidgetResizable(True)
+        self._heatmap_colorbar_scroll.setFrameShape(QFrame.NoFrame)
+        self._heatmap_colorbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._heatmap_colorbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._heatmap_colorbar_scroll.setFixedHeight(70)
+        heatmap_outer_layout.addWidget(self._heatmap_colorbar_scroll)
+        # Any leftover height in this splitter panel collapses to the
+        # bottom instead of stretching the (fixed-size) heatmap's scroll
+        # viewport -- that stretch was the source of the blank gap that
+        # used to appear between the heatmap and the colour scale.
+        heatmap_outer_layout.addStretch(1)
+
+        self._summary_splitter.addWidget(heatmap_box)
+
+        ridge_box = QGroupBox("Marker Ridgeline Grid")
+        ridge_layout = QVBoxLayout(ridge_box)
+        self._ridge_scroll = QScrollArea()
+        self._ridge_scroll.setWidgetResizable(True)
+        self._ridge_placeholder = QLabel(
+            "Select a clustering run, then click 'Recompute Marker Summary'."
+        )
+        self._ridge_placeholder.setStyleSheet("color: grey; font-style: italic;")
+        self._ridge_placeholder.setAlignment(Qt.AlignCenter)
+        self._ridge_scroll.setWidget(self._ridge_placeholder)
+        ridge_layout.addWidget(self._ridge_scroll, stretch=1)
+        self._summary_splitter.addWidget(ridge_box)
+
+        self._summary_splitter.setStretchFactor(0, 1)
+        self._summary_splitter.setStretchFactor(1, 1)
+        self._summary_splitter.setChildrenCollapsible(False)
+
+        self._marker_summary_tab_index = self.annotation_sub_tabs.addTab(
+            page, "Marker Heatmap / Ridgelines"
+        )
 
     # ------------------------------------------------------------------
     # Refresh (called on tab activation)
@@ -7578,6 +8240,15 @@ class ClusterAnnotationTab(QWidget):
         self._update_compat_warning()
         self._redraw_map()
         self._populate_label_table()
+        run_id = self.run_combo.currentData()
+        cache = self._violin_cache.get(run_id)
+        if cache:
+            self._populate_violin_channel_combo(cache['channels'])
+            self._draw_current_violin()
+        if self.annotation_sub_tabs.currentIndex() == getattr(self, '_marker_summary_tab_index', -1):
+            ms_cache = self._marker_summary_cache.get(run_id)
+            if ms_cache:
+                self._draw_marker_summary()
 
     # ------------------------------------------------------------------
     # Run selectors
@@ -7641,9 +8312,28 @@ class ClusterAnnotationTab(QWidget):
         self._update_compat_warning()
         self._redraw_map()
         self._populate_label_table()
-        self._show_violin_placeholder(
-            "Clustering run changed — click 'Plot Violins' to refresh."
-        )
+        run_id = self.run_combo.currentData()
+        cache = self._violin_cache.get(run_id)
+        if cache:
+            # Item 9: this run's violins were already computed earlier in
+            # the session — restore instantly instead of discarding them.
+            self._populate_violin_channel_combo(cache['channels'])
+            self._draw_current_violin()
+        elif run_id is not None and self._checked_channels():
+            self._recompute_violins()
+        else:
+            self._show_violin_placeholder(
+                "Select a clustering run and channel(s) to plot violins."
+            )
+        # Marker Summary sub-tab (Items 4/5): only touch it if it's the
+        # currently visible sub-tab — same lazy-when-visible rule
+        # _on_annotation_sub_tab_changed uses.
+        if self.annotation_sub_tabs.currentIndex() == getattr(self, '_marker_summary_tab_index', -1):
+            ms_cache = self._marker_summary_cache.get(run_id)
+            if ms_cache:
+                self._draw_marker_summary()
+            elif run_id is not None:
+                self._recompute_marker_summary()
 
     def _on_dr_run_changed(self, _index: int):
         self._update_compat_warning()
@@ -7675,12 +8365,22 @@ class ClusterAnnotationTab(QWidget):
                 w.deleteLater()
         self.channel_checkboxes.clear()
 
+        n_cols = 4
         for grid_idx, ch in enumerate(channels):
             cb = QCheckBox(labels.get(ch, ch))
             cb.setChecked(ch in previously_checked)
+            cb.toggled.connect(self._on_violin_channel_checkbox_toggled)
             self.channel_checkboxes[ch] = cb
-            row, col = divmod(grid_idx, 4)
+            row, col = divmod(grid_idx, n_cols)
             self.channel_grid.addWidget(cb, row, col)
+
+        # Grow to show every marker at once instead of clipping to the old
+        # fixed 70-140px box -- still caps out and falls back to the
+        # scroll area's own scrollbar for pathologically long panels.
+        n_rows = -(-len(channels) // n_cols) if channels else 1  # ceil div
+        content_h = min(n_rows * 22 + 16, 260)
+        self._channel_scroll.setMinimumHeight(content_h)
+        self._channel_scroll.setMaximumHeight(content_h)
 
     def _set_all_channels(self, checked: bool):
         for cb in self.channel_checkboxes.values():
@@ -7695,25 +8395,23 @@ class ClusterAnnotationTab(QWidget):
         self._violin_placeholder.setAlignment(Qt.AlignCenter)
         self._violin_scroll.setWidget(self._violin_placeholder)
 
-    def _plot_violins(self):
+    def _on_violin_channel_checkbox_toggled(self, _checked: bool):
+        self._violin_recompute_timer.start()
+
+    def _pool_violin_data(self, cl_run: dict, channels: list[str]) -> dict[str, dict[int, list]]:
         """
-        Split by the SELECTED run's own per-sample label arrays and draw
-        one violin subplot per checked channel. Prefers the run's own
-        'marker_values' snapshot (frozen at classification time -- see
+        Pool per-cluster raw values for each channel from the run's own
+        per-sample label arrays. Prefers the run's own 'marker_values'
+        snapshot (frozen at classification time -- see
         drc_clustering.py's _snapshot_marker_values -- guaranteed
         row-for-row aligned to 'labels' regardless of gate/channel edits
         made since). Falls back to live-reloading + truncating for runs
         archived before that snapshot existed.
-        """
-        cl_run = self._selected_cluster_run()
-        if cl_run is None:
-            QMessageBox.warning(self, "No Run Selected", "Select a clustering run first.")
-            return
-        channels = self._checked_channels()
-        if not channels:
-            QMessageBox.warning(self, "No Channels", "Check at least one channel to plot.")
-            return
 
+        Extracted from the old single-shot _plot_violins so results can
+        be cached per run_id (Item 9) instead of recomputed every time
+        the viewed channel changes (Item 3).
+        """
         labels_dict = cl_run.get('labels', {}) or {}
         snapshot_dict = cl_run.get('marker_values', {}) or {}
         training_samples = cl_run.get('training_sample_ids', [])
@@ -7731,7 +8429,7 @@ class ClusterAnnotationTab(QWidget):
                 values = np.asarray(values)
                 if len(values) != len(labels):
                     _log.warning(
-                        "_plot_violins: %s -- snapshot (%d) vs labels (%d) "
+                        "_pool_violin_data: %s -- snapshot (%d) vs labels (%d) "
                         "length mismatch, skipping sample.",
                         rel, len(values), len(labels),
                     )
@@ -7743,7 +8441,7 @@ class ClusterAnnotationTab(QWidget):
                 values, names = mv
                 if len(values) != len(labels):
                     _log.warning(
-                        "_plot_violins: %s -- values (%d) vs labels (%d) length "
+                        "_pool_violin_data: %s -- values (%d) vs labels (%d) length "
                         "mismatch, truncating to %d. This run predates the "
                         "marker-value snapshot fix -- re-run clustering for "
                         "guaranteed alignment.",
@@ -7764,87 +8462,132 @@ class ClusterAnnotationTab(QWidget):
         for ch in channels:
             means = {cl: float(np.mean(np.concatenate(vals)))
                     for cl, vals in pooled.get(ch, {}).items()}
-            _log.info("_plot_violins: %s per-cluster raw mean: %s", ch, means)
+            _log.info("_pool_violin_data: %s per-cluster raw mean: %s", ch, means)
 
-        from matplotlib.figure import Figure
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-        from PySide6.QtGui import QPalette
-        from PySide6.QtWidgets import QApplication
+        return pooled
 
-        n = len(channels)
-        n_cols = min(3, n)
-        n_rows = -(-n // n_cols)
+    def _recompute_violins(self):
+        """
+        Pool data for every checked channel and cache it against the
+        current run (Item 9), then show whichever channel is selected in
+        violin_channel_combo (Item 3 — one big plot at a time instead of
+        a multi-panel grid).
+        """
+        cl_run = self._selected_cluster_run()
+        run_id = self.run_combo.currentData()
+        if cl_run is None or run_id is None:
+            self._show_violin_placeholder("Select a clustering run to plot violins.")
+            return
+        channels = self._checked_channels()
+        if not channels:
+            self._show_violin_placeholder("Check at least one channel to plot.")
+            return
 
-        _palette = QApplication.instance().palette()
-        is_dark = _palette.color(QPalette.ColorRole.Base).value() < 128
-        _fg = 'white' if is_dark else 'black'
-        _violin_color = '#5dade2' if is_dark else '#2e6da4'
-        _mean_color = '#ffd54f' if is_dark else '#c0392b'
-        display_labels = _antigen_dash_labels(self.controller)
+        pooled = self._pool_violin_data(cl_run, channels)
+        self._violin_cache[run_id] = {
+            'pooled': pooled,
+            'channels': list(channels),
+            'names_map': cl_run.get('names', {}),
+            'colors_map': cl_run.get('colors', {}),
+        }
+        self._populate_violin_channel_combo(channels)
+        self._draw_current_violin()
 
-        fig = Figure(figsize=(4.2 * n_cols, 3.2 * n_rows), constrained_layout=True)
-        if is_dark:
-            fig.patch.set_facecolor('#1e1e1e')
-        names_map = cl_run.get('names', {})
+    def _populate_violin_channel_combo(self, channels: list[str]):
+        prev = self.violin_channel_combo.currentData()
+        self.violin_channel_combo.blockSignals(True)
+        self.violin_channel_combo.clear()
+        labels = _antigen_dash_labels(self.controller)
+        for ch in channels:
+            self.violin_channel_combo.addItem(labels.get(ch, ch), ch)
+        idx = self.violin_channel_combo.findData(prev)
+        self.violin_channel_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.violin_channel_combo.blockSignals(False)
 
-        for i, ch in enumerate(channels):
-            ax = fig.add_subplot(n_rows, n_cols, i + 1)
-            if is_dark:
-                ax.set_facecolor('#2b2b2b')
-                ax.tick_params(colors=_fg)
-                ax.xaxis.label.set_color(_fg)
-                ax.yaxis.label.set_color(_fg)
-                ax.title.set_color(_fg)
-                for spine in ax.spines.values():
-                    spine.set_edgecolor(_fg)
-            # Explicit grid, drawn UNDER the data and deliberately faint --
-            # otherwise this inherits whatever global style is active (see
-            # the "suppress inherited seaborn 'whitegrid'" comments
-            # elsewhere in this file), which draws full-strength gridlines
-            # on TOP of the violins.
-            ax.set_axisbelow(True)
-            ax.grid(True, axis='y', linewidth=0.4, alpha=0.15, color=_fg)
-            title = display_labels.get(ch, ch)
-            by_cluster = pooled.get(ch, {})
-            cl_ids = sorted(by_cluster.keys())
-            if not cl_ids:
-                ax.set_title(f"{title} (no data)", fontsize=8)
-                ax.axis('off')
-                continue
-            data = [_apply_channel_transform(self.state, ch, np.concatenate(by_cluster[cl_id]))
-                   for cl_id in cl_ids]
-            parts = ax.violinplot(data, showmeans=True, showextrema=False)
-            for body in parts['bodies']:
-                body.set_facecolor(_violin_color)
-                body.set_edgecolor(_violin_color)
-                body.set_alpha(0.75)
-            if 'cmeans' in parts:
-                parts['cmeans'].set_color(_mean_color)
-                parts['cmeans'].set_linewidth(1.5)
-            ax.set_xticks(range(1, len(cl_ids) + 1))
-            ax.set_xticklabels(
-                [names_map.get(cl, str(cl)) for cl in cl_ids],
-                rotation=45, ha='right', fontsize=7,
-            )
-            ax.set_title(title, fontsize=9)
-            tick_spec = _channel_axis_ticks(self.state, ch)
-            if tick_spec is not None:
-                major_ticks, minor_ticks, limits = tick_spec
-                ax.set_yticks([pos for pos, _label in major_ticks])
-                ax.set_yticklabels([label for _pos, label in major_ticks])
-                ax.set_yticks([pos for pos, _label in minor_ticks], minor=True)
-                ax.tick_params(axis='y', which='minor', length=2, labelsize=0)
-                ax.set_ylim(limits[0], limits[1])
-                ax.set_ylabel('Intensity', fontsize=7)
-            else:
-                ax.set_ylabel('Transformed intensity', fontsize=7)
-            ax.tick_params(labelsize=7)
-
-        canvas = FigureCanvasQTAgg(fig)
+    def _draw_current_violin(self):
+        """Redraw from cached pooled data -- no recomputation, so
+        switching the viewed channel (or switching back to a previously-
+        viewed clustering run) is instant."""
+        run_id = self.run_combo.currentData()
+        cache = self._violin_cache.get(run_id)
+        if not cache or not cache['pooled']:
+            self._show_violin_placeholder("Check at least one channel to plot.")
+            return
+        ch = self.violin_channel_combo.currentData()
+        if ch is None:
+            return
+        fig = self._make_single_violin_figure(
+            ch, cache['pooled'].get(ch, {}), cache['names_map'], cache.get('colors_map', {}),
+        )
+        canvas = _new_scrollable_canvas(fig)
         dpi = fig.get_dpi()
         canvas.setMinimumSize(int(fig.get_figwidth() * dpi), int(fig.get_figheight() * dpi))
         self._violin_scroll.setWidget(canvas)
         canvas.draw()
+
+    def _make_single_violin_figure(self, ch: str, by_cluster: dict, names_map: dict,
+                                   colors_map: dict | None = None):
+        """One big violin plot for a single channel, filling the
+        available space (Item 3 — was a small tile in a multi-panel grid).
+        Each violin is coloured by its own cluster's colour (same colours
+        as the Cluster Map / legend / label table) instead of one flat
+        colour for all of them."""
+        from matplotlib.figure import Figure
+
+        is_dark = _resolve_is_dark(self.state)
+        fg = 'white' if is_dark else 'black'
+        fallback_color = '#5dade2' if is_dark else '#2e6da4'
+        mean_color = '#ffd54f' if is_dark else '#c0392b'
+        colors_map = colors_map or {}
+        title = _antigen_dash_labels(self.controller).get(ch, ch)
+
+        fig = Figure(figsize=(9, 6), constrained_layout=True)
+        ax = fig.add_subplot(111)
+        _style_figure_theme(fig, is_dark, axes=[ax])
+        # Explicit grid, drawn UNDER the data and deliberately faint --
+        # otherwise this inherits whatever global style is active (see
+        # the "suppress inherited seaborn 'whitegrid'" comments elsewhere
+        # in this file), which draws full-strength gridlines on TOP of
+        # the violin.
+        ax.set_axisbelow(True)
+        ax.grid(True, axis='y', linewidth=0.4, alpha=0.15, color=fg)
+
+        cl_ids = sorted(by_cluster.keys())
+        if not cl_ids:
+            ax.set_title(f"{title} (no data)", fontsize=11)
+            ax.axis('off')
+            return fig
+
+        data = [_apply_channel_transform(self.state, ch, np.concatenate(by_cluster[cl_id]))
+               for cl_id in cl_ids]
+        parts = ax.violinplot(data, showmeans=True, showextrema=False)
+        for cl_id, body in zip(cl_ids, parts['bodies']):
+            color = colors_map.get(cl_id, fallback_color)
+            body.set_facecolor(color)
+            body.set_edgecolor(color)
+            body.set_alpha(0.75)
+        if 'cmeans' in parts:
+            parts['cmeans'].set_color(mean_color)
+            parts['cmeans'].set_linewidth(1.5)
+        ax.set_xticks(range(1, len(cl_ids) + 1))
+        ax.set_xticklabels(
+            [names_map.get(cl, str(cl)) for cl in cl_ids],
+            rotation=45, ha='right', fontsize=10,
+        )
+        ax.set_title(title, fontsize=13)
+        tick_spec = _channel_axis_ticks(self.state, ch)
+        if tick_spec is not None:
+            major_ticks, minor_ticks, limits = tick_spec
+            ax.set_yticks([pos for pos, _label in major_ticks])
+            ax.set_yticklabels([label for _pos, label in major_ticks])
+            ax.set_yticks([pos for pos, _label in minor_ticks], minor=True)
+            ax.tick_params(axis='y', which='minor', length=2, labelsize=0)
+            ax.set_ylim(limits[0], limits[1])
+            ax.set_ylabel('Intensity', fontsize=10)
+        else:
+            ax.set_ylabel('Transformed intensity', fontsize=10)
+        ax.tick_params(labelsize=9)
+        return fig
 
     # ------------------------------------------------------------------
     # Panel 2 — cluster map
@@ -7856,21 +8599,29 @@ class ClusterAnnotationTab(QWidget):
 
         self._map_figure.clear()
         ax = self._map_figure.add_subplot(111)
-        ax.set_aspect('equal', adjustable='datalim')
+        self._draw_map_axes(ax, cl_run, dr_run, fontsize=7)
+        _style_figure_theme(self._map_figure, _resolve_is_dark(self.state), axes=[ax])
+        self._map_canvas.draw_idle()
+        self._rebuild_map_legend(cl_run)
+
+    def _draw_map_axes(self, ax, cl_run: dict | None, dr_run: dict | None, fontsize: int = 7):
+        """
+        Draw the cluster map onto *ax* -- shared by the inline panel
+        (_redraw_map) and the bigger pop-out dialog (_pop_out_map, Item
+        6) so both render identically, the same way PlotCard and this
+        tab already share drc_scatter.draw_cluster_scatter itself.
+        """
+        ax.set_aspect('equal', adjustable='box')
 
         if dr_run is None:
             ax.text(0.5, 0.5, 'No DR run selected.', ha='center', va='center',
                     transform=ax.transAxes, fontsize=9)
-            self._map_canvas.draw_idle()
-            self._rebuild_map_legend(cl_run)
             return
 
         emb_dict = dr_run.get('embeddings', {}) or {}
         if not emb_dict:
             ax.text(0.5, 0.5, f"No embeddings for \"{dr_run.get('label', '')}\".",
                     ha='center', va='center', transform=ax.transAxes, fontsize=9)
-            self._map_canvas.draw_idle()
-            self._rebuild_map_legend(cl_run)
             return
 
         labels_dict = cl_run.get('labels', {}) if cl_run else {}
@@ -7909,22 +8660,45 @@ class ClusterAnnotationTab(QWidget):
             xy, lab = xy[idx], lab[idx]
 
         algo = dr_run.get('algorithm', '') or ''
-        ax.set_xlabel(f"{algo} 1", fontsize=7)
-        ax.set_ylabel(f"{algo} 2", fontsize=7)
-        ax.tick_params(labelsize=7)
+        ax.set_xlabel(f"{algo} 1", fontsize=fontsize)
+        ax.set_ylabel(f"{algo} 2", fontsize=fontsize)
+        ax.tick_params(labelsize=fontsize)
 
         drc_scatter.draw_cluster_scatter(ax, xy, lab, cl_run, self.controller)
-        self._map_canvas.draw_idle()
-        self._rebuild_map_legend(cl_run)
+
+    def _pop_out_map(self):
+        """Regenerate the cluster map at a larger size in its own window,
+        with the same pan/zoom toolbar the Stats results tabs already
+        have (Item 6)."""
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+
+        cl_run = self._selected_cluster_run()
+        dr_run = self._selected_dr_run()
+
+        dlg_fig = Figure(figsize=(8, 8), constrained_layout=True)
+        ax = dlg_fig.add_subplot(111)
+        self._draw_map_axes(ax, cl_run, dr_run, fontsize=10)
+        _style_figure_theme(dlg_fig, _resolve_is_dark(self.state), axes=[ax])
+
+        dlg_canvas = _new_scrollable_canvas(dlg_fig)
+        dlg_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        dlg_toolbar = NavigationToolbar2QT(dlg_canvas, None)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Cluster Map")
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dlg.resize(900, 900)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(dlg_toolbar)
+        layout.addWidget(dlg_canvas)
+        dlg_canvas.draw()
+        dlg.show()
 
     def _rebuild_map_legend(self, cl_run: dict | None):
-        while self._legend_layout.count():
-            item = self._legend_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
         colors = cl_run.get('colors', {}) if cl_run else {}
         names = cl_run.get('names', {}) if cl_run else {}
+        entries: list[QWidget] = []
         for lbl in sorted(colors.keys()):
             color = colors[lbl]
             name = names.get(lbl, 'Noise' if lbl < 0 else str(lbl))
@@ -7952,9 +8726,9 @@ class ClusterAnnotationTab(QWidget):
 
             row_w = QWidget()
             row_w.setLayout(row)
-            self._legend_layout.addWidget(row_w)
+            entries.append(row_w)
 
-        self._legend_layout.addStretch()
+        self._legend_widget.set_entries(entries)
 
     def _prompt_rename(self, label: int):
         from PySide6.QtWidgets import QInputDialog
@@ -8028,13 +8802,14 @@ class ClusterAnnotationTab(QWidget):
             self.label_table.setItem(row, 3, pct_item)
         self.label_table.blockSignals(False)
 
-        # Grow to show every cluster, capped at ~half when there are a lot
-        # (matches the violin/map panels rather than fighting them for space).
+        # Small fixed floor only. This used to grow with cluster count,
+        # but _populate_label_table() runs on every run switch, rename,
+        # and recolour -- not just once at startup -- so a minimum that
+        # regrew here kept re-asserting itself mid-drag and fighting the
+        # splitter. The table has its own scrollbar for extra rows.
         row_h = self.label_table.verticalHeader().defaultSectionSize()
         header_h = self.label_table.horizontalHeader().height()
-        n_rows = len(unique)
-        visible_rows = n_rows if n_rows <= 20 else max(10, n_rows // 2)
-        self.label_table.setMinimumHeight(header_h + row_h * visible_rows + 8)
+        self.label_table.setMinimumHeight(header_h + row_h * 3 + 8)
 
     def _on_table_item_changed(self, item: QTableWidgetItem):
         """Inline rename via the Name column. Same duplicate check as the
@@ -8069,6 +8844,337 @@ class ClusterAnnotationTab(QWidget):
             self._populate_label_table()
             self._rebuild_map_legend(cl_run)
             self._redraw_map()
+
+    def _on_annotation_sub_tab_changed(self, index: int):
+        """Lazily compute the Marker Summary sub-tab only when it becomes
+        visible, and only if this run hasn't been computed yet -- same
+        lazy/cached pattern as the violin panel (Item 9)."""
+        if index != getattr(self, '_marker_summary_tab_index', -1):
+            return
+        run_id = self.run_combo.currentData()
+        if run_id in self._marker_summary_cache:
+            self._draw_marker_summary()
+        elif run_id is not None:
+            self._recompute_marker_summary()
+
+    def _recompute_marker_summary(self):
+        cl_run = self._selected_cluster_run()
+        run_id = self.run_combo.currentData()
+        if cl_run is None or run_id is None:
+            self._show_marker_summary_placeholder("Select a clustering run first.")
+            return
+        channels = [c for c in self.state.selected_channels
+                   if c not in drc_pipeline.META_CHANNELS]
+        if not channels:
+            self._show_marker_summary_placeholder(
+                "No channels selected (see Configuration tab)."
+            )
+            return
+        cluster_order = sorted(cl for cl in cl_run.get('colors', {}) if cl >= 0)
+        pooled = self._pool_violin_data(cl_run, channels)
+        self._marker_summary_cache[run_id] = {
+            'channels': channels,
+            'cluster_order': cluster_order,
+            'pooled': pooled,
+            'names_map': cl_run.get('names', {}),
+            'colors_map': cl_run.get('colors', {}),
+        }
+        self._marker_summary_last_drawn = None
+        self._draw_marker_summary()
+
+    def _show_marker_summary_placeholder(self, text: str):
+        for scroll in (self._heatmap_scroll, self._ridge_scroll):
+            placeholder = QLabel(text)
+            placeholder.setStyleSheet("color: grey; font-style: italic;")
+            placeholder.setAlignment(Qt.AlignCenter)
+            scroll.setWidget(placeholder)
+        for empty_scroll in (self._heatmap_col_header_scroll, self._heatmap_row_header_scroll,
+                             self._heatmap_colorbar_scroll):
+            empty_scroll.setWidget(QWidget())
+
+    def _draw_marker_summary(self):
+        run_id = self.run_combo.currentData()
+        cache = self._marker_summary_cache.get(run_id)
+        if not cache or not cache['cluster_order']:
+            self._marker_summary_last_drawn = None
+            self._show_marker_summary_placeholder(
+                "No clustered data to summarise for this run."
+            )
+            return
+
+        is_dark = _resolve_is_dark(self.state)
+        draw_key = (run_id, is_dark)
+        if draw_key == self._marker_summary_last_drawn:
+            # Same run, same theme, pooled data hasn't changed since the
+            # last render -- switching back to this sub-tab shouldn't
+            # rebuild two matplotlib figures from scratch every time.
+            return
+        self._marker_summary_last_drawn = draw_key
+
+        mat = self._compute_marker_heatmap_matrix(
+            cache['pooled'], cache['channels'], cache['cluster_order'],
+        )
+        main_fig, col_fig, row_fig = self._make_marker_cluster_heatmap_figures(
+            mat, cache['channels'], cache['cluster_order'], cache['names_map'],
+        )
+        dpi = main_fig.get_dpi()
+
+        main_canvas = _new_scrollable_canvas(main_fig)
+        main_canvas.setFixedSize(int(main_fig.get_figwidth() * dpi), int(main_fig.get_figheight() * dpi))
+        self._heatmap_scroll.setWidget(main_canvas)
+        main_canvas.draw()
+
+        col_canvas = _new_scrollable_canvas(col_fig)
+        col_canvas.setFixedSize(int(col_fig.get_figwidth() * dpi), int(col_fig.get_figheight() * dpi))
+        self._heatmap_col_header_scroll.setWidget(col_canvas)
+        self._heatmap_col_header_scroll.setFixedHeight(int(col_fig.get_figheight() * dpi))
+        col_canvas.draw()
+
+        row_canvas = _new_scrollable_canvas(row_fig)
+        row_canvas.setFixedSize(int(row_fig.get_figwidth() * dpi), int(row_fig.get_figheight() * dpi))
+        self._heatmap_row_header_scroll.setWidget(row_canvas)
+        self._heatmap_row_header_scroll.setFixedWidth(int(row_fig.get_figwidth() * dpi))
+        row_canvas.draw()
+
+        self._heatmap_corner.setFixedSize(
+            int(row_fig.get_figwidth() * dpi), int(col_fig.get_figheight() * dpi)
+        )
+
+        cbar_fig = self._make_marker_cluster_colorbar_figure(mat)
+        cbar_dpi = cbar_fig.get_dpi()
+        cbar_canvas = _new_scrollable_canvas(cbar_fig)
+        cbar_canvas.setFixedSize(int(cbar_fig.get_figwidth() * cbar_dpi), int(cbar_fig.get_figheight() * cbar_dpi))
+        self._heatmap_colorbar_scroll.setWidget(cbar_canvas)
+        cbar_canvas.draw()
+
+        ridge_fig = self._make_marker_ridgeline_figure(
+            cache['pooled'], cache['channels'], cache['cluster_order'],
+            cache['names_map'], cache['colors_map'],
+        )
+        ridge_canvas = _new_scrollable_canvas(ridge_fig)
+        dpi2 = ridge_fig.get_dpi()
+        ridge_canvas.setMinimumSize(int(ridge_fig.get_figwidth() * dpi2), int(ridge_fig.get_figheight() * dpi2))
+        self._ridge_scroll.setWidget(ridge_canvas)
+        ridge_canvas.draw()
+
+        # Default the splitter to the heatmap's own natural height, read
+        # from Qt's own layout metrics rather than a guessed "chrome"
+        # constant (Item 10) -- pin the one flexible piece (the main
+        # heatmap viewport, normally stretched by heatmap_grid) to its
+        # exact content height just long enough to ask heatmap_box for its
+        # real sizeHint (title bar + margins included, computed by the
+        # actual style rather than estimated), then release the pin so
+        # the viewport goes back to its normal flexible behaviour.
+        main_h_px = int(main_fig.get_figheight() * dpi)
+        self._heatmap_scroll.setFixedHeight(main_h_px)
+        heatmap_box.adjustSize()
+        ideal_top_h = heatmap_box.sizeHint().height()
+        self._heatmap_scroll.setMinimumHeight(0)
+        self._heatmap_scroll.setMaximumHeight(16_777_215)  # QWIDGETSIZE_MAX
+
+        total_h = self._summary_splitter.height()
+        if total_h > 0:
+            top_h = max(150, min(ideal_top_h, total_h - 150))
+            self._summary_splitter.setSizes([top_h, total_h - top_h])
+
+    def _compute_marker_heatmap_matrix(self, pooled_by_channel: dict, channels: list[str],
+                                       cluster_order: list[int]) -> np.ndarray:
+        """
+        median MFI per cluster x marker, on the TRANSFORMED
+        (Transforms-tab) scale -- same convention the ridgeline grid
+        uses via _apply_channel_transform, so both panels describe the
+        same axis. Rows = clusters (same fixed order as the ridgeline
+        grid), columns = markers. Median rather than mean so a handful
+        of extreme events in a cluster can't swing a whole cell's colour.
+        NaN where a cluster/marker combination has no pooled data.
+        """
+        mat = np.full((len(cluster_order), len(channels)), np.nan)
+        for col, ch in enumerate(channels):
+            by_cluster = pooled_by_channel.get(ch, {})
+            for row, cl_id in enumerate(cluster_order):
+                vals = by_cluster.get(cl_id)
+                if vals:
+                    arr = _apply_channel_transform(self.state, ch, np.concatenate(vals))
+                    mat[row, col] = float(np.median(arr))
+        return mat
+
+    def _make_marker_cluster_heatmap_figures(self, mat: np.ndarray, channels: list[str],
+                                             cluster_order: list[int], names_map: dict):
+        """
+        Three figures sharing one DPI, built for frozen-header scrolling:
+        main_fig (the heatmap image, no labels), col_fig (marker-name
+        strip, same total WIDTH as main_fig), row_fig (cluster-name
+        strip, same total HEIGHT as main_fig).
+
+        main_fig and col_fig both reserve a fixed blank margin on the
+        left and right of their data region (label_margin_in, identical
+        in both figures) -- without it, a marker label anchored at the
+        first or last column has nowhere to go but off the edge of the
+        canvas. Adding the same margin to both figures keeps the
+        pixels-per-column scale identical between them, so column i
+        still lands at the same pixel offset in both (which is what
+        lets one QScrollArea's scrollbars drive the other) -- it just
+        means there's now a thin blank strip down each side of the
+        heatmap image too.
+        """
+        from matplotlib.figure import Figure
+
+        is_dark = _resolve_is_dark(self.state)
+        labels = _antigen_dash_labels(self.controller)
+        fg = 'white' if is_dark else 'black'
+
+        n_channels = len(channels)
+        n_clusters = len(cluster_order)
+        dpi = 100
+        core_w = max(5.0, 0.55 * n_channels)
+        label_margin_in = 1.1
+        main_w = core_w + 2 * label_margin_in
+        main_h = max(4.0, 0.35 * n_clusters)
+        col_header_h = 1.8
+        row_header_w = 1.6
+        # Horizontal placement shared by main_fig and col_fig -- same
+        # left offset and same width fraction, so column i is at the
+        # identical pixel x in both.
+        data_rect_x = label_margin_in / main_w
+        data_rect_w = core_w / main_w
+
+        mat_filled = np.nan_to_num(mat, nan=0.0)
+
+        main_fig = Figure(figsize=(main_w, main_h), dpi=dpi)
+        ax = main_fig.add_axes([data_rect_x, 0, data_rect_w, 1])
+        ax.imshow(mat_filled, aspect='auto', cmap='viridis')
+        ax.set_xlim(-0.5, n_channels - 0.5)
+        ax.set_ylim(n_clusters - 0.5, -0.5)
+        ax.axis('off')
+        ax.set_xticks(np.arange(-0.5, n_channels, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, n_clusters, 1), minor=True)
+        ax.grid(which='minor', color='white', linestyle='-', linewidth=0.6)
+        ax.tick_params(which='minor', bottom=False, left=False)
+        _style_figure_theme(main_fig, is_dark, axes=[ax])
+
+        col_fig = Figure(figsize=(main_w, col_header_h), dpi=dpi)
+        cax = col_fig.add_axes([data_rect_x, 0, data_rect_w, 1])
+        cax.set_xlim(-0.5, n_channels - 0.5)
+        cax.set_ylim(0, 1)
+        cax.axis('off')
+        for i, ch in enumerate(channels):
+            # Anchor at the start of the label, at the column's centre
+            cax.text(i, 0.05, labels.get(ch, ch), rotation=45, ha='left', va='bottom',
+                     rotation_mode='anchor', fontsize=8, color=fg)
+        _style_figure_theme(col_fig, is_dark)
+
+        row_fig = Figure(figsize=(row_header_w, main_h), dpi=dpi)
+        rax = row_fig.add_axes([0, 0, 1, 1])
+        rax.set_ylim(n_clusters - 0.5, -0.5)
+        rax.set_xlim(0, 1)
+        rax.axis('off')
+        for row, cl in enumerate(cluster_order):
+            rax.text(0.92, row, names_map.get(cl, str(cl)), ha='right', va='center',
+                     fontsize=8, color=fg)
+        _style_figure_theme(row_fig, is_dark)
+
+        return main_fig, col_fig, row_fig
+
+    def _make_marker_cluster_colorbar_figure(self, mat: np.ndarray):
+        """Standalone colour-scale strip, separate from the (now
+        label-free) heatmap figure so it never needs to scroll."""
+        from matplotlib.figure import Figure
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
+
+        is_dark = _resolve_is_dark(self.state)
+        mat_filled = np.nan_to_num(mat, nan=0.0)
+        vmin = float(mat_filled.min()) if mat_filled.size else 0.0
+        vmax = float(mat_filled.max()) if mat_filled.size else 1.0
+        if vmin == vmax:
+            vmax = vmin + 1.0
+        sm = ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax), cmap='viridis')
+        sm.set_array([])
+
+        fig = Figure(figsize=(4.0, 0.7), dpi=100, constrained_layout=True)
+        ax = fig.add_subplot(111)
+        fig.colorbar(sm, cax=ax, orientation='horizontal', label='Median transformed MFI')
+        _style_figure_theme(fig, is_dark, axes=[ax])
+        return fig
+
+    def _make_marker_ridgeline_figure(self, pooled_by_channel: dict, channels: list[str],
+                                      cluster_order: list[int], names_map: dict,
+                                      colors_map: dict):
+        """
+        CATALYST/diffcyt-style marker ridge grid — one small
+        subplot per marker (channels, as columns), each containing every
+        cluster's density curve stacked as a row, in the SAME order in
+        every panel (cluster_order — see _recompute_marker_summary),
+        coloured with the run's own per-cluster colours so identity
+        matches the Cluster Map / legend elsewhere in this tab.
+        """
+        from matplotlib.figure import Figure
+        from scipy.stats import gaussian_kde
+
+        is_dark = _resolve_is_dark(self.state)
+        labels = _antigen_dash_labels(self.controller)
+
+        n = len(channels)
+        n_cols = min(4, max(1, n))
+        n_rows = -(-n // n_cols) if n else 1
+        row_h = 0.55
+        panel_h = max(3.0, len(cluster_order) * row_h + 1.0)
+        fig = Figure(figsize=(3.2 * n_cols, panel_h * n_rows), constrained_layout=True)
+
+        ax0 = None
+        for i, ch in enumerate(channels):
+            ax = fig.add_subplot(n_rows, n_cols, i + 1, sharey=ax0)
+            if ax0 is None:
+                ax0 = ax
+
+            by_cluster = pooled_by_channel.get(ch, {})
+            for row_idx, cl_id in enumerate(cluster_order):
+                vals = by_cluster.get(cl_id)
+                if not vals:
+                    continue
+                arr = _apply_channel_transform(self.state, ch, np.concatenate(vals))
+                arr = arr[np.isfinite(arr)]
+                if len(arr) < 5 or np.ptp(arr) == 0:
+                    continue
+                try:
+                    kde = gaussian_kde(arr)
+                except Exception:
+                    continue
+                xs = np.linspace(arr.min(), arr.max(), 200)
+                density = kde(xs)
+                density = density / density.max() * 1.4   # ridge height, allows slight overlap
+                baseline = row_idx
+                color = colors_map.get(cl_id, '#888888')
+                ax.fill_between(xs, baseline, baseline + density, color=color, alpha=0.75, linewidth=0)
+                ax.plot(xs, baseline + density, color=color, linewidth=0.8)
+
+            ax.set_title(labels.get(ch, ch), fontsize=9)
+            ax.set_ylim(-0.3, len(cluster_order) + 0.3)
+            if i % n_cols == 0:
+                ax.set_yticks(range(len(cluster_order)))
+                ax.set_yticklabels([names_map.get(cl, str(cl)) for cl in cluster_order], fontsize=7)
+            else:
+                ax.tick_params(labelleft=False)
+            ax.tick_params(labelsize=6)
+
+            # Data stays on the transformed scale (arr, above) -- only the
+            # tick labels switch to the original raw-scale numbers, same
+            # convention as the Transforms tab's 2D histograms and the
+            # violin y-axis (_channel_axis_ticks).
+            tick_spec = _channel_axis_ticks(self.state, ch)
+            if tick_spec is not None:
+                major_ticks, minor_ticks, limits = tick_spec
+                ax.set_xticks([pos for pos, _label in major_ticks])
+                ax.set_xticklabels([label for _pos, label in major_ticks], fontsize=6)
+                ax.set_xticks([pos for pos, _label in minor_ticks], minor=True)
+                ax.tick_params(axis='x', which='minor', length=2, labelsize=0)
+                ax.set_xlim(limits[0], limits[1])
+                ax.set_xlabel('Intensity', fontsize=6)
+            else:
+                ax.set_xlabel('Transformed intensity', fontsize=6)
+
+        _style_figure_theme(fig, is_dark)
+        return fig
 
 
 class PluginWidget(QWidget):
@@ -8264,16 +9370,12 @@ class PluginWidget(QWidget):
                 current_key = self._settings_key()
                 if current_key != self._loaded_experiment_key:
                     # Only reload from QSettings / rebuild the workspace when
-                    # we're switching to a DIFFERENT experiment. On every
-                    # other activation, self.state.plot_configs is already
-                    # authoritative (kept live by add_plot/remove_card) —
-                    # QSettings is only written on inner-tab switch, so
-                    # re-pulling it here on every reactivation was clobbering
-                    # live deletions with a stale on-disk snapshot.
+                    # we're switching to a different experiment.
                     self.load_state()
                     if hasattr(self, 'workspace_tab'):
                         wt = self.workspace_tab
                         wt.col_combo.setCurrentText(str(self.state.workspace_n_columns))
+                        wt.theme_combo.setCurrentText(self.state.plot_theme.capitalize())
                         for card in list(wt._plot_cards):
                             wt.remove_card(card)
                         pending = getattr(self, '_pending_plot_configs', [])
@@ -8363,6 +9465,9 @@ class PluginWidget(QWidget):
             s.setValue('reference_group',   self.state.reference_group)
             s.setValue('paired',            self.state.paired)
             s.setValue('pairing_variable',  self.state.pairing_variable)
+            s.setValue('covariate_columns',
+                      list(self.state.covariates.columns)
+                      if self.state.covariates is not None else [])
             s.setValue('covariates',
                       repr(self.state.covariates.to_dict(orient='index'))
                       if self.state.covariates is not None else '')
@@ -8373,6 +9478,7 @@ class PluginWidget(QWidget):
             s.setValue('active_cl_algo',    self.state.active_clustering_algorithm or '')
             s.setValue('cluster_colors',    repr(self.state.cluster_colors))
             s.setValue('workspace_n_columns', self.state.workspace_n_columns)
+            s.setValue('plot_theme', self.state.plot_theme)
             # plot_configs: only save serialisable display settings (no widgets)
             try:
                 import json
@@ -8380,22 +9486,13 @@ class PluginWidget(QWidget):
             except Exception:
                 pass
             s.setValue('cluster_names', repr(self.state.cluster_names))
-            # marker_roles is intentionally NOT persisted across sessions --
-            # there's no automatic categorisation yet, so every experiment
-            # open should re-default every channel to 'state' rather than
-            # carry forward a per-channel dict that may predate this
-            # default (see _populate_marker_roles_list). Within a session,
-            # checkbox choices already live on self.state.marker_roles in
-            # memory and need no QSettings round-trip to survive a tab switch.
+            # marker_roles is not persisted across sessions -- to be changed
             if hasattr(self, 'cluster_annotation_tab'):
                 cat = self.cluster_annotation_tab
                 s.setValue('annotation_run_id', cat.run_combo.currentData() or '')
                 s.setValue('annotation_dr_run_id', cat.dr_run_combo.currentData() or '')
                 s.setValue('annotation_channels_checked', cat._checked_channels())
-            # Groups tab: include-type-markers checkbox (patterns are
-            # already saved directly from state.group_patterns above —
-            # Item 13 removed the group_a_pattern/group_b_pattern QLineEdits
-            # this block used to read from).
+            # Groups tab: include-type-markers checkbox
             if hasattr(self, 'groups_stats_tab'):
                 gst = self.groups_stats_tab
                 if hasattr(gst, 'chk_include_type_markers'):
@@ -8409,7 +9506,7 @@ class PluginWidget(QWidget):
             # Guard against clobbering a good saved selection with an empty
             # one. ConfigTab.refresh() builds these widgets lazily (only
             # once the tab becomes active this session), but
-            # _on_inner_tab_changed() calls save_state() BEFORE refreshing
+            # _on_inner_tab_changed() calls save_state() before refreshing
             # the newly-activated tab — so on the first switch into
             # Configuration each session, channel_checkboxes/picker can
             # still be empty here even though a real selection already
@@ -8566,9 +9663,6 @@ class PluginWidget(QWidget):
                 self.state.compare_group_b = s.value('compare_group_b', '') or (
                     self.state.group_names[1] if len(self.state.group_names) > 1 else '')
 
-            # Item 13 phase 2 (restored regardless of the legacy/normal
-            # branch above -- these are new fields with no pre-Phase-2
-            # equivalent to migrate from).
             selection = s.value('testing_group_selection', [])
             self.state.testing_group_selection = list(selection) if selection else []
             self.state.contrast_mode = s.value('contrast_mode', 'reference') or 'reference'
@@ -8576,8 +9670,22 @@ class PluginWidget(QWidget):
             paired_val = s.value('paired', False)
             self.state.paired = paired_val in (True, 'true', 'True', 1, '1')
             self.state.pairing_variable = s.value('pairing_variable', '')
+            cov_cols = list(s.value('covariate_columns', []))
             cov_repr = s.value('covariates', '')
-            if cov_repr:
+            if cov_cols:
+                try:
+                    loaded_cov = eval(cov_repr) if cov_repr else {}  # noqa: S307
+                except Exception:
+                    loaded_cov = {}
+                cov_df = pd.DataFrame.from_dict(loaded_cov, orient='index')
+                for c in cov_cols:
+                    if c not in cov_df.columns:
+                        cov_df[c] = ''
+                # Restore the original column order (to_dict/from_dict does
+                # not guarantee it) and drop anything not in cov_cols --
+                # e.g. a column whose group was since removed elsewhere.
+                self.state.covariates = cov_df[cov_cols]
+            elif cov_repr:
                 try:
                     loaded_cov = eval(cov_repr)  # noqa: S307
                     self.state.covariates = (
@@ -8585,6 +9693,8 @@ class PluginWidget(QWidget):
                     )
                 except Exception:
                     self.state.covariates = None
+            else:
+                self.state.covariates = None
 
             # DR / clustering status metadata
             dr_status_repr = s.value('dr_status', '')
@@ -8627,6 +9737,10 @@ class PluginWidget(QWidget):
                 except (ValueError, TypeError):
                     pass
 
+            theme = s.value('plot_theme', None)
+            if theme in ('auto', 'light', 'dark'):
+                self.state.plot_theme = theme
+
             plot_configs_json = s.value('plot_configs', '')
             if plot_configs_json:
                 try:
@@ -8645,10 +9759,7 @@ class PluginWidget(QWidget):
                 except Exception:
                     pass
 
-            # marker_roles: deliberately not restored -- see the matching
-            # comment in save_state(). state.marker_roles starts empty each
-            # session, so _populate_marker_roles_list() always applies the
-            # current 'state'-by-default policy.
+            # marker_roles: not restored -- to be changed
 
             self._pending_include_type_markers = s.value('include_type_markers', False)
             self._pending_annotation_run_id = s.value('annotation_run_id', '')
@@ -8735,7 +9846,7 @@ class PluginWidget(QWidget):
         the experiment file.  Silently skips on failure (e.g. a reducer that
         is not picklable — the user will need to retrain).
 
-        clustering_runs / dr_runs are NOT included here — those are
+        clustering_runs / dr_runs are not included here — those are
         archived individually (their own pickle + manifest entry) at the
         moment each run completes; see drc_run_archive.py.
         """
@@ -8800,7 +9911,7 @@ class PluginWidget(QWidget):
 
         # Rebuild the run archive regardless of whether the current-state
         # sidecar exists — manifest.json/runs/ are independent of it.
-        # Metadata only (Item 6 §0.2 lazy-load) — a run's actual payload is
+        # Metadata only  — a run's actual payload is
         # hydrated on demand the first time something selects it (see
         # GroupsStatsTab._selected_run_entry / PlotCard's run selector).
         try:
@@ -9005,7 +10116,7 @@ class PluginWidget(QWidget):
             for ch, cb in cat.channel_checkboxes.items():
                 cb.setChecked(ch in checked)
         if cat.run_combo.currentData() is not None and cat._checked_channels():
-            cat._plot_violins()
+            cat._recompute_violins()
 
     def _apply_pending_state_to_transform_tab(self):
         """Add and configure biplot tiles after TransformTab.refresh() has run."""
@@ -9068,6 +10179,27 @@ class PluginWidget(QWidget):
     def _refresh_active_tab(self):
         self._refresh_tab_at(self.inner_tabs.currentIndex())
 
+    def refresh_plot_theme(self):
+        """
+        Re-render every currently-visible plot under the new theme
+        (Item 1). Confusion Matrix and Composition Barplot tabs used to
+        be the one known gap here -- see
+        GroupsStatsTab.refresh_theme_dependent_result_tabs for why they
+        needed their own path instead of piggybacking on _draw_results.
+        """
+        self.workspace_tab.refresh()
+        self.cluster_annotation_tab._redraw_map()
+        cat = self.cluster_annotation_tab
+        run_id = cat.run_combo.currentData()
+        if run_id in cat._violin_cache:
+            cat._draw_current_violin()
+        if cat.annotation_sub_tabs.currentIndex() == getattr(cat, '_marker_summary_tab_index', -1) \
+                and run_id in cat._marker_summary_cache:
+            cat._draw_marker_summary()
+        if self.state.stats_comparisons:
+            self.groups_stats_tab._draw_results()
+        self.groups_stats_tab.refresh_theme_dependent_result_tabs()
+
     def _refresh_tab_at(self, index: int):
         """Call refresh() on the tab at *index* if it has that method."""
         tabs = [
@@ -9125,7 +10257,7 @@ class PluginWidget(QWidget):
         float32 (n_events, n_selected) feature matrix.
 
         Delegates to drc_pipeline.transform_selected_channels, which builds the
-        channel→column map from the FULL unmixed channel list (no index shift)
+        channel→column map from the full unmixed channel list (no index shift)
         and uses the FlowKit 1.3.0 transform signature with no arcsinh fallback.
         """
         return drc_pipeline.transform_selected_channels(
@@ -9134,7 +10266,7 @@ class PluginWidget(QWidget):
 
     def _get_sample_data(self, rel_path: str, algo: str, af_state=None) -> np.ndarray | None:
         """
-        Load + unmix + gate + transform ONE sample → (n_events, n_selected).
+        Load + unmix + gate + transform one sample → (n_events, n_selected).
         Used during 'Apply to All Samples' and per-sample cluster assignment.
 
         af_state: optional AF snapshot captured on the main thread before the
@@ -9543,13 +10675,7 @@ class PluginWidget(QWidget):
                         algorithm=algo,
                         cluster_labels=dict(self.state.cluster_labels),
                         colors=dict(self.state.cluster_colors),
-                        # Every new run starts with its own EMPTY names dict
-                        # (same as colors already does via
-                        # assign_cluster_colors resetting state.cluster_colors
-                        # each run) — never seeded from state.cluster_names,
-                        # which is a legacy global that isn't kept in sync
-                        # with per-run renames and was the actual source of
-                        # names "bleeding" between unrelated runs.
+                        # Every new run starts with its own empty names dict
                         names={},
                         n_clusters=self.state.n_clusters,
                         gates=list(self.state.selected_gates),
@@ -9579,7 +10705,7 @@ class PluginWidget(QWidget):
         worker.start()
 
     # ==================================================================
-    # Stage 7 — T-REX (on-demand, called from WorkspaceTab PlotCard)
+    # T-REX (on-demand, called from WorkspaceTab PlotCard)
     # ==================================================================
 
     def run_trex(self):
@@ -9587,7 +10713,7 @@ class PluginWidget(QWidget):
         Build a T-REX kNN index over pooled Group A + B events and score all
         samples.  Results stored in state.trex_scores.
 
-        Only events belonging to the selected T-REX DR run's OWN embedding
+        Only events belonging to the selected T-REX DR run's own embedding
         can ever be plotted with a score, so scoring is restricted to that
         run's event set from the start -- rather than freshly re-gating
         live data and hoping it still lines up with whatever's on screen.
@@ -9601,7 +10727,8 @@ class PluginWidget(QWidget):
              normalised so |score| ≤ 1.
           5. Store per-sample arrays in state.trex_scores.
         """
-        if not self.state.stats_runnable():
+        shown = set(self.groups_stats_tab._table_sample_paths())
+        if not self.state.stats_runnable(shown):
             QMessageBox.warning(
                 self, "T-REX",
                 "Assign ≥ 3 samples to each group before running T-REX."
@@ -9667,7 +10794,7 @@ class PluginWidget(QWidget):
                     except ValueError:
                         return sp
 
-                # kNN runs in the ORIGINAL marker-feature space (feat_dict),
+                # kNN runs in the original marker-feature space (feat_dict),
                 # not the 2D embedding -- true T-REX neighbours, per the
                 # published algorithm. feat_dict and emb_dict were cached
                 # together, row-for-row, at embedding time (_DrWorker), so
