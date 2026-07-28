@@ -7,6 +7,7 @@ import hashlib
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from honeychrome.settings import experiments_folder, library_file
@@ -145,15 +146,80 @@ class SpectralReferenceLibrary:
         self.library_path = library_path or (base_directory / library_file)
 
     # --- connection helper ---------------------------------------------------
-    def _connect(self) -> sqlite3.Connection:
+    def _open_connection(self) -> sqlite3.Connection:
         self.library_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.library_path)
         conn.row_factory = sqlite3.Row
         return conn
 
+    @contextmanager
+    def _connect(self):
+        """Yield a connection, commit on success, roll back on error, always close."""
+        conn = self._open_connection()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def ensure_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+
+    def ensure_honeychrome_rows_populated(self) -> None:
+        """Ingest the bundled reference CSVs as ``origin='honeychrome'`` rows.
+
+        Idempotent: a shipped row is inserted only if one does not already exist
+        for that ``(fluorophore, cytometer_key)``. Each shipped row is the QC
+        target for its ``(fluorophore, cytometer_key)`` by default, but only when
+        no QC target exists yet — so re-running never clobbers a user override.
+        """
+        self.ensure_schema()
+        now = time.time()
+        with self._connect() as conn:
+            for cytometer_key in _CYTOMETER_TO_CSV:
+                df = load_reference_library(cytometer_key)
+                if df is None:
+                    continue
+                channel_names = [str(c) for c in df.columns]
+                config_key = compute_config_key(cytometer_key, channel_names)
+                for fluor, row in df.iterrows():
+                    fluor = str(fluor)
+                    exists = conn.execute(
+                        'SELECT 1 FROM reference_library_profiles '
+                        'WHERE fluorophore = ? AND cytometer_key = ? AND origin = ? LIMIT 1',
+                        (fluor, cytometer_key, 'honeychrome'),
+                    ).fetchone()
+                    if exists:
+                        continue
+                    profile = {c: float(row[c]) for c in channel_names}
+                    has_qc = conn.execute(
+                        'SELECT 1 FROM reference_library_profiles '
+                        'WHERE fluorophore = ? AND cytometer_key = ? AND is_qc_target = 1 LIMIT 1',
+                        (fluor, cytometer_key),
+                    ).fetchone()
+                    conn.execute(
+                        """INSERT INTO reference_library_profiles
+                           (fluorophore, display_name, origin, cytometer_key, config_key,
+                            channel_names_json, profile_json, gate_channel, source_sample_name,
+                            source_experiment_dir, notes, created_at, updated_at, is_deletable,
+                            is_reference, is_qc_target)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?)""",
+                        (fluor, fluor, 'honeychrome', cytometer_key, config_key,
+                         json.dumps(channel_names), json.dumps(profile), None, None,
+                         None, None, now, now, 0 if has_qc else 1),
+                    )
+
+    def list_cytometer_keys(self) -> list[str]:
+        """Distinct instrument families present in the library."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                'SELECT DISTINCT cytometer_key FROM reference_library_profiles ORDER BY cytometer_key'
+            ).fetchall()
+        return [r['cytometer_key'] for r in rows]
 
     # --- row <-> dataclass ---------------------------------------------------
     @staticmethod
@@ -264,9 +330,9 @@ class SpectralReferenceLibrary:
                 (new_display_name, time.time(), profile_id),
             )
 
-    def set_reference(self, profile_id: int) -> None:
+    def set_reference(self, profile_id: int, value: bool = True) -> None:
         """Make ``profile_id`` the reference for its (fluorophore, config_key)
-        group, clearing the flag on any sibling first (app-layer uniqueness)."""
+        group (clearing any sibling first), or clear it when ``value`` is False."""
         now = time.time()
         with self._connect() as conn:
             row = conn.execute(
@@ -275,19 +341,20 @@ class SpectralReferenceLibrary:
             ).fetchone()
             if row is None:
                 raise ValueError(f'No reference profile with id {profile_id}')
+            if value:
+                conn.execute(
+                    'UPDATE reference_library_profiles SET is_reference = 0, updated_at = ? '
+                    'WHERE fluorophore = ? AND config_key = ?',
+                    (now, row['fluorophore'], row['config_key']),
+                )
             conn.execute(
-                'UPDATE reference_library_profiles SET is_reference = 0, updated_at = ? '
-                'WHERE fluorophore = ? AND config_key = ?',
-                (now, row['fluorophore'], row['config_key']),
-            )
-            conn.execute(
-                'UPDATE reference_library_profiles SET is_reference = 1, updated_at = ? WHERE id = ?',
-                (now, profile_id),
+                'UPDATE reference_library_profiles SET is_reference = ?, updated_at = ? WHERE id = ?',
+                (1 if value else 0, now, profile_id),
             )
 
-    def set_qc_target(self, profile_id: int) -> None:
+    def set_qc_target(self, profile_id: int, value: bool = True) -> None:
         """Make ``profile_id`` the QC target for its (fluorophore, cytometer_key)
-        group, clearing the flag on any sibling first (app-layer uniqueness)."""
+        group (clearing any sibling first), or clear it when ``value`` is False."""
         now = time.time()
         with self._connect() as conn:
             row = conn.execute(
@@ -296,14 +363,15 @@ class SpectralReferenceLibrary:
             ).fetchone()
             if row is None:
                 raise ValueError(f'No reference profile with id {profile_id}')
+            if value:
+                conn.execute(
+                    'UPDATE reference_library_profiles SET is_qc_target = 0, updated_at = ? '
+                    'WHERE fluorophore = ? AND cytometer_key = ?',
+                    (now, row['fluorophore'], row['cytometer_key']),
+                )
             conn.execute(
-                'UPDATE reference_library_profiles SET is_qc_target = 0, updated_at = ? '
-                'WHERE fluorophore = ? AND cytometer_key = ?',
-                (now, row['fluorophore'], row['cytometer_key']),
-            )
-            conn.execute(
-                'UPDATE reference_library_profiles SET is_qc_target = 1, updated_at = ? WHERE id = ?',
-                (now, profile_id),
+                'UPDATE reference_library_profiles SET is_qc_target = ?, updated_at = ? WHERE id = ?',
+                (1 if value else 0, now, profile_id),
             )
 
     # --- delete --------------------------------------------------------------

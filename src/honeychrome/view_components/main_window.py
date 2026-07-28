@@ -196,6 +196,10 @@ class MainWindow(QMainWindow):
         view_menu.addAction(action_gains)
         view_menu.addAction(action_oscilloscope)
 
+        action_reference_library = QAction(icon('table'), "Reference Library", self)
+        action_reference_library.triggered.connect(self.open_reference_library_widget)
+        view_menu.addAction(action_reference_library)
+
         # help menu
         action_forum = QAction(icon('bubble-text'), "Discussions", self)
         action_forum.triggered.connect(lambda: self.bus.popupMessage.emit('Do you want to ask a question, or discuss an issue or a feature request? Visit the <a href="https://github.com/salmansamson/honeychrome/discussions">Honeychrome discussions page on Github</a>.'))
@@ -540,6 +544,15 @@ class MainWindow(QMainWindow):
         else:
             widget.raise_()  # Bring to top
             widget.activateWindow()  # Give focus
+
+    def open_reference_library_widget(self):
+        from honeychrome.view_components.reference_library_widget import ReferenceLibraryWidget
+        widget = ReferenceLibraryWidget(self.controller, self.bus)
+        if widget.isHidden():
+            widget.show()
+        else:
+            widget.raise_()
+            widget.activateWindow()
 
     @Slot(bool)
     def open_import_fcs_files_widget(self, failed_to_load_sample_warning=False):
