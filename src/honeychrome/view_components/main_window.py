@@ -505,6 +505,17 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.save_state()
 
+        # Flush every plugin's own persisted state before tearing down.
+        for plugin in getattr(self, 'tab_plugins', {}).values():
+            widget = plugin.get('widget')
+            if widget is not None and hasattr(widget, 'save_state'):
+                try:
+                    widget.save_state()
+                except Exception:
+                    logger.exception(
+                        f"Failed to save state for plugin {plugin.get('module')}"
+                    )
+
         # Clean up child widgets
         for child in self.findChildren(QWidget):
             child.deleteLater()
