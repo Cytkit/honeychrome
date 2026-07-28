@@ -182,31 +182,41 @@ def _build_flowkit_transform(transform_id: int, params: dict):
     return None
 
 
-def transform_selected_channels(controller, state, gated_data: np.ndarray) -> np.ndarray:
+def transform_channels(controller, state, gated_data: np.ndarray,
+                        channels: list[str]) -> tuple[np.ndarray, list[str]]:
     """
-    Slice the user-selected channels out of the FULL unmixed gated matrix and
-    apply each channel's configured transform.
+    Slice the GIVEN channels out of the FULL unmixed gated matrix and apply
+    each channel's configured transform (state.channel_transform_params) --
+    same per-channel logic transform_selected_channels always used, just
+    for an EXPLICIT channel list rather than state.selected_channels. Lets
+    a caller transform a channel set that isn't necessarily today's live
+    Configuration selection (e.g. Cluster ID's per-run recorded channels,
+    which may differ from what's currently selected there).
 
     Parameters
     ----------
     gated_data : (n_events, n_unmixed_full_channels) untransformed unmixed data
+    channels   : channel names to slice + transform, in the order wanted
 
     Returns
     -------
-    (n_events, n_selected_channels) float32 transformed feature matrix, columns
-    ordered to match ``state.selected_channels`` (minus meta/unresolved).
+    (feature_matrix, used_names) -- used_names may be SHORTER than
+    `channels` if some don't resolve to an unmixed column (skip-and-warn,
+    same as resolve_selected_columns) -- callers must zip against
+    used_names, never assume channels[i] lines up with column i.
 
     Raises
     ------
     RuntimeError if a transform cannot be applied (no silent arcsinh fallback).
     """
-    log_stage(log, "TRANSFORM SELECTED CHANNELS")
-    resolved = resolve_selected_columns(controller, state)
-    if not resolved:
-        raise RuntimeError(
-            "No selected channels could be resolved to unmixed columns — "
-            "check the channel selection in the Configuration tab."
-        )
+    ch_idx = build_channel_index(controller)
+    resolved = []
+    for ch in channels:
+        col = ch_idx.get(ch)
+        if col is None:
+            log.warning("transform_channels: channel %r has no unmixed column — skipped", ch)
+            continue
+        resolved.append((ch, col))
 
     out_cols = []
     used_names = []
@@ -239,8 +249,33 @@ def transform_selected_channels(controller, state, gated_data: np.ndarray) -> np
         out_cols.append(col)
         used_names.append(ch)
 
+    if not out_cols:
+        return np.empty((len(gated_data), 0), dtype=np.float32), []
     feature = np.column_stack(out_cols).astype(np.float32)
     log_array(log, "transformed_features", feature, used_names)
+    return feature, used_names
+
+
+def transform_selected_channels(controller, state, gated_data: np.ndarray) -> np.ndarray:
+    """
+    Slice the user-selected channels out of the FULL unmixed gated matrix and
+    apply each channel's configured transform. Thin wrapper around
+    transform_channels() for state.selected_channels -- unchanged signature
+    and behaviour for every existing caller.
+
+    Raises
+    ------
+    RuntimeError if no selected channel resolves to an unmixed column, or a
+    transform cannot be applied (no silent arcsinh fallback).
+    """
+    log_stage(log, "TRANSFORM SELECTED CHANNELS")
+    channels = [c for c in state.selected_channels if c not in META_CHANNELS]
+    feature, used_names = transform_channels(controller, state, gated_data, channels)
+    if not used_names:
+        raise RuntimeError(
+            "No selected channels could be resolved to unmixed columns — "
+            "check the channel selection in the Configuration tab."
+        )
     return feature
 
 
@@ -427,6 +462,28 @@ def load_sample_marker_values(controller, state, rel_path, af_state=None) -> tup
         return select_untransformed_channels(controller, state, gated)
     except Exception as exc:
         log.exception("could not load marker values for %s: %s", rel_path, exc)
+        return None
+
+
+def load_sample_transformed_values(controller, state, rel_path, channels: list[str],
+                                    af_state=None) -> tuple[np.ndarray, list[str]] | None:
+    """
+    Full pipeline for ONE sample -> TRANSFORMED values (state's configured
+    per-channel transform, same as load_sample_features) for an EXPLICIT
+    channel list rather than state.selected_channels -- e.g. Cluster ID's
+    per-run recorded channel set, which may differ from today's live
+    Configuration selection.
+
+    Returns (values, channel_names) or None on error. channel_names may be
+    SHORTER than `channels` -- see transform_channels().
+
+    af_state: optional AF snapshot — see apply_unmixing_af_aware() docstring.
+    """
+    try:
+        gated = load_unmixed_gated(controller, state, sample_abs_path(controller, rel_path), af_state=af_state)
+        return transform_channels(controller, state, gated, channels)
+    except Exception as exc:
+        log.exception("could not load transformed values for %s: %s", rel_path, exc)
         return None
 
 

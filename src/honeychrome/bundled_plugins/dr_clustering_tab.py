@@ -225,6 +225,7 @@ import drc_stats
 import drc_run_archive
 import drc_gate_tree
 import drc_scatter
+import drc_cluster_id
 
 _log = drc_logging.get_logger(__name__)
 
@@ -7869,7 +7870,7 @@ class ClusterAnnotationTab(QWidget):
     """
     Tab 5 — Cluster Annotation (Item 8)
     -------------------------------------
-    Three coordinated panels for a SELECTED clustering run:
+    Four coordinated elements for a SELECTED clustering run:
       1. Per-marker violin plots, one per selected channel, cluster on the
          x-axis. Values come from drc_pipeline.load_sample_marker_values(),
          pooled across the run's own training samples and split by that
@@ -7886,6 +7887,14 @@ class ClusterAnnotationTab(QWidget):
          drc_scatter helpers PlotCard uses, so edits made from either UI
          (or from Workspace) are always the SAME per-run 'names'/'colors'
          payload — there is no separate copy to fall out of sync.
+      4. Cluster ID Suggestions (Item 15, drc_cluster_id.py) — two more
+         label-table columns computed from the SAME checked channels as
+         Panel 1: an auto-generated MEM label (safe one-click adoption,
+         double-click the cell or "Adopt All MEM Labels") and a suggested
+         cell type scored against a bundled marker-signature database
+         (display-only — a biological claim, not a statistic, so adopting
+         one means retyping it into Name yourself). Neither is persisted;
+         both recompute on demand and clear when the selected run changes.
     """
 
     def __init__(self, state: PipelineState, bus, controller, parent=None):
@@ -7905,6 +7914,13 @@ class ClusterAnnotationTab(QWidget):
         self._violin_recompute_timer.setSingleShot(True)
         self._violin_recompute_timer.setInterval(400)
         self._violin_recompute_timer.timeout.connect(self._recompute_violins)
+        # Item 15 -- Cluster ID suggestion cache. Tab-local, NOT persisted
+        # to the run archive (same "recompute on demand" convention as the
+        # violin placeholder). Keyed by run_id so switching clustering runs
+        # can never show stale suggestions against the newly-selected run.
+        self._mem_labels: dict[int, str] = {}
+        self._cell_type_df = None
+        self._suggestions_run_id: str | None = None
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -8077,20 +8093,76 @@ class ClusterAnnotationTab(QWidget):
         splitter.addWidget(map_box)
 
         # ============================================================
-        # Panel 3 — Cluster label table
+        # Panel 3 — Cluster label table (+ Item 15 suggestion controls)
         # ============================================================
         table_box = QGroupBox("Cluster Labels")
         table_layout = QVBoxLayout(table_box)
 
-        self.label_table = QTableWidget(0, 4)
-        self.label_table.setHorizontalHeaderLabels(['Name', 'Colour', 'Events', '% of total'])
+        suggest_row = QHBoxLayout()
+        suggest_row.addWidget(QLabel("MEM threshold:"))
+        self.mem_threshold_spin = QDoubleSpinBox()
+        self.mem_threshold_spin.setRange(0.5, 10.0)
+        self.mem_threshold_spin.setSingleStep(0.5)
+        self.mem_threshold_spin.setValue(2.0)
+        self.mem_threshold_spin.setFixedWidth(70)
+        self.mem_threshold_spin.setToolTip(
+            "Minimum |MEM score| (0-10 scale) for a marker to appear in the\n"
+            "generated MEM label. Lower = more markers included per cluster."
+        )
+        suggest_row.addWidget(self.mem_threshold_spin)
+
+        self.compute_suggestions_btn = QPushButton("Compute Cluster ID Suggestions")
+        self.compute_suggestions_btn.setToolTip(
+            "Uses the channel set recorded for THIS clustering run at the "
+            "time it was created (its Configuration tab selection back "
+            "then) as the marker set for both the MEM label and the "
+            "cell-type score -- not whatever is currently checked above, "
+            "and not Configuration's current selection either."
+        )
+        self.compute_suggestions_btn.clicked.connect(self._compute_cluster_id_suggestions)
+        suggest_row.addWidget(self.compute_suggestions_btn)
+
+        self.adopt_all_mem_btn = QPushButton("Adopt All MEM Labels")
+        self.adopt_all_mem_btn.setToolTip(
+            "One-click: set every cluster's Name in this run to its generated\n"
+            "MEM label. Duplicate labels are numbered to stay unique."
+        )
+        self.adopt_all_mem_btn.clicked.connect(self._adopt_all_mem_labels)
+        suggest_row.addWidget(self.adopt_all_mem_btn)
+        suggest_row.addStretch()
+        table_layout.addLayout(suggest_row)
+
+        self._suggestions_status = QLabel(
+            "Cluster ID suggestions not yet computed for this run."
+        )
+        self._suggestions_status.setStyleSheet("color: grey; font-style: italic;")
+        self._suggestions_status.setWordWrap(True)
+        table_layout.addWidget(self._suggestions_status)
+
+        # Item 15 follow-up -- Compute loads + unmixes every training
+        # sample from disk, which can take a while; this is the only
+        # visible feedback besides the status label above.
+        self._suggestions_progress = QProgressBar()
+        self._suggestions_progress.setVisible(False)
+        self._suggestions_progress.setTextVisible(True)
+        table_layout.addWidget(self._suggestions_progress)
+
+        self.label_table = QTableWidget(0, 6)
+        self.label_table.setHorizontalHeaderLabels(
+            ['Name', 'Colour', 'Events', '% of total', 'MEM Label', 'Suggested Type']
+        )
         self.label_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.label_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.label_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.label_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.label_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.label_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
         self.label_table.verticalHeader().setVisible(False)
         self.label_table.setToolTip(
-            "Double-click Name to rename; double-click Colour to recolour."
+            "Double-click Name to rename; double-click Colour to recolour;\n"
+            "double-click MEM Label to adopt it as this cluster's Name.\n"
+            "Suggested Type is informational only -- retype it into Name\n"
+            "yourself if you want to adopt it."
         )
         self.label_table.itemChanged.connect(self._on_table_item_changed)
         self.label_table.cellDoubleClicked.connect(self._on_table_cell_double_clicked)
@@ -8309,6 +8381,15 @@ class ClusterAnnotationTab(QWidget):
         return None
 
     def _on_run_changed(self, _index: int):
+        # Item 15 -- suggestions are per-run; clear the cache so a stale
+        # MEM/cell-type result from the PREVIOUS run can't be shown against
+        # the newly-selected one.
+        self._mem_labels = {}
+        self._cell_type_df = None
+        self._suggestions_run_id = None
+        self._suggestions_status.setText(
+            "Clustering run changed — click 'Compute Cluster ID Suggestions' to refresh."
+        )
         self._update_compat_warning()
         self._redraw_map()
         self._populate_label_table()
@@ -8779,6 +8860,12 @@ class ClusterAnnotationTab(QWidget):
         unique = (sorted(int(l) for l in np.unique(all_labels)) if total
                  else sorted(colors.keys()))
 
+        # Item 15 -- only show suggestions if they were computed for THIS
+        # run (not stale leftovers from a previously-selected run).
+        suggestions_current = bool(cl_run.get('run_id')) and \
+            self._suggestions_run_id == cl_run.get('run_id')
+        cell_type_df = self._cell_type_df if suggestions_current else None
+
         self.label_table.setRowCount(len(unique))
         for row, cl_id in enumerate(unique):
             name = names.get(cl_id, 'Noise' if cl_id < 0 else str(cl_id))
@@ -8800,6 +8887,33 @@ class ClusterAnnotationTab(QWidget):
             pct_item = QTableWidgetItem(f"{pct:.1f}%")
             pct_item.setFlags(pct_item.flags() & ~Qt.ItemIsEditable)
             self.label_table.setItem(row, 3, pct_item)
+
+            mem_text = '—'
+            if suggestions_current and cl_id >= 0:
+                mem_text = self._mem_labels.get(cl_id, '—')
+            mem_item = QTableWidgetItem(mem_text)
+            mem_item.setFlags(mem_item.flags() & ~Qt.ItemIsEditable)
+            mem_item.setData(Qt.UserRole, cl_id)
+            mem_item.setToolTip(
+                "Double-click to adopt as this cluster's Name." if mem_text != '—' else ''
+            )
+            self.label_table.setItem(row, 4, mem_item)
+
+            type_text, type_tip = '—', ''
+            if cell_type_df is not None and cl_id >= 0 and cl_id in cell_type_df.index:
+                rec = cell_type_df.loc[cl_id]
+                suggested = rec.get('suggested_type') or ''
+                if suggested:
+                    type_text = f"{suggested} ⚠" if rec.get('is_tie') else suggested
+                    type_tip = (
+                        f"Tied score ({rec.get('score')}) between multiple cell types "
+                        "-- not a confident call." if rec.get('is_tie')
+                        else f"Score: {rec.get('score')}"
+                    )
+            type_item = QTableWidgetItem(type_text)
+            type_item.setFlags(type_item.flags() & ~Qt.ItemIsEditable)
+            type_item.setToolTip(type_tip)
+            self.label_table.setItem(row, 5, type_item)
         self.label_table.blockSignals(False)
 
         # Small fixed floor only. This used to grow with cluster count,
@@ -8830,20 +8944,200 @@ class ClusterAnnotationTab(QWidget):
         self._rebuild_map_legend(cl_run)
 
     def _on_table_cell_double_clicked(self, row: int, col: int):
-        if col != 1:
-            return
-        item = self.label_table.item(row, col)
-        cl_id = item.data(Qt.UserRole)
+        if col == 1:
+            item = self.label_table.item(row, col)
+            cl_id = item.data(Qt.UserRole)
+            cl_run = self._selected_cluster_run()
+            if cl_run is None:
+                return
+            current = cl_run.get('colors', {}).get(cl_id, '#aaaaaa')
+            colour = QColorDialog.getColor(QColor(current), self, f"Colour for cluster {cl_id}")
+            if colour.isValid():
+                drc_scatter.recolor_cluster(self.controller, cl_run, cl_id, colour.name())
+                self._populate_label_table()
+                self._rebuild_map_legend(cl_run)
+                self._redraw_map()
+        elif col == 4:
+            # Item 15 -- one-click MEM label adoption for a single cluster.
+            item = self.label_table.item(row, col)
+            cl_id = item.data(Qt.UserRole)
+            cl_run = self._selected_cluster_run()
+            if cl_run is None or cl_id not in self._mem_labels:
+                return
+            if drc_scatter.rename_cluster(
+                self.controller, cl_run, cl_id, self._mem_labels[cl_id], self
+            ):
+                self._rebuild_map_legend(cl_run)
+                self._populate_label_table()
+
+    # ------------------------------------------------------------------
+    # Panel 4 — Cluster ID suggestions (Item 15)
+    # ------------------------------------------------------------------
+
+    def _compute_cluster_id_suggestions(self):
+        """
+        Runs both suggestion mechanisms for the selected run over the
+        CHANNEL SET RECORDED FOR THIS RUN -- cl_run['channels'], the
+        Configuration tab's selection at the time THIS SPECIFIC run was
+        created (archived once by drc_run_archive.archive_clustering_run() /
+        archive_dr_run(), never touched again). Deliberately NOT Panel 1's
+        Per-Marker Violin Plots checkboxes (those only ever drove the violin
+        plots) and NOT state.selected_channels (today's live Configuration
+        selection, which may belong to an entirely different run by the
+        time this one is selected in the combo):
+          - MEM Label: a descriptive statistic of the data itself, safe to
+            one-click adopt (see _adopt_all_mem_labels / the MEM Label
+            double-click handler above).
+          - Suggested Type: a database lookup against drc_cluster_id's
+            bundled cell-type marker signatures -- a biological CLAIM, not
+            just a computed statistic, so it is display-only here;
+            adopting one is a manual retype into Name.
+
+        Marker naming is enforced in two tiers before/after computing --
+        see drc_cluster_id's module docstring:
+          1. HARD gate (blocks): any channel in this run's recorded set
+             with no Antigen typed in at all, in the Spectral Process tab.
+             Refuses to proceed -- this used to silently fall back to the
+             fluorophore Label, mixing marker names and fluorophore names
+             in the same MEM Label output with no indication why.
+          2. SOFT warning (proceeds anyway): an Antigen that's filled in
+             but doesn't match anything in marker_database.csv. Shown
+             after computing -- these channels contribute nothing to
+             Suggested Type, but still count toward MEM Label as typed.
+
+        Shows a determinate progress bar while computing -- loading +
+        unmixing every training sample from disk is the dominant cost, so
+        the bar advances one step per sample rather than per channel.
+        """
         cl_run = self._selected_cluster_run()
         if cl_run is None:
+            QMessageBox.warning(self, "No Run Selected", "Select a clustering run first.")
             return
-        current = cl_run.get('colors', {}).get(cl_id, '#aaaaaa')
-        colour = QColorDialog.getColor(QColor(current), self, f"Colour for cluster {cl_id}")
-        if colour.isValid():
-            drc_scatter.recolor_cluster(self.controller, cl_run, cl_id, colour.name())
-            self._populate_label_table()
-            self._rebuild_map_legend(cl_run)
-            self._redraw_map()
+        channels = cl_run.get('channels', [])
+        if not channels:
+            QMessageBox.warning(
+                self, "No Channels Recorded",
+                "This clustering run has no channel set recorded (the "
+                "Configuration tab's selection at the time it was created) "
+                "-- Cluster ID cannot run without it."
+            )
+            return
+
+        # Item 15 (marker naming, tier 1 -- HARD gate). Every channel in
+        # this run's recorded set must have an Antigen typed in before
+        # we'll compute anything -- otherwise MEM Label falls back to the
+        # fluorophore Label for that channel and mixes marker/fluorophore
+        # names in the same output with no indication why.
+        missing_antigen = drc_cluster_id.channels_missing_antigen(self.controller, channels)
+        if missing_antigen:
+            display_labels = _antigen_dash_labels(self.controller)
+            names = '\n  '.join(display_labels.get(ch, ch) for ch in missing_antigen)
+            QMessageBox.warning(
+                self, "Antigen Not Assigned",
+                "Cluster ID requires every channel in this run's recorded "
+                "set to have an Antigen assigned in the Spectral Process "
+                "tab first.\n\nMissing Antigen for:\n  " + names +
+                "\n\nAssign an Antigen to these channels and try again."
+            )
+            return
+
+        from PySide6.QtWidgets import QApplication
+        n_samples = len(cl_run.get('training_sample_ids', [])) or 1
+        self._suggestions_progress.setRange(0, n_samples)
+        self._suggestions_progress.setValue(0)
+        self._suggestions_progress.setVisible(True)
+        self._suggestions_status.setText("Computing MEM scores and cell-type matches …")
+        QApplication.instance().processEvents()
+
+        def _on_progress(n_done: int):
+            self._suggestions_progress.setValue(n_done)
+            QApplication.instance().processEvents()
+
+        try:
+            mem_labels, _mem_scores, cell_type_df, unmatched_markers = \
+                drc_cluster_id.compute_cluster_id_suggestions(
+                    self.controller, self.state, cl_run, channels,
+                    mem_threshold=self.mem_threshold_spin.value(),
+                    progress_callback=_on_progress,
+                )
+        except Exception as exc:
+            _log.exception("Cluster ID suggestion computation failed: %s", exc)
+            QMessageBox.warning(
+                self, "Computation Failed", f"Could not compute suggestions:\n{exc}"
+            )
+            self._suggestions_status.setText(
+                "Cluster ID suggestions not yet computed for this run."
+            )
+            self._suggestions_progress.setVisible(False)
+            return
+
+        self._suggestions_progress.setVisible(False)
+        self._mem_labels = mem_labels
+        self._cell_type_df = cell_type_df
+        self._suggestions_run_id = cl_run.get('run_id')
+
+        # Item 15 (marker naming, tier 2 -- SOFT warning). Antigen text
+        # that's present but unrecognised by marker_database.csv doesn't
+        # block anything -- just flag it, since it silently contributes
+        # nothing to Suggested Type otherwise.
+        if unmatched_markers:
+            display_labels = _antigen_dash_labels(self.controller)
+            lines = '\n  '.join(
+                f'{display_labels.get(ch, ch)} — Antigen "{antigen}"'
+                for ch, antigen in unmatched_markers
+            )
+            QMessageBox.warning(
+                self, "Unmatched Antigens",
+                "The following Antigen entries didn't match anything in "
+                "marker_database.csv, so they will NOT contribute to "
+                "Suggested Type (cell-type scoring). They still count "
+                "toward MEM Label as typed.\n\n  " + lines
+            )
+
+        n_ties = int(cell_type_df['is_tie'].sum()) if cell_type_df is not None and not cell_type_df.empty else 0
+        tie_note = (
+            f"  {n_ties} cluster(s) tied between multiple cell types — see tooltip."
+            if n_ties else ""
+        )
+        self._suggestions_status.setText(
+            f"Suggestions ready for {len(mem_labels)} cluster(s), "
+            f"{len(channels)} channel(s).{tie_note}"
+        )
+        self._populate_label_table()
+
+    def _adopt_all_mem_labels(self):
+        """
+        One-click adoption of every cluster's MEM label as its Name (the
+        MEM-label path -- see class docstring). Duplicate labels (most
+        commonly two clusters both scoring 'Uncharacterized') are numbered
+        rather than rejected one-by-one, so this doesn't pop a Duplicate
+        Name dialog per collision.
+        """
+        cl_run = self._selected_cluster_run()
+        if cl_run is None or not self._mem_labels or \
+           self._suggestions_run_id != cl_run.get('run_id'):
+            QMessageBox.warning(
+                self, "Nothing to Adopt",
+                "Compute Cluster ID suggestions for this run first."
+            )
+            return
+        reply = QMessageBox.question(
+            self, "Adopt All MEM Labels",
+            f"Set the Name of all {len(self._mem_labels)} cluster(s) in this "
+            "run to their generated MEM label? This overwrites any existing "
+            "names.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        seen: dict[str, int] = {}
+        for cl_id in sorted(self._mem_labels.keys()):
+            base = self._mem_labels[cl_id]
+            seen[base] = seen.get(base, 0) + 1
+            name = base if seen[base] == 1 else f"{base} ({seen[base]})"
+            drc_scatter.rename_cluster(self.controller, cl_run, cl_id, name, self)
+        self._rebuild_map_legend(cl_run)
+        self._populate_label_table()
 
     def _on_annotation_sub_tab_changed(self, index: int):
         """Lazily compute the Marker Summary sub-tab only when it becomes
