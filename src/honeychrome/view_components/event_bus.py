@@ -66,6 +66,9 @@ class EventBus(QObject):
     axesReset = Signal(list)
     histsStatsRecalculated = Signal(str, list)
     updateRois = Signal(str, int)
+    # controller -> UI: reposition each plot's ROIs to the current sample's
+    # effective gate (per-sample custom gates make a gate differ between samples)
+    repositionRois = Signal(str)
 
     ### gating templates (per-sample gating, independent raw / unmixed lists)
     # controller -> UI: (scope, list of template names, active template name)
@@ -78,6 +81,14 @@ class EventBus(QObject):
     renameTemplateRequested = Signal(str, str, str)
     # controller -> UI: a template was applied; rebuild the grid+tree for this scope ('raw'/'unmixed')
     templateApplied = Signal(str)
+
+    ### per-sample custom gates (one shared template, per-sample gate overrides)
+    # UI -> controller: customise / revert / adopt a gate for the current sample (scope, gate_name)
+    customiseGateRequested = Signal(str, str)
+    revertGateRequested = Signal(str, str)
+    adoptGateRequested = Signal(str, str)
+    # controller -> UI: the current sample's customised gate names for a scope (scope, [gate_names])
+    customGatesChanged = Signal(str, list)
 
     ### spectral process
     showSelectedProfiles = Signal(list)

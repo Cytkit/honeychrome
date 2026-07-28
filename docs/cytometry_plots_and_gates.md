@@ -63,6 +63,17 @@ Also drag the gate title to move the label or double click to rename.
 
 Right click a gate to bring up a menu: you can create a new plot with this as source gate, or delete the gate.
 ![right_click_gate2.png](/assets/right_click_gate2.png)
+
+## Per-sample custom gates
+All samples in an experiment share one gating template, so editing a gate normally updates it for every sample. If a single sample needs a different gate boundary, you can override just that gate for just that sample, while every other gate (and every other sample) stays on the shared template.
+
+Right click a gate in the gating hierarchy panel to manage this:
+- **Customise for this sample** — gives the current sample its own copy of the gate. The gate label turns **orange** on the plot to show it is customised; dragging or resizing it now only affects this sample.
+- **Revert to template** — discards the sample's custom gate and returns it to the shared template (the label turns green again).
+- **Adopt custom gate as template** — promotes the current sample's custom gate into the shared template, so all non-customised samples follow it.
+
+Customised gates are kept per sample, so switching between samples shows each one with its own gate where it has been customised, and the template gate everywhere else.
+
 ## Dotplots coloured by gate, and other options
 In menu Edit > App Configuration, there are several useful options for cytometry plots. Among them you can select the colourmap, size of plots, etc.
 

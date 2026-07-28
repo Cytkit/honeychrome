@@ -298,6 +298,9 @@ class GatingHierarchyWidget(QWidget):
         self.tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.show_context_menu)
 
+        # gate names customised for the current sample (per-sample custom gates)
+        self._custom_gates = set()
+
         # Template picker bar (per-sample gating). Choosing a template both shows
         # its gates and assigns the current sample to it; ＋ makes a new template.
         self.template_bar = self._build_template_bar()
@@ -333,6 +336,7 @@ class GatingHierarchyWidget(QWidget):
             self.bus.changedGatingHierarchy.connect(self.update_hierarchy)
             self.bus.histsStatsRecalculated.connect(self.update_data)
             self.bus.templatesChanged.connect(self.populate_templates)
+            self.bus.customGatesChanged.connect(self.on_custom_gates_changed)
 
         # Install event filter on tree view
         self.tree_view.installEventFilter(self)
@@ -407,6 +411,14 @@ class GatingHierarchyWidget(QWidget):
         if ok and new and new != old and self.bus is not None:
             self.bus.renameTemplateRequested.emit(self.mode, old, new)
 
+    @Slot(str, list)
+    def on_custom_gates_changed(self, scope, names):
+        """Track which gates are customised for the current sample in this scope,
+        so the context menu offers Customise vs Revert/Adopt for each gate."""
+        if scope != self.mode:
+            return
+        self._custom_gates = set(names or [])
+
     def eventFilter(self, obj, event):
         if obj == self.tree_view and event.type() == event.Type.KeyPress:
             if event.matches(QKeySequence.Copy):
@@ -441,6 +453,22 @@ class GatingHierarchyWidget(QWidget):
             menu = QMenu(self)
             copy_action = menu.addAction(f"Copy hierarchy statistics from {item_name} downwards")
             copy_action.triggered.connect(lambda : self.model.copy_hierarchy(index))
+
+            # Per-sample custom gates: customise this gate for the current sample,
+            # or (if already customised) revert to / adopt as the shared template.
+            if self.bus is not None and item_name and item_name != 'root':
+                menu.addSeparator()
+                if item_name in self._custom_gates:
+                    revert_action = menu.addAction(f"Revert '{item_name}' to template")
+                    revert_action.triggered.connect(
+                        lambda: self.bus.revertGateRequested.emit(self.mode, item_name))
+                    adopt_action = menu.addAction(f"Adopt '{item_name}' custom gate as template")
+                    adopt_action.triggered.connect(
+                        lambda: self.bus.adoptGateRequested.emit(self.mode, item_name))
+                else:
+                    customise_action = menu.addAction(f"Customise '{item_name}' for this sample")
+                    customise_action.triggered.connect(
+                        lambda: self.bus.customiseGateRequested.emit(self.mode, item_name))
 
         # todo add delete/rename, should be integrated with delete/rename menus on plots
         #

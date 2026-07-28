@@ -84,6 +84,7 @@ class DraggableRoiLabel(pg.TextItem):
         self.setFont(font)
         self.setColor("k")
         self.fill = pg.mkBrush(0, 255, 0, 128)
+        self._apply_custom_fill()
 
         self.setFlag(self.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(self.GraphicsItemFlag.ItemIsSelectable, True)
@@ -123,9 +124,39 @@ class DraggableRoiLabel(pg.TextItem):
 
     @Slot()
     def add_statistic_to_name(self):
+        self._apply_custom_fill()
         if self.data_for_cytometry_plots['statistics']:
             if self.gate_name in self.data_for_cytometry_plots['statistics'].keys():
                 self.setText(f'{self.gate_name}: {self.data_for_cytometry_plots['statistics'][self.gate_name]['p_gate_parent']*100:.2f}%')
+
+    def _apply_custom_fill(self):
+        """Tint the label AND the gate outline orange when this gate is
+        customised for the current sample (a per-sample custom gate), else the
+        default green (template)."""
+        try:
+            sample_id = (self.data_for_cytometry_plots or {}).get('sample_id')
+            customised = bool(sample_id and self.gating.is_custom_gate(sample_id, self.gate_name))
+        except Exception:
+            customised = False
+        self.fill = pg.mkBrush(255, 165, 0, 160) if customised else pg.mkBrush(0, 255, 0, 128)
+        self.update()
+
+        # Recolour the gate outline itself, not just the label. Rectangle /
+        # ellipse / polygon expose setPen; QuadROI (vx/vy) and RangeROI (v1/v2)
+        # draw their edges as InfiniteLines, so recolour those too.
+        pen = pg.mkPen((255, 165, 0) if customised else 'g', width=3)
+        roi = self.parent_roi
+        try:
+            roi.setPen(pen)
+        except Exception:
+            pass
+        for attr in ('vx', 'vy', 'v1', 'v2'):
+            line = getattr(roi, attr, None)
+            if line is not None:
+                try:
+                    line.setPen(pen)
+                except Exception:
+                    pass
 
     def move_label_with_roi(self):
         roi_pos = self.parent_roi.pos()

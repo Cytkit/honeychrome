@@ -164,6 +164,8 @@ class ExperimentModel:
         self.cytometry['gating_templates'] = migrate_cytometry_templates(self.cytometry)
         migrate_scoped_gating_templates(self.cytometry)
         self.samples.setdefault('sample_template_assignments', {})
+        self.cytometry.setdefault('raw_custom_sample_gates', {})
+        self.cytometry.setdefault('unmixed_custom_sample_gates', {})
 
         ### save ###
         self.save()
@@ -185,6 +187,8 @@ class ExperimentModel:
         self.cytometry['gating_templates'] = migrate_cytometry_templates(self.cytometry)
         migrate_scoped_gating_templates(self.cytometry)
         self.samples.setdefault('sample_template_assignments', {})
+        self.cytometry.setdefault('raw_custom_sample_gates', {})
+        self.cytometry.setdefault('unmixed_custom_sample_gates', {})
 
     def save(self):
         if self.experiment_path is None:

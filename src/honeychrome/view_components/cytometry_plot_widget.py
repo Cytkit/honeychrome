@@ -116,6 +116,7 @@ class CytometryPlotWidget(QFrame):
             self.bus.updateSourceChildGates.connect(self.refresh_source_child_gates)
             self.bus.histsStatsRecalculated.connect(self.update_axes_stats_hist)
             self.bus.updateRois.connect(self.configure_rois)
+            self.bus.repositionRois.connect(self._on_reposition_rois)
 
         # Create main layout
         main_layout = QVBoxLayout(self)
@@ -595,6 +596,14 @@ class CytometryPlotWidget(QFrame):
         self.data_for_cytometry_plots['plots'].append(plot)
         self.bus.showNewPlot.emit(self.mode)
 
+    @Slot(str)
+    def _on_reposition_rois(self, mode):
+        """Redraw this plot's ROIs from the current sample's effective gate.
+        Emitted on sample load so a customised gate shows its own per-sample
+        shape (and non-customised samples snap back to the template shape)."""
+        if mode == self.mode:
+            self.configure_rois(self.mode, self.n_in_plot_sequence)
+
     @Slot(str, int)
     def configure_rois(self, mode, index):
         if mode == self.mode and index == self.n_in_plot_sequence:
@@ -607,7 +616,7 @@ class CytometryPlotWidget(QFrame):
 
             for gate_name in self.plot['child_gates']:
                 try:
-                    gate = self.gating.get_gate(gate_name)
+                    gate = self._effective_gate(gate_name)
                 except Exception:
                     logger.warning(f'configure_rois: gate "{gate_name}" not found in gating strategy — skipping ROI.')
                     continue
@@ -704,6 +713,13 @@ class CytometryPlotWidget(QFrame):
             self.bus.updateSourceChildGates.emit(self.mode, gate_name)
             self.bus.changedGatingHierarchy.emit(self.mode, gate_name)
 
+    def _effective_gate(self, gate_name):
+        """Gate to edit for the current sample: its custom sample gate if one
+        exists, otherwise the shared template gate. Editing what this returns
+        keeps a customised gate per-sample and leaves others on the template."""
+        sample_id = (self.data_for_cytometry_plots or {}).get('sample_id')
+        return self.gating.get_gate(gate_name, sample_id=sample_id)
+
     def update_polygon(self, roi):
         roi_state = roi.getState()
         origin = roi_state['pos']
@@ -712,7 +728,7 @@ class CytometryPlotWidget(QFrame):
         # convert QPointF to list of pairs
         vertices = [(origin.x() + v.x(), origin.y() + v.y()) for v in vertices]
         vertices, dim_x, dim_y = define_polygon_gate(vertices, self.plot['channel_x'], self.plot['channel_y'], self.transformations)
-        gate = self.gating.get_gate(roi.label.gate_name)
+        gate = self._effective_gate(roi.label.gate_name)
         gate.vertices = vertices
 
         if self.bus is not None:
@@ -755,7 +771,7 @@ class CytometryPlotWidget(QFrame):
         size = roi_state['size']
 
         dim_x, dim_y = define_rectangle_gate(pos, size, self.plot['channel_x'], self.plot['channel_y'], self.transformations)
-        gate = self.gating.get_gate(roi.label.gate_name)
+        gate = self._effective_gate(roi.label.gate_name)
         gate.dimensions = [dim_x, dim_y]
 
         if self.bus is not None:
@@ -802,7 +818,7 @@ class CytometryPlotWidget(QFrame):
 
         dim_x, dim_y, coordinates, covariance_matrix, distance_square = define_ellipse_gate(pos, size, angle, self.plot['channel_x'], self.plot['channel_y'], self.transformations)
 
-        gate = self.gating.get_gate(roi.label.gate_name)
+        gate = self._effective_gate(roi.label.gate_name)
         gate.coordinates = coordinates
         gate.covariance_matrix = covariance_matrix
         gate.distance_square = distance_square
@@ -844,7 +860,7 @@ class CytometryPlotWidget(QFrame):
         x2 = roi.v2.value()
         dim_x = define_range_gate(x1, x2, self.plot['channel_x'], self.transformations)
 
-        gate = self.gating.get_gate(roi.label.gate_name)
+        gate = self._effective_gate(roi.label.gate_name)
         gate.dimensions = [dim_x]
 
         if self.bus is not None:
@@ -881,7 +897,7 @@ class CytometryPlotWidget(QFrame):
         y = roi.vy.value()
         quad_divs, quadrants = define_quad_gates(x, y, self.plot['channel_x'], self.plot['channel_y'], self.transformations)
 
-        gate = self.gating.get_gate(roi.gate_name)
+        gate = self._effective_gate(roi.gate_name)
         gate.quadrants = {q.id: q for q in quadrants}
         gate.dimensions = quad_divs
 

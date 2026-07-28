@@ -152,6 +152,11 @@ class View(QObject):
         self.bus.renameTemplateRequested.connect(self.controller.rename_template)
         self.bus.templateApplied.connect(self.on_template_applied)
 
+        # per-sample custom gates (customise / revert / adopt a single gate)
+        self.bus.customiseGateRequested.connect(self.controller.customise_gate)
+        self.bus.revertGateRequested.connect(self.controller.revert_gate_to_template)
+        self.bus.adoptGateRequested.connect(self.controller.adopt_custom_gate_as_template)
+
         # change spectral model, unmix!, change fine tuning matrix
         self.bus.spectralModelUpdated.connect(self.controller.refresh_spectral_process)
         self.bus.spectralProcessRefreshed.connect(lambda : self.init_plot_grids_and_gating_trees('unmixed'))
