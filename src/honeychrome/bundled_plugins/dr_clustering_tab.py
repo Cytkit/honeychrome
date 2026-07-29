@@ -7921,6 +7921,7 @@ class ClusterAnnotationTab(QWidget):
         self._mem_labels: dict[int, str] = {}
         self._cell_type_df = None
         self._suggestions_run_id: str | None = None
+        self._cluster_id_worker = None
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -8110,6 +8111,19 @@ class ClusterAnnotationTab(QWidget):
             "generated MEM label. Lower = more markers included per cluster."
         )
         suggest_row.addWidget(self.mem_threshold_spin)
+
+        suggest_row.addWidget(QLabel("Species:"))
+        self.species_combo = QComboBox()
+        self.species_combo.addItem("Human", "human")
+        self.species_combo.addItem("Mouse", "mouse")
+        self.species_combo.setToolTip(
+            "Restricts Suggested Type to drc_cell_type_database.csv entries\n"
+            "defined for this species. Human and mouse entries can define the\n"
+            "same cell-type name with different markers (e.g. CD90 vs CD90.2),\n"
+            "so mixing both would let wrong-species definitions compete for\n"
+            "the same cluster. Has no effect on MEM Label (species-agnostic)."
+        )
+        suggest_row.addWidget(self.species_combo)
 
         self.compute_suggestions_btn = QPushButton("Compute Cluster ID Suggestions")
         self.compute_suggestions_btn.setToolTip(
@@ -8904,12 +8918,8 @@ class ClusterAnnotationTab(QWidget):
                 rec = cell_type_df.loc[cl_id]
                 suggested = rec.get('suggested_type') or ''
                 if suggested:
-                    type_text = f"{suggested} ⚠" if rec.get('is_tie') else suggested
-                    type_tip = (
-                        f"Tied score ({rec.get('score')}) between multiple cell types "
-                        "-- not a confident call." if rec.get('is_tie')
-                        else f"Score: {rec.get('score')}"
-                    )
+                    type_text = suggested
+                    type_tip = f"Score: {rec.get('score')}"
             type_item = QTableWidgetItem(type_text)
             type_item.setFlags(type_item.flags() & ~Qt.ItemIsEditable)
             type_item.setToolTip(type_tip)
@@ -9009,6 +9019,9 @@ class ClusterAnnotationTab(QWidget):
         unmixing every training sample from disk is the dominant cost, so
         the bar advances one step per sample rather than per channel.
         """
+        if self._cluster_id_worker is not None and self._cluster_id_worker.isRunning():
+            return
+
         cl_run = self._selected_cluster_run()
         if cl_run is None:
             QMessageBox.warning(self, "No Run Selected", "Select a clustering run first.")
@@ -9027,7 +9040,7 @@ class ClusterAnnotationTab(QWidget):
         # this run's recorded set must have an Antigen typed in before
         # we'll compute anything -- otherwise MEM Label falls back to the
         # fluorophore Label for that channel and mixes marker/fluorophore
-        # names in the same output with no indication why.
+        # names in the same MEM Label output with no indication why.
         missing_antigen = drc_cluster_id.channels_missing_antigen(self.controller, channels)
         if missing_antigen:
             display_labels = _antigen_dash_labels(self.controller)
@@ -9041,40 +9054,86 @@ class ClusterAnnotationTab(QWidget):
             )
             return
 
-        from PySide6.QtWidgets import QApplication
-        n_samples = len(cl_run.get('training_sample_ids', [])) or 1
-        self._suggestions_progress.setRange(0, n_samples)
+        total_steps = drc_cluster_id.total_progress_steps(cl_run)
+        self._suggestions_progress.setRange(0, total_steps)
         self._suggestions_progress.setValue(0)
         self._suggestions_progress.setVisible(True)
         self._suggestions_status.setText("Computing MEM scores and cell-type matches …")
-        QApplication.instance().processEvents()
+        self.compute_suggestions_btn.setEnabled(False)
 
-        def _on_progress(n_done: int):
-            self._suggestions_progress.setValue(n_done)
-            QApplication.instance().processEvents()
+        mem_threshold = self.mem_threshold_spin.value()
+        species = self.species_combo.currentData()
 
-        try:
-            mem_labels, _mem_scores, cell_type_df, unmatched_markers = \
-                drc_cluster_id.compute_cluster_id_suggestions(
-                    self.controller, self.state, cl_run, channels,
-                    mem_threshold=self.mem_threshold_spin.value(),
-                    progress_callback=_on_progress,
-                )
-        except Exception as exc:
-            _log.exception("Cluster ID suggestion computation failed: %s", exc)
+        # Snapshot AF/transfer-matrix state HERE, on the main thread, before
+        # the worker starts -- same reasoning as _StatsWorker/_ClWorker/
+        # _DrWorker: controller.load_sample() reassigns these arrays in
+        # place whenever the user loads a different sample in the main
+        # window, and the AF kernel touches them via raw C pointers, so a
+        # concurrent reassignment is a memory-corruption hazard, not just
+        # stale data.
+        af_state = (
+            self.controller.transfer_matrix,
+            self.controller.af_precomputed,
+            self.controller.af_spectra,
+        )
+
+        plugin_ref = self
+
+        class _ClusterIdWorker(QThread):
+            progress = Signal(int)
+            finished = Signal(bool, str, object)
+
+            def __init__(self_, cl_run, channels, mem_threshold, species, af_state):
+                super().__init__()
+                self_._cl_run = cl_run
+                self_._channels = channels
+                self_._mem_threshold = mem_threshold
+                self_._species = species
+                self_._af_state = af_state
+
+            def run(self_):
+                try:
+                    result = drc_cluster_id.compute_cluster_id_suggestions(
+                        plugin_ref.controller, plugin_ref.state,
+                        self_._cl_run, self_._channels,
+                        mem_threshold=self_._mem_threshold,
+                        species=self_._species,
+                        progress_callback=lambda n: self_.progress.emit(n),
+                        af_state=self_._af_state,
+                    )
+                    self_.finished.emit(True, '', result)
+                except Exception as exc:
+                    traceback.print_exc()
+                    self_.finished.emit(False, str(exc), None)
+
+        worker = _ClusterIdWorker(cl_run, channels, mem_threshold, species, af_state)
+        worker.progress.connect(self._suggestions_progress.setValue)
+        worker.finished.connect(
+            lambda success, err, result, run_id=cl_run.get('run_id'), n_channels=len(channels):
+                self._on_cluster_id_finished(success, err, result, run_id, n_channels)
+        )
+        self._cluster_id_worker = worker
+        worker.start()
+
+    def _on_cluster_id_finished(self, success: bool, error_msg: str, result, run_id, n_channels):
+        self._cluster_id_worker = None
+        self.compute_suggestions_btn.setEnabled(True)
+        self._suggestions_progress.setVisible(False)
+
+        if not success:
+            _log.error("Cluster ID suggestion computation failed: %s", error_msg)
             QMessageBox.warning(
-                self, "Computation Failed", f"Could not compute suggestions:\n{exc}"
+                self, "Computation Failed", f"Could not compute suggestions:\n{error_msg}"
             )
             self._suggestions_status.setText(
                 "Cluster ID suggestions not yet computed for this run."
             )
-            self._suggestions_progress.setVisible(False)
             return
 
-        self._suggestions_progress.setVisible(False)
+        mem_labels, _mem_scores, cell_type_df, unmatched_markers = result
         self._mem_labels = mem_labels
         self._cell_type_df = cell_type_df
-        self._suggestions_run_id = cl_run.get('run_id')
+        self._suggestions_run_id = run_id
 
         # Item 15 (marker naming, tier 2 -- SOFT warning). Antigen text
         # that's present but unrecognised by marker_database.csv doesn't
@@ -9094,14 +9153,10 @@ class ClusterAnnotationTab(QWidget):
                 "toward MEM Label as typed.\n\n  " + lines
             )
 
-        n_ties = int(cell_type_df['is_tie'].sum()) if cell_type_df is not None and not cell_type_df.empty else 0
-        tie_note = (
-            f"  {n_ties} cluster(s) tied between multiple cell types — see tooltip."
-            if n_ties else ""
-        )
         self._suggestions_status.setText(
             f"Suggestions ready for {len(mem_labels)} cluster(s), "
-            f"{len(channels)} channel(s).{tie_note}"
+            f"{n_channels} channel(s), {self.species_combo.currentText()} "
+            f"cell types."
         )
         self._populate_label_table()
 
@@ -9786,6 +9841,8 @@ class PluginWidget(QWidget):
                 s.setValue('annotation_run_id', cat.run_combo.currentData() or '')
                 s.setValue('annotation_dr_run_id', cat.dr_run_combo.currentData() or '')
                 s.setValue('annotation_channels_checked', cat._checked_channels())
+                if hasattr(cat, 'species_combo'):
+                    s.setValue('cluster_id_species', cat.species_combo.currentData() or 'human')
             # Groups tab: include-type-markers checkbox
             if hasattr(self, 'groups_stats_tab'):
                 gst = self.groups_stats_tab
@@ -10062,6 +10119,7 @@ class PluginWidget(QWidget):
             self._pending_annotation_channels = (
                 list(annotation_channels) if annotation_channels else []
             )
+            self._pending_cluster_id_species = s.value('cluster_id_species', 'human')
 
             # Config tab: restore channel and training-sample selections
             # (will be applied when ConfigTab.refresh() runs).  Gate
@@ -10409,6 +10467,10 @@ class PluginWidget(QWidget):
         if checked:
             for ch, cb in cat.channel_checkboxes.items():
                 cb.setChecked(ch in checked)
+        if hasattr(cat, 'species_combo'):
+            idx = cat.species_combo.findData(getattr(self, '_pending_cluster_id_species', 'human'))
+            if idx >= 0:
+                cat.species_combo.setCurrentIndex(idx)
         if cat.run_combo.currentData() is not None and cat._checked_channels():
             cat._recompute_violins()
 

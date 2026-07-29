@@ -53,6 +53,8 @@ scoring, canonicalised at lookup time):
 from __future__ import annotations
 
 import csv
+import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -72,7 +74,10 @@ log = get_logger(__name__)
 
 def pool_cluster_marker_values(controller, state, cl_run: dict,
                                 channels: list[str],
-                                progress_callback=None) -> dict[str, dict[int, np.ndarray]]:
+                                progress_callback=None,
+                                af_state=None,
+                                max_events_per_cluster: int | None = 1000,
+                                seed: int = 42) -> dict[str, dict[int, np.ndarray]]:
     """
     Pool TRANSFORMED marker values (state.channel_transform_params -- the
     SAME per-channel transform the Transforms tab and clustering itself
@@ -87,9 +92,33 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
     background thread, since loading + unmixing each sample from disk is
     the dominant cost here, not the in-memory MEM math afterward.
 
-    Returns {channel: {cluster_id: concatenated np.ndarray}}. A channel/
-    cluster combination with no data is simply absent from the inner dict
-    (callers must use .get()).
+    af_state: optional AF snapshot (transfer_matrix, af_precomputed,
+    af_spectra) -- see drc_pipeline.apply_unmixing_af_aware()'s docstring.
+    Pass this when calling from a background worker thread; leave as None
+    only for main-thread callers.
+
+    max_events_per_cluster: caps each (channel, cluster) pooled array at
+    this many events via random downsampling (default 1000). MEM's
+    median/IQR and the Otsu threshold are order statistics that don't
+    need every event, and calculate_mem_scores in particular rebuilds
+    and np.percentile-sorts a REF array of every OTHER cluster's events
+    for EVERY (channel, cluster) pair -- left uncapped, that cost scales
+    with the full pooled event count, not a fixed small number.
+    Downsampled INDEPENDENTLY per (channel, cluster) with a fixed seed --
+    safe because every downstream stat here (MEM, cluster medians, Otsu
+    thresholds) is a per-channel MARGINAL statistic; nothing compares
+    events across channels, so there's no requirement that the same
+    events survive downsampling in every channel. Pass None to disable
+    (use every pooled event -- the previous behaviour).
+
+    seed: numpy default_rng seed for the downsampling above. Fixed at 42
+    (matching drc_pipeline.load_training_pool's own downsampling
+    convention) so repeated runs against the same run/channels are
+    reproducible.
+
+    Returns {channel: {cluster_id: concatenated (and possibly
+    downsampled) np.ndarray}}. A channel/cluster combination with no
+    data is simply absent from the inner dict (callers must use .get()).
     """
     labels_dict = cl_run.get('labels', {}) or {}
     training_samples = cl_run.get('training_sample_ids', [])
@@ -101,7 +130,7 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
         len(channels), len(training_samples),
     )
     for i, rel in enumerate(training_samples):
-        mv = drc_pipeline.load_sample_transformed_values(controller, state, rel, channels)
+        mv = drc_pipeline.load_sample_transformed_values(controller, state, rel, channels, af_state=af_state)
         if mv is None:
             log.warning("pool_cluster_marker_values: %s -- could not load transformed values, skipped", rel)
             if progress_callback is not None:
@@ -134,10 +163,23 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
         if progress_callback is not None:
             progress_callback(i + 1)
 
-    result = {
-        ch: {cl: np.concatenate(vals) for cl, vals in by_cl.items() if len(vals)}
-        for ch, by_cl in pooled.items()
-    }
+    rng = np.random.default_rng(seed)
+    result: dict[str, dict[int, np.ndarray]] = {}
+    n_capped = 0
+    n_total = 0
+    for ch, by_cl in pooled.items():
+        result[ch] = {}
+        for cl, vals in by_cl.items():
+            if not vals:
+                continue
+            arr = np.concatenate(vals)
+            n_total += 1
+            if max_events_per_cluster is not None and len(arr) > max_events_per_cluster:
+                idx = rng.choice(len(arr), size=max_events_per_cluster, replace=False)
+                arr = arr[idx]
+                n_capped += 1
+            result[ch][cl] = arr
+
     for ch, by_cl in result.items():
         if not by_cl:
             log.warning(
@@ -150,6 +192,11 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
                 "  %-22s pooled %d cluster(s), n_events: %s",
                 ch, len(by_cl), {cl: len(v) for cl, v in by_cl.items()},
             )
+    log.info(
+        "pool_cluster_marker_values: capped %d/%d (channel, cluster) cell(s) "
+        "to <= %s events (seed=%d)",
+        n_capped, n_total, max_events_per_cluster, seed,
+    )
     return result
 
 
@@ -234,6 +281,127 @@ def calculate_mem_scores(pooled: dict[str, dict[int, np.ndarray]],
         mem_scaled = mem_raw
     log.info("MEM matrix: %s", mem_scaled.shape)
     return mem_scaled
+
+
+def calculate_cluster_medians(pooled: dict[str, dict[int, np.ndarray]]) -> pd.DataFrame:
+    """
+    Per-cluster ABSOLUTE median of the TRANSFORMED marker values in
+    `pooled` -- no reference cluster, no rescale, no comparison of any
+    kind between clusters. This is what score_cell_types takes as input,
+    matching flow_cluster_id_score.R's own "thresholded flow expression
+    matrix" convention: the biexponential/logicle transform already puts
+    the negative/positive boundary at (approximately) zero, so a
+    cluster's median transformed value on its own IS the signal the R
+    function expects -- unlike calculate_mem_scores (auto-reference +
+    global rescale) or the z-score approach this replaces (auto-reference
+    + population SD), both of which are RELATIVE: "how different is this
+    cluster from the rest of this run."
+
+    That relativity is exactly what broke scoring against a marker with
+    NO cross-cluster variation -- e.g. CD3 in an all-CD3+, pre-gated
+    T-cell run, where every cluster is already CD3+CD45+ and there is no
+    cross-cluster difference for MEM or a z-score to detect, so both
+    assign it ~0 regardless of how the result is rescaled or weighted.
+    An absolute median doesn't have this problem: CD3's median transformed
+    value sits well above the transform's zero point for every cluster in
+    that run, because the cells really are CD3+, and now that correctly
+    registers as positive evidence for every one of them.
+
+    Returns a (cluster x channel) DataFrame; NaN cells follow the same
+    convention as calculate_mem_scores (no pooled data for that
+    cluster/channel).
+    """
+    channels = list(pooled.keys())
+    clusters = sorted({cl for by_cl in pooled.values() for cl in by_cl})
+    if not clusters or not channels:
+        return pd.DataFrame(index=clusters, columns=channels, dtype=float)
+
+    med = pd.DataFrame(index=clusters, columns=channels, dtype=float)
+    for ch in channels:
+        by_cl = pooled[ch]
+        for cl in clusters:
+            pop = by_cl.get(cl)
+            if pop is None or len(pop) == 0:
+                continue
+            med.loc[cl, ch] = float(np.median(pop))
+    arr = med.to_numpy(dtype=float)
+    if np.any(~np.isnan(arr)):
+        log.info(
+            "cluster-median matrix: %s, value range [%.3g, %.3g], mean %.3g "
+            "-- this is the ABSOLUTE scale score_cell_types compares "
+            "against min_score",
+            med.shape, float(np.nanmin(arr)), float(np.nanmax(arr)), float(np.nanmean(arr)),
+        )
+    else:
+        log.warning("cluster-median matrix: %s, ALL NaN -- no pooled data at all", med.shape)
+    return med
+
+
+def _otsu_threshold(values: np.ndarray, n_bins: int = 256) -> float:
+    """
+    Standard 1-D Otsu threshold: the cut point that maximises between-class
+    variance, splitting `values` into a "low" and "high" group. Used by
+    calculate_channel_thresholds() to find the negative/positive split for
+    a channel -- does NOT require true bimodality to behave sensibly; a
+    unimodal distribution (e.g. a marker that's uniformly positive across
+    an entire pre-gated run) still gets a cutoff at the edge of that one
+    population, not a nonsensical mid-population split.
+    """
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return 0.0
+    vmin, vmax = float(finite.min()), float(finite.max())
+    if vmax <= vmin:
+        return vmin
+
+    hist, edges = np.histogram(finite, bins=n_bins, range=(vmin, vmax))
+    hist = hist.astype(float)
+    bin_centers = (edges[:-1] + edges[1:]) / 2
+
+    weight_low = np.cumsum(hist)
+    weight_high = hist.sum() - weight_low
+    cum_val = np.cumsum(hist * bin_centers)
+    total_val = cum_val[-1]
+
+    mean_low = np.divide(cum_val, weight_low, out=np.zeros_like(cum_val), where=weight_low > 0)
+    mean_high = np.divide(total_val - cum_val, weight_high,
+                           out=np.zeros_like(cum_val), where=weight_high > 0)
+    between_class_var = weight_low * weight_high * (mean_low - mean_high) ** 2
+
+    return float(bin_centers[int(np.argmax(between_class_var))])
+
+
+def calculate_channel_thresholds(pooled: dict[str, dict[int, np.ndarray]]) -> dict[str, float]:
+    """
+    Per-channel Otsu threshold (see _otsu_threshold), computed from EVERY
+    pooled event across EVERY cluster combined -- a property of the
+    channel's overall distribution in this run, not of any one cluster
+    relative to another. Subtracting this from calculate_cluster_medians's
+    output (see score_cell_types's caller) is the missing "thresholding"
+    step flow_cluster_id_score.R's docstring assumes: without it, "off"
+    reads as a small positive number rather than ~0/negative, which lets
+    cell-type entries with MORE listed positive markers win purely by
+    accumulating more small positive contributions, regardless of whether
+    those markers are actually on (see this module's top-level notes on
+    the 2024 "Memory CD4 Treg wins everything" diagnosis for the concrete
+    numbers).
+
+    Deliberately NOT per-cluster or per-run-relative like calculate_mem_scores
+    or the z-score approach both replaced by calculate_cluster_medians: a
+    channel that's uniformly positive across every cluster in a pre-gated
+    run (e.g. CD3 in an all-CD3+ dataset) still gets a sensible threshold
+    at the edge of that single population, so every cluster stays above
+    it and CD3 still counts as positive evidence for all of them.
+
+    Returns {channel: threshold}. A channel with no pooled data anywhere
+    gets threshold 0.0.
+    """
+    thresholds: dict[str, float] = {}
+    for ch, by_cl in pooled.items():
+        all_vals = np.concatenate([v for v in by_cl.values() if len(v)]) if by_cl else np.array([])
+        thresholds[ch] = _otsu_threshold(all_vals) if all_vals.size else 0.0
+    log.info("calculate_channel_thresholds: %s", {k: round(v, 3) for k, v in thresholds.items()})
+    return thresholds
 
 
 def generate_mem_labels(mem_scores: pd.DataFrame, display_labels: dict[str, str],
@@ -371,6 +539,13 @@ def build_channel_marker_map(controller, channels: list[str]) -> tuple[dict[str,
         result[ch] = canonical or antigen
         if not canonical:
             unmatched.append((ch, antigen))
+    log.info(
+        "build_channel_marker_map: %d/%d channel(s) matched a canonical "
+        "marker; unmatched (raw antigen text, won't match any "
+        "cell_type_database.csv row): %s",
+        len(channels) - len(unmatched), len(channels),
+        [antigen for _ch, antigen in unmatched],
+    )
     return result, unmatched
 
 
@@ -423,95 +598,185 @@ def load_cell_type_database(path: Path | str | None = None) -> list[dict]:
     return rows
 
 
+def filter_cell_type_db_by_species(cell_type_db: list[dict],
+                                    species: str | None) -> list[dict]:
+    """
+    Restrict cell_type_db to entries whose species field includes
+    `species`. Rows store species as a ';'-joined list (e.g. 'human;mouse'
+    for the handful of entries -- Astrocyte, LSEC, Oligodendrocyte -- whose
+    canonicalised marker set happens to be identical across species; see
+    drc_cell_type_database.csv), so a mouse-panel run still sees those.
+
+    species=None (or '') returns cell_type_db unchanged -- callers that
+    haven't wired up a species selector (or want the old unrestricted
+    behaviour) aren't forced to pass anything.
+    """
+    if not species:
+        log.info("filter_cell_type_db_by_species: no species set -- scoring against all %d entries", len(cell_type_db))
+        return cell_type_db
+    species = species.strip().lower()
+    filtered = [e for e in cell_type_db if species in (e['species'] or '').lower().split(';')]
+    log.info(
+        "filter_cell_type_db_by_species: %d/%d entries kept for species=%r",
+        len(filtered), len(cell_type_db), species,
+    )
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Cell-type scoring (ported from flow_cluster_id_score.R)
 # ---------------------------------------------------------------------------
 
-def score_cell_types(mem_scores: pd.DataFrame, channel_marker_map: dict[str, str],
-                      cell_type_db: list[dict]) -> pd.DataFrame:
+def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
+                      cell_type_db: list[dict],
+                      min_score: float = 1.0) -> pd.DataFrame:
     """
-    Python port of flow_cluster_id_score.R (scType-derived): per cluster,
+    Python port of flow_cluster_id_score.R (scType-derived), realigned
+    with the R original's actual shape:
 
-        score(type) = sum(MEM[pos markers]) / sqrt(n_pos)
-                      - sum(MEM[neg markers]) / sqrt(n_neg)
+        score(type) = sum(scores[pos markers]) / sqrt(n_pos)
+                      - sum(scores[neg markers]) / sqrt(n_neg)
 
-    The highest-scoring type wins; an EXACT tie is flagged (is_tie=True)
-    rather than arbitrarily broken -- same behaviour as the R original,
-    which returns all tied names joined by ' | '. cluster_id.md's "Advanced
-    Tie-Breaking Strategies" (marker weighting, margin-based near-ties,
-    hierarchical fallback) are deliberately NOT implemented here -- natural
-    follow-ups, not part of this integration.
+    `scores` is calculate_cluster_medians's output with each channel's
+    calculate_channel_thresholds() Otsu threshold subtracted (done by the
+    caller, compute_cluster_id_suggestions) -- each cluster's OWN median
+    transformed value, centred so "off" reads near/below zero and "on"
+    reads clearly positive, matching the R function's "thresholded flow
+    expression matrix" input. This is NOT MEM and NOT a z-score, and
+    critically, NOT compared to other clusters at all -- a marker with
+    zero cross-cluster variation (e.g. CD3 in an all-CD3+ pre-gated run)
+    still reads as strongly positive here, since the threshold is a
+    property of the channel's overall distribution, not of what's
+    different between clusters -- something neither MEM nor a z-score
+    can do. Without the threshold subtraction, "off" markers still read
+    as a small positive number rather than ~0, which biases scoring
+    toward cell types with longer positive-marker lists regardless of
+    whether those markers are actually on -- see calculate_channel_thresholds's
+    docstring for the concrete numbers that exposed this.
 
-    Deliberate deviation from the R original: flow_cluster_id_score.R
-    doesn't guard the POSITIVE-marker sum against an empty marker set (only
-    the negative one), so a cell type with zero of its positive markers
-    present in the data resolves to NaN in R, and NaN comparisons there
-    would raise rather than resolve sensibly. Here, a missing marker simply
-    contributes 0 to its side (matching cluster_id.md's own
-    assign_cell_types_robust), and a cell type is skipped ENTIRELY only if
-    NEITHER its positive nor negative markers have any representation in
-    channel_marker_map -- i.e. this specific panel has no evidence for or
-    against it at all, so scoring it as "0, no evidence either way" would
-    let it win by default in a database of otherwise-irrelevant entries
-    (see the human vs. mouse Neutrophil rows in drc_cell_type_database.csv
-    for why this matters in practice).
+    Deliberate deviation from the R original (unchanged from previous
+    ports): a missing marker contributes 0 to its side rather than
+    resolving to NaN, and a cell type is skipped ENTIRELY only if NEITHER
+    its positive nor negative markers have any representation in
+    channel_marker_map.
 
-    mem_scores columns are CHANNEL names; cell_type_db positive/negative
-    lists are CANONICAL MARKER names -- channel_marker_map bridges the two.
-    Returns a DataFrame indexed by cluster id with columns
-    ['suggested_type', 'score', 'is_tie']. A cluster with no cell type
-    scoreable at all gets suggested_type='' , score=None, is_tie=False.
+    MINIMUM SCORE (min_score, default 1.0, unchanged from the previous
+    revision): a cluster with nothing scoring at least this gets
+    'Uncharacterized' rather than whatever happened to be least-negative
+    -- several unrelated types tying at or near 0 (none of their positive
+    markers are even in this panel) is an absence of a suggestion, not
+    one.
+
+    HIERARCHY TIE-BREAK (unchanged): an exact tie resolves to whichever
+    entry was seen FIRST in cell_type_db -- drc_cell_type_database.csv
+    lists parent/less-resolved populations before their children, so keep
+    new entries appended in that order, not alphabetised, or this
+    silently starts preferring whatever sorts first instead.
+
+    NOT currently implemented (dropped from the last two revisions,
+    which built them to fight problems specific to a RELATIVE scoring
+    input): the absence-only reward/penalty split and signed-square
+    marker weighting. Re-evaluate whether either is still needed once
+    this plain version has been checked against real data -- don't
+    assume it is.
+
+    scores columns are CHANNEL names; cell_type_db positive/negative
+    lists are CANONICAL MARKER names -- channel_marker_map bridges the
+    two. Returns a DataFrame indexed by cluster id with columns
+    ['suggested_type', 'score']. A cluster with no cell type scoreable at
+    all, or nothing clearing min_score, gets suggested_type='',
+    score=None.
     """
     marker_to_channel: dict[str, str] = {}
     for ch, marker in channel_marker_map.items():
         marker_to_channel.setdefault(marker, ch)
+    log.info(
+        "score_cell_types: %d cell-type entries to check, %d canonical marker(s) "
+        "resolved from this panel's channels: %s",
+        len(cell_type_db), len(marker_to_channel), sorted(marker_to_channel),
+    )
+
+    n_evaluable = 0  # entries with at least one marker present in this panel
 
     records = []
-    for cl in mem_scores.index:
-        row = mem_scores.loc[cl]
+    for cl in scores.index:
+        row = scores.loc[cl]
         best_score = -np.inf
-        best_types: list[str] = []
+        best_type = ''
 
         for entry in cell_type_db:
             pos_channels = [marker_to_channel[m] for m in entry['positive'] if m in marker_to_channel]
             neg_channels = [marker_to_channel[m] for m in entry['negative'] if m in marker_to_channel]
             if not pos_channels and not neg_channels:
                 continue  # no evidence either way in this panel -- skip entirely
+            n_evaluable += 1
 
             pos_vals = [row[ch] for ch in pos_channels if ch in row.index and pd.notna(row[ch])]
             neg_vals = [row[ch] for ch in neg_channels if ch in row.index and pd.notna(row[ch])]
             sum_pos = (sum(pos_vals) / np.sqrt(len(pos_vals))) if pos_vals else 0.0
-            sum_neg = (-sum(neg_vals) / np.sqrt(len(neg_vals))) if neg_vals else 0.0
-            score = float(sum_pos + sum_neg)
+            sum_neg = (sum(neg_vals) / np.sqrt(len(neg_vals))) if neg_vals else 0.0
+            score = float(sum_pos - sum_neg)
 
             if score > best_score:
                 best_score = score
-                best_types = [entry['cell_type']]
-            elif score == best_score:
-                best_types.append(entry['cell_type'])
+                best_type = entry['cell_type']
+            # exact ties: keep whichever was seen FIRST (higher in the
+            # hierarchy, per cell_type_db's own row order) -- do not
+            # overwrite on score == best_score.
 
-        if not best_types:
-            records.append({'cluster': int(cl), 'suggested_type': '', 'score': None, 'is_tie': False})
+        cleared = best_type and best_score >= min_score
+        log.info(
+            "  cluster=%-3s best=%-20s score=%s%s",
+            cl, best_type or '(none evaluable)',
+            f"{best_score:.3f}" if best_score > -np.inf else 'n/a',
+            '' if cleared else f"  <- below min_score={min_score}",
+        )
+
+        if not best_type or best_score < min_score:
+            records.append({'cluster': int(cl), 'suggested_type': '', 'score': None})
         else:
             records.append({
                 'cluster': int(cl),
-                'suggested_type': ' | '.join(dict.fromkeys(best_types)),  # de-dupe, keep order
+                'suggested_type': best_type,
                 'score': round(float(best_score), 2),
-                'is_tie': len(set(best_types)) > 1,
             })
 
+    log.info(
+        "score_cell_types: %d/%d (cluster, cell-type entry) pair(s) had at least "
+        "one marker present in this panel",
+        n_evaluable, len(scores.index) * len(cell_type_db),
+    )
     return pd.DataFrame.from_records(records).set_index('cluster') if records \
-        else pd.DataFrame(columns=['suggested_type', 'score', 'is_tie'])
+        else pd.DataFrame(columns=['suggested_type', 'score'])
 
 
 # ---------------------------------------------------------------------------
 # Single entry point for the tab
 # ---------------------------------------------------------------------------
 
+def total_progress_steps(cl_run: dict) -> int:
+    """
+    Total progress_callback ticks compute_cluster_id_suggestions will
+    emit for this run: one per training sample loaded (pooling), plus
+    one per remaining pipeline stage (MEM scores, cluster medians,
+    channel thresholds, MEM labels + marker mapping, cell-type scoring
+    -- 5 stages). Call this BEFORE compute_cluster_id_suggestions to
+    size a progress bar's range, so the range and the actual callback
+    count can't drift apart if a stage is ever added or removed below.
+    """
+    n_samples = len(cl_run.get('training_sample_ids', [])) or 1
+    return n_samples + 5
+
+
 def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: list[str],
                                     mem_threshold: float = 2.0, iqr_floor: float = 0.5,
+                                    min_score: float = 0.2,
                                     cell_type_db_path: Path | str | None = None,
-                                    progress_callback=None):
+                                    species: str | None = None,
+                                    progress_callback=None,
+                                    af_state=None,
+                                    max_events_per_cluster: int | None = 1000,
+                                    downsample_seed: int = 42):
     """
     One-call pipeline for the Cluster Annotation tab's Item 15 controls.
 
@@ -524,24 +789,60 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
     progress_callback: optional callable(n_samples_done: int), forwarded
     straight through to pool_cluster_marker_values -- see its docstring.
 
+    species: 'human', 'mouse', or None. Restricts cell-type scoring to
+    drc_cell_type_database.csv entries defined for that species (see
+    filter_cell_type_db_by_species) -- has NO effect on MEM Label, which
+    is purely descriptive of the data and species-agnostic. None scores
+    against the whole database, human and mouse entries both.
+
+    min_score: forwarded to score_cell_types -- see its docstring.
+
+    af_state: optional AF snapshot (transfer_matrix, af_precomputed,
+    af_spectra), forwarded straight through to pool_cluster_marker_values --
+    see its docstring. Pass this when calling from a background worker
+    thread.
+
+    max_events_per_cluster, downsample_seed: forwarded straight through
+    to pool_cluster_marker_values -- see its docstring.
+
     Returns (mem_labels, mem_scores, cell_type_df, unmatched_markers):
       mem_labels        -- dict[cluster_id -> str], ready to display/adopt
       mem_scores        -- (cluster x channel) DataFrame, in case a future
                            caller wants the raw matrix (e.g. a heatmap)
       cell_type_df      -- DataFrame indexed by cluster, columns
-                           ['suggested_type', 'score', 'is_tie']
+                           ['suggested_type', 'score'] -- see
+                           score_cell_types for how ties are resolved
+                           (hierarchy order, not reported)
       unmatched_markers -- [(channel, antigen_text), ...] from
                            build_channel_marker_map -- Antigen entries that
                            didn't match marker_database.csv and so will
                            NOT contribute to cell-type scoring. The tab
                            surfaces this as a warning after computing
-                           (Change 10) rather than failing or silently
-                           dropping them.
+                           rather than failing or silently dropping them.
     """
     log_stage(log, "CLUSTER ID SUGGESTIONS")
-    pooled = pool_cluster_marker_values(controller, state, cl_run, channels,
-                                         progress_callback=progress_callback)
+    n_samples = len(cl_run.get('training_sample_ids', [])) or 1
+
+    pooled = pool_cluster_marker_values(
+        controller, state, cl_run, channels,
+        progress_callback=progress_callback,
+        af_state=af_state,
+        max_events_per_cluster=max_events_per_cluster,
+        seed=downsample_seed,
+    )
+
     mem_scores = calculate_mem_scores(pooled, iqr_floor=iqr_floor)
+    if progress_callback is not None:
+        progress_callback(n_samples + 1)
+
+    cluster_medians = calculate_cluster_medians(pooled)
+    if progress_callback is not None:
+        progress_callback(n_samples + 2)
+
+    channel_thresholds = calculate_channel_thresholds(pooled)
+    thresholded = cluster_medians.subtract(pd.Series(channel_thresholds), axis=1)
+    if progress_callback is not None:
+        progress_callback(n_samples + 3)
 
     antigen_map = _channel_to_antigen_map(controller)
     display_labels = {ch: (antigen_map.get(ch) or ch) for ch in channels}
@@ -551,9 +852,15 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
         "compute_cluster_id_suggestions: %d/%d cluster(s) Uncharacterized (threshold=%.2g)",
         n_uncharacterized, len(mem_labels), mem_threshold,
     )
-
     channel_marker_map, unmatched_markers = build_channel_marker_map(controller, channels)
     cell_type_db = load_cell_type_database(cell_type_db_path)
-    cell_type_df = score_cell_types(mem_scores, channel_marker_map, cell_type_db)
+    cell_type_db = filter_cell_type_db_by_species(cell_type_db, species)
+    if progress_callback is not None:
+        progress_callback(n_samples + 4)
+
+    cell_type_df = score_cell_types(thresholded, channel_marker_map, cell_type_db,
+                                     min_score=min_score)
+    if progress_callback is not None:
+        progress_callback(n_samples + 5)
 
     return mem_labels, mem_scores, cell_type_df, unmatched_markers
