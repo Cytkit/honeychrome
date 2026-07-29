@@ -252,6 +252,41 @@ def update_dr_run_embeddings(controller, state, run_id: str, embeddings: dict,
             break
 
 
+def update_cluster_id_suggestions(controller, state, run_id: str,
+                                   mem_labels: dict, cell_type_df) -> None:
+    """
+    Persist Item 15's Cluster ID Suggestions (MEM Label + Suggested Type)
+    for an already-archived clustering run -- same "update after the
+    fact" pattern as update_dr_run_embeddings() above, needed for the
+    same reason: suggestions are computed in a LATER step than
+    archive_clustering_run() (the user clicks "Compute Cluster ID
+    Suggestions" after the run already exists in the picker), so this is
+    the only path that ever writes them into the pickle --
+    archive_clustering_run() itself always writes the empty placeholders.
+
+    mem_labels: dict[cluster_id -> str], as returned by
+        compute_cluster_id_suggestions.
+    cell_type_df: the DataFrame returned by compute_cluster_id_suggestions
+        (score_cell_types's output) -- pickled as-is, same as any other
+        non-JSON payload value here (reducer, labels, etc.).
+
+    Does NOT create a new manifest entry or run_id, and does NOT touch
+    manifest.json -- mem_labels/cell_type_df are small enough, and
+    specific enough to THIS payload, that they don't need their own
+    manifest fields (same reasoning as 'names'/'colors' living only in
+    the pickle, never in the lightweight JSON manifest).
+    """
+    payload = load_run_payload(controller, run_id) or {}
+    payload['mem_labels'] = mem_labels
+    payload['cell_type_suggestions'] = cell_type_df
+    save_run_payload(controller, run_id, payload)
+    for entry in state.clustering_runs:
+        if entry.get('run_id') == run_id:
+            entry['mem_labels'] = mem_labels
+            entry['cell_type_suggestions'] = cell_type_df
+            break
+
+
 def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
                             colors, names, n_clusters, gates,
                             training_sample_ids, channels, params,
@@ -285,6 +320,13 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
         'names': names,
         'marker_values': marker_values or {},
         'dr_positions': dr_positions or {},
+        # Item 15 -- not computed yet at archive time (the user runs
+        # "Compute Cluster ID Suggestions" AFTER the run already exists);
+        # placeholders here just keep the payload shape consistent from
+        # the start. See update_cluster_id_suggestions() for how these
+        # get filled in later.
+        'mem_labels': {},
+        'cell_type_suggestions': None,
     })
 
     entry = _manifest_entry(
@@ -301,6 +343,8 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
     full_entry['names'] = names
     full_entry['marker_values'] = marker_values or {}
     full_entry['dr_positions'] = dr_positions or {}
+    full_entry['mem_labels'] = {}
+    full_entry['cell_type_suggestions'] = None
     state.clustering_runs.append(full_entry)
     log.info("archived clustering run %r (run_id=%s, %s cluster(s))",
              run_label, run_id, n_clusters)
@@ -397,4 +441,6 @@ def hydrate_run(controller, entry: dict) -> dict:
         entry['names'] = payload.get('names', {})
         entry['marker_values'] = payload.get('marker_values', {})
         entry['dr_positions'] = payload.get('dr_positions', {})
+        entry['mem_labels'] = payload.get('mem_labels', {})
+        entry['cell_type_suggestions'] = payload.get('cell_type_suggestions')
     return entry
