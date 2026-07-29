@@ -8445,10 +8445,14 @@ class ClusterAnnotationTab(QWidget):
         self._violin_recompute_timer.setSingleShot(True)
         self._violin_recompute_timer.setInterval(400)
         self._violin_recompute_timer.timeout.connect(self._recompute_violins)
-        # Item 15 -- Cluster ID suggestion cache. Tab-local, NOT persisted
-        # to the run archive (same "recompute on demand" convention as the
-        # violin placeholder). Keyed by run_id so switching clustering runs
-        # can never show stale suggestions against the newly-selected run.
+        # Item 15 -- Cluster ID suggestion cache, mirrored into the run
+        # archive (drc_run_archive.archive_clustering_run's 'mem_labels'/
+        # 'cell_type_suggestions' payload fields -- see
+        # update_cluster_id_suggestions). These three attributes are still
+        # the tab's live working copy; _on_run_changed restores them from
+        # the newly-selected run's persisted values (if any) instead of
+        # always clearing to empty, and _on_cluster_id_finished writes
+        # back through to the archive after a fresh computation.
         self._mem_labels: dict[int, str] = {}
         self._cell_type_df = None
         self._suggestions_run_id: str | None = None
@@ -8854,6 +8858,14 @@ class ClusterAnnotationTab(QWidget):
         self._populate_run_combo()
         self._populate_dr_run_combo()
         self._populate_channel_list()
+        # Item 15 -- _populate_run_combo() above re-selects whatever run_id
+        # was already active, so it never fires currentIndexChanged /
+        # _on_run_changed on its own; without this call, a freshly
+        # (re)activated tab (including right after opening the experiment)
+        # never restores a previously-computed, already-persisted
+        # suggestion for the still-selected run. See
+        # _sync_suggestions_from_run's docstring.
+        self._sync_suggestions_from_run(self._selected_cluster_run())
         self._update_compat_warning()
         self._redraw_map()
         self._populate_label_table()
@@ -8925,16 +8937,47 @@ class ClusterAnnotationTab(QWidget):
                 return drc_run_archive.hydrate_run(self.controller, entry)
         return None
 
+    def _sync_suggestions_from_run(self, cl_run):
+        """
+        Restore self._mem_labels / self._cell_type_df /
+        self._suggestions_run_id from whatever cl_run has persisted (see
+        drc_run_archive.update_cluster_id_suggestions), or clear them if
+        this run has nothing saved.
+
+        Shared by _on_run_changed (an actual combo selection change) AND
+        refresh() (tab (re)activation, called on EVERY switch back into
+        this plugin, including right after an experiment loads).
+        refresh()'s own _populate_run_combo() re-selects the SAME run_id
+        that was already selected, so Qt's currentIndexChanged never
+        fires and _on_run_changed never runs on its own -- without this
+        also being called from refresh(), a freshly reopened experiment
+        (or simply switching back to this plugin tab) never restores
+        suggestions for the still-selected run, even though they were
+        safely on disk the whole time.
+        """
+        self._mem_labels = (cl_run.get('mem_labels') or {}) if cl_run else {}
+        self._cell_type_df = cl_run.get('cell_type_suggestions') if cl_run else None
+        has_saved = bool(self._mem_labels) or self._cell_type_df is not None
+        self._suggestions_run_id = cl_run.get('run_id') if (cl_run and has_saved) else None
+        if self._suggestions_run_id:
+            self._suggestions_status.setText(
+                f"Suggestions restored for {len(self._mem_labels)} cluster(s), "
+                f"{len(cl_run.get('channels', []))} channel(s), "
+                f"{self.species_combo.currentText()} cell types."
+            )
+        else:
+            self._suggestions_status.setText(
+                "Clustering run changed — click 'Compute Cluster ID Suggestions' to refresh."
+            )
+
     def _on_run_changed(self, _index: int):
-        # Item 15 -- suggestions are per-run; clear the cache so a stale
-        # MEM/cell-type result from the PREVIOUS run can't be shown against
-        # the newly-selected one.
-        self._mem_labels = {}
-        self._cell_type_df = None
-        self._suggestions_run_id = None
-        self._suggestions_status.setText(
-            "Clustering run changed — click 'Compute Cluster ID Suggestions' to refresh."
-        )
+        # Item 15 -- suggestions are per-run and now persisted (see
+        # update_cluster_id_suggestions); restore whatever the
+        # newly-selected run already has saved rather than always
+        # clearing to empty, so switching runs doesn't throw away a
+        # suggestion computed earlier in a previous session.
+        cl_run = self._selected_cluster_run()
+        self._sync_suggestions_from_run(cl_run)
         self._update_compat_warning()
         self._redraw_map()
         self._populate_label_table()
@@ -9449,8 +9492,13 @@ class ClusterAnnotationTab(QWidget):
                 rec = cell_type_df.loc[cl_id]
                 suggested = rec.get('suggested_type') or ''
                 if suggested:
-                    type_text = suggested
-                    type_tip = f"Score: {rec.get('score')}"
+                    low_conf = bool(rec.get('low_confidence'))
+                    type_text = f"{suggested} ⚠" if low_conf else suggested
+                    type_tip = (
+                        "Driven mainly by absent negative markers, not positive "
+                        "evidence -- treat with caution." if low_conf
+                        else f"Score: {rec.get('score')}"
+                    )
             type_item = QTableWidgetItem(type_text)
             type_item.setFlags(type_item.flags() & ~Qt.ItemIsEditable)
             type_item.setToolTip(type_tip)
@@ -9607,6 +9655,13 @@ class ClusterAnnotationTab(QWidget):
             self.controller.af_precomputed,
             self.controller.af_spectra,
         )
+        # Item 15 -- the unstained sample(s) used to derive positivity
+        # thresholds have no AF profile of their own; resolve a stand-in
+        # per unstained sample (name match, or the run's most common
+        # assignment) and snapshot ITS AF state too, same main-thread
+        # requirement as af_state above -- see
+        # drc_cluster_id.resolve_unstained_af_states's docstring.
+        unstained_af_states = drc_cluster_id.resolve_unstained_af_states(self.controller, cl_run)
 
         plugin_ref = self
 
@@ -9614,13 +9669,15 @@ class ClusterAnnotationTab(QWidget):
             progress = Signal(int)
             finished = Signal(bool, str, object)
 
-            def __init__(self_, cl_run, channels, mem_threshold, species, af_state):
+            def __init__(self_, cl_run, channels, mem_threshold, species, af_state,
+                         unstained_af_states):
                 super().__init__()
                 self_._cl_run = cl_run
                 self_._channels = channels
                 self_._mem_threshold = mem_threshold
                 self_._species = species
                 self_._af_state = af_state
+                self_._unstained_af_states = unstained_af_states
 
             def run(self_):
                 try:
@@ -9631,13 +9688,15 @@ class ClusterAnnotationTab(QWidget):
                         species=self_._species,
                         progress_callback=lambda n: self_.progress.emit(n),
                         af_state=self_._af_state,
+                        unstained_af_states=self_._unstained_af_states,
                     )
                     self_.finished.emit(True, '', result)
                 except Exception as exc:
                     traceback.print_exc()
                     self_.finished.emit(False, str(exc), None)
 
-        worker = _ClusterIdWorker(cl_run, channels, mem_threshold, species, af_state)
+        worker = _ClusterIdWorker(cl_run, channels, mem_threshold, species, af_state,
+                                   unstained_af_states)
         worker.progress.connect(self._suggestions_progress.setValue)
         worker.finished.connect(
             lambda success, err, result, run_id=cl_run.get('run_id'), n_channels=len(channels):
@@ -9665,6 +9724,9 @@ class ClusterAnnotationTab(QWidget):
         self._mem_labels = mem_labels
         self._cell_type_df = cell_type_df
         self._suggestions_run_id = run_id
+        drc_run_archive.update_cluster_id_suggestions(
+            self.controller, self.state, run_id, mem_labels, cell_type_df,
+        )
 
         # Item 15 (marker naming, tier 2 -- SOFT warning). Antigen text
         # that's present but unrecognised by marker_database.csv doesn't

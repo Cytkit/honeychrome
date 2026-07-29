@@ -54,7 +54,10 @@ from __future__ import annotations
 
 import csv
 import math
+import re
 import time
+from collections import Counter
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -371,35 +374,358 @@ def _otsu_threshold(values: np.ndarray, n_bins: int = 256) -> float:
     return float(bin_centers[int(np.argmax(between_class_var))])
 
 
-def calculate_channel_thresholds(pooled: dict[str, dict[int, np.ndarray]]) -> dict[str, float]:
-    """
-    Per-channel Otsu threshold (see _otsu_threshold), computed from EVERY
-    pooled event across EVERY cluster combined -- a property of the
-    channel's overall distribution in this run, not of any one cluster
-    relative to another. Subtracting this from calculate_cluster_medians's
-    output (see score_cell_types's caller) is the missing "thresholding"
-    step flow_cluster_id_score.R's docstring assumes: without it, "off"
-    reads as a small positive number rather than ~0/negative, which lets
-    cell-type entries with MORE listed positive markers win purely by
-    accumulating more small positive contributions, regardless of whether
-    those markers are actually on (see this module's top-level notes on
-    the 2024 "Memory CD4 Treg wins everything" diagnosis for the concrete
-    numbers).
+def _is_bead_sample(path: str, name: str) -> bool:
+    """Mirrors spectral_controller.py::get_unstained_negative's _is_bead()."""
+    return bool(re.search(r'bead', name, re.IGNORECASE) or re.search(r'bead', path, re.IGNORECASE))
 
-    Deliberately NOT per-cluster or per-run-relative like calculate_mem_scores
-    or the z-score approach both replaced by calculate_cluster_medians: a
-    channel that's uniformly positive across every cluster in a pre-gated
-    run (e.g. CD3 in an all-CD3+ dataset) still gets a sensible threshold
-    at the edge of that single population, so every cluster stays above
-    it and CD3 still counts as positive evidence for all of them.
 
-    Returns {channel: threshold}. A channel with no pooled data anywhere
-    gets threshold 0.0.
+def _resolve_unstained_cell_sample_paths(controller) -> list[str]:
     """
-    thresholds: dict[str, float] = {}
-    for ch, by_cl in pooled.items():
+    Returns the rel_path of every unstained CELL sample (manually tagged via
+    the sample panel, OR name/path matching "unstained", excluding Beads) --
+    same resolution logic as
+    autospectral_optimization_functions.py::_resolve_unstained_cell_sample_names,
+    but returns rel_path keys (what training_sample_ids and
+    _load_unstained_gated_transformed below expect) rather than display
+    names.
+    """
+    samples = getattr(controller.experiment, 'samples', {}) or {}
+    all_samples = samples.get('all_samples', {})
+    manually_unstained = set(samples.get('unstained_samples', []))
+
+    def _is_unstained(path: str, name: str) -> bool:
+        return (path in manually_unstained
+                or 'unstained' in path.lower()
+                or 'unstained' in name.lower())
+
+    return [
+        path for path, name in all_samples.items()
+        if _is_unstained(path, name) and not _is_bead_sample(path, name)
+    ]
+
+
+def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | None]:
+    """
+    MAIN-THREAD ONLY -- call this BEFORE starting a background worker,
+    exactly like the existing af_state snapshot passed into
+    compute_cluster_id_suggestions, and forward the result through as
+    unstained_af_states. See drc_pipeline.resolve_af_state_for_profiles's
+    docstring for why: this reads controller.af_precomputed_cache and
+    controller.experiment.process['af_profiles'], both of which the main
+    thread can reassign while a background worker is reading them.
+
+    The unstained sample(s) used by calculate_unstained_channel_thresholds
+    are never assigned an AF profile themselves in the AutoSpectral AF tab
+    -- there's no per-cell classification to run AF discovery against on
+    an unstained control -- so each one needs a stand-in AF assignment to
+    be unmixed consistently with the STAINED training samples it's meant
+    to set a threshold for:
+
+      1. An AF profile whose name matches the unstained sample's OWN
+         display name exactly (experiment.process['af_profiles'] keys) --
+         lets you deliberately name a profile after the unstained sample
+         it represents.
+      2. Otherwise, the MOST-FREQUENTLY-ASSIGNED profile combination
+         across cl_run['training_sample_ids'] -- exact assigned lists
+         compared as tuples, so two samples combining two profiles the
+         same way count as the same combination rather than splitting
+         across their individual profile names.
+      3. If none of the training samples have ANY AF profile assigned,
+         that unstained sample gets af_state=None -- unmixed WITHOUT
+         per-cell AF correction, matching the run itself having none.
+
+    Returns {unstained_rel_path: af_state_or_None} for every unstained
+    cell sample _resolve_unstained_cell_sample_paths finds --
+    calculate_unstained_channel_thresholds looks its own rel_path up in
+    this dict (via .get(), so a path this somehow omitted just resolves to
+    None -- AF-unaware -- rather than raising).
+    """
+    unstained_paths = _resolve_unstained_cell_sample_paths(controller)
+    if not unstained_paths:
+        return {}
+
+    samples = getattr(controller.experiment, 'samples', {}) or {}
+    all_samples_names = samples.get('all_samples', {})
+    sample_af_profiles = samples.get('sample_af_profiles', {})
+    af_profiles = controller.experiment.process.get('af_profiles', {})
+    raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
+
+    most_common_combo: tuple = ()
+    most_common_resolved = False
+
+    def _resolve_most_common_combo() -> tuple:
+        # sample_af_profiles is keyed the same way as all_samples
+        # (experiment_dir-relative) -- training_sample_ids is picker-
+        # relative (relative to raw_samples_subdirectory), same conversion
+        # _load_unstained_gated_transformed's rel_path convention note
+        # documents elsewhere in this module.
+        assignments = []
+        for rel in cl_run.get('training_sample_ids', []):
+            key = str(Path(raw_subdir) / rel)
+            assigned = tuple(sample_af_profiles.get(key, []))
+            if assigned:
+                assignments.append(assigned)
+        if not assignments:
+            log.info(
+                "resolve_unstained_af_states: no training sample in this run "
+                "has an AF profile assigned -- unstained sample(s) will be "
+                "unmixed without AF correction"
+            )
+            return ()
+        combo, count = Counter(assignments).most_common(1)[0]
+        log.info(
+            "resolve_unstained_af_states: most common AF assignment across "
+            "%d training sample(s) is %s (%d/%d sample(s) assigned)",
+            len(cl_run.get('training_sample_ids', [])), combo, count, len(assignments),
+        )
+        return combo
+
+    result: dict[str, tuple | None] = {}
+    af_state_cache: dict[tuple, tuple | None] = {}
+    for rel in unstained_paths:
+        display_name = all_samples_names.get(rel)
+        if display_name and display_name in af_profiles:
+            profile_names: tuple = (display_name,)
+            log.info(
+                "resolve_unstained_af_states: %s -- AF profile matching its "
+                "own name (%r) found, using it", rel, display_name,
+            )
+        else:
+            if not most_common_resolved:
+                most_common_combo = _resolve_most_common_combo()
+                most_common_resolved = True
+            profile_names = most_common_combo
+
+        if profile_names not in af_state_cache:
+            af_state_cache[profile_names] = (
+                drc_pipeline.resolve_af_state_for_profiles(controller, list(profile_names))
+                if profile_names else None
+            )
+        result[rel] = af_state_cache[profile_names]
+
+    return result
+
+
+def _load_unstained_gated_transformed(
+    controller, state, rel_path, channels: list[str], af_state=None,
+    min_singlets_events: int = 500,
+) -> tuple[np.ndarray, list[str]] | None:
+    """
+    Load ONE unstained sample -> TRANSFORMED values for `channels`.
+
+    Gated on 'Singlets', NOT state.selected_gates -- an unstained sample
+    carries no staining, so it will not fall inside whatever stained gate
+    the training samples use; forcing it through state.selected_gates (the
+    way drc_pipeline.load_sample_transformed_values does for training
+    samples) would return zero events. 'Singlets' should always exist on
+    the Raw Data gating hierarchy (settings.py's base_gate_priority_order
+    puts it first), so it's used whenever present AND it has at least
+    min_singlets_events events; otherwise falls back to 'root' (every event
+    in the file, ungated) -- a near-empty or corrupt Singlets gate would
+    otherwise hand back a percentile computed from a handful of events.
+
+    Otherwise mirrors drc_pipeline.load_unmixed_gated + transform_channels:
+    same AF-aware unmixing (apply_unmixing_af_aware), same per-channel
+    transform (transform_channels). Deliberately NOT cached in
+    state.gated_data_cache -- that cache is keyed on state.selected_gates,
+    which this intentionally bypasses, and this is only called once per
+    unstained sample per Cluster ID run, not a hot path.
+
+    af_state: optional AF snapshot -- see apply_unmixing_af_aware()'s
+    docstring. Pass this when calling from a background worker thread.
+
+    Returns (values, channel_names) or None on error.
+    """
+    try:
+        # rel_path comes from all_samples (experiment_dir-relative, already
+        # includes raw_samples_subdirectory) -- NOT training_sample_ids'
+        # picker-relative convention, so sample_abs_path() must NOT be used
+        # here (it would prepend raw_samples_subdirectory a second time).
+        abs_path = controller.experiment_dir / rel_path
+        raw_settings = controller.experiment.settings['raw']
+        whitelisted_pnn = raw_settings.get('whitelisted_pnn') or None
+
+        sample = drc_pipeline.sample_from_fcs(abs_path)
+        if whitelisted_pnn is not None:
+            try:
+                raw = sample.get_events(source='raw', col_order=whitelisted_pnn)
+            except (KeyError, ValueError) as e:
+                log.warning(
+                    "_load_unstained_gated_transformed: col_order get_events "
+                    "failed (%s) -- reading all channels", e,
+                )
+                raw = sample.get_events(source='raw')
+        else:
+            raw = sample.get_events(source='raw')
+
+        unmixed = drc_pipeline.apply_unmixing_af_aware(controller, raw, af_state=af_state)
+
+        cdd = deepcopy(controller.data_for_cytometry_plots_unmixed)
+        cdd['event_data'] = unmixed
+        gate_names = [g[0] for g in cdd['gating'].get_gate_ids()]
+
+        gated = None
+        if 'Singlets' in gate_names:
+            singlets = drc_pipeline.apply_gate_by_lookup_table(deepcopy(cdd), 'Singlets')
+            if len(singlets) >= min_singlets_events:
+                gated = singlets
+            else:
+                log.info(
+                    "_load_unstained_gated_transformed: %s -- 'Singlets' has only "
+                    "%d event(s) (< %d) -- falling back to 'root'",
+                    rel_path, len(singlets), min_singlets_events,
+                )
+        else:
+            log.info(
+                "_load_unstained_gated_transformed: %s -- no 'Singlets' gate found "
+                "-- falling back to 'root'", rel_path,
+            )
+
+        if gated is None:
+            gated = unmixed  # 'root' gate membership is all-True by construction
+
+        return drc_pipeline.transform_channels(controller, state, gated, channels)
+    except Exception as exc:
+        log.exception("_load_unstained_gated_transformed: could not load %s: %s", rel_path, exc)
+        return None
+
+
+def calculate_unstained_channel_thresholds(
+    controller, state, channels: list[str], unstained_af_states: dict | None = None,
+    percentile: float = 99.0, safety_factor: float = 2.0,
+    min_singlets_events: int = 500,
+) -> dict[str, float]:
+    """
+    Per-channel positivity threshold derived from the experiment's own
+    unstained CELL sample(s), gated on 'Singlets' (or 'root' -- see
+    _load_unstained_gated_transformed) and TRANSFORMED the same way as the
+    clustering channels themselves.
+
+    Threshold = safety_factor * the `percentile`-th percentile of the
+    unstained sample's transformed values for that channel (default: 2x
+    the 99th percentile). This is deliberately NOT the Otsu cut
+    (_otsu_threshold / calculate_channel_thresholds) -- Otsu assumes SOME
+    negative population is present to split against, which breaks down
+    for a marker that's uniformly positive across the whole run (e.g. CD45)
+    or has been gated to be uniformly positive (e.g. CD3 in pre-gated T
+    cells): Otsu then finds a nonsensical mid-population split instead of
+    "positive," and the marker is lost to Cluster ID scoring. An unstained
+    sample has no such marker on it at all, so its own background spread
+    gives a channel threshold that works regardless of what the STAINED
+    training samples look like.
+
+    unstained_af_states: {rel_path: af_state_or_None}, as returned by
+    resolve_unstained_af_states -- the unstained sample never has an AF
+    profile of its own, so it must be unmixed with a STAND-IN AF state
+    resolved per sample, never the training samples' own af_state (they
+    have no bearing on an unstained control -- see
+    resolve_unstained_af_states for how the stand-in is chosen). A rel_path
+    missing from this dict (or a None value) is unmixed WITHOUT per-cell
+    AF correction, same as any other AF-unaware call.
+
+    If more than one unstained cell sample is found, the per-channel
+    threshold is the MEDIAN across samples (each sample's own
+    percentile*safety_factor computed independently first) -- one
+    atypical unstained run doesn't skew the threshold for every channel.
+
+    Returns {channel: threshold} covering ONLY channels present in at
+    least one loadable unstained sample -- callers must treat a channel
+    missing from this dict as "no unstained-derived threshold available"
+    and fall back to Otsu (see calculate_channel_thresholds), not assume
+    0.0 here. Returns {} if no unstained cell sample is found/loadable at
+    all.
+    """
+    unstained_paths = _resolve_unstained_cell_sample_paths(controller)
+    if not unstained_paths:
+        log.info("calculate_unstained_channel_thresholds: no unstained cell sample found")
+        return {}
+
+    per_sample: list[dict[str, float]] = []
+    for rel in unstained_paths:
+        af_state = (unstained_af_states or {}).get(rel)
+        mv = _load_unstained_gated_transformed(
+            controller, state, rel, channels, af_state=af_state,
+            min_singlets_events=min_singlets_events,
+        )
+        if mv is None:
+            log.warning("calculate_unstained_channel_thresholds: %s -- could not load, skipped", rel)
+            continue
+        values, names = mv
+        if values.shape[0] == 0:
+            log.warning("calculate_unstained_channel_thresholds: %s -- no events, skipped", rel)
+            continue
+        per_sample.append({
+            ch: float(safety_factor * np.percentile(values[:, names.index(ch)], percentile))
+            for ch in channels if ch in names
+        })
+
+    if not per_sample:
+        log.warning(
+            "calculate_unstained_channel_thresholds: found %d unstained sample(s) "
+            "but none could be loaded", len(unstained_paths),
+        )
+        return {}
+
+    thresholds = {
+        ch: float(np.median([d[ch] for d in per_sample if ch in d]))
+        for ch in channels if any(ch in d for d in per_sample)
+    }
+    log.info(
+        "calculate_unstained_channel_thresholds: %d unstained sample(s) -> %s",
+        len(per_sample), {k: round(v, 3) for k, v in thresholds.items()},
+    )
+    return thresholds
+
+
+def calculate_channel_thresholds(controller, state, pooled: dict[str, dict[int, np.ndarray]],
+                                  channels: list[str], unstained_af_states: dict | None = None) -> dict[str, float]:
+    """
+    Per-channel positivity threshold, PREFERRING the unstained-sample-derived
+    threshold (calculate_unstained_channel_thresholds) and falling back to
+    the Otsu cut (_otsu_threshold) per-channel wherever the former has
+    nothing for that channel -- either because no unstained cell sample
+    exists in the experiment at all, or because that particular channel
+    wasn't present in any loadable unstained sample.
+
+    The Otsu path (computed from EVERY pooled event across EVERY cluster
+    combined -- a property of the channel's overall distribution in THIS
+    run, not of any one cluster relative to another) is unchanged from
+    before; it's still needed as the fallback since it doesn't require an
+    unstained sample to produce a usable cut -- see _otsu_threshold's
+    docstring.
+
+    Subtracting this from calculate_cluster_medians's output (see
+    score_cell_types's caller) is the missing "thresholding" step
+    flow_cluster_id_score.R's docstring assumes: without it, "off" reads as
+    a small positive number rather than ~0/negative, which lets cell-type
+    entries with MORE listed positive markers win purely by accumulating
+    more small positive contributions, regardless of whether those markers
+    are actually on (see this module's top-level notes on the 2024
+    "Memory CD4 Treg wins everything" diagnosis for the concrete numbers).
+
+    unstained_af_states: forwarded to calculate_unstained_channel_thresholds
+    -- see its docstring and resolve_unstained_af_states.
+
+    Returns {channel: threshold}. A channel with no unstained-derived value
+    AND no pooled data anywhere gets threshold 0.0 (_otsu_threshold's own
+    empty-input fallback).
+    """
+    unstained_thresholds = calculate_unstained_channel_thresholds(
+        controller, state, channels, unstained_af_states=unstained_af_states,
+    )
+
+    thresholds: dict[str, float] = dict(unstained_thresholds)
+    otsu_channels = [ch for ch in channels if ch not in unstained_thresholds]
+    for ch in otsu_channels:
+        by_cl = pooled.get(ch, {})
         all_vals = np.concatenate([v for v in by_cl.values() if len(v)]) if by_cl else np.array([])
         thresholds[ch] = _otsu_threshold(all_vals) if all_vals.size else 0.0
+
+    if otsu_channels:
+        log.info(
+            "calculate_channel_thresholds: Otsu fallback for channel(s) without an "
+            "unstained-derived threshold: %s", otsu_channels,
+        )
     log.info("calculate_channel_thresholds: %s", {k: round(v, 3) for k, v in thresholds.items()})
     return thresholds
 
@@ -629,7 +955,8 @@ def filter_cell_type_db_by_species(cell_type_db: list[dict],
 
 def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
                       cell_type_db: list[dict],
-                      min_score: float = 1.0) -> pd.DataFrame:
+                      min_score: float = 0.3,
+                      pos_evidence_floor: float = 0.0) -> pd.DataFrame:
     """
     Python port of flow_cluster_id_score.R (scType-derived), realigned
     with the R original's actual shape:
@@ -638,7 +965,7 @@ def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
                       - sum(scores[neg markers]) / sqrt(n_neg)
 
     `scores` is calculate_cluster_medians's output with each channel's
-    calculate_channel_thresholds() Otsu threshold subtracted (done by the
+    calculate_channel_thresholds() threshold subtracted (done by the
     caller, compute_cluster_id_suggestions) -- each cluster's OWN median
     transformed value, centred so "off" reads near/below zero and "on"
     reads clearly positive, matching the R function's "thresholded flow
@@ -660,12 +987,30 @@ def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
     its positive nor negative markers have any representation in
     channel_marker_map.
 
-    MINIMUM SCORE (min_score, default 1.0, unchanged from the previous
-    revision): a cluster with nothing scoring at least this gets
-    'Uncharacterized' rather than whatever happened to be least-negative
-    -- several unrelated types tying at or near 0 (none of their positive
-    markers are even in this panel) is an absence of a suggestion, not
-    one.
+    ABSENCE-ONLY GUARD (pos_evidence_floor) -- RE-INTRODUCED: the
+    negative-marker term is a REWARD when those markers read absent (as
+    expected, i.e. below their threshold) and a PENALTY when they
+    unexpectedly read present -- both are real signal on their own. The
+    problem is the reward half: since `scores` is already
+    threshold-subtracted, a cluster with a low value on EVERY channel in
+    the panel (debris, dying cells, unmixing noise near the threshold
+    everywhere) reads as "absent" for every negative marker of every cell
+    type, and that absence reward alone can outscore a type with genuine
+    positive evidence. So the reward component only counts when this cell
+    type ALSO has net-positive support from its OWN positive markers in
+    this cluster (sum_pos > pos_evidence_floor); the penalty component
+    (neg markers unexpectedly PRESENT) always counts regardless, since
+    that's real contradicting evidence, not an artifact of "everything
+    reads low here." This was implemented once already against the old
+    MEM-then-z-score scoring inputs and dropped when scoring switched to
+    the (unrelated) threshold-subtracted absolute values below -- same
+    guard, reapplied to the current input.
+
+    MINIMUM SCORE (min_score, default 0.3): a cluster with
+    nothing scoring at least this gets 'Uncharacterized' rather than
+    whatever happened to be least-negative -- several unrelated types
+    tying at or near 0 (none of their positive markers are even in this
+    panel) is an absence of a suggestion, not one.
 
     HIERARCHY TIE-BREAK (unchanged): an exact tie resolves to whichever
     entry was seen FIRST in cell_type_db -- drc_cell_type_database.csv
@@ -673,19 +1018,12 @@ def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
     new entries appended in that order, not alphabetised, or this
     silently starts preferring whatever sorts first instead.
 
-    NOT currently implemented (dropped from the last two revisions,
-    which built them to fight problems specific to a RELATIVE scoring
-    input): the absence-only reward/penalty split and signed-square
-    marker weighting. Re-evaluate whether either is still needed once
-    this plain version has been checked against real data -- don't
-    assume it is.
-
     scores columns are CHANNEL names; cell_type_db positive/negative
     lists are CANONICAL MARKER names -- channel_marker_map bridges the
     two. Returns a DataFrame indexed by cluster id with columns
-    ['suggested_type', 'score']. A cluster with no cell type scoreable at
-    all, or nothing clearing min_score, gets suggested_type='',
-    score=None.
+    ['suggested_type', 'score', 'low_confidence']. A cluster with no cell
+    type scoreable at all, or nothing clearing min_score, gets
+    suggested_type='', score=None, low_confidence=False.
     """
     marker_to_channel: dict[str, str] = {}
     for ch, marker in channel_marker_map.items():
@@ -703,6 +1041,7 @@ def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
         row = scores.loc[cl]
         best_score = -np.inf
         best_type = ''
+        best_has_pos_evidence = False
 
         for entry in cell_type_db:
             pos_channels = [marker_to_channel[m] for m in entry['positive'] if m in marker_to_channel]
@@ -715,30 +1054,41 @@ def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
             neg_vals = [row[ch] for ch in neg_channels if ch in row.index and pd.notna(row[ch])]
             sum_pos = (sum(pos_vals) / np.sqrt(len(pos_vals))) if pos_vals else 0.0
             sum_neg = (sum(neg_vals) / np.sqrt(len(neg_vals))) if neg_vals else 0.0
-            score = float(sum_pos - sum_neg)
+
+            has_pos_evidence = bool(pos_vals) and sum_pos > pos_evidence_floor
+            neg_contribution = -sum_neg
+            neg_reward = max(neg_contribution, 0.0)   # markers absent as expected
+            neg_penalty = min(neg_contribution, 0.0)  # markers unexpectedly present -- always counts
+            score = float(sum_pos + neg_penalty + (neg_reward if has_pos_evidence else 0.0))
 
             if score > best_score:
                 best_score = score
                 best_type = entry['cell_type']
+                best_has_pos_evidence = has_pos_evidence
             # exact ties: keep whichever was seen FIRST (higher in the
             # hierarchy, per cell_type_db's own row order) -- do not
             # overwrite on score == best_score.
 
         cleared = best_type and best_score >= min_score
         log.info(
-            "  cluster=%-3s best=%-20s score=%s%s",
+            "  cluster=%-3s best=%-20s score=%s%s%s",
             cl, best_type or '(none evaluable)',
             f"{best_score:.3f}" if best_score > -np.inf else 'n/a',
             '' if cleared else f"  <- below min_score={min_score}",
+            '  [low_confidence]' if cleared and not best_has_pos_evidence else '',
         )
 
         if not best_type or best_score < min_score:
-            records.append({'cluster': int(cl), 'suggested_type': '', 'score': None})
+            records.append({
+                'cluster': int(cl), 'suggested_type': '', 'score': None,
+                'low_confidence': False,
+            })
         else:
             records.append({
                 'cluster': int(cl),
                 'suggested_type': best_type,
                 'score': round(float(best_score), 2),
+                'low_confidence': not best_has_pos_evidence,
             })
 
     log.info(
@@ -747,7 +1097,7 @@ def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
         n_evaluable, len(scores.index) * len(cell_type_db),
     )
     return pd.DataFrame.from_records(records).set_index('cluster') if records \
-        else pd.DataFrame(columns=['suggested_type', 'score'])
+        else pd.DataFrame(columns=['suggested_type', 'score', 'low_confidence'])
 
 
 # ---------------------------------------------------------------------------
@@ -770,11 +1120,13 @@ def total_progress_steps(cl_run: dict) -> int:
 
 def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: list[str],
                                     mem_threshold: float = 2.0, iqr_floor: float = 0.5,
-                                    min_score: float = 0.2,
+                                    min_score: float = 0.3,
+                                    pos_evidence_floor: float = 0.0,
                                     cell_type_db_path: Path | str | None = None,
                                     species: str | None = None,
                                     progress_callback=None,
                                     af_state=None,
+                                    unstained_af_states: dict | None = None,
                                     max_events_per_cluster: int | None = 1000,
                                     downsample_seed: int = 42):
     """
@@ -795,12 +1147,22 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
     is purely descriptive of the data and species-agnostic. None scores
     against the whole database, human and mouse entries both.
 
-    min_score: forwarded to score_cell_types -- see its docstring.
+    min_score, pos_evidence_floor: forwarded to score_cell_types -- see
+    its docstring.
 
     af_state: optional AF snapshot (transfer_matrix, af_precomputed,
     af_spectra), forwarded straight through to pool_cluster_marker_values --
     see its docstring. Pass this when calling from a background worker
     thread.
+
+    unstained_af_states: {rel_path: af_state_or_None}, as returned by
+    resolve_unstained_af_states -- forwarded to calculate_channel_thresholds
+    (and from there to calculate_unstained_channel_thresholds). NOT the
+    same thing as af_state above: the unstained sample used to derive
+    positivity thresholds has no AF profile of its own, so it needs its
+    OWN resolved stand-in, never the training samples' af_state. Must be
+    resolved on the MAIN THREAD before this function is called from a
+    background worker -- see resolve_unstained_af_states's docstring.
 
     max_events_per_cluster, downsample_seed: forwarded straight through
     to pool_cluster_marker_values -- see its docstring.
@@ -810,9 +1172,10 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
       mem_scores        -- (cluster x channel) DataFrame, in case a future
                            caller wants the raw matrix (e.g. a heatmap)
       cell_type_df      -- DataFrame indexed by cluster, columns
-                           ['suggested_type', 'score'] -- see
-                           score_cell_types for how ties are resolved
-                           (hierarchy order, not reported)
+                           ['suggested_type', 'score', 'low_confidence']
+                           -- see score_cell_types for how ties are
+                           resolved (hierarchy order, not reported) and
+                           what low_confidence means (absence-only guard)
       unmatched_markers -- [(channel, antigen_text), ...] from
                            build_channel_marker_map -- Antigen entries that
                            didn't match marker_database.csv and so will
@@ -839,7 +1202,9 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
     if progress_callback is not None:
         progress_callback(n_samples + 2)
 
-    channel_thresholds = calculate_channel_thresholds(pooled)
+    channel_thresholds = calculate_channel_thresholds(
+        controller, state, pooled, channels, unstained_af_states=unstained_af_states,
+    )
     thresholded = cluster_medians.subtract(pd.Series(channel_thresholds), axis=1)
     if progress_callback is not None:
         progress_callback(n_samples + 3)
@@ -859,7 +1224,8 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
         progress_callback(n_samples + 4)
 
     cell_type_df = score_cell_types(thresholded, channel_marker_map, cell_type_db,
-                                     min_score=min_score)
+                                     min_score=min_score,
+                                     pos_evidence_floor=pos_evidence_floor)
     if progress_callback is not None:
         progress_callback(n_samples + 5)
 

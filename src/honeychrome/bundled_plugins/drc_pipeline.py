@@ -48,6 +48,8 @@ from honeychrome.controller_components.functions import (
 )
 from honeychrome.controller_components.autospectral_functions import (
     apply_af_transfer,
+    combine_af_precomputed,
+    precompute_joint_cov_extras,
 )
 
 from drc_logging import (
@@ -362,6 +364,68 @@ def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray, af_state=Non
         )
         return result['unmixed']
     return apply_transfer_matrix(transfer_matrix, raw_event_data)
+
+
+def resolve_af_state_for_profiles(controller, profile_names: list[str]):
+    """
+    Build an (transfer_matrix, af_precomputed, af_spectra) AF snapshot for
+    an EXPLICIT list of AF profile names, mirroring
+    Controller.initialise_af_matrices()'s cache-combining logic (dict
+    lookups + hstack only, no linalg -- see that method's own docstring)
+    for a profile list that isn't necessarily
+    controller.current_sample_path's own assignment (e.g. an unstained
+    sample, which never has one -- see
+    drc_cluster_id.resolve_unstained_af_states, the caller this exists
+    for).
+
+    MAIN-THREAD ONLY. Reads controller.af_precomputed_cache and
+    controller.experiment.process['af_profiles'], both of which the main
+    thread can reassign (editing/deleting an AF profile in the
+    AutoSpectral AF tab, or cache_all_af_profiles() after a spectral
+    process refresh) -- a caller needing this from a background worker
+    MUST call this HERE, on the main thread, before the worker starts, and
+    pass the returned tuple through as a snapshot, exactly like any other
+    af_state (see apply_unmixing_af_aware's docstring above for why a
+    concurrent reassignment while a worker reads these is a
+    memory-corruption hazard, not just stale data).
+
+    Returns (transfer_matrix, af_precomputed, af_spectra), or None if
+    profile_names is empty or none of them have a cache hit (mirrors
+    initialise_af_matrices's own "no cache hit" fallback) -- callers
+    should treat None as "AF-unaware" and pass
+    (transfer_matrix, None, None) to apply_unmixing_af_aware instead.
+    """
+    if not profile_names:
+        return None
+    cached = [
+        controller.af_precomputed_cache[name]
+        for name in profile_names
+        if name in controller.af_precomputed_cache
+    ]
+    if not cached:
+        log.warning(
+            "resolve_af_state_for_profiles: no cache hit for profile(s) %s "
+            "(cache has: %s)", profile_names, list(controller.af_precomputed_cache),
+        )
+        return None
+
+    af_profiles = controller.experiment.process.get('af_profiles', {})
+    spectra_mats = [
+        np.array(af_profiles[name]['spectra'])
+        for name in profile_names
+        if name in af_profiles and name in controller.af_precomputed_cache
+    ]
+    if not spectra_mats:
+        return None
+    af_spectra = np.vstack(spectra_mats)
+
+    if len(cached) == 1:
+        combined = cached[0]
+    else:
+        combined = combine_af_precomputed(cached)
+        combined.update(precompute_joint_cov_extras(combined, af_spectra))
+
+    return (controller.transfer_matrix, combined, af_spectra)
 
 
 def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray:
