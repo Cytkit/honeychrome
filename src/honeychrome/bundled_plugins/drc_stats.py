@@ -51,6 +51,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.decomposition import PCA
 
 import drc_pipeline
 from drc_logging import get_logger, log_stage, log_files
@@ -341,6 +342,121 @@ def compute_sample_mfis(controller, state, all_rel, channels=None,
     df = pd.DataFrame(mfi_mat, index=all_rel, columns=list(channels))
     log.info("sample MFI matrix: %s", df.shape)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Sample PCA (Item 16)
+# ---------------------------------------------------------------------------
+
+def compute_sample_pca(state, use_freq: bool, use_counts: bool, use_mfi: bool,
+                       n_loadings: int = 10) -> dict | None:
+    """
+    Sample-level PCA over any combination of the per-sample feature
+    matrices Run Statistics already computed (``state.freq_df`` /
+    ``state.counts_df`` / ``state.mfi_df`` — samples x cluster-features,
+    raw scale). Independent of "Viewing comparison": uses every sample
+    across every group in ``state.stats_group_vec``, not one pairwise
+    comparison at a time.
+
+    Each requested matrix's columns are z-scored independently before
+    concatenation, so frequency (%), count (raw events), and MFI
+    (log1p-intensity) don't dominate one another on scale alone. A single
+    joint 2-component PCA is then fit on the combined, standardized
+    matrix.
+
+    Loadings are scaled by sqrt(explained_variance) per axis (a
+    correlation-biplot convention) and reduced to the top ``n_loadings``
+    by 2-D vector length, so the arrows shown are the most differentiating
+    variables rather than every feature in the (potentially huge)
+    cluster x channel matrix.
+
+    Returns None if no requested source is available/populated, or if
+    fewer than 2 samples or 2 non-degenerate (non-zero-variance) features
+    remain. Otherwise a dict:
+      'scores':   DataFrame (n_samples x ['PC1','PC2']), index=rel-path,
+                  in state.stats_all_rel order.
+      'loadings': DataFrame (<=n_loadings x ['PC1','PC2']), index=feature
+                  label, already reduced to the top-N.
+      'explained_variance_ratio': (float, float) — PC1, PC2.
+      'groups':   list[str] aligned 1:1 to scores.index.
+      'sources':  list[str] subset of ['Freq','Counts','MFI'] — which
+                  matrices actually contributed (for the plot title).
+    """
+    log_stage(log, "SAMPLE PCA")
+
+    sources, frames = [], []
+    if use_freq and state.freq_df is not None and not state.freq_df.empty:
+        sources.append('Freq')
+        frames.append(state.freq_df.add_prefix('Freq: '))
+    if use_counts and state.counts_df is not None and not state.counts_df.empty:
+        sources.append('Counts')
+        frames.append(state.counts_df.add_prefix('Counts: '))
+    if use_mfi and state.mfi_df is not None and not state.mfi_df.empty:
+        sources.append('MFI')
+        frames.append(state.mfi_df.add_prefix('MFI: '))
+
+    if not frames:
+        log.warning("Sample PCA: no requested source is available -- "
+                   "run Statistics with Frequencies/Counts/MFIs checked first.")
+        return None
+
+    combined = pd.concat(frames, axis=1, join='inner')
+    if combined.shape[0] < 2:
+        log.warning("Sample PCA: fewer than 2 samples after aligning sources.")
+        return None
+
+    # Drop zero-variance columns -- guards the z-score division and keeps
+    # a cluster with an identical value in every sample from contributing
+    # a meaningless (but numerically NaN-producing) loading.
+    stds = combined.std(axis=0, ddof=0)
+    combined = combined[stds[stds > 1e-12].index]
+    if combined.shape[1] < 2:
+        log.warning("Sample PCA: fewer than 2 non-degenerate features to run PCA on.")
+        return None
+
+    means = combined.mean(axis=0)
+    stds = combined.std(axis=0, ddof=0)
+    z = (combined - means) / stds
+
+    n_comp = min(2, z.shape[0], z.shape[1])
+    pca = PCA(n_components=n_comp)
+    pcs = pca.fit_transform(z.values)
+
+    if n_comp < 2:
+        pcs = np.hstack([pcs, np.zeros((pcs.shape[0], 2 - n_comp))])
+        explained = list(pca.explained_variance_ratio_) + [0.0] * (2 - n_comp)
+    else:
+        explained = list(pca.explained_variance_ratio_[:2])
+
+    scores = pd.DataFrame(pcs[:, :2], index=combined.index, columns=['PC1', 'PC2'])
+
+    # Correlation-biplot scaling: component loadings * sqrt(eigenvalue),
+    # so arrow length reflects how much variance that feature explains on
+    # each axis (not just the raw eigenvector direction).
+    load_mat = np.zeros((z.shape[1], 2))
+    for c in range(n_comp):
+        load_mat[:, c] = pca.components_[c] * np.sqrt(max(pca.explained_variance_[c], 0.0))
+    loadings = pd.DataFrame(load_mat, index=combined.columns, columns=['PC1', 'PC2'])
+
+    magnitude = np.sqrt(loadings['PC1'] ** 2 + loadings['PC2'] ** 2)
+    top_idx = magnitude.sort_values(ascending=False).head(max(1, int(n_loadings))).index
+    loadings_top = loadings.loc[top_idx]
+
+    group_by_rel = dict(zip(state.stats_all_rel, state.stats_group_vec))
+    groups = [group_by_rel.get(rel, 'Unassigned') for rel in scores.index]
+
+    log.info("Sample PCA: %s, %d samples, %d features (%d shown as loadings), "
+             "PC1=%.1f%% PC2=%.1f%%",
+             '+'.join(sources), scores.shape[0], combined.shape[1], len(loadings_top),
+             explained[0] * 100, explained[1] * 100)
+
+    return {
+        'scores': scores,
+        'loadings': loadings_top,
+        'explained_variance_ratio': tuple(explained[:2]),
+        'groups': groups,
+        'sources': sources,
+    }
 
 
 # ---------------------------------------------------------------------------

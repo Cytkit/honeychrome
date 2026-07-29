@@ -489,6 +489,51 @@ def _contrasting_text_color(hex_color: str) -> str:
     return 'black' if luminance > 140 else 'white'
 
 
+def _resolve_group_colour(state: 'PipelineState', name: str) -> str:
+    """Return this group's colour (Item 16/17), assigning the next unused
+    colorcet glasbey swatch and persisting it on first use. Shared between
+    GroupsStatsTab (Comparison Groups table / Sample PCA) and PlotCard
+    (Workspace 'Group' colour mode) so both always draw from the exact
+    same state.group_colors dict and never disagree with each other."""
+    colour = state.group_colors.get(name)
+    if colour:
+        return colour
+    import colorcet as cc
+    used = set(state.group_colors.values())
+    for c in cc.glasbey:
+        if c not in used:
+            colour = c
+            break
+    else:
+        colour = cc.glasbey[len(state.group_colors) % len(cc.glasbey)]
+    state.group_colors[name] = colour
+    return colour
+
+
+def _sample_groups_by_rel(controller, state: 'PipelineState') -> dict[str, str]:
+    """Return {rel_path: group_name} (Item 17). state.sample_groups is
+    keyed by each sample's FULL path (see
+    GroupsStatsTab._populate_table), but Workspace plot data (DR
+    embeddings, cluster labels) is keyed by path relative to
+    raw_samples_subdirectory (see PluginWidget._archive_dr_run) -- this
+    converts once so PlotCard's 'Group' colour mode can look samples up
+    by the same rel-path keys its own 'origin' array already carries."""
+    try:
+        raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
+    except (KeyError, AttributeError):
+        raw_subdir = None
+    out: dict[str, str] = {}
+    for sp, g in state.sample_groups.items():
+        rel = sp
+        if raw_subdir:
+            try:
+                rel = str(Path(sp).relative_to(raw_subdir))
+            except ValueError:
+                pass
+        out[rel] = g
+    return out
+
+
 def _new_scrollable_canvas(fig):
     """
     FigureCanvasQTAgg subclass that ignores wheel events (Item 2) so
@@ -867,6 +912,30 @@ class PipelineState:
     # selected run's training channel set, else 'state' — see
     # GroupsStatsTab._populate_marker_roles_list(). User-overridable (some
     # markers, e.g. HLA-DR, genuinely serve double duty).
+    group_colors: dict[str, str] = field(default_factory=dict)
+    # {group_name: hex colour} — Item 16. Assigned from the colorcet
+    # glasbey palette the first time a group is drawn (see
+    # GroupsStatsTab._group_colour); user-overridable via the 'Colour'
+    # column on the Comparison Groups table. Used by the Sample PCA plot
+    # (and available for any future all-groups plot).
+    pca_use_freq: bool = True
+    pca_use_counts: bool = False
+    pca_use_mfi: bool = False
+    # Item 16 — which of state.freq_df/counts_df/mfi_df feed the Sample
+    # PCA plot. Independent of the "Test:" checkboxes above (those gate
+    # what Run Statistics computes in the first place; a source can only
+    # be used here if it was also computed there).
+    pca_show_loadings: bool = True
+    pca_n_loadings: int = 10
+    pca_point_size: float = 60.0
+    pca_arrow_lw: float = 1.2
+    pca_arrow_color: str = '#555555'
+    pca_axis_fontsize: int = 9
+    pca_show_grid: bool = True
+    pca_scores_df: pd.DataFrame | None = None
+    pca_loadings_df: pd.DataFrame | None = None
+    pca_explained_variance: tuple = (0.0, 0.0)
+    pca_run_label: str = ''
     stats_all_rel: list = field(default_factory=list)
     # sample rel-paths in limma row order
     stats_group_vec: list = field(default_factory=list)
@@ -3565,15 +3634,23 @@ class GroupsStatsTab(QWidget):
         name_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
         group_box_layout.addWidget(name_hint)
 
-        self.groups_table = QTableWidget(0, 2)
-        self.groups_table.setHorizontalHeaderLabels(['Group Name', 'Match Pattern (regex)'])
+        self.groups_table = QTableWidget(0, 3)
+        self.groups_table.setHorizontalHeaderLabels(
+            ['Group Name', 'Match Pattern (regex)', 'Colour']
+        )
         self.groups_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.groups_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.groups_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.groups_table.verticalHeader().setVisible(False)
         self.groups_table.setEditTriggers(QAbstractItemView.DoubleClicked)
         self.groups_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.groups_table.setMaximumHeight(120)
         self.groups_table.itemChanged.connect(self._on_groups_table_item_changed)
+        self.groups_table.cellDoubleClicked.connect(self._on_groups_table_cell_double_clicked)
+        self.groups_table.setToolTip(
+            "Double-click a group's Colour cell to change it — used by the "
+            "Sample PCA plot (and any future all-groups plot)."
+        )
         group_box_layout.addWidget(self.groups_table)
 
         groups_btn_row = QHBoxLayout()
@@ -3962,6 +4039,100 @@ class GroupsStatsTab(QWidget):
 
         bottom_layout.addWidget(stats_box)
 
+        # ============================================================
+        # Sample PCA (Item 16)
+        # ============================================================
+        pca_box = QGroupBox("Sample PCA")
+        pca_layout = QVBoxLayout(pca_box)
+
+        pca_hint = QLabel(
+            "PCA over every sample in the checked 'Groups to Test' "
+            "(not one comparison at a time) — pick which computed source(s) "
+            "to build it from below. Requires Run Statistics to have been "
+            "run first with the matching 'Test:' box(es) checked."
+        )
+        pca_hint.setWordWrap(True)
+        pca_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
+        pca_layout.addWidget(pca_hint)
+
+        pca_source_row = QHBoxLayout()
+        pca_source_row.addWidget(QLabel("Build from:"))
+        self.pca_chk_freq = QCheckBox("Frequencies")
+        self.pca_chk_freq.setChecked(self.state.pca_use_freq)
+        self.pca_chk_counts = QCheckBox("Counts")
+        self.pca_chk_counts.setChecked(self.state.pca_use_counts)
+        self.pca_chk_mfi = QCheckBox("MFIs")
+        self.pca_chk_mfi.setChecked(self.state.pca_use_mfi)
+        pca_source_row.addWidget(self.pca_chk_freq)
+        pca_source_row.addWidget(self.pca_chk_counts)
+        pca_source_row.addWidget(self.pca_chk_mfi)
+        pca_source_row.addSpacing(20)
+
+        self.pca_chk_loadings = QCheckBox("Show loadings")
+        self.pca_chk_loadings.setChecked(self.state.pca_show_loadings)
+        pca_source_row.addWidget(self.pca_chk_loadings)
+
+        pca_source_row.addWidget(QLabel("Top N"))
+        self.pca_n_loadings_spin = QSpinBox()
+        self.pca_n_loadings_spin.setRange(1, 50)
+        self.pca_n_loadings_spin.setValue(self.state.pca_n_loadings)
+        self.pca_n_loadings_spin.setFixedWidth(60)
+        pca_source_row.addWidget(self.pca_n_loadings_spin)
+        pca_source_row.addStretch()
+        pca_layout.addLayout(pca_source_row)
+
+        pca_appearance_row = QHBoxLayout()
+        pca_appearance_row.addWidget(QLabel("Point size"))
+        self.pca_point_size_spin = QSpinBox()
+        self.pca_point_size_spin.setRange(5, 500)
+        self.pca_point_size_spin.setValue(int(self.state.pca_point_size))
+        self.pca_point_size_spin.setFixedWidth(60)
+        pca_appearance_row.addWidget(self.pca_point_size_spin)
+
+        pca_appearance_row.addWidget(QLabel("Arrow width"))
+        self.pca_arrow_lw_spin = QDoubleSpinBox()
+        self.pca_arrow_lw_spin.setRange(0.1, 10.0)
+        self.pca_arrow_lw_spin.setSingleStep(0.1)
+        self.pca_arrow_lw_spin.setDecimals(1)
+        self.pca_arrow_lw_spin.setValue(self.state.pca_arrow_lw)
+        self.pca_arrow_lw_spin.setFixedWidth(60)
+        pca_appearance_row.addWidget(self.pca_arrow_lw_spin)
+
+        pca_appearance_row.addWidget(QLabel("Arrow colour"))
+        self.pca_arrow_color_btn = QPushButton()
+        self.pca_arrow_color_btn.setFixedWidth(50)
+        self.pca_arrow_color_btn.clicked.connect(self._pick_pca_arrow_color)
+        pca_appearance_row.addWidget(self.pca_arrow_color_btn)
+        self._update_pca_arrow_color_btn()
+
+        pca_appearance_row.addWidget(QLabel("Axis font size"))
+        self.pca_axis_fontsize_spin = QSpinBox()
+        self.pca_axis_fontsize_spin.setRange(6, 24)
+        self.pca_axis_fontsize_spin.setValue(self.state.pca_axis_fontsize)
+        self.pca_axis_fontsize_spin.setFixedWidth(50)
+        pca_appearance_row.addWidget(self.pca_axis_fontsize_spin)
+
+        self.pca_chk_grid = QCheckBox("Grid lines")
+        self.pca_chk_grid.setChecked(self.state.pca_show_grid)
+        pca_appearance_row.addWidget(self.pca_chk_grid)
+        pca_appearance_row.addStretch()
+        pca_layout.addLayout(pca_appearance_row)
+
+        pca_btn_row = QHBoxLayout()
+        self.pca_btn = QPushButton("Show PCA")
+        self.pca_btn.setEnabled(False)
+        self.pca_btn.setToolTip(
+            "Requires ≥ 3 samples in at least two checked 'Groups to Test', "
+            "and Run Statistics already computed for at least one checked "
+            "'Build from' source."
+        )
+        self.pca_btn.clicked.connect(self._show_pca)
+        pca_btn_row.addWidget(self.pca_btn)
+        pca_btn_row.addStretch()
+        pca_layout.addLayout(pca_btn_row)
+
+        bottom_layout.addWidget(pca_box)
+
         # Results area: one tab per plot
         self._results_tabs = QTabWidget()
         self._results_tabs.setTabsClosable(True)
@@ -3983,7 +4154,8 @@ class GroupsStatsTab(QWidget):
         return ['Unassigned'] + list(self.state.group_names)
 
     def _populate_groups_table(self):
-        """Rebuild the Group Name / Match Pattern management table from state."""
+        """Rebuild the Group Name / Match Pattern / Colour management table
+        from state."""
         self.groups_table.blockSignals(True)
         self.groups_table.setRowCount(0)
         for name in self.state.group_names:
@@ -3993,7 +4165,29 @@ class GroupsStatsTab(QWidget):
             self.groups_table.setItem(
                 row, 1, QTableWidgetItem(self.state.group_patterns.get(name, ''))
             )
+            colour_item = QTableWidgetItem('')
+            colour_item.setBackground(QColor(self._group_colour(name)))
+            colour_item.setFlags(colour_item.flags() & ~Qt.ItemIsEditable)
+            self.groups_table.setItem(row, 2, colour_item)
         self.groups_table.blockSignals(False)
+
+    def _group_colour(self, name: str) -> str:
+        """Return this group's colour (Item 16) -- thin per-tab wrapper
+        around the shared _resolve_group_colour() (Item 17) so PlotCard's
+        'Group' colour mode and this tab's Comparison Groups table /
+        Sample PCA plot always agree."""
+        return _resolve_group_colour(self.state, name)
+
+    def _on_groups_table_cell_double_clicked(self, row: int, col: int):
+        """Colour column only (0/1 are text-edited via itemChanged above)."""
+        if col != 2 or row >= len(self.state.group_names):
+            return
+        name = self.state.group_names[row]
+        current = self._group_colour(name)
+        colour = QColorDialog.getColor(QColor(current), self, f"Colour for group '{name}'")
+        if colour.isValid():
+            self.state.group_colors[name] = colour.name()
+            self._populate_groups_table()
 
     def _on_groups_table_item_changed(self, item: QTableWidgetItem):
         """
@@ -4026,6 +4220,8 @@ class GroupsStatsTab(QWidget):
                         self.state.sample_groups[sp] = new_name
                 if old_name in self.state.group_patterns:
                     self.state.group_patterns[new_name] = self.state.group_patterns.pop(old_name)
+                if old_name in self.state.group_colors:
+                    self.state.group_colors[new_name] = self.state.group_colors.pop(old_name)
                 if self.state.compare_group_a == old_name:
                     self.state.compare_group_a = new_name
                 if self.state.compare_group_b == old_name:
@@ -4053,6 +4249,7 @@ class GroupsStatsTab(QWidget):
                                 f"A group named '{name}' already exists.")
             return
         self.state.group_names.append(name)
+        self._group_colour(name)   # seed a default colour immediately
         self._populate_groups_table()
         self._refresh_group_combos()
         self._refresh_compare_combos()
@@ -4077,6 +4274,7 @@ class GroupsStatsTab(QWidget):
                 self.state.sample_groups[sp] = 'Unassigned'
         self.state.group_names.pop(row)
         self.state.group_patterns.pop(name, None)
+        self.state.group_colors.pop(name, None)
         if self.state.compare_group_a == name:
             self.state.compare_group_a = ''
         if self.state.compare_group_b == name:
@@ -4620,6 +4818,8 @@ class GroupsStatsTab(QWidget):
         self.run_trex_btn.setEnabled(self.state.stats_runnable(shown))
         self.confusion_btn.setEnabled(runnable)
         self.composition_btn.setEnabled(runnable)
+        if hasattr(self, 'pca_btn'):
+            self.pca_btn.setEnabled(runnable)
         if dr_only_selected:
             self.run_stats_btn.setToolTip(
                 "This is a DR run — it has no cluster labels.  Select or "
@@ -5264,6 +5464,231 @@ class GroupsStatsTab(QWidget):
                         fontsize=8)
 
         fig.colorbar(im, ax=ax, shrink=0.7, label='Normalized events')
+        _style_figure_theme(fig, is_dark)
+        self._stamp_run_label(fig, run_label)
+        return fig
+
+    def _pick_pca_arrow_color(self):
+        colour = QColorDialog.getColor(QColor(self.state.pca_arrow_color), self, "Arrow colour")
+        if colour.isValid():
+            self.state.pca_arrow_color = colour.name()
+            self._update_pca_arrow_color_btn()
+
+    def _update_pca_arrow_color_btn(self):
+        text_color = _contrasting_text_color(self.state.pca_arrow_color)
+        self.pca_arrow_color_btn.setStyleSheet(
+            f"background-color: {self.state.pca_arrow_color}; color: {text_color};"
+        )
+
+    def _show_pca(self):
+        """
+        Compute and display the Sample PCA plot (Item 16). Independent of
+        Run Statistics' per-comparison "Viewing comparison" — always uses
+        every sample across every checked 'Groups to Test'. Re-clicking
+        replaces the existing PCA tab in place, same as Confusion Matrix /
+        Composition Barplot.
+        """
+        resolved = self._resolve_stats_source()
+        if resolved is None:
+            return
+        _labels_for_stats, run_label, _run_id, _names_for_stats = resolved
+
+        use_freq = self.pca_chk_freq.isChecked()
+        use_counts = self.pca_chk_counts.isChecked()
+        use_mfi = self.pca_chk_mfi.isChecked()
+        self.state.pca_use_freq = use_freq
+        self.state.pca_use_counts = use_counts
+        self.state.pca_use_mfi = use_mfi
+        self.state.pca_show_loadings = self.pca_chk_loadings.isChecked()
+        self.state.pca_n_loadings = self.pca_n_loadings_spin.value()
+        self.state.pca_point_size = float(self.pca_point_size_spin.value())
+        self.state.pca_arrow_lw = self.pca_arrow_lw_spin.value()
+        self.state.pca_axis_fontsize = self.pca_axis_fontsize_spin.value()
+        self.state.pca_show_grid = self.pca_chk_grid.isChecked()
+
+        if not (use_freq or use_counts or use_mfi):
+            QMessageBox.warning(self, "Sample PCA",
+                                "Check at least one of Frequencies/Counts/MFIs "
+                                "under 'Build from' first.")
+            return
+
+        # Item 17 -- warn (rather than silently drop) whenever a checked
+        # 'Build from' source hasn't actually been computed by Run
+        # Statistics yet (e.g. Counts checked here but 'Cluster Counts
+        # (GLM)' wasn't checked under 'Test:' the last time Run Statistics
+        # ran). Previously this only surfaced once EVERY checked source
+        # turned out missing -- if at least one other source WAS
+        # available, compute_sample_pca() would just quietly use that one
+        # instead, with no indication Counts had been dropped.
+        missing = []
+        if use_freq and (self.state.freq_df is None or self.state.freq_df.empty):
+            missing.append('Frequencies')
+        if use_counts and (self.state.counts_df is None or self.state.counts_df.empty):
+            missing.append('Counts')
+        if use_mfi and (self.state.mfi_df is None or self.state.mfi_df.empty):
+            missing.append('MFIs')
+
+        if missing:
+            n_checked = sum([use_freq, use_counts, use_mfi])
+            if len(missing) >= n_checked:
+                QMessageBox.warning(
+                    self, "Sample PCA",
+                    f"{', '.join(missing)} checked under 'Build from', but not "
+                    "yet computed. Run Statistics first with the matching "
+                    "'Test:' box(es) checked (Frequencies → 'Cluster "
+                    "Frequencies (limma)', Counts → 'Cluster Counts (GLM)', "
+                    "MFIs → 'Cluster MFIs')."
+                )
+                return
+            reply = QMessageBox.warning(
+                self, "Sample PCA",
+                f"{', '.join(missing)} checked under 'Build from', but not yet "
+                "computed by Run Statistics (check the matching 'Test:' "
+                "box(es) and re-run it first) -- continuing with the "
+                "remaining checked source(s) only.",
+                QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok,
+            )
+            if reply != QMessageBox.Ok:
+                return
+
+        try:
+            pca_result = drc_stats.compute_sample_pca(
+                self.state, use_freq, use_counts, use_mfi,
+                n_loadings=self.state.pca_n_loadings,
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Sample PCA Error", str(e))
+            return
+
+        if pca_result is None:
+            QMessageBox.warning(
+                self, "Sample PCA",
+                "No PCA could be computed — make sure Run Statistics has "
+                "already been run with the matching 'Test:' box(es) checked, "
+                "and that at least 2 samples / 2 non-degenerate features "
+                "are available."
+            )
+            return
+
+        self.state.pca_scores_df = pca_result['scores']
+        self.state.pca_loadings_df = pca_result['loadings']
+        self.state.pca_explained_variance = pca_result['explained_variance_ratio']
+        self.state.pca_run_label = run_label
+
+        fig = self._make_pca_figure(pca_result, run_label=run_label)
+        self._add_results_tab(
+            fig, "Sample PCA", "sample_pca",
+            maker=self._make_pca_figure,
+            maker_kwargs=dict(pca_result=pca_result, run_label=run_label),
+            key="sample_pca",
+        )
+
+    def _make_pca_figure(self, pca_result: dict | None, run_label: str = ''):
+        """
+        Sample-level PCA scatter, coloured by Group, with an optional
+        top-N loadings biplot (arrows + adjustText-de-overlapped labels —
+        same convention as _make_volcano_figure). Axis labels carry the
+        % variance explained by that component.
+        """
+        from matplotlib.figure import Figure
+
+        is_dark = _resolve_is_dark(self.state)
+        fig = Figure(figsize=(6, 6), constrained_layout=True)
+        ax = fig.add_subplot(111)
+        fg = 'white' if is_dark else 'black'
+
+        if pca_result is None:
+            ax.axis('off')
+            ax.text(0.5, 0.5, 'No data to display',
+                    ha='center', va='center', fontsize=10, transform=ax.transAxes)
+            _style_figure_theme(fig, is_dark)
+            self._stamp_run_label(fig, run_label)
+            return fig
+
+        scores = pca_result['scores']
+        loadings = pca_result['loadings']
+        groups = pca_result['groups']
+        ev = pca_result['explained_variance_ratio']
+
+        point_size = self.state.pca_point_size
+        show_grid = self.state.pca_show_grid
+        axis_fontsize = self.state.pca_axis_fontsize
+        arrow_color = self.state.pca_arrow_color
+        arrow_lw = self.state.pca_arrow_lw
+        show_loadings = self.state.pca_show_loadings
+
+        unique_groups = list(dict.fromkeys(groups))   # first-seen order
+        for grp in unique_groups:
+            colour = self._group_colour(grp) if grp != 'Unassigned' else '#7f7f7f'
+            mask = [g == grp for g in groups]
+            ax.scatter(
+                scores['PC1'].values[mask], scores['PC2'].values[mask],
+                s=point_size, color=colour, edgecolors=fg, linewidths=0.4,
+                label=grp, zorder=3,
+            )
+
+        if show_loadings and not loadings.empty:
+            score_max = max(
+                float(scores['PC1'].abs().max()) if len(scores) else 1.0,
+                float(scores['PC2'].abs().max()) if len(scores) else 1.0,
+                1e-6,
+            )
+            load_max = max(
+                float(loadings['PC1'].abs().max()),
+                float(loadings['PC2'].abs().max()),
+                1e-12,
+            )
+            scale = (score_max * 0.8) / load_max
+            arrow_ends = loadings[['PC1', 'PC2']].values * scale
+
+            # Item 17 fix -- ax.text() does NOT contribute to matplotlib's
+            # autoscale, so without this the axes were only ever sized to
+            # the sample points (score_max), never the loading arrows
+            # themselves. adjustText's de-overlap step then had no room to
+            # nudge a label into and pushed some straight past a limit
+            # that was never set to hold them, landing off-screen. Widen
+            # the limits to include every arrow endpoint BEFORE
+            # adjustText runs, so it has real headroom to work with.
+            all_x = np.concatenate([scores['PC1'].values, arrow_ends[:, 0], [0.0]])
+            all_y = np.concatenate([scores['PC2'].values, arrow_ends[:, 1], [0.0]])
+            x_span = max(float(np.ptp(all_x)), 1e-6)
+            y_span = max(float(np.ptp(all_y)), 1e-6)
+            ax.set_xlim(all_x.min() - x_span * 0.15, all_x.max() + x_span * 0.15)
+            ax.set_ylim(all_y.min() - y_span * 0.15, all_y.max() + y_span * 0.15)
+
+            texts = []
+            for (feat, _row), (x_end, y_end) in zip(loadings.iterrows(), arrow_ends):
+                ax.annotate(
+                    '', xy=(x_end, y_end), xytext=(0, 0),
+                    arrowprops=dict(arrowstyle='-|>', color=arrow_color, lw=arrow_lw),
+                    zorder=4,
+                )
+                texts.append(ax.text(x_end, y_end, feat, fontsize=7, color=fg, zorder=5))
+            if texts:
+                try:
+                    from adjustText import adjust_text
+                    adjust_text(texts, ax=ax,
+                                arrowprops=dict(arrowstyle='-', color=fg, lw=0.4))
+                except ImportError:
+                    # adjustText not yet installed into this plugin's bundled
+                    # environment -- labels stay at arrow tips, un-de-overlapped.
+                    pass
+
+        # Item 17 fix -- these were previously drawn unconditionally, so
+        # unticking 'Grid lines' turned off the real ax.grid() but left
+        # what looked like two leftover grid lines (the axes through the
+        # origin) behind. Both are now the same toggle.
+        if show_grid:
+            ax.axhline(0, color='grey', linestyle='--', linewidth=0.6, zorder=1)
+            ax.axvline(0, color='grey', linestyle='--', linewidth=0.6, zorder=1)
+
+        ax.set_xlabel(f"PC1 ({ev[0] * 100:.1f}% variance)", fontsize=axis_fontsize)
+        ax.set_ylabel(f"PC2 ({ev[1] * 100:.1f}% variance)", fontsize=axis_fontsize)
+        ax.tick_params(labelsize=axis_fontsize)
+        ax.grid(show_grid, linestyle=':', linewidth=0.5, alpha=0.6)
+        ax.set_title(f"Sample PCA ({' + '.join(pca_result['sources'])})", fontsize=10)
+        ax.legend(fontsize=7, loc='best', frameon=True)
+
         _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
         return fig
@@ -6555,12 +6980,12 @@ class PlotCard(QFrame):
     Controls (top toolbar):
       • DR algorithm selector
       • Sample selector (All Samples pooled, or individual)
-      • Colour mode: Clusters | Marker (T-REX walled off, see _COLOUR_MODES)
+      • Colour mode: Clusters | Marker | Group (T-REX walled off, see _COLOUR_MODES)
       • Marker channel selector (visible in Marker mode)
       • Magic wand (copy) and paste buttons
       • Close button
 
-    Right-click on a cluster legend colour swatch → colour picker.
+    Right-click on a cluster/group legend colour swatch → colour picker.
 
     Parameters
     ----------
@@ -6571,7 +6996,7 @@ class PlotCard(QFrame):
     workspace  Parent WorkspaceTab (for remove_card / magic-wand).
     """
 
-    _COLOUR_MODES = ['Clusters', 'Marker']
+    _COLOUR_MODES = ['Clusters', 'Marker', 'Group']
 
     def __init__(self, plot_id: str, state: PipelineState, bus, controller,
                  workspace: 'WorkspaceTab', parent=None):
@@ -7102,6 +7527,11 @@ class PlotCard(QFrame):
             lab_disp    = lab
             origin_disp = origin
 
+        # Item 17 -- cached so _rebuild_group_legend() (called right after
+        # this method, and only from here) knows which samples/groups are
+        # actually present in the CURRENT view without recomputing origin.
+        self._last_origin_disp = origin_disp
+
         if colour_mode == 'Clusters':
             self._draw_cluster_scatter(ax, xy_disp, lab_disp, cl_run)
         elif colour_mode == 'Marker':
@@ -7109,6 +7539,8 @@ class PlotCard(QFrame):
                                       disp_idx, sample_row_offsets, run)
         elif colour_mode == 'T-REX':
             self._draw_trex_scatter(ax, xy_disp, lab_disp, emb_dict, run, origin_disp)
+        elif colour_mode == 'Group':
+            self._draw_group_scatter(ax, xy_disp, origin_disp)
 
         # Apply label colour to colourbar (Marker / T-REX), title, and axis
         # labels (Item 7 — previously only covered title + colourbar).
@@ -7294,6 +7726,32 @@ class PlotCard(QFrame):
         ax.set_title("T-REX enrichment (red=A, blue=B) — grey = not in Compare pair",
                     fontsize=8)
 
+    def _draw_group_scatter(self, ax, xy, origin):
+        """
+        Colour points by their sample's assigned comparison Group (Item
+        17), sharing state.group_colors with the Comparison Groups
+        table's Colour column and the Sample PCA plot (Item 16) via
+        _resolve_group_colour(). 'Unassigned' samples are grey.
+        """
+        rel_to_group = _sample_groups_by_rel(self.controller, self.state)
+        groups = np.array(
+            [rel_to_group.get(str(rel), 'Unassigned') for rel in origin],
+            dtype=object,
+        )
+        present = set(np.unique(groups))
+        ordered = [g for g in self.state.group_names if g in present]
+        if 'Unassigned' in present:
+            ordered.append('Unassigned')
+        if not ordered:
+            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#7f7f7f', alpha=0.4)
+            ax.set_title("Group: no samples assigned", fontsize=8)
+            return
+        for grp in ordered:
+            colour = _resolve_group_colour(self.state, grp) if grp != 'Unassigned' else '#7f7f7f'
+            mask = groups == grp
+            ax.scatter(xy[mask, 0], xy[mask, 1], s=1, c=colour, alpha=0.6, linewidths=0)
+        ax.set_title("Group", fontsize=8)
+
     def _show_placeholder(self, text: str):
         self._figure.clear()
         ax = self._figure.add_subplot(111)
@@ -7308,16 +7766,21 @@ class PlotCard(QFrame):
     # ------------------------------------------------------------------
 
     def _rebuild_legend(self):
-        """Rebuild the right-side cluster legend (swatch + name label per
-        cluster), reading from the currently-selected clustering run's own
-        'colors'/'names' (Item 6 — these live per-run, not on a single
-        ambient dict)."""
+        """Rebuild the right-side legend (swatch + name label per cluster
+        or group). Clusters read from the currently-selected clustering
+        run's own 'colors'/'names' (Item 6 — these live per-run, not on a
+        single ambient dict). Group mode (Item 17) delegates to
+        _rebuild_group_legend()."""
         while self._legend_layout.count():
             item = self._legend_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        if self.colour_mode_combo.currentText() != 'Clusters':
+        mode = self.colour_mode_combo.currentText()
+        if mode == 'Group':
+            self._rebuild_group_legend()
+            return
+        if mode != 'Clusters':
             self._legend_scroll.setVisible(False)
             return
         cl_run = self._selected_cluster_run()
@@ -7358,6 +7821,74 @@ class PlotCard(QFrame):
             self._legend_layout.addWidget(row_w)
 
         self._legend_layout.addStretch()
+
+    def _rebuild_group_legend(self):
+        """
+        Right-side legend for 'Group' colour mode (Item 17) — one swatch
+        per group actually present in the current plot's data (not every
+        defined group), right-click to recolour. Shares state.group_colors
+        with the Comparison Groups table's Colour column and the Sample
+        PCA plot, so a change from any of the three places is reflected
+        in all of them.
+        """
+        origin_disp = getattr(self, '_last_origin_disp', None)
+        if origin_disp is None:
+            self._legend_scroll.setVisible(False)
+            return
+        rel_to_group = _sample_groups_by_rel(self.controller, self.state)
+        present = {rel_to_group.get(str(rel), 'Unassigned') for rel in origin_disp}
+        ordered = [g for g in self.state.group_names if g in present]
+        if 'Unassigned' in present:
+            ordered.append('Unassigned')
+        if not ordered:
+            self._legend_scroll.setVisible(False)
+            return
+
+        self._legend_scroll.setVisible(True)
+        for name in ordered:
+            colour = _resolve_group_colour(self.state, name) if name != 'Unassigned' else '#7f7f7f'
+
+            row = QHBoxLayout()
+            row.setSpacing(4)
+
+            swatch = QPushButton()
+            swatch.setFixedSize(14, 14)
+            swatch.setStyleSheet(
+                f"background-color: {colour}; border: 1px solid #555; border-radius: 2px;"
+            )
+            if name != 'Unassigned':
+                swatch.setToolTip("Right-click to change colour")
+                swatch.setContextMenuPolicy(Qt.CustomContextMenu)
+                swatch.customContextMenuRequested.connect(
+                    lambda pos, n=name, s=swatch: self._pick_group_colour(n, s)
+                )
+            else:
+                swatch.setToolTip("Samples not assigned to a group")
+            row.addWidget(swatch)
+
+            name_lbl = QLabel(name)
+            name_lbl.setStyleSheet(f"font-size: {self._legend_font_spin.value()}px;")
+            row.addWidget(name_lbl, stretch=1)
+
+            row_w = QWidget()
+            row_w.setLayout(row)
+            self._legend_layout.addWidget(row_w)
+
+        self._legend_layout.addStretch()
+
+    def _pick_group_colour(self, name: str, swatch: QPushButton):
+        """Open a colour dialog to change a group's colour (Item 17) --
+        writes to the same state.group_colors dict as the Comparison
+        Groups table's Colour column and the Sample PCA plot, so the
+        change shows up in all three immediately."""
+        current = _resolve_group_colour(self.state, name)
+        colour = QColorDialog.getColor(QColor(current), self, f"Colour for group '{name}'")
+        if colour.isValid():
+            self.state.group_colors[name] = colour.name()
+            swatch.setStyleSheet(
+                f"background-color: {colour.name()}; border: 1px solid #555; border-radius: 2px;"
+            )
+            self.refresh()
 
     def _pick_cluster_colour(self, label: int, swatch: QPushButton):
         """Open a colour dialog to change a cluster's colour. Persistence
@@ -9806,8 +10337,20 @@ class PluginWidget(QWidget):
             s.setValue('sample_groups',     repr(self.state.sample_groups))
             s.setValue('group_names',       list(self.state.group_names))
             s.setValue('group_patterns',    repr(self.state.group_patterns))
+            s.setValue('group_colors',      repr(self.state.group_colors))
             s.setValue('compare_group_a',   self.state.compare_group_a)
             s.setValue('compare_group_b',   self.state.compare_group_b)
+            # Item 16 -- Sample PCA appearance/config
+            s.setValue('pca_use_freq',      self.state.pca_use_freq)
+            s.setValue('pca_use_counts',    self.state.pca_use_counts)
+            s.setValue('pca_use_mfi',       self.state.pca_use_mfi)
+            s.setValue('pca_show_loadings', self.state.pca_show_loadings)
+            s.setValue('pca_n_loadings',    self.state.pca_n_loadings)
+            s.setValue('pca_point_size',    self.state.pca_point_size)
+            s.setValue('pca_arrow_lw',      self.state.pca_arrow_lw)
+            s.setValue('pca_arrow_color',   self.state.pca_arrow_color)
+            s.setValue('pca_axis_fontsize', self.state.pca_axis_fontsize)
+            s.setValue('pca_show_grid',     self.state.pca_show_grid)
             # Item 13 phase 2
             s.setValue('testing_group_selection', list(self.state.testing_group_selection))
             s.setValue('contrast_mode',     self.state.contrast_mode)
@@ -10009,6 +10552,12 @@ class PluginWidget(QWidget):
                         self.state.group_patterns = eval(patterns_repr)  # noqa: S307
                     except Exception:
                         pass
+                colors_repr = s.value('group_colors', '')
+                if colors_repr:
+                    try:
+                        self.state.group_colors = eval(colors_repr)  # noqa: S307
+                    except Exception:
+                        pass
                 self.state.compare_group_a = s.value('compare_group_a', '') or (
                     self.state.group_names[0] if self.state.group_names else '')
                 self.state.compare_group_b = s.value('compare_group_b', '') or (
@@ -10021,6 +10570,46 @@ class PluginWidget(QWidget):
             paired_val = s.value('paired', False)
             self.state.paired = paired_val in (True, 'true', 'True', 1, '1')
             self.state.pairing_variable = s.value('pairing_variable', '')
+            pca_use_freq = s.value('pca_use_freq', None)
+            if pca_use_freq is not None:
+                self.state.pca_use_freq = pca_use_freq in (True, 'true', 'True', 1, '1')
+            pca_use_counts = s.value('pca_use_counts', None)
+            if pca_use_counts is not None:
+                self.state.pca_use_counts = pca_use_counts in (True, 'true', 'True', 1, '1')
+            pca_use_mfi = s.value('pca_use_mfi', None)
+            if pca_use_mfi is not None:
+                self.state.pca_use_mfi = pca_use_mfi in (True, 'true', 'True', 1, '1')
+            pca_show_loadings = s.value('pca_show_loadings', None)
+            if pca_show_loadings is not None:
+                self.state.pca_show_loadings = pca_show_loadings in (True, 'true', 'True', 1, '1')
+            pca_n_loadings = s.value('pca_n_loadings', None)
+            if pca_n_loadings is not None:
+                try:
+                    self.state.pca_n_loadings = int(pca_n_loadings)
+                except (ValueError, TypeError):
+                    pass
+            pca_point_size = s.value('pca_point_size', None)
+            if pca_point_size is not None:
+                try:
+                    self.state.pca_point_size = float(pca_point_size)
+                except (ValueError, TypeError):
+                    pass
+            pca_arrow_lw = s.value('pca_arrow_lw', None)
+            if pca_arrow_lw is not None:
+                try:
+                    self.state.pca_arrow_lw = float(pca_arrow_lw)
+                except (ValueError, TypeError):
+                    pass
+            self.state.pca_arrow_color = s.value('pca_arrow_color', self.state.pca_arrow_color)
+            pca_axis_fontsize = s.value('pca_axis_fontsize', None)
+            if pca_axis_fontsize is not None:
+                try:
+                    self.state.pca_axis_fontsize = int(pca_axis_fontsize)
+                except (ValueError, TypeError):
+                    pass
+            pca_show_grid = s.value('pca_show_grid', None)
+            if pca_show_grid is not None:
+                self.state.pca_show_grid = pca_show_grid in (True, 'true', 'True', 1, '1')
             cov_cols = list(s.value('covariate_columns', []))
             cov_repr = s.value('covariates', '')
             if cov_cols:
