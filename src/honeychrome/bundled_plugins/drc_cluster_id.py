@@ -592,7 +592,7 @@ def _load_unstained_gated_transformed(
 
 def calculate_unstained_channel_thresholds(
     controller, state, channels: list[str], unstained_af_states: dict | None = None,
-    percentile: float = 99.0, safety_factor: float = 2.0,
+    percentile: float = 98.0, safety_factor: float = 1.2,
     min_singlets_events: int = 500,
 ) -> dict[str, float]:
     """

@@ -905,13 +905,13 @@ class PipelineState:
     composition_names: dict[int, str] = field(default_factory=dict)
     marker_roles: dict[str, str] = field(default_factory=dict)
     # {channel_name: 'type' | 'state'} — Item 11 (diffcyt-style split).
-    # 'type' channels drove the active/selected clustering run and are
-    # excluded from MFI significance testing by default, to avoid the same
-    # channel driving both the cluster assignment and its own significance
-    # call. A channel with no entry yet defaults to 'type' if it was in the
-    # selected run's training channel set, else 'state' — see
+    # 'type' channels are excluded from MFI significance testing, to avoid
+    # the same channel driving both the cluster assignment and its own
+    # significance call. A channel with no entry yet defaults to 'state'
+    # (included) — there is no automatic categorisation, see
     # GroupsStatsTab._populate_marker_roles_list(). User-overridable (some
-    # markers, e.g. HLA-DR, genuinely serve double duty).
+    # markers, e.g. HLA-DR, genuinely serve double duty). Checkbox polarity
+    # in the UI (Item 6): ticked = 'state'/included, unticked = 'type'/excluded.
     group_colors: dict[str, str] = field(default_factory=dict)
     # {group_name: hex colour} — Item 16. Assigned from the colorcet
     # glasbey palette the first time a group is drawn (see
@@ -3913,11 +3913,12 @@ class GroupsStatsTab(QWidget):
         roles_box = QGroupBox("Marker Roles — MFI Testing")
         roles_layout = QVBoxLayout(roles_box)
         roles_hint = QLabel(
-            "Channels used to build the selected clustering run default to "
-            "'type' and are excluded from MFI significance testing, to avoid "
-            "the same channel driving both the cluster assignment and its "
-            "own significance call. Check a channel to mark it 'type' "
-            "(excluded); uncheck to test it ('state')."
+            "Every channel defaults to 'state' (tested) and is included in "
+            "MFI significance testing. Check a channel to keep it included; "
+            "uncheck a channel to mark it 'type' (a clustering marker) and "
+            "exclude it -- useful for a channel that drove the selected "
+            "clustering run, to avoid it driving both the cluster "
+            "assignment and its own significance call."
         )
         roles_hint.setWordWrap(True)
         roles_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
@@ -3948,12 +3949,17 @@ class GroupsStatsTab(QWidget):
         self.chk_include_type_markers = QCheckBox(
             "Include clustering (type) markers in MFI testing"
         )
-        self.chk_include_type_markers.setChecked(False)
+        # Item 6 -- default is now "include everything", matching every
+        # channel checkbox below defaulting to checked/included.
+        self.chk_include_type_markers.setChecked(True)
         self.chk_include_type_markers.setToolTip(
-            "Off (default): MFI significance testing uses 'state'-role "
-            "channels only. On: restores testing every selected channel, "
-            "regardless of role."
+            "On (default): every selected channel is tested for MFI "
+            "significance, regardless of the roles below -- ticking this "
+            "also ticks every channel checkbox below. Off: only channels "
+            "checked below are tested; unchecked ('type') channels are "
+            "excluded."
         )
+        self.chk_include_type_markers.toggled.connect(self._on_include_type_markers_toggled)
         roles_layout.addWidget(self.chk_include_type_markers)
 
         stats_layout.addWidget(roles_box)
@@ -4137,7 +4143,7 @@ class GroupsStatsTab(QWidget):
         self._results_tabs = QTabWidget()
         self._results_tabs.setTabsClosable(True)
         self._results_tabs.tabCloseRequested.connect(self._on_results_tab_close_requested)
-        self._results_tabs.setMinimumHeight(700)
+        self._results_tabs.setMinimumHeight(1400)  # Item 4 -- more room to fit everything
         bottom_layout.addWidget(self._results_tabs, stretch=1)
 
         content_layout.addWidget(bottom_widget, stretch=1)
@@ -4226,9 +4232,22 @@ class GroupsStatsTab(QWidget):
                     self.state.compare_group_a = new_name
                 if self.state.compare_group_b == old_name:
                     self.state.compare_group_b = new_name
+                # Item 5 -- 'Groups to Test' is a separate checked-name
+                # list (state.testing_group_selection), not derived from
+                # group_names on the fly, so a rename left it holding the
+                # stale old name until the checklist was rebuilt for some
+                # unrelated reason.
+                if self.state.testing_group_selection and old_name in self.state.testing_group_selection:
+                    self.state.testing_group_selection = [
+                        new_name if g == old_name else g
+                        for g in self.state.testing_group_selection
+                    ]
+                if self.state.reference_group == old_name:
+                    self.state.reference_group = new_name
                 self.state.group_names[row] = new_name
                 self.state.invalidate_trex()
                 self._populate_table()
+                self._populate_test_groups_list()
                 self._refresh_compare_combos()
                 self._update_group_count_label()
         else:
@@ -5033,14 +5052,26 @@ class GroupsStatsTab(QWidget):
                 role = 'state'
                 self.state.marker_roles[ch] = role
             cb = QCheckBox(labels.get(ch, ch))
-            cb.setChecked(role == 'type')
+            # Item 6 -- checked now means "included" ('state'), not
+            # "type"/excluded, so ticked boxes visually match what's
+            # actually tested.
+            cb.setChecked(role == 'state')
             cb.toggled.connect(lambda checked, c=ch: self._on_marker_role_changed(c, checked))
             self.marker_roles_checkboxes[ch] = cb
             row, col = divmod(grid_idx, 4)
             self.marker_roles_grid.addWidget(cb, row, col)
 
     def _on_marker_role_changed(self, ch: str, checked: bool):
-        self.state.marker_roles[ch] = 'type' if checked else 'state'
+        # Item 6 -- checked = included/'state', unchecked = excluded/'type'.
+        self.state.marker_roles[ch] = 'state' if checked else 'type'
+
+    def _on_include_type_markers_toggled(self, checked: bool):
+        """Item 6 -- ticking 'Include clustering (type) markers' also
+        ticks every channel checkbox above, so the two controls can't
+        disagree about which channels are actually included."""
+        if checked:
+            for cb in self.marker_roles_checkboxes.values():
+                cb.setChecked(True)
 
     def _reset_marker_roles_to_defaults(self):
         """
@@ -8358,6 +8389,15 @@ class _WrappingLegendWidget(QWidget):
         self._grid.setContentsMargins(2, 2, 2, 2)
         self._grid.setSpacing(4)
         self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        # Item 2 -- self.height() is 0/unreliable the first time
+        # set_entries() runs on a widget inside a not-yet-shown tab page
+        # (Qt defers layout of hidden QTabWidget pages), which made
+        # _reflow() pack every entry into its own column instead of
+        # wrapping -- pushing all but the first name or two off the
+        # right edge of the scroll viewport. Remember the last height we
+        # actually reflowed at so a premature call falls back to that
+        # instead of 0.
+        self._last_good_height = 0
 
     def set_entries(self, entries: list[QWidget]):
         """Replace the displayed rows and re-flow into columns."""
@@ -8368,6 +8408,10 @@ class _WrappingLegendWidget(QWidget):
         for w in entries:
             w.setParent(self)
         self._reflow()
+        # Item 2 -- re-reflow once the event loop has processed any
+        # pending show/resize events, in case this call landed before
+        # the containing tab page/splitter had real geometry.
+        QTimer.singleShot(0, self._reflow)
 
     def sizeHint(self):
         return QSize(90, self.ROW_HEIGHT)
@@ -8391,11 +8435,76 @@ class _WrappingLegendWidget(QWidget):
             return
         for w in self._entries:
             self._grid.removeWidget(w)
-        rows_per_col = max(1, self.height() // self.ROW_HEIGHT)
+        height = self.height()
+        if height <= self.ROW_HEIGHT:
+            # Not laid out yet -- fall back to the last height we knew
+            # was real, rather than wrapping at effectively zero.
+            height = self._last_good_height or height
+        else:
+            self._last_good_height = height
+        rows_per_col = max(1, height // self.ROW_HEIGHT)
         for i, w in enumerate(self._entries):
             col, row = divmod(i, rows_per_col)
             self._grid.addWidget(w, row, col)
 
+class _MarkerSummaryWorker(QThread):
+    """
+    Item 3 -- pools per-cluster marker values (disk I/O + unmixing, via
+    the owning ClusterAnnotationTab's own _pool_violin_data) and builds
+    the heatmap/ridgeline Figures on a background thread, so recomputing
+    -- or just switching back to an already-pooled run -- never blocks
+    the UI. Figure objects themselves are plain matplotlib (no Qt), so
+    building them off the main thread is safe; only the canvas
+    construction/draw() in _apply_marker_summary_figures touches Qt and
+    must stay on the main thread (see the finished signal's connection).
+
+    If *pooled* is already known (switching back to a cached run), pass
+    it in directly and the pooling step is skipped.
+    """
+    finished = Signal(bool, str, dict)
+
+    def __init__(self, plugin, cl_run: dict, channels: list[str],
+                cluster_order: list[int], af_state, pooled, parent=None):
+        super().__init__(parent)
+        self._plugin = plugin
+        self._cl_run = cl_run
+        self._channels = channels
+        self._cluster_order = cluster_order
+        self._af_state = af_state
+        self._pooled = pooled
+
+    def run(self):
+        try:
+            plugin = self._plugin
+            pooled = self._pooled
+            if pooled is None:
+                pooled = plugin._pool_violin_data(
+                    self._cl_run, self._channels, af_state=self._af_state,
+                )
+            names_map = self._cl_run.get('names', {})
+            colors_map = self._cl_run.get('colors', {})
+            mat = plugin._compute_marker_heatmap_matrix(
+                pooled, self._channels, self._cluster_order,
+            )
+            main_fig, col_fig, row_fig = plugin._make_marker_cluster_heatmap_figures(
+                mat, self._channels, self._cluster_order, names_map,
+            )
+            cbar_fig = plugin._make_marker_cluster_colorbar_figure(mat)
+            ridge_fig = plugin._make_marker_ridgeline_figure(
+                pooled, self._channels, self._cluster_order, names_map, colors_map,
+            )
+            self.finished.emit(True, '', {
+                'pooled': pooled,
+                'channels': self._channels,
+                'cluster_order': self._cluster_order,
+                'names_map': names_map,
+                'colors_map': colors_map,
+                'main_fig': main_fig, 'col_fig': col_fig, 'row_fig': row_fig,
+                'cbar_fig': cbar_fig, 'ridge_fig': ridge_fig,
+            })
+        except Exception as exc:
+            traceback.print_exc()
+            self.finished.emit(False, str(exc), {})
 
 class ClusterAnnotationTab(QWidget):
     """
@@ -8723,7 +8832,7 @@ class ClusterAnnotationTab(QWidget):
         splitter.setStretchFactor(2, 1)
         splitter.setSizes([780, 1040, 340])
         splitter.setChildrenCollapsible(False)
-        splitter.setMinimumHeight(2160)
+        splitter.setMinimumHeight(2600)  # Item 4 -- more room to fit everything
 
         # ============================================================
         # Sub-tab 2 — Marker Heatmap & Ridgelines (Items 4 & 5)
@@ -8761,6 +8870,7 @@ class ClusterAnnotationTab(QWidget):
         page_layout.addWidget(self._summary_splitter, stretch=1)
 
         heatmap_box = QGroupBox("Median MFI per Cluster (Transformed)")
+        self._heatmap_box = heatmap_box  # Item 3 -- needed from _apply_marker_summary_figures
         heatmap_outer_layout = QVBoxLayout(heatmap_box)
 
         # Frozen-header grid: (0,0) corner spacer, (0,1) marker-name
@@ -8845,6 +8955,13 @@ class ClusterAnnotationTab(QWidget):
         self._summary_splitter.setStretchFactor(0, 1)
         self._summary_splitter.setStretchFactor(1, 1)
         self._summary_splitter.setChildrenCollapsible(False)
+        # Item 4 -- this sub-tab had no floor at all (unlike the
+        # Annotation splitter above, which sets one), so the heatmap +
+        # colour scale + ridgeline grid got squeezed into whatever the
+        # tab's visible height happened to be. This tab's own outer
+        # QScrollArea (see _build_ui) scrolls past this if the window is
+        # shorter than it.
+        self._summary_splitter.setMinimumHeight(1800)
 
         self._marker_summary_tab_index = self.annotation_sub_tabs.addTab(
             page, "Marker Heatmap / Ridgelines"
@@ -9067,7 +9184,8 @@ class ClusterAnnotationTab(QWidget):
     def _on_violin_channel_checkbox_toggled(self, _checked: bool):
         self._violin_recompute_timer.start()
 
-    def _pool_violin_data(self, cl_run: dict, channels: list[str]) -> dict[str, dict[int, list]]:
+    def _pool_violin_data(self, cl_run: dict, channels: list[str],
+                          af_state=None) -> dict[str, dict[int, list]]:
         """
         Pool per-cluster raw values for each channel from the run's own
         per-sample label arrays. Prefers the run's own 'marker_values'
@@ -9104,7 +9222,14 @@ class ClusterAnnotationTab(QWidget):
                     )
                     continue
             else:
-                mv = drc_pipeline.load_sample_marker_values(self.controller, self.state, rel)
+                # Item 3 -- af_state, when given, is a main-thread
+                # snapshot of (transfer_matrix, af_precomputed,
+                # af_spectra) so a background worker never reads these
+                # live off the controller while the main window could be
+                # reassigning them (see apply_unmixing_af_aware()).
+                mv = drc_pipeline.load_sample_marker_values(
+                    self.controller, self.state, rel, af_state=af_state,
+                )
                 if mv is None:
                     continue
                 values, names = mv
@@ -9189,8 +9314,13 @@ class ClusterAnnotationTab(QWidget):
             ch, cache['pooled'].get(ch, {}), cache['names_map'], cache.get('colors_map', {}),
         )
         canvas = _new_scrollable_canvas(fig)
-        dpi = fig.get_dpi()
-        canvas.setMinimumSize(int(fig.get_figwidth() * dpi), int(fig.get_figheight() * dpi))
+        # Item 1 -- fill the Splitter panel instead of forcing a fixed
+        # pixel size (which made the scroll area scroll rather than
+        # shrink/grow the plot with the panel). setWidgetResizable(True)
+        # on _violin_scroll already resizes whatever widget it holds to
+        # the viewport size; Expanding just lets it grow past the
+        # figure's own inches-based default too.
+        canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._violin_scroll.setWidget(canvas)
         canvas.draw()
 
@@ -9338,7 +9468,8 @@ class ClusterAnnotationTab(QWidget):
     def _pop_out_map(self):
         """Regenerate the cluster map at a larger size in its own window,
         with the same pan/zoom toolbar the Stats results tabs already
-        have (Item 6)."""
+        have (Item 6), and its own copy of the swatch legend (Item 2 --
+        the pop-out previously showed no legend at all)."""
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 
@@ -9354,17 +9485,54 @@ class ClusterAnnotationTab(QWidget):
         dlg_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         dlg_toolbar = NavigationToolbar2QT(dlg_canvas, None)
 
+        dlg_legend_scroll = QScrollArea()
+        dlg_legend_scroll.setWidgetResizable(True)
+        dlg_legend_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        dlg_legend_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        dlg_legend_scroll.setMinimumWidth(140)
+        dlg_legend_scroll.setFrameShape(QFrame.NoFrame)
+        dlg_legend_widget = _WrappingLegendWidget()
+        dlg_legend_scroll.setWidget(dlg_legend_widget)
+
+        def _refresh_popout():
+            ax.clear()
+            self._draw_map_axes(ax, self._selected_cluster_run(), dr_run, fontsize=10)
+            _style_figure_theme(dlg_fig, _resolve_is_dark(self.state), axes=[ax])
+            dlg_canvas.draw_idle()
+            dlg_legend_widget.set_entries(
+                self._build_legend_entries(self._selected_cluster_run(), extra_refresh=_refresh_popout)
+            )
+
+        dlg_legend_widget.set_entries(
+            self._build_legend_entries(cl_run, extra_refresh=_refresh_popout)
+        )
+
         dlg = QDialog(self)
         dlg.setWindowTitle("Cluster Map")
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.resize(900, 900)
         layout = QVBoxLayout(dlg)
         layout.addWidget(dlg_toolbar)
-        layout.addWidget(dlg_canvas)
+        plot_row = QHBoxLayout()
+        plot_row.addWidget(dlg_canvas, stretch=1)
+        plot_row.addWidget(dlg_legend_scroll)
+        layout.addLayout(plot_row)
         dlg_canvas.draw()
         dlg.show()
 
-    def _rebuild_map_legend(self, cl_run: dict | None):
+    def _build_legend_entries(self, cl_run: dict | None, extra_refresh=None) -> list[QWidget]:
+        """
+        Build one swatch+name row per cluster. Shared by the inline
+        legend (_rebuild_map_legend) and the pop-out dialog's own legend
+        (_pop_out_map, Item 2) so both look and behave identically.
+
+        extra_refresh, if given, is called after a rename/recolour is
+        applied through THIS set of entries -- lets the pop-out dialog
+        redraw its own (separate) figure and legend after an edit made
+        from within the dialog, in addition to the normal
+        self._rebuild_map_legend()/self._redraw_map() the underlying
+        _pick_colour()/_prompt_rename() already trigger for the main panel.
+        """
         colors = cl_run.get('colors', {}) if cl_run else {}
         names = cl_run.get('names', {}) if cl_run else {}
         entries: list[QWidget] = []
@@ -9382,22 +9550,33 @@ class ClusterAnnotationTab(QWidget):
             )
             swatch.setToolTip("Right-click to change colour")
             swatch.setContextMenuPolicy(Qt.CustomContextMenu)
-            swatch.customContextMenuRequested.connect(
-                lambda pos, l=lbl: self._pick_colour(l)
-            )
+
+            def _on_recolor(pos, l=lbl):
+                self._pick_colour(l)
+                if extra_refresh:
+                    extra_refresh()
+            swatch.customContextMenuRequested.connect(_on_recolor)
             row.addWidget(swatch)
 
             name_lbl = QLabel(name)
             name_lbl.setStyleSheet("font-size: 9px;")
             name_lbl.setToolTip("Double-click to rename")
-            name_lbl.mouseDoubleClickEvent = lambda e, l=lbl: self._prompt_rename(l)
+
+            def _on_rename(e, l=lbl):
+                self._prompt_rename(l)
+                if extra_refresh:
+                    extra_refresh()
+            name_lbl.mouseDoubleClickEvent = _on_rename
             row.addWidget(name_lbl, stretch=1)
 
             row_w = QWidget()
             row_w.setLayout(row)
             entries.append(row_w)
 
-        self._legend_widget.set_entries(entries)
+        return entries
+
+    def _rebuild_map_legend(self, cl_run: dict | None):
+        self._legend_widget.set_entries(self._build_legend_entries(cl_run))
 
     def _prompt_rename(self, label: int):
         from PySide6.QtWidgets import QInputDialog
@@ -9813,16 +9992,59 @@ class ClusterAnnotationTab(QWidget):
             )
             return
         cluster_order = sorted(cl for cl in cl_run.get('colors', {}) if cl >= 0)
-        pooled = self._pool_violin_data(cl_run, channels)
-        self._marker_summary_cache[run_id] = {
-            'channels': channels,
-            'cluster_order': cluster_order,
-            'pooled': pooled,
-            'names_map': cl_run.get('names', {}),
-            'colors_map': cl_run.get('colors', {}),
-        }
+
+        # Item 3 -- pooling (disk I/O + unmixing) and figure construction
+        # can take a while for large runs; both now happen on a
+        # background QThread instead of blocking the UI, the same way
+        # _StatsWorker/_DrWorker/_ClusterIdWorker already do elsewhere in
+        # this tab. AF/transfer-matrix state is snapshotted HERE, on the
+        # main thread, before the worker starts -- see _StatsWorker's own
+        # comment for why reading it live off the controller from a
+        # background thread is a memory-corruption hazard, not just a
+        # stale-data one.
+        af_state = (
+            self.controller.transfer_matrix,
+            self.controller.af_precomputed,
+            self.controller.af_spectra,
+        )
         self._marker_summary_last_drawn = None
-        self._draw_marker_summary()
+        self._start_marker_summary_worker(
+            cl_run, channels, cluster_order, af_state, pooled=None, run_id=run_id,
+        )
+
+    def _start_marker_summary_worker(self, cl_run: dict, channels: list[str],
+                                     cluster_order: list[int], af_state, pooled, run_id):
+        self.marker_summary_recompute_btn.setEnabled(False)
+        self._show_marker_summary_placeholder("⏳ Computing marker summary …")
+        worker = _MarkerSummaryWorker(self, cl_run, channels, cluster_order, af_state, pooled)
+        worker.finished.connect(
+            lambda ok, err, payload, rid=run_id: self._on_marker_summary_finished(ok, err, payload, rid)
+        )
+        self._marker_summary_worker = worker
+        worker.start()
+
+    def _on_marker_summary_finished(self, success: bool, error: str, payload: dict, run_id):
+        self.marker_summary_recompute_btn.setEnabled(True)
+        if not success:
+            self._show_marker_summary_placeholder(f"Failed to compute marker summary: {error}")
+            return
+        self._marker_summary_cache[run_id] = {
+            'channels': payload['channels'],
+            'cluster_order': payload['cluster_order'],
+            'pooled': payload['pooled'],
+            'names_map': payload['names_map'],
+            'colors_map': payload['colors_map'],
+        }
+        if self.run_combo.currentData() != run_id:
+            # The user switched to a different run while this was
+            # computing -- the result is cached for later, but don't draw
+            # it over whatever run is now actually selected.
+            return
+        self._marker_summary_last_drawn = (run_id, _resolve_is_dark(self.state))
+        self._apply_marker_summary_figures(
+            payload['main_fig'], payload['col_fig'], payload['row_fig'],
+            payload['cbar_fig'], payload['ridge_fig'],
+        )
 
     def _show_marker_summary_placeholder(self, text: str):
         for scroll in (self._heatmap_scroll, self._ridge_scroll):
@@ -9851,14 +10073,18 @@ class ClusterAnnotationTab(QWidget):
             # last render -- switching back to this sub-tab shouldn't
             # rebuild two matplotlib figures from scratch every time.
             return
-        self._marker_summary_last_drawn = draw_key
 
-        mat = self._compute_marker_heatmap_matrix(
-            cache['pooled'], cache['channels'], cache['cluster_order'],
+        # Item 3 -- figure construction from already-pooled data still
+        # goes through the background worker (skipping the pooling step,
+        # since 'pooled' is passed straight through) so a big ridge grid
+        # can't block the UI just from switching back to a cached run.
+        cl_run = self._selected_cluster_run() or {}
+        self._start_marker_summary_worker(
+            cl_run, cache['channels'], cache['cluster_order'], None,
+            pooled=cache['pooled'], run_id=run_id,
         )
-        main_fig, col_fig, row_fig = self._make_marker_cluster_heatmap_figures(
-            mat, cache['channels'], cache['cluster_order'], cache['names_map'],
-        )
+
+    def _apply_marker_summary_figures(self, main_fig, col_fig, row_fig, cbar_fig, ridge_fig):
         dpi = main_fig.get_dpi()
 
         main_canvas = _new_scrollable_canvas(main_fig)
@@ -9882,17 +10108,12 @@ class ClusterAnnotationTab(QWidget):
             int(row_fig.get_figwidth() * dpi), int(col_fig.get_figheight() * dpi)
         )
 
-        cbar_fig = self._make_marker_cluster_colorbar_figure(mat)
         cbar_dpi = cbar_fig.get_dpi()
         cbar_canvas = _new_scrollable_canvas(cbar_fig)
         cbar_canvas.setFixedSize(int(cbar_fig.get_figwidth() * cbar_dpi), int(cbar_fig.get_figheight() * cbar_dpi))
         self._heatmap_colorbar_scroll.setWidget(cbar_canvas)
         cbar_canvas.draw()
 
-        ridge_fig = self._make_marker_ridgeline_figure(
-            cache['pooled'], cache['channels'], cache['cluster_order'],
-            cache['names_map'], cache['colors_map'],
-        )
         ridge_canvas = _new_scrollable_canvas(ridge_fig)
         dpi2 = ridge_fig.get_dpi()
         ridge_canvas.setMinimumSize(int(ridge_fig.get_figwidth() * dpi2), int(ridge_fig.get_figheight() * dpi2))
@@ -9909,8 +10130,8 @@ class ClusterAnnotationTab(QWidget):
         # the viewport goes back to its normal flexible behaviour.
         main_h_px = int(main_fig.get_figheight() * dpi)
         self._heatmap_scroll.setFixedHeight(main_h_px)
-        heatmap_box.adjustSize()
-        ideal_top_h = heatmap_box.sizeHint().height()
+        self._heatmap_box.adjustSize()
+        ideal_top_h = self._heatmap_box.sizeHint().height()
         self._heatmap_scroll.setMinimumHeight(0)
         self._heatmap_scroll.setMaximumHeight(16_777_215)  # QWIDGETSIZE_MAX
 
@@ -10763,7 +10984,7 @@ class PluginWidget(QWidget):
 
             # marker_roles: not restored -- to be changed
 
-            self._pending_include_type_markers = s.value('include_type_markers', False)
+            self._pending_include_type_markers = s.value('include_type_markers', True)
             self._pending_annotation_run_id = s.value('annotation_run_id', '')
             self._pending_annotation_dr_run_id = s.value('annotation_dr_run_id', '')
             annotation_channels = s.value('annotation_channels_checked', [])
