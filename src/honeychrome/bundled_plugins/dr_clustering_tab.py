@@ -84,6 +84,7 @@ _REQUIRED_PACKAGES = {
     'hnswlib':    'hnswlib',
     'inmoose':    'inmoose',
     'adjustText': 'adjustText',
+    'hdbscan':    'hdbscan',
 }
 
 
@@ -557,6 +558,52 @@ def _new_scrollable_canvas(fig):
     return _ScrollableFigureCanvas(fig)
 
 
+def _make_scatter_hover_handler(fig, ax, scatter, labels: list[str], is_dark: bool):
+    """
+    Build a matplotlib 'motion_notify_event' handler that shows
+    labels[i] in a small annotation box whenever the mouse hovers over
+    point i of *scatter* (Item 6) -- lets a plot identify every point on
+    demand without drawing (or de-overlapping) hundreds of static text
+    labels up front.
+
+    Returns the handler function; the CALLER connects it once a canvas
+    actually exists (fig.canvas.mpl_connect('motion_notify_event', ...) --
+    see _add_results_tab / GroupsStatsTab._pop_out), since a bare Figure
+    has no canvas yet at the point a figure-maker like _make_volcano_figure
+    runs. Stash the returned handler on the figure itself
+    (fig._hover_handler = ...) so callers can find and connect it
+    generically without knowing which figure-maker produced it.
+    """
+    annot = ax.annotate(
+        '', xy=(0, 0), xytext=(12, 12), textcoords='offset points',
+        fontsize=7,
+        bbox=dict(boxstyle='round', fc='#333333' if is_dark else '#ffffe0',
+                  ec='#888888', alpha=0.95),
+        color='white' if is_dark else 'black',
+        arrowprops=dict(arrowstyle='-', color='#888888'),
+    )
+    annot.set_visible(False)
+
+    def _on_hover(event):
+        if event.inaxes != ax:
+            if annot.get_visible():
+                annot.set_visible(False)
+                fig.canvas.draw_idle()
+            return
+        cont, ind = scatter.contains(event)
+        if cont:
+            idx = ind['ind'][0]
+            annot.xy = scatter.get_offsets()[idx]
+            annot.set_text(labels[idx])
+            annot.set_visible(True)
+            fig.canvas.draw_idle()
+        elif annot.get_visible():
+            annot.set_visible(False)
+            fig.canvas.draw_idle()
+
+    return _on_hover
+
+
 class _AspectCanvasHolder(QWidget):
     """
     Pins a single child widget to a top-left rectangle that preserves a
@@ -966,7 +1013,7 @@ class PipelineState:
     # One dict per PlotCard on the workspace canvas
     display_clipboard: dict | None = None
 
-    # --- Data pipeline cache (perf) ---
+    # --- Data pipeline cache ---
     gated_data_cache: dict[tuple, np.ndarray] = field(default_factory=dict)
     # {(abs_path_str, sorted_gates_tuple, id(transfer_matrix)): gated array}
     # Populated by drc_pipeline.load_unmixed_gated(). Avoids re-reading and
@@ -1589,6 +1636,24 @@ class ConfigTab(QWidget):
         )
         umap_grid.addWidget(self.umap_n_epochs, 1, 3)
 
+        umap_grid.addWidget(QLabel("n_jobs:"), 2, 0)
+        self.umap_n_jobs = QSpinBox()
+        self.umap_n_jobs.setRange(-1, 64)
+        self.umap_n_jobs.setValue(1)
+        self.umap_n_jobs.setSpecialValueText('all cores')
+        self.umap_n_jobs.setToolTip(
+            "-1 = use all available cores.  Default: 1 (single-threaded,\n"
+            "matches previous behaviour).\n"
+            "UMAP disables real multi-threading whenever a fixed random seed\n"
+            "is set (needed for reproducible runs) -- see CONTEXT_UMAP.md.\n"
+            "Setting this above 1 drops the fixed seed for THIS run so the\n"
+            "parallelism actually takes effect: embeddings will no longer be\n"
+            "bit-for-bit reproducible run-to-run, though cluster structure is\n"
+            "stable in practice. Leave at 1 if exact reproducibility matters\n"
+            "more than training speed."
+        )
+        umap_grid.addWidget(self.umap_n_jobs, 2, 1)
+
         dr_layout.addWidget(self._umap_params)
 
         # ---- tSNE params ----
@@ -1870,6 +1935,40 @@ class ConfigTab(QWidget):
             lambda on: self._cl_dr_combo.setEnabled(on)
         )
 
+        # ---- Assignment scope (Items 9 & 11) ----
+        # Item 11 -- unchecked by default: every training sample's own
+        # events get their EXACT label straight out of the fit itself
+        # (Leiden/HDBSCAN) or the native SOM node mapping (FlowSOM) -- no
+        # downsampling, no approximate assignment needed for them at all.
+        self.cl_downsample_chk = QCheckBox("Downsample training data (faster, less accurate)")
+        self.cl_downsample_chk.setChecked(False)
+        self.cl_downsample_chk.setToolTip(
+            "Unchecked (default): every gated event from every Training\n"
+            "Sample is used to fit the model -- slower, but every training\n"
+            "sample's own events get an exact label with no approximation.\n"
+            "Checked: caps each training sample to 'Training events per\n"
+            "sample' above (like the previous default) -- faster, but\n"
+            "events beyond the cap are labelled via an approximate method\n"
+            "(k-NN majority vote for Leiden, approximate_predict for\n"
+            "HDBSCAN) instead of the fit itself."
+        )
+        cl_layout.addWidget(self.cl_downsample_chk)
+
+        # Item 9 -- opt-in, not default (matches DR's own "Apply to All
+        # Samples" being a manual second step, not automatic): every
+        # sample in the experiment gets cluster labels, not just Training
+        # Samples. Training Samples still only decides what fits the
+        # model either way.
+        self.cl_assign_all_chk = QCheckBox("Assign clusters to all samples")
+        self.cl_assign_all_chk.setChecked(False)
+        self.cl_assign_all_chk.setToolTip(
+            "Unchecked (default): only Training Samples get cluster labels.\n"
+            "Checked: every other sample in the experiment gets labels too\n"
+            "(via the same approximate method used for any downsampled\n"
+            "events), not just the ones picked as Training Samples."
+        )
+        cl_layout.addWidget(self.cl_assign_all_chk)
+
         # ---- Run button + status ----
         cl_run_row = QHBoxLayout()
         self.cl_run_btn = QPushButton("▶  Run Clustering")
@@ -2045,6 +2144,7 @@ class ConfigTab(QWidget):
                 'min_dist':    self.umap_min_dist.value(),
                 'metric':      self.umap_metric.currentText(),
                 'n_epochs':    self.umap_n_epochs.value(),
+                'n_jobs':      self.umap_n_jobs.value(),
             }
         elif algo == 'tSNE':
             return {
@@ -2074,6 +2174,21 @@ class ConfigTab(QWidget):
         self._leiden_params.setVisible(algo == 'Leiden')
         self._hdbscan_params.setVisible(algo == 'HDBSCAN')
 
+        # Item 13 -- HDBSCAN doesn't behave well directly on the full
+        # multichannel feature space (confirmed: hundreds of
+        # near-meaningless clusters on a real run). Force DR space and
+        # disable the raw-feature-space option while it's selected;
+        # restore both for FlowSOM/Leiden, which are fine in either space.
+        is_hdbscan = (algo == 'HDBSCAN')
+        self._rb_space_raw.setEnabled(not is_hdbscan)
+        if is_hdbscan and not self._rb_space_dr.isChecked():
+            self._rb_space_dr.setChecked(True)
+        self._rb_space_raw.setToolTip(
+            "Not available for HDBSCAN -- see the note below."
+            if is_hdbscan else
+            "Cluster directly on the logicle-transformed channel values."
+        )
+
         notes = {
             'FlowSOM': (
                 "FlowSOM: self-organising map → metaclustering."
@@ -2084,8 +2199,10 @@ class ConfigTab(QWidget):
             ),
             'HDBSCAN': (
                 "HDBSCAN: density-based clustering, no fixed distance threshold.\n"
-                "Works on both the raw feature space and a DR embedding without\n"
-                "retuning.  Events labelled −1 (noise) are shown in grey."
+                "Restricted to a DR embedding -- high-dimensional density estimates\n"
+                "degenerate badly directly on the full feature space (far too many\n"
+                "small, near-meaningless clusters). Events labelled −1 (noise) are\n"
+                "shown in grey."
             ),
         }
         self._cl_algo_note.setText(notes.get(algo, ''))
@@ -2128,6 +2245,10 @@ class ConfigTab(QWidget):
         space, dr_algo = self.clustering_space()
         params['_space'] = space
         params['_dr_algo'] = dr_algo
+        params['_assign_all_samples'] = self.cl_assign_all_chk.isChecked()
+        params['_event_cap'] = (
+            self.state.n_training_events if self.cl_downsample_chk.isChecked() else None
+        )
         plugin = self._plugin_widget()
         if plugin:
             plugin._run_clustering(algo, params)
@@ -2666,22 +2787,15 @@ class TransformTab(QWidget):
         Reload Transform objects from controller.unmixed_transformations,
         repopulate the channel list and biplot x-combo, then load event data.
         """
-        _t_refresh0 = time.perf_counter()
         if self.controller.experiment.process.get('unmixing_matrix') is None:
             return
 
         # Gate tree — always rebuilt so renamed/added gates appear; checked
         # set comes from the shared state.selected_gates (kept in sync with
         # ConfigTab's tree by PluginWidget._on_gate_tree_changed).
-        _t0 = time.perf_counter()
         hierarchy = self.controller.unmixed_gating.get_gate_hierarchy(output='dict')
-        _log.info("TIMING TransformTab.refresh: get_gate_hierarchy took %.3fs",
-                   time.perf_counter() - _t0)
-        _t0 = time.perf_counter()
         self.gate_tree.set_hierarchy(hierarchy)
         self.gate_tree.set_checked_names(self.state.selected_gates)
-        _log.info("TIMING TransformTab.refresh: gate_tree rebuild+sync took %.3fs",
-                   time.perf_counter() - _t0)
 
         # Deep-copy Transform objects from controller so we can tweak locally
         src = self.controller.unmixed_transformations or {}
@@ -2750,8 +2864,6 @@ class TransformTab(QWidget):
         if not restored and channels:
             self.channel_list.setCurrentRow(0)
 
-        _log.info("TIMING TransformTab.refresh: total (excluding deferred preview load) took %.3fs",
-                   time.perf_counter() - _t_refresh0)
         QTimer.singleShot(50, self._redraw_plots)
 
     # ------------------------------------------------------------------
@@ -2767,7 +2879,6 @@ class TransformTab(QWidget):
         Populate self._raw_data from controller.unmixed_event_data,
         optionally gating on state.selected_gates.
         """
-        _t_total0 = time.perf_counter()
         self._raw_data = {}
         try:
             event_data = self.controller.unmixed_event_data
@@ -2783,7 +2894,6 @@ class TransformTab(QWidget):
 
             selected_gates = self.state.selected_gates
             if selected_gates and selected_gates != ['root']:
-                _t0 = time.perf_counter()
                 _n_in = len(event_data)
                 try:
                     cytometry_dict = dict(self.controller.data_for_cytometry_plots_unmixed)
@@ -2791,9 +2901,6 @@ class TransformTab(QWidget):
                     event_data = apply_gates_union_by_lookup_table(cytometry_dict, selected_gates)
                 except Exception as e:
                     print(f"[DR Plugin] TransformTab: gating failed ({selected_gates}): {e}")
-                _log.info("TIMING TransformTab._do_load_preview_data: "
-                          "apply_gates_union_by_lookup_table (%d events in -> %d out, gates=%r) took %.3fs",
-                          _n_in, len(event_data), selected_gates, time.perf_counter() - _t0)
 
             for i, ch in enumerate(channel_names):
                 if i < event_data.shape[1]:
@@ -2801,8 +2908,6 @@ class TransformTab(QWidget):
 
             print(f"[DR Plugin] TransformTab: {len(event_data):,} events "
                   f"(gates={selected_gates!r})")
-            _log.info("TIMING TransformTab._do_load_preview_data: total took %.3fs",
-                       time.perf_counter() - _t_total0)
 
             # Immediately draw tiles — don't wait for the debounce timer
             QTimer.singleShot(0, self._redraw_plots)
@@ -3553,6 +3658,29 @@ class TransformTab(QWidget):
             print(f"[DR TransformTab] Could not restore computed transforms: {e}")
 
 
+class _ResultsDrawWorker(QThread):
+    """
+    Builds every Groups & Stats results Figure (heatmap/volcano for
+    freq/counts/MFI) off the main thread (Item 7) -- same reasoning as
+    _MarkerSummaryWorker elsewhere in this file: Figure objects are plain
+    matplotlib, no Qt, so building them off-thread is safe; only tab/
+    canvas creation (GroupsStatsTab._on_results_figures_built, on the
+    main thread) touches Qt.
+    """
+    finished = Signal(dict)
+
+    def __init__(self, build_fn, parent=None):
+        super().__init__(parent)
+        self._build_fn = build_fn
+
+    def run(self):
+        try:
+            payload = self._build_fn()
+        except Exception:
+            traceback.print_exc()
+            payload = {}
+        self.finished.emit(payload)
+
 
 class GroupsStatsTab(QWidget):
     """
@@ -3583,6 +3711,12 @@ class GroupsStatsTab(QWidget):
         # successfully computed Run Statistics — lets _run_statistics
         # replot instead of re-running limma when only thresholds changed.
         self._last_stats_data_key = None
+        # Item 7: the _ResultsDrawWorker currently building figures, if
+        # any, and whether another _draw_results() call arrived while it
+        # was busy (coalesced into one more redraw once it finishes,
+        # rather than a second worker starting against a moving target).
+        self._results_draw_worker = None
+        self._results_draw_pending = False
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -4591,12 +4725,9 @@ class GroupsStatsTab(QWidget):
         training-sample selection if no run is selected yet, and to all
         samples if that's empty too.
         """
-        # Item 13: group names/patterns/compare-selection live on state
-        # directly now — just repopulate the management widgets from it.
         self._populate_groups_table()
         self._refresh_compare_combos()
 
-        # Item 13 phase 2: Groups-to-Test / contrast mode / pairing widgets.
         self._populate_test_groups_list()
         self._populate_pairing_variable_combo()
         self.chk_paired.blockSignals(True)
@@ -5927,6 +6058,11 @@ class GroupsStatsTab(QWidget):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
+        # Hover tooltips (Item 6) -- figure-makers that want them stash a
+        # handler on the Figure itself (fig._hover_handler), since no
+        # canvas exists yet when they run; connect it now that one does.
+        if hasattr(fig, '_hover_handler'):
+            canvas.mpl_connect('motion_notify_event', fig._hover_handler)
 
         toolbar = NavigationToolbar2QT(canvas, None)
 
@@ -5962,6 +6098,11 @@ class GroupsStatsTab(QWidget):
                 QSizePolicy.Policy.Expanding,
                 QSizePolicy.Policy.Expanding,
             )
+            # Hover tooltips (Item 6) -- dlg_fig is a fresh figure (from
+            # maker(**maker_kwargs) above), so its own handler needs
+            # connecting too.
+            if hasattr(dlg_fig, '_hover_handler'):
+                dlg_canvas.mpl_connect('motion_notify_event', dlg_fig._hover_handler)
             dlg_toolbar = NavigationToolbar2QT(dlg_canvas, None)
 
             class _PlotDialog(QDialog):
@@ -6099,10 +6240,27 @@ class GroupsStatsTab(QWidget):
         selected 'Viewing comparison' (Item 13 phase 2 — a single Run
         Statistics call can now produce several comparisons; each plot
         still shows exactly one at a time — see §2.4 of the change doc).
+
+        Figure-building (the expensive part -- heatmap dendrograms,
+        volcano scatter/labelling) happens on a background QThread
+        (_ResultsDrawWorker, Item 7) -- confirmed necessary from a real
+        run: 2.4s entirely on the main thread even after Item 4/6's label
+        fix. Only tab add/remove (Qt) happens here and in
+        _on_results_figures_built, on the main thread.
         """
+        if self._results_draw_worker is not None:
+            # A build is already in flight -- don't start a second one
+            # against a moving target; remember to redraw once more as
+            # soon as this one finishes instead.
+            self._results_draw_pending = True
+            return
+
         self._last_drawn_cluster_names = dict(self.state.cluster_names)
         # Remove only this method's own tabs (by key) — leaves Confusion
         # Matrix / Composition Barplot (and anything else) untouched.
+        # Done immediately (not after the background build) so a stale
+        # previous comparison's plots don't linger while the new ones
+        # are being built.
         for key in ('freq_heatmap', 'freq_volcano', 'counts_heatmap', 'counts_volcano',
                    'mfi_heatmap', 'mfi_volcano'):
             self._remove_results_tab_by_key(key)
@@ -6112,15 +6270,56 @@ class GroupsStatsTab(QWidget):
             return
         view_idx = max(0, self.viewing_comparison_combo.currentIndex())
         name_a, name_b = self.state.stats_comparisons[view_idx]
-        comparison_label = f"{name_b} vs {name_a}"
         run_label = self.state.stats_run_label or 'Active (unsaved)'
+        pval_threshold = self.pval_spin.value()
+        fc_threshold = self.fc_spin.value()
 
-        # Samples outside this specific comparison aren't part of what it
-        # tested (pairwise mode fits each pair on just its own samples;
-        # reference mode's joint fit still only makes sense to *display*
-        # two groups at a time here).
+        # Snapshot the current result DataFrames NOW, on the main thread.
+        # The background worker must never read self.state live --
+        # _on_stats_finished re-enables the Run Statistics button as soon
+        # as computation finishes, so a fresh click could otherwise
+        # reassign state.freq_results/mfi_df/etc. WHILE this build is
+        # still reading them.
+        freq_results_snap    = self.state.freq_results
+        freq_df_snap         = self.state.freq_df
+        counts_results_snap  = self.state.counts_results
+        counts_df_snap       = self.state.counts_df
+        mfi_results_snap     = self.state.mfi_results
+        mfi_df_snap          = self.state.mfi_df
+        mfi_sample_df_snap   = self.state.mfi_sample_df
+        stats_all_rel_snap   = list(self.state.stats_all_rel)
+        stats_group_vec_snap = list(self.state.stats_group_vec)
+
+        def _build():
+            return self._build_results_figures(
+                name_a, name_b, run_label, pval_threshold, fc_threshold,
+                freq_results_snap, freq_df_snap,
+                counts_results_snap, counts_df_snap,
+                mfi_results_snap, mfi_df_snap, mfi_sample_df_snap,
+                stats_all_rel_snap, stats_group_vec_snap,
+            )
+
+        worker = _ResultsDrawWorker(_build)
+        worker.finished.connect(self._on_results_figures_built)
+        self._results_draw_worker = worker
+        worker.start()
+
+    def _build_results_figures(self, name_a, name_b, run_label,
+                                pval_threshold, fc_threshold,
+                                freq_results, freq_df,
+                                counts_results, counts_df,
+                                mfi_results, mfi_df, mfi_sample_df,
+                                stats_all_rel, stats_group_vec) -> dict:
+        """
+        Pure compute: build every results Figure from the snapshotted
+        DataFrames passed in (no self.state reads, no Qt) -- runs on
+        _ResultsDrawWorker's background thread. Returns an ordered dict
+        of {key: {'fig', 'error', 'title', 'maker', 'maker_kwargs'}} for
+        _on_results_figures_built to turn into tabs on the main thread.
+        """
+        comparison_label = f"{name_b} vs {name_a}"
         relevant_rel = {
-            rel for rel, g in zip(self.state.stats_all_rel, self.state.stats_group_vec)
+            rel for rel, g in zip(stats_all_rel, stats_group_vec)
             if g in (name_a, name_b)
         }
 
@@ -6136,156 +6335,88 @@ class GroupsStatsTab(QWidget):
             keep = [r for r in sample_df.index if r in relevant_rel]
             return sample_df.loc[keep]
 
-        freq_results_view    = _view_results(self.state.freq_results)
-        freq_df_view         = _view_samples(self.state.freq_df)
-        counts_results_view  = _view_results(self.state.counts_results)
-        counts_df_view       = _view_samples(self.state.counts_df)
-        mfi_results_view     = _view_results(self.state.mfi_results)
-        mfi_df_view          = _view_samples(self.state.mfi_df)
-        mfi_sample_df_view   = _view_samples(self.state.mfi_sample_df)
+        freq_results_view    = _view_results(freq_results)
+        freq_df_view         = _view_samples(freq_df)
+        counts_results_view  = _view_results(counts_results)
+        counts_df_view       = _view_samples(counts_df)
+        mfi_results_view     = _view_results(mfi_results)
+        mfi_df_view          = _view_samples(mfi_df)
+        mfi_sample_df_view   = _view_samples(mfi_sample_df)
+
+        results: dict = {}
+
+        def _build(key, title, maker, maker_kwargs):
+            try:
+                fig = maker(**maker_kwargs)
+                results[key] = dict(fig=fig, error=None, title=title,
+                                     maker=maker, maker_kwargs=maker_kwargs)
+            except Exception as e:
+                traceback.print_exc()
+                results[key] = dict(fig=None, error=str(e), title=title,
+                                     maker=maker, maker_kwargs=maker_kwargs)
 
         if freq_results_view is not None:
-            try:
-                fig = self._make_heatmap_figure(
-                    freq_results_view,
-                    freq_df_view,
-                    title=f"Significantly Different Cluster Frequencies: {name_b} vs {name_a}",
-                    group_a=name_a, group_b=name_b,
-                    run_label=run_label,
-                )
-                self._add_results_tab(fig, "Freq Heatmap", "freq_heatmap",
-                         maker=self._make_heatmap_figure,
-                         maker_kwargs=dict(
-                             results_df=freq_results_view,
-                             sample_df=freq_df_view,
-                             title=f"Significantly Different Cluster Frequencies: {name_b} vs {name_a}",
-                             group_a=name_a, group_b=name_b,
-                             run_label=run_label,
-                         ),
-                         key="freq_heatmap")
-            except Exception as e:
-                tab = QLabel(f"Heatmap error: {e}")
-                tab.setStyleSheet("color: red;")
-                tab.setProperty('_tab_key', 'freq_heatmap')
-                self._results_tabs.addTab(tab, "Freq Heatmap")
-
-            try:
-                fig_v = self._make_volcano_figure(
-                    freq_results_view,
-                    title=f"Cluster Frequency Volcano: {name_b} vs {name_a}",
-                    pval_threshold=self.pval_spin.value(),
-                    fc_threshold=self.fc_spin.value(),
-                    run_label=run_label,
-                )
-                self._add_results_tab(fig_v, "Freq Volcano", "freq_volcano",
-                         maker=self._make_volcano_figure,
-                         maker_kwargs=dict(
-                             results_df=freq_results_view,
-                             title=f"Cluster Frequency Volcano: {name_b} vs {name_a}",
-                             pval_threshold=self.pval_spin.value(),
-                             fc_threshold=self.fc_spin.value(),
-                             run_label=run_label,
-                         ),
-                         key="freq_volcano")
-            except Exception as e:
-                tab = QLabel(f"Volcano error: {e}")
-                tab.setStyleSheet("color: red;")
-                tab.setProperty('_tab_key', 'freq_volcano')
-                self._results_tabs.addTab(tab, "Freq Volcano")
+            _build('freq_heatmap', "Freq Heatmap", self._make_heatmap_figure, dict(
+                results_df=freq_results_view, sample_df=freq_df_view,
+                title=f"Significantly Different Cluster Frequencies: {name_b} vs {name_a}",
+                group_a=name_a, group_b=name_b, run_label=run_label,
+            ))
+            _build('freq_volcano', "Freq Volcano", self._make_volcano_figure, dict(
+                results_df=freq_results_view,
+                title=f"Cluster Frequency Volcano: {name_b} vs {name_a}",
+                pval_threshold=pval_threshold, fc_threshold=fc_threshold,
+                run_label=run_label,
+            ))
 
         if counts_results_view is not None:
-            try:
-                fig_c = self._make_heatmap_figure(
-                    counts_results_view,
-                    counts_df_view,
-                    title=f"Cluster Counts: {name_b} vs {name_a}",
-                    group_a=name_a, group_b=name_b,
-                    run_label=run_label,
-                )
-                self._add_results_tab(fig_c, "Counts Heatmap", "counts_heatmap",
-                         maker=self._make_heatmap_figure,
-                         maker_kwargs=dict(
-                             results_df=counts_results_view,
-                             sample_df=counts_df_view,
-                             title=f"Cluster Counts: {name_b} vs {name_a}",
-                             group_a=name_a, group_b=name_b,
-                             run_label=run_label,
-                         ),
-                         key="counts_heatmap")
-            except Exception as e:
-                tab = QLabel(f"Counts heatmap error: {e}")
-                tab.setStyleSheet("color: red;")
-                tab.setProperty('_tab_key', 'counts_heatmap')
-                self._results_tabs.addTab(tab, "Counts Heatmap")
-
-            try:
-                fig_cv = self._make_volcano_figure(
-                    counts_results_view,
-                    title=f"Cluster Counts Volcano: {name_b} vs {name_a}",
-                    pval_threshold=self.pval_spin.value(),
-                    fc_threshold=self.fc_spin.value(),
-                    run_label=run_label,
-                )
-                self._add_results_tab(fig_cv, "Counts Volcano", "counts_volcano",
-                         maker=self._make_volcano_figure,
-                         maker_kwargs=dict(
-                             results_df=counts_results_view,
-                             title=f"Cluster Counts Volcano: {name_b} vs {name_a}",
-                             pval_threshold=self.pval_spin.value(),
-                             fc_threshold=self.fc_spin.value(),
-                             run_label=run_label,
-                         ),
-                         key="counts_volcano")
-            except Exception as e:
-                tab = QLabel(f"Counts volcano error: {e}")
-                tab.setStyleSheet("color: red;")
-                tab.setProperty('_tab_key', 'counts_volcano')
-                self._results_tabs.addTab(tab, "Counts Volcano")
+            _build('counts_heatmap', "Counts Heatmap", self._make_heatmap_figure, dict(
+                results_df=counts_results_view, sample_df=counts_df_view,
+                title=f"Cluster Counts: {name_b} vs {name_a}",
+                group_a=name_a, group_b=name_b, run_label=run_label,
+            ))
+            _build('counts_volcano', "Counts Volcano", self._make_volcano_figure, dict(
+                results_df=counts_results_view,
+                title=f"Cluster Counts Volcano: {name_b} vs {name_a}",
+                pval_threshold=pval_threshold, fc_threshold=fc_threshold,
+                run_label=run_label,
+            ))
 
         if mfi_sample_df_view is not None:
-            try:
-                fig_m = self._make_sample_mfi_heatmap_figure(
-                    mfi_sample_df_view,
-                    group_a=name_a, group_b=name_b,
-                    run_label=run_label,
-                )
-                self._add_results_tab(fig_m, "MFI Heatmap", "mfi_heatmap",
-                         maker=self._make_sample_mfi_heatmap_figure,
-                         maker_kwargs=dict(
-                             mfi_sample_df=mfi_sample_df_view,
-                             group_a=name_a, group_b=name_b,
-                             run_label=run_label,
-                         ),
-                         key="mfi_heatmap")
-            except Exception as e:
-                tab = QLabel(f"MFI heatmap error: {e}")
-                tab.setStyleSheet("color: red;")
-                tab.setProperty('_tab_key', 'mfi_heatmap')
-                self._results_tabs.addTab(tab, "MFI Heatmap")
+            _build('mfi_heatmap', "MFI Heatmap", self._make_sample_mfi_heatmap_figure, dict(
+                mfi_sample_df=mfi_sample_df_view,
+                group_a=name_a, group_b=name_b, run_label=run_label,
+            ))
+            _build('mfi_volcano', "MFI Volcano", self._make_volcano_figure, dict(
+                results_df=mfi_results_view,
+                title=f"Cluster MFI Volcano: {name_b} vs {name_a}",
+                pval_threshold=pval_threshold, fc_threshold=fc_threshold,
+                run_label=run_label,
+            ))
 
-            try:
-                fig_mv = self._make_volcano_figure(
-                    mfi_results_view,
-                    title=f"Cluster MFI Volcano: {name_b} vs {name_a}",
-                    pval_threshold=self.pval_spin.value(),
-                    fc_threshold=self.fc_spin.value(),
-                    run_label=run_label,
-                )
-                self._add_results_tab(fig_mv, "MFI Volcano", "mfi_volcano",
-                         maker=self._make_volcano_figure,
-                         maker_kwargs=dict(
-                             results_df=mfi_results_view,
-                             title=f"Cluster MFI Volcano: {name_b} vs {name_a}",
-                             pval_threshold=self.pval_spin.value(),
-                             fc_threshold=self.fc_spin.value(),
-                             run_label=run_label,
-                         ),
-                         key="mfi_volcano")
-            except Exception as e:
-                tab = QLabel(f"MFI volcano error: {e}")
+        return results
+
+    def _on_results_figures_built(self, payload: dict):
+        """
+        Main-thread slot: turn _build_results_figures' payload into tabs
+        -- the only Qt-touching part of the whole redraw. Connected to
+        _ResultsDrawWorker.finished.
+        """
+        self._results_draw_worker = None
+        for key, item in payload.items():
+            if item['error'] is not None:
+                tab = QLabel(f"{item['title']} error: {item['error']}")
                 tab.setStyleSheet("color: red;")
-                tab.setProperty('_tab_key', 'mfi_volcano')
-                self._results_tabs.addTab(tab, "MFI Volcano")
+                tab.setProperty('_tab_key', key)
+                self._results_tabs.addTab(tab, item['title'])
+            else:
+                self._add_results_tab(
+                    item['fig'], item['title'], key,
+                    maker=item['maker'], maker_kwargs=item['maker_kwargs'],
+                    key=key,
+                )
+        if self._results_draw_pending:
+            self._results_draw_pending = False
+            self._draw_results()
 
     @staticmethod
     def _stamp_run_label(fig, run_label: str):
@@ -6703,44 +6834,57 @@ class GroupsStatsTab(QWidget):
 
         non_sig = ~sig
         ax.scatter(logfc[non_sig], neg_lp[non_sig], c='#aaaaaa', s=25, alpha=0.8, linewidths=0)
+        sig_scatter = None
         if sig.any():
-            sc = ax.scatter(logfc[sig], neg_lp[sig], c=neg_lp[sig], cmap='viridis',
+            sig_scatter = ax.scatter(logfc[sig], neg_lp[sig], c=neg_lp[sig], cmap='viridis',
                             s=25, alpha=0.9, linewidths=0)
-            fig.colorbar(sc, ax=ax, shrink=0.7, label='-log10(adj. P-value)')
+            fig.colorbar(sig_scatter, ax=ax, shrink=0.7, label='-log10(adj. P-value)')
 
         ax.axhline(-np.log10(pval_threshold), color='grey', linestyle='--', linewidth=0.8)
         ax.axvline( fc_threshold,              color='grey', linestyle='--', linewidth=0.8)
         ax.axvline(-fc_threshold,              color='grey', linestyle='--', linewidth=0.8)
 
-        # Label significant features -- colour now follows the theme
-        # (was always black, invisible in dark mode), and labels are
-        # spread apart with adjustText instead of a fixed (3, 3) point
-        # offset for every one, which stacked labels directly on top of
-        # each other whenever several significant points landed close
-        # together.
+        # Static labels: only the _MAX_STATIC_LABELS most significant
+        # points, with a small fixed offset -- no adjustText (Item 6:
+        # dropped entirely -- it hung for minutes with several hundred
+        # significant points, e.g. an MFI volcano, see item 4). EVERY
+        # significant point still gets identified via a mouse-hover
+        # tooltip (_make_scatter_hover_handler) instead, which scales to
+        # any number of points at effectively zero draw cost.
+        _MAX_STATIC_LABELS = 10
         sig_x = logfc[sig]
         sig_y = neg_lp[sig]
         sig_labels = [lbl for lbl, is_pt_sig in zip(features, sig) if is_pt_sig]
-        texts = [ax.text(x_val, y_val, lbl, fontsize=6, color=fg)
-                for x_val, y_val, lbl in zip(sig_x, sig_y, sig_labels)]
-        if texts:
-            try:
-                from adjustText import adjust_text
-                adjust_text(texts, x=sig_x, y=sig_y, ax=ax,
-                            arrowprops=dict(arrowstyle='-', color=fg, lw=0.5))
-            except ImportError:
-                # adjustText not yet installed into this plugin's bundled
-                # environment (see _REQUIRED_PACKAGES / _bootstrap above)
-                # -- labels stay at their point, un-de-overlapped, until
-                # the plugin re-bootstraps and picks it up.
-                pass
+        n_sig_total = len(sig_labels)
+        if n_sig_total > _MAX_STATIC_LABELS:
+            # Most significant first (largest -log10 adj. P-value).
+            top_idx = np.argsort(sig_y)[::-1][:_MAX_STATIC_LABELS]
+        else:
+            top_idx = np.arange(n_sig_total)
+        for i in top_idx:
+            ax.annotate(sig_labels[i], xy=(sig_x[i], sig_y[i]),
+                        xytext=(4, 4), textcoords='offset points',
+                        fontsize=6, color=fg)
+
+        # Hover tooltip covers EVERY significant point (not just the
+        # _MAX_STATIC_LABELS statically-labelled ones). No canvas exists
+        # yet here, so the handler is stashed on the Figure for
+        # _add_results_tab/_pop_out to connect once one does.
+        if sig_scatter is not None:
+            fig._hover_handler = _make_scatter_hover_handler(
+                fig, ax, sig_scatter, sig_labels, is_dark,
+            )
 
         x_lim = max(np.abs(logfc).max() * 1.05, fc_threshold * 1.5)
         ax.set_xlim(-x_lim, x_lim)
 
         ax.set_xlabel("log2 Fold Change")
         ax.set_ylabel("-log10(adj. P-value)")
-        ax.set_title(title, fontsize=10)
+        display_title = title
+        if n_sig_total > _MAX_STATIC_LABELS:
+            display_title = (f"{title}  (top {_MAX_STATIC_LABELS} of {n_sig_total} "
+                             f"labelled; hover any point for its name)")
+        ax.set_title(display_title, fontsize=10)
         _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
         return fig
@@ -9256,7 +9400,6 @@ class ClusterAnnotationTab(QWidget):
         for ch in channels:
             means = {cl: float(np.mean(np.concatenate(vals)))
                     for cl, vals in pooled.get(ch, {}).items()}
-            _log.info("_pool_violin_data: %s per-cluster raw mean: %s", ch, means)
 
         return pooled
 
@@ -10366,16 +10509,10 @@ class PluginWidget(QWidget):
         # Perform Qt-dependent imports now that we're on the main thread.
         # pyqtgraph and colorcet create Qt internals on first import; doing
         # so on the background loader thread produces QObject::setParent warnings.
-        _t0 = time.perf_counter()
         _ensure_qt_imports()
-        _log.info("TIMING PluginWidget.__init__: _ensure_qt_imports took %.3fs",
-                   time.perf_counter() - _t0)
 
         # Install missing ML dependencies (also deferred to main thread).
-        _t0 = time.perf_counter()
         _bootstrap()
-        _log.info("TIMING PluginWidget.__init__: _bootstrap took %.3fs",
-                   time.perf_counter() - _t0)
 
         # Shared state — passed by reference to all inner tabs
         self.state = PipelineState()
@@ -10402,6 +10539,8 @@ class PluginWidget(QWidget):
         # self.state. initialise_gui() only re-reads QSettings and rebuilds
         # the workspace when this changes — see initialise_gui() for why.
         self._loaded_experiment_key = None
+
+        self._last_tab_refresh_key: dict[int, tuple] = {}
 
         # ------------------------------------------------------------------
         # Outer layout: disabled label + scrollable content
@@ -10534,6 +10673,7 @@ class PluginWidget(QWidget):
                 if current_key != self._loaded_experiment_key:
                     # Only reload from QSettings / rebuild the workspace when
                     # we're switching to a different experiment.
+                    self._last_tab_refresh_key = {}
                     self.load_state()
                     if hasattr(self, 'workspace_tab'):
                         wt = self.workspace_tab
@@ -10557,10 +10697,7 @@ class PluginWidget(QWidget):
                 self._loading = False
 
             # Refresh the active inner tab
-            _t0 = time.perf_counter()
             self._refresh_active_tab()
-            _log.info("TIMING initialise_gui: _refresh_active_tab (tab index %d) took %.3fs",
-                       self.inner_tabs.currentIndex(), time.perf_counter() - _t0)
         else:
             self.label_disabled.setVisible(True)
             self.content_widget.setVisible(False)
@@ -10711,6 +10848,7 @@ class PluginWidget(QWidget):
                 s.setValue('umap_min_dist',    ct.umap_min_dist.value())
                 s.setValue('umap_metric',      ct.umap_metric.currentText())
                 s.setValue('umap_n_epochs',    ct.umap_n_epochs.value())
+                s.setValue('umap_n_jobs',      ct.umap_n_jobs.value())
             if hasattr(ct, 'tsne_perplexity'):
                 s.setValue('tsne_perplexity', ct.tsne_perplexity.value())
                 s.setValue('tsne_n_iter',     ct.tsne_n_iter.value())
@@ -10739,6 +10877,10 @@ class PluginWidget(QWidget):
                           ct.hdbscan_min_samples.value())
                 s.setValue('hdbscan_cluster_selection_epsilon',
                           ct.hdbscan_cluster_selection_epsilon.value())
+            if hasattr(ct, 'cl_assign_all_chk'):
+                s.setValue('cl_assign_all_samples', ct.cl_assign_all_chk.isChecked())
+            if hasattr(ct, 'cl_downsample_chk'):
+                s.setValue('cl_downsample_training', ct.cl_downsample_chk.isChecked())
         finally:
             s.endGroup()
 
@@ -11011,6 +11153,7 @@ class PluginWidget(QWidget):
             self._pending_umap_min_dist    = s.value('umap_min_dist', None)
             self._pending_umap_metric      = s.value('umap_metric', '')
             self._pending_umap_n_epochs    = s.value('umap_n_epochs', None)
+            self._pending_umap_n_jobs      = s.value('umap_n_jobs', None)
             self._pending_tsne_perplexity  = s.value('tsne_perplexity', None)
             self._pending_tsne_n_iter      = s.value('tsne_n_iter', None)
             self._pending_tsne_n_jobs      = s.value('tsne_n_jobs', None)
@@ -11029,6 +11172,14 @@ class PluginWidget(QWidget):
             self._pending_hdbscan_min_samples      = s.value('hdbscan_min_samples', None)
             self._pending_hdbscan_cluster_selection_epsilon = s.value(
                 'hdbscan_cluster_selection_epsilon', None)
+            cl_assign_all = s.value('cl_assign_all_samples', None)
+            self._pending_cl_assign_all_samples = (
+                cl_assign_all in (True, 'true', 'True', 1, '1') if cl_assign_all is not None else None
+            )
+            cl_downsample = s.value('cl_downsample_training', None)
+            self._pending_cl_downsample_training = (
+                cl_downsample in (True, 'true', 'True', 1, '1') if cl_downsample is not None else None
+            )
 
         finally:
             s.endGroup()
@@ -11281,6 +11432,7 @@ class PluginWidget(QWidget):
             _set_spin(ct.umap_min_dist,    getattr(self, '_pending_umap_min_dist', None), float)
             _set_combo(ct.umap_metric,     getattr(self, '_pending_umap_metric', ''))
             _set_spin(ct.umap_n_epochs,    getattr(self, '_pending_umap_n_epochs', None))
+            _set_spin(ct.umap_n_jobs,      getattr(self, '_pending_umap_n_jobs', None))
         if hasattr(ct, 'tsne_perplexity'):
             _set_spin(ct.tsne_perplexity, getattr(self, '_pending_tsne_perplexity', None))
             _set_spin(ct.tsne_n_iter,     getattr(self, '_pending_tsne_n_iter', None))
@@ -11315,6 +11467,14 @@ class PluginWidget(QWidget):
                      getattr(self, '_pending_hdbscan_min_samples', None))
             _set_spin(ct.hdbscan_cluster_selection_epsilon,
                      getattr(self, '_pending_hdbscan_cluster_selection_epsilon', None), float)
+        if hasattr(ct, 'cl_assign_all_chk'):
+            _pending_assign_all = getattr(self, '_pending_cl_assign_all_samples', None)
+            if _pending_assign_all is not None:
+                ct.cl_assign_all_chk.setChecked(_pending_assign_all)
+        if hasattr(ct, 'cl_downsample_chk'):
+            _pending_downsample = getattr(self, '_pending_cl_downsample_training', None)
+            if _pending_downsample is not None:
+                ct.cl_downsample_chk.setChecked(_pending_downsample)
 
     def _apply_pending_state_to_annotation_tab(self):
         """Restore the Cluster Annotation tab's run selections and checked
@@ -11428,8 +11588,88 @@ class PluginWidget(QWidget):
             self.groups_stats_tab._draw_results()
         self.groups_stats_tab.refresh_theme_dependent_result_tabs()
 
+    def _tab_refresh_key(self, index: int):
+        """
+        Cheap fingerprint of the state that determines what tab *index*
+        would show if refreshed right now (item 2 -- avoid redoing a full
+        tab refresh when nothing relevant changed, e.g. plain tab-hopping).
+
+        Deliberately coarse and conservative: every field a tab's refresh()
+        reads to decide WHAT to display is included, so a false "unchanged"
+        read (which would show stale data) shouldn't happen; missing a field
+        here just costs one redundant refresh, which is the status quo
+        today. Dicts mutated in place (cluster_names, sample_groups, ...)
+        are snapshotted BY VALUE (sorted tuple of items), not id(), since
+        id() wouldn't change on an in-place edit. Objects that are always
+        wholesale-replaced when they change (result DataFrames, run
+        archives) use id()/len() instead of hashing their content.
+        """
+        s = self.state
+        if index == 0:      # TransformTab
+            return (
+                tuple(sorted(s.selected_gates)),
+                tuple(
+                    (ch, round(v.get('W', 0.0), 4), round(v.get('A', 0.0), 4),
+                     round(v.get('T', 0.0), 4), round(v.get('M', 0.0), 4))
+                    for ch, v in sorted(s.channel_transform_params.items())
+                ),
+            )
+        elif index == 1:    # ConfigTab
+            return (
+                tuple(sorted(s.selected_gates)),
+                tuple(s.selected_channels),
+                tuple(sorted(s.training_sample_ids)),
+                s.n_training_events,
+                tuple(sorted(s.dr_status.items())),
+                s.active_clustering_algorithm,
+                s.n_clusters,
+                len(s.dr_runs), len(s.clustering_runs),
+            )
+        elif index == 2:    # ClusterAnnotationTab
+            return (
+                len(s.dr_runs), len(s.clustering_runs),
+                tuple(sorted(s.cluster_names.items())),
+                tuple(sorted(s.cluster_colors.items())),
+            )
+        elif index == 3:    # GroupsStatsTab
+            return (
+                tuple(sorted(s.sample_groups.items())),
+                tuple(s.group_names),
+                tuple(sorted(s.group_patterns.items())),
+                tuple(s.testing_group_selection),
+                s.contrast_mode, s.reference_group, s.paired, s.pairing_variable,
+                len(s.dr_runs), len(s.clustering_runs),
+                s.stats_run_id,
+                tuple(sorted(s.cluster_names.items())),
+                id(s.freq_results), id(s.counts_results), id(s.mfi_results),
+                id(s.confusion_df), id(s.composition_df),
+                s.composition_as_pct, s.composition_group_var,
+            )
+        elif index == 4:    # WorkspaceTab
+            return (
+                len(s.dr_runs), len(s.clustering_runs),
+                tuple(sorted(s.cluster_names.items())),
+                tuple(sorted(s.cluster_colors.items())),
+                len(s.plot_configs),
+                s.workspace_n_columns, s.plot_theme,
+            )
+        return None
+
     def _refresh_tab_at(self, index: int):
-        """Call refresh() on the tab at *index* if it has that method."""
+        """
+        Call refresh() on the tab at *index* if it has that method --
+        skipping the call entirely if this tab's own fingerprint
+        (_tab_refresh_key) hasn't changed since the last time it ran
+        (item 2). This sits ABOVE refresh(); it doesn't replace the
+        finer-grained guards individual refresh() methods already have
+        (e.g. GroupsStatsTab's _last_drawn_cluster_names / _has_results_tab
+        checks), which still apply whenever refresh() does run.
+        """
+        key = self._tab_refresh_key(index)
+        if key is not None and self._last_tab_refresh_key.get(index) == key:
+            return
+        self._last_tab_refresh_key[index] = key
+
         tabs = [
             self.transform_tab,
             self.config_tab,
@@ -11511,6 +11751,7 @@ class PluginWidget(QWidget):
         """Train a UMAP reducer and store the kNN index in state."""
         import umap as umap_lib
         import hnswlib
+        import os
 
         n_neighbors = params['n_neighbors']
         self.progress_message(f"Building hnswlib kNN index (k={n_neighbors}) …")
@@ -11524,9 +11765,21 @@ class PluginWidget(QWidget):
         index.set_ef(50)
         self.state.umap_knn_index = index
 
+        # n_jobs > 1 requires giving up the fixed seed -- umap-learn forces
+        # n_jobs back to 1 internally whenever random_state is set, to keep
+        # training deterministic (see the warning suppressed at module
+        # load, and CONTEXT_UMAP.md). Only drop determinism when the user
+        # actually asked for parallelism; n_jobs=1 (the default) keeps
+        # today's exact behaviour unchanged.
+        n_jobs = params.get('n_jobs', 1)
+        if n_jobs == -1:
+            n_jobs = os.cpu_count() or 1
+        random_state = 42 if n_jobs == 1 else None
+
         self.progress_message(
             f"Training UMAP  (n_neighbors={n_neighbors}, "
-            f"min_dist={params['min_dist']}, metric={params['metric']}) …"
+            f"min_dist={params['min_dist']}, metric={params['metric']}, "
+            f"n_jobs={n_jobs}) …"
         )
 
         # Wire the tqdm hook for per-epoch progress if one was supplied.
@@ -11538,7 +11791,8 @@ class PluginWidget(QWidget):
             metric=params['metric'],
             n_epochs=params['n_epochs'],
             n_components=2,
-            random_state=42,
+            random_state=random_state,
+            n_jobs=n_jobs,
             low_memory=False,
             verbose=False,
             tqdm_kwds=tqdm_kwds,
@@ -11773,11 +12027,28 @@ class PluginWidget(QWidget):
         channels = [c for c in self.state.selected_channels
                     if c not in drc_pipeline.META_CHANNELS]
         n_events = sum(len(e) for e in embeddings.values())
+        # _PaCMAPWrapper is defined in THIS plugin module, which is loaded
+        # dynamically by plugin_loaders.py under a synthetic module name
+        # ('bundled_plugins.dr_clustering_tab') -- pickle can't re-import
+        # that name to save a class reference, so an instance of a
+        # locally-defined class can never be archived directly (same
+        # class of issue as _UMAPTqdmHook just above, which is dropped
+        # before pickling for the same reason). Unwrap into its two
+        # plain, real-package pieces instead of dropping the training
+        # data entirely -- PaCMAP.transform() needs both, so a future
+        # consumer of a hydrated run's 'reducer' field could still
+        # re-wrap them into a _PaCMAPWrapper.
+        reducer_to_archive = reducer
+        if isinstance(reducer, _PaCMAPWrapper):
+            reducer_to_archive = {
+                'pacmap_reducer': reducer._reducer,
+                'pacmap_training_data': reducer._training_data,
+            }
         try:
             entry = drc_run_archive.archive_dr_run(
                 self.controller, self.state,
                 algorithm=algo,
-                reducer=reducer,
+                reducer=reducer_to_archive,
                 embeddings=dict(embeddings),
                 embedding_features=dict(embedding_features),
                 gates=list(self.state.selected_gates),
