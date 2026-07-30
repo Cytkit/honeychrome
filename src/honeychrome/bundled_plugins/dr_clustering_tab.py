@@ -1118,6 +1118,16 @@ class PipelineState:
         Safe to call repeatedly.
         """
         current = set(sample_paths)
+        removed = [p for p in self.sample_groups if p not in current]
+        if removed and len(removed) == len(self.sample_groups):
+            # Wiping EVERY existing entry in one call is the failure mode
+            # we're hunting -- legitimate sample-list shrinkage should be
+            # partial, not total, except on a genuinely empty experiment.
+            _log.warning(
+                "initialise_sample_groups: about to delete ALL %d existing "
+                "sample_groups entries (incoming sample_paths had %d entries)",
+                len(removed), len(sample_paths),
+            )
         for path in current:
             if path not in self.sample_groups:
                 self.sample_groups[path] = 'Unassigned'
@@ -4874,6 +4884,10 @@ class GroupsStatsTab(QWidget):
         # Redraw plots if results are present and haven't been rendered yet
         # (_last_drawn_cluster_names == {} after load_state resets it) or if
         # cluster names changed since last draw (e.g. after a rename).
+        _log.info("GroupsStatsTab.refresh: freq_results=%s mfi_results=%s counts_results=%s",
+                  self.state.freq_results is not None,
+                  self.state.mfi_results is not None,
+                  self.state.counts_results is not None)
         if (self.state.freq_results is not None or self.state.mfi_results is not None
                 or self.state.counts_results is not None):
             if (not self._last_drawn_cluster_names or
@@ -5294,34 +5308,39 @@ class GroupsStatsTab(QWidget):
         button on every change, since selecting a DR-only run must grey
         it out immediately even if some other clustering run exists
         elsewhere in the list.
+
+        Results are linked to the run they were computed against via
+        state.stats_run_id, not deleted just because a different run is
+        now showing in this combo -- selecting a different run only means
+        "Run Statistics" will (re)compute against that run when clicked;
+        it doesn't retroactively invalidate a previous run's results,
+        which are still valid for that run and still exportable.
         """
         run_id = self._run_combo.currentData()
         self._update_run_button()
         if run_id is None:
             return
+        have_results = (self.state.freq_results is not None
+                        or self.state.mfi_results is not None
+                        or self.state.counts_results is not None)
         if run_id == self.state.stats_run_id:
-            # Matches stored results — redraw if needed.
-            if (self.state.freq_results is not None or self.state.mfi_results is not None
-                    or self.state.counts_results is not None):
+            if have_results:
                 self._draw_results()
             return
-        # Different run — clear stored results and prompt re-run.
-        self.state.freq_results = None
-        self.state.mfi_results  = None
-        self.state.freq_df      = None
-        self.state.mfi_df       = None
-        self.state.mfi_sample_df = None
-        self.state.counts_results = None
-        self.state.counts_df      = None
-        self.state.stats_all_rel  = []
-        self.state.stats_group_vec = []
-        self._last_stats_data_key = None
-        self._results_tabs.clear()
-        self.export_results_btn.setEnabled(False)
-        self.stats_status_label.setText(
-            "Run changed — click 'Run Statistics' to recompute."
-        )
-        self.stats_status_label.setStyleSheet("color: orange;")
+        # Different run selected -- existing results (if any) still belong
+        # to state.stats_run_id and are left alone; just tell the user
+        # this combo's selection no longer matches what's currently shown.
+        if have_results:
+            self.stats_status_label.setText(
+                f"Showing results for a different run ({self.state.stats_run_label or 'previous run'}) "
+                "— click 'Run Statistics' to compute for this run."
+            )
+            self.stats_status_label.setStyleSheet("color: #d9822b;")
+        else:
+            self.stats_status_label.setText(
+                "No results yet for this run — click 'Run Statistics' to compute."
+            )
+            self.stats_status_label.setStyleSheet("color: orange;")
 
     # ------------------------------------------------------------------
     # Marker roles (Item 11) — type (clustering) vs state (tested)
@@ -6748,17 +6767,20 @@ class GroupsStatsTab(QWidget):
         }
 
         def _hclust(data):
+            """Returns (leaf_order, linkage_matrix_or_None) -- Z is reused
+            for the dendrogram plots below instead of being recomputed
+            (see the same fix in _make_heatmap_figure)."""
             filled = np.nan_to_num(data, nan=0.0)
             if filled.shape[0] < 2:
-                return list(range(filled.shape[0]))
+                return list(range(filled.shape[0])), None
             try:
                 Z = linkage(pdist(filled, metric='euclidean'), method='ward')
-                return dendrogram(Z, no_plot=True)['leaves']
+                return dendrogram(Z, no_plot=True)['leaves'], Z
             except Exception:
-                return list(range(filled.shape[0]))
+                return list(range(filled.shape[0])), None
 
-        row_order = _hclust(mat.T)
-        col_order = _hclust(mat)
+        row_order, Zr = _hclust(mat.T)
+        col_order, Zc = _hclust(mat)
 
         mat_ord = mat[:, row_order][col_order, :].T   # (n_features, n_samples)
         feat_labels = [feat_labels_raw[i] for i in row_order]
@@ -6789,9 +6811,8 @@ class GroupsStatsTab(QWidget):
 
         ax_cdend = fig.add_subplot(gs[0, 1])
         ax_cdend.axis('off')
-        if n_samples > 1:
+        if n_samples > 1 and Zc is not None:
             try:
-                Zc = linkage(pdist(np.nan_to_num(mat, nan=0.0), metric='euclidean'), method='ward')
                 dendrogram(Zc, ax=ax_cdend, color_threshold=0,
                            above_threshold_color='#555555',
                            link_color_func=lambda _: '#555555', no_labels=True)
@@ -6813,9 +6834,8 @@ class GroupsStatsTab(QWidget):
 
         ax_rdend = fig.add_subplot(gs[2, 0])
         ax_rdend.axis('off')
-        if n_features > 1:
+        if n_features > 1 and Zr is not None:
             try:
-                Zr = linkage(pdist(np.nan_to_num(mat.T, nan=0.0), metric='euclidean'), method='ward')
                 dendrogram(Zr, ax=ax_rdend, orientation='left', color_threshold=0,
                            above_threshold_color='#555555',
                            link_color_func=lambda _: '#555555', no_labels=True)
@@ -6926,17 +6946,22 @@ class GroupsStatsTab(QWidget):
 
         # ---- Hierarchical clustering ----
         def _hclust(data, metric='euclidean', method='ward'):
+            """Returns (leaf_order, linkage_matrix_or_None). Z is reused
+            below to draw the dendrogram -- previously a second
+            pdist+linkage call recomputed it from scratch purely to plot
+            it, doubling the cost of the single most expensive step in
+            this figure."""
             if data.shape[0] < 2:
-                return list(range(data.shape[0]))
+                return list(range(data.shape[0])), None
             try:
                 Z    = linkage(pdist(data, metric=metric), method=method)
                 dend = dendrogram(Z, no_plot=True)
-                return dend['leaves']
+                return dend['leaves'], Z
             except Exception:
-                return list(range(data.shape[0]))
+                return list(range(data.shape[0])), None
 
-        row_order = _hclust(mat.T)              # cluster features (rows of heatmap)
-        col_order = _hclust(mat)                # cluster samples  (cols of heatmap)
+        row_order, Zr = _hclust(mat.T)              # cluster features (rows of heatmap)
+        col_order, Zc = _hclust(mat)                # cluster samples  (cols of heatmap)
 
         mat_ord     = mat[:, row_order][col_order, :].T   # (n_features, n_samples)
         feat_labels = [cols_present[i] for i in row_order]
@@ -6989,9 +7014,8 @@ class GroupsStatsTab(QWidget):
         # ---- Column dendrogram (top-centre) ----
         ax_cdend = fig.add_subplot(gs[0, 1])
         ax_cdend.axis('off')
-        if n_samples > 1:
+        if n_samples > 1 and Zc is not None:
             try:
-                Zc = linkage(pdist(mat, metric='euclidean'), method='ward')
                 dendrogram(Zc, ax=ax_cdend, color_threshold=0,
                            above_threshold_color='#555555',
                            link_color_func=lambda _: '#555555',
@@ -7025,9 +7049,8 @@ class GroupsStatsTab(QWidget):
         # ---- Row dendrogram (main-left) ----
         ax_rdend = fig.add_subplot(gs[2, 0])
         ax_rdend.axis('off')
-        if n_features > 1:
+        if n_features > 1 and Zr is not None:
             try:
-                Zr = linkage(pdist(mat.T, metric='euclidean'), method='ward')
                 dendrogram(Zr, ax=ax_rdend, orientation='left',
                            color_threshold=0,
                            above_threshold_color='#555555',
@@ -8660,18 +8683,28 @@ class _UMAPTqdmHook:
     we intercept each epoch update and forward it as a ``(current, total)``
     pair to a caller-supplied callback — without any tqdm dependency.
 
+    total_override: the user-configured n_epochs value (from the UI
+    spinbox). UMAP's own tqdm call doesn't reliably hand back a total that
+    matches this -- previously n_epochs was left as an unused
+    n_epochs_total parameter on _run_umap instead of actually being wired
+    through, so the bar's denominator came only from whatever UMAP itself
+    reported. This class now always reports the real configured epoch
+    count instead.
+
     Usage::
 
-        hook = _UMAPTqdmHook(callback=lambda cur, tot: ...)
+        hook = _UMAPTqdmHook(callback=lambda cur, tot: ..., total_override=500)
         umap_lib.UMAP(..., tqdm_kwds={'tqdm_class': hook}).fit(data)
     """
 
-    def __init__(self, callback):
+    def __init__(self, callback, total_override: int | None = None):
         self._cb = callback          # callable(current: int, total: int)
+        self._total_override = total_override
 
     # tqdm is instantiated as tqdm_class(iterable, **kw); we capture total.
     def __call__(self, iterable=None, total=None, **_kw):
-        return self._Iter(iterable, total, self._cb)
+        eff_total = self._total_override if self._total_override else (total or 0)
+        return self._Iter(iterable, eff_total, self._cb)
 
     class _Iter:
         def __init__(self, iterable, total, cb):
@@ -8784,11 +8817,13 @@ class _DrWorker(QThread):
 
         if algo == 'UMAP':
             # UMAP supports a tqdm hook — gives us per-epoch progress.
+            # total_override pins the bar's denominator to the actual
+            # configured n_epochs, instead of whatever total UMAP's own
+            # tqdm call happens to report.
             n_epochs = self._params.get('n_epochs', 500)
-            hook = _UMAPTqdmHook(callback=self._emit_progress)
+            hook = _UMAPTqdmHook(callback=self._emit_progress, total_override=n_epochs)
             reducer = plugin._run_umap(self._params, training_data,
-                                       progress_hook=hook,
-                                       n_epochs_total=n_epochs)
+                                       progress_hook=hook)
         elif algo == 'tSNE':
             reducer = plugin._run_opentsne(self._params, training_data)
         elif algo == 'PaCMAP':
@@ -9047,25 +9082,47 @@ class _MarkerSummaryWorker(QThread):
         self._pooled = pooled
 
     def run(self):
+        import time
+        t_start = time.perf_counter()
+
+        def _lap(prev: float, label: str) -> float:
+            now = time.perf_counter()
+            _log.info("marker summary timing: %-22s %6.2fs", label, now - prev)
+            return now
+
         try:
             plugin = self._plugin
             pooled = self._pooled
+            t = t_start
             if pooled is None:
                 pooled = plugin._pool_violin_data(
                     self._cl_run, self._channels, af_state=self._af_state,
                 )
+                t = _lap(t, "pool_violin_data")
+            else:
+                _log.info("marker summary timing: %-22s %6s  (reused, run switch)",
+                          "pool_violin_data", "--")
             names_map = self._cl_run.get('names', {})
             colors_map = self._cl_run.get('colors', {})
-            mat = plugin._compute_marker_heatmap_matrix(
+            transformed = plugin._transform_and_pool_matrix_values(
                 pooled, self._channels, self._cluster_order,
             )
+            t = _lap(t, "transform_and_pool")
+            mat = plugin._compute_marker_heatmap_matrix(
+                transformed, self._channels, self._cluster_order,
+            )
+            t = _lap(t, "compute_matrix")
             main_fig, col_fig, row_fig = plugin._make_marker_cluster_heatmap_figures(
                 mat, self._channels, self._cluster_order, names_map,
             )
+            t = _lap(t, "heatmap_figures")
             cbar_fig = plugin._make_marker_cluster_colorbar_figure(mat)
+            t = _lap(t, "colorbar_figure")
             ridge_fig = plugin._make_marker_ridgeline_figure(
-                pooled, self._channels, self._cluster_order, names_map, colors_map,
+                transformed, self._channels, self._cluster_order, names_map, colors_map,
             )
+            t = _lap(t, "ridgeline_figure")
+            _log.info("marker summary timing: %-22s %6.2fs", "TOTAL", t - t_start)
             self.finished.emit(True, '', {
                 'pooled': pooled,
                 'channels': self._channels,
@@ -9545,6 +9602,8 @@ class ClusterAnnotationTab(QWidget):
     # ------------------------------------------------------------------
 
     def refresh(self):
+        _log.info("ClusterAnnotationTab.refresh: selected_channels=%d clustering_runs=%d",
+                  len(self.state.selected_channels), len(self.state.clustering_runs))
         self._populate_run_combo()
         self._populate_dr_run_combo()
         self._populate_channel_list()
@@ -9817,18 +9876,21 @@ class ClusterAnnotationTab(QWidget):
                 m = min(len(values), len(labels))
                 values, labels = values[:m], labels[:m]
 
+            # Boolean mask per cluster computed once per sample and reused
+            # across every channel -- previously `labels == cl_id` was
+            # recomputed inside the channel loop, redoing the same
+            # full-length comparison once per channel for no reason (cost
+            # scaled with n_channels x n_clusters x n_events instead of
+            # n_clusters x n_events).
+            cluster_masks = {int(cl_id): (labels == cl_id)
+                             for cl_id in np.unique(labels) if cl_id >= 0}
+
             for ch in channels:
                 if ch not in names:
                     continue
                 col = values[:, names.index(ch)]
-                for cl_id in np.unique(labels):
-                    if cl_id < 0:
-                        continue
-                    pooled[ch].setdefault(int(cl_id), []).append(col[labels == cl_id])
-
-        for ch in channels:
-            means = {cl: float(np.mean(np.concatenate(vals)))
-                    for cl, vals in pooled.get(ch, {}).items()}
+                for cl_id, mask in cluster_masks.items():
+                    pooled[ch].setdefault(cl_id, []).append(col[mask])
 
         return pooled
 
@@ -9983,6 +10045,7 @@ class ClusterAnnotationTab(QWidget):
         tab already share drc_scatter.draw_cluster_scatter itself.
         """
         ax.set_aspect('equal', adjustable='box')
+        ax.grid(False)   # suppress inherited seaborn 'whitegrid'
 
         if dr_run is None:
             ax.text(0.5, 0.5, 'No DR run selected.', ha='center', va='center',
@@ -10724,24 +10787,47 @@ class ClusterAnnotationTab(QWidget):
             top_h = max(150, min(ideal_top_h, total_h - 150))
             self._summary_splitter.setSizes([top_h, total_h - top_h])
 
-    def _compute_marker_heatmap_matrix(self, pooled_by_channel: dict, channels: list[str],
+    def _transform_and_pool_matrix_values(self, pooled_by_channel: dict, channels: list[str],
+                                          cluster_order: list[int]) -> dict[str, dict[int, np.ndarray]]:
+        """
+        Concatenate + transform each (channel, cluster) cell's pooled raw
+        values exactly ONCE, shared between the heatmap matrix (median per
+        cell) and the ridgeline KDE grid -- previously each did this
+        independently, so every cell's transform + concatenation ran
+        twice for no reason.
+        """
+        out: dict[str, dict[int, np.ndarray]] = {}
+        for ch in channels:
+            by_cluster = pooled_by_channel.get(ch, {})
+            out[ch] = {}
+            for cl_id in cluster_order:
+                vals = by_cluster.get(cl_id)
+                if vals:
+                    out[ch][cl_id] = _apply_channel_transform(
+                        self.state, ch, np.concatenate(vals))
+        return out
+    
+    def _compute_marker_heatmap_matrix(self, transformed: dict, channels: list[str],
                                        cluster_order: list[int]) -> np.ndarray:
         """
         median MFI per cluster x marker, on the TRANSFORMED
         (Transforms-tab) scale -- same convention the ridgeline grid
-        uses via _apply_channel_transform, so both panels describe the
-        same axis. Rows = clusters (same fixed order as the ridgeline
-        grid), columns = markers. Median rather than mean so a handful
-        of extreme events in a cluster can't swing a whole cell's colour.
-        NaN where a cluster/marker combination has no pooled data.
+        uses, so both panels describe the same axis. Rows = clusters
+        (same fixed order as the ridgeline grid), columns = markers.
+        Median rather than mean so a handful of extreme events in a
+        cluster can't swing a whole cell's colour. NaN where a
+        cluster/marker combination has no pooled data.
+
+        transformed: precomputed {channel: {cluster_id: transformed_array}}
+        from _transform_and_pool_matrix_values -- shared with the
+        ridgeline grid so the transform + concatenation only happens once.
         """
         mat = np.full((len(cluster_order), len(channels)), np.nan)
         for col, ch in enumerate(channels):
-            by_cluster = pooled_by_channel.get(ch, {})
+            by_cluster = transformed.get(ch, {})
             for row, cl_id in enumerate(cluster_order):
-                vals = by_cluster.get(cl_id)
-                if vals:
-                    arr = _apply_channel_transform(self.state, ch, np.concatenate(vals))
+                arr = by_cluster.get(cl_id)
+                if arr is not None:
                     mat[row, col] = float(np.median(arr))
         return mat
 
@@ -10844,19 +10930,33 @@ class ClusterAnnotationTab(QWidget):
         _style_figure_theme(fig, is_dark, axes=[ax])
         return fig
 
-    def _make_marker_ridgeline_figure(self, pooled_by_channel: dict, channels: list[str],
+    def _make_marker_ridgeline_figure(self, transformed: dict, channels: list[str],
                                       cluster_order: list[int], names_map: dict,
                                       colors_map: dict):
         """
         CATALYST/diffcyt-style marker ridge grid — one small
         subplot per marker (channels, as columns), each containing every
-        cluster's density curve stacked as a row, in the SAME order in
-        every panel (cluster_order — see _recompute_marker_summary),
-        coloured with the run's own per-cluster colours so identity
-        matches the Cluster Map / legend elsewhere in this tab.
+        cluster's histogram stacked as a row, in the SAME order in every
+        panel (cluster_order — see _recompute_marker_summary), coloured
+        with the run's own per-cluster colours so identity matches the
+        Cluster Map / legend elsewhere in this tab. First cluster in
+        cluster_order is drawn at the TOP row (Item 6).
+
+        Uses a plain np.histogram per cluster instead of gaussian_kde --
+        same approach as functions.calc_hist1d (the fast 1D histogram
+        used elsewhere in Honeychrome): a single O(n) binning pass per
+        cluster with a fixed bin count, no O(n x eval_points) kernel
+        evaluation. Bin edges are shared across every cluster within a
+        channel's panel (computed once from that channel's fixed
+        transformed-scale limits, or from the pooled data's own range as
+        a fallback) so the curves stay directly comparable and bins don't
+        need recomputing per cluster.
+
+        transformed: precomputed {channel: {cluster_id: transformed_array}}
+        from _transform_and_pool_matrix_values -- shared with the heatmap
+        matrix so the transform + concatenation only happens once.
         """
         from matplotlib.figure import Figure
-        from scipy.stats import gaussian_kde
 
         is_dark = _resolve_is_dark(self.state)
         labels = _antigen_dash_labels(self.controller)
@@ -10865,8 +10965,11 @@ class ClusterAnnotationTab(QWidget):
         n_cols = min(4, max(1, n))
         n_rows = -(-n // n_cols) if n else 1
         row_h = 0.55
-        panel_h = max(3.0, len(cluster_order) * row_h + 1.0)
+        n_clusters = len(cluster_order)
+        panel_h = max(3.0, n_clusters * row_h + 1.0)
         fig = Figure(figsize=(3.2 * n_cols, panel_h * n_rows), constrained_layout=True)
+
+        N_BINS = 200
 
         ax0 = None
         for i, ch in enumerate(channels):
@@ -10874,32 +10977,58 @@ class ClusterAnnotationTab(QWidget):
             if ax0 is None:
                 ax0 = ax
 
-            by_cluster = pooled_by_channel.get(ch, {})
+            by_cluster = transformed.get(ch, {})
+
+            # Shared bin edges for every cluster in this panel -- prefer
+            # the channel's fixed transformed-scale limits (same ones
+            # used for the x-axis below) so bins line up with the axis
+            # exactly; fall back to the pooled data's own range if no
+            # transform tick spec is available for this channel.
+            tick_spec = _channel_axis_ticks(self.state, ch)
+            if tick_spec is not None:
+                bin_lo, bin_hi = tick_spec[2][0], tick_spec[2][1]
+            else:
+                all_vals = [v[np.isfinite(v)] for v in by_cluster.values() if v is not None]
+                all_vals = [v for v in all_vals if v.size]
+                if all_vals:
+                    combined = np.concatenate(all_vals)
+                    bin_lo, bin_hi = float(combined.min()), float(combined.max())
+                else:
+                    bin_lo, bin_hi = 0.0, 1.0
+            if bin_hi <= bin_lo:
+                bin_hi = bin_lo + 1.0
+            bin_edges = np.linspace(bin_lo, bin_hi, N_BINS + 1)
+            bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
             for row_idx, cl_id in enumerate(cluster_order):
-                vals = by_cluster.get(cl_id)
-                if not vals:
+                arr = by_cluster.get(cl_id)
+                if arr is None:
                     continue
-                arr = _apply_channel_transform(self.state, ch, np.concatenate(vals))
                 arr = arr[np.isfinite(arr)]
                 if len(arr) < 5 or np.ptp(arr) == 0:
                     continue
-                try:
-                    kde = gaussian_kde(arr)
-                except Exception:
+                counts, _ = np.histogram(arr, bins=bin_edges)
+                counts = counts.astype(float)
+                if counts.max() <= 0:
                     continue
-                xs = np.linspace(arr.min(), arr.max(), 200)
-                density = kde(xs)
-                density = density / density.max() * 1.4   # ridge height, allows slight overlap
-                baseline = row_idx
+                density = counts / counts.max() * 1.4   # ridge height, allows slight overlap
+                # First cluster in cluster_order at the TOP -- baseline
+                # counts down from n_clusters-1, not up from 0.
+                baseline = n_clusters - 1 - row_idx
                 color = colors_map.get(cl_id, '#888888')
-                ax.fill_between(xs, baseline, baseline + density, color=color, alpha=0.75, linewidth=0)
-                ax.plot(xs, baseline + density, color=color, linewidth=0.8)
+                ax.fill_between(bin_centers, baseline, baseline + density, color=color,
+                                alpha=0.75, linewidth=0, step='mid')
+                ax.plot(bin_centers, baseline + density, color=color, linewidth=0.8,
+                        drawstyle='steps-mid')
 
             ax.set_title(labels.get(ch, ch), fontsize=9)
-            ax.set_ylim(-0.3, len(cluster_order) + 0.3)
+            ax.set_ylim(-0.3, n_clusters + 0.3)
             if i % n_cols == 0:
-                ax.set_yticks(range(len(cluster_order)))
-                ax.set_yticklabels([names_map.get(cl, str(cl)) for cl in cluster_order], fontsize=7)
+                ax.set_yticks(range(n_clusters))
+                ax.set_yticklabels(
+                    [names_map.get(cl, str(cl)) for cl in reversed(cluster_order)],
+                    fontsize=7,
+                )
             else:
                 ax.tick_params(labelleft=False)
             ax.tick_params(labelsize=6)
@@ -10908,7 +11037,6 @@ class ClusterAnnotationTab(QWidget):
             # tick labels switch to the original raw-scale numbers, same
             # convention as the Transforms tab's 2D histograms and the
             # violin y-axis (_channel_axis_ticks).
-            tick_spec = _channel_axis_ticks(self.state, ch)
             if tick_spec is not None:
                 major_ticks, minor_ticks, limits = tick_spec
                 ax.set_xticks([pos for pos, _label in major_ticks])
@@ -10979,7 +11107,13 @@ class PluginWidget(QWidget):
         # Tracks which experiment's persisted state is currently loaded into
         # self.state. initialise_gui() only re-reads QSettings and rebuilds
         # the workspace when this changes — see initialise_gui() for why.
+        # _loaded_experiment_dir is the matching experiment_dir, cached so
+        # save_state() can still correctly flush self.state to where it
+        # actually belongs even after self.controller has already switched
+        # to a different experiment (see save_state()'s key-mismatch
+        # handling, addendum part 6).
         self._loaded_experiment_key = None
+        self._loaded_experiment_dir = None
 
         self._last_tab_refresh_key: dict[int, tuple] = {}
 
@@ -11134,6 +11268,7 @@ class PluginWidget(QWidget):
                                 bool(getattr(self, '_pending_include_type_markers', False))
                             )
                     self._loaded_experiment_key = current_key
+                    self._loaded_experiment_dir = self.controller.experiment_dir
             finally:
                 self._loading = False
 
@@ -11184,15 +11319,57 @@ class PluginWidget(QWidget):
         Lightweight scalar/list values go to QSettings.
         Fitted models, embeddings, and cluster labels are pickled to a
         sidecar file alongside the experiment (avoids QSettings size limits).
+
+        self.controller.experiment can already point at a DIFFERENT
+        experiment than the one self.state actually belongs to (e.g.
+        opening a new experiment fires a mode-change that reaches
+        initialise_gui()'s "leaving the plugin" branch, which calls this,
+        before this plugin's own load_state() has run for the new
+        experiment). Recomputing the destination live in that situation
+        would silently write the OLD experiment's results into the NEW
+        one's QSettings group and sidecar file. Instead, flush to the
+        cached key/dir this state was actually loaded under -- this is
+        still synchronous and completes before the caller moves on, so no
+        delay or user-facing message is needed, just the right target.
         """
+        import traceback
+        traceback.print_stack(limit=8)
         if self._loading:
             return
-        key = self._settings_key()
+        if self._loaded_experiment_key is None:
+            # This instance has never successfully run load_state() for ANY
+            # experiment yet (e.g. a freshly (re)constructed PluginWidget,
+            # right after an experiment reopen, before the user has even
+            # navigated into this tab). self.state is still just
+            # constructor defaults at this point -- saving now would
+            # overwrite a real, previously-saved file with blanks, which is
+            # exactly what was happening. Nothing meaningful to save yet.
+            _log.info(
+                "save_state: skipping -- no experiment has been loaded into "
+                "this instance yet (self.state is still default-constructed)."
+            )
+            return
+        current_key = self._settings_key()
+        if current_key != self._loaded_experiment_key:
+            _log.info(
+                "save_state: controller has switched to %r, but state.* still "
+                "belongs to %r -- flushing there instead of the live (wrong) target.",
+                current_key, self._loaded_experiment_key,
+            )
+            key = self._loaded_experiment_key
+            sidecar_dir = self._loaded_experiment_dir
+        else:
+            key = current_key
+            sidecar_dir = self.controller.experiment_dir
         s = self._qsettings
         s.beginGroup(key)
         try:
             s.setValue('selected_gates',    list(self.state.selected_gates))
-            s.setValue('selected_channels', self.state.selected_channels)
+            # Guard against clobbering a good saved selection with a
+            # transiently empty one -- same reasoning as
+            # config_channels_checked below.
+            if self.state.selected_channels:
+                s.setValue('selected_channels', self.state.selected_channels)
             s.setValue('n_training_events', self.state.n_training_events)
             s.setValue('training_samples',  self.state.training_sample_ids)
             s.setValue('sample_groups',     repr(self.state.sample_groups))
@@ -11241,7 +11418,7 @@ class PluginWidget(QWidget):
             except Exception:
                 pass
             s.setValue('cluster_names', repr(self.state.cluster_names))
-            # marker_roles is not persisted across sessions -- to be changed
+            s.setValue('marker_roles', repr(self.state.marker_roles))
             if hasattr(self, 'cluster_annotation_tab'):
                 cat = self.cluster_annotation_tab
                 s.setValue('annotation_run_id', cat.run_combo.currentData() or '')
@@ -11328,7 +11505,7 @@ class PluginWidget(QWidget):
             s.endGroup()
 
         # Pickle heavy state (models, embeddings, cluster labels) to sidecar
-        self._save_model_sidecar()
+        self._save_model_sidecar(sidecar_dir)
         print(f"[DR Plugin] State saved for experiment: {key}")
 
     def load_state(self):
@@ -11352,6 +11529,8 @@ class PluginWidget(QWidget):
             channels = s.value('selected_channels', [])
             if channels:
                 self.state.selected_channels = list(channels)
+            _log.info("load_state[%s]: selected_channels restored=%d (raw QSettings value had %d)",
+                      key, len(self.state.selected_channels), len(channels) if channels else 0)
 
             n_ev = s.value('n_training_events', None)
             if n_ev is not None:
@@ -11573,7 +11752,13 @@ class PluginWidget(QWidget):
                 except Exception:
                     pass
 
-            # marker_roles: not restored -- to be changed
+            roles_repr = s.value('marker_roles', '')
+            if roles_repr:
+                try:
+                    loaded = eval(roles_repr)  # noqa: S307
+                    self.state.marker_roles = {str(k): v for k, v in loaded.items()}
+                except Exception:
+                    pass
 
             self._pending_include_type_markers = s.value('include_type_markers', True)
             self._pending_annotation_run_id = s.value('annotation_run_id', '')
@@ -11653,18 +11838,26 @@ class PluginWidget(QWidget):
     # Sidecar persistence — pickle for heavy objects
     # ------------------------------------------------------------------
 
-    def _sidecar_path(self) -> Path | None:
+    def _sidecar_path(self, experiment_dir: Path | None = None) -> Path | None:
         """
         Return the path for the pickle sidecar file, or None if unavailable.
         Moved under experiment_dir/cache/dr_clustering/ (§0.2) — one-time
         migration from the old loose file happens in _load_model_sidecar().
+
+        experiment_dir: explicit override, used by save_state() to flush a
+        PREVIOUS experiment's state after self.controller has already
+        switched to a different one -- drc_run_archive.current_state_path()
+        always reads the CURRENT (live) experiment, which would be wrong
+        in that situation. Falls back to that live lookup otherwise.
         """
+        if experiment_dir is not None:
+            return experiment_dir / 'cache' / 'dr_clustering' / 'current_state.pkl'
         try:
             return drc_run_archive.current_state_path(self.controller)
         except Exception:
             return None
 
-    def _save_model_sidecar(self):
+    def _save_model_sidecar(self, experiment_dir: Path | None = None):
         """
         Pickle trained reducers, embeddings, and cluster labels alongside
         the experiment file.  Silently skips on failure (e.g. a reducer that
@@ -11673,10 +11866,25 @@ class PluginWidget(QWidget):
         clustering_runs / dr_runs are not included here — those are
         archived individually (their own pickle + manifest entry) at the
         moment each run completes; see drc_run_archive.py.
+
+        experiment_dir: see _sidecar_path() -- passed through from
+        save_state() when flushing a previous experiment's state.
         """
-        path = self._sidecar_path()
+        path = self._sidecar_path(experiment_dir)
         if path is None:
             return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _log.info(
+            "_save_model_sidecar: writing %s -- freq_results=%s mfi_results=%s "
+            "counts_results=%s stats_run_id=%r sample_groups=%d group_names=%r",
+            path,
+            self.state.freq_results is not None,
+            self.state.mfi_results is not None,
+            self.state.counts_results is not None,
+            self.state.stats_run_id,
+            len(self.state.sample_groups),
+            list(self.state.group_names),
+        )
         import pickle
         payload = {}
         for key, obj in (
@@ -11803,6 +12011,16 @@ class PluginWidget(QWidget):
                   f"{len(self.state.cluster_labels)} labelled samples, "
                   f"{len(self.state.dr_runs)} DR run(s), "
                   f"{len(self.state.clustering_runs)} clustering run(s) archived)")
+            _log.info(
+                "sidecar restore check: freq_results=%s counts_results=%s mfi_results=%s "
+                "stats_run_id=%r selected_channels=%d marker_roles=%d",
+                self.state.freq_results is not None,
+                self.state.counts_results is not None,
+                self.state.mfi_results is not None,
+                self.state.stats_run_id,
+                len(self.state.selected_channels),
+                len(self.state.marker_roles),
+            )
         except Exception as e:
             print(f"[DR Plugin] Could not load model sidecar: {e}")
 
@@ -12202,7 +12420,7 @@ class PluginWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _run_umap(self, params: dict, training_data: np.ndarray,
-                  progress_hook=None, n_epochs_total: int = 500):
+                  progress_hook=None):
         """Train a UMAP reducer and store the kNN index in state."""
         import umap as umap_lib
         import hnswlib
