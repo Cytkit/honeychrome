@@ -558,16 +558,44 @@ def _downsample(data: np.ndarray, n: int, rng) -> np.ndarray:
     return data[idx]
 
 
-def load_training_pool(controller, state, seed: int = 42, af_state=None) -> np.ndarray | None:
+def _downsample_with_indices(data: np.ndarray, n: int, rng) -> tuple[np.ndarray, np.ndarray]:
     """
-    Pool transformed, gated, downsampled events across all training samples.
-    Returns ``(total_events, n_selected_channels)`` float32, or None on error.
+    Like _downsample, but also returns the indices into *data* that were
+    kept, in the same row order as the returned chunk. Needed wherever a
+    downsampled embedding must later be aligned back to a full-length
+    per-sample array (e.g. cluster labels, which always cover every
+    gated event) by real event identity rather than by coincidental row
+    count -- see drc_scatter.align_labels_to_embedding.
+    """
+    if len(data) <= n:
+        return data, np.arange(len(data))
+    idx = rng.choice(len(data), size=n, replace=False)
+    return data[idx], idx
+
+
+def load_training_pool_with_sample_bounds(
+        controller, state, seed: int = 42, af_state=None
+) -> tuple[np.ndarray, list[tuple[str, int, np.ndarray]]] | None:
+    """
+    Same pooling as load_training_pool, but also returns, per sample in
+    concatenation order, (rel_path, n_events, event_indices) --
+    event_indices are the row indices into that sample's FULL gated/
+    transformed feature array (load_sample_features's own output) that
+    were kept, in the same order as the pooled rows.
+
+    Used by PHATE, which has no out-of-sample transform: it must be fit on
+    the whole pool in one call, so the caller needs to know which rows of
+    the returned array belong to which sample in order to split the single
+    resulting embedding back out per-sample afterwards. event_indices then
+    lets that per-sample embedding be aligned back to cluster labels (which
+    always cover every gated event) by real event identity, even though
+    PHATE only ever saw a downsampled subset of them.
 
     af_state: optional (transfer_matrix, af_precomputed, af_spectra) snapshot —
         see apply_unmixing_af_aware() docstring. Pass this from any
         background worker thread; leave as None only for main-thread callers.
     """
-    log_stage(log, "LOAD TRAINING POOL")
+    log_stage(log, "LOAD TRAINING POOL (WITH BOUNDS)")
     if not state.training_sample_ids:
         log.warning("no training samples selected")
         return None
@@ -583,14 +611,16 @@ def load_training_pool(controller, state, seed: int = 42, af_state=None) -> np.n
 
     rng = np.random.default_rng(seed)
     chunks = []
+    bounds: list[tuple[str, int, np.ndarray]] = []
     for rel_path in state.training_sample_ids:
         feats = load_sample_features(controller, state, rel_path, af_state=af_state)
         if feats is None or feats.shape[0] == 0:
             log.warning("  %s contributed no events", rel_path)
             continue
-        chunk = _downsample(feats, state.n_training_events, rng)
+        chunk, idx = _downsample_with_indices(feats, state.n_training_events, rng)
         log.info("  %s → %d events after downsample", rel_path, chunk.shape[0])
         chunks.append(chunk)
+        bounds.append((rel_path, chunk.shape[0], idx))
 
     if not chunks:
         log.error("no training data could be loaded")
@@ -600,4 +630,4 @@ def load_training_pool(controller, state, seed: int = 42, af_state=None) -> np.n
     log_array(log, "training_pool",
               data,
               [c for c in state.selected_channels if c not in META_CHANNELS])
-    return data
+    return data, bounds

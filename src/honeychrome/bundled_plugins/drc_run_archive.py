@@ -184,7 +184,8 @@ def delete_run_payload(controller, run_id: str) -> None:
 
 def archive_dr_run(controller, state, *, algorithm, reducer, embeddings,
                     gates, training_sample_ids, channels, params,
-                    n_events, label=None, embedding_features=None) -> dict:
+                    n_events, label=None, embedding_features=None,
+                    embedding_event_indices=None) -> dict:
     """
     Archive a completed DR training run: pickle the reducer + embeddings to
     ``cache/dr_clustering/runs/<run_id>.pkl``, append a lightweight entry to
@@ -197,6 +198,15 @@ def archive_dr_run(controller, state, *, algorithm, reducer, embeddings,
         compute true marker-space neighbours with guaranteed row-for-row
         alignment to what's plotted, without re-deriving anything from live
         (re-gate-able) data. Optional for callers that don't have it.
+    embedding_event_indices: optional {sample_path: np.ndarray} -- only
+        meaningful for a DR run whose embedding is a downsampled subset of
+        a sample's full gated events (currently PHATE only). Indices into
+        that sample's FULL gated/transformed feature array, in the same
+        row order as the embedding. Lets the Cluster Map (Workspace and
+        Cluster Annotation) align a downsampled embedding to cluster
+        labels -- which always cover every gated event -- by real event
+        identity instead of greying the sample out. See
+        drc_scatter.align_labels_to_embedding.
     """
     log_stage(log, "ARCHIVE DR RUN")
     run_id = _new_run_id()
@@ -207,6 +217,7 @@ def archive_dr_run(controller, state, *, algorithm, reducer, embeddings,
         'reducer': reducer,
         'embeddings': embeddings,
         'embedding_features': embedding_features or {},
+        'embedding_event_indices': embedding_event_indices or {},
     })
 
     entry = _manifest_entry(
@@ -221,6 +232,7 @@ def archive_dr_run(controller, state, *, algorithm, reducer, embeddings,
     full_entry['reducer'] = reducer
     full_entry['embeddings'] = embeddings
     full_entry['embedding_features'] = embedding_features or {}
+    full_entry['embedding_event_indices'] = embedding_event_indices or {}
     state.dr_runs.append(full_entry)
     log.info("archived DR run %r (run_id=%s, %d embedded sample(s))",
              run_label, run_id, len(embeddings))
@@ -291,7 +303,8 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
                             colors, names, n_clusters, gates,
                             training_sample_ids, channels, params,
                             n_events, label=None,
-                            marker_values=None, dr_positions=None) -> dict:
+                            marker_values=None, dr_positions=None,
+                            tree_data=None) -> dict:
     """
     Archive a completed clustering run.  Same file/manifest layout as
     archive_dr_run(), with 'labels' (per-sample label arrays), 'colors' and
@@ -308,6 +321,11 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
         the run was clustered in DR-embedding space. Lets the cluster map
         plot correct positions even if state.embeddings for that algorithm
         have since been overwritten by a later DR run.
+    tree_data: optional {'node_weights': ndarray, 'node_to_meta': ndarray,
+        'node_counts': ndarray, 'xdim': int, 'ydim': int} -- FlowSOM only.
+        Lets the Workspace tab's FlowSOM Tree plot type render the MST
+        without needing the live (possibly since-overwritten)
+        state.trained_reducers['FlowSOM'] entry.
     """
     log_stage(log, "ARCHIVE CLUSTERING RUN")
     run_id = _new_run_id()
@@ -327,6 +345,7 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
         # get filled in later.
         'mem_labels': {},
         'cell_type_suggestions': None,
+        'tree_data': tree_data,
     })
 
     entry = _manifest_entry(
@@ -345,6 +364,7 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
     full_entry['dr_positions'] = dr_positions or {}
     full_entry['mem_labels'] = {}
     full_entry['cell_type_suggestions'] = None
+    full_entry['tree_data'] = tree_data
     state.clustering_runs.append(full_entry)
     log.info("archived clustering run %r (run_id=%s, %s cluster(s))",
              run_label, run_id, n_clusters)
@@ -434,6 +454,7 @@ def hydrate_run(controller, entry: dict) -> dict:
         entry['reducer'] = payload.get('reducer')
         entry['embeddings'] = payload.get('embeddings', {})
         entry['embedding_features'] = payload.get('embedding_features', {})
+        entry['embedding_event_indices'] = payload.get('embedding_event_indices', {})
     elif kind == 'clustering' and 'labels' not in entry:
         payload = load_run_payload(controller, entry['run_id']) or {}
         entry['labels'] = payload.get('labels', {})

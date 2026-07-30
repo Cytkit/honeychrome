@@ -79,6 +79,7 @@ _REQUIRED_PACKAGES = {
     'umap':       'umap-learn',
     'openTSNE':   'openTSNE',
     'pacmap':     'pacmap',
+    'phate':      'phate',
     'leidenalg':  'leidenalg',
     'igraph':     'python-igraph',
     'hnswlib':    'hnswlib',
@@ -813,6 +814,15 @@ class PipelineState:
     # from (same feature space the reducer was fit on). Cached alongside
     # embeddings precisely so T-REX (or anything else needing true
     # marker-space neighbours) never has to re-derive them from live data.
+    embedding_event_indices: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    # {algorithm_name: {sample_path: np.ndarray}} -- only populated for a DR
+    # run whose embedding is a downsampled subset of a sample's full gated
+    # events (currently PHATE only, which has no out-of-sample transform).
+    # Indices into that sample's FULL gated/transformed feature array, same
+    # row order as the embedding. Lets the Cluster Map align a downsampled
+    # embedding to cluster labels (which always cover every gated event) by
+    # real event identity instead of greying the sample out -- see
+    # drc_scatter.align_labels_to_embedding.
     umap_knn_index: Any | None = None
     # hnswlib index built during UMAP training; reused by Leiden and T-REX
     dr_runs: list[dict] = field(default_factory=list)
@@ -1574,7 +1584,7 @@ class ConfigTab(QWidget):
         algo_row = QHBoxLayout()
         algo_row.addWidget(QLabel("Algorithm:"))
         self._dr_algo_group = QButtonGroup(self)
-        for algo in ('UMAP', 'tSNE', 'PaCMAP'):
+        for algo in ('UMAP', 'tSNE', 'PaCMAP', 'PHATE'):
             rb = QRadioButton(algo)
             if algo == 'UMAP':
                 rb.setChecked(True)
@@ -1727,6 +1737,45 @@ class ConfigTab(QWidget):
 
         dr_layout.addWidget(self._pacmap_params)
         self._pacmap_params.setVisible(False)
+
+        # ---- PHATE params ----
+        self._phate_params = QWidget()
+        phate_grid = QGridLayout(self._phate_params)
+        phate_grid.setContentsMargins(0, 0, 0, 0)
+        phate_grid.setSpacing(4)
+
+        phate_grid.addWidget(QLabel("knn:"), 0, 0)
+        self.phate_knn = QSpinBox()
+        self.phate_knn.setRange(2, 200)
+        self.phate_knn.setValue(5)
+        self.phate_knn.setToolTip(
+            "Number of nearest neighbours for the initial affinity graph.\n"
+            "Default: 5"
+        )
+        phate_grid.addWidget(self.phate_knn, 0, 1)
+
+        phate_grid.addWidget(QLabel("decay:"), 0, 2)
+        self.phate_decay = QSpinBox()
+        self.phate_decay.setRange(1, 200)
+        self.phate_decay.setValue(40)
+        self.phate_decay.setToolTip(
+            "Rate of alpha-decay kernel decay. Default: 40"
+        )
+        phate_grid.addWidget(self.phate_decay, 0, 3)
+
+        phate_grid.addWidget(QLabel("t (0 = auto):"), 1, 0)
+        self.phate_t = QSpinBox()
+        self.phate_t.setRange(0, 500)
+        self.phate_t.setValue(0)
+        self.phate_t.setSpecialValueText("auto")
+        self.phate_t.setToolTip(
+            "Diffusion time-scale. 0 = PHATE picks it automatically "
+            "via the von Neumann entropy heuristic (recommended)."
+        )
+        phate_grid.addWidget(self.phate_t, 1, 1)
+
+        dr_layout.addWidget(self._phate_params)
+        self._phate_params.setVisible(False)
 
         # ---- Run button + status ----
         dr_run_row = QHBoxLayout()
@@ -2074,6 +2123,7 @@ class ConfigTab(QWidget):
         self._umap_params.setVisible(algo == 'UMAP')
         self._tsne_params.setVisible(algo == 'tSNE')
         self._pacmap_params.setVisible(algo == 'PaCMAP')
+        self._phate_params.setVisible(algo == 'PHATE')
 
         notes = {
             'UMAP': (
@@ -2087,6 +2137,12 @@ class ConfigTab(QWidget):
             'PaCMAP': (
                 "PaCMAP: pair-centric MA embedding; balances local and global "
                 "structure without perplexity tuning."
+            ),
+            'PHATE': (
+                "PHATE: diffusion-based embedding, strong for trajectory/"
+                "continuum structure. No out-of-sample projection — trains "
+                "and embeds the training samples only; 'Apply to All "
+                "Samples' is disabled for this algorithm."
             ),
         }
         self._dr_algo_note.setText(notes.get(algo, ''))
@@ -2121,6 +2177,21 @@ class ConfigTab(QWidget):
             self.dr_apply_btn.setEnabled(False)
         self.dr_run_btn.setEnabled(not running)
         self.dr_cancel_btn.setEnabled(running)
+
+        # PHATE has no out-of-sample transform — training already embeds
+        # every training sample, so "Apply to All Samples" never applies.
+        if algo == 'PHATE':
+            self.dr_apply_btn.setEnabled(False)
+            self.dr_apply_btn.setToolTip(
+                "PHATE has no out-of-sample projection. Training already "
+                "embeds every training sample; new samples require "
+                "re-training with them included in the training set."
+            )
+        else:
+            self.dr_apply_btn.setToolTip(
+                "Project every sample through the trained model to produce embeddings\n"
+                "(including samples not in the training set)."
+            )
 
     def _on_run_dr_clicked(self):
         """Collect params and delegate to PluginWidget._run_dr()."""
@@ -2157,6 +2228,13 @@ class ConfigTab(QWidget):
                 'n_neighbors': self.pacmap_n_neighbors.value(),
                 'MN_ratio':    self.pacmap_mn_ratio.value(),
                 'FP_ratio':    self.pacmap_fp_ratio.value(),
+            }
+        elif algo == 'PHATE':
+            t_val = self.phate_t.value()
+            return {
+                'knn':   self.phate_knn.value(),
+                'decay': self.phate_decay.value(),
+                't':     'auto' if t_val == 0 else t_val,
             }
         return {}
 
@@ -7202,9 +7280,22 @@ class PlotCard(QFrame):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
-        # ---- Toolbar row 1: DR run | sample | colour mode | marker ----
+        # ---- Toolbar row 1: plot type | DR run | sample | colour mode | marker ----
         row1 = QHBoxLayout()
         row1.setSpacing(4)
+
+        row1.addWidget(QLabel("Plot type:"))
+        self.plot_type_combo = QComboBox()
+        self.plot_type_combo.addItems(['Scatter', 'FlowSOM Tree'])
+        self.plot_type_combo.setFixedWidth(100)
+        self.plot_type_combo.setToolTip(
+            "Scatter: per-event DR embedding.\n"
+            "FlowSOM Tree: SOM-node minimum-spanning-tree view of a "
+            "FlowSOM clustering run (select it in the Overlay dropdown)."
+        )
+        self.plot_type_combo.currentTextChanged.connect(self._on_plot_type_changed)
+        _style_combo_popup(self.plot_type_combo)
+        row1.addWidget(self.plot_type_combo)
 
         row1.addWidget(QLabel("DR run:"))
         self.dr_combo = QComboBox()
@@ -7477,11 +7568,16 @@ class PlotCard(QFrame):
 
     def _populate_cluster_run_combo(self):
         """Rebuild the clustering-run overlay combo from
-        state.clustering_runs, keyed by run_id."""
+        state.clustering_runs, keyed by run_id.  In 'FlowSOM Tree' plot
+        mode, only FlowSOM runs are offered — Leiden/HDBSCAN runs have no
+        tree_data and can't be drawn as a tree."""
         self.cluster_run_combo.blockSignals(True)
         prev_run_id = self.cluster_run_combo.currentData()
         self.cluster_run_combo.clear()
+        flowsom_only = self.plot_type_combo.currentText() == 'FlowSOM Tree'
         runs = sorted(self.state.clustering_runs, key=lambda e: e.get('timestamp', ''))
+        if flowsom_only:
+            runs = [e for e in runs if e.get('algorithm') == 'FlowSOM']
         for entry in runs:
             self.cluster_run_combo.addItem(entry.get('label', ''), entry.get('run_id'))
         if self.cluster_run_combo.count() == 0:
@@ -7570,6 +7666,27 @@ class PlotCard(QFrame):
         self._update_compatibility_warning()
         self._schedule_refresh()
 
+    def _on_plot_type_changed(self, mode: str):
+        """Toggle between the per-event Scatter view and the FlowSOM MST
+        Tree view. Tree mode has no DR run / sample / marker concept — it
+        only needs a FlowSOM clustering run, picked via the Overlay combo,
+        which is re-populated filtered to FlowSOM-only runs."""
+        is_tree = (mode == 'FlowSOM Tree')
+
+        self.dr_combo.setVisible(not is_tree)
+        self.sample_combo.setVisible(not is_tree)
+        self.colour_mode_combo.setVisible(not is_tree)
+        self.marker_combo.setVisible(not is_tree and self.colour_mode_combo.currentText() == 'Marker')
+
+        self.cluster_run_label.setVisible(True)
+        self.cluster_run_combo.setVisible(True)
+        if not is_tree:
+            # Restore the normal Colour-mode-driven overlay visibility.
+            self._on_colour_mode_changed(self.colour_mode_combo.currentText())
+
+        self._populate_cluster_run_combo()
+        self._schedule_refresh()
+
     def _schedule_refresh(self, *_):
         self._sync_config_to_state()
         # Debounce: apply_config() can trigger this from several combo
@@ -7602,7 +7719,13 @@ class PlotCard(QFrame):
 
     def refresh(self):
         """Re-render the scatter plot from the currently-selected DR run
-        (and, in Clusters mode, the currently-selected clustering run)."""
+        (and, in Clusters mode, the currently-selected clustering run).
+        In 'FlowSOM Tree' plot-type mode, delegates entirely to
+        _draw_flowsom_tree_view() instead — a tree has no DR-run concept."""
+        if self.plot_type_combo.currentText() == 'FlowSOM Tree':
+            self._draw_flowsom_tree_view()
+            return
+
         run = self._selected_dr_run()
         if run is None:
             self._show_placeholder("No DR run selected.\nTrain a DR algorithm first.")
@@ -7618,6 +7741,8 @@ class PlotCard(QFrame):
 
         cl_run = self._selected_cluster_run()
         labels_dict = cl_run.get('labels', {}) if cl_run else {}
+        indices_dict = run.get('embedding_event_indices', {}) or {}
+        unaligned_samples: list[str] = []
 
         # Gather data (plus the sample-of-origin per row, needed for Marker mode)
         sample_data_item = self.sample_combo.currentData()
@@ -7629,7 +7754,11 @@ class PlotCard(QFrame):
                 self._show_placeholder(f"No embedding for {Path(rel_path).name}.")
                 return
             xy = emb
-            lab = labels_dict.get(rel_path)
+            lbl_raw = labels_dict.get(rel_path)
+            lab, aligned_ok = drc_scatter.align_labels_to_embedding(
+                lbl_raw, len(emb), indices_dict.get(rel_path))
+            if lbl_raw is not None and not aligned_ok:
+                unaligned_samples.append(rel_path)
             origin = np.array([rel_path] * len(emb), dtype=object)
             sample_row_offsets = {rel_path: (0, len(emb))}
         else:
@@ -7643,23 +7772,25 @@ class PlotCard(QFrame):
                 offset += n
                 xys.append(emb)
                 origins.append(np.array([rel] * n, dtype=object))
-                lbl = labels_dict.get(rel)
-                if lbl is None:
+                lbl_raw = labels_dict.get(rel)
+                lbl, aligned_ok = drc_scatter.align_labels_to_embedding(
+                    lbl_raw, n, indices_dict.get(rel))
+                if lbl_raw is None:
                     _log.debug("workspace: no cluster labels for %s — greyed", rel)
-                    labs.append(np.full(n, -1, dtype=np.int32))
-                elif len(lbl) != n:
+                elif not aligned_ok:
                     _log.warning("workspace: label/embedding length mismatch for %s "
                                  "(%d labels vs %d points) — greyed",
-                                 rel, len(lbl), n)
-                    labs.append(np.full(n, -1, dtype=np.int32))
-                else:
-                    labs.append(lbl)
+                                 rel, len(lbl_raw), n)
+                    unaligned_samples.append(rel)
+                labs.append(lbl)
             if not xys:
                 self._show_placeholder("No embeddings found.")
                 return
             xy = np.concatenate(xys, axis=0)
             lab = np.concatenate(labs, axis=0)
             origin = np.concatenate(origins, axis=0)
+
+        self._last_unaligned_samples = unaligned_samples
 
         colour_mode = self.colour_mode_combo.currentText()
 
@@ -7709,6 +7840,13 @@ class PlotCard(QFrame):
 
         if colour_mode == 'Clusters':
             self._draw_cluster_scatter(ax, xy_disp, lab_disp, cl_run)
+            if self._last_unaligned_samples:
+                ax.text(0.02, 0.02,
+                       f"⚠ {len(self._last_unaligned_samples)} sample(s) shown "
+                       "without cluster colour — DR run and clustering run "
+                       "don't share indexed events",
+                       transform=ax.transAxes, fontsize=max(_af - 1, 6),
+                       color='#d9822b', va='bottom', ha='left', zorder=10)
         elif colour_mode == 'Marker':
             self._draw_marker_scatter(ax, xy_disp, origin_disp,
                                       disp_idx, sample_row_offsets, run)
@@ -7738,6 +7876,69 @@ class PlotCard(QFrame):
         identically instead of duplicating this logic).
         """
         drc_scatter.draw_cluster_scatter(ax, xy, labels, cl_run, self.controller)
+
+    def _draw_flowsom_tree_view(self):
+        """
+        Render a FlowSOM MST tree: SOM-node bubbles sized by cell count,
+        coloured by metacluster, connected by the minimum-spanning-tree
+        edges over the node codebook vectors (classic FlowSOM tree layout,
+        see drc_clustering.build_flowsom_tree). Not wired to
+        _rebuild_legend() -- deliberately deferred; the tree's own colour
+        key (metacluster → colour) already matches the Clusters-mode
+        scatter legend, so a dedicated legend can be added later without
+        touching this method's core rendering.
+        """
+        cl_run = self._selected_cluster_run()
+        if cl_run is None or cl_run.get('algorithm') != 'FlowSOM':
+            self._show_placeholder(
+                "Select a FlowSOM clustering run in the Overlay dropdown."
+            )
+            return
+        tree_data = cl_run.get('tree_data')
+        if not tree_data:
+            self._show_placeholder(
+                "This FlowSOM run has no tree data.\n"
+                "Re-run FlowSOM to enable the tree view."
+            )
+            return
+
+        is_dark = _resolve_is_dark(self.state)
+        self._figure.clear()
+        ax = self._figure.add_subplot(111)
+        _style_figure_theme(self._figure, is_dark, axes=[ax])
+        ax.set_aspect('equal', adjustable='box')
+        ax.axis('off')
+
+        layout = drc_clustering.build_flowsom_tree(
+            tree_data['node_weights'], tree_data['node_to_meta'],
+            tree_data['node_counts'],
+        )
+        positions    = layout['positions']
+        edges        = layout['edges']
+        node_to_meta = tree_data['node_to_meta']
+        node_counts  = tree_data['node_counts']
+
+        colors_dict = cl_run.get('colors', {})
+        node_colors = [colors_dict.get(int(m), '#7f7f7f') for m in node_to_meta]
+
+        edge_color = '#888888' if is_dark else '#bbbbbb'
+        for i, j in edges:
+            ax.plot([positions[i, 0], positions[j, 0]],
+                    [positions[i, 1], positions[j, 1]],
+                    color=edge_color, linewidth=0.8, zorder=1)
+
+        max_count = max(int(node_counts.max()), 1)
+        sizes = 20 + 480 * (node_counts / max_count)
+        ax.scatter(positions[:, 0], positions[:, 1], s=sizes, c=node_colors,
+                   edgecolors=('#dddddd' if is_dark else '#222222'),
+                   linewidths=0.4, zorder=2)
+
+        lc = self._label_color
+        ax.set_title(f"FlowSOM Tree — {cl_run.get('label', '')}", color=lc,
+                    fontsize=self._axis_font_spin.value())
+        ax.title.set_color(lc)
+
+        self._canvas.draw_idle()
 
     def _draw_marker_scatter(self, ax, xy, origin, disp_idx, sample_row_offsets,
                              run: dict):
@@ -8359,7 +8560,10 @@ class _DrWorker(QThread):
             if self._cancelled:
                 return
             if self._task == 'train':
-                self._do_train()
+                if self._algo == 'PHATE':
+                    self._do_train_phate()
+                else:
+                    self._do_train()
             elif self._task == 'apply':
                 self._do_apply(training_only=self._training_only)
         except Exception as exc:
@@ -8421,6 +8625,62 @@ class _DrWorker(QThread):
 
         self._emit(f"{algo} training complete.  Embedding training samples …")
         self._do_apply(training_only=True)
+
+    def _do_train_phate(self):
+        """
+        PHATE-specific training path. Unlike _do_train(), this does not
+        call the shared _do_apply() afterwards — PHATE produces the
+        embedding for every training-pool row as a side effect of fit,
+        so per-sample embeddings are sliced directly from that single
+        result using the known sample boundaries.
+        """
+        plugin = self._plugin
+
+        self._emit("Loading training pool for PHATE …")
+        self._emit_progress(0, 0)
+        result = drc_pipeline.load_training_pool_with_sample_bounds(
+            plugin.controller, plugin.state, af_state=self._af_state)
+        if result is None:
+            self.finished.emit(False, "No training data could be loaded.")
+            return
+        pooled_data, sample_bounds = result
+
+        if self._cancelled:
+            self.finished.emit(False, "Cancelled.")
+            return
+
+        self._emit(f"Training PHATE on {len(pooled_data):,} pooled events "
+                   f"({len(sample_bounds)} sample(s)) …")
+        try:
+            reducer, embedding = plugin._run_phate(self._params, pooled_data)
+        except Exception as exc:
+            traceback.print_exc()
+            self.finished.emit(False, str(exc))
+            return
+
+        if self._cancelled:
+            self.finished.emit(False, "Cancelled.")
+            return
+
+        plugin.state.trained_reducers['PHATE'] = reducer
+        plugin.state.dr_status['PHATE'] = 'done'
+        plugin.state.dr_timestamps['PHATE'] = datetime.now().isoformat(timespec='seconds')
+
+        embeddings: dict[str, np.ndarray] = {}
+        features: dict[str, np.ndarray] = {}
+        event_indices: dict[str, np.ndarray] = {}
+        offset = 0
+        for rel_path, n_events, idx in sample_bounds:
+            embeddings[rel_path] = embedding[offset:offset + n_events].astype(np.float32)
+            features[rel_path] = pooled_data[offset:offset + n_events].astype(np.float32)
+            event_indices[rel_path] = idx
+            offset += n_events
+        plugin.state.embeddings['PHATE'] = embeddings
+        plugin.state.embedding_features['PHATE'] = features
+        plugin.state.embedding_event_indices['PHATE'] = event_indices
+
+        self._emit("PHATE training complete.")
+        self.finished.emit(True, "")
 
     def _do_apply(self, training_only: bool):
         plugin = self._plugin
@@ -9569,28 +9829,34 @@ class ClusterAnnotationTab(QWidget):
         labels_dict = cl_run.get('labels', {}) if cl_run else {}
         own_positions = (cl_run.get('dr_positions', {}) if cl_run else {}) or {}
         cl_params = (cl_run.get('params', {}) if cl_run else {}) or {}
+        indices_dict = dr_run.get('embedding_event_indices', {}) or {}
         # Only trust the run's own frozen positions as a substitute when
         # they're nominally the SAME embedding space as what's on screen --
         # mixing two different algorithms' coordinates would be meaningless.
         same_algo = bool(cl_params.get('_dr_algo')) and \
             cl_params.get('_dr_algo') == (dr_run.get('algorithm') or '')
+        unaligned_samples: list[str] = []
         xys, labs = [], []
         for rel, emb in emb_dict.items():
             n = len(emb)
-            lbl = labels_dict.get(rel)
-            if lbl is not None and len(lbl) == n:
+            lbl_raw = labels_dict.get(rel)
+            lbl, aligned_ok = drc_scatter.align_labels_to_embedding(
+                lbl_raw, n, indices_dict.get(rel))
+            if aligned_ok:
                 xys.append(emb)
                 labs.append(lbl)
-            elif lbl is not None and same_algo and rel in own_positions \
-                    and len(own_positions[rel]) == len(lbl):
+            elif lbl_raw is not None and same_algo and rel in own_positions \
+                    and len(own_positions[rel]) == len(lbl_raw):
                 # The selected DR run's live embeddings for this sample no
                 # longer match this clustering run's labels (e.g. DR was
                 # retrained for this algorithm since archiving) -- fall
                 # back to the exact positions this run actually classified
                 # against instead of greying the sample out.
                 xys.append(own_positions[rel])
-                labs.append(lbl)
+                labs.append(lbl_raw)
             else:
+                if lbl_raw is not None:
+                    unaligned_samples.append(rel)
                 xys.append(emb)
                 labs.append(np.full(n, -1, dtype=np.int32))
         xy = np.concatenate(xys, axis=0)
@@ -9607,6 +9873,12 @@ class ClusterAnnotationTab(QWidget):
         ax.tick_params(labelsize=fontsize)
 
         drc_scatter.draw_cluster_scatter(ax, xy, lab, cl_run, self.controller)
+        if unaligned_samples:
+            ax.text(0.02, 0.02,
+                   f"⚠ {len(unaligned_samples)} sample(s) shown without cluster "
+                   "colour — DR run and clustering run don't share indexed events",
+                   transform=ax.transAxes, fontsize=max(fontsize - 1, 6),
+                   color='#d9822b', va='bottom', ha='left', zorder=10)
 
     def _pop_out_map(self):
         """Regenerate the cluster map at a larger size in its own window,
@@ -11706,8 +11978,10 @@ class PluginWidget(QWidget):
     def _load_training_data(self, af_state=None) -> np.ndarray | None:
         """
         Pool transformed, gated, downsampled events from all training samples.
-        Delegates to drc_pipeline.load_training_pool (correct channel alignment,
-        correct FlowKit transform, no silent arcsinh fallback, full logging).
+        Delegates to drc_pipeline.load_training_pool_with_sample_bounds
+        (correct channel alignment, correct FlowKit transform, no silent
+        arcsinh fallback, full logging), discarding the per-sample bounds —
+        UMAP/tSNE/PaCMAP don't need them; only PHATE's training path does.
 
         Must be callable from a background thread — contains no Qt GUI calls.
         Pre-flight validation (empty samples / channels / gate) is performed
@@ -11716,8 +11990,12 @@ class PluginWidget(QWidget):
         af_state: optional AF snapshot captured on the main thread before the
         worker started — see drc_pipeline.apply_unmixing_af_aware() docstring.
         """
-        result = drc_pipeline.load_training_pool(self.controller, self.state, af_state=af_state)
-        return result
+        result = drc_pipeline.load_training_pool_with_sample_bounds(
+            self.controller, self.state, af_state=af_state)
+        if result is None:
+            return None
+        data, _bounds = result
+        return data
 
     def _logicle_transform_array(self, data: np.ndarray, sample=None) -> np.ndarray:
         """
@@ -11877,6 +12155,40 @@ class PluginWidget(QWidget):
         return _PaCMAPWrapper(reducer, training_data)
 
     # ------------------------------------------------------------------
+    # PHATE
+    # ------------------------------------------------------------------
+
+    def _run_phate(self, params: dict, pooled_data: np.ndarray):
+        """
+        Fit PHATE on the full pooled training array in one call and return
+        both the fitted operator and its embedding of that same array.
+
+        PHATE has no out-of-sample transform (see module note above), so
+        unlike UMAP/tSNE/PaCMAP there is no separate train/apply split:
+        the embedding produced here IS the final per-sample result, sliced
+        by the caller using the sample boundaries from
+        drc_pipeline.load_training_pool_with_sample_bounds().
+        """
+        import phate
+
+        self.progress_message(
+            f"Training PHATE  (knn={params['knn']}, decay={params['decay']}, "
+            f"t={params['t']}) …"
+        )
+        reducer = phate.PHATE(
+            n_components=2,
+            knn=params['knn'],
+            decay=params['decay'],
+            t=params['t'],
+            n_jobs=-1,
+            random_state=42,
+            verbose=False,
+        )
+        embedding = reducer.fit_transform(pooled_data)
+        self.progress_message("PHATE training complete.")
+        return reducer, embedding
+
+    # ------------------------------------------------------------------
     # Public DR entry points
     # ------------------------------------------------------------------
 
@@ -11929,6 +12241,14 @@ class PluginWidget(QWidget):
 
     def _apply_dr_to_all_samples(self, algo: str):
         """Start background embedding of ALL samples.  Returns immediately."""
+        if algo == 'PHATE':
+            QMessageBox.information(
+                self, "Not Available for PHATE",
+                "PHATE has no out-of-sample projection. Training already "
+                "embeds every training sample; to include additional "
+                "samples, add them to the training set and re-train."
+            )
+            return
         if self.state.trained_reducers.get(algo) is None:
             QMessageBox.warning(self, "No Trained Model",
                                 f"Train a {algo} model first.")
@@ -12022,6 +12342,7 @@ class PluginWidget(QWidget):
         reducer = self.state.trained_reducers.get(algo)
         embeddings = self.state.embeddings.get(algo, {})
         embedding_features = self.state.embedding_features.get(algo, {})
+        embedding_event_indices = self.state.embedding_event_indices.get(algo, {})
         if reducer is None:
             return
         channels = [c for c in self.state.selected_channels
@@ -12051,6 +12372,7 @@ class PluginWidget(QWidget):
                 reducer=reducer_to_archive,
                 embeddings=dict(embeddings),
                 embedding_features=dict(embedding_features),
+                embedding_event_indices=dict(embedding_event_indices),
                 gates=list(self.state.selected_gates),
                 training_sample_ids=list(self.state.training_sample_ids),
                 channels=channels,
@@ -12169,6 +12491,15 @@ class PluginWidget(QWidget):
                     channels = [c for c in self.state.selected_channels
                                 if c not in drc_pipeline.META_CHANNELS]
                     n_events = sum(len(a) for a in self.state.cluster_labels.values())
+                    # FlowSOM Tree view (Workspace) needs the SOM codebook,
+                    # metacluster mapping and per-node counts archived
+                    # alongside the run — not just the live in-memory copy,
+                    # which a later FlowSOM run would overwrite.
+                    tree_data = None
+                    if algo == 'FlowSOM':
+                        fsom_state = self.state.trained_reducers.get('FlowSOM')
+                        if fsom_state:
+                            tree_data = dict(fsom_state)
                     entry = drc_run_archive.archive_clustering_run(
                         self.controller, self.state,
                         algorithm=algo,
@@ -12184,6 +12515,7 @@ class PluginWidget(QWidget):
                         n_events=n_events,
                         marker_values=dict(self.state.cluster_marker_values),
                         dr_positions=dict(self.state.cluster_dr_positions),
+                        tree_data=tree_data,
                     )
                     self.progress_message(
                         f"Run archived as \"{entry['label']}\""

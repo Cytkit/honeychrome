@@ -324,14 +324,16 @@ def run_flowsom(controller, state, params: dict, progress=None, af_state=None):
     log.info("run_flowsom: SOM nodes per metacluster: %s",
              dict(zip(meta_ids.tolist(), node_counts.tolist())))
 
-    flowsom_assign_all(controller, state, node_weights, node_to_meta,
-                       assign_all=params.get('_assign_all_samples', False),
-                       progress=progress, af_state=af_state)
+    node_event_counts = flowsom_assign_all(
+        controller, state, node_weights, node_to_meta,
+        assign_all=params.get('_assign_all_samples', False),
+        progress=progress, af_state=af_state)
     state.n_clusters = k
     state.active_clustering_algorithm = 'FlowSOM'
     state.trained_reducers['FlowSOM'] = {
         'node_weights': node_weights,
         'node_to_meta': node_to_meta,
+        'node_counts': node_event_counts,
         'xdim': xdim, 'ydim': ydim,
     }
     _progress(progress, f"FlowSOM done: {k} metaclusters.")
@@ -339,8 +341,12 @@ def run_flowsom(controller, state, params: dict, progress=None, af_state=None):
 
 def flowsom_assign_all(controller, state, node_weights, node_to_meta,
                        assign_all: bool = False, progress=None,
-                       af_state=None) -> None:
+                       af_state=None) -> np.ndarray:
     """Map each sample's events to SOM nodes, then to metaclusters.
+
+    Returns node_counts: np.ndarray shape (n_nodes,) — total event count
+    assigned to each SOM node across all assigned samples, used by the
+    FlowSOM MST tree view to size node bubbles.
 
     assign_all: see _assignable_sample_paths (Item 9) -- default (False)
         restricts to state.training_sample_ids; True additionally labels
@@ -354,6 +360,7 @@ def flowsom_assign_all(controller, state, node_weights, node_to_meta,
 
     state.cluster_labels = {}
     state.cluster_marker_values = {}
+    node_counts = np.zeros(len(node_weights), dtype=np.int64)
     for sample_key in all_samples:
         try:
             rel_path = str(Path(sample_key).relative_to(raw_subdir))
@@ -366,6 +373,7 @@ def flowsom_assign_all(controller, state, node_weights, node_to_meta,
             continue
         try:
             node_ids = flowsom_consensus.assign_to_nodes(node_weights, sample_data)
+            node_counts += np.bincount(node_ids, minlength=len(node_weights))
             labels = node_to_meta[node_ids].astype(np.int32)
             state.cluster_labels[rel_path] = labels
             _snapshot_marker_values(controller, state, rel_path, labels, af_state=af_state)
@@ -377,6 +385,35 @@ def flowsom_assign_all(controller, state, node_weights, node_to_meta,
     if state.cluster_labels:
         all_labels = np.concatenate(list(state.cluster_labels.values()))
         assign_cluster_colors(state, all_labels)
+
+    return node_counts
+
+
+def build_flowsom_tree(node_weights: np.ndarray, node_to_meta: np.ndarray,
+                       node_counts: np.ndarray) -> dict:
+    """
+    Classic FlowSOM tree: minimum spanning tree over SOM codebook vectors
+    (Euclidean distance), laid out with igraph's Kamada-Kawai algorithm —
+    the same approach R FlowSOM's BuildMST/PlotStars uses.
+
+    Returns {'positions': (n_nodes, 2) ndarray, 'edges': list[(i, j)]}.
+    Pure function — no state access, safe to call from the Workspace tab's
+    render path directly.
+    """
+    import igraph
+    from scipy.spatial.distance import pdist, squareform
+    from scipy.sparse.csgraph import minimum_spanning_tree
+
+    dist = squareform(pdist(node_weights, metric='euclidean'))
+    mst_sparse = minimum_spanning_tree(dist)
+    mst_coo = mst_sparse.tocoo()
+    edges = list(zip(mst_coo.row.tolist(), mst_coo.col.tolist()))
+
+    n_nodes = node_weights.shape[0]
+    g = igraph.Graph(n=n_nodes, edges=edges)
+    layout = g.layout_kamada_kawai()
+    positions = np.array(layout.coords)
+    return {'positions': positions, 'edges': edges}
 
 
 # ---------------------------------------------------------------------------

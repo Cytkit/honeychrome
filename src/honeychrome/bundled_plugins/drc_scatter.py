@@ -174,3 +174,42 @@ def compatibility_warning(dr_run: dict | None, cl_run: dict | None) -> str | Non
         f"{sorted(dr_gates)} / {len(dr_samples)} sample(s) — "
         "results may not align."
     )
+
+def align_labels_to_embedding(labels: np.ndarray | None, n: int,
+                              event_indices: np.ndarray | None) -> tuple[np.ndarray, bool]:
+    """
+    Align one sample's cluster-label array to one of its DR embeddings.
+
+    Returns (aligned_labels, ok): aligned_labels always has length *n*
+    (-1 = unlabelled/unavailable); ok is True only when real per-event
+    correspondence was established, False when the sample had to be
+    greyed out for lack of one — callers should surface a warning in the
+    False case (compatibility_warning's gate/sample-set check doesn't
+    catch this: a DR run and clustering run can share the exact same
+    gate and sample set and still not share the same *rows*, e.g. PHATE
+    trained on a 1,000-event downsample of a sample the clustering run
+    labelled in full).
+
+    labels: the sample's cluster-label array from a clustering run, or
+        None if this sample has no labels under the selected run.
+    event_indices: indices into the sample's FULL gated/transformed
+        feature array that this embedding's rows correspond to, in the
+        same row order as the embedding — present when the DR run
+        downsampled before embedding (currently only PHATE, which has no
+        out-of-sample transform; see PipelineState.embedding_event_indices).
+        None when the embedding already covers every gated event 1:1
+        (UMAP/tSNE/PaCMAP, whose embeddings and cluster labels both
+        iterate every gated event in the same order).
+
+    Priority: exact length match first (the common, cheap case);
+    index-based slice second, for a downsampled embedding whose exact
+    source events are known; otherwise unaligned.
+    """
+    if labels is None:
+        return np.full(n, -1, dtype=np.int32), False
+    if len(labels) == n:
+        return labels.astype(np.int32), True
+    if event_indices is not None and len(event_indices) == n \
+            and int(event_indices.max(initial=-1)) < len(labels):
+        return labels[event_indices].astype(np.int32), True
+    return np.full(n, -1, dtype=np.int32), False
