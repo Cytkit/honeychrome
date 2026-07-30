@@ -986,13 +986,21 @@ class PipelineState:
     pca_n_loadings: int = 10
     pca_point_size: float = 60.0
     pca_arrow_lw: float = 1.2
-    pca_arrow_color: str = '#555555'
+    pca_arrow_color: str = '#ADD8E6'
     pca_axis_fontsize: int = 9
     pca_show_grid: bool = True
+    pca_label_loadings: bool = True
+    pca_label_points: bool = False
     pca_scores_df: pd.DataFrame | None = None
     pca_loadings_df: pd.DataFrame | None = None
     pca_explained_variance: tuple = (0.0, 0.0)
     pca_run_label: str = ''
+    pca_groups: list = field(default_factory=list)
+    pca_sources: list = field(default_factory=list)
+    # groups/sources -- the last two pieces _make_pca_figure needs that
+    # weren't already cached above -- so a fully-persisted PCA result can
+    # be rebuilt into the dict shape it expects without recomputing (see
+    # _pca_result_from_state).
     stats_all_rel: list = field(default_factory=list)
     # sample rel-paths in limma row order
     stats_group_vec: list = field(default_factory=list)
@@ -4296,6 +4304,25 @@ class GroupsStatsTab(QWidget):
         self.pca_n_loadings_spin.setValue(self.state.pca_n_loadings)
         self.pca_n_loadings_spin.setFixedWidth(60)
         pca_source_row.addWidget(self.pca_n_loadings_spin)
+
+        self.pca_chk_label_loadings = QCheckBox("Label loadings")
+        self.pca_chk_label_loadings.setChecked(self.state.pca_label_loadings)
+        self.pca_chk_label_loadings.setToolTip(
+            "Show each loading's feature name as a permanent label at its "
+            "arrow tip. Mouse-over identifies every loading regardless of "
+            "this toggle -- this only controls the always-visible ones."
+        )
+        pca_source_row.addWidget(self.pca_chk_label_loadings)
+
+        self.pca_chk_label_points = QCheckBox("Label points")
+        self.pca_chk_label_points.setChecked(self.state.pca_label_points)
+        self.pca_chk_label_points.setToolTip(
+            "Show each sample's name as a permanent label next to its "
+            "point. Mouse-over identifies every point regardless of this "
+            "toggle -- this only controls the always-visible ones."
+        )
+        pca_source_row.addWidget(self.pca_chk_label_points)
+
         pca_source_row.addStretch()
         pca_layout.addLayout(pca_source_row)
 
@@ -4348,6 +4375,21 @@ class GroupsStatsTab(QWidget):
         pca_btn_row.addWidget(self.pca_btn)
         pca_btn_row.addStretch()
         pca_layout.addLayout(pca_btn_row)
+
+        # Live-refresh (Item 6) -- once the PCA has been shown once,
+        # changing any of these regenerates it without needing another
+        # 'Show PCA' click. See _on_pca_option_changed.
+        self.pca_chk_freq.stateChanged.connect(self._on_pca_option_changed)
+        self.pca_chk_counts.stateChanged.connect(self._on_pca_option_changed)
+        self.pca_chk_mfi.stateChanged.connect(self._on_pca_option_changed)
+        self.pca_chk_loadings.stateChanged.connect(self._on_pca_option_changed)
+        self.pca_n_loadings_spin.valueChanged.connect(self._on_pca_option_changed)
+        self.pca_chk_label_loadings.stateChanged.connect(self._on_pca_option_changed)
+        self.pca_chk_label_points.stateChanged.connect(self._on_pca_option_changed)
+        self.pca_point_size_spin.valueChanged.connect(self._on_pca_option_changed)
+        self.pca_arrow_lw_spin.valueChanged.connect(self._on_pca_option_changed)
+        self.pca_axis_fontsize_spin.valueChanged.connect(self._on_pca_option_changed)
+        self.pca_chk_grid.stateChanged.connect(self._on_pca_option_changed)
 
         bottom_layout.addWidget(pca_box)
 
@@ -4871,6 +4913,42 @@ class GroupsStatsTab(QWidget):
                 key="composition_barplot",
             )
 
+        # PCA controls (Item 6/16) -- sync widget state from self.state
+        # now, since load_state() restores QSettings into self.state but
+        # runs after these widgets were already built (with construction-
+        # time defaults), so nothing else re-syncs them. Signals blocked
+        # so this doesn't itself fire _on_pca_option_changed.
+        for w, val, setter in (
+            (self.pca_chk_freq, self.state.pca_use_freq, 'setChecked'),
+            (self.pca_chk_counts, self.state.pca_use_counts, 'setChecked'),
+            (self.pca_chk_mfi, self.state.pca_use_mfi, 'setChecked'),
+            (self.pca_chk_loadings, self.state.pca_show_loadings, 'setChecked'),
+            (self.pca_n_loadings_spin, self.state.pca_n_loadings, 'setValue'),
+            (self.pca_chk_label_loadings, self.state.pca_label_loadings, 'setChecked'),
+            (self.pca_chk_label_points, self.state.pca_label_points, 'setChecked'),
+            (self.pca_point_size_spin, int(self.state.pca_point_size), 'setValue'),
+            (self.pca_arrow_lw_spin, self.state.pca_arrow_lw, 'setValue'),
+            (self.pca_axis_fontsize_spin, self.state.pca_axis_fontsize, 'setValue'),
+            (self.pca_chk_grid, self.state.pca_show_grid, 'setChecked'),
+        ):
+            w.blockSignals(True)
+            getattr(w, setter)(val)
+            w.blockSignals(False)
+        self._update_pca_arrow_color_btn()
+        self._update_pca_source_availability()
+
+        # Redraw the PCA tab too, same "persisted + not already showing"
+        # rule as Confusion Matrix / Composition Barplot above.
+        pca_result = self._pca_result_from_state()
+        if pca_result is not None and not self._has_results_tab('sample_pca'):
+            fig_pca = self._make_pca_figure(pca_result, run_label=self.state.pca_run_label)
+            self._add_results_tab(
+                fig_pca, "Sample PCA", "sample_pca",
+                maker=self._make_pca_figure,
+                maker_kwargs=dict(pca_result=pca_result, run_label=self.state.pca_run_label),
+                key="sample_pca",
+            )
+
     # ------------------------------------------------------------------
     # Table population
     # ------------------------------------------------------------------
@@ -5048,6 +5126,7 @@ class GroupsStatsTab(QWidget):
         self.composition_btn.setEnabled(runnable)
         if hasattr(self, 'pca_btn'):
             self.pca_btn.setEnabled(runnable)
+            self._update_pca_source_availability()
         if dr_only_selected:
             self.run_stats_btn.setToolTip(
                 "This is a DR run — it has no cluster labels.  Select or "
@@ -5066,14 +5145,32 @@ class GroupsStatsTab(QWidget):
         else:
             self.run_stats_btn.setToolTip("")
 
+    def _update_pca_source_availability(self):
+        """Grey out whichever 'Build from' checkbox has no computed data
+        yet -- Frequencies/Counts/MFIs only become usable once Run
+        Statistics has actually computed that source."""
+        self.pca_chk_freq.setEnabled(
+            self.state.freq_df is not None and not self.state.freq_df.empty
+        )
+        self.pca_chk_counts.setEnabled(
+            self.state.counts_df is not None and not self.state.counts_df.empty
+        )
+        self.pca_chk_mfi.setEnabled(
+            self.state.mfi_df is not None and not self.state.mfi_df.empty
+        )
+
     # ------------------------------------------------------------------
     # Run combo management
     # ------------------------------------------------------------------
 
     def _populate_run_combo(self):
         """
-        Rebuild the unified run combo — DR + clustering runs together
-        (Item 6 Decision #2).  A run is included only if its recorded
+        Rebuild the Differential Statistics run combo -- clustering runs
+        only. DR runs have no cluster labels, so Run Statistics /
+        Confusion Matrix / Composition / PCA can never operate on one;
+        listing them here was a T-REX-era holdover from before T-REX got
+        its own dedicated trex_dr_run_combo (see below) -- it used to
+        share this combo instead. A run is included only if its recorded
         training sample set overlaps the samples currently assigned to
         group A or B.
 
@@ -5112,14 +5209,13 @@ class GroupsStatsTab(QWidget):
         self._run_combo.clear()
 
         all_runs = sorted(
-            list(self.state.dr_runs) + list(self.state.clustering_runs),
+            list(self.state.clustering_runs),
             key=lambda e: e.get('timestamp', ''),
         )
         for entry in all_runs:
             run_keys = set(entry.get('training_sample_ids', []))
             if not run_keys.isdisjoint(assigned_rel) or not assigned_rel:
-                suffix = ' · DR' if entry.get('kind') == 'dr' else ''
-                self._run_combo.addItem(entry['label'] + suffix, entry.get('run_id'))
+                self._run_combo.addItem(entry['label'], entry.get('run_id'))
 
         # If no archived runs, show a placeholder (userData=None; every
         # other method treats currentData() is None as "nothing selected").
@@ -5713,12 +5809,27 @@ class GroupsStatsTab(QWidget):
         if colour.isValid():
             self.state.pca_arrow_color = colour.name()
             self._update_pca_arrow_color_btn()
+            self._on_pca_option_changed()
 
     def _update_pca_arrow_color_btn(self):
         text_color = _contrasting_text_color(self.state.pca_arrow_color)
         self.pca_arrow_color_btn.setStyleSheet(
             f"background-color: {self.state.pca_arrow_color}; color: {text_color};"
         )
+
+    def _on_pca_option_changed(self, *_args):
+        """
+        Any PCA control changing after the plot has already been shown
+        once regenerates it live -- point size, arrow colour/width, grid,
+        and the two label toggles now take effect immediately instead of
+        needing another 'Show PCA' click. The very first render still
+        requires the button (Run Statistics has to have run first, and
+        _show_pca's own missing-source checks still apply on every
+        re-render -- e.g. unchecking the only computed 'Build from'
+        source will still warn).
+        """
+        if self.state.pca_scores_df is not None and self.pca_btn.isEnabled():
+            self._show_pca()
 
     def _show_pca(self):
         """
@@ -5745,6 +5856,8 @@ class GroupsStatsTab(QWidget):
         self.state.pca_arrow_lw = self.pca_arrow_lw_spin.value()
         self.state.pca_axis_fontsize = self.pca_axis_fontsize_spin.value()
         self.state.pca_show_grid = self.pca_chk_grid.isChecked()
+        self.state.pca_label_loadings = self.pca_chk_label_loadings.isChecked()
+        self.state.pca_label_points = self.pca_chk_label_points.isChecked()
 
         if not (use_freq or use_counts or use_mfi):
             QMessageBox.warning(self, "Sample PCA",
@@ -5814,6 +5927,8 @@ class GroupsStatsTab(QWidget):
         self.state.pca_loadings_df = pca_result['loadings']
         self.state.pca_explained_variance = pca_result['explained_variance_ratio']
         self.state.pca_run_label = run_label
+        self.state.pca_groups = pca_result['groups']
+        self.state.pca_sources = pca_result['sources']
 
         fig = self._make_pca_figure(pca_result, run_label=run_label)
         self._add_results_tab(
@@ -5823,12 +5938,35 @@ class GroupsStatsTab(QWidget):
             key="sample_pca",
         )
 
+    def _pca_result_from_state(self) -> dict | None:
+        """
+        Rebuild the dict _make_pca_figure() expects from persisted
+        state.pca_* fields, so the PCA tab gets the same "already
+        computed -- redraw it without recomputing" treatment refresh()/
+        refresh_theme_dependent_result_tabs() already give Confusion
+        Matrix and Composition Barplot. Returns None if nothing's been
+        computed yet this session/experiment.
+        """
+        if self.state.pca_scores_df is None or self.state.pca_loadings_df is None:
+            return None
+        return {
+            'scores': self.state.pca_scores_df,
+            'loadings': self.state.pca_loadings_df,
+            'explained_variance_ratio': self.state.pca_explained_variance,
+            'groups': self.state.pca_groups,
+            'sources': self.state.pca_sources,
+        }
+
     def _make_pca_figure(self, pca_result: dict | None, run_label: str = ''):
         """
         Sample-level PCA scatter, coloured by Group, with an optional
-        top-N loadings biplot (arrows + adjustText-de-overlapped labels —
-        same convention as _make_volcano_figure). Axis labels carry the
-        % variance explained by that component.
+        top-N loadings biplot (arrows). Mouse-over (_make_scatter_hover_
+        handler -- same convention as _make_volcano_figure) identifies
+        every point and every loading UNCONDITIONALLY, regardless of the
+        two label toggles -- those instead control a separate, always-
+        on-screen static label (no adjustText; a plain fixed-offset
+        annotation, same as the volcano plots' static top labels). Axis
+        labels carry the % variance explained by that component.
         """
         from matplotlib.figure import Figure
 
@@ -5856,6 +5994,15 @@ class GroupsStatsTab(QWidget):
         arrow_color = self.state.pca_arrow_color
         arrow_lw = self.state.pca_arrow_lw
         show_loadings = self.state.pca_show_loadings
+        label_loadings = self.state.pca_label_loadings
+        label_points = self.state.pca_label_points
+
+        # Mouse-over tooltip targets (Item 6 convention, shared with the
+        # volcano plots) -- collected as loadings/points are drawn below,
+        # then handed to a single invisible overlay scatter at the end.
+        # Always populated, independent of the two label toggles below.
+        hover_xy: list[tuple[float, float]] = []
+        hover_labels: list[str] = []
 
         unique_groups = list(dict.fromkeys(groups))   # first-seen order
         for grp in unique_groups:
@@ -5866,6 +6013,19 @@ class GroupsStatsTab(QWidget):
                 s=point_size, color=colour, edgecolors=fg, linewidths=0.4,
                 label=grp, zorder=3,
             )
+
+        sample_names = [Path(s).stem for s in scores.index]
+        hover_xy.extend(zip(scores['PC1'].values, scores['PC2'].values))
+        hover_labels.extend(sample_names)
+        if label_points:
+            # Static, always-on-screen label -- separate from the
+            # mouse-over above, which covers every point either way.
+            for x_val, y_val, name in zip(
+                scores['PC1'].values, scores['PC2'].values, sample_names
+            ):
+                ax.annotate(name, xy=(x_val, y_val), xytext=(4, 4),
+                           textcoords='offset points', fontsize=6,
+                           color=fg, zorder=5)
 
         if show_loadings and not loadings.empty:
             score_max = max(
@@ -5884,11 +6044,8 @@ class GroupsStatsTab(QWidget):
             # Item 17 fix -- ax.text() does NOT contribute to matplotlib's
             # autoscale, so without this the axes were only ever sized to
             # the sample points (score_max), never the loading arrows
-            # themselves. adjustText's de-overlap step then had no room to
-            # nudge a label into and pushed some straight past a limit
-            # that was never set to hold them, landing off-screen. Widen
-            # the limits to include every arrow endpoint BEFORE
-            # adjustText runs, so it has real headroom to work with.
+            # themselves. Widen the limits to include every arrow
+            # endpoint so nothing lands outside the visible axes.
             all_x = np.concatenate([scores['PC1'].values, arrow_ends[:, 0], [0.0]])
             all_y = np.concatenate([scores['PC2'].values, arrow_ends[:, 1], [0.0]])
             x_span = max(float(np.ptp(all_x)), 1e-6)
@@ -5896,36 +6053,65 @@ class GroupsStatsTab(QWidget):
             ax.set_xlim(all_x.min() - x_span * 0.15, all_x.max() + x_span * 0.15)
             ax.set_ylim(all_y.min() - y_span * 0.15, all_y.max() + y_span * 0.15)
 
-            texts = []
             for (feat, _row), (x_end, y_end) in zip(loadings.iterrows(), arrow_ends):
                 ax.annotate(
                     '', xy=(x_end, y_end), xytext=(0, 0),
                     arrowprops=dict(arrowstyle='-|>', color=arrow_color, lw=arrow_lw),
                     zorder=4,
                 )
-                texts.append(ax.text(x_end, y_end, feat, fontsize=7, color=fg, zorder=5))
-            if texts:
-                try:
-                    from adjustText import adjust_text
-                    adjust_text(texts, ax=ax,
-                                arrowprops=dict(arrowstyle='-', color=fg, lw=0.4))
-                except ImportError:
-                    # adjustText not yet installed into this plugin's bundled
-                    # environment -- labels stay at arrow tips, un-de-overlapped.
-                    pass
+                # Sample points along the whole shaft (not just the tip)
+                # so hovering anywhere on the arrow -- not only its head
+                # -- shows the label, unconditionally. Still just more
+                # points fed into the same overlay scatter/handler below,
+                # no new hover machinery. Starts at t=0.2 rather than 0
+                # so hover targets from several arrows converging near
+                # the origin don't all pile on top of each other.
+                for t in np.linspace(0.2, 1.0, 8):
+                    hover_xy.append((x_end * t, y_end * t))
+                    hover_labels.append(feat)
+                if label_loadings:
+                    # Static, always-on-screen label at the tip --
+                    # separate from the mouse-over above.
+                    ax.annotate(feat, xy=(x_end, y_end), xytext=(4, 4),
+                               textcoords='offset points', fontsize=7,
+                               color=fg, zorder=5)
+
+        # Item 6 -- single invisible overlay scatter covers every point
+        # and loading for mouse-over, unconditionally; handed to
+        # _make_scatter_hover_handler exactly like the volcano plots. No
+        # canvas exists yet here, so the handler is stashed on the Figure
+        # for _add_results_tab/_pop_out to connect once one does.
+        if hover_xy:
+            hover_arr = np.array(hover_xy)
+            hover_sc = ax.scatter(
+                hover_arr[:, 0], hover_arr[:, 1],
+                s=point_size * 2.5, alpha=0, zorder=6,
+            )
+            fig._hover_handler = _make_scatter_hover_handler(
+                fig, ax, hover_sc, hover_labels, is_dark,
+            )
 
         # Item 17 fix -- these were previously drawn unconditionally, so
         # unticking 'Grid lines' turned off the real ax.grid() but left
         # what looked like two leftover grid lines (the axes through the
-        # origin) behind. Both are now the same toggle.
+        # origin) behind. Both are now the same toggle. Also hiding the
+        # axes' own border (spines) when grid is off -- best guess at the
+        # "PCA-inherent lines" that survived the earlier fix is the plain
+        # rectangular frame around the plot, which ax.grid() never
+        # touches. If lines still show up with this in place, the
+        # simplest next step is dropping the "Grid lines" control
+        # entirely rather than chasing it further.
         if show_grid:
             ax.axhline(0, color='grey', linestyle='--', linewidth=0.6, zorder=1)
             ax.axvline(0, color='grey', linestyle='--', linewidth=0.6, zorder=1)
+        else:
+            for spine in ax.spines.values():
+                spine.set_visible(False)
 
         ax.set_xlabel(f"PC1 ({ev[0] * 100:.1f}% variance)", fontsize=axis_fontsize)
         ax.set_ylabel(f"PC2 ({ev[1] * 100:.1f}% variance)", fontsize=axis_fontsize)
         ax.tick_params(labelsize=axis_fontsize)
-        ax.grid(show_grid, linestyle=':', linewidth=0.5, alpha=0.6)
+        ax.grid(show_grid, which='both', linestyle=':', linewidth=0.5, alpha=0.6)
         ax.set_title(f"Sample PCA ({' + '.join(pca_result['sources'])})", fontsize=10)
         ax.legend(fontsize=7, loc='best', frameon=True)
 
@@ -6089,6 +6275,7 @@ class GroupsStatsTab(QWidget):
         self.stats_status_label.setText("✓ Statistics complete.")
         self.stats_status_label.setStyleSheet("color: green;")
         self.export_results_btn.setEnabled(True)
+        self._update_pca_source_availability()
         self._draw_results()
 
     # ------------------------------------------------------------------
@@ -6297,6 +6484,15 @@ class GroupsStatsTab(QWidget):
                                   names=self.state.composition_names,
                                   group_var=self.state.composition_group_var),
                 key="composition_barplot",
+            )
+        pca_result = self._pca_result_from_state()
+        if pca_result is not None and self._has_results_tab('sample_pca'):
+            fig_pca = self._make_pca_figure(pca_result, run_label=self.state.pca_run_label)
+            self._add_results_tab(
+                fig_pca, "Sample PCA", "sample_pca",
+                maker=self._make_pca_figure,
+                maker_kwargs=dict(pca_result=pca_result, run_label=self.state.pca_run_label),
+                key="sample_pca",
             )
 
     def _remove_results_tab_by_key(self, key: str):
@@ -6959,9 +7155,9 @@ class GroupsStatsTab(QWidget):
         ax.set_xlabel("log2 Fold Change")
         ax.set_ylabel("-log10(adj. P-value)")
         display_title = title
-        if n_sig_total > _MAX_STATIC_LABELS:
-            display_title = (f"{title}  (top {_MAX_STATIC_LABELS} of {n_sig_total} "
-                             f"labelled; hover any point for its name)")
+        #if n_sig_total > _MAX_STATIC_LABELS:
+        #    display_title = (f"{title}  (top {_MAX_STATIC_LABELS} of {n_sig_total} "
+        #                     f"labelled; hover any point for its name)")
         ax.set_title(display_title, fontsize=10)
         _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
@@ -6990,7 +7186,6 @@ class GroupsStatsTab(QWidget):
         QMessageBox.warning(self, "T-REX", "Could not find parent PluginWidget.")
 
     def _export_results_csv(self):
-        """Export all statistics results to a combined CSV."""
         """Export all statistics results to a combined CSV."""
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Statistics Results", "", "CSV files (*.csv)"
@@ -7022,7 +7217,7 @@ class GroupsStatsTab(QWidget):
 
 class WorkspaceTab(QWidget):
     """
-    Tab 3 — Workspace  (Stage 5 + 7 complete)
+    Tab 3 — Workspace
     -------------------------------------------
     Scrollable canvas of PlotCard widgets showing DR scatter plots.
     Each PlotCard supports:
@@ -7228,7 +7423,7 @@ class WorkspaceTab(QWidget):
 
 class PlotCard(QFrame):
     """
-    A single DR scatter plot on the workspace canvas.  (Stage 5 + 7)
+    A single DR scatter plot on the workspace canvas.
 
     Controls (top toolbar):
       • DR algorithm selector
@@ -7338,8 +7533,6 @@ class PlotCard(QFrame):
         row2.setSpacing(4)
 
         # Clustering-run overlay selector — only meaningful in Clusters mode
-        # (Item 6: each card independently picks which archived clustering
-        # run's labels to overlay on the chosen DR run's embedding).
         self.cluster_run_label = QLabel("Overlay:")
         self.cluster_run_label.setVisible(False)
         row2.addWidget(self.cluster_run_label)
@@ -7492,11 +7685,6 @@ class PlotCard(QFrame):
         self._figure = Figure(figsize=(self._plot_w_in, self._plot_h_in), layout='compressed')
         self._canvas = _new_scrollable_canvas(self._figure)
         self._canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # _AspectCanvasHolder (Item 4) pins the canvas to a top-left
-        # rectangle itself, rather than relying on QHBoxLayout cross-axis
-        # alignment + a resizeEvent hack to produce one as a side effect —
-        # see the class docstring for why that combination turned out to
-        # be fragile. Ratio starts at 1:1 (square) and follows Plot W/H.
         self._canvas_container = _AspectCanvasHolder(
             self._canvas, aspect_ratio=self._plot_h_in / self._plot_w_in
         )
@@ -8778,13 +8966,16 @@ class _SquareContainer(QWidget):
 
 class _WrappingLegendWidget(QWidget):
     """
-    Cluster-swatch legend for the Cluster Map panel. Instead of a single
-    column that scrolls taller than the plot next to it, entries fill
-    top-to-bottom then wrap into a new column -- so the legend's height
-    tracks the plot's height, and only very long cluster lists need a
-    (horizontal) scrollbar.
+    Cluster-swatch legend for the Cluster Map panel. Entries fill
+    top-to-bottom then wrap into a new column, capped at MAX_ROWS_PER_COL
+    rows per column -- so long cluster lists (>20) always spread across
+    columns rather than relying on the widget's on-screen height, which
+    is 0/unreliable the first time set_entries() runs (e.g. inside a
+    not-yet-shown pop-out QDialog, before dlg.show()), previously
+    collapsing every entry into its own column instead of wrapping.
     """
     ROW_HEIGHT = 20
+    MAX_ROWS_PER_COL = 20
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -8793,15 +8984,6 @@ class _WrappingLegendWidget(QWidget):
         self._grid.setContentsMargins(2, 2, 2, 2)
         self._grid.setSpacing(4)
         self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        # Item 2 -- self.height() is 0/unreliable the first time
-        # set_entries() runs on a widget inside a not-yet-shown tab page
-        # (Qt defers layout of hidden QTabWidget pages), which made
-        # _reflow() pack every entry into its own column instead of
-        # wrapping -- pushing all but the first name or two off the
-        # right edge of the scroll viewport. Remember the last height we
-        # actually reflowed at so a premature call falls back to that
-        # instead of 0.
-        self._last_good_height = 0
 
     def set_entries(self, entries: list[QWidget]):
         """Replace the displayed rows and re-flow into columns."""
@@ -8812,22 +8994,11 @@ class _WrappingLegendWidget(QWidget):
         for w in entries:
             w.setParent(self)
         self._reflow()
-        # Item 2 -- re-reflow once the event loop has processed any
-        # pending show/resize events, in case this call landed before
-        # the containing tab page/splitter had real geometry.
-        QTimer.singleShot(0, self._reflow)
 
     def sizeHint(self):
         return QSize(90, self.ROW_HEIGHT)
 
     def minimumSizeHint(self):
-        # Deliberately NOT derived from the grid layout's own minimum --
-        # if it were, the widget's reported minimum would grow to fit
-        # whatever column count it currently has, the scroll area would
-        # honour that minimum, and self.height() would echo it straight
-        # back, so a single tall column could never be forced to wrap.
-        # Returning a small constant lets the scroll area's viewport
-        # (the real, external constraint) drive our actual height.
         return QSize(60, self.ROW_HEIGHT)
 
     def resizeEvent(self, event):
@@ -8839,14 +9010,12 @@ class _WrappingLegendWidget(QWidget):
             return
         for w in self._entries:
             self._grid.removeWidget(w)
-        height = self.height()
-        if height <= self.ROW_HEIGHT:
-            # Not laid out yet -- fall back to the last height we knew
-            # was real, rather than wrapping at effectively zero.
-            height = self._last_good_height or height
-        else:
-            self._last_good_height = height
-        rows_per_col = max(1, height // self.ROW_HEIGHT)
+        n = len(self._entries)
+        # Column count now derives from entry count alone (capped at
+        # MAX_ROWS_PER_COL rows/column), not from self.height() -- makes
+        # the layout deterministic regardless of whether the widget has
+        # been shown/resized yet.
+        rows_per_col = max(1, min(self.MAX_ROWS_PER_COL, n))
         for i, w in enumerate(self._entries):
             col, row = divmod(i, rows_per_col)
             self._grid.addWidget(w, row, col)
@@ -11043,6 +11212,8 @@ class PluginWidget(QWidget):
             s.setValue('pca_arrow_color',   self.state.pca_arrow_color)
             s.setValue('pca_axis_fontsize', self.state.pca_axis_fontsize)
             s.setValue('pca_show_grid',     self.state.pca_show_grid)
+            s.setValue('pca_label_loadings', self.state.pca_label_loadings)
+            s.setValue('pca_label_points',   self.state.pca_label_points)
             # Item 13 phase 2
             s.setValue('testing_group_selection', list(self.state.testing_group_selection))
             s.setValue('contrast_mode',     self.state.contrast_mode)
@@ -11307,6 +11478,12 @@ class PluginWidget(QWidget):
             pca_show_grid = s.value('pca_show_grid', None)
             if pca_show_grid is not None:
                 self.state.pca_show_grid = pca_show_grid in (True, 'true', 'True', 1, '1')
+            pca_label_loadings = s.value('pca_label_loadings', None)
+            if pca_label_loadings is not None:
+                self.state.pca_label_loadings = pca_label_loadings in (True, 'true', 'True', 1, '1')
+            pca_label_points = s.value('pca_label_points', None)
+            if pca_label_points is not None:
+                self.state.pca_label_points = pca_label_points in (True, 'true', 'True', 1, '1')
             cov_cols = list(s.value('covariate_columns', []))
             cov_repr = s.value('covariates', '')
             if cov_cols:
