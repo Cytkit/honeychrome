@@ -299,6 +299,47 @@ def update_cluster_id_suggestions(controller, state, run_id: str,
             break
 
 
+def save_marker_summary(controller, state, run_id: str, summary: dict) -> None:
+    """
+    Persist Cluster Annotation's Marker MFI heatmap + ridgeline grid for an
+    already-archived clustering run -- same "update after the fact" pattern
+    as update_cluster_id_suggestions() above, needed for the same reason:
+    these are computed in a LATER step ("Recompute Marker Summary") than
+    archive_clustering_run() itself.
+
+    summary keys: 'is_dark' (bool, the theme these figures were rendered
+    for), 'channels', 'cluster_order', 'names_map', 'colors_map', and the
+    five matplotlib Figures ('main_fig', 'col_fig', 'row_fig', 'cbar_fig',
+    'ridge_fig'). Deliberately does NOT include the pooled per-event arrays
+    that fed them -- those are reconstructible from the run's own already-
+    archived 'marker_values' snapshot, and would roughly double this
+    payload's size for data that's only needed on a theme change.
+
+    Each value is probed with pickle.dumps() before being written, same
+    defensive pattern _save_model_sidecar() already uses elsewhere -- a
+    Figure that turns out not to be picklable (e.g. one still attached to
+    a Qt canvas) just means this run falls back to on-demand recompute next
+    time, not a crash. Figures passed in here MUST be canvas-less (call
+    this before attaching them to any FigureCanvasQTAgg) or the probe will
+    fail for all of them.
+    """
+    safe_summary = {}
+    for key, value in summary.items():
+        try:
+            pickle.dumps(value)
+            safe_summary[key] = value
+        except Exception as exc:
+            log.warning("marker summary: skipping '%s' for run %s (not picklable: %s)",
+                        key, run_id, exc)
+    payload = load_run_payload(controller, run_id) or {}
+    payload['marker_summary'] = safe_summary or None
+    save_run_payload(controller, run_id, payload)
+    for entry in state.clustering_runs:
+        if entry.get('run_id') == run_id:
+            entry['marker_summary'] = payload['marker_summary']
+            break
+
+
 def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
                             colors, names, n_clusters, gates,
                             training_sample_ids, channels, params,
@@ -346,6 +387,11 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
         'mem_labels': {},
         'cell_type_suggestions': None,
         'tree_data': tree_data,
+        # Marker Heatmap/Ridgeline figures -- also computed in a later
+        # step (Cluster Annotation's "Recompute Marker Summary"), same
+        # placeholder-now / filled-in-later pattern. See
+        # save_marker_summary().
+        'marker_summary': None,
     })
 
     entry = _manifest_entry(
@@ -365,6 +411,7 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
     full_entry['mem_labels'] = {}
     full_entry['cell_type_suggestions'] = None
     full_entry['tree_data'] = tree_data
+    full_entry['marker_summary'] = None
     state.clustering_runs.append(full_entry)
     log.info("archived clustering run %r (run_id=%s, %s cluster(s))",
              run_label, run_id, n_clusters)
@@ -464,4 +511,5 @@ def hydrate_run(controller, entry: dict) -> dict:
         entry['dr_positions'] = payload.get('dr_positions', {})
         entry['mem_labels'] = payload.get('mem_labels', {})
         entry['cell_type_suggestions'] = payload.get('cell_type_suggestions')
+        entry['marker_summary'] = payload.get('marker_summary')
     return entry

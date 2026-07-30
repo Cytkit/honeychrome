@@ -4892,7 +4892,14 @@ class GroupsStatsTab(QWidget):
                 or self.state.counts_results is not None):
             if (not self._last_drawn_cluster_names or
                     dict(self.state.cluster_names) != self._last_drawn_cluster_names):
+                _log.info("GroupsStatsTab.refresh: calling _draw_results() "
+                          "(last_drawn=%r stats_comparisons=%d)",
+                          self._last_drawn_cluster_names, len(self.state.stats_comparisons))
                 self._draw_results()
+            else:
+                _log.info("GroupsStatsTab.refresh: SKIPPING _draw_results() -- "
+                          "_last_drawn_cluster_names (%r) already matches current state",
+                          self._last_drawn_cluster_names)
 
         # Confusion Matrix / Composition Barplot are independent of Run
         # Statistics and of each other — redraw each once per load if its
@@ -6545,6 +6552,8 @@ class GroupsStatsTab(QWidget):
             # A build is already in flight -- don't start a second one
             # against a moving target; remember to redraw once more as
             # soon as this one finishes instead.
+            _log.info("_draw_results: a build is already in flight -- "
+                      "deferring (setting _results_draw_pending=True)")
             self._results_draw_pending = True
             return
 
@@ -6560,10 +6569,17 @@ class GroupsStatsTab(QWidget):
 
         self._refresh_viewing_comparison_combo()
         if not self.state.stats_comparisons:
+            _log.info("_draw_results: state.stats_comparisons is empty -- nothing to draw")
             return
         view_idx = max(0, self.viewing_comparison_combo.currentIndex())
         name_a, name_b = self.state.stats_comparisons[view_idx]
         run_label = self.state.stats_run_label or 'Active (unsaved)'
+        _log.info("_draw_results: building comparison %r vs %r, run_label=%r "
+                  "(freq_results=%s mfi_results=%s counts_results=%s)",
+                  name_b, name_a, run_label,
+                  self.state.freq_results is not None,
+                  self.state.mfi_results is not None,
+                  self.state.counts_results is not None)
         pval_threshold = self.pval_spin.value()
         fc_threshold = self.fc_spin.value()
 
@@ -6695,6 +6711,9 @@ class GroupsStatsTab(QWidget):
         _ResultsDrawWorker.finished.
         """
         self._results_draw_worker = None
+        _log.info("_on_results_figures_built: received %d entry/entries: %r",
+                  len(payload), {k: ('ok' if v['error'] is None else v['error'])
+                                 for k, v in payload.items()})
         for key, item in payload.items():
             if item['error'] is not None:
                 tab = QLabel(f"{item['title']} error: {item['error']}")
@@ -9623,6 +9642,7 @@ class ClusterAnnotationTab(QWidget):
         if cache:
             self._populate_violin_channel_combo(cache['channels'])
             self._draw_current_violin()
+        self._restore_marker_summary_from_archive(run_id, self._selected_cluster_run())
         if self.annotation_sub_tabs.currentIndex() == getattr(self, '_marker_summary_tab_index', -1):
             ms_cache = self._marker_summary_cache.get(run_id)
             if ms_cache:
@@ -9744,8 +9764,9 @@ class ClusterAnnotationTab(QWidget):
                 "Select a clustering run and channel(s) to plot violins."
             )
         # Marker Summary sub-tab (Items 4/5): only touch it if it's the
-        # currently visible sub-tab — same lazy-when-visible rule
+        # currently visible sub-tab -- same lazy-when-visible rule
         # _on_annotation_sub_tab_changed uses.
+        self._restore_marker_summary_from_archive(run_id, cl_run)
         if self.annotation_sub_tabs.currentIndex() == getattr(self, '_marker_summary_tab_index', -1):
             ms_cache = self._marker_summary_cache.get(run_id)
             if ms_cache:
@@ -10613,6 +10634,28 @@ class ClusterAnnotationTab(QWidget):
         self._rebuild_map_legend(cl_run)
         self._populate_label_table()
 
+    def _restore_marker_summary_from_archive(self, run_id, cl_run: dict | None):
+        """
+        If *cl_run* carries a persisted Marker Summary
+        (drc_run_archive.save_marker_summary) and it isn't already in the
+        in-memory cache, populate the cache from it -- restores the
+        already-rendered heatmap/ridgeline figures after reopening the
+        experiment, without repeating the ~10s ridgeline build. cl_run is
+        already hydrated by _selected_cluster_run(), so this is just a
+        dict copy, no disk I/O of its own beyond what hydrate_run() did.
+
+        Deliberately does NOT restore a 'pooled' key -- only the rendered
+        figures are archived (see save_marker_summary's docstring), so a
+        later theme change against a purely-restored cache entry falls
+        back to a full repool (see _draw_marker_summary).
+        """
+        if run_id is None or run_id in self._marker_summary_cache or not cl_run:
+            return
+        saved = cl_run.get('marker_summary')
+        if not saved:
+            return
+        self._marker_summary_cache[run_id] = dict(saved)
+
     def _on_annotation_sub_tab_changed(self, index: int):
         """Lazily compute the Marker Summary sub-tab only when it becomes
         visible, and only if this run hasn't been computed yet -- same
@@ -10620,6 +10663,7 @@ class ClusterAnnotationTab(QWidget):
         if index != getattr(self, '_marker_summary_tab_index', -1):
             return
         run_id = self.run_combo.currentData()
+        self._restore_marker_summary_from_archive(run_id, self._selected_cluster_run())
         if run_id in self._marker_summary_cache:
             self._draw_marker_summary()
         elif run_id is not None:
@@ -10675,19 +10719,44 @@ class ClusterAnnotationTab(QWidget):
         if not success:
             self._show_marker_summary_placeholder(f"Failed to compute marker summary: {error}")
             return
+        is_dark = _resolve_is_dark(self.state)
         self._marker_summary_cache[run_id] = {
             'channels': payload['channels'],
             'cluster_order': payload['cluster_order'],
             'pooled': payload['pooled'],
             'names_map': payload['names_map'],
             'colors_map': payload['colors_map'],
+            'is_dark': is_dark,
+            'main_fig': payload['main_fig'],
+            'col_fig': payload['col_fig'],
+            'row_fig': payload['row_fig'],
+            'cbar_fig': payload['cbar_fig'],
+            'ridge_fig': payload['ridge_fig'],
         }
+        # Persist the rendered figures to this run's own archive entry --
+        # MUST happen before _apply_marker_summary_figures below attaches
+        # each Figure to a Qt canvas (FigureCanvasQTAgg isn't picklable),
+        # so a reopened experiment can restore the already-rendered
+        # heatmap/ridgeline instead of repeating the ~10s build.
+        drc_run_archive.save_marker_summary(self.controller, self.state, run_id, {
+            'is_dark': is_dark,
+            'channels': payload['channels'],
+            'cluster_order': payload['cluster_order'],
+            'names_map': payload['names_map'],
+            'colors_map': payload['colors_map'],
+            'main_fig': payload['main_fig'],
+            'col_fig': payload['col_fig'],
+            'row_fig': payload['row_fig'],
+            'cbar_fig': payload['cbar_fig'],
+            'ridge_fig': payload['ridge_fig'],
+        })
         if self.run_combo.currentData() != run_id:
             # The user switched to a different run while this was
-            # computing -- the result is cached for later, but don't draw
-            # it over whatever run is now actually selected.
+            # computing -- the result is cached (and now archived) for
+            # later, but don't draw it over whatever run is now actually
+            # selected.
             return
-        self._marker_summary_last_drawn = (run_id, _resolve_is_dark(self.state))
+        self._marker_summary_last_drawn = (run_id, is_dark)
         self._apply_marker_summary_figures(
             payload['main_fig'], payload['col_fig'], payload['row_fig'],
             payload['cbar_fig'], payload['ridge_fig'],
@@ -10721,15 +10790,34 @@ class ClusterAnnotationTab(QWidget):
             # rebuild two matplotlib figures from scratch every time.
             return
 
-        # Item 3 -- figure construction from already-pooled data still
-        # goes through the background worker (skipping the pooling step,
-        # since 'pooled' is passed straight through) so a big ridge grid
-        # can't block the UI just from switching back to a cached run.
-        cl_run = self._selected_cluster_run() or {}
-        self._start_marker_summary_worker(
-            cl_run, cache['channels'], cache['cluster_order'], None,
-            pooled=cache['pooled'], run_id=run_id,
-        )
+        if cache.get('main_fig') is not None and cache.get('is_dark') == is_dark:
+            # Figures already exist for this run at the CURRENT theme --
+            # either built earlier this session or restored from this
+            # run's archived payload (drc_run_archive.save_marker_summary)
+            # -- reuse them directly instead of rebuilding via the worker.
+            self._marker_summary_last_drawn = draw_key
+            self._apply_marker_summary_figures(
+                cache['main_fig'], cache['col_fig'], cache['row_fig'],
+                cache['cbar_fig'], cache['ridge_fig'],
+            )
+            return
+
+        if cache.get('pooled') is not None:
+            # Item 3 -- figure construction from already-pooled data still
+            # goes through the background worker (skipping the pooling
+            # step, since 'pooled' is passed straight through) so a big
+            # ridge grid can't block the UI just from a theme switch.
+            cl_run = self._selected_cluster_run() or {}
+            self._start_marker_summary_worker(
+                cl_run, cache['channels'], cache['cluster_order'], None,
+                pooled=cache['pooled'], run_id=run_id,
+            )
+        else:
+            # This entry came from the archive (figures only, no pooled
+            # arrays -- see save_marker_summary's docstring) and the
+            # theme no longer matches what was rendered -- needs a full
+            # repool, same cost as the very first view of this run.
+            self._recompute_marker_summary()
 
     def _apply_marker_summary_figures(self, main_fig, col_fig, row_fig, cbar_fig, ridge_fig):
         dpi = main_fig.get_dpi()
@@ -11876,11 +11964,13 @@ class PluginWidget(QWidget):
         path.parent.mkdir(parents=True, exist_ok=True)
         _log.info(
             "_save_model_sidecar: writing %s -- freq_results=%s mfi_results=%s "
-            "counts_results=%s stats_run_id=%r sample_groups=%d group_names=%r",
+            "counts_results=%s stats_comparisons=%d stats_run_id=%r "
+            "sample_groups=%d group_names=%r",
             path,
             self.state.freq_results is not None,
             self.state.mfi_results is not None,
             self.state.counts_results is not None,
+            len(self.state.stats_comparisons),
             self.state.stats_run_id,
             len(self.state.sample_groups),
             list(self.state.group_names),
@@ -11898,8 +11988,10 @@ class PluginWidget(QWidget):
             ('freq_df',           self.state.freq_df),
             ('counts_df',         self.state.counts_df),
             ('mfi_df',            self.state.mfi_df),
+            ('mfi_sample_df',     self.state.mfi_sample_df),
             ('stats_all_rel',     self.state.stats_all_rel),
             ('stats_group_vec',   self.state.stats_group_vec),
+            ('stats_comparisons', self.state.stats_comparisons),
             ('stats_run_label',   self.state.stats_run_label),
             ('stats_run_id',      self.state.stats_run_id),
             ('confusion_df',          self.state.confusion_df),
@@ -11910,6 +12002,12 @@ class PluginWidget(QWidget):
             ('composition_group_var', self.state.composition_group_var),
             ('composition_run_label', self.state.composition_run_label),
             ('composition_names',     self.state.composition_names),
+            ('pca_scores_df',           self.state.pca_scores_df),
+            ('pca_loadings_df',         self.state.pca_loadings_df),
+            ('pca_explained_variance',  self.state.pca_explained_variance),
+            ('pca_run_label',           self.state.pca_run_label),
+            ('pca_groups',              self.state.pca_groups),
+            ('pca_sources',             self.state.pca_sources),
         ):
             try:
                 pickle.dumps(obj)   # probe before writing
@@ -11981,10 +12079,14 @@ class PluginWidget(QWidget):
                 self.state.counts_df = payload['counts_df']
             if isinstance(payload.get('mfi_df'), pd.DataFrame):
                 self.state.mfi_df = payload['mfi_df']
+            if isinstance(payload.get('mfi_sample_df'), pd.DataFrame):
+                self.state.mfi_sample_df = payload['mfi_sample_df']
             if isinstance(payload.get('stats_all_rel'), list):
                 self.state.stats_all_rel = payload['stats_all_rel']
             if isinstance(payload.get('stats_group_vec'), list):
                 self.state.stats_group_vec = payload['stats_group_vec']
+            if isinstance(payload.get('stats_comparisons'), list):
+                self.state.stats_comparisons = payload['stats_comparisons']
             if isinstance(payload.get('confusion_df'), pd.DataFrame):
                 self.state.confusion_df = payload['confusion_df']
             if isinstance(payload.get('confusion_run_label'), str):
@@ -12001,6 +12103,18 @@ class PluginWidget(QWidget):
                 self.state.composition_run_label = payload['composition_run_label']
             if isinstance(payload.get('composition_names'), dict):
                 self.state.composition_names = payload['composition_names']
+            if isinstance(payload.get('pca_scores_df'), pd.DataFrame):
+                self.state.pca_scores_df = payload['pca_scores_df']
+            if isinstance(payload.get('pca_loadings_df'), pd.DataFrame):
+                self.state.pca_loadings_df = payload['pca_loadings_df']
+            if isinstance(payload.get('pca_explained_variance'), tuple):
+                self.state.pca_explained_variance = payload['pca_explained_variance']
+            if isinstance(payload.get('pca_run_label'), str):
+                self.state.pca_run_label = payload['pca_run_label']
+            if isinstance(payload.get('pca_groups'), list):
+                self.state.pca_groups = payload['pca_groups']
+            if isinstance(payload.get('pca_sources'), list):
+                self.state.pca_sources = payload['pca_sources']
             if isinstance(payload.get('stats_run_label'), str):
                 self.state.stats_run_label = payload['stats_run_label']
             if isinstance(payload.get('stats_run_id'), str):
