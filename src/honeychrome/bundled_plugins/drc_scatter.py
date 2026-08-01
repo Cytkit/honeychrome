@@ -20,7 +20,6 @@ single shared dict.
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QMessageBox
 
 import drc_run_archive

@@ -54,7 +54,7 @@ import pandas as pd
 from sklearn.decomposition import PCA
 
 import drc_pipeline
-from drc_logging import get_logger, log_stage, log_files
+from drc_logging import get_logger, log_stage
 
 log = get_logger(__name__)
 
