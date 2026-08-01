@@ -3020,17 +3020,6 @@ class TransformTab(QWidget):
         tr = self._transforms[channel]
         self.xform_type_label.setText(self._XFORM_LABELS.get(tr.id, str(tr.id)))
 
-        # Debug: print current transform parameters for this channel
-        print(f"\n[DR TransformTab] Active channel: {channel}")
-        print(f"  id={tr.id}  ({self._XFORM_LABELS.get(tr.id, '?')})")
-        print(f"  T (scale_t)   = {tr.scale_t}")
-        print(f"  W (logicle_w) = {tr.logicle_w}")
-        print(f"  M (logicle_m) = {tr.logicle_m}  [stored in Transform]")
-        print(f"  M (from PnR)  = {self._compute_M():.4f}  [log10(magnitude_ceiling)]")
-        print(f"  A (logicle_a) = {tr.logicle_a}")
-        print(f"  limits        = {tr.limits}")
-        print(f"  zero          = {tr.zero}")
-
         self._configure_hist_axes()
         self._configure_tile_axes_all()
         self._schedule_redraw()
@@ -3222,7 +3211,6 @@ class TransformTab(QWidget):
             if map_pos < 0.5 * vmax:
                 tr.logicle_w = max(0.01, tr.logicle_w / factor)
                 tr.set_transform()
-                print(f"[DR TransformTab] {channel}: W adjusted → {tr.logicle_w:.4f}")
             else:
                 new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
                 new_min = (vmin - axis.zoomZero) * factor + axis.zoomZero
@@ -3277,7 +3265,6 @@ class TransformTab(QWidget):
             if map_pos < 0.5 * vmax:
                 tr.logicle_w = max(0.01, tr.logicle_w / factor)
                 tr.set_transform()
-                print(f"[DR TransformTab] {ch}: W adjusted via hist axis → {tr.logicle_w:.4f}")
             else:
                 new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
                 new_min = (vmin - axis.zoomZero) * factor + axis.zoomZero
@@ -3378,7 +3365,6 @@ class TransformTab(QWidget):
                 writer = csv.DictWriter(f, fieldnames=['channel', 'id', 'T', 'W', 'M', 'A'])
                 writer.writeheader()
                 writer.writerows(rows)
-            print(f"[DR TransformTab] Saved {len(rows)} channel transforms → {path}")
             QMessageBox.information(
                 self, "Save Transforms",
                 f"Saved {len(rows)} channels to:\n{path}"
@@ -3503,7 +3489,6 @@ class TransformTab(QWidget):
                 f"\nSkipped {len(skipped_invalid)} invalid row(s):\n"
                 + ", ".join(skipped_invalid[:10])
             )
-        print(f"[DR TransformTab] CSV load: {'  '.join(msg_parts)}")
         QMessageBox.information(self, "Load Transforms", "".join(msg_parts))
 
         if updated:
@@ -6241,46 +6226,6 @@ class GroupsStatsTab(QWidget):
         self._stamp_run_label(fig, run_label)
         return fig
 
-    def _limma_test(
-        self,
-        data_df: 'pd.DataFrame',
-        group_vec: list[str],
-        pval_threshold: float,
-        fc_threshold: float,
-    ) -> 'pd.DataFrame':
-        """
-        Run limma lmFit + eBayes + topTable on *data_df*.
-
-        data_df  : rows = samples, columns = features (clusters / channel-clusters)
-        group_vec: list of 'A' or 'B' per row
-
-        Returns a DataFrame with columns:
-            feature, logFC, AveExpr, t, P.Value, adj.P.Val, B, significant
-        """
-        from inmoose.limma import lmFit, eBayes, topTable
-
-        n = len(group_vec)
-        design = np.zeros((n, 2), dtype=float)
-        for i, g in enumerate(group_vec):
-            design[i, 0] = 1.0          # intercept (group A baseline)
-            design[i, 1] = 1.0 if g == 'B' else 0.0
-
-        # inmoose expects (features × samples) as a numpy array
-        expr = data_df.values.T.astype(float)   # (n_features, n_samples)
-
-        fit = lmFit(expr, design)
-        fit = eBayes(fit)
-        n_features = expr.shape[0]
-        tt = topTable(fit, coef=1, number=n_features, sort_by='p')
-
-        tt = tt.reset_index(drop=True)
-        tt.insert(0, 'feature', data_df.columns.tolist()[:n_features])
-        tt['significant'] = (
-            (tt['adj.P.Val'] <= pval_threshold) &
-            (tt['logFC'].abs() >= fc_threshold)
-        )
-        return tt
-
     def _on_stats_finished(self, success: bool, error_msg: str, data_key=None):
         self._stats_worker = None
         self.run_stats_btn.setEnabled(True)
@@ -7223,9 +7168,6 @@ class GroupsStatsTab(QWidget):
         ax.set_xlabel("log2 Fold Change")
         ax.set_ylabel("-log10(adj. P-value)")
         display_title = title
-        #if n_sig_total > _MAX_STATIC_LABELS:
-        #    display_title = (f"{title}  (top {_MAX_STATIC_LABELS} of {n_sig_total} "
-        #                     f"labelled; hover any point for its name)")
         ax.set_title(display_title, fontsize=10)
         _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
@@ -12668,19 +12610,6 @@ class PluginWidget(QWidget):
             return None
         data, _bounds = result
         return data
-
-    def _logicle_transform_array(self, data: np.ndarray, sample=None) -> np.ndarray:
-        """
-        Apply each selected channel's configured transform and return a
-        float32 (n_events, n_selected) feature matrix.
-
-        Delegates to drc_pipeline.transform_selected_channels, which builds the
-        channel→column map from the full unmixed channel list (no index shift)
-        and uses the FlowKit 1.3.0 transform signature with no arcsinh fallback.
-        """
-        return drc_pipeline.transform_selected_channels(
-            self.controller, self.state, data
-        )
 
     def _get_sample_data(self, rel_path: str, algo: str, af_state=None) -> np.ndarray | None:
         """
