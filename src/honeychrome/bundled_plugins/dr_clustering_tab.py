@@ -53,6 +53,12 @@ Stage 6 — Groups & Stats (complete):
 Stage 7 — Advanced workspace (complete):
   T-REX scatter colouring, per-cluster colour pickers (right-click), magic-wand
   display-config copy/paste, multi-page PDF export.
+
+Stage 8 — Report tab (complete):
+  ReportTab (drc_report.py): per-source-tab tick-lists (Workspace, Cluster
+  Annotation, Stats), PNG/CSV export per item into a timestamped run
+  folder, one combined PDF, and an always-generated settings.txt
+  documenting how to reproduce the analysis.
 """
 
 # ---------------------------------------------------------------------------
@@ -184,13 +190,13 @@ import numpy as np
 import pandas as pd
 
 from PySide6.QtCore import Qt, QTimer, QSettings, QEvent, QRectF, QThread, Signal, QSize
-from PySide6.QtGui import QPen, QColor, QPalette
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
     QPushButton, QLabel, QComboBox, QGroupBox,
     QCheckBox, QSpinBox, QDoubleSpinBox, QRadioButton,
-    QButtonGroup, QListWidget, QListWidgetItem, QListView,
-    QAbstractItemView, QSplitter, QFrame, QGridLayout, QDoubleSpinBox,
+    QButtonGroup, QListWidget, QListWidgetItem,
+    QAbstractItemView, QSplitter, QFrame, QGridLayout,
     QLineEdit, QFileDialog, QMessageBox, QSizePolicy,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QColorDialog, QProgressBar,
@@ -202,9 +208,7 @@ from honeychrome.controller_components.functions import (
     apply_gates_in_place,
 )
 from honeychrome.controller_components.transform import Transform
-from honeychrome.view_components.busy_cursor import with_busy_cursor
 from honeychrome.view_components.clear_layout import clear_layout
-from honeychrome.view_components.exportable_plot_widget import ExportablePlotWidget
 from honeychrome.view_components.ordered_multi_sample_picker import OrderedMultiSamplePicker
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 import honeychrome.settings as hc_settings
@@ -228,6 +232,7 @@ import drc_run_archive
 import drc_gate_tree
 import drc_scatter
 import drc_cluster_id
+import drc_report
 
 _log = drc_logging.get_logger(__name__)
 
@@ -744,24 +749,6 @@ def _non_control_sample_paths(controller) -> list[str]:
     excluded = set(samples.get('single_stain_controls', []) or []) \
              | set(samples.get('unstained_samples', []) or [])
     return [sp for sp in all_samples if sp not in excluded]
-
-
-def _downsample(data: np.ndarray, n: int, rng=None) -> np.ndarray:
-    """
-    Return a random subset of *n* rows from *data*.
-    If data has fewer than *n* rows, return data unchanged.
-
-    Parameters
-    ----------
-    data : np.ndarray  shape (n_events, n_channels)
-    n    : int         target number of events
-    rng  : np.random.Generator | None
-    """
-    if len(data) <= n:
-        return data
-    rng = rng or np.random.default_rng()
-    idx = rng.choice(len(data), size=n, replace=False)
-    return data[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -3813,6 +3800,13 @@ class GroupsStatsTab(QWidget):
         # rather than a second worker starting against a moving target).
         self._results_draw_worker = None
         self._results_draw_pending = False
+        # {key: {'title', 'maker', 'maker_kwargs'}} -- mirrors whatever's
+        # currently open in self._results_tabs, kept in sync by
+        # _add_results_tab / _remove_results_tab_by_key /
+        # _on_results_tab_close_requested. Lets the Report tab regenerate
+        # a fresh Figure/DataFrame for any open result without duplicating
+        # the maker logic -- see get_report_items().
+        self._results_registry: dict[str, dict] = {}
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -6441,6 +6435,9 @@ class GroupsStatsTab(QWidget):
         container = QWidget()
         if key is not None:
             container.setProperty('_tab_key', key)
+            self._results_registry[key] = dict(
+                title=tab_title, maker=maker, maker_kwargs=maker_kwargs,
+            )
         vbox = QVBoxLayout(container)
         vbox.setContentsMargins(4, 4, 4, 4)
         vbox.setSpacing(4)
@@ -6460,9 +6457,37 @@ class GroupsStatsTab(QWidget):
         """Manually close any results tab (Freq/MFI heatmap/volcano,
         Confusion Matrix, or Composition Barplot)."""
         widget = self._results_tabs.widget(index)
+        key = widget.property('_tab_key') if widget is not None else None
         self._results_tabs.removeTab(index)
         if widget is not None:
             widget.deleteLater()
+        if key is not None:
+            self._results_registry.pop(key, None)
+
+    def get_report_items(self) -> list:
+        """One drc_report.ReportItem per currently-open results tab
+        (Freq/Counts/MFI heatmap+volcano, Confusion Matrix, Composition,
+        Sample PCA) -- covers every result kind automatically since they
+        all go through _add_results_tab's maker/maker_kwargs registry."""
+        items = []
+        for i in range(self._results_tabs.count()):
+            widget = self._results_tabs.widget(i)
+            key = widget.property('_tab_key') if widget is not None else None
+            if key is None:
+                continue
+            entry = self._results_registry.get(key)
+            if entry is None:
+                continue
+            maker = entry['maker']
+            maker_kwargs = entry['maker_kwargs']
+            items.append(drc_report.ReportItem(
+                key=key,
+                tab='Stats',
+                label=entry['title'],
+                get_figure=lambda maker=maker, kwargs=maker_kwargs: maker(**kwargs),
+                get_tables=lambda kwargs=maker_kwargs: drc_report.tables_from_maker_kwargs(kwargs),
+            ))
+        return items
 
     def _has_results_tab(self, key: str) -> bool:
         """True if a results tab carrying this key is already showing —
@@ -6532,6 +6557,7 @@ class GroupsStatsTab(QWidget):
             if widget is not None and widget.property('_tab_key') == key:
                 self._results_tabs.removeTab(i)
                 widget.deleteLater()
+                self._results_registry.pop(key, None)
                 return
 
     def _draw_results(self):
@@ -7461,6 +7487,24 @@ class WorkspaceTab(QWidget):
         """Re-render all PlotCards from current PipelineState."""
         for card in self._plot_cards:
             card.refresh()
+
+    def get_report_items(self) -> list:
+        """One drc_report.ReportItem per PlotCard currently on the
+        canvas -- reuses each card's own get_figure() (already the
+        currently-displayed Figure), no separate rendering path."""
+        items = []
+        for card in self._plot_cards:
+            label = (
+                f"{card.plot_id}: {card.dr_combo.currentText()} · "
+                f"{card.sample_combo.currentText()} · {card.colour_mode_combo.currentText()}"
+            )
+            items.append(drc_report.ReportItem(
+                key=card.plot_id,
+                tab='Workspace',
+                label=label,
+                get_figure=card.get_figure,
+            ))
+        return items
 
 
 class PlotCard(QFrame):
@@ -11139,13 +11183,117 @@ class ClusterAnnotationTab(QWidget):
         _style_figure_theme(fig, is_dark)
         return fig
 
+    def _make_marker_heatmap_export_figure(self, run_id: str):
+        """
+        Single self-contained heatmap (axis-labelled, with an integrated
+        colour bar) for Report/PDF export -- unlike the on-screen frozen-
+        header split (main/col/row/cbar figs) used by
+        _apply_marker_summary_figures, which only makes sense inside the
+        live scrolling GUI.
+        """
+        from matplotlib.figure import Figure
+
+        cache = self._marker_summary_cache.get(run_id)
+        if not cache or not cache.get('pooled') or not cache.get('cluster_order'):
+            return None
+
+        channels = cache['channels']
+        cluster_order = cache['cluster_order']
+        names_map = cache['names_map']
+        transformed = self._transform_and_pool_matrix_values(cache['pooled'], channels, cluster_order)
+        mat = self._compute_marker_heatmap_matrix(transformed, channels, cluster_order)
+
+        is_dark = _resolve_is_dark(self.state)
+        labels = _antigen_dash_labels(self.controller)
+        n_channels = len(channels)
+        n_clusters = len(cluster_order)
+
+        fig = Figure(
+            figsize=(max(6.0, 0.5 * n_channels + 2), max(4.0, 0.35 * n_clusters + 1)),
+            constrained_layout=True,
+        )
+        gs = fig.add_gridspec(1, 2, width_ratios=[20, 1], wspace=0.05)
+        ax = fig.add_subplot(gs[0, 0])
+        cax = fig.add_subplot(gs[0, 1])
+
+        mat_filled = np.nan_to_num(mat, nan=0.0)
+        im = ax.imshow(mat_filled, aspect='auto', cmap='viridis')
+        ax.set_xticks(range(n_channels))
+        ax.set_xticklabels([labels.get(ch, ch) for ch in channels], rotation=45, ha='right', fontsize=8)
+        ax.set_yticks(range(n_clusters))
+        ax.set_yticklabels([names_map.get(cl, str(cl)) for cl in cluster_order], fontsize=8)
+        ax.set_title('Median MFI per Cluster (Transformed)', fontsize=11)
+        fig.colorbar(im, cax=cax, label='Median transformed MFI')
+        _style_figure_theme(fig, is_dark, axes=[ax])
+        return fig
+
+    def get_report_items(self) -> list:
+        """
+        drc_report.ReportItems for the currently selected clustering run:
+        the Cluster Map, one violin plot per checked channel (from the
+        already-pooled violin cache), the Marker Heatmap + Ridgeline (if
+        Marker Summary has been computed for this run), and the Cluster
+        Label table.
+        """
+        items = []
+        cl_run = self._selected_cluster_run()
+        if cl_run is None:
+            return items
+        run_id = self.run_combo.currentData()
+        run_label = self.run_combo.currentText()
+
+        items.append(drc_report.ReportItem(
+            key='cluster_map',
+            tab='Cluster Annotation',
+            label=f"Cluster Map ({run_label})",
+            get_figure=lambda: self._map_figure,
+        ))
+
+        violin_cache = self._violin_cache.get(run_id)
+        if violin_cache and violin_cache.get('pooled'):
+            labels_map = _antigen_dash_labels(self.controller)
+            for ch in violin_cache['channels']:
+                items.append(drc_report.ReportItem(
+                    key=f'violin_{ch}',
+                    tab='Cluster Annotation',
+                    label=f"Violin: {labels_map.get(ch, ch)}",
+                    get_figure=lambda ch=ch, cache=violin_cache: self._make_single_violin_figure(
+                        ch, cache['pooled'].get(ch, {}), cache['names_map'], cache.get('colors_map', {}),
+                    ),
+                ))
+
+        summary_cache = self._marker_summary_cache.get(run_id)
+        if summary_cache and summary_cache.get('pooled'):
+            items.append(drc_report.ReportItem(
+                key='marker_heatmap',
+                tab='Cluster Annotation',
+                label=f"Marker Heatmap ({run_label})",
+                get_figure=lambda rid=run_id: self._make_marker_heatmap_export_figure(rid),
+            ))
+            items.append(drc_report.ReportItem(
+                key='marker_ridgeline',
+                tab='Cluster Annotation',
+                label=f"Marker Ridgeline ({run_label})",
+                get_figure=lambda cache=summary_cache: cache['ridge_fig'],
+            ))
+
+        items.append(drc_report.ReportItem(
+            key='cluster_label_table',
+            tab='Cluster Annotation',
+            label=f"Cluster Labels ({run_label})",
+            get_tables=lambda: {'cluster_labels': drc_report.qtable_to_dataframe(self.label_table)},
+        ))
+
+        return items
+
 
 class PluginWidget(QWidget):
     """
     Top-level plugin widget.
 
     Inserted as a tab in the Honeychrome main window by plugin_loaders.py.
-    Owns the PipelineState and all four inner tabs.
+    Owns the PipelineState and all six inner tabs (Transforms,
+    Configuration, Cluster Annotation, Stats, Workspace, Report).
 
     The outer layer follows the exact pattern of the Honeychrome example
     plugin: a disabled-label shown when unmixing is not yet available,
@@ -11245,12 +11393,22 @@ class PluginWidget(QWidget):
         self.groups_stats_tab = GroupsStatsTab(self.state, bus, controller)
         self.workspace_tab = WorkspaceTab(self.state, bus, controller)
         self.cluster_annotation_tab = ClusterAnnotationTab(self.state, bus, controller)
+        # Built last -- holds references to the four tabs above so it can
+        # enumerate their currently-rendered plots/tables (see
+        # drc_report.ReportTab.get_report_items callers).
+        self.report_tab = drc_report.ReportTab(
+            self.state, bus, controller,
+            workspace_tab=self.workspace_tab,
+            groups_stats_tab=self.groups_stats_tab,
+            cluster_annotation_tab=self.cluster_annotation_tab,
+        )
 
         self.inner_tabs.addTab(self.transform_tab,    "Transforms")
         self.inner_tabs.addTab(self.config_tab,       "Configuration")
         self.inner_tabs.addTab(self.cluster_annotation_tab, "Cluster Annotation")
         self.inner_tabs.addTab(self.groups_stats_tab, "Stats")
         self.inner_tabs.addTab(self.workspace_tab,    "Workspace")
+        self.inner_tabs.addTab(self.report_tab,       "Report")
 
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
 
@@ -11300,6 +11458,8 @@ class PluginWidget(QWidget):
                 card._populate_selectors()
         if hasattr(self, 'cluster_annotation_tab'):
             self.cluster_annotation_tab.refresh()
+        if hasattr(self, 'report_tab'):
+            self.report_tab.refresh()
 
     def initialise_gui(self, mode: str):
         """
@@ -12434,6 +12594,8 @@ class PluginWidget(QWidget):
                 len(s.plot_configs),
                 s.workspace_n_columns, s.plot_theme,
             )
+        elif index == 5:    # ReportTab -- cheap to rebuild; always refresh
+            return None
         return None
 
     def _refresh_tab_at(self, index: int):
@@ -12457,6 +12619,7 @@ class PluginWidget(QWidget):
             self.cluster_annotation_tab,
             self.groups_stats_tab,
             self.workspace_tab,
+            self.report_tab,
         ]
         if 0 <= index < len(tabs):
             tab = tabs[index]
