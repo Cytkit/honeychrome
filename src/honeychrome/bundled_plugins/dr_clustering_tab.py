@@ -9240,6 +9240,13 @@ class _WrappingLegendWidget(QWidget):
     is 0/unreliable the first time set_entries() runs (e.g. inside a
     not-yet-shown pop-out QDialog, before dlg.show()), previously
     collapsing every entry into its own column instead of wrapping.
+
+    sizeHint()/minimumSizeHint() reflect the ACTUAL flowed size (computed
+    in _reflow, cached in _cached_size) rather than a fixed placeholder --
+    the containing QScrollArea has setWidgetResizable(True), so a
+    hardcoded small hint was making it shrink this widget down to the
+    viewport width, squeezing every column's swatch+label into that
+    width and clipping the name labels.
     """
     ROW_HEIGHT = 20
     MAX_ROWS_PER_COL = 20
@@ -9251,6 +9258,7 @@ class _WrappingLegendWidget(QWidget):
         self._grid.setContentsMargins(2, 2, 2, 2)
         self._grid.setSpacing(4)
         self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._cached_size = QSize(90, self.ROW_HEIGHT)
 
     def set_entries(self, entries: list[QWidget]):
         """Replace the displayed rows and re-flow into columns."""
@@ -9263,10 +9271,10 @@ class _WrappingLegendWidget(QWidget):
         self._reflow()
 
     def sizeHint(self):
-        return QSize(90, self.ROW_HEIGHT)
+        return self._cached_size
 
     def minimumSizeHint(self):
-        return QSize(60, self.ROW_HEIGHT)
+        return self._cached_size
 
     def resizeEvent(self, event):
         self._reflow()
@@ -9283,9 +9291,27 @@ class _WrappingLegendWidget(QWidget):
         # the layout deterministic regardless of whether the widget has
         # been shown/resized yet.
         rows_per_col = max(1, min(self.MAX_ROWS_PER_COL, n))
+        ncols = (n + rows_per_col - 1) // rows_per_col
+        col_widths = [0] * ncols
         for i, w in enumerate(self._entries):
             col, row = divmod(i, rows_per_col)
             self._grid.addWidget(w, row, col)
+            # sizeHint here needs the label's natural (unclipped) width --
+            # ensure the row widget hasn't been squashed by a previous
+            # reflow before we measure it.
+            w.setMinimumWidth(0)
+            col_widths[col] = max(col_widths[col], w.sizeHint().width())
+
+        margins = self._grid.contentsMargins()
+        spacing = self._grid.spacing()
+        total_w = (margins.left() + margins.right()
+                   + sum(col_widths) + spacing * max(0, ncols - 1))
+        total_h = (margins.top() + margins.bottom()
+                   + rows_per_col * self.ROW_HEIGHT)
+        new_size = QSize(max(60, total_w), max(self.ROW_HEIGHT, total_h))
+        if new_size != self._cached_size:
+            self._cached_size = new_size
+            self.updateGeometry()
 
 class _MarkerSummaryWorker(QThread):
     """
