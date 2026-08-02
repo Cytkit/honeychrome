@@ -50,8 +50,11 @@ with open(os.path.join(HERE, 'af_kernel.c'), 'r') as f:
 
 use_openmp = os.environ.get('HONEYCHROME_OPENMP', '').strip() not in ('', '0', 'false', 'False')
 
-# On Linux, default to OpenMP on; on macOS, default off unless explicitly set
-if sys.platform.startswith('linux') and 'HONEYCHROME_OPENMP' not in os.environ:
+# Default to OpenMP on for both platforms unless explicitly disabled
+# (HONEYCHROME_OPENMP=0). The libomp check below already falls back to
+# single-threaded with a warning if libomp isn't installed, so there's no
+# need to gate the attempt behind an explicit opt-in.
+if 'HONEYCHROME_OPENMP' not in os.environ:
     use_openmp = True
 
 if sys.platform == 'win32':
