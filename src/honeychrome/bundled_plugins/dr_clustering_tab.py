@@ -413,6 +413,28 @@ def _antigen_dash_labels(controller) -> dict[str, str]:
         result[ch] = f'{antigen} - {ch}' if antigen else ch
     return result
 
+def _antigen_or_label_map(controller) -> dict[str, str]:
+    """
+    Map channel name -> antigen if assigned, else the channel/label itself.
+    Used where space is tight (MFI Volcano/Heatmap tick labels) and the
+    combined 'Antigen - Channel' format (_antigen_dash_labels) would be
+    too verbose.
+    """
+    try:
+        unmixed_pnn = controller.experiment.settings.get('unmixed', {}).get(
+            'event_channels_pnn') or []
+        spectral_model = controller.experiment.process.get('spectral_model') or []
+    except (AttributeError, KeyError):
+        return {}
+    label_to_antigen = {
+        c.get('label'): (c.get('antigen') or '') for c in spectral_model
+    }
+    result = {}
+    for ch in unmixed_pnn:
+        antigen = label_to_antigen.get(ch, '')
+        result[ch] = antigen if antigen else ch
+    return result
+
 def _resolve_is_dark(state: 'PipelineState') -> bool:
     """
     Whether plots should render with dark styling, given the Workspace
@@ -3120,7 +3142,7 @@ class TransformTab(QWidget):
             return
         labels = _antigen_dash_labels(self.controller)
         tile.configure_axes(self._transforms[x_ch], self._transforms[y_ch],
-                            x_label=labels.get(x_ch, x_ch), y_label=y_ch)
+                            x_label=labels.get(x_ch, x_ch), y_label=labels.get(y_ch, y_ch))
 
     def _configure_tile_axes_all(self):
         for tile in self._biplot_tiles:
@@ -6971,12 +6993,8 @@ class GroupsStatsTab(QWidget):
         samp_labels = [sample_labels[i] for i in col_order]
         grp_ord = [rel_to_group.get(sample_labels[i], name_a) for i in col_order]
 
-        # Same antigen display-label remap the per-cluster MFI heatmap uses.
-        from honeychrome.controller_components.functions import build_display_label_map
-        unmixed_pnn = self.controller.experiment.settings.get('unmixed', {}).get(
-            'event_channels_pnn') or []
-        spectral_model = self.controller.experiment.process.get('spectral_model') or []
-        disp_map = build_display_label_map(unmixed_pnn, spectral_model)
+        # Antigen-only remap, falling back to Label/channel name.
+        disp_map = _antigen_or_label_map(self.controller)
         feat_labels = [disp_map.get(f, f) for f in feat_labels]
 
         col_w, row_h, dend_h, grp_h, xlabel_h = 0.55, 0.30, 1.2, 0.18, 0.8
@@ -7152,25 +7170,6 @@ class GroupsStatsTab(QWidget):
         samp_labels = [sample_labels[i] for i in col_order]
         grp_ord     = [rel_to_group.get(sample_labels[i], name_a) for i in col_order]
 
-        # Remap MFI feature labels: replace channel suffix with antigen display label.
-        if 'MFI' in title:
-            from honeychrome.controller_components.functions import build_display_label_map
-            unmixed_pnn = self.controller.experiment.settings.get('unmixed', {}).get(
-                'event_channels_pnn') or []
-            spectral_model = self.controller.experiment.process.get('spectral_model') or []
-            disp_map = build_display_label_map(unmixed_pnn, spectral_model)
-            # Each feature is "{cluster_label}_{channel_name}"; channel_name may itself
-            # contain underscores, so match against the known channel set.
-            known_channels = set(disp_map.keys())
-            def _remap_feat(feat: str) -> str:
-                for ch in known_channels:
-                    suffix = f'_{ch}'
-                    if feat.endswith(suffix):
-                        cluster_part = feat[: -len(suffix)]
-                        return f'{cluster_part}_{disp_map[ch]}'
-                return feat
-            feat_labels = [_remap_feat(f) for f in feat_labels]
-
         # ---- Figure sizing ----
         col_w   = 0.55          # inches per sample column
         row_h   = 0.30          # inches per feature row
@@ -7308,6 +7307,20 @@ class GroupsStatsTab(QWidget):
             (results_df['P.Value'] <= pval_threshold) & (results_df['logFC'].abs() >= fc_threshold)
         ).values
         features = results_df['feature'].tolist()
+
+        # MFI features are "{cluster_label}_{channel}" -- remap the channel
+        # suffix to Antigen (falling back to Label) for point labels/hover.
+        if 'MFI' in title:
+            disp_map = _antigen_or_label_map(self.controller)
+            known_channels = set(disp_map.keys())
+            def _remap_feat(feat: str) -> str:
+                for ch in known_channels:
+                    suffix = f'_{ch}'
+                    if feat.endswith(suffix):
+                        cluster_part = feat[: -len(suffix)]
+                        return f'{cluster_part}_{disp_map[ch]}'
+                return feat
+            features = [_remap_feat(f) for f in features]
 
         fig = Figure(figsize=(5, 5), constrained_layout=True)
         ax  = fig.add_subplot(111)
