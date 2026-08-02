@@ -6,9 +6,12 @@ import pyqtgraph as pg
 
 
 import warnings
+import logging
 
 from honeychrome.settings import label_offset_default, roi_handle_size
 from honeychrome.controller_components.functions import rename_label_offset
+
+logger = logging.getLogger(__name__)
 
 warnings.filterwarnings("ignore", message="t.core.qobject.connect: QObject::connect(QStyleHints, QStyleHints): unique connections require a pointer to member function of a QObject subclass")
 
@@ -92,6 +95,31 @@ class DraggableRoiLabel(pg.TextItem):
         if self.bus is not None:
             self.bus.histsStatsRecalculated.connect(self.add_statistic_to_name)
 
+    @property
+    def current_sample_id(self):
+        """The loaded sample, read live from the plot widget.
+
+        ``data_for_cytometry_plots`` is *rebound* to a different dict when the
+        mode changes, so the copy taken in ``__init__`` can go stale; ask the
+        widget each time instead.
+        """
+        try:
+            data = self.parent_roi.vb.parent().data_for_cytometry_plots
+        except Exception:
+            data = self.data_for_cytometry_plots
+        return (data or {}).get('sample_id')
+
+    def is_customised(self):
+        """True if this gate is overridden for the loaded sample."""
+        sample_id = self.current_sample_id
+        if not sample_id:
+            return False
+        try:
+            return bool(self.gating.is_custom_gate(sample_id, self.gate_name))
+        except Exception as e:
+            logger.debug(f'is_customised: {self.gate_name!r} for {sample_id} ({e})')
+            return False
+
     def paint(self, p, *args):
         """Draw background behind text."""
         rect = self.boundingRect().adjusted(-2, -2, 2, 2)
@@ -133,11 +161,7 @@ class DraggableRoiLabel(pg.TextItem):
         """Tint the label AND the gate outline orange when this gate is
         customised for the current sample (a per-sample custom gate), else the
         default green (template)."""
-        try:
-            sample_id = (self.data_for_cytometry_plots or {}).get('sample_id')
-            customised = bool(sample_id and self.gating.is_custom_gate(sample_id, self.gate_name))
-        except Exception:
-            customised = False
+        customised = self.is_customised()
         self.fill = pg.mkBrush(255, 165, 0, 160) if customised else pg.mkBrush(0, 255, 0, 128)
         self.update()
 
@@ -189,6 +213,52 @@ class DraggableRoiLabel(pg.TextItem):
 
         # print(self.gating.get_gate_ids())
 
+def _build_custom_gate_actions(menu, label):
+    """Append the per-sample custom gate actions to ``menu``, mirroring the
+    gating hierarchy tree's context menu, and return what was added.
+
+    ``label`` is the ROI's :class:`DraggableRoiLabel`, which knows the gate name,
+    the gating strategy, the mode and the event bus. With no sample loaded there
+    is nothing to customise *for*, so the action is shown greyed out rather than
+    hidden — otherwise the menu looks as though the feature is missing.
+    """
+    bus = getattr(label, 'bus', None)
+    gate_name = getattr(label, 'gate_name', None)
+    if bus is None or not gate_name or gate_name == 'root':
+        return []
+
+    mode = label.mode
+    added = [menu.addSeparator()]
+    if label.is_customised():
+        # emit label.gate_name (not the captured name) so a rename still works
+        added.append(menu.addAction(
+            f"Revert '{gate_name}' to template",
+            lambda: bus.revertGateRequested.emit(mode, label.gate_name)))
+        added.append(menu.addAction(
+            f"Adopt '{gate_name}' custom gate as template",
+            lambda: bus.adoptGateRequested.emit(mode, label.gate_name)))
+    else:
+        action = menu.addAction(
+            f"Customise '{gate_name}' for this sample",
+            lambda: bus.customiseGateRequested.emit(mode, label.gate_name))
+        action.setEnabled(bool(label.current_sample_id))
+        added.append(action)
+    return added
+
+
+def exec_gate_menu(menu, label, screen_pos):
+    """Show an ROI's context menu with fresh per-sample custom gate actions.
+
+    Those actions are rebuilt on every right-click because whether the gate is
+    customised for the current sample changes as the user works, and the menus
+    themselves are built once in each ROI's ``__init__``.
+    """
+    for action in getattr(menu, '_custom_gate_actions', ()):
+        menu.removeAction(action)
+    menu._custom_gate_actions = _build_custom_gate_actions(menu, label)
+    menu.exec(screen_pos)
+
+
 class ContextMenuTargetItem(pg.TargetItem):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -196,10 +266,11 @@ class ContextMenuTargetItem(pg.TargetItem):
         # Create context menu
         self.menu = QMenu()
         self.action_remove = self.menu.addAction("Delete Gate")
+        self.gate_label = None  # set by the owning ROI once its label exists
 
     def mouseClickEvent(self, ev):
         if ev.button() == Qt.MouseButton.RightButton:
-            self.menu.exec(ev.screenPos().toPoint())
+            exec_gate_menu(self.menu, self.gate_label, ev.screenPos().toPoint())
             ev.accept()
         else:
             super().mouseClickEvent(ev)
@@ -232,6 +303,7 @@ class QuadROI(pg.ROI):
         xlim, ylim = self.vb.viewRange()
         self.label = DraggableRoiLabel(self, gate_name, gating, mode, pos=(xlim[0], ylim[0]), anchor=(0, 1))
         self.vb.addItem(self.label)
+        self.target.gate_label = self.label
         # self.label = [
         #     DraggableRoiLabel(self, gate_name +'++', gating, mode, pos=(xlim[1], ylim[1]), anchor=(1, 0)),
         #     DraggableRoiLabel(self, gate_name +'+-', gating, mode, pos=(xlim[1], ylim[0]), anchor=(1, 1)),
@@ -278,10 +350,11 @@ class ContextMenuRangeRegion(pg.LinearRegionItem):
         # Create context menu
         self.menu = QMenu()
         self.action_remove = self.menu.addAction("Delete Gate")
+        self.gate_label = None  # set by the owning ROI once its label exists
 
     def mouseClickEvent(self, ev):
         if ev.button() == Qt.MouseButton.RightButton:
-            self.menu.exec(ev.screenPos().toPoint())
+            exec_gate_menu(self.menu, self.gate_label, ev.screenPos().toPoint())
             ev.accept()
         else:
             super().mouseClickEvent(ev)
@@ -314,6 +387,7 @@ class RangeROI(pg.ROI):
         self.label_pos = clip_position(x1+self.label_offset[0], self.label_offset[1])
         self.label = DraggableRoiLabel(self, gate_name, gating, mode, pos=self.label_pos, anchor=(0, 1))
         self.vb.addItem(self.label)
+        self.region.gate_label = self.label
         self.region.sigRegionChanged.connect(self.label.move_label_with_roi)
 
         # Connect actions
@@ -394,7 +468,7 @@ class PolygonROI(pg.PolyLineROI):
     def mouseClickEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
             # Show context menu at cursor position
-            self.menu.exec(event.screenPos().toPoint())
+            exec_gate_menu(self.menu, self.label, event.screenPos().toPoint())
             event.accept()
         else:
             # Keep normal ROI drag/resize behavior
@@ -403,7 +477,7 @@ class PolygonROI(pg.PolyLineROI):
     def segmentClickEvent(self, event, segment):
         if event.button() == Qt.MouseButton.RightButton:
             event.accept()
-            self.menu.exec(event.screenPos().toPoint())
+            exec_gate_menu(self.menu, self.label, event.screenPos().toPoint())
         else:
             pg.LineSegmentROI.mouseClickEvent(segment, event)
 
@@ -445,7 +519,7 @@ class RectangleROI(pg.RectROI):
     def mouseClickEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
             # Show context menu at cursor position
-            self.menu.exec(event.screenPos().toPoint())
+            exec_gate_menu(self.menu, self.label, event.screenPos().toPoint())
             event.accept()
         else:
             # Keep normal ROI drag/resize behavior
@@ -490,7 +564,7 @@ class EllipseROI(pg.EllipseROI):
     def mouseClickEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
             # Show context menu at cursor position
-            self.menu.exec(event.screenPos().toPoint())
+            exec_gate_menu(self.menu, self.label, event.screenPos().toPoint())
             event.accept()
         else:
             # Keep normal ROI drag/resize behavior
