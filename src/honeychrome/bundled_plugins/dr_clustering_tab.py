@@ -9801,7 +9801,12 @@ class ClusterAnnotationTab(QWidget):
         ridge_layout.addWidget(self._ridge_scroll, stretch=1)
         self._summary_splitter.addWidget(ridge_box)
 
-        self._summary_splitter.setStretchFactor(0, 1)
+        # Heatmap pane stays pinned to its own content height (set in
+        # _apply_marker_summary_figures via setMaximumHeight) instead of
+        # sharing growth with the ridge pane -- factor 0 means it never
+        # claims extra splitter height, so the ridge grid (factor 1) is
+        # the only pane that grows into newly available space.
+        self._summary_splitter.setStretchFactor(0, 0)
         self._summary_splitter.setStretchFactor(1, 1)
         self._summary_splitter.setChildrenCollapsible(False)
         # Item 4 -- this sub-tab had no floor at all (unlike the
@@ -11070,10 +11075,18 @@ class ClusterAnnotationTab(QWidget):
         self._heatmap_scroll.setMinimumHeight(0)
         self._heatmap_scroll.setMaximumHeight(16_777_215)  # QWIDGETSIZE_MAX
 
-        total_h = self._summary_splitter.height()
-        if total_h > 0:
-            top_h = max(150, min(ideal_top_h, total_h - 150))
-            self._summary_splitter.setSizes([top_h, total_h - top_h])
+        # Cap the heatmap pane at exactly its content height instead of
+        # reading the splitter's CURRENT height (which is 0 the first
+        # time this runs, before the tab has ever been shown, and which
+        # otherwise grows the pane past its content on every later
+        # window/splitter resize since both panes used to share stretch
+        # factor 1). With the cap in place, requesting more than the pane
+        # can take below just clamps to the cap -- stretch factor 0 (set
+        # at splitter construction) keeps it pinned there afterward, and
+        # ridge_box, the splitter's only stretch=1 pane, absorbs whatever
+        # height the heatmap pane doesn't need.
+        self._heatmap_box.setMaximumHeight(ideal_top_h)
+        self._summary_splitter.setSizes([ideal_top_h, 1_000_000])
 
     def _transform_and_pool_matrix_values(self, pooled_by_channel: dict, channels: list[str],
                                           cluster_order: list[int]) -> dict[str, dict[int, np.ndarray]]:
