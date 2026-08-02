@@ -11,13 +11,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 class TreeItem:
-    def __init__(self, name, event_count, p_root, p_parent, event_conc, parent=None):
+    def __init__(self, name, event_count, p_root, p_parent, event_conc, parent=None, gate_type=None):
         self.name = name
         self.event_count = event_count
         self.event_conc = event_conc
         self.p_root = p_root
         self.p_parent = p_parent
         self.parent_item = parent
+        self.gate_type = gate_type   # flowkit gate type, e.g. 'RectangleGate' | 'Quadrant'
         self.child_items = []
 
     def append_child(self, item):
@@ -83,7 +84,8 @@ class DictTreeModel(QAbstractItemModel):
                 p_parent = ''
                 event_conc = ''
 
-            item = TreeItem(name, n_events_gate, p_root, p_parent, event_conc, parent_item)
+            item = TreeItem(name, n_events_gate, p_root, p_parent, event_conc, parent_item,
+                            gate_type=hierarchy_dict_node.get('gate_type'))
             parent_item.append_child(item)
 
             if 'children' in hierarchy_dict_node.keys():
@@ -456,7 +458,13 @@ class GatingHierarchyWidget(QWidget):
 
             # Per-sample custom gates: customise this gate for the current sample,
             # or (if already customised) revert to / adopt as the shared template.
-            if self.bus is not None and item_name and item_name != 'root':
+            # A QuadrantGate's four quadrants are not gates in their own right —
+            # FlowKit refuses to return them ("specify the owning QuadrantGate"),
+            # and their geometry comes entirely from the parent's dividers — so
+            # customise the parent instead of offering a dead action here.
+            item = index.internalPointer()
+            is_quadrant = getattr(item, 'gate_type', None) == 'Quadrant'
+            if self.bus is not None and item_name and item_name != 'root' and not is_quadrant:
                 menu.addSeparator()
                 if item_name in self._custom_gates:
                     revert_action = menu.addAction(f"Revert '{item_name}' to template")
