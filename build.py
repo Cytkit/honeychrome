@@ -93,6 +93,37 @@ def get_project_files():
                   'AutoSpectral Optimization kernel — it may fail to load '
                   'OpenMP on machines without Homebrew libomp installed.')
 
+    # SOM kernel (bundled_plugins/) -- same situation as
+    # _autospectral_opt_kernel just above: lives in the wholesale-copied
+    # bundled_plugins/ folder (so the file itself needs no extra collection
+    # step) but is loaded dynamically by som_kernel_wrapper.py rather than
+    # hidden-imported, so it also never goes through PyInstaller's
+    # automatic @loader_path rewrite and needs the same manual fix.
+    if platform.system() == 'Darwin':
+        try:
+            libomp_prefix = subprocess.check_output(
+                ['brew', '--prefix', 'libomp'], stderr=subprocess.DEVNULL
+            ).decode().strip()
+            libomp_src = os.path.join(libomp_prefix, 'lib', 'libomp.dylib')
+            som_kernel_dir = os.path.join(
+                project_root, 'src', 'honeychrome', 'bundled_plugins'
+            )
+            for fname in os.listdir(som_kernel_dir):
+                if fname.startswith('_som_kernel') and fname.endswith('.dylib'):
+                    som_kernel_path = os.path.join(som_kernel_dir, fname)
+                    if os.path.exists(libomp_src):
+                        libomp_dest = os.path.join(som_kernel_dir, 'libomp.dylib')
+                        shutil.copy2(libomp_src, libomp_dest)
+                        subprocess.run([
+                            'install_name_tool', '-change',
+                            libomp_src, '@loader_path/libomp.dylib',
+                            som_kernel_path,
+                        ], check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print('WARNING: could not rewrite libomp dependency for the '
+                  'SOM kernel — it may fail to load OpenMP on machines '
+                  'without Homebrew libomp installed.')
+
     return assets
 
 def main():

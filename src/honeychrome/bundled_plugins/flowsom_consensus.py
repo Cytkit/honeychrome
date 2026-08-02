@@ -13,11 +13,24 @@ released ``anndata``/``flowsom`` pair currently supports it (confirmed via
 anndata's own dev-branch release notes: AnnData.X only becomes properly
 copy-on-write in the *upcoming* 0.14).
 
-``angelolab/pyFlowSOM`` has no anndata/mudata dependency at all — plain
-numpy in, numpy out — so it's immune to that whole class of issue. It only
-implements the SOM step, though; the R FlowSOM algorithm's consensus
-hierarchical metaclustering step (``ConsensusClusterPlus``, Monti et al.
-2003) is implemented from scratch here.
+The SOM step itself no longer uses ``angelolab/pyFlowSOM``: its C
+extension (``flowsom.c`` / ``cyFlowSOM.pyx``) is a single-threaded port of
+the classic online/per-event Kohonen trainer with no confirmed arm64 wheel
+(flagged, never resolved, in DR_CLUSTERING_REVAMP_PLAN.md). SOM training and
+assignment now go through ``som_kernel_wrapper.py`` — an in-house
+OpenMP-accelerated *batch* SOM kernel, the same algorithm AutoSpectral's
+``AutoSpectralRcpp::som_train_batch_cpp()`` already uses (see that
+project's ``som.R``/``som.cpp`` for the reference this was ported from).
+Batch training reads the codebook as it stood at the end of the previous
+epoch and updates it once per epoch (Gaussian neighbourhood kernel)
+instead of once per event (bubble kernel) — a different schedule from
+classic FlowSOM, not a bit-for-bit reproduction, but consensus
+metaclustering below is specifically designed to be robust to this kind of
+training-run codebook variation.
+
+The R FlowSOM algorithm's consensus hierarchical metaclustering step
+(``ConsensusClusterPlus``, Monti et al. 2003) is implemented from scratch
+here, independent of the SOM training method.
 
 Consensus metaclustering operates on the SOM's node codebook (xdim*ydim
 vectors, typically 100-400), not raw events, so it stays cheap regardless
@@ -29,7 +42,9 @@ from __future__ import annotations
 import numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
+from scipy.spatial import distance_matrix
 
+import som_kernel_wrapper
 from drc_logging import get_logger, log_stage
 
 log = get_logger(__name__)
@@ -37,47 +52,58 @@ log = get_logger(__name__)
 _DISTF_EUCLIDEAN = 2
 
 
+def _grid_neighbor_distance(xdim: int, ydim: int) -> np.ndarray:
+    """Chebyshev distance between SOM grid nodes -- same convention
+    pyFlowSOM's neighborhood_distance() used, and the R FlowSOM/kohonen
+    default. Grid topology is unchanged by the kernel swap, only the
+    training algorithm that fills the codebook is."""
+    grid = np.meshgrid(np.arange(1, xdim + 1), np.arange(1, ydim + 1))
+    grid = np.column_stack((grid[0].flat, grid[1].flat))
+    return distance_matrix(grid, grid, p=np.inf)
+
+
 def train_som(data: np.ndarray, xdim: int, ydim: int, n_iter: int,
               seed: int = 42) -> np.ndarray:
-    """Train a SOM via pyFlowSOM. Returns node codebook, shape (xdim*ydim, n_channels)."""
-    import pyFlowSOM
-    data_f = np.asarray(data, dtype=np.float64, order='F')
+    """Train a batch SOM via the in-house OpenMP kernel (som_kernel_wrapper).
+    Returns node codebook, shape (xdim*ydim, n_channels).
+
+    Radius/epoch schedule matches AutoSpectral's get.som.codes() (som.R):
+    radius anneals from the grid's 67th-percentile neighbour distance down
+    to 10% of that (never to 0 -- the batch trainer's Gaussian kernel needs
+    a strictly positive radius throughout), one radius per epoch, n_iter
+    epochs total.
+    """
     log_stage(log, "SOM TRAINING")
-    node_weights = pyFlowSOM.som(data_f, xdim=xdim, ydim=ydim, rlen=n_iter,
-                                  distf=_DISTF_EUCLIDEAN, seed=seed)
-    node_weights = np.asarray(node_weights, dtype=np.float64)
-    log.info("SOM trained: %d nodes (%dx%d), %d channels",
-             node_weights.shape[0], xdim, ydim, node_weights.shape[1])
+    data_f = np.asarray(data, dtype=np.float64)
+    ncodes = xdim * ydim
+
+    nhbrdist = _grid_neighbor_distance(xdim, ydim)
+    radius_start = float(np.percentile(nhbrdist, 67))
+    radius_end = radius_start * 0.1
+    radii = np.linspace(radius_start, radius_end, n_iter)
+
+    rng = np.random.default_rng(seed)
+    init_idx = rng.choice(data_f.shape[0], ncodes, replace=False)
+    init_codes = data_f[init_idx]
+
+    node_weights = som_kernel_wrapper.train_som_batch(
+        data_f, init_codes, nhbrdist, radii,
+        dist=_DISTF_EUCLIDEAN, n_threads=0,
+    )
+    log.info("SOM trained: %d nodes (%dx%d), %d channels, %d epochs",
+             node_weights.shape[0], xdim, ydim, node_weights.shape[1], n_iter)
     return node_weights
 
 
 def assign_to_nodes(node_weights: np.ndarray, data: np.ndarray) -> np.ndarray:
-    """Map each row of data to its nearest SOM node. Returns 0-based node index per row.
-
-    pyFlowSOM's documented return isn't explicit about 0- vs 1-based
-    indexing, so this detects it defensively from the observed range rather
-    than assuming: [0, n_nodes-1] is left as-is, [1, n_nodes] is shifted
-    down by one. Any other range raises, since that would mean the
-    indexing convention isn't what either assumption expects.
-    """
-    import pyFlowSOM
-    node_weights_f = np.asarray(node_weights, dtype=np.float64, order='F')
-    data_f = np.asarray(data, dtype=np.float64, order='F')
-    node_ids, _dists = pyFlowSOM.map_data_to_nodes(node_weights_f, data_f,
-                                                    distf=_DISTF_EUCLIDEAN)
-    node_ids = np.asarray(node_ids, dtype=np.int64)
-    n_nodes = node_weights.shape[0]
-    lo, hi = int(node_ids.min()), int(node_ids.max())
-    if lo == 1 and hi == n_nodes:
-        node_ids = node_ids - 1
-    elif lo == 0 and hi == n_nodes - 1:
-        pass
-    else:
-        raise ValueError(
-            f"Unexpected node index range [{lo}, {hi}] for {n_nodes} nodes — "
-            f"pyFlowSOM.map_data_to_nodes indexing convention may have changed."
-        )
-    return node_ids
+    """Map each row of data to its nearest SOM node. Returns 0-based node
+    index per row. The in-house kernel returns clean 0-based indices by
+    construction -- no defensive index-convention detection needed (that
+    was only required for pyFlowSOM's undocumented 1-based return)."""
+    node_ids, _dists = som_kernel_wrapper.map_to_codes(
+        data, node_weights, dist=_DISTF_EUCLIDEAN, n_threads=0,
+    )
+    return node_ids.astype(np.int64)
 
 
 def _consensus_matrix(node_weights: np.ndarray, k: int, H: int,

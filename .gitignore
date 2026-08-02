@@ -25,3 +25,4 @@ Thumbs.db
 *.pyd
 *.dylib
 _af_kernel*.c
+_som_kernel.c

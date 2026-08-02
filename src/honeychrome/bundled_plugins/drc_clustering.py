@@ -8,10 +8,11 @@ shared label-assignment logic can be inspected and tested in isolation. Uses the
 corrected ``drc_pipeline`` for all data loading and ``drc_logging`` for stage
 instrumentation.
 
-FlowSOM uses ``flowsom_consensus`` (pyFlowSOM + our own consensus
-hierarchical metaclustering) rather than ``saeyslab/flowsom`` — the latter's
-internal AnnData/MuData mutation is incompatible with pandas 3.0's
-Copy-on-Write. All cluster labels (FlowSOM/Leiden/HDBSCAN) are 0-based with
+FlowSOM uses ``flowsom_consensus`` (an in-house OpenMP batch SOM kernel +
+our own consensus hierarchical metaclustering) rather than
+``saeyslab/flowsom`` — the latter's internal AnnData/MuData mutation is
+incompatible with pandas 3.0's Copy-on-Write. All cluster labels
+(FlowSOM/Leiden/HDBSCAN) are 0-based with
 −1 reserved for noise, matching Leiden/HDBSCAN and the stats ``range(n_clusters)``
 loop by construction — no post-hoc index shift needed for FlowSOM anymore.
 
