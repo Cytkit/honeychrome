@@ -259,6 +259,23 @@ class _CheckableGateTreeModel(QAbstractItemModel):
                 Qt.Unchecked if states <= {Qt.Unchecked} else Qt.PartiallyChecked
             )
 
+    # ------------------------------------------------------------------
+    # View-expansion support
+    # ------------------------------------------------------------------
+
+    def iter_marked_indices(self):
+        """Yield a QModelIndex for every node whose check_state is not
+        Unchecked (i.e. Checked or PartiallyChecked). Used by the view to
+        expand ancestor chains so a restored/synced selection stays
+        visible instead of being hidden under the default collapse."""
+        def _walk(parent_item, parent_index):
+            for row, child in enumerate(parent_item.child_items):
+                child_index = self.index(row, 0, parent_index)
+                if child.check_state != Qt.Unchecked:
+                    yield child_index
+                yield from _walk(child, child_index)
+        yield from _walk(self.root_item, QModelIndex())
+
 
 class GateTreeWidget(QWidget):
     """
@@ -299,3 +316,14 @@ class GateTreeWidget(QWidget):
     def set_checked_names(self, names: list[str]):
         """Programmatic sync/restore — does not emit selectionChanged."""
         self.model.set_checked_names(names)
+        self._expand_to_checked()
+
+    def _expand_to_checked(self):
+        """Expand every ancestor of a Checked/PartiallyChecked node so a
+        restored (or cross-tab-synced) selection stays visible instead of
+        being hidden under set_hierarchy()'s default two-level collapse."""
+        for idx in self.model.iter_marked_indices():
+            parent = idx.parent()
+            while parent.isValid():
+                self.tree_view.expand(parent)
+                parent = parent.parent()
