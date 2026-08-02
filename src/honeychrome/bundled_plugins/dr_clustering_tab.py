@@ -3942,9 +3942,16 @@ class GroupsStatsTab(QWidget):
             "column and/or covariate/pairing columns automatically."
         )
         self.suggest_groupings_btn.clicked.connect(self._suggest_groupings)
+        self.remove_column_btn = QPushButton("Remove Column")
+        self.remove_column_btn.setToolTip(
+            "Remove a covariate column (e.g. one added by mistake, or left "
+            "empty) from the table below."
+        )
+        self.remove_column_btn.clicked.connect(self._remove_covariate_column)
         csv_row.addWidget(self.import_csv_btn)
         csv_row.addWidget(self.export_csv_btn)
         csv_row.addWidget(self.add_column_btn)
+        csv_row.addWidget(self.remove_column_btn)
         csv_row.addWidget(self.suggest_groupings_btn)
         csv_row.addStretch()
 
@@ -5095,6 +5102,38 @@ class GroupsStatsTab(QWidget):
         self._populate_table()
         self._populate_pairing_variable_combo()
 
+    def _remove_covariate_column(self):
+        """Delete one covariate column entirely (e.g. an empty leftover
+        from a mistaken '+ Add Column', or one superseded by a Suggest
+        Groupings result). Clears it from the Pairing variable selector
+        too if it was the one selected."""
+        from PySide6.QtWidgets import QInputDialog
+        cols = list(self.state.covariates.columns) if self.state.covariates is not None else []
+        if not cols:
+            QMessageBox.information(self, "Remove Column", "There are no covariate columns to remove.")
+            return
+        name, ok = QInputDialog.getItem(
+            self, "Remove Column", "Column to remove:", cols, editable=False
+        )
+        if not ok or not name:
+            return
+        reply = QMessageBox.question(
+            self, "Remove Column",
+            f"Remove covariate column '{name}'? This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.state.covariates = self.state.covariates.drop(columns=[name])
+        if self.state.pairing_variable == name:
+            self.state.pairing_variable = ''
+            if self.state.paired:
+                self.state.paired = False
+                self.chk_paired.setChecked(False)
+        self._last_stats_data_key = None
+        self._populate_table()
+        self._populate_pairing_variable_combo()
+
     def _suggest_groupings(self):
         """
         Scan on-screen sample names (and, when the experiment's Sample
@@ -5249,6 +5288,16 @@ class GroupsStatsTab(QWidget):
 
         if self.state.covariates is None:
             self.state.covariates = pd.DataFrame(index=pd.Index([], dtype=str))
+
+        raw_subdir = self.controller.experiment.settings['raw'].get('raw_samples_subdirectory')
+
+        def _to_rel(sp):
+            if raw_subdir:
+                try:
+                    return str(Path(sp).relative_to(raw_subdir))
+                except ValueError:
+                    pass
+            return sp
 
         for role, name, sug in chosen:
             if role == 'group':
