@@ -2501,9 +2501,12 @@ class BiplotTile(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(2)
 
-        # y-channel selector combo (hidden; driven by InteractiveLabel click)
+        # y-channel selector combo -- not shown; kept purely as the
+        # internal selection store, driven by the InteractiveLabel click
+        # menu below (the visible combo was redundant with that menu).
         self._y_combo = QComboBox()
         self._y_combo.setMaximumHeight(22)
+        self._y_combo.setVisible(False)
         self._y_combo.currentTextChanged.connect(self._on_y_changed)
         outer.addWidget(self._y_combo)
 
@@ -2568,8 +2571,12 @@ class BiplotTile(QWidget):
         self._y_combo.blockSignals(False)
         self._y_channel = self._y_combo.currentText()
 
-        # Sync InteractiveLabel menu items
-        self._label_y.leftClickMenuItems = available
+        # Sync InteractiveLabel menu items -- antigen-labeled for display;
+        # selection is index-based (see InteractiveLabel.selectable_menu_
+        # activates_function), so display text doesn't need to match
+        # `available`'s raw channel names.
+        labels = _antigen_dash_labels(self._parent_tab.controller)
+        self._label_y.leftClickMenuItems = [labels.get(ch, ch) for ch in available]
         ch = self._y_combo.currentText()
         self._label_y.leftItemSelected = available.index(ch) if ch in available else 0
 
@@ -2578,7 +2585,8 @@ class BiplotTile(QWidget):
 
     def _on_y_changed(self, ch: str):
         self._y_channel = ch
-        self._label_y.setText(ch)
+        labels = _antigen_dash_labels(self._parent_tab.controller)
+        self._label_y.setText(labels.get(ch, ch))
         # Keep leftItemSelected in sync
         channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
         if ch in channels:
@@ -7656,6 +7664,42 @@ class WorkspaceTab(QWidget):
         return items
 
 
+class _MarkerValuesWorker(QThread):
+    """
+    Loads per-sample marker values (disk I/O + AF-aware unmixing, via
+    drc_pipeline.load_sample_marker_values) for a PlotCard's Marker colour
+    mode on a background thread, so a cold redraw never blocks the UI.
+    Same pattern as _MarkerSummaryWorker/_StatsWorker/_DrWorker elsewhere
+    in this tab. Loaded arrays flow through the SAME state.gated_data_cache
+    every other caller of load_unmixed_gated shares, so this only actually
+    touches disk on a genuine cache miss (first Marker-mode draw for a
+    given sample set / gate selection / unmixing matrix) -- PlotCard's own
+    cache (see _marker_cache_key) skips even starting this worker once
+    that's warm.
+    """
+    finished = Signal(bool, str, dict)  # success, error, {rel_path: (values, names)}
+
+    def __init__(self, controller, state, samples: list[str], af_state, parent=None):
+        super().__init__(parent)
+        self._controller = controller
+        self._state = state
+        self._samples = samples
+        self._af_state = af_state
+
+    def run(self):
+        try:
+            results: dict[str, tuple] = {}
+            for rel in self._samples:
+                mv = drc_pipeline.load_sample_marker_values(
+                    self._controller, self._state, rel, af_state=self._af_state)
+                if mv is not None:
+                    results[rel] = mv
+            self.finished.emit(True, '', results)
+        except Exception as exc:
+            traceback.print_exc()
+            self.finished.emit(False, str(exc), {})
+
+
 class PlotCard(QFrame):
     """
     A single DR scatter plot on the workspace canvas.
@@ -7690,6 +7734,8 @@ class PlotCard(QFrame):
         self.controller = controller
         self.workspace  = workspace
         self._figure    = None   # current matplotlib Figure
+        self._marker_worker = None            # in-flight _MarkerValuesWorker, if any
+        self._marker_values_cache: dict = {}  # single-entry -- see _on_marker_values_finished
 
         self.setFrameShape(QFrame.StyledPanel)
         self.setFrameShadow(QFrame.Raised)
@@ -8237,6 +8283,26 @@ class PlotCard(QFrame):
 
         colour_mode = self.colour_mode_combo.currentText()
 
+        # Marker mode needs untransformed per-sample values -- disk I/O +
+        # AF-aware unmixing for every sample shown, the single most
+        # expensive step in this whole method (see
+        # drc_pipeline.load_unmixed_gated's docstring). Load them on a
+        # background thread and re-enter refresh() once they land, rather
+        # than blocking the UI here. A per-card cache (_marker_cache_key)
+        # means this only actually happens on a cold cache -- first
+        # Marker-mode draw for this sample set / gate selection / unmixing
+        # matrix -- repeat draws (theme, columns, even switching marker
+        # channel) hit the cache and fall straight through.
+        marker_values_by_sample = None
+        if colour_mode == 'Marker':
+            needed_samples = sorted({str(r) for r in np.unique(origin)})
+            cache_key = self._marker_cache_key(needed_samples)
+            marker_values_by_sample = self._marker_values_cache.get(cache_key)
+            if marker_values_by_sample is None:
+                self._show_placeholder("⏳ Loading marker values …")
+                self._start_marker_values_worker(needed_samples, cache_key)
+                return
+
         is_dark = _resolve_is_dark(self.state)
 
         self._figure.clear()
@@ -8292,7 +8358,8 @@ class PlotCard(QFrame):
                        color='#d9822b', va='bottom', ha='left', zorder=10)
         elif colour_mode == 'Marker':
             self._draw_marker_scatter(ax, xy_disp, origin_disp,
-                                      disp_idx, sample_row_offsets, run)
+                                      disp_idx, sample_row_offsets, run,
+                                      marker_values_by_sample)
         elif colour_mode == 'T-REX':
             self._draw_trex_scatter(ax, xy_disp, lab_disp, emb_dict, run, origin_disp)
         elif colour_mode == 'Group':
@@ -8311,6 +8378,55 @@ class PlotCard(QFrame):
 
         self._canvas.draw_idle()
         self._rebuild_legend()
+
+    # ------------------------------------------------------------------
+    # Marker-mode background loading
+    # ------------------------------------------------------------------
+
+    def _marker_cache_key(self, samples: list[str]):
+        """Cache key for _marker_values_cache. Deliberately excludes the
+        selected marker channel -- load_sample_marker_values returns ALL
+        selected channels for a sample in one call, so switching which
+        channel is displayed never needs a reload, only a re-draw."""
+        return (
+            tuple(sorted(samples)),
+            tuple(sorted(self.state.selected_gates)),
+            id(self.controller.transfer_matrix),
+        )
+
+    def _start_marker_values_worker(self, samples: list[str], cache_key):
+        """Load per-sample marker values on a background thread. AF/
+        transfer-matrix state is snapshotted HERE, on the main thread,
+        before the worker starts -- same reasoning as _MarkerSummaryWorker
+        (reading it live off the controller from a background thread is a
+        memory-corruption hazard, not just a stale-data one)."""
+        if self._marker_worker is not None:
+            return   # already loading; its finish will re-trigger refresh()
+        af_state = (
+            self.controller.transfer_matrix,
+            self.controller.af_precomputed,
+            self.controller.af_spectra,
+        )
+        worker = _MarkerValuesWorker(self.controller, self.state, samples, af_state)
+        worker.finished.connect(
+            lambda ok, err, payload, key=cache_key:
+                self._on_marker_values_finished(ok, err, payload, key)
+        )
+        self._marker_worker = worker
+        worker.start()
+
+    def _on_marker_values_finished(self, success: bool, error: str,
+                                   payload: dict, cache_key):
+        self._marker_worker = None
+        if not success:
+            self._show_placeholder(f"Failed to load marker values: {error}")
+            return
+        # Single-entry cache -- only one gate/matrix combination is ever
+        # "current" in a session, and each entry holds full per-sample
+        # gated arrays, so keeping stale combinations around would just be
+        # wasted memory for data nothing will ask for again.
+        self._marker_values_cache = {cache_key: payload}
+        self.refresh()
 
     def _draw_cluster_scatter(self, ax, xy, labels, cl_run: dict | None):
         """
@@ -8384,8 +8500,12 @@ class PlotCard(QFrame):
         self._canvas.draw_idle()
 
     def _draw_marker_scatter(self, ax, xy, origin, disp_idx, sample_row_offsets,
-                             run: dict):
-        """Colour by UNTRANSFORMED marker intensity on the full data scale."""
+                             run: dict, marker_values_by_sample: dict):
+        """Colour by UNTRANSFORMED marker intensity on the full data scale.
+        marker_values_by_sample is {rel_path: (values, names)} for every
+        sample in *origin*, already loaded by refresh() (synchronously from
+        cache, or via _MarkerValuesWorker on a cold cache) -- this method
+        does no disk I/O of its own."""
         ch = self.marker_combo.currentData()
         if not ch or not self.state.selected_channels:
             ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#aaaaaa', alpha=0.4)
@@ -8411,8 +8531,7 @@ class PlotCard(QFrame):
 
         values = np.full(len(xy), np.nan, dtype=np.float32)
         for rel in np.unique(origin):
-            mv = drc_pipeline.load_sample_marker_values(
-                self.controller, self.state, str(rel))
+            mv = marker_values_by_sample.get(str(rel))
             if mv is None:
                 continue
             vals, names = mv
