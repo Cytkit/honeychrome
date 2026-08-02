@@ -146,9 +146,11 @@ CREATE INDEX IF NOT EXISTS idx_ref_lib_cytometer
     ON reference_library_profiles (cytometer_key, fluorophore);
 """
 
-
-# Columns added after the first release; migrated in with ALTER TABLE.
-_ADDED_COLUMNS = {
+# This table is new on this branch, so no released database contains it. It can
+# however already exist in a colleague's library file from an earlier build of
+# the branch, without these columns -- add them in the same way SpectralLibrary
+# does for spectral_controls_history. Drop this once the branch is merged.
+_DEV_ADDED_COLUMNS = {
     'antigen': 'TEXT',
     'particle_type': 'TEXT',
     'lot_number': 'TEXT',
@@ -185,9 +187,8 @@ class SpectralReferenceLibrary:
     def ensure_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
-            # migrate DBs created before these columns existed
             existing = {r[1] for r in conn.execute('PRAGMA table_info(reference_library_profiles)')}
-            for column, coltype in _ADDED_COLUMNS.items():
+            for column, coltype in _DEV_ADDED_COLUMNS.items():
                 if column not in existing:
                     conn.execute(
                         f'ALTER TABLE reference_library_profiles ADD COLUMN {column} {coltype}'
@@ -243,8 +244,8 @@ class SpectralReferenceLibrary:
         self._backfill_peak_detectors()
 
     def _backfill_peak_detectors(self) -> None:
-        """Fill in ``gate_channel`` for rows saved before the peak-detector column
-        was shown (derived from the spectrum's maximum)."""
+        """Fill in ``gate_channel`` for any row saved without one, deriving it
+        from the spectrum's maximum."""
         with self._connect() as conn:
             rows = conn.execute(
                 'SELECT id, profile_json FROM reference_library_profiles '

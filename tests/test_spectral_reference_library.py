@@ -12,6 +12,18 @@ from honeychrome.controller_components.spectral_reference_library import (
     CONFIG_KEY_UNKNOWN_CYTOMETER,
 )
 
+# Layout shipped by early development builds: no antigen/particle_type/lot_number.
+_OLD_TABLE_SQL = """
+CREATE TABLE reference_library_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, fluorophore TEXT NOT NULL,
+    display_name TEXT NOT NULL, origin TEXT NOT NULL, cytometer_key TEXT NOT NULL,
+    config_key TEXT NOT NULL, channel_names_json TEXT NOT NULL,
+    profile_json TEXT NOT NULL, gate_channel TEXT, source_sample_name TEXT,
+    source_experiment_dir TEXT, notes TEXT, created_at REAL NOT NULL,
+    updated_at REAL NOT NULL, is_deletable INTEGER NOT NULL DEFAULT 1,
+    is_reference INTEGER NOT NULL DEFAULT 0, is_qc_target INTEGER NOT NULL DEFAULT 0);
+"""
+
 
 # --- compute_config_key -----------------------------------------------------
 
@@ -201,21 +213,12 @@ def test_update_fields_ignores_unknown_columns(lib):
     assert lib.get_profile(p.id).origin == 'user'
 
 
-def test_migration_adds_columns_to_old_schema(tmp_path):
-    """A DB created before antigen/particle_type/lot_number existed must migrate."""
+def test_table_from_an_earlier_dev_build_gains_the_new_columns(tmp_path):
+    """A colleague's DB from before antigen/particle_type/lot_number existed."""
     import sqlite3
-    path = tmp_path / 'old.db'
+    path = tmp_path / 'stale.db'
     conn = sqlite3.connect(path)
-    conn.executescript(
-        """CREATE TABLE reference_library_profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, fluorophore TEXT NOT NULL,
-            display_name TEXT NOT NULL, origin TEXT NOT NULL, cytometer_key TEXT NOT NULL,
-            config_key TEXT NOT NULL, channel_names_json TEXT NOT NULL,
-            profile_json TEXT NOT NULL, gate_channel TEXT, source_sample_name TEXT,
-            source_experiment_dir TEXT, notes TEXT, created_at REAL NOT NULL,
-            updated_at REAL NOT NULL, is_deletable INTEGER NOT NULL DEFAULT 1,
-            is_reference INTEGER NOT NULL DEFAULT 0, is_qc_target INTEGER NOT NULL DEFAULT 0);"""
-    )
+    conn.executescript(_OLD_TABLE_SQL)
     conn.commit()
     conn.close()
 
