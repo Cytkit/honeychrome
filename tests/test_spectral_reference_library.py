@@ -166,3 +166,157 @@ def test_cannot_delete_honeychrome_profile(lib):
 def test_delete_unknown_id_raises(lib):
     with pytest.raises(ValueError):
         lib.delete_profile(9999)
+
+
+# --- acquisition metadata + user-editable fields ----------------------------
+
+def test_metadata_fields_roundtrip(lib):
+    p = _save(lib, fluor='PE', antigen='CD3', particle_type='Cells',
+              lot_number='LOT-42', gate_channel='B2-A', notes='fixed PBMC')
+    got = lib.get_profile(p.id)
+    assert got.antigen == 'CD3'
+    assert got.particle_type == 'Cells'
+    assert got.lot_number == 'LOT-42'
+    assert got.gate_channel == 'B2-A'
+    assert got.notes == 'fixed PBMC'
+
+
+def test_metadata_fields_default_to_none(lib):
+    got = lib.get_profile(_save(lib).id)
+    assert got.antigen is None
+    assert got.particle_type is None
+    assert got.lot_number is None
+
+
+def test_update_fields_edits_user_entered_values(lib):
+    p = _save(lib, fluor='PE')
+    lib.update_fields(p.id, lot_number='LOT-7', notes='new note', antigen='CD4')
+    got = lib.get_profile(p.id)
+    assert (got.lot_number, got.notes, got.antigen) == ('LOT-7', 'new note', 'CD4')
+
+
+def test_update_fields_ignores_unknown_columns(lib):
+    p = _save(lib, fluor='PE')
+    lib.update_fields(p.id, origin='honeychrome', not_a_column='x')
+    assert lib.get_profile(p.id).origin == 'user'
+
+
+def test_migration_adds_columns_to_old_schema(tmp_path):
+    """A DB created before antigen/particle_type/lot_number existed must migrate."""
+    import sqlite3
+    path = tmp_path / 'old.db'
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """CREATE TABLE reference_library_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, fluorophore TEXT NOT NULL,
+            display_name TEXT NOT NULL, origin TEXT NOT NULL, cytometer_key TEXT NOT NULL,
+            config_key TEXT NOT NULL, channel_names_json TEXT NOT NULL,
+            profile_json TEXT NOT NULL, gate_channel TEXT, source_sample_name TEXT,
+            source_experiment_dir TEXT, notes TEXT, created_at REAL NOT NULL,
+            updated_at REAL NOT NULL, is_deletable INTEGER NOT NULL DEFAULT 1,
+            is_reference INTEGER NOT NULL DEFAULT 0, is_qc_target INTEGER NOT NULL DEFAULT 0);"""
+    )
+    conn.commit()
+    conn.close()
+
+    store = SpectralReferenceLibrary(library_path=path)
+    store.ensure_schema()
+    p = _save(store, fluor='PE', lot_number='LOT-1')
+    assert store.get_profile(p.id).lot_number == 'LOT-1'
+
+
+def test_peak_detector_backfilled_for_rows_without_one(lib):
+    p = _save(lib, fluor='PE', channels=('B1-A', 'B2-A', 'B3-A'))
+    assert lib.get_profile(p.id).gate_channel is None
+    lib._backfill_peak_detectors()
+    # profile values increase with index, so the last channel is the peak
+    assert lib.get_profile(p.id).gate_channel == 'B3-A'
+
+
+# --- CSV import / export ----------------------------------------------------
+
+def _write_csv(path, rows, channels=('B1-A', 'B2-A', 'B3-A')):
+    import csv
+    with open(path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['fluorophore', *channels])
+        for name, values in rows.items():
+            writer.writerow([name, *values])
+    return path
+
+
+def test_import_csv_creates_user_profiles(lib, tmp_path):
+    path = _write_csv(tmp_path / 'ref.csv', {'PE': [1, 2, 4], 'APC': [0, 5, 5]})
+    imported = lib.import_csv(path, 'Aurora')
+    assert len(imported) == 2
+    assert {p.fluorophore for p in imported} == {'PE', 'APC'}
+    assert all(p.origin == 'user' and p.is_deletable for p in imported)
+
+
+def test_import_csv_normalises_rows_to_peak_of_one(lib, tmp_path):
+    """Imported spectra must be scaled like the shipped CSVs, else they cannot be
+    compared with them on the same plot."""
+    path = _write_csv(tmp_path / 'ref.csv', {'PE': [1, 2, 4]})
+    profile = lib.import_csv(path, 'Aurora')[0].profile
+    assert profile == {'B1-A': 0.25, 'B2-A': 0.5, 'B3-A': 1.0}
+
+
+def test_import_csv_sets_peak_detector(lib, tmp_path):
+    path = _write_csv(tmp_path / 'ref.csv', {'PE': [1, 9, 4]})
+    assert lib.import_csv(path, 'Aurora')[0].gate_channel == 'B2-A'
+
+
+def test_import_csv_skips_rows_with_no_signal(lib, tmp_path):
+    path = _write_csv(tmp_path / 'ref.csv', {'PE': [1, 2, 4], 'Empty': [0, 0, 0]})
+    imported = lib.import_csv(path, 'Aurora')
+    assert [p.fluorophore for p in imported] == ['PE']
+
+
+def test_import_csv_profiles_are_listed_for_that_instrument(lib, tmp_path):
+    path = _write_csv(tmp_path / 'ref.csv', {'PE': [1, 2, 4]})
+    lib.import_csv(path, 'Aurora')
+    assert [p.fluorophore for p in lib.list_profiles('Aurora')] == ['PE']
+
+
+def test_export_csv_roundtrips_through_import(lib, tmp_path):
+    source = _write_csv(tmp_path / 'in.csv', {'PE': [1, 2, 4], 'APC': [8, 4, 2]})
+    imported = lib.import_csv(source, 'Aurora')
+
+    out = tmp_path / 'out.csv'
+    lib.export_csv(out, imported)
+
+    fresh = SpectralReferenceLibrary(library_path=tmp_path / 'fresh.db')
+    fresh.ensure_schema()
+    reimported = {p.fluorophore: p.profile for p in fresh.import_csv(out, 'Aurora')}
+    assert reimported == {p.fluorophore: p.profile for p in imported}
+
+
+def test_export_csv_keeps_detector_order(lib, tmp_path):
+    path = _write_csv(tmp_path / 'in.csv', {'PE': [1, 2, 4]})
+    imported = lib.import_csv(path, 'Aurora')
+    out = tmp_path / 'out.csv'
+    lib.export_csv(out, imported)
+
+    import csv
+    with open(out, newline='') as f:
+        header = next(csv.reader(f))
+    assert header[1:] == ['B1-A', 'B2-A', 'B3-A']
+
+
+def test_export_csv_pads_mixed_configurations_with_zero(lib, tmp_path):
+    a = _save(lib, fluor='PE', channels=('B1-A', 'B2-A'))
+    b = _save(lib, fluor='APC', channels=('B1-A', 'B2-A', 'V1-A'))
+    out = tmp_path / 'out.csv'
+    lib.export_csv(out, [a, b])
+
+    import csv
+    with open(out, newline='') as f:
+        rows = list(csv.reader(f))
+    assert rows[0][1:] == ['B1-A', 'B2-A', 'V1-A']
+    pe = next(r for r in rows if r[0] == 'PE')
+    assert float(pe[3]) == 0.0   # PE has no V1-A
+
+
+def test_export_csv_with_no_profiles_raises(lib, tmp_path):
+    with pytest.raises(ValueError):
+        lib.export_csv(tmp_path / 'out.csv', [])

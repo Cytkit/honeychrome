@@ -115,8 +115,8 @@ class LegendEntry(QWidget):
 
 
 class BottomAxisVerticalTickLabels(pg.AxisItem):
-    def __init__(self, **kwargs):
-        self.angle = 90
+    def __init__(self, angle=90, **kwargs):
+        self.angle = angle
         self._label_padding = 15
         self.orientation = 'bottom'
         self.tick_colors: dict = {}        # must be before super().__init__()
@@ -171,6 +171,15 @@ class BottomAxisVerticalTickLabels(pg.AxisItem):
                         label_padding = -15
                         text_rect = QRectF(label_padding, -rect.height() / 2, rect.width(), rect.height())
                         p.drawText(text_rect, int(Qt.AlignLeft | Qt.AlignVCenter), text)
+                    elif self.orientation == 'bottom' and self.angle:
+                        # Any other angle (e.g. 45 deg): anchor at the tick and let the
+                        # label trail away down-left, so labels never overlap each other.
+                        tick_anchor = QPointF(rect.center().x(), rect.top())
+                        p.translate(tick_anchor)
+                        p.rotate(-self.angle)
+                        text_rect = QRectF(-rect.width() - 4, -rect.height() / 2,
+                                           rect.width(), rect.height())
+                        p.drawText(text_rect, int(Qt.AlignRight | Qt.AlignVCenter), text)
                     else:
                         p.drawText(rect, int(flags), text)
                 finally:

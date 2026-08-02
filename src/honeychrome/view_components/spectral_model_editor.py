@@ -5,11 +5,13 @@ from datetime import datetime
 from typing import List, Any, Dict
 from PySide6 import QtCore
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QThread, Slot, QObject, QEvent, QSize, Signal, QSettings
-from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QStyledItemDelegate, QComboBox, QLineEdit, QMessageBox, QHeaderView, QLabel, QWidget, QCheckBox)
+from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QStyledItemDelegate, QComboBox, QLineEdit, QMessageBox, QHeaderView, QLabel, QWidget, QCheckBox, QMenu, QInputDialog)
 
 from honeychrome.controller_components.functions import raw_gates_list
 from honeychrome.controller_components.spectral_controller import SpectralAutoGenerator, ProfileUpdater, SpectralCleaner, spectral_library
-from honeychrome.controller_components.spectral_reference_library import cosine_similarity_to_reference
+from honeychrome.controller_components.spectral_reference_library import (
+    cosine_similarity_to_reference, SpectralReferenceLibrary, compute_config_key,
+)
 from honeychrome.view_components.cosine_qc_viewer import COSINE_QC_WARNING_THRESHOLD
 from honeychrome.controller_components.spectral_functions import sanitise_control_in_place, _find_default_unstained
 from honeychrome.view_components.icon_loader import icon
@@ -263,6 +265,10 @@ class SpectralControlsEditor(QFrame):
         self.bus.rawGateRenamed.connect(self._on_raw_gate_renamed)
         self.bus.rawGateRenamed.connect(lambda old_name, new_name: self.refresh_comboboxes())
         self.view.selectionModel().selectionChanged.connect(self._show_selected_profiles)
+
+        # right-click a control to save its spectrum to the Reference Library
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._show_row_context_menu)
 
         # Different resize modes for different columns
         # Column 0: label
@@ -1596,6 +1602,70 @@ class SpectralControlsEditor(QFrame):
             self.bus.cleaningResultsReady.emit()
         logger.info('SpectralControlsEditor: Clean Controls run complete.')
         self._warn_low_cosine_controls()
+
+    def _show_row_context_menu(self, position):
+        """Right-click menu on a control row: save its spectrum to the Reference
+        Library, carrying the antigen / particle type / major channel / source
+        sample across from this tab."""
+        index = self.view.indexAt(position)
+        if not index.isValid():
+            return
+        row = self.proxy.mapToSource(index).row()
+        control = self.model._data[row]
+        profile = (self.controller.experiment.process.get('profiles') or {}).get(control.get('label'))
+
+        menu = QMenu(self)
+        action = menu.addAction('Save to Reference Library')
+        action.setEnabled(bool(profile))
+        if not profile:
+            action.setToolTip('Generate a profile for this control first')
+        action.triggered.connect(lambda: self._save_control_to_reference_library(control, profile))
+        menu.exec(self.view.viewport().mapToGlobal(position))
+
+    def _save_control_to_reference_library(self, control, profile):
+        """Persist one generated control spectrum as a curated reference profile."""
+        label = (control.get('label') or '').strip()
+        channels = list(self.fluorescence_channels_pnn)
+        if not label or not profile or len(profile) != len(channels):
+            QMessageBox.warning(self, 'Save to Reference Library',
+                                'This control has no profile matching the current channels.')
+            return
+
+        name, ok = QInputDialog.getText(self, 'Save to Reference Library',
+                                        'Fluorophore name:', text=label)
+        name = (name or '').strip()
+        if not ok or not name:
+            return
+        notes, _ = QInputDialog.getText(self, 'Save to Reference Library', 'Notes (optional):')
+
+        raw = self.controller.experiment.settings['raw']
+        cytometer_key = raw.get('cytometer_db_col') or ''
+        try:
+            library = SpectralReferenceLibrary()
+            library.save_profile(
+                fluorophore=name,
+                profile=dict(zip(channels, [float(v) for v in profile])),
+                cytometer_key=cytometer_key,
+                config_key=compute_config_key(cytometer_key, channels),
+                channel_names=channels,
+                antigen=control.get('antigen') or None,
+                particle_type=control.get('particle_type') or None,
+                gate_channel=control.get('gate_channel') or None,
+                source_sample_name=control.get('sample_name') or None,
+                source_experiment_dir=str(self.controller.experiment_dir or ''),
+                notes=(notes or '').strip() or None,
+            )
+        except Exception as exc:
+            logger.warning(f'Save to Reference Library failed: {exc}')
+            QMessageBox.critical(self, 'Save to Reference Library', str(exc))
+            return
+
+        message = f'Saved "{name}" to the Reference Library.'
+        if not cytometer_key:
+            message += ' (Instrument not identified — saved as "unknown".)'
+        if self.bus is not None:
+            self.bus.statusMessage.emit(message)
+        logger.info(f'SpectralControlsEditor: {message}')
 
     def _warn_low_cosine_controls(self):
         """Show a single warning popup listing controls with cosine similarity

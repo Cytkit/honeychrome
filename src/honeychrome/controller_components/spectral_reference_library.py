@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 
 from honeychrome.settings import experiments_folder, library_file
 
+import logging
+logger = logging.getLogger(__name__)
+
 base_directory = Path.home() / experiments_folder
 
 _CYTOMETER_TO_CSV = {
@@ -100,7 +103,10 @@ class ReferenceProfile:
     config_key: str                      # exact channel-config identity
     channel_names: list[str]             # ordered PNN list — keys of profile
     profile: dict[str, float]            # channel name -> normalised intensity [0, 1]
-    gate_channel: str | None = None      # peak channel, for display only
+    gate_channel: str | None = None      # peak/major detector, for display only
+    antigen: str | None = None           # marker the conjugate targets (from Spectral Process)
+    particle_type: str | None = None     # 'Cells' | 'Beads' (from Spectral Process)
+    lot_number: str | None = None        # user-entered reagent lot
     source_sample_name: str | None = None
     source_experiment_dir: str | None = None
     notes: str | None = None
@@ -122,6 +128,9 @@ CREATE TABLE IF NOT EXISTS reference_library_profiles (
     channel_names_json      TEXT    NOT NULL,
     profile_json            TEXT    NOT NULL,
     gate_channel            TEXT,
+    antigen                 TEXT,
+    particle_type           TEXT,
+    lot_number              TEXT,
     source_sample_name      TEXT,
     source_experiment_dir   TEXT,
     notes                   TEXT,
@@ -136,6 +145,14 @@ CREATE INDEX IF NOT EXISTS idx_ref_lib_config
 CREATE INDEX IF NOT EXISTS idx_ref_lib_cytometer
     ON reference_library_profiles (cytometer_key, fluorophore);
 """
+
+
+# Columns added after the first release; migrated in with ALTER TABLE.
+_ADDED_COLUMNS = {
+    'antigen': 'TEXT',
+    'particle_type': 'TEXT',
+    'lot_number': 'TEXT',
+}
 
 
 class SpectralReferenceLibrary:
@@ -168,6 +185,13 @@ class SpectralReferenceLibrary:
     def ensure_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            # migrate DBs created before these columns existed
+            existing = {r[1] for r in conn.execute('PRAGMA table_info(reference_library_profiles)')}
+            for column, coltype in _ADDED_COLUMNS.items():
+                if column not in existing:
+                    conn.execute(
+                        f'ALTER TABLE reference_library_profiles ADD COLUMN {column} {coltype}'
+                    )
 
     def ensure_honeychrome_rows_populated(self) -> None:
         """Ingest the bundled reference CSVs as ``origin='honeychrome'`` rows.
@@ -196,6 +220,9 @@ class SpectralReferenceLibrary:
                     if exists:
                         continue
                     profile = {c: float(row[c]) for c in channel_names}
+                    # shipped rows have no acquisition metadata; derive the peak
+                    # (major) detector from the spectrum itself so the column is useful
+                    peak_channel = max(profile, key=profile.get) if profile else None
                     has_qc = conn.execute(
                         'SELECT 1 FROM reference_library_profiles '
                         'WHERE fluorophore = ? AND cytometer_key = ? AND is_qc_target = 1 LIMIT 1',
@@ -209,9 +236,31 @@ class SpectralReferenceLibrary:
                             is_reference, is_qc_target)
                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?)""",
                         (fluor, fluor, 'honeychrome', cytometer_key, config_key,
-                         json.dumps(channel_names), json.dumps(profile), None, None,
+                         json.dumps(channel_names), json.dumps(profile), peak_channel, None,
                          None, None, now, now, 0 if has_qc else 1),
                     )
+
+        self._backfill_peak_detectors()
+
+    def _backfill_peak_detectors(self) -> None:
+        """Fill in ``gate_channel`` for rows saved before the peak-detector column
+        was shown (derived from the spectrum's maximum)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                'SELECT id, profile_json FROM reference_library_profiles '
+                'WHERE gate_channel IS NULL OR gate_channel = ""'
+            ).fetchall()
+            for row in rows:
+                try:
+                    profile = json.loads(row['profile_json'])
+                except Exception:
+                    continue
+                if not profile:
+                    continue
+                conn.execute(
+                    'UPDATE reference_library_profiles SET gate_channel = ? WHERE id = ?',
+                    (max(profile, key=profile.get), row['id']),
+                )
 
     def list_cytometer_keys(self) -> list[str]:
         """Distinct instrument families present in the library."""
@@ -234,6 +283,9 @@ class SpectralReferenceLibrary:
             channel_names=json.loads(row['channel_names_json']),
             profile=json.loads(row['profile_json']),
             gate_channel=row['gate_channel'],
+            antigen=row['antigen'],
+            particle_type=row['particle_type'],
+            lot_number=row['lot_number'],
             source_sample_name=row['source_sample_name'],
             source_experiment_dir=row['source_experiment_dir'],
             notes=row['notes'],
@@ -255,6 +307,9 @@ class SpectralReferenceLibrary:
         display_name: str | None = None,
         origin: str = 'user',
         gate_channel: str | None = None,
+        antigen: str | None = None,
+        particle_type: str | None = None,
+        lot_number: str | None = None,
         source_sample_name: str | None = None,
         source_experiment_dir: str | None = None,
         notes: str | None = None,
@@ -269,13 +324,14 @@ class SpectralReferenceLibrary:
             cur = conn.execute(
                 """INSERT INTO reference_library_profiles
                    (fluorophore, display_name, origin, cytometer_key, config_key,
-                    channel_names_json, profile_json, gate_channel, source_sample_name,
-                    source_experiment_dir, notes, created_at, updated_at, is_deletable,
-                    is_reference, is_qc_target)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)""",
+                    channel_names_json, profile_json, gate_channel, antigen, particle_type,
+                    lot_number, source_sample_name, source_experiment_dir, notes,
+                    created_at, updated_at, is_deletable, is_reference, is_qc_target)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)""",
                 (fluorophore, display_name or fluorophore, origin, cytometer_key, config_key,
-                 json.dumps(list(channel_names)), json.dumps(profile), gate_channel,
-                 source_sample_name, source_experiment_dir, notes, now, now, int(is_deletable)),
+                 json.dumps(list(channel_names)), json.dumps(profile), gate_channel, antigen,
+                 particle_type, lot_number, source_sample_name, source_experiment_dir, notes,
+                 now, now, int(is_deletable)),
             )
             new_id = cur.lastrowid
         return self.get_profile(new_id)
@@ -323,6 +379,21 @@ class SpectralReferenceLibrary:
         return self._row_to_profile(row) if row else None
 
     # --- update --------------------------------------------------------------
+    _EDITABLE_FIELDS = ('display_name', 'fluorophore', 'antigen', 'particle_type',
+                        'lot_number', 'notes', 'gate_channel')
+
+    def update_fields(self, profile_id: int, **fields) -> None:
+        """Update user-editable text fields (antigen, lot number, notes, ...)."""
+        allowed = {k: v for k, v in fields.items() if k in self._EDITABLE_FIELDS}
+        if not allowed:
+            return
+        assignments = ', '.join(f'{k} = ?' for k in allowed)
+        with self._connect() as conn:
+            conn.execute(
+                f'UPDATE reference_library_profiles SET {assignments}, updated_at = ? WHERE id = ?',
+                (*allowed.values(), time.time(), profile_id),
+            )
+
     def rename_profile(self, profile_id: int, new_display_name: str) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -385,3 +456,55 @@ class SpectralReferenceLibrary:
             if not row['is_deletable']:
                 raise ValueError('Honeychrome-origin profiles cannot be deleted')
             conn.execute('DELETE FROM reference_library_profiles WHERE id = ?', (profile_id,))
+
+    # --- CSV import / export -------------------------------------------------
+    def import_csv(self, path, cytometer_key: str) -> list[ReferenceProfile]:
+        """Import a reference CSV (same shape as the bundled ones: first column =
+        fluorophore, remaining columns = detector names).
+
+        Rows are normalised to a peak of 1.0, exactly like the shipped CSVs, so
+        imported and shipped spectra are directly comparable. Imported rows are
+        always ``origin='user'`` (deletable). Returns the profiles created.
+        """
+        df = pd.read_csv(path, index_col=0)
+        channel_names = [str(c) for c in df.columns]
+        config_key = compute_config_key(cytometer_key, channel_names)
+
+        imported = []
+        for fluorophore, row in df.iterrows():
+            values = pd.to_numeric(row, errors='coerce').fillna(0.0)
+            peak = float(values.max())
+            if peak <= 0:
+                logger.warning(f'import_csv: skipping "{fluorophore}" — no positive signal')
+                continue
+            profile = {c: float(values[c]) / peak for c in channel_names}
+            imported.append(self.save_profile(
+                fluorophore=str(fluorophore),
+                profile=profile,
+                cytometer_key=cytometer_key,
+                config_key=config_key,
+                channel_names=channel_names,
+                origin='user',
+                gate_channel=max(profile, key=profile.get),
+            ))
+        return imported
+
+    def export_csv(self, path, profiles: list[ReferenceProfile]) -> None:
+        """Write ``profiles`` to a CSV in the same shape as the bundled libraries.
+
+        Columns follow the profiles' own detector order (first seen wins), so a
+        mixed-configuration selection still lines up; missing detectors are 0.
+        """
+        if not profiles:
+            raise ValueError('No profiles to export')
+        columns: list[str] = []
+        for profile in profiles:
+            for channel in profile.channel_names:
+                if channel not in columns:
+                    columns.append(channel)
+        data = {
+            p.display_name: [float(p.profile.get(c, 0.0)) for c in columns]
+            for p in profiles
+        }
+        pd.DataFrame.from_dict(data, orient='index', columns=columns).to_csv(path)
+
