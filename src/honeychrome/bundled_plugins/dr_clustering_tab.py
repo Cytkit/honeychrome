@@ -3905,9 +3905,17 @@ class GroupsStatsTab(QWidget):
             "testing."
         )
         self.add_column_btn.clicked.connect(self._add_covariate_column)
+        self.suggest_groupings_btn = QPushButton("Suggest Groupings…")
+        self.suggest_groupings_btn.setToolTip(
+            "Scan the sample names below for repeated, delimiter-separated "
+            "tokens (e.g. tissue, mouse/donor ID) and suggest a Group "
+            "column and/or covariate/pairing columns automatically."
+        )
+        self.suggest_groupings_btn.clicked.connect(self._suggest_groupings)
         csv_row.addWidget(self.import_csv_btn)
         csv_row.addWidget(self.export_csv_btn)
         csv_row.addWidget(self.add_column_btn)
+        csv_row.addWidget(self.suggest_groupings_btn)
         csv_row.addStretch()
 
         self._group_count_label = QLabel()
@@ -5056,6 +5064,192 @@ class GroupsStatsTab(QWidget):
         self.state.covariates[name] = ''
         self._populate_table()
         self._populate_pairing_variable_combo()
+
+    def _suggest_groupings(self):
+        """
+        Scan on-screen sample names (and, when the experiment's Sample
+        name source setting differs from plain filenames, the
+        FCS-keyword-derived display name already computed at import time
+        -- see experiment_model.py) for repeated, delimiter-separated
+        tokens, and offer to populate the Group column and/or add
+        covariate/pairing columns from what's found. Pure string
+        processing over already-loaded sample paths -- no disk I/O, runs
+        synchronously on the main thread.
+        """
+        sample_paths = self._table_sample_paths()
+        if len(sample_paths) < 2:
+            QMessageBox.information(
+                self, "Suggest Groupings",
+                "Need at least two samples on screen to detect a pattern."
+            )
+            return
+        display_names = self.controller.experiment.samples.get('all_samples', {})
+        result = drc_stats.suggest_covariates_from_names(sample_paths, display_names)
+        if not result['suggestions']:
+            msg = "No repeated naming patterns were found across these sample names."
+            if result['irregular_samples']:
+                msg += (f"\n\n{len(result['irregular_samples'])} sample name(s) have an "
+                        "unusual structure and couldn't be compared.")
+            QMessageBox.information(self, "Suggest Groupings", msg)
+            return
+        self._show_suggestion_dialog(result, sample_paths)
+
+    def _show_suggestion_dialog(self, result: dict, sample_paths: list[str]):
+        """
+        Lets the user review, rename, and select which detected naming
+        patterns to apply as the Group column and/or new covariate
+        columns. Built fresh each call -- no persistent state here beyond
+        what gets written into self.state on Apply.
+        """
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox
+
+        suggestions = result['suggestions']
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Suggest Groupings")
+        dlg.setMinimumWidth(720)
+        layout = QVBoxLayout(dlg)
+
+        hint = QLabel(
+            "Detected repeated naming patterns across the samples in the table "
+            "below. Tick the ones to apply, adjust role/column name if needed, "
+            "then Apply."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        if result['irregular_samples']:
+            warn = QLabel(
+                f"{len(result['irregular_samples'])} sample(s) have a different "
+                "naming structure and are excluded from every suggestion below."
+            )
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color: grey; font-style: italic;")
+            layout.addWidget(warn)
+
+        table = QTableWidget(len(suggestions), 5)
+        table.setHorizontalHeaderLabels(
+            ['Use', 'Detected field', 'Role', 'Column / group name', 'Example values']
+        )
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        table.verticalHeader().setVisible(False)
+
+        role_labels = {'group': 'Group', 'pairing': 'Pairing/covariate', 'covariate': 'Covariate'}
+        for row, sug in enumerate(suggestions):
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            chk.setCheckState(Qt.Checked if sug['role_guess'] in ('group', 'pairing') else Qt.Unchecked)
+            table.setItem(row, 0, chk)
+
+            field_item = QTableWidgetItem(sug['field_name'])
+            field_item.setFlags(Qt.ItemIsEnabled)
+            table.setItem(row, 1, field_item)
+
+            role_combo = QComboBox()
+            role_combo.addItems(['Group', 'Pairing/covariate', 'Covariate'])
+            role_combo.setCurrentText(role_labels[sug['role_guess']])
+            table.setCellWidget(row, 2, role_combo)
+
+            default_name = ('Group' if sug['role_guess'] == 'group'
+                            else f"field_{sug['position'] + 1}")
+            table.setItem(row, 3, QTableWidgetItem(default_name))
+
+            examples_item = QTableWidgetItem(', '.join(sug['examples']))
+            examples_item.setFlags(Qt.ItemIsEnabled)
+            table.setItem(row, 4, examples_item)
+
+        layout.addWidget(table)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Cancel)
+        buttons.rejected.connect(dlg.reject)
+        apply_btn = buttons.button(QDialogButtonBox.Apply)
+        apply_btn.clicked.connect(
+            lambda: self._apply_suggestions(dlg, table, suggestions, sample_paths)
+        )
+        layout.addWidget(buttons)
+
+        dlg.exec()
+
+    def _apply_suggestions(self, dlg, table, suggestions: list[dict], sample_paths: list[str]):
+        """
+        Writes the checked rows from the Suggest Groupings dialog into
+        state: at most one 'Group' role overwrites state.group_names /
+        state.sample_groups for the on-screen samples only (with
+        confirmation, same precedent as Auto-assign by pattern); any
+        number of 'Pairing/covariate' or 'Covariate' rows are written
+        into state.covariates, one column each.
+        """
+        role_map = {'Group': 'group', 'Pairing/covariate': 'pairing', 'Covariate': 'covariate'}
+
+        chosen = []
+        for row, sug in enumerate(suggestions):
+            if table.item(row, 0).checkState() != Qt.Checked:
+                continue
+            role = role_map[table.cellWidget(row, 2).currentText()]
+            name = table.item(row, 3).text().strip()
+            if not name:
+                QMessageBox.warning(self, "Suggest Groupings", "Column/group name cannot be blank.")
+                return
+            chosen.append((role, name, sug))
+
+        if not chosen:
+            dlg.accept()
+            return
+
+        group_rows = [c for c in chosen if c[0] == 'group']
+        if len(group_rows) > 1:
+            QMessageBox.warning(
+                self, "Suggest Groupings",
+                "Only one detected field can be applied as the Group column at a time."
+            )
+            return
+
+        if group_rows:
+            reply = QMessageBox.question(
+                self, "Suggest Groupings",
+                "Applying a detected field as the Group column will overwrite every "
+                "on-screen sample's current group, including manual selections. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        if self.state.covariates is None:
+            self.state.covariates = pd.DataFrame(index=pd.Index([], dtype=str))
+
+        for role, name, sug in chosen:
+            if role == 'group':
+                distinct_vals = sorted(set(sug['values'].values()))
+                self.state.group_names = distinct_vals
+                for sp in sample_paths:
+                    self.state.sample_groups[sp] = sug['values'].get(sp, 'Unassigned')
+                for val in distinct_vals:
+                    self._group_colour(val)  # seed default colours
+            else:
+                if name in self.state.covariates.columns:
+                    name = f"{name}_2"
+                self.state.covariates[name] = ''
+                for sp, val in sug['values'].items():
+                    rel = _to_rel(sp)
+                    if rel not in self.state.covariates.index:
+                        self.state.covariates.loc[rel] = ''
+                    self.state.covariates.loc[rel, name] = val
+                if role == 'pairing':
+                    self.state.pairing_variable = name
+
+        self._populate_groups_table()
+        self._refresh_group_combos()
+        self._refresh_compare_combos()
+        self._populate_table()
+        self._populate_pairing_variable_combo()
+        self._populate_test_groups_list()
+        self.state.invalidate_trex()
+        self._update_group_count_label()
+        self._update_run_button()
+        dlg.accept()
 
     def _on_covariate_edited(self, rel: str, col_name: str, value: str):
         """Write one sample's value for one covariate column directly."""
@@ -7752,16 +7946,35 @@ class PlotCard(QFrame):
         """
         self._populate_dr_run_combo()
         self._populate_cluster_run_combo()
-
-        self.marker_combo.blockSignals(True)
-        self.marker_combo.clear()
-        labels = _antigen_dash_labels(self.controller)
-        for ch in self.state.selected_channels:
-            self.marker_combo.addItem(labels.get(ch, ch), ch)
-        self.marker_combo.blockSignals(False)
+        self._populate_marker_combo()
 
         self._update_compatibility_warning()
         self._schedule_refresh()
+
+    def _populate_marker_combo(self):
+        """
+        Rebuild the marker-overlay combo from the CURRENTLY SELECTED DR
+        run's own archived channel list, not the live session's
+        state.selected_channels -- a run trained under an earlier channel
+        selection must still offer every marker it was actually trained
+        on, and must not silently offer ones it wasn't. Falls back to
+        state.selected_channels only when no run is selected yet (a fresh,
+        empty card) or an old run has nothing archived under 'channels'.
+        """
+        run = self._selected_dr_run()
+        channels = (run.get('channels') if run else None) or self.state.selected_channels
+
+        self.marker_combo.blockSignals(True)
+        current_ch = self.marker_combo.currentData()
+        self.marker_combo.clear()
+        labels = _antigen_dash_labels(self.controller)
+        for ch in channels:
+            self.marker_combo.addItem(labels.get(ch, ch), ch)
+        if current_ch:
+            idx = self.marker_combo.findData(current_ch)
+            if idx >= 0:
+                self.marker_combo.setCurrentIndex(idx)
+        self.marker_combo.blockSignals(False)
 
     def _populate_dr_run_combo(self):
         """Rebuild the DR-run combo from state.dr_runs, keyed by run_id —
@@ -7850,6 +8063,7 @@ class PlotCard(QFrame):
 
     def _on_dr_run_changed(self, _index: int):
         self._refresh_sample_combo()
+        self._populate_marker_combo()
         self._update_compatibility_warning()
         self._schedule_refresh()
 
@@ -11554,10 +11768,11 @@ class PluginWidget(QWidget):
         s = self._qsettings
         s.beginGroup(key)
         try:
-            s.setValue('selected_gates',    list(self.state.selected_gates))
             # Guard against clobbering a good saved selection with a
             # transiently empty one -- same reasoning as
             # config_channels_checked below.
+            if self.state.selected_gates:
+                s.setValue('selected_gates', list(self.state.selected_gates))
             if self.state.selected_channels:
                 s.setValue('selected_channels', self.state.selected_channels)
             s.setValue('n_training_events', self.state.n_training_events)
@@ -11611,11 +11826,19 @@ class PluginWidget(QWidget):
             s.setValue('marker_roles', repr(self.state.marker_roles))
             if hasattr(self, 'cluster_annotation_tab'):
                 cat = self.cluster_annotation_tab
-                s.setValue('annotation_run_id', cat.run_combo.currentData() or '')
-                s.setValue('annotation_dr_run_id', cat.dr_run_combo.currentData() or '')
-                s.setValue('annotation_channels_checked', cat._checked_channels())
-                if hasattr(cat, 'species_combo'):
-                    s.setValue('cluster_id_species', cat.species_combo.currentData() or 'human')
+                # Guard against clobbering a good saved selection with the
+                # tab's un-populated defaults. run_combo/dr_run_combo are
+                # only filled in by _populate_run_combo(), which only runs
+                # inside ClusterAnnotationTab.refresh() -- i.e. only once
+                # the user has actually visited this tab this session (see
+                # _refresh_tab_at). Until then count() is 0, so these
+                # fields must not be overwritten.
+                if cat.run_combo.count() > 0:
+                    s.setValue('annotation_run_id', cat.run_combo.currentData() or '')
+                    s.setValue('annotation_dr_run_id', cat.dr_run_combo.currentData() or '')
+                    s.setValue('annotation_channels_checked', cat._checked_channels())
+                    if hasattr(cat, 'species_combo'):
+                        s.setValue('cluster_id_species', cat.species_combo.currentData() or 'human')
             # Groups tab: include-type-markers checkbox
             if hasattr(self, 'groups_stats_tab'):
                 gst = self.groups_stats_tab

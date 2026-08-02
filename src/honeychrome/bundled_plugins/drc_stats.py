@@ -63,6 +63,138 @@ log = get_logger(__name__)
 # Group resolution
 # ---------------------------------------------------------------------------
 
+def suggest_covariates_from_names(
+    sample_rel_paths: list[str],
+    display_names: dict[str, str] | None = None,
+) -> dict:
+    """
+    Scan sample names for repeated, delimiter-separated tokens that could
+    serve as a Group or pairing/covariate column in the Groups & Stats tab
+    -- e.g. 'Mouse1_Spleen.fcs' / 'Mouse1_LN.fcs' / 'Mouse2_Spleen.fcs'
+    suggests a 2-level Spleen/LN grouping field and a per-mouse pairing
+    field, since 'Mouse1' recurs across two different tissue values.
+
+    Tokenizes both the raw filename (Path(rel_path).name) and, when
+    given, the experiment's display name for that sample (already
+    FCS-keyword-derived when Settings -> Sample name source is
+    'tubename'/'fil' -- see experiment_model.py) -- so no separate FCS
+    keyword read is needed here.
+
+    Only samples sharing the most common ("modal") token count are
+    compared position-by-position; samples with a different token count
+    are reported separately under 'irregular_samples' and excluded from
+    every suggestion.
+
+    Returns:
+        {
+            'suggestions': [
+                {
+                    'field_name':  str,   -- e.g. 'Name field 2 of 3 (filename)'
+                    'source':      'filename' | 'display_name',
+                    'position':    int,
+                    'values':      dict[sample_rel_path, str],
+                    'n_distinct':  int,
+                    'examples':    list[str],   -- up to 5 distinct values
+                    'role_guess':  'group' | 'pairing' | 'covariate',
+                },
+                ...
+            ],
+            'irregular_samples': list[str],  -- rel paths excluded from all suggestions
+        }
+    Returns {'suggestions': [], 'irregular_samples': [...]} if no usable
+    pattern is found (e.g. fewer than 2 samples, or every position is
+    either constant or fully unique).
+    """
+    import re
+    from pathlib import Path
+    from collections import Counter
+
+    def _tokenize(name: str) -> list[str]:
+        stem = Path(name).stem
+        return [t for t in re.split(r'[^A-Za-z0-9]+', stem) if t]
+
+    sources: list[tuple[str, dict[str, list[str]]]] = []
+
+    filename_tokens = {sp: _tokenize(Path(sp).name) for sp in sample_rel_paths}
+    sources.append(('filename', filename_tokens))
+
+    if display_names:
+        display_tokens = {
+            sp: _tokenize(display_names[sp])
+            for sp in sample_rel_paths if sp in display_names
+        }
+        # Only worth treating as a separate source if it actually differs
+        # from the filename tokenization for at least one sample --
+        # otherwise it's the same information twice (plain-filename mode).
+        if any(display_tokens.get(sp) != filename_tokens.get(sp) for sp in display_tokens):
+            sources.append(('display_name', display_tokens))
+
+    all_suggestions = []
+    irregular_all: set[str] = set()
+
+    for source_label, tokens_by_sample in sources:
+        if len(tokens_by_sample) < 2:
+            continue
+        lengths = Counter(len(v) for v in tokens_by_sample.values())
+        modal_length, _ = lengths.most_common(1)[0]
+        regular = {sp: toks for sp, toks in tokens_by_sample.items() if len(toks) == modal_length}
+        irregular = set(tokens_by_sample) - set(regular)
+        irregular_all |= irregular
+        n_samples = len(regular)
+        if n_samples < 2 or modal_length == 0:
+            continue
+
+        candidates = []
+        for pos in range(modal_length):
+            values = {sp: toks[pos] for sp, toks in regular.items()}
+            n_distinct = len(set(values.values()))
+            if n_distinct <= 1 or n_distinct >= n_samples:
+                continue  # constant, or no repeats at all -- not usable
+            candidates.append((pos, values, n_distinct))
+
+        if not candidates:
+            continue
+
+        # Primary "group" candidate: smallest distinct count within a
+        # sane range for a comparison group (2-8 levels).
+        group_candidates = [c for c in candidates if 2 <= c[2] <= 8]
+        primary = min(group_candidates, key=lambda c: c[2]) if group_candidates else None
+
+        for pos, values, n_distinct in sorted(candidates, key=lambda c: c[2]):
+            if primary is not None and pos == primary[0]:
+                role = 'group'
+            elif primary is not None:
+                # Cross-tab against the primary group candidate: does this
+                # field's value recur across >=2 different group values
+                # (pairing candidate), or is it nested inside a single
+                # group value (just a correlated covariate)?
+                _, group_values, _ = primary
+                co_occurrence: dict[str, set[str]] = {}
+                for sp, v in values.items():
+                    co_occurrence.setdefault(v, set()).add(group_values[sp])
+                crosses = sum(1 for s in co_occurrence.values() if len(s) >= 2)
+                role = 'pairing' if crosses > len(co_occurrence) / 2 else 'covariate'
+            else:
+                role = 'covariate'
+
+            distinct_vals = sorted(set(values.values()))
+            all_suggestions.append({
+                'field_name': f"Name field {pos + 1} of {modal_length} ({source_label})",
+                'source': source_label,
+                'position': pos,
+                'values': values,
+                'n_distinct': n_distinct,
+                'examples': distinct_vals[:5],
+                'role_guess': role,
+            })
+
+    # Group suggestions first, then pairing, then covariate; smallest
+    # n_distinct first within each role.
+    role_order = {'group': 0, 'pairing': 1, 'covariate': 2}
+    all_suggestions.sort(key=lambda s: (role_order[s['role_guess']], s['n_distinct']))
+
+    return {'suggestions': all_suggestions, 'irregular_samples': sorted(irregular_all)}
+
 def resolve_test_groups(controller, state, cluster_labels_override=None):
     """
     Resolve every group in ``state.testing_group_selection`` (Item 13 phase
