@@ -267,6 +267,40 @@ def _assign_by_slicing_or_predict(controller, state, pooled_data, boundaries, fi
     log.info("assigned labels to %d samples", len(state.cluster_labels))
 
 
+def build_centroid_tree_data(fit_data: np.ndarray, fit_labels: np.ndarray,
+                             all_labels: np.ndarray) -> dict:
+    """
+    Cluster-centroid tree data for Leiden/HDBSCAN -- same shape as
+    FlowSOM's state.trained_reducers['FlowSOM'] entry ('node_weights',
+    'node_to_meta', 'node_counts'), so build_flowsom_tree() renders an MST
+    for these algorithms too. Leiden/HDBSCAN have no SOM-style sub-node
+    structure -- each 'node' here IS a final cluster, so node_to_meta is
+    the identity mapping (each node's own label) rather than a
+    many-nodes-to-few-metaclusters rollup.
+
+    fit_data / fit_labels: the training pool and its fitted labels --
+        node_weights is each cluster's centroid over this pool, the same
+        "training data only" scope FlowSOM's SOM codebook is trained on.
+    all_labels: every assigned label across every sample this run
+        touched (state.cluster_labels, concatenated) -- node_counts uses
+        this full set, matching FlowSOM's node_counts semantics (total
+        event count per node across ALL assigned samples, not just the
+        training pool).
+    """
+    unique_labels = np.unique(fit_labels)
+    node_weights = np.array(
+        [fit_data[fit_labels == lbl].mean(axis=0) for lbl in unique_labels])
+    node_to_meta = unique_labels.astype(np.int32)
+
+    all_ids, all_counts = np.unique(all_labels, return_counts=True)
+    count_map = dict(zip(all_ids.tolist(), all_counts.tolist()))
+    node_counts = np.array([count_map.get(int(lbl), 0) for lbl in unique_labels],
+                           dtype=np.int64)
+
+    return {'node_weights': node_weights, 'node_to_meta': node_to_meta,
+            'node_counts': node_counts}
+
+
 # ---------------------------------------------------------------------------
 # FlowSOM
 # ---------------------------------------------------------------------------
@@ -538,6 +572,10 @@ def run_leiden(controller, state, params: dict, progress=None, af_state=None) ->
     n_cl = int(train_labels.max()) + 1
     state.n_clusters = n_cl
     state.active_clustering_algorithm = 'Leiden'
+    all_labels_final = (np.concatenate(list(state.cluster_labels.values()))
+                        if state.cluster_labels else train_labels)
+    state.trained_reducers['Leiden'] = build_centroid_tree_data(
+        data, train_labels, all_labels_final)
     _progress(progress, f"Leiden done: {n_cl} communities.")
 
 
@@ -635,6 +673,10 @@ def run_hdbscan(controller, state, params: dict, progress=None, af_state=None) -
     )
     state.n_clusters = n_cl
     state.active_clustering_algorithm = 'HDBSCAN'
+    all_labels_final = (np.concatenate(list(state.cluster_labels.values()))
+                        if state.cluster_labels else train_labels)
+    state.trained_reducers['HDBSCAN'] = build_centroid_tree_data(
+        data, train_labels, all_labels_final)
 
 
 # ---------------------------------------------------------------------------

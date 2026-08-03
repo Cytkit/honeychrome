@@ -74,11 +74,7 @@ def draw_cluster_scatter(ax, xy, labels, cl_run: dict | None, controller) -> Non
         log.warning("cluster_colors empty for run %s — assigning palette on the fly",
                      cl_run.get('run_id'))
         colors.update(assign_run_cluster_colors(np.asarray(labels)))
-        drc_run_archive.save_run_payload(controller, cl_run['run_id'], {
-            'labels': cl_run.get('labels', {}),
-            'colors': colors,
-            'names': cl_run.get('names', {}),
-        })
+        drc_run_archive.update_run_payload(controller, cl_run)
     names = cl_run.get('names', {})
 
     unique_labels = sorted(int(l) for l in np.unique(labels))
@@ -127,11 +123,7 @@ def rename_cluster(controller, cl_run: dict | None, label: int, new_name: str,
             )
             return False
     names[label] = new_name
-    drc_run_archive.save_run_payload(controller, cl_run['run_id'], {
-        'labels': cl_run.get('labels', {}),
-        'colors': cl_run.get('colors', {}),
-        'names': names,
-    })
+    drc_run_archive.update_run_payload(controller, cl_run)
     return True
 
 
@@ -142,11 +134,7 @@ def recolor_cluster(controller, cl_run: dict | None, label: int, new_hex: str) -
         return
     colors = cl_run.setdefault('colors', {})
     colors[label] = new_hex
-    drc_run_archive.save_run_payload(controller, cl_run['run_id'], {
-        'labels': cl_run.get('labels', {}),
-        'colors': colors,
-        'names': cl_run.get('names', {}),
-    })
+    drc_run_archive.update_run_payload(controller, cl_run)
 
 
 def compatibility_warning(dr_run: dict | None, cl_run: dict | None) -> str | None:
