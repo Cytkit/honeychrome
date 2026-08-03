@@ -4,12 +4,11 @@ drc_stats.py — Differential statistics (inmoose/limma) for the DR/Clustering p
 Companion to ``dr_clustering_tab.py`` (filename intentionally NOT ``*_tab.py``).
 
 Computes cluster-frequency and cluster-MFI differential statistics between two
-sample groups via ``inmoose.limma`` (lmFit → eBayes → topTable), verified against
-CONTEXT_InMoose.md (v0.9.1).
+sample groups via ``inmoose.limma`` (lmFit → eBayes → topTable).
 
-Item 14 adds a parallel negative-binomial GLM (statsmodels) path for cluster
-differential ABUNDANCE on raw counts, run alongside (not instead of) the
-Frequency/limma test — both remain independently selectable so the two can be
+Added a parallel negative-binomial GLM (statsmodels) path for cluster
+differential ABUNDANCE on raw counts, run alongside the Frequency/limma test. 
+Both remain independently selectable so the two can be
 compared on the same data. MFI/differential-expression testing is unaffected;
 it stays on the limma/InMoose path either way.
 
@@ -24,7 +23,7 @@ Fixes baked in (see the diagnosis docs):
          not a filtered-index lookup against full-width data.
   • S6 — each sample's FCS is loaded ONCE, not once per channel.
 
-Group bookkeeping note (Item 13): ``state.sample_groups`` values are the
+Group bookkeeping note: ``state.sample_groups`` values are the
 group's own name (a free-form user-defined string) or the reserved
 'Unassigned' sentinel — there is no longer a slot/display-name split (that
 indirection, and the S3 bug it existed to guard against, are both gone: a
@@ -37,7 +36,7 @@ plus ``state.reference_group`` decide the contrast(s), and
 ``state.paired``/``state.pairing_variable`` add an optional fixed-effect
 blocking term (patsy formula ``+ C(pair_id)`` — InMoose documents no
 ``duplicateCorrelation``-style random-effect blocking, so this is a
-fixed-effect-only approach; see the Item 13 change doc §2.2). Results carry
+fixed-effect-only approach). Results carry
 a ``comparison`` column when more than one contrast was run.
 
 ``state.compare_group_a``/``state.compare_group_b`` remain — but only for
@@ -197,8 +196,8 @@ def suggest_covariates_from_names(
 
 def resolve_test_groups(controller, state, cluster_labels_override=None):
     """
-    Resolve every group in ``state.testing_group_selection`` (Item 13 phase
-    2 — falls back to every defined group if the selection is empty) to
+    Resolve every group in ``state.testing_group_selection`` 
+    (falls back to every defined group if the selection is empty) to
     rel-path keys present in ``cluster_labels_override`` (or
     ``state.cluster_labels`` if not supplied).
 
@@ -250,12 +249,12 @@ def resolve_test_groups(controller, state, cluster_labels_override=None):
 def build_contrasts(group_names: list[str], mode: str,
                     reference: str | None) -> list[tuple[str, str]]:
     """
-    Item 13 phase 2. Returns the list of (baseline, other) pairs to test.
+    Returns the list of (baseline, other) pairs to test.
 
     mode='reference': (reference, other) for every OTHER qualifying group —
-        one joint fit, multiple coefficients (§2.1).
+        one joint fit, multiple coefficients.
     mode='pairwise':  every unique pair among group_names, in group_names
-        order — each pair gets its own independent fit (§2.1).
+        order — each pair gets its own independent fit.
     """
     if mode == 'reference':
         if reference not in group_names:
@@ -296,7 +295,7 @@ def n_clusters_from_labels(state, all_rel, cluster_labels_override=None) -> int:
 def _label_for(state, cl: int, names_override: dict | None) -> str:
     """
     Resolve a cluster's display name. When names_override is given (the
-    SELECTED run's own 'names' dict — see drc_scatter.py / Item 8), it is
+    SELECTED run's own 'names' dict — see drc_scatter.py), it is
     authoritative and state.cluster_names is never consulted, so labels
     can't bleed in from an unrelated run. Falls back to the legacy global
     dict only for the "Active (unsaved)" pseudo-run, which has no run
@@ -329,10 +328,10 @@ def compute_frequencies(state, all_rel, n_clusters, cluster_labels_override=None
 def compute_counts(state, all_rel, n_clusters, cluster_labels_override=None,
                    names_override: dict | None = None) -> pd.DataFrame:
     """
-    Per-sample RAW event count in each cluster → (n_samples × n_clusters).
+    Per-sample RAW event count in each cluster → (n_samples by n_clusters).
 
     Same shape/index/columns as compute_frequencies() — just unnormalized.
-    This is the counterpart Item 14's GLM-on-counts path needs alongside the
+    This is the counterpart the GLM-on-counts path needs alongside the
     existing percentage matrix; run_statistics() computes both from the same
     already-resolved all_rel/n_clusters rather than each re-deriving them.
     """
@@ -352,8 +351,8 @@ def compute_counts(state, all_rel, n_clusters, cluster_labels_override=None,
 def resolve_mfi_channels(state, include_type_markers: bool = False) -> list[str]:
     """
     Return the channel list MFI significance testing should use, filtered
-    by marker role (Item 11 — diffcyt's type/state split, §5). 'type'
-    channels (those that drove the clustering assignment) are excluded by
+    by marker role (diffcyt's type/state split). 'type'
+    channels (those that drove the clustering assignment) can be excluded by
     default, to avoid the same channel driving both the cluster call and
     its own significance test. include_type_markers=True restores the
     previous all-selected-channels behaviour.
@@ -371,12 +370,12 @@ def compute_mfis(controller, state, all_rel, n_clusters,
     """
     Per-sample mean intensity of each selected channel within each cluster.
 
-    Returns (n_samples × (n_clusters · n_channels)). Loads each sample's
+    Returns (n_samples by (n_clusters · n_channels)). Loads each sample's
     untransformed selected-channel values ONCE via drc_pipeline (correct
     channel→column mapping), then iterates channels in memory.
 
-    channels: explicit channel list to test (Item 11). Defaults to every
-              selected channel (pre-Item-11 behaviour) when not supplied,
+    channels: explicit channel list to test. Defaults to every
+              selected channel when not supplied,
               so any other caller keeps working unchanged.
 
     af_state: optional (transfer_matrix, af_precomputed, af_spectra) snapshot,
@@ -477,7 +476,7 @@ def compute_sample_mfis(controller, state, all_rel, channels=None,
 
 
 # ---------------------------------------------------------------------------
-# Sample PCA (Item 16)
+# Sample PCA
 # ---------------------------------------------------------------------------
 
 def compute_sample_pca(state, use_freq: bool, use_counts: bool, use_mfi: bool,
@@ -592,7 +591,7 @@ def compute_sample_pca(state, use_freq: bool, use_counts: bool, use_mfi: bool,
 
 
 # ---------------------------------------------------------------------------
-# Composition views (Items 10 & 12 — CyCONDOR comparison, §5)
+# Composition views
 # ---------------------------------------------------------------------------
 
 def compute_confusion_matrix(controller, state, cluster_labels_override=None,
@@ -609,9 +608,8 @@ def compute_confusion_matrix(controller, state, cluster_labels_override=None,
     run is selected (same availability gate as run_statistics(), via
     resolve_test_groups()'s ≥3-per-group check).
 
-    Returns (n_clusters × n_groups) DataFrame — one column per qualifying
-    group in state.testing_group_selection (Item 13 phase 2: no longer
-    limited to exactly two).
+    Returns (n_clusters by n_groups) DataFrame — one column per qualifying
+    group in state.testing_group_selection.
     """
     log_stage(log, "CONFUSION MATRIX")
     group_rel = resolve_test_groups(controller, state, cluster_labels_override=cluster_labels_override)
@@ -739,7 +737,7 @@ def _limma_fit_one(data_df: pd.DataFrame, group_vec: list[str], baseline: str,
     expr = data_df.values.T.astype(float)        # (features, samples)
     n_features = expr.shape[0]
     if n_features < 3:
-        # See eBayes' Infdf/squeezeVar note (unchanged from Phase 1) — fails
+        # See eBayes' Infdf/squeezeVar note — fails
         # clearly here instead of a bare KeyError deep inside inmoose.
         raise RuntimeError(
             f"Only {n_features} feature(s) to test (need >= 3) for "
@@ -767,7 +765,7 @@ def _limma_fit_one(data_df: pd.DataFrame, group_vec: list[str], baseline: str,
     coef_col = f"column{coef_idx}"
     tt = topTable(fit, coef=coef_col, number=np.inf, adjust_method='fdr_bh', sort_by='p')
 
-    # S0: normalise inmoose DEResults columns → R/limma names used downstream.
+    # normalise inmoose DEResults columns → R/limma names used downstream.
     tt = pd.DataFrame(tt).rename(columns={
         'log2FoldChange': 'logFC',
         'pvalue':         'P.Value',
@@ -786,8 +784,7 @@ def run_limma(data_df: pd.DataFrame, group_vec: list[str],
               pval_threshold: float, fc_threshold: float,
               pairing_vec: list[str] | None = None) -> pd.DataFrame:
     """
-    lmFit → eBayes → topTable, generalised to N groups and multiple
-    contrasts (Item 13 phase 2).
+    lmFit → eBayes → topTable, generalised to N groups and multiple contrasts.
 
     data_df   : rows = samples (index aligned to group_vec/pairing_vec),
                 columns = features (clusters / channel-clusters)
@@ -802,14 +799,13 @@ def run_limma(data_df: pd.DataFrame, group_vec: list[str],
                   pair's samples first. No documented InMoose equivalent to
                   limma's makeContrasts for extracting custom linear
                   combinations from one N-level fit, so each pairwise
-                  comparison is a fresh, self-contained 2-group test — see
-                  §2.1 of the Item 13 change doc.
+                  comparison is a fresh, self-contained 2-group test.
     pairing_vec: optional per-row blocking id (e.g. donor), same order as
                 group_vec; added as a fixed-effect term in the formula.
 
     Returns one combined DataFrame — feature, logFC, AveExpr, t, P.Value,
     adj.P.Val, B, comparison, significant — concatenated across every
-    requested contrast. A single 2-group call (Phase 1's only case) returns
+    requested contrast. A single 2-group call returns
     the exact same rows as before, with one added 'comparison' column.
     """
     frames = []
@@ -843,12 +839,11 @@ def run_limma(data_df: pd.DataFrame, group_vec: list[str],
 
     combined = pd.concat(frames, ignore_index=True)
 
-    # Item 13 phase 2 addendum (§2.7): adj.P.Val above is corrected
-    # SEPARATELY per contrast (topTable's own per-call default). Add a
-    # GLOBAL correction -- one BH-FDR pass over every finite P.Value in
-    # the whole combined table -- and use that for 'significant' instead.
-    # Identical to adj.P.Val when there's only one contrast (Phase 1's
-    # 2-group case), so this changes nothing for that path.
+    # adj.P.Val above is corrected SEPARATELY per contrast (topTable's 
+    # own per-call default). Add a GLOBAL correction -- one BH-FDR pass 
+    # over every finite P.Value in the whole combined table -- and use 
+    # that for 'significant' instead. Identical to adj.P.Val when there's
+    #  only one contrast, so this changes nothing for that path.
     from statsmodels.stats.multitest import multipletests
     combined['adj.P.Val.global'] = np.nan
     valid = np.isfinite(combined['P.Value'].values.astype(float))
@@ -869,7 +864,7 @@ def run_limma(data_df: pd.DataFrame, group_vec: list[str],
 
 def _glm_fit_one_cluster(y: np.ndarray, design: np.ndarray):
     """Poisson-then-NB fit for one cluster's raw counts (unchanged
-    Cameron & Trivedi auxiliary-OLS alpha estimate from Phase 1/Item 14).
+    Cameron & Trivedi auxiliary-OLS alpha estimate.
     Returns the fitted GLM result, or None if even the Poisson fit fails."""
     import statsmodels.api as sm
 
@@ -951,9 +946,8 @@ def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
                    pairing_vec: list[str] | None = None) -> pd.DataFrame:
     """
     Per-cluster negative-binomial GLM differential abundance test on raw
-    event counts (Item 14), generalised to N groups/multiple contrasts —
-    same contrasts/mode/pairing_vec semantics as run_limma() (Item 13
-    phase 2), kept in lockstep per the docstring's own promise.
+    event counts, generalised to N groups/multiple contrasts —
+    same contrasts/mode/pairing_vec semantics as run_limma().
 
     Unlike run_limma()'s single shared eBayes fit in 'reference' mode, each
     (cluster, contrast) pair here is its own independent per-cluster GLM —
@@ -994,7 +988,7 @@ def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
 
     combined = pd.concat(frames, ignore_index=True)
 
-    # Item 13 phase 2 addendum (§2.7) -- same global-vs-separate fix as
+    # same global-vs-separate fix as
     # run_limma(): adj.P.Val above is corrected separately per contrast
     # (each _glm_counts_one_contrast() call runs its own multipletests()
     # over just that contrast's clusters). Add a global BH-FDR pass over
@@ -1033,19 +1027,18 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
     returns ``(freq_results, mfi_results, counts_results)`` (any may be
     None).
 
-    Item 13 phase 2: resolves state.testing_group_selection (falling back
+    Resolves state.testing_group_selection (falling back
     to every defined group), builds the contrast list from
     state.contrast_mode/reference_group, and — if state.paired is set and
     state.pairing_variable names a real state.covariates column — builds a
     per-sample blocking vector, all shared across freq/counts/mfi so the
     three tests always report the exact same set of comparisons.
 
-    include_type_markers: Item 11 — when False (default), the MFI branch
+    include_type_markers: when False (default), the MFI branch
         tests 'state'-role channels only, excluding whichever channels
-        drove the clustering assignment. When True, restores the
-        pre-Item-11 behaviour of testing every selected channel.
+        drove the clustering assignment. When True, tests every selected channel.
 
-    run_counts: Item 14 — when True, additionally runs the negative-
+    run_counts: when True, additionally runs the negative-
         binomial GLM abundance test on raw cluster counts (run_glm_counts),
         alongside (not instead of) the Frequency/limma test controlled by
         run_freq. Independent of run_freq/run_mfi — any combination of the

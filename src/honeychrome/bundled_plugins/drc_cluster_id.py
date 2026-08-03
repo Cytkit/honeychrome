@@ -11,26 +11,15 @@ Two independent scoring mechanisms feed the Cluster Annotation tab's Item 15
   1. MEM (Marker Enrichment Modeling) -- ported from cluster_id.md.
      calculate_mem_scores() -> generate_mem_labels(). A descriptive
      statistic of the cluster's own data; safe to auto-adopt.
-  2. Cell-type scoring -- ported from flow_cluster_id_score.R (your own
-     scType-derived adaptation; original scType by Aleksandr Ianevski,
-     GNU GPL-3.0, https://github.com/IanevskiAleksandr/sc-type). Looks MEM
-     scores up against a marker-signature database
-     (drc_cell_type_database.csv); a biological CLAIM rather than a computed
-     statistic, so the tab only ever displays this as a suggestion.
+  2. Cell-type scoring -- ported from flow_cluster_id_score.R (original scType
+     by Aleksandr Ianevski, GNU GPL-3.0, https://github.com/IanevskiAleksandr/sc-type).
 
 Values are TRANSFORMED using each channel's configured transform
 (state.channel_transform_params -- the same logicle/log/linear transform
 the Transforms tab and clustering itself use), via
-drc_pipeline.load_sample_transformed_values(). This is a deliberate
-REVERSAL of this module's original choice to mirror
-drc_stats.compute_mfis's log1p(max(raw, 0)) convention -- that worked for
-MFI significance testing (a robust summary statistic across sample
-groups), but for MEM's positive/negative separation, the scale needs to
-match what the Transforms tab (and clustering itself) actually considers
-positive/negative for a channel, not a generic log1p over the full raw
-dynamic range. A channel with no transform configured yet in the
-Transforms tab falls back to whatever transform_channels()'s default
-resolves to (id=1 / logicle, matching _build_flowkit_transform's default)
+drc_pipeline.load_sample_transformed_values(). A channel with no transform 
+configured yet in the Transforms tab falls back to whatever transform_channels()'s 
+default resolves to (id=1 / logicle, matching _build_flowkit_transform's default)
 rather than failing.
 
 Marker naming is enforced in two tiers, both keyed off the Spectral
@@ -286,27 +275,10 @@ def calculate_mem_scores(pooled: dict[str, dict[int, np.ndarray]],
 
 def calculate_cluster_medians(pooled: dict[str, dict[int, np.ndarray]]) -> pd.DataFrame:
     """
-    Per-cluster ABSOLUTE median of the TRANSFORMED marker values in
+    Per-cluster median of the TRANSFORMED marker values in
     `pooled` -- no reference cluster, no rescale, no comparison of any
     kind between clusters. This is what score_cell_types takes as input,
-    matching flow_cluster_id_score.R's own "thresholded flow expression
-    matrix" convention: the biexponential/logicle transform already puts
-    the negative/positive boundary at (approximately) zero, so a
-    cluster's median transformed value on its own IS the signal the R
-    function expects -- unlike calculate_mem_scores (auto-reference +
-    global rescale) or the z-score approach this replaces (auto-reference
-    + population SD), both of which are RELATIVE: "how different is this
-    cluster from the rest of this run."
-
-    That relativity is exactly what broke scoring against a marker with
-    NO cross-cluster variation -- e.g. CD3 in an all-CD3+, pre-gated
-    T-cell run, where every cluster is already CD3+CD45+ and there is no
-    cross-cluster difference for MEM or a z-score to detect, so both
-    assign it ~0 regardless of how the result is rescaled or weighted.
-    An absolute median doesn't have this problem: CD3's median transformed
-    value sits well above the transform's zero point for every cluster in
-    that run, because the cells really are CD3+, and now that correctly
-    registers as positive evidence for every one of them.
+    combined with thresholding for positivity over the unstained sample.
 
     Returns a (cluster x channel) DataFrame; NaN cells follow the same
     convention as calculate_mem_scores (no pooled data for that
@@ -347,6 +319,8 @@ def _otsu_threshold(values: np.ndarray, n_bins: int = 256) -> float:
     unimodal distribution (e.g. a marker that's uniformly positive across
     an entire pre-gated run) still gets a cutoff at the edge of that one
     population, not a nonsensical mid-population split.
+
+    Not used unless no unstained cell sample can be located.
     """
     finite = values[np.isfinite(values)]
     if finite.size == 0:
@@ -691,15 +665,6 @@ def calculate_channel_thresholds(controller, state, pooled: dict[str, dict[int, 
     before; it's still needed as the fallback since it doesn't require an
     unstained sample to produce a usable cut -- see _otsu_threshold's
     docstring.
-
-    Subtracting this from calculate_cluster_medians's output (see
-    score_cell_types's caller) is the missing "thresholding" step
-    flow_cluster_id_score.R's docstring assumes: without it, "off" reads as
-    a small positive number rather than ~0/negative, which lets cell-type
-    entries with MORE listed positive markers win purely by accumulating
-    more small positive contributions, regardless of whether those markers
-    are actually on (see this module's top-level notes on the 2024
-    "Memory CD4 Treg wins everything" diagnosis for the concrete numbers).
 
     unstained_af_states: forwarded to calculate_unstained_channel_thresholds
     -- see its docstring and resolve_unstained_af_states.
@@ -1128,7 +1093,7 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
                                     max_events_per_cluster: int | None = 1000,
                                     downsample_seed: int = 42):
     """
-    One-call pipeline for the Cluster Annotation tab's Item 15 controls.
+    One-call pipeline for the Cluster Annotation tab's controls.
 
     Does NOT itself check for missing Antigen -- the tab calls
     channels_missing_antigen() BEFORE this and refuses to proceed if

@@ -2,7 +2,7 @@
 dr_clustering_tab.py — DR / Clustering / Statistics Plugin for Honeychrome
 ===========================================================================
 Honeychrome plugin providing:
-  • Dimensionality reduction  — UMAP, PaCMAP
+  • Dimensionality reduction  — UMAP, PaCMAP, tSNE, PHATE
   • Clustering               — FlowSOM, Leiden, HDBSCAN
   • Transform inspector      — read-only preview of Logicle parameters
   • Group & statistics       — sample grouping, limma differential analysis
@@ -13,27 +13,31 @@ Plugin contract (required by plugin_loaders.py):
   PluginWidget(QWidget)      — instantiated with (bus, controller)
 
 Distribution:
-  Place in  honeychrome/plugin_templates/dr_clustering_tab.py
-  main.py copies it to  ~/Experiments/plugins/  on first launch.
+  Lives in  honeychrome/bundled_plugins/dr_clustering_tab.py  (see
+  plugin_loaders.py — discovered automatically as *_tab.py, gated behind
+  'EnableBundledPlugin_dr_clustering_tab' in QSettings). Never copied into
+  ~/Experiments/plugins/ — that mechanism is for the open, unreviewed
+  user-plugin ecosystem only.
   Users enable it in App Configuration → restart → tab appears.
 
 Dependencies:
-  Heavy ML packages are installed automatically on first load via
-  _bootstrap() below.  No user Python interaction is required.
+  Heavy ML packages (umap-learn, openTSNE, pacmap, phate, leidenalg,
+  igraph, hnswlib, inmoose, hdbscan) are ordinary Honeychrome dependencies
+  now (requirements.in) — installed as part of the app's own build, same
+  as pandas or scikit-learn. All ML imports stay LAZY (inside method
+  bodies), unchanged from before; this only removes the runtime
+  pip-install path, not the lazy-import discipline.
 
-Stage 1 — skeleton (complete):
-  PipelineState, PluginWidget, 4-tab QTabWidget, bootstrap, bus wiring.
-
-Stage 2 — Transforms tab (complete):
+Transforms:
   Transform preview, auto-transform, CSV import/export, QSettings persistence.
 
-Stage 3 — DR pipeline (complete):
+DR pipeline:
   ConfigTab DR section: algorithm radios, per-algorithm hyperparameter panels,
   Train / Apply to All Samples buttons, status labels.
   _run_umap(), _run_pacmap() with hnswlib kNN.
   _apply_dr_to_all_samples() projects every sample.
 
-Stage 4 — Clustering (complete):
+Clustering:
   ConfigTab clustering section: FlowSOM / Leiden / HDBSCAN radio buttons
   with per-algorithm hyperparameter panels.
   FlowSOM: SOM grid, manual metacluster count (2-200).
@@ -42,19 +46,15 @@ Stage 4 — Clustering (complete):
   All algorithms assign labels to every sample via nearest-centroid.
   Cluster colours from cc.glasbey; noise label −1 → grey.
 
-Stage 5 — Workspace basics (complete):
-  WorkspaceTab with scrollable PlotCard grid, matplotlib scatter, cluster
-  colouring, DR / sample selectors, PNG export, PDF export.
-
-Stage 6 — Groups & Stats (complete):
+Groups & Stats:
   GroupsStatsTab: named groups with regex auto-population, limma statistics
   (inmoose), heatmap+dendrogram, volcano plot, CSV result export.
 
-Stage 7 — Advanced workspace (complete):
-  T-REX scatter colouring, per-cluster colour pickers (right-click), magic-wand
+Workspace:
+  Per-marker scatter colouring, per-cluster colour pickers (right-click), magic-wand
   display-config copy/paste, multi-page PDF export.
 
-Stage 8 — Report tab (complete):
+Report tab:
   ReportTab (drc_report.py): per-source-tab tick-lists (Workspace, Cluster
   Annotation, Stats), PNG/CSV export per item into a timestamped run
   folder, one combined PDF, and an always-generated settings.txt
@@ -62,74 +62,32 @@ Stage 8 — Report tab (complete):
 """
 
 # ---------------------------------------------------------------------------
-# 0.  Dependency bootstrap — runs once at module load
-#     Installs any missing ML packages into the same Python environment
-#     that Honeychrome is using.  Silent on subsequent launches.
+# 0.  Module-level setup
+#     Bundled plugin: all heavy ML packages are ordinary Honeychrome
+#     dependencies (requirements.in), installed as part of the app's own
+#     build/environment — no runtime bootstrap/self-install needed. All ML
+#     imports stay LAZY (inside method bodies) regardless, same as before.
 # ---------------------------------------------------------------------------
 import os as _os
 import sys
-import subprocess
 import warnings
-from importlib import import_module
 
 # Set Numba threading layer at module-import time, before any JIT compilation.
 # 'omp' ships with llvmlite (a hard Numba dep) and is always available.
 # Unlike the default 'workqueue' layer, 'omp' is safe when two Numba-compiled
 # functions (e.g. UMAP and FlowSOM) are running concurrently on separate
 # QThreads.  Must be set before the first numba import, which is why it lives
-# here at module scope rather than inside _bootstrap().
+# here at module scope.
 if 'NUMBA_THREADING_LAYER' not in _os.environ:
     _os.environ['NUMBA_THREADING_LAYER'] = 'omp'
 
-_REQUIRED_PACKAGES = {
-    'umap':       'umap-learn',
-    'openTSNE':   'openTSNE',
-    'pacmap':     'pacmap',
-    'phate':      'phate',
-    'leidenalg':  'leidenalg',
-    'igraph':     'python-igraph',
-    'hnswlib':    'hnswlib',
-    'inmoose':    'inmoose',
-    'adjustText': 'adjustText',
-    'hdbscan':    'hdbscan',
-}
 
-
-
-def _can_import(module_name: str) -> bool:
-    """Return True if *module_name* can be imported without error."""
-    try:
-        # Suppress warnings during import check so noisy packages
-        # (umap TensorFlow check, faiss/hnswlib Swig types) don't pollute the log.
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            import_module(module_name)
-        return True
-    except ImportError:
-        return False
-
-
-def _bootstrap():
-    """Install any missing plugin dependencies into the current environment."""
-    missing = [
-        pip_name
-        for mod_name, pip_name in _REQUIRED_PACKAGES.items()
-        if not _can_import(mod_name)
-    ]
-    if missing:
-        print(f"[DR/Clustering Plugin] First-time setup: installing {missing} …")
-        print("[DR/Clustering Plugin] This may take up to a minute.")
-        try:
-            subprocess.check_call(
-                [sys.executable, '-m', 'pip', 'install', '--quiet'] + missing
-            )
-            print("[DR/Clustering Plugin] Dependencies installed successfully.")
-        except subprocess.CalledProcessError as e:
-            print(f"[DR/Clustering Plugin] WARNING: could not install some packages: {e}")
-            print("[DR/Clustering Plugin] Some features may be unavailable.")
-
-
-    # Suppress noisy third-party warnings.
+def _suppress_third_party_warnings():
+    """Silence noisy third-party warnings triggered by the lazy ML imports
+    below (umap/faiss/hnswlib Swig types, PaCMAP/UMAP notices). Called from
+    PluginWidget.__init__ on the main thread — kept at the same call site
+    the old _bootstrap() used, so warning-filter timing relative to the
+    rest of __init__ doesn't change."""
     warnings.filterwarnings('ignore', category=ImportWarning)
     warnings.filterwarnings('ignore', category=DeprecationWarning,
                             message='.*SwigPy.*')
@@ -141,18 +99,6 @@ def _bootstrap():
     # UMAP n_jobs overridden by random_state — expected, not actionable.
     warnings.filterwarnings('ignore', category=UserWarning,
                             message='.*n_jobs value.*overridden.*random_state.*')
-
-
-# _bootstrap() is intentionally NOT called here at module scope.
-# Module import runs on a background QThread (see _PluginLoaderWorker in
-# main_window.py).  Calling subprocess.check_call or importing heavy packages
-# (pyqtgraph, colorcet) on a non-main thread triggers QObject::setParent
-# warnings.  _bootstrap() is called instead from PluginWidget.__init__,
-# which runs on the main thread via instantiate_plugin_widgets().
-
-
-# Third-party warning filters are applied inside _bootstrap() so they
-# take effect on the main thread after PluginWidget is instantiated.
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +386,7 @@ def _antigen_or_label_map(controller) -> dict[str, str]:
 def _resolve_is_dark(state: 'PipelineState') -> bool:
     """
     Whether plots should render with dark styling, given the Workspace
-    theme toggle (Item 1). 'auto' mirrors the live app palette — the only
+    theme toggle. 'auto' mirrors the live app palette — the only
     behaviour that existed before; 'light'/'dark' force it regardless,
     replacing what used to be three separate ad hoc
     QApplication.palette() checks scattered across this file.
@@ -457,8 +403,8 @@ def _resolve_is_dark(state: 'PipelineState') -> bool:
 
 def _style_figure_theme(fig, is_dark: bool, axes=None) -> str:
     """
-    Apply Honeychrome's dark/light figure background styling in one place
-    (Item 1) — single source of truth instead of every figure-maker
+    Apply Honeychrome's dark/light figure background styling in one place:
+    single source of truth instead of every figure-maker
     duplicating its own is_dark branch (which is exactly why several
     figures had no dark-mode handling at all). Returns the foreground
     colour string so callers can reuse it (e.g. for violin means).
@@ -488,7 +434,7 @@ def _style_figure_theme(fig, is_dark: bool, axes=None) -> str:
 
 def _style_combo_popup(combo: 'QComboBox'):
     """
-    Force readable dropdown-list colours on a QComboBox (Item 2). Row
+    Force readable dropdown-list colours on a QComboBox. Row
     labels already flip white/black automatically via QPalette, but the
     popup's item view doesn't reliably inherit that on every platform —
     left alone, items render in black text regardless of theme, which is
@@ -512,7 +458,7 @@ def _style_combo_popup(combo: 'QComboBox'):
 
 def _contrasting_text_color(hex_color: str) -> str:
     """Return 'black' or 'white' -- whichever reads better against the
-    given hex background (Item 5). Used for swatch-style buttons whose
+    given hex background. Used for swatch-style buttons whose
     background is a user-chosen colour, so it can't be assumed to already
     contrast with the app's own light/dark theme."""
     c = QColor(hex_color)
@@ -521,7 +467,7 @@ def _contrasting_text_color(hex_color: str) -> str:
 
 
 def _resolve_group_colour(state: 'PipelineState', name: str) -> str:
-    """Return this group's colour (Item 16/17), assigning the next unused
+    """Return this group's colour, assigning the next unused
     colorcet glasbey swatch and persisting it on first use. Shared between
     GroupsStatsTab (Comparison Groups table / Sample PCA) and PlotCard
     (Workspace 'Group' colour mode) so both always draw from the exact
@@ -542,7 +488,7 @@ def _resolve_group_colour(state: 'PipelineState', name: str) -> str:
 
 
 def _sample_groups_by_rel(controller, state: 'PipelineState') -> dict[str, str]:
-    """Return {rel_path: group_name} (Item 17). state.sample_groups is
+    """Return {rel_path: group_name}. state.sample_groups is
     keyed by each sample's FULL path (see
     GroupsStatsTab._populate_table), but Workspace plot data (DR
     embeddings, cluster labels) is keyed by path relative to
@@ -567,7 +513,7 @@ def _sample_groups_by_rel(controller, state: 'PipelineState') -> dict[str, str]:
 
 def _new_scrollable_canvas(fig):
     """
-    FigureCanvasQTAgg subclass that ignores wheel events (Item 2) so
+    FigureCanvasQTAgg subclass that ignores wheel events so
     mouse-scroll passes through to an enclosing QScrollArea instead of
     being swallowed by matplotlib's Qt backend, which unconditionally
     accept()s wheel events for its own (unused, in this plugin) scroll-
@@ -592,7 +538,7 @@ def _make_scatter_hover_handler(fig, ax, scatter, labels: list[str], is_dark: bo
     """
     Build a matplotlib 'motion_notify_event' handler that shows
     labels[i] in a small annotation box whenever the mouse hovers over
-    point i of *scatter* (Item 6) -- lets a plot identify every point on
+    point i of *scatter* -- lets a plot identify every point on
     demand without drawing (or de-overlapping) hundreds of static text
     labels up front.
 
@@ -638,8 +584,7 @@ class _AspectCanvasHolder(QWidget):
     """
     Pins a single child widget to a top-left rectangle that preserves a
     configurable aspect ratio (height / width), maximised within the
-    holder's own size (Item 4 — PlotCard's DR plot canvas; Item 9 —
-    adjustable Plot W / Plot H in Appearance).
+    holder's own size.
 
     The shared `_SquareWidget` pattern used elsewhere in this file (a plain
     QVBoxLayout plus a resizeEvent hack that calls setFixedHeight once it
@@ -798,10 +743,8 @@ class PipelineState:
 
     # --- Configuration ---
     selected_gates: list[str] = field(default_factory=list)
-    # Checked gate names (§0.3).  A run is built from the UNION of events
-    # across all listed gates.  Empty list = no gate selected.  Until Item 4
-    # replaces the gate combo with the checkable gate tree, the UI only ever
-    # sets this to a 0- or 1-element list.
+    # Checked gate names.  A run is built from the UNION of events
+    # across all listed gates.  Empty list = no gate selected.
     selected_channels: list[str] = field(default_factory=list)
     training_sample_ids: list[str] = field(default_factory=list)
     n_training_events: int = 10_000
@@ -837,7 +780,7 @@ class PipelineState:
     umap_knn_index: Any | None = None
     # hnswlib index built during UMAP training; reused by Leiden and T-REX
     dr_runs: list[dict] = field(default_factory=list)
-    # Ordered archive of completed DR training runs (§0.2), parallel to
+    # Ordered archive of completed DR training runs, parallel to
     # clustering_runs below.  Each entry (manifest fields + heavy payload):
     # {
     #   'run_id': str, 'kind': 'dr', 'label': str, 'algorithm': str,
@@ -896,28 +839,25 @@ class PipelineState:
 
     # --- Groups and covariates ---
     sample_groups: dict[str, str] = field(default_factory=dict)
-    # {sample_path: group_name | 'Unassigned'} — Item 13: group_name is a
+    # {sample_path: group_name | 'Unassigned'}: group_name is a
     # free-form, user-defined string (there is no longer a fixed 'A'/'B'
     # slot; the group's NAME is the value directly). 'Unassigned' is a
     # reserved sentinel and can never itself be added as a group name.
     group_names: list[str] = field(default_factory=lambda: ['A', 'B'])
-    # Ordered list of currently-defined group names (Item 13 — replaces the
-    # old fixed two-slot model). Display order in the UI == this order.
+    # Ordered list of currently-defined group names. Display order in the UI == this order.
     group_patterns: dict[str, str] = field(default_factory=dict)
-    # {group_name: filename regex} for "Auto-assign by pattern" (Item 13 —
-    # replaces the old group_a_pattern/group_b_pattern QLineEdit pair).
+    # {group_name: filename regex} for "Auto-assign by pattern"
     compare_group_a: str = ''
     compare_group_b: str = ''
-    # Item 13 — T-REX's own two-group pair (its neighbour-fraction score is
-    # only defined for two conditions, so it never grew past Phase 1 — see
-    # §0.2 point 2). Run Statistics/Confusion Matrix/Composition-by-group
-    # use testing_group_selection below instead, as of Phase 2.
+    # T-REX's own two-group pair.
+    # Run Statistics/Confusion Matrix/Composition-by-group
+    # use testing_group_selection below instead.
     covariates: pd.DataFrame | None = None
     # rows = samples (rel-path index), columns = covariate names, all
-    # values str. Item 13 phase 2: now actually populated by CSV import
+    # values str. now actually populated by CSV import
     # (see _import_csv) — previously defined but never written to.
 
-    # --- Item 13 phase 2: N-group testing ---
+    # --- N-group testing ---
     testing_group_selection: list[str] = field(default_factory=list)
     # Which defined groups participate in Frequency/Counts/MFI testing,
     # Confusion Matrix, and Composition-by-group. Empty means "not yet
@@ -946,21 +886,21 @@ class PipelineState:
     freq_df: pd.DataFrame | None = None
     # raw (samples × clusters) frequency matrix
     counts_results: pd.DataFrame | None = None
-    # negative-binomial GLM output for cluster raw counts (Item 14) —
+    # negative-binomial GLM output for cluster raw counts
     # a parallel abundance test alongside freq_results, not a replacement.
     counts_df: pd.DataFrame | None = None
-    # raw (samples × clusters) count matrix
+    # raw (samples x clusters) count matrix
     mfi_results: pd.DataFrame | None = None
     # limma output for per-cluster marker MFIs
     mfi_df: pd.DataFrame | None = None
-    # raw (samples × cluster·channel) log1p-MFI matrix
+    # raw (samples x cluster·channel) log1p-MFI matrix
     mfi_sample_df: pd.DataFrame | None = None
-    # raw (samples × channel) log1p-MFI matrix, whole-sample aggregate —
+    # raw (samples x channel) log1p-MFI matrix, whole-sample aggregate —
     # what the MFI Heatmap actually draws (no cluster breakdown, no
     # significance filter). mfi_df/mfi_results stay cluster-level, for
     # the MFI Volcano.
 
-    # Confusion Matrix / Composition Barplot (Items 10 & 12) — independent
+    # Confusion Matrix / Composition Barplot — independent
     # of Run Statistics, so persisted separately so they survive reopen
     # the same way freq/mfi results already do.
     confusion_df: pd.DataFrame | None = None
@@ -984,16 +924,16 @@ class PipelineState:
     # bug where _make_composition_figure re-resolved colours from
     # whichever run happens to be selected in the combo at redraw time.
     marker_roles: dict[str, str] = field(default_factory=dict)
-    # {channel_name: 'type' | 'state'} — Item 11 (diffcyt-style split).
+    # {channel_name: 'type' | 'state'} — diffcyt-style split.
     # 'type' channels are excluded from MFI significance testing, to avoid
     # the same channel driving both the cluster assignment and its own
     # significance call. A channel with no entry yet defaults to 'state'
     # (included) — there is no automatic categorisation, see
     # GroupsStatsTab._populate_marker_roles_list(). User-overridable (some
     # markers, e.g. HLA-DR, genuinely serve double duty). Checkbox polarity
-    # in the UI (Item 6): ticked = 'state'/included, unticked = 'type'/excluded.
+    # in the UI: ticked = 'state'/included, unticked = 'type'/excluded.
     group_colors: dict[str, str] = field(default_factory=dict)
-    # {group_name: hex colour} — Item 16. Assigned from the colorcet
+    # {group_name: hex colour}. Assigned from the colorcet
     # glasbey palette the first time a group is drawn (see
     # GroupsStatsTab._group_colour); user-overridable via the 'Colour'
     # column on the Comparison Groups table. Used by the Sample PCA plot
@@ -1001,7 +941,7 @@ class PipelineState:
     pca_use_freq: bool = True
     pca_use_counts: bool = False
     pca_use_mfi: bool = False
-    # Item 16 — which of state.freq_df/counts_df/mfi_df feed the Sample
+    # which of state.freq_df/counts_df/mfi_df feed the Sample
     # PCA plot. Independent of the "Test:" checkboxes above (those gate
     # what Run Statistics computes in the first place; a source can only
     # be used here if it was also computed there).
@@ -1066,7 +1006,7 @@ class PipelineState:
     # Holds a copied PlotCard display config for magic-wand paste
     workspace_n_columns: int = 3
     plot_theme: str = 'auto'
-    # 'auto' | 'light' | 'dark' — Item 1's Workspace toggle. 'auto' mirrors
+    # 'auto' | 'light' | 'dark' — Workspace toggle. 'auto' mirrors
     # the live app palette (the previous, only, behaviour); 'light'/'dark'
     # force every plot in this plugin regardless of the app's own setting.
 
@@ -1076,7 +1016,7 @@ class PipelineState:
 
     def stats_runnable(self, sample_keys: set[str] | None = None) -> bool:
         """
-        Return True if the two selected "Compare" groups (Item 13) are
+        Return True if the two selected "Compare" groups are
         distinct and each has >= 3 assigned samples. Pass sample_keys to
         restrict the count to a specific run's samples (see n_per_group);
         omitting it counts across the whole experiment.
@@ -1106,7 +1046,7 @@ class PipelineState:
 
     def n_group_stats_runnable(self, sample_keys: set[str] | None = None) -> bool:
         """
-        Item 13 phase 2. True if at least 2 of the checked 'Groups to Test'
+        True if at least 2 of the checked 'Groups to Test'
         each have >= 3 assigned samples. Governs Run Statistics/Confusion
         Matrix/Composition-by-group -- separate from stats_runnable(),
         which still gates T-REX's fixed Compare pair. Pass sample_keys to
@@ -1166,7 +1106,7 @@ class PipelineState:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# 5a.  Run management table (Item 6) — used by ConfigTab only.
+# 5a.  Run management table — used by ConfigTab only.
 # ---------------------------------------------------------------------------
 
 class _SortableItem(QTableWidgetItem):
@@ -1196,7 +1136,7 @@ class _SortableItem(QTableWidgetItem):
 
 class RunDetailDialog(QDialog):
     """
-    Item 6 pop-out 'View' dialog for one archived run — full gate list,
+    Pop-out 'View' dialog for one archived run — full gate list,
     sample list with per-sample event counts, channel list, and the
     algorithm's hyperparameter dict, plus a 'Save config as CSV' export.
 
@@ -1309,7 +1249,7 @@ class RunDetailDialog(QDialog):
 
 class RunManagementTable(CopyableTableWidget):
     """
-    Item 6 run management table.  Lives at the bottom of ConfigTab.
+    Run management table.  Lives at the bottom of ConfigTab.
 
     Columns: Label (editable, double-click) · Kind · Algorithm · Gate(s)
     (count + tooltip) · Samples (count + tooltip) · Events · Channels
@@ -1525,15 +1465,11 @@ def _make_scroll_guard(widget):
 
 class ConfigTab(QWidget):
     """
-    Tab 0 — Analysis Configuration
+    Tab — Analysis Configuration
     --------------------------------
     Gate selector, channel checkboxes, training-sample picker,
     training-event count, DR algorithm + hyperparameter panels,
     clustering algorithm + hyperparameter panels.
-
-    Stage 1: placeholder layout.
-    Stage 3: DR controls implemented.
-    Stage 4: Clustering controls implemented.
     """
 
     def __init__(self, state: PipelineState, bus, controller, parent=None):
@@ -1571,7 +1507,7 @@ class ConfigTab(QWidget):
         shared_box = QGroupBox("Data Selection")
         shared_layout = QVBoxLayout(shared_box)
 
-        # Gate selector — checkable multi-select tree (§0.3).  Same tree
+        # Gate selector — checkable multi-select tree.  Same tree
         # class as TransformTab's; this one is documented as the override —
         # checking different gates here updates the same shared
         # state.selected_gates list (kept in sync by
@@ -1619,7 +1555,7 @@ class ConfigTab(QWidget):
         self.main_layout.addWidget(shared_box)
 
         # ------------------------------------------------------------------
-        # Dimensionality Reduction — Stage 3
+        # Dimensionality Reduction
         # ------------------------------------------------------------------
         dr_box = QGroupBox("Dimensionality Reduction")
         dr_box.setCheckable(True)
@@ -1868,7 +1804,7 @@ class ConfigTab(QWidget):
         self._on_dr_algo_changed()   # set initial state
 
         # ------------------------------------------------------------------
-        # Clustering — Stage 4
+        # Clustering
         # ------------------------------------------------------------------
         cl_box = QGroupBox("Clustering")
         cl_box.setCheckable(True)
@@ -2029,8 +1965,8 @@ class ConfigTab(QWidget):
             lambda on: self._cl_dr_combo.setEnabled(on)
         )
 
-        # ---- Assignment scope (Items 9 & 11) ----
-        # Item 11 -- unchecked by default: every training sample's own
+        # ---- Assignment scope ----
+        # Unchecked by default: every training sample's own
         # events get their EXACT label straight out of the fit itself
         # (Leiden/HDBSCAN) or the native SOM node mapping (FlowSOM) -- no
         # downsampling, no approximate assignment needed for them at all.
@@ -2048,7 +1984,7 @@ class ConfigTab(QWidget):
         )
         cl_layout.addWidget(self.cl_downsample_chk)
 
-        # Item 9 -- opt-in, not default (matches DR's own "Apply to All
+        # Opt-in, not default (matches DR's own "Apply to All
         # Samples" being a manual second step, not automatic): every
         # sample in the experiment gets cluster labels, not just Training
         # Samples. Training Samples still only decides what fits the
@@ -2085,7 +2021,7 @@ class ConfigTab(QWidget):
 
         self.main_layout.addWidget(cl_box)
 
-        # ---- Archived Runs (Item 6) ----
+        # ---- Archived Runs ----
         runs_box = QGroupBox("Archived Runs")
         runs_box_layout = QVBoxLayout(runs_box)
 
@@ -2297,7 +2233,7 @@ class ConfigTab(QWidget):
         self._leiden_params.setVisible(algo == 'Leiden')
         self._hdbscan_params.setVisible(algo == 'HDBSCAN')
 
-        # Item 13 -- HDBSCAN doesn't behave well directly on the full
+        # HDBSCAN doesn't behave well directly on the full
         # multichannel feature space (confirmed: hundreds of
         # near-meaningless clusters on a real run). Force DR space and
         # disable the raw-feature-space option while it's selected;
@@ -2486,7 +2422,7 @@ class ConfigTab(QWidget):
         self._refresh_cl_status()
         self._refresh_cl_space_combo()
 
-        # Run management table (Item 6) — cheap metadata-only rebuild, safe
+        # Run management table — cheap metadata-only rebuild, safe
         # to call every time this tab becomes active.
         self.run_table.refresh()
 
@@ -2551,7 +2487,7 @@ class BiplotTile(QWidget):
         self._axis_y.linkToView(self._vb)
 
         # X-axis InteractiveLabel — click to change the shared active/x
-        # channel (Item 2), same mechanism as the y-axis above. Routes
+        # channel, same mechanism as the y-axis above. Routes
         # through parent_tab since x is shared across every tile, not
         # local to this one.
         self._label_x = InteractiveLabel('', parent_plot=self, size='9pt')
@@ -2585,7 +2521,7 @@ class BiplotTile(QWidget):
 
     def _set_x_from_label(self, item_index, _parent):
         """Called by InteractiveLabel when the user picks a channel from
-        the x-axis menu (Item 2). x is the TransformTab's shared active
+        the x-axis menu. x is the TransformTab's shared active
         channel, not local to this tile -- route through parent_tab so
         every tile's x-axis and the 1-D histogram update together."""
         channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
@@ -2611,7 +2547,7 @@ class BiplotTile(QWidget):
         ch = self._y_combo.currentText()
         self._label_y.leftItemSelected = available.index(ch) if ch in available else 0
 
-        # Item 2 — x-axis menu shares the same available list; selection
+        # x-axis menu shares the same available list; selection
         # tracks the tab's active channel, not anything local to this tile.
         self._label_x.leftClickMenuItems = [labels.get(ch, ch) for ch in available]
         x_ch = self._parent_tab._active_channel
@@ -2622,7 +2558,7 @@ class BiplotTile(QWidget):
 
     def set_x_selected(self, x_ch: str):
         """Sync the x-axis InteractiveLabel's highlighted menu item to
-        the tab's current active channel (Item 2) -- called whenever the
+        the tab's current active channel -- called whenever the
         shared x channel changes, mirroring _on_y_changed's own
         leftItemSelected sync for the y-axis."""
         channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
@@ -2769,7 +2705,7 @@ class TransformTab(QWidget):
         )
         outer.addWidget(notice)
 
-        # --- Gate selection — primary tree (§0.3, Item 4) ---
+        # --- Gate selection — primary tree ---
         gate_box = QGroupBox("Gate(s)")
         gate_box_layout = QVBoxLayout(gate_box)
         self.gate_tree = drc_gate_tree.GateTreeWidget()
@@ -2981,7 +2917,7 @@ class TransformTab(QWidget):
         # Restore any previously computed auto-transform W values
         self._load_computed_transforms()
         skip = {'ribbon', 'Time', 'event_id'}
-        # Item 8: order by the cytometer's own PNN order (self._pnn, set
+        # Order by the cytometer's own PNN order (self._pnn, set
         # just above) -- the same order the Spectral Process tab uses --
         # rather than self._transforms' dict order, which reflects
         # however the experiment file happened to store the transforms
@@ -3107,7 +3043,7 @@ class TransformTab(QWidget):
 
     def _set_active_channel_from_tile(self, channel: str):
         """
-        Item 2 — a BiplotTile's x-axis InteractiveLabel was clicked.  x is
+        A BiplotTile's x-axis InteractiveLabel was clicked.  x is
         the tab's shared active channel, so route through the left-hand
         channel_list selection (same path a manual list click takes) --
         that already fires _on_channel_selected, which updates the 1-D
@@ -3215,7 +3151,7 @@ class TransformTab(QWidget):
         labels = _antigen_dash_labels(self.controller)
         tile.configure_axes(self._transforms[x_ch], self._transforms[y_ch],
                             x_label=labels.get(x_ch, x_ch), y_label=labels.get(y_ch, y_ch))
-        tile.set_x_selected(x_ch)   # Item 2 -- keep menu highlight in sync
+        tile.set_x_selected(x_ch)   # keep menu highlight in sync
 
     def _configure_tile_axes_all(self):
         for tile in self._biplot_tiles:
@@ -3824,7 +3760,7 @@ class TransformTab(QWidget):
 class _ResultsDrawWorker(QThread):
     """
     Builds every Groups & Stats results Figure (heatmap/volcano for
-    freq/counts/MFI) off the main thread (Item 7) -- same reasoning as
+    freq/counts/MFI) off the main thread -- same reasoning as
     _MarkerSummaryWorker elsewhere in this file: Figure objects are plain
     matplotlib, no Qt, so building them off-thread is safe; only tab/
     canvas creation (GroupsStatsTab._on_results_figures_built, on the
@@ -3849,13 +3785,12 @@ class GroupsStatsTab(QWidget):
     """
     Tab 2 — Groups, Factors & Statistics
     --------------------------------------
-    Stage 6 (complete):
       • Named comparison groups with regex auto-population
       • Sample-to-group assignment table with combo boxes
       • Covariate entry (arbitrary named columns)
       • CSV import / export
       • Statistics controls: cluster frequencies (limma), cluster counts
-        (GLM, Item 14), and/or MFIs, p-value and log2FC thresholds
+        (GLM), and/or MFIs, p-value and log2FC thresholds
       • Background limma statistics via inmoose
       • Results: heatmap+dendrogram and volcano plot, CSV export
     """
@@ -3865,7 +3800,7 @@ class GroupsStatsTab(QWidget):
         self.state = state
         self.bus = bus
         self.controller = controller
-        # Item 13: group names/patterns/compare-selection all live directly
+        # group names/patterns/compare-selection all live directly
         # on state now (state.group_names / state.group_patterns /
         # state.compare_group_a / state.compare_group_b) — no local mirror
         # to keep in sync.
@@ -3874,7 +3809,7 @@ class GroupsStatsTab(QWidget):
         # successfully computed Run Statistics — lets _run_statistics
         # replot instead of re-running limma when only thresholds changed.
         self._last_stats_data_key = None
-        # Item 7: the _ResultsDrawWorker currently building figures, if
+        # the _ResultsDrawWorker currently building figures, if
         # any, and whether another _draw_results() call arrived while it
         # was busy (coalesced into one more redraw once it finishes,
         # rather than a second worker starting against a moving target).
@@ -3929,7 +3864,7 @@ class GroupsStatsTab(QWidget):
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(6)
 
-        # ---- Group management (Item 13 — arbitrary N named groups) ----
+        # ---- Group management (arbitrary N named groups) ----
         group_box = QGroupBox("Comparison Groups")
         group_box_layout = QVBoxLayout(group_box)
 
@@ -4075,7 +4010,7 @@ class GroupsStatsTab(QWidget):
         stats_layout.addLayout(run_sel_row)
         self._run_combo.currentIndexChanged.connect(self._on_run_combo_changed)
 
-        # ---- Groups to Test + contrast mode + pairing (Item 13 phase 2) ----
+        # ---- Groups to Test + contrast mode + pairing ----
         test_groups_box = QGroupBox("Groups to Test")
         test_groups_layout = QVBoxLayout(test_groups_box)
 
@@ -4139,8 +4074,8 @@ class GroupsStatsTab(QWidget):
 
         stats_layout.addWidget(test_groups_box)
 
-        # ---- T-REX Compare selector (Item 13 — pairwise only, see §0.2) ----
-        # Walled off from the user for now (see CLAUDE.md session notes) --
+        # ---- T-REX Compare selector ----
+        # Walled off from the user for now
         # containers below are hidden but left fully wired so this can be
         # re-enabled later just by removing the setVisible(False) calls.
         self.trex_compare_container = QWidget()
@@ -4201,7 +4136,7 @@ class GroupsStatsTab(QWidget):
         self.chk_counts = QCheckBox("Cluster Counts (GLM)")
         self.chk_counts.setChecked(False)
         self.chk_counts.setToolTip(
-            "Item 14 — raw event counts per cluster per sample → negative-"
+            "Raw event counts per cluster per sample → negative-"
             "binomial GLM.\nParallel option to the Frequency test, not a "
             "replacement — run both to compare on the same data."
         )
@@ -4233,7 +4168,7 @@ class GroupsStatsTab(QWidget):
         config_row.addStretch()
         stats_layout.addLayout(config_row)
 
-        # ---- Marker roles (Item 11): type (clustering) vs state (tested) ----
+        # ---- Marker roles: type (clustering) vs state (tested) ----
         roles_box = QGroupBox("Marker Roles — MFI Testing")
         roles_layout = QVBoxLayout(roles_box)
         roles_hint = QLabel(
@@ -4273,7 +4208,7 @@ class GroupsStatsTab(QWidget):
         self.chk_include_type_markers = QCheckBox(
             "Include clustering (type) markers in MFI testing"
         )
-        # Item 6 -- default is now "include everything", matching every
+        # default is now "include everything", matching every
         # channel checkbox below defaulting to checked/included.
         self.chk_include_type_markers.setChecked(True)
         self.chk_include_type_markers.setToolTip(
@@ -4350,7 +4285,7 @@ class GroupsStatsTab(QWidget):
         run_row.addWidget(self.export_results_btn)
         stats_layout.addLayout(run_row)
 
-        # ---- Viewing comparison (Item 13 phase 2) ----
+        # ---- Viewing comparison ----
         viewing_row = QHBoxLayout()
         viewing_row.addWidget(QLabel("Viewing comparison:"))
         self.viewing_comparison_combo = QComboBox()
@@ -4370,7 +4305,7 @@ class GroupsStatsTab(QWidget):
         bottom_layout.addWidget(stats_box)
 
         # ============================================================
-        # Sample PCA (Item 16)
+        # Sample PCA
         # ============================================================
         pca_box = QGroupBox("Sample PCA")
         pca_layout = QVBoxLayout(pca_box)
@@ -4480,7 +4415,7 @@ class GroupsStatsTab(QWidget):
         pca_btn_row.addStretch()
         pca_layout.addLayout(pca_btn_row)
 
-        # Live-refresh (Item 6) -- once the PCA has been shown once,
+        # Live-refresh -- once the PCA has been shown once,
         # changing any of these regenerates it without needing another
         # 'Show PCA' click. See _on_pca_option_changed.
         self.pca_chk_freq.stateChanged.connect(self._on_pca_option_changed)
@@ -4501,7 +4436,7 @@ class GroupsStatsTab(QWidget):
         self._results_tabs = QTabWidget()
         self._results_tabs.setTabsClosable(True)
         self._results_tabs.tabCloseRequested.connect(self._on_results_tab_close_requested)
-        self._results_tabs.setMinimumHeight(1400)  # Item 4 -- more room to fit everything
+        self._results_tabs.setMinimumHeight(1400)
         bottom_layout.addWidget(self._results_tabs, stretch=1)
 
         content_layout.addWidget(bottom_widget, stretch=1)
@@ -4510,7 +4445,7 @@ class GroupsStatsTab(QWidget):
         self._last_drawn_cluster_names: dict[int, str] = {}
 
     # ------------------------------------------------------------------
-    # Group management (Item 13 — arbitrary N named groups)
+    # Group management (arbitrary N named groups)
     # ------------------------------------------------------------------
 
     def _group_options(self) -> list[str]:
@@ -4536,8 +4471,8 @@ class GroupsStatsTab(QWidget):
         self.groups_table.blockSignals(False)
 
     def _group_colour(self, name: str) -> str:
-        """Return this group's colour (Item 16) -- thin per-tab wrapper
-        around the shared _resolve_group_colour() (Item 17) so PlotCard's
+        """Return this group's colour -- thin per-tab wrapper
+        around the shared _resolve_group_colour() so PlotCard's
         'Group' colour mode and this tab's Comparison Groups table /
         Sample PCA plot always agree."""
         return _resolve_group_colour(self.state, name)
@@ -4557,7 +4492,7 @@ class GroupsStatsTab(QWidget):
         """
         Handle an in-place edit of a group's name (col 0) or match pattern
         (col 1). A name edit is a REAL rename now — sample_groups values
-        ARE group names (no slot indirection left, see §0.2) — so every
+        ARE group names (no slot indirection left) — so every
         sample currently assigned to the old name is rewritten to the new
         one in the same operation.
         """
@@ -4590,11 +4525,8 @@ class GroupsStatsTab(QWidget):
                     self.state.compare_group_a = new_name
                 if self.state.compare_group_b == old_name:
                     self.state.compare_group_b = new_name
-                # Item 5 -- 'Groups to Test' is a separate checked-name
-                # list (state.testing_group_selection), not derived from
-                # group_names on the fly, so a rename left it holding the
-                # stale old name until the checklist was rebuilt for some
-                # unrelated reason.
+                # 'Groups to Test' is a separate checked-name
+                # list (state.testing_group_selection)
                 if self.state.testing_group_selection and old_name in self.state.testing_group_selection:
                     self.state.testing_group_selection = [
                         new_name if g == old_name else g
@@ -4712,7 +4644,7 @@ class GroupsStatsTab(QWidget):
         self._update_group_count_label()
 
     # ------------------------------------------------------------------
-    # Groups to Test / contrast mode / pairing (Item 13 phase 2)
+    # Groups to Test / contrast mode / pairing
     # ------------------------------------------------------------------
 
     def _populate_test_groups_list(self):
@@ -4821,10 +4753,8 @@ class GroupsStatsTab(QWidget):
         auto-assign results) so a re-run is always a clean, deterministic
         pass over the current patterns -- nothing about a sample's history
         can leave it stuck on a stale value. Patterns are separate from
-        group names so a group named 'A' can't match every file (bug R1),
-        and only on-screen samples are touched (bug R2) — Item 13
-        generalizes this from a fixed A/B pair to however many groups are
-        defined.
+        group names so a group named 'A' can't match every file,
+        and only on-screen samples are touched.
         """
         patterns = {}
         for name in self.state.group_names:
@@ -5031,7 +4961,7 @@ class GroupsStatsTab(QWidget):
                 key="composition_barplot",
             )
 
-        # PCA controls (Item 6/16) -- sync widget state from self.state
+        # PCA controls -- sync widget state from self.state
         # now, since load_state() restores QSettings into self.state but
         # runs after these widgets were already built (with construction-
         # time defaults), so nothing else re-syncs them. Signals blocked
@@ -5527,7 +5457,7 @@ class GroupsStatsTab(QWidget):
         does that (see _selected_run_entry).
 
         Combo items are keyed by run_id (userData), not label text —
-        labels are user-editable (Item 6's rename) and not guaranteed
+        labels are user-editable and not guaranteed
         unique, so text-matching would be fragile.
         """
         assigned = {sp for sp, g in self.state.sample_groups.items()
@@ -5582,7 +5512,7 @@ class GroupsStatsTab(QWidget):
 
     def _clear_stale_run_results(self):
         """
-        Item 1 -- drop Freq/Counts/MFI/PCA Stats results (tied to
+        drop Freq/Counts/MFI/PCA Stats results (tied to
         state.stats_run_id) if their source clustering run has been
         deleted from the archive. Called from PluginWidget._on_runs_
         changed on every rename/delete; rename leaves run_id untouched
@@ -5631,7 +5561,7 @@ class GroupsStatsTab(QWidget):
 
     def _sync_confusion_composition_to_run(self):
         """
-        Item 1 (round 4) -- unlike Freq/MFI/Counts/PCA (see
+        Unlike Freq/MFI/Counts/PCA (see
         _clear_stale_run_results), Confusion Matrix and Composition
         Barplot are meant to go stale on a plain combo-selection change
         too, not just a run deletion -- a deletion just happens to also
@@ -5642,12 +5572,6 @@ class GroupsStatsTab(QWidget):
         whatever's still there post-delete/rename).
         """
         current_run_id = self._run_combo.currentData()
-        # TEMP diagnostic (round 4) -- remove once Item 1 is confirmed fixed.
-        _log.info(
-            "_sync_confusion_composition_to_run: current_run_id=%r "
-            "confusion_run_id=%r composition_run_id=%r",
-            current_run_id, self.state.confusion_run_id, self.state.composition_run_id,
-        )
 
         if self.state.confusion_run_id and self.state.confusion_run_id != current_run_id:
             _log.info("_sync_confusion_composition_to_run: clearing confusion_matrix "
@@ -5770,7 +5694,7 @@ class GroupsStatsTab(QWidget):
             self.stats_status_label.setStyleSheet("color: orange;")
 
     # ------------------------------------------------------------------
-    # Marker roles (Item 11) — type (clustering) vs state (tested)
+    # Marker roles — type (clustering) vs state (tested)
     # ------------------------------------------------------------------
 
     def _populate_marker_roles_list(self):
@@ -5803,7 +5727,7 @@ class GroupsStatsTab(QWidget):
                 role = 'state'
                 self.state.marker_roles[ch] = role
             cb = QCheckBox(labels.get(ch, ch))
-            # Item 6 -- checked now means "included" ('state'), not
+            # hecked now means "included" ('state'), not
             # "type"/excluded, so ticked boxes visually match what's
             # actually tested.
             cb.setChecked(role == 'state')
@@ -5813,11 +5737,11 @@ class GroupsStatsTab(QWidget):
             self.marker_roles_grid.addWidget(cb, row, col)
 
     def _on_marker_role_changed(self, ch: str, checked: bool):
-        # Item 6 -- checked = included/'state', unchecked = excluded/'type'.
+        # checked = included/'state', unchecked = excluded/'type'.
         self.state.marker_roles[ch] = 'state' if checked else 'type'
 
     def _on_include_type_markers_toggled(self, checked: bool):
-        """Item 6 -- ticking 'Include clustering (type) markers' also
+        """Ticking 'Include clustering (type) markers' also
         ticks every channel checkbox above, so the two controls can't
         disagree about which channels are actually included."""
         if checked:
@@ -5857,10 +5781,8 @@ class GroupsStatsTab(QWidget):
                 return
             valid = set(self.state.group_names) | {'Unassigned'}
             unknown_names = set()
-            # Item 13 phase 2: any column beyond sample/group/full_path is a
-            # covariate (e.g. donor ID for paired testing) -- the CSV
-            # import tooltip already promised this; it just wasn't wired
-            # up until now.
+            # Any column beyond sample/group/full_path is a
+            # covariate (e.g. donor ID for paired testing)
             covariate_cols = [c for c in df.columns if c not in ('sample', 'group', 'full_path')]
             try:
                 raw_subdir = self.controller.experiment.settings['raw'][
@@ -5942,7 +5864,7 @@ class GroupsStatsTab(QWidget):
             QMessageBox.warning(self, "Export Error", str(e))
 
     # ------------------------------------------------------------------
-    # Statistics — Stage 6
+    # Statistics
     # ------------------------------------------------------------------
 
     def _run_statistics(self):
@@ -6109,12 +6031,9 @@ class GroupsStatsTab(QWidget):
             df = getattr(self.state, attr)
             if df is None or 'logFC' not in df.columns:
                 continue
-            # Item 13 phase 2 addendum (§2.7): prefer the global (all-
+            # Prefer the global (all-
             # contrasts-pooled) correction, matching run_limma()/
-            # run_glm_counts()'s own default. The plain-adj.P.Val/P.Value
-            # fallbacks only matter for results computed before this fix
-            # landed (results aren't persisted across sessions, so this is
-            # just a same-session safety net, not a migration path).
+            # run_glm_counts()'s own default.
             if 'adj.P.Val.global' in df.columns:
                 pval_col = 'adj.P.Val.global'
             elif 'adj.P.Val' in df.columns:
@@ -6162,7 +6081,7 @@ class GroupsStatsTab(QWidget):
 
     def _show_confusion_matrix(self):
         """
-        Compute and display the confusion-matrix heatmap (Item 10).
+        Compute and display the confusion-matrix heatmap.
         Independent of Run Statistics — usable as soon as groups are
         assigned and a clustering run is selected. Re-clicking replaces
         the existing Confusion Matrix tab in place rather than adding
@@ -6215,7 +6134,7 @@ class GroupsStatsTab(QWidget):
             self._stamp_run_label(fig, run_label)
             return fig
 
-        # Item 13: drc_stats.compute_confusion_matrix() now returns the
+        # drc_stats.compute_confusion_matrix() now returns the
         # real selected group names as columns directly — no rename needed.
         disp_df = conf_df
         n_clusters = len(disp_df)
@@ -6280,7 +6199,7 @@ class GroupsStatsTab(QWidget):
 
     def _show_pca(self):
         """
-        Compute and display the Sample PCA plot (Item 16). Independent of
+        Compute and display the Sample PCA plot. Independent of
         Run Statistics' per-comparison "Viewing comparison" — always uses
         every sample across every checked 'Groups to Test'. Re-clicking
         replaces the existing PCA tab in place, same as Confusion Matrix /
@@ -6312,14 +6231,11 @@ class GroupsStatsTab(QWidget):
                                 "under 'Build from' first.")
             return
 
-        # Item 17 -- warn (rather than silently drop) whenever a checked
+        # Warn (rather than silently drop) whenever a checked
         # 'Build from' source hasn't actually been computed by Run
         # Statistics yet (e.g. Counts checked here but 'Cluster Counts
         # (GLM)' wasn't checked under 'Test:' the last time Run Statistics
-        # ran). Previously this only surfaced once EVERY checked source
-        # turned out missing -- if at least one other source WAS
-        # available, compute_sample_pca() would just quietly use that one
-        # instead, with no indication Counts had been dropped.
+        # ran).
         missing = []
         if use_freq and (self.state.freq_df is None or self.state.freq_df.empty):
             missing.append('Frequencies')
@@ -6444,7 +6360,7 @@ class GroupsStatsTab(QWidget):
         label_loadings = self.state.pca_label_loadings
         label_points = self.state.pca_label_points
 
-        # Mouse-over tooltip targets (Item 6 convention, shared with the
+        # Mouse-over tooltip targets (shared with the
         # volcano plots) -- collected as loadings/points are drawn below,
         # then handed to a single invisible overlay scatter at the end.
         # Always populated, independent of the two label toggles below.
@@ -6488,7 +6404,7 @@ class GroupsStatsTab(QWidget):
             scale = (score_max * 0.8) / load_max
             arrow_ends = loadings[['PC1', 'PC2']].values * scale
 
-            # Item 17 fix -- ax.text() does NOT contribute to matplotlib's
+            # ax.text() does NOT contribute to matplotlib's
             # autoscale, so without this the axes were only ever sized to
             # the sample points (score_max), never the loading arrows
             # themselves. Widen the limits to include every arrow
@@ -6523,7 +6439,7 @@ class GroupsStatsTab(QWidget):
                                textcoords='offset points', fontsize=7,
                                color=fg, zorder=5)
 
-        # Item 6 -- single invisible overlay scatter covers every point
+        # single invisible overlay scatter covers every point
         # and loading for mouse-over, unconditionally; handed to
         # _make_scatter_hover_handler exactly like the volcano plots. No
         # canvas exists yet here, so the handler is stashed on the Figure
@@ -6538,16 +6454,6 @@ class GroupsStatsTab(QWidget):
                 fig, ax, hover_sc, hover_labels, is_dark,
             )
 
-        # Item 17 fix -- these were previously drawn unconditionally, so
-        # unticking 'Grid lines' turned off the real ax.grid() but left
-        # what looked like two leftover grid lines (the axes through the
-        # origin) behind. Both are now the same toggle. Also hiding the
-        # axes' own border (spines) when grid is off -- best guess at the
-        # "PCA-inherent lines" that survived the earlier fix is the plain
-        # rectangular frame around the plot, which ax.grid() never
-        # touches. If lines still show up with this in place, the
-        # simplest next step is dropping the "Grid lines" control
-        # entirely rather than chasing it further.
         if show_grid:
             ax.axhline(0, color='grey', linestyle='--', linewidth=0.6, zorder=1)
             ax.axvline(0, color='grey', linestyle='--', linewidth=0.6, zorder=1)
@@ -6568,8 +6474,8 @@ class GroupsStatsTab(QWidget):
 
     def _show_composition_barplot(self):
         """
-        Compute and display the stacked composition barplot (Item 12).
-        Same availability gate as Item 10's confusion matrix. Re-clicking
+        Compute and display the stacked composition barplot.
+        Same availability gate as the confusion matrix. Re-clicking
         (or toggling %/By-group) replaces the existing Composition tab in
         place rather than adding another.
         """
@@ -6578,7 +6484,7 @@ class GroupsStatsTab(QWidget):
             return
         labels_for_stats, run_label, run_id, names_for_stats = resolved
 
-        # Item 3 (round 3) -- freeze this run's OWN colours now, same as
+        # freeze this run's OWN colours now, same as
         # names_for_stats above. _selected_run_entry() is what
         # _resolve_stats_source() itself just called internally
         # (hydrate_run is a no-op on an already-hydrated entry, so this
@@ -6720,7 +6626,7 @@ class GroupsStatsTab(QWidget):
                       closed manually via its close button.
 
         Extracted from the old _draw_results-local `_add_tab` closure so
-        Items 10/12 can add standalone result tabs (Confusion Matrix,
+        it can add standalone result tabs (Confusion Matrix,
         Composition) outside of _draw_results, using the same pop-out/
         export machinery as the heatmap/volcano tabs.
         """
@@ -6739,7 +6645,7 @@ class GroupsStatsTab(QWidget):
         w_px = int(fig.get_figwidth()  * dpi)
         h_px = int(fig.get_figheight() * dpi)
 
-        # Item 4 -- these plots routinely overflowed the viewport at full
+        # these plots routinely overflowed the viewport at full
         # size. The inline canvas now starts at roughly a third of the
         # figure's natural size (DEFAULT_SCALE_PCT) and the slider added
         # to btn_row below lets the user scale it back up. Fixed (not
@@ -6753,7 +6659,7 @@ class GroupsStatsTab(QWidget):
             QSizePolicy.Policy.Fixed,
             QSizePolicy.Policy.Fixed,
         )
-        # Hover tooltips (Item 6) -- figure-makers that want them stash a
+        # Hover tooltips -- figure-makers that want them stash a
         # handler on the Figure itself (fig._hover_handler), since no
         # canvas exists yet when they run; connect it now that one does.
         if hasattr(fig, '_hover_handler'):
@@ -6801,7 +6707,7 @@ class GroupsStatsTab(QWidget):
                 QSizePolicy.Policy.Expanding,
                 QSizePolicy.Policy.Expanding,
             )
-            # Hover tooltips (Item 6) -- dlg_fig is a fresh figure (from
+            # Hover tooltips -- dlg_fig is a fresh figure (from
             # maker(**maker_kwargs) above), so its own handler needs
             # connecting too.
             if hasattr(dlg_fig, '_hover_handler'):
@@ -6850,7 +6756,7 @@ class GroupsStatsTab(QWidget):
         btn_row.addWidget(export_btn)
         btn_row.addSpacing(16)
 
-        # Item 4 -- manual resize slider for the inline canvas.
+        # manual resize slider for the inline canvas.
         btn_row.addWidget(QLabel("Size:"))
         size_slider = QSlider(Qt.Horizontal)
         size_slider.setRange(20, 200)
@@ -7005,15 +6911,13 @@ class GroupsStatsTab(QWidget):
     def _draw_results(self):
         """
         Render heatmap and volcano into per-plot tabs, for the currently
-        selected 'Viewing comparison' (Item 13 phase 2 — a single Run
+        selected 'Viewing comparison' (a single Run
         Statistics call can now produce several comparisons; each plot
-        still shows exactly one at a time — see §2.4 of the change doc).
+        still shows exactly one at a time ).
 
         Figure-building (the expensive part -- heatmap dendrograms,
         volcano scatter/labelling) happens on a background QThread
-        (_ResultsDrawWorker, Item 7) -- confirmed necessary from a real
-        run: 2.4s entirely on the main thread even after Item 4/6's label
-        fix. Only tab add/remove (Qt) happens here and in
+        (_ResultsDrawWorker). Only tab add/remove (Qt) happens here and in
         _on_results_figures_built, on the main thread.
         """
         if self._results_draw_worker is not None:
@@ -7364,13 +7268,13 @@ class GroupsStatsTab(QWidget):
         Per-sample heatmap with row + column dendrograms.
 
         results_df : limma/GLM output for ONE comparison (feature, logFC,
-                     significant, …) — Item 13 phase 2: the caller has
+                     significant, …): the caller has
                      already filtered a multi-comparison result down to a
                      single comparison's rows before calling this.
         sample_df  : raw feature matrix for that SAME comparison's samples
                      only (rows=samples, cols=features), index=rel-paths.
         group_a/group_b : the two group names this comparison represents
-                     (Item 13 phase 2 — passed explicitly rather than read
+                     passed explicitly rather than read
                      from state.compare_group_a/b, since that pair now
                      belongs to T-REX and may be completely unrelated to
                      whichever comparison is being drawn here).
@@ -7573,8 +7477,8 @@ class GroupsStatsTab(QWidget):
                               pval_threshold: float, fc_threshold: float,
                               run_label: str = ''):
         """Volcano plot: x=logFC, y=-log10(adj.P.Val). Significant points
-        are coloured via viridis, scaled by -log10(adj. P-value) (Item
-        11 -- previously flat red for every significant point); non-
+        are coloured via viridis, scaled by -log10(adj. P-value).
+        Previously flat red for every significant point); non-
         significant points stay flat grey. run_label is stamped in the
         upper-left corner (plot provenance)."""
         from matplotlib.figure import Figure
@@ -7620,9 +7524,7 @@ class GroupsStatsTab(QWidget):
         ax.axvline(-fc_threshold,              color='grey', linestyle='--', linewidth=0.8)
 
         # Static labels: only the _MAX_STATIC_LABELS most significant
-        # points, with a small fixed offset -- no adjustText (Item 6:
-        # dropped entirely -- it hung for minutes with several hundred
-        # significant points, e.g. an MFI volcano, see item 4). EVERY
+        # points, with a small fixed offset. EVERY
         # significant point still gets identified via a mouse-hover
         # tooltip (_make_scatter_hover_handler) instead, which scales to
         # any number of points at effectively zero draw cost.
@@ -7715,7 +7617,7 @@ class GroupsStatsTab(QWidget):
 
 class WorkspaceTab(QWidget):
     """
-    Tab 3 — Workspace
+    Tab — Workspace
     -------------------------------------------
     Scrollable canvas of PlotCard widgets showing DR scatter plots.
     Each PlotCard supports:
@@ -8227,7 +8129,7 @@ class PlotCard(QFrame):
         self._axis_font_spin.valueChanged.connect(self._schedule_refresh)
         app_inner_layout.addWidget(self._axis_font_spin)
 
-        # Plot width/height in inches (Item 9) -- drives both the
+        # Plot width/height in inches -- drives both the
         # matplotlib figure's own size and _AspectCanvasHolder's ratio, so
         # the rendered plot's proportions actually change rather than
         # just the figure's internal DPI scaling.
@@ -8350,7 +8252,7 @@ class PlotCard(QFrame):
 
     def _populate_dr_run_combo(self):
         """Rebuild the DR-run combo from state.dr_runs, keyed by run_id —
-        never label text, since labels are user-editable (Item 6 rename)."""
+        never label text, since labels are user-editable."""
         self.dr_combo.blockSignals(True)
         prev_run_id = self.dr_combo.currentData()
         self.dr_combo.clear()
@@ -8447,7 +8349,7 @@ class PlotCard(QFrame):
         """
         Show the ⚠ indicator when the selected clustering run's gate-set
         or sample-set isn't a subset of the selected DR run's. Delegates
-        the set comparison to drc_scatter (Item 8 — shared with the
+        the set comparison to drc_scatter (shared with the
         Cluster Annotation tab's cluster-map panel).
         """
         if self.colour_mode_combo.currentText() != 'Clusters':
@@ -8625,7 +8527,7 @@ class PlotCard(QFrame):
         self._cbar_ax = self._figure.add_subplot(gs[0, 1])
         self._cbar_ax.set_visible(False)
         _style_figure_theme(self._figure, is_dark, axes=[ax])
-        # Item 6 -- box_aspect pins the rendered box to square regardless
+        # box_aspect pins the rendered box to square regardless
         # of the reserved colourbar column or the embedding's own x/y
         # range; adjustable='datalim' pads xlim/ylim to match instead of
         # reshaping the box (which is what let a taller-than-wide data
@@ -8661,7 +8563,7 @@ class PlotCard(QFrame):
             lab_disp    = lab
             origin_disp = origin
 
-        # Item 17 -- cached so _rebuild_group_legend() (called right after
+        # cached so _rebuild_group_legend() (called right after
         # this method, and only from here) knows which samples/groups are
         # actually present in the CURRENT view without recomputing origin.
         self._last_origin_disp = origin_disp
@@ -8684,8 +8586,7 @@ class PlotCard(QFrame):
         elif colour_mode == 'Group':
             self._draw_group_scatter(ax, xy_disp, origin_disp)
 
-        # Apply label colour to colourbar (Marker / T-REX), title, and axis
-        # labels (Item 7 — previously only covered title + colourbar).
+        # Apply label colour to colourbar (Marker / T-REX), title, and axis labels
         lc = self._label_color
         ax.title.set_color(lc)
         ax.xaxis.label.set_color(lc)
@@ -8772,8 +8673,8 @@ class PlotCard(QFrame):
 
     def _draw_cluster_scatter(self, ax, xy, labels, cl_run: dict | None):
         """
-        Colour points by cluster label. Delegates to drc_scatter (Item 8 —
-        extracted so the Cluster Annotation tab's cluster-map panel renders
+        Colour points by cluster label. Delegates to drc_scatter
+        (extracted so the Cluster Annotation tab's cluster-map panel renders
         identically instead of duplicating this logic).
         """
         drc_scatter.draw_cluster_scatter(ax, xy, labels, cl_run, self.controller)
@@ -8827,7 +8728,6 @@ class PlotCard(QFrame):
         self._figure.clear()
         ax = self._figure.add_subplot(111)
         _style_figure_theme(self._figure, is_dark, axes=[ax])
-        # Item 6 -- see the matching comment in refresh() above.
         ax.set_box_aspect(1)
         ax.set_aspect('equal', adjustable='datalim')
         ax.axis('off')
@@ -8956,7 +8856,7 @@ class PlotCard(QFrame):
         if keep:
             cb.set_ticks([p for p, l in keep])
             cb.set_ticklabels([l for p, l in keep])
-        # "Legend font" (Item 8) now sizes the Marker colourbar's label and
+        # "Legend font" now sizes the Marker colourbar's label and
         # tick text too, not just the Clusters-mode swatch legend.
         _lf = self._legend_font_spin.value()
         cb.set_label(display_label, fontsize=_lf)
@@ -9028,9 +8928,9 @@ class PlotCard(QFrame):
 
     def _draw_group_scatter(self, ax, xy, origin):
         """
-        Colour points by their sample's assigned comparison Group (Item
-        17), sharing state.group_colors with the Comparison Groups
-        table's Colour column and the Sample PCA plot (Item 16) via
+        Colour points by their sample's assigned comparison Group,
+        sharing state.group_colors with the Comparison Groups
+        table's Colour column and the Sample PCA plot via
         _resolve_group_colour(). 'Unassigned' samples are grey.
         """
         rel_to_group = _sample_groups_by_rel(self.controller, self.state)
@@ -9068,8 +8968,8 @@ class PlotCard(QFrame):
     def _rebuild_legend(self):
         """Rebuild the right-side legend (swatch + name label per cluster
         or group). Clusters read from the currently-selected clustering
-        run's own 'colors'/'names' (Item 6 — these live per-run, not on a
-        single ambient dict). Group mode (Item 17) delegates to
+        run's own 'colors'/'names' (these live per-run, not on a
+        single ambient dict). Group mode delegates to
         _rebuild_group_legend(). In 'Cluster Tree' plot-type mode the
         colour-mode combo is hidden (and may be holding a stale value from
         whatever it was set to before switching into Tree mode), so Tree
@@ -9129,7 +9029,7 @@ class PlotCard(QFrame):
 
     def _rebuild_group_legend(self):
         """
-        Right-side legend for 'Group' colour mode (Item 17) — one swatch
+        Right-side legend for 'Group' colour mode — one swatch
         per group actually present in the current plot's data (not every
         defined group), right-click to recolour. Shares state.group_colors
         with the Comparison Groups table's Colour column and the Sample
@@ -9182,7 +9082,7 @@ class PlotCard(QFrame):
         self._legend_layout.addStretch()
 
     def _pick_group_colour(self, name: str, swatch: QPushButton):
-        """Open a colour dialog to change a group's colour (Item 17) --
+        """Open a colour dialog to change a group's colour--
         writes to the same state.group_colors dict as the Comparison
         Groups table's Colour column and the Sample PCA plot, so the
         change shows up in all three immediately."""
@@ -9197,7 +9097,7 @@ class PlotCard(QFrame):
 
     def _pick_cluster_colour(self, label: int, swatch: QPushButton):
         """Open a colour dialog to change a cluster's colour. Persistence
-        delegates to drc_scatter (Item 8 — shared with the Cluster
+        delegates to drc_scatter (— shared with the Cluster
         Annotation tab)."""
         cl_run = self._selected_cluster_run()
         if cl_run is None:
@@ -9214,7 +9114,7 @@ class PlotCard(QFrame):
 
     def _rename_cluster(self, label: int):
         """Inline rename for a cluster via an input dialog. Duplicate-check
-        and persistence delegate to drc_scatter (Item 8 — shared with the
+        and persistence delegate to drc_scatter (shared with the
         Cluster Annotation tab's rename paths)."""
         from PySide6.QtWidgets import QInputDialog
         cl_run = self._selected_cluster_run()
@@ -9231,7 +9131,7 @@ class PlotCard(QFrame):
             self._rebuild_legend()
     
     def _on_plot_dims_changed(self):
-        """Plot W/H changed (Item 9) — resize the actual figure and update
+        """Plot W/H changed — resize the actual figure and update
         the holder's aspect ratio so both the matplotlib canvas and the Qt
         widget wrapping it agree on the new proportions."""
         w = self._plot_w_spin.value()
@@ -9253,7 +9153,7 @@ class PlotCard(QFrame):
     def _update_label_color_btn(self):
         """Update the button background to preview the chosen colour, with
         contrasting text so the button stays legible regardless of which
-        colour is picked or the app's light/dark theme (Item 5)."""
+        colour is picked or the app's light/dark theme."""
         text_color = _contrasting_text_color(self._label_color)
         self._label_color_btn.setStyleSheet(
             f"background-color: {self._label_color}; color: {text_color};"
@@ -9283,10 +9183,6 @@ class PlotCard(QFrame):
     def apply_config(self, config: dict):
         if not config:
             return
-        # Pre-Item-6 saved layouts have 'dr_algo' instead of 'dr_run_id' —
-        # there's no run_id to recover from a bare algorithm name, so those
-        # fall through to whatever _populate_dr_run_combo() already
-        # defaulted to (the newest run) rather than raising.
         dr_run_id = config.get('dr_run_id')
         if dr_run_id:
             idx = self.dr_combo.findData(dr_run_id)
@@ -9695,7 +9591,7 @@ class _DrWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# 5g.  Cluster Annotation tab (Item 8)
+# Cluster Annotation tab
 # ---------------------------------------------------------------------------
 
 class _SquareContainer(QWidget):
@@ -9810,7 +9706,7 @@ class _WrappingLegendWidget(QWidget):
 
 class _MarkerSummaryWorker(QThread):
     """
-    Item 3 -- pools per-cluster marker values (disk I/O + unmixing, via
+    Pools per-cluster marker values (disk I/O + unmixing, via
     the owning ClusterAnnotationTab's own _pool_violin_data) and builds
     the heatmap/ridgeline Figures on a background thread, so recomputing
     -- or just switching back to an already-pooled run -- never blocks
@@ -9920,7 +9816,7 @@ class _RunHydrateWorker(QThread):
 
 class ClusterAnnotationTab(QWidget):
     """
-    Tab 5 — Cluster Annotation (Item 8)
+    Tab — Cluster Annotation
     -------------------------------------
     Four coordinated elements for a SELECTED clustering run:
       1. Per-marker violin plots, one per selected channel, cluster on the
@@ -9929,8 +9825,7 @@ class ClusterAnnotationTab(QWidget):
          run's own per-sample label arrays — never the "currently active"
          globals, so switching runs here never touches Workspace state.
       2. Cluster map — a DR scatter plot coloured by cluster, via its own
-         DR-run selector (Item 6's "other places that now need to know
-         about multiple runs"). Rendering, legend editing, and the
+         DR-run selector. Rendering, legend editing, and the
          DR/clustering compatibility warning all delegate to drc_scatter,
          shared with Workspace's PlotCard so both render identically.
       3. Cluster label table — one row per cluster: editable name, colour
@@ -9939,14 +9834,13 @@ class ClusterAnnotationTab(QWidget):
          drc_scatter helpers PlotCard uses, so edits made from either UI
          (or from Workspace) are always the SAME per-run 'names'/'colors'
          payload — there is no separate copy to fall out of sync.
-      4. Cluster ID Suggestions (Item 15, drc_cluster_id.py) — two more
+      4. Cluster ID Suggestions (drc_cluster_id.py) — two more
          label-table columns computed from the SAME checked channels as
          Panel 1: an auto-generated MEM label (safe one-click adoption,
          double-click the cell or "Adopt All MEM Labels") and a suggested
          cell type scored against a bundled marker-signature database
          (display-only — a biological claim, not a statistic, so adopting
-         one means retyping it into Name yourself). Neither is persisted;
-         both recompute on demand and clear when the selected run changes.
+         one means retyping it into Name yourself).
     """
 
     def __init__(self, state: PipelineState, bus, controller, parent=None):
@@ -9955,18 +9849,18 @@ class ClusterAnnotationTab(QWidget):
         self.bus = bus
         self.controller = controller
         # {run_id: {'pooled': {ch: {cl_id: [arrays]}}, 'channels': [...],
-        #  'names_map': {...}}} — Item 9: cached per clustering run so
+        #  'names_map': {...}}} — cached per clustering run so
         # switching FlowSOM -> Leiden -> FlowSOM redraws the FlowSOM
         # violin instantly instead of reverting to the placeholder.
         self._violin_cache: dict[str, dict] = {}
-        # Debounced auto-recompute (Item 3's "auto-plot all") — avoids
+        # Debounced auto-recompute — avoids
         # recomputing on every single checkbox click while the user is
         # still adjusting the checked set.
         self._violin_recompute_timer = QTimer(self)
         self._violin_recompute_timer.setSingleShot(True)
         self._violin_recompute_timer.setInterval(400)
         self._violin_recompute_timer.timeout.connect(self._recompute_violins)
-        # Item 15 -- Cluster ID suggestion cache, mirrored into the run
+        # Cluster ID suggestion cache, mirrored into the run
         # archive (drc_run_archive.archive_clustering_run's 'mem_labels'/
         # 'cell_type_suggestions' payload fields -- see
         # update_cluster_id_suggestions). These three attributes are still
@@ -10155,7 +10049,7 @@ class ClusterAnnotationTab(QWidget):
         self._legend_scroll = legend_scroll
         map_plot_row.addWidget(legend_scroll)
 
-        # Item 4 (round 2) -- plot pane absorbs any extra space; legend
+        # Plot pane absorbs any extra space; legend
         # pane starts at a rough default and gets fitted to its real
         # content the first time _rebuild_map_legend runs (see
         # _sync_legend_column_width), then stays user-controlled once
@@ -10171,7 +10065,7 @@ class ClusterAnnotationTab(QWidget):
         splitter.addWidget(map_box)
 
         # ============================================================
-        # Panel 3 — Cluster label table (+ Item 15 suggestion controls)
+        # Panel 3 — Cluster label table
         # ============================================================
         table_box = QGroupBox("Cluster Labels")
         table_layout = QVBoxLayout(table_box)
@@ -10230,7 +10124,7 @@ class ClusterAnnotationTab(QWidget):
         self._suggestions_status.setWordWrap(True)
         table_layout.addWidget(self._suggestions_status)
 
-        # Item 15 follow-up -- Compute loads + unmixes every training
+        # Compute loads + unmixes every training
         # sample from disk, which can take a while; this is the only
         # visible feedback besides the status label above.
         self._suggestions_progress = QProgressBar()
@@ -10263,23 +10157,20 @@ class ClusterAnnotationTab(QWidget):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 1)
-        # Item 6 -- halved the Cluster Map's share (stretch 4->2, size
-        # 1040->520); trimmed the overall minimum by the same 520px so
-        # panels 0/2 don't get inflated back into the freed space.
         splitter.setSizes([780, 520, 340])
         splitter.setChildrenCollapsible(False)
-        splitter.setMinimumHeight(2080)  # Item 4 -- more room to fit everything
+        splitter.setMinimumHeight(2080)
 
         # ============================================================
-        # Sub-tab 2 — Marker Heatmap & Ridgelines (Items 4 & 5)
+        # Sub-tab — Marker Heatmap & Ridgelines
         # ============================================================
         self._build_marker_summary_ui()
 
     def _build_marker_summary_ui(self):
         """
-        Sub-tab 2: mean-MFI heatmap (Item 4) and marker ridgeline grid
-        (Item 5), both keyed off the SAME clustering run selected at the
-        top of this tab, both cached per run_id (Item 9's pattern)
+        Sub-tab 2: mean-MFI heatmap and marker ridgeline grid,
+        both keyed off the SAME clustering run selected at the
+        top of this tab, both cached per run_id
         so switching runs doesn't discard an already-computed summary.
         """
         self._marker_summary_cache: dict[str, dict] = {}
@@ -10306,7 +10197,7 @@ class ClusterAnnotationTab(QWidget):
         page_layout.addWidget(self._summary_splitter, stretch=1)
 
         heatmap_box = QGroupBox("Median MFI per Cluster (Transformed)")
-        self._heatmap_box = heatmap_box  # Item 3 -- needed from _apply_marker_summary_figures
+        self._heatmap_box = heatmap_box
         heatmap_outer_layout = QVBoxLayout(heatmap_box)
 
         # Frozen-header grid: (0,0) corner spacer, (0,1) marker-name
@@ -10396,12 +10287,6 @@ class ClusterAnnotationTab(QWidget):
         self._summary_splitter.setStretchFactor(0, 0)
         self._summary_splitter.setStretchFactor(1, 1)
         self._summary_splitter.setChildrenCollapsible(False)
-        # Item 4 -- this sub-tab had no floor at all (unlike the
-        # Annotation splitter above, which sets one), so the heatmap +
-        # colour scale + ridgeline grid got squeezed into whatever the
-        # tab's visible height happened to be. This tab's own outer
-        # QScrollArea (see _build_ui) scrolls past this if the window is
-        # shorter than it.
         self._summary_splitter.setMinimumHeight(1800)
 
         self._marker_summary_tab_index = self.annotation_sub_tabs.addTab(
@@ -10426,7 +10311,7 @@ class ClusterAnnotationTab(QWidget):
         # hydrate_run() is a cheap no-op and this proceeds normally.
         if self._start_hydrate_worker_if_needed():
             return
-        # Item 15 -- _populate_run_combo() above re-selects whatever run_id
+        # _populate_run_combo() above re-selects whatever run_id
         # was already active, so it never fires currentIndexChanged /
         # _on_run_changed on its own; without this call, a freshly
         # (re)activated tab (including right after opening the experiment)
@@ -10492,7 +10377,7 @@ class ClusterAnnotationTab(QWidget):
 
     def _populate_run_combo(self):
         """Rebuild the clustering-run combo from state.clustering_runs,
-        keyed by run_id (labels are user-editable — Item 6's rename)."""
+        keyed by run_id (labels are user-editable)."""
         self.run_combo.blockSignals(True)
         prev_run_id = self.run_combo.currentData()
         self.run_combo.clear()
@@ -10578,7 +10463,7 @@ class ClusterAnnotationTab(QWidget):
             )
 
     def _on_run_changed(self, _index: int):
-        # Item 15 -- suggestions are per-run and now persisted (see
+        # suggestions are per-run and now persisted (see
         # update_cluster_id_suggestions); restore whatever the
         # newly-selected run already has saved rather than always
         # clearing to empty, so switching runs doesn't throw away a
@@ -10591,7 +10476,7 @@ class ClusterAnnotationTab(QWidget):
         run_id = self.run_combo.currentData()
         cache = self._violin_cache.get(run_id)
         if cache:
-            # Item 9: this run's violins were already computed earlier in
+            # this run's violins were already computed earlier in
             # the session — restore instantly instead of discarding them.
             self._populate_violin_channel_combo(cache['channels'])
             self._draw_current_violin()
@@ -10601,7 +10486,7 @@ class ClusterAnnotationTab(QWidget):
             self._show_violin_placeholder(
                 "Select a clustering run and channel(s) to plot violins."
             )
-        # Marker Summary sub-tab (Items 4/5): only touch it if it's the
+        # Marker Summary sub-tab: only touch it if it's the
         # currently visible sub-tab -- same lazy-when-visible rule
         # _on_annotation_sub_tab_changed uses.
         self._restore_marker_summary_from_archive(run_id, cl_run)
@@ -10653,7 +10538,7 @@ class ClusterAnnotationTab(QWidget):
 
         # Grow to show every marker at once instead of clipping to the old
         # fixed 70-140px box -- still caps out and falls back to the
-        # scroll area's own scrollbar for pathologically long panels.
+        # scroll area's own scrollbar for large panels.
         n_rows = -(-len(channels) // n_cols) if channels else 1  # ceil div
         content_h = min(n_rows * 22 + 16, 260)
         self._channel_scroll.setMinimumHeight(content_h)
@@ -10687,8 +10572,8 @@ class ClusterAnnotationTab(QWidget):
         archived before that snapshot existed.
 
         Extracted from the old single-shot _plot_violins so results can
-        be cached per run_id (Item 9) instead of recomputed every time
-        the viewed channel changes (Item 3).
+        be cached per run_id instead of recomputed every time
+        the viewed channel changes.
         """
         labels_dict = cl_run.get('labels', {}) or {}
         snapshot_dict = cl_run.get('marker_values', {}) or {}
@@ -10713,7 +10598,7 @@ class ClusterAnnotationTab(QWidget):
                     )
                     continue
             else:
-                # Item 3 -- af_state, when given, is a main-thread
+                # af_state, when given, is a main-thread
                 # snapshot of (transfer_matrix, af_precomputed,
                 # af_spectra) so a background worker never reads these
                 # live off the controller while the main window could be
@@ -10756,8 +10641,8 @@ class ClusterAnnotationTab(QWidget):
     def _recompute_violins(self):
         """
         Pool data for every checked channel and cache it against the
-        current run (Item 9), then show whichever channel is selected in
-        violin_channel_combo (Item 3 — one big plot at a time instead of
+        current run, then show whichever channel is selected in
+        violin_channel_combo (one big plot at a time instead of
         a multi-panel grid).
         """
         cl_run = self._selected_cluster_run()
@@ -10807,7 +10692,7 @@ class ClusterAnnotationTab(QWidget):
             ch, cache['pooled'].get(ch, {}), cache['names_map'], cache.get('colors_map', {}),
         )
         canvas = _new_scrollable_canvas(fig)
-        # Item 1 -- fill the Splitter panel instead of forcing a fixed
+        # fill the Splitter panel instead of forcing a fixed
         # pixel size (which made the scroll area scroll rather than
         # shrink/grow the plot with the panel). setWidgetResizable(True)
         # on _violin_scroll already resizes whatever widget it holds to
@@ -10819,8 +10704,7 @@ class ClusterAnnotationTab(QWidget):
 
     def _make_single_violin_figure(self, ch: str, by_cluster: dict, names_map: dict,
                                    colors_map: dict | None = None):
-        """One big violin plot for a single channel, filling the
-        available space (Item 3 — was a small tile in a multi-panel grid).
+        """One big violin plot for a single channel, filling the space.
         Each violin is coloured by its own cluster's colour (same colours
         as the Cluster Map / legend / label table) instead of one flat
         colour for all of them."""
@@ -10899,11 +10783,10 @@ class ClusterAnnotationTab(QWidget):
     def _draw_map_axes(self, ax, cl_run: dict | None, dr_run: dict | None, fontsize: int = 7):
         """
         Draw the cluster map onto *ax* -- shared by the inline panel
-        (_redraw_map) and the bigger pop-out dialog (_pop_out_map, Item
-        6) so both render identically, the same way PlotCard and this
+        (_redraw_map) and the bigger pop-out dialog (_pop_out_map)
+        so both render identically, the same way PlotCard and this
         tab already share drc_scatter.draw_cluster_scatter itself.
         """
-        # Item 6 -- see the matching comment in PlotCard.refresh().
         ax.set_box_aspect(1)
         ax.set_aspect('equal', adjustable='datalim')
         ax.grid(False)   # suppress inherited seaborn 'whitegrid'
@@ -10976,8 +10859,7 @@ class ClusterAnnotationTab(QWidget):
     def _pop_out_map(self):
         """Regenerate the cluster map at a larger size in its own window,
         with the same pan/zoom toolbar the Stats results tabs already
-        have (Item 6), and its own copy of the swatch legend (Item 2 --
-        the pop-out previously showed no legend at all)."""
+        have, and its own copy of the swatch legend."""
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 
@@ -11032,7 +10914,7 @@ class ClusterAnnotationTab(QWidget):
         """
         Build one swatch+name row per cluster. Shared by the inline
         legend (_rebuild_map_legend) and the pop-out dialog's own legend
-        (_pop_out_map, Item 2) so both look and behave identically.
+        (_pop_out_map) so both look and behave identically.
 
         extra_refresh, if given, is called after a rename/recolour is
         applied through THIS set of entries -- lets the pop-out dialog
@@ -11095,7 +10977,7 @@ class ClusterAnnotationTab(QWidget):
 
     def _sync_legend_column_width(self):
         """
-        Item 4 (round 2) -- size the legend column to fit its current
+        Size the legend column to fit its current
         content (longest name across however many columns
         _WrappingLegendWidget wrapped into), so the default is never
         narrower than the names actually need. No-ops once the user has
@@ -11164,7 +11046,7 @@ class ClusterAnnotationTab(QWidget):
         unique = (sorted(int(l) for l in np.unique(all_labels)) if total
                  else sorted(colors.keys()))
 
-        # Item 15 -- only show suggestions if they were computed for THIS
+        # only show suggestions if they were computed for THIS
         # run (not stale leftovers from a previously-selected run).
         suggestions_current = bool(cl_run.get('run_id')) and \
             self._suggestions_run_id == cl_run.get('run_id')
@@ -11263,7 +11145,7 @@ class ClusterAnnotationTab(QWidget):
                 self._rebuild_map_legend(cl_run)
                 self._redraw_map()
         elif col == 4:
-            # Item 15 -- one-click MEM label adoption for a single cluster.
+            #one-click MEM label adoption for a single cluster.
             item = self.label_table.item(row, col)
             cl_id = item.data(Qt.UserRole)
             cl_run = self._selected_cluster_run()
@@ -11276,7 +11158,7 @@ class ClusterAnnotationTab(QWidget):
                 self._populate_label_table()
 
     # ------------------------------------------------------------------
-    # Panel 4 — Cluster ID suggestions (Item 15)
+    # Panel 4 — Cluster ID suggestions
     # ------------------------------------------------------------------
 
     def _compute_cluster_id_suggestions(self):
@@ -11331,7 +11213,7 @@ class ClusterAnnotationTab(QWidget):
             )
             return
 
-        # Item 15 (marker naming, tier 1 -- HARD gate). Every channel in
+        # Every channel in
         # this run's recorded set must have an Antigen typed in before
         # we'll compute anything -- otherwise MEM Label falls back to the
         # fluorophore Label for that channel and mixes marker/fluorophore
@@ -11371,10 +11253,10 @@ class ClusterAnnotationTab(QWidget):
             self.controller.af_precomputed,
             self.controller.af_spectra,
         )
-        # Item 15 -- the unstained sample(s) used to derive positivity
+        # The unstained sample(s) used to derive positivity
         # thresholds have no AF profile of their own; resolve a stand-in
         # per unstained sample (name match, or the run's most common
-        # assignment) and snapshot ITS AF state too, same main-thread
+        # assignment) and snapshot its AF state too, same main-thread
         # requirement as af_state above -- see
         # drc_cluster_id.resolve_unstained_af_states's docstring.
         unstained_af_states = drc_cluster_id.resolve_unstained_af_states(self.controller, cl_run)
@@ -11444,7 +11326,7 @@ class ClusterAnnotationTab(QWidget):
             self.controller, self.state, run_id, mem_labels, cell_type_df,
         )
 
-        # Item 15 (marker naming, tier 2 -- SOFT warning). Antigen text
+        # Antigen text
         # that's present but unrecognised by marker_database.csv doesn't
         # block anything -- just flag it, since it silently contributes
         # nothing to Suggested Type otherwise.
@@ -11528,7 +11410,7 @@ class ClusterAnnotationTab(QWidget):
     def _on_annotation_sub_tab_changed(self, index: int):
         """Lazily compute the Marker Summary sub-tab only when it becomes
         visible, and only if this run hasn't been computed yet -- same
-        lazy/cached pattern as the violin panel (Item 9)."""
+        lazy/cached pattern as the violin panel."""
         if index != getattr(self, '_marker_summary_tab_index', -1):
             return
         run_id = self.run_combo.currentData()
@@ -11553,7 +11435,7 @@ class ClusterAnnotationTab(QWidget):
             return
         cluster_order = sorted(cl for cl in cl_run.get('colors', {}) if cl >= 0)
 
-        # Item 3 -- pooling (disk I/O + unmixing) and figure construction
+        # Pooling (disk I/O + unmixing) and figure construction
         # can take a while for large runs; both now happen on a
         # background QThread instead of blocking the UI, the same way
         # _StatsWorker/_DrWorker/_ClusterIdWorker already do elsewhere in
@@ -11672,7 +11554,7 @@ class ClusterAnnotationTab(QWidget):
             return
 
         if cache.get('pooled') is not None:
-            # Item 3 -- figure construction from already-pooled data still
+            # figure construction from already-pooled data still
             # goes through the background worker (skipping the pooling
             # step, since 'pooled' is passed straight through) so a big
             # ridge grid can't block the UI just from a theme switch.
@@ -11726,7 +11608,7 @@ class ClusterAnnotationTab(QWidget):
 
         # Default the splitter to the heatmap's own natural height, read
         # from Qt's own layout metrics rather than a guessed "chrome"
-        # constant (Item 10) -- pin the one flexible piece (the main
+        # constant -- pin the one flexible piece (the main
         # heatmap viewport, normally stretched by heatmap_grid) to its
         # exact content height just long enough to ask heatmap_box for its
         # real sizeHint (title bar + margins included, computed by the
@@ -11905,7 +11787,7 @@ class ClusterAnnotationTab(QWidget):
         panel (cluster_order — see _recompute_marker_summary), coloured
         with the run's own per-cluster colours so identity matches the
         Cluster Map / legend elsewhere in this tab. First cluster in
-        cluster_order is drawn at the TOP row (Item 6).
+        cluster_order is drawn at the TOP row.
 
         Uses a plain np.histogram per cluster instead of gaussian_kde --
         same approach as functions.calc_hist1d (the fast 1D histogram
@@ -12149,8 +12031,8 @@ class PluginWidget(QWidget):
         # so on the background loader thread produces QObject::setParent warnings.
         _ensure_qt_imports()
 
-        # Install missing ML dependencies (also deferred to main thread).
-        _bootstrap()
+        # Silence noisy third-party warnings (deferred to main thread).
+        _suppress_third_party_warnings()
 
         # Shared state — passed by reference to all inner tabs
         self.state = PipelineState()
@@ -12245,14 +12127,14 @@ class PluginWidget(QWidget):
 
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
 
-        # Item 6: a rename/delete in the run management table must be
+        # a rename/delete in the run management table must be
         # reflected immediately in every other run selector, not just on
         # next tab switch.
         self.config_tab.run_table.runsChanged.connect(self._on_runs_changed)
 
         # Keep the two gate trees (TransformTab's primary, ConfigTab's
         # override) in sync — same idea as the old combo pair's
-        # blockSignals(), applied to tree checkbox state instead (§0.3).
+        # blockSignals(), applied to tree checkbox state instead.
         self.transform_tab.gate_tree.selectionChanged.connect(self._on_gate_tree_changed)
         self.config_tab.gate_tree.selectionChanged.connect(self._on_gate_tree_changed)
 
@@ -12278,14 +12160,13 @@ class PluginWidget(QWidget):
 
     def _on_runs_changed(self):
         """
-        A run was renamed or deleted in ConfigTab's management table
-        (Item 6).  Refresh every other place that lists runs so the
-        change shows up immediately.
+        A run was renamed or deleted in ConfigTab's management table.
+        Refresh every other place that lists runs so the change shows up immediately.
         """
         if hasattr(self, 'groups_stats_tab'):
             self.groups_stats_tab._clear_stale_run_results()
             self.groups_stats_tab._populate_run_combo()
-            # Item 1 (round 4) -- AFTER _populate_run_combo(), so this
+            # FTER _populate_run_combo(), so this
             # compares against wherever the combo actually settled post-
             # delete/rename, not the about-to-be-stale prior selection.
             self.groups_stats_tab._sync_confusion_composition_to_run()
@@ -12463,7 +12344,7 @@ class PluginWidget(QWidget):
             s.setValue('group_colors',      repr(self.state.group_colors))
             s.setValue('compare_group_a',   self.state.compare_group_a)
             s.setValue('compare_group_b',   self.state.compare_group_b)
-            # Item 16 -- Sample PCA appearance/config
+            # Sample PCA appearance/config
             s.setValue('pca_use_freq',      self.state.pca_use_freq)
             s.setValue('pca_use_counts',    self.state.pca_use_counts)
             s.setValue('pca_use_mfi',       self.state.pca_use_mfi)
@@ -12476,7 +12357,7 @@ class PluginWidget(QWidget):
             s.setValue('pca_show_grid',     self.state.pca_show_grid)
             s.setValue('pca_label_loadings', self.state.pca_label_loadings)
             s.setValue('pca_label_points',   self.state.pca_label_points)
-            # Item 13 phase 2
+            # stats and covariates
             s.setValue('testing_group_selection', list(self.state.testing_group_selection))
             s.setValue('contrast_mode',     self.state.contrast_mode)
             s.setValue('reference_group',   self.state.reference_group)
@@ -12645,11 +12526,7 @@ class PluginWidget(QWidget):
                 except Exception:
                     loaded_groups = None
 
-            # Item 13: detect the pre-Item-13 session shape (exactly 2
-            # stored names, every sample_groups value restricted to the old
-            # 'A'/'B'/'Unassigned' slots) and migrate transparently — 'A' /
-            # 'B' become that session's own custom names, one-time, with no
-            # user action needed.
+            # one-time migration for development.
             is_legacy = (
                 loaded_groups is not None
                 and len(group_names_stored) == 2
@@ -13118,12 +12995,11 @@ class PluginWidget(QWidget):
             if isinstance(payload.get('composition_colors'), dict):
                 self.state.composition_colors = payload['composition_colors']
 
-            # Item 1 (round 5) -- migration for sidecars saved before
+            # migration for sidecars saved before
             # confusion_run_id/composition_run_id existed: confusion_df/
             # composition_df loaded fine above, but the id came back ''
             # even though confusion_run_label/composition_run_label is a
-            # real (non-"Active (unsaved)") run name -- a sign this is an
-            # old file, not a genuinely-unsaved result. Best-effort
+            # real (non-"Active (unsaved)") run name. Best-effort
             # backfill by matching that label against a still-archived
             # run; if none matches (renamed or deleted since), the id is
             # unverifiable, so drop the data rather than risk showing it
@@ -13407,11 +13283,7 @@ class PluginWidget(QWidget):
 
     def refresh_plot_theme(self):
         """
-        Re-render every currently-visible plot under the new theme
-        (Item 1). Confusion Matrix and Composition Barplot tabs used to
-        be the one known gap here -- see
-        GroupsStatsTab.refresh_theme_dependent_result_tabs for why they
-        needed their own path instead of piggybacking on _draw_results.
+        Re-render every currently-visible plot under the new theme.
         """
         self.workspace_tab.refresh()
         self.cluster_annotation_tab._redraw_map()
@@ -13429,7 +13301,7 @@ class PluginWidget(QWidget):
     def _tab_refresh_key(self, index: int):
         """
         Cheap fingerprint of the state that determines what tab *index*
-        would show if refreshed right now (item 2 -- avoid redoing a full
+        would show if refreshed right now (avoid redoing a full
         tab refresh when nothing relevant changed, e.g. plain tab-hopping).
 
         Deliberately coarse and conservative: every field a tab's refresh()
@@ -13499,8 +13371,8 @@ class PluginWidget(QWidget):
         """
         Call refresh() on the tab at *index* if it has that method --
         skipping the call entirely if this tab's own fingerprint
-        (_tab_refresh_key) hasn't changed since the last time it ran
-        (item 2). This sits ABOVE refresh(); it doesn't replace the
+        (_tab_refresh_key) hasn't changed since the last time it ran.
+        This sits ABOVE refresh(); it doesn't replace the
         finer-grained guards individual refresh() methods already have
         (e.g. GroupsStatsTab's _last_drawn_cluster_names / _has_results_tab
         checks), which still apply whenever refresh() does run.
@@ -13541,7 +13413,7 @@ class PluginWidget(QWidget):
             self.bus.statusMessage.emit(text)
 
     # ==================================================================
-    # Stage 3 — Dimensionality Reduction
+    # Dimensionality Reduction
     # ==================================================================
 
     def _load_training_data(self, af_state=None) -> np.ndarray | None:
@@ -13591,10 +13463,7 @@ class PluginWidget(QWidget):
 
         # n_jobs > 1 requires giving up the fixed seed -- umap-learn forces
         # n_jobs back to 1 internally whenever random_state is set, to keep
-        # training deterministic (see the warning suppressed at module
-        # load, and CONTEXT_UMAP.md). Only drop determinism when the user
-        # actually asked for parallelism; n_jobs=1 (the default) keeps
-        # today's exact behaviour unchanged.
+        # training deterministic.
         n_jobs = params.get('n_jobs', 1)
         if n_jobs == -1:
             n_jobs = os.cpu_count() or 1
@@ -13977,7 +13846,7 @@ class PluginWidget(QWidget):
         self._on_runs_changed()
 
     # ==================================================================
-    # Stage 4 — Clustering
+    # Clustering
     # ==================================================================
 
     # ------------------------------------------------------------------
@@ -14105,7 +13974,7 @@ class PluginWidget(QWidget):
         worker.start()
 
     # ==================================================================
-    # T-REX (on-demand, called from WorkspaceTab PlotCard)
+    # T-REX (walled off)
     # ==================================================================
 
     def run_trex(self):

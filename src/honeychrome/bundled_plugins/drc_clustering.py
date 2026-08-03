@@ -16,14 +16,14 @@ incompatible with pandas 3.0's Copy-on-Write. All cluster labels
 −1 reserved for noise, matching Leiden/HDBSCAN and the stats ``range(n_clusters)``
 loop by construction — no post-hoc index shift needed for FlowSOM anymore.
 
-Assignment architecture (Items 8/9/11)
+Assignment architecture
 ---------------------------------------
 Training Samples only ever decide what fits the model (SOM / kNN graph /
 HDBSCAN density estimate) — who gets labelled afterward is a separate
 question, controlled by two independent UI toggles collected into
 ``params`` by ``ConfigTab._on_run_clustering_clicked``:
 
-- ``params['_event_cap']`` (Item 11): ``None`` (default) trains on every
+- ``params['_event_cap']``: ``None`` (default) trains on every
   gated event from every training sample; an int caps each training
   sample's contribution ("Downsample training data" checked). Whenever a
   training sample's events were NOT capped out of the pool, Leiden and
@@ -32,9 +32,8 @@ question, controlled by two independent UI toggles collected into
   all (see ``_assign_by_slicing_or_predict``). FlowSOM has no such
   shortcut: a SOM never outputs per-event labels directly, so mapping
   every event onto the trained grid (``assign_to_nodes``) is always
-  required regardless of ``_event_cap`` — Item 11 only changes how much
-  data trains the grid, not how assignment works for it.
-- ``params['_assign_all_samples']`` (Item 9): ``False`` (default) restricts
+  required regardless of ``_event_cap``.
+- ``params['_assign_all_samples']`` : ``False`` (default) restricts
   labelling to ``state.training_sample_ids``; ``True`` additionally labels
   every other non-control sample in the experiment, via the same
   approximate method used for any downsampled/out-of-pool events.
@@ -111,12 +110,12 @@ def _snapshot_marker_values(controller, state, rel_path: str, labels: np.ndarray
 
 
 # ---------------------------------------------------------------------------
-# Shared assignment scope + training pool (Items 8/9/11)
+# Shared assignment scope + training pool
 # ---------------------------------------------------------------------------
 
 def _assignable_sample_paths(controller, state, assign_all: bool) -> set[str]:
     """
-    Which samples should receive cluster labels this run (Item 9).
+    Which samples should receive cluster labels this run.
 
     assign_all=True: every experiment sample except single-stain/
     unstained controls -- those are spectral reference samples, never
@@ -148,7 +147,7 @@ def _assignable_sample_paths(controller, state, assign_all: bool) -> set[str]:
 def _pool_training_data_with_boundaries(controller, state, event_cap: int | None,
                                         seed: int = 42, af_state=None):
     """
-    Clustering-specific training pool (Item 11) -- separate from
+    Clustering-specific training pool -- separate from
     drc_pipeline.load_training_pool (still used by DR, which always
     applies state.n_training_events): event_cap=None (the new default)
     means every gated event from every training sample, no downsampling;
@@ -219,7 +218,7 @@ def _assign_by_slicing_or_predict(controller, state, pooled_data, boundaries, fi
                                   dr_space: str | None = None, progress=None,
                                   af_state=None) -> None:
     """
-    Shared assignment for Leiden/HDBSCAN (Items 8/9/11): whenever a
+    Shared assignment for Leiden/HDBSCAN: whenever a
     training sample's events were NOT downsampled out of the pool
     (was_downsampled is False in *boundaries* -- always true when
     event_cap is None, the default), its EXACT labels come straight out
@@ -316,14 +315,13 @@ def run_flowsom(controller, state, params: dict, progress=None, af_state=None):
     flowsom_consensus.py, matching the R algorithm's ConsensusClusterPlus
     step rather than a single hierarchical cut.
 
-    Item 11: trains on every gated event from every training sample by
+    Trains on every gated event from every training sample by
     default (params['_event_cap'] is None unless "Downsample training
     data" is checked). Unlike Leiden/HDBSCAN, a SOM never outputs
     per-event labels directly -- mapping every event onto the trained
     grid (assign_to_nodes, in flowsom_assign_all) is its native,
     always-required mechanism, so there's no exact-slice shortcut to
-    take here even when nothing was downsampled; only the "train on more
-    data by default" half of Item 11 applies to FlowSOM.
+    take here even when nothing was downsampled.
 
     af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()
         docstring. Must be passed when called from a background worker thread.
@@ -383,7 +381,7 @@ def flowsom_assign_all(controller, state, node_weights, node_to_meta,
     assigned to each SOM node across all assigned samples, used by the
     FlowSOM MST tree view to size node bubbles.
 
-    assign_all: see _assignable_sample_paths (Item 9) -- default (False)
+    assign_all: see _assignable_sample_paths -- default (False)
         restricts to state.training_sample_ids; True additionally labels
         every other non-control sample.
     af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()
@@ -458,12 +456,8 @@ def build_flowsom_tree(node_weights: np.ndarray, node_to_meta: np.ndarray,
 def get_training_embeddings(controller, state, algo: str | None, event_cap: int | None,
                             af_state=None, seed: int = 42):
     """Concatenated training-sample embeddings for *algo*, with per-sample
-    row boundaries (Item 11) -- respects event_cap the same way the raw
-    feature-space pool does (Item 14 fix: this branch previously ignored
-    event_cap entirely and always used each sample's FULL embedding,
-    regardless of the "Downsample training data" checkbox -- confirmed
-    from a real run where "Downsample training data" was checked but the
-    HDBSCAN log still showed every event). Falls back to the pooled raw
+    row boundaries -- respects event_cap the same way the raw
+    feature-space pool does. Falls back to the pooled raw
     feature space (respecting event_cap) if *algo*'s embeddings aren't
     available.
 
@@ -494,13 +488,13 @@ def get_training_embeddings(controller, state, algo: str | None, event_cap: int 
 def run_leiden(controller, state, params: dict, progress=None, af_state=None) -> None:
     """Build a kNN graph and run Leiden community detection.
 
-    Item 11: trains on every gated event from every training sample by
+    Trains on every gated event from every training sample by
     default (params['_event_cap'] is None unless "Downsample training
     data" is checked) -- every training sample's OWN events then get
     their EXACT label straight out of the partition itself (see
     _assign_by_slicing_or_predict), with no k-NN-vote approximation for
     them at all. k-NN-vote only runs for a sample that WAS downsampled,
-    or (Item 9) a non-training sample if "Assign clusters to all
+    or a non-training sample if "Assign clusters to all
     samples" is checked.
 
     af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()
@@ -585,7 +579,7 @@ def run_leiden(controller, state, params: dict, progress=None, af_state=None) ->
 
 def run_hdbscan(controller, state, params: dict, progress=None, af_state=None) -> None:
     """
-    Run HDBSCAN on a DR embedding only (Item 13).
+    Run HDBSCAN on a DR embedding only.
 
     Confirmed on a real dataset: HDBSCAN degenerates badly directly on
     the full multichannel feature space (hundreds of near-meaningless
@@ -598,7 +592,7 @@ def run_hdbscan(controller, state, params: dict, progress=None, af_state=None) -
     arrive some other way.
 
     Uses the standalone `hdbscan` package (scikit-learn-contrib/hdbscan),
-    not sklearn.cluster.HDBSCAN (Item 8/10): sklearn's built-in has no
+    not sklearn.cluster.HDBSCAN: sklearn's built-in has no
     out-of-sample prediction at all -- only fit/fit_predict/labels_ -- so
     assigning anything beyond the fit previously had to fall back to
     NearestCentroid, which assumes convex clusters and can never output
@@ -607,13 +601,13 @@ def run_hdbscan(controller, state, params: dict, progress=None, af_state=None) -
     respecting density-based, non-convex cluster shapes and legitimately
     labelling new points as noise (-1).
 
-    Item 11: trains on every gated event from every training sample by
+    Trains on every gated event from every training sample by
     default (params['_event_cap'] is None unless "Downsample training
     data" is checked) -- every training sample's OWN events then get
     their EXACT label straight out of clusterer.labels_ (see
     _assign_by_slicing_or_predict), with no approximate_predict call for
     them at all. approximate_predict only runs for a sample that WAS
-    downsampled, or (Item 9) a non-training sample if "Assign clusters
+    downsampled, or a non-training sample if "Assign clusters
     to all samples" is checked.
 
     af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()

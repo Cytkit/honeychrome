@@ -4,8 +4,7 @@ drc_run_archive.py — Per-run cache/archive for the DR/Clustering plugin
 Companion module to ``dr_clustering_tab.py`` (filename intentionally does
 NOT end in ``_tab.py``, so it is not picked up as a separate plugin tab).
 
-Implements the §0.2 cache/run-archive redesign from
-DR_CLUSTERING_REVAMP_PLAN.md: replaces the single monolithic
+Implements the cache/run-archive redesign: replaces the single monolithic
 ``dr_clustering_state.pkl`` blob (which overwrote DR results on every rerun
 and gave clustering only a partial, un-queryable history) with:
 
@@ -27,7 +26,7 @@ state.dr_runs / state.clustering_runs hold the manifest fields PLUS the
 heavy payload merged in — the same shape existing consumers
 (GroupsStatsTab's run combo) already expect from clustering_runs entries.
 Runs are loaded eagerly at experiment-open (load_all_runs()) so those
-existing consumers keep working unchanged; Item 6's management table can
+existing consumers keep working unchanged; the management table can
 switch to lazy loading (only the manifest fields, hydrating a run's payload
 on first selection) once it exists, since a table only needs metadata to
 populate its rows.
@@ -411,18 +410,11 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
         'names': names,
         'marker_values': marker_values or {},
         'dr_positions': dr_positions or {},
-        # Item 15 -- not computed yet at archive time (the user runs
-        # "Compute Cluster ID Suggestions" AFTER the run already exists);
-        # placeholders here just keep the payload shape consistent from
-        # the start. See update_cluster_id_suggestions() for how these
-        # get filled in later.
+        # not computed yet at archive time
         'mem_labels': {},
         'cell_type_suggestions': None,
         'tree_data': tree_data,
-        # Marker Heatmap/Ridgeline figures -- also computed in a later
-        # step (Cluster Annotation's "Recompute Marker Summary"), same
-        # placeholder-now / filled-in-later pattern. See
-        # save_marker_summary().
+        # Marker Heatmap/Ridgeline figures -- also computed later
         'marker_summary': None,
     })
 

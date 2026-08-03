@@ -1,5 +1,5 @@
 """
-drc_gate_tree.py — Checkable multi-select gate tree (§0.3 / Item 4)
+drc_gate_tree.py — Checkable multi-select gate tree 
 =====================================================================
 Companion module to ``dr_clustering_tab.py`` (filename intentionally does
 NOT end in ``_tab.py``, so it is not picked up as a separate plugin tab).
