@@ -159,6 +159,35 @@ def save_run_payload(controller, run_id: str, payload: dict) -> None:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+# The full set of heavy per-run fields hydrate_run() restores from disk --
+# keep this in sync with hydrate_run()'s 'clustering' branch below.
+_CLUSTERING_RUN_PAYLOAD_FIELDS = (
+    'labels', 'colors', 'names', 'marker_values', 'dr_positions',
+    'mem_labels', 'cell_type_suggestions', 'marker_summary', 'tree_data',
+)
+
+
+def update_run_payload(controller, cl_run: dict) -> None:
+    """
+    Re-persist a clustering run's full heavy payload from its CURRENT
+    in-memory state, preserving every field hydrate_run() restores --
+    not just whichever one the caller changed. save_run_payload() is a
+    full overwrite, not a merge, so building a payload with only one or
+    two changed fields (as rename_cluster/recolor_cluster used to)
+    silently drops the rest from disk (tree_data, marker_values,
+    mem_labels, cell_type_suggestions, marker_summary, dr_positions) --
+    invisible in the current session, since the in-memory dict is
+    untouched, but gone the next time this run is hydrated fresh from
+    the manifest (experiment reopen / app relaunch).
+
+    cl_run must already be fully hydrated -- true for any run reached
+    via _selected_cluster_run()/hydrate_run(), which every caller of
+    this goes through.
+    """
+    payload = {field: cl_run.get(field) for field in _CLUSTERING_RUN_PAYLOAD_FIELDS}
+    save_run_payload(controller, cl_run['run_id'], payload)
+
+
 def load_run_payload(controller, run_id: str) -> dict | None:
     """Unpickle a run's heavy payload.  Returns None if missing/corrupt."""
     path = run_pickle_path(controller, run_id)
@@ -363,10 +392,13 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
         plot correct positions even if state.embeddings for that algorithm
         have since been overwritten by a later DR run.
     tree_data: optional {'node_weights': ndarray, 'node_to_meta': ndarray,
-        'node_counts': ndarray, 'xdim': int, 'ydim': int} -- FlowSOM only.
-        Lets the Workspace tab's FlowSOM Tree plot type render the MST
-        without needing the live (possibly since-overwritten)
-        state.trained_reducers['FlowSOM'] entry.
+        'node_counts': ndarray} (FlowSOM additionally carries 'xdim'/
+        'ydim') -- any clustering algorithm now: FlowSOM's SOM codebook,
+        or Leiden/HDBSCAN per-cluster centroids from
+        drc_clustering.build_centroid_tree_data. Lets the Workspace tab's
+        Cluster Tree plot type render the MST without needing the live
+        (possibly since-overwritten) state.trained_reducers[algorithm]
+        entry.
     """
     log_stage(log, "ARCHIVE CLUSTERING RUN")
     run_id = _new_run_id()
@@ -512,4 +544,5 @@ def hydrate_run(controller, entry: dict) -> dict:
         entry['mem_labels'] = payload.get('mem_labels', {})
         entry['cell_type_suggestions'] = payload.get('cell_type_suggestions')
         entry['marker_summary'] = payload.get('marker_summary')
+        entry['tree_data'] = payload.get('tree_data')
     return entry

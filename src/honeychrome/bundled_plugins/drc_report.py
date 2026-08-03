@@ -51,10 +51,12 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QGroupBox,
     QPushButton, QLabel, QListWidget, QListWidgetItem, QFrame,
-    QAbstractItemView, QMessageBox, QApplication,
+    QAbstractItemView, QMessageBox, QApplication, QProgressDialog,
 )
+from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 
 import drc_logging
+import drc_help_texts
 
 log = drc_logging.get_logger(__name__)
 
@@ -403,6 +405,11 @@ class ReportTab(QWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(8)
 
+        self.help_widget = HelpToggleWidget(
+            text=drc_help_texts.report_tab_help_text
+        )
+        outer.addWidget(self.help_widget)
+
         self.context_label = QLabel("Reporting on: (no clustering run selected)")
         self.context_label.setStyleSheet("font-weight: bold;")
         outer.addWidget(self.context_label)
@@ -553,6 +560,19 @@ class ReportTab(QWidget):
 
         log.info("generate_report: writing %d item(s) to %s", len(items), report_dir)
 
+        # Item 3 -- visible progress while the PDF is built. No cancel
+        # button: this runs on the main thread inside one PdfPages
+        # context, so interrupting partway through would leave a broken
+        # PDF on disk rather than actually stopping cleanly.
+        progress = QProgressDialog(
+            "Generating report…", None, 0, len(items) + 1, self
+        )
+        progress.setWindowTitle("Generate Report")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.setValue(0)
+
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -573,6 +593,7 @@ class ReportTab(QWidget):
                 for item in items:
                     by_section.setdefault(item.tab, []).append(item)
 
+                done = 0
                 for section_name in _SECTIONS:
                     section_items = by_section.get(section_name, [])
                     if not section_items:
@@ -582,12 +603,18 @@ class ReportTab(QWidget):
                     subfolder = report_dir / sanitize_filename(section_name)
                     subfolder.mkdir(parents=True, exist_ok=True)
                     for item in section_items:
+                        progress.setLabelText(f"Adding {item.label} …")
                         self._export_item(item, subfolder, pdf)
+                        done += 1
+                        progress.setValue(done)
+                        QApplication.processEvents()
 
             settings_text = build_settings_document(
                 self.state, self.controller, cl_run, dr_run, pval_threshold, fc_threshold,
             )
+            progress.setLabelText("Writing settings document …")
             (report_dir / 'settings.txt').write_text(settings_text)
+            progress.setValue(len(items) + 1)
 
             self.bus.statusMessage.emit(f"ReportTab: exported {report_dir}")
             self.bus.popupMessage.emit(f"Report generated: {report_dir}")
@@ -597,6 +624,7 @@ class ReportTab(QWidget):
             self.bus.warningMessage.emit(f"Could not generate report: {e}")
         finally:
             QApplication.restoreOverrideCursor()
+            progress.close()
 
         self.refresh()
 

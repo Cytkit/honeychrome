@@ -199,7 +199,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QSplitter, QFrame, QGridLayout,
     QLineEdit, QFileDialog, QMessageBox, QSizePolicy,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QTabWidget, QColorDialog, QProgressBar,
+    QTabWidget, QColorDialog, QProgressBar, QSlider,
     QDialog, QTextEdit, QApplication,
 )
 
@@ -211,6 +211,7 @@ from honeychrome.controller_components.transform import Transform
 from honeychrome.view_components.clear_layout import clear_layout
 from honeychrome.view_components.ordered_multi_sample_picker import OrderedMultiSamplePicker
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
+from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 import honeychrome.settings as hc_settings
 
 # ---------------------------------------------------------------------------
@@ -233,6 +234,7 @@ import drc_gate_tree
 import drc_scatter
 import drc_cluster_id
 import drc_report
+import drc_help_texts
 
 _log = drc_logging.get_logger(__name__)
 
@@ -963,12 +965,24 @@ class PipelineState:
     # the same way freq/mfi results already do.
     confusion_df: pd.DataFrame | None = None
     confusion_run_label: str = ''
+    confusion_run_id: str = ''
+    # run_id of the clustering_runs entry the confusion matrix was
+    # computed against -- authoritative match key, same idea as
+    # stats_run_id above (confusion_run_label alone can't detect a
+    # deleted run, since labels are just display text).
     confusion_names: dict[int, str] = field(default_factory=dict)
     composition_df: pd.DataFrame | None = None
     composition_as_pct: bool = True
     composition_group_var: str = 'sample'
     composition_run_label: str = ''
+    composition_run_id: str = ''
+    # see confusion_run_id above -- same purpose, for Composition Barplot.
     composition_names: dict[int, str] = field(default_factory=dict)
+    composition_colors: dict[int, str] = field(default_factory=dict)
+    # cluster colours FROZEN from the run composition_df was computed
+    # against, at compute time -- see _show_composition_barplot. Fixes a
+    # bug where _make_composition_figure re-resolved colours from
+    # whichever run happens to be selected in the combo at redraw time.
     marker_roles: dict[str, str] = field(default_factory=dict)
     # {channel_name: 'type' | 'state'} — Item 11 (diffcyt-style split).
     # 'type' channels are excluded from MFI significance testing, to avoid
@@ -1545,6 +1559,11 @@ class ConfigTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
+
+        self.help_widget = HelpToggleWidget(
+            text=drc_help_texts.configuration_tab_help_text
+        )
+        self.main_layout.addWidget(self.help_widget)
 
         # ------------------------------------------------------------------
         # Shared controls
@@ -2532,8 +2551,12 @@ class BiplotTile(QWidget):
         self._axis_x.linkToView(self._vb)
         self._axis_y.linkToView(self._vb)
 
-        # X-axis label (non-interactive — pinned to active channel)
-        self._label_x = pg.LabelItem('', size='9pt')
+        # X-axis InteractiveLabel — click to change the shared active/x
+        # channel (Item 2), same mechanism as the y-axis above. Routes
+        # through parent_tab since x is shared across every tile, not
+        # local to this one.
+        self._label_x = InteractiveLabel('', parent_plot=self, size='9pt')
+        self._label_x.leftClickMenuFunction = self._set_x_from_label
         self._gw.addItem(self._label_x, row=2, col=2)
 
         self._vb.setMouseEnabled(x=False, y=False)
@@ -2561,6 +2584,15 @@ class BiplotTile(QWidget):
             self._label_y.leftItemSelected = item_index
             self._y_combo.setCurrentText(channels[item_index])
 
+    def _set_x_from_label(self, item_index, _parent):
+        """Called by InteractiveLabel when the user picks a channel from
+        the x-axis menu (Item 2). x is the TransformTab's shared active
+        channel, not local to this tile -- route through parent_tab so
+        every tile's x-axis and the 1-D histogram update together."""
+        channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
+        if 0 <= item_index < len(channels):
+            self._parent_tab._set_active_channel_from_tile(channels[item_index])
+
     def set_channels(self, available: list[str], y_channel: str = ''):
         self._y_combo.blockSignals(True)
         current = y_channel or self._y_combo.currentText()
@@ -2580,8 +2612,23 @@ class BiplotTile(QWidget):
         ch = self._y_combo.currentText()
         self._label_y.leftItemSelected = available.index(ch) if ch in available else 0
 
+        # Item 2 — x-axis menu shares the same available list; selection
+        # tracks the tab's active channel, not anything local to this tile.
+        self._label_x.leftClickMenuItems = [labels.get(ch, ch) for ch in available]
+        x_ch = self._parent_tab._active_channel
+        self._label_x.leftItemSelected = available.index(x_ch) if x_ch in available else 0
+
     def y_channel(self) -> str:
         return self._y_combo.currentText()
+
+    def set_x_selected(self, x_ch: str):
+        """Sync the x-axis InteractiveLabel's highlighted menu item to
+        the tab's current active channel (Item 2) -- called whenever the
+        shared x channel changes, mirroring _on_y_changed's own
+        leftItemSelected sync for the y-axis."""
+        channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
+        if x_ch in channels:
+            self._label_x.leftItemSelected = channels.index(x_ch)
 
     def _on_y_changed(self, ch: str):
         self._y_channel = ch
@@ -2703,6 +2750,11 @@ class TransformTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(6)
+
+        self.help_widget = HelpToggleWidget(
+            text=drc_help_texts.transforms_tab_help_text
+        )
+        outer.addWidget(self.help_widget)
 
         # --- Read-only notice ---
         notice = QLabel(
@@ -3054,6 +3106,19 @@ class TransformTab(QWidget):
         self._configure_tile_axes_all()
         self._schedule_redraw()
 
+    def _set_active_channel_from_tile(self, channel: str):
+        """
+        Item 2 — a BiplotTile's x-axis InteractiveLabel was clicked.  x is
+        the tab's shared active channel, so route through the left-hand
+        channel_list selection (same path a manual list click takes) --
+        that already fires _on_channel_selected, which updates the 1-D
+        histogram axis and every tile's axes together.
+        """
+        for i in range(self.channel_list.count()):
+            if self.channel_list.item(i).data(Qt.UserRole) == channel:
+                self.channel_list.setCurrentRow(i)
+                return
+
     # ------------------------------------------------------------------
     # M parameter — cytometer-specific, derived from $PnR
     # ------------------------------------------------------------------
@@ -3151,6 +3216,7 @@ class TransformTab(QWidget):
         labels = _antigen_dash_labels(self.controller)
         tile.configure_axes(self._transforms[x_ch], self._transforms[y_ch],
                             x_label=labels.get(x_ch, x_ch), y_label=labels.get(y_ch, y_ch))
+        tile.set_x_selected(x_ch)   # Item 2 -- keep menu highlight in sync
 
     def _configure_tile_axes_all(self):
         for tile in self._biplot_tiles:
@@ -3850,6 +3916,11 @@ class GroupsStatsTab(QWidget):
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(8, 8, 8, 8)
         content_layout.setSpacing(8)
+
+        self.help_widget = HelpToggleWidget(
+            text=drc_help_texts.stats_tab_help_text
+        )
+        content_layout.addWidget(self.help_widget)
 
         # ============================================================
         # Top panel: group definitions + sample assignment table
@@ -4901,6 +4972,7 @@ class GroupsStatsTab(QWidget):
         matched = self._scoped_sample_groups()
         self._populate_table(matched)
         self._populate_run_combo()
+        self._sync_confusion_composition_to_run()
         self._populate_trex_dr_combo()
         self._populate_marker_roles_list()
         self._update_run_button()
@@ -4945,6 +5017,7 @@ class GroupsStatsTab(QWidget):
             fig = self._make_composition_figure(
                 self.state.composition_df, as_pct=self.state.composition_as_pct,
                 run_label=self.state.composition_run_label, names=self.state.composition_names,
+                colors=self.state.composition_colors,
                 group_var=self.state.composition_group_var,
             )
             self._add_results_tab(
@@ -4954,6 +5027,7 @@ class GroupsStatsTab(QWidget):
                                   as_pct=self.state.composition_as_pct,
                                   run_label=self.state.composition_run_label,
                                   names=self.state.composition_names,
+                                  colors=self.state.composition_colors,
                                   group_var=self.state.composition_group_var),
                 key="composition_barplot",
             )
@@ -5507,6 +5581,94 @@ class GroupsStatsTab(QWidget):
 
         self._run_combo.blockSignals(False)
 
+    def _clear_stale_run_results(self):
+        """
+        Item 1 -- drop Freq/Counts/MFI/PCA Stats results (tied to
+        state.stats_run_id) if their source clustering run has been
+        deleted from the archive. Called from PluginWidget._on_runs_
+        changed on every rename/delete; rename leaves run_id untouched
+        (only the label changes) so this is a no-op then -- only a
+        genuine delete removes a run_id from state.clustering_runs,
+        which is what actually triggers a clear here. '' (the "Active
+        (unsaved)" cluster_labels case -- see _resolve_stats_source) is
+        never archived and therefore never stale by this check.
+
+        Confusion Matrix / Composition Barplot are handled separately,
+        by _sync_confusion_composition_to_run() -- they're also meant to
+        go stale on a plain combo-selection change, not just a delete.
+        """
+        valid_ids = {e.get('run_id') for e in self.state.clustering_runs}
+
+        if self.state.stats_run_id and self.state.stats_run_id not in valid_ids:
+            for key in ('freq_heatmap', 'freq_volcano', 'counts_heatmap',
+                       'counts_volcano', 'mfi_heatmap', 'mfi_volcano', 'sample_pca'):
+                self._remove_results_tab_by_key(key)
+            self.state.freq_results = None
+            self.state.counts_results = None
+            self.state.mfi_results = None
+            self.state.freq_df = None
+            self.state.counts_df = None
+            self.state.mfi_df = None
+            self.state.mfi_sample_df = None
+            self.state.stats_all_rel = []
+            self.state.stats_group_vec = []
+            self.state.stats_comparisons = []
+            self.state.stats_run_label = ''
+            self.state.stats_run_id = ''
+            # Sample PCA is built from freq_df/counts_df/mfi_df above --
+            # stale along with them; it has no run_id of its own.
+            self.state.pca_scores_df = None
+            self.state.pca_loadings_df = None
+            self.state.pca_explained_variance = (0.0, 0.0)
+            self.state.pca_run_label = ''
+            self.state.pca_groups = []
+            self.state.pca_sources = []
+            self._last_stats_data_key = None
+            self.stats_status_label.setText(
+                "Previous results' clustering run was deleted -- run "
+                "statistics again."
+            )
+            self.stats_status_label.setStyleSheet("color: #d9822b;")
+
+    def _sync_confusion_composition_to_run(self):
+        """
+        Item 1 (round 4) -- unlike Freq/MFI/Counts/PCA (see
+        _clear_stale_run_results), Confusion Matrix and Composition
+        Barplot are meant to go stale on a plain combo-selection change
+        too, not just a run deletion -- a deletion just happens to also
+        change what's selected here, once the deleted entry falls out of
+        the combo. Called from _on_run_combo_changed (user picks a
+        different run), refresh() (tab reactivation), and PluginWidget.
+        _on_runs_changed (AFTER _populate_run_combo() has re-settled on
+        whatever's still there post-delete/rename).
+        """
+        current_run_id = self._run_combo.currentData()
+        # TEMP diagnostic (round 4) -- remove once Item 1 is confirmed fixed.
+        _log.info(
+            "_sync_confusion_composition_to_run: current_run_id=%r "
+            "confusion_run_id=%r composition_run_id=%r",
+            current_run_id, self.state.confusion_run_id, self.state.composition_run_id,
+        )
+
+        if self.state.confusion_run_id and self.state.confusion_run_id != current_run_id:
+            _log.info("_sync_confusion_composition_to_run: clearing confusion_matrix "
+                      "(was %r)", self.state.confusion_run_id)
+            self._remove_results_tab_by_key('confusion_matrix')
+            self.state.confusion_df = None
+            self.state.confusion_run_label = ''
+            self.state.confusion_run_id = ''
+            self.state.confusion_names = {}
+
+        if self.state.composition_run_id and self.state.composition_run_id != current_run_id:
+            _log.info("_sync_confusion_composition_to_run: clearing composition_barplot "
+                      "(was %r)", self.state.composition_run_id)
+            self._remove_results_tab_by_key('composition_barplot')
+            self.state.composition_df = None
+            self.state.composition_run_label = ''
+            self.state.composition_run_id = ''
+            self.state.composition_names = {}
+            self.state.composition_colors = {}
+
     def _populate_trex_dr_combo(self):
         """T-REX needs its own DR-run selector (distinct from the Stats
         run combo, which is clustering-only, and from Workspace's own
@@ -5574,9 +5736,16 @@ class GroupsStatsTab(QWidget):
         "Run Statistics" will (re)compute against that run when clicked;
         it doesn't retroactively invalidate a previous run's results,
         which are still valid for that run and still exportable.
+
+        Confusion Matrix / Composition Barplot are the exception -- they
+        persist without a "Run Statistics" click, so a stale one left
+        showing for a run no longer selected here is easy to miss (round
+        4). _sync_confusion_composition_to_run() clears each the moment
+        this combo's selection stops matching the run it came from.
         """
         run_id = self._run_combo.currentData()
         self._update_run_button()
+        self._sync_confusion_composition_to_run()
         if run_id is None:
             return
         have_results = (self.state.freq_results is not None
@@ -6003,7 +6172,7 @@ class GroupsStatsTab(QWidget):
         resolved = self._resolve_stats_source()
         if resolved is None:
             return
-        labels_for_stats, run_label, _run_id, names_for_stats = resolved
+        labels_for_stats, run_label, run_id, names_for_stats = resolved
 
         try:
             conf_df = drc_stats.compute_confusion_matrix(
@@ -6016,6 +6185,7 @@ class GroupsStatsTab(QWidget):
 
         self.state.confusion_df = conf_df
         self.state.confusion_run_label = run_label
+        self.state.confusion_run_id = run_id
         self.state.confusion_names = dict(names_for_stats)
 
         fig = self._make_confusion_matrix_figure(conf_df, run_label=run_label)
@@ -6407,7 +6577,18 @@ class GroupsStatsTab(QWidget):
         resolved = self._resolve_stats_source()
         if resolved is None:
             return
-        labels_for_stats, run_label, _run_id, names_for_stats = resolved
+        labels_for_stats, run_label, run_id, names_for_stats = resolved
+
+        # Item 3 (round 3) -- freeze this run's OWN colours now, same as
+        # names_for_stats above. _selected_run_entry() is what
+        # _resolve_stats_source() itself just called internally
+        # (hydrate_run is a no-op on an already-hydrated entry, so this
+        # second call is cheap), NOT a fresh/different lookup.
+        run_entry_for_colors = self._selected_run_entry()
+        if run_entry_for_colors is not None and run_entry_for_colors.get('kind') == 'clustering':
+            colors_for_stats = dict(run_entry_for_colors.get('colors', {}))
+        else:
+            colors_for_stats = dict(self.state.cluster_colors)
 
         group_var = 'group' if self.composition_by_group_chk.isChecked() else 'sample'
         as_pct = self.composition_pct_chk.isChecked()
@@ -6427,27 +6608,34 @@ class GroupsStatsTab(QWidget):
         self.state.composition_as_pct = as_pct
         self.state.composition_group_var = group_var
         self.state.composition_run_label = run_label
+        self.state.composition_run_id = run_id
         self.state.composition_names = dict(names_for_stats)
+        self.state.composition_colors = colors_for_stats
 
         fig = self._make_composition_figure(comp_df, as_pct=as_pct, run_label=run_label,
-                                            names=names_for_stats, group_var=group_var)
+                                            names=names_for_stats, colors=colors_for_stats,
+                                            group_var=group_var)
         self._add_results_tab(
             fig, "Composition", "composition_barplot",
             maker=self._make_composition_figure,
             maker_kwargs=dict(comp_df=comp_df, as_pct=as_pct, run_label=run_label,
-                              names=names_for_stats, group_var=group_var),
+                              names=names_for_stats, colors=colors_for_stats,
+                              group_var=group_var),
             key="composition_barplot",
         )
 
     def _make_composition_figure(self, comp_df: 'pd.DataFrame', as_pct: bool,
                                  run_label: str = '', names: dict | None = None,
-                                 group_var: str = 'sample'):
+                                 colors: dict | None = None, group_var: str = 'sample'):
         """
         Stacked bar: x-axis = sample or group (comp_df.index), segments =
-        clusters, coloured via the SELECTED run's own colours (not the
-        ambient state.cluster_colors, for the same "no bleeding across
-        runs" reason names are now passed in explicitly) — falls back to a
-        neutral grey if a cluster's colour can't be resolved.
+        clusters, coloured via the colours FROZEN at compute time (the
+        colors param -- see _show_composition_barplot), never a live
+        re-lookup of "whichever run is selected right now" -- that broke
+        the moment the combo moved to a different run (including via a
+        deletion), miscolouring or greying out this run's own clusters.
+        Falls back to a neutral grey if a cluster's colour can't be
+        resolved even from the frozen dict.
         """
         from matplotlib.figure import Figure
 
@@ -6469,10 +6657,7 @@ class GroupsStatsTab(QWidget):
 
         x = np.arange(n_rows)
         bottom = np.zeros(n_rows)
-        cl_run = self._selected_run_entry()
-        if cl_run is not None and cl_run.get('kind') != 'clustering':
-            cl_run = None
-        colors = cl_run.get('colors', {}) if cl_run else self.state.cluster_colors
+        colors = colors or {}
         for cl_id, col in enumerate(comp_df.columns):
             color = colors.get(cl_id, '#888888')
             vals = comp_df[col].values.astype(float)
@@ -6555,11 +6740,19 @@ class GroupsStatsTab(QWidget):
         w_px = int(fig.get_figwidth()  * dpi)
         h_px = int(fig.get_figheight() * dpi)
 
+        # Item 4 -- these plots routinely overflowed the viewport at full
+        # size. The inline canvas now starts at roughly a third of the
+        # figure's natural size (DEFAULT_SCALE_PCT) and the slider added
+        # to btn_row below lets the user scale it back up. Fixed (not
+        # Expanding) so the canvas actually shrinks instead of the
+        # QScrollArea stretching it back out to fill the viewport. Pop
+        # Out / Export both call maker(**maker_kwargs) for a fresh
+        # full-size figure of their own, so neither is affected by this.
+        DEFAULT_SCALE_PCT = 100
         canvas = _new_scrollable_canvas(fig)
-        canvas.setMinimumSize(w_px, h_px)
         canvas.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Fixed,
         )
         # Hover tooltips (Item 6) -- figure-makers that want them stash a
         # handler on the Figure itself (fig._hover_handler), since no
@@ -6567,16 +6760,24 @@ class GroupsStatsTab(QWidget):
         if hasattr(fig, '_hover_handler'):
             canvas.mpl_connect('motion_notify_event', fig._hover_handler)
 
-        toolbar = NavigationToolbar2QT(canvas, None)
-
         scroll = QScrollArea()
         scroll.setWidget(canvas)
         scroll.setWidgetResizable(True)
-        # Grows to the actual figure height -- no cap. This tab's own
-        # outer QScrollArea (GroupsStatsTab._build_ui) scrolls the whole
-        # page if that makes it taller than the viewport, rather than
-        # nesting a second scrollbar inside this one.
-        scroll.setMinimumHeight(h_px + 40)
+
+        def _apply_canvas_scale(pct: int):
+            """Resize the inline canvas to pct% of the figure's natural
+            size; keeps this tab's own QScrollArea tall enough to show it
+            without a nested scrollbar."""
+            new_w = max(80, int(w_px * pct / 100))
+            new_h = max(80, int(h_px * pct / 100))
+            canvas.setFixedSize(new_w, new_h)
+            # Grows/shrinks with the slider -- no cap otherwise. This
+            # tab's own outer QScrollArea (GroupsStatsTab._build_ui)
+            # scrolls the whole page if that makes it taller than the
+            # viewport, rather than nesting a second scrollbar in here.
+            scroll.setMinimumHeight(new_h + 40)
+
+        _apply_canvas_scale(DEFAULT_SCALE_PCT)
 
         # Placeholder shown while plot is popped out
         placeholder = QLabel(f'"{tab_title}" is open in a separate window.\nClose that window to restore it here.')
@@ -6648,6 +6849,27 @@ class GroupsStatsTab(QWidget):
                                    self._export_figure(f, s))
         btn_row.addWidget(popout_btn)
         btn_row.addWidget(export_btn)
+        btn_row.addSpacing(16)
+
+        # Item 4 -- manual resize slider for the inline canvas.
+        btn_row.addWidget(QLabel("Size:"))
+        size_slider = QSlider(Qt.Horizontal)
+        size_slider.setRange(20, 200)
+        size_slider.setValue(DEFAULT_SCALE_PCT)
+        size_slider.setFixedWidth(120)
+        size_slider.setToolTip(
+            "Resize this plot. Pop Out and Export always use full size."
+        )
+        size_pct_label = QLabel(f"{DEFAULT_SCALE_PCT}%")
+        size_pct_label.setFixedWidth(36)
+
+        def _on_size_slider_changed(pct: int):
+            _apply_canvas_scale(pct)
+            size_pct_label.setText(f"{pct}%")
+
+        size_slider.valueChanged.connect(_on_size_slider_changed)
+        btn_row.addWidget(size_slider)
+        btn_row.addWidget(size_pct_label)
         btn_row.addStretch()
 
         container = QWidget()
@@ -6659,10 +6881,11 @@ class GroupsStatsTab(QWidget):
         vbox = QVBoxLayout(container)
         vbox.setContentsMargins(4, 4, 4, 4)
         vbox.setSpacing(4)
-        vbox.addWidget(toolbar)
+        # Pop Out/Export/Size row above the canvas so it's always visible
+        # without scrolling, whatever the canvas's current scale.
+        vbox.addLayout(btn_row)
         vbox.addWidget(scroll, stretch=1)
         vbox.addWidget(placeholder, stretch=1)
-        vbox.addLayout(btn_row)
 
         if insert_at is not None:
             self._results_tabs.insertTab(insert_at, container, tab_title)
@@ -6742,6 +6965,7 @@ class GroupsStatsTab(QWidget):
             fig_comp = self._make_composition_figure(
                 self.state.composition_df, as_pct=self.state.composition_as_pct,
                 run_label=self.state.composition_run_label, names=self.state.composition_names,
+                colors=self.state.composition_colors,
                 group_var=self.state.composition_group_var,
             )
             self._add_results_tab(
@@ -6751,6 +6975,7 @@ class GroupsStatsTab(QWidget):
                                   as_pct=self.state.composition_as_pct,
                                   run_label=self.state.composition_run_label,
                                   names=self.state.composition_names,
+                                  colors=self.state.composition_colors,
                                   group_var=self.state.composition_group_var),
                 key="composition_barplot",
             )
@@ -7520,6 +7745,11 @@ class WorkspaceTab(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
+        self.help_widget = HelpToggleWidget(
+            text=drc_help_texts.workspace_tab_help_text
+        )
+        outer.addWidget(self.help_widget)
+
         # --- Toolbar ---
         toolbar = QFrame()
         toolbar.setFrameShape(QFrame.StyledPanel)
@@ -7749,6 +7979,36 @@ class _MarkerValuesWorker(QThread):
             self.finished.emit(False, str(exc), {})
 
 
+class _ClusterTreeLayoutWorker(QThread):
+    """
+    Computes the MST + Kamada-Kawai layout for a Cluster Tree view on a
+    background thread. HDBSCAN in particular can produce far more nodes
+    (final clusters) than FlowSOM's usual handful of metaclusters, and
+    igraph's layout_kamada_kawai() cost grows fast with node count --
+    easily long enough to freeze the UI if called straight from
+    refresh() on the main thread. Pure computation only (numpy/scipy/
+    igraph, via drc_clustering.build_flowsom_tree) -- no Qt widget
+    access, so unlike most workers in this file it needs no AF/
+    transfer-matrix snapshot.
+    """
+    finished = Signal(bool, str, dict)  # success, error, layout dict
+
+    def __init__(self, node_weights, node_to_meta, node_counts, parent=None):
+        super().__init__(parent)
+        self._node_weights = node_weights
+        self._node_to_meta = node_to_meta
+        self._node_counts = node_counts
+
+    def run(self):
+        try:
+            layout = drc_clustering.build_flowsom_tree(
+                self._node_weights, self._node_to_meta, self._node_counts)
+            self.finished.emit(True, '', layout)
+        except Exception as exc:
+            traceback.print_exc()
+            self.finished.emit(False, str(exc), {})
+
+
 class PlotCard(QFrame):
     """
     A single DR scatter plot on the workspace canvas.
@@ -7785,6 +8045,10 @@ class PlotCard(QFrame):
         self._figure    = None   # current matplotlib Figure
         self._marker_worker = None            # in-flight _MarkerValuesWorker, if any
         self._marker_values_cache: dict = {}  # single-entry -- see _on_marker_values_finished
+        self._tree_layout_worker = None       # in-flight _ClusterTreeLayoutWorker, if any
+        self._tree_layout_cache: dict = {}    # {run_id: layout} -- a run's tree_data is
+                                               # frozen at archive time, so its MST/layout
+                                               # never changes; cached permanently per run_id.
 
         self.setFrameShape(QFrame.StyledPanel)
         self.setFrameShadow(QFrame.Raised)
@@ -7811,12 +8075,13 @@ class PlotCard(QFrame):
 
         row1.addWidget(QLabel("Plot type:"))
         self.plot_type_combo = QComboBox()
-        self.plot_type_combo.addItems(['Scatter', 'FlowSOM Tree'])
+        self.plot_type_combo.addItems(['Scatter', 'Cluster Tree'])
         self.plot_type_combo.setFixedWidth(100)
         self.plot_type_combo.setToolTip(
             "Scatter: per-event DR embedding.\n"
-            "FlowSOM Tree: SOM-node minimum-spanning-tree view of a "
-            "FlowSOM clustering run (select it in the Overlay dropdown)."
+            "Cluster Tree: minimum-spanning-tree view of a clustering run's "
+            "nodes (select it in the Overlay dropdown) -- SOM nodes for "
+            "FlowSOM, per-cluster centroids for Leiden/HDBSCAN."
         )
         self.plot_type_combo.currentTextChanged.connect(self._on_plot_type_changed)
         _style_combo_popup(self.plot_type_combo)
@@ -8105,16 +8370,16 @@ class PlotCard(QFrame):
 
     def _populate_cluster_run_combo(self):
         """Rebuild the clustering-run overlay combo from
-        state.clustering_runs, keyed by run_id.  In 'FlowSOM Tree' plot
-        mode, only FlowSOM runs are offered — Leiden/HDBSCAN runs have no
-        tree_data and can't be drawn as a tree."""
+        state.clustering_runs, keyed by run_id. Used for both Scatter-mode
+        overlay and Cluster Tree mode -- Tree mode now works for any
+        clustering algorithm (FlowSOM/Leiden/HDBSCAN all populate
+        tree_data), so no algorithm filtering is needed here; a run
+        archived before this feature existed just falls back to the
+        "no tree data" placeholder in _draw_cluster_tree_view()."""
         self.cluster_run_combo.blockSignals(True)
         prev_run_id = self.cluster_run_combo.currentData()
         self.cluster_run_combo.clear()
-        flowsom_only = self.plot_type_combo.currentText() == 'FlowSOM Tree'
         runs = sorted(self.state.clustering_runs, key=lambda e: e.get('timestamp', ''))
-        if flowsom_only:
-            runs = [e for e in runs if e.get('algorithm') == 'FlowSOM']
         for entry in runs:
             self.cluster_run_combo.addItem(entry.get('label', ''), entry.get('run_id'))
         if self.cluster_run_combo.count() == 0:
@@ -8205,11 +8470,11 @@ class PlotCard(QFrame):
         self._schedule_refresh()
 
     def _on_plot_type_changed(self, mode: str):
-        """Toggle between the per-event Scatter view and the FlowSOM MST
-        Tree view. Tree mode has no DR run / sample / marker concept — it
-        only needs a FlowSOM clustering run, picked via the Overlay combo,
-        which is re-populated filtered to FlowSOM-only runs."""
-        is_tree = (mode == 'FlowSOM Tree')
+        """Toggle between the per-event Scatter view and the Cluster Tree
+        view. Tree mode has no DR run / sample / marker concept — it only
+        needs a clustering run, picked via the Overlay combo (any
+        algorithm now, not just FlowSOM)."""
+        is_tree = (mode == 'Cluster Tree')
 
         self.dr_combo.setVisible(not is_tree)
         self.sample_combo.setVisible(not is_tree)
@@ -8258,10 +8523,10 @@ class PlotCard(QFrame):
     def refresh(self):
         """Re-render the scatter plot from the currently-selected DR run
         (and, in Clusters mode, the currently-selected clustering run).
-        In 'FlowSOM Tree' plot-type mode, delegates entirely to
-        _draw_flowsom_tree_view() instead — a tree has no DR-run concept."""
-        if self.plot_type_combo.currentText() == 'FlowSOM Tree':
-            self._draw_flowsom_tree_view()
+        In 'Cluster Tree' plot-type mode, delegates entirely to
+        _draw_cluster_tree_view() instead — a tree has no DR-run concept."""
+        if self.plot_type_combo.currentText() == 'Cluster Tree':
+            self._draw_cluster_tree_view()
             return
 
         run = self._selected_dr_run()
@@ -8348,7 +8613,7 @@ class PlotCard(QFrame):
             cache_key = self._marker_cache_key(needed_samples)
             marker_values_by_sample = self._marker_values_cache.get(cache_key)
             if marker_values_by_sample is None:
-                self._show_placeholder("⏳ Loading marker values …")
+                self._show_placeholder("Loading marker values …")
                 self._start_marker_values_worker(needed_samples, cache_key)
                 return
 
@@ -8361,7 +8626,13 @@ class PlotCard(QFrame):
         self._cbar_ax = self._figure.add_subplot(gs[0, 1])
         self._cbar_ax.set_visible(False)
         _style_figure_theme(self._figure, is_dark, axes=[ax])
-        ax.set_aspect('equal', adjustable='box')
+        # Item 6 -- box_aspect pins the rendered box to square regardless
+        # of the reserved colourbar column or the embedding's own x/y
+        # range; adjustable='datalim' pads xlim/ylim to match instead of
+        # reshaping the box (which is what let a taller-than-wide data
+        # range make the box non-square before).
+        ax.set_box_aspect(1)
+        ax.set_aspect('equal', adjustable='datalim')
         _af = self._axis_font_spin.value()
         if self._show_axis_labels.isChecked():
             ax.set_xlabel(f"{algo} 1", fontsize=_af)
@@ -8477,6 +8748,29 @@ class PlotCard(QFrame):
         self._marker_values_cache = {cache_key: payload}
         self.refresh()
 
+    def _start_tree_layout_worker(self, run_id: str, tree_data: dict):
+        """Compute the Cluster Tree's MST + Kamada-Kawai layout on a
+        background thread (see _ClusterTreeLayoutWorker) -- pure
+        computation over already-archived tree_data, so unlike the
+        marker-values worker it needs no AF/transfer-matrix snapshot."""
+        worker = _ClusterTreeLayoutWorker(
+            tree_data['node_weights'], tree_data['node_to_meta'], tree_data['node_counts'])
+        worker.finished.connect(
+            lambda ok, err, layout, rid=run_id:
+                self._on_tree_layout_finished(ok, err, layout, rid)
+        )
+        self._tree_layout_worker = worker
+        worker.start()
+
+    def _on_tree_layout_finished(self, success: bool, error: str,
+                                 layout: dict, run_id: str):
+        self._tree_layout_worker = None
+        if not success:
+            self._show_placeholder(f"Failed to build tree layout: {error}")
+            return
+        self._tree_layout_cache[run_id] = layout
+        self.refresh()
+
     def _draw_cluster_scatter(self, ax, xy, labels, cl_run: dict | None):
         """
         Colour points by cluster label. Delegates to drc_scatter (Item 8 —
@@ -8485,42 +8779,60 @@ class PlotCard(QFrame):
         """
         drc_scatter.draw_cluster_scatter(ax, xy, labels, cl_run, self.controller)
 
-    def _draw_flowsom_tree_view(self):
+    def _draw_cluster_tree_view(self):
         """
-        Render a FlowSOM MST tree: SOM-node bubbles sized by cell count,
-        coloured by metacluster, connected by the minimum-spanning-tree
-        edges over the node codebook vectors (classic FlowSOM tree layout,
-        see drc_clustering.build_flowsom_tree). Not wired to
-        _rebuild_legend() -- deliberately deferred; the tree's own colour
-        key (metacluster → colour) already matches the Clusters-mode
-        scatter legend, so a dedicated legend can be added later without
-        touching this method's core rendering.
+        Render a cluster tree: node bubbles sized by cell count, coloured
+        by cluster/metacluster, connected by minimum-spanning-tree edges
+        over the node weight vectors (classic FlowSOM tree layout, see
+        drc_clustering.build_flowsom_tree -- a pure MST+layout function
+        that doesn't care what the "nodes" represent). Works for any
+        clustering algorithm: FlowSOM's nodes are its SOM codebook
+        vectors (many nodes roll up into few metaclusters); Leiden/
+        HDBSCAN have no such sub-structure, so each node IS a final
+        cluster (see drc_clustering.build_centroid_tree_data). Wired to
+        _rebuild_legend(), same as the Scatter path -- without this the
+        legend kept showing whatever run/colour-mode was last rendered in
+        Scatter view (plain 0..n numbers) instead of the selected run's
+        own adopted names (e.g. MEM/cell-type labels from "Compute
+        Cluster ID Suggestions") whenever the run shown in the Tree
+        changed.
         """
         cl_run = self._selected_cluster_run()
-        if cl_run is None or cl_run.get('algorithm') != 'FlowSOM':
+        if cl_run is None:
             self._show_placeholder(
-                "Select a FlowSOM clustering run in the Overlay dropdown."
+                "Select a clustering run in the Overlay dropdown."
             )
             return
         tree_data = cl_run.get('tree_data')
         if not tree_data:
             self._show_placeholder(
-                "This FlowSOM run has no tree data.\n"
-                "Re-run FlowSOM to enable the tree view."
+                f"This {cl_run.get('algorithm', '')} run has no tree data.\n"
+                "Re-run clustering to enable the tree view."
             )
+            return
+
+        # The MST/layout computation (igraph's layout_kamada_kawai, in
+        # particular) can be slow for runs with many nodes -- HDBSCAN
+        # especially -- so it's computed on a background thread and
+        # cached per run_id (tree_data is frozen at archive time, so a
+        # run's layout never needs recomputing once it's built).
+        run_id = cl_run.get('run_id')
+        layout = self._tree_layout_cache.get(run_id)
+        if layout is None:
+            self._show_placeholder("Computing tree layout …")
+            if self._tree_layout_worker is None:
+                self._start_tree_layout_worker(run_id, tree_data)
             return
 
         is_dark = _resolve_is_dark(self.state)
         self._figure.clear()
         ax = self._figure.add_subplot(111)
         _style_figure_theme(self._figure, is_dark, axes=[ax])
-        ax.set_aspect('equal', adjustable='box')
+        # Item 6 -- see the matching comment in refresh() above.
+        ax.set_box_aspect(1)
+        ax.set_aspect('equal', adjustable='datalim')
         ax.axis('off')
 
-        layout = drc_clustering.build_flowsom_tree(
-            tree_data['node_weights'], tree_data['node_to_meta'],
-            tree_data['node_counts'],
-        )
         positions    = layout['positions']
         edges        = layout['edges']
         node_to_meta = tree_data['node_to_meta']
@@ -8542,11 +8854,13 @@ class PlotCard(QFrame):
                    linewidths=0.4, zorder=2)
 
         lc = self._label_color
-        ax.set_title(f"FlowSOM Tree — {cl_run.get('label', '')}", color=lc,
+        ax.set_title(f"{cl_run.get('algorithm', '')} Cluster Tree — "
+                    f"{cl_run.get('label', '')}", color=lc,
                     fontsize=self._axis_font_spin.value())
         ax.title.set_color(lc)
 
         self._canvas.draw_idle()
+        self._rebuild_legend()
 
     def _draw_marker_scatter(self, ax, xy, origin, disp_idx, sample_row_offsets,
                              run: dict, marker_values_by_sample: dict):
@@ -8757,17 +9071,22 @@ class PlotCard(QFrame):
         or group). Clusters read from the currently-selected clustering
         run's own 'colors'/'names' (Item 6 — these live per-run, not on a
         single ambient dict). Group mode (Item 17) delegates to
-        _rebuild_group_legend()."""
+        _rebuild_group_legend(). In 'Cluster Tree' plot-type mode the
+        colour-mode combo is hidden (and may be holding a stale value from
+        whatever it was set to before switching into Tree mode), so Tree
+        mode always gets the cluster legend regardless of that combo's
+        current text."""
         while self._legend_layout.count():
             item = self._legend_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
+        is_tree = self.plot_type_combo.currentText() == 'Cluster Tree'
         mode = self.colour_mode_combo.currentText()
-        if mode == 'Group':
+        if mode == 'Group' and not is_tree:
             self._rebuild_group_legend()
             return
-        if mode != 'Clusters':
+        if mode != 'Clusters' and not is_tree:
             self._legend_scroll.setVisible(False)
             return
         cl_run = self._selected_cluster_run()
@@ -9392,6 +9711,15 @@ class _SquareContainer(QWidget):
         child.setParent(self)
 
     def resizeEvent(self, event):
+        # Skip the very first resize(s) before this widget has real
+        # on-screen geometry (both 0 during initial construction, prior
+        # to being shown/laid out) -- handing the canvas a literal 0x0
+        # geometry here is what made matplotlib's constrained-layout
+        # engine warn about axes collapsing to zero. Same guard
+        # _AspectCanvasHolder._apply_geometry() already has.
+        if self.width() <= 0 or self.height() <= 0:
+            super().resizeEvent(event)
+            return
         side = max(0, min(self.width(), self.height()))
         x = (self.width() - side) // 2
         y = (self.height() - side) // 2
@@ -9651,6 +9979,11 @@ class ClusterAnnotationTab(QWidget):
         content_layout.setContentsMargins(8, 8, 8, 8)
         content_layout.setSpacing(8)
 
+        self.help_widget = HelpToggleWidget(
+            text=drc_help_texts.cluster_annotation_tab_help_text
+        )
+        content_layout.addWidget(self.help_widget)
+
         # ---- Clustering run selector (shared by both sub-tabs below) ----
         run_row = QHBoxLayout()
         run_row.addWidget(QLabel("Clustering run:"))
@@ -9770,27 +10103,40 @@ class ClusterAnnotationTab(QWidget):
         map_row.addWidget(self.map_popout_btn)
         map_layout.addLayout(map_row)
 
-        map_plot_row = QHBoxLayout()
+        map_plot_row = QSplitter(Qt.Horizontal)
+        map_plot_row.setChildrenCollapsible(False)
         from matplotlib.figure import Figure
         self._map_figure = Figure(figsize=(4, 4), constrained_layout=True)
         self._map_canvas = _new_scrollable_canvas(self._map_figure)
         self._map_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._map_square = _SquareContainer(self._map_canvas)
         self._map_square.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        map_plot_row.addWidget(self._map_square, stretch=1)
+        map_plot_row.addWidget(self._map_square)
 
         legend_scroll = QScrollArea()
         legend_scroll.setWidgetResizable(True)
         legend_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         legend_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        legend_scroll.setMinimumWidth(110)
+        legend_scroll.setMinimumWidth(90)
         legend_scroll.setFrameShape(QFrame.NoFrame)
         self._legend_widget = _WrappingLegendWidget()
         legend_scroll.setWidget(self._legend_widget)
         self._legend_scroll = legend_scroll
         map_plot_row.addWidget(legend_scroll)
 
-        map_layout.addLayout(map_plot_row, stretch=1)
+        # Item 4 (round 2) -- plot pane absorbs any extra space; legend
+        # pane starts at a rough default and gets fitted to its real
+        # content the first time _rebuild_map_legend runs (see
+        # _sync_legend_column_width), then stays user-controlled once
+        # the handle below has been dragged.
+        map_plot_row.setStretchFactor(0, 1)
+        map_plot_row.setStretchFactor(1, 0)
+        map_plot_row.setSizes([600, 110])
+        self._legend_width_user_set = False
+        map_plot_row.splitterMoved.connect(self._on_map_legend_splitter_moved)
+        self._map_plot_splitter = map_plot_row
+
+        map_layout.addWidget(map_plot_row, stretch=1)
         splitter.addWidget(map_box)
 
         # ============================================================
@@ -9884,11 +10230,14 @@ class ClusterAnnotationTab(QWidget):
         splitter.addWidget(table_box)
 
         splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 4)
+        splitter.setStretchFactor(1, 2)
         splitter.setStretchFactor(2, 1)
-        splitter.setSizes([780, 1040, 340])
+        # Item 6 -- halved the Cluster Map's share (stretch 4->2, size
+        # 1040->520); trimmed the overall minimum by the same 520px so
+        # panels 0/2 don't get inflated back into the freed space.
+        splitter.setSizes([780, 520, 340])
         splitter.setChildrenCollapsible(False)
-        splitter.setMinimumHeight(2600)  # Item 4 -- more room to fit everything
+        splitter.setMinimumHeight(2080)  # Item 4 -- more room to fit everything
 
         # ============================================================
         # Sub-tab 2 — Marker Heatmap & Ridgelines (Items 4 & 5)
@@ -10477,7 +10826,9 @@ class ClusterAnnotationTab(QWidget):
         6) so both render identically, the same way PlotCard and this
         tab already share drc_scatter.draw_cluster_scatter itself.
         """
-        ax.set_aspect('equal', adjustable='box')
+        # Item 6 -- see the matching comment in PlotCard.refresh().
+        ax.set_box_aspect(1)
+        ax.set_aspect('equal', adjustable='datalim')
         ax.grid(False)   # suppress inherited seaborn 'whitegrid'
 
         if dr_run is None:
@@ -10657,6 +11008,35 @@ class ClusterAnnotationTab(QWidget):
 
     def _rebuild_map_legend(self, cl_run: dict | None):
         self._legend_widget.set_entries(self._build_legend_entries(cl_run))
+        self._sync_legend_column_width()
+
+    def _on_map_legend_splitter_moved(self, *_args):
+        """User dragged the Cluster Map / legend splitter handle -- stop
+        auto-fitting the legend column from here on, so a later rename/
+        recolour rebuild doesn't undo their choice."""
+        self._legend_width_user_set = True
+
+    def _sync_legend_column_width(self):
+        """
+        Item 4 (round 2) -- size the legend column to fit its current
+        content (longest name across however many columns
+        _WrappingLegendWidget wrapped into), so the default is never
+        narrower than the names actually need. No-ops once the user has
+        manually dragged the splitter handle (_on_map_legend_splitter_
+        moved) -- their choice then sticks across future rebuilds.
+        """
+        if self._legend_width_user_set:
+            return
+        splitter = self._map_plot_splitter
+        total = sum(splitter.sizes()) or splitter.width()
+        if total <= 0:
+            return
+        # Content width + scrollbar/frame allowance, clamped so a
+        # handful of long names doesn't eat the whole panel and a
+        # single short name doesn't collapse it.
+        content_w = self._legend_widget.sizeHint().width()
+        legend_w = max(90, min(content_w + 24, 320, total - 150))
+        splitter.setSizes([max(150, total - legend_w), legend_w])
 
     def _prompt_rename(self, label: int):
         from PySide6.QtWidgets import QInputDialog
@@ -11826,7 +12206,12 @@ class PluginWidget(QWidget):
         change shows up immediately.
         """
         if hasattr(self, 'groups_stats_tab'):
+            self.groups_stats_tab._clear_stale_run_results()
             self.groups_stats_tab._populate_run_combo()
+            # Item 1 (round 4) -- AFTER _populate_run_combo(), so this
+            # compares against wherever the combo actually settled post-
+            # delete/rename, not the about-to-be-stale prior selection.
+            self.groups_stats_tab._sync_confusion_composition_to_run()
             self.groups_stats_tab._populate_trex_dr_combo()
             self.groups_stats_tab._update_run_button()
         if hasattr(self, 'workspace_tab'):
@@ -11956,8 +12341,6 @@ class PluginWidget(QWidget):
         still synchronous and completes before the caller moves on, so no
         delay or user-facing message is needed, just the right target.
         """
-        import traceback
-        traceback.print_stack(limit=8)
         if self._loading:
             return
         if self._loaded_experiment_key is None:
@@ -12541,12 +12924,15 @@ class PluginWidget(QWidget):
             ('stats_run_id',      self.state.stats_run_id),
             ('confusion_df',          self.state.confusion_df),
             ('confusion_run_label',   self.state.confusion_run_label),
+            ('confusion_run_id',      self.state.confusion_run_id),
             ('confusion_names',       self.state.confusion_names),
             ('composition_df',        self.state.composition_df),
             ('composition_as_pct',    self.state.composition_as_pct),
             ('composition_group_var', self.state.composition_group_var),
             ('composition_run_label', self.state.composition_run_label),
+            ('composition_run_id',    self.state.composition_run_id),
             ('composition_names',     self.state.composition_names),
+            ('composition_colors',    self.state.composition_colors),
             ('pca_scores_df',           self.state.pca_scores_df),
             ('pca_loadings_df',         self.state.pca_loadings_df),
             ('pca_explained_variance',  self.state.pca_explained_variance),
@@ -12636,6 +13022,8 @@ class PluginWidget(QWidget):
                 self.state.confusion_df = payload['confusion_df']
             if isinstance(payload.get('confusion_run_label'), str):
                 self.state.confusion_run_label = payload['confusion_run_label']
+            if isinstance(payload.get('confusion_run_id'), str):
+                self.state.confusion_run_id = payload['confusion_run_id']
             if isinstance(payload.get('confusion_names'), dict):
                 self.state.confusion_names = payload['confusion_names']
             if isinstance(payload.get('composition_df'), pd.DataFrame):
@@ -12646,8 +13034,55 @@ class PluginWidget(QWidget):
                 self.state.composition_group_var = payload['composition_group_var']
             if isinstance(payload.get('composition_run_label'), str):
                 self.state.composition_run_label = payload['composition_run_label']
+            if isinstance(payload.get('composition_run_id'), str):
+                self.state.composition_run_id = payload['composition_run_id']
             if isinstance(payload.get('composition_names'), dict):
                 self.state.composition_names = payload['composition_names']
+            if isinstance(payload.get('composition_colors'), dict):
+                self.state.composition_colors = payload['composition_colors']
+
+            # Item 1 (round 5) -- migration for sidecars saved before
+            # confusion_run_id/composition_run_id existed: confusion_df/
+            # composition_df loaded fine above, but the id came back ''
+            # even though confusion_run_label/composition_run_label is a
+            # real (non-"Active (unsaved)") run name -- a sign this is an
+            # old file, not a genuinely-unsaved result. Best-effort
+            # backfill by matching that label against a still-archived
+            # run; if none matches (renamed or deleted since), the id is
+            # unverifiable, so drop the data rather than risk showing it
+            # forever with no way to detect it's gone stale.
+            if (self.state.confusion_df is not None and not self.state.confusion_run_id
+                    and self.state.confusion_run_label not in ('', 'Active (unsaved)')):
+                match = next((e for e in self.state.clustering_runs
+                             if e.get('label') == self.state.confusion_run_label), None)
+                if match is not None:
+                    self.state.confusion_run_id = match.get('run_id', '')
+                    _log.info("_load_model_sidecar: backfilled confusion_run_id=%r "
+                              "from label %r", self.state.confusion_run_id,
+                              self.state.confusion_run_label)
+                else:
+                    _log.info("_load_model_sidecar: dropping unverifiable confusion_df "
+                              "(label %r, no matching run)", self.state.confusion_run_label)
+                    self.state.confusion_df = None
+                    self.state.confusion_run_label = ''
+                    self.state.confusion_names = {}
+            if (self.state.composition_df is not None and not self.state.composition_run_id
+                    and self.state.composition_run_label not in ('', 'Active (unsaved)')):
+                match = next((e for e in self.state.clustering_runs
+                             if e.get('label') == self.state.composition_run_label), None)
+                if match is not None:
+                    self.state.composition_run_id = match.get('run_id', '')
+                    _log.info("_load_model_sidecar: backfilled composition_run_id=%r "
+                              "from label %r", self.state.composition_run_id,
+                              self.state.composition_run_label)
+                else:
+                    _log.info("_load_model_sidecar: dropping unverifiable composition_df "
+                              "(label %r, no matching run)", self.state.composition_run_label)
+                    self.state.composition_df = None
+                    self.state.composition_run_label = ''
+                    self.state.composition_names = {}
+                    self.state.composition_colors = {}
+
             if isinstance(payload.get('pca_scores_df'), pd.DataFrame):
                 self.state.pca_scores_df = payload['pca_scores_df']
             if isinstance(payload.get('pca_loadings_df'), pd.DataFrame):
@@ -13535,15 +13970,18 @@ class PluginWidget(QWidget):
                     channels = [c for c in self.state.selected_channels
                                 if c not in drc_pipeline.META_CHANNELS]
                     n_events = sum(len(a) for a in self.state.cluster_labels.values())
-                    # FlowSOM Tree view (Workspace) needs the SOM codebook,
-                    # metacluster mapping and per-node counts archived
-                    # alongside the run — not just the live in-memory copy,
-                    # which a later FlowSOM run would overwrite.
+                    # Cluster Tree view (Workspace) needs the node/centroid
+                    # weights, node-to-cluster mapping and per-node counts
+                    # archived alongside the run — not just the live
+                    # in-memory copy, which a later run of the same
+                    # algorithm would overwrite. Works for any clustering
+                    # algorithm now: FlowSOM stores its SOM codebook here,
+                    # Leiden/HDBSCAN store per-cluster centroids
+                    # (build_centroid_tree_data) -- same dict shape either way.
                     tree_data = None
-                    if algo == 'FlowSOM':
-                        fsom_state = self.state.trained_reducers.get('FlowSOM')
-                        if fsom_state:
-                            tree_data = dict(fsom_state)
+                    reducer_state = self.state.trained_reducers.get(algo)
+                    if isinstance(reducer_state, dict) and 'node_weights' in reducer_state:
+                        tree_data = dict(reducer_state)
                     entry = drc_run_archive.archive_clustering_run(
                         self.controller, self.state,
                         algorithm=algo,
