@@ -1694,19 +1694,18 @@ class ConfigTab(QWidget):
 
         umap_grid.addWidget(QLabel("n_jobs:"), 2, 0)
         self.umap_n_jobs = QSpinBox()
-        self.umap_n_jobs.setRange(-1, 64)
-        self.umap_n_jobs.setValue(1)
+        self.umap_n_jobs.setRange(-1, _os.cpu_count() or 1)
+        self.umap_n_jobs.setValue(-1)
         self.umap_n_jobs.setSpecialValueText('all cores')
         self.umap_n_jobs.setToolTip(
-            "-1 = use all available cores.  Default: 1 (single-threaded,\n"
-            "matches previous behaviour).\n"
+            "-1 = use all available cores.  Default: all cores.\n"
             "UMAP disables real multi-threading whenever a fixed random seed\n"
-            "is set (needed for reproducible runs) -- see CONTEXT_UMAP.md.\n"
-            "Setting this above 1 drops the fixed seed for THIS run so the\n"
-            "parallelism actually takes effect: embeddings will no longer be\n"
-            "bit-for-bit reproducible run-to-run, though cluster structure is\n"
-            "stable in practice. Leave at 1 if exact reproducibility matters\n"
-            "more than training speed."
+            "is set (needed for reproducible runs).\n"
+            "Setting this above 1 drops the fixed seed for THIS run, and the\n"
+            "hnswlib kNN graph it shares with Leiden clustering is built in\n"
+            "parallel too: neither the embedding nor Leiden's clusters will\n"
+            "be bit-for-bit reproducible run-to-run. Set to 1 if exact\n"
+            "reproducibility matters more than training speed."
         )
         umap_grid.addWidget(self.umap_n_jobs, 2, 1)
 
@@ -9890,6 +9889,35 @@ class _MarkerSummaryWorker(QThread):
             traceback.print_exc()
             self.finished.emit(False, str(exc), {})
 
+
+class _RunHydrateWorker(QThread):
+    """
+    Unpickles a clustering/DR run's heavy payload (see
+    drc_run_archive.hydrate_run) on a background thread. The first time a
+    run is selected in a session, its manifest entry only carries
+    metadata (drc_run_archive.load_manifest_entries loads lazily) --
+    hydrate_run()'s disk read used to happen inline from refresh() on the
+    main thread, which is what froze the UI the first time the Cluster
+    Annotation tab opened in an experiment. hydrate_run() mutates each
+    entry dict in place and does no Qt widget access, so it's safe to
+    run here.
+    """
+    finished = Signal()
+
+    def __init__(self, controller, entries: list, parent=None):
+        super().__init__(parent)
+        self._controller = controller
+        self._entries = entries
+
+    def run(self):
+        for entry in self._entries:
+            try:
+                drc_run_archive.hydrate_run(self._controller, entry)
+            except Exception:
+                traceback.print_exc()
+        self.finished.emit()
+
+
 class ClusterAnnotationTab(QWidget):
     """
     Tab 5 — Cluster Annotation (Item 8)
@@ -9950,6 +9978,9 @@ class ClusterAnnotationTab(QWidget):
         self._cell_type_df = None
         self._suggestions_run_id: str | None = None
         self._cluster_id_worker = None
+        # In-flight _RunHydrateWorker, if any -- see
+        # _start_hydrate_worker_if_needed.
+        self._hydrate_worker = None
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -10387,6 +10418,14 @@ class ClusterAnnotationTab(QWidget):
         self._populate_run_combo()
         self._populate_dr_run_combo()
         self._populate_channel_list()
+        # The rest of refresh() below (via _selected_cluster_run() /
+        # _selected_dr_run()) needs the selected run(s)' heavy payload
+        # unpickled from disk. Do that on a background thread first if
+        # it hasn't happened yet this session; _on_hydrate_finished
+        # re-enters refresh() once it's ready, at which point
+        # hydrate_run() is a cheap no-op and this proceeds normally.
+        if self._start_hydrate_worker_if_needed():
+            return
         # Item 15 -- _populate_run_combo() above re-selects whatever run_id
         # was already active, so it never fires currentIndexChanged /
         # _on_run_changed on its own; without this call, a freshly
@@ -10408,6 +10447,44 @@ class ClusterAnnotationTab(QWidget):
             ms_cache = self._marker_summary_cache.get(run_id)
             if ms_cache:
                 self._draw_marker_summary()
+
+    def _start_hydrate_worker_if_needed(self) -> bool:
+        """
+        Kick a background _RunHydrateWorker for the currently-selected
+        clustering/DR run entries if either still needs its heavy
+        payload unpickled from disk (see drc_run_archive.hydrate_run).
+        Returns True if a worker was started or one is already in
+        flight -- callers should stop the rest of refresh() in that
+        case and let _on_hydrate_finished re-enter it once ready.
+        """
+        if self._hydrate_worker is not None:
+            return True
+        run_id = self.run_combo.currentData()
+        dr_run_id = self.dr_run_combo.currentData()
+        to_hydrate = [
+            entry for entry in self.state.clustering_runs
+            if entry.get('run_id') == run_id and 'labels' not in entry
+        ]
+        to_hydrate += [
+            entry for entry in self.state.dr_runs
+            if entry.get('run_id') == dr_run_id and 'embeddings' not in entry
+        ]
+        if not to_hydrate:
+            return False
+        self._map_figure.clear()
+        ax = self._map_figure.add_subplot(111)
+        ax.text(0.5, 0.5, 'Loading clustering run …', ha='center', va='center',
+                transform=ax.transAxes, fontsize=9)
+        self._map_canvas.draw_idle()
+        worker = _RunHydrateWorker(self.controller, to_hydrate)
+        worker.finished.connect(self._on_hydrate_finished)
+        self._hydrate_worker = worker
+        worker.start()
+        return True
+
+    def _on_hydrate_finished(self):
+        self._hydrate_worker = None
+        self.refresh()
 
     # ------------------------------------------------------------------
     # Run selectors
@@ -13511,16 +13588,6 @@ class PluginWidget(QWidget):
         import os
 
         n_neighbors = params['n_neighbors']
-        self.progress_message(f"Building hnswlib kNN index (k={n_neighbors}) …")
-
-        # Build hnswlib index first — reuse for Leiden later
-        dim = training_data.shape[1]
-        index = hnswlib.Index(space='l2', dim=dim)
-        index.init_index(max_elements=len(training_data),
-                         ef_construction=200, M=16)
-        index.add_items(training_data)
-        index.set_ef(50)
-        self.state.umap_knn_index = index
 
         # n_jobs > 1 requires giving up the fixed seed -- umap-learn forces
         # n_jobs back to 1 internally whenever random_state is set, to keep
@@ -13532,6 +13599,26 @@ class PluginWidget(QWidget):
         if n_jobs == -1:
             n_jobs = os.cpu_count() or 1
         random_state = 42 if n_jobs == 1 else None
+
+        self.progress_message(f"Building hnswlib kNN index (k={n_neighbors}) …")
+
+        # Build hnswlib index first — reuse for Leiden later.
+        # num_threads tied to the same n_jobs choice as UMAP itself: a
+        # parallel build is NOT deterministic even with random_seed fixed
+        # (concurrent insertion order is scheduler-dependent), so this
+        # index -- and every Leiden partition built on it -- silently
+        # varied run-to-run whenever it had to be rebuilt (e.g. after
+        # closing/reopening the experiment, since umap_knn_index isn't
+        # persisted to the sidecar). Single-threaded build when n_jobs==1
+        # keeps the graph itself reproducible, matching the UMAP seed
+        # behaviour above instead of disagreeing with it.
+        dim = training_data.shape[1]
+        index = hnswlib.Index(space='l2', dim=dim)
+        index.init_index(max_elements=len(training_data),
+                         ef_construction=200, M=16, random_seed=42)
+        index.add_items(training_data, num_threads=n_jobs)
+        index.set_ef(50)
+        self.state.umap_knn_index = index
 
         self.progress_message(
             f"Training UMAP  (n_neighbors={n_neighbors}, "
@@ -13769,7 +13856,7 @@ class PluginWidget(QWidget):
         if total > 0:
             bar.setRange(0, total)
             bar.setValue(current)
-            bar.setFormat(f"epoch {current}/{total}")
+            bar.setFormat(f"embedded {current}/{total}")
             bar.setTextVisible(True)
         else:
             # Indeterminate — e.g. kNN build phase or non-UMAP algorithms
