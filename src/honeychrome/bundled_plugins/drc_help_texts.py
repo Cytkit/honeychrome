@@ -88,7 +88,7 @@ single embedding.</li>
 represents transitions between related populations as branches or
 connections rather than gaps.</li>
 </ul>
-<p>None of these algorithms preserve inter-cluster distances in an
+<p>None of these algorithms preserves inter-cluster distances in an
 absolute sense — they are useful for visual grouping and getting a feel
 for the data, not for treating on-plot distances as a quantitative
 metric. See the Further Reading links below for a practical comparison
@@ -100,8 +100,8 @@ training pool, then <b>Apply to All Samples</b> to project every sample
 <h4>3. Clustering</h4>
 <ul>
 <li><b>FlowSOM</b> — self-organising map followed by metaclustering; set
-the SOM grid size and number of metaclusters. Produces a
-minimum-spanning-tree ("star chart") view, viewable in the Workspace
+the SOM grid size and number of metaclusters. Honeychrome uses a batched
+FlowSOM training for fast processing of even millions of events.
 tab.</li>
 <li><b>Leiden</b> — graph-based community detection; reuses UMAP's
 neighbour graph if one is available. Leiden was designed specifically to
@@ -141,11 +141,14 @@ plugin (Cluster Annotation, Stats, Workspace) immediately.</p>
 [5]<a href="https://doi.org/10.1002/cyto.a.22625">Van Gassen et al. 2015, Cytometry A (FlowSOM)</a><br/>
 [6]<a href="https://doi.org/10.1038/s41598-019-41695-z">Traag, Waltman and van Eck 2019, Sci Rep (Leiden)</a><br/>
 [7]<a href="https://doi.org/10.1007/978-3-642-37456-2_14">Campello, Moulavi and Sander 2013, PAKDD (HDBSCAN)</a><br/>
+[8]<a href="https://doi.org/10.12688/f1000research.21642.2">Kratochvil, Koladiya and Vondrasek 2020, F100Res (EmbedSOM)</a><br/>
+[9]<a href="https://doi.org/10.1016/j.cell.2015.05.047">Levine et al. 2015, Cell (Phenograph)</a><br/>
+[10]<a href="https://doi.org/10.1038/s41467-019-13055-y">Belkina et al. 2019, Nature Communications (OptSNE)</a><br/>
 </p>
 '''
 
 cluster_annotation_tab_help_text = '''
-<h3>Cluster Annotation — inspect, name, and QC your clusters</h3>
+<h3>Cluster Annotation: inspect, name, and QC your clusters</h3>
 <p><b>Prerequisite:</b> run (or select an existing) clustering run in the
 Configuration tab first, then pick it from the <i>Clustering run</i>
 selector at the top of this tab.</p>
@@ -157,28 +160,24 @@ selector at the top of this tab.</p>
 for each. Use this to sanity-check that clusters actually separate on
 the markers you expect.</li>
 <li><b>Cluster Map:</b> a scatter plot of the selected DR embedding,
-coloured by cluster. If the selected run is a FlowSOM run, you can
-switch to the <b>FlowSOM MST</b> view (also available as a Workspace
-plot type) — SOM-node bubbles sized by cell count and coloured by
-metacluster, connected by the minimum-spanning-tree edges over the node
-codebook vectors, the classic FlowSOM "star chart"/tree layout.</li>
+coloured by cluster.</li>
 <li><b>Cluster Labels:</b> a table of cluster names, with two
 independent ways to get suggestions (see below). You always have final
 control to rename any cluster by hand.</li>
 </ul>
 
 <h4>Cluster ID Suggestions</h4>
-<p>Two independent mechanisms feed the Cluster Labels table, and it's
-worth understanding the difference:</p>
+<p>Two independent mechanisms feed the Cluster Labels table, trying to
+help you figure out what type(s) of cells are present:</p>
 <ol>
-<li><b>MEM (Marker Enrichment Modeling)</b> — a descriptive statistic of
+<li><b>MEM (Marker Enrichment Modeling)</b>: a descriptive statistic of
 the cluster's own transformed marker expression relative to a background
 reference, producing labels like "CD4+6 CD8−5". Because it only
 describes what the cluster's data actually shows, it is safe to adopt
 automatically; use <b>Adopt All MEM Labels</b> to do so. Set the
 <i>MEM threshold</i> to control how large a score has to be before a
 marker is reported in the label.</li>
-<li><b>Cell-type scoring</b> — matches each cluster's MEM profile
+<li><b>Cell-type scoring</b>: matches each cluster's MEM profile
 against a database of expected marker signatures for named cell types
 (<i>species</i> selector, plus <tt>drc_cell_type_database.csv</tt>). This
 is a <b>biological claim</b>, not a computed statistic — treat it as a
@@ -199,11 +198,11 @@ nothing to cell-type scoring but doesn't block MEM.</p>
 
 <h4>Marker Summary sub-tab</h4>
 <ul>
-<li><b>Heatmap of median MFI per cluster</b> (transformed) — a quick
+<li><b>Heatmap of median MFI per cluster</b> (transformed): a quick
 overview of which clusters express which markers, useful alongside or
 instead of the Cluster Labels table when you'd rather read the raw
 expression pattern yourself.</li>
-<li><b>Marker Ridgeline Grid</b> — per-cluster expression histograms for
+<li><b>Marker Ridgeline Grid</b>: per-cluster expression histograms for
 each marker, stacked for easy comparison.</li>
 </ul>
 <p>Click <b>Recompute Marker Summary</b> after changing the clustering
@@ -294,10 +293,7 @@ is the probability of seeing data at least this extreme, in a
 hypothetical infinite series of repeated experiments, <i>if the null
 hypothesis were exactly true</i>. It is <b>not</b> the probability that
 the null hypothesis is true, and it is not the probability that your
-observed effect is real — a persistently common misreading that the
-American Statistical Association's own statement on p-values addresses
-directly (reference [3] below), and that has been the subject of
-considerable methodological debate (reference [4]).</li>
+observed effect is real (see reference [3] below).</li>
 <li><b>Bayesian</b> — assigns a probability distribution directly to
 the hypothesis or parameter itself, and updates that distribution from a
 starting ("prior") belief using the observed data via Bayes' theorem, to
@@ -305,19 +301,8 @@ produce a posterior probability — a number that really does answer "how
 likely is it, given this data, that there is a real difference between
 groups?" The cost is that a genuinely Bayesian analysis requires
 specifying a prior, which is itself a modelling choice open to
-disagreement (reference [5] gives a practical, non-dogmatic introduction
-to this style of analysis and how it compares to the frequentist "New
-Statistics").</li>
-<li><b>Where limma sits:</b> empirical Bayes moderation borrows the
-Bayesian idea of a prior, but estimates that prior automatically from
-the data being tested rather than from a genuine external belief, purely
-to solve the practical problem of noisy per-cluster variances with few
-samples. The p-value limma ultimately reports is still a standard
-frequentist one, with the usual frequentist caveats above — moderation
-improves how reliably that p-value behaves across many
-simultaneously-tested clusters, but does not turn it into a posterior
-probability that your specific cluster's effect is real.</li>
-</ul>
+disagreement (reference [5] gives a practical introduction to this style
+ of analysis and how it compares to the frequentist "New Statistics").</li>
 
 <h4>What does the negative-binomial GLM do? (Cluster Counts)</h4>
 <p>Raw event counts per cluster per sample are <i>count</i> data, not
@@ -351,7 +336,7 @@ conditions. Choose the <b>Pairing variable</b>: a column in your Sample
 Group Assignment table (e.g. "PatientID" or "Subject") whose value
 identifies which samples belong to the same pair or block.</p>
 <ul>
-<li><b>What it actually does:</b> pairing adds a fixed-effect blocking
+<li><b>What it does:</b> pairing adds a fixed-effect blocking
 term to the underlying design (<tt>+ C(pair_id)</tt> in the model
 formula) — in effect, it fits and removes a separate baseline offset per
 pair before testing the group effect, so the comparison is driven by
@@ -375,16 +360,6 @@ correctly.</li>
 Paired design unticked — forcing a pairing structure onto unrelated
 samples doesn't help and can distort the result.</li>
 </ul>
-
-<h4>3. T-REX</h4>
-<p>Compares two groups directly at the single-cell level rather than via
-per-cluster summaries: pooled events from both groups are indexed with a
-kNN graph, and each event gets an enrichment score based on the fraction
-of its neighbours coming from each group (−1 = fully Group B–enriched,
-+1 = fully Group A–enriched). Useful for spotting rare, localized
-differences that a coarse clustering might average away. Invalidated
-whenever group assignments change — re-run after editing the Sample
-Group Assignment table.</p>
 
 <h4>4. Confusion Matrix, Composition Barplot, and Export</h4>
 <p>Despite the name (borrowed from CyCONDOR, the R package this feature
@@ -417,7 +392,7 @@ heatmap is often quicker for spotting one standout cluster/group
 combination. <b>Export Results CSV</b> writes out the full statistics
 table for the currently viewed comparison.</p>
 
-<h4>5. Sample PCA — what it shows and how to interpret it</h4>
+<h4>5. Sample PCA</h4>
 <p>PCA (Principal Component Analysis) takes the per-sample summary table
 you build from whichever combination of Frequencies, Counts, and/or MFIs
 you check, and finds a small number of new axes ("principal components",
@@ -466,7 +441,9 @@ above.</p>
 [3]<a href="https://doi.org/10.1080/00031305.2016.1154108">Wasserstein and Lazar 2016, The American Statistician (ASA statement on p-values)</a><br/>
 [4]<a href="https://doi.org/10.1038/506150a">Nuzzo 2014, Nature (statistical errors and the misuse of p-values)</a><br/>
 [5]<a href="https://doi.org/10.3758/s13423-016-1221-4">Kruschke and Liddell 2018, Psychon Bull Rev (a Bayesian alternative framework)</a><br/>
-[6]<a href="https://doi.org/10.7554/eLife.64653">Barone et al. 2021, eLife (T-REX)</a><br/>
+[6]<a href="https://doi.org/10.1038/s42003-019-0415-5">Weber et al. 2019, Communications Biology (diffcyt)</a><br/>
+[7]<a href="https://doi.org/10.1093/bioinformatics/btp616">Robinson, McCarthy and Smyth 2009, Bioinformatics (edgeR)</a><br/>
+[8]<a href="https://doi.org/10.1038/s41598-025-03376-y">Colange et al. 2025, Scientific Reports (InMoose)</a><br/>
 </p>
 '''
 
@@ -512,11 +489,11 @@ section will offer to include when you generate a report.</p>
 
 report_tab_help_text = '''
 <h3>Report — export what's currently on screen</h3>
-<p>The Report tab is a thin, read-only consumer of the other tabs'
-current state — it doesn't recompute anything itself, and there is no
-separate "reporting run" selector. It reports on whichever clustering
-run is currently selected in the <b>Cluster Annotation</b> tab, since
-that's the one place in the plugin where a clustering run selection is
+<p>The Report tab takes information from the other tabs' current
+state. It doesn't recompute anything itself, and there is no separate
+"reporting run" selector. It reports on whichever clustering run is
+currently selected in the <b>Cluster Annotation</b> tab, since that's
+the one place in the plugin where a clustering run selection is
 already required.</p>
 <h4>Before you generate a report</h4>
 <ol>
