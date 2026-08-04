@@ -251,10 +251,15 @@ below for how this changes the model and what it requires.</li>
 <li><b>Tests</b> — Cluster Frequencies (limma), Cluster Counts
 (negative-binomial GLM), and Cluster MFIs (limma) can each be ticked
 independently; see the dedicated sections below for what each is
-actually doing and how to read its result.</li>
+actually doing and how to read its result. MFI values (here and in the
+MFI Heatmap) are each channel's Transforms-tab scale (Logicle/
+biexponential, or linear where configured) — the same scale you see in
+the main cytometry plots and Transforms tab, not a separate fixed
+transform.</li>
 <li>Set the <i>p-value</i> and <i>|log₂FC|</i> thresholds used to flag
-significant hits in the volcano plot and heatmap, then click
-<b>Run Statistics</b>.</li>
+significant hits in the volcano plot and heatmap, and choose the
+<b>FDR</b> correction scope (see "FDR correction scope" below), then
+click <b>Run Statistics</b>.</li>
 </ul>
 
 <h4>What is limma, and what does its p-value actually mean?</h4>
@@ -276,12 +281,21 @@ cluster (or every channel, for MFIs) being tested in the same run: it
 estimates the typical spread of variances across all of them and shrinks
 each individual cluster's variance estimate toward that common trend,
 producing a "moderated t-statistic" that is markedly more stable, and
-better calibrated, than treating each cluster in isolation. This
-moderation step is the "Bayes" part of limma's name — it uses a prior
-built from the data itself (an <i>empirical</i> Bayes prior, rather than
-one specified in advance) purely to stabilise the variance term. The
+better calibrated, than treating each cluster in isolation.</p>
+<p>This moderation step is the "Bayes" part of limma's name — it uses a
+prior built from the data itself (an <i>empirical</i> Bayes prior, rather
+than one specified in advance) purely to stabilise the variance term. The
 hypothesis test and p-value that come out the other end are still
 ordinary frequentist ones — see below.</p>
+<p>Where available, the volcano plot also draws a thin horizontal error
+bar through each significant point, showing the 95% confidence interval
+of its log₂ fold-change (a wider bar means the fold-change estimate is
+less precise — typically fewer events, more sample-to-sample variability,
+or fewer samples in that comparison). The CI is a separate quantity from
+the p-value: a point can have a wide CI and still cross the significance
+threshold if the underlying effect is large, or a narrow CI and still be
+non-significant if the effect itself is small.</p>
+
 
 <h4>Frequentist vs Bayesian statistics (and where limma sits between them)</h4>
 <p>These are two different ways of assigning meaning to "probability" in
@@ -303,6 +317,31 @@ groups?" The cost is that a genuinely Bayesian analysis requires
 specifying a prior, which is itself a modelling choice open to
 disagreement (reference [5] gives a practical introduction to this style
  of analysis and how it compares to the frequentist "New Statistics").</li>
+
+<h4>FDR correction scope: pooled vs per-comparison</h4>
+<p>Every comparison (from either "Reference" or "All pairwise" contrast
+mode) already gets its own Benjamini-Hochberg FDR correction across the
+clusters/channels tested within that comparison. The <b>FDR</b> selector
+controls a second, optional layer on top of that, used only to decide
+which p-value feeds the "significant" flag shown in the volcano plot and
+heatmap:</p>
+<ul>
+<li><b>Pooled (all comparisons)</b> (default) — one BH-FDR correction is
+run across every finite p-value from every comparison currently
+displayed, and that pooled adjusted p-value decides significance. This is
+the more conservative choice once more than one comparison is on screen
+at once (e.g. "All pairwise" with several groups), since it treats the
+whole set of comparisons as one combined multiple-testing problem.</li>
+<li><b>Per comparison</b> — each comparison's own correction (computed
+over just that comparison's clusters/channels) is used instead, without
+pooling across comparisons. This matches running each comparison as a
+fully separate analysis, and is the more standard choice if you plan to
+report each comparison independently rather than as one combined
+test.</li>
+</ul>
+<p>Both p-values are always computed and included in the exported CSV
+regardless of which is selected here — this toggle only changes which one
+drives the "significant" flag and coloured points in the plots.</p>
 
 <h4>What does the negative-binomial GLM do? (Cluster Counts)</h4>
 <p>Raw event counts per cluster per sample are <i>count</i> data, not

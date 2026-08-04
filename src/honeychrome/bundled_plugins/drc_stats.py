@@ -371,8 +371,10 @@ def compute_mfis(controller, state, all_rel, n_clusters,
     Per-sample mean intensity of each selected channel within each cluster.
 
     Returns (n_samples by (n_clusters · n_channels)). Loads each sample's
-    untransformed selected-channel values ONCE via drc_pipeline (correct
-    channel→column mapping), then iterates channels in memory.
+    selected-channel values ONCE via drc_pipeline, each channel on its own
+    configured Transforms-tab scale (Logicle/biexponential/linear — the
+    same scale the main cytometry plots and Transforms tab use), then
+    iterates channels in memory.
 
     channels: explicit channel list to test. Defaults to every
               selected channel when not supplied,
@@ -391,7 +393,7 @@ def compute_mfis(controller, state, all_rel, n_clusters,
 
     sample_vals = {}
     for rel in all_rel:
-        mv = drc_pipeline.load_sample_marker_values(controller, state, rel, af_state=af_state)
+        mv = drc_pipeline.load_sample_transformed_values(controller, state, rel, channels, af_state=af_state)
         if mv is not None:
             sample_vals[rel] = mv          # (values (n,n_sel), names)
 
@@ -412,8 +414,7 @@ def compute_mfis(controller, state, all_rel, n_clusters,
             for cl in range(n_clusters):
                 sel = lab == cl
                 if sel.any():
-                    vals = np.maximum(col[sel], 0.0)
-                    mfi_mat[i, cl] = float(np.mean(np.log1p(vals)))
+                    mfi_mat[i, cl] = float(np.mean(col[sel]))
         frames.append(pd.DataFrame(
             mfi_mat, index=all_rel,
             columns=[f'{_label_for(state, cl, names_override)}_{ch}' for cl in range(n_clusters)]))
@@ -441,6 +442,9 @@ def compute_sample_mfis(controller, state, all_rel, channels=None,
     This is the plain sample-level view for the MFI Heatmap instead:
     no cluster breakdown, no significance filtering.
 
+    Each channel is on its own configured Transforms-tab scale (Logicle/
+    biexponential/linear), same as compute_mfis().
+
     Returns (n_samples x n_channels), NaN where a sample has no events for
     a channel (rather than a fabricated 0).
     """
@@ -453,7 +457,7 @@ def compute_sample_mfis(controller, state, all_rel, channels=None,
 
     sample_vals = {}
     for rel in all_rel:
-        mv = drc_pipeline.load_sample_marker_values(controller, state, rel, af_state=af_state)
+        mv = drc_pipeline.load_sample_transformed_values(controller, state, rel, channels, af_state=af_state)
         if mv is not None:
             sample_vals[rel] = mv
 
@@ -468,7 +472,7 @@ def compute_sample_mfis(controller, state, all_rel, channels=None,
                 continue
             col = values[:, names.index(ch)]
             if len(col):
-                mfi_mat[i, j] = float(np.mean(np.log1p(np.maximum(col, 0.0))))
+                mfi_mat[i, j] = float(np.mean(col))
 
     df = pd.DataFrame(mfi_mat, index=all_rel, columns=list(channels))
     log.info("sample MFI matrix: %s", df.shape)
@@ -763,7 +767,8 @@ def _limma_fit_one(data_df: pd.DataFrame, group_vec: list[str], baseline: str,
     # labels columns generically as 'column0', 'column1', ... in the same
     # order as the design matrix, so translate position -> that name.
     coef_col = f"column{coef_idx}"
-    tt = topTable(fit, coef=coef_col, number=np.inf, adjust_method='fdr_bh', sort_by='p')
+    tt = topTable(fit, coef=coef_col, number=np.inf, adjust_method='fdr_bh',
+                 sort_by='p', confint=True)
 
     # normalise inmoose DEResults columns → R/limma names used downstream.
     tt = pd.DataFrame(tt).rename(columns={
@@ -772,6 +777,15 @@ def _limma_fit_one(data_df: pd.DataFrame, group_vec: list[str], baseline: str,
         'adj_pvalue':     'adj.P.Val',
         'stat':           't',
     })
+    if 'CI.L' not in tt.columns or 'CI.R' not in tt.columns:
+        log.warning(
+            "topTable(confint=True) did not return 'CI.L'/'CI.R' for %r vs "
+            "%r (got columns: %s) — CI bands will be blank for this "
+            "comparison until the actual column names are confirmed.",
+            other, baseline, list(tt.columns),
+        )
+        tt['CI.L'] = np.nan
+        tt['CI.R'] = np.nan
     feature_names = np.asarray(data_df.columns)
     tt.insert(0, 'feature', feature_names[tt.index.to_numpy()])
     tt = tt.reset_index(drop=True)
@@ -782,7 +796,8 @@ def _limma_fit_one(data_df: pd.DataFrame, group_vec: list[str], baseline: str,
 def run_limma(data_df: pd.DataFrame, group_vec: list[str],
               contrasts: list[tuple[str, str]], mode: str,
               pval_threshold: float, fc_threshold: float,
-              pairing_vec: list[str] | None = None) -> pd.DataFrame:
+              pairing_vec: list[str] | None = None,
+              fdr_scope: str = 'global') -> pd.DataFrame:
     """
     lmFit → eBayes → topTable, generalised to N groups and multiple contrasts.
 
@@ -802,10 +817,15 @@ def run_limma(data_df: pd.DataFrame, group_vec: list[str],
                   comparison is a fresh, self-contained 2-group test.
     pairing_vec: optional per-row blocking id (e.g. donor), same order as
                 group_vec; added as a fixed-effect term in the formula.
+    fdr_scope: 'global' (default) — 'significant' is based on the BH-FDR
+                correction pooled across every displayed comparison.
+                'per_comparison' — uses each comparison's own correction
+                instead. Both corrected columns (adj.P.Val,
+                adj.P.Val.global) are always present regardless.
 
     Returns one combined DataFrame — feature, logFC, AveExpr, t, P.Value,
-    adj.P.Val, B, comparison, significant — concatenated across every
-    requested contrast. A single 2-group call returns
+    adj.P.Val, B, CI.L, CI.R, comparison, significant — concatenated across
+    every requested contrast. A single 2-group call returns
     the exact same rows as before, with one added 'comparison' column.
     """
     frames = []
@@ -852,24 +872,28 @@ def run_limma(data_df: pd.DataFrame, group_vec: list[str],
             combined.loc[valid, 'P.Value'].values.astype(float), method='fdr_bh'
         )[1]
 
+    sig_col = 'adj.P.Val.global' if fdr_scope == 'global' else 'adj.P.Val'
     combined['significant'] = (
-        (combined['adj.P.Val.global'] <= pval_threshold) &
+        (combined[sig_col] <= pval_threshold) &
         (combined['logFC'].abs() >= fc_threshold)
     )
-    log.info("limma: %d rows across %d comparison(s), %d significant (global FDR)",
+    log.info("limma: %d rows across %d comparison(s), %d significant (%s FDR)",
              len(combined), combined['comparison'].nunique(),
-             int(combined['significant'].sum()))
+             int(combined['significant'].sum()), fdr_scope)
     return combined
 
 
-def _glm_fit_one_cluster(y: np.ndarray, design: np.ndarray):
+def _glm_fit_one_cluster(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
     """Poisson-then-NB fit for one cluster's raw counts (unchanged
     Cameron & Trivedi auxiliary-OLS alpha estimate.
+    ``offset`` is log(per-sample total classified events) — a library-size
+    term so the fit compares cluster rates, not raw totals, across samples
+    with different total event counts.
     Returns the fitted GLM result, or None if even the Poisson fit fails."""
     import statsmodels.api as sm
 
     try:
-        poisson_fit = sm.GLM(y, design, family=sm.families.Poisson()).fit()
+        poisson_fit = sm.GLM(y, design, family=sm.families.Poisson(), offset=offset).fit()
     except Exception as e:
         log.warning("Poisson GLM failed (%s) — marking untestable", e)
         return None
@@ -879,7 +903,7 @@ def _glm_fit_one_cluster(y: np.ndarray, design: np.ndarray):
         alpha = float(sm.OLS(aux_y, mu).fit().params[0])
         if not np.isfinite(alpha) or alpha <= 0:
             raise ValueError("non-positive alpha estimate")
-        return sm.GLM(y, design, family=sm.families.NegativeBinomial(alpha=alpha)).fit()
+        return sm.GLM(y, design, family=sm.families.NegativeBinomial(alpha=alpha), offset=offset).fit()
     except Exception as e:
         log.warning("NB GLM failed (%s), falling back to Poisson", e)
         return poisson_fit
@@ -890,7 +914,13 @@ def _glm_counts_one_contrast(counts_df: pd.DataFrame, group_vec: list[str],
                              pairing_vec: list[str] | None) -> pd.DataFrame:
     """One design + per-cluster NB/Poisson fit + FDR correction for a single
     baseline-vs-other coefficient. Shared by both contrast modes in
-    run_glm_counts() below, mirroring _limma_fit_one()."""
+    run_glm_counts() below, mirroring _limma_fit_one().
+
+    Each cluster's fit includes a log(total classified events for that
+    sample) offset — a library-size term, so the coefficient reflects a
+    per-cluster RATE difference between groups rather than being confounded
+    by samples with different total event counts.
+    """
     import patsy
     from statsmodels.stats.multitest import multipletests
 
@@ -909,20 +939,32 @@ def _glm_counts_one_contrast(counts_df: pd.DataFrame, group_vec: list[str],
     coef_idx = list(design.columns).index(f"C(group, Treatment({baseline!r}))[T.{other}]")
     design_mat = design.values
 
+    # Library-size offset: log(total classified events) per sample, floored
+    # at 1 event so a sample with zero tested-cluster events doesn't produce
+    # log(0). Same row order as design_mat and every counts_df column.
+    totals = counts_df.sum(axis=1).values.astype(float)
+    offset = np.log(np.maximum(totals, 1.0))
+
     LN2 = np.log(2.0)
+    Z95 = 1.959963985
     clusters = list(counts_df.columns)
     logfc = np.full(len(clusters), np.nan)
     tvals = np.full(len(clusters), np.nan)
     pvals = np.full(len(clusters), np.nan)
+    ci_lo = np.full(len(clusters), np.nan)
+    ci_hi = np.full(len(clusters), np.nan)
 
     for i, cl in enumerate(clusters):
         y = counts_df[cl].values.astype(float)
-        fit = _glm_fit_one_cluster(y, design_mat)
+        fit = _glm_fit_one_cluster(y, design_mat, offset)
         if fit is None:
             continue
         logfc[i] = fit.params[coef_idx] / LN2
         tvals[i] = fit.tvalues[coef_idx]
         pvals[i] = fit.pvalues[coef_idx]
+        se_log2 = fit.bse[coef_idx] / LN2
+        ci_lo[i] = logfc[i] - Z95 * se_log2
+        ci_hi[i] = logfc[i] + Z95 * se_log2
 
     adj_pvals = np.full(len(clusters), np.nan)
     valid = np.isfinite(pvals)
@@ -935,6 +977,8 @@ def _glm_counts_one_contrast(counts_df: pd.DataFrame, group_vec: list[str],
         't':         tvals,
         'P.Value':   pvals,
         'adj.P.Val': adj_pvals,
+        'CI.L':      ci_lo,
+        'CI.R':      ci_hi,
     })
     tt['comparison'] = f"{other} vs {baseline}"
     return tt
@@ -943,7 +987,8 @@ def _glm_counts_one_contrast(counts_df: pd.DataFrame, group_vec: list[str],
 def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
                    contrasts: list[tuple[str, str]], mode: str,
                    pval_threshold: float, fc_threshold: float,
-                   pairing_vec: list[str] | None = None) -> pd.DataFrame:
+                   pairing_vec: list[str] | None = None,
+                   fdr_scope: str = 'global') -> pd.DataFrame:
     """
     Per-cluster negative-binomial GLM differential abundance test on raw
     event counts, generalised to N groups/multiple contrasts —
@@ -958,7 +1003,12 @@ def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
     across every cluster; 'pairwise' mode subsets samples/design per pair,
     same as run_limma().
 
-    Returns the same feature/logFC/P.Value/adj.P.Val/t/comparison/
+    fdr_scope: 'global' (default) — 'significant' is based on the BH-FDR
+        correction pooled across every displayed comparison. 'per_comparison'
+        — uses each comparison's own correction instead. Both corrected
+        columns (adj.P.Val, adj.P.Val.global) are always present regardless.
+
+    Returns the same feature/logFC/P.Value/adj.P.Val/t/CI.L/CI.R/comparison/
     significant schema run_limma() produces.
     """
     frames = []
@@ -1001,13 +1051,14 @@ def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
             combined.loc[valid, 'P.Value'].values.astype(float), method='fdr_bh'
         )[1]
 
+    sig_col = 'adj.P.Val.global' if fdr_scope == 'global' else 'adj.P.Val'
     combined['significant'] = (
-        (combined['adj.P.Val.global'] <= pval_threshold) &
+        (combined[sig_col] <= pval_threshold) &
         (combined['logFC'].abs() >= fc_threshold)
     )
-    log.info("GLM counts: %d rows across %d comparison(s), %d significant (global FDR), %d untestable",
+    log.info("GLM counts: %d rows across %d comparison(s), %d significant (%s FDR), %d untestable",
              len(combined), combined['comparison'].nunique(),
-             int(combined['significant'].sum()), int(combined['logFC'].isna().sum()))
+             int(combined['significant'].sum()), fdr_scope, int(combined['logFC'].isna().sum()))
     return combined
 
 
@@ -1021,7 +1072,8 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
                    include_type_markers: bool = False,
                    names_override: dict | None = None,
                    run_counts: bool = False,
-                   af_state=None):
+                   af_state=None,
+                   fdr_scope: str = 'global'):
     """
     Run the requested differential tests. Writes results onto ``state`` and
     returns ``(freq_results, mfi_results, counts_results)`` (any may be
@@ -1082,7 +1134,8 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
             names_override=names_override,
         )
         freq_results = run_limma(freq_df, group_vec, contrasts, state.contrast_mode,
-                                 pval_threshold, fc_threshold, pairing_vec=pairing_vec)
+                                 pval_threshold, fc_threshold, pairing_vec=pairing_vec,
+                                 fdr_scope=fdr_scope)
         state.freq_results = freq_results
         state.freq_df = freq_df          # raw (samples × features) matrix
 
@@ -1093,7 +1146,8 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
             names_override=names_override,
         )
         counts_results = run_glm_counts(counts_df, group_vec, contrasts, state.contrast_mode,
-                                        pval_threshold, fc_threshold, pairing_vec=pairing_vec)
+                                        pval_threshold, fc_threshold, pairing_vec=pairing_vec,
+                                        fdr_scope=fdr_scope)
         state.counts_results = counts_results
         state.counts_df = counts_df      # raw (samples × features) count matrix
 
@@ -1113,7 +1167,8 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
         )
         if mfi_df is not None:
             mfi_results = run_limma(mfi_df, group_vec, contrasts, state.contrast_mode,
-                                    pval_threshold, fc_threshold, pairing_vec=pairing_vec)
+                                    pval_threshold, fc_threshold, pairing_vec=pairing_vec,
+                                    fdr_scope=fdr_scope)
             state.mfi_results = mfi_results
             state.mfi_df = mfi_df        # raw (samples × features) matrix
 

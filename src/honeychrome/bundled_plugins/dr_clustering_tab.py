@@ -873,6 +873,11 @@ class PipelineState:
     pairing_variable: str = ''
     # Column name in state.covariates used as a fixed-effect blocking term
     # when paired=True (e.g. donor ID).
+    stats_fdr_scope: str = 'global'
+    # 'global'         -- 'significant' uses one BH-FDR correction pooled
+    #   across every comparison currently displayed (default).
+    # 'per_comparison' -- 'significant' uses each comparison's own
+    #   correction instead, without pooling across comparisons.
     stats_comparisons: list[tuple[str, str]] = field(default_factory=list)
     # (baseline, other) pairs actually tested by the last Run Statistics
     # call, aligned 1:1 with the unique values of freq_results/mfi_results/
@@ -893,12 +898,13 @@ class PipelineState:
     mfi_results: pd.DataFrame | None = None
     # limma output for per-cluster marker MFIs
     mfi_df: pd.DataFrame | None = None
-    # raw (samples x cluster·channel) log1p-MFI matrix
+    # raw (samples x cluster·channel) MFI matrix, each channel on its
+    # configured Transforms-tab scale (Logicle/biexponential/linear)
     mfi_sample_df: pd.DataFrame | None = None
-    # raw (samples x channel) log1p-MFI matrix, whole-sample aggregate —
-    # what the MFI Heatmap actually draws (no cluster breakdown, no
-    # significance filter). mfi_df/mfi_results stay cluster-level, for
-    # the MFI Volcano.
+    # raw (samples x channel) MFI matrix (same per-channel Transforms-tab
+    # scale), whole-sample aggregate — what the MFI Heatmap actually draws
+    # (no cluster breakdown, no significance filter). mfi_df/mfi_results
+    # stay cluster-level, for the MFI Volcano.
 
     # Confusion Matrix / Composition Barplot — independent
     # of Run Statistics, so persisted separately so they survive reopen
@@ -4165,6 +4171,19 @@ class GroupsStatsTab(QWidget):
         self.fc_spin.setValue(0.5)
         self.fc_spin.setFixedWidth(70)
         config_row.addWidget(self.fc_spin)
+
+        config_row.addSpacing(20)
+        config_row.addWidget(QLabel("FDR:"))
+        self.fdr_scope_combo = QComboBox()
+        self.fdr_scope_combo.addItems(["Pooled (all comparisons)", "Per comparison"])
+        self.fdr_scope_combo.setToolTip(
+            "Which BH-FDR correction feeds the 'significant' flag on the "
+            "volcano plot and heatmap. Pooled: one correction across every "
+            "comparison shown. Per comparison: each comparison corrected "
+            "on its own clusters/channels only."
+        )
+        config_row.addWidget(self.fdr_scope_combo)
+
         config_row.addStretch()
         stats_layout.addLayout(config_row)
 
@@ -5922,6 +5941,8 @@ class GroupsStatsTab(QWidget):
 
         pval_threshold = self.pval_spin.value()
         fc_threshold   = self.fc_spin.value()
+        fdr_scope = 'per_comparison' if self.fdr_scope_combo.currentIndex() == 1 else 'global'
+        self.state.stats_fdr_scope = fdr_scope
 
         include_type_markers = self.chk_include_type_markers.isChecked()
         groups_fingerprint = tuple(sorted(self.state.sample_groups.items()))
@@ -5976,7 +5997,8 @@ class GroupsStatsTab(QWidget):
             progress = Signal(str)
 
             def __init__(self_, run_freq, run_mfi, group_names, labels_override,
-                        include_type_markers, names_override, run_counts, af_state):
+                        include_type_markers, names_override, run_counts, af_state,
+                        fdr_scope):
                 super().__init__()
                 self_._run_freq = run_freq
                 self_._run_mfi  = run_mfi
@@ -5986,6 +6008,7 @@ class GroupsStatsTab(QWidget):
                 self_._include_type_markers = include_type_markers
                 self_._names_override = names_override
                 self_._af_state = af_state
+                self_._fdr_scope = fdr_scope
 
             def run(self_):
                 try:
@@ -6005,6 +6028,7 @@ class GroupsStatsTab(QWidget):
                     names_override=self_._names_override,
                     run_counts=self_._run_counts,
                     af_state=self_._af_state,
+                    fdr_scope=self_._fdr_scope,
                 )
                 if freq is not None:
                     self_.progress.emit(f"Frequency limma: {len(freq)} clusters tested.")
@@ -6014,7 +6038,8 @@ class GroupsStatsTab(QWidget):
                     self_.progress.emit(f"MFI limma: {len(mfi)} features tested.")
 
         worker = _StatsWorker(run_freq, run_mfi, list(self.state.group_names), labels_for_stats,
-                             include_type_markers, names_for_stats, run_counts, af_state)
+                             include_type_markers, names_for_stats, run_counts, af_state,
+                             fdr_scope)
         worker.progress.connect(lambda msg: print(f"[DR Stats] {msg}"))
         worker.finished.connect(lambda success, err, key=data_key: self._on_stats_finished(success, err, key))
         self._stats_worker = worker
@@ -6025,16 +6050,17 @@ class GroupsStatsTab(QWidget):
         Recompute the 'significant' column on already-computed freq/counts/
         mfi results in place, without re-running limma/GLM. logFC/p-values
         are threshold-independent, so this is all that's needed when only
-        the thresholds changed since the last run.
+        the thresholds or FDR scope changed since the last run.
         """
+        per_comparison = self.state.stats_fdr_scope == 'per_comparison'
         for attr in ('freq_results', 'counts_results', 'mfi_results'):
             df = getattr(self.state, attr)
             if df is None or 'logFC' not in df.columns:
                 continue
-            # Prefer the global (all-
-            # contrasts-pooled) correction, matching run_limma()/
-            # run_glm_counts()'s own default.
-            if 'adj.P.Val.global' in df.columns:
+            # Prefer the global (all-contrasts-pooled) correction unless
+            # 'Per comparison' is selected, matching run_limma()/
+            # run_glm_counts()'s own fdr_scope handling.
+            if not per_comparison and 'adj.P.Val.global' in df.columns:
                 pval_col = 'adj.P.Val.global'
             elif 'adj.P.Val' in df.columns:
                 pval_col = 'adj.P.Val'
@@ -7462,7 +7488,7 @@ class GroupsStatsTab(QWidget):
         cb = fig.colorbar(im, cax=ax_cb)
         cb.ax.tick_params(labelsize=7)
         if 'MFI' in title:
-            cb_label = 'log1p-MFI'
+            cb_label = 'MFI (Transforms-tab scale)'
         elif 'Counts' in title:
             cb_label = 'Event count'
         else:
@@ -7479,7 +7505,9 @@ class GroupsStatsTab(QWidget):
         """Volcano plot: x=logFC, y=-log10(adj.P.Val). Significant points
         are coloured via viridis, scaled by -log10(adj. P-value).
         Previously flat red for every significant point); non-
-        significant points stay flat grey. run_label is stamped in the
+        significant points stay flat grey. Significant points also get a
+        thin horizontal error bar showing the log2FC's 95% confidence
+        interval (CI.L/CI.R), when present. run_label is stamped in the
         upper-left corner (plot provenance)."""
         from matplotlib.figure import Figure
 
@@ -7513,6 +7541,25 @@ class GroupsStatsTab(QWidget):
 
         non_sig = ~sig
         ax.scatter(logfc[non_sig], neg_lp[non_sig], c='#aaaaaa', s=25, alpha=0.8, linewidths=0)
+
+        # 95% CI error bars for significant points (log2FC uncertainty) --
+        # drawn before the markers (low zorder) so the dots sit on top;
+        # skipped wherever CI.L/CI.R weren't available for that row.
+        if 'CI.L' in results_df.columns and 'CI.R' in results_df.columns and sig.any():
+            ci_lo = results_df['CI.L'].values.astype(float)[sig]
+            ci_hi = results_df['CI.R'].values.astype(float)[sig]
+            valid_ci = np.isfinite(ci_lo) & np.isfinite(ci_hi)
+            if valid_ci.any():
+                xerr = np.vstack([
+                    np.maximum(logfc[sig][valid_ci] - ci_lo[valid_ci], 0.0),
+                    np.maximum(ci_hi[valid_ci] - logfc[sig][valid_ci], 0.0),
+                ])
+                ax.errorbar(
+                    logfc[sig][valid_ci], neg_lp[sig][valid_ci],
+                    xerr=xerr, fmt='none', ecolor=fg, elinewidth=0.6,
+                    alpha=0.35, capsize=0, zorder=1,
+                )
+
         sig_scatter = None
         if sig.any():
             sig_scatter = ax.scatter(logfc[sig], neg_lp[sig], c=neg_lp[sig], cmap='viridis',
@@ -7552,7 +7599,16 @@ class GroupsStatsTab(QWidget):
                 fig, ax, sig_scatter, sig_labels, is_dark,
             )
 
-        x_lim = max(np.abs(logfc).max() * 1.05, fc_threshold * 1.5)
+        ci_extent = 0.0
+        if 'CI.L' in results_df.columns and 'CI.R' in results_df.columns:
+            finite_ci = np.concatenate([
+                results_df['CI.L'].values.astype(float),
+                results_df['CI.R'].values.astype(float),
+            ])
+            finite_ci = np.abs(finite_ci[np.isfinite(finite_ci)])
+            if finite_ci.size:
+                ci_extent = float(finite_ci.max())
+        x_lim = max(np.abs(logfc).max() * 1.05, fc_threshold * 1.5, ci_extent * 1.05)
         ax.set_xlim(-x_lim, x_lim)
 
         ax.set_xlabel("log2 Fold Change")
