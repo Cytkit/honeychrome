@@ -836,7 +836,7 @@ class AutoSpectralTab(QWidget):
         grp = QGroupBox('Stored AF Profiles')
         layout = QVBoxLayout(grp)
 
-        self._profile_plot_axis = BottomAxisVerticalTickLabels()
+        self._profile_plot_axis = BottomAxisVerticalTickLabels(angle=45)
         self._profile_plot = pg.PlotWidget(axisItems={'bottom': self._profile_plot_axis})
         self._profile_plot.setLabel('left', 'Intensity')
         self._profile_plot.showGrid(x=True, y=True, alpha=0.3)

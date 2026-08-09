@@ -11,7 +11,7 @@ import datetime
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, Slot
-from PySide6.QtGui import QFontMetrics, QColor
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QSplitter, QHeaderView, QFileDialog,
@@ -433,22 +433,8 @@ class ReferenceLibraryWidget(QWidget):
         }
         # the plot is widened below to guarantee room, so every detector is labelled
         self._axis_bottom.setTicks([pairs, []])
-        self._reserve_axis_height([label for _, label in pairs])
         self.plot_widget.setMinimumWidth(_MIN_PX_PER_CHANNEL * len(channels) + 120)
         self.plot_widget.setXRange(-0.5, len(channels) - 0.5, padding=0.02)
-
-    def _reserve_axis_height(self, labels):
-        """Give the bottom axis enough height for the rotated labels.
-
-        A label rotated by 45 degrees needs roughly ``(width + height) * sin(45)``
-        of vertical space, plus the tick offset. Without reserving it the longest
-        detector names get clipped by whatever sits below the plot."""
-        if not labels:
-            return
-        metrics = QFontMetrics(self.font())
-        longest = max(metrics.horizontalAdvance(label) for label in labels)
-        needed = (longest + metrics.height()) * 0.75 + 46
-        self._axis_bottom.setHeight(int(needed))
 
     def _clear_legend(self):
         self._legend_layout.clear()

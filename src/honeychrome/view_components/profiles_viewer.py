@@ -14,6 +14,9 @@ from honeychrome.view_components.help_toggle_widget import WheelBlocker
 from honeychrome.controller_components.cytometer_whitelist import (
     get_detector_laser_map, LASER_LABEL_COLORS,
 )
+from honeychrome.view_components.cytometry_plot_components import (
+    ROTATED_LABEL_HEIGHT, TICK_TEXT_OFFSET,
+)
 
 
 # --------------------- Flow Layout -------------------------
@@ -115,7 +118,7 @@ class LegendEntry(QWidget):
 
 
 class BottomAxisVerticalTickLabels(pg.AxisItem):
-    def __init__(self, angle=90, **kwargs):
+    def __init__(self, angle=45, **kwargs):
         self.angle = angle
         self._label_padding = 15
         self.orientation = 'bottom'
@@ -126,17 +129,23 @@ class BottomAxisVerticalTickLabels(pg.AxisItem):
         self.setStyle(tickTextOffset=30, tickLength=5)
 
     def setTicks(self, ticks):
-        extra_offset = int(10 + abs(self.angle) * 0.4)
-        self.setStyle(tickTextOffset=extra_offset)
+        self.setStyle(tickTextOffset=TICK_TEXT_OFFSET)
         super().setTicks(ticks)
+        self.setHeight(ROTATED_LABEL_HEIGHT if self.angle and ticks else None)
         self.updateGeometry()
         self.update()
 
+    def _labels_are_rotated(self):
+        """Only the explicitly set detector labels are drawn at an angle; the
+        automatic numeric ticks of an empty plot stay horizontal."""
+        return self.orientation == 'bottom' and self.angle and self._tickLevels
+
     def generateDrawSpecs(self, p):
-        # Temporarily expand boundingRect so pyqtgraph's edge-cull check
-        # (br & rect != rect) never drops labels at the first/last detectors.
-        # After rotation in drawPicture, labels extend upward into the axis
-        # area, not sideways, so no horizontal clipping actually occurs.
+        if not self._labels_are_rotated():
+            return super().generateDrawSpecs(p)
+        # Rotated labels extend past the axis rect, so widen it for pyqtgraph's
+        # edge-cull check (br & rect != rect) or the first and last detectors
+        # lose their label.
         orig_boundingRect = self.boundingRect
 
         def _expanded_boundingRect():
@@ -155,6 +164,7 @@ class BottomAxisVerticalTickLabels(pg.AxisItem):
 
         tick_colors = getattr(self, 'tick_colors', {})
         default_pen = p.pen()
+        rotated = self._labels_are_rotated()
 
         p.save()
         try:
@@ -164,18 +174,10 @@ class BottomAxisVerticalTickLabels(pg.AxisItem):
                     color = tick_colors.get(text)
                     p.setPen(QPen(color) if color else default_pen)
 
-                    if self.orientation == 'bottom' and self.angle == 90:
-                        tick_anchor = QPointF(rect.center().x(), rect.top())
-                        p.translate(tick_anchor)
-                        p.rotate(-self.angle)
-                        label_padding = -15
-                        text_rect = QRectF(label_padding, -rect.height() / 2, rect.width(), rect.height())
-                        p.drawText(text_rect, int(Qt.AlignLeft | Qt.AlignVCenter), text)
-                    elif self.orientation == 'bottom' and self.angle:
-                        # Any other angle (e.g. 45 deg): anchor at the tick and let the
-                        # label trail away down-left, so labels never overlap each other.
-                        tick_anchor = QPointF(rect.center().x(), rect.top())
-                        p.translate(tick_anchor)
+                    if rotated:
+                        # Anchor at the tick and let the label trail away down-left,
+                        # so labels never overlap each other.
+                        p.translate(QPointF(rect.center().x(), rect.top()))
                         p.rotate(-self.angle)
                         text_rect = QRectF(-rect.width() - 4, -rect.height() / 2,
                                            rect.width(), rect.height())
@@ -219,7 +221,7 @@ class ProfilesViewer(QFrame):
         self.layout.addWidget(self.legendContainer)
 
         # Create the PyQtGraph widget
-        bottom_axis_vertical_tick_labels = BottomAxisVerticalTickLabels()
+        bottom_axis_vertical_tick_labels = BottomAxisVerticalTickLabels(angle=45)
         self.plot_widget = TransparentPlotWidget(axisItems={'bottom': bottom_axis_vertical_tick_labels})
         self.layout.addWidget(self.plot_widget, stretch=1)
         vb = self.plot_widget.getViewBox()

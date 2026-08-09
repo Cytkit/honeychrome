@@ -341,7 +341,7 @@ class CytometryPlotWidget(QFrame):
                 tick_colors = {}
 
             self.axis_bottom.tick_colors = tick_colors
-            self.axis_bottom.setTicks(ticks, angle=90)
+            self.axis_bottom.setTicks(ticks, angle=45)
             self.axis_left.setTicks(self.transformations['ribbon'].ticks())
             self.axis_left.zoomZero = self.transformations['ribbon'].zero
             self.vb.setMouseEnabled(x=False, y=False)
