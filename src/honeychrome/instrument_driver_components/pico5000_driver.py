@@ -101,7 +101,7 @@ def generate_test_signal():
 
 
 from scipy import signal
-sos_butter = signal.butter(4, 0.4e6, fs=1 / deltaT, output='sos')
+sos_butter = signal.butter(4, 1.25e6, fs=1e9 / SAMPLE_INTERVAL_NS, output='sos')
 def filter_and_decimate(trace):
     trace = signal.sosfiltfilt(sos_butter, trace)
     trace = trace[::analysis_decimation]
@@ -243,6 +243,8 @@ if __name__ == '__main__':
     pico_device.start_acquisition()
     blob = pico_device.read_out_traces()
     traces = blob.reshape((-1, n_channels_trace, n_time_points_in_event))
+
+    pico_device.disconnect()
 
     from matplotlib import pyplot as plt
     fig, ax = plt.subplots(3)
