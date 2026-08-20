@@ -131,3 +131,15 @@ class CytkitDevice:
         memory_head, memory_tail, n_events_in_memory = self._get_memory_head_tail_n_events()
         blob_of_traces_as_array = self._pop_from_memory(memory_head, memory_tail)
         return blob_of_traces_as_array
+
+
+
+if __name__ == '__main__':
+
+    cytkit_device = CytkitDevice()
+    cytkit_device.connect_to_device()
+    cytkit_device.start_acquisition()
+    blob = cytkit_device.read_out_traces()
+
+    cytkit_device.disconnect()
+
