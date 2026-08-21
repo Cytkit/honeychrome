@@ -20,18 +20,30 @@ class CytkitDevice:
         read_out_traces
     """
     def __init__(self):
-        # TODO: why can't we have two SPI devices? is there a loss of efficiency here if we have one and keep initialising it for registers vs memory?
         self.devA = None
-        # self.devB = None
+        self.devB = None
 
     def connect_to_device(self):
-        self.devA = ft4222.openByDescription('FT4222 A')
-        # self.devB = ft4222.openByDescription('FT4222 B')
-        #self.devA.spiMaster_Init(Mode.QUAD, Clock.DIV_2, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0) # for registers
-        # self.devA.spiMaster_Init(Mode.QUAD, Clock.DIV_2, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS1) # for memory
-        self._configure_instrument()
-        print('[Instrument driver] Connected')
-        return {'source':'[Instrument driver]', 'status':'OK', 'message':'Connected to instrument'}
+        num_devices = ft4222.createDeviceInfoList()
+        for n in range(num_devices):
+            device_info_detail = ft4222.getDeviceInfoDetail(n)
+
+            if device_info_detail['description'] == b'FT4222 A':
+                self.devA = ft4222.openByDescription('FT4222 A')
+
+            if device_info_detail['description'] == b'FT4222 B':
+                self.devB = ft4222.openByDescription('FT4222 B')
+
+        if self.devA and self.devB:
+            self.devA.spiMaster_Init(Mode.QUAD, Clock.DIV_2, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0)  # for registers
+            self.devB.spiMaster_Init(Mode.QUAD, Clock.DIV_2, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0)  # for memory
+
+            self._configure_instrument()
+            print('[Cytkit driver] Connected')
+            return {'source':'[Cytkit driver]', 'status':'OK', 'message':'Connected to Cytkit'}
+
+        else:
+            raise ConnectionError
 
     def disconnect(self):
         pass
@@ -51,16 +63,15 @@ class CytkitDevice:
 
     def _memory_select(self):
         # call this every time to read from memory
-        self.devA.spiMaster_Init(Mode.QUAD, Clock.DIV_2, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0) # for memory
-        # TODO why doesn't SS1 work?
+        self.devB.spiMaster_Init(Mode.QUAD, Clock.DIV_2, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0) # for memory
 
     def _register_write(self, register_name, data_to_write):
-        self._register_select()
+        # self._register_select()
         byte_string = operation_register + registers_map[register_name].to_bytes(2) + dummy_bytes + data_to_write
         self.devA.spiMaster_MultiReadWrite(0, byte_string, 0)
 
     def _register_read(self, register_name, data_size):
-        self._register_select()
+        # self._register_select()
         byte_string = operation_memory + registers_map[register_name].to_bytes(2) + dummy_bytes
         return self.devA.spiMaster_MultiReadWrite(0, byte_string, data_size)
 
@@ -94,7 +105,7 @@ class CytkitDevice:
         self._register_write('ENABLES', data_to_write)
 
     def _get_memory_head_tail_n_events(self):
-        self._register_select()
+        # self._register_select()
 
         byte_string_to_write = operation_register + registers_map['MEMHEAD'].to_bytes(2) + dummy_bytes
         byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
