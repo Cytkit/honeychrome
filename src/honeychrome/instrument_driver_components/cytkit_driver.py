@@ -107,15 +107,15 @@ class CytkitDevice:
     def _get_memory_head_tail_n_events(self):
         # self._register_select()
 
-        byte_string_to_write = operation_register + registers_map['MEMHEAD'].to_bytes(2) + dummy_bytes
+        byte_string_to_write = operation_register + registers_map['MEM_ADDR_L'].to_bytes(2) + dummy_bytes
         byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
         memory_head = int.from_bytes(byte_string_output)
 
-        byte_string_to_write = operation_register + registers_map['MEMTAIL'].to_bytes(2) + dummy_bytes
+        byte_string_to_write = operation_register + registers_map['MEM_ADDR_H'].to_bytes(2) + dummy_bytes
         byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
         memory_tail = int.from_bytes(byte_string_output)
 
-        byte_string_to_write = operation_register + registers_map['NEVENTS'].to_bytes(2) + dummy_bytes
+        byte_string_to_write = operation_register + registers_map['MEM_ADDR_U'].to_bytes(2) + dummy_bytes
         byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
         n_events_in_memory = int.from_bytes(byte_string_output)
 
@@ -151,6 +151,8 @@ if __name__ == '__main__':
     cytkit_device.connect_to_device()
     cytkit_device.start_acquisition()
     blob = cytkit_device.read_out_traces()
+
+    print(blob.shape)
 
     cytkit_device.disconnect()
 
