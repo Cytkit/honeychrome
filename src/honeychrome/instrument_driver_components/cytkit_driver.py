@@ -1,3 +1,5 @@
+import time
+
 import ft4222
 from ft4222.SPI import Cpha, Cpol
 from ft4222.SPIMaster import Mode, Clock, SlaveSelect
@@ -72,7 +74,7 @@ class CytkitDevice:
 
     def _register_read(self, register_name, data_size):
         # self._register_select()
-        byte_string = operation_memory + registers_map[register_name].to_bytes(2) + dummy_bytes
+        byte_string = operation_register + registers_map[register_name].to_bytes(2) + dummy_bytes
         return self.devA.spiMaster_MultiReadWrite(0, byte_string, data_size)
 
     def _memory_read(self, start_address, total_bytes, chunk_size=65535):
@@ -101,8 +103,13 @@ class CytkitDevice:
         pump_sheath_enable = True
         pump_sample_enable = True
         laser_enable = True
-        data_to_write = bitarray([False, False, False, False, fan_enable, pump_sheath_enable, pump_sample_enable, laser_enable]).tobytes()
+        data_to_write =  b'\x00' + bitarray([False, False, False, False, fan_enable, pump_sheath_enable, pump_sample_enable, laser_enable]).tobytes()
+        # data_to_write = bitarray([True, True, True, True, True, True, True, True]).tobytes()
+        print(data_to_write)
         self._register_write('ENABLES', data_to_write)
+
+        test_response = self._register_read('ENABLES', 2)
+        print(test_response)
 
     def _get_memory_head_tail_n_events(self):
         # self._register_select()
@@ -149,6 +156,9 @@ if __name__ == '__main__':
 
     cytkit_device = CytkitDevice()
     cytkit_device.connect_to_device()
+
+    time.sleep(1)
+
     cytkit_device.start_acquisition()
     blob = cytkit_device.read_out_traces()
 
