@@ -3,14 +3,15 @@ This is the default configuration for the instrument driver
 '''
 
 # FGPA and communication settings
-operation_register = b'\x01'
-operation_memory = b'\x02'
+operation_write = b'\x01'
+operation_read = b'\x02'
 dummy_bytes = b'\x00\x00'
 memory_start_address = 0
 memory_end_address = 1_000_000
 
 registers_map = {
-    'ENABLES': 0x0010,
+    'ID_WORD': 0x0001,
+    'LASER': 0x0010,
     'PMP_SMP_SPD': 0x0011,
     'PMP_SHT_SPD': 0x0012,
     'MISC': 0x0015,

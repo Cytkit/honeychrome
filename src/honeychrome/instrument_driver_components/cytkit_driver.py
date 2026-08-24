@@ -7,7 +7,7 @@ from bitarray import bitarray
 import numpy as np
 
 from honeychrome.settings import traces_cache_dtype
-from honeychrome.instrument_driver_components.cytkit_configuration import operation_register, operation_memory, dummy_bytes, memory_start_address, memory_end_address, registers_map
+from honeychrome.instrument_driver_components.cytkit_configuration import operation_write, operation_read, dummy_bytes, memory_start_address, memory_end_address, registers_map
 
 empty_array = np.array([], dtype=np.uint16)
 
@@ -37,8 +37,8 @@ class CytkitDevice:
                 self.devB = ft4222.openByDescription('FT4222 B')
 
         if self.devA and self.devB:
-            self.devA.spiMaster_Init(Mode.QUAD, Clock.DIV_2, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0)  # for registers
-            self.devB.spiMaster_Init(Mode.QUAD, Clock.DIV_2, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0)  # for memory
+            self._register_init()
+            self._memory_init()
 
             self._configure_instrument()
             print('[Cytkit driver] Connected')
@@ -59,70 +59,61 @@ class CytkitDevice:
     def change_device_settings(self, settings):
         pass
 
-    def _register_select(self):
-        # call this every time to write to or read from registers
-        self.devA.spiMaster_Init(Mode.QUAD, Clock.DIV_2, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0) # for registers
+    def _register_init(self):
+        self.devA.spiMaster_Init(Mode.QUAD, Clock.DIV_4, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0) # for registers
 
-    def _memory_select(self):
-        # call this every time to read from memory
-        self.devB.spiMaster_Init(Mode.QUAD, Clock.DIV_2, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0) # for memory
+    def _memory_init(self):
+        self.devB.spiMaster_Init(Mode.QUAD, Clock.DIV_4, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0) # for memory
 
     def _register_write(self, register_name, data_to_write):
-        # self._register_select()
-        byte_string = operation_register + registers_map[register_name].to_bytes(2) + dummy_bytes + data_to_write
-        self.devA.spiMaster_MultiReadWrite(0, byte_string, 0)
+        if type(data_to_write) != int:
+            raise TypeError
 
-    def _register_read(self, register_name, data_size):
-        # self._register_select()
-        byte_string = operation_register + registers_map[register_name].to_bytes(2) + dummy_bytes
-        return self.devA.spiMaster_MultiReadWrite(0, byte_string, data_size)
+        byte_string = operation_write + registers_map[register_name].to_bytes(2, byteorder='big') + dummy_bytes + data_to_write.to_bytes(2, byteorder='big')
+        self.devA.spiMaster_MultiReadWrite(b'', byte_string, 0)
 
-    def _memory_read(self, start_address, total_bytes, chunk_size=65535):
-        self._memory_select()
+    def _register_read(self, register_name):
+        byte_string = operation_read + registers_map[register_name].to_bytes(2, byteorder='big')
+        data_read = self.devA.spiMaster_MultiReadWrite(b'', byte_string, 4) # 2 bytes dummy, 2 bytes register
+        return int.from_bytes(data_read[2:], byteorder='big', signed=False)
 
+    def _memory_read(self, total_bytes, chunk_size=65535):
         # read out block of memory in chunks
         data = bytearray(total_bytes)
         bytes_read = 0
-        capture_address = start_address
         while bytes_read < total_bytes:
             # Calculate how many bytes to read in this chunk
             remaining = total_bytes - bytes_read
             current_chunk = min(chunk_size, remaining)
-            capture_address += current_chunk
 
             # Write address and read the chunk
-            byte_string = operation_memory + capture_address.to_bytes(3) + dummy_bytes
-            chunk = self.devA.spiMaster_MultiReadWrite(0, byte_string, current_chunk)
+            chunk = self.devB.spiMaster_MultiReadWrite(b'', b'', current_chunk)
             data.extend(chunk)
             bytes_read += len(chunk)
 
         return bytes(data)
 
     def _configure_instrument(self):
-        fan_enable = True
-        pump_sheath_enable = True
-        pump_sample_enable = True
-        laser_enable = True
-        data_to_write =  b'\x00' + bitarray([False, False, False, False, fan_enable, pump_sheath_enable, pump_sample_enable, laser_enable]).tobytes()
-        # data_to_write = bitarray([True, True, True, True, True, True, True, True]).tobytes()
-        print(data_to_write)
-        self._register_write('ENABLES', data_to_write)
+        id_word = self._register_read('ID_WORD')
+        print(id_word)
 
-        test_response = self._register_read('ENABLES', 2)
-        print(test_response)
+        self._register_write('LASER', 1)
+
+
+
 
     def _get_memory_head_tail_n_events(self):
         # self._register_select()
 
-        byte_string_to_write = operation_register + registers_map['MEM_ADDR_L'].to_bytes(2) + dummy_bytes
+        byte_string_to_write = operation_write + registers_map['MEM_ADDR_L'].to_bytes(2) + dummy_bytes
         byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
         memory_head = int.from_bytes(byte_string_output)
 
-        byte_string_to_write = operation_register + registers_map['MEM_ADDR_H'].to_bytes(2) + dummy_bytes
+        byte_string_to_write = operation_write + registers_map['MEM_ADDR_H'].to_bytes(2) + dummy_bytes
         byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
         memory_tail = int.from_bytes(byte_string_output)
 
-        byte_string_to_write = operation_register + registers_map['MEM_ADDR_U'].to_bytes(2) + dummy_bytes
+        byte_string_to_write = operation_write + registers_map['MEM_ADDR_U'].to_bytes(2) + dummy_bytes
         byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
         n_events_in_memory = int.from_bytes(byte_string_output)
 
