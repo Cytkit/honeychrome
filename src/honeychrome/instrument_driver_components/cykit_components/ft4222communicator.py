@@ -54,6 +54,21 @@ class Ft4222Communicator:
         data_read = self.devA.spiMaster_MultiReadWrite(b'', byte_string, 4) # 2 bytes dummy, 2 bytes register
         return int.from_bytes(data_read[2:], byteorder='big', signed=False)
 
+    def register_2byte_write(self, register_low, register_high, data_to_write):
+        self.register_write(register_low, (data_to_write >> 8) & 0xFFFF)
+        self.register_write(register_high, (data_to_write >> 16) & 0xFFFF)
+
+    def register_2byte_read(self, register_low, register_high):
+        value = self.register_read(register_high) << 16
+        value |= self.register_read(register_low)
+        return value
+
+    def register_read_modify_write(self, register_name, value, mask):
+        working_value = self.register_read(register_name)
+        working_value &= ~mask # sets masked bits to zero, keeps all other bits
+        working_value |= (value & mask) # sets masked bits to value, keeps all other bits
+        self.register_write(register_name, working_value)
+
     def memory_read(self, total_bytes, chunk_size=65535):
         # read out block of memory in chunks
         data = bytearray(total_bytes)

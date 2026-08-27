@@ -5,6 +5,8 @@ import numpy as np
 from honeychrome.instrument_driver_components.cykit_components.ft4222communicator import Ft4222Communicator
 from honeychrome.instrument_driver_components.cykit_components.fan import Fan
 from honeychrome.instrument_driver_components.cykit_components.laser import Laser
+from honeychrome.instrument_driver_components.cykit_components.sample_pump import SamplePump
+from honeychrome.instrument_driver_components.cykit_components.sheath_pump import SheathPump
 
 
 class CytkitDevice:
