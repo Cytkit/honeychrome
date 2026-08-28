@@ -125,10 +125,35 @@ class Pressure:
 
 
     def set_offset(self, offset, units):
+        self.readback_offset = convert_unit_to_psi(offset, units)
+
     def get_offset(self, units):
+        return convert_psi_to_unit(self.readback_offset, units)
 
     def _sensor_reset(self):
-    def _sensor_load_coeff_data(self):
+        self._sensor_write_read(0x1E, 8, 5)
+
+    def _sensor_PROM_read(self, address):
+        command = 0xA0 + ((address & 0x07) << 1)
+        command <<= 16
+
+        return self._sensor_write_read(command, 24, 0) & 0xFFFF
+
+    def _sensor_conversion_start(self, D1_D2, OSR):
+        command = 0x40 + ((OSR & 0x07) << 1)
+        if D1_D2:
+            command |= 0x10
+
+        self._sensor_write_read(command, 8, 15)
+
+    def _sensor_ADC_read(self):
+        pass
+
+    def _sensor_get_raw_pressure(self):
+        pass
+
+    def _sensor_get_raw_temperature(self):
+        pass
 
     def _sensor_load_cal_data(self):
         # Clear the calibration data
@@ -144,19 +169,6 @@ class Pressure:
 
         # Check the CRC
         CRC_calculated = self._CRC_calculate()
-
-    def _sensor_write_read(self, data_out, size, cs_delay):
-
-        self.ft4222.register_write('PRES_TXFR_SIZE', size) # Set the transfer size in bits
-        self.ft4222.register_2byte_write('PRES_DATA_L', 'PRES_DATA_H', data_out)
-        self.ft4222.register_write('PRES_CS_WAIT', cs_delay) # Set the CSDelay in ~650us steps
-        self.ft4222.register_write('PRES_CTRL', 1)	#Start the transfer
-
-        while not (self.ft4222.register_read('PRES_CTRL') & 0x0010): # Wait for completion
-            pass
-
-        data_return = self.ft4222.register_2byte_read('PRES_DATA_L', 'PRES_DATA_H')
-        return data_return
 
     def _CRC_calculate(self):
         n_rem = 0x00;
@@ -181,3 +193,16 @@ class Pressure:
 
         return n_rem ^ 0x00
 
+
+    def _sensor_write_read(self, data_out, size, cs_delay):
+
+        self.ft4222.register_write('PRES_TXFR_SIZE', size) # Set the transfer size in bits
+        self.ft4222.register_2byte_write('PRES_DATA_L', 'PRES_DATA_H', data_out)
+        self.ft4222.register_write('PRES_CS_WAIT', cs_delay) # Set the CSDelay in ~650us steps
+        self.ft4222.register_write('PRES_CTRL', 1)	#Start the transfer
+
+        while not (self.ft4222.register_read('PRES_CTRL') & 0x0010): # Wait for completion
+            pass
+
+        data_return = self.ft4222.register_2byte_read('PRES_DATA_L', 'PRES_DATA_H')
+        return data_return
