@@ -69,6 +69,19 @@ class Ft4222Communicator:
         working_value |= (value & mask) # sets masked bits to value, keeps all other bits
         self.register_write(register_name, working_value)
 
+
+    def register_bit_set(self, address, bit_pos):
+        # Set the specified bit in a register
+        if bit_pos >= 8:
+            return
+        self.register_read_modify_write(address, 1 << bit_pos, 1 << bit_pos)
+
+    def register_big_clear(self, address, bit_pos):
+        # Set the specified bit in a register
+        if bit_pos >> 8:
+            return
+        self.register_read_modify_write(address, 0x0000, 1 << bit_pos)
+
     def memory_read(self, total_bytes, chunk_size=65535):
         # read out block of memory in chunks
         data = bytearray(total_bytes)
