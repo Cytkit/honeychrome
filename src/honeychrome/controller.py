@@ -1015,15 +1015,18 @@ class Controller(QObject):
     def reapply_fine_tuning(self):
         self._reapply_fine_tuning_impl()
 
+
     @Slot()
-    def on_gain_change(self, ch_name, value):
-        logger.info(f"{ch_name} gain changed to {value}")
-
-
-    def connect_instrument(self):
-        self.pipe_connection_instrument.send({'command': 'connect'})
+    def find_and_connect_instrument(self):
+        self.pipe_connection_instrument.send({'command': 'find_and_connect'})
         response = self.pipe_connection_instrument.recv()
-        #TODO self.view.display_instrument_status(response)
+        #TODO display response
+        logger.info(response)
+
+    @Slot()
+    def initialise_instrument(self):
+        self.pipe_connection_instrument.send({'command': 'initialise'})
+        response = self.pipe_connection_instrument.recv()
         logger.info(response)
 
     @Slot()
@@ -1045,7 +1048,7 @@ class Controller(QObject):
         self.load_sample(self.live_sample_path) # this sets off thread for update_hists_and_stats through initialise_data_for_cytometry_plots call
 
         # start acquisition on instrument
-        self.pipe_connection_instrument.send({'command': 'start'})
+        self.pipe_connection_instrument.send({'command': 'start_acquisition'})
         response = self.pipe_connection_instrument.recv()
         logger.info(response)
 
@@ -1062,7 +1065,7 @@ class Controller(QObject):
     @Slot()
     def stop_acquisition(self):
         # stop instrument
-        self.pipe_connection_instrument.send({'command': 'stop'})
+        self.pipe_connection_instrument.send({'command': 'stop_acquisition'})
         response = self.pipe_connection_instrument.recv()
         logger.info(response)
 
@@ -1107,14 +1110,21 @@ class Controller(QObject):
         if self.bus is not None:
             self.bus.sampleTreeUpdated.emit()
 
+    @Slot()
+    def restart_acquisition(self):
+        pass
 
+    @Slot()
+    def flush_sip(self):
+        pass
 
-    def update_instrument_settings(self):
-        self.pipe_connection_instrument.send({'command': 'set', 'data': 'TODO insert settings update here'})
-        response = self.pipe_connection_instrument.recv()
+    @Slot()
+    def backflush_sip(self):
+        pass
 
-        logger.info(response)
-        # TODO self.view.display_instrument_status(response)
+    @Slot(str, int)
+    def on_gain_change(self, ch_name, value):
+        logger.info(f"{ch_name} gain changed to {value}")
 
     def quit_instrument_quit_analyser(self):
         self.pipe_connection_analyser.send({'command': 'quit'})  # quit analyser
@@ -1838,7 +1848,7 @@ if __name__ == '__main__':
     quit instrument
     '''
     # connect instrument
-    kc.connect_instrument()
+    kc.find_and_connect_instrument()
 
     # create blank sample
     kc.new_sample('A0 Label (Cells)', 'single_stain_controls') # this autosaves the empty sample and experiment again

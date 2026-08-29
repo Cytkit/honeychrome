@@ -12,12 +12,36 @@ from honeychrome.instrument_driver_components.cykit_components.sheath_pump impor
 class CytkitDevice:
     """
     Device driver must provide the following methods:
-        connect_to_device
+        find_and_connect_to_device
+            no arguments
+            return status, message
         disconnect
+            no arguments
+            no return
+        initialise
+            no arguments
+            return status, message
         start_acquisition
+            no arguments
+            return status, message
         stop_acquisition
-        change_device_settings
+            no arguments
+            return status, message
+        get_state
+            argument: list of parameters to get, if list is empty gets everything
+            return status, message (where message is dict of parameters)
+        set_state
+            argument: dict of parameters to set
+            return status, message
+        flush_sip
+            no arguments
+            return status, message
+        backflush_sip
+            no arguments
+            return status, message
         read_out_traces
+            no arguments
+            returns blob of traces
     """
     def __init__(self):
         self.ft4222 = Ft4222Communicator()
@@ -28,7 +52,7 @@ class CytkitDevice:
         self.sheath_pump = None
         self.vi_monitor = None
 
-    def connect_to_device(self):
+    def find_and_connect_to_device(self):
         self.ft4222.find_and_connect()
 
         # if the connection above worked, initialise the hardware wrappers
@@ -40,7 +64,7 @@ class CytkitDevice:
         self.vi_monitor = VIMonitor(self.ft4222)
 
         # then configure the hardware
-        self._configure_instrument()
+        self.initialise()
 
         print('[Cytkit driver] Connected')
         return {'source': '[Cytkit driver]', 'status': 'OK', 'message': 'Connected to Cytkit'}
@@ -48,25 +72,37 @@ class CytkitDevice:
     def disconnect(self):
         pass
 
+    def initialise(self):
+        id_word = self.ft4222.register_read('ID_WORD')
+        print(id_word)
+
+        self.laser.set_state(1) # turn on laser
+
+        return 'OK', 'Cytkit initialised'
+
     def start_acquisition(self):
-        pass
+        return 'OK', 'Cytkit started acquisition'
 
     def stop_acquisition(self):
-        pass
+        return 'OK', 'Cytkit stopped acquisition'
 
-    def change_device_settings(self, settings):
-        pass
+    def set_state(self, dict_of_parameters):
+        return 'OK', 'Cytkit state set'
+
+    def get_state(self, list_of_parameters):
+        return 'OK', {parameter:None for parameter in list_of_parameters}
+
+    def flush_sip(self):
+        return 'OK', 'Cytkit SIP flushed'
+
+    def backflush_sip(self):
+        return 'OK', 'Cytkit SIP backflushed'
+
 
     def read_out_traces(self):
         memory_head, memory_tail, n_events_in_memory = self.ft4222.get_memory_head_tail_n_events()
         blob_of_traces_as_array = self.ft4222.pop_from_memory(memory_head, memory_tail)
         return blob_of_traces_as_array
-
-    def _configure_instrument(self):
-        id_word = self.ft4222._register_read('ID_WORD')
-        print(id_word)
-
-        self.laser.set_state(1) # turn on laser
 
 
 if __name__ == '__main__':

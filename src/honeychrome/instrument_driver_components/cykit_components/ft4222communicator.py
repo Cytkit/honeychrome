@@ -3,10 +3,11 @@ import ft4222
 from ft4222.SPI import Cpha, Cpol
 from ft4222.SPIMaster import Mode, Clock, SlaveSelect
 
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import operation_write, operation_read, dummy_bytes, memory_start_address, memory_end_address, registers_map
+from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import operation_write, operation_read, dummy_bytes, memory_start_address, memory_end_address, registers_map, lookup_address
 from honeychrome.settings import traces_cache_dtype
 
 empty_array = np.array([], dtype=np.uint16)
+
 
 class Ft4222Communicator:
     def __init__(self):
@@ -42,15 +43,15 @@ class Ft4222Communicator:
     def _memory_init(self):
         self.devB.spiMaster_Init(Mode.QUAD, Clock.DIV_4, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0) # for memory
 
-    def register_write(self, register_name, data_to_write):
+    def register_write(self, register, data_to_write):
         if type(data_to_write) != int:
             raise TypeError
 
-        byte_string = operation_write + registers_map[register_name].to_bytes(2, byteorder='big') + dummy_bytes + data_to_write.to_bytes(2, byteorder='big')
+        byte_string = operation_write + lookup_address(register) + dummy_bytes + data_to_write.to_bytes(2, byteorder='big')
         self.devA.spiMaster_MultiReadWrite(b'', byte_string, 0)
 
-    def register_read(self, register_name):
-        byte_string = operation_read + registers_map[register_name].to_bytes(2, byteorder='big')
+    def register_read(self, register):
+        byte_string = operation_read + lookup_address(register)
         data_read = self.devA.spiMaster_MultiReadWrite(b'', byte_string, 4) # 2 bytes dummy, 2 bytes register
         return int.from_bytes(data_read[2:], byteorder='big', signed=False)
 

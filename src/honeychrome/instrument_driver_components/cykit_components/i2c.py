@@ -1,87 +1,68 @@
+import time
+
+from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import lookup_address
+
+
 class I2C:
-    def __init__(self, ft4222_communicator, base_address):
+    def __init__(self, ft4222_communicator, base_register, bus_name):
         self.ft4222 = ft4222_communicator
-        self.base_address = base_address
+        self.base_address = lookup_address(base_register)
+        self.bus_name = bus_name
 
-        BaseAddress + 0x0000
+    def write(self, address, write_buffer, write_size):
+        self._write_read(address, write_buffer, write_size, None, 0, 'Write')
 
-    def write:
+    def read(self, address, read_buffer, read_size):
+        self._write_read(address, None, 0, read_buffer, read_size, 'Read')
 
-    def read:
-
-    def write_read:
+    def write_read(self, address, write_buffer, write_size, read_buffer, read_size):
+        self._write_read(address, write_buffer, write_size, read_buffer, read_size, 'WriteRead')
 
     def _write_read(self, address, write_buffer, write_size, read_buffer, read_size, caller_name):
-        if ~self.ft4222.is_connected():
+        if not self.ft4222.is_connected():
             return
 
-        '''
-        
-    // Check if running when expected to be idle
-	Status = DataLink->RegRead(BaseAddress + 0x0000);
-	if (!(Status & 0x0010))
-	{
-		Log->Printf(MSGLOG_LVL_WARNING, MSGLOG_MASK_I2C, "I2C [Bus %s] %s: Unexpectedly running I2C core [0x%04X].", BusName, CallerName, Status);
-	}
+        # Check if running when expected to be idle
+	    status = self.ft4222.register_read(self.base_address + 0x0000)
 
-    // Flush the FIFOs
-	DataLink->RegWrite(BaseAddress + 0x0000, 0x0002);
-    // Verify the FIFO levels
-    Status = DataLink->RegRead(BaseAddress + 0x0005);
-    if (Status != 0)
-	{
-		Log->Printf(MSGLOG_LVL_WARNING, MSGLOG_MASK_I2C, "I2C [Bus %s] %s: In FIFO Level not cleared (%u).", BusName, CallerName, Status);
-	}
-    Status = DataLink->RegRead(BaseAddress + 0x0006);
-    if (Status != 0)
-	{
-		Log->Printf(MSGLOG_LVL_WARNING, MSGLOG_MASK_I2C, "I2C [Bus %s] %s: Out FIFO Level not cleared (%u).", BusName, CallerName, Status);
-	}
+        # Flush the FIFOs
+        self.ft4222.register_write(self.base_address + 0x0000, 0x0002)
 
-    // Set the device address
-    DataLink->RegWrite(BaseAddress + 0x0001, Address >> 1);
-    // Load the write buffer
-    if (WriteBuffer)
-	{
-		for (Count=0; Count<WriteSize; Count++)
-		{
-			DataLink->RegWrite(BaseAddress + 0x0003, *WriteBuffer++);
-		}
-	}
-    // Set the read size
-    if (ReadBuffer)
-	{
-		DataLink->RegWrite(BaseAddress + 0x0002, ReadSize);
-	}
-	else
-	{
-		DataLink->RegWrite(BaseAddress + 0x0002, 0);
-	}
-    // Start the transfer
-    DataLink->RegWrite(BaseAddress + 0x0000, 0x0001);
-    // Wait for completion
-    Count = 0;
-    while (1)
-    {
-        Status = DataLink->RegRead(BaseAddress + 0x0000);
-        if (Status & 0x0010)
-		{
-			Log->Printf(MSGLOG_LVL_MESSAGE, MSGLOG_MASK_I2C, "I2C [Bus %s] %s: Complete [0x%04X].", BusName, CallerName, Status);
-			break;
-		}
-        Sleep(1);
-        Count++;
-        if (Count == 50)
-		{
-			Log->Printf(MSGLOG_LVL_WARNING, MSGLOG_MASK_I2C, "I2C [Bus %s] %s: Long wait detected [0x%04X].", BusName, CallerName, Status);
-		}
-		if (Count > 100000)
-		{
-			return false;
-		}
-    }
+        # Verify the FIFO levels
+        status = self.ft4222.register_read(self.base_address + 0x0005)
+        status = self.ft4222.register_read(self.base_address + 0x0006)
 
-    // Check FIFO level vs. ReadSize
+        # Set the device address
+        self.ft4222.register_write(self.base_address + 0x0001, address >> 1)
+        # Load the write buffer
+        if write_buffer:
+            for count in range(write_size):
+                self.ft4222.register_write(self.base_address + 0x0003, write_buffer[count])
+
+        # Set the read size
+        if read_buffer:
+            self.ft4222.register_read(self.base_address + 0x0002, read_size)
+        else:
+            self.ft4222.register_write(self.base_address + 0x0002, 0)
+
+        # Start the transfer
+        self.ft4222.register_write(self.base_address + 0x0000, 0x0001)
+        # Wait for completion
+        count = 0
+        while True:
+            status = self.ft4222.register_read(self.base_address + 0x0000)
+            time.sleep(1)
+            count += 1
+            if count > 100000:
+                return False
+
+            # Check FIFO level vs. ReadSize
+            self.ft4222.register_read(self.base_address + 0x0006)
+
+            status = self.ft4222.register_read(self.base_address + 0x0006)
+
+
+
 	Status = DataLink->RegRead(BaseAddress + 0x0006);
     if (ReadSize != Status)
 	{

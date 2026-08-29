@@ -27,6 +27,7 @@ class AcquisitionWidget(QWidget):
 
         acquisition_toolbar = QToolBar("Acquisition Toolbar")
         acquisition_toolbar.setMovable(False)
+        self.action_initialise = QAction(icon('plug-connected'), "Initialise", self)
         self.action_start_acquisition = QAction(icon('player-record', colour='red'), "Start Acquisition", self)
         self.action_stop_acquisition = QAction(icon('player-stop'), "Stop Acquisition", self)
         self.action_stop_acquisition.setEnabled(False)
@@ -34,8 +35,10 @@ class AcquisitionWidget(QWidget):
         self.action_restart_acquisition.setEnabled(False)
         self.action_flush = QAction(icon('wash'), "Flush", self)
         self.action_backflush = QAction(icon('wiper-wash'), "Backflush", self)
+        self.action_initialise.triggered.connect(self.initialise)
         self.action_start_acquisition.triggered.connect(self.start_acquisition)
         self.action_stop_acquisition.triggered.connect(self.stop_acquisition)
+        acquisition_toolbar.addAction(self.action_initialise)
         acquisition_toolbar.addAction(self.action_start_acquisition)
         acquisition_toolbar.addAction(self.action_stop_acquisition)
         acquisition_toolbar.addAction(self.action_restart_acquisition)
@@ -69,6 +72,9 @@ class AcquisitionWidget(QWidget):
         frame_layout.addLayout(slider_layout)
 
         layout.addWidget(frame)
+
+    def initialise(self):
+        pass
 
     def start_acquisition(self):
         self.action_start_acquisition.setEnabled(False)

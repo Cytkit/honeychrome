@@ -9,6 +9,14 @@ dummy_bytes = b'\x00\x00'
 memory_start_address = 0
 memory_end_address = 1_000_000
 
+def lookup_address(register):
+    if type(register) == str:
+        return registers_map[register].to_bytes(2, byteorder='big')
+    elif type(register) == int and 0 <= register and 255 >= register:
+        return register
+    else:
+        raise TypeError
+
 registers_map = {
     'RESERVED':	0x0000,   #
     'ID_WORD':	0x0001,   #	ID

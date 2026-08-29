@@ -33,12 +33,36 @@ def gaussian_rows_areas(x_grid, areas, mu, sigma):
 class DummyDevice:
     """
     Device driver must provide the following methods:
-        connect_to_device
+        find_and_connect_to_device
+            no arguments
+            return status, message
         disconnect
+            no arguments
+            no return
+        initialise
+            no arguments
+            return status, message
         start_acquisition
+            no arguments
+            return status, message
         stop_acquisition
-        change_device_settings
+            no arguments
+            return status, message
+        get_state
+            argument: list of parameters to get, if list is empty gets everything
+            return status, message (where message is dict of parameters)
+        set_state
+            argument: dict of parameters to set
+            return status, message
+        flush_sip
+            no arguments
+            return status, message
+        backflush_sip
+            no arguments
+            return status, message
         read_out_traces
+            no arguments
+            returns blob of traces
     """
     def __init__(self):
         sample = Sample(fcs_file)
@@ -51,20 +75,32 @@ class DummyDevice:
         self.fsc_height_index = fcs_file_channels.index('FSC-H')
         self.scale = magnitude_ceiling / int(sample.metadata['p2r'])
 
-    def connect_to_device(self):
-        pass
+    def find_and_connect_to_device(self):
+        return 'OK', 'Dummy device connected'
 
     def disconnect(self):
         pass
 
+    def initialise(self):
+        return 'OK', 'Dummy device initialised'
+
     def start_acquisition(self):
-        pass
+        return 'OK', 'Dummy device started acquisition'
 
     def stop_acquisition(self):
-        pass
+        return 'OK', 'Dummy device stopped acquisition'
 
-    def change_device_settings(self, settings):
-        pass
+    def set_state(self, dict_of_parameters):
+        return 'OK', 'Dummy device doesn''t have any parameters to set'
+
+    def get_state(self, list_of_parameters):
+        return 'OK', {parameter:None for parameter in list_of_parameters}
+
+    def flush_sip(self):
+        return 'OK', 'Dummy device doesn''t have a sip to flush'
+
+    def backflush_sip(self):
+        return 'OK', 'Dummy device doesn''t have a sip to backflush'
 
     def generate_traces(self, n):
         # reads events, returns a blob_np

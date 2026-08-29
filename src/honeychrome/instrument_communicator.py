@@ -67,7 +67,7 @@ class Instrument(mp.Process):
 
 
     def run(self):
-        self.connect_to_instrument()
+        self.find_and_connect_to_instrument()
 
         # initialise the things that can't be pickled
         self.stop_transfer = threading.Event()
@@ -91,14 +91,22 @@ class Instrument(mp.Process):
                 break
 
             response_to_experiment_control = None
-            if incoming_from_experiment_control['command'] == 'connect':
-                response_to_experiment_control = self.connect_to_instrument()
-            elif incoming_from_experiment_control['command'] == 'start':
+            if incoming_from_experiment_control['command'] == 'find_and_connect':
+                response_to_experiment_control = self.find_and_connect_to_instrument()
+            elif incoming_from_experiment_control['command'] == 'initialise':
+                response_to_experiment_control = self.initialise_instrument()
+            elif incoming_from_experiment_control['command'] == 'start_acquisition':
                 response_to_experiment_control = self.start_acquisition()
-            elif incoming_from_experiment_control['command'] == 'stop':
+            elif incoming_from_experiment_control['command'] == 'stop_acquisition':
                 response_to_experiment_control = self.stop_acquisition()
-            elif incoming_from_experiment_control['command'] == 'set':
-                response_to_experiment_control = self.change_instrument_settings(incoming_from_experiment_control['data'])
+            elif incoming_from_experiment_control['command'] == 'flush_sip':
+                response_to_experiment_control = self.flush_sip()
+            elif incoming_from_experiment_control['command'] == 'backflush_sip':
+                response_to_experiment_control = self.backflush_sip()
+            elif incoming_from_experiment_control['command'] == 'set_instrument_state':
+                response_to_experiment_control = self.set_instrument_state(incoming_from_experiment_control['data'])
+            elif incoming_from_experiment_control['command'] == 'get_instrument_state':
+                response_to_experiment_control = self.get_instrument_state(incoming_from_experiment_control['data'])
             elif incoming_from_experiment_control['command'] == 'quit':
                 response_to_experiment_control = {'source':'[Instrument driver]', 'status':'OK', 'message':' Quitting'}
                 self.pipe_connection.send(response_to_experiment_control)
@@ -115,7 +123,7 @@ class Instrument(mp.Process):
         print('[Instrument driver] Quit')
 
 
-    def connect_to_instrument(self):
+    def find_and_connect_to_instrument(self):
         for device_name in devices_boot_order:
             try:
                 if device_name == 'cytkit':
@@ -130,10 +138,10 @@ class Instrument(mp.Process):
                     from honeychrome.instrument_driver_components.dummy_driver import DummyDevice
                     device = DummyDevice()
 
-                device.connect_to_device()
+                status, message = device.find_and_connect_to_device()
                 self.device = device
                 print(f'[Instrument driver] {device_name} connected')
-                return {'source': '[Instrument driver]', 'status': 'OK', 'message': f'Connected to instrument {device_name}'}
+                return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
             except Exception as e:
                 print(f'[Instrument driver] {device_name} not connected: {e}')
@@ -143,9 +151,12 @@ class Instrument(mp.Process):
     def disconnect_instrument(self):
         self.device.disconnect()
 
+    def initialise_instrument(self):
+        status, message = self.device.initialise()
+        return {'source': '[Instrument driver]', 'status': status, 'message': message}
+
     def start_acquisition(self):
-        # TODO send registers to start pumps etc, initialise data collection in FPGA
-        self.device.start_acquisition()
+        status, message = self.device.start_acquisition()
         """Start transfer in a separate thread"""
         self.thread = threading.Thread(
             target=self.transfer,
@@ -153,19 +164,28 @@ class Instrument(mp.Process):
         )
         self.thread.start()
         print('[Instrument driver] Acquisition started')
-        return {'source':'[Instrument driver]', 'status':'OK', 'message':'Acquisition started'}
+        return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
     def stop_acquisition(self):
-        # TODO send registers to stop pumps etc, stop data collection in FPGA
-        self.device.stop_acquisition()
+        status, message = self.device.stop_acquisition()
         self.stop_transfer.set()
-        return {'source':'[Instrument driver]', 'status':'OK', 'message':'Acquisition ended'}
+        return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
-    def change_instrument_settings(self, data):
-        # TODO send registers to set pumps in FPGA etc
-        self.device.change_device_settings(data)
-        print(data)
-        return {'source':'[Instrument driver]', 'status':'OK', 'message':'Instrument configuration changed'}
+    def set_instrument_state(self, data):
+        status, message = self.device.set_state(data)
+        return {'source': '[Instrument driver]', 'status': status, 'message': message}
+
+    def get_instrument_state(self, data):
+        status, message = self.device.get_state(data)
+        return {'source': '[Instrument driver]', 'status': status, 'message': message}
+
+    def flush_sip(self, data):
+        status, message = self.device.flush_sip(data)
+        return {'source': '[Instrument driver]', 'status': status, 'message': message}
+
+    def backflush_sip(self, data):
+        status, message = self.device.backflush_sip(data)
+        return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
     def transfer(self):
         while True:
@@ -242,22 +262,22 @@ if __name__ == '__main__':
     )
     instrument.start()
 
-    pipe_experiment_instrument_e.send({'command':'connect'})
+    pipe_experiment_instrument_e.send({'command':'find_and_connect'})
     response = pipe_experiment_instrument_e.recv()
     print(response)
 
-    pipe_experiment_instrument_e.send({'command':'start'})
+    pipe_experiment_instrument_e.send({'command':'star_acquisition'})
     response = pipe_experiment_instrument_e.recv()
     print(response)
 
-    pipe_experiment_instrument_e.send({'command':'set', 'data':'TODO insert settings update here'})
+    pipe_experiment_instrument_e.send({'command':'set_instrument_state', 'data':'TODO insert settings update here'})
     response = pipe_experiment_instrument_e.recv()
     print(response)
 
     #wait for a bit
     time.sleep(1)
 
-    pipe_experiment_instrument_e.send({'command':'stop'})
+    pipe_experiment_instrument_e.send({'command':'stop_acquisition'})
     response = pipe_experiment_instrument_e.recv()
     print(response)
 

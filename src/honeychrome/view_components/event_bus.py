@@ -40,11 +40,13 @@ class EventBus(QObject):
     # update oscilloscope
 
     ### instrument control
+    findConnectInstrument = Signal()
+    initialiseInstrument = Signal()
     startAcquisition = Signal()
     stopAcquisition = Signal()
     restartAcquisition = Signal()
-    # flush
-    # backflush
+    flushSip = Signal()
+    backFlushSip = Signal()
     gainChanged = Signal(str, int) # change gains
 
     # update instrument configuration

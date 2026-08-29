@@ -113,18 +113,42 @@ def filter_and_decimate(trace):
 class Pico5000_Device:
     """
     Device driver must provide the following methods:
-        connect_to_device
+        find_and_connect_to_device
+            no arguments
+            return status, message
         disconnect
+            no arguments
+            no return
+        initialise
+            no arguments
+            return status, message
         start_acquisition
+            no arguments
+            return status, message
         stop_acquisition
-        change_device_settings
+            no arguments
+            return status, message
+        get_state
+            argument: list of parameters to get, if list is empty gets everything
+            return status, message (where message is dict of parameters)
+        set_state
+            argument: dict of parameters to set
+            return status, message
+        flush_sip
+            no arguments
+            return status, message
+        backflush_sip
+            no arguments
+            return status, message
         read_out_traces
+            no arguments
+            returns blob of traces
     """
     def __init__(self):
         self.buffer_list_a = []
         self.buffer_list_b = []
 
-    def connect_to_device(self):
+    def find_and_connect_to_device(self):
         # 1. Open and Power
         res = ps.ps5000aOpenUnit(ctypes.byref(chandle), None, resolution)
         error_name = PICO_STATUS_LOOKUP.get(res, "UNKNOWN")
@@ -187,12 +211,14 @@ class Pico5000_Device:
             self.buffer_list_a.append(buf_a)
             self.buffer_list_b.append(buf_b)
 
+        return 'OK', 'Picoscope 5000-series instrument connected'
+
 
     def disconnect(self):
         ps.ps5000aStop(chandle)
         ps.ps5000aCloseUnit(chandle)
 
-    def start_acquisition(self):
+    def initialise(self):
         # start arb sig generator
         if inject_signal:
             awg_buffer, delta_phase = generate_test_signal()
@@ -202,11 +228,25 @@ class Pico5000_Device:
                 delta_phase,  # stopDeltaPhase
                 0, 0, awg_buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)), len(awg_buffer), 0, 0, 0, 0, 0, 0, 0, 0)
 
-    def stop_acquisition(self):
-        pass
+        return 'OK', 'Picoscope 5000-series initialised'
 
-    def change_device_settings(self, settings):
-        pass
+    def start_acquisition(self):
+        return 'OK', 'Picoscope 5000-series started acquisition'
+
+    def stop_acquisition(self):
+        return 'OK', 'Picoscope 5000-series stopped acquisition'
+
+    def set_state(self, dict_of_parameters):
+        return 'OK', 'Picoscope 5000-series parameters are set elsewhere'
+
+    def get_state(self, list_of_parameters):
+        return 'OK', {parameter:None for parameter in list_of_parameters}
+
+    def flush_sip(self):
+        return 'OK', 'Picoscope 5000-series doesn''t provide flush'
+
+    def backflush_sip(self):
+        return 'OK', 'Picoscope 5000-series doesn''t provide backflush'
 
     def read_out_traces(self):
         # Start capturing MAX_SEGMENTS
