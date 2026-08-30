@@ -834,13 +834,7 @@ def apply_gates_in_place(data_for_cytometry_plots, gates_to_calculate=None):
                     scale_x = transform_x.scale
                     indices_x_data_searchsorted = np.searchsorted(scale_x, x) - 2
                     if len(scale_x) > len(lookup_tables[gate_id[0]]):
-                        # Clamp the top edge into the last table bin. `scale` carries
-                        # two ±inf sentinels so it's normally exactly one longer than
-                        # the table (harmless). For a *dynamic* (per-sample) Time gate
-                        # the table is rebuilt on load at this sample's own scale, so
-                        # only this one-bin edge is clamped; a *non-dynamic* Time gate
-                        # keeps a shared table built at a different scale, so this also
-                        # guards the larger mismatch (see apply_dynamic_gate_dimensions).
+                        # `scale` includes two infinity sentinels around the bins.
                         indices_x_data_searchsorted[indices_x_data_searchsorted >= len(lookup_tables[gate_id[0]])] = len(lookup_tables[gate_id[0]]) - 1
                     indices_data_digitized_flattened = indices_x_data_searchsorted
 
@@ -877,9 +871,7 @@ def apply_gates_in_place(data_for_cytometry_plots, gates_to_calculate=None):
                             continue
                         table = lookup_tables[name]
                         idx = indices_data_digitized_flattened
-                        # Safety clamp: a transient template/transform scale
-                        # mismatch can produce out-of-range indices; clamp so we
-                        # never IndexError (correct values follow on next recalc).
+                        # A transient transform-scale mismatch can exceed the table.
                         if idx.size and (idx.max() >= len(table) or idx.min() < 0):
                             idx = np.clip(idx, 0, len(table) - 1)
                         mask = table[idx]

@@ -70,18 +70,6 @@ class EventBus(QObject):
     # effective gate (per-sample custom gates make a gate differ between samples)
     repositionRois = Signal(str)
 
-    ### gating templates (per-sample gating, independent raw / unmixed lists)
-    # controller -> UI: (scope, list of template names, active template name)
-    templatesChanged = Signal(str, list, str)
-    # UI -> controller: pick a template for the current sample (scope, name)
-    selectTemplateRequested = Signal(str, str)
-    # UI -> controller: create a new (empty) template and select it (scope, name)
-    createTemplateRequested = Signal(str, str)
-    # UI -> controller: rename a template (scope, old_name, new_name)
-    renameTemplateRequested = Signal(str, str, str)
-    # controller -> UI: a template was applied; rebuild the grid+tree for this scope ('raw'/'unmixed')
-    templateApplied = Signal(str)
-
     ### per-sample custom gates (one shared template, per-sample gate overrides)
     # UI -> controller: customise / revert / adopt a gate for the current sample (scope, gate_name)
     customiseGateRequested = Signal(str, str)

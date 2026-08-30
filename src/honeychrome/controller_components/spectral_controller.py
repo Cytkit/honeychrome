@@ -641,6 +641,14 @@ class SpectralAutoGenerator(QObject):
     def generate_spectral_control(self, n):
         sample_path = self.samples['single_stain_controls'][n]
 
+        if (self.base_gate_label != 'root'
+                and not self.raw_gating.find_matching_gate_paths(self.base_gate_label)):
+            warnings.warn(
+                f'Autogenerate: base gate "{self.base_gate_label}" not found in the '
+                f'shared raw gating hierarchy.'
+            )
+            return False
+
         nevents = self.samples['all_sample_nevents'][sample_path]
         tubename = self.samples['all_samples'][sample_path]
         if nevents > 0:

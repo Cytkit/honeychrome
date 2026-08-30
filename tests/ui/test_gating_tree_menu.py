@@ -80,6 +80,11 @@ def test_a_normal_gate_offers_customise(tree):
     assert "Customise 'Cells' for this sample" in _menu_for(tree, 'Cells')
 
 
+def test_gating_tree_has_no_multiple_template_picker(tree):
+    assert not hasattr(tree, 'template_bar')
+    assert not hasattr(tree, 'template_combo')
+
+
 def test_the_owning_quadrant_gate_offers_customise(tree):
     assert "Customise 'Q1' for this sample" in _menu_for(tree, 'Q1')
 

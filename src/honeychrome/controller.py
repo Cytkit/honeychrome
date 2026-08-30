@@ -42,17 +42,6 @@ import time
 from honeychrome.experiment_model import ExperimentModel, check_fcs_matches_experiment
 from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml, gate_to_gml, gate_from_gml
-from honeychrome.controller_components.gating_templates import (
-    DEFAULT_TEMPLATE_NAME,
-    dynamic_key,
-    empty_scoped_template,
-    scoped_template_for_sample,
-)
-from honeychrome.controller_components.gating_instantiation import (
-    replace_gates_in_place,
-    resolve_dynamic_dimensions_in_place,
-    sample_context_from_events,
-)
 from honeychrome.settings import traces_cache_size, traces_cache_dtype, adc_rate
 import honeychrome.settings as settings
 from honeychrome.settings import max_events_in_cache, n_channels_per_event, experiments_folder, live_data_process_repeat_time, settings_default, samples_default, channel_dict
@@ -122,8 +111,6 @@ class Controller(QObject):
         self.unmixed_transformations = None
         self.raw_gating = GatingStrategy()
         self.unmixed_gating = GatingStrategy()
-        self.active_template = {'raw': DEFAULT_TEMPLATE_NAME, 'unmixed': DEFAULT_TEMPLATE_NAME}
-        self._pending_template_scope = None
         # per-sample custom gates: {scope: {sample_path: {gate_name: flowkit Gate}}}
         # all samples share one hierarchy; a sample may override a single gate.
         self.custom_sample_gates = {'raw': {}, 'unmixed': {}}
@@ -285,28 +272,14 @@ class Controller(QObject):
         if self.raw_transformations is None:
             logger.warning('Controller: save_experiment called before transformations initialised, skipping')
             return
-        # convert ephemeral gating back to gml — persist into each scope's ACTIVE
-        # template (raw / unmixed are independent template lists).
         unmixing_active = (
             self.experiment.process['unmixing_matrix'] is not None and self.unmixed_gating is not None
         )
-        raw_active = self._scoped_templates('raw').setdefault(
-            self._active_template_name('raw'), empty_scoped_template())
-        raw_active['gml'] = to_gml(self.raw_gating)
+        self.experiment.cytometry['raw_gating'] = to_gml(self.raw_gating)
         if unmixing_active:
-            unmixed_active = self._scoped_templates('unmixed').setdefault(
-                self._active_template_name('unmixed'), empty_scoped_template())
-            unmixed_active['gml'] = to_gml(self.unmixed_gating)
-
-        # Legacy fields mirror each scope's DEFAULT template so old readers still
-        # see a valid hierarchy (backward compatible).
-        raw_default = self._scoped_templates('raw').get(self._default_template_name('raw'), raw_active)
-        self.experiment.cytometry['raw_gating'] = raw_default.get('gml') or to_gml(self.raw_gating)
+            self.experiment.cytometry['gating'] = to_gml(self.unmixed_gating)
         update_transforms(self.experiment.cytometry['raw_transforms'], self.raw_transformations)
         if unmixing_active:
-            unmixed_default = self._scoped_templates('unmixed').get(
-                self._default_template_name('unmixed'), unmixed_active)
-            self.experiment.cytometry['gating'] = unmixed_default.get('gml') or to_gml(self.unmixed_gating)
             update_transforms(self.experiment.cytometry['transforms'], self.unmixed_transformations)
 
         # Persist per-sample custom gates as GML fragments (one per overridden
@@ -486,39 +459,6 @@ class Controller(QObject):
             warnings.warn('No events bus connected')
 
 
-    def _active_dynamic_specs(self, scope):
-        """Dynamic dimension specs for the active scoped template, or {}.
-
-        ``scope`` is ``'raw'`` or ``'unmixed'``. Missing template ⇒ {} (no
-        dynamic dims), i.e. today's behaviour.
-        """
-        template = self._scoped_template(scope)
-        if not template:
-            return {}
-        return template.get('dynamic_dimensions') or {}
-
-    def apply_dynamic_gate_dimensions(self):
-        """Resolve dynamic (e.g. Time) gate dimensions for the loaded sample.
-
-        For gates whose dimensions are marked dynamic in the active template, the
-        bounds are resolved from this sample's own channel ranges and the affected
-        gates' lookup tables are rebuilt — so one template gates every sample by
-        the same *relative* window (e.g. middle 90% of each run) even when the
-        samples differ in duration. No dynamic specs ⇒ this is a no-op.
-        """
-        dfc = self.data_for_cytometry_plots
-        if not dfc or dfc.get('event_data') is None or not len(dfc['event_data']):
-            return
-        scope = self._scope_for_mode()
-        dynamic_specs = self._active_dynamic_specs(scope)
-        if not dynamic_specs:
-            return
-
-        context = sample_context_from_events(dfc['event_data'], dfc['pnn'])
-        affected = resolve_dynamic_dimensions_in_place(dfc['gating'], dynamic_specs, context)
-        for gate_id in affected:
-            self.calculate_lookup_tables(mode=scope, top_gate=gate_id)
-
     def _rebuild_per_sample_lookup_tables(self, scope):
         """Rebuild lookup tables only for gates that touch a per-sample (default,
         e.g. Time) transform, so they match THIS sample's scale.
@@ -539,21 +479,6 @@ class Controller(QObject):
                 continue
             if any(getattr(transforms.get(ch), 'id', None) == 'default' for ch in channels):
                 self.calculate_lookup_tables(mode=scope, top_gate=gate_id)
-
-    def set_gate_dimension_dynamic(self, scope, gate_id, channel, kind='time', params=None,
-                                   template_name=None):
-        """Mark a gate dimension as dynamic (per-sample) in a scoped template.
-
-        Stored outside GatingML in the scope's template ``dynamic_dimensions``
-        and re-resolved for the currently loaded sample. ``scope`` is
-        ``'raw'`` or ``'unmixed'``."""
-        params = params or {}
-        name = template_name or self._active_template_name(scope)
-        template = self._scoped_templates(scope).setdefault(name, empty_scoped_template())
-        dynamic_dimensions = template.setdefault('dynamic_dimensions', {})
-        dynamic_dimensions[dynamic_key(gate_id, channel)] = {'kind': kind, 'params': params}
-        if scope == self._scope_for_mode():
-            self.apply_dynamic_gate_dimensions()
 
     # --- Per-sample custom gates (FlowKit custom sample gates) ---------------
     #
@@ -604,21 +529,23 @@ class Controller(QObject):
         gating.add_gate(deepcopy(gate), gate_path=gate_path, sample_id=sample_id)
 
     def apply_custom_sample_gates(self, scope=None):
-        """Install the current sample's stored custom gates onto the active gating,
-        then rebuild just those gates' lookup tables. Mirrors
-        :meth:`apply_dynamic_gate_dimensions`; a no-op when the sample has none."""
+        """Install this sample's overrides and refresh every affected lookup table."""
         if not self.current_sample_path:
             return
         scope = scope or self._scope_for_mode()
         gating = self._gating_for_scope(scope)
-        overrides = self.custom_sample_gates.get(scope, {}).get(self.current_sample_path, {})
-        if gating is None or not overrides:
+        all_overrides = self.custom_sample_gates.get(scope, {})
+        overrides = all_overrides.get(self.current_sample_path, {})
+        if gating is None:
             return
         existing = [g[0] for g in gating.get_gate_ids()]
         for gate_name, gate in overrides.items():
             if gate_name not in existing:
                 continue  # template no longer has this gate
             self._install_custom_gate(gating, gate_name, gate, self.current_sample_path)
+        for gate_name in {name for gates in all_overrides.values() for name in gates}:
+            if gate_name not in existing:
+                continue
             self.calculate_lookup_tables(mode=scope, top_gate=gate_name)
 
     def customise_gate(self, scope, gate_name):
@@ -752,184 +679,12 @@ class Controller(QObject):
         except Exception:
             pass
 
-    # --- Gating templates (per-scope: independent raw / unmixed lists) -------
-
     def _scope_for_mode(self):
-        """Template scope for the current tab: 'raw' or 'unmixed'."""
+        """Gating scope for the current tab: 'raw' or 'unmixed'."""
         return 'raw' if self.current_mode == 'raw' else 'unmixed'
-
-    def _scoped_templates(self, scope):
-        """The template dict for a scope ('raw'/'unmixed'), created if absent."""
-        key = 'raw_gating_templates' if scope == 'raw' else 'unmixed_gating_templates'
-        return self.experiment.cytometry.setdefault(key, {})
-
-    def _active_template_name(self, scope):
-        return self.active_template.get(scope, DEFAULT_TEMPLATE_NAME)
-
-    def _scoped_template(self, scope, name=None):
-        name = name or self._active_template_name(scope)
-        return self._scoped_templates(scope).get(name)
 
     def _gating_for_scope(self, scope):
         return self.raw_gating if scope == 'raw' else self.unmixed_gating
-
-    def _scoped_template_gml(self, scope, name=None):
-        """GML for a scope + template, falling back to legacy cytometry fields."""
-        legacy = self.experiment.cytometry.get('raw_gating' if scope == 'raw' else 'gating')
-        template = self._scoped_template(scope, name)
-        if template is None:
-            return legacy
-        return template.get('gml') or legacy
-
-    def _bind_template_plots(self, scope, name=None):
-        """Point the scope's plot list at its active template's plots.
-
-        ``cytometry['raw_plots']``/``['plots']`` and the runtime
-        ``data_for_cytometry_plots_*['plots']`` become the SAME list object as
-        the template's ``plots`` — so plots travel with the template, edits
-        persist into it, and existing code reading those keys keeps working."""
-        template = self._scoped_template(scope, name)
-        if template is None:
-            return
-        template.setdefault('plots', [])
-        if scope == 'raw':
-            self.experiment.cytometry['raw_plots'] = template['plots']
-            self.data_for_cytometry_plots_raw['plots'] = template['plots']
-        else:
-            self.experiment.cytometry['plots'] = template['plots']
-            self.data_for_cytometry_plots_unmixed['plots'] = template['plots']
-
-    def list_templates(self, scope):
-        """Template names for a scope (at least ``default`` after migration)."""
-        return list(self._scoped_templates(scope).keys())
-
-    def _default_template_name(self, scope):
-        """Primary template mirrored to the legacy fields; follows a rename."""
-        key = 'default_raw_template_name' if scope == 'raw' else 'default_unmixed_template_name'
-        return self.experiment.cytometry.get(key, DEFAULT_TEMPLATE_NAME)
-
-    def _resolve_default_template(self, scope):
-        """The scope's default/primary template name that ACTUALLY exists.
-
-        Follows a rename via the stored pointer, then falls back to ``default``,
-        then to the first available template — so a renamed default never dangles
-        (which used to leave unassigned samples pointing at a missing 'default')."""
-        templates = self._scoped_templates(scope)
-        name = self._default_template_name(scope)
-        if name in templates:
-            return name
-        if DEFAULT_TEMPLATE_NAME in templates:
-            return DEFAULT_TEMPLATE_NAME
-        return next(iter(templates), DEFAULT_TEMPLATE_NAME)
-
-    def rename_template(self, scope, old, new):
-        """Rename a template within a scope (e.g. raw ``default`` -> ``QC``)."""
-        new = (new or '').strip()
-        templates = self._scoped_templates(scope)
-        if not new or old not in templates or new in templates or old == new:
-            return
-        self._scoped_templates(scope)  # ensure key exists
-        key = 'raw_gating_templates' if scope == 'raw' else 'unmixed_gating_templates'
-        self.experiment.cytometry[key] = {
-            (new if k == old else k): v for k, v in templates.items()
-        }
-        assignments = self.experiment.samples.get('sample_template_assignments', {})
-        for entry in assignments.values():
-            if isinstance(entry, dict) and entry.get(scope) == old:
-                entry[scope] = new
-        if self.active_template.get(scope) == old:
-            self.active_template[scope] = new
-        if self._default_template_name(scope) == old:
-            dkey = 'default_raw_template_name' if scope == 'raw' else 'default_unmixed_template_name'
-            self.experiment.cytometry[dkey] = new
-        self._emit_templates_changed()
-        logger.info(f'Controller: renamed {scope} template {old!r} -> {new!r}')
-
-    def _emit_templates_changed(self):
-        """Tell each tab's picker its scope's template list + active template."""
-        if self.bus is None:
-            return
-        for scope in ('raw', 'unmixed'):
-            self.bus.templatesChanged.emit(scope, self.list_templates(scope), self._active_template_name(scope))
-
-    def create_template(self, scope, name, copy_active=False):
-        """Create a new template in a scope. Empty (root-only, no plots) by
-        default; ``copy_active=True`` duplicates the active gating + plots.
-        No-op if the name already exists."""
-        templates = self._scoped_templates(scope)
-        if name in templates:
-            return name
-        if copy_active:
-            gml = to_gml(self._gating_for_scope(scope))
-            plots = deepcopy((self.experiment.cytometry.get('raw_plots' if scope == 'raw' else 'plots')) or [])
-        else:
-            gml = to_gml(GatingStrategy())
-            plots = []
-        templates[name] = {'gml': gml, 'plots': plots, 'dynamic_dimensions': {}}
-        if self.bus is not None:
-            self.bus.changedGatingHierarchy.emit(scope, None)
-        self._emit_templates_changed()
-        return name
-
-    def create_and_select_template(self, scope, name):
-        """Create a new EMPTY template (root-only gates, no plots) in a scope and
-        select it for the current sample (the ``＋`` action)."""
-        self.create_template(scope, name, copy_active=False)
-        self.select_template(scope, name)
-
-    def select_template(self, scope, name, assign_current_sample=True):
-        """Make ``name`` the active template for ``scope`` and the current sample.
-
-        Loads the template's gates + plots, re-resolves dynamic dims, and
-        refreshes that tab. This is the user action behind picking a template."""
-        if name not in self._scoped_templates(scope):
-            logger.warning(f'Controller: select_template unknown {scope} template {name!r}')
-            return
-        if assign_current_sample and self.current_sample_path:
-            assignments = self.experiment.samples.setdefault('sample_template_assignments', {})
-            entry = assignments.setdefault(self.current_sample_path, {})
-            if not isinstance(entry, dict):
-                entry = {}
-                assignments[self.current_sample_path] = entry
-            entry[scope] = name
-        self._load_gating_from_template(scope, name)
-        self.clear_data_for_cytometry_plots()
-        self.initialise_data_for_cytometry_plots(force_recalc_histograms=True)
-        if self.bus is not None:
-            self.bus.changedGatingHierarchy.emit(scope, None)
-        self._emit_templates_changed()
-        logger.info(f'Controller: selected {scope} template {name!r} for {self.current_sample_path}')
-
-    def _load_gating_from_template(self, scope, name):
-        """Swap the scope's active gating to ``name``'s GML + plots, in place.
-
-        Gating strategies are mutated in place (identity kept) so cached
-        references stay valid. Flags a pending grid rebuild only when this scope
-        is the current tab; the rebuild fires after stats are ready."""
-        self.active_template[scope] = name
-        gml = self._scoped_template_gml(scope, name)
-        if scope == 'raw':
-            replace_gates_in_place(self.raw_gating, from_gml(gml))
-        elif self.experiment.process.get('unmixing_matrix') is not None and gml:
-            replace_gates_in_place(self.unmixed_gating, from_gml(gml))
-        self._bind_template_plots(scope, name)
-        if self.raw_transformations is not None:
-            self.calculate_lookup_tables(mode=scope)
-        if scope == self._scope_for_mode():
-            self._pending_template_scope = scope
-
-    def ensure_template_for_current_sample(self):
-        """Switch each scope's active gating to the loaded sample's assigned
-        template. Called on sample load so different samples can use different
-        templates. No-op for a scope already on the right template."""
-        if not self.current_sample_path:
-            return
-        for scope in ('raw', 'unmixed'):
-            desired = scoped_template_for_sample(scope, self.current_sample_path, self.experiment.samples)
-            if desired not in self._scoped_templates(scope):
-                desired = self._resolve_default_template(scope)
-            if desired != self.active_template.get(scope) and desired in self._scoped_templates(scope):
-                self._load_gating_from_template(scope, desired)
 
     def filter_raw_fluorescence_channels(self):
         if self.experiment.process['fluorescence_channel_filter'] == 'area_only':
@@ -956,8 +711,6 @@ class Controller(QObject):
         self.unmixed_transformations = None
         self.raw_gating = GatingStrategy()
         self.unmixed_gating = GatingStrategy()
-        self.active_template = {'raw': DEFAULT_TEMPLATE_NAME, 'unmixed': DEFAULT_TEMPLATE_NAME}
-        self._pending_template_scope = None
         self.custom_sample_gates = {'raw': {}, 'unmixed': {}}
         self.cleaned_events: dict = {}
         self.data_for_cytometry_plots = {'pnn': None, 'fluoro_indices': None, 'lookup_tables': None, 'event_data': None, 'transformations': None, 'statistics': {}, 'gating': GatingStrategy(), 'plots': [], 'histograms': [], 'gate_membership': {}}
@@ -974,17 +727,6 @@ class Controller(QObject):
             scope = ['raw', 'unmixed']
             self.flush_ephemeral_data()
 
-        # Resolve each scope's active template to its ACTUAL default (which may
-        # have been renamed) so the picker, gating and plots all use the right
-        # one; before a sample is loaded there is no assignment to go on.
-        for _scope in scope:
-            self.active_template[_scope] = self._resolve_default_template(_scope)
-
-        # Per-sample gating: point the plot lists at the active templates' plots,
-        # so plots travel with each scope's template (and edits persist into it).
-        self._bind_template_plots('raw')
-        self._bind_template_plots('unmixed')
-
         # plots is list of dicts
         # type:
         # ---hist1d: channel_x, source_gate, child_gates
@@ -1000,7 +742,7 @@ class Controller(QObject):
 
         ###### initialise data for cytometry plots
         if 'raw' in scope:
-            self.raw_gating = from_gml(self._scoped_template_gml('raw'))
+            self.raw_gating = from_gml(self.experiment.cytometry['raw_gating'])
             self.raw_transformations = generate_transformations(self.experiment.cytometry['raw_transforms'])
 
             _raw = self.experiment.settings['raw']
@@ -1024,7 +766,7 @@ class Controller(QObject):
         # recreate transfer matrix and compensated_unmixing_matrix if unmixing matrix is not None
         if 'unmixed' in scope:
             if self.experiment.process['unmixing_matrix']:
-                self.unmixed_gating = from_gml(self._scoped_template_gml('unmixed'))
+                self.unmixed_gating = from_gml(self.experiment.cytometry['gating'])
                 self.unmixed_transformations = generate_transformations(self.experiment.cytometry['transforms'])
                 # Call the plain impl, not reapply_fine_tuning(): this method
                 # (initialise_ephemeral_data) is itself called from inside the
@@ -1091,9 +833,7 @@ class Controller(QObject):
             logger.warning(self.data_for_cytometry_plots_raw['transformations'] is self.raw_transformations)
             logger.warning(self.data_for_cytometry_plots_raw['gating'] is self.raw_gating)
 
-        # populate the template picker after (re)loading an experiment
         self._load_custom_sample_gates()
-        self._emit_templates_changed()
 
     def initialise_transfer_matrix(self):
         # run in intitialisation of ephemeral data or if spillover changed
@@ -1725,19 +1465,7 @@ class Controller(QObject):
                                 upper_limit = max(self.data_for_cytometry_plots['event_data'][:, index]) * 1.05
                                 transformation.set_transform(limits=[0, upper_limit])
 
-                # Per-sample templates: if this sample is assigned a different
-                # template than the active one, switch the active gating to it.
-                self.ensure_template_for_current_sample()
-                self._emit_templates_changed()
-
-                # Per-sample gating: resolve any dynamic (e.g. Time) gate dimensions
-                # for this sample and rebuild just those gates' lookup tables, so a
-                # single template adapts to each sample's own channel range.
-                self.apply_dynamic_gate_dimensions()
-
-                # Per-sample custom gates: install this sample's manual gate
-                # overrides (stored as FlowKit custom sample gates) and rebuild
-                # their lookup tables. No-op when the sample has no overrides.
+                # Refresh every gate whose geometry can vary by sample.
                 self.apply_custom_sample_gates()
 
                 # refresh custom-gate highlighting on both tabs for this sample
@@ -1753,22 +1481,6 @@ class Controller(QObject):
                 self.calc_hists_and_stats(status_message_signal=(self.bus.statusMessage if self.bus else None))
 
                 logger.info(f'Controller: prepared hists and stats, mode: {self.current_mode}')
-
-                # A pending template switch rebuilds the plot grid + tree AFTER
-                # histograms/stats are computed, so the fresh plot widgets see
-                # consistent data (their plot set differs from the old template).
-                # We then re-emit histsStatsRecalculated so the just-built widgets
-                # draw the already-computed (consistent) histograms — building
-                # before compute would let them draw stale/mismatched data.
-                if self._pending_template_scope is not None:
-                    scope = self._pending_template_scope
-                    self._pending_template_scope = None
-                    if self.bus is not None:
-                        self.bus.templateApplied.emit(scope)
-                        self.bus.histsStatsRecalculated.emit(
-                            self.current_mode,
-                            list(range(len(self.data_for_cytometry_plots['plots'] or []))),
-                        )
 
                 # Reposition ROIs to THIS sample's effective gate: with per-sample
                 # custom gates a gate's geometry differs between samples, so the

@@ -1049,9 +1049,7 @@ class CytometryPlotWidget(QFrame):
 
     def plot_hist2d(self):
         heatmap = self.data_for_cytometry_plots['histograms'][self.n_in_plot_sequence]
-        # Guard against a transient plot/histogram mismatch (e.g. mid template
-        # switch, where this index briefly holds a histogram for a different
-        # plot type/scale). Skip drawing; the next recalculation redraws.
+        # A redraw can briefly observe a histogram calculated for another plot.
         if getattr(heatmap, 'ndim', 0) != 2:
             return
         self.img.setImage(heatmap)
@@ -1066,9 +1064,7 @@ class CytometryPlotWidget(QFrame):
     def plot_hist1d(self):
         count = self.data_for_cytometry_plots['histograms'][self.n_in_plot_sequence]
         step_scale = self.transformations[self.plot['channel_x']].step_scale
-        # Guard against a transient mismatch (e.g. mid template switch) where the
-        # histogram at this index was computed for a different plot/scale.
-        # pyqtgraph step mode needs len(x) == len(y)+1; skip if inconsistent.
+        # Pyqtgraph step mode requires one more x edge than y values.
         if getattr(count, 'ndim', 0) != 1 or len(step_scale) != len(count) + 1:
             return
         self.hist.setData(step_scale, count)

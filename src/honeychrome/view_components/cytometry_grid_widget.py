@@ -162,8 +162,7 @@ class CytometryGridWidget(QScrollArea):
                 self.bus.plotChangeRequested.emit(self.mode, n_in_plot_sequence)
 
     def show_new_plot_widget(self):
-        # Ensure the column layout exists (empty grids compute n_columns lazily),
-        # otherwise place_tile would crash with n_columns is None.
+        # Empty grids calculate their column layout lazily.
         if self.n_columns is None:
             self.init_grid()
         new_plot_widget = NewPlotWidget(bus=self.bus, mode=self.mode, data_for_cytometry_plots=self.data_for_cytometry_plots)
@@ -236,11 +235,6 @@ class CytometryGridWidget(QScrollArea):
                     data_for_cytometry_plots=self.data_for_cytometry_plots, parent=self.container)
                 self.plot_widgets.append(new_widget)
 
-        # Lay the tiles out NOW (synchronously) so that when this is a template
-        # switch, the plots are in the layout before histograms are (re)emitted —
-        # otherwise a fresh widget receives its data before it is placed and
-        # renders blank. The debounce re-runs init_grid after the widget settles
-        # to its final size (correct column count).
         self.init_grid()
         self.debounce_timer.start(300)
 
@@ -254,10 +248,7 @@ class CytometryGridWidget(QScrollArea):
     def init_grid(self):
         if self.data_for_cytometry_plots is None:
             return
-        # called every time width changes. Establish the column layout even when
-        # there are no plots (e.g. a brand-new empty template) so the first
-        # Add Plot can place a tile — otherwise n_columns stays None and
-        # place_tile crashes.
+        # Establish the layout even when there are no plots yet.
         old_n_columns = self.n_columns
         self.n_columns = max([self.width() // settings.cytometry_plot_width_target_retrieved, 1])
         self.cytometry_plot_real_width = (self.width() - 45)// self.n_columns
@@ -274,7 +265,6 @@ class CytometryGridWidget(QScrollArea):
 
         logger.info(f'Cytometry Grid Widget: setting width to {self.n_columns} columns')
 
-        # Place each plot as a plot_widget
         if self.data_for_cytometry_plots['plots']:
             for n, plot in enumerate(self.data_for_cytometry_plots['plots']):
 
@@ -291,16 +281,8 @@ class CytometryGridWidget(QScrollArea):
                 self.place_tile(plot_widget, w, h)
                 plot_widget.n_in_plot_sequence = n
 
-                # Draw the tile's current data as soon as it's placed. A grid
-                # (re)build — e.g. a template switch — otherwise relies on a
-                # separately-timed histsStatsRecalculated signal that a freshly
-                # built widget can miss, leaving the plot blank. Drawing here is
-                # idempotent and cheap (reads already-computed histograms).
+                # Fresh widgets may be created after their data was calculated.
                 plot_widget.update_axes_stats_hist(self.mode)
-
-                    # print(self.n_columns)
-                    # print(n, w, h, self.data_for_cytometry_plots['plots'])
-                    # print(self.occupied)
 
 
     def fits(self, row, col, w, h):

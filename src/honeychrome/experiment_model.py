@@ -45,11 +45,51 @@ from typing import Optional
 
 from honeychrome.controller_components.functions import generate_transformations, assign_default_transforms
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import to_gml
-from honeychrome.controller_components.gating_templates import migrate_cytometry_templates, migrate_scoped_gating_templates
 from honeychrome.settings import settings_default, samples_default, process_default, cytometry_default, sample_name_source
 
 import logging
 logger = logging.getLogger(__name__)
+
+_MULTIPLE_TEMPLATE_KEYS = (
+    'gating_templates',
+    'raw_gating_templates',
+    'unmixed_gating_templates',
+    'default_raw_template_name',
+    'default_unmixed_template_name',
+)
+
+
+def discard_multiple_gating_templates(cytometry, samples, use_default=True):
+    """Collapse pre-release template data to one shared raw/unmixed hierarchy."""
+    if use_default:
+        unified = cytometry.get('gating_templates') or {}
+        for scope, gating_key, plots_key, templates_key, default_key in (
+            ('raw', 'raw_gating', 'raw_plots', 'raw_gating_templates',
+             'default_raw_template_name'),
+            ('unmixed', 'gating', 'plots', 'unmixed_gating_templates',
+             'default_unmixed_template_name'),
+        ):
+            templates = cytometry.get(templates_key) or {}
+            default_name = cytometry.get(default_key, 'default')
+            template = templates.get(default_name) or templates.get('default')
+            if template is None and templates:
+                template = next(iter(templates.values()))
+            if template is None:
+                old_template = unified.get(default_name) or unified.get('default')
+                if old_template:
+                    template = {
+                        'gml': old_template.get(f'{scope}_gml'),
+                        'plots': old_template.get(f'{scope}_plots'),
+                    }
+            if template:
+                if template.get('gml'):
+                    cytometry[gating_key] = template['gml']
+                if template.get('plots') is not None:
+                    cytometry[plots_key] = deepcopy(template['plots'])
+
+    for key in _MULTIPLE_TEMPLATE_KEYS:
+        cytometry.pop(key, None)
+    samples.pop('sample_template_assignments', None)
 
 def check_for_windows_junction(path):
     if os.path.isjunction(path):
@@ -160,10 +200,6 @@ class ExperimentModel:
         self.cytometry['raw_gating'] = to_gml(raw_gating)
         self.cytometry['raw_plots'] = raw_plots
 
-        ### per-sample gating: ensure template fields exist (backward compatible) ###
-        self.cytometry['gating_templates'] = migrate_cytometry_templates(self.cytometry)
-        migrate_scoped_gating_templates(self.cytometry)
-        self.samples.setdefault('sample_template_assignments', {})
         self.cytometry.setdefault('raw_custom_sample_gates', {})
         self.cytometry.setdefault('unmixed_custom_sample_gates', {})
 
@@ -182,17 +218,14 @@ class ExperimentModel:
         self.cytometry = file_data['cytometry']
         self.statistics = file_data['statistics']
 
-        # per-sample gating (backward compatible): synthesise a default template
-        # from legacy raw_gating/gating when older .kit files lack these fields.
-        self.cytometry['gating_templates'] = migrate_cytometry_templates(self.cytometry)
-        migrate_scoped_gating_templates(self.cytometry)
-        self.samples.setdefault('sample_template_assignments', {})
+        discard_multiple_gating_templates(self.cytometry, self.samples)
         self.cytometry.setdefault('raw_custom_sample_gates', {})
         self.cytometry.setdefault('unmixed_custom_sample_gates', {})
 
     def save(self):
         if self.experiment_path is None:
             raise ValueError("No file path set for saving")
+        discard_multiple_gating_templates(self.cytometry, self.samples, use_default=False)
         file_data = {
             'settings':self.settings,
             'samples':self.samples,
