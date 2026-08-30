@@ -15,6 +15,7 @@ adc_rate = 2.5  # [MHz]
 max_event_time = 120  # [us]
 deltaT = 1/adc_rate # [us]
 adc_scale_mv = 30 # the adc level for 1 mV
+standby_time = 600_000 # ms to automatically put instrument to standby (switch off laser and pumps)
 
 ### peak detection settings
 trigger_channel = 'FSC'

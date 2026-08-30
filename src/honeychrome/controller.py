@@ -1020,14 +1020,19 @@ class Controller(QObject):
     def find_and_connect_instrument(self):
         self.pipe_connection_instrument.send({'command': 'find_and_connect'})
         response = self.pipe_connection_instrument.recv()
-        #TODO display response
+
         logger.info(response)
+        if self.bus:
+            self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
 
     @Slot()
     def initialise_instrument(self):
         self.pipe_connection_instrument.send({'command': 'initialise'})
         response = self.pipe_connection_instrument.recv()
+
         logger.info(response)
+        if self.bus:
+            self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
 
     @Slot()
     def start_acquisition(self):
@@ -1051,16 +1056,14 @@ class Controller(QObject):
         self.pipe_connection_instrument.send({'command': 'start_acquisition'})
         response = self.pipe_connection_instrument.recv()
         logger.info(response)
+        if self.bus:
+            self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
 
         # start analyser (flush cache and start analysing incoming traces and producing events)
         self.pipe_connection_analyser.send({'command': 'start'})
         response = self.pipe_connection_analyser.recv()
         logger.info(response)
 
-        if self.bus:
-            self.bus.statusMessage.emit(f'Acquisition started')
-
-        logger.info('Controller: acquisition started')
 
     @Slot()
     def stop_acquisition(self):
@@ -1068,14 +1071,13 @@ class Controller(QObject):
         self.pipe_connection_instrument.send({'command': 'stop_acquisition'})
         response = self.pipe_connection_instrument.recv()
         logger.info(response)
+        if self.bus:
+            self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
 
         # stop analyser
         self.pipe_connection_analyser.send({'command': 'stop'})
         response = self.pipe_connection_analyser.recv()
         logger.info(response)
-
-        if self.bus:
-            self.bus.statusMessage.emit(f'Acquisition stopped')
 
         # stop live update thread
         self.stop_live_data_processing.set()

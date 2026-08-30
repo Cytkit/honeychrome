@@ -51,6 +51,7 @@ class CytkitDevice:
         self.sample_pump = None
         self.sheath_pump = None
         self.vi_monitor = None
+        self.initialised = False
 
     def find_and_connect_to_device(self):
         self.ft4222.find_and_connect()
@@ -77,6 +78,11 @@ class CytkitDevice:
         print(id_word)
 
         self.laser.set_state(1) # turn on laser
+
+        if not self.initialised:
+            self.initialised = True
+        else:
+            self.initialised = False
 
         return 'OK', 'Cytkit initialised'
 

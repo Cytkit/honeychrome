@@ -1,8 +1,9 @@
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton, QSlider, QSpinBox, QHBoxLayout,
                                QVBoxLayout, QDockWidget, QLabel, QToolBar, QSizePolicy, QFrame, QGraphicsOpacityEffect)
-from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer
 
+from honeychrome import settings
 from honeychrome.view_components.icon_loader import icon
 
 
@@ -29,12 +30,15 @@ class AcquisitionWidget(QWidget):
         acquisition_toolbar.setMovable(False)
         self.action_initialise = QAction(icon('plug-connected'), "Initialise", self)
         self.action_start_acquisition = QAction(icon('player-record', colour='red'), "Start Acquisition", self)
+        self.action_start_acquisition.setEnabled(False)
         self.action_stop_acquisition = QAction(icon('player-stop'), "Stop Acquisition", self)
         self.action_stop_acquisition.setEnabled(False)
         self.action_restart_acquisition = QAction(icon('repeat'), "Restart Acquisition", self)
         self.action_restart_acquisition.setEnabled(False)
         self.action_flush = QAction(icon('wash'), "Flush", self)
+        self.action_flush.setEnabled(False)
         self.action_backflush = QAction(icon('wiper-wash'), "Backflush", self)
+        self.action_backflush.setEnabled(False)
         self.action_initialise.triggered.connect(self.initialise)
         self.action_start_acquisition.triggered.connect(self.start_acquisition)
         self.action_stop_acquisition.triggered.connect(self.stop_acquisition)
@@ -73,8 +77,26 @@ class AcquisitionWidget(QWidget):
 
         layout.addWidget(frame)
 
+        self.standby_timer = QTimer()
+        self.standby_timer.setSingleShot(True)
+        self.standby_timer.timeout.connect(self.stand_by)
+
     def initialise(self):
-        pass
+        if self.bus is not None:
+            self.bus.initialiseInstrument.emit()
+        self.action_start_acquisition.setEnabled(True)
+        self.action_flush.setEnabled(True)
+        self.action_backflush.setEnabled(True)
+
+        self.standby_timer.start(settings.standby_time)
+
+    def standby(self):
+        if self.action_initialise.isEnabled and self.action_start_acquisition.isEnabled:
+            if self.bus is not None:
+                self.bus.initialiseInstrument.emit() # if already initialised, this puts it to standby
+        self.action_start_acquisition.setEnabled(False)
+        self.action_flush.setEnabled(False)
+        self.action_backflush.setEnabled(False)
 
     def start_acquisition(self):
         self.action_start_acquisition.setEnabled(False)
