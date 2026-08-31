@@ -2,8 +2,11 @@ import time
 
 import numpy as np
 
+from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import registers_map
+from honeychrome.instrument_driver_components.cykit_components.dacs import DACs
 from honeychrome.instrument_driver_components.cykit_components.ft4222communicator import Ft4222Communicator
 from honeychrome.instrument_driver_components.cykit_components.fan import Fan
+from honeychrome.instrument_driver_components.cykit_components.i2c import I2C
 from honeychrome.instrument_driver_components.cykit_components.laser import Laser
 from honeychrome.instrument_driver_components.cykit_components.pressure import Pressure
 from honeychrome.instrument_driver_components.cykit_components.sample_pump import SamplePump
@@ -52,7 +55,11 @@ class CytkitDevice:
         self.pressure = None
         self.sample_pump = None
         self.sheath_pump = None
+        self.i2c_bus_a = None
+        self.i2c_bus_b = None
         self.vi_monitor = None
+        self.dacs = None
+
         self.initialised = False
 
     def find_and_connect_to_device(self):
@@ -64,7 +71,11 @@ class CytkitDevice:
         self.pressure = Pressure(self.ft4222)
         self.sample_pump = SamplePump(self.ft4222)
         self.sheath_pump = SheathPump(self.ft4222)
-        self.vi_monitor = VIMonitor(self.ft4222)
+        self.i2c_bus_a = I2C(self.ft4222, registers_map['I2CA_CTRL'], 'I2C Bus A')
+        self.i2c_bus_b = I2C(self.ft4222, registers_map['I2CB_CTRL'], 'I2C Bus B')
+        self.vi_monitor = VIMonitor(self.i2c_bus_a, self.i2c_bus_b)
+        self.dacs = DACs(self.ft4222)
+
 
         # then configure the hardware
         self.initialise()

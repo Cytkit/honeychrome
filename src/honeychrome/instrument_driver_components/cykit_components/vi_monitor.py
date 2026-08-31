@@ -8,8 +8,7 @@ MON_ID_P_3_3V = 6
 MON_ID_P_1_8V = 7
 
 class VIMonitor:
-    def __init__(self, ft4222_communicator, I2CBusA, I2CBusB):
-        self.ft4222_communicator = ft4222_communicator
+    def __init__(self, I2CBusA, I2CBusB):
         self.I2CBusA = I2CBusA
         self.I2CBusB = I2CBusB
 

@@ -73,3 +73,40 @@ registers_map = {
     'ADC_ENABLE':	0x00B0,   #	HW ADC Controls
     'ADC_VIRT_ENABLE':	0x00C0,   #	Virtual ADC Controls
 }
+
+dac_dictionary = {
+    0: {'address': 0x98, 'channel_number': 0, 'channel_name': 'SiPM Bias 0'},
+    1: {'address': 0x98, 'channel_number': 1, 'channel_name': 'SiPM Bias 1'},
+    2: {'address': 0x98, 'channel_number': 2, 'channel_name': 'SiPM Bias 2'},
+    3: {'address': 0x98, 'channel_number': 3, 'channel_name': 'SiPM Bias 3'},
+    4: {'address': 0x98, 'channel_number': 4, 'channel_name': 'SiPM Bias 4'},
+    5: {'address': 0x98, 'channel_number': 5, 'channel_name': 'SiPM Bias 5'},
+    6: {'address': 0x98, 'channel_number': 6, 'channel_name': 'SiPM Bias 6'},
+    7: {'address': 0x98, 'channel_number': 7, 'channel_name': 'SiPM Bias 7'},
+    8: {'address': 0x9A, 'channel_number': 0, 'channel_name': 'SiPM Bias 8'},
+    9: {'address': 0x9A, 'channel_number': 1, 'channel_name': 'SiPM Bias 9'},
+    10: {'address': 0x9A, 'channel_number': 2, 'channel_name': 'SiPM Bias 10'},
+    11: {'address': 0x9A, 'channel_number': 3, 'channel_name': 'SiPM Bias 11'},
+    12: {'address': 0x9A, 'channel_number': 4, 'channel_name': 'SiPM Bias 12'},
+    13: {'address': 0x9A, 'channel_number': 5, 'channel_name': 'SiPM Bias 13'},
+    14: {'address': 0x9A, 'channel_number': 6, 'channel_name': 'Spare 0'},
+    15: {'address': 0x9A, 'channel_number': 7, 'channel_name': 'Spare 1'},
+    16: {'address': 0x9C, 'channel_number': 0, 'channel_name': 'SiPM Ref 0'},
+    17: {'address': 0x9C, 'channel_number': 1, 'channel_name': 'SiPM Ref 1'},
+    18: {'address': 0x9C, 'channel_number': 2, 'channel_name': 'SiPM Ref 2'},
+    19: {'address': 0x9C, 'channel_number': 3, 'channel_name': 'SiPM Ref 3'},
+    20: {'address': 0x9C, 'channel_number': 4, 'channel_name': 'SiPM Ref 4'},
+    21: {'address': 0x9C, 'channel_number': 5, 'channel_name': 'SiPM Ref 5'},
+    22: {'address': 0x9C, 'channel_number': 6, 'channel_name': 'SiPM Ref 6'},
+    23: {'address': 0x9C, 'channel_number': 7, 'channel_name': 'SiPM Ref 7'},
+    24: {'address': 0x9E, 'channel_number': 0, 'channel_name': 'SiPM Ref 8'},
+    25: {'address': 0x9E, 'channel_number': 1, 'channel_name': 'SiPM Ref 9'},
+    26: {'address': 0x9E, 'channel_number': 2, 'channel_name': 'SiPM Ref 10'},
+    27: {'address': 0x9E, 'channel_number': 3, 'channel_name': 'SiPM Ref 11'},
+    28: {'address': 0x9E, 'channel_number': 4, 'channel_name': 'SiPM Ref 12'},
+    29: {'address': 0x9E, 'channel_number': 5, 'channel_name': 'SiPM Ref 13'},
+    30: {'address': 0x9E, 'channel_number': 6, 'channel_name': 'FSC Ref'},
+    31: {'address': 0x9E, 'channel_number': 7, 'channel_name': 'SSC Ref'},
+}
+index_dac_bias_zero = 0
+index_dac_ref_zero = 15
