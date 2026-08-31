@@ -211,6 +211,7 @@ class Pico5000_Device:
             self.buffer_list_a.append(buf_a)
             self.buffer_list_b.append(buf_b)
 
+        self.initialised = False
         return 'OK', 'Picoscope 5000-series instrument connected'
 
 
@@ -228,7 +229,13 @@ class Pico5000_Device:
                 delta_phase,  # stopDeltaPhase
                 0, 0, awg_buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)), len(awg_buffer), 0, 0, 0, 0, 0, 0, 0, 0)
 
-        return 'OK', 'Picoscope 5000-series initialised'
+        if not self.initialised:
+            self.initialised = True
+            return 'OK', 'Picoscope 5000-series initialised'
+        else:
+            self.initialised = False
+            return 'OK', 'Picoscope 5000-series on standby'
+
 
     def start_acquisition(self):
         return 'OK', 'Picoscope 5000-series started acquisition'

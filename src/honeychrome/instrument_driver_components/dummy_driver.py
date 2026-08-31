@@ -74,6 +74,7 @@ class DummyDevice:
         self.fsc_area_index = fcs_file_channels.index('FSC-A')
         self.fsc_height_index = fcs_file_channels.index('FSC-H')
         self.scale = magnitude_ceiling / int(sample.metadata['p2r'])
+        self.initialised = False
 
     def find_and_connect_to_device(self):
         return 'OK', 'Dummy device connected'
@@ -82,7 +83,12 @@ class DummyDevice:
         pass
 
     def initialise(self):
-        return 'OK', 'Dummy device initialised'
+        if not self.initialised:
+            self.initialised = True
+            return 'OK', 'Dummy device initialised'
+        else:
+            self.initialised = False
+            return 'OK', 'Dummy device on standby'
 
     def start_acquisition(self):
         return 'OK', 'Dummy device started acquisition'

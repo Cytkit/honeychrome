@@ -5,8 +5,10 @@ import numpy as np
 from honeychrome.instrument_driver_components.cykit_components.ft4222communicator import Ft4222Communicator
 from honeychrome.instrument_driver_components.cykit_components.fan import Fan
 from honeychrome.instrument_driver_components.cykit_components.laser import Laser
+from honeychrome.instrument_driver_components.cykit_components.pressure import Pressure
 from honeychrome.instrument_driver_components.cykit_components.sample_pump import SamplePump
 from honeychrome.instrument_driver_components.cykit_components.sheath_pump import SheathPump
+from honeychrome.instrument_driver_components.cykit_components.vi_monitor import VIMonitor
 
 
 class CytkitDevice:
@@ -81,10 +83,11 @@ class CytkitDevice:
 
         if not self.initialised:
             self.initialised = True
+            return 'OK', 'Cytkit initialised'
         else:
             self.initialised = False
+            return 'OK', 'Cytkit on standby'
 
-        return 'OK', 'Cytkit initialised'
 
     def start_acquisition(self):
         return 'OK', 'Cytkit started acquisition'
@@ -114,7 +117,7 @@ class CytkitDevice:
 if __name__ == '__main__':
 
     cytkit_device = CytkitDevice()
-    cytkit_device.connect_to_device()
+    cytkit_device.find_and_connect_to_device()
 
     time.sleep(1)
 

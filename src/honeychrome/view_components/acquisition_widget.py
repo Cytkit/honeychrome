@@ -42,6 +42,9 @@ class AcquisitionWidget(QWidget):
         self.action_initialise.triggered.connect(self.initialise)
         self.action_start_acquisition.triggered.connect(self.start_acquisition)
         self.action_stop_acquisition.triggered.connect(self.stop_acquisition)
+        self.action_restart_acquisition.triggered.connect(self.restart_acquisition)
+        self.action_flush.triggered.connect(self.flush)
+        self.action_backflush.triggered.connect(self.backflush)
         acquisition_toolbar.addAction(self.action_initialise)
         acquisition_toolbar.addAction(self.action_start_acquisition)
         acquisition_toolbar.addAction(self.action_stop_acquisition)
@@ -77,26 +80,28 @@ class AcquisitionWidget(QWidget):
 
         layout.addWidget(frame)
 
+        self.initialised = False
+
         self.standby_timer = QTimer()
         self.standby_timer.setSingleShot(True)
-        self.standby_timer.timeout.connect(self.stand_by)
+        self.standby_timer.timeout.connect(self.initialise)
 
     def initialise(self):
         if self.bus is not None:
-            self.bus.initialiseInstrument.emit()
-        self.action_start_acquisition.setEnabled(True)
-        self.action_flush.setEnabled(True)
-        self.action_backflush.setEnabled(True)
+            self.bus.initialiseInstrument.emit() # if already initialised, this puts it to standby
 
-        self.standby_timer.start(settings.standby_time)
-
-    def standby(self):
-        if self.action_initialise.isEnabled and self.action_start_acquisition.isEnabled:
-            if self.bus is not None:
-                self.bus.initialiseInstrument.emit() # if already initialised, this puts it to standby
-        self.action_start_acquisition.setEnabled(False)
-        self.action_flush.setEnabled(False)
-        self.action_backflush.setEnabled(False)
+        if self.initialised:
+            self.initialised = False
+            self.action_start_acquisition.setEnabled(False)
+            self.action_flush.setEnabled(False)
+            self.action_backflush.setEnabled(False)
+            self.standby_timer.stop()
+        else:
+            self.initialised = True
+            self.action_start_acquisition.setEnabled(True)
+            self.action_flush.setEnabled(True)
+            self.action_backflush.setEnabled(True)
+            self.standby_timer.start(settings.standby_time)
 
     def start_acquisition(self):
         self.action_start_acquisition.setEnabled(False)
@@ -107,9 +112,8 @@ class AcquisitionWidget(QWidget):
         self.action_backflush.setEnabled(False)
         if self.bus is not None:
             self.bus.startAcquisition.emit()
-
-        # Start flashing
         self.start_flashing()
+        self.standby_timer.stop()
 
     def start_flashing(self):
         self.animation.setDuration(900)
@@ -130,6 +134,21 @@ class AcquisitionWidget(QWidget):
         if self.bus is not None:
             self.bus.stopAcquisition.emit()
         self.animation.stop()
+        self.standby_timer.start(settings.standby_time)
+
+    def restart_acquisition(self):
+        if self.bus is not None:
+            self.bus.restartAcquisition.emit()
+
+    def flush(self):
+        if self.bus is not None:
+            self.bus.flushSip.emit()
+        self.standby_timer.start(settings.standby_time)
+
+    def backflush(self):
+        if self.bus is not None:
+            self.bus.backFlushSip.emit()
+        self.standby_timer.start(settings.standby_time)
 
 class MainWindow(QMainWindow):
     def __init__(self):

@@ -179,12 +179,12 @@ class Instrument(mp.Process):
         status, message = self.device.get_state(data)
         return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
-    def flush_sip(self, data):
-        status, message = self.device.flush_sip(data)
+    def flush_sip(self):
+        status, message = self.device.flush_sip()
         return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
-    def backflush_sip(self, data):
-        status, message = self.device.backflush_sip(data)
+    def backflush_sip(self):
+        status, message = self.device.backflush_sip()
         return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
     def transfer(self):

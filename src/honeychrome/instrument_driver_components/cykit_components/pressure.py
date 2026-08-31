@@ -9,6 +9,14 @@ coefficient_data = [
     2097152, # 2 ^ 21
 ]
 
+PRES_D1 = False
+PRES_D2 = True
+PRES_OSR_256 = 0x00
+PRES_OSR_512 = 0x01
+PRES_OSR_1024 = 0x02
+PRES_OSR_2048 = 0x03
+PRES_OSR_4096 = 0x04
+
 def convert_unit_to_psi(value, units):
     if units == 'PRES_UNITS_PA':
         return value / 6894.76
@@ -147,13 +155,15 @@ class Pressure:
         self._sensor_write_read(command, 8, 15)
 
     def _sensor_ADC_read(self):
-        pass
+        return self._sensor_write_read(0x00000000, 32, 0) & 0xFFFFFF
 
     def _sensor_get_raw_pressure(self):
-        pass
+        self._sensor_conversion_start(PRES_D1, PRES_OSR_4096)
+        return self._sensor_ADC_read()
 
     def _sensor_get_raw_temperature(self):
-        pass
+        self._sensor_conversion_start(PRES_D2, PRES_OSR_4096)
+        return self._sensor_ADC_read()
 
     def _sensor_load_cal_data(self):
         # Clear the calibration data

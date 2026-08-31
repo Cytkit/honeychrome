@@ -1118,11 +1118,21 @@ class Controller(QObject):
 
     @Slot()
     def flush_sip(self):
-        pass
+        # send flush command and wait for response
+        self.pipe_connection_instrument.send({'command': 'flush_sip'})
+        response = self.pipe_connection_instrument.recv()
+        logger.info(response)
+        if self.bus:
+            self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
 
     @Slot()
     def backflush_sip(self):
-        pass
+        # send backflush command and wait for response
+        self.pipe_connection_instrument.send({'command': 'backflush_sip'})
+        response = self.pipe_connection_instrument.recv()
+        logger.info(response)
+        if self.bus:
+            self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
 
     @Slot(str, int)
     def on_gain_change(self, ch_name, value):

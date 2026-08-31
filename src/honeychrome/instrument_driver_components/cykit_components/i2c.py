@@ -51,29 +51,23 @@ class I2C:
         count = 0
         while True:
             status = self.ft4222.register_read(self.base_address + 0x0000)
+            if status & 0x0010:
+                break
+
             time.sleep(1)
             count += 1
             if count > 100000:
                 return False
 
-            # Check FIFO level vs. ReadSize
-            self.ft4222.register_read(self.base_address + 0x0006)
+        # Check FIFO level vs. ReadSize
+        self.ft4222.register_read(self.base_address + 0x0006)
 
-            status = self.ft4222.register_read(self.base_address + 0x0006)
+        status = self.ft4222.register_read(self.base_address + 0x0006)
 
 
+        # Unload the read buffer
+        for count in range(read_size):
+            read_buffer[count] = status = self.ft4222.register_read(self.base_address + 0x0004)
 
-	Status = DataLink->RegRead(BaseAddress + 0x0006);
-    if (ReadSize != Status)
-	{
-		Log->Printf(MSGLOG_LVL_WARNING, MSGLOG_MASK_I2C, "I2C [Bus %s] %s: Out data FIFO level mis-match (Exp:%u / Act:%u).", BusName, CallerName, ReadSize, Status);
-	}
-    // Unload the read buffer
-    for (Count=0; Count<ReadSize; Count++)
-    {
-        *ReadBuffer++ = DataLink->RegRead(BaseAddress + 0x0004);
-    }
-
-    // Return success
-    return true;
-    '''
+        # Return success
+        return True
