@@ -59,6 +59,7 @@ class CytkitDevice:
         self.i2c_bus_b = None
         self.vi_monitor = None
         self.dacs = None
+        self.adcs = None
 
         self.initialised = False
 
@@ -74,7 +75,8 @@ class CytkitDevice:
         self.i2c_bus_a = I2C(self.ft4222, registers_map['I2CA_CTRL'], 'I2C Bus A')
         self.i2c_bus_b = I2C(self.ft4222, registers_map['I2CB_CTRL'], 'I2C Bus B')
         self.vi_monitor = VIMonitor(self.i2c_bus_a, self.i2c_bus_b)
-        self.dacs = DACs(self.ft4222)
+        self.dacs = DACs(self.i2c_bus_a)
+        self.adcs = ADCs(self.ft4222)
 
 
         # then configure the hardware

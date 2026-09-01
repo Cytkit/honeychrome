@@ -110,3 +110,23 @@ dac_dictionary = {
 }
 index_dac_bias_zero = 0
 index_dac_ref_zero = 15
+
+adc_dictionary = {
+    	0: {'name':'ADC_ID_SIPM_0', 'register_base': 0x1000},
+		1: {'name': 'ADC_ID_SIPM_1', 'register_base': 0x1100},
+		2: {'name': 'ADC_ID_SIPM_2', 'register_base': 0x1200},
+		3: {'name': 'ADC_ID_SIPM_3', 'register_base': 0x1300},
+		4: {'name': 'ADC_ID_SIPM_4', 'register_base': 0x1400},
+		5: {'name': 'ADC_ID_SIPM_5', 'register_base': 0x1500},
+		6: {'name': 'ADC_ID_SIPM_6', 'register_base': 0x1600},
+		7: {'name': 'ADC_ID_SIPM_7', 'register_base': 0x1700},
+		8: {'name': 'ADC_ID_SIPM_8', 'register_base': 0x1800},
+		9: {'name': 'ADC_ID_SIPM_9', 'register_base': 0x1900},
+		10: {'name': 'ADC_ID_SIPM_10', 'register_base': 0x1A00},
+		11: {'name': 'ADC_ID_SIPM_11', 'register_base': 0x1B00},
+		12: {'name': 'ADC_ID_SIPM_12', 'register_base': 0x1C00},
+		13: {'name': 'ADC_ID_SIPM_13', 'register_base': 0x1D00},
+		14: {'name': 'ADC_ID_FSC', 'register_base': 0x1E00},
+		15: {'name': 'ADC_ID_SSC', 'register_base': 0x1F00},
+		0xFF: {'name': 'ADC_ID_ALL', 'register_base': None},
+}
