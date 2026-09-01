@@ -71,6 +71,7 @@ View:
 from honeychrome.view import View, logo_icon
 
 import logging
+import logging.handlers
 import warnings
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
@@ -212,6 +213,11 @@ def main():
     # command pipes
     pipe_experiment_instrument_e, pipe_experiment_instrument_i = mp.Pipe()
     pipe_experiment_analyser_e, pipe_experiment_analyser_a = mp.Pipe()
+    # logging queue
+    logging_queue = mp.Queue()
+    # Set up listener in the main process
+    listener = logging.handlers.QueueListener(logging_queue, logging.StreamHandler(), respect_handler_level=True)
+    listener.start()
 
     '''
     start instrument driver
@@ -222,7 +228,8 @@ def main():
         traces_cache_lock=traces_cache_lock,
         index_head_traces_cache=index_head_traces_cache,
         index_tail_traces_cache=index_tail_traces_cache,
-        pipe_connection=pipe_experiment_instrument_i
+        pipe_connection=pipe_experiment_instrument_i,
+        logging_queue=logging_queue
     )
     instrument.start()
 
@@ -316,6 +323,7 @@ def main():
     events_cache_shm.close()
     traces_cache_shm.unlink()
     events_cache_shm.unlink()
+    listener.stop()
 
     sys.exit(exit_code)
 

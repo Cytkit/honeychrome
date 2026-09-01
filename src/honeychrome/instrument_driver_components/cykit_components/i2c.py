@@ -20,10 +20,10 @@ class I2C:
 
     def _write_read(self, address, write_buffer, write_size, read_buffer, read_size, caller_name):
         if not self.ft4222.is_connected():
-            return
+            return False
 
         # Check if running when expected to be idle
-	    status = self.ft4222.register_read(self.base_address + 0x0000)
+        status = self.ft4222.register_read(self.base_address + 0x0000)
 
         # Flush the FIFOs
         self.ft4222.register_write(self.base_address + 0x0000, 0x0002)

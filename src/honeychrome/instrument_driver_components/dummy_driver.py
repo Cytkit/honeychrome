@@ -1,3 +1,5 @@
+import logging
+import time
 from pathlib import Path
 from flowkit import Sample
 import numpy as np
@@ -75,6 +77,7 @@ class DummyDevice:
         self.fsc_height_index = fcs_file_channels.index('FSC-H')
         self.scale = magnitude_ceiling / int(sample.metadata['p2r'])
         self.initialised = False
+        self.logger = logging.getLogger(__name__)
 
     def find_and_connect_to_device(self):
         return 'OK', 'Dummy device connected'
@@ -83,6 +86,8 @@ class DummyDevice:
         pass
 
     def initialise(self):
+        self.logger.info("Example initialisation message to log")
+        time.sleep(1)
         if not self.initialised:
             self.initialised = True
             return 'OK', 'Dummy device initialised'

@@ -39,8 +39,18 @@ class Instrument(mp.Process):
                  traces_cache_name=None,
                  traces_cache_lock=None,
                  index_head_traces_cache=None, index_tail_traces_cache=None,
-                 pipe_connection=None):
+                 pipe_connection=None, logging_queue=None):
         super().__init__()
+
+        # Route standard logs through the queue
+        import logging.handlers
+        qh = logging.handlers.QueueHandler(logging_queue)
+        self.logger = logging.getLogger(__name__)
+        self.logger.addHandler(qh)
+
+        ### example
+        # self.logger = logging.getLogger(__name__)
+        # self.logger.info("************Worker logging message back to main process")
 
         # device will be a connected instrument or dummy if no instrument found
         self.device = None
@@ -241,6 +251,8 @@ class Instrument(mp.Process):
 
 
 if __name__ == '__main__':
+    import logging
+
     mp.set_start_method("spawn")
 
     # Allocate shared memory block, plus head and tail indices
@@ -250,6 +262,11 @@ if __name__ == '__main__':
     index_tail_traces_cache = mp.Value('i', 0)
 
     pipe_experiment_instrument_e, pipe_experiment_instrument_i = mp.Pipe()
+    # logging queue
+    logging_queue = mp.Queue()
+    # Set up listener in the main process
+    listener = logging.handlers.QueueListener(logging_queue, logging.StreamHandler(), respect_handler_level=True)
+    listener.start()
 
     # start instrument dummy
     instrument = Instrument(
@@ -258,7 +275,8 @@ if __name__ == '__main__':
         traces_cache_lock=traces_cache_lock,
         index_head_traces_cache=index_head_traces_cache,
         index_tail_traces_cache=index_tail_traces_cache,
-        pipe_connection=pipe_experiment_instrument_i
+        pipe_connection=pipe_experiment_instrument_i,
+        logging_queue=logging_queue
     )
     instrument.start()
 
@@ -289,3 +307,4 @@ if __name__ == '__main__':
     print(response)
 
     instrument.join()
+    listener.stop()
