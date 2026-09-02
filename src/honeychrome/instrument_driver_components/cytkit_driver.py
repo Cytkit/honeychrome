@@ -2,11 +2,13 @@ import time
 
 import numpy as np
 
+from honeychrome.instrument_driver_components.cykit_components.adcs import ADCs
 from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import registers_map
 from honeychrome.instrument_driver_components.cykit_components.dacs import DACs
 from honeychrome.instrument_driver_components.cykit_components.ft4222communicator import Ft4222Communicator
 from honeychrome.instrument_driver_components.cykit_components.fan import Fan
 from honeychrome.instrument_driver_components.cykit_components.i2c import I2C
+from honeychrome.instrument_driver_components.cykit_components.id_data import IDData
 from honeychrome.instrument_driver_components.cykit_components.laser import Laser
 from honeychrome.instrument_driver_components.cykit_components.pressure import Pressure
 from honeychrome.instrument_driver_components.cykit_components.sample_pump import SamplePump
@@ -49,7 +51,9 @@ class CytkitDevice:
             returns blob of traces
     """
     def __init__(self):
+        self.name = 'Cytkit'
         self.ft4222 = Ft4222Communicator()
+        self.id_data = None
         self.fan = None
         self.laser = None
         self.pressure = None
@@ -67,6 +71,7 @@ class CytkitDevice:
         self.ft4222.find_and_connect()
 
         # if the connection above worked, initialise the hardware wrappers
+        self.id_data = IDData(self.ft4222)
         self.fan = Fan(self.ft4222)
         self.laser = Laser(self.ft4222)
         self.pressure = Pressure(self.ft4222)
@@ -78,26 +83,22 @@ class CytkitDevice:
         self.dacs = DACs(self.i2c_bus_a)
         self.adcs = ADCs(self.ft4222)
 
-
-        # then configure the hardware
-        self.initialise()
-
         print('[Cytkit driver] Connected')
-        return {'source': '[Cytkit driver]', 'status': 'OK', 'message': 'Connected to Cytkit'}
+        return  'OK', 'Connected to Cytkit'
 
     def disconnect(self):
         pass
 
     def initialise(self):
-        id_word = self.ft4222.register_read('ID_WORD')
-        print(id_word)
-
-        self.laser.set_state(1) # turn on laser
+        # id_word = self.ft4222.register_read('ID_WORD')
+        # print(id_word)
 
         if not self.initialised:
+            self.laser.set_state(1)  # turn on laser
             self.initialised = True
             return 'OK', 'Cytkit initialised'
         else:
+            self.laser.set_state(0)  # turn off laser
             self.initialised = False
             return 'OK', 'Cytkit on standby'
 
@@ -108,11 +109,26 @@ class CytkitDevice:
     def stop_acquisition(self):
         return 'OK', 'Cytkit stopped acquisition'
 
-    def set_state(self, dict_of_parameters):
-        return 'OK', 'Cytkit state set'
+    def set_state(self, dict_of_parameter_value):
+        message = {}
+        for parameter, value in dict_of_parameter_value.items():
+            if parameter == 'laser_enable':
+                self.laser.set_state(int(value))
+                message['laser_enable'] = value
+
+        return 'OK', message
 
     def get_state(self, list_of_parameters):
-        return 'OK', {parameter:None for parameter in list_of_parameters}
+        message = {}
+        for parameter in list_of_parameters:
+            if parameter == 'check_id':
+                value = self.id_data.check_id()
+                message['check_id'] = value
+            elif parameter == 'pressure':
+                value = self.pressure.get_pressure('PRES_UNITS_PA', 1)
+                message['pressure'] = value
+
+        return 'OK', message
 
     def flush_sip(self):
         return 'OK', 'Cytkit SIP flushed'

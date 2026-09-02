@@ -67,6 +67,7 @@ class DummyDevice:
             returns blob of traces
     """
     def __init__(self):
+        self.name = 'Dummy'
         sample = Sample(fcs_file)
         self.events = sample.get_events('raw')
 
@@ -101,8 +102,8 @@ class DummyDevice:
     def stop_acquisition(self):
         return 'OK', 'Dummy device stopped acquisition'
 
-    def set_state(self, dict_of_parameters):
-        return 'OK', 'Dummy device doesn''t have any parameters to set'
+    def set_state(self, dict_of_parameter_value):
+        return 'OK', {parameter: value for parameter, value in dict_of_parameter_value.items()}
 
     def get_state(self, list_of_parameters):
         return 'OK', {parameter:None for parameter in list_of_parameters}

@@ -1035,6 +1035,18 @@ class Controller(QObject):
             self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
 
     @Slot()
+    def is_instrument_initialised(self):
+        self.pipe_connection_instrument.send({'command': 'is_initialised'})
+        response = self.pipe_connection_instrument.recv()
+
+        logger.info(response)
+        if self.bus:
+            self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
+
+        return response['message']['initialised']
+
+
+    @Slot()
     def start_acquisition(self):
         # set live sample, switch current sample to live sample, prepare hists and stats
         if not self.current_sample or self.current_sample and self.current_sample.event_count != 0:

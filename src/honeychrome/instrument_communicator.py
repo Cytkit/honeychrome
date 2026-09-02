@@ -30,6 +30,7 @@ import numpy as np
 import time
 import warnings
 
+from honeychrome.instrument_driver_components.cytkit_driver import CytkitDevice
 from honeychrome.settings import devices_boot_order, traces_cache_size, traces_cache_dtype, max_events_in_traces_cache, trace_n_points, transfer_target_repeat_time
 
 debug = False
@@ -105,6 +106,8 @@ class Instrument(mp.Process):
                 response_to_experiment_control = self.find_and_connect_to_instrument()
             elif incoming_from_experiment_control['command'] == 'initialise':
                 response_to_experiment_control = self.initialise_instrument()
+            elif incoming_from_experiment_control['command'] == 'is_initialised':
+                response_to_experiment_control = self.is_instrument_initialised()
             elif incoming_from_experiment_control['command'] == 'start_acquisition':
                 response_to_experiment_control = self.start_acquisition()
             elif incoming_from_experiment_control['command'] == 'stop_acquisition':
@@ -134,6 +137,23 @@ class Instrument(mp.Process):
 
 
     def find_and_connect_to_instrument(self):
+        # first check if instrument is connected already
+        if self.device:
+            # check connection
+            try:
+                device_name = self.device.name
+                print(f'[Instrument driver] {device_name} already connected')
+                if device_name == 'Cytkit':
+                    status, message = self.device.get_state('check_id')
+                    if not message['check_id']:
+                        raise ConnectionError
+
+                return {'source': '[Instrument driver]', 'status': status, 'message': message}
+
+            except Exception as e:
+                print(f'[Instrument driver] {self.device} not connected: {e}')
+
+        # if not already connected, try to connect
         for device_name in devices_boot_order:
             try:
                 if device_name == 'cytkit':
@@ -164,6 +184,12 @@ class Instrument(mp.Process):
     def initialise_instrument(self):
         status, message = self.device.initialise()
         return {'source': '[Instrument driver]', 'status': status, 'message': message}
+
+    def is_instrument_initialised(self):
+        if self.device:
+            return {'source': '[Instrument driver]', 'status': 'OK', 'message': {'initialised': self.device.initialised}}
+        else:
+            return {'source': '[Instrument driver]', 'status': 'Error', 'message': {'initialised': None}}
 
     def start_acquisition(self):
         status, message = self.device.start_acquisition()

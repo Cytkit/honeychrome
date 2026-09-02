@@ -147,6 +147,7 @@ class Pico5000_Device:
     def __init__(self):
         self.buffer_list_a = []
         self.buffer_list_b = []
+        self.name = 'Pico5000'
 
     def find_and_connect_to_device(self):
         # 1. Open and Power
