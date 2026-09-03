@@ -128,6 +128,10 @@ class CytkitDevice:
             value = self.pressure.get_pressure('PRES_UNITS_PA', 1)
             message['pressure'] = value
 
+        if 'temperatures' in list_of_parameters:
+            message['temperatures'] = {}
+            message['temperatures']['temp_p_sensor'] = self.pressure.get_temperature()
+
         if 'vi_monitors' in list_of_parameters:
             message['vi_monitors'] = {'V':{}, 'I':{}}
             for channel in monitor_dictionary:

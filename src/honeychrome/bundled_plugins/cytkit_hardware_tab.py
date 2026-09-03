@@ -227,11 +227,19 @@ class PluginWidget(QWidget):
         layout.addStretch()
         toolbox.addItem(tab, "ADCs")
 
-        # VI Monitoring tab:
-        # label for each reading
+        # Monitoring tab:
+        # label for each reading V, I
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        self.read_monitors = QPushButton('Read Monitors')
+
+        self.read_temperatures = QPushButton('Read Temperatures')
+        self.read_temperatures.clicked.connect(lambda: self.get_instrument_state(['temperatures']))
+        layout.addWidget(self.read_temperatures)
+        form = QFormLayout()
+        self.temp_p_sensor_label = QLabel('None')
+        form.addRow('Temperature (of pressure sensor)', self.temp_p_sensor_label)
+
+        self.read_monitors = QPushButton('Read VI Monitors')
         self.read_monitors.clicked.connect(lambda: self.get_instrument_state(['vi_monitors']))
         layout.addWidget(self.read_monitors)
         form = QFormLayout()
@@ -241,6 +249,7 @@ class PluginWidget(QWidget):
             form.addRow(monitor_dictionary[channel]['name'], self.monitor_labels[channel])
         layout.addLayout(form)
 
+        # fan control: enable cb, duty spin, freq spin, tacho label
         title = QLabel('Cooling Fan')
         title.setStyleSheet(heading_style)
         layout.addWidget(title)
@@ -260,15 +269,6 @@ class PluginWidget(QWidget):
 
         layout.addStretch()
         toolbox.addItem(tab, "Monitoring")
-
-        # Temperatures tab:
-        # fan control: enable cb, duty spin, freq spin, tacho label
-        # label for each reading
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.addWidget(QLabel("Content for temperatures_tab"))
-        layout.addStretch()
-        toolbox.addItem(tab, "Temperatures")
 
         # Front panel display:
         # file load dialog, upload button
@@ -322,12 +322,10 @@ class PluginWidget(QWidget):
             case 4: # ADCs
                 pass
             case 5: # monitoring
+                self.get_instrument_state(['vi_monitors','temperatures','fan_tacho'])
+            case 6: # display
                 pass
-            case 6: # temperatures
-                pass
-            case 7: # display
-                pass
-            case 8: # registers
+            case 7: # registers
                 pass
 
     @Slot(list)
@@ -354,6 +352,9 @@ class PluginWidget(QWidget):
 
         if 'pressure' in response['message']:
             self.pressure_value.setText(f'{response['message']['pressure']} Pa')
+
+        if 'temperatures' in response['message']:
+            self.temp_p_sensor_label.setText(f'{response['message']['temperatures']['temp_p_sensor']} C')
 
         if 'vi_monitors' in response['message']:
             for channel in monitor_dictionary:
