@@ -1,11 +1,5 @@
-MON_ID_P_36_0V = 0
-MON_ID_P_36_0V_BIAS = 1
-MON_ID_P_12_0V = 2
-MON_ID_P_12_0V_BIAS = 3
-MON_ID_P_5_0V = 4
-MON_ID_P_5_0V_BIAS = 5
-MON_ID_P_3_3V = 6
-MON_ID_P_1_8V = 7
+from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import monitor_dictionary
+
 
 class VIMonitor:
     def __init__(self, I2CBusA, I2CBusB):
@@ -24,34 +18,13 @@ class VIMonitor:
         return return_value * 0.00025
 
     def _read_raw_value(self, channel, command):
-        if channel == MON_ID_P_36_0V:
+        i2_c_address = monitor_dictionary[channel]['i2_c_address']
+        if monitor_dictionary[channel]['i2c_bus'] == 'A':
             bus = self.I2CBusA
-            i2_c_address = 0x80
-        elif channel == MON_ID_P_36_0V_BIAS:
-            bus = self.I2CBusA
-            i2_c_address = 0x82
-        elif channel == MON_ID_P_12_0V:
-            bus = self.I2CBusA
-            i2_c_address = 0x84
-        elif channel == MON_ID_P_12_0V_BIAS:
-            bus = self.I2CBusA
-            i2_c_address = 0x86
-        elif channel == MON_ID_P_5_0V:
+        elif monitor_dictionary[channel]['i2c_bus'] == 'B':
             bus = self.I2CBusB
-            i2_c_address = 0x80
-        elif channel == MON_ID_P_5_0V_BIAS:
-            bus = self.I2CBusB
-            i2_c_address = 0x82
-        elif channel == MON_ID_P_3_3V:
-            bus = self.I2CBusB
-            i2_c_address = 0x84
-        elif channel == MON_ID_P_1_8V:
-            bus = self.I2CBusB
-            i2_c_address = 0x86
         else:
             bus = None
-            i2_c_address = None
-
 
         # Set the command
         write_buffer = [command]

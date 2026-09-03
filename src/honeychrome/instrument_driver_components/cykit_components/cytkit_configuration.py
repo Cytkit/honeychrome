@@ -130,3 +130,14 @@ adc_dictionary = {
 		15: {'name': 'ADC_ID_SSC', 'register_base': 0x1F00},
 		0xFF: {'name': 'ADC_ID_ALL', 'register_base': None},
 }
+
+monitor_dictionary = {
+    0: {'name': 'MON_ID_P_36_0V', 'i2_c_address': 0x80, 'i2_c_bus':'A'},
+    1: {'name': 'MON_ID_P_36_0V_BIAS', 'i2_c_address': 0x82, 'i2_c_bus':'A'},
+    2: {'name': 'MON_ID_P_12_0V', 'i2_c_address': 0x84, 'i2_c_bus':'A'},
+    3: {'name': 'MON_ID_P_12_0V_BIAS', 'i2_c_address': 0x86, 'i2_c_bus':'A'},
+    4: {'name': 'MON_ID_P_5_0V', 'i2_c_address': 0x80, 'i2_c_bus':'B'},
+    5: {'name': 'MON_ID_P_5_0V_BIAS', 'i2_c_address': 0x82, 'i2_c_bus':'B'},
+    6: {'name': 'MON_ID_P_3_3V', 'i2_c_address': 0x84, 'i2_c_bus':'B'},
+    7: {'name': 'MON_ID_P_1_8V', 'i2_c_address': 0x86, 'i2_c_bus':'B'},
+}

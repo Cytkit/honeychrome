@@ -3,7 +3,7 @@ import time
 import numpy as np
 
 from honeychrome.instrument_driver_components.cykit_components.adcs import ADCs
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import registers_map
+from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import registers_map, monitor_dictionary
 from honeychrome.instrument_driver_components.cykit_components.dacs import DACs
 from honeychrome.instrument_driver_components.cykit_components.ft4222communicator import Ft4222Communicator
 from honeychrome.instrument_driver_components.cykit_components.fan import Fan
@@ -120,13 +120,25 @@ class CytkitDevice:
 
     def get_state(self, list_of_parameters):
         message = {}
-        for parameter in list_of_parameters:
-            if parameter == 'check_id':
-                value = self.id_data.check_id()
-                message['check_id'] = value
-            elif parameter == 'pressure':
-                value = self.pressure.get_pressure('PRES_UNITS_PA', 1)
-                message['pressure'] = value
+        if 'check_id' in list_of_parameters:
+            value = self.id_data.check_id()
+            message['check_id'] = value
+
+        if 'pressure'in list_of_parameters:
+            value = self.pressure.get_pressure('PRES_UNITS_PA', 1)
+            message['pressure'] = value
+
+        if 'vi_monitors' in list_of_parameters:
+            message['vi_monitors'] = {'V':{}, 'I':{}}
+            for channel in monitor_dictionary:
+                V = self.vi_monitor.read_voltage(channel)
+                I = self.vi_monitor.read_current(channel)
+                message['vi_monitors'][channel]['V'] = V
+                message['vi_monitors'][channel]['I'] = I
+
+        if 'fan_tacho'in list_of_parameters:
+            value = self.fan.get_tacho()
+            message['pressure'] = value
 
         return 'OK', message
 

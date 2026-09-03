@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, Slot, Signal, QSize
 import logging
 
 from honeychrome.controller import Controller
+from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import monitor_dictionary
 from honeychrome.settings import heading_style
 from honeychrome.view_components.icon_loader import icon
 
@@ -97,11 +98,10 @@ class PluginWidget(QWidget):
         self.datetime = QLabel()
         layout.addWidget(self.datetime)
         self.initialised = QCheckBox("Initialised")
-        self.update_initialised()
         self.initialised.setEnabled(False)
         layout.addWidget(self.initialised)
 
-        help_text(layout, '🛈 Note that if Cytkit is initialised, automation overrides the settings below')
+        help_text(layout, '🛈 Note that if Cytkit is initialised, automation will override the settings below')
         layout.addStretch()
         toolbox.addItem(tab, "Connection")
 
@@ -231,7 +231,33 @@ class PluginWidget(QWidget):
         # label for each reading
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.addWidget(QLabel("Content for monitoring_tab"))
+        self.read_monitors = QPushButton('Read Monitors')
+        self.read_monitors.clicked.connect(lambda: self.get_instrument_state(['vi_monitors']))
+        layout.addWidget(self.read_monitors)
+        form = QFormLayout()
+        self.monitor_labels = {}
+        for channel in monitor_dictionary:
+            self.monitor_labels[channel] = QLabel('None')
+            form.addRow(monitor_dictionary[channel]['name'], self.monitor_labels[channel])
+        layout.addLayout(form)
+
+        title = QLabel('Cooling Fan')
+        title.setStyleSheet(heading_style)
+        layout.addWidget(title)
+        self.fan_enable_cb = QCheckBox("Fan Enable")
+        layout.addWidget(self.fan_enable_cb)
+        self.fan_duty_spinbox = LabeledSpinBox('Fan Duty', 0, 255, 127, 8)
+        layout.addWidget(self.fan_duty_spinbox)
+        help_text(layout, '🛈 Fan duty is a number in the range 0--255, where 0 is off, and 255 is on 100% of the time')
+        self.fan_freq_spinbox = LabeledSpinBox('Fan Frequency', 0, 2_000_000_000, 1000, 100)
+        layout.addWidget(self.fan_freq_spinbox)
+        help_text(layout, '🛈 fan frequency is the frequency of the duty cycle in Hz')
+        self.fan_tacho_value = QLabel('0 rpm')
+        layout.addWidget(self.fan_tacho_value)
+        self.fan_tacho_btn = QPushButton('Measure Fan Speed')
+        self.fan_tacho_btn.clicked.connect(lambda: self.get_instrument_state(['fan_tacho']))
+        layout.addWidget(self.fan_tacho_btn)
+
         layout.addStretch()
         toolbox.addItem(tab, "Monitoring")
 
@@ -279,11 +305,38 @@ class PluginWidget(QWidget):
         # toolbox.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         main_layout.addWidget(toolbox)
 
+        # Connect the signal to a slot
+        toolbox.currentChanged.connect(self.on_tab_changed)
+
+    def on_tab_changed(self, index):
+        match index:
+            case 0: # connection
+                self.get_instrument_state(['version','datetime'])
+                self.update_initialised()
+            case 1: # light
+                self.get_instrument_state(['laser_enable'])
+            case 2: # fluidics
+                self.get_instrument_state(['pressure'])
+            case 3: # DACs
+                pass
+            case 4: # ADCs
+                pass
+            case 5: # monitoring
+                pass
+            case 6: # temperatures
+                pass
+            case 7: # display
+                pass
+            case 8: # registers
+                pass
 
     @Slot(list)
     def get_instrument_state(self, parameters):
-        self.controller.pipe_connection_instrument.send({'command': 'get_instrument_state', 'data': parameters})
-        response = self.controller.pipe_connection_instrument.recv()
+        if self.controller:
+            self.controller.pipe_connection_instrument.send({'command': 'get_instrument_state', 'data': parameters})
+            response = self.controller.pipe_connection_instrument.recv()
+        else:
+            response = {'message': {}}
 
         if 'check_id' in response['message']:
             if response['message']['check_id']:
@@ -302,6 +355,13 @@ class PluginWidget(QWidget):
         if 'pressure' in response['message']:
             self.pressure_value.setText(f'{response['message']['pressure']} Pa')
 
+        if 'vi_monitors' in response['message']:
+            for channel in monitor_dictionary:
+                self.monitor_labels[channel].setText(f'{response['message'][channel]['V']} V, {response['message'][channel]['I']} mA')
+
+        if 'fan_tacho' in response['message']:
+            self.fan_tacho_value.setText(f'{response['message']['fan_tacho']} rpm')
+
         if self.bus:
             self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
 
@@ -318,10 +378,11 @@ class PluginWidget(QWidget):
 
     @Slot()
     def update_initialised(self):
-        if self.controller.is_instrument_initialised():
-            self.initialised.setChecked(True)
-        else:
-            self.initialised.setChecked(False)
+        if self.controller:
+            if self.controller.is_instrument_initialised():
+                self.initialised.setChecked(True)
+            else:
+                self.initialised.setChecked(False)
 
 
 if __name__ == "__main__":
