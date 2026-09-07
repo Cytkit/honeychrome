@@ -19,9 +19,9 @@ class VIMonitor:
 
     def _read_raw_value(self, channel, command):
         i2_c_address = monitor_dictionary[channel]['i2_c_address']
-        if monitor_dictionary[channel]['i2c_bus'] == 'A':
+        if monitor_dictionary[channel]['i2_c_bus'] == 'A':
             bus = self.I2CBusA
-        elif monitor_dictionary[channel]['i2c_bus'] == 'B':
+        elif monitor_dictionary[channel]['i2_c_bus'] == 'B':
             bus = self.I2CBusB
         else:
             bus = None

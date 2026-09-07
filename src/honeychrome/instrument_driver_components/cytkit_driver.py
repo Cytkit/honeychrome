@@ -77,8 +77,8 @@ class CytkitDevice:
         self.pressure = Pressure(self.ft4222)
         self.sample_pump = SamplePump(self.ft4222)
         self.sheath_pump = SheathPump(self.ft4222)
-        self.i2c_bus_a = I2C(self.ft4222, registers_map['I2CA_CTRL'], 'I2C Bus A')
-        self.i2c_bus_b = I2C(self.ft4222, registers_map['I2CB_CTRL'], 'I2C Bus B')
+        self.i2c_bus_a = I2C(self.ft4222, 'I2C Bus A')
+        self.i2c_bus_b = I2C(self.ft4222, 'I2C Bus B')
         self.vi_monitor = VIMonitor(self.i2c_bus_a, self.i2c_bus_b)
         self.dacs = DACs(self.i2c_bus_a)
         self.adcs = ADCs(self.ft4222)
@@ -113,8 +113,16 @@ class CytkitDevice:
         message = {}
         for parameter, value in dict_of_parameter_value.items():
             if parameter == 'laser_enable':
-                self.laser.set_state(int(value))
+                self.laser.set_state(value)
                 message['laser_enable'] = value
+            if parameter == 'fan_state':
+                if 'freq' in value:
+                    self.fan.set_pwm_frequency(value['freq'])
+                if 'duty' in value:
+                    self.fan.set_pwm_duty(value['duty'])
+                if 'enable' in value:
+                    self.fan.set_enable(value['enable'])
+                message['fan_state'] = value
 
         return 'OK', message
 
@@ -144,9 +152,16 @@ class CytkitDevice:
                 message['vi_monitors'][channel]['V'] = V
                 message['vi_monitors'][channel]['I'] = I
 
-        if 'fan_tacho'in list_of_parameters:
-            value = self.fan.get_tacho()
-            message['pressure'] = value
+        if 'fan_state'in list_of_parameters:
+            message['fan_state'] = {}
+            enable = self.fan.get_enable()
+            message['fan_state']['enable'] = enable
+            freq = self.fan.get_pwm_frequency()
+            message['fan_state']['freq'] = freq
+            duty = self.fan.get_pwm_duty()
+            message['fan_state']['duty'] = duty
+            tacho = self.fan.get_tacho()
+            message['fan_state']['tacho'] = tacho
 
         return 'OK', message
 
@@ -171,14 +186,17 @@ if __name__ == '__main__':
     print(cytkit_device.get_state(['read_id_data']))
 
     print(cytkit_device.set_state({'laser_enable' : True}))
-    time.sleep(1)
+
+    # print(cytkit_device.get_state(['pressure'])) # not yet working
+    # print(cytkit_device.get_state(['temperatures'])) # not yet working
+    # print(cytkit_device.get_state(['vi_monitors'])) # not yet working
+
+    print(cytkit_device.get_state('fan_state'))
+    print(cytkit_device.set_state({'fan_state': {'enable': True, 'freq': 1000, 'duty': 50}}))
+    print(cytkit_device.get_state('fan_state'))
+
+    time.sleep(2)
     print(cytkit_device.set_state({'laser_enable' : False}))
-
-    print(cytkit_device.get_state(['pressure']))
-    # cytkit_device.get_state(['check_id', 'pressure', 'temperatures', 'vi_monitors', 'fan_tacho'])
-
-
-    time.sleep(1)
 
     # # read traces
     # cytkit_device.start_acquisition()

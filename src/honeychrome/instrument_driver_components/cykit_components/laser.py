@@ -6,7 +6,7 @@ class Laser:
         self.set_state(0) # switch off
 
     def set_state(self, state):
-        self.ft4222.register_write('LASER', state)
+        self.ft4222.register_write('LASER', int(state))
 
     def get_state(self):
         return self.ft4222.register_read('LASER') == 1 # boolean output

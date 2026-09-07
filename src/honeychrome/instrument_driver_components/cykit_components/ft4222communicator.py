@@ -35,7 +35,7 @@ class Ft4222Communicator:
             return True
 
         else:
-            raise ConnectionError
+            raise ConnectionError(f'Connection did not succeed FT4222 A: {self.devA}, and B: {self.devB}')
 
     def _register_init(self):
         self.devA.spiMaster_Init(Mode.QUAD, Clock.DIV_4, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0) # for registers
