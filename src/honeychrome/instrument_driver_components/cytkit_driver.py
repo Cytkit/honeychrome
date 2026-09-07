@@ -120,9 +120,13 @@ class CytkitDevice:
 
     def get_state(self, list_of_parameters):
         message = {}
-        if 'check_id' in list_of_parameters:
-            value = self.id_data.check_id()
-            message['check_id'] = value
+        if 'check_connection' in list_of_parameters:
+            connected = self.id_data.check_connection()
+            message['check_connection'] = connected
+
+        if 'read_id_data' in list_of_parameters:
+            version, datetime = self.id_data.read_id_data()
+            message['read_id_data'] = {'version':version, 'datetime':datetime}
 
         if 'pressure'in list_of_parameters:
             value = self.pressure.get_pressure('PRES_UNITS_PA', 1)
@@ -162,14 +166,24 @@ class CytkitDevice:
 if __name__ == '__main__':
 
     cytkit_device = CytkitDevice()
-    cytkit_device.find_and_connect_to_device()
+    print(cytkit_device.find_and_connect_to_device())
+    print(cytkit_device.get_state(['check_connection']))
+    print(cytkit_device.get_state(['read_id_data']))
+
+    print(cytkit_device.set_state({'laser_enable' : True}))
+    time.sleep(1)
+    print(cytkit_device.set_state({'laser_enable' : False}))
+
+    print(cytkit_device.get_state(['pressure']))
+    # cytkit_device.get_state(['check_id', 'pressure', 'temperatures', 'vi_monitors', 'fan_tacho'])
+
 
     time.sleep(1)
 
-    cytkit_device.start_acquisition()
-    blob = cytkit_device.read_out_traces()
-
-    print(blob.shape)
+    # # read traces
+    # cytkit_device.start_acquisition()
+    # blob = cytkit_device.read_out_traces()
+    # print(blob.shape)
 
     cytkit_device.disconnect()
 

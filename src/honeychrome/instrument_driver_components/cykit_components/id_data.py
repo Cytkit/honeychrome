@@ -10,30 +10,32 @@ class IDData:
 
         self.ft4222 = ft4222_communicator
 
-    def check_id(self):
+    def check_connection(self):
         if self.ft4222.register_read('ID_WORD') == 0xCAFE:
             return True
         return False
 
     def read_id_data(self):
-        year = self.ft4222.read_reg('TIMESTAMP_A')
-        value = self.ft4222.read_reg('TIMESTAMP_B')
+        year = self.ft4222.register_read('TIMESTAMP_A')
+        value = self.ft4222.register_read('TIMESTAMP_B')
         month = (value >> 8) & 0x00FF
         day = (value >> 0) & 0x00FF
-        value = self.ft4222.read_reg('TIMESTAMP_C')
+        value = self.ft4222.register_read('TIMESTAMP_C')
         hour = (value >> 8) & 0x00FF
         minute = (value >> 0) & 0x00FF
 
-        value = self.ft4222.read_reg('TIMESTAMP_D')
+        value = self.ft4222.register_read('TIMESTAMP_D')
         second = (value >> 0) & 0x00FF
 
         self.timestamp = datetime.datetime(year=year, month=month, day=day, hour=hour, minute=minute, second=second)
 
-        value = self.ft4222.read_reg('VERSION_A')
+        value = self.ft4222.register_read('VERSION_A')
         self.version_major = (value >> 8) & 0x00FF
         self.version_minor = (value >> 0) & 0x00FF
 
-        value = self.ft4222.read_reg('VERSION_B')
+        value = self.ft4222.register_read('VERSION_B')
         self.version_revision = (value >> 0) & 0x00FF
 
-        self.version_build = self.ft4222.read_reg('VERSION_C')
+        self.version_build = self.ft4222.register_read('VERSION_C')
+
+        return self.timestamp, self.version_build

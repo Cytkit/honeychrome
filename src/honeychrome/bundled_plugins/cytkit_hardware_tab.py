@@ -9,7 +9,9 @@ import logging
 
 from honeychrome.controller import Controller
 from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import monitor_dictionary
+from honeychrome.main import configure_multiprocessing
 from honeychrome.settings import heading_style
+from honeychrome.view_components.event_bus import EventBus
 from honeychrome.view_components.icon_loader import icon
 
 logger = logging.getLogger(__name__)
@@ -84,7 +86,7 @@ class PluginWidget(QWidget):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         self.update_connection_status_btn = QPushButton("Update Connection Status")
-        self.update_connection_status_btn.clicked.connect(lambda: self.get_instrument_state(['check_id','version','datetime']))
+        self.update_connection_status_btn.clicked.connect(lambda: self.get_instrument_state(['check_connection','read_id_data']))
         layout.addWidget(self.update_connection_status_btn)
         self.connection_status_not_connected = QLabel('<span style="font-weight:bold; color:red">Not connected</span>')
         self.connection_status_not_connected.setTextFormat(Qt.RichText)
@@ -232,13 +234,22 @@ class PluginWidget(QWidget):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        # Temp monitors
+        title = QLabel('Temperatures')
+        title.setStyleSheet(heading_style)
+        layout.addWidget(title)
         self.read_temperatures = QPushButton('Read Temperatures')
         self.read_temperatures.clicked.connect(lambda: self.get_instrument_state(['temperatures']))
         layout.addWidget(self.read_temperatures)
         form = QFormLayout()
         self.temp_p_sensor_label = QLabel('None')
-        form.addRow('Temperature (of pressure sensor)', self.temp_p_sensor_label)
+        form.addRow('Temperature (at pressure sensor)', self.temp_p_sensor_label)
+        layout.addLayout(form)
 
+        # VI monitors
+        title = QLabel('VI Monitors')
+        title.setStyleSheet(heading_style)
+        layout.addWidget(title)
         self.read_monitors = QPushButton('Read VI Monitors')
         self.read_monitors.clicked.connect(lambda: self.get_instrument_state(['vi_monitors']))
         layout.addWidget(self.read_monitors)
@@ -336,8 +347,8 @@ class PluginWidget(QWidget):
         else:
             response = {'message': {}}
 
-        if 'check_id' in response['message']:
-            if response['message']['check_id']:
+        if 'check_connection' in response['message']:
+            if response['message']['check_connection']:
                 self.connection_status_connected.setVisible(True)
                 self.connection_status_not_connected.setVisible(False)
             else:
@@ -387,9 +398,116 @@ class PluginWidget(QWidget):
 
 
 if __name__ == "__main__":
-    from PySide6.QtWidgets import QApplication, QMainWindow
+    import sys
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    import multiprocessing as mp
+    from multiprocessing import shared_memory, Lock
+    import numpy as np
+
+    configure_multiprocessing()
+
+    '''
+    define objects for communication between processes
+    '''
+    from honeychrome.settings import traces_cache_size, traces_cache_dtype
+    from honeychrome.settings import max_events_in_cache, n_channels_per_event
+    import honeychrome.settings as settings
+
+    # Allocate shared memory block, plus head and tail indices
+    traces_cache_shm = shared_memory.SharedMemory(create=True, size=np.zeros(traces_cache_size, dtype=traces_cache_dtype).nbytes)
+    traces_cache_lock = Lock()
+    index_head_traces_cache = mp.Value('i', 0)
+    index_tail_traces_cache = mp.Value('i', 0)
+
+    events_cache_shm = shared_memory.SharedMemory(create=True,
+                                                  size=np.zeros((max_events_in_cache, n_channels_per_event),
+                                                                dtype=np.int_).nbytes)
+    events_cache_lock = Lock()
+    index_head_events_cache = mp.Value('i', 0)
+    index_tail_events_cache = mp.Value('i', 0)
+
+    # oscilloscope traces
+    oscilloscope_traces_queue = mp.Queue()
+    # command pipes
+    pipe_experiment_instrument_e, pipe_experiment_instrument_i = mp.Pipe()
+    pipe_experiment_analyser_e, pipe_experiment_analyser_a = mp.Pipe()
+    # logging queue
+    logging_queue = mp.Queue()
+    # Set up listener in the main process
+    listener = logging.handlers.QueueListener(logging_queue, logging.StreamHandler(), respect_handler_level=True)
+    listener.start()
+
+    '''
+    start instrument driver
+    '''
+    from honeychrome.instrument_communicator import Instrument
+
+    instrument = Instrument(
+        use_dummy_instrument=settings.use_dummy_instrument_retrieved,
+        traces_cache_name=traces_cache_shm.name,
+        traces_cache_lock=traces_cache_lock,
+        index_head_traces_cache=index_head_traces_cache,
+        index_tail_traces_cache=index_tail_traces_cache,
+        pipe_connection=pipe_experiment_instrument_i,
+        logging_queue=logging_queue
+    )
+    instrument.start()
+
+    '''
+    start trace analyser
+    '''
+    from honeychrome.trace_analyst import TraceAnalyser
+
+    trace_analyser = TraceAnalyser(
+        traces_cache_name=traces_cache_shm.name,
+        traces_cache_lock=traces_cache_lock,
+        index_head_traces_cache=index_head_traces_cache,
+        index_tail_traces_cache=index_tail_traces_cache,
+        events_cache_name=events_cache_shm.name,
+        events_cache_lock=events_cache_lock,
+        index_head_events_cache=index_head_events_cache,
+        index_tail_events_cache=index_tail_events_cache,
+        oscilloscope_traces_queue=oscilloscope_traces_queue,
+        pipe_connection=pipe_experiment_analyser_a
+    )
+    trace_analyser.start()
+
+    '''
+    start controller
+    '''
+    from honeychrome.controller import Controller
+
+    controller = Controller(
+            events_cache_name=events_cache_shm.name,
+            events_cache_lock=events_cache_lock,
+            index_head_events_cache=index_head_events_cache,
+            index_tail_events_cache=index_tail_events_cache,
+            oscilloscope_traces_queue=oscilloscope_traces_queue,
+            pipe_connection_instrument=pipe_experiment_instrument_e,
+            pipe_connection_analyser=pipe_experiment_analyser_e)
+
+    '''
+    start application and view
+    '''
+    bus = EventBus()
+    controller.bus = bus # connect signals coming from controller
+
     app = QApplication([])
-    window = PluginWidget()
+    window = PluginWidget(bus=bus, controller=controller)
     window.resize(1000, 1000)
     window.show()
-    app.exec()
+    exit_code = app.exec()
+
+    # end processes, free memory
+    controller.quit_instrument_quit_analyser()
+    trace_analyser.join()
+    instrument.join()
+    traces_cache_shm.close()
+    events_cache_shm.close()
+    traces_cache_shm.unlink()
+    events_cache_shm.unlink()
+    listener.stop()
+
+    sys.exit(exit_code)

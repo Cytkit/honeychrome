@@ -56,7 +56,7 @@ class Ft4222Communicator:
         return int.from_bytes(data_read[2:], byteorder='big', signed=False)
 
     def register_2byte_write(self, register_low, register_high, data_to_write):
-        self.register_write(register_low, (data_to_write >> 8) & 0xFFFF)
+        self.register_write(register_low, (data_to_write >> 0) & 0xFFFF)
         self.register_write(register_high, (data_to_write >> 16) & 0xFFFF)
 
     def register_2byte_read(self, register_low, register_high):
