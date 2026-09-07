@@ -22,13 +22,13 @@ class I2C:
 
 
     def write(self, address, write_buffer, write_size):
-        self._write_read(address, write_buffer, write_size, None, 0, 'Write')
+        return self._write_read(address, write_buffer, write_size, None, 0, 'Write')
 
     def read(self, address, read_buffer, read_size):
-        self._write_read(address, None, 0, read_buffer, read_size, 'Read')
+        return self._write_read(address, None, 0, read_buffer, read_size, 'Read')
 
     def write_read(self, address, write_buffer, write_size, read_buffer, read_size):
-        self._write_read(address, write_buffer, write_size, read_buffer, read_size, 'WriteRead')
+        return self._write_read(address, write_buffer, write_size, read_buffer, read_size, 'WriteRead')
 
     def _write_read(self, address, write_buffer, write_size, read_buffer, read_size, caller_name):
         if not self.ft4222.connected():
@@ -66,7 +66,7 @@ class I2C:
             if status & 0x0010:
                 break
 
-            time.sleep(1)
+            time.sleep(0.001)
             count += 1
             if count > 100000:
                 return False

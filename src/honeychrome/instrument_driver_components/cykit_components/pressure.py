@@ -73,11 +73,11 @@ class Pressure:
         self.ft4222 = ft4222_communicator
         self.readback_offset = None
         self.calibration_data = None
+        self.connect()
 
     def connect(self):
         self.readback_offset = 0.0
         self._sensor_reset()
-        self._sensor_load_coeff_data()
         self._sensor_load_cal_data()
 
     def disconnect(self):
@@ -89,10 +89,10 @@ class Pressure:
 
             # Read the raw ADC pressure and temperature values
             raw_pressure_value = self._sensor_get_raw_pressure()
-            raw_temperaure_value = self._sensor_get_raw_temperature()
+            raw_temperature_value = self._sensor_get_raw_temperature()
 
             # Calculate the actual pressure
-            dT = raw_temperaure_value - (self.calibration_data[5] * coefficient_data[5])
+            dT = raw_temperature_value - (self.calibration_data[5] * coefficient_data[5])
             offset = (self.calibration_data[2] * coefficient_data[2]) + ((self.calibration_data[4] * dT) / coefficient_data[4])
             sensitivity = (self.calibration_data[1] * coefficient_data[1]) + ((self.calibration_data[3] * dT) / coefficient_data[3])
 

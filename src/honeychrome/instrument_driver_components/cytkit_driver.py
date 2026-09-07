@@ -174,8 +174,8 @@ class CytkitDevice:
             for channel in monitor_dictionary:
                 V = self.vi_monitor.read_voltage(channel)
                 I = self.vi_monitor.read_current(channel)
-                message['vi_monitors'][channel]['V'] = V
-                message['vi_monitors'][channel]['I'] = I
+                message['vi_monitors']['V'][channel] = V
+                message['vi_monitors']['I'][channel] = I
 
         if 'fan_state'in list_of_parameters:
             message['fan_state'] = {}
@@ -238,29 +238,26 @@ if __name__ == '__main__':
     print('test laser')
     print(cytkit_device.set_state({'laser_enable' : True}))
 
-    # print('test pressure')
-    # print(cytkit_device.get_state(['pressure'])) # not yet working
+    print('test pressure')
+    print(cytkit_device.get_state(['pressure']))
 
-    # print('test temperatures')
-    # print(cytkit_device.get_state(['temperatures'])) # not yet working
+    print('test temperatures')
+    print(cytkit_device.get_state(['temperatures'])) # not yet working
 
-    # print('test vi monitors')
-    # print(cytkit_device.get_state(['vi_monitors'])) # not yet working
+    print('test vi monitors')
+    print(cytkit_device.get_state(['vi_monitors'])) # not yet working
 
     print('test fan')
     print(cytkit_device.get_state(['fan_state']))
-    print(cytkit_device.set_state({'fan_state': {'enable': True, 'freq': 1000, 'duty': 128}}))
-    # print(cytkit_device.set_state({'fan_state': {'duty': 128}}))
-    # print(cytkit_device.set_state({'fan_state': {'freq': 1000}}))
-    # print(cytkit_device.set_state({'fan_state': {'enable': True}}))
+    print(cytkit_device.set_state({'fan_state': {'enable': True, 'freq': 100, 'duty': 128}}))
     print(cytkit_device.get_state(['fan_state']))
 
     print('test sheath pump')
-    print(cytkit_device.set_state({'sheath_pump_state': {'enable': True, 'freq': 1000, 'duty': 128}}))
+    print(cytkit_device.set_state({'sheath_pump_state': {'enable': True, 'freq': 100, 'duty': 128}}))
     print(cytkit_device.get_state(['sheath_pump_state']))
 
     print('test sample pump')
-    print(cytkit_device.set_state({'sample_pump_state': {'enable': True, 'reverse': False, 'ramp': True, 'speed': 1000, 'steps_per_cycle': 1, 'clocks_per_cycle': 100_000}}))
+    print(cytkit_device.set_state({'sample_pump_state': {'enable': True, 'reverse': False, 'ramp': True, 'speed': 6000, 'steps_per_cycle': 1, 'clocks_per_cycle': 100_000}}))
     print(cytkit_device.get_state(['sample_pump_state']))
 
     # test dacs
@@ -271,6 +268,7 @@ if __name__ == '__main__':
     print(cytkit_device.set_state({'laser_enable' : False}))
     print(cytkit_device.set_state({'sheath_pump_state': {'enable': False}}))
     print(cytkit_device.set_state({'sample_pump_state': {'enable': False}}))
+    print(cytkit_device.set_state({'fan_state': {'enable': False}}))
 
     # # read traces
     # cytkit_device.start_acquisition()
