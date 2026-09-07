@@ -38,4 +38,4 @@ class IDData:
 
         self.version_build = self.ft4222.register_read('VERSION_C')
 
-        return self.timestamp, self.version_build
+        return self.version_build, self.timestamp

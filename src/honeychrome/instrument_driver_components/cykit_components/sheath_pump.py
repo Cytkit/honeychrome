@@ -6,7 +6,7 @@ class SheathPump:
         self.set_enable(False)
 
     def set_enable(self, enable):
-        self.ft4222.register_write('SHPMP_CTRL', 1)
+        self.ft4222.register_write('SHPMP_CTRL', int(enable))
 
     def get_enable(self):
         return self.ft4222.register_read('SHPMP_CTRL') == 1

@@ -30,7 +30,7 @@ class SamplePump:
 
         self.ft4222.register_read_modify_write('SMPMP_CTRL', value, mask)
 
-    def set_reverse(self):
+    def get_reverse(self):
         mask = 0x0010
         return self.ft4222.register_read('SMPMP_CTRL') & mask == 1
 
@@ -44,7 +44,7 @@ class SamplePump:
 
         self.ft4222.register_read_modify_write('SMPMP_CTRL', value, mask)
 
-    def set_ramp(self):
+    def get_ramp(self):
         mask = 0x1000
         return self.ft4222.register_read('SMPMP_CTRL') & mask == 1
 

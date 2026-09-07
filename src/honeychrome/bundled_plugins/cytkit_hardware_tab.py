@@ -172,7 +172,7 @@ class PluginWidget(QWidget):
         self.sample_pump_rampSpC_spinbox = LabeledSpinBox('Sample Pump Ramp SpC', 0, 100, 1, 1)
         layout.addWidget(self.sample_pump_rampSpC_spinbox)
         help_text(layout, '🛈 Sample pump ramp SpC (speed increments per cycle) is the ramp step to make in units of 0.1 Hz when changing the pump speed')
-        # cycles per clock - how many clock cycles before increment ramp step
+        # clocks per cycle - how many clock cycles before increment ramp step
         # note 100 MHz FPGA clock
         self.sample_pump_rampCpC_spinbox = LabeledSpinBox('Sample Pump Ramp CpC', 0, 2_000_000_000, 100_000, 1_000)
         layout.addWidget(self.sample_pump_rampCpC_spinbox)
