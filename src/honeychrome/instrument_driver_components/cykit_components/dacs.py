@@ -18,13 +18,13 @@ class DACs:
         self.set_value(index_dac_bias_zero + index, value)
 
     def get_value(self, dac_id):
-        self._dac_get(dac_dictionary[dac_id]['address'], dac_dictionary[dac_id]['channel_number'], dac_dictionary[dac_id]['channel_name'])
+        return self._dac_get(dac_dictionary[dac_id]['address'], dac_dictionary[dac_id]['channel_number'], dac_dictionary[dac_id]['channel_name'])
 
     def get_value_ref(self, index):
-        self.get_value(index_dac_ref_zero + index)
+        return self.get_value(index_dac_ref_zero + index)
 
     def get_value_bias(self, index):
-        self.get_value(index_dac_bias_zero + index)
+        return self.get_value(index_dac_bias_zero + index)
 
     def _dac_set(self, i2c_address, channel, value, dac_name):
         # Limit checks

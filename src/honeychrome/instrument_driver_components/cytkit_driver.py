@@ -3,7 +3,7 @@ import time
 import numpy as np
 
 from honeychrome.instrument_driver_components.cykit_components.adcs import ADCs
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import registers_map, monitor_dictionary
+from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary
 from honeychrome.instrument_driver_components.cykit_components.dacs import DACs
 from honeychrome.instrument_driver_components.cykit_components.ft4222communicator import Ft4222Communicator
 from honeychrome.instrument_driver_components.cykit_components.fan import Fan
@@ -149,6 +149,15 @@ class CytkitDevice:
                     self.sample_pump.set_clocks_per_cycle(value['clocks_per_cycle'])
                 message['sample_pump_state'] = value
 
+            if parameter == 'dacs':
+                if 'bias' in value:
+                    for index in value['bias']:
+                        self.dacs.set_value_bias(index, value['bias'][index])
+                if 'ref' in value:
+                    for index in value['ref']:
+                        self.dacs.set_value_ref(index, value['ref'][index])
+                message['dacs'] = value
+
         return 'OK', message
 
     def get_state(self, list_of_parameters):
@@ -197,7 +206,7 @@ class CytkitDevice:
             duty = self.sheath_pump.get_pwm_duty()
             message['sheath_pump_state']['duty'] = duty
 
-        if 'sample_pump_state'in list_of_parameters:
+        if 'sample_pump_state' in list_of_parameters:
             message['sample_pump_state'] = {}
             enable = self.sample_pump.get_enable()
             message['sample_pump_state']['enable'] = enable
@@ -211,6 +220,12 @@ class CytkitDevice:
             message['sample_pump_state']['steps_per_cycle'] = steps_per_cycle
             clocks_per_cycle = self.sample_pump.get_clocks_per_cycle()
             message['sample_pump_state']['clocks_per_cycle'] = clocks_per_cycle
+
+        if 'dacs' in list_of_parameters:
+            message['dacs'] = {'bias':{}, 'ref':{}}
+            for index in range(16):
+                message['dacs']['bias'][index] = self.dacs.get_value_bias(index)
+                message['dacs']['ref'][index] = self.dacs.get_value_ref(index)
 
         return 'OK', message
 
@@ -260,7 +275,9 @@ if __name__ == '__main__':
     print(cytkit_device.set_state({'sample_pump_state': {'enable': True, 'reverse': False, 'ramp': True, 'speed': 6000, 'steps_per_cycle': 1, 'clocks_per_cycle': 100_000}}))
     print(cytkit_device.get_state(['sample_pump_state']))
 
-    # test dacs
+    print('test dacs')
+    print(cytkit_device.set_state({'dacs': {'bias': {index:50+index for index in range(16)}, 'ref': {index:20-index for index in range(16)}}}))
+    print(cytkit_device.get_state(['dacs']))
 
     # test adcs
 
@@ -277,3 +294,31 @@ if __name__ == '__main__':
 
     cytkit_device.disconnect()
 
+'''
+Example output:
+('OK', {'check_connection': True})
+('OK', {'read_id_data': {'version': 152, 'datetime': datetime.datetime(2026, 9, 7, 21, 41, 53)}})
+test laser
+('OK', {'laser_enable': True})
+test pressure
+('OK', {'pressure': -44.38498682354143})
+test temperatures
+('OK', {'temperatures': {'temp_p_sensor': 31.312837285995485}})
+test vi monitors
+('OK', {'vi_monitors': {'V': {0: 31.6096, 1: 31.6416, 2: 11.9376, 3: 11.940800000000001, 4: 5.0016, 5: 5.0, 6: 3.3120000000000003, 7: 1.8048000000000002}, 'I': {0: 16.195, 1: 0.0, 2: 16.22925, 3: 16.38275, 4: 16.0735, 5: 16.383, 6: 16.25775, 7: 16.29425}}})
+test fan
+('OK', {'fan_state': {'enable': True, 'freq': 100, 'duty': 128, 'tacho': 0}})
+('OK', {'fan_state': {'enable': True, 'freq': 100, 'duty': 128}})
+('OK', {'fan_state': {'enable': True, 'freq': 100, 'duty': 128, 'tacho': 0}})
+test sheath pump
+('OK', {'sheath_pump_state': {'enable': True, 'freq': 100, 'duty': 128}})
+('OK', {'sheath_pump_state': {'enable': True, 'freq': 100, 'duty': 128}})
+test sample pump
+('OK', {'sample_pump_state': {'enable': True, 'reverse': False, 'ramp': True, 'speed': 6000, 'steps_per_cycle': 1, 'clocks_per_cycle': 100000}})
+('OK', {'sample_pump_state': {'enable': True, 'reverse': False, 'ramp': False, 'speed': 6000, 'steps_per_cycle': 1, 'clocks_per_cycle': 100000}})
+('OK', {'laser_enable': False})
+('OK', {'sheath_pump_state': {'enable': False}})
+('OK', {'sample_pump_state': {'enable': False}})
+('OK', {'fan_state': {'enable': False}})
+
+'''

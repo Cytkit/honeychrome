@@ -109,7 +109,7 @@ dac_dictionary = {
     31: {'address': 0x9E, 'channel_number': 7, 'channel_name': 'SSC Ref'},
 }
 index_dac_bias_zero = 0
-index_dac_ref_zero = 15
+index_dac_ref_zero = 16
 
 adc_dictionary = {
     	0: {'name':'ADC_ID_SIPM_0', 'register_base': 0x1000},
