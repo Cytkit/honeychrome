@@ -355,11 +355,9 @@ class PluginWidget(QWidget):
                 self.connection_status_connected.setVisible(False)
                 self.connection_status_not_connected.setVisible(True)
 
-        if 'version' in response['message']:
-            self.version.setText(response['message']['version'])
-
-        if 'datetime' in response['message']:
-            self.datetime.setText(response['message']['datetime'])
+        if 'read_id_data' in response['message']:
+            self.version.setText(response['message']['read_id_data']['version'])
+            self.datetime.setText(response['message']['read_id_data']['datetime'])
 
         if 'pressure' in response['message']:
             self.pressure_value.setText(f'{response['message']['pressure']} Pa')
@@ -369,10 +367,34 @@ class PluginWidget(QWidget):
 
         if 'vi_monitors' in response['message']:
             for channel in monitor_dictionary:
-                self.monitor_labels[channel].setText(f'{response['message'][channel]['V']} V, {response['message'][channel]['I']} mA')
+                self.monitor_labels[channel].setText(f'{response['message']['vi_monitors']['V'][channel]} V, {response['message']['vi_monitors']['I'][channel]} mA')
 
-        if 'fan_tacho' in response['message']:
-            self.fan_tacho_value.setText(f'{response['message']['fan_tacho']} rpm')
+        if 'fan_state' in response['message']:
+            self.fan_enable_cb.setChecked(response['message']['fan_state']['enable'])
+            self.fan_freq_spinbox.spinbox.setValue(response['message']['fan_state']['freq'])
+            self.fan_duty_spinbox.spinbox.setValue(response['message']['fan_state']['duty'])
+            self.fan_tacho_value.setText(f'{response['message']['fan_state']['tacho']} rpm')
+
+        if 'sheath_pump_state' in response['message']:
+            self.sheath_pump_enable_cb.setChecked(response['message']['sheath_pump_state']['enable'])
+            self.sheath_pump_freq_spinbox.spinbox.setValue(response['message']['sheath_pump_state']['freq'])
+            self.sheath_pump_duty_spinbox.spinbox.setValue(response['message']['sheath_pump_state']['duty'])
+
+        if 'sample_pump_state' in response['message']:
+            self.sample_pump_enable_cb.setChecked(response['message']['sample_pump_state']['enable'])
+            self.sample_pump_reverse_cb.setChecked(response['message']['sample_pump_state']['reverse'])
+            self.sample_pump_ramp_cb.setChecked(response['message']['sample_pump_state']['ramp'])
+            self.sample_pump_speed_spinbox.spinbox.setValue(response['message']['sample_pump_state']['speed'])
+            self.sample_pump_rampSpC_spinbox.spinbox.setValue(response['message']['sample_pump_state']['steps_per_cycle'])
+            self.sample_pump_rampCpC_spinbox.spinbox.setValue(response['message']['sample_pump_state']['clocks_per_cycle'])
+
+        if 'dacs' in response['message']:
+            if 'bias' in response['message']['dacs']:
+                for index in response['message']['dacs']['bias']:
+                    self.dac_spinboxes[index].spinbox.setValue(response['message']['dacs']['bias'][index])
+            if 'ref' in response['message']['dacs']:
+                for index in response['message']['dacs']['ref']:
+                    self.dac_spinboxes[index].spinbox.setValue(response['message']['dacs']['ref'][index])
 
         if self.bus:
             self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
