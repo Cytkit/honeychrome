@@ -241,7 +241,7 @@ class PluginWidget(QWidget):
                 spin.spinbox.valueChanged.connect(lambda value, n: self.set_instrument_state({'dacs': {dac_type: {row: value}}}))
                 self.dac_table.setCellWidget(row, col, spin)
                 # value = dac_table.cellWidget(0, 1).value()
-                # dac_table.cellWidget(0, 1).spinbox.setValue(value)
+                # self.dac_table.cellWidget(0, 1).spinbox.setValue(value)
 
         self.dac_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.dac_table.verticalHeader().setVisible(False)  # Hide row numbers
@@ -444,10 +444,13 @@ class PluginWidget(QWidget):
         if 'dacs' in response['message']:
             if 'bias' in response['message']['dacs']:
                 for index in response['message']['dacs']['bias']:
-                    self.dac_spinboxes[index].spinbox.setValue(response['message']['dacs']['bias'][index])
+                    value = response['message']['dacs']['bias'][index]
+                    self.dac_table.cellWidget(index, 0).spinbox.setValue(value)
+
             if 'ref' in response['message']['dacs']:
                 for index in response['message']['dacs']['ref']:
-                    self.dac_spinboxes[index].spinbox.setValue(response['message']['dacs']['ref'][index])
+                    value = response['message']['dacs']['bias'][index]
+                    self.dac_table.cellWidget(index, 1).spinbox.setValue(value)
 
         if self.bus:
             self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
