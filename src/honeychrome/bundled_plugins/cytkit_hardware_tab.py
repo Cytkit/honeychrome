@@ -2,13 +2,13 @@
 Cytkit State plugin (hardware monitor and settings)
 """
 from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QTabWidget, QToolBox, QFormLayout, QComboBox, QCheckBox, QSpinBox, QHBoxLayout, QFrame
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QTabWidget, QToolBox, QFormLayout, QComboBox, QCheckBox, QSpinBox, QHBoxLayout, QFrame, QTableWidget, QHeaderView
 from PySide6.QtCore import Qt, Slot, Signal, QSize
 
 import logging
 
 from honeychrome.controller import Controller
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import monitor_dictionary
+from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import monitor_dictionary, dac_dictionary, number_of_dacs_pairs
 from honeychrome.main import configure_multiprocessing
 from honeychrome.settings import heading_style
 from honeychrome.view_components.event_bus import EventBus
@@ -20,7 +20,7 @@ plugin_name = 'Cytkit Hardware'
 
 
 class LabeledSpinBox(QWidget):
-    def __init__(self, text, min=0, max=100, default=1, step=1, parent=None):
+    def __init__(self, text, min=0, max=100, default=1, step=1, parent=None, label_right=False):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)  # Removes default padding
@@ -31,8 +31,14 @@ class LabeledSpinBox(QWidget):
         self.spinbox.setValue(default)
         self.spinbox.setSingleStep(step)
 
-        layout.addWidget(self.label)
-        layout.addWidget(self.spinbox)
+        if not label_right:
+            layout.addWidget(self.label)
+            layout.addWidget(self.spinbox)
+        else:
+            self.spinbox.setAlignment(Qt.AlignRight)  # Right justify
+            layout.addWidget(self.spinbox)
+            layout.addWidget(self.label)
+
 
 class HLine(QFrame):
     def __init__(self, parent=None):
@@ -159,22 +165,28 @@ class PluginWidget(QWidget):
         title.setStyleSheet(heading_style)
         layout.addWidget(title)
         self.sample_pump_enable_cb = QCheckBox("Sample Pump Enable")
+        self.sample_pump_enable_cb.toggled.connect(lambda checked: self.set_instrument_state({'sample_pump_state': {'enable': checked}}))
         layout.addWidget(self.sample_pump_enable_cb)
         self.sample_pump_reverse_cb = QCheckBox("Sample Pump Reverse")
+        self.sample_pump_reverse_cb.toggled.connect(lambda checked: self.set_instrument_state({'sample_pump_state': {'reverse': checked}}))
         layout.addWidget(self.sample_pump_reverse_cb)
-        self.sample_pump_ramp_cb = QCheckBox("Sample Pump Ramp") # put on by default
+        self.sample_pump_ramp_cb = QCheckBox("Sample Pump Ramp")
+        self.sample_pump_ramp_cb.toggled.connect(lambda checked: self.set_instrument_state({'sample_pump_state': {'ramp': checked}}))
         layout.addWidget(self.sample_pump_ramp_cb)
         # frequency of pump steps 0.1 Hz, i.e. 10_000 for 1 kHz - fpga can do range(65_535)
         self.sample_pump_speed_spinbox = LabeledSpinBox('Sample Pump Speed', 0, 65_535, 0, 100)
+        self.sample_pump_speed_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'sample_pump_state': {'speed': value}}))
         layout.addWidget(self.sample_pump_speed_spinbox)
         help_text(layout, '🛈 Sample pump speed is the frequency of pump steps in units of 0.1 Hz')
         # steps per cycle - speed increments per cycle
         self.sample_pump_rampSpC_spinbox = LabeledSpinBox('Sample Pump Ramp SpC', 0, 100, 1, 1)
+        self.sample_pump_rampSpC_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'sample_pump_state': {'steps_per_cycle': value}}))
         layout.addWidget(self.sample_pump_rampSpC_spinbox)
         help_text(layout, '🛈 Sample pump ramp SpC (speed increments per cycle) is the ramp step to make in units of 0.1 Hz when changing the pump speed')
         # clocks per cycle - how many clock cycles before increment ramp step
         # note 100 MHz FPGA clock
         self.sample_pump_rampCpC_spinbox = LabeledSpinBox('Sample Pump Ramp CpC', 0, 2_000_000_000, 100_000, 1_000)
+        self.sample_pump_rampCpC_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'sample_pump_state': {'clocks_per_cycle': value}}))
         layout.addWidget(self.sample_pump_rampCpC_spinbox)
         help_text(layout, '🛈 Sample pump ramp CpC (cycles per clock) is the number of FPGA clock cycles to count (at 2 GHz) before changing the sample pump speed by one step')
 
@@ -187,11 +199,14 @@ class PluginWidget(QWidget):
         title.setStyleSheet(heading_style)
         layout.addWidget(title)
         self.sheath_pump_enable_cb = QCheckBox("Sheath Pump Enable")
+        self.sheath_pump_enable_cb.toggled.connect(lambda checked: self.set_instrument_state({'sheath_pump_state': {'enable': checked}}))
         layout.addWidget(self.sheath_pump_enable_cb)
         self.sheath_pump_duty_spinbox = LabeledSpinBox('Sheath Pump Duty', 0, 255, 127, 8)
+        self.sheath_pump_duty_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'sheath_pump_state': {'duty': value}}))
         layout.addWidget(self.sheath_pump_duty_spinbox)
         help_text(layout, '🛈 Sheath pump duty is a number in the range 0--255, where 0 is off, and 255 is on 100% of the time')
         self.sheath_pump_freq_spinbox = LabeledSpinBox('Sheath Pump Frequency', 0, 2_000_000_000, 1000, 100)
+        self.sheath_pump_freq_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'sheath_pump_state': {'freq': value}}))
         layout.addWidget(self.sheath_pump_freq_spinbox)
         help_text(layout, '🛈 Sheath pump frequency is the frequency of the duty cycle in Hz')
 
@@ -214,7 +229,28 @@ class PluginWidget(QWidget):
         # dac bias, dac ref x chanels
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.addWidget(QLabel("Content for dacs_tab"))
+
+        layout.addWidget(QLabel("DACs for each channel (DAC units 0..255)"))
+        self.dac_table = QTableWidget(number_of_dacs_pairs, 2)
+        self.dac_table.setHorizontalHeaderLabels(["Bias", "Ref"])
+        for row in range(number_of_dacs_pairs):
+            for col in range(2):
+                dac_index = row + col * number_of_dacs_pairs
+                dac_type = 'bias' if col == 0 else 'ref'
+                spin = LabeledSpinBox(min=0, max=255, text=dac_dictionary[dac_index]['channel_name'], label_right=True)
+                spin.spinbox.valueChanged.connect(lambda value, n: self.set_instrument_state({'dacs': {dac_type: {row: value}}}))
+                self.dac_table.setCellWidget(row, col, spin)
+                # value = dac_table.cellWidget(0, 1).value()
+                # dac_table.cellWidget(0, 1).spinbox.setValue(value)
+
+        self.dac_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.dac_table.verticalHeader().setVisible(False)  # Hide row numbers
+        self.dac_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        total_height = (self.dac_table.verticalHeader().length() + self.dac_table.horizontalHeader().height() + (self.dac_table.frameWidth() * 2))
+        self.dac_table.setFixedHeight(total_height)
+        # dac_table.setVerticalHeaderLabels([dac_dictionary[n]['channel_name'] for n in range(number_of_dacs_pairs)])
+        layout.addWidget(self.dac_table)
+
         layout.addStretch()
         toolbox.addItem(tab, "DACs")
 
@@ -253,23 +289,35 @@ class PluginWidget(QWidget):
         self.read_monitors = QPushButton('Read VI Monitors')
         self.read_monitors.clicked.connect(lambda: self.get_instrument_state(['vi_monitors']))
         layout.addWidget(self.read_monitors)
-        form = QFormLayout()
-        self.monitor_labels = {}
-        for channel in monitor_dictionary:
-            self.monitor_labels[channel] = QLabel('None')
-            form.addRow(monitor_dictionary[channel]['name'], self.monitor_labels[channel])
-        layout.addLayout(form)
+
+        self.vi_table = QTableWidget(len(monitor_dictionary), 2)
+        self.vi_table.setHorizontalHeaderLabels(["V [V]", "I [mA]"])
+        for row in range(len(monitor_dictionary)):
+            for col in range(2):
+                self.vi_table.setCellWidget(row, col, QLabel())
+                # value = self.vi_table.cellWidget(0, 1).value()
+                # self.vi_table.cellWidget(0, 1).spinbox.setValue(value)
+
+        self.vi_table.setVerticalHeaderLabels([monitor_dictionary[row]['name'] for row in range(len(monitor_dictionary))])
+        self.vi_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        total_height = (self.vi_table.verticalHeader().length() + self.vi_table.horizontalHeader().height() + (self.vi_table.frameWidth() * 2))
+        self.vi_table.setFixedHeight(total_height)
+        self.vi_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.vi_table)
 
         # fan control: enable cb, duty spin, freq spin, tacho label
         title = QLabel('Cooling Fan')
         title.setStyleSheet(heading_style)
         layout.addWidget(title)
         self.fan_enable_cb = QCheckBox("Fan Enable")
+        self.fan_enable_cb.toggled.connect(lambda checked: self.set_instrument_state({'fan_state': {'enable': checked}}))
         layout.addWidget(self.fan_enable_cb)
         self.fan_duty_spinbox = LabeledSpinBox('Fan Duty', 0, 255, 127, 8)
+        self.fan_duty_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'fan_state': {'duty': value}}))
         layout.addWidget(self.fan_duty_spinbox)
         help_text(layout, '🛈 Fan duty is a number in the range 0--255, where 0 is off, and 255 is on 100% of the time')
         self.fan_freq_spinbox = LabeledSpinBox('Fan Frequency', 0, 2_000_000_000, 1000, 100)
+        self.fan_freq_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'fan_state': {'freq': value}}))
         layout.addWidget(self.fan_freq_spinbox)
         help_text(layout, '🛈 fan frequency is the frequency of the duty cycle in Hz')
         self.fan_tacho_value = QLabel('0 rpm')
@@ -319,6 +367,9 @@ class PluginWidget(QWidget):
         # Connect the signal to a slot
         toolbox.currentChanged.connect(self.on_tab_changed)
 
+        # update everything
+        self.get_instrument_state([])
+
     def on_tab_changed(self, index):
         match index:
             case 0: # connection
@@ -367,7 +418,9 @@ class PluginWidget(QWidget):
 
         if 'vi_monitors' in response['message']:
             for channel in monitor_dictionary:
-                self.monitor_labels[channel].setText(f'{response['message']['vi_monitors']['V'][channel]} V, {response['message']['vi_monitors']['I'][channel]} mA')
+                for col, monitor_type in enumerate(['V', 'I']):
+                    value = response['message']['vi_monitors']['V'][channel]
+                    self.vi_table.cellWidget(channel, col).setText(value)
 
         if 'fan_state' in response['message']:
             self.fan_enable_cb.setChecked(response['message']['fan_state']['enable'])

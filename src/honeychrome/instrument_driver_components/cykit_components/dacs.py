@@ -1,4 +1,5 @@
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import dac_dictionary, index_dac_ref_zero, index_dac_bias_zero
+from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import dac_dictionary, number_of_dacs_pairs
+
 
 class DACs:
     def __init__(self, i2c_bus):
@@ -12,19 +13,31 @@ class DACs:
         self._dac_set(dac_dictionary[dac_id]['address'], dac_dictionary[dac_id]['channel_number'], value, dac_dictionary[dac_id]['channel_name'])
 
     def set_value_ref(self, index, value):
-        self.set_value(index_dac_ref_zero + index, value)
+        if 0 <= index <= number_of_dacs_pairs:
+            self.set_value(number_of_dacs_pairs + index, value)
+        else:
+            raise ValueError("Index out of range")
 
     def set_value_bias(self, index, value):
-        self.set_value(index_dac_bias_zero + index, value)
+        if 0 <= index <= number_of_dacs_pairs:
+            self.set_value(index, value)
+        else:
+            raise ValueError("Index out of range")
 
     def get_value(self, dac_id):
         return self._dac_get(dac_dictionary[dac_id]['address'], dac_dictionary[dac_id]['channel_number'], dac_dictionary[dac_id]['channel_name'])
 
     def get_value_ref(self, index):
-        return self.get_value(index_dac_ref_zero + index)
+        if 0 <= index <= number_of_dacs_pairs:
+            return self.get_value(number_of_dacs_pairs + index)
+        else:
+            raise ValueError("Index out of range")
 
     def get_value_bias(self, index):
-        return self.get_value(index_dac_bias_zero + index)
+        if 0 <= index <= number_of_dacs_pairs:
+            return self.get_value(index)
+        else:
+            raise ValueError("Index out of range")
 
     def _dac_set(self, i2c_address, channel, value, dac_name):
         # Limit checks

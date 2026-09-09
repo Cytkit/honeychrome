@@ -84,6 +84,10 @@ class CytkitDevice:
         self.adcs = ADCs(self.ft4222)
 
         print('[Cytkit driver] Connected')
+
+        # set initial settings
+        self.sample_pump.set_ramp(True)
+
         return  'OK', 'Connected to Cytkit'
 
     def disconnect(self):
@@ -161,6 +165,19 @@ class CytkitDevice:
         return 'OK', message
 
     def get_state(self, list_of_parameters):
+        if not list_of_parameters: # if no list, get everything
+            list_of_parameters = [
+                'check_connection',
+                'read_id_data',
+                'pressure',
+                'temperatures',
+                'vi_monitors',
+                'fan_state',
+                'sheath_pump_state',
+                'sample_pump_state',
+                'dacs'
+            ]
+
         message = {}
         if 'check_connection' in list_of_parameters:
             connected = self.id_data.check_connection()
