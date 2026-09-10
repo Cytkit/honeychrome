@@ -331,8 +331,10 @@ def run_flowsom(controller, state, params: dict, progress=None, af_state=None):
     data, _boundaries = _pool_training_data_with_boundaries(
         controller, state, event_cap, af_state=af_state)
     if data is None:
-        _progress(progress, "FlowSOM: no training data.")
-        return
+        raise RuntimeError(
+            "FlowSOM: no training data. Check the gate and training sample "
+            "selection on the Configuration tab."
+        )
     log_array(log, "flowsom_input", data,
               [c for c in state.selected_channels if c not in drc_pipeline.META_CHANNELS])
 
@@ -518,8 +520,10 @@ def run_leiden(controller, state, params: dict, progress=None, af_state=None) ->
                                                                af_state=af_state)
         dr_algo = None
     if data is None:
-        _progress(progress, "Leiden: no training data.")
-        return
+        raise RuntimeError(
+            "Leiden: no training data. Check the gate and training sample "
+            "selection on the Configuration tab."
+        )
     log_array(log, "leiden_input", data)
 
     resolution = params['resolution']
@@ -621,17 +625,20 @@ def run_hdbscan(controller, state, params: dict, progress=None, af_state=None) -
     event_cap = params.get('_event_cap')
 
     if space != 'dr' or not dr_algo:
-        _progress(progress, "HDBSCAN requires a DR embedding -- it doesn't behave "
-                            "well directly on the full feature space. Train a DR "
-                            "algorithm (UMAP/PaCMAP) and select 'DR embedding' above.")
-        return
+        raise RuntimeError(
+            "HDBSCAN requires a DR embedding -- it doesn't behave well "
+            "directly on the full feature space. Train a DR algorithm "
+            "(UMAP/PaCMAP) and select 'DR embedding' above."
+        )
 
     data, boundaries = get_training_embeddings(controller, state, dr_algo, event_cap,
                                                 af_state=af_state)
     space_label = f'{dr_algo} embedding'
     if data is None:
-        _progress(progress, "HDBSCAN: no training data.")
-        return
+        raise RuntimeError(
+            f"HDBSCAN: no training data in the {space_label}. Re-run the DR "
+            "step, or check the gate and training sample selection."
+        )
     log_array(log, "hdbscan_input", data)
 
     min_cluster_size = params['min_cluster_size']
