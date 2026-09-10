@@ -1,5 +1,5 @@
 """
-dr_clustering_tab.py — DR / Clustering / Statistics Plugin for Honeychrome
+dr_clustering_tab.py — Honeycluster Plugin for Honeychrome
 ===========================================================================
 Honeychrome plugin providing:
   • Dimensionality reduction  — UMAP, PaCMAP, tSNE, PHATE
@@ -226,7 +226,7 @@ def _ensure_qt_imports():
 # ---------------------------------------------------------------------------
 # 2.  Plugin identity
 # ---------------------------------------------------------------------------
-plugin_name = 'DR / Clustering / Statistics'
+plugin_name = 'Honeycluster'
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +338,80 @@ def _read_transforms_from_experiment(controller):
             'limits': list(params.get('limits', [0, 1])),
         }
     return result
+
+def _qs_list(settings, key: str) -> list[str]:
+    """
+    Read a QSettings value that was written as a list of strings.
+
+    QSettings' native backends do not round-trip Python lists faithfully.
+    The INI backend (Linux, and any non-native format) stores an empty
+    list as '@Invalid()' and returns None for it — the `default` argument
+    does not apply, because the key exists. A one-element list comes back
+    as a bare string, which list() would then split into characters.
+    The macOS plist backend has neither problem, so both faults are
+    invisible there.
+    """
+    raw = settings.value(key, None)
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw] if raw else []
+    try:
+        return [str(v) for v in raw]
+    except TypeError:
+        return [str(raw)]
+
+
+def _qs_bool(settings, key: str, default=None):
+    """Read a QSettings bool. INI backends return 'true'/'false' strings."""
+    raw = settings.value(key, None)
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ('true', '1', 'yes', 'on')
+
+
+def _qs_int(settings, key: str, default=None):
+    """Read a QSettings int. INI backends return strings."""
+    raw = settings.value(key, None)
+    if raw is None or raw == '':
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _qs_float(settings, key: str, default=None):
+    """Read a QSettings float. INI backends return strings."""
+    raw = settings.value(key, None)
+    if raw is None or raw == '':
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _with_extension(path: str, ext: str) -> str:
+    """Append *ext* ('.csv') unless *path* already ends in it."""
+    return path if path.lower().endswith(ext.lower()) else path + ext
+
+
+def _cluster_display_name(names: dict, label: int) -> str:
+    """Display name for a cluster id, falling back to 'Cluster N'."""
+    if label in names:
+        return names[label]
+    return 'Noise' if label < 0 else f'Cluster {label}'
+
+
+# Muted italic styling for inline hint labels. Deliberately sets no
+# font-size: an absolute px size ignores the user's font scaling, and
+# palette(mid) tracks the active light/dark palette where a fixed
+# 'grey' would not.
+HINT_STYLE = "color: palette(mid); font-style: italic;"
+
 
 def _antigen_dash_labels(controller) -> dict[str, str]:
     """
@@ -1075,10 +1149,8 @@ class PipelineState:
         self.trex_scores = {}
 
     def cluster_label(self, cluster_id: int) -> str:
-        """Return display name for a cluster id, falling back to str(id)."""
-        if cluster_id < 0:
-            return self.cluster_names.get(cluster_id, 'Noise')
-        return self.cluster_names.get(cluster_id, str(cluster_id))
+        """Return display name for a cluster id, falling back to 'Cluster N'."""
+        return _cluster_display_name(self.cluster_names, cluster_id)
 
     def initialise_sample_groups(self, sample_paths: list[str]):
         """
@@ -1229,6 +1301,7 @@ class RunDetailDialog(QDialog):
         )
         if not path:
             return
+        path = _with_extension(path, '.csv')
         counts = self._per_sample_counts()
         try:
             with open(path, 'w', newline='') as f:
@@ -2037,7 +2110,7 @@ class ConfigTab(QWidget):
             "every run selector elsewhere in the plugin immediately."
         )
         runs_hint.setWordWrap(True)
-        runs_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
+        runs_hint.setStyleSheet(HINT_STYLE)
         runs_box_layout.addWidget(runs_hint)
 
         self.run_table = RunManagementTable(self.controller, self.state)
@@ -2696,20 +2769,6 @@ class TransformTab(QWidget):
             text=drc_help_texts.transforms_tab_help_text
         )
         outer.addWidget(self.help_widget)
-
-        # --- Read-only notice ---
-        notice = QLabel(
-            "ℹ  Parameters are read from the current experiment.  "
-            "Edits here are local previews only — they do not affect the "
-            "main Honeychrome cytometry plots.  To save changes, use the "
-            "Transforms panel in the main Honeychrome interface."
-        )
-        notice.setWordWrap(True)
-        notice.setStyleSheet(
-            "QLabel { background:#fff3cd; color:#5a4a00; border:1px solid #ffc107; "
-            "border-radius:4px; padding:6px; }"
-        )
-        outer.addWidget(notice)
 
         # --- Gate selection — primary tree ---
         gate_box = QGroupBox("Gate(s)")
@@ -3382,6 +3441,7 @@ class TransformTab(QWidget):
         )
         if not path:
             return
+        path = _with_extension(path, '.csv')
 
         skip = {'ribbon', 'Time', 'event_id'}
         rows = []
@@ -3881,7 +3941,7 @@ class GroupsStatsTab(QWidget):
             "pattern per group and use 'Auto-assign by pattern'."
         )
         name_hint.setWordWrap(True)
-        name_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
+        name_hint.setStyleSheet(HINT_STYLE)
         group_box_layout.addWidget(name_hint)
 
         self.groups_table = QTableWidget(0, 3)
@@ -4025,7 +4085,7 @@ class GroupsStatsTab(QWidget):
             "Confusion Matrix, and Composition-by-group."
         )
         test_groups_hint.setWordWrap(True)
-        test_groups_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
+        test_groups_hint.setStyleSheet(HINT_STYLE)
         test_groups_layout.addWidget(test_groups_hint)
 
         self.test_groups_list = QListWidget()
@@ -4107,7 +4167,7 @@ class GroupsStatsTab(QWidget):
             "many groups are checked above."
         )
         compare_hint.setWordWrap(True)
-        compare_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
+        compare_hint.setStyleSheet(HINT_STYLE)
         compare_container_layout.addWidget(compare_hint)
         stats_layout.addWidget(self.trex_compare_container)
         self.trex_compare_container.setVisible(False)
@@ -4199,7 +4259,7 @@ class GroupsStatsTab(QWidget):
             "assignment and its own significance call."
         )
         roles_hint.setWordWrap(True)
-        roles_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
+        roles_hint.setStyleSheet(HINT_STYLE)
         roles_layout.addWidget(roles_hint)
 
         roles_btn_row = QHBoxLayout()
@@ -4336,7 +4396,7 @@ class GroupsStatsTab(QWidget):
             "run first with the matching 'Test:' box(es) checked."
         )
         pca_hint.setWordWrap(True)
-        pca_hint.setStyleSheet("color: grey; font-style: italic; font-size: 10px;")
+        pca_hint.setStyleSheet(HINT_STYLE)
         pca_layout.addWidget(pca_hint)
 
         pca_source_row = QHBoxLayout()
@@ -5858,6 +5918,7 @@ class GroupsStatsTab(QWidget):
         )
         if not path:
             return
+        path = _with_extension(path, '.csv')
         try:
             try:
                 raw_subdir = self.controller.experiment.settings['raw'][
@@ -7648,6 +7709,7 @@ class GroupsStatsTab(QWidget):
         )
         if not path:
             return
+        path = _with_extension(path, '.csv')
         try:
             frames = {}
             if self.state.freq_results is not None:
@@ -7865,6 +7927,7 @@ class WorkspaceTab(QWidget):
         )
         if not path:
             return
+        path = _with_extension(path, '.pdf')
         try:
             from matplotlib.backends.backend_pdf import PdfPages
             with PdfPages(path) as pdf:
@@ -9054,7 +9117,7 @@ class PlotCard(QFrame):
         self._legend_scroll.setVisible(True)
         for lbl in sorted(colors.keys()):
             color = colors[lbl]
-            name  = names.get(lbl, 'Noise' if lbl < 0 else str(lbl))
+            name  = _cluster_display_name(names, lbl)
 
             row = QHBoxLayout()
             row.setSpacing(4)
@@ -9177,7 +9240,7 @@ class PlotCard(QFrame):
         if cl_run is None:
             return
         names = cl_run.get('names', {})
-        current = names.get(label, 'Noise' if label < 0 else str(label))
+        current = _cluster_display_name(names, label)
         new_name, ok = QInputDialog.getText(
             self, f"Rename cluster {label}", "New name:", text=current
         )
@@ -9310,6 +9373,7 @@ class PlotCard(QFrame):
         )
         if not path:
             return
+        path = _with_extension(path, '.png')
         try:
             self._figure.savefig(path, dpi=150, bbox_inches='tight')
             QMessageBox.information(self, "Exported", f"Saved to {path}")
@@ -10984,7 +11048,7 @@ class ClusterAnnotationTab(QWidget):
         entries: list[QWidget] = []
         for lbl in sorted(colors.keys()):
             color = colors[lbl]
-            name = names.get(lbl, 'Noise' if lbl < 0 else str(lbl))
+            name  = _cluster_display_name(names, lbl)
 
             row = QHBoxLayout()
             row.setSpacing(4)
@@ -11059,7 +11123,7 @@ class ClusterAnnotationTab(QWidget):
         if cl_run is None:
             return
         names = cl_run.get('names', {})
-        current = names.get(label, 'Noise' if label < 0 else str(label))
+        current = _cluster_display_name(names, label)
         new_name, ok = QInputDialog.getText(
             self, f"Rename cluster {label}", "New name:", text=current
         )
@@ -11110,7 +11174,7 @@ class ClusterAnnotationTab(QWidget):
 
         self.label_table.setRowCount(len(unique))
         for row, cl_id in enumerate(unique):
-            name = names.get(cl_id, 'Noise' if cl_id < 0 else str(cl_id))
+            name = _cluster_display_name(names, cl_id)
             name_item = QTableWidgetItem(name)
             name_item.setData(Qt.UserRole, cl_id)
             self.label_table.setItem(row, 0, name_item)
@@ -12118,7 +12182,7 @@ class PluginWidget(QWidget):
         # save_state() can still correctly flush self.state to where it
         # actually belongs even after self.controller has already switched
         # to a different experiment (see save_state()'s key-mismatch
-        # handling, addendum part 6).
+        # handling).
         self._loaded_experiment_key = None
         self._loaded_experiment_dir = None
 
@@ -12222,9 +12286,6 @@ class PluginWidget(QWidget):
         if hasattr(self, 'groups_stats_tab'):
             self.groups_stats_tab._clear_stale_run_results()
             self.groups_stats_tab._populate_run_combo()
-            # FTER _populate_run_combo(), so this
-            # compares against wherever the combo actually settled post-
-            # delete/rename, not the about-to-be-stale prior selection.
             self.groups_stats_tab._sync_confusion_composition_to_run()
             self.groups_stats_tab._populate_trex_dr_combo()
             self.groups_stats_tab._update_run_button()
@@ -12272,6 +12333,13 @@ class PluginWidget(QWidget):
                     # Only reload from QSettings / rebuild the workspace when
                     # we're switching to a different experiment.
                     self._last_tab_refresh_key = {}
+                    # Claim the experiment BEFORE the restore work below.
+                    # If any of it raises, save_state() must still know
+                    # which experiment self.state belongs to -- otherwise
+                    # it silently skips every subsequent save and the
+                    # session becomes unsaveable as well as unrestorable.
+                    self._loaded_experiment_key = current_key
+                    self._loaded_experiment_dir = self.controller.experiment_dir
                     self.load_state()
                     if hasattr(self, 'workspace_tab'):
                         wt = self.workspace_tab
@@ -12290,8 +12358,6 @@ class PluginWidget(QWidget):
                             gst.chk_include_type_markers.setChecked(
                                 bool(getattr(self, '_pending_include_type_markers', False))
                             )
-                    self._loaded_experiment_key = current_key
-                    self._loaded_experiment_dir = self.controller.experiment_dir
             finally:
                 self._loading = False
 
@@ -12425,7 +12491,7 @@ class PluginWidget(QWidget):
             s.setValue('covariates',
                       repr(self.state.covariates.to_dict(orient='index'))
                       if self.state.covariates is not None else '')
-            # DR / clustering status (lightweight — no arrays)
+            # Honeycluster status (lightweight — no arrays)
             s.setValue('dr_status',         repr(self.state.dr_status))
             s.setValue('dr_timestamps',     repr(self.state.dr_timestamps))
             s.setValue('n_clusters',        self.state.n_clusters if self.state.n_clusters is not None else '')
@@ -12531,6 +12597,16 @@ class PluginWidget(QWidget):
                 s.setValue('cl_assign_all_samples', ct.cl_assign_all_chk.isChecked())
             if hasattr(ct, 'cl_downsample_chk'):
                 s.setValue('cl_downsample_training', ct.cl_downsample_chk.isChecked())
+
+            # temporary diagnostic
+            _log.info(
+                "save_state[%s] SUMMARY: gates=%r channels=%d training=%r "
+                "n_clusters=%r algo=%r",
+                key, list(self.state.selected_gates),
+                len(self.state.selected_channels),
+                list(self.state.training_sample_ids),
+                self.state.n_clusters, self.state.active_clustering_algorithm,
+            )
         finally:
             s.endGroup()
 
@@ -12547,20 +12623,22 @@ class PluginWidget(QWidget):
         s = self._qsettings
         s.beginGroup(key)
         try:
-            gates = s.value('selected_gates', [])
+            gates = _qs_list(s, 'selected_gates')
             if gates:
-                self.state.selected_gates = list(gates)
+                self.state.selected_gates = gates
             else:
                 # Pre-multi-gate settings, saved under the old singular key.
                 legacy_gate = s.value('selected_gate', '')
                 if legacy_gate:
                     self.state.selected_gates = [legacy_gate]
 
-            channels = s.value('selected_channels', [])
+            channels = _qs_list(s, 'selected_channels')
             if channels:
-                self.state.selected_channels = list(channels)
-            _log.info("load_state[%s]: selected_channels restored=%d (raw QSettings value had %d)",
-                      key, len(self.state.selected_channels), len(channels) if channels else 0)
+                self.state.selected_channels = channels
+            _log.info("load_state[%s]: selected_gates restored=%r, "
+                      "selected_channels restored=%d (raw value had %d)",
+                      key, self.state.selected_gates,
+                      len(self.state.selected_channels), len(channels))
 
             n_ev = s.value('n_training_events', None)
             if n_ev is not None:
@@ -12569,12 +12647,14 @@ class PluginWidget(QWidget):
                 except (ValueError, TypeError):
                     pass
 
-            training = s.value('training_samples', [])
+            training = _qs_list(s, 'training_samples')
             if training:
-                self.state.training_sample_ids = list(training)
+                self.state.training_sample_ids = training
+            _log.info("load_state[%s]: training_samples restored=%r",
+                      key, self.state.training_sample_ids)
 
             groups_repr = s.value('sample_groups', '')
-            group_names_stored = list(s.value('group_names', []))
+            group_names_stored = _qs_list(s, 'group_names')
             loaded_groups = None
             if groups_repr:
                 try:
@@ -12636,8 +12716,7 @@ class PluginWidget(QWidget):
                 self.state.compare_group_b = s.value('compare_group_b', '') or (
                     self.state.group_names[1] if len(self.state.group_names) > 1 else '')
 
-            selection = s.value('testing_group_selection', [])
-            self.state.testing_group_selection = list(selection) if selection else []
+            self.state.testing_group_selection = _qs_list(s, 'testing_group_selection')
             self.state.contrast_mode = s.value('contrast_mode', 'reference') or 'reference'
             self.state.reference_group = s.value('reference_group', '')
             paired_val = s.value('paired', False)
@@ -12689,7 +12768,7 @@ class PluginWidget(QWidget):
             pca_label_points = s.value('pca_label_points', None)
             if pca_label_points is not None:
                 self.state.pca_label_points = pca_label_points in (True, 'true', 'True', 1, '1')
-            cov_cols = list(s.value('covariate_columns', []))
+            cov_cols = _qs_list(s, 'covariate_columns')
             cov_repr = s.value('covariates', '')
             if cov_cols:
                 try:
@@ -12715,7 +12794,7 @@ class PluginWidget(QWidget):
             else:
                 self.state.covariates = None
 
-            # DR / clustering status metadata
+            # Honeycluster status metadata
             dr_status_repr = s.value('dr_status', '')
             if dr_status_repr:
                 try:
@@ -12789,10 +12868,8 @@ class PluginWidget(QWidget):
             self._pending_include_type_markers = s.value('include_type_markers', True)
             self._pending_annotation_run_id = s.value('annotation_run_id', '')
             self._pending_annotation_dr_run_id = s.value('annotation_dr_run_id', '')
-            annotation_channels = s.value('annotation_channels_checked', [])
-            self._pending_annotation_channels = (
-                list(annotation_channels) if annotation_channels else []
-            )
+            self._pending_annotation_channels = _qs_list(
+                s, 'annotation_channels_checked')
             self._pending_cluster_id_species = s.value('cluster_id_species', 'human')
 
             # Config tab: restore channel and training-sample selections
@@ -12801,12 +12878,11 @@ class PluginWidget(QWidget):
             # and TransformTab.refresh() both read state.selected_gates
             # (restored above) directly.
             self._pending_channels_checked = s.value('config_channels_checked', '')
-            self._pending_training_samples = s.value('config_training_samples', [])
+            self._pending_training_samples = _qs_list(s, 'config_training_samples')
             # Transform tab: restore biplot tile count and y-channels
-            n_tiles = s.value('transform_n_tiles', None)
-            tile_y  = s.value('transform_biplot_y_channels', [])
-            self._pending_tile_y_channels = list(tile_y) if tile_y else []
-            self._pending_n_tiles         = int(n_tiles) if n_tiles else 0
+            self._pending_tile_y_channels = _qs_list(
+                s, 'transform_biplot_y_channels')
+            self._pending_n_tiles = _qs_int(s, 'transform_n_tiles', 0) or 0
             # DR algorithm and hyperparameters
             self._pending_dr_algo          = s.value('dr_algo', '')
             self._pending_umap_n_neighbors = s.value('umap_n_neighbors', None)
@@ -12832,18 +12908,34 @@ class PluginWidget(QWidget):
             self._pending_hdbscan_min_samples      = s.value('hdbscan_min_samples', None)
             self._pending_hdbscan_cluster_selection_epsilon = s.value(
                 'hdbscan_cluster_selection_epsilon', None)
-            cl_assign_all = s.value('cl_assign_all_samples', None)
-            self._pending_cl_assign_all_samples = (
-                cl_assign_all in (True, 'true', 'True', 1, '1') if cl_assign_all is not None else None
-            )
-            cl_downsample = s.value('cl_downsample_training', None)
-            self._pending_cl_downsample_training = (
-                cl_downsample in (True, 'true', 'True', 1, '1') if cl_downsample is not None else None
-            )
+            self._pending_cl_assign_all_samples = _qs_bool(
+                s, 'cl_assign_all_samples', None)
+            self._pending_cl_downsample_training = _qs_bool(
+                s, 'cl_downsample_training', None)
 
+        except Exception:
+            # A single unreadable settings key must not cost the user the
+            # entire restore. The sidecar below holds the expensive state
+            # (embeddings, cluster labels, stats results) and the run
+            # manifest, so it runs regardless.
+            _log.exception(
+                "load_state[%s]: settings restore failed part-way; "
+                "continuing to the model sidecar with whatever was read.",
+                key,
+            )
         finally:
             s.endGroup()
 
+        # temporary diagnostic
+        _log.info(
+            "load_state[%s] SUMMARY: gates=%r channels=%d training=%r "
+            "groups=%d group_names=%r cov_cols=%r runs_pending",
+            key, self.state.selected_gates, len(self.state.selected_channels),
+            self.state.training_sample_ids, len(self.state.sample_groups),
+            self.state.group_names,
+            list(self.state.covariates.columns)
+            if self.state.covariates is not None else None,
+        )
         # Restore heavy state (models, embeddings, cluster labels) from sidecar
         self._load_model_sidecar()
         print(f"[DR Plugin] State loaded for experiment: {key}")
@@ -12980,6 +13072,12 @@ class PluginWidget(QWidget):
                 except OSError as e:
                     print(f"[DR Plugin] Could not migrate legacy sidecar: {e}")
 
+        # temporary diagnostic
+        _log.info("_load_model_sidecar: path=%s exists=%s cache_root=%s",
+                path, path.exists() if path else None,
+                drc_run_archive.cache_root(self.controller))
+                
+
         # Rebuild the run archive regardless of whether the current-state
         # sidecar exists — manifest.json/runs/ are independent of it.
         # Metadata only  — a run's actual payload is
@@ -12991,6 +13089,9 @@ class PluginWidget(QWidget):
             self.state.clustering_runs = cl_entries
             if hasattr(self, 'config_tab'):
                 self.config_tab.run_table.refresh()
+            # temporary diagnostic
+            _log.info("_load_model_sidecar: manifest gave %d DR run(s), "
+                      "%d clustering run(s)", len(dr_entries), len(cl_entries))
         except Exception as e:
             print(f"[DR Plugin] Could not load run archive: {e}")
 
@@ -13394,6 +13495,7 @@ class PluginWidget(QWidget):
         elif index == 2:    # ClusterAnnotationTab
             return (
                 len(s.dr_runs), len(s.clustering_runs),
+                tuple(sorted(s.cluster_labels)),
                 tuple(sorted(s.cluster_names.items())),
                 tuple(sorted(s.cluster_colors.items())),
             )
@@ -13405,6 +13507,7 @@ class PluginWidget(QWidget):
                 tuple(s.testing_group_selection),
                 s.contrast_mode, s.reference_group, s.paired, s.pairing_variable,
                 len(s.dr_runs), len(s.clustering_runs),
+                tuple(sorted(s.cluster_labels)),
                 s.stats_run_id,
                 tuple(sorted(s.cluster_names.items())),
                 id(s.freq_results), id(s.counts_results), id(s.mfi_results),
