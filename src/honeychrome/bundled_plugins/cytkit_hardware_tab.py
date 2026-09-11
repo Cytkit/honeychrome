@@ -86,7 +86,9 @@ class PluginWidget(QWidget):
         # --- Add GUI elements ---
 
         # Create tab widget
-        toolbox = QToolBox()
+        toolbox = QTabWidget()
+        toolbox.setTabPosition(QTabWidget.TabPosition.West)  # Tabs on left
+
 
         # Create tabs
         # connection: either "find and connect" button or connected text, version number and datetime stamp
@@ -112,7 +114,7 @@ class PluginWidget(QWidget):
 
         help_text(layout, '🛈 Note that if Cytkit is initialised, automation will override the settings below')
         layout.addStretch()
-        toolbox.addItem(tab, "Connection")
+        toolbox.addTab(tab, "Connection")
 
         # Light tab: laser and LED calibration, interlock status, disable interlocks with warning
         tab = QWidget()
@@ -152,7 +154,7 @@ class PluginWidget(QWidget):
         help_text(layout, '🛈 The LED flasher is a standard signal used for testing fluorescence and side scatter sensitivity')
 
         layout.addStretch()
-        toolbox.addItem(tab, "Light")
+        toolbox.addTab(tab, "Light")
 
 
 
@@ -224,7 +226,7 @@ class PluginWidget(QWidget):
         layout.addWidget(self.pressure_zero_btn)
 
         layout.addStretch()
-        toolbox.addItem(tab, "Fluidics")
+        toolbox.addTab(tab, "Fluidics")
 
         # DACs tab:
         # dac bias, dac ref x chanels
@@ -239,7 +241,7 @@ class PluginWidget(QWidget):
                 dac_index = row + col * number_of_dacs_pairs
                 dac_type = 'bias' if col == 0 else 'ref'
                 spin = LabeledSpinBox(min=0, max=255, text=dac_dictionary[dac_index]['channel_name'], label_right=True)
-                spin.spinbox.valueChanged.connect(lambda value, n: self.set_instrument_state({'dacs': {dac_type: {row: value}}}))
+                spin.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'dacs': {dac_type: {row: value}}}))
                 self.dac_table.setCellWidget(row, col, spin)
                 # value = dac_table.cellWidget(0, 1).value()
                 # self.dac_table.cellWidget(0, 1).spinbox.setValue(value)
@@ -253,7 +255,7 @@ class PluginWidget(QWidget):
         layout.addWidget(self.dac_table)
 
         layout.addStretch()
-        toolbox.addItem(tab, "DACs")
+        toolbox.addTab(tab, "DACs")
 
         # ADCs tab:
         # checkboxes: enable x chanels, select all, select none
@@ -264,7 +266,7 @@ class PluginWidget(QWidget):
         layout = QVBoxLayout(tab)
         layout.addWidget(QLabel("Content for adcs_tab"))
         layout.addStretch()
-        toolbox.addItem(tab, "ADCs")
+        toolbox.addTab(tab, "ADCs")
 
         # Monitoring tab:
         # label for each reading V, I
@@ -328,7 +330,7 @@ class PluginWidget(QWidget):
         layout.addWidget(self.fan_tacho_btn)
 
         layout.addStretch()
-        toolbox.addItem(tab, "Monitoring")
+        toolbox.addTab(tab, "Monitoring")
 
         # Front panel display:
         # file load dialog, upload button
@@ -336,7 +338,7 @@ class PluginWidget(QWidget):
         layout = QVBoxLayout(tab)
         layout.addWidget(QLabel("Content for display_tab"))
         layout.addStretch()
-        toolbox.addItem(tab, "Display")
+        toolbox.addTab(tab, "Display")
 
         # Registers tab:
         # write: register field, data field
@@ -345,7 +347,7 @@ class PluginWidget(QWidget):
         layout = QVBoxLayout(tab)
         layout.addWidget(QLabel("Content for registers_tab"))
         layout.addStretch()
-        toolbox.addItem(tab, "Registers")
+        toolbox.addTab(tab, "Registers")
 
         # Style the toolbox
         toolbox.setStyleSheet("""
@@ -382,7 +384,7 @@ class PluginWidget(QWidget):
             case 2: # fluidics
                 self.get_instrument_state(['pressure'])
             case 3: # DACs
-                pass
+                self.get_instrument_state(['dacs'])
             case 4: # ADCs
                 pass
             case 5: # monitoring
@@ -433,7 +435,7 @@ class PluginWidget(QWidget):
             for channel in monitor_dictionary:
                 for col, monitor_type in enumerate(['V', 'I']):
                     value = response['message']['vi_monitors']['V'][channel]
-                    self.vi_table.cellWidget(channel, col).setText(f'{value}')
+                    self.vi_table.cellWidget(channel, col).setText(f'{value:0.2f}')
 
         if 'fan_state' in response['message']:
             self.fan_enable_cb.setChecked(response['message']['fan_state']['enable'])
