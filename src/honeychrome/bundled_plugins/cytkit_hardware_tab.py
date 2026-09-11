@@ -392,9 +392,6 @@ class PluginWidget(QWidget):
 
     @Slot(list)
     def get_instrument_state(self, parameters):
-        if not self.device:
-
-
         if self.controller:
             self.controller.pipe_connection_instrument.send({'command': 'get_instrument_state', 'data': parameters})
             response = self.controller.pipe_connection_instrument.recv()
@@ -486,6 +483,8 @@ if __name__ == "__main__":
     import multiprocessing as mp
     from multiprocessing import shared_memory, Lock
     import numpy as np
+    import logging
+    import logging.handlers
 
     configure_multiprocessing()
 

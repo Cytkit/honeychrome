@@ -279,10 +279,11 @@ class Instrument(mp.Process):
 
 if __name__ == '__main__':
     from pathlib import Path
-    from honeychrome.main import setup_logging
-    from honeychrome.settings import experiments_folder
     import logging
     import logging.handlers
+
+    from honeychrome.main import setup_logging
+    from honeychrome.settings import experiments_folder
 
     mp.set_start_method("spawn")
 
