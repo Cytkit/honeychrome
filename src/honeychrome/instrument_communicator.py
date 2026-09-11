@@ -138,14 +138,14 @@ class Instrument(mp.Process):
 
     def find_and_connect_to_instrument(self):
         # first check if instrument is connected already
-        if self.device:
+        if self.device and self.device.name != 'Dummy':
             # check connection
             try:
                 device_name = self.device.name
                 print(f'[Instrument driver] {device_name} already connected')
                 if device_name == 'Cytkit':
-                    status, message = self.device.get_state('check_id')
-                    if not message['check_id']:
+                    status, message = self.device.get_state('check_connection')
+                    if not message['check_connection']:
                         raise ConnectionError
 
                 return {'source': '[Instrument driver]', 'status': status, 'message': message}
@@ -179,6 +179,7 @@ class Instrument(mp.Process):
         return {'source': '[Instrument driver]', 'status': 'OK', 'message': 'No device connected'}
 
     def disconnect_instrument(self):
+        self.device.set_state({'laser_enable': False}) # always send command to switch off laser just in case
         self.device.disconnect()
 
     def initialise_instrument(self):
@@ -277,7 +278,11 @@ class Instrument(mp.Process):
 
 
 if __name__ == '__main__':
+    from pathlib import Path
+    from honeychrome.main import setup_logging
+    from honeychrome.settings import experiments_folder
     import logging
+    import logging.handlers
 
     mp.set_start_method("spawn")
 
@@ -288,6 +293,8 @@ if __name__ == '__main__':
     index_tail_traces_cache = mp.Value('i', 0)
 
     pipe_experiment_instrument_e, pipe_experiment_instrument_i = mp.Pipe()
+
+    logger = setup_logging(Path.home() / experiments_folder / 'honeychrome.log')
     # logging queue
     logging_queue = mp.Queue()
     # Set up listener in the main process
@@ -306,21 +313,25 @@ if __name__ == '__main__':
     )
     instrument.start()
 
+    print('Find and connect!')
     pipe_experiment_instrument_e.send({'command':'find_and_connect'})
     response = pipe_experiment_instrument_e.recv()
     print(response)
 
-    pipe_experiment_instrument_e.send({'command':'star_acquisition'})
+    print('Start acquisition!')
+    pipe_experiment_instrument_e.send({'command':'start_acquisition'})
     response = pipe_experiment_instrument_e.recv()
     print(response)
 
-    pipe_experiment_instrument_e.send({'command':'set_instrument_state', 'data':'TODO insert settings update here'})
+    print('Set state!')
+    pipe_experiment_instrument_e.send({'command':'set_instrument_state', 'data': {'laser_enable': True}})
     response = pipe_experiment_instrument_e.recv()
     print(response)
 
     #wait for a bit
     time.sleep(1)
 
+    print('Stop acquisition!')
     pipe_experiment_instrument_e.send({'command':'stop_acquisition'})
     response = pipe_experiment_instrument_e.recv()
     print(response)
@@ -328,6 +339,7 @@ if __name__ == '__main__':
     #wait for a bit
     time.sleep(3)
 
+    print('Quit!')
     pipe_experiment_instrument_e.send({'command':'quit'})
     response = pipe_experiment_instrument_e.recv()
     print(response)

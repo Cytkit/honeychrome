@@ -392,6 +392,9 @@ class PluginWidget(QWidget):
 
     @Slot(list)
     def get_instrument_state(self, parameters):
+        if not self.device:
+
+
         if self.controller:
             self.controller.pipe_connection_instrument.send({'command': 'get_instrument_state', 'data': parameters})
             response = self.controller.pipe_connection_instrument.recv()

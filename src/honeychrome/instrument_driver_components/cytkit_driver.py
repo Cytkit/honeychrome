@@ -313,18 +313,21 @@ if __name__ == '__main__':
 
 '''
 Example output:
+
+[Cytkit driver] Connected
+('OK', 'Connected to Cytkit')
 ('OK', {'check_connection': True})
 ('OK', {'read_id_data': {'version': 152, 'datetime': datetime.datetime(2026, 9, 7, 21, 41, 53)}})
 test laser
 ('OK', {'laser_enable': True})
 test pressure
-('OK', {'pressure': -44.38498682354143})
+('OK', {'pressure': -44.38457712241033})
 test temperatures
-('OK', {'temperatures': {'temp_p_sensor': 31.312837285995485}})
+('OK', {'temperatures': {'temp_p_sensor': 25.0246448802948}})
 test vi monitors
-('OK', {'vi_monitors': {'V': {0: 31.6096, 1: 31.6416, 2: 11.9376, 3: 11.940800000000001, 4: 5.0016, 5: 5.0, 6: 3.3120000000000003, 7: 1.8048000000000002}, 'I': {0: 16.195, 1: 0.0, 2: 16.22925, 3: 16.38275, 4: 16.0735, 5: 16.383, 6: 16.25775, 7: 16.29425}}})
+('OK', {'vi_monitors': {'V': {0: 31.556800000000003, 1: 31.553600000000003, 2: 11.942400000000001, 3: 11.939200000000001, 4: 5.0016, 5: 5.0, 6: 3.3104, 7: 1.8064}, 'I': {0: 16.206500000000002, 1: 16.37675, 2: 16.233, 3: 16.38175, 4: 16.0685, 5: 16.38325, 6: 16.26775, 7: 16.295}}})
 test fan
-('OK', {'fan_state': {'enable': True, 'freq': 100, 'duty': 128, 'tacho': 0}})
+('OK', {'fan_state': {'enable': False, 'freq': 100, 'duty': 128, 'tacho': 0}})
 ('OK', {'fan_state': {'enable': True, 'freq': 100, 'duty': 128}})
 ('OK', {'fan_state': {'enable': True, 'freq': 100, 'duty': 128, 'tacho': 0}})
 test sheath pump
@@ -333,9 +336,11 @@ test sheath pump
 test sample pump
 ('OK', {'sample_pump_state': {'enable': True, 'reverse': False, 'ramp': True, 'speed': 6000, 'steps_per_cycle': 1, 'clocks_per_cycle': 100000}})
 ('OK', {'sample_pump_state': {'enable': True, 'reverse': False, 'ramp': False, 'speed': 6000, 'steps_per_cycle': 1, 'clocks_per_cycle': 100000}})
+test dacs
+('OK', {'dacs': {'bias': {0: 50, 1: 51, 2: 52, 3: 53, 4: 54, 5: 55, 6: 56, 7: 57, 8: 58, 9: 59, 10: 60, 11: 61, 12: 62, 13: 63, 14: 64, 15: 65}, 'ref': {0: 20, 1: 19, 2: 18, 3: 17, 4: 16, 5: 15, 6: 14, 7: 13, 8: 12, 9: 11, 10: 10, 11: 9, 12: 8, 13: 7, 14: 6, 15: 5}}})
+('OK', {'dacs': {'bias': {0: 50, 1: 51, 2: 52, 3: 53, 4: 54, 5: 55, 6: 56, 7: 57, 8: 58, 9: 59, 10: 60, 11: 61, 12: 62, 13: 63, 14: 64, 15: 65}, 'ref': {0: 20, 1: 19, 2: 18, 3: 17, 4: 16, 5: 15, 6: 14, 7: 13, 8: 12, 9: 11, 10: 10, 11: 9, 12: 8, 13: 7, 14: 6, 15: 5}}})
 ('OK', {'laser_enable': False})
 ('OK', {'sheath_pump_state': {'enable': False}})
 ('OK', {'sample_pump_state': {'enable': False}})
 ('OK', {'fan_state': {'enable': False}})
-
 '''
