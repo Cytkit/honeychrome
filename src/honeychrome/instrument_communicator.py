@@ -30,7 +30,6 @@ import numpy as np
 import time
 import warnings
 
-from honeychrome.instrument_driver_components.cytkit_driver import CytkitDevice
 from honeychrome.settings import devices_boot_order, traces_cache_size, traces_cache_dtype, max_events_in_traces_cache, trace_n_points, transfer_target_repeat_time
 
 debug = False
@@ -104,6 +103,8 @@ class Instrument(mp.Process):
             response_to_experiment_control = None
             if incoming_from_experiment_control['command'] == 'find_and_connect':
                 response_to_experiment_control = self.find_and_connect_to_instrument()
+            elif incoming_from_experiment_control['command'] == 'get_connected_device_name':
+                response_to_experiment_control = self.get_connected_device_name()
             elif incoming_from_experiment_control['command'] == 'initialise':
                 response_to_experiment_control = self.initialise_instrument()
             elif incoming_from_experiment_control['command'] == 'is_initialised':
@@ -177,6 +178,12 @@ class Instrument(mp.Process):
                 print(f'[Instrument driver] {device_name} not connected: {e}')
 
         return {'source': '[Instrument driver]', 'status': 'OK', 'message': 'No device connected'}
+
+    def get_connected_device_name(self):
+        message = {'device_name': None}
+        if self.device:
+            message = {'device_name': self.device.name}
+        return {'source': '[Instrument driver]', 'status': 'OK', 'message': message}
 
     def disconnect_instrument(self):
         self.device.set_state({'laser_enable': False}) # always send command to switch off laser just in case

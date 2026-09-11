@@ -118,9 +118,10 @@ class Controller(QObject):
         self.current_mode = 'raw'
         self.mode_switch_in_progress = False
 
-        # pipe connections
+        # pipe connections to instrument
         self.pipe_connection_instrument = pipe_connection_instrument
         self.pipe_connection_analyser = pipe_connection_analyser
+        self.device_name = None
 
         # Events cache
         self.shm_events = None
@@ -1024,6 +1025,18 @@ class Controller(QObject):
         logger.info(response)
         if self.bus:
             self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
+
+    @Slot()
+    def get_connected_device_name(self):
+        self.pipe_connection_instrument.send({'command': 'get_connected_device_name'})
+        response = self.pipe_connection_instrument.recv()
+        self.device_name = response['message']['device_name']
+
+        logger.info(response)
+        if self.bus:
+            self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
+
+        return self.device_name
 
     @Slot()
     def initialise_instrument(self):

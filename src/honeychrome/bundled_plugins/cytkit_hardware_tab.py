@@ -4,6 +4,7 @@ Cytkit State plugin (hardware monitor and settings)
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QTabWidget, QToolBox, QFormLayout, QComboBox, QCheckBox, QSpinBox, QHBoxLayout, QFrame, QTableWidget, QHeaderView
 from PySide6.QtCore import Qt, Slot, Signal, QSize
+from PySide6.QtWidgets import QApplication
 
 import logging
 
@@ -92,12 +93,12 @@ class PluginWidget(QWidget):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         self.update_connection_status_btn = QPushButton("Update Connection Status")
-        self.update_connection_status_btn.clicked.connect(lambda: self.get_instrument_state(['check_connection','read_id_data']))
+        self.update_connection_status_btn.clicked.connect(self.update_connection_status)
         layout.addWidget(self.update_connection_status_btn)
-        self.connection_status_not_connected = QLabel('<span style="font-weight:bold; color:red">Not connected</span>')
+        self.connection_status_not_connected = QLabel('<span style="font-weight:bold; color:red">Cytkit not connected</span>')
         self.connection_status_not_connected.setTextFormat(Qt.RichText)
         layout.addWidget(self.connection_status_not_connected)
-        self.connection_status_connected = QLabel('<span style="font-weight:bold; color:green">Connected</span>')
+        self.connection_status_connected = QLabel('<span style="font-weight:bold; color:green">Cytkit connected</span>')
         self.connection_status_connected.setTextFormat(Qt.RichText)
         self.connection_status_connected.setVisible(False)
         layout.addWidget(self.connection_status_connected)
@@ -368,7 +369,8 @@ class PluginWidget(QWidget):
         toolbox.currentChanged.connect(self.on_tab_changed)
 
         # update everything
-        self.get_instrument_state([])
+        self.device_name = None
+        self.update_connection_status()
 
     def on_tab_changed(self, index):
         match index:
@@ -390,6 +392,17 @@ class PluginWidget(QWidget):
             case 7: # registers
                 pass
 
+    @Slot()
+    def update_connection_status(self):
+        if self.controller:
+            self.controller.find_and_connect_instrument()
+            self.device_name = self.controller.get_connected_device_name()
+        if self.device_name == 'Cytkit':
+            self.get_instrument_state([])
+        else:
+            self.connection_status_connected.setVisible(False)
+            self.connection_status_not_connected.setVisible(True)
+
     @Slot(list)
     def get_instrument_state(self, parameters):
         if self.controller:
@@ -407,8 +420,8 @@ class PluginWidget(QWidget):
                 self.connection_status_not_connected.setVisible(True)
 
         if 'read_id_data' in response['message']:
-            self.version.setText(response['message']['read_id_data']['version'])
-            self.datetime.setText(response['message']['read_id_data']['datetime'])
+            self.version.setText(f'Firmware version: {response['message']['read_id_data']['version']}')
+            self.datetime.setText(f'Firmware datestamp: {response['message']['read_id_data']['datetime']}')
 
         if 'pressure' in response['message']:
             self.pressure_value.setText(f'{response['message']['pressure']} Pa')
@@ -420,7 +433,7 @@ class PluginWidget(QWidget):
             for channel in monitor_dictionary:
                 for col, monitor_type in enumerate(['V', 'I']):
                     value = response['message']['vi_monitors']['V'][channel]
-                    self.vi_table.cellWidget(channel, col).setText(value)
+                    self.vi_table.cellWidget(channel, col).setText(f'{value}')
 
         if 'fan_state' in response['message']:
             self.fan_enable_cb.setChecked(response['message']['fan_state']['enable'])
@@ -478,8 +491,6 @@ class PluginWidget(QWidget):
 if __name__ == "__main__":
     import sys
 
-    from PySide6.QtCore import Qt
-    from PySide6.QtWidgets import QApplication
     import multiprocessing as mp
     from multiprocessing import shared_memory, Lock
     import numpy as np
@@ -574,7 +585,7 @@ if __name__ == "__main__":
     bus = EventBus()
     controller.bus = bus # connect signals coming from controller
 
-    app = QApplication([])
+    app = QApplication(sys.argv)
     window = PluginWidget(bus=bus, controller=controller)
     window.resize(1000, 1000)
     window.show()
