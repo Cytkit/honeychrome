@@ -2,6 +2,11 @@
 This is the default configuration for the instrument driver
 '''
 
+# hardware settings
+pump_max = 255 # 0..255 sheath pump allowed PWM range in control loop
+fan_max = 255 # 0..255 fan allowed PWM range in control loop
+control_loop_interval = 2 # s
+
 # FGPA and communication settings
 operation_write = b'\x01'
 operation_read = b'\x02'

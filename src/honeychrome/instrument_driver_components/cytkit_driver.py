@@ -1,9 +1,9 @@
 import time
 
-import numpy as np
+from threading import Thread, Event, Lock
 
 from honeychrome.instrument_driver_components.cykit_components.adcs import ADCs
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary
+from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval
 from honeychrome.instrument_driver_components.cykit_components.dacs import DACs
 from honeychrome.instrument_driver_components.cykit_components.ft4222communicator import Ft4222Communicator
 from honeychrome.instrument_driver_components.cykit_components.fan import Fan
@@ -14,7 +14,110 @@ from honeychrome.instrument_driver_components.cykit_components.pressure import P
 from honeychrome.instrument_driver_components.cykit_components.sample_pump import SamplePump
 from honeychrome.instrument_driver_components.cykit_components.sheath_pump import SheathPump
 from honeychrome.instrument_driver_components.cykit_components.vi_monitor import VIMonitor
+from honeychrome.settings import pressure_set_point
 
+
+class PID:
+    '''
+    pid = PID(kp=1.0, ki=0.1, kd=0.05, out_min=0, out_max=255)
+    setpoint = 100
+    current = 0
+
+    for _ in range(100):
+        error = setpoint - current
+        output = pid.update(error, dt=0.1)
+        current += output  # simple plant model
+    '''
+    def __init__(self, kp, ki, kd, out_min, out_max):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.out_min, self.out_max = out_min, out_max
+        self.integral = 0
+        self.prev_error = 0
+
+    def update(self, error, dt):
+        self.integral += error * dt
+        derivative = (error - self.prev_error) / dt
+        output = (self.kp * error
+                  + self.ki * self.integral
+                  + self.kd * derivative)
+
+        # Clamp output and prevent integral windup
+        clamped = max(self.out_min, min(self.out_max, output))
+        if clamped != output:
+            self.integral -= error * dt  # undo integration
+
+        self.prev_error = error
+        return int(clamped)
+
+class PressureControlWorker(Thread):
+    '''
+    w = Worker(0.5)
+    w.start()
+    time.sleep(3)
+    w.stop()
+    w.join()
+    '''
+    def __init__(self, pressure, sheath_pump, pressure_set_point, pump_max, interval):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self.value = 0
+        self._stop_event = Event()
+        self._lock = Lock()
+        self.pressure = pressure
+        self.sheath_pump = sheath_pump
+
+        self.pid = PID(kp=1.0, ki=0.1, kd=0.05, out_min=0, out_max=pump_max)
+        self.pressure_set_point = pressure_set_point
+        self.current_pressure = self.pressure.get_pressure('PRES_UNITS_PA', 1)
+
+    def run(self):
+        while not self._stop_event.is_set():
+            with self._lock:
+                error = self.pressure_set_point - self.current_pressure
+                output = self.pid.update(error, dt=self.interval)
+                self.sheath_pump.set_pwm_duty(output)
+
+            print(f"[PressureControlWorker] error={error} output={output}")
+            self._stop_event.wait(self.interval)   # interruptible sleep
+
+    def stop(self):
+        self._stop_event.set()
+
+
+class TemperatureControlWorker(Thread):
+    '''
+    w = Worker(0.5)
+    w.start()
+    time.sleep(3)
+    w.stop()
+    w.join()
+    '''
+    def __init__(self, temperature, fan, temperature_set_point, fan_max, interval):
+        super().__init__(daemon=True)
+        self.fan_max = fan_max
+        self.interval = interval
+        self.value = 0
+        self._stop_event = Event()
+        self._lock = Lock()
+        self.temperature = temperature
+        self.fan = fan
+
+        self.pid = PID(kp=1.0, ki=0.1, kd=0.05, out_min=0, out_max=pump_max)
+        self.temperature_set_point = temperature_set_point
+        self.current_temperature = self.temperature.get_temperature()
+
+    def run(self):
+        while not self._stop_event.is_set():
+            with self._lock:
+                error = self.temperature_set_point - self.current_temperature
+                output = self.pid.update(error, dt=self.interval)
+                self.fan.set_pwm_duty(output)
+
+            print(f"[TemperatureControlWorker] error={error} output={output}")
+            self._stop_event.wait(self.interval)   # interruptible sleep
+
+    def stop(self):
+        self._stop_event.set()
 
 class CytkitDevice:
     """
@@ -64,7 +167,8 @@ class CytkitDevice:
         self.vi_monitor = None
         self.dacs = None
         self.adcs = None
-
+        self.pressure_control_worker = None
+        self.temperature_control_worker = None
         self.initialised = False
 
     def find_and_connect_to_device(self):
@@ -87,11 +191,16 @@ class CytkitDevice:
 
         # set initial settings
         self.sample_pump.set_ramp(True)
-
+        self.pressure_control_worker = PressureControlWorker(self.pressure, self.sheath_pump, pressure_set_point, pump_max, control_loop_interval)
+        self.temperature_control_worker = PressureControlWorker(self.pressure, self.sheath_pump, pressure_set_point, pump_max, control_loop_interval)
+        self.temperature_control_worker.start()
         return  'OK', 'Connected to Cytkit'
 
     def disconnect(self):
-        pass
+        self.temperature_control_worker.stop()
+        self.pressure_control_worker.stop()
+        self.temperature_control_worker.join()
+        self.pressure_control_worker.join()
 
     def initialise(self):
         # id_word = self.ft4222.register_read('ID_WORD')
@@ -99,10 +208,12 @@ class CytkitDevice:
 
         if not self.initialised:
             self.laser.set_state(1)  # turn on laser
+            self.pressure_control_worker.start()
             self.initialised = True
             return 'OK', 'Cytkit initialised'
         else:
             self.laser.set_state(0)  # turn off laser
+            self.pressure_control_worker.stop()
             self.initialised = False
             return 'OK', 'Cytkit on standby'
 
