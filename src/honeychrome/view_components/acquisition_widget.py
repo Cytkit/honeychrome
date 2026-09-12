@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton, 
 from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer
 
 from honeychrome import settings
+from honeychrome.view_components.busy_cursor import with_busy_cursor
 from honeychrome.view_components.icon_loader import icon
 
 
@@ -86,6 +87,7 @@ class AcquisitionWidget(QWidget):
         self.standby_timer.setSingleShot(True)
         self.standby_timer.timeout.connect(self.initialise)
 
+    @with_busy_cursor
     def initialise(self):
         if self.bus is not None:
             self.bus.initialiseInstrument.emit() # if already initialised, this puts it to standby
@@ -103,6 +105,7 @@ class AcquisitionWidget(QWidget):
             self.action_backflush.setEnabled(True)
             self.standby_timer.start(settings.standby_time)
 
+    @with_busy_cursor
     def start_acquisition(self):
         self.action_start_acquisition.setEnabled(False)
         self.action_stop_acquisition.setIcon(icon('player-stop', colour='red'))
@@ -124,6 +127,7 @@ class AcquisitionWidget(QWidget):
         self.animation.setLoopCount(-1)
         self.animation.start()
 
+    @with_busy_cursor
     def stop_acquisition(self):
         self.action_start_acquisition.setEnabled(True)
         self.action_stop_acquisition.setIcon(icon('player-stop'))
@@ -140,11 +144,13 @@ class AcquisitionWidget(QWidget):
         if self.bus is not None:
             self.bus.restartAcquisition.emit()
 
+    @with_busy_cursor
     def flush(self):
         if self.bus is not None:
             self.bus.flushSip.emit()
         self.standby_timer.start(settings.standby_time)
 
+    @with_busy_cursor
     def backflush(self):
         if self.bus is not None:
             self.bus.backFlushSip.emit()

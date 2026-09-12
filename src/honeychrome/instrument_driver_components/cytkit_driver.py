@@ -219,9 +219,13 @@ class CytkitDevice:
 
 
     def start_acquisition(self):
+        # 1. prine SIP
+        # 2. set steady sample flow rate
         return 'OK', 'Cytkit started acquisition'
 
     def stop_acquisition(self):
+        # 1. backflush SIP
+        # 2. stop sample flow
         return 'OK', 'Cytkit stopped acquisition'
 
     def set_state(self, dict_of_parameter_value):
@@ -379,9 +383,13 @@ class CytkitDevice:
         return 'OK', message
 
     def flush_sip(self):
+        # 1. forward flush high flow rate, set time
+        # 2. stop
         return 'OK', 'Cytkit SIP flushed'
 
     def backflush_sip(self):
+        # 1. backward flush high flow rate, set time
+        # 2. stop
         return 'OK', 'Cytkit SIP backflushed'
 
 

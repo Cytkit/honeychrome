@@ -97,9 +97,11 @@ class DummyDevice:
             return 'OK', 'Dummy device on standby'
 
     def start_acquisition(self):
+        time.sleep(2)
         return 'OK', 'Dummy device started acquisition'
 
     def stop_acquisition(self):
+        time.sleep(2)
         return 'OK', 'Dummy device stopped acquisition'
 
     def set_state(self, dict_of_parameter_value):
