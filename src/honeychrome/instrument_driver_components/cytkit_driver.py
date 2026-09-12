@@ -162,6 +162,15 @@ class CytkitDevice:
                         self.dacs.set_value_ref(index, value['ref'][index])
                 message['dacs'] = value
 
+            if parameter == 'register_setter':
+                try:
+                    x = int(value['value'])
+                except ValueError:
+                    x = 0
+
+                self.ft4222.register_write(value['register'], x)
+                message['register_setter'] = {'register': value['register'], 'value': x}
+
         return 'OK', message
 
     def get_state(self, list_of_parameters):
@@ -188,6 +197,12 @@ class CytkitDevice:
             message['read_id_data'] = {'version':version, 'datetime':datetime}
 
         if 'pressure'in list_of_parameters:
+            value = self.pressure.get_pressure('PRES_UNITS_PA', 1)
+            message['pressure'] = value
+
+        if 'zero_pressure'in list_of_parameters:
+            value = self.pressure.get_pressure('PRES_UNITS_PA', 10)
+            self.pressure.set_offset(value, 'PRES_UNITS_PA')
             value = self.pressure.get_pressure('PRES_UNITS_PA', 1)
             message['pressure'] = value
 
@@ -243,6 +258,12 @@ class CytkitDevice:
             for index in range(16):
                 message['dacs']['bias'][index] = self.dacs.get_value_bias(index)
                 message['dacs']['ref'][index] = self.dacs.get_value_ref(index)
+
+        if 'register_getter' in list_of_parameters:
+            if type(list_of_parameters) is dict:
+                if type(list_of_parameters['register_getter']) is int:
+                    value = self.ft4222.register_read(message['register_getter'])
+                    message['register_getter'] = value
 
         return 'OK', message
 

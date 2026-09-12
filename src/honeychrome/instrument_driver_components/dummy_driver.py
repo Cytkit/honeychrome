@@ -103,10 +103,20 @@ class DummyDevice:
         return 'OK', 'Dummy device stopped acquisition'
 
     def set_state(self, dict_of_parameter_value):
+        print(dict_of_parameter_value)
         return 'OK', {parameter: value for parameter, value in dict_of_parameter_value.items()}
 
     def get_state(self, list_of_parameters):
+        # return ('OK',
+        #  {'dacs':
+        #       {'bias': {0: 50, 1: 51, 2: 52, 3: 53, 4: 54, 5: 55, 6: 56, 7: 57, 8: 58, 9: 59, 10: 60, 11: 61, 12: 62, 13: 63, 14: 64, 15: 65},
+        #        'ref': {0: 20, 1: 19, 2: 18, 3: 17, 4: 16, 5: 15, 6: 14, 7: 13, 8: 12, 9: 11, 10: 10, 11: 9, 12: 8, 13: 7, 14: 6, 15: 5}
+        #        }
+        #   }
+        #  )
+        print(list_of_parameters)
         return 'OK', {parameter:None for parameter in list_of_parameters}
+
 
     def flush_sip(self):
         return 'OK', 'Dummy device doesn''t have a sip to flush'

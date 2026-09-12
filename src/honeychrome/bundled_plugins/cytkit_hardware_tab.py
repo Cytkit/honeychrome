@@ -1,15 +1,15 @@
 """
 Cytkit State plugin (hardware monitor and settings)
 """
-from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QTabWidget, QToolBox, QFormLayout, QComboBox, QCheckBox, QSpinBox, QHBoxLayout, QFrame, QTableWidget, QHeaderView
+from PySide6.QtGui import QCursor, QIntValidator
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QTabWidget, QToolBox, QFormLayout, QComboBox, QCheckBox, QSpinBox, QHBoxLayout, QFrame, QTableWidget, QHeaderView, QLineEdit
 from PySide6.QtCore import Qt, Slot, Signal, QSize
 from PySide6.QtWidgets import QApplication
 
 import logging
 
 from honeychrome.controller import Controller
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import monitor_dictionary, dac_dictionary, number_of_dacs_pairs
+from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import monitor_dictionary, dac_dictionary, number_of_dacs_pairs, registers_map
 from honeychrome.main import configure_multiprocessing
 from honeychrome.settings import heading_style
 from honeychrome.view_components.event_bus import EventBus
@@ -223,6 +223,7 @@ class PluginWidget(QWidget):
         self.pressure_measure_btn.clicked.connect(lambda: self.get_instrument_state(['pressure']))
         layout.addWidget(self.pressure_measure_btn)
         self.pressure_zero_btn = QPushButton('Zero Pressure')
+        self.pressure_zero_btn.clicked.connect(lambda: self.get_instrument_state(['zero_pressure']))
         layout.addWidget(self.pressure_zero_btn)
 
         layout.addStretch()
@@ -345,7 +346,25 @@ class PluginWidget(QWidget):
         # read: register field, data label
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.addWidget(QLabel("Content for registers_tab"))
+
+        self.register_combo = QComboBox()
+        self.register_combo.addItem('Select a register')
+        self.register_combo.addItems(registers_map.keys())
+        layout.addWidget(self.register_combo)
+        self.register_value_lineedit = QLineEdit()
+        validator = QIntValidator(0, 255, self.register_value_lineedit)
+        self.register_value_lineedit.setValidator(validator)
+        self.register_value_lineedit.setPlaceholderText("Value to set 0-255")
+        layout.addWidget(self.register_value_lineedit)
+
+        self.set_register_button = QPushButton('Set Register Value')
+        self.set_register_button.clicked.connect(lambda: self.set_instrument_state({'register_setter':{'register': self.register_combo.currentText(), 'value': self.register_value_lineedit.text()}}))
+        layout.addWidget(self.set_register_button)
+        self.get_register_button = QPushButton('Get Register Value')
+        self.get_register_button.clicked.connect(lambda: self.get_instrument_state({'register_getter':self.register_combo.currentText()}))
+        layout.addWidget(self.get_register_button)
+        self.register_value = QLabel('Value: None')
+        layout.addWidget(self.register_value)
         layout.addStretch()
         toolbox.addTab(tab, "Registers")
 
@@ -429,13 +448,15 @@ class PluginWidget(QWidget):
             self.pressure_value.setText(f'{response['message']['pressure']} Pa')
 
         if 'temperatures' in response['message']:
-            self.temp_p_sensor_label.setText(f'{response['message']['temperatures']['temp_p_sensor']} C')
+            if response['message']['temperatures']:
+                self.temp_p_sensor_label.setText(f'{response['message']['temperatures']['temp_p_sensor']} C')
 
         if 'vi_monitors' in response['message']:
-            for channel in monitor_dictionary:
-                for col, monitor_type in enumerate(['V', 'I']):
-                    value = response['message']['vi_monitors']['V'][channel]
-                    self.vi_table.cellWidget(channel, col).setText(f'{value:0.2f}')
+            if response['message']['vi_monitors']:
+                for channel in monitor_dictionary:
+                    for col, monitor_type in enumerate(['V', 'I']):
+                        value = response['message']['vi_monitors']['V'][channel]
+                        self.vi_table.cellWidget(channel, col).setText(f'{value:0.2f}')
 
         if 'fan_state' in response['message']:
             self.fan_enable_cb.setChecked(response['message']['fan_state']['enable'])
@@ -457,15 +478,19 @@ class PluginWidget(QWidget):
             self.sample_pump_rampCpC_spinbox.spinbox.setValue(response['message']['sample_pump_state']['clocks_per_cycle'])
 
         if 'dacs' in response['message']:
-            if 'bias' in response['message']['dacs']:
-                for index in response['message']['dacs']['bias']:
-                    value = response['message']['dacs']['bias'][index]
-                    self.dac_table.cellWidget(index, 0).spinbox.setValue(value)
+            if response['message']['dacs']:
+                if 'bias' in response['message']['dacs']:
+                    for index in response['message']['dacs']['bias']:
+                        value = response['message']['dacs']['bias'][index]
+                        self.dac_table.cellWidget(index, 0).spinbox.setValue(value)
+                if 'ref' in response['message']['dacs']:
+                    for index in response['message']['dacs']['ref']:
+                        value = response['message']['dacs']['bias'][index]
+                        self.dac_table.cellWidget(index, 1).spinbox.setValue(value)
 
-            if 'ref' in response['message']['dacs']:
-                for index in response['message']['dacs']['ref']:
-                    value = response['message']['dacs']['bias'][index]
-                    self.dac_table.cellWidget(index, 1).spinbox.setValue(value)
+        if 'register_getter' in response['message']:
+            value = response['message']['register_getter']
+            self.register_value.setText(f'Value: {value}')
 
         if self.bus:
             self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
