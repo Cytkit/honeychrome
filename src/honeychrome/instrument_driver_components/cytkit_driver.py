@@ -74,8 +74,6 @@ class PressureControlWorker(Thread):
 
     def run(self):
         self.sheath_pump.set_enable(True)
-        self.sheath_pump.set_pwm_frequency(200)
-        self.sheath_pump.set_pwm_duty(0)
         while not self._stop_event.is_set():
             with self._lock:
                 self.current_pressure = self.pressure.get_pressure('PRES_UNITS_PA', 1)
@@ -83,7 +81,7 @@ class PressureControlWorker(Thread):
                 output = self.pid.update(error, dt=self.interval)
                 self.sheath_pump.set_pwm_duty(output)
 
-            logger.info(f"[PressureControlWorker] pressure={self.current_pressure} error={error} output={output}")
+            logger.info(f"[PressureControlWorker] pressure={self.current_pressure:0.2f} error={error:0.2f} output={output}")
             self._stop_event.wait(self.interval)   # interruptible sleep
 
     def stop(self):
@@ -115,8 +113,6 @@ class TemperatureControlWorker(Thread):
 
     def run(self):
         self.fan.set_enable(True)
-        self.fan.set_pwm_frequency(25000)
-        self.fan.set_pwm_duty(0)
         while not self._stop_event.is_set():
             with self._lock:
                 self.current_temperature = self.temperature.get_temperature()
@@ -124,7 +120,7 @@ class TemperatureControlWorker(Thread):
                 output = self.pid.update(error, dt=self.interval)
                 self.fan.set_pwm_duty(output)
 
-            logger.info(f"[TemperatureControlWorker] current_temperature={self.current_temperature} error={error} output={output}")
+            logger.info(f"[TemperatureControlWorker] current_temperature={self.current_temperature:0.2f} error={error:0.2f} output={output}")
             self._stop_event.wait(self.interval)   # interruptible sleep
 
     def stop(self):
@@ -204,6 +200,13 @@ class CytkitDevice:
         # set initial settings
         self.get_state(['zero_pressure']) # calibrate assuming pressure zero before start
         self.sample_pump.set_ramp(True)
+        self.sample_pump.set_speed(6000)
+        self.sample_pump.set_steps_per_cycle(1)
+        self.sample_pump.set_clocks_per_cycle(100_000)
+        self.fan.set_pwm_frequency(25000)
+        self.fan.set_pwm_duty(0)
+        self.sheath_pump.set_pwm_frequency(25000)
+        self.sheath_pump.set_pwm_duty(0)
         self.pressure_control_worker = PressureControlWorker(self.pressure, self.sheath_pump, pressure_set_point, pump_max, control_loop_interval)
         self.temperature_control_worker = TemperatureControlWorker(self.pressure, self.fan, temperature_set_point, fan_max, control_loop_interval)
         # self.pressure_control_worker.start() # should not normally start pressure control by default - only at initiatisation
