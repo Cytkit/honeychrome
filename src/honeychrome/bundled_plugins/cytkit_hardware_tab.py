@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 import logging
 
 from honeychrome.controller import Controller
+from honeychrome.instrument_driver_components.cykit_components.alignment_camera import AlignmentCameraWidget
 from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import monitor_dictionary, dac_dictionary, number_of_dacs_pairs, registers_map
 from honeychrome.main import configure_multiprocessing
 from honeychrome.settings import heading_style
@@ -368,6 +369,17 @@ class PluginWidget(QWidget):
         layout.addStretch()
         toolbox.addTab(tab, "Registers")
 
+        # Alignment camera tab:
+        # usb webcam connection
+        # exposure, gain, image
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.alignment_camera = AlignmentCameraWidget(parent=self)
+        layout.addWidget(self.alignment_camera)
+        layout.addStretch()
+        toolbox.addTab(tab, "Alignment Camera")
+
+
         # Style the toolbox
         toolbox.setStyleSheet("""
             QToolBox::tab {
@@ -411,6 +423,8 @@ class PluginWidget(QWidget):
             case 6: # display
                 pass
             case 7: # registers
+                pass
+            case 8: # alignment camera
                 pass
 
     @Slot()
