@@ -328,7 +328,7 @@ class PluginWidget(QWidget):
         self.fan_tacho_value = QLabel('0 rpm')
         layout.addWidget(self.fan_tacho_value)
         self.fan_tacho_btn = QPushButton('Measure Fan Speed')
-        self.fan_tacho_btn.clicked.connect(lambda: self.get_instrument_state(['fan_tacho']))
+        self.fan_tacho_btn.clicked.connect(lambda: self.get_instrument_state(['fan_state']))
         layout.addWidget(self.fan_tacho_btn)
 
         layout.addStretch()
@@ -523,10 +523,9 @@ class PluginWidget(QWidget):
     @Slot()
     def update_initialised(self):
         if self.controller:
-            if self.controller.is_instrument_initialised():
-                self.initialised.setChecked(True)
-            else:
-                self.initialised.setChecked(False)
+            initialised = self.controller.is_instrument_initialised()
+            self.initialised.setChecked(initialised)
+            print(f'Initialisation status: {initialised}')
 
 
 if __name__ == "__main__":

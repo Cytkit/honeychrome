@@ -3,7 +3,7 @@ import time
 from threading import Thread, Event, Lock
 
 from honeychrome.instrument_driver_components.cykit_components.adcs import ADCs
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval
+from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max
 from honeychrome.instrument_driver_components.cykit_components.dacs import DACs
 from honeychrome.instrument_driver_components.cykit_components.ft4222communicator import Ft4222Communicator
 from honeychrome.instrument_driver_components.cykit_components.fan import Fan
@@ -14,8 +14,10 @@ from honeychrome.instrument_driver_components.cykit_components.pressure import P
 from honeychrome.instrument_driver_components.cykit_components.sample_pump import SamplePump
 from honeychrome.instrument_driver_components.cykit_components.sheath_pump import SheathPump
 from honeychrome.instrument_driver_components.cykit_components.vi_monitor import VIMonitor
-from honeychrome.settings import pressure_set_point
+from honeychrome.settings import pressure_set_point, temperature_set_point
 
+import logging
+logger = logging.getLogger(__name__)
 
 class PID:
     '''
@@ -66,21 +68,26 @@ class PressureControlWorker(Thread):
         self.pressure = pressure
         self.sheath_pump = sheath_pump
 
-        self.pid = PID(kp=1.0, ki=0.1, kd=0.05, out_min=0, out_max=pump_max)
+        self.pid = PID(kp=-10.0, ki=-1, kd=-0.05, out_min=0, out_max=pump_max)
         self.pressure_set_point = pressure_set_point
-        self.current_pressure = self.pressure.get_pressure('PRES_UNITS_PA', 1)
+        self.current_pressure = None
 
     def run(self):
+        self.sheath_pump.set_enable(True)
+        self.sheath_pump.set_pwm_frequency(200)
+        self.sheath_pump.set_pwm_duty(0)
         while not self._stop_event.is_set():
             with self._lock:
+                self.current_pressure = self.pressure.get_pressure('PRES_UNITS_PA', 1)
                 error = self.pressure_set_point - self.current_pressure
                 output = self.pid.update(error, dt=self.interval)
                 self.sheath_pump.set_pwm_duty(output)
 
-            print(f"[PressureControlWorker] error={error} output={output}")
+            logger.info(f"[PressureControlWorker] pressure={self.current_pressure} error={error} output={output}")
             self._stop_event.wait(self.interval)   # interruptible sleep
 
     def stop(self):
+        self.sheath_pump.set_enable(False)
         self._stop_event.set()
 
 
@@ -102,21 +109,26 @@ class TemperatureControlWorker(Thread):
         self.temperature = temperature
         self.fan = fan
 
-        self.pid = PID(kp=1.0, ki=0.1, kd=0.05, out_min=0, out_max=pump_max)
+        self.pid = PID(kp=-50.0, ki=-5, kd=-0.5, out_min=0, out_max=fan_max)
         self.temperature_set_point = temperature_set_point
-        self.current_temperature = self.temperature.get_temperature()
+        self.current_temperature = None
 
     def run(self):
+        self.fan.set_enable(True)
+        self.fan.set_pwm_frequency(25000)
+        self.fan.set_pwm_duty(0)
         while not self._stop_event.is_set():
             with self._lock:
+                self.current_temperature = self.temperature.get_temperature()
                 error = self.temperature_set_point - self.current_temperature
                 output = self.pid.update(error, dt=self.interval)
                 self.fan.set_pwm_duty(output)
 
-            print(f"[TemperatureControlWorker] error={error} output={output}")
+            logger.info(f"[TemperatureControlWorker] current_temperature={self.current_temperature} error={error} output={output}")
             self._stop_event.wait(self.interval)   # interruptible sleep
 
     def stop(self):
+        self.fan.set_enable(False)
         self._stop_event.set()
 
 class CytkitDevice:
@@ -187,20 +199,26 @@ class CytkitDevice:
         self.dacs = DACs(self.i2c_bus_a)
         self.adcs = ADCs(self.ft4222)
 
-        print('[Cytkit driver] Connected')
+        logger.info('[Cytkit driver] Connected')
 
         # set initial settings
+        self.get_state(['zero_pressure']) # calibrate assuming pressure zero before start
         self.sample_pump.set_ramp(True)
         self.pressure_control_worker = PressureControlWorker(self.pressure, self.sheath_pump, pressure_set_point, pump_max, control_loop_interval)
-        self.temperature_control_worker = PressureControlWorker(self.pressure, self.sheath_pump, pressure_set_point, pump_max, control_loop_interval)
-        self.temperature_control_worker.start()
+        self.temperature_control_worker = TemperatureControlWorker(self.pressure, self.fan, temperature_set_point, fan_max, control_loop_interval)
+        # self.pressure_control_worker.start() # should not normally start pressure control by default - only at initiatisation
+        self.temperature_control_worker.start() # normally start temperature control by default and run until disconnect
         return  'OK', 'Connected to Cytkit'
 
     def disconnect(self):
-        self.temperature_control_worker.stop()
-        self.pressure_control_worker.stop()
-        self.temperature_control_worker.join()
-        self.pressure_control_worker.join()
+        workers = [self.temperature_control_worker, self.pressure_control_worker]
+
+        for w in workers:
+            w.stop()
+
+        for w in workers:
+            if w.is_alive():
+                w.join(timeout=2)  # always use a timeout
 
     def initialise(self):
         # id_word = self.ft4222.register_read('ID_WORD')
@@ -311,11 +329,11 @@ class CytkitDevice:
             version, datetime = self.id_data.read_id_data()
             message['read_id_data'] = {'version':version, 'datetime':datetime}
 
-        if 'pressure'in list_of_parameters:
+        if 'pressure' in list_of_parameters:
             value = self.pressure.get_pressure('PRES_UNITS_PA', 1)
             message['pressure'] = value
 
-        if 'zero_pressure'in list_of_parameters:
+        if 'zero_pressure' in list_of_parameters:
             value = self.pressure.get_pressure('PRES_UNITS_PA', 10)
             self.pressure.set_offset(value, 'PRES_UNITS_PA')
             value = self.pressure.get_pressure('PRES_UNITS_PA', 1)
@@ -438,7 +456,8 @@ if __name__ == '__main__':
 
     # test adcs
 
-    time.sleep(2)
+    time.sleep(5)
+    print('quit')
     print(cytkit_device.set_state({'laser_enable' : False}))
     print(cytkit_device.set_state({'sheath_pump_state': {'enable': False}}))
     print(cytkit_device.set_state({'sample_pump_state': {'enable': False}}))

@@ -97,7 +97,7 @@ class Instrument(mp.Process):
             try:
                 incoming_from_experiment_control = self.pipe_connection.recv()
             except EOFError:
-                print("Pipe closed by experiment control; shutting down gracefully.")
+                self.logger.info("Pipe closed by experiment control; shutting down gracefully.")
                 break
 
             response_to_experiment_control = None
@@ -129,12 +129,13 @@ class Instrument(mp.Process):
             self.pipe_connection.send(response_to_experiment_control)
 
         while self.thread.is_alive():
-            print('[Instrument driver] Waiting until transfer thread ends')
+            self.logger.info('[Instrument driver] Waiting until transfer thread ends')
             time.sleep(0.25)
 
+        time.sleep(1)
         self.disconnect_instrument()
         shm.close()
-        print('[Instrument driver] Quit')
+        self.logger.info('[Instrument driver] Quit')
 
 
     def find_and_connect_to_instrument(self):
@@ -143,7 +144,7 @@ class Instrument(mp.Process):
             # check connection
             try:
                 device_name = self.device.name
-                print(f'[Instrument driver] {device_name} already connected')
+                self.logger.info(f'[Instrument driver] {device_name} already connected')
                 if device_name == 'Cytkit':
                     status, message = self.device.get_state('check_connection')
                     if not message['check_connection']:
@@ -152,7 +153,7 @@ class Instrument(mp.Process):
                 return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
             except Exception as e:
-                print(f'[Instrument driver] {self.device} not connected: {e}')
+                self.logger.info(f'[Instrument driver] {self.device} not connected: {e}')
 
         # if not already connected, try to connect
         for device_name in devices_boot_order:
@@ -171,11 +172,11 @@ class Instrument(mp.Process):
 
                 status, message = device.find_and_connect_to_device()
                 self.device = device
-                print(f'[Instrument driver] {device_name} connected')
+                self.logger.info(f'[Instrument driver] {device_name} connected')
                 return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
             except Exception as e:
-                print(f'[Instrument driver] {device_name} not connected: {e}')
+                self.logger.info(f'[Instrument driver] {device_name} not connected: {e}')
 
         return {'source': '[Instrument driver]', 'status': 'OK', 'message': 'No device connected'}
 
@@ -207,7 +208,7 @@ class Instrument(mp.Process):
             daemon=True
         )
         self.thread.start()
-        print('[Instrument driver] Acquisition started')
+        self.logger.info('[Instrument driver] Acquisition started')
         return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
     def stop_acquisition(self):
@@ -277,7 +278,7 @@ class Instrument(mp.Process):
                 self.index_tail_traces_cache.value = cache_new_tail
 
             if debug == True:
-                print(f'[Instrument driver] pushed data to traces cache (head:{head}, tail:{cache_new_tail})')
+                self.logger.info(f'[Instrument driver] pushed data to traces cache (head:{head}, tail:{cache_new_tail})')
         else:
             warnings.warn("[Instrument driver] Traces cache is full, data dropped")
             pass

@@ -18,8 +18,8 @@ adc_scale_mv = 30 # the adc level for 1 mV
 
 # instrument automation settings
 standby_time = 600_000 # ms to automatically put instrument to standby (switch off laser and pumps)
-pressure_set_point = -50 # Pa
-temperature_set_point = 27 # degC
+pressure_set_point = -20 # Pa
+temperature_set_point = 29 # degC
 
 ### peak detection settings
 trigger_channel = 'FSC'

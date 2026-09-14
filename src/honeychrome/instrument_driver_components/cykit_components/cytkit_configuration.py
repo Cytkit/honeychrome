@@ -5,7 +5,7 @@ This is the default configuration for the instrument driver
 # hardware settings
 pump_max = 255 # 0..255 sheath pump allowed PWM range in control loop
 fan_max = 255 # 0..255 fan allowed PWM range in control loop
-control_loop_interval = 2 # s
+control_loop_interval = 5 # s
 
 # FGPA and communication settings
 operation_write = b'\x01'
@@ -44,7 +44,7 @@ registers_map = {
     'FAN_CTRL':	0x0040,   #	Fan
     'FAN_DUTY':	0x0041,   #
     'FAN_FREQ':	0x0042,   #
-    'FAN_TACHO':	0x0043,   #
+    'FAN_TACHO':	0x0043,   # todo something wrong here, can't read tacho
     'INT_MASK':	0x0050,   #	Interlock
     'INT_INV':	0x0051,   #
     'INT_STATE':	0x0052,   #
