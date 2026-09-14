@@ -39,6 +39,10 @@ class AlignmentCameraWidget(QWidget):
         default_step = int(1000 * (np.log10(default_val) - log_min) / (log_max - log_min))
         self.slider.setValue(default_step)
 
+        self.status_label = QLabel("Camera not connected")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.control_layout.addWidget(self.status_label)
+
         # self.autoexposure_btn = QPushButton("Autoexposure (laser off, find channel)")
         # self.autoexposure_btn.clicked.connect(self.autoexposure)
         # self.control_layout.addWidget(self.autoexposure_btn)
@@ -55,10 +59,12 @@ class AlignmentCameraWidget(QWidget):
             for device in QMediaDevices.videoInputs():
                 if 'HD Camera: HD Camera' in device.description():
                     selected_device = device
+                    self.status_label.setText('Camera connected.')
                     break
 
             if not selected_device:
                 print('Camera not found.')
+                self.status_label.setText('Camera not found.')
                 return
 
             # Configure Qt Camera Pipeline
@@ -87,14 +93,11 @@ class AlignmentCameraWidget(QWidget):
         if not frame.isValid():
             return
 
-        # Convert frame directly to QPixmap
         image = frame.toImage()
         pixmap = QPixmap.fromImage(image)
 
-        # Rotate 90 degrees clockwise without OpenCV
+        # rotated_pixmap = pixmap.transformed(QTransform().rotate(90).scale(0.5, 0.5))
         rotated_pixmap = pixmap.transformed(QTransform().rotate(90))
-
-        # Render in GUI
         self.image_label.setPixmap(rotated_pixmap)
 
     # def autoexposure(self):
