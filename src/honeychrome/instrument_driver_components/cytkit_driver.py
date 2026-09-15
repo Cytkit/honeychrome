@@ -14,7 +14,7 @@ from honeychrome.instrument_driver_components.cykit_components.pressure import P
 from honeychrome.instrument_driver_components.cykit_components.sample_pump import SamplePump
 from honeychrome.instrument_driver_components.cykit_components.sheath_pump import SheathPump
 from honeychrome.instrument_driver_components.cykit_components.vi_monitor import VIMonitor
-from honeychrome.settings import pressure_set_point, temperature_set_point
+from honeychrome import settings
 
 import logging
 logger = logging.getLogger(__name__)
@@ -179,6 +179,20 @@ class CytkitDevice:
         self.temperature_control_worker = None
         self.initialised = False
 
+        self.pressure_set_point = settings.pressure_set_point_retrieved
+        self.temperature_set_point = settings.temperature_set_point_retrieved
+
+        self.sample_pump_priming_speed = settings.sample_pump_priming_speed_retrieved
+        self.sample_pump_priming_time = settings.sample_pump_priming_time_retrieved
+        self.sample_pump_unpriming_speed = settings.sample_pump_unpriming_speed_retrieved
+        self.sample_pump_unpriming_time = settings.sample_pump_unpriming_time_retrieved
+        self.sample_pump_acquisition_speed = settings.sample_pump_acquisition_speed_retrieved
+        self.sample_pump_settle_time = settings.sample_pump_settle_time_retrieved
+        self.sample_pump_flush_speed = settings.sample_pump_flush_speed_retrieved
+        self.sample_pump_flush_time = settings.sample_pump_flush_time_retrieved
+        self.sample_pump_backflush_speed = settings.sample_pump_backflush_speed_retrieved
+        self.sample_pump_backflush_time = settings.sample_pump_backflush_time_retrieved
+
     def find_and_connect_to_device(self):
         self.ft4222.find_and_connect()
 
@@ -200,15 +214,16 @@ class CytkitDevice:
         # set initial settings
         self.get_state(['zero_pressure']) # calibrate assuming pressure zero before start
         self.sample_pump.set_ramp(True)
-        self.sample_pump.set_speed(6000)
+        self.sample_pump.set_enable(False)
+        self.sample_pump.set_speed(0)
         self.sample_pump.set_steps_per_cycle(1)
         self.sample_pump.set_clocks_per_cycle(100_000)
         self.fan.set_pwm_frequency(25000)
         self.fan.set_pwm_duty(0)
         self.sheath_pump.set_pwm_frequency(25000)
         self.sheath_pump.set_pwm_duty(0)
-        self.pressure_control_worker = PressureControlWorker(self.pressure, self.sheath_pump, pressure_set_point, pump_max, control_loop_interval)
-        self.temperature_control_worker = TemperatureControlWorker(self.pressure, self.fan, temperature_set_point, fan_max, control_loop_interval)
+        self.pressure_control_worker = PressureControlWorker(self.pressure, self.sheath_pump, self.pressure_set_point, pump_max, control_loop_interval)
+        self.temperature_control_worker = TemperatureControlWorker(self.pressure, self.fan, self.temperature_set_point, fan_max, control_loop_interval)
         # self.pressure_control_worker.start() # should not normally start pressure control by default - only at initiatisation
         self.temperature_control_worker.start() # normally start temperature control by default and run until disconnect
         return  'OK', 'Connected to Cytkit'
@@ -240,13 +255,35 @@ class CytkitDevice:
 
 
     def start_acquisition(self):
-        # 1. prine SIP
+        # 0. stop pump
+        self.sample_pump.set_ramp(False)
+        self.sample_pump.set_speed(0)
+        self.sample_pump.set_reverse(False)
+        self.sample_pump.set_enable(True)
+        # 1. prime SIP
+        self.sample_pump.set_ramp(True)
+        self.sample_pump.set_speed(self.sample_pump_priming_speed)
+        time.sleep(self.sample_pump_priming_time)
         # 2. set steady sample flow rate
+        self.sample_pump.set_speed(self.sample_pump_acquisition_speed)
+        time.sleep(self.sample_pump_settle_time)
+
         return 'OK', 'Cytkit started acquisition'
 
     def stop_acquisition(self):
-        # 1. backflush SIP
+        # 0. stop pump
+        self.sample_pump.set_ramp(False)
+        self.sample_pump.set_speed(0)
+        self.sample_pump.set_reverse(True)
+        self.sample_pump.set_enable(True)
+        # 1. unprime SIP
+        self.sample_pump.set_ramp(True)
+        self.sample_pump.set_speed(self.sample_pump_unpriming_speed)
+        time.sleep(self.sample_pump_unpriming_time)
         # 2. stop sample flow
+        self.sample_pump.set_speed(0)
+        self.sample_pump.set_enable(False)
+
         return 'OK', 'Cytkit stopped acquisition'
 
     def set_state(self, dict_of_parameter_value):
@@ -306,6 +343,49 @@ class CytkitDevice:
 
                 self.ft4222.register_write(value['register'], x)
                 message['register_setter'] = {'register': value['register'], 'value': x}
+
+            if parameter == 'pressure_set_point':
+                self.pressure_set_point = value
+                if self.pressure_control_worker:
+                    self.pressure_control_worker.pressure_set_point = value
+                message['pressure_set_point'] = value
+
+            if parameter == 'temperature_set_point':
+                self.temperature_set_point = value
+                if self.temperature_control_worker:
+                    self.temperature_control_worker.temperature_set_point = value
+                message['temperature_set_point'] = value
+
+            if parameter == 'sample_pump_priming_speed':
+                self.sample_pump_priming_speed = value
+                message[parameter] = value
+            if parameter == 'sample_pump_priming_time':
+                self.sample_pump_priming_time = value
+                message[parameter] = value
+            if parameter == 'sample_pump_unpriming_speed':
+                self.sample_pump_unpriming_speed = value
+                message[parameter] = value
+            if parameter == 'sample_pump_unpriming_time':
+                self.sample_pump_unpriming_time = value
+                message[parameter] = value
+            if parameter == 'sample_pump_acquisition_speed':
+                self.sample_pump_acquisition_speed = value
+                message[parameter] = value
+            if parameter == 'sample_pump_settle_time':
+                self.sample_pump_settle_time = value
+                message[parameter] = value
+            if parameter == 'sample_pump_flush_speed':
+                self.sample_pump_flush_speed = value
+                message[parameter] = value
+            if parameter == 'sample_pump_flush_time':
+                self.sample_pump_flush_time = value
+                message[parameter] = value
+            if parameter == 'sample_pump_backflush_speed':
+                self.sample_pump_backflush_speed = value
+                message[parameter] = value
+            if parameter == 'sample_pump_backflush_time':
+                self.sample_pump_backflush_time = value
+                message[parameter] = value
 
         return 'OK', message
 
@@ -404,13 +484,34 @@ class CytkitDevice:
         return 'OK', message
 
     def flush_sip(self):
+        # 0. stop pump
+        self.sample_pump.set_ramp(False)
+        self.sample_pump.set_speed(0)
+        self.sample_pump.set_reverse(False)
+        self.sample_pump.set_enable(True)
         # 1. forward flush high flow rate, set time
+        self.sample_pump.set_ramp(True)
+        self.sample_pump.set_speed(self.sample_pump_flush_speed)
+        time.sleep(self.sample_pump_flush_time)
         # 2. stop
+        self.sample_pump.set_speed(0)
+        self.sample_pump.set_enable(False)
+
         return 'OK', 'Cytkit SIP flushed'
 
     def backflush_sip(self):
-        # 1. backward flush high flow rate, set time
+        # 0. stop pump
+        self.sample_pump.set_ramp(False)
+        self.sample_pump.set_speed(0)
+        self.sample_pump.set_reverse(True)
+        self.sample_pump.set_enable(True)
+        # 1. forward flush high flow rate, set time
+        self.sample_pump.set_ramp(True)
+        self.sample_pump.set_speed(self.sample_pump_backflush_speed)
+        time.sleep(self.sample_pump_backflush_time)
         # 2. stop
+        self.sample_pump.set_speed(0)
+        self.sample_pump.set_enable(False)
         return 'OK', 'Cytkit SIP backflushed'
 
 

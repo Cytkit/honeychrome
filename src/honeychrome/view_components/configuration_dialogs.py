@@ -441,8 +441,10 @@ class InstrumentConfigDialog(QDialog):
         self.height_channel_combo.addItems(adc_channels)
         form.addRow("Height Channel:", self.height_channel_combo)
 
-        self.use_dummy_instrument = QCheckBox("Use Dummy Instrument:")
-        form.addRow(self.use_dummy_instrument)
+        # self.use_dummy_instrument = QCheckBox("Use Dummy Instrument:")
+        # form.addRow(self.use_dummy_instrument)
+
+        form.addRow(QLabel("Additional settings for Cytkit can be found in the plugin tab Cytkit Hardware"))
 
         scroll.setWidget(container)
         main_layout.addWidget(scroll)
@@ -481,13 +483,13 @@ class InstrumentConfigDialog(QDialog):
         if index >= 0:
             self.height_channel_combo.setCurrentIndex(index)
 
-        self.use_dummy_instrument.setChecked(self.settings.value("use_dummy_instrument", use_dummy_instrument, type=bool))
+        # self.use_dummy_instrument.setChecked(self.settings.value("use_dummy_instrument", use_dummy_instrument, type=bool))
 
     def save_settings(self):
         self.settings.setValue("trigger_channel", self.trigger_channel_combo.currentText())
         self.settings.setValue("width_channel", self.width_channel_combo.currentText())
         self.settings.setValue("height_channel", self.height_channel_combo.currentText())
-        self.settings.setValue("use_dummy_instrument", self.use_dummy_instrument.isChecked())
+        # self.settings.setValue("use_dummy_instrument", self.use_dummy_instrument.isChecked())
 
     def handle_accept(self):
         self.save_settings()
@@ -503,7 +505,7 @@ class InstrumentConfigDialog(QDialog):
         index = self.height_channel_combo.findText(height_channels[0])
         if index >= 0:
             self.height_channel_combo.setCurrentIndex(index)
-        self.use_dummy_instrument.setChecked(use_dummy_instrument)
+        # self.use_dummy_instrument.setChecked(use_dummy_instrument)
 
 
 class FolderSelectorLineEdit(QLineEdit):

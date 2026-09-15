@@ -21,6 +21,18 @@ standby_time = 600_000 # ms to automatically put instrument to standby (switch o
 pressure_set_point = -20 # Pa
 temperature_set_point = 40 # degC
 
+sample_pump_conversion_factor = 0.001 # uL/step
+sample_pump_priming_speed = 6000 # steps/s
+sample_pump_priming_time = 10. # s
+sample_pump_unpriming_speed = 6000 # steps/s
+sample_pump_unpriming_time = 10. # s
+sample_pump_acquisition_speed = 1000 # steps/s
+sample_pump_settle_time = 1. # s
+sample_pump_flush_speed = 6000 # steps/s
+sample_pump_flush_time = 30. # s
+sample_pump_backflush_speed = 6000 # steps/s
+sample_pump_backflush_time = 30. # s
+
 ### peak detection settings
 trigger_channel = 'FSC'
 FSC_sense = -1
@@ -266,3 +278,18 @@ spectral_cleaning_n_spectral_retrieved = q_settings.value("spectral_cleaning_n_s
 report_include_raw_retrieved = q_settings.value("report_include_raw", report_include_raw, type=bool)
 report_include_unmixed_retrieved = q_settings.value("report_include_unmixed", report_include_unmixed, type=bool)
 report_include_process_retrieved = q_settings.value("report_include_process", report_include_process, type=bool)
+
+pressure_set_point_retrieved = q_settings.value('pressure_set_point', pressure_set_point, type=int)
+temperature_set_point_retrieved = q_settings.value('temperature_set_point', temperature_set_point, type=int)
+
+sample_pump_conversion_factor = 0.001 # uL/step
+sample_pump_priming_speed_retrieved = q_settings.value('sample_pump_priming_speed', sample_pump_priming_speed, type=int)
+sample_pump_priming_time_retrieved = q_settings.value('sample_pump_priming_time', sample_pump_priming_time, type=float)
+sample_pump_unpriming_speed_retrieved = q_settings.value('sample_pump_unpriming_speed', sample_pump_unpriming_speed, type=int)
+sample_pump_unpriming_time_retrieved = q_settings.value('sample_pump_unpriming_time', sample_pump_unpriming_time, type=float)
+sample_pump_acquisition_speed_retrieved = q_settings.value('sample_pump_acquisition_speed', sample_pump_acquisition_speed, type=int)
+sample_pump_settle_time_retrieved = q_settings.value('sample_pump_settle_time', sample_pump_settle_time, type=float)
+sample_pump_flush_speed_retrieved = q_settings.value('sample_pump_flush_speed', sample_pump_flush_speed, type=int)
+sample_pump_flush_time_retrieved = q_settings.value('sample_pump_flush_time', sample_pump_flush_time, type=float)
+sample_pump_backflush_speed_retrieved = q_settings.value('sample_pump_backflush_speed', sample_pump_backflush_speed, type=int)
+sample_pump_backflush_time_retrieved = q_settings.value('sample_pump_backflush_time', sample_pump_backflush_time, type=float)

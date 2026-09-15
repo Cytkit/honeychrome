@@ -2,8 +2,8 @@
 Cytkit State plugin (hardware monitor and settings)
 """
 from PySide6.QtGui import QCursor, QIntValidator
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QTabWidget, QToolBox, QFormLayout, QComboBox, QCheckBox, QSpinBox, QHBoxLayout, QFrame, QTableWidget, QHeaderView, QLineEdit
-from PySide6.QtCore import Qt, Slot, Signal, QSize
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QTabWidget, QToolBox, QFormLayout, QComboBox, QCheckBox, QSpinBox, QHBoxLayout, QFrame, QTableWidget, QHeaderView, QLineEdit, QDoubleSpinBox
+from PySide6.QtCore import Qt, Slot, Signal, QSize, QSettings
 from PySide6.QtWidgets import QApplication
 
 import logging
@@ -15,6 +15,7 @@ from honeychrome.main import configure_multiprocessing
 from honeychrome.settings import heading_style
 from honeychrome.view_components.event_bus import EventBus
 from honeychrome.view_components.icon_loader import icon
+from honeychrome import settings
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +23,17 @@ plugin_name = 'Cytkit Hardware'
 
 
 class LabeledSpinBox(QWidget):
-    def __init__(self, text, min=0, max=100, default=1, step=1, parent=None, label_right=False):
+    def __init__(self, text, min=0, max=100, default=1, step=1, parent=None, label_right=False, double_spin=False):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)  # Removes default padding
 
         self.label = QLabel(text, self)
-        self.spinbox = QSpinBox(self)
+        if double_spin:
+            self.spinbox = QDoubleSpinBox(self)
+        else:
+            self.spinbox = QSpinBox(self)
+
         self.spinbox.setRange(min, max)
         self.spinbox.setValue(default)
         self.spinbox.setSingleStep(step)
@@ -67,6 +72,7 @@ class PluginWidget(QWidget):
         super().__init__(parent)
         self.bus = bus
         self.controller = controller
+        self.settings = QSettings("honeychrome", "cytkit_hardware")
 
         # --- Create widget, scroll area and layouts to hold the plugin content ---
 
@@ -113,7 +119,62 @@ class PluginWidget(QWidget):
         self.initialised.setEnabled(False)
         layout.addWidget(self.initialised)
 
-        help_text(layout, '🛈 Note that if Cytkit is initialised, automation will override the settings below')
+        self.version = QLabel()
+
+        title = QLabel('Automation Settings')
+        title.setStyleSheet(heading_style)
+        layout.addWidget(title)
+
+        self.pressure_set_point_spin = LabeledSpinBox(min=-40, max=0, step=1, default=settings.pressure_set_point_retrieved, text='Sheath pressure (vacuum) set point [Pa]')
+        self.pressure_set_point_spin.spinbox.valueChanged.connect(self.set_pressure_set_point)
+        layout.addWidget(self.pressure_set_point_spin)
+
+        self.temperature_set_point_spin = LabeledSpinBox(min=0, max=50, step=1, default=settings.temperature_set_point_retrieved, text='Internal temperature set point [C]')
+        self.temperature_set_point_spin.spinbox.valueChanged.connect(self.set_temperature_set_point)
+        layout.addWidget(self.temperature_set_point_spin)
+
+        self.sample_pump_priming_speed = LabeledSpinBox(min=0, max=65_535, step=100, default=settings.sample_pump_priming_speed_retrieved, text='Sample pump priming speed [steps/s]')
+        self.sample_pump_priming_speed.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_priming_speed': value}))
+        layout.addWidget(self.sample_pump_priming_speed)
+
+        self.sample_pump_priming_time = LabeledSpinBox(min=0, max=60, step=1, default=settings.sample_pump_priming_time_retrieved, text='Sample pump priming time [s]', double_spin=True)
+        self.sample_pump_priming_time.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_priming_time': value}))
+        layout.addWidget(self.sample_pump_priming_time)
+
+        self.sample_pump_unpriming_speed = LabeledSpinBox(min=0, max=65_535, step=100, default=settings.sample_pump_unpriming_speed_retrieved, text='Sample pump unpriming speed [steps/s]')
+        self.sample_pump_unpriming_speed.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_unpriming_speed': value}))
+        layout.addWidget(self.sample_pump_unpriming_speed)
+
+        self.sample_pump_unpriming_time = LabeledSpinBox(min=0, max=60, step=1, default=settings.sample_pump_unpriming_time_retrieved, text='Sample pump unpriming time [s]', double_spin=True)
+        self.sample_pump_unpriming_time.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_unpriming_time': value}))
+        layout.addWidget(self.sample_pump_unpriming_time)
+
+        self.sample_pump_acquisition_speed = LabeledSpinBox(min=0, max=65_535, step=100, default=settings.sample_pump_acquisition_speed_retrieved, text='Sample pump acquisition speed [steps/s]')
+        self.sample_pump_acquisition_speed.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_acquisition_speed': value}))
+        layout.addWidget(self.sample_pump_acquisition_speed)
+
+        self.sample_pump_settle_time = LabeledSpinBox(min=0, max=60, step=0.1, default=settings.sample_pump_settle_time_retrieved, text='Sample pump settle time [s]', double_spin=True)
+        self.sample_pump_settle_time.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_settle_time': value}))
+        layout.addWidget(self.sample_pump_settle_time)
+
+        self.sample_pump_flush_speed = LabeledSpinBox(min=0, max=65_535, step=100, default=settings.sample_pump_flush_speed_retrieved, text='Sample pump flush speed [steps/s]')
+        self.sample_pump_flush_speed.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_flush_speed': value}))
+        layout.addWidget(self.sample_pump_flush_speed)
+
+        self.sample_pump_flush_time = LabeledSpinBox(min=0, max=600, step=1, default=settings.sample_pump_flush_time_retrieved, text='Sample pump flush time [s]', double_spin=True)
+        self.sample_pump_flush_time.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_flush_time': value}))
+        layout.addWidget(self.sample_pump_flush_time)
+
+        self.sample_pump_backflush_speed = LabeledSpinBox(min=0, max=65_535, step=100, default=settings.sample_pump_backflush_speed_retrieved, text='Sample pump backflush speed [steps/s]')
+        self.sample_pump_backflush_speed.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_backflush_speed': value}))
+        layout.addWidget(self.sample_pump_backflush_speed)
+
+        self.sample_pump_backflush_time = LabeledSpinBox(min=0, max=600, step=1, default=settings.sample_pump_backflush_time_retrieved, text='Sample pump backflush time [s]', double_spin=True)
+        self.sample_pump_backflush_time.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_backflush_time': value}))
+        layout.addWidget(self.sample_pump_backflush_time)
+
+
+        help_text(layout, '🛈 Note that if Cytkit is initialised, automation will override the manual settings below')
         layout.addStretch()
         toolbox.addTab(tab, "Connection")
 
@@ -519,6 +580,22 @@ class PluginWidget(QWidget):
             self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
 
         logger.info(response)
+
+    @Slot(int)
+    def set_pressure_set_point(self, set_point):
+        self.settings.setValue("pressure_set_point", set_point)
+        self.set_instrument_state({'pressure_set_point': set_point})
+
+    @Slot(int)
+    def set_temperature_set_point(self, set_point):
+        self.set_instrument_state({'temperature_set_point': set_point})
+
+    @Slot(dict)
+    def set_pump_controls(self, dict_of_parameter_value):
+        for parameter, value in dict_of_parameter_value.items():
+            self.settings.setValue(parameter, value)
+        self.set_instrument_state({'set_pump_controls': dict_of_parameter_value})
+
 
     @Slot()
     def update_initialised(self):

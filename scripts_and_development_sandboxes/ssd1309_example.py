@@ -97,8 +97,8 @@ def run_animation():
 
     box_x, box_y = 10.0, 30.0
     vx, vy = 45.0, 30.0
-    text_x = 128
-    ticker_text = "FT4222 SPI DYNAMIC ANIMATION ENGINE"
+    text_x = 64
+    ticker_text = "AZIZ"
 
     last_time = time.monotonic()
     frame_count = 0
