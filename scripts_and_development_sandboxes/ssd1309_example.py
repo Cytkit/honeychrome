@@ -20,7 +20,7 @@ class SSD1309_Animated:
 
         print("Initializing SPI Master on FT4222 A...")
         self.dev_spi.spiMaster_Init(
-            MasterSingle.SINGLE, Clock.DIV_4, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0
+            MasterSingle.SINGLE, Clock.DIV_32, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0
         )
 
         print("Initializing GPIOs on FT4222 B...")
