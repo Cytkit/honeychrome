@@ -162,9 +162,6 @@ class CytometryGridWidget(QScrollArea):
                 self.bus.plotChangeRequested.emit(self.mode, n_in_plot_sequence)
 
     def show_new_plot_widget(self):
-        # Empty grids calculate their column layout lazily.
-        if self.n_columns is None:
-            self.init_grid()
         new_plot_widget = NewPlotWidget(bus=self.bus, mode=self.mode, data_for_cytometry_plots=self.data_for_cytometry_plots)
         self.place_tile(new_plot_widget, 1, 1)
         self.debounce_timer.start(300)
@@ -235,8 +232,7 @@ class CytometryGridWidget(QScrollArea):
                     data_for_cytometry_plots=self.data_for_cytometry_plots, parent=self.container)
                 self.plot_widgets.append(new_widget)
 
-        self.init_grid()
-        self.debounce_timer.start(300)
+            self.debounce_timer.start(300)
 
     def resizeEvent(self, event: QResizeEvent):
         super().resizeEvent(event)
@@ -248,41 +244,51 @@ class CytometryGridWidget(QScrollArea):
     def init_grid(self):
         if self.data_for_cytometry_plots is None:
             return
-        # Establish the layout even when there are no plots yet.
-        old_n_columns = self.n_columns
-        self.n_columns = max([self.width() // settings.cytometry_plot_width_target_retrieved, 1])
-        self.cytometry_plot_real_width = (self.width() - 45)// self.n_columns
-        for n in range(self.n_columns):
-            self.layout.setColumnMinimumWidth(n, self.cytometry_plot_real_width)
-
-        self.occupied = []
-        self.row = 0
-        self.last_row = 0
-        if self.n_columns < 1:
-            self.n_columns = 1
-        elif self.n_columns > 10:
-            self.n_columns = 10
-
-        logger.info(f'Cytometry Grid Widget: setting width to {self.n_columns} columns')
-
+        # called every time width changes
         if self.data_for_cytometry_plots['plots']:
-            for n, plot in enumerate(self.data_for_cytometry_plots['plots']):
+            old_n_columns = self.n_columns
+            self.n_columns = max([self.width() // settings.cytometry_plot_width_target_retrieved, 1])
+            self.cytometry_plot_real_width = (self.width() - 45)// self.n_columns
+            for n in range(self.n_columns):
+                self.layout.setColumnMinimumWidth(n, self.cytometry_plot_real_width)
 
-                # set width to 3 if plot is ribbon and width not set
-                if plot['type'] == 'ribbon' and 'width' not in plot.keys():
-                    plot['width'] = 3
+            if True: # old_n_columns != self.n_columns:
+                self.occupied = []
+                self.row = 0
+                self.last_row = 0
+                if self.n_columns < 1:
+                    self.n_columns = 1
+                elif self.n_columns > 10:
+                    self.n_columns = 10
 
-                # set tile to 1x1 if width/height not previously set
-                w = min([plot.get("width", 1), self.n_columns])
-                h = plot.get("height", 1)
-                # Create tile widget
-                plot_widget = self.plot_widgets[n]
+                logger.info(f'Cytometry Grid Widget: setting width to {self.n_columns} columns')
 
-                self.place_tile(plot_widget, w, h)
-                plot_widget.n_in_plot_sequence = n
+                # # Create container widget
+                # if self.container is not None:
+                #     self.container.deleteLater()
+                #     self.container = None
+                # self.container = QWidget(parent=self)
+                # self.layout = QGridLayout(self.container)  # Layout assigned to container
 
-                # Fresh widgets may be created after their data was calculated.
-                plot_widget.update_axes_stats_hist(self.mode)
+                # Place each plot as a plot_widget
+                for n, plot in enumerate(self.data_for_cytometry_plots['plots']):
+
+                    # set width to 3 if plot is ribbon and width not set
+                    if plot['type'] == 'ribbon' and 'width' not in plot.keys():
+                        plot['width'] = 3
+
+                    # set tile to 1x1 if width/height not previously set
+                    w = min([plot.get("width", 1), self.n_columns])
+                    h = plot.get("height", 1)
+                    # Create tile widget
+                    plot_widget = self.plot_widgets[n]
+
+                    self.place_tile(plot_widget, w, h)
+                    plot_widget.n_in_plot_sequence = n
+
+                    # print(self.n_columns)
+                    # print(n, w, h, self.data_for_cytometry_plots['plots'])
+                    # print(self.occupied)
 
 
     def fits(self, row, col, w, h):

@@ -116,7 +116,6 @@ class CytometryPlotWidget(QFrame):
             self.bus.updateSourceChildGates.connect(self.refresh_source_child_gates)
             self.bus.histsStatsRecalculated.connect(self.update_axes_stats_hist)
             self.bus.updateRois.connect(self.configure_rois)
-            self.bus.repositionRois.connect(self._on_reposition_rois)
 
         # Create main layout
         main_layout = QVBoxLayout(self)
@@ -595,14 +594,6 @@ class CytometryPlotWidget(QFrame):
         plot['child_gates'] = []
         self.data_for_cytometry_plots['plots'].append(plot)
         self.bus.showNewPlot.emit(self.mode)
-
-    @Slot(str)
-    def _on_reposition_rois(self, mode):
-        """Redraw this plot's ROIs from the current sample's effective gate.
-        Emitted on sample load so a customised gate shows its own per-sample
-        shape (and non-customised samples snap back to the template shape)."""
-        if mode == self.mode:
-            self.configure_rois(self.mode, self.n_in_plot_sequence)
 
     @Slot(str, int)
     def configure_rois(self, mode, index):
