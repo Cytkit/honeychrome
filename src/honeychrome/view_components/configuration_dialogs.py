@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt, QSettings
 
 from honeychrome.settings import (colourmap_choice, graphics_export_formats, hist2dtype, colormap_name, graphics_export_format, cytometry_plot_width_target,
                       tile_size_nxn_grid, subsample, max_display_events, hist_bins, density_cutoff, trigger_channel, adc_channels, width_channels, height_channels,
-                      use_dummy_instrument, magnitude_ceilings, magnitude_ceiling, raw_settings, unmixed_settings, experiments_folder,
+                      use_dummy_instrument, steps_per_microlitre, magnitude_ceilings, magnitude_ceiling, raw_settings, unmixed_settings, experiments_folder,
                       magnitude_ceilings_int, spectral_positive_gate_percent, spectral_negative_gate_percent, report_include_raw, report_include_unmixed, report_include_process, send_debug_data,
                       heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral)
 import honeychrome.settings as settings
@@ -412,8 +412,10 @@ class AppConfigDialog(QDialog):
 
 
 class InstrumentConfigDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, bus=None):
         super().__init__(parent)
+        self.bus = bus
+
         self.setWindowTitle("Instrument Configuration: restart application for changes to take effect")
         self.resize(700, 700)
         self.settings = QSettings("honeychrome", "instrument_configuration")
@@ -443,6 +445,9 @@ class InstrumentConfigDialog(QDialog):
 
         # self.use_dummy_instrument = QCheckBox("Use Dummy Instrument:")
         # form.addRow(self.use_dummy_instrument)
+
+        self.steps_per_microlitre_spin = QDoubleSpinBox(minimum=0, maximum=10000, decimals=1)
+        form.addRow("Volume calibration of the sample pump (steps per microlitre):", self.steps_per_microlitre_spin)
 
         form.addRow(QLabel("Additional settings for Cytkit can be found in the plugin tab Cytkit Hardware"))
 
@@ -483,12 +488,20 @@ class InstrumentConfigDialog(QDialog):
         if index >= 0:
             self.height_channel_combo.setCurrentIndex(index)
 
+        steps_per_microlitre_retrieved = self.settings.value("steps_per_microlitre", steps_per_microlitre)
+        self.steps_per_microlitre_spin.setValue(float(steps_per_microlitre_retrieved))
+
         # self.use_dummy_instrument.setChecked(self.settings.value("use_dummy_instrument", use_dummy_instrument, type=bool))
 
     def save_settings(self):
         self.settings.setValue("trigger_channel", self.trigger_channel_combo.currentText())
         self.settings.setValue("width_channel", self.width_channel_combo.currentText())
         self.settings.setValue("height_channel", self.height_channel_combo.currentText())
+        self.settings.setValue("steps_per_microlitre", self.steps_per_microlitre_spin.value())
+
+        if self.bus:
+            self.bus.setSamplePumpFlowRate.emit(0)
+
         # self.settings.setValue("use_dummy_instrument", self.use_dummy_instrument.isChecked())
 
     def handle_accept(self):
@@ -505,6 +518,7 @@ class InstrumentConfigDialog(QDialog):
         index = self.height_channel_combo.findText(height_channels[0])
         if index >= 0:
             self.height_channel_combo.setCurrentIndex(index)
+        self.steps_per_microlitre_spin.setValue(steps_per_microlitre)
         # self.use_dummy_instrument.setChecked(use_dummy_instrument)
 
 

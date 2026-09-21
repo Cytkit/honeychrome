@@ -73,6 +73,7 @@ class AcquisitionWidget(QWidget):
         # Sync slider and spinbox
         self.slider.valueChanged.connect(self.spinbox.setValue)
         self.spinbox.valueChanged.connect(self.slider.setValue)
+        self.slider.valueChanged.connect(self.bus.setSamplePumpFlowRate)
 
         slider_layout.addWidget(QLabel("Sample [uL/min]:"))
         slider_layout.addWidget(self.slider)

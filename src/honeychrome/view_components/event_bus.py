@@ -42,6 +42,7 @@ class EventBus(QObject):
     ### instrument control
     findConnectInstrument = Signal()
     initialiseInstrument = Signal()
+    setSamplePumpFlowRate = Signal(int)
     startAcquisition = Signal()
     stopAcquisition = Signal()
     restartAcquisition = Signal()

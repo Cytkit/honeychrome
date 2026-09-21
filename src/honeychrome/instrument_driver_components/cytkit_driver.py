@@ -2,18 +2,18 @@ import time
 
 from threading import Thread, Event, Lock
 
-from honeychrome.instrument_driver_components.cykit_components.adcs import ADCs
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max
-from honeychrome.instrument_driver_components.cykit_components.dacs import DACs
-from honeychrome.instrument_driver_components.cykit_components.ft4222communicator import Ft4222Communicator
-from honeychrome.instrument_driver_components.cykit_components.fan import Fan
-from honeychrome.instrument_driver_components.cykit_components.i2c import I2C
-from honeychrome.instrument_driver_components.cykit_components.id_data import IDData
-from honeychrome.instrument_driver_components.cykit_components.laser import Laser
-from honeychrome.instrument_driver_components.cykit_components.pressure import Pressure
-from honeychrome.instrument_driver_components.cykit_components.sample_pump import SamplePump
-from honeychrome.instrument_driver_components.cykit_components.sheath_pump import SheathPump
-from honeychrome.instrument_driver_components.cykit_components.vi_monitor import VIMonitor
+from honeychrome.instrument_driver_components.cytkit_components.adcs import ADCs
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max
+from honeychrome.instrument_driver_components.cytkit_components.dacs import DACs
+from honeychrome.instrument_driver_components.cytkit_components.ft4222communicator import Ft4222Communicator
+from honeychrome.instrument_driver_components.cytkit_components.fan import Fan
+from honeychrome.instrument_driver_components.cytkit_components.i2c import I2C
+from honeychrome.instrument_driver_components.cytkit_components.id_data import IDData
+from honeychrome.instrument_driver_components.cytkit_components.laser import Laser
+from honeychrome.instrument_driver_components.cytkit_components.pressure import Pressure
+from honeychrome.instrument_driver_components.cytkit_components.sample_pump import SamplePump
+from honeychrome.instrument_driver_components.cytkit_components.sheath_pump import SheathPump
+from honeychrome.instrument_driver_components.cytkit_components.vi_monitor import VIMonitor
 from honeychrome import settings
 
 import logging
@@ -157,6 +157,14 @@ class CytkitDevice:
         backflush_sip
             no arguments
             return status, message
+        set_gain
+            argument: dict of parameters to set {channel: bias} in dac units 0..255
+            return status, message
+        set_sample_flow_rate
+            argument: dict of parameters to set:
+                {'sample_flow_rate': (float)
+                'steps_per_microlitre': (float)}
+            return status, message
         read_out_traces
             no arguments
             returns blob of traces
@@ -186,12 +194,14 @@ class CytkitDevice:
         self.sample_pump_priming_time = settings.sample_pump_priming_time_retrieved
         self.sample_pump_unpriming_speed = settings.sample_pump_unpriming_speed_retrieved
         self.sample_pump_unpriming_time = settings.sample_pump_unpriming_time_retrieved
-        self.sample_pump_acquisition_speed = settings.sample_pump_acquisition_speed_retrieved
         self.sample_pump_settle_time = settings.sample_pump_settle_time_retrieved
         self.sample_pump_flush_speed = settings.sample_pump_flush_speed_retrieved
         self.sample_pump_flush_time = settings.sample_pump_flush_time_retrieved
         self.sample_pump_backflush_speed = settings.sample_pump_backflush_speed_retrieved
         self.sample_pump_backflush_time = settings.sample_pump_backflush_time_retrieved
+
+        self.sample_pump_acquisition_rate = settings.sample_pump_acquisition_rate_retrieved
+        self.sample_pump_steps_per_microlitre = settings.steps_per_microlitre_retrieved
 
     def find_and_connect_to_device(self):
         self.ft4222.find_and_connect()
@@ -229,6 +239,8 @@ class CytkitDevice:
         return  'OK', 'Connected to Cytkit'
 
     def disconnect(self):
+        self.laser.set_state(0)  # always send command to switch off laser just in case
+
         workers = [self.temperature_control_worker, self.pressure_control_worker]
 
         for w in workers:
@@ -265,7 +277,7 @@ class CytkitDevice:
         self.sample_pump.set_speed(self.sample_pump_priming_speed)
         time.sleep(self.sample_pump_priming_time)
         # 2. set steady sample flow rate
-        self.sample_pump.set_speed(self.sample_pump_acquisition_speed)
+        self.sample_pump.set_speed(int(self.sample_pump_acquisition_rate * self.sample_pump_steps_per_microlitre))
         time.sleep(self.sample_pump_settle_time)
 
         return 'OK', 'Cytkit started acquisition'
@@ -513,6 +525,17 @@ class CytkitDevice:
         self.sample_pump.set_speed(0)
         self.sample_pump.set_enable(False)
         return 'OK', 'Cytkit SIP backflushed'
+
+    def set_gain(self, dict_of_gains):
+        message = self.set_state({'dacs':{'bias':dict_of_gains}})
+        return 'OK', message
+
+    def set_sample_flow_rate(self, data):
+        if 'sample_flow_rate' in data:
+            self.sample_pump_acquisition_rate = data['sample_flow_rate']
+        if 'steps_per_microlitre' in data:
+            self.sample_pump_steps_per_microlitre = data['steps_per_microlitre']
+        self.sample_pump.set_speed(int(self.sample_pump_acquisition_rate * self.sample_pump_steps_per_microlitre))
 
 
     def read_out_traces(self):

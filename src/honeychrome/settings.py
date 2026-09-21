@@ -20,18 +20,19 @@ adc_scale_mv = 30 # the adc level for 1 mV
 standby_time = 600_000 # ms to automatically put instrument to standby (switch off laser and pumps)
 pressure_set_point = -20 # Pa
 temperature_set_point = 40 # degC
+steps_per_microlitre = 25
 
-sample_pump_conversion_factor = 0.001 # uL/step
 sample_pump_priming_speed = 6000 # steps/s
 sample_pump_priming_time = 10. # s
 sample_pump_unpriming_speed = 6000 # steps/s
 sample_pump_unpriming_time = 10. # s
-sample_pump_acquisition_speed = 1000 # steps/s
-sample_pump_settle_time = 1. # s
 sample_pump_flush_speed = 6000 # steps/s
 sample_pump_flush_time = 30. # s
 sample_pump_backflush_speed = 6000 # steps/s
 sample_pump_backflush_time = 30. # s
+sample_pump_settle_time = 1. # s
+sample_pump_acquisition_rate = 30 # uL/min
+
 
 ### peak detection settings
 trigger_channel = 'FSC'
@@ -82,8 +83,8 @@ n_channels_per_event = len(event_channels_pnn)
 use_dummy_instrument = True
 
 ### settings for controller and gui
-default_gains_immuno = {'B1':1., 'B2':1., 'B3':1., 'B4':1., 'B5':1., 'B6':1., 'B7':1., 'B8':1., 'B9':1., 'B10':1., 'B11':1., 'B12':1., 'B13':1., 'B14':1.}
-default_gains_xfp = {'B1':1., 'B2':1., 'B3':1., 'B4':1., 'B5':1., 'B6':1., 'B7':1., 'B8':1., 'B9':1., 'B10':1., 'B11':1., 'B12':1., 'B13':1., 'B14':1.}
+default_gains_immuno = {channel: 100 for channel in fluorescence_channels}
+default_gains_xfp = {channel: 50 for channel in fluorescence_channels}
 cytometry_plot_width_target = 350 # pixels
 cytometry_plot_width_export = 70 # mm
 tile_size_nxn_grid = 100 # pixels
@@ -281,15 +282,15 @@ report_include_process_retrieved = q_settings.value("report_include_process", re
 
 pressure_set_point_retrieved = q_settings.value('pressure_set_point', pressure_set_point, type=int)
 temperature_set_point_retrieved = q_settings.value('temperature_set_point', temperature_set_point, type=int)
+steps_per_microlitre_retrieved = q_settings.value('steps_per_microlitre', steps_per_microlitre, type=int)
 
-sample_pump_conversion_factor = 0.001 # uL/step
 sample_pump_priming_speed_retrieved = q_settings.value('sample_pump_priming_speed', sample_pump_priming_speed, type=int)
 sample_pump_priming_time_retrieved = q_settings.value('sample_pump_priming_time', sample_pump_priming_time, type=float)
 sample_pump_unpriming_speed_retrieved = q_settings.value('sample_pump_unpriming_speed', sample_pump_unpriming_speed, type=int)
 sample_pump_unpriming_time_retrieved = q_settings.value('sample_pump_unpriming_time', sample_pump_unpriming_time, type=float)
-sample_pump_acquisition_speed_retrieved = q_settings.value('sample_pump_acquisition_speed', sample_pump_acquisition_speed, type=int)
 sample_pump_settle_time_retrieved = q_settings.value('sample_pump_settle_time', sample_pump_settle_time, type=float)
 sample_pump_flush_speed_retrieved = q_settings.value('sample_pump_flush_speed', sample_pump_flush_speed, type=int)
 sample_pump_flush_time_retrieved = q_settings.value('sample_pump_flush_time', sample_pump_flush_time, type=float)
 sample_pump_backflush_speed_retrieved = q_settings.value('sample_pump_backflush_speed', sample_pump_backflush_speed, type=int)
 sample_pump_backflush_time_retrieved = q_settings.value('sample_pump_backflush_time', sample_pump_backflush_time, type=float)
+sample_pump_acquisition_rate_retrieved = q_settings.value('sample_pump_acquisition_speed', sample_pump_acquisition_rate, type=float)

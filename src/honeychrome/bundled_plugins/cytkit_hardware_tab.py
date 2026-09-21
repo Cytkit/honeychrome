@@ -9,8 +9,8 @@ from PySide6.QtWidgets import QApplication
 import logging
 
 from honeychrome.controller import Controller
-from honeychrome.instrument_driver_components.cykit_components.alignment_camera import AlignmentCameraWidget
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import monitor_dictionary, dac_dictionary, number_of_dacs_pairs, registers_map
+from honeychrome.instrument_driver_components.cytkit_components.alignment_camera import AlignmentCameraWidget
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import monitor_dictionary, dac_dictionary, number_of_dacs_pairs, registers_map
 from honeychrome.main import configure_multiprocessing
 from honeychrome.settings import heading_style
 from honeychrome.view_components.event_bus import EventBus
@@ -594,7 +594,7 @@ class PluginWidget(QWidget):
     def set_pump_controls(self, dict_of_parameter_value):
         for parameter, value in dict_of_parameter_value.items():
             self.settings.setValue(parameter, value)
-        self.set_instrument_state({'set_pump_controls': dict_of_parameter_value})
+        self.set_instrument_state(dict_of_parameter_value)
 
 
     @Slot()

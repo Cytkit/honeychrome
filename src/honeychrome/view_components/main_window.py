@@ -526,7 +526,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def instrument_config(self):
-        dialog = InstrumentConfigDialog(self)
+        dialog = InstrumentConfigDialog(self, self.bus)
         dialog.exec()
 
     def expt_settings(self):

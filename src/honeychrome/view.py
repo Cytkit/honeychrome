@@ -128,6 +128,7 @@ class View(QObject):
         # instrument control
         self.bus.findConnectInstrument.connect(self.controller.find_and_connect_instrument)
         self.bus.initialiseInstrument.connect(self.controller.initialise_instrument)
+        self.bus.setSamplePumpFlowRate.connect(self.controller.set_sample_pump_flow_rate)
         self.bus.startAcquisition.connect(self.controller.start_acquisition)
         self.bus.stopAcquisition.connect(self.controller.stop_acquisition)
         self.bus.restartAcquisition.connect(self.controller.restart_acquisition)

@@ -117,6 +117,10 @@ class Instrument(mp.Process):
                 response_to_experiment_control = self.flush_sip()
             elif incoming_from_experiment_control['command'] == 'backflush_sip':
                 response_to_experiment_control = self.backflush_sip()
+            elif incoming_from_experiment_control['command'] == 'set_gain':
+                response_to_experiment_control = self.set_gain(incoming_from_experiment_control['data'])
+            elif incoming_from_experiment_control['command'] == 'set_sample_flow_rate':
+                response_to_experiment_control = self.set_sample_flow_rate(incoming_from_experiment_control['data'])
             elif incoming_from_experiment_control['command'] == 'set_instrument_state':
                 response_to_experiment_control = self.set_instrument_state(incoming_from_experiment_control['data'])
             elif incoming_from_experiment_control['command'] == 'get_instrument_state':
@@ -187,7 +191,6 @@ class Instrument(mp.Process):
         return {'source': '[Instrument driver]', 'status': 'OK', 'message': message}
 
     def disconnect_instrument(self):
-        self.device.set_state({'laser_enable': False}) # always send command to switch off laser just in case
         self.device.disconnect()
 
     def initialise_instrument(self):
@@ -230,6 +233,14 @@ class Instrument(mp.Process):
 
     def backflush_sip(self):
         status, message = self.device.backflush_sip()
+        return {'source': '[Instrument driver]', 'status': status, 'message': message}
+
+    def set_gain(self, data):
+        status, message = self.device.set_gain(data)
+        return {'source': '[Instrument driver]', 'status': status, 'message': message}
+
+    def set_sample_flow_rate(self, data):
+        status, message = self.device.set_sample_flow_rate(data)
         return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
     def transfer(self):
