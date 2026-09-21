@@ -272,15 +272,11 @@ class Controller(QObject):
         if self.raw_transformations is None:
             logger.warning('Controller: save_experiment called before transformations initialised, skipping')
             return
-        unmixing_active = (
-            self.experiment.process['unmixing_matrix'] is not None and self.unmixed_gating is not None
-        )
+        # convert ephemeral gating back to gml
         self.experiment.cytometry['raw_gating'] = to_gml(self.raw_gating)
         update_transforms(self.experiment.cytometry['raw_transforms'], self.raw_transformations)
         if self.experiment.process['unmixing_matrix'] is not None and self.unmixed_gating is not None:
             self.experiment.cytometry['gating'] = to_gml(self.unmixed_gating)
-        update_transforms(self.experiment.cytometry['raw_transforms'], self.raw_transformations)
-        if unmixing_active:
             update_transforms(self.experiment.cytometry['transforms'], self.unmixed_transformations)
 
         # Persist per-sample custom gates as GML fragments (one per overridden
@@ -1492,6 +1488,8 @@ class Controller(QObject):
 
                 if self.bus:
                     self.bus.statusMessage.emit(f'Ready.')
+
+                # then if sample is live, start thread to calc hist and stats on updates... or calc once only
                 if not self.stop_live_data_processing.is_set() and self.current_sample_path == self.live_sample_path:
                     # start live update thread
                     self.thread = threading.Thread(target=self.update_hists_and_stats, args=(), daemon=True)
