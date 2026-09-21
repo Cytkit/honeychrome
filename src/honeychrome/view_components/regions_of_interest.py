@@ -92,8 +92,9 @@ class DraggableRoiLabel(pg.TextItem):
         self.setFlag(self.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(self.GraphicsItemFlag.ItemIsSelectable, True)
 
+        self.update_label_statistic_and_gate()
         if self.bus is not None:
-            self.bus.histsStatsRecalculated.connect(self.add_statistic_to_name)
+            self.bus.histsStatsRecalculated.connect(self.update_label_statistic_and_gate)
 
     @property
     def current_sample_id(self):
@@ -151,7 +152,7 @@ class DraggableRoiLabel(pg.TextItem):
                 self.rename_gate(new_name)
 
     @Slot()
-    def add_statistic_to_name(self):
+    def update_label_statistic_and_gate(self):
         self._apply_custom_fill()
         if self.data_for_cytometry_plots['statistics']:
             if self.gate_name in self.data_for_cytometry_plots['statistics'].keys():

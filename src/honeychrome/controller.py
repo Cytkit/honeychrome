@@ -76,7 +76,8 @@ cytometry_data_dictionary = {
     'gating': GatingStrategy(), # flowkit.GatingStrategy object used to define the gating lookup tables
     'plots': [], # set of cytometry plot definitions (1D histograms, 2D histograms, ribbon plots referencing the channel names, source gates and child gates
     'histograms': [], # set of 1D and 2D histograms for plotting on the plots
-    'gate_membership': {} # dictionary of gate membership for each gate, boolean array corresponding to event_data
+    'gate_membership': {}, # dictionary of gate membership for each gate, boolean array corresponding to event_data
+    'sample_id': None
 }
 
 class Controller(QObject):
@@ -555,9 +556,11 @@ class Controller(QObject):
             names = list(self.custom_sample_gates.get(scope, {}).get(self.current_sample_path, {}).keys())
         self.bus.customGatesChanged.emit(scope, names)
 
-        for n, plot in enumerate(self.data_for_cytometry_plots['plots']):
-            # if set(names) & set(plot['child_gates']):
-            self.bus.updateRois.emit(scope, n)
+        ## bad to update here... interferes with plot updates in other signal
+        # for n, plot in enumerate(self.data_for_cytometry_plots['plots']):
+        #     # if set(names) & set(plot['child_gates']):
+        #     self.bus.updateRois.emit(scope, n)
+        self.bus.refreshCustomRois.emit(scope)
 
     def _load_custom_sample_gates(self):
         """Rebuild ``custom_sample_gates`` from the .kit's GML fragments. Missing

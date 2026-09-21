@@ -491,7 +491,7 @@ class SpectralAutoGenerator(QObject):
                 self.bus.updateRois.emit('raw', index)
 
         logger.info('SpectralAutoGenerator: regenerated spectral model and raw gating hierarchy:')
-        logger.info(self.raw_gating.get_gate_hierarchy(output='json'))
+        logger.info(self.raw_gating.get_gate_hierarchy(output='ascii'))
 
         if self.bus and self.negative_profile_warnings:
             labels = ', '.join(f'"{label}"' for label in self.negative_profile_warnings)

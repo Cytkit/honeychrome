@@ -66,6 +66,7 @@ class EventBus(QObject):
     axesReset = Signal(list)
     histsStatsRecalculated = Signal(str, list)
     updateRois = Signal(str, int)
+    refreshCustomRois = Signal(str)
 
     ### per-sample custom gates (one shared template, per-sample gate overrides)
     # UI -> controller: customise / revert / adopt a gate for the current sample (scope, gate_name)

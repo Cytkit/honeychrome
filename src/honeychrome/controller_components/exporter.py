@@ -213,7 +213,7 @@ class ReportGenerator(QObject):
                     plot_widget.setFixedSize(width, height)
                     plot_widget.plot_histogram()
                     for roi in plot_widget.rois:
-                        roi.label.add_statistic_to_name()
+                        roi.label.update_label_statistic_and_gate()
                     png_buffer = pm_to_png_buffer(get_widget_pixmap(plot_widget, scale_factor=scale_factor))
                     add_inline_picture(doc, png_buffer, own_line)
 
