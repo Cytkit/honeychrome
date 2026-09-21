@@ -527,7 +527,13 @@ class CytkitDevice:
         return 'OK', 'Cytkit SIP backflushed'
 
     def set_gain(self, dict_of_gains):
-        message = self.set_state({'dacs':{'bias':dict_of_gains}})
+        sanitised_dict_of_gains = {}
+        for channel in dict_of_gains:
+            if channel in settings.fluorescence_channels and 0<=dict_of_gains[channel]<=255:
+                index = settings.fluorescence_channels.index(channel)
+                sanitised_dict_of_gains[index] = dict_of_gains[channel]
+
+        message = self.set_state({'dacs':{'bias':sanitised_dict_of_gains}})
         return 'OK', message
 
     def set_sample_flow_rate(self, data):

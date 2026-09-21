@@ -1173,7 +1173,12 @@ class Controller(QObject):
 
     @Slot(str, int)
     def on_gain_change(self, ch_name, value):
-        logger.info(f"{ch_name} gain changed to {value}")
+        # send set_gain command and wait for response
+        self.pipe_connection_instrument.send({'command': 'set_gain', 'data': {ch_name: value}})
+        response = self.pipe_connection_instrument.recv()
+        logger.info(response)
+        if self.bus:
+            self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
 
     def quit_instrument_quit_analyser(self):
         self.pipe_connection_analyser.send({'command': 'quit'})  # quit analyser
