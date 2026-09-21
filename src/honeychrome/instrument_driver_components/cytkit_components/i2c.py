@@ -1,6 +1,6 @@
 import time
 
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import lookup_address
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import lookup_address
 
 
 class I2C:

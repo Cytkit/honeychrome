@@ -1,4 +1,4 @@
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import adc_dictionary
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import adc_dictionary
 
 
 class ADCs:

@@ -1,4 +1,4 @@
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import dac_dictionary, number_of_dacs_pairs
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import dac_dictionary, number_of_dacs_pairs
 
 
 class DACs:

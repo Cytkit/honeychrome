@@ -3,7 +3,7 @@ import ft4222
 from ft4222.SPI import Cpha, Cpol
 from ft4222.SPIMaster import Mode, Clock, SlaveSelect
 
-from honeychrome.instrument_driver_components.cykit_components.cytkit_configuration import operation_write, operation_read, dummy_bytes, memory_start_address, memory_end_address, registers_map, lookup_address
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import operation_write, operation_read, dummy_bytes, memory_start_address, memory_end_address, registers_map, lookup_address
 from honeychrome.settings import traces_cache_dtype
 
 empty_array = np.array([], dtype=np.uint16)
