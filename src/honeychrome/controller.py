@@ -276,7 +276,8 @@ class Controller(QObject):
             self.experiment.process['unmixing_matrix'] is not None and self.unmixed_gating is not None
         )
         self.experiment.cytometry['raw_gating'] = to_gml(self.raw_gating)
-        if unmixing_active:
+        update_transforms(self.experiment.cytometry['raw_transforms'], self.raw_transformations)
+        if self.experiment.process['unmixing_matrix'] is not None and self.unmixed_gating is not None:
             self.experiment.cytometry['gating'] = to_gml(self.unmixed_gating)
         update_transforms(self.experiment.cytometry['raw_transforms'], self.raw_transformations)
         if unmixing_active:
