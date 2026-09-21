@@ -1,6 +1,9 @@
+import os
 import sys
 import time
 import math
+from pathlib import Path
+
 import ft4222
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import Qt, QImage, QPixmap
@@ -8,7 +11,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QApplication
 from ft4222.SPIMaster import Mode as MasterSingle, Clock, SlaveSelect
 from ft4222.SPI import Cpha, Cpol
 from ft4222.GPIO import Dir, Port
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageQt import ImageQt
 
 width=128
@@ -142,6 +145,40 @@ class SSD1309:
 
         self.data(buf)
 
+
+ASSETS_DIR = Path(__file__).parent.parent / "src" / "honeychrome" / "instrument_driver_components" / "cytkit_components" / "oled_frames"
+
+# frame = Image.new('1', (128, 64), 0)
+font4x6 = ImageFont.load(ASSETS_DIR / 'fonts' / 'pil' / '4x6.pil')
+font5x7 = ImageFont.load(ASSETS_DIR / 'fonts' / 'pil' / '5x7.pil')
+font5x8 = ImageFont.load(ASSETS_DIR / 'fonts' / 'pil' / '5x8.pil')
+font6x9 = ImageFont.load(ASSETS_DIR / 'fonts' / 'pil' / '6x9.pil')
+font6x10 = ImageFont.load(ASSETS_DIR / 'fonts' / 'pil' / '6x10.pil')
+font6x12 = ImageFont.load(ASSETS_DIR / 'fonts' / 'pil' / '6x12.pil')
+font6x13 = ImageFont.load(ASSETS_DIR / 'fonts' / 'pil' / '6x13.pil')
+font6x13B = ImageFont.load(ASSETS_DIR / 'fonts' / 'pil' / '6x13B.pil')
+font6x13O = ImageFont.load(ASSETS_DIR / 'fonts' / 'pil' / '6x13O.pil')
+
+def load_and_convert_frame(filename=None):
+    if filename:
+        frame = Image.open(ASSETS_DIR / filename)
+        # print(frame.mode, frame.size)
+        frame = frame.convert("L").point(lambda x: 255 if x > 128 else 0, mode="1")
+    else:
+        frame = Image.new('1', (128, 64), 0)
+
+    draw = ImageDraw.Draw(frame)
+    return frame, draw
+
+def draw_text_lr(draw, x, y, text, font, fill, anchor='l'):
+    if anchor == 'r':
+        bbox = draw.textbbox((0, 0), text, font=font)
+        w = bbox[2] - bbox[0]
+        draw.text((x - w, y), text, font=font, fill=fill)
+    else:
+        draw.text((x, y), text, font=font, fill=fill)
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
@@ -151,37 +188,19 @@ if __name__ == "__main__":
         oled = SSD1309_sim()
         oled.show()
 
-    box_x, box_y = 10.0, 30.0
-    vx, vy = 45.0, 30.0
-    text_x = 64
-    ticker_text = "AZIZ"
-
-
     last_time = time.monotonic()
     frame_count = 0
     fps = 0
     fps_timer = last_time
-
+    chapter_time = last_time
+    chapter = 0
 
     def run_animation():
-        global last_time, box_x, box_y, vx, vy, text_x, frame_count, fps_timer, fps
+        global last_time, frame_count, fps_timer, fps, chapter, chapter_time
 
         current_time = time.monotonic()
         dt = current_time - last_time
         last_time = current_time
-
-        # Update positions
-        box_x += vx * dt
-        box_y += vy * dt
-
-        if box_x <= 0 or box_x >= 118:
-            vx *= -1
-        if box_y <= 20 or box_y >= 54:
-            vy *= -1
-
-        text_x -= 40 * dt
-        if text_x < -220:
-            text_x = 128
 
         frame_count += 1
         if current_time - fps_timer >= 1.0:
@@ -190,24 +209,108 @@ if __name__ == "__main__":
             fps_timer = current_time
             print(f"Status: Rendering at {fps} FPS")
 
-        # Draw frame
-        frame = Image.new('1', (128, 64), 0)
-        draw = ImageDraw.Draw(frame)
+        # chapter = 5
+        match chapter:
+            case 0:
+                frame, draw = load_and_convert_frame("connection front panel template.png")
+                chapter_interval = 1
+                connection_alive_animation = False
 
-        draw.text((2, 2), f"FPS: {fps}", fill=1)
-        draw.line((0, 14, 127, 14), fill=1)
-        draw.text((int(text_x), 2), ticker_text, fill=1)
+                draw_text_lr(draw, 3, 0, "Connect", font6x13, 1)
+                draw_text_lr(draw, 3, 15, "USB 2.0", font6x13, 1)
+                draw_text_lr(draw, 3, 36, "Cytkit is powered on.", font4x6, 1)
+                draw_text_lr(draw, 3, 44, "Connect to host PC", font4x6, 1)
+                draw_text_lr(draw, 3, 52, "then run Honeychrome.", font4x6, 1)
 
-        wave_val = int((math.sin(current_time * 4) + 1) * 60)
-        draw.rectangle((2, 58, 125, 62), outline=1, fill=0)
-        draw.rectangle((3, 59, 3 + wave_val, 61), outline=0, fill=1)
-        draw.rectangle((int(box_x), int(box_y), int(box_x) + 9, int(box_y) + 9), outline=1, fill=1)
+            case 1:
+                frame, draw = load_and_convert_frame("logo front panel dark antenna.png")
+                chapter_interval = 1
+                connection_alive_animation = False
+
+            case 2:
+                frame, draw = load_and_convert_frame("logo front panel dark flash.png")
+                chapter_interval = 1
+                connection_alive_animation = False
+
+            case 3:
+                if frame_count % 20 > 10:
+                    frame, draw = load_and_convert_frame("logo front panel template.png")
+                else:
+                    frame, draw = load_and_convert_frame("logo front panel template off.png")
+                chapter_interval = 1
+                connection_alive_animation = False
+
+
+            case 4:
+                frame, draw = load_and_convert_frame("logo front panel present light.png")
+                chapter_interval = 2
+                connection_alive_animation = True
+
+                draw_text_lr(draw, 127, 0, "Cytkit", font6x13, 0, anchor='r')
+                draw_text_lr(draw, 127, 15, "Open", font5x8, 0, anchor='r')
+                draw_text_lr(draw, 127, 23, "Spectral", font5x8, 0, anchor='r')
+                draw_text_lr(draw, 127, 31, "Cytometry", font5x8, 0, anchor='r')
+                draw_text_lr(draw, 127, 50, "Connected!", font4x6, 0, anchor='r')
+
+
+            case 5:
+                frame, draw = load_and_convert_frame("info front panel flying off.png")
+                chapter_interval = 1
+                connection_alive_animation = True
+
+                draw_text_lr(draw, 0, 50, "Acquiring!", font6x13, 1)
+
+            case 6:
+                frame, draw = load_and_convert_frame("info front panel arriving.png")
+                chapter_interval = 10
+                connection_alive_animation = True
+
+                x_right = 70
+                y_array = [0 + n*10 for n in range(6)]
+                draw_text_lr(draw, x_right, y_array[0], "Laser", font5x8, 1, anchor='r')
+                draw_text_lr(draw, x_right, y_array[1], "Pres", font5x8, 1, anchor='r')
+                draw_text_lr(draw, x_right, y_array[2], "Temp", font5x8, 1, anchor='r')
+                draw_text_lr(draw, x_right, y_array[3], "Flow", font5x8, 1, anchor='r')
+                draw_text_lr(draw, x_right, y_array[4], "Trig", font5x8, 1, anchor='r')
+
+                x_right += 3
+                draw_text_lr(draw, x_right, y_array[0], "On", font5x8, 1, anchor='l')
+                draw_text_lr(draw, x_right, y_array[1], f"{frame_count} Pa", font5x8, 1, anchor='l')
+                draw_text_lr(draw, x_right, y_array[2], f"{frame_count} C", font5x8, 1, anchor='l')
+                draw_text_lr(draw, x_right, y_array[3], f"{frame_count} uL/min", font5x8, 1, anchor='l')
+                draw_text_lr(draw, x_right, y_array[4], f"{frame_count} ev/s", font5x8, 1, anchor='l')
+
+            case 7:
+                frame, draw = load_and_convert_frame("info front panel flying off.png")
+                chapter_interval = 1
+                connection_alive_animation = True
+
+                draw_text_lr(draw, 0, 50, "Stopped!", font6x13, 1)
+
+
+            case _:
+                chapter = 0
+                return
+
+
+        if connection_alive_animation:
+            track_length = 256
+            x_left = (current_time*500 % track_length) - track_length//2
+            x_right = x_left + 64
+            draw.rectangle((0, 63, 128, 63), outline=0)
+            draw.rectangle((x_left, 63, x_right, 63), outline=1)
 
         oled.display(frame)
+
+        if current_time - chapter_time >= chapter_interval:
+            chapter_time = current_time
+            chapter += 1
+            print(chapter)
+
 
 
     timer = QTimer()
     timer.timeout.connect(run_animation)
-    timer.start(10)
+    timer.start(30)
 
     app.exec()
