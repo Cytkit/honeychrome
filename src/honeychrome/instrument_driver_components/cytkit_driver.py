@@ -128,6 +128,38 @@ class TemperatureControlWorker(Thread):
         self.fan.set_enable(False)
         self._stop_event.set()
 
+class SamplePumpFlowRateGetter(Thread):
+    def __init__(self, parent, sample_pump):
+        super().__init__(daemon=True)
+        self.sample_pump = sample_pump
+        self._stop_event = Event()
+        self._lock = Lock()
+        self.parent = parent
+        self.flow_rate = 0
+
+    def run(self):
+        while not self._stop_event.is_set():
+            enabled = self.sample_pump.get_enable()
+            reverse = self.sample_pump.get_reverse()
+            speed = self.sample_pump.get_speed()
+            steps_per_microlitre = self.parent.sample_pump_steps_per_microlitre
+            self.flow_rate = enabled * reverse * speed / steps_per_microlitre
+            time.sleep(0.5)
+
+class LaserGetter(Thread):
+    def __init__(self, laser):
+        super().__init__(daemon=True)
+        self.laser = laser
+        self._stop_event = Event()
+        self._lock = Lock()
+        self.enabled = 0
+
+    def run(self):
+        while not self._stop_event.is_set():
+            self.enabled = self.laser.get_state()
+            time.sleep(0.5)
+
+
 class CytkitDevice:
     """
     Device driver must provide the following methods:

@@ -1,9 +1,13 @@
 import logging
+import random
 import time
 from pathlib import Path
+from threading import Thread, Event, Lock
+
 from flowkit import Sample
 import numpy as np
 
+from honeychrome import settings
 from honeychrome.instrument_driver_components.cytkit_components.display import Display
 from honeychrome.settings import adc_channels, magnitude_ceiling, traces_cache_dtype, n_channels_trace, n_time_points_in_event, transfer_target_repeat_time
 
@@ -32,6 +36,97 @@ def gaussian_rows_areas(x_grid, areas, mu, sigma):
 
     return array_of_traces
 
+class EventRateCounter:
+    def __init__(self):
+        self.time_last = None
+        self.event_rate = 0
+
+    def update(self, number_of_new_events):
+        time_now = time.perf_counter()
+        if not self.time_last or time_now - self.time_last > 1.0:
+            self.event_rate = 0
+        elif self.event_rate == 0:
+            interval = time_now - self.time_last
+            self.event_rate = number_of_new_events/interval
+        else:
+            interval = time_now - self.time_last
+            self.event_rate = self.event_rate * (1.0-interval) + number_of_new_events
+        self.time_last = time_now
+
+    def reset(self):
+        self.time_last = None
+        self.event_rate = 0
+
+class SamplePumpSim:
+    def __init__(self):
+        self.enable = False
+        self.reverse = False
+        self.speed = 0
+
+    def get_enable(self):
+        return self.enable
+    def get_reverse(self):
+        return self.reverse
+    def get_speed(self):
+        return self.speed
+
+class LaserSim:
+    def __init__(self):
+        self.enable = False
+
+    def get_state(self):
+        return self.enable
+
+class SamplePumpFlowRateGetter(Thread):
+    def __init__(self, parent, sample_pump):
+        super().__init__(daemon=True)
+        self.sample_pump = sample_pump
+        self._stop_event = Event()
+        self._lock = Lock()
+        self.parent = parent
+        self.flow_rate = 0
+
+    def run(self):
+        while not self._stop_event.is_set():
+            enabled = self.sample_pump.get_enable()
+            reverse = -1 if self.sample_pump.get_reverse() else 1
+            speed = self.sample_pump.get_speed()
+            steps_per_microlitre = self.parent.sample_pump_steps_per_microlitre
+            self.flow_rate = enabled * reverse * speed / steps_per_microlitre
+            time.sleep(0.5)
+
+class LaserGetter(Thread):
+    def __init__(self, laser):
+        super().__init__(daemon=True)
+        self.laser = laser
+        self._stop_event = Event()
+        self._lock = Lock()
+        self.enabled = 0
+
+    def run(self):
+        while not self._stop_event.is_set():
+            self.enabled = self.laser.get_state()
+            time.sleep(0.5)
+
+class RandomPressureGenerator(Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.pressure = 0
+
+    def run(self):
+        while True:
+            self.pressure = random.normalvariate(-18, sigma=2)
+            time.sleep(0.1)
+
+class RandomTemperatureGenerator(Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.temperature = 0
+
+    def run(self):
+        while True:
+            self.temperature = random.normalvariate(26, sigma=10)
+            time.sleep(0.1)
 
 class DummyDevice:
     """
@@ -89,10 +184,24 @@ class DummyDevice:
         self.initialised = False
         self.logger = logging.getLogger(__name__)
 
-        self.display = Display()
+        self.sample_pump_acquisition_rate = settings.sample_pump_acquisition_rate_retrieved
+        self.sample_pump_steps_per_microlitre = settings.steps_per_microlitre_retrieved
+
+        self.event_rate_counter = EventRateCounter()
+        self.sample_pump = SamplePumpSim()
+        self.laser = LaserSim()
+        self.sample_pump_flow_rate_getter = SamplePumpFlowRateGetter(self, self.sample_pump)
+        self.sample_pump_flow_rate_getter.start()
+        self.pressure_control_worker = RandomPressureGenerator()
+        self.pressure_control_worker.start()
+        self.temperature_control_worker = RandomTemperatureGenerator()
+        self.temperature_control_worker.start()
+        self.laser_getter = LaserGetter(self.laser)
+        self.laser_getter.start()
+        self.display = Display(transfer_object=self.event_rate_counter, sample_pump_object=self.sample_pump_flow_rate_getter, pressure_object=self.pressure_control_worker, temperature_object=self.temperature_control_worker, laser_object=self.laser_getter)
+        self.display.start()
 
     def find_and_connect_to_device(self):
-        self.display.animate_logo()
         return 'OK', 'Dummy device connected'
 
     def disconnect(self):
@@ -105,19 +214,28 @@ class DummyDevice:
         self.logger.info("Example initialisation message to log")
         if not self.initialised:
             self.initialised = True
+            self.laser.enable = True
             self.display.action_message(["Initialised!", "Sheath on, laser on."])
             return 'OK', 'Dummy device initialised'
         else:
             self.initialised = False
+            self.laser.enable = False
             self.display.action_message(["Stand by.", "Sheath off, laser off."])
             return 'OK', 'Dummy device on standby'
 
     def start_acquisition(self):
         self.display.action_message("Acquisition starting...")
+        self.sample_pump.enable = True
+        self.sample_pump.reverse = False
+        self.sample_pump.speed = int(self.sample_pump_acquisition_rate * self.sample_pump_steps_per_microlitre)
         return 'OK', 'Dummy device started acquisition'
 
     def stop_acquisition(self):
         self.display.action_message("Acquisition stopped.")
+        self.sample_pump.enable = False
+        self.sample_pump.reverse = False
+        self.sample_pump.speed = 0
+        self.event_rate_counter.reset()
         return 'OK', 'Dummy device stopped acquisition'
 
     def set_state(self, dict_of_parameter_value):
@@ -137,17 +255,23 @@ class DummyDevice:
 
 
     def flush_sip(self):
-        self.display.action_message(["Flushing SIP."])
+        self.display.action_message("Flushing SIP.")
         return 'OK', 'Dummy device doesn''t have a sip to flush'
 
     def backflush_sip(self):
-        self.display.action_message(["Backflushing SIP."])
+        self.display.action_message("Backflushing SIP.")
         return 'OK', 'Dummy device doesn''t have a sip to backflush'
 
     def set_gain(self, dict_of_gains):
         return 'OK', 'Dummy device doesn''t have gains'
 
     def set_sample_flow_rate(self, data):
+        if 'sample_flow_rate' in data:
+            self.sample_pump_acquisition_rate = data['sample_flow_rate']
+        if 'steps_per_microlitre' in data:
+            self.sample_pump_steps_per_microlitre = data['steps_per_microlitre']
+        self.sample_pump.speed = int(self.sample_pump_acquisition_rate * self.sample_pump_steps_per_microlitre)
+
         return 'OK', 'Dummy device doesn''t have a sample pump'
 
     def generate_traces(self, n):
@@ -167,7 +291,8 @@ class DummyDevice:
 
     def read_out_traces(self):
         n = dummy_event_rate * transfer_target_repeat_time
-        n_events_in_memory = np.random.randint(n)
+        n_events_in_memory = np.random.poisson(n)
+        self.event_rate_counter.update(n_events_in_memory)
         blob_of_traces_as_array, _ = self.generate_traces(n_events_in_memory)
         return blob_of_traces_as_array
 

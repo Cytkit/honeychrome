@@ -231,7 +231,7 @@ class SimProxy:
 
 
 class Display(Thread):
-    def __init__(self):
+    def __init__(self, transfer_object=None, sample_pump_object=None, pressure_object=None, temperature_object=None, laser_object=None):
         super().__init__(daemon=True)
         try:
             self.oled = SSD1309()
@@ -250,11 +250,11 @@ class Display(Thread):
         self._lock = Lock()
         self._closed = False
 
-        self.event_rate = 0
-        self.sample_flow_rate = 0
-        self.pressure = 0
-        self.temperature = 0
-        self.laser_enabled = 0
+        self.transfer_object = transfer_object
+        self.sample_pump_object = sample_pump_object
+        self.pressure_object = pressure_object
+        self.temperature_object = temperature_object
+        self.laser_object = laser_object
 
     def run(self):
         while not self._stop_event.is_set():
@@ -286,7 +286,7 @@ class Display(Thread):
                 draw_text_lr(draw, 127, 50, "Connected!", font4x6, 0, anchor='r')
                 self.frame = frame
                 self.draw = draw
-                self.message_timeout = 5
+                self.message_timeout = 3
                 self.animate_logo = False
                 self.transmission_animation = True
 
@@ -340,6 +340,12 @@ class Display(Thread):
         self.frame = deepcopy(frame_info)
         self.draw = ImageDraw.Draw(self.frame)
 
+        event_rate = self.transfer_object.event_rate if self.transfer_object else 0
+        sample_flow_rate = self.sample_pump_object.flow_rate if self.sample_pump_object else 0
+        pressure = self.pressure_object.pressure if self.pressure_object else 0
+        temperature = self.temperature_object.temperature if self.temperature_object else 0
+        laser_enabled = self.laser_object.enabled if self.laser_object else False
+
         x_right = 65
         y_array = [0 + n*10 for n in range(5)]
         draw_text_lr(self.draw, x_right, y_array[0], "Trig", font5x8, 1, anchor='r')
@@ -349,19 +355,12 @@ class Display(Thread):
         draw_text_lr(self.draw, x_right, y_array[4], "", font5x8, 1, anchor='r')
 
         x_right += 3
-        draw_text_lr(self.draw, x_right, y_array[0], f"{self.event_rate:5.0f} ev/s", font5x8, 1, anchor='l')
-        draw_text_lr(self.draw, x_right, y_array[1], f"{self.sample_flow_rate:5.2f} uL/min", font5x8, 1, anchor='l')
-        draw_text_lr(self.draw, x_right, y_array[2], f"{self.pressure:5.2f} Pa", font5x8, 1, anchor='l')
-        draw_text_lr(self.draw, x_right, y_array[3], f"{self.temperature:5.2f} C", font5x8, 1, anchor='l')
-        draw_text_lr(self.draw, x_right, y_array[4], "Laser On" if self.laser_enabled else "Laser off", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[0], f"{event_rate:5.0f} ev/s", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[1], f"{sample_flow_rate:5.2f} uL/min", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[2], f"{pressure:5.2f} Pa", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[3], f"{temperature:5.2f} C", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[4], "Laser On" if laser_enabled else "Laser off", font5x8, 1, anchor='l')
 
-    def set_info(self, event_rate, sample_flow_rate, pressure, temperature, laser_enabled):
-        with self._lock:
-            self.event_rate = event_rate
-            self.sample_flow_rate = sample_flow_rate
-            self.pressure = pressure
-            self.temperature = temperature
-            self.laser_enabled = laser_enabled
 
 if __name__ == '__main__':
 
