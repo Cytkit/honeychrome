@@ -1,8 +1,7 @@
-import os
 import sys
 import time
-import math
 from pathlib import Path
+import numpy as np
 
 import ft4222
 from PySide6.QtCore import QTimer
@@ -14,8 +13,9 @@ from ft4222.GPIO import Dir, Port
 from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageQt import ImageQt
 
-width=128
-height=64
+WIDTH = 128
+HEIGHT = 64
+PAGES = 8
 
 class SSD1309_sim(QWidget):
     scale = 6
@@ -30,7 +30,7 @@ class SSD1309_sim(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.image_label = QLabel('Waiting for image...')
-        self.image_label.setFixedSize(width * self.scale, height * self.scale)
+        self.image_label.setFixedSize(WIDTH * self.scale, HEIGHT * self.scale)
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setScaledContents(False)
 
@@ -55,13 +55,59 @@ class SSD1309_sim(QWidget):
         pixmap = QPixmap.fromImage(q_image)
 
         scaled = pixmap.scaled(
-            width  * self.scale,
-            height * self.scale,
+            WIDTH * self.scale,
+            HEIGHT * self.scale,
             Qt.IgnoreAspectRatio,      # exact multiple, no distortion
             Qt.FastTransformation,     # <-- nearest-neighbor, keeps pixels crisp
         )
         self.image_label.setPixmap(scaled)
 
+def _dirty_rect(new: bytes, old: bytes):
+    """Return (x0, x1, page0, page1) bounding box of changed bytes, or None.
+
+    x0/x1 are inclusive column indices, page0/page1 inclusive page indices.
+    """
+    new_arr = np.frombuffer(new, dtype=np.uint8).reshape(PAGES, WIDTH)
+    old_arr = np.frombuffer(old, dtype=np.uint8).reshape(PAGES, WIDTH)
+
+    # Byte-level diff mask per (page, column)
+    diff = new_arr != old_arr
+    if not diff.any():
+        return None
+
+    # Find columns that changed anywhere
+    col_any = diff.any(axis=0)  # shape (128,)
+    cols = np.flatnonzero(col_any)
+    x0, x1 = int(cols[0]), int(cols[-1])
+
+    # Find pages that changed anywhere in that column span
+    page_any = diff[:, x0:x1 + 1].any(axis=1)  # shape (8,)
+    pages = np.flatnonzero(page_any)
+    page0, page1 = int(pages[0]), int(pages[-1])
+
+    return x0, x1, page0, page1
+
+def _dirty_rects(new: bytes, old: bytes):
+    new_arr = np.frombuffer(new, dtype=np.uint8).reshape(PAGES, WIDTH)
+    old_arr = np.frombuffer(old, dtype=np.uint8).reshape(PAGES, WIDTH)
+    diff = new_arr != old_arr
+    if not diff.any():
+        return []
+
+    page_changed = diff.any(axis=1)
+    rects = []
+    p = 0
+    while p < PAGES:
+        if not page_changed[p]:
+            p += 1
+            continue
+        start = p
+        while p < PAGES and page_changed[p]:
+            p += 1
+        end = p - 1
+        cols = np.flatnonzero(diff[start:end + 1].any(axis=0))
+        rects.append((int(cols[0]), int(cols[-1]), start, end))
+    return rects
 
 class SSD1309:
     def __init__(self):
@@ -86,6 +132,10 @@ class SSD1309:
         self.init_display()
         print("Initialization complete! Starting render loop...\n")
 
+        # Cache of the last transmitted buffer for diffing
+        self._last_buf = None
+        self.byte_tally = 0
+
     def set_dc(self, is_data: bool):
         # Write DC signal to Channel B
         self.dev_gpio.gpio_Write(Port.P0, is_data)
@@ -105,7 +155,7 @@ class SSD1309:
             # SPI write on Channel nA
             self.dev_spi.spiMaster_SingleWrite(bytes([cmd]), True)
 
-    def data(self, data_bytes):
+    def write_data(self, data_bytes):
         self.set_dc(True)
         # SPI write on Channel A
         self.dev_spi.spiMaster_SingleWrite(bytes(data_bytes), True)
@@ -129,22 +179,82 @@ class SSD1309:
         ]
         self.command(*init_cmds)
         time.sleep(0.1)  # Allow power supply rail to stabilize
+        self._last_buf = None
 
-    def display(self, image: Image.Image):
-        """Converts image to SSD1309 page layout and transmits via SPI."""
+    def _to_page_buffer(self, image: Image.Image) -> bytes:
+        """Convert a Pillow image into the SSD1309 page-addressed byte layout."""
         img = image.convert('1')
-        self.command(0x21, 0, width - 1)
-        self.command(0x22, 0, (height // 8) - 1)
+        arr = np.array(img, dtype=np.uint8)              # (64, 128)
+        pages = arr.reshape(PAGES, 8, WIDTH)   # (8, 8, 128)
+        bits = np.packbits(pages, axis=1, bitorder='little')  # (8, 1, 128)
+        return bits.reshape(PAGES * WIDTH).tobytes()
 
-        buf = bytearray(1024)
-        pix = img.load()
-        for y in range(height):
-            for x in range(width):
-                if pix[x, y]:
-                    buf[x + (y // 8) * width] |= (1 << (y % 8))
 
-        self.data(buf)
+    # def display(self, image: Image.Image):
+    #     """Converts image to SSD1309 page layout and transmits via SPI."""
+    #     img = image.convert('1')
+    #     self.command(0x21, 0, WIDTH - 1)
+    #     self.command(0x22, 0, (HEIGHT // 8) - 1)
+    #
+    #     arr = np.array(img, dtype=np.uint8)  # shape (64, 128)
+    #     pages = arr.reshape(8, 8, 128)  # split rows into 8 pages
+    #     bits = np.packbits(pages, axis=1, bitorder='little')  # shape (8, 1, 128)
+    #     buf = bits.reshape(1024).tobytes()
+    #
+    #     self.write_data(buf)
 
+
+    def _send_rect(self, buf: bytes, x0: int, x1: int, page0: int, page1: int):
+        """Transmit the rectangle [x0..x1] x [page0..page1] from buf."""
+        buf_arr = np.frombuffer(buf, dtype=np.uint8).reshape(PAGES, WIDTH)
+
+        # Restrict the column and page windows
+        self.command(0x21, x0, x1)
+        self.command(0x22, page0, page1)
+
+        # Extract the sub-array and flatten row-major (page-major), matching
+        # the SSD1309's horizontal addressing auto-increment order.
+        region = buf_arr[page0:page1 + 1, x0:x1 + 1]
+        region_bytes = region.tobytes()
+        self.byte_tally += len(region_bytes)
+        self.write_data(region_bytes)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def display(self, image: Image.Image, force_full: bool = False):
+        """Send only the changed region of the framebuffer to the SSD1309."""
+        new_buf = self._to_page_buffer(image)
+
+        if force_full or self._last_buf is None:
+            self._send_rect(new_buf, 0, WIDTH - 1, 0, PAGES - 1)
+            self._last_buf = new_buf
+            return
+
+        # rect = _dirty_rect(new_buf, self._last_buf)
+        # if not rect:
+        #     return  # nothing changed
+        #
+        # x0, x1, page0, page1 = rect
+        # self._send_rect(new_buf, x0, x1, page0, page1)
+        # self._last_buf = new_buf
+
+        rects = _dirty_rects(new_buf, self._last_buf)
+        if not rects:
+            return  # nothing changed
+
+        for rect in rects:
+            x0, x1, page0, page1 = rect
+            self._send_rect(new_buf, x0, x1, page0, page1)
+            self._last_buf = new_buf
+
+    def close(self):
+        try:
+            self.dev_spi.spiMaster_Uninit()
+        except Exception:
+            pass
+        self.dev_spi.close()
+        self.dev_gpio.close()
 
 ASSETS_DIR = Path(__file__).parent.parent / "src" / "honeychrome" / "instrument_driver_components" / "cytkit_components" / "oled_frames"
 
@@ -207,9 +317,10 @@ if __name__ == "__main__":
             fps = frame_count
             frame_count = 0
             fps_timer = current_time
-            print(f"Status: Rendering at {fps} FPS")
+            print(f"Status: Rendering at {fps} FPS, transfer rate {oled.byte_tally} bytes/s")
+            oled.byte_tally = 0
 
-        # chapter = 5
+        chapter = 6
         match chapter:
             case 0:
                 frame, draw = load_and_convert_frame("connection front panel template.png")
@@ -265,20 +376,20 @@ if __name__ == "__main__":
                 chapter_interval = 10
                 connection_alive_animation = True
 
-                x_right = 70
-                y_array = [0 + n*10 for n in range(6)]
-                draw_text_lr(draw, x_right, y_array[0], "Laser", font5x8, 1, anchor='r')
-                draw_text_lr(draw, x_right, y_array[1], "Pres", font5x8, 1, anchor='r')
-                draw_text_lr(draw, x_right, y_array[2], "Temp", font5x8, 1, anchor='r')
-                draw_text_lr(draw, x_right, y_array[3], "Flow", font5x8, 1, anchor='r')
-                draw_text_lr(draw, x_right, y_array[4], "Trig", font5x8, 1, anchor='r')
+                x_right = 65
+                y_array = [0 + n*10 for n in range(5)]
+                draw_text_lr(draw, x_right, y_array[0], "Trig", font5x8, 1, anchor='r')
+                draw_text_lr(draw, x_right, y_array[1], "Flow", font5x8, 1, anchor='r')
+                draw_text_lr(draw, x_right, y_array[2], "Pres", font5x8, 1, anchor='r')
+                draw_text_lr(draw, x_right, y_array[3], "Temp", font5x8, 1, anchor='r')
+                draw_text_lr(draw, x_right, y_array[4], "", font5x8, 1, anchor='r')
 
                 x_right += 3
-                draw_text_lr(draw, x_right, y_array[0], "On", font5x8, 1, anchor='l')
-                draw_text_lr(draw, x_right, y_array[1], f"{frame_count} Pa", font5x8, 1, anchor='l')
-                draw_text_lr(draw, x_right, y_array[2], f"{frame_count} C", font5x8, 1, anchor='l')
-                draw_text_lr(draw, x_right, y_array[3], f"{frame_count} uL/min", font5x8, 1, anchor='l')
-                draw_text_lr(draw, x_right, y_array[4], f"{frame_count} ev/s", font5x8, 1, anchor='l')
+                draw_text_lr(draw, x_right, y_array[0], f"{np.random.randint(5000):5.0f} ev/s", font5x8, 1, anchor='l')
+                draw_text_lr(draw, x_right, y_array[1], f"{np.random.random()+30:5.2f} uL/min", font5x8, 1, anchor='l')
+                draw_text_lr(draw, x_right, y_array[2], f"{np.random.random()*20:5.2f} Pa", font5x8, 1, anchor='l')
+                draw_text_lr(draw, x_right, y_array[3], f"{np.random.random()*20:5.2f} C", font5x8, 1, anchor='l')
+                draw_text_lr(draw, x_right, y_array[4], "Laser On", font5x8, 1, anchor='l')
 
             case 7:
                 frame, draw = load_and_convert_frame("info front panel flying off.png")
@@ -300,6 +411,7 @@ if __name__ == "__main__":
             draw.rectangle((0, 63, 128, 63), outline=0)
             draw.rectangle((x_left, 63, x_right, 63), outline=1)
 
+        # oled.display(frame, force_full=True)
         oled.display(frame)
 
         if current_time - chapter_time >= chapter_interval:
@@ -311,6 +423,6 @@ if __name__ == "__main__":
 
     timer = QTimer()
     timer.timeout.connect(run_animation)
-    timer.start(30)
+    timer.start(40)
 
     app.exec()
