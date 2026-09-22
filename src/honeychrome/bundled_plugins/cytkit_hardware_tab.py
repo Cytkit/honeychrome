@@ -149,9 +149,9 @@ class PluginWidget(QWidget):
         self.sample_pump_unpriming_time.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_unpriming_time': value}))
         layout.addWidget(self.sample_pump_unpriming_time)
 
-        self.sample_pump_acquisition_speed = LabeledSpinBox(min=0, max=65_535, step=100, default=settings.sample_pump_acquisition_speed_retrieved, text='Sample pump acquisition speed [steps/s]')
-        self.sample_pump_acquisition_speed.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_acquisition_speed': value}))
-        layout.addWidget(self.sample_pump_acquisition_speed)
+        self.sample_pump_acquisition_rate = LabeledSpinBox(min=0, max=65_535, step=100, default=settings.sample_pump_acquisition_rate_retrieved, text='Sample pump acquisition rate [uL/min]')
+        self.sample_pump_acquisition_rate.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_acquisition_rate': value}))
+        layout.addWidget(self.sample_pump_acquisition_rate)
 
         self.sample_pump_settle_time = LabeledSpinBox(min=0, max=60, step=0.1, default=settings.sample_pump_settle_time_retrieved, text='Sample pump settle time [s]', double_spin=True)
         self.sample_pump_settle_time.spinbox.valueChanged.connect(lambda value: self.set_pump_controls({'sample_pump_settle_time': value}))

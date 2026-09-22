@@ -4,6 +4,7 @@ from pathlib import Path
 from flowkit import Sample
 import numpy as np
 
+from honeychrome.instrument_driver_components.cytkit_components.display import Display
 from honeychrome.settings import adc_channels, magnitude_ceiling, traces_cache_dtype, n_channels_trace, n_time_points_in_event, transfer_target_repeat_time
 
 fcs_file = Path(__file__).parent / 'data' / 'example_for_dummy_acquisition.fcs'
@@ -35,36 +36,44 @@ def gaussian_rows_areas(x_grid, areas, mu, sigma):
 class DummyDevice:
     """
     Device driver must provide the following methods:
-        find_and_connect_to_device
-            no arguments
-            return status, message
-        disconnect
-            no arguments
-            no return
-        initialise
-            no arguments
-            return status, message
-        start_acquisition
-            no arguments
-            return status, message
-        stop_acquisition
-            no arguments
-            return status, message
-        get_state
-            argument: list of parameters to get, if list is empty gets everything
-            return status, message (where message is dict of parameters)
-        set_state
-            argument: dict of parameters to set
-            return status, message
-        flush_sip
-            no arguments
-            return status, message
-        backflush_sip
-            no arguments
-            return status, message
-        read_out_traces
-            no arguments
-            returns blob of traces
+            find_and_connect_to_device
+                no arguments
+                return status, message
+            disconnect
+                no arguments
+                no return
+            initialise
+                no arguments
+                return status, message
+            start_acquisition
+                no arguments
+                return status, message
+            stop_acquisition
+                no arguments
+                return status, message
+            get_state
+                argument: list of parameters to get, if list is empty gets everything
+                return status, message (where message is dict of parameters)
+            set_state
+                argument: dict of parameters to set
+                return status, message
+            flush_sip
+                no arguments
+                return status, message
+            backflush_sip
+                no arguments
+                return status, message
+            set_gain
+                argument: dict of parameters to set {channel: bias} in dac units 0..255
+                return status, message
+            set_sample_flow_rate
+                argument: dict of parameters to set:
+                    {'sample_flow_rate': (float)
+                    'steps_per_microlitre': (float)}
+                return status, message
+            read_out_traces
+                no arguments
+                returns blob of traces
     """
     def __init__(self):
         self.name = 'Dummy'
@@ -80,28 +89,33 @@ class DummyDevice:
         self.initialised = False
         self.logger = logging.getLogger(__name__)
 
+        self.display = Display()
+
     def find_and_connect_to_device(self):
+        self.display.animate_logo()
         return 'OK', 'Dummy device connected'
 
     def disconnect(self):
-        pass
+        self.display.disconnect()
+        return 'OK', 'Dummy device disconnected'
 
     def initialise(self):
         self.logger.info("Example initialisation message to log")
-        time.sleep(1)
         if not self.initialised:
             self.initialised = True
+            self.display.action_message("Initialised! (Sheath on, laser on.)")
             return 'OK', 'Dummy device initialised'
         else:
             self.initialised = False
+            self.display.action_message("Stand by. (Sheath off, laser off.)")
             return 'OK', 'Dummy device on standby'
 
     def start_acquisition(self):
-        time.sleep(2)
+        self.display.action_message("Acquisition starting...")
         return 'OK', 'Dummy device started acquisition'
 
     def stop_acquisition(self):
-        time.sleep(2)
+        self.display.action_message("Acquisition stopped.")
         return 'OK', 'Dummy device stopped acquisition'
 
     def set_state(self, dict_of_parameter_value):
@@ -125,6 +139,12 @@ class DummyDevice:
 
     def backflush_sip(self):
         return 'OK', 'Dummy device doesn''t have a sip to backflush'
+
+    def set_gain(self, dict_of_gains):
+        return 'OK', 'Dummy device doesn''t have gains'
+
+    def set_sample_flow_rate(self, data):
+        return 'OK', 'Dummy device doesn''t have a sample pump'
 
     def generate_traces(self, n):
         # reads events, returns a blob_np

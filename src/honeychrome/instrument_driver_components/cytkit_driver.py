@@ -5,6 +5,7 @@ from threading import Thread, Event, Lock
 from honeychrome.instrument_driver_components.cytkit_components.adcs import ADCs
 from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max
 from honeychrome.instrument_driver_components.cytkit_components.dacs import DACs
+from honeychrome.instrument_driver_components.cytkit_components.display import Display
 from honeychrome.instrument_driver_components.cytkit_components.ft4222communicator import Ft4222Communicator
 from honeychrome.instrument_driver_components.cytkit_components.fan import Fan
 from honeychrome.instrument_driver_components.cytkit_components.i2c import I2C
@@ -185,6 +186,7 @@ class CytkitDevice:
         self.adcs = None
         self.pressure_control_worker = None
         self.temperature_control_worker = None
+        self.display = None
         self.initialised = False
 
         self.pressure_set_point = settings.pressure_set_point_retrieved
@@ -218,6 +220,7 @@ class CytkitDevice:
         self.vi_monitor = VIMonitor(self.i2c_bus_a, self.i2c_bus_b)
         self.dacs = DACs(self.i2c_bus_a)
         self.adcs = ADCs(self.ft4222)
+        # self.display = Display()
 
         logger.info('[Cytkit driver] Connected')
 
@@ -380,8 +383,8 @@ class CytkitDevice:
             if parameter == 'sample_pump_unpriming_time':
                 self.sample_pump_unpriming_time = value
                 message[parameter] = value
-            if parameter == 'sample_pump_acquisition_speed':
-                self.sample_pump_acquisition_speed = value
+            if parameter == 'sample_pump_acquisition_rate':
+                self.sample_pump_acquisition_rate = value
                 message[parameter] = value
             if parameter == 'sample_pump_settle_time':
                 self.sample_pump_settle_time = value
