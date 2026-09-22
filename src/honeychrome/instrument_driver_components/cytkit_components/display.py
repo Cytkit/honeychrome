@@ -12,6 +12,7 @@ from ft4222.GPIO import Dir, Port
 from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageQt import ImageQt
 
+
 WIDTH = 128
 HEIGHT = 64
 PAGES = 8
@@ -192,6 +193,37 @@ class SSD1309:
         self.dev_spi.close()
         self.dev_gpio.close()
 
+class SimProxy:
+    """Drop-in replacement for SSD1309 that ships frames to a subprocess."""
+    def __init__(self):
+        import multiprocessing as mp
+        from honeychrome.instrument_driver_components.cytkit_components.display_simulator import run_sim
+
+        self.queue = mp.Queue(maxsize=4)
+        self.proc = mp.Process(target=run_sim, args=(self.queue,), daemon=True)
+        self.proc.start()
+        self.byte_tally = 0
+
+    def display(self, pil_img, force_full=False):
+        # Convert to the same 1024-byte page layout the real driver uses
+        from PIL import Image
+        import numpy as np
+        img = pil_img.convert("1")
+        arr = np.array(img, dtype=np.uint8)
+        pages = arr.reshape(8, 8, 128)
+        bits = np.packbits(pages, axis=1, bitorder="little")
+        buf = bits.reshape(1024).tobytes()
+
+        self.byte_tally += 1024
+        try:
+            self.queue.put_nowait(buf)
+        except Exception:
+            pass  # drop frame if child is slow
+
+    def close(self):
+        self.queue.put(None)          # sentinel
+        self.proc.join(timeout=2)
+
 class TransmissionAnimation(Thread):
     def __init__(self, interval, oled, frame, draw):
         super().__init__(daemon=True)
@@ -237,8 +269,7 @@ class Display:
         try:
             self.oled = SSD1309()
         except:
-            self.oled = SSD1309_sim()
-            self.oled.show()
+            self.oled = SimProxy()
 
         self.frame = Image.new('1', (128, 64), 0)
         self.draw = ImageDraw.Draw(self.frame)
@@ -288,7 +319,6 @@ class Display:
 
         self.transmission_animation.set_frame(frame, draw)
         self.transmission_animation.start()
-        time.sleep(2)
 
     def action_message(self, message):
         frame, draw = load_and_convert_frame("info front panel flying off.png")
@@ -319,75 +349,10 @@ class Display:
 
 if __name__ == '__main__':
 
-    from PySide6.QtCore import QTimer, Signal, Slot
-    from PySide6.QtGui import Qt, QImage, QPixmap
-    from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QApplication
-
-
-    class SSD1309_sim(QWidget):
-        ON_COLOR = (255, 255, 0)
-        OFF_COLOR = (0, 0, 0)
-
-        # Carries the converted QImage from the worker to the main thread
-        _image_ready = Signal(object)
-
-        def __init__(self):
-            super().__init__()
-            self.byte_tally = 0
-
-            layout = QVBoxLayout(self)
-            layout.setContentsMargins(0, 0, 0, 0)
-            self.image_label = QLabel()
-            self.image_label.setFixedSize(WIDTH * SCALE, HEIGHT * SCALE)
-            self.image_label.setAlignment(Qt.AlignCenter)
-            layout.addWidget(self.image_label)
-
-            # Connect the cross-thread signal to the main-thread slot
-            self._image_ready.connect(self._on_image_ready, Qt.QueuedConnection)
-
-        # Called from the worker thread — only emits, never touches widgets
-        def display(self, pil_img, force_full=False):
-            pil_img = pil_img.convert("RGB")
-            px = pil_img.load()
-            for y in range(pil_img.height):
-                for x in range(pil_img.width):
-                    r, g, b = px[x, y]
-                    px[x, y] = self.ON_COLOR if (r or g or b) else self.OFF_COLOR
-
-            # Copy so the image survives the thread hop
-            q_image = ImageQt(pil_img).copy()
-            self._image_ready.emit(q_image)
-            self.byte_tally += WIDTH * PAGES
-
-        # Runs on the main thread
-        @Slot(object)
-        def _on_image_ready(self, q_image):
-            pixmap = QPixmap.fromImage(q_image).scaled(WIDTH * SCALE, HEIGHT * SCALE, Qt.IgnoreAspectRatio, Qt.FastTransformation, )
-            self.image_label.setPixmap(pixmap)
-
-        def close(self):
-            self.hide()
-            QApplication.instance().quit()
-
-
-
-    class SequenceRunner(Thread):
-        def __init__(self, display):
-            super().__init__(daemon=True)
-            self.display = display
-
-        def run(self):
-            self.display.animate_logo()
-            self.display.action_message('Acquiring!')
-            self.display.info_display(1000, 53, -18, 26, True)
-            time.sleep(4)
-            self.display.disconnect()
-
-    app = QApplication(sys.argv)
     display = Display()
 
-    seq = SequenceRunner(display)
-    seq.start()
-
-    app.aboutToQuit.connect(display.transmission_animation.stop)
-    sys.exit(app.exec())
+    display.animate_logo()
+    display.action_message('Acquiring!')
+    display.info_display(1000, 53, -18, 26, True)
+    time.sleep(4)
+    display.disconnect()

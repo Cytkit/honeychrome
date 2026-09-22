@@ -464,7 +464,7 @@ class PluginWidget(QWidget):
 
         # update everything
         self.device_name = None
-        self.update_connection_status()
+        # self.update_connection_status()
 
     def on_tab_changed(self, index):
         match index:
