@@ -220,11 +220,11 @@ class DummyDevice:
         else:
             self.initialised = False
             self.laser.enable = False
-            self.display.action_message(["Stand by.", "Sheath off, laser off."])
+            self.display.action_message(["Stand by", "Sheath off, laser off."])
             return 'OK', 'Dummy device on standby'
 
     def start_acquisition(self):
-        self.display.action_message("Acquisition starting...")
+        self.display.action_message("Acquiring...")
         self.sample_pump.enable = True
         self.sample_pump.reverse = False
         self.sample_pump.speed = int(self.sample_pump_acquisition_rate * self.sample_pump_steps_per_microlitre)

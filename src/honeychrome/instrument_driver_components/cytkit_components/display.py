@@ -245,7 +245,7 @@ class Display(Thread):
         self.animate_logo = True
 
         self.message_timeout = 0
-        self.interval = 0.1
+        self.interval = 0.05
         self._stop_event = Event()
         self._lock = Lock()
         self._closed = False
