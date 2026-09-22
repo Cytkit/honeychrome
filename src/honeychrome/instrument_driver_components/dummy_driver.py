@@ -263,10 +263,12 @@ class DummyDevice:
         return 'OK', 'Dummy device doesn''t have a sip to backflush'
 
     def set_gain(self, dict_of_gains):
+        self.display.action_message(f"{dict_of_gains}")
         return 'OK', 'Dummy device doesn''t have gains'
 
     def set_sample_flow_rate(self, data):
         if 'sample_flow_rate' in data:
+            self.display.action_message(f"Set flow {data['sample_flow_rate']:0.1f} uL/min")
             self.sample_pump_acquisition_rate = data['sample_flow_rate']
         if 'steps_per_microlitre' in data:
             self.sample_pump_steps_per_microlitre = data['steps_per_microlitre']
