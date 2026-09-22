@@ -96,18 +96,20 @@ class DummyDevice:
         return 'OK', 'Dummy device connected'
 
     def disconnect(self):
-        self.display.disconnect()
+        if self.display.is_alive():
+            self.display.join(timeout=2)
+
         return 'OK', 'Dummy device disconnected'
 
     def initialise(self):
         self.logger.info("Example initialisation message to log")
         if not self.initialised:
             self.initialised = True
-            self.display.action_message("Initialised! (Sheath on, laser on.)")
+            self.display.action_message(["Initialised!", "Sheath on, laser on."])
             return 'OK', 'Dummy device initialised'
         else:
             self.initialised = False
-            self.display.action_message("Stand by. (Sheath off, laser off.)")
+            self.display.action_message(["Stand by.", "Sheath off, laser off."])
             return 'OK', 'Dummy device on standby'
 
     def start_acquisition(self):
@@ -135,9 +137,11 @@ class DummyDevice:
 
 
     def flush_sip(self):
+        self.display.action_message(["Flushing SIP."])
         return 'OK', 'Dummy device doesn''t have a sip to flush'
 
     def backflush_sip(self):
+        self.display.action_message(["Backflushing SIP."])
         return 'OK', 'Dummy device doesn''t have a sip to backflush'
 
     def set_gain(self, dict_of_gains):

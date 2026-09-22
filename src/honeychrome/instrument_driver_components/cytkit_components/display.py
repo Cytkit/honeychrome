@@ -1,5 +1,6 @@
 import sys
 import time
+from copy import deepcopy
 from pathlib import Path
 from threading import Thread, Event, Lock
 
@@ -41,6 +42,10 @@ def load_and_convert_frame(filename=None):
 
     draw = ImageDraw.Draw(frame)
     return frame, draw
+
+frame_info, draw_info = load_and_convert_frame("info front panel arriving.png")
+frame_flying, draw_flying = load_and_convert_frame("info front panel flying off.png")
+
 
 def draw_text_lr(draw, x, y, text, font, fill, anchor='l'):
     if anchor == 'r':
@@ -224,48 +229,10 @@ class SimProxy:
         self.queue.put(None)          # sentinel
         self.proc.join(timeout=2)
 
-class TransmissionAnimation(Thread):
-    def __init__(self, interval, oled, frame, draw):
-        super().__init__(daemon=True)
-        self.interval = interval
-        self.value = 0
-        self._stop_event = Event()
-        self._lock = Lock()
-        self._closed = False
 
-        self.oled = oled
-        self.frame = frame
-        self.draw = draw
-
-    def set_frame(self, frame, draw):
-        with self._lock:
-            self.frame = frame
-            self.draw = draw
-
-    def run(self):
-        while not self._stop_event.is_set():
-            with self._lock:
-                if self._closed:
-                    return
-                track_length = 256
-                current_time = time.monotonic()
-                x_left = (current_time * 500 % track_length) - track_length // 2
-                x_right = x_left + 64
-                self.draw.rectangle((0, 63, 128, 63), outline=0)
-                self.draw.rectangle((x_left, 63, x_right, 63), outline=1)
-                self.oled.display(self.frame)
-            self._stop_event.wait(self.interval)   # interruptible sleep
-
-    def stop(self):
-        self._stop_event.set()
-
-    def close(self):
-        with self._lock:
-            self._closed = True
-        self.stop()
-
-class Display:
+class Display(Thread):
     def __init__(self):
+        super().__init__(daemon=True)
         try:
             self.oled = SSD1309()
         except:
@@ -273,86 +240,135 @@ class Display:
 
         self.frame = Image.new('1', (128, 64), 0)
         self.draw = ImageDraw.Draw(self.frame)
-        self.transmission_animation = TransmissionAnimation(0.1, self.oled, self.frame, self.draw)
+
+        self.transmission_animation = False
+        self.animate_logo = True
+
+        self.message_timeout = 0
+        self.interval = 0.1
+        self._stop_event = Event()
+        self._lock = Lock()
+        self._closed = False
+
+        self.event_rate = 0
+        self.sample_flow_rate = 0
+        self.pressure = 0
+        self.temperature = 0
+        self.laser_enabled = 0
+
+    def run(self):
+        while not self._stop_event.is_set():
+            if self._closed:
+                return
+
+            if self.animate_logo:
+                frame, draw = load_and_convert_frame("logo front panel dark antenna.png")
+                self.oled.display(frame)
+                time.sleep(1)
+
+                frame, draw = load_and_convert_frame("logo front panel dark flash.png")
+                self.oled.display(frame)
+                time.sleep(1)
+
+                for frame_count in range(30):
+                    if frame_count % 2 == 0:
+                        frame, draw = load_and_convert_frame("logo front panel template.png")
+                    else:
+                        frame, draw = load_and_convert_frame("logo front panel template off.png")
+                    self.oled.display(frame)
+                    time.sleep(0.033)
+
+                frame, draw = load_and_convert_frame("logo front panel present light.png")
+                draw_text_lr(draw, 127, 0, "Cytkit", font6x13, 0, anchor='r')
+                draw_text_lr(draw, 127, 15, "Open", font5x8, 0, anchor='r')
+                draw_text_lr(draw, 127, 23, "Spectral", font5x8, 0, anchor='r')
+                draw_text_lr(draw, 127, 31, "Cytometry", font5x8, 0, anchor='r')
+                draw_text_lr(draw, 127, 50, "Connected!", font4x6, 0, anchor='r')
+                self.frame = frame
+                self.draw = draw
+                self.message_timeout = 5
+                self.animate_logo = False
+                self.transmission_animation = True
+
+            self.message_timeout -= self.interval
+            if self.message_timeout < 0 and self.transmission_animation:
+                self.info_display()
+
+            if self.transmission_animation:
+                track_length = 256
+                current_time = time.monotonic()
+                x_left = (current_time * 500 % track_length) - track_length // 2
+                x_right = x_left + 64
+                self.draw.rectangle((0, 63, 128, 63), outline=0)
+                self.draw.rectangle((x_left, 63, x_right, 63), outline=1)
+
+            self.oled.display(self.frame)
+            self._stop_event.wait(self.interval)   # interruptible sleep
+
+    def stop(self):
+        self._stop_event.set()
+
+    def close(self):
+        self.transmission_animation = False
+
+        self.frame, self.draw = load_and_convert_frame("connection front panel template.png")
+        draw_text_lr(self.draw, 3, 0, "Connect", font6x13, 1)
+        draw_text_lr(self.draw, 3, 15, "USB 2.0", font6x13, 1)
+        draw_text_lr(self.draw, 3, 36, "Cytkit is powered on.", font4x6, 1)
+        draw_text_lr(self.draw, 3, 44, "Connect to host PC", font4x6, 1)
+        draw_text_lr(self.draw, 3, 52, "then run Honeychrome.", font4x6, 1)
+
+        self._closed = True
+        self.stop()
 
     def disconnect(self):
-        self.transmission_animation.close()
-        if self.transmission_animation.is_alive():
-            self.transmission_animation.join(timeout=2)
-
-        frame, draw = load_and_convert_frame("connection front panel template.png")
-        draw_text_lr(draw, 3, 0, "Connect", font6x13, 1)
-        draw_text_lr(draw, 3, 15, "USB 2.0", font6x13, 1)
-        draw_text_lr(draw, 3, 36, "Cytkit is powered on.", font4x6, 1)
-        draw_text_lr(draw, 3, 44, "Connect to host PC", font4x6, 1)
-        draw_text_lr(draw, 3, 52, "then run Honeychrome.", font4x6, 1)
-
-        # self.oled.display(frame, force_full=True)
-        self.oled.display(frame)
-        time.sleep(1)
-        self.oled.close()
-
-    def animate_logo(self):
-        frame, draw = load_and_convert_frame("logo front panel dark antenna.png")
-        self.oled.display(frame)
-        time.sleep(1)
-
-        frame, draw = load_and_convert_frame("logo front panel dark flash.png")
-        self.oled.display(frame)
-        time.sleep(1)
-
-        for frame_count in range(30):
-            if frame_count % 2 == 0:
-                frame, draw = load_and_convert_frame("logo front panel template.png")
-            else:
-                frame, draw = load_and_convert_frame("logo front panel template off.png")
-            self.oled.display(frame)
-            time.sleep(0.033)
-
-
-        frame, draw = load_and_convert_frame("logo front panel present light.png")
-        draw_text_lr(draw, 127, 0, "Cytkit", font6x13, 0, anchor='r')
-        draw_text_lr(draw, 127, 15, "Open", font5x8, 0, anchor='r')
-        draw_text_lr(draw, 127, 23, "Spectral", font5x8, 0, anchor='r')
-        draw_text_lr(draw, 127, 31, "Cytometry", font5x8, 0, anchor='r')
-        draw_text_lr(draw, 127, 50, "Connected!", font4x6, 0, anchor='r')
-
-        self.transmission_animation.set_frame(frame, draw)
-        self.transmission_animation.start()
+        self.close()
 
     def action_message(self, message):
-        frame, draw = load_and_convert_frame("info front panel flying off.png")
-        draw_text_lr(draw, 0, 50, message, font6x13, 1)
-        self.transmission_animation.set_frame(frame, draw)
-        time.sleep(1)
+        self.frame = deepcopy(frame_flying)
+        self.draw = ImageDraw.Draw(self.frame)
 
-    def info_display(self, event_rate, sample_flow_rate, pressure, temperature, laser_enabled):
-        frame, draw = load_and_convert_frame("info front panel arriving.png")
+        if type(message) == str:
+            draw_text_lr(self.draw, 0, 50, message, font6x13, 1)
+        elif type(message) == list:
+            draw_text_lr(self.draw, 0, 37, message[0], font6x13, 1)
+            draw_text_lr(self.draw, 0, 52, message[1], font5x8, 1)
+
+        self.message_timeout = 1
+
+    def info_display(self):
+        self.frame = deepcopy(frame_info)
+        self.draw = ImageDraw.Draw(self.frame)
 
         x_right = 65
         y_array = [0 + n*10 for n in range(5)]
-        draw_text_lr(draw, x_right, y_array[0], "Trig", font5x8, 1, anchor='r')
-        draw_text_lr(draw, x_right, y_array[1], "Flow", font5x8, 1, anchor='r')
-        draw_text_lr(draw, x_right, y_array[2], "Pres", font5x8, 1, anchor='r')
-        draw_text_lr(draw, x_right, y_array[3], "Temp", font5x8, 1, anchor='r')
-        draw_text_lr(draw, x_right, y_array[4], "", font5x8, 1, anchor='r')
+        draw_text_lr(self.draw, x_right, y_array[0], "Trig", font5x8, 1, anchor='r')
+        draw_text_lr(self.draw, x_right, y_array[1], "Flow", font5x8, 1, anchor='r')
+        draw_text_lr(self.draw, x_right, y_array[2], "Pres", font5x8, 1, anchor='r')
+        draw_text_lr(self.draw, x_right, y_array[3], "Temp", font5x8, 1, anchor='r')
+        draw_text_lr(self.draw, x_right, y_array[4], "", font5x8, 1, anchor='r')
 
         x_right += 3
-        draw_text_lr(draw, x_right, y_array[0], f"{event_rate:5.0f} ev/s", font5x8, 1, anchor='l')
-        draw_text_lr(draw, x_right, y_array[1], f"{sample_flow_rate:5.2f} uL/min", font5x8, 1, anchor='l')
-        draw_text_lr(draw, x_right, y_array[2], f"{pressure:5.2f} Pa", font5x8, 1, anchor='l')
-        draw_text_lr(draw, x_right, y_array[3], f"{temperature:5.2f} C", font5x8, 1, anchor='l')
-        draw_text_lr(draw, x_right, y_array[4], "Laser On" if laser_enabled else "Laser off", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[0], f"{self.event_rate:5.0f} ev/s", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[1], f"{self.sample_flow_rate:5.2f} uL/min", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[2], f"{self.pressure:5.2f} Pa", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[3], f"{self.temperature:5.2f} C", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[4], "Laser On" if self.laser_enabled else "Laser off", font5x8, 1, anchor='l')
 
-        self.transmission_animation.set_frame(frame, draw)
-
+    def set_info(self, event_rate, sample_flow_rate, pressure, temperature, laser_enabled):
+        with self._lock:
+            self.event_rate = event_rate
+            self.sample_flow_rate = sample_flow_rate
+            self.pressure = pressure
+            self.temperature = temperature
+            self.laser_enabled = laser_enabled
 
 if __name__ == '__main__':
 
     display = Display()
-
-    display.animate_logo()
+    display.start()
+    time.sleep(10)
     display.action_message('Acquiring!')
-    display.info_display(1000, 53, -18, 26, True)
+    display.set_info(1000, 53, -18, 26, True)
     time.sleep(4)
     display.disconnect()
