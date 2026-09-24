@@ -239,18 +239,18 @@ class PluginWidget(QWidget):
         self.sample_pump_ramp_cb.toggled.connect(lambda checked: self.set_instrument_state({'sample_pump_state': {'ramp': checked}}))
         layout.addWidget(self.sample_pump_ramp_cb)
         # frequency of pump steps 0.1 Hz, i.e. 10_000 for 1 kHz - fpga can do range(65_535)
-        self.sample_pump_speed_spinbox = LabeledSpinBox('Sample Pump Speed', 0, 65_535, 0, 100)
+        self.sample_pump_speed_spinbox = LabeledSpinBox('Sample Pump Speed', 0, 65_535, 0, 1000)
         self.sample_pump_speed_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'sample_pump_state': {'speed': value}}))
         layout.addWidget(self.sample_pump_speed_spinbox)
         help_text(layout, '🛈 Sample pump speed is the frequency of pump steps in units of 0.1 Hz')
         # steps per cycle - speed increments per cycle
-        self.sample_pump_rampSpC_spinbox = LabeledSpinBox('Sample Pump Ramp SpC', 0, 100, 1, 1)
+        self.sample_pump_rampSpC_spinbox = LabeledSpinBox('Sample Pump Ramp SpC', 0, 100, settings.sample_pump_steps_per_cycle, 1)
         self.sample_pump_rampSpC_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'sample_pump_state': {'steps_per_cycle': value}}))
         layout.addWidget(self.sample_pump_rampSpC_spinbox)
         help_text(layout, '🛈 Sample pump ramp SpC (speed increments per cycle) is the ramp step to make in units of 0.1 Hz when changing the pump speed')
         # clocks per cycle - how many clock cycles before increment ramp step
         # note 100 MHz FPGA clock
-        self.sample_pump_rampCpC_spinbox = LabeledSpinBox('Sample Pump Ramp CpC', 0, 2_000_000_000, 100_000, 1_000)
+        self.sample_pump_rampCpC_spinbox = LabeledSpinBox('Sample Pump Ramp CpC', 0, 2_000_000_000, settings.sample_pump_clocks_per_cycle, 100)
         self.sample_pump_rampCpC_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'sample_pump_state': {'clocks_per_cycle': value}}))
         layout.addWidget(self.sample_pump_rampCpC_spinbox)
         help_text(layout, '🛈 Sample pump ramp CpC (cycles per clock) is the number of FPGA clock cycles to count (at 2 GHz) before changing the sample pump speed by one step')

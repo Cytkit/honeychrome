@@ -19,20 +19,21 @@ adc_scale_mv = 30 # the adc level for 1 mV
 # instrument automation settings
 standby_time = 600_000 # ms to automatically put instrument to standby (switch off laser and pumps)
 pressure_set_point = -20 # Pa
-temperature_set_point = 40 # degC
-steps_per_microlitre = 25
+temperature_set_point = 30 # degC
+sample_pump_steps_per_microlitre = 109 # measured value: at speed 20000*0.1Hz, took 54.5s to pump 1mL = 109 steps/uL
 
-sample_pump_priming_speed = 6000 # steps/s
+sample_pump_priming_speed = 30000 # steps/0.1s
 sample_pump_priming_time = 10. # s
-sample_pump_unpriming_speed = 6000 # steps/s
+sample_pump_unpriming_speed = 30000 # steps/0.1s
 sample_pump_unpriming_time = 10. # s
-sample_pump_flush_speed = 6000 # steps/s
+sample_pump_flush_speed = 30000 # steps/0.1s
 sample_pump_flush_time = 30. # s
-sample_pump_backflush_speed = 6000 # steps/s
+sample_pump_backflush_speed = 30000 # steps/0.1s
 sample_pump_backflush_time = 30. # s
 sample_pump_settle_time = 1. # s
 sample_pump_acquisition_rate = 30 # uL/min
-
+sample_pump_steps_per_cycle = 1
+sample_pump_clocks_per_cycle = 2000
 
 ### peak detection settings
 trigger_channel = 'FSC'
@@ -282,7 +283,7 @@ report_include_process_retrieved = q_settings.value("report_include_process", re
 
 pressure_set_point_retrieved = q_settings.value('pressure_set_point', pressure_set_point, type=int)
 temperature_set_point_retrieved = q_settings.value('temperature_set_point', temperature_set_point, type=int)
-steps_per_microlitre_retrieved = q_settings.value('steps_per_microlitre', steps_per_microlitre, type=int)
+sample_pump_steps_per_microlitre_retrieved = q_settings.value('sample_pump_steps_per_microlitre', sample_pump_steps_per_microlitre, type=int)
 
 sample_pump_priming_speed_retrieved = q_settings.value('sample_pump_priming_speed', sample_pump_priming_speed, type=int)
 sample_pump_priming_time_retrieved = q_settings.value('sample_pump_priming_time', sample_pump_priming_time, type=float)

@@ -185,7 +185,7 @@ class DummyDevice:
         self.logger = logging.getLogger(__name__)
 
         self.sample_pump_acquisition_rate = settings.sample_pump_acquisition_rate_retrieved
-        self.sample_pump_steps_per_microlitre = settings.steps_per_microlitre_retrieved
+        self.sample_pump_steps_per_microlitre = settings.sample_pump_steps_per_microlitre_retrieved
 
         self.event_rate_counter = EventRateCounter()
         self.sample_pump = SamplePumpSim()
@@ -228,7 +228,7 @@ class DummyDevice:
         self.display.action_message("Acquiring...")
         self.sample_pump.enable = True
         self.sample_pump.reverse = False
-        self.sample_pump.speed = int(self.sample_pump_acquisition_rate * self.sample_pump_steps_per_microlitre)
+        self.sample_pump.speed = int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre)
         return 'OK', 'Dummy device started acquisition'
 
     def stop_acquisition(self):
@@ -273,7 +273,7 @@ class DummyDevice:
             self.sample_pump_acquisition_rate = data['sample_flow_rate']
         if 'steps_per_microlitre' in data:
             self.sample_pump_steps_per_microlitre = data['steps_per_microlitre']
-        self.sample_pump.speed = int(self.sample_pump_acquisition_rate * self.sample_pump_steps_per_microlitre)
+        self.sample_pump.speed = int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre)
 
         return 'OK', 'Dummy device doesn''t have a sample pump'
 

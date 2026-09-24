@@ -85,7 +85,7 @@ class Pressure:
     def disconnect(self):
         pass
 
-    def get_pressure(self, units, num_averages):
+    def get_pressure(self, units, num_averages=10):
         pressure_tally = []
         for count in range(num_averages):
 
@@ -116,22 +116,28 @@ class Pressure:
         return convert_psi_to_unit(average_pressure, units)
 
 
-    def get_temperature(self):
+    def get_temperature(self, num_averages=10):
+        temperature_tally = []
 
-        # --- Get the measured device temperature( in C) ---
+        for count in range(num_averages):
+            # --- Get the measured device temperature( in C) ---
+            raw_temperaure_value = self._sensor_get_raw_temperature()
 
-        raw_temperaure_value = self._sensor_get_raw_temperature()
+            # Calculate the actual pressure
+            dT = raw_temperaure_value - (self.calibration_data[5] * coefficient_data[5])
+            temperature = 2000 + ((dT * self.calibration_data[6]) / coefficient_data[6])
 
-        # Calculate the actual pressure
-        dT = raw_temperaure_value - (self.calibration_data[5] * coefficient_data[5])
-        temperature = 2000 + ((dT * self.calibration_data[6]) / coefficient_data[6])
+            # Range check
+            if temperature < -4000 or temperature > 12500:
+                # Fault
+                temperature = 0
 
-        # Range check
-        if temperature < -4000 or temperature > 12500:
-            # Fault
-            return 0
+            temperature = temperature / 100
+            temperature_tally.append(temperature)
 
-        return temperature / 100
+        average_temperature = np.median(np.array(temperature_tally))
+        return average_temperature
+
 
 
     def set_offset(self, offset, units):

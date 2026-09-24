@@ -1043,7 +1043,7 @@ class Controller(QObject):
     def set_sample_pump_flow_rate(self, value):
         # self.pipe_connection_instrument.send({'command': 'set_sample_flow_rate', 'data': {'steps_per_microlitre': value}})
         self.sample_flow_rate = float(value)
-        self.pipe_connection_instrument.send({'command': 'set_sample_flow_rate', 'data': {'sample_flow_rate': self.sample_flow_rate, 'steps_per_microlitre': settings.steps_per_microlitre_retrieved}})
+        self.pipe_connection_instrument.send({'command': 'set_sample_flow_rate', 'data': {'sample_flow_rate': self.sample_flow_rate, 'steps_per_microlitre': settings.sample_pump_steps_per_microlitre_retrieved}})
         response = self.pipe_connection_instrument.recv()
 
         logger.info(response)

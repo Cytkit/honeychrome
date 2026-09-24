@@ -288,7 +288,7 @@ class Display(Thread):
                 draw_text_lr(draw, 127, 50, "Connected!", font4x6, 0, anchor='r')
                 self.frame = frame
                 self.draw = draw
-                self.message_timeout = 1
+                self.message_timeout = 2
                 self.animate_logo = False
                 self.transmission_animation = True
 
@@ -333,7 +333,7 @@ class Display(Thread):
             draw_text_lr(self.draw, 0, 37, message[0], font6x13, 1)
             draw_text_lr(self.draw, 0, 52, message[1], font5x8, 1)
 
-        self.message_timeout = 1
+        self.message_timeout = 2
 
     def info_display(self):
         self.frame = deepcopy(frame_info)
@@ -367,6 +367,5 @@ if __name__ == '__main__':
     display.start()
     time.sleep(10)
     display.action_message('Acquiring!')
-    display.set_info(1000, 53, -18, 26, True)
     time.sleep(4)
     display.close()

@@ -170,7 +170,7 @@ class SamplePumpFlowRateGetter(Thread):
             reverse = -1 if self.sample_pump.get_reverse() else 1
             speed = self.sample_pump.get_speed()
             steps_per_microlitre = self.parent.sample_pump_steps_per_microlitre
-            self.flow_rate = enabled * reverse * speed / steps_per_microlitre
+            self.flow_rate = enabled * reverse * speed / steps_per_microlitre *6 # factor 6 is for 60 seconds * 0.1 Hz
             time.sleep(0.5)
 
 class LaserGetter(Thread):
@@ -265,7 +265,7 @@ class CytkitDevice:
         self.sample_pump_backflush_time = settings.sample_pump_backflush_time_retrieved
 
         self.sample_pump_acquisition_rate = settings.sample_pump_acquisition_rate_retrieved
-        self.sample_pump_steps_per_microlitre = settings.steps_per_microlitre_retrieved
+        self.sample_pump_steps_per_microlitre = settings.sample_pump_steps_per_microlitre_retrieved
 
     def find_and_connect_to_device(self):
         self.ft4222.find_and_connect()
@@ -289,8 +289,8 @@ class CytkitDevice:
         self.sample_pump.set_ramp(True)
         self.sample_pump.set_enable(False)
         self.sample_pump.set_speed(0)
-        self.sample_pump.set_steps_per_cycle(1)
-        self.sample_pump.set_clocks_per_cycle(100_000)
+        self.sample_pump.set_steps_per_cycle(settings.sample_pump_steps_per_cycle)
+        self.sample_pump.set_clocks_per_cycle(settings.sample_pump_clocks_per_cycle)
         self.fan.set_pwm_frequency(25000)
         self.fan.set_pwm_duty(0)
         self.sheath_pump.set_pwm_frequency(25000)
@@ -334,44 +334,35 @@ class CytkitDevice:
             self.laser.set_state(1)  # turn on laser
             self.pressure_control_worker.control_on = True
             self.initialised = True
+            self.display.action_message(["Initialised!", "Sheath on, laser on."])
             return 'OK', 'Cytkit initialised'
         else:
             self.laser.set_state(0)  # turn off laser
             self.pressure_control_worker.control_on = False
             self.initialised = False
+            self.display.action_message(["Stand by", "Sheath off, laser off."])
             return 'OK', 'Cytkit on standby'
 
 
     def start_acquisition(self):
-        # 0. stop pump
-        self.sample_pump.set_ramp(False)
-        self.sample_pump.set_speed(0)
-        self.sample_pump.set_reverse(False)
-        self.sample_pump.set_enable(True)
-        # 1. prime SIP
-        self.sample_pump.set_ramp(True)
-        self.sample_pump.set_speed(self.sample_pump_priming_speed)
+        self.display.action_message(["Acquisition", "Priming..."])
+        self.sample_pump.ramp_to(self.sample_pump_priming_speed)
         time.sleep(self.sample_pump_priming_time)
-        # 2. set steady sample flow rate
-        self.sample_pump.set_speed(int(self.sample_pump_acquisition_rate * self.sample_pump_steps_per_microlitre))
+
+        self.display.action_message(["Acquisition", f"Rate set {self.sample_pump_acquisition_rate} uL/min"])
+        self.sample_pump.set_speed(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
         time.sleep(self.sample_pump_settle_time)
 
+        self.display.action_message(["Acquisition", f"Started!"])
         return 'OK', 'Cytkit started acquisition'
 
     def stop_acquisition(self):
-        # 0. stop pump
-        self.sample_pump.set_ramp(False)
-        self.sample_pump.set_speed(0)
-        self.sample_pump.set_reverse(True)
-        self.sample_pump.set_enable(True)
-        # 1. unprime SIP
-        self.sample_pump.set_ramp(True)
-        self.sample_pump.set_speed(self.sample_pump_unpriming_speed)
+        self.display.action_message(["Sample flow stopped", "Unpriming..."])
+        self.sample_pump.ramp_to(0)
+        self.sample_pump.ramp_to(self.sample_pump_unpriming_speed)
         time.sleep(self.sample_pump_unpriming_time)
-        # 2. stop sample flow
-        self.sample_pump.set_speed(0)
-        self.sample_pump.set_enable(False)
-
+        self.sample_pump.ramp_to(0)
+        self.display.action_message("Acquisition finished.")
         return 'OK', 'Cytkit stopped acquisition'
 
     def set_state(self, dict_of_parameter_value):
@@ -409,7 +400,7 @@ class CytkitDevice:
                 if 'speed' in value:
                     self.sample_pump.set_speed(value['speed'])
                 if 'rate' in value:
-                    self.sample_pump.set_speed(value['rate'])
+                    self.sample_pump.set_speed(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
                 if 'steps_per_cycle' in value:
                     self.sample_pump.set_steps_per_cycle(value['steps_per_cycle'])
                 if 'clocks_per_cycle' in value:
@@ -574,37 +565,27 @@ class CytkitDevice:
         return 'OK', message
 
     def flush_sip(self):
-        # 0. stop pump
-        self.sample_pump.set_ramp(False)
-        self.sample_pump.set_speed(0)
-        self.sample_pump.set_reverse(False)
-        self.sample_pump.set_enable(True)
-        # 1. forward flush high flow rate, set time
-        self.sample_pump.set_ramp(True)
-        self.sample_pump.set_speed(self.sample_pump_flush_speed)
-        time.sleep(self.sample_pump_flush_time)
-        # 2. stop
-        self.sample_pump.set_speed(0)
-        self.sample_pump.set_enable(False)
+        self.display.action_message(["Flushing SIP", f"Duration: {self.sample_pump_flush_time} s"])
 
+        self.sample_pump.ramp_to(self.sample_pump_flush_speed)
+        time.sleep(self.sample_pump_flush_time)
+        self.sample_pump.ramp_to(0)
+
+        self.display.action_message("Flush complete")
         return 'OK', 'Cytkit SIP flushed'
 
     def backflush_sip(self):
-        # 0. stop pump
-        self.sample_pump.set_ramp(False)
-        self.sample_pump.set_speed(0)
-        self.sample_pump.set_reverse(True)
-        self.sample_pump.set_enable(True)
-        # 1. forward flush high flow rate, set time
-        self.sample_pump.set_ramp(True)
-        self.sample_pump.set_speed(self.sample_pump_backflush_speed)
+        self.display.action_message(["Backflushing SIP", f"Duration: {self.sample_pump_backflush_time} s"])
+
+        self.sample_pump.ramp_to(-self.sample_pump_backflush_speed)
         time.sleep(self.sample_pump_backflush_time)
-        # 2. stop
-        self.sample_pump.set_speed(0)
-        self.sample_pump.set_enable(False)
-        return 'OK', 'Cytkit SIP backflushed'
+        self.sample_pump.ramp_to(0)
+
+        self.display.action_message("Backflush complete")
+        return 'OK', 'Cytkit SIP flushed'
 
     def set_gain(self, dict_of_gains):
+        self.display.action_message(f"{dict_of_gains}")
         sanitised_dict_of_gains = {}
         for channel in dict_of_gains:
             if channel in settings.fluorescence_channels and 0<=dict_of_gains[channel]<=255:
@@ -616,10 +597,11 @@ class CytkitDevice:
 
     def set_sample_flow_rate(self, data):
         if 'sample_flow_rate' in data:
+            self.display.action_message(f"Set flow {data['sample_flow_rate']:0.1f} uL/min")
             self.sample_pump_acquisition_rate = data['sample_flow_rate']
         if 'steps_per_microlitre' in data:
             self.sample_pump_steps_per_microlitre = data['steps_per_microlitre']
-        message = self.set_state({'sample_pump_state':{'rate':int(self.sample_pump_acquisition_rate * self.sample_pump_steps_per_microlitre)}})
+        message = self.set_state({'sample_pump_state':{'rate':self.sample_pump_acquisition_rate}})
         return 'OK', message
 
 

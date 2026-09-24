@@ -1,3 +1,6 @@
+import time
+
+
 class SamplePump:
     def __init__(self, ft4222_communicator):
         self.ft4222 = ft4222_communicator
@@ -67,3 +70,41 @@ class SamplePump:
 
     def get_clocks_per_cycle(self):
         return self.ft4222.register_2byte_read('SMPMP_CPC_L', 'SMPMP_CPC_H')
+
+    def ramp_to(self, speed):
+        reverse = speed < 0
+        current_speed = self.get_speed()
+        current_ramp = self.get_ramp()
+        current_reverse = self.get_reverse()
+        current_enable = self.get_enable()
+
+        change_direction = current_reverse != reverse
+
+        stage_speed = min(abs(speed), 10000)
+
+        if change_direction or not current_enable:
+            # disable first, then ramp from zero
+            self.set_enable(False)
+            self.set_ramp(False)
+            self.set_speed(0)
+            self.set_reverse(reverse)
+            self.set_ramp(True)
+            self.set_enable(True)
+            self.set_speed(stage_speed)
+        else:
+            # not starting from zero, pump is currently enabled, and direction is not changing
+            self.set_speed(stage_speed)
+
+        # for n in range(10):
+        #     print(self.get_speed(), bin(self.ft4222.register_read('SMPMP_CTRL')))
+        #     time.sleep(0.0001)
+        #
+        # while abs(speed) != stage_speed:
+        #     stage_speed = min(abs(speed), stage_speed + 10000)
+        #     print(stage_speed)
+        #     self.set_speed(stage_speed)
+        #     time.sleep(1)
+        #
+        # time.sleep(1)
+        # if speed == 0:
+        #     self.set_enable(False)

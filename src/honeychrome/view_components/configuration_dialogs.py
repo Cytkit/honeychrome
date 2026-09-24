@@ -9,10 +9,10 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QWidget, 
 from PySide6.QtCore import Qt, QSettings
 
 from honeychrome.settings import (colourmap_choice, graphics_export_formats, hist2dtype, colormap_name, graphics_export_format, cytometry_plot_width_target,
-                      tile_size_nxn_grid, subsample, max_display_events, hist_bins, density_cutoff, trigger_channel, adc_channels, width_channels, height_channels,
-                      use_dummy_instrument, steps_per_microlitre, magnitude_ceilings, magnitude_ceiling, raw_settings, unmixed_settings, experiments_folder,
-                      magnitude_ceilings_int, spectral_positive_gate_percent, spectral_negative_gate_percent, report_include_raw, report_include_unmixed, report_include_process, send_debug_data,
-                      heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral)
+                                  tile_size_nxn_grid, subsample, max_display_events, hist_bins, density_cutoff, trigger_channel, adc_channels, width_channels, height_channels,
+                                  use_dummy_instrument, sample_pump_steps_per_microlitre, magnitude_ceilings, magnitude_ceiling, raw_settings, unmixed_settings, experiments_folder,
+                                  magnitude_ceilings_int, spectral_positive_gate_percent, spectral_negative_gate_percent, report_include_raw, report_include_unmixed, report_include_process, send_debug_data,
+                                  heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral)
 import honeychrome.settings as settings
 
 
@@ -488,8 +488,8 @@ class InstrumentConfigDialog(QDialog):
         if index >= 0:
             self.height_channel_combo.setCurrentIndex(index)
 
-        steps_per_microlitre_retrieved = self.settings.value("steps_per_microlitre", steps_per_microlitre)
-        self.steps_per_microlitre_spin.setValue(float(steps_per_microlitre_retrieved))
+        sample_pump_steps_per_microlitre_retrieved = self.settings.value("sample_pump_steps_per_microlitre", sample_pump_steps_per_microlitre)
+        self.steps_per_microlitre_spin.setValue(float(sample_pump_steps_per_microlitre_retrieved))
 
         # self.use_dummy_instrument.setChecked(self.settings.value("use_dummy_instrument", use_dummy_instrument, type=bool))
 
@@ -497,7 +497,9 @@ class InstrumentConfigDialog(QDialog):
         self.settings.setValue("trigger_channel", self.trigger_channel_combo.currentText())
         self.settings.setValue("width_channel", self.width_channel_combo.currentText())
         self.settings.setValue("height_channel", self.height_channel_combo.currentText())
-        self.settings.setValue("steps_per_microlitre", self.steps_per_microlitre_spin.value())
+        self.settings.setValue("sample_pump_steps_per_microlitre", self.steps_per_microlitre_spin.value())
+        self.settings.setValue("temperature_set_point", self.steps_per_microlitre_spin.value())
+        self.settings.setValue("", self.steps_per_microlitre_spin.value())
 
         if self.bus:
             self.bus.setSamplePumpFlowRate.emit(0)
@@ -518,7 +520,7 @@ class InstrumentConfigDialog(QDialog):
         index = self.height_channel_combo.findText(height_channels[0])
         if index >= 0:
             self.height_channel_combo.setCurrentIndex(index)
-        self.steps_per_microlitre_spin.setValue(steps_per_microlitre)
+        self.steps_per_microlitre_spin.setValue(sample_pump_steps_per_microlitre)
         # self.use_dummy_instrument.setChecked(use_dummy_instrument)
 
 
