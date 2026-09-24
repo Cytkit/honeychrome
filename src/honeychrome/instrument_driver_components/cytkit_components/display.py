@@ -233,10 +233,12 @@ class SimProxy:
 class Display(Thread):
     def __init__(self, transfer_object=None, sample_pump_object=None, pressure_object=None, temperature_object=None, laser_object=None):
         super().__init__(daemon=True)
-        try:
-            self.oled = SSD1309()
-        except:
-            self.oled = SimProxy()
+        # try:
+        #     self.oled = SSD1309()
+        # except:
+        #     self.oled = SimProxy()
+
+        self.oled = SimProxy()
 
         self.frame = Image.new('1', (128, 64), 0)
         self.draw = ImageDraw.Draw(self.frame)
@@ -286,7 +288,7 @@ class Display(Thread):
                 draw_text_lr(draw, 127, 50, "Connected!", font4x6, 0, anchor='r')
                 self.frame = frame
                 self.draw = draw
-                self.message_timeout = 3
+                self.message_timeout = 1
                 self.animate_logo = False
                 self.transmission_animation = True
 
@@ -339,8 +341,8 @@ class Display(Thread):
 
         event_rate = self.transfer_object.event_rate if self.transfer_object else 0
         sample_flow_rate = self.sample_pump_object.flow_rate if self.sample_pump_object else 0
-        pressure = self.pressure_object.pressure if self.pressure_object else 0
-        temperature = self.temperature_object.temperature if self.temperature_object else 0
+        pressure = self.pressure_object.pressure if self.pressure_object and self.pressure_object.pressure else 0
+        temperature = self.temperature_object.temperature if self.temperature_object and self.temperature_object.temperature else 0
         laser_enabled = self.laser_object.enabled if self.laser_object else False
 
         x_right = 65

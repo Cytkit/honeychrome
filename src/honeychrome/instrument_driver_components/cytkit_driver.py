@@ -66,23 +66,29 @@ class PressureControlWorker(Thread):
         self.value = 0
         self._stop_event = Event()
         self._lock = Lock()
-        self.pressure = pressure
+        self.control_on = False
+
+        self.pressure_control = pressure
         self.sheath_pump = sheath_pump
 
         self.pid = PID(kp=-10.0, ki=-1, kd=-0.05, out_min=0, out_max=pump_max)
         self.pressure_set_point = pressure_set_point
-        self.current_pressure = None
+        self.pressure = None
 
     def run(self):
         self.sheath_pump.set_enable(True)
         while not self._stop_event.is_set():
             with self._lock:
-                self.current_pressure = self.pressure.get_pressure('PRES_UNITS_PA', 1)
-                error = self.pressure_set_point - self.current_pressure
-                output = self.pid.update(error, dt=self.interval)
-                self.sheath_pump.set_pwm_duty(output)
+                self.pressure = self.pressure_control.get_pressure('PRES_UNITS_PA', 10)
 
-            logger.info(f"[PressureControlWorker] pressure={self.current_pressure:0.2f} error={error:0.2f} output={output}")
+                if self.control_on:
+                    error = self.pressure_set_point - self.pressure
+                    output = self.pid.update(error, dt=self.interval)
+                    self.sheath_pump.set_pwm_duty(output)
+                    logger.info(f"[PressureControlWorker] pressure={self.pressure:0.2f} error={error:0.2f} output={output}")
+                else:
+                    logger.info(f"[PressureControlWorker] pressure={self.pressure:0.2f}")
+
             self._stop_event.wait(self.interval)   # interruptible sleep
 
     def stop(self):
@@ -105,28 +111,49 @@ class TemperatureControlWorker(Thread):
         self.value = 0
         self._stop_event = Event()
         self._lock = Lock()
-        self.temperature = temperature
+        self.temperature_control = temperature
         self.fan = fan
 
         self.pid = PID(kp=-50.0, ki=-5, kd=-0.5, out_min=0, out_max=fan_max)
         self.temperature_set_point = temperature_set_point
-        self.current_temperature = None
+        self.temperature = None
 
     def run(self):
         self.fan.set_enable(True)
         while not self._stop_event.is_set():
             with self._lock:
-                self.current_temperature = self.temperature.get_temperature()
-                error = self.temperature_set_point - self.current_temperature
+                self.temperature = self.temperature_control.get_temperature()
+                error = self.temperature_set_point - self.temperature
                 output = self.pid.update(error, dt=self.interval)
                 self.fan.set_pwm_duty(output)
 
-            logger.info(f"[TemperatureControlWorker] current_temperature={self.current_temperature:0.2f} error={error:0.2f} output={output}")
+            logger.info(f"[TemperatureControlWorker] temperature={self.temperature:0.2f} error={error:0.2f} output={output}")
             self._stop_event.wait(self.interval)   # interruptible sleep
 
     def stop(self):
         self.fan.set_enable(False)
         self._stop_event.set()
+
+class EventRateCounter:
+    def __init__(self):
+        self.time_last = None
+        self.event_rate = 0
+
+    def update(self, number_of_new_events):
+        time_now = time.perf_counter()
+        if not self.time_last or time_now - self.time_last > 1.0:
+            self.event_rate = 0
+        elif self.event_rate == 0:
+            interval = time_now - self.time_last
+            self.event_rate = number_of_new_events/interval
+        else:
+            interval = time_now - self.time_last
+            self.event_rate = self.event_rate * (1.0-interval) + number_of_new_events
+        self.time_last = time_now
+
+    def reset(self):
+        self.time_last = None
+        self.event_rate = 0
 
 class SamplePumpFlowRateGetter(Thread):
     def __init__(self, parent, sample_pump):
@@ -140,7 +167,7 @@ class SamplePumpFlowRateGetter(Thread):
     def run(self):
         while not self._stop_event.is_set():
             enabled = self.sample_pump.get_enable()
-            reverse = self.sample_pump.get_reverse()
+            reverse = -1 if self.sample_pump.get_reverse() else 1
             speed = self.sample_pump.get_speed()
             steps_per_microlitre = self.parent.sample_pump_steps_per_microlitre
             self.flow_rate = enabled * reverse * speed / steps_per_microlitre
@@ -218,6 +245,9 @@ class CytkitDevice:
         self.adcs = None
         self.pressure_control_worker = None
         self.temperature_control_worker = None
+        self.event_rate_counter = None
+        self.laser_getter = None
+        self.sample_pump_flow_rate_getter = None
         self.display = None
         self.initialised = False
 
@@ -252,8 +282,6 @@ class CytkitDevice:
         self.vi_monitor = VIMonitor(self.i2c_bus_a, self.i2c_bus_b)
         self.dacs = DACs(self.i2c_bus_a)
         self.adcs = ADCs(self.ft4222)
-        # self.display = Display()
-
         logger.info('[Cytkit driver] Connected')
 
         # set initial settings
@@ -269,8 +297,17 @@ class CytkitDevice:
         self.sheath_pump.set_pwm_duty(0)
         self.pressure_control_worker = PressureControlWorker(self.pressure, self.sheath_pump, self.pressure_set_point, pump_max, control_loop_interval)
         self.temperature_control_worker = TemperatureControlWorker(self.pressure, self.fan, self.temperature_set_point, fan_max, control_loop_interval)
-        # self.pressure_control_worker.start() # should not normally start pressure control by default - only at initiatisation
-        self.temperature_control_worker.start() # normally start temperature control by default and run until disconnect
+        self.pressure_control_worker.start()
+        self.temperature_control_worker.start()
+
+        self.event_rate_counter = EventRateCounter()
+        self.sample_pump_flow_rate_getter = SamplePumpFlowRateGetter(self, self.sample_pump)
+        self.sample_pump_flow_rate_getter.start()
+        self.laser_getter = LaserGetter(self.laser)
+        self.laser_getter.start()
+        self.display = Display(transfer_object=self.event_rate_counter, sample_pump_object=self.sample_pump_flow_rate_getter, pressure_object=self.pressure_control_worker, temperature_object=self.temperature_control_worker, laser_object=self.laser_getter)
+        self.display.start()
+
         return  'OK', 'Connected to Cytkit'
 
     def disconnect(self):
@@ -295,12 +332,12 @@ class CytkitDevice:
 
         if not self.initialised:
             self.laser.set_state(1)  # turn on laser
-            self.pressure_control_worker.start()
+            self.pressure_control_worker.control_on = True
             self.initialised = True
             return 'OK', 'Cytkit initialised'
         else:
             self.laser.set_state(0)  # turn off laser
-            self.pressure_control_worker.stop()
+            self.pressure_control_worker.control_on = False
             self.initialised = False
             return 'OK', 'Cytkit on standby'
 
@@ -371,6 +408,8 @@ class CytkitDevice:
                     self.sample_pump.set_ramp(value['ramp'])
                 if 'speed' in value:
                     self.sample_pump.set_speed(value['speed'])
+                if 'rate' in value:
+                    self.sample_pump.set_speed(value['rate'])
                 if 'steps_per_cycle' in value:
                     self.sample_pump.set_steps_per_cycle(value['steps_per_cycle'])
                 if 'clocks_per_cycle' in value:
@@ -468,9 +507,9 @@ class CytkitDevice:
             message['pressure'] = value
 
         if 'zero_pressure' in list_of_parameters:
-            value = self.pressure.get_pressure('PRES_UNITS_PA', 10)
+            value = self.pressure.get_pressure('PRES_UNITS_PA', 100)
             self.pressure.set_offset(value, 'PRES_UNITS_PA')
-            value = self.pressure.get_pressure('PRES_UNITS_PA', 1)
+            value = self.pressure.get_pressure('PRES_UNITS_PA', 10)
             message['pressure'] = value
 
         if 'temperatures' in list_of_parameters:
@@ -580,11 +619,13 @@ class CytkitDevice:
             self.sample_pump_acquisition_rate = data['sample_flow_rate']
         if 'steps_per_microlitre' in data:
             self.sample_pump_steps_per_microlitre = data['steps_per_microlitre']
-        self.sample_pump.set_speed(int(self.sample_pump_acquisition_rate * self.sample_pump_steps_per_microlitre))
+        message = self.set_state({'sample_pump_state':{'rate':int(self.sample_pump_acquisition_rate * self.sample_pump_steps_per_microlitre)}})
+        return 'OK', message
 
 
     def read_out_traces(self):
         memory_head, memory_tail, n_events_in_memory = self.ft4222.get_memory_head_tail_n_events()
+        self.event_rate_counter.update(n_events_in_memory)
         blob_of_traces_as_array = self.ft4222.pop_from_memory(memory_head, memory_tail)
         return blob_of_traces_as_array
 

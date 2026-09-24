@@ -1,4 +1,6 @@
 # sensor coefficients
+import numpy as np
+
 coefficient_data = [
     0, # Unused
     32768, # 2 ^ 15
@@ -84,7 +86,7 @@ class Pressure:
         pass
 
     def get_pressure(self, units, num_averages):
-        average_pressure = 0
+        pressure_tally = []
         for count in range(num_averages):
 
             # Read the raw ADC pressure and temperature values
@@ -104,9 +106,9 @@ class Pressure:
                 # Fault
                 return
 
-            average_pressure += pressure
+            pressure_tally.append(pressure)
 
-        average_pressure /= num_averages
+        average_pressure = np.median(np.array(pressure_tally))
 
         # offset correction
         average_pressure -= self.readback_offset

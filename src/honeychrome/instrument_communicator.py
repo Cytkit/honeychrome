@@ -160,7 +160,7 @@ class Instrument(mp.Process):
                 self.logger.info(f'[Instrument driver] {self.device} not connected: {e}')
 
         # if not already connected, try to connect
-        devices_boot_order = ['dummy_device'] # for testing
+        # devices_boot_order = ['dummy_device'] # uncomment just for testing
         for device_name in devices_boot_order:
             try:
                 if device_name == 'cytkit':
