@@ -310,19 +310,16 @@ class Display(Thread):
 
     def close(self):
         self.transmission_animation = False
-
         self.frame, self.draw = load_and_convert_frame("connection front panel template.png")
         draw_text_lr(self.draw, 3, 0, "Connect", font6x13, 1)
         draw_text_lr(self.draw, 3, 15, "USB 2.0", font6x13, 1)
         draw_text_lr(self.draw, 3, 36, "Cytkit is powered on.", font4x6, 1)
         draw_text_lr(self.draw, 3, 44, "Connect to host PC", font4x6, 1)
         draw_text_lr(self.draw, 3, 52, "then run Honeychrome.", font4x6, 1)
+        self.oled.display(self.frame)
 
         self._closed = True
         self.stop()
-
-    def disconnect(self):
-        self.close()
 
     def action_message(self, message):
         self.frame = deepcopy(frame_flying)
@@ -370,4 +367,4 @@ if __name__ == '__main__':
     display.action_message('Acquiring!')
     display.set_info(1000, 53, -18, 26, True)
     time.sleep(4)
-    display.disconnect()
+    display.close()

@@ -205,6 +205,7 @@ class DummyDevice:
         return 'OK', 'Dummy device connected'
 
     def disconnect(self):
+        self.display.close()
         if self.display.is_alive():
             self.display.join(timeout=2)
 

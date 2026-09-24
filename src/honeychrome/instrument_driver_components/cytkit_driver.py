@@ -281,9 +281,13 @@ class CytkitDevice:
         for w in workers:
             w.stop()
 
+        self.display.close()
+
         for w in workers:
             if w.is_alive():
                 w.join(timeout=2)  # always use a timeout
+        if self.display.is_alive():
+            self.display.join(timeout=2)
 
     def initialise(self):
         # id_word = self.ft4222.register_read('ID_WORD')
