@@ -55,11 +55,11 @@ class Ft4222Communicator:
         data_read = self.devA.spiMaster_MultiReadWrite(b'', byte_string, 4) # 2 bytes dummy, 2 bytes register
         return int.from_bytes(data_read[2:], byteorder='big', signed=False)
 
-    def register_2byte_write(self, register_low, register_high, data_to_write):
+    def register_2reg_write(self, register_low, register_high, data_to_write):
         self.register_write(register_low, (data_to_write >> 0) & 0xFFFF)
         self.register_write(register_high, (data_to_write >> 16) & 0xFFFF)
 
-    def register_2byte_read(self, register_low, register_high):
+    def register_2reg_read(self, register_low, register_high):
         value = self.register_read(register_high) << 16
         value |= self.register_read(register_low)
         return value

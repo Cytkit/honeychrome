@@ -215,12 +215,12 @@ class Pressure:
     def _sensor_write_read(self, data_out, size, cs_delay):
 
         self.ft4222.register_write('PRES_TXFR_SIZE', size) # Set the transfer size in bits
-        self.ft4222.register_2byte_write('PRES_DATA_L', 'PRES_DATA_H', data_out)
+        self.ft4222.register_2reg_write('PRES_DATA_L', 'PRES_DATA_H', data_out)
         self.ft4222.register_write('PRES_CS_WAIT', cs_delay) # Set the CSDelay in ~650us steps
         self.ft4222.register_write('PRES_CTRL', 1)	#Start the transfer
 
         while not (self.ft4222.register_read('PRES_CTRL') & 0x0010): # Wait for completion
             pass
 
-        data_return = self.ft4222.register_2byte_read('PRES_DATA_L', 'PRES_DATA_H')
+        data_return = self.ft4222.register_2reg_read('PRES_DATA_L', 'PRES_DATA_H')
         return data_return

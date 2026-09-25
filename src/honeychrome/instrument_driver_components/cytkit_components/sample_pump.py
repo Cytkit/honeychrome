@@ -66,10 +66,10 @@ class SamplePump:
         return self.ft4222.register_read('SMPMP_SPC')
 
     def set_clocks_per_cycle(self, clocks_per_cycle):
-        self.ft4222.register_2byte_write('SMPMP_CPC_L', 'SMPMP_CPC_H', clocks_per_cycle)
+        self.ft4222.register_2reg_write('SMPMP_CPC_L', 'SMPMP_CPC_H', clocks_per_cycle)
 
     def get_clocks_per_cycle(self):
-        return self.ft4222.register_2byte_read('SMPMP_CPC_L', 'SMPMP_CPC_H')
+        return self.ft4222.register_2reg_read('SMPMP_CPC_L', 'SMPMP_CPC_H')
 
     def ramp_to(self, speed):
         reverse = speed < 0

@@ -233,12 +233,12 @@ class SimProxy:
 class Display(Thread):
     def __init__(self, transfer_object=None, sample_pump_object=None, pressure_object=None, temperature_object=None, laser_object=None):
         super().__init__(daemon=True)
-        # try:
-        #     self.oled = SSD1309()
-        # except:
-        #     self.oled = SimProxy()
-
-        self.oled = SimProxy()
+        try:
+            self.oled = SSD1309()
+        except:
+            self.oled = SimProxy()
+        # self.oled = SSD1309()
+        # self.oled = SimProxy()
 
         self.frame = Image.new('1', (128, 64), 0)
         self.draw = ImageDraw.Draw(self.frame)
@@ -365,7 +365,7 @@ if __name__ == '__main__':
 
     display = Display()
     display.start()
-    time.sleep(10)
-    display.action_message('Acquiring!')
     time.sleep(4)
+    display.action_message('Acquiring!')
+    time.sleep(3)
     display.close()
