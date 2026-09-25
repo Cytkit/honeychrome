@@ -344,21 +344,28 @@ class Display(Thread):
         pressure = self.pressure_object.pressure if self.pressure_object and self.pressure_object.pressure else 0
         temperature = self.temperature_object.temperature if self.temperature_object and self.temperature_object.temperature else 0
         laser_enabled = self.laser_object.enabled if self.laser_object else False
+        interlock_status = ""
+        if self.laser_object and not self.laser_object.interlock_enabled:
+            interlock_status = "Interlock DISABLED"
+        elif self.laser_object and self.laser_object.interlock_state:
+            interlock_status = "Interlock OPENED"
 
         x_right = 65
-        y_array = [0 + n*10 for n in range(5)]
-        draw_text_lr(self.draw, x_right, y_array[0], "Trig", font5x8, 1, anchor='r')
-        draw_text_lr(self.draw, x_right, y_array[1], "Flow", font5x8, 1, anchor='r')
-        draw_text_lr(self.draw, x_right, y_array[2], "Pres", font5x8, 1, anchor='r')
-        draw_text_lr(self.draw, x_right, y_array[3], "Temp", font5x8, 1, anchor='r')
-        draw_text_lr(self.draw, x_right, y_array[4], "", font5x8, 1, anchor='r')
+        y_array = [0 + n*10 for n in range(6)]
+        draw_text_lr(self.draw, x_right, y_array[0], "", font5x8, 1, anchor='r')
+        draw_text_lr(self.draw, x_right, y_array[1], "Trig", font5x8, 1, anchor='r')
+        draw_text_lr(self.draw, x_right, y_array[2], "Flow", font5x8, 1, anchor='r')
+        draw_text_lr(self.draw, x_right, y_array[3], "Pres", font5x8, 1, anchor='r')
+        draw_text_lr(self.draw, x_right, y_array[4], "Temp", font5x8, 1, anchor='r')
+        draw_text_lr(self.draw, x_right, y_array[5], "", font5x8, 1, anchor='r')
 
         x_right += 3
-        draw_text_lr(self.draw, x_right, y_array[0], f"{event_rate:5.0f} ev/s", font5x8, 1, anchor='l')
-        draw_text_lr(self.draw, x_right, y_array[1], f"{sample_flow_rate:5.2f} uL/min", font5x8, 1, anchor='l')
-        draw_text_lr(self.draw, x_right, y_array[2], f"{pressure:5.2f} Pa", font5x8, 1, anchor='l')
-        draw_text_lr(self.draw, x_right, y_array[3], f"{temperature:5.2f} C", font5x8, 1, anchor='l')
-        draw_text_lr(self.draw, x_right, y_array[4], "Laser On" if laser_enabled else "Laser off", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right-30, y_array[0], interlock_status, font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[1], f"{event_rate:5.0f} ev/s", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[2], f"{sample_flow_rate:5.2f} uL/min", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[3], f"{pressure:5.2f} Pa", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[4], f"{temperature:5.2f} C", font5x8, 1, anchor='l')
+        draw_text_lr(self.draw, x_right, y_array[5], "Laser On" if laser_enabled else "Laser off", font5x8, 1, anchor='l')
 
 
 if __name__ == '__main__':
@@ -366,6 +373,6 @@ if __name__ == '__main__':
     display = Display()
     display.start()
     time.sleep(4)
-    display.action_message('Acquiring!')
-    time.sleep(3)
+    # display.action_message('Acquiring!')
+    time.sleep(10)
     display.close()

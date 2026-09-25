@@ -180,10 +180,14 @@ class LaserGetter(Thread):
         self._stop_event = Event()
         self._lock = Lock()
         self.enabled = 0
+        self.interlock_state = 0
+        self.interlock_enabled = 0
 
     def run(self):
         while not self._stop_event.is_set():
             self.enabled = self.laser.get_state()
+            self.interlock_state = self.laser.get_interlock_state()
+            self.interlock_enabled = self.laser.get_interlock_mask()
             time.sleep(0.5)
 
 
@@ -285,6 +289,10 @@ class CytkitDevice:
         logger.info('[Cytkit driver] Connected')
 
         # set initial settings
+        self.laser.set_interlock_effects(force=False, stop_fan=False, stop_sheath=False, stop_sample=False, stop_laser=True)
+        self.laser.set_interlock_inversion(1) # 1 is normally closed, i.e. break circuit to trigger interlock stop laser
+        self.laser.set_interlock_mask(1) # currently should be 1, i.e. only one interlock circuit
+
         self.get_state(['zero_pressure']) # calibrate assuming pressure zero before start
         self.sample_pump.set_ramp(True)
         self.sample_pump.set_enable(False)

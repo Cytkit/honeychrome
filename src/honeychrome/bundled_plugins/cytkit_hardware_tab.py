@@ -187,9 +187,9 @@ class PluginWidget(QWidget):
         self.laser_cb = QCheckBox("Laser enable")
         self.laser_cb.toggled.connect(lambda checked: self.set_instrument_state({'laser_enable': checked}))
         layout.addWidget(self.laser_cb)
-        self.interlock_status = QCheckBox("Interlocks closed")
-        layout.addWidget(self.interlock_status)
-        self.interlock_status.setEnabled(False)
+
+        self.interlock_status_label = QLabel("Interlock status: disconnected")
+        layout.addWidget(self.interlock_status_label)
         frame = QFrame()
         frame.setObjectName("warningFrame")  # Set a unique name
         frame.setStyleSheet('''
@@ -202,9 +202,14 @@ class PluginWidget(QWidget):
         icon_label = QLabel()
         icon_label.setPixmap(pixmap)
         frame_layout.addWidget(icon_label)
-        self.interlock_disable = QCheckBox("Disable Interlocks")
+        self.interlock_disable = QCheckBox("Interlock Enabled")
+        self.interlock_disable.toggled.connect(lambda checked: self.set_instrument_state({'interlock_enabled': checked}))
         frame_layout.addWidget(self.interlock_disable)
         frame_layout.addWidget(QLabel('Warning: if interlocks are disabled, laser can be on when the instrument cover is removed, thus exposing the beam. \nIt is recommended to follow laser safety training and carry out a risk assessment.'))
+        self.interlock_force_btn = QPushButton("Test interlock")
+        self.interlock_force_btn.clicked.connect(lambda: self.set_instrument_state({'interlock_forced': True}))
+        frame_layout.addWidget(self.interlock_force_btn)
+        frame_layout.addWidget(QLabel('Test interlock: forces the interlock signal on the FPGA to turn off the laser, simulating opening the interlock switch.'))
         layout.addWidget(frame)
 
         # LED calibration
