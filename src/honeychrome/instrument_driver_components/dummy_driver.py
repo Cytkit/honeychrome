@@ -9,6 +9,7 @@ import numpy as np
 
 from honeychrome import settings
 from honeychrome.instrument_driver_components.cytkit_components.display import Display
+from honeychrome.instrument_driver_components.cytkit_components.laser import Laser
 from honeychrome.settings import adc_channels, magnitude_ceiling, traces_cache_dtype, n_channels_trace, n_time_points_in_event, transfer_target_repeat_time
 
 fcs_file = Path(__file__).parent / 'data' / 'example_for_dummy_acquisition.fcs'
@@ -73,9 +74,41 @@ class SamplePumpSim:
 class LaserSim:
     def __init__(self):
         self.enable = False
+        self.interlock_state = 0 # i.e. 1 = circuit opened
+        self.interlock_enabled = 1 # i.e. mask 1 = first switch
+        self.interlock_forced = 0 # i.e. 1 = force open
+
+    def set_state(self, enabled):
+        if self.interlock_enabled and (self.interlock_forced or self.interlock_state):
+            self.enable = False
+        else:
+            self.enable = enabled == 1
 
     def get_state(self):
         return self.enable
+
+    def get_interlock_state(self):
+        return self.interlock_state
+
+    def set_interlock_state(self, opened):
+        self.interlock_state = opened
+
+    def get_interlock_mask(self):
+        return self.interlock_enabled
+
+    def set_interlock_mask(self, enabled):
+        self.interlock_enabled = enabled
+        if self.interlock_enabled and self.interlock_state:
+            self.set_state(0)
+
+    def get_interlock_effects(self):
+        return self.interlock_forced
+
+    def set_interlock_effects(self, forced=False):
+        self.interlock_forced = forced
+        self.interlock_state = forced
+        if self.interlock_forced and self.interlock_enabled:
+            self.set_state(0)
 
 class SamplePumpFlowRateGetter(Thread):
     def __init__(self, parent, sample_pump):
@@ -102,10 +135,14 @@ class LaserGetter(Thread):
         self._stop_event = Event()
         self._lock = Lock()
         self.enabled = 0
+        self.interlock_state = 0
+        self.interlock_enabled = 1
 
     def run(self):
         while not self._stop_event.is_set():
             self.enabled = self.laser.get_state()
+            self.interlock_state = self.laser.get_interlock_state()
+            self.interlock_enabled = self.laser.get_interlock_mask()
             time.sleep(0.5)
 
 class RandomPressureGenerator(Thread):
@@ -241,7 +278,22 @@ class DummyDevice:
 
     def set_state(self, dict_of_parameter_value):
         print(dict_of_parameter_value)
-        return 'OK', {parameter: value for parameter, value in dict_of_parameter_value.items()}
+        message = {parameter: value for parameter, value in dict_of_parameter_value.items()}
+
+        for parameter, value in dict_of_parameter_value.items():
+            if parameter == 'laser_enable':
+                self.laser.set_state(value)
+                message['laser_enable'] = value
+
+            if parameter == 'interlock_enabled':
+                self.laser.set_interlock_mask(value)
+                message['interlock_enabled'] = value
+
+            if parameter == 'interlock_forced':
+                self.laser.set_interlock_effects(forced=value)
+                message['interlock_forced'] = value
+
+        return 'OK', message
 
     def get_state(self, list_of_parameters):
         # return ('OK',
@@ -252,7 +304,16 @@ class DummyDevice:
         #   }
         #  )
         print(list_of_parameters)
-        return 'OK', {parameter:None for parameter in list_of_parameters}
+        message = {parameter:None for parameter in list_of_parameters}
+
+        if 'laser' in list_of_parameters:
+            state = self.laser.get_state()
+            interlock_mask = self.laser.get_interlock_mask()
+            interlock_state = self.laser.get_interlock_state()
+            interlock_forced = self.laser.get_interlock_effects()
+            message['laser'] = {'state': state, 'interlock_mask': interlock_mask, 'interlock_state': interlock_state, 'interlock_forced': interlock_forced}
+
+        return 'OK', message
 
 
     def flush_sip(self):

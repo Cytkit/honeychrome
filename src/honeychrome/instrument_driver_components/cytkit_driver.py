@@ -380,6 +380,14 @@ class CytkitDevice:
                 self.laser.set_state(value)
                 message['laser_enable'] = value
 
+            if parameter == 'interlock_enabled':
+                self.laser.set_interlock_mask(value)
+                message['interlock_enabled'] = value
+
+            if parameter == 'interlock_forced':
+                self.laser.set_interlock_effects(force=value)
+                message['interlock_forced'] = value
+
             if parameter == 'fan_state':
                 if 'freq' in value:
                     self.fan.set_pwm_frequency(value['freq'])
@@ -483,6 +491,7 @@ class CytkitDevice:
             list_of_parameters = [
                 'check_connection',
                 'read_id_data',
+                'laser',
                 'pressure',
                 'temperatures',
                 'vi_monitors',
@@ -500,6 +509,13 @@ class CytkitDevice:
         if 'read_id_data' in list_of_parameters:
             version, datetime = self.id_data.read_id_data()
             message['read_id_data'] = {'version':version, 'datetime':datetime}
+
+        if 'laser' in list_of_parameters:
+            state = self.laser.get_state()
+            interlock_mask = self.laser.get_interlock_mask()
+            interlock_state = self.laser.get_interlock_state()
+            interlock_forced, _, _, _, _ = self.laser.get_interlock_effects()
+            message['laser'] = {'state': state, 'interlock_mask': interlock_mask, 'interlock_state': interlock_state, 'interlock_forced': interlock_forced}
 
         if 'pressure' in list_of_parameters:
             value = self.pressure.get_pressure('PRES_UNITS_PA', 1)

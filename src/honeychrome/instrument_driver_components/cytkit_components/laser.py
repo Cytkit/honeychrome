@@ -15,13 +15,13 @@ class Laser:
         return self.ft4222.register_read('INT_MASK') & 0x0001
 
     def set_interlock_mask(self, state):
-        self.ft4222.register_write('INT_MASK', state)
+        self.ft4222.register_write('INT_MASK', int(state))
 
     def get_interlock_inversion(self):
         return self.ft4222.register_read('INT_INV') & 0x0001
 
     def set_interlock_inversion(self, inversion):
-        self.ft4222.register_write('INT_INV', inversion)
+        self.ft4222.register_write('INT_INV', int(inversion))
 
     def get_interlock_state(self):
         return self.ft4222.register_read('INT_STATE') & 0x0001
