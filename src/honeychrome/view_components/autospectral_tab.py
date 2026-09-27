@@ -7,7 +7,7 @@ Location: src/honeychrome/view_components/autospectral_tab.py
 
 Sections
 --------
-1  Extract AF profile from an unstained sample (KMeans).
+1  Extract AF profile from an unstained sample (SOM, KMeans fallback).
 2  Manage stored AF profiles (spectral plot, CSV load/save/delete).
 3  Assign AF profiles to samples (grid: rows=non-SSC samples, columns=profiles).
 4  Side-by-side OLS vs AF-corrected biplot comparison, using the same
@@ -76,20 +76,20 @@ class AfTrainingWorker(QObject):
     error = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, unstained_raw, fluor_spectra, n_clusters, source_fcs_path):
+    def __init__(self, unstained_raw, fluor_spectra, som_dim, source_fcs_path):
         super().__init__()
         self.unstained_raw = unstained_raw
         self.fluor_spectra = fluor_spectra
-        self.n_clusters = n_clusters
+        self.som_dim = som_dim
         self.source_fcs_path = source_fcs_path   # stored so the slot can read it
 
     def run(self):
         try:
-            self.progress.emit('Fitting KMeans clusters to unstained sample...')
+            self.progress.emit('Clustering unstained sample and refining AF spectra...')
             af_spectra = get_af_spectra(
                 self.unstained_raw,
                 self.fluor_spectra,
-                n_clusters=self.n_clusters,
+                som_dim=self.som_dim,
             )
             self.finished.emit(af_spectra)
         except Exception as e:
@@ -852,15 +852,17 @@ class AutoSpectralTab(QWidget):
         self._sample_combo.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         layout.addRow('Unstained sample:', self._sample_combo)
 
-        self._n_clusters_spin = QSpinBox()
-        self._n_clusters_spin.setRange(4, 1000)
-        self._n_clusters_spin.setValue(200)
-        self._n_clusters_spin.setToolTip(
-            'KMeans cluster count (equivalent to som.dim² in R AutoSpectral).'
+        self._som_dim_spin = QSpinBox()
+        self._som_dim_spin.setRange(2, 30)
+        self._som_dim_spin.setValue(10)
+        self._som_dim_spin.setToolTip(
+            'Side length of the square SOM grid (som.dim in R AutoSpectral); '
+            'the grid has som.dim² nodes. KMeans with the same number of '
+            'clusters is used when the compiled SOM kernel is unavailable.'
         )
-        self._n_clusters_spin.installEventFilter(WheelBlocker(self._n_clusters_spin))
-        self._n_clusters_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        layout.addRow('AF clusters:', self._n_clusters_spin)
+        self._som_dim_spin.installEventFilter(WheelBlocker(self._som_dim_spin))
+        self._som_dim_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        layout.addRow('SOM grid size:', self._som_dim_spin)
 
         self._extract_btn = QPushButton('Extract AF Profile')
         self._extract_btn.clicked.connect(self._run_extraction)
@@ -1186,11 +1188,11 @@ class AutoSpectralTab(QWidget):
             return
 
         self._extract_btn.setEnabled(False)
-        self._extract_status.setText('Running KMeans clustering...')
+        self._extract_status.setText('Extracting AF spectra...')
 
         self._train_thread = QThread()
         self._train_worker = AfTrainingWorker(
-            raw_fl, fluor_spectra, self._n_clusters_spin.value(), sample_path
+            raw_fl, fluor_spectra, self._som_dim_spin.value(), sample_path
         )
         self._train_worker.moveToThread(self._train_thread)
         self._train_thread.started.connect(self._train_worker.run)
@@ -1212,6 +1214,7 @@ class AutoSpectralTab(QWidget):
         fl_ids = self.controller.filtered_raw_fluorescence_channel_ids
         channel_names = [pnn_raw[i] for i in fl_ids]
 
+        csv_save_error = None
         try:
             profile_name = save_af_profile_csv(
                 af_spectra, channel_names, source_fcs_path,
@@ -1219,6 +1222,7 @@ class AutoSpectralTab(QWidget):
             )
         except Exception as e:
             logger.error(f'AutoSpectral: failed to save CSV: {e}')
+            csv_save_error = str(e)
             profile_name = Path(source_fcs_path).stem + ' AutoSpectral AF'
 
         af_profiles = self.controller.experiment.process.get('af_profiles', {})
@@ -1234,10 +1238,16 @@ class AutoSpectralTab(QWidget):
         # this is the only linalg.solve call needed; sample loading just does hstack.
         self.controller.cache_af_profile(profile_name)
 
-        self._extract_status.setText(
-            f'Done. Profile "{profile_name}" stored ({n_af} AF spectra).'
-        )
-        self._refresh_profile_list()
+        if csv_save_error:
+            self._extract_status.setText(
+                f'Profile "{profile_name}" stored in-memory, but saving its CSV '
+                f'failed: {csv_save_error}'
+            )
+        else:
+            self._extract_status.setText(
+                f'Done. Profile "{profile_name}" stored ({n_af} AF spectra).'
+            )
+        self._refresh_profile_list(select_name=profile_name)
         self._rebuild_assignment_grid()
 
         if self.bus:
@@ -1254,9 +1264,18 @@ class AutoSpectralTab(QWidget):
     # Section 2 — profile list and spectral plot
     # ======================================================================
 
-    def _refresh_profile_list(self):
-        """Rebuild profile list, restore or default selection, and draw the plot."""
-        current_name = (
+    def _refresh_profile_list(self, select_name: str | None = None):
+        """Rebuild profile list, restore or default selection, and draw the plot.
+
+        select_name, when given, takes priority over whatever was previously
+        selected. Callers that just (re-)created or loaded a specific profile
+        (extraction, CSV load) pass it here so that profile is the one shown —
+        otherwise, if a *different* profile happened to be selected in the
+        list already, the "restore previous selection" behaviour below would
+        silently keep showing that unrelated profile and the just-updated
+        spectra would never appear on screen.
+        """
+        current_name = select_name or (
             self._profile_list.currentItem().text()
             if self._profile_list.currentItem() else None
         )
@@ -1402,7 +1421,7 @@ class AutoSpectralTab(QWidget):
         # Cache precomputed matrices for the loaded profile.
         self.controller.cache_af_profile(profile_name)
 
-        self._refresh_profile_list()
+        self._refresh_profile_list(select_name=profile_name)
         self._rebuild_assignment_grid()
         if self.bus:
             self.bus.statusMessage.emit(
@@ -1788,9 +1807,15 @@ class AutoSpectralTab(QWidget):
         # valid — skip the worker and just redraw.
         spillover = self.controller.experiment.process.get('spillover')
         spillover_key = tuple(np.array(spillover).ravel()) if spillover is not None else None
-        # Use a content hash of the precomputed P matrix rather than id()
-        p_matrix = af_precomputed.get('P') if af_precomputed is not None else None
-        af_key = bytes(p_matrix.data) if p_matrix is not None else None
+        # Use a content hash of the AF spectra actually being applied, not P:
+        # P = solve(fluor_spectra @ fluor_spectra.T, fluor_spectra) depends only
+        # on the fluorophore library, not on which AF profile(s) are assigned
+        # (see combine_af_precomputed's docstring — P is shared across profiles),
+        # so keying on P made this cache blind to AF-assignment changes while
+        # staying on "Assigned to sample": ticking a different profile changed
+        # af_spectra but never af_key, so a stale cached result was reused and
+        # "No change — redrawing..." was reported incorrectly.
+        af_key = bytes(np.ascontiguousarray(af_spectra).data) if af_spectra is not None else None
         state_key = (
             self.controller.current_sample_path,
             profile_key,
