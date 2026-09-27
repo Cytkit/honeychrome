@@ -312,7 +312,7 @@ def test_get_af_spectra_returns_valid_output():
     rng = np.random.default_rng(21)
     unstained = rng.exponential(scale=300.0, size=(1000, N_CHANNELS))
 
-    af_spectra = get_af_spectra(unstained, fluor_spectra, n_clusters=20)
+    af_spectra = get_af_spectra(unstained, fluor_spectra, som_dim=4)
 
     assert af_spectra.shape[0] >= 1, "Expected at least the population mean row"
     assert af_spectra.shape[1] == N_CHANNELS, \
@@ -333,7 +333,7 @@ def test_get_af_spectra_raises_on_too_few_cells():
     from honeychrome.controller_components.autospectral_functions import get_af_spectra
 
     fluor_spectra = _make_fluor_spectra()
-    tiny = RNG.uniform(0, 500, size=(50, N_CHANNELS))  # below default min_cells=200
+    tiny = RNG.uniform(0, 500, size=(50, N_CHANNELS))  # below default min_cells=100
 
     with pytest.raises(ValueError, match="Insufficient cells"):
         get_af_spectra(tiny, fluor_spectra)
@@ -360,7 +360,7 @@ def test_get_af_spectra_removes_fluorophore_contaminants():
 
     af_spectra = get_af_spectra(
         unstained, fluor_spectra,
-        n_clusters=10,
+        som_dim=3,
     )
 
 
@@ -420,7 +420,7 @@ def test_controller_af_assignment_changes_unmixed_output(loaded_controller):
     fluor_spectra = kc._build_fluor_spectra()
 
     from honeychrome.controller_components.autospectral_functions import get_af_spectra
-    af_spectra = get_af_spectra(raw_fl, fluor_spectra, n_clusters=20)
+    af_spectra = get_af_spectra(raw_fl, fluor_spectra, som_dim=4)
 
     channel_names = [kc.experiment.settings['raw']['event_channels_pnn'][i] for i in fluor_ids]
 
@@ -484,7 +484,7 @@ def test_controller_af_unmixing_preserves_scatter_channels(loaded_controller):
     from honeychrome.controller_components.autospectral_functions import (
         get_af_spectra, precompute_af_matrices, apply_af_transfer,
     )
-    af_spectra  = get_af_spectra(raw_fl, fluor_spectra, n_clusters=20)
+    af_spectra  = get_af_spectra(raw_fl, fluor_spectra, som_dim=4)
     precomputed = precompute_af_matrices(fluor_spectra, af_spectra)
 
     ols_result = kc.raw_event_data @ kc.transfer_matrix
@@ -525,7 +525,7 @@ def test_controller_clear_af_reverts_to_ols(loaded_controller):
     fluor_ids     = kc.filtered_raw_fluorescence_channel_ids
     raw_fl        = kc.raw_event_data[:, fluor_ids]
     fluor_spectra = kc._build_fluor_spectra()
-    af_spectra    = get_af_spectra(raw_fl, fluor_spectra, n_clusters=20)
+    af_spectra    = get_af_spectra(raw_fl, fluor_spectra, som_dim=4)
     channel_names = [kc.experiment.settings['raw']['event_channels_pnn'][i] for i in fluor_ids]
 
     profile_name = 'test_clear_af_profile AutoSpectral AF'
@@ -582,7 +582,7 @@ def test_controller_regenerate_spectral_process_with_af_assigned(loaded_controll
     fluor_ids     = kc.filtered_raw_fluorescence_channel_ids
     raw_fl        = kc.raw_event_data[:, fluor_ids]
     fluor_spectra = kc._build_fluor_spectra()
-    af_spectra    = get_af_spectra(raw_fl, fluor_spectra, n_clusters=20)
+    af_spectra    = get_af_spectra(raw_fl, fluor_spectra, som_dim=4)
     channel_names = [kc.experiment.settings['raw']['event_channels_pnn'][i] for i in fluor_ids]
 
     profile_name = 'test_regen_profile AutoSpectral AF'
@@ -645,7 +645,7 @@ def test_experiment_save_load_preserves_af_state():
     fluor_ids     = kc.filtered_raw_fluorescence_channel_ids
     raw_fl        = kc.raw_event_data[:, fluor_ids]
     fluor_spectra = kc._build_fluor_spectra()
-    af_spectra    = get_af_spectra(raw_fl, fluor_spectra, n_clusters=20)
+    af_spectra    = get_af_spectra(raw_fl, fluor_spectra, som_dim=4)
     channel_names = [kc.experiment.settings['raw']['event_channels_pnn'][i] for i in fluor_ids]
 
     profile_name = 'test_persistence_profile AutoSpectral AF'
