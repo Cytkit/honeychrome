@@ -228,6 +228,20 @@ def _ensure_qt_imports():
 # ---------------------------------------------------------------------------
 plugin_name = 'Honeycluster'
 
+# QSettings 'application' identifier for this plugin's persisted
+# gates/channels/DR-clustering state -- deliberately frozen to the
+# plugin's ORIGINAL name, independent of plugin_name (the display
+# name shown on the tab). QSettings('honeychrome', app) scopes an
+# entirely separate store per distinct *app* string (a different INI
+# file on Linux, a different plist domain on macOS) -- so renaming
+# plugin_name for the tab label would silently orphan every
+# experiment's already-saved settings under the old app string,
+# exactly reproducing the "my data vanished on restart" symptom
+# this plugin already fixed once. Never derive this from plugin_name;
+# if it ever needs to change, add an explicit migration in
+# load_state() that reads the old key when the new one is empty.
+_SETTINGS_APP_KEY = 'plugin_DR / Clustering / Statistics'
+
 
 # ---------------------------------------------------------------------------
 # 3.  Module-level helper functions
@@ -411,6 +425,49 @@ def _cluster_display_name(names: dict, label: int) -> str:
 # palette(mid) tracks the active light/dark palette where a fixed
 # 'grey' would not.
 HINT_STYLE = "color: palette(mid); font-style: italic;"
+
+
+def _channel_antigens(controller) -> dict[str, str]:
+    """
+    channel -> raw antigen text from the spectral model (empty string if
+    none assigned). Used only to decide default channel selection in
+    TransformTab.refresh() -- see _is_viability_antigen() below. Mirrors
+    drc_cluster_id._channel_to_antigen_map(), kept as a separate copy here
+    for the same reason _antigen_dash_labels() is: this file must not
+    import from drc_cluster_id.py.
+    """
+    try:
+        unmixed_pnn = controller.experiment.settings.get('unmixed', {}).get(
+            'event_channels_pnn') or []
+        spectral_model = controller.experiment.process.get('spectral_model') or []
+    except (AttributeError, KeyError):
+        return {}
+    label_to_antigen = {c.get('label'): (c.get('antigen') or '') for c in spectral_model}
+    return {ch: label_to_antigen.get(ch, '') for ch in unmixed_pnn}
+
+
+def _is_viability_antigen(antigen: str) -> bool:
+    """
+    True if *antigen* canonicalises to the 'Viability' marker in
+    marker_database.csv (covers 'fixable', 'Livedead', 'viable',
+    'viablity', 'live-dead', 'LD', and 'Viability' itself). Viability dyes
+    carry a real antigen label -- they are not scatter or an empty
+    detector -- but are not clustering markers, so they are excluded from
+    the default channel selection alongside them.
+
+    Falls back to False (never excludes) if label_matching is unavailable
+    or antigen is blank, since a missing optional dependency should never
+    make a channel silently disappear from the default selection.
+    """
+    if not antigen:
+        return False
+    try:
+        from honeychrome.controller_components.label_matching import (
+            match_marker, get_marker_db,
+        )
+    except ImportError:
+        return False
+    return match_marker(antigen, get_marker_db()) == 'Viability'
 
 
 def _antigen_dash_labels(controller) -> dict[str, str]:
@@ -2447,26 +2504,27 @@ class ConfigTab(QWidget):
             'unmixed', {}
         ).get('event_channels_pnn') or []
 
-        # Identify scatter channels to pre-uncheck them
-        scatter = set(
-            self.controller.experiment.settings.get(
-                'unmixed', {}
-            ).get('scatter_channels') or []
-        )
-
         # Channels to always exclude from DR (non-data columns)
         _always_exclude = {'event_id', 'Time', 'ribbon'}
 
         if channels and not self.channel_checkboxes:
             labels = _antigen_dash_labels(self.controller)
+            antigens = _channel_antigens(self.controller)
             grid_idx = 0
             for ch in channels:
                 if ch in _always_exclude:
                     continue
                 cb = QCheckBox(labels.get(ch, ch))
-                # Pre-check fluorescence channels; uncheck scatter
-                is_scatter = any(s in ch for s in scatter)
-                cb.setChecked(not is_scatter)
+                # Pre-check only channels with an antibody assigned. A
+                # channel with no antigen (scatter, Time, AF, an unused
+                # detector) is excluded by construction rather than by
+                # matching against a scatter-channel name list, and
+                # viability dyes -- which do carry an antigen-like label
+                # but are not clustering markers -- are excluded
+                # explicitly via _is_viability_antigen().
+                antigen = antigens.get(ch, '')
+                default_on = bool(antigen) and not _is_viability_antigen(antigen)
+                cb.setChecked(default_on)
                 self.channel_checkboxes[ch] = cb
                 row, col = divmod(grid_idx, 4)
                 self.channel_layout.addWidget(cb, row, col)
@@ -3676,7 +3734,8 @@ class TransformTab(QWidget):
             f"W computed for {n_updated} Logicle channel(s) from {source_note},\n"
             f"using the Parks & Moore method (lower-quarter quantile of negatives).\n\n"
             f"Parameters saved and will be restored on next open.\n"
-            f"To make permanent, use the Transforms panel in the main interface."
+            f"These are local previews only -- to change what the main "
+            f"Honeychrome plots use, drag the same axis there."
         )
 
     def _get_training_sample_full_paths(self) -> list[Path]:
@@ -3775,7 +3834,7 @@ class TransformTab(QWidget):
         try:
             exp_dir = str(self.controller.experiment_dir)
             safe_key = exp_dir.replace('\\', '/').replace(':', '_').replace(' ', '_')
-            s = QSettings('honeychrome', f'plugin_{plugin_name}')
+            s = QSettings('honeychrome', _SETTINGS_APP_KEY)
             s.beginGroup(safe_key)
             computed = {
                 ch: round(tr.logicle_w, 6)
@@ -3797,7 +3856,7 @@ class TransformTab(QWidget):
         try:
             exp_dir = str(self.controller.experiment_dir)
             safe_key = exp_dir.replace('\\', '/').replace(':', '_').replace(' ', '_')
-            s = QSettings('honeychrome', f'plugin_{plugin_name}')
+            s = QSettings('honeychrome', _SETTINGS_APP_KEY)
             s.beginGroup(safe_key)
             computed_repr = s.value('computed_transform_W', '')
             s.endGroup()
@@ -6044,9 +6103,8 @@ class GroupsStatsTab(QWidget):
         # initialise_af_matrices() whenever the user loads a different
         # sample in the main window. Without this snapshot the background
         # worker and a main-window sample load race on the same mutable
-        # numpy arrays — and the AF kernel touches them via raw C pointers
-        # (af_kernel_wrapper.py), so a concurrent reassignment is a
-        # memory-corruption/crash hazard, not just stale data.
+        # numpy arrays, and a reload mid-run could pair one sample's
+        # transfer matrix with another sample's AF library.
         af_state = (
             self.controller.transfer_matrix,
             self.controller.af_precomputed,
@@ -12163,7 +12221,7 @@ class PluginWidget(QWidget):
         self._active_dr_run_id: dict[str, str] = {}
 
         # QSettings instance — keyed per experiment in save_state/load_state
-        self._qsettings = QSettings('honeychrome', f'plugin_{plugin_name}')
+        self._qsettings = QSettings('honeychrome', _SETTINGS_APP_KEY)
 
         # Guard: suppress save_state during the load sequence (content_widget
         # becoming visible fires currentChanged → save before load completes).
