@@ -22,6 +22,7 @@ Usage
             n_passes=1, n_threads=1, cell_weight=False,
             noise_floor=None, alpha=0.5, collinear_thresh=0.5,
             joint_pair_resolution=True, n_af_passes=1, refine_af_quantile=0.5,
+            exact_variant_scan=False,
         )
         # result : ndarray (N, F+2) — [fluor abundances | AF abundance | AF index (1-based)]
 
@@ -30,10 +31,6 @@ as this file (the compiled pybind11 extension).
 AUTOSPECTRAL_OPT_KERNEL_AVAILABLE is False and unmix_autospectral_joint
 raises ImportError if the extension is absent — run
 build_autospectral_opt_kernel.py first.
-
-Scope note: this kernel has not yet been cross-validated cell-by-cell
-against the R binding (CONTEXT_AutoSpectral.md §4.4 steps 2-3) — see the
-AutoSpectral Optimization change document header.
 """
 
 import logging
@@ -77,6 +74,7 @@ def unmix_autospectral_joint(
     joint_pair_resolution: bool = True,
     n_af_passes: int = 1,
     refine_af_quantile: float = 0.5,
+    exact_variant_scan: bool = False,
 ) -> np.ndarray:
     """
     Call the compiled joint AF + fluorophore-variant unmixing kernel.
@@ -99,6 +97,10 @@ def unmix_autospectral_joint(
         see get_spectral_variants.R line ~481 — NOT raw per-event data).
     noise_floor : None, scalar-shaped (1,), or (D,) float64. None -> 125.0
         everywhere (matches the R/C++ default).
+    exact_variant_scan : score candidate variants with the closed-form
+        single-endmember swap instead of the fixed-abundance residual
+        approximation (unmix.autospectral.rcpp's exact.variant.scan). Ignored
+        when cell_weight is True.
 
     Returns
     -------
@@ -145,4 +147,5 @@ def unmix_autospectral_joint(
         joint_pair_resolution,
         n_af_passes,
         refine_af_quantile,
+        exact_variant_scan,
     )

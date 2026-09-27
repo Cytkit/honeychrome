@@ -35,8 +35,14 @@ import re
 import sys
 
 import numpy as np
-from sklearn.cluster import KMeans, MiniBatchKMeans
 
+from honeychrome.controller_components.autospectral_functions import (
+    apply_af_unmixing,
+    get_af_spectra,
+    get_som_codes,
+    precompute_af_matrices,
+    precompute_joint_cov_extras,
+)
 from honeychrome.controller_components.functions import sample_from_fcs
 from honeychrome.controller_components.spectral_functions import get_raw_events
 from honeychrome.controller_components.spectral_cleaning import (
@@ -47,8 +53,8 @@ from honeychrome.controller_components.spectral_cleaning import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Compiled kernel — same sys.path trick as af_kernel_wrapper.py, since this
-# module and the wrapper both live directly in bundled_plugins/.
+# Compiled kernel — same-directory import, since this module and the
+# wrapper both live directly in bundled_plugins/.
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -68,7 +74,7 @@ def compute_af_pcs_from_unstained(unstained_raw: np.ndarray, n_pcs: int = 4) -> 
     """
     Top-n_pcs AF principal components via SVD directly on a representative
     unstained control file. Entirely self-contained — does not
-    depend on Honeychrome's own af_profiles/KMeans-derived AF spectra.
+    depend on Honeychrome's own af_profiles AF spectra.
     """
     mean_vec = unstained_raw.mean(axis=0)
     centered = unstained_raw - mean_vec
@@ -97,39 +103,56 @@ def cosine_qc_select(
     events: np.ndarray,
     reference_vec: np.ndarray,
     sim_threshold: float = 0.985,
-) -> tuple[np.ndarray, np.ndarray]:
+    sim_threshold_floor: float = 0.90,
+    min_events: int = 20,
+) -> tuple[np.ndarray, np.ndarray, float]:
     """
-    L-inf-normalise each event (peak-normalise), keep only
-    events with cosine similarity to `reference_vec` >= sim_threshold.
+    Keep events with cosine similarity to `reference_vec` >= sim_threshold.
+
+    When fewer than `min_events` pass, the threshold is relaxed in 0.01
+    steps down to `sim_threshold_floor`, stopping at the first value that
+    retains `min_events`. A fluorophore collinear with AF can have its whole
+    population sit just under the nominal threshold, where a fixed cutoff
+    would discard a real, if noisier, population rather than screen out
+    contaminants. Relaxation is logged as a warning.
 
     Note: this is deliberately not spectral_cleaning.py::cosine_filter(),
     which selects events least similar to a reference (for base-spectrum
     construction) — the opposite selection direction from what's needed here.
 
-    Returns (selected_idx, cosine_values) — cosine_values covers every input
-    event, selected_idx indexes into `events`.
+    Returns (selected_idx, cosine_values, threshold_used) — cosine_values
+    covers every input event, selected_idx indexes into `events`.
     """
-    ev_max = events.max(axis=1)
-    ev_max = np.where(ev_max <= 0, 1.0, ev_max)
-    ev_norm = events / ev_max[:, np.newaxis]
-
     ref_norm = np.linalg.norm(reference_vec) + 1e-9
-    row_norm = np.linalg.norm(ev_norm, axis=1) + 1e-9
-    cosine = (ev_norm @ reference_vec) / (row_norm * ref_norm)
+    row_norm = np.linalg.norm(events, axis=1) + 1e-9
+    cosine = (events @ reference_vec) / (row_norm * ref_norm)
 
+    threshold_used = sim_threshold
     selected_idx = np.where(cosine >= sim_threshold)[0]
-    return selected_idx, cosine
+
+    if len(selected_idx) < min_events and sim_threshold > sim_threshold_floor:
+        n_steps = int(np.floor(round((sim_threshold - sim_threshold_floor) / 0.01, 9)))
+        for step in range(1, n_steps + 1):
+            relaxed = sim_threshold - 0.01 * step
+            candidate_idx = np.where(cosine >= relaxed)[0]
+            if len(candidate_idx) >= min_events:
+                selected_idx = candidate_idx
+                threshold_used = relaxed
+                logger.warning(
+                    f'cosine_qc_select: fewer than {min_events} events at '
+                    f'sim_threshold = {sim_threshold}; relaxed to {relaxed:.3f} to '
+                    f'retain {len(selected_idx)} event(s). This fluorophore is likely '
+                    f'collinear with autofluorescence, very dim, or otherwise unreliable.'
+                )
+                break
+
+    return selected_idx, cosine, threshold_used
 
 
-def compute_positivity_thresholds(raw_events: np.ndarray, percentile: float = 90.0) -> np.ndarray:
+def compute_positivity_thresholds(raw_events: np.ndarray, percentile: float = 99.5) -> np.ndarray:
     """
-    Per-channel raw-space positivity threshold from a representative sample.
-
-    Dropped from the 99.5th to the 90th percentile — 99.5 was pushing the
-    threshold high enough in some channels to exclude clearly-positive
-    single-stain events entirely. The downstream `* 2` re-selection check
-    plus the cosine-similarity QC step still screen out anything that
-    isn't a genuine positive.
+    Per-channel raw-space positivity threshold from a representative
+    unstained sample (get_spectral_variants.R's `raw.thresholds`).
     """
     return np.percentile(raw_events, percentile, axis=0)
 
@@ -141,45 +164,52 @@ def compute_unmixed_positivity_thresholds(
 ) -> np.ndarray:
     """
     Per-fluorophore unmixed-space positivity threshold, plain OLS (no AF
-    correction). Kept for reference/other callers — discover_all_variants()
-    no longer uses this for its Setup thresholds; see
-    compute_af_corrected_unmixed_thresholds() below, which is the one that
-    matches get_spectral_variants.R's `unmixed.thresholds`.
+    correction). Used for bead controls, where AF extraction is not
+    meaningful; cell controls use compute_af_extracted_unmixed_thresholds().
     """
     P_full = np.linalg.solve(reference_spectra @ reference_spectra.T, reference_spectra)
     unmixed = raw_events @ P_full.T
     return np.percentile(unmixed, percentile, axis=0)
 
 
-def compute_af_corrected_unmixed_thresholds(
-    raw_events: np.ndarray,
+def compute_af_extracted_unmixed_thresholds(
+    unstained_raw: np.ndarray,
+    unstained_subsample: np.ndarray,
     reference_spectra: np.ndarray,
-    af_pcs: np.ndarray,
-    percentile: float = 98.0,
+    fluor_names: list,
+    percentile: float = 99.5,
 ) -> np.ndarray:
     """
-    Per-fluorophore unmixed-space positivity threshold, AF-corrected.
+    Per-fluorophore unmixed-space positivity threshold, AF-extracted.
 
-    Port of get_spectral_variants.R's `unmixed.thresholds`, which are the
-    99.5th percentile of `unmix.autospectral(unstained, spectra, af.spectra)`
-    — the unstained sample unmixed *with AF accounted for*, not plain OLS
-    against the fluorophore spectra alone. Plain OLS leaves residual
-    autofluorescence smeared across every fluorophore column (there's no AF
-    term in that basis), which inflates this threshold well above the true
-    near-zero background and can screen out genuinely positive events
-    downstream in discover_fluor_variants()'s `* 2` re-selection check.
+    Port of get_spectral_variants.R's `unmixed.thresholds`: AF spectra are
+    extracted from the unstained sample (get_af_spectra, base stage only),
+    the unstained sample is unmixed with per-cell AF extraction, and the
+    `percentile` of each fluorophore column is taken. Plain OLS would leave
+    autofluorescence smeared across every fluorophore column and inflate the
+    threshold.
 
-    Jointly unmixes against `[af_pcs; reference_spectra]` (mirrors
-    project_out_af_pcs()'s single-fluorophore version, generalised to all
-    fluorophores at once) and keeps only the fluorophore columns of the
-    result — self-contained, same as the rest of Setup's AF handling, no
-    dependency on an assigned AF profile.
+    unstained_raw       : (N, D) all unstained events, for AF extraction
+    unstained_subsample : (n, D) events to unmix for the percentile
     """
-    combined = np.vstack([af_pcs, reference_spectra])              # (n_pcs+F, D)
-    P_combined = np.linalg.solve(combined @ combined.T, combined)  # (n_pcs+F, D)
-    unmixed_combined = raw_events @ P_combined.T                   # (N, n_pcs+F)
-    n_pcs = af_pcs.shape[0]
-    fluor_unmixed = unmixed_combined[:, n_pcs:]                    # (N, F)
+    af_spectra = get_af_spectra(unstained_raw, reference_spectra, refine=False)
+
+    if AUTOSPECTRAL_OPT_KERNEL_AVAILABLE and af_spectra.shape[0] >= 2:
+        result = unmix_autospectral_joint(
+            raw_data_in=unstained_subsample,
+            spectra=reference_spectra,
+            af_spectra=af_spectra,
+            fluor_names=fluor_names,
+            pos_thresholds=np.zeros(reference_spectra.shape[0]),
+            variants=[],
+            n_threads=max(1, (os.cpu_count() or 2) - 1),
+        )
+        fluor_unmixed = result[:, :reference_spectra.shape[0]]
+    else:
+        precomputed = precompute_af_matrices(reference_spectra, af_spectra)
+        precomputed.update(precompute_joint_cov_extras(precomputed, af_spectra))
+        fluor_unmixed = apply_af_unmixing(unstained_subsample, precomputed, af_spectra)['unmixed']
+
     return np.percentile(fluor_unmixed, percentile, axis=0)
 
 
@@ -203,19 +233,37 @@ def discover_fluor_variants(
     af_pcs: np.ndarray | None,
     saturation_ceiling: float,
     n_cells: int = 10_000,
-    variants: int = 20,
+    som_dim: int = 5,
     k_neighbors: int = 3,
     sim_threshold: float = 0.985,
+    sim_threshold_floor: float = 0.90,
+    af_collinear_threshold: float = 0.95,
     random_state: int = 0,
 ) -> dict | None:
     """
     Port of get.fluor.variants().
 
+    Positive events are background-corrected (scatter-matched unstained
+    neighbours, or the control's own negatives), AF principal components are
+    projected out for cell controls, events still positive after an OLS unmix
+    are screened by cosine similarity to the reference spectrum (with
+    adaptive relaxation, see cosine_qc_select), and the survivors are
+    clustered with a som_dim x som_dim cosine-distance SOM (KMeans fallback,
+    see get_som_codes). Each node's spectral code, L-inf normalised and
+    shrunk toward the reference in off-peak channels, is a candidate variant.
+    Row 0 of the result is always the reference spectrum itself.
+
+    AF projection is skipped when the reference spectrum's cosine
+    similarity to any AF principal component reaches af_collinear_threshold:
+    a joint fit against near-collinear AF and fluorophore directions can push
+    real fluorophore signal into the AF term.
+
     Returns None when there isn't enough clean signal to characterise
     variation for `label` — caller should fall back to the single reference
     spectrum. Otherwise:
         {'v_mats': (n_variants, D), 'delta': (n_variants, D),
-         'delta_norms': (n_variants,), 'n_events_used': int}
+         'delta_norms': (n_variants,), 'n_events_used': int,
+         'cosine_threshold_used': float, 'af_collinear': bool}
     """
     reference_vec = np.asarray(reference_spectra[fluor_idx], dtype=np.float64)
 
@@ -243,15 +291,28 @@ def discover_fluor_variants(
         )
     else:
         neg_idx = np.setdiff1d(np.arange(len(pos_kept)), pos_idx)
-        if len(neg_idx) >= 50:
+        if len(neg_idx) > 50:
             background = pos_kept[neg_idx].mean(axis=0)
             spectral_sub = pos_kept[pos_idx] - background
         else:
             spectral_sub = pos_kept[pos_idx].copy()
 
-    # 4. AF PC projection — cell controls only.
+    # 4. AF PC projection — cell controls only, and only when the reference
+    #    is not collinear with an AF direction.
+    af_collinear = False
     if is_cell_control and af_pcs is not None and len(af_pcs) > 0:
-        spectral_sub = project_out_af_pcs(spectral_sub, af_pcs, reference_vec)
+        pc_norms = np.linalg.norm(af_pcs, axis=1) + 1e-9
+        ref_norm = np.linalg.norm(reference_vec) + 1e-9
+        af_pc_cosine = float(np.max(np.abs(af_pcs @ reference_vec) / (pc_norms * ref_norm)))
+        af_collinear = af_pc_cosine >= af_collinear_threshold
+        if af_collinear:
+            logger.info(
+                f'discover_fluor_variants: "{label}" is highly collinear with '
+                f'autofluorescence (cosine = {af_pc_cosine:.3f} >= {af_collinear_threshold}); '
+                f'skipping AF-component projection.'
+            )
+        else:
+            spectral_sub = project_out_af_pcs(spectral_sub, af_pcs, reference_vec)
 
     # 5. OLS unmix in full reference-spectra space.
     P_full = np.linalg.solve(reference_spectra @ reference_spectra.T, reference_spectra)
@@ -267,33 +328,31 @@ def discover_fluor_variants(
         return None
 
     # 6. Cosine-similarity QC against the reference spectrum.
-    cosine_idx, _cos_vals = cosine_qc_select(spectral_sub[keep_idx], reference_vec, sim_threshold)
+    cosine_idx, _cos_vals, threshold_used = cosine_qc_select(
+        spectral_sub[keep_idx], reference_vec, sim_threshold, sim_threshold_floor,
+    )
     if len(cosine_idx) < 20:
         logger.info(
             f'discover_fluor_variants: "{label}" — only {len(cosine_idx)} events '
-            f'passed cosine QC (>= {sim_threshold}), falling back to reference spectrum.'
+            f'passed cosine QC even at {sim_threshold_floor}, falling back to '
+            f'reference spectrum.'
         )
         return None
 
     final_idx = keep_idx[cosine_idx]
     event_n = len(final_idx)
 
-    # 7. Clustering — target variant count, auto-shrunk for small event counts.
-    n_clusters = variants
+    # 7. SOM clustering (cosine distance), grid shrunk for small event counts.
     if event_n < 500:
-        n_clusters = max(4, int(np.floor(event_n / 3)))
+        som_dim = max(2, int(np.floor(np.sqrt(event_n / 3))))
 
     cluster_input = np.concatenate(
         [unmixed_full[final_idx], spectral_sub[final_idx]], axis=1
     )
-    if event_n > 200_000:
-        km = MiniBatchKMeans(n_clusters=n_clusters, random_state=random_state, n_init='auto')
-    else:
-        km = KMeans(n_clusters=n_clusters, random_state=random_state, n_init='auto')
-    km.fit(cluster_input)
+    codes, engine = get_som_codes(cluster_input, som_dim, dist=4, random_state=random_state)
 
     n_channels = spectral_sub.shape[1]
-    centres_spectral = km.cluster_centers_[:, -n_channels:]
+    centres_spectral = codes[:, -n_channels:]
 
     # L-inf normalise (plain max, matching get_fluor_variants.R's `x / max(x)`).
     peak_vals = centres_spectral.max(axis=1, keepdims=True)
@@ -303,7 +362,7 @@ def discover_fluor_variants(
     v_mats = v_mats[valid]
 
     if len(v_mats) == 0:
-        logger.info(f'discover_fluor_variants: "{label}" — no valid cluster centroids, falling back to reference spectrum.')
+        logger.info(f'discover_fluor_variants: "{label}" — no valid SOM codes, falling back to reference spectrum.')
         return None
 
     # 8. Off-peak shrinkage: blend 50/50 toward the reference in channels
@@ -312,19 +371,24 @@ def discover_fluor_variants(
     v_mats_shrunk = v_mats.copy()
     v_mats_shrunk[:, ~peak_mask] = 0.5 * v_mats[:, ~peak_mask] + 0.5 * reference_vec[~peak_mask]
 
+    # Row 0 is always the reference spectrum itself.
+    v_mats_shrunk = np.vstack([reference_vec[np.newaxis, :], v_mats_shrunk])
+
     # 9. Delta matrix + norms.
     delta = v_mats_shrunk - reference_vec[np.newaxis, :]
     delta_norms = np.linalg.norm(delta, axis=1)
 
     logger.info(
-        f'discover_fluor_variants: "{label}" — {len(v_mats_shrunk)} variant(s) '
-        f'from {event_n} qualifying events.'
+        f'discover_fluor_variants: "{label}" — {len(v_mats_shrunk) - 1} variant(s) '
+        f'from {event_n} qualifying events ({som_dim}x{som_dim} {engine}).'
     )
     return {
         'v_mats': v_mats_shrunk,
         'delta': delta,
         'delta_norms': delta_norms,
         'n_events_used': event_n,
+        'cosine_threshold_used': threshold_used,
+        'af_collinear': af_collinear,
     }
 
 
@@ -370,12 +434,54 @@ def _resolve_unstained_cell_sample_names(samples: dict) -> list:
     return names
 
 
+def _unstained_threshold_entry(
+    unstained_raw: np.ndarray,
+    reference_spectra: np.ndarray,
+    fluor_names: list,
+    is_cell_control: bool,
+    n_af_pcs: int,
+    subsample_n: int = 100_000,
+    random_state: int = 0,
+) -> dict:
+    """
+    Positivity thresholds and AF-PC basis from one unstained sample.
+
+    Raw thresholds, AF PCs and the unmixed percentile use at most
+    `subsample_n` events (get_spectral_variants.R's gate.downsample.n.cells);
+    AF spectra for the unmixed thresholds are extracted from every event.
+    Cell samples get AF-extracted unmixed thresholds; bead samples plain OLS,
+    since AF extraction on beads isn't meaningful and discover_fluor_variants()
+    never projects AF out of bead controls.
+    """
+    subsample = unstained_raw
+    if len(subsample) > subsample_n:
+        rng = np.random.default_rng(random_state)
+        subsample = subsample[np.sort(rng.choice(len(subsample), subsample_n, replace=False))]
+
+    if is_cell_control:
+        af_pcs = compute_af_pcs_from_unstained(subsample, n_pcs=n_af_pcs)
+        unmixed = compute_af_extracted_unmixed_thresholds(
+            unstained_raw, subsample, reference_spectra, fluor_names,
+        )
+    else:
+        af_pcs = None
+        unmixed = compute_unmixed_positivity_thresholds(subsample, reference_spectra)
+
+    return {
+        'raw': compute_positivity_thresholds(subsample),
+        'unmixed': unmixed,
+        'af_pcs': af_pcs,
+    }
+
+
 def discover_all_variants(
     controller,
     n_cells: int = 10_000,
-    variants: int = 20,
+    som_dim: int = 5,
     k_neighbors: int = 3,
     sim_threshold: float = 0.985,
+    sim_threshold_floor: float = 0.90,
+    af_collinear_threshold: float = 0.95,
     n_af_pcs: int = 4,
     progress_callback=None,
 ) -> dict:
@@ -455,12 +561,9 @@ def discover_all_variants(
         if unstained_raw is None or len(unstained_raw) == 0:
             logger.warning(f'discover_all_variants: could not load events for unstained sample "{name}" — skipping.')
             continue
-        af_pcs = compute_af_pcs_from_unstained(unstained_raw, n_pcs=n_af_pcs)
-        threshold_cache[name] = {
-            'raw': compute_positivity_thresholds(unstained_raw),
-            'unmixed': compute_af_corrected_unmixed_thresholds(unstained_raw, reference_spectra, af_pcs),
-            'af_pcs': af_pcs,
-        }
+        threshold_cache[name] = _unstained_threshold_entry(
+            unstained_raw, reference_spectra, fluor_names_all, True, n_af_pcs,
+        )
 
     if not threshold_cache:
         raise ValueError(
@@ -487,12 +590,9 @@ def discover_all_variants(
         when there's no pairing or it can't be loaded.
 
         `is_cell_control` selects which unmixed-threshold calculation is
-        used: AF-corrected (fitting AF PCs on the paired sample) for cell
-        controls, matching the reference-spectrum-space intent of
+        used: AF-extracted for cell controls, matching
         `get_spectral_variants.R`'s `unmixed.thresholds`; plain OLS for
-        bead controls, since fitting AF PCs on bead data isn't meaningful
-        and `discover_fluor_variants()` never applies AF projection to
-        bead controls anyway (step 4 is gated on `is_cell_control`).
+        bead controls (see _unstained_threshold_entry()).
         Cell and bead entries for the same underlying sample name are
         cached separately so a sample used as both a cell and bead pairing
         (unusual, but not impossible) can't return the wrong entry type.
@@ -505,19 +605,9 @@ def discover_all_variants(
         paired_raw, _paired_scatter = _load_gated(sample_name, 'root')
         if paired_raw is None or len(paired_raw) == 0:
             return None
-        if is_cell_control:
-            paired_af_pcs = compute_af_pcs_from_unstained(paired_raw, n_pcs=n_af_pcs)
-            unmixed_thresholds = compute_af_corrected_unmixed_thresholds(
-                paired_raw, reference_spectra, paired_af_pcs
-            )
-        else:
-            paired_af_pcs = None
-            unmixed_thresholds = compute_unmixed_positivity_thresholds(paired_raw, reference_spectra)
-        entry = {
-            'raw': compute_positivity_thresholds(paired_raw),
-            'unmixed': unmixed_thresholds,
-            'af_pcs': paired_af_pcs,
-        }
+        entry = _unstained_threshold_entry(
+            paired_raw, reference_spectra, fluor_names_all, is_cell_control, n_af_pcs,
+        )
         threshold_cache[cache_key] = entry
         return entry
 
@@ -562,7 +652,7 @@ def discover_all_variants(
 
         # Prefer this control's own paired unstained sample for both
         # thresholds and the AF-PC basis (Major-Channel raw threshold +
-        # AF-corrected unmixed threshold, cells only — beads get plain-OLS
+        # AF-extracted unmixed threshold, cells only — beads get plain-OLS
         # thresholds, see _resolve_control_threshold_entry()); fall back to
         # the median-across-all-unstained-cell-samples entry when there's
         # no pairing or it can't be loaded.
@@ -591,8 +681,9 @@ def discover_all_variants(
             unmixed_pos_threshold=control_unmixed_pos_threshold,
             af_pcs=af_pcs,
             saturation_ceiling=saturation_ceiling,
-            n_cells=n_cells, variants=variants, k_neighbors=k_neighbors,
-            sim_threshold=sim_threshold,
+            n_cells=n_cells, som_dim=som_dim, k_neighbors=k_neighbors,
+            sim_threshold=sim_threshold, sim_threshold_floor=sim_threshold_floor,
+            af_collinear_threshold=af_collinear_threshold,
         )
         if variant_result is not None:
             results[label] = variant_result
@@ -711,6 +802,7 @@ def unmix_autospectral_optimization(
     joint_pair_resolution: bool = True,
     n_af_passes: int = 1,
     refine_af_quantile: float = 0.5,
+    exact_variant_scan: bool = False,
 ) -> dict:
     """
     Assembles the `variants` list from the Table section's active
@@ -732,9 +824,9 @@ def unmix_autospectral_optimization(
                     Labels with no entry in variants_meta are silently
                     skipped (AF-only contribution from that fluorophore).
     unmixed_pos_thresholds : (F,) float64, unmixed-space positivity
-                    thresholds — the cached, AF-corrected thresholds from
+                    thresholds — the cached, AF-extracted thresholds from
                     discover_all_variants() (see
-                    compute_af_corrected_unmixed_thresholds()). Callers with
+                    compute_af_extracted_unmixed_thresholds()). Callers with
                     no cached value available (Setup hasn't been run this
                     session) should pass all-zeros rather than recomputing
                     anything from the sample being processed — see
@@ -786,6 +878,7 @@ def unmix_autospectral_optimization(
         joint_pair_resolution=joint_pair_resolution,
         n_af_passes=n_af_passes,
         refine_af_quantile=refine_af_quantile,
+        exact_variant_scan=exact_variant_scan,
     )
     F = reference_spectra.shape[0]
     return {

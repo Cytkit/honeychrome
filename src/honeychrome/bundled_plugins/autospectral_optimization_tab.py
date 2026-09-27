@@ -93,11 +93,11 @@ class VariantSetupWorker(QObject):
     error = Signal(str)
     progress = Signal(int, int, str)
 
-    def __init__(self, controller, n_cells, variants, k_neighbors, sim_threshold):
+    def __init__(self, controller, n_cells, som_dim, k_neighbors, sim_threshold):
         super().__init__()
         self.controller = controller
         self.n_cells = n_cells
-        self.variants = variants
+        self.som_dim = som_dim
         self.k_neighbors = k_neighbors
         self.sim_threshold = sim_threshold
 
@@ -109,7 +109,7 @@ class VariantSetupWorker(QObject):
             output = discover_all_variants(
                 self.controller,
                 n_cells=self.n_cells,
-                variants=self.variants,
+                som_dim=self.som_dim,
                 k_neighbors=self.k_neighbors,
                 sim_threshold=self.sim_threshold,
                 progress_callback=_progress,
@@ -161,9 +161,6 @@ class JointComparisonWorker(QObject):
             plain_ols_data = apply_transfer_matrix(self.transfer_matrix, raw_sub)
 
             # Panel 2: AutoSpectral AF-corrected OLS (no variant optimization).
-            # Merge in joint-cov error weights so apply_af_unmixing takes the
-            # compiled C kernel path (AF_KERNEL_AVAILABLE) when present —
-            # without 'af_error_weights' it silently falls back to plain NumPy.
             af_precomputed = precompute_af_matrices(self.reference_spectra, self.af_spectra)
             af_precomputed.update(precompute_joint_cov_extras(af_precomputed, self.af_spectra))
             af_result = apply_af_unmixing(raw_fl, af_precomputed, self.af_spectra)
@@ -622,14 +619,14 @@ class PluginWidget(QWidget):
         setup_grp = QGroupBox('Setup')
         setup_form = QFormLayout(setup_grp)
         self._n_cells_spin = QSpinBox(); self._n_cells_spin.setRange(100, 1_000_000); self._n_cells_spin.setValue(10_000)
-        self._variants_spin = QSpinBox(); self._variants_spin.setRange(3, 200); self._variants_spin.setValue(20)
+        self._som_dim_spin = QSpinBox(); self._som_dim_spin.setRange(2, 20); self._som_dim_spin.setValue(5)
         self._k_neighbors_spin = QSpinBox(); self._k_neighbors_spin.setRange(1, 50); self._k_neighbors_spin.setValue(3)
         self._sim_threshold_spin = QDoubleSpinBox(); self._sim_threshold_spin.setRange(0.0, 1.0)
         self._sim_threshold_spin.setDecimals(3); self._sim_threshold_spin.setSingleStep(0.005); self._sim_threshold_spin.setValue(0.985)
-        for w in (self._n_cells_spin, self._variants_spin, self._k_neighbors_spin, self._sim_threshold_spin):
+        for w in (self._n_cells_spin, self._som_dim_spin, self._k_neighbors_spin, self._sim_threshold_spin):
             w.installEventFilter(WheelBlocker(w)); w.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         setup_form.addRow('n.cells:', self._n_cells_spin)
-        setup_form.addRow('variants:', self._variants_spin)
+        setup_form.addRow('som.dim:', self._som_dim_spin)
         setup_form.addRow('k.neighbors:', self._k_neighbors_spin)
         setup_form.addRow('sim.threshold:', self._sim_threshold_spin)
         adv_layout.addWidget(setup_grp)
@@ -775,7 +772,7 @@ class PluginWidget(QWidget):
         self._setup_worker = VariantSetupWorker(
             self.controller,
             n_cells=self._n_cells_spin.value(),
-            variants=self._variants_spin.value(),
+            som_dim=self._som_dim_spin.value(),
             k_neighbors=self._k_neighbors_spin.value(),
             sim_threshold=self._sim_threshold_spin.value(),
         )

@@ -3,8 +3,7 @@ build_autospectral_opt_kernel.py
 ----------------------------------
 Configure + build the _autospectral_opt_kernel pybind11/Armadillo extension
 and copy the resulting shared library next to this script, so
-autospectral_opt_kernel_wrapper.py's sys.path trick (same pattern as
-af_kernel_wrapper.py) can import it.
+autospectral_opt_kernel_wrapper.py's same-directory import can find it.
 
 Prerequisites (macOS, Apple Silicon, local dev):
     brew install armadillo libomp cmake

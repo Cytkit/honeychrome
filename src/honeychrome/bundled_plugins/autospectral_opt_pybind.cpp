@@ -1,9 +1,7 @@
 // autospectral_opt_pybind.cpp
 // ---------------------------------------------------------------------------
 // pybind11 binding over unmix_autospectral_joint_core() (core_joint_unmix.hpp).
-// Converts numpy arrays <-> Armadillo types; the R side has its own,
-// separate Rcpp wrapper (unmix_autospectral_joint_pipeline.cpp) which this
-// file does not touch or depend on.
+// Converts numpy arrays <-> Armadillo types.
 // ---------------------------------------------------------------------------
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -72,7 +70,8 @@ static py::array_t<double> unmix_autospectral_joint(
     double                      collinear_thresh,
     bool                        joint_pair_resolution,
     int                         n_af_passes,
-    double                      refine_af_quantile
+    double                      refine_af_quantile,
+    bool                        exact_variant_scan
 ) {
   std::vector<FluorVariantInput> cpp_variants;
   cpp_variants.reserve(variants.size());
@@ -99,7 +98,7 @@ static py::array_t<double> unmix_autospectral_joint(
       n_passes, n_threads, cell_weight,
       &nf,
       alpha, collinear_thresh, joint_pair_resolution,
-      n_af_passes, refine_af_quantile
+      n_af_passes, refine_af_quantile, exact_variant_scan
   );
 
   return arma_to_np(result);
@@ -115,7 +114,7 @@ PYBIND11_MODULE(_autospectral_opt_kernel, m) {
         py::arg("cell_weight") = false, py::arg("noise_floor") = py::none(),
         py::arg("alpha") = 0.5, py::arg("collinear_thresh") = 0.5,
         py::arg("joint_pair_resolution") = true, py::arg("n_af_passes") = 1,
-        py::arg("refine_af_quantile") = 0.5,
+        py::arg("refine_af_quantile") = 0.5, py::arg("exact_variant_scan") = false,
         "Joint per-cell AF + fluorophore-variant unmixing. Returns an "
         "(N, F+2) array: [fluor abundances | AF abundance | AF index (1-based)].");
 }
