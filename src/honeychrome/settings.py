@@ -150,6 +150,7 @@ n_fluorophore_channels = len(fluorescence_channel_ids)
 
 width_ceiling = 50_000 # nanoseconds
 default_ceiling = 60
+default_time_gate_ignore_start_seconds = 10
 # Max bins for the 'default' (Time) transform. Time can span tens of thousands
 # of units; a per-unit grid makes a Time gate's 2D lookup table huge and slow to
 # rebuild per sample. A few thousand bins is plenty for the histogram and gating.

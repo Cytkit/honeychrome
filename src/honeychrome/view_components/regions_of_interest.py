@@ -392,7 +392,7 @@ class RangeROI(pg.ROI):
         self.region.sigRegionChanged.connect(self.label.move_label_with_roi)
 
         # Connect actions
-        self.region.action_remove.triggered.connect(self.request_remove)
+        self.region.action_remove.triggered.connect(lambda: self.request_remove(delete_gate=True))
 
     def _line_moved(self, line):
         # Update region when a line moves

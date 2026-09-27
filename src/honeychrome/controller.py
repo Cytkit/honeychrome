@@ -457,6 +457,31 @@ class Controller(QObject):
         if self.bus is None:
             warnings.warn('No events bus connected')
 
+
+    def _rebuild_per_sample_lookup_tables(self):
+        """Rebuild lookup tables only for gates that touch a per-sample (default,
+        e.g. Time) transform, so they match THIS sample's scale.
+
+        Gates on fixed transforms (fluorescence, FSC/SSC) keep their cached table
+        — so a normal sample switch stays fast; only Time-involving gates pay the
+        rebuild cost (and the Time transform's bins are capped so it stays cheap).
+        """
+        scope = 'raw' if self.current_mode == 'raw' else 'unmixed'
+        if not self.data_for_cytometry_plots:
+            return
+        gating = self.data_for_cytometry_plots.get('gating')
+        transforms = self.data_for_cytometry_plots.get('transformations')
+        if gating is None:
+            return
+        for gate_id, gate_path in gating.get_gate_ids():
+            try:
+                channels = gating.get_gate(gate_id).get_dimension_ids()
+            except Exception:
+                continue
+            if any(getattr(transforms.get(ch), 'id', None) == 'default' for ch in channels):
+                self.calculate_lookup_tables(mode=scope, top_gate=gate_id)
+
+
     def apply_custom_sample_gates(self, scope=None):
         """Install this sample's overrides and refresh every affected lookup table."""
         if not self.current_sample_path:
@@ -490,6 +515,7 @@ class Controller(QObject):
             logger.warning('customise_gate: no sample loaded')
             return
         gating = self.raw_gating if scope == 'raw' else self.unmixed_gating
+        transformations = self.raw_transformations if scope == 'raw' else self.unmixed_transformations
         sample_id = self.current_sample_path
         if gating.is_custom_gate(sample_id, gate_name):
             return
@@ -501,6 +527,16 @@ class Controller(QObject):
         custom = deepcopy(template_gate)
         self.custom_sample_gates.setdefault(scope, {}).setdefault(sample_id, {})[gate_name] = custom
         install_custom_gate(gating, gate_name, custom, sample_id)
+
+        gate = gating.get_gate(gate_name, sample_id=sample_id)
+        channels = gate.get_dimension_ids()
+        for n, channel in enumerate(channels):
+            if channel == 'Time':
+                x1, x2 = transformations['Time'].limits
+                x1 = min(0.1 * x2, settings.default_time_gate_ignore_start_seconds)
+                dim_x = define_range_gate(x1, x2, channel, transformations)
+                gate.dimensions[n] = dim_x
+
         if self.bus is not None:
             self.bus.changedGatingHierarchy.emit(scope, gate_name)
         self.refresh_custom_gates_on_current_tab_for_current_sample(scope)
@@ -1564,6 +1600,13 @@ class Controller(QObject):
                 gating = self.data_for_cytometry_plots['gating']
                 if gating is None:
                     return
+
+                # Full recalculation: rebuild lookup tables ONLY for gates that use
+                # a per-sample (default, e.g. Time) transform, so they match this
+                # sample's scale. Fixed-transform gates (fluorescence, FSC/SSC) keep
+                # their cached table — rebuilding everything here was slow (laggy).
+                self._rebuild_per_sample_lookup_tables()
+
                 gate_membership = {'root': np.ones(len(self.data_for_cytometry_plots['event_data']), dtype=np.bool_)}
                 self.data_for_cytometry_plots.update({'gate_membership': gate_membership})
                 # self.data_for_cytometry_plots['gate_membership']['root'] = np.ones(len(self.data_for_cytometry_plots['event_data']), dtype=np.bool_)

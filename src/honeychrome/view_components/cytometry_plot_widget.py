@@ -864,7 +864,9 @@ class CytometryPlotWidget(QFrame):
 
         # create ROI
         if self.data_for_cytometry_plots['transformations'][self.plot['channel_x']].id == 'default':
-            x1, x2 = 0.35 * settings.default_ceiling, 0.65 * settings.default_ceiling
+            # x1, x2 = 0.35 * settings.default_ceiling, 0.65 * settings.default_ceiling
+            x1 = 0
+            x2 = settings.default_time_max_bins
         else:
             x1, x2 = 0.35, 0.65
 
