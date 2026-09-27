@@ -18,8 +18,8 @@ elsewhere in this plugin. It reads the transforms currently configured in
 the main Honeychrome experiment, but any adjustments you make here are
 <b>local previews only</b> — they are saved to this plugin's own settings,
 not written back to the experiment. To change the transforms used
-elsewhere in Honeychrome, use the Transforms panel in the main
-application.</p>
+elsewhere in Honeychrome, drag the same channel's axis on the main
+cytometry plots.</p>
 
 <h4>Before you start</h4>
 <ol>
