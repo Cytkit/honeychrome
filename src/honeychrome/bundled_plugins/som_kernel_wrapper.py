@@ -1,14 +1,13 @@
 """
 som_kernel_wrapper.py
 ----------------------
-Python interface to the compiled _som_kernel cffi extension.
+Python interface to the compiled _som_kernel cffi extension (som_kernel.c):
+OpenMP batch self-organising map training and nearest-code mapping.
 
-Batch SOM training + nearest-code mapping for the FlowSOM path of the
-DR/Clustering plugin (see flowsom_consensus.py). Replaces pyFlowSOM's
-compiled Cython extension (flowsom.c / cyFlowSOM.pyx) -- that extension is
-the retired online (per-event) Kohonen trainer, single-threaded, with an
-unverified arm64 wheel/source-build story (see flowsom_consensus.py's
-module docstring). Mirrors af_kernel_wrapper.py's structure.
+Used by the DR/Clustering plugin's FlowSOM path (flowsom_consensus.py) and
+by autospectral_functions.get_som_codes() for AutoSpectral autofluorescence
+and fluorophore-variant clustering, which falls back to KMeans when this
+kernel is unavailable.
 
 Usage
 -----

@@ -9,8 +9,7 @@ Run once at build time (or during development setup):
 The output is _som_kernel.<platform>.so (Linux) or
 _som_kernel.<platform>.dylib (macOS), placed alongside this script
 (honeychrome/bundled_plugins/) -- where som_kernel_wrapper.py's
-same-directory import trick finds it. Mirrors build_af_kernel.py; see
-that file for the OpenMP flag rationale.
+same-directory import trick finds it.
 
 OpenMP
 ------
@@ -60,8 +59,7 @@ use_openmp = os.environ.get('HONEYCHROME_OPENMP', '').strip() not in ('', '0', '
 # Default to OpenMP on for both platforms unless explicitly disabled
 # (HONEYCHROME_OPENMP=0). macOS's libomp check below already falls back to
 # single-threaded with a warning if libomp isn't installed, so there's no
-# need to gate the attempt behind an explicit opt-in the way the original
-# af_kernel build script does.
+# need to gate the attempt behind an explicit opt-in.
 if 'HONEYCHROME_OPENMP' not in os.environ:
     use_openmp = True
 

@@ -13,20 +13,14 @@ released ``anndata``/``flowsom`` pair currently supports it (confirmed via
 anndata's own dev-branch release notes: AnnData.X only becomes properly
 copy-on-write in the *upcoming* 0.14).
 
-The SOM step itself no longer uses ``angelolab/pyFlowSOM``: its C
-extension (``flowsom.c`` / ``cyFlowSOM.pyx``) is a single-threaded port of
-the classic online/per-event Kohonen trainer with no confirmed arm64 wheel
-(flagged, never resolved, in DR_CLUSTERING_REVAMP_PLAN.md). SOM training and
-assignment now go through ``som_kernel_wrapper.py`` — an in-house
-OpenMP-accelerated *batch* SOM kernel, the same algorithm AutoSpectral's
-``AutoSpectralRcpp::som_train_batch_cpp()`` already uses (see that
-project's ``som.R``/``som.cpp`` for the reference this was ported from).
-Batch training reads the codebook as it stood at the end of the previous
-epoch and updates it once per epoch (Gaussian neighbourhood kernel)
-instead of once per event (bubble kernel) — a different schedule from
-classic FlowSOM, not a bit-for-bit reproduction, but consensus
-metaclustering below is specifically designed to be robust to this kind of
-training-run codebook variation.
+SOM training and assignment go through ``som_kernel_wrapper.py``, the
+OpenMP batch SOM kernel (``som_kernel.c``) shared with AutoSpectral. Batch
+training reads the codebook as it stood at the end of the previous epoch
+and updates it once per epoch with a Gaussian neighbourhood kernel, rather
+than once per event with a bubble kernel as R FlowSOM does. Codebooks are
+therefore not bit-for-bit those of R FlowSOM, but the consensus
+metaclustering below is robust to this kind of run-to-run codebook
+variation.
 
 The R FlowSOM algorithm's consensus hierarchical metaclustering step
 (``ConsensusClusterPlus``, Monti et al. 2003) is implemented from scratch
@@ -53,10 +47,9 @@ _DISTF_EUCLIDEAN = 2
 
 
 def _grid_neighbor_distance(xdim: int, ydim: int) -> np.ndarray:
-    """Chebyshev distance between SOM grid nodes -- same convention
-    pyFlowSOM's neighborhood_distance() used, and the R FlowSOM/kohonen
-    default. Grid topology is unchanged by the kernel swap, only the
-    training algorithm that fills the codebook is."""
+    """Chebyshev distance between SOM grid nodes, the R FlowSOM/kohonen
+    convention. Nodes are numbered with x varying fastest, as in R's
+    expand.grid()."""
     grid = np.meshgrid(np.arange(1, xdim + 1), np.arange(1, ydim + 1))
     grid = np.column_stack((grid[0].flat, grid[1].flat))
     return distance_matrix(grid, grid, p=np.inf)
@@ -96,10 +89,8 @@ def train_som(data: np.ndarray, xdim: int, ydim: int, n_iter: int,
 
 
 def assign_to_nodes(node_weights: np.ndarray, data: np.ndarray) -> np.ndarray:
-    """Map each row of data to its nearest SOM node. Returns 0-based node
-    index per row. The in-house kernel returns clean 0-based indices by
-    construction -- no defensive index-convention detection needed (that
-    was only required for pyFlowSOM's undocumented 1-based return)."""
+    """Map each row of data to its nearest SOM node. Returns the 0-based
+    node index per row."""
     node_ids, _dists = som_kernel_wrapper.map_to_codes(
         data, node_weights, dist=_DISTF_EUCLIDEAN, n_threads=0,
     )

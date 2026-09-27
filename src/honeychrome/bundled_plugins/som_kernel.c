@@ -1,30 +1,41 @@
 /*
  * som_kernel.c
  * ------------
- * OpenMP batch Self-Organizing Map training + nearest-code assignment,
- * for the FlowSOM clustering path of the DR/Clustering plugin
- * (flowsom_consensus.py).
+ * Batch self-organising map (SOM) training and nearest-code assignment,
+ * parallelised with OpenMP. Shared by the DR/Clustering plugin's FlowSOM
+ * path (flowsom_consensus.py) and by AutoSpectral's autofluorescence and
+ * fluorophore-variant clustering (autospectral_functions.get_som_codes).
  *
- * Ported from AutoSpectral's som_train_batch_cpp() / map_data_to_codes_cpp()
- * (Rcpp), themselves adapted from EmbedSOM's bsom() -- see project history
- * (som.cpp, embedsom_som.cpp). Batch SOM: one full-dataset pass (epoch)
- * between codebook updates -- not pyFlowSOM's retired online/per-event
- * trainer. See flowsom_consensus.py module docstring for the rationale.
+ * Algorithm: Kohonen's batch map (Kohonen, Self-Organizing Maps, 3rd ed.,
+ * Springer, 2001), the same batch update used by EmbedSOM (Kratochvil,
+ * Koladiya and Vondrasek, F1000Research 2020). Each epoch assigns every
+ * event to its nearest code using the codebook as it stood at the end of
+ * the previous epoch, accumulates per-node event sums S_j and counts n_j,
+ * then sets every code to
  *
- * All 2-D arrays are C-contiguous (row-major), matching af_kernel.c's
- * convention: element (row, col) of an (nrow, ncol) array is
+ *     m_i = sum_j w_ij S_j / sum_j w_ij n_j,    w_ij = exp(-g_ij^2 / r^2)
+ *
+ * where g_ij is the grid distance between nodes i and j and r is the
+ * epoch's neighbourhood radius. A node whose denominator is zero keeps its
+ * previous code.
+ *
+ * The implementation follows AutoSpectralRcpp's som_train_batch_cpp() and
+ * map_data_to_codes_cpp(), with column-major Rcpp matrices replaced by
+ * C-contiguous arrays: element (row, col) of an (nrow, ncol) array is
  * ptr[row*ncol + col].
  *
- * Parallelisation strategy (same as som.cpp):
- *   - Assignment (Step 1) is parallelised over events, one accumulator
- *     buffer PER THREAD (heap arrays, indexed by omp_get_thread_num()),
- *     reduced serially afterward -- cheap relative to the assignment
- *     step itself.
- *   - Neighbourhood diffusion update (Step 2) is parallelised over
- *     destination node: each iteration only reads the already-reduced
- *     global sums and writes its own distinct row of the codebook.
+ * Parallelisation:
+ *   - Assignment is parallelised over events. Each thread accumulates into
+ *     its own heap buffer, indexed by omp_get_thread_num(), and the buffers
+ *     are summed serially afterwards, which is cheap next to the
+ *     assignment itself.
+ *   - The codebook update is parallelised over destination node: each
+ *     iteration reads only the reduced global sums and writes its own row.
  *
- * Compile: see build_som_kernel.py (cffi, mirrors build_af_kernel.py).
+ * Distance codes: 1 manhattan, 2 euclidean (default), 3 chebyshev,
+ * 4 cosine (1 - cosine similarity).
+ *
+ * Compile: see build_som_kernel.py (cffi).
  */
 
 #include <stdint.h>
@@ -38,9 +49,7 @@
 #endif
 
 /* ---- distance functions ------------------------------------------------
- * p1, p2: row pointers (px contiguous doubles each) -- already offset by
- * the caller, so no stride/leading-dimension argument needed (unlike the
- * Fortran-order version in som.cpp).
+ * p1 and p2 each point at the start of a row of px contiguous doubles.
  */
 
 static double dist_eucl(const double *p1, const double *p2, int px) {
@@ -62,9 +71,9 @@ static double dist_chebyshev(const double *p1, const double *p2, int px) {
 }
 
 static double dist_cosine(const double *p1, const double *p2, int px) {
-    double nom = 0.0, d1 = 0.0, d2 = 0.0;
-    for (int j = 0; j < px; j++) { nom += p1[j] * p2[j]; d1 += p1[j] * p1[j]; d2 += p2[j] * p2[j]; }
-    return (-nom / (sqrt(d1) * sqrt(d2))) + 1.0;
+    double dot = 0.0, aa = 0.0, bb = 0.0;
+    for (int j = 0; j < px; j++) { dot += p1[j] * p2[j]; aa += p1[j] * p1[j]; bb += p2[j] * p2[j]; }
+    return 1.0 - dot / (sqrt(aa) * sqrt(bb));
 }
 
 typedef double (*dist_fun)(const double *, const double *, int);
