@@ -333,10 +333,8 @@ def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray, af_state=Non
         live races against the main thread's controller.load_sample()/
         initialise_af_matrices(), which reassign these same attributes
         whenever the user loads/reloads a sample in the main window while
-        the worker is still running. The AF kernel operates on raw pointers
-        into these arrays (af_kernel_wrapper.py), so a concurrent
-        reassignment/GC of an array the worker is mid-read on is a memory-
-        corruption hazard, not just a stale-data one.
+        the worker is still running, so a live read could pair one sample's
+        transfer matrix with another sample's AF library.
     """
     if af_state is not None:
         transfer_matrix, af_precomputed, af_spectra = af_state
