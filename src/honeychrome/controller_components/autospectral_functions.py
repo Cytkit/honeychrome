@@ -5,10 +5,19 @@ AutoSpectral AF extraction for Honeychrome.
 
 Public API
 ----------
-get_af_spectra(unstained_raw, fluor_spectra, n_clusters)
-    Identifies AF spectral profiles from an unstained sample using KMeans
-    clustering.  Returns an (n_af, n_channels) ndarray of L-inf-normalised
-    AF spectra, with the population mean prepended as row 0.
+get_af_spectra(unstained_raw, fluor_spectra, som_dim)
+    Identifies AF spectral profiles from an unstained sample using SOM
+    clustering (KMeans when the compiled SOM kernel is unavailable), with
+    optional solver-validated refinement for poorly corrected cells.
+    Returns an (n_af, n_channels) ndarray of L-inf-normalised AF spectra,
+    with the population mean prepended as row 0.
+
+get_som_codes(data, som_dim, dist)
+    Batch SOM codebook via the compiled SOM kernel, falling back to KMeans.
+
+assign_af_joint_l2(raw_data, fluor_spectra, af_spectra)
+    Per-cell AF assignment by the joint covariance-weighted L2 fluorophore
+    error x L2 residual error criterion.
 
 apply_af_unmixing(raw_data, precomputed, af_spectra)
     Per-cell AF extraction and OLS unmixing for fluorescence channels only.
@@ -30,18 +39,11 @@ load_af_profile_csv(csv_path)
     Returns (profile_name, spectra_ndarray, channel_names).
 """
 
-import numpy as np
 import logging
+import sys
 from pathlib import Path
 
-try:
-    from honeychrome.controller_components.af_kernel_wrapper import (
-        joint_cov_l1_argmin as _c_joint_cov_l1_argmin,
-        AF_KERNEL_AVAILABLE,
-    )
-except ImportError:
-    _c_joint_cov_l1_argmin = None
-    AF_KERNEL_AVAILABLE    = False
+import numpy as np
 
 
 logger = logging.getLogger(__name__)
@@ -157,11 +159,14 @@ def precompute_af_matrices(fluor_spectra: np.ndarray, af_spectra: np.ndarray) ->
     Returns
     -------
     dict with keys:
-        P           : (n_fluors, n_channels)
+        P           : (n_fluors, n_channels)  OLS unmixing matrix
         S_t         : (n_channels, n_fluors)
-        v_library   : (n_fluors, n_af)
-        r_library   : (n_channels, n_af)
-        r_dots      : (n_af,)
+        v_library   : (n_fluors, n_af)  in-span projection of each AF variant
+        r_library   : (n_channels, n_af)  out-of-span residual of each variant
+        r_dots      : (n_af,)  squared norm of each r_library column. Not
+                      floored for identifiability here; that floor depends on
+                      the whole library, which may be several profiles
+                      combined, so it is applied at scoring time.
     """
     P = np.linalg.solve(fluor_spectra @ fluor_spectra.T, fluor_spectra)
     S_t = fluor_spectra.T
@@ -170,7 +175,7 @@ def precompute_af_matrices(fluor_spectra: np.ndarray, af_spectra: np.ndarray) ->
     v_library = P @ AF_t
     r_library = AF_t - S_t @ v_library
     r_dots = np.einsum('ij,ij->j', r_library, r_library)
-    r_dots = np.where(r_dots < 1e-20, 1e-20, r_dots)
+    r_dots = np.where(r_dots <= 0.0, 1e-10, r_dots)
 
     return {
         'P': P,
@@ -183,8 +188,11 @@ def precompute_af_matrices(fluor_spectra: np.ndarray, af_spectra: np.ndarray) ->
 
 def precompute_joint_cov_extras(precomputed: dict, af_spectra: np.ndarray) -> dict:
     """
-    Compute covariance-based fluorophore error weights for joint-cov L1 scoring.
-    Call once after precompute_af_matrices(); cache alongside af_precomputed.
+    Covariance-based fluorophore error weights for joint-cov L2 scoring: the
+    AF library's spectral covariance propagated into fluorophore space, with
+    the square root of its diagonal as the per-fluorophore weight. Call once
+    after precompute_af_matrices() (or after combining profiles, since the
+    weights depend on the full library); cache alongside af_precomputed.
     """
     P = precomputed['P']   # (n_fluors, n_channels)
     n_channels = af_spectra.shape[1]
@@ -206,6 +214,8 @@ def combine_af_precomputed(precomputed_list: list) -> dict:
     independent across profiles, combination is simply np.hstack — no further
     matrix algebra is needed.  P and S_t are identical for all profiles (they
     depend only on fluor_spectra) so we take them from the first entry.
+    af_error_weights depend on the combined library and must be recomputed
+    with precompute_joint_cov_extras() afterwards.
 
     Parameters
     ----------
@@ -278,10 +288,121 @@ def apply_af_transfer(raw_event_data, transfer_matrix, af_precomputed, af_spectr
 
 
 # ---------------------------------------------------------------------------
-# Per-sample unmixing
+# Per-cell AF assignment and unmixing
 # ---------------------------------------------------------------------------
 
-# after
+def _joint_l2_library_terms(precomputed: dict, af_spectra: np.ndarray):
+    """
+    Per-variant constants for the joint L2 score, taken across the whole
+    (possibly combined) AF library.
+
+    Returns (w, k_denom, c_fluor):
+        w       : (n_fluors,) covariance-derived fluorophore error weights
+        k_denom : (n_af,) r_dots floored at 1% of the largest. An AF variant
+                  lying almost inside the fluorophore span has a vanishing
+                  out-of-span residual, so its abundance is not identifiable
+                  and the raw ratio explodes; the floor caps that. Used only
+                  for the abundance estimate inside the score.
+        c_fluor : (n_af,) sum_f w_f * v_library[f, j]^2, the curvature of the
+                  weighted squared fluorophore error.
+    """
+    w = precomputed.get('af_error_weights')
+    if w is None:
+        w = precompute_joint_cov_extras(precomputed, af_spectra)['af_error_weights']
+    r_dots = precomputed['r_dots']
+    k_denom = np.maximum(r_dots, 0.01 * max(float(r_dots.max()), 1e-10))
+    c_fluor = w @ (precomputed['v_library'] ** 2)
+    return w, k_denom, c_fluor
+
+
+def _assign_af_chunk(chunk, precomputed, w, k_denom, c_fluor):
+    """
+    Joint covariance-weighted L2 fluorophore x L2 residual AF scoring for one
+    chunk of cells (port of AutoSpectral's assign.af.joint.cov.l2()).
+
+    For variant j with abundance k (clamped >= 0), both error terms are
+    quadratics in k:
+        e_fluor_j = base_e_fluor - 2k <w*u, v_j> + k^2 c_fluor_j
+        e_resid_j = base_e_resid - 2k <resid, r_j> + k^2 |r_j|^2
+    where u is the AF-free OLS unmix and resid the raw-space residual against
+    its non-negative part. Each term is one matrix product across the chunk,
+    so no (cells x fluors x variants) temporary is formed. The score is the
+    product of the two proportional errors; the variant minimising it wins.
+
+    Returns (best_j, numerator, unmixed):
+        best_j    : (B,) 0-based variant index
+        numerator : (B, n_af) chunk @ r_library
+        unmixed   : (B, n_fluors) AF-free OLS unmix
+    """
+    P         = precomputed['P']
+    S_t       = precomputed['S_t']
+    v_library = precomputed['v_library']
+    r_library = precomputed['r_library']
+    r_dots    = precomputed['r_dots']
+
+    unmixed = chunk @ P.T
+    resid   = chunk - np.maximum(unmixed, 0.0) @ S_t.T
+
+    base_e_fluor = (unmixed * unmixed) @ w + 1e-6
+    base_e_resid = np.einsum('ij,ij->i', resid, resid) + 1e-6
+
+    numerator = chunk @ r_library
+    k  = np.maximum(numerator / k_denom, 0.0)
+    k2 = k * k
+
+    e_fluor = (unmixed * w) @ v_library
+    e_fluor *= -2.0 * k
+    e_fluor += k2 * c_fluor
+    e_fluor += base_e_fluor[:, np.newaxis]
+    np.maximum(e_fluor, 0.0, out=e_fluor)
+    e_fluor /= base_e_fluor[:, np.newaxis]
+
+    e_resid = resid @ r_library
+    e_resid *= -2.0 * k
+    e_resid += k2 * r_dots
+    e_resid += base_e_resid[:, np.newaxis]
+    np.maximum(e_resid, 0.0, out=e_resid)
+    e_resid /= base_e_resid[:, np.newaxis]
+
+    e_fluor *= e_resid
+    best_j = np.argmin(e_fluor, axis=1)
+    return best_j, numerator, unmixed
+
+
+def assign_af_joint_l2(
+    raw_data: np.ndarray,
+    fluor_spectra: np.ndarray,
+    af_spectra: np.ndarray,
+    chunk_size: int = 50_000,
+) -> np.ndarray:
+    """
+    Assign each cell its best-fitting AF variant by the joint
+    covariance-weighted L2 fluorophore x L2 residual criterion.
+
+    Parameters
+    ----------
+    raw_data      : (n_cells, n_channels) raw fluorescence only
+    fluor_spectra : (n_fluors, n_channels)
+    af_spectra    : (n_af, n_channels)
+    chunk_size    : cells per processing batch
+
+    Returns
+    -------
+    ndarray (n_cells,) int64, 0-based row index into af_spectra.
+    """
+    precomputed = precompute_af_matrices(fluor_spectra, af_spectra)
+    precomputed.update(precompute_joint_cov_extras(precomputed, af_spectra))
+    w, k_denom, c_fluor = _joint_l2_library_terms(precomputed, af_spectra)
+
+    n_cells = raw_data.shape[0]
+    best = np.empty(n_cells, dtype=np.int64)
+    for start in range(0, n_cells, chunk_size):
+        end   = min(start + chunk_size, n_cells)
+        chunk = np.ascontiguousarray(raw_data[start:end], dtype=np.float64)
+        best[start:end] = _assign_af_chunk(chunk, precomputed, w, k_denom, c_fluor)[0]
+    return best
+
+
 def apply_af_unmixing(
     raw_data: np.ndarray,
     precomputed: dict,
@@ -291,16 +412,21 @@ def apply_af_unmixing(
     """
     Per-cell AF extraction and OLS unmixing (fluorescence channels only).
 
-    When the compiled C kernel is available (AF_KERNEL_AVAILABLE), uses joint
-    covariance-weighted L1 fluorophore × L2 residual scoring, parallelised
-    over cells with OpenMP.  Falls back to plain NumPy L1 if the extension
-    is absent or if af_error_weights is missing from precomputed.
+    Each cell is assigned the AF variant minimising the joint
+    covariance-weighted L2 fluorophore x L2 residual score (see
+    _assign_af_chunk), then solved jointly with the fluorophores by
+    Frisch-Waugh-Lovell, as in AutoSpectral's unmix.af.fwl(): the AF
+    abundance is the projection of the cell onto the variant's out-of-span
+    residual direction, and the fluorophore abundances are the AF-free OLS
+    solution minus that abundance times the variant's in-span projection.
+    Identical to an OLS solve against [fluor_spectra; af_spectra[j]] per cell.
 
     Parameters
     ----------
     raw_data    : (n_cells, n_channels) raw fluorescence only
     precomputed : dict from precompute_af_matrices(), optionally extended
-                  with precompute_joint_cov_extras() merged in
+                  with precompute_joint_cov_extras() merged in (computed here
+                  from af_spectra when absent)
     af_spectra  : (n_af, n_channels)
     chunk_size  : cells per processing batch
 
@@ -309,73 +435,28 @@ def apply_af_unmixing(
     dict with keys: unmixed (n_cells, n_fluors), af_scale (n_cells,),
                     af_idx (n_cells,) 1-based
     """
-    P         = precomputed['P']           # (n_fluors, n_channels)
     v_library = precomputed['v_library']   # (n_fluors, n_af)
-    r_library = precomputed['r_library']   # (n_channels, n_af)
     r_dots    = precomputed['r_dots']      # (n_af,)
-    S_t       = precomputed['S_t']         # (n_channels, n_fluors)
+    w, k_denom, c_fluor = _joint_l2_library_terms(precomputed, af_spectra)
 
-    w = precomputed.get('af_error_weights')
-    use_c = AF_KERNEL_AVAILABLE and w is not None
-
-    n_cells, _ = raw_data.shape
-    n_fluors   = P.shape[0]
+    n_cells  = raw_data.shape[0]
+    n_fluors = precomputed['P'].shape[0]
+    v_library_t = np.ascontiguousarray(v_library.T)
 
     unmixed_out  = np.empty((n_cells, n_fluors), dtype=np.float64)
     af_scale_out = np.empty(n_cells,             dtype=np.float64)
     af_idx_out   = np.empty(n_cells,             dtype=np.int32)
 
-    if use_c:
-        w       = np.ascontiguousarray(w, dtype=np.float64)
-        v_lib_c = np.ascontiguousarray(v_library, dtype=np.float64)
-
     for start in range(0, n_cells, chunk_size):
         end   = min(start + chunk_size, n_cells)
         chunk = np.ascontiguousarray(raw_data[start:end], dtype=np.float64)
-        B     = end - start
 
-        init_fluor = chunk @ P.T
-        K          = (chunk @ r_library) / r_dots[np.newaxis, :]
+        best_j, numerator, unmixed = _assign_af_chunk(
+            chunk, precomputed, w, k_denom, c_fluor
+        )
 
-        if use_c:
-            # L2 residual term — vectorised NumPy
-            init_fluor_nn = np.where(init_fluor < 0.0, 0.0, init_fluor)
-            resid_base    = chunk - init_fluor_nn @ S_t.T
-            rb_sq         = np.sum(resid_base ** 2, axis=1)
-            rb_rl         = resid_base @ r_library
-            er_sq         = (rb_sq[:, np.newaxis]
-                             - 2.0 * K * rb_rl
-                             + K ** 2 * r_dots[np.newaxis, :])
-            e_resid      = np.ascontiguousarray(np.sqrt(np.maximum(er_sq, 0.0)))
-            base_e_resid = np.sqrt(rb_sq) + 1e-6
-            base_e_fluor = (np.sum(w[np.newaxis, :] * np.abs(init_fluor), axis=1)
-                            + 1e-6)
-
-            # C kernel: L1 fluor scoring + argmin, OpenMP-parallel
-            best_j = _c_joint_cov_l1_argmin(
-                np.ascontiguousarray(init_fluor),
-                np.ascontiguousarray(K),
-                v_lib_c,
-                w,
-                np.ascontiguousarray(base_e_fluor),
-                e_resid,
-                np.ascontiguousarray(base_e_resid),
-            )
-        else:
-            # NumPy fallback: plain L1, 3D temporary
-            error = np.sum(
-                np.abs(
-                    init_fluor[:, :, np.newaxis]
-                    - K[:, np.newaxis, :] * v_library[np.newaxis, :, :]
-                ),
-                axis=1,
-            )
-            best_j = np.argmin(error, axis=1)
-
-        best_k   = K[np.arange(B), best_j]
-        best_af  = af_spectra[best_j]
-        residual = chunk - best_k[:, np.newaxis] * best_af
-        unmixed_out[start:end]  = residual @ P.T
+        best_k = numerator[np.arange(end - start), best_j] / r_dots[best_j]
+        unmixed_out[start:end]  = unmixed - best_k[:, np.newaxis] * v_library_t[best_j]
         af_scale_out[start:end] = best_k
         af_idx_out[start:end]   = best_j + 1
 
@@ -383,36 +464,161 @@ def apply_af_unmixing(
 
 
 # ---------------------------------------------------------------------------
+# Clustering engine: batch SOM with KMeans fallback
+# ---------------------------------------------------------------------------
+
+def _load_som_kernel():
+    """
+    Return the som_kernel_wrapper module from bundled_plugins/ when its
+    compiled kernel is importable, else None.
+    """
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        plugin_dir = Path(meipass) / 'honeychrome' / 'bundled_plugins'
+    else:
+        plugin_dir = Path(__file__).resolve().parent.parent / 'bundled_plugins'
+    if not (plugin_dir / 'som_kernel_wrapper.py').exists():
+        return None
+    if str(plugin_dir) not in sys.path:
+        sys.path.append(str(plugin_dir))
+    try:
+        import som_kernel_wrapper
+    except Exception as e:
+        logger.info(f'get_som_codes: SOM kernel wrapper could not be imported ({e}).')
+        return None
+    return som_kernel_wrapper if som_kernel_wrapper.SOM_KERNEL_AVAILABLE else None
+
+
+def get_som_codes(
+    data: np.ndarray,
+    som_dim: int,
+    dist: int = 2,
+    rlen: int = 10,
+    random_state: int = 42,
+    n_threads: int = 0,
+    unit_norm: bool = False,
+):
+    """
+    Codebook of a som_dim x som_dim self-organising map trained on `data`.
+
+    Mirrors AutoSpectral's get.som.codes(): a batch SOM on a square grid with
+    Chebyshev neighbour distances, the neighbourhood radius annealing over
+    `rlen` epochs from the 67th percentile of grid distances to a tenth of
+    that, and the codebook initialised from a random sample of rows. Uses the
+    compiled OpenMP kernel (bundled_plugins/som_kernel_wrapper.py) when it is
+    available; otherwise falls back to KMeans (MiniBatchKMeans above 200,000
+    rows) with som_dim**2 clusters. Under dist=4 the fallback clusters
+    unit-length rows but returns each cluster's mean on the original scale,
+    matching the SOM's cosine assignment with raw-value code updates.
+
+    With unit_norm=True every row is scaled to unit L2 length before
+    training (all-zero rows are dropped), as get.som.codes(unit.norm = TRUE)
+    does. Under dist=4 this makes each code the mean of unit event vectors,
+    so bright events do not dominate it. Cosine assignments are unchanged,
+    and the returned codes are on the unit-normalised scale.
+
+    Parameters
+    ----------
+    data         : (n, n_features)
+    som_dim      : grid side length; the codebook has som_dim**2 rows
+    dist         : 1 manhattan, 2 euclidean, 3 chebyshev, 4 cosine. The
+                   KMeans fallback treats anything other than 4 as euclidean.
+    rlen         : SOM training epochs
+    random_state : seed for the initial codebook / KMeans
+    n_threads    : OpenMP threads for the SOM kernel, 0 = all cores
+    unit_norm    : scale rows to unit L2 length before training
+
+    Returns
+    -------
+    (codes, engine) — codes (som_dim**2, n_features) float64; engine is
+    'som' or 'kmeans'.
+    """
+    data = np.ascontiguousarray(data, dtype=np.float64)
+    if unit_norm:
+        norms = np.linalg.norm(data, axis=1)
+        keep = norms > 0
+        data = np.ascontiguousarray(data[keep] / norms[keep, np.newaxis])
+    n_codes = int(som_dim) ** 2
+    if data.shape[0] < n_codes:
+        raise ValueError(
+            f'Not enough events ({data.shape[0]}) to initialise a '
+            f'{som_dim}x{som_dim} SOM ({n_codes} nodes).'
+        )
+
+    som = _load_som_kernel()
+    if som is not None:
+        grid = np.array([(i, j) for j in range(1, som_dim + 1) for i in range(1, som_dim + 1)],
+                        dtype=np.float64)
+        nhbrdist = np.abs(grid[:, np.newaxis, :] - grid[np.newaxis, :, :]).max(axis=2)
+        radius_start = float(np.percentile(nhbrdist, 67))
+        radii = np.linspace(radius_start, 0.1 * radius_start, rlen)
+        rng = np.random.default_rng(random_state)
+        init_codes = data[rng.choice(data.shape[0], n_codes, replace=False)]
+        codes = som.train_som_batch(
+            data, init_codes, nhbrdist, radii, dist=dist, n_threads=n_threads,
+        )
+        return codes, 'som'
+
+    from sklearn.cluster import KMeans, MiniBatchKMeans
+
+    if data.shape[0] > 200_000:
+        km = MiniBatchKMeans(n_clusters=n_codes, random_state=random_state, n_init='auto')
+    else:
+        km = KMeans(n_clusters=n_codes, random_state=random_state, n_init='auto')
+
+    if dist == 4:
+        norms = np.linalg.norm(data, axis=1, keepdims=True)
+        norms = np.where(norms < 1e-12, 1.0, norms)
+        labels = km.fit_predict(data / norms)
+        codes = np.zeros((n_codes, data.shape[1]), dtype=np.float64)
+        counts = np.bincount(labels, minlength=n_codes)
+        np.add.at(codes, labels, data)
+        filled = counts > 0
+        codes[filled] /= counts[filled, np.newaxis]
+        codes[~filled] = km.cluster_centers_[~filled]
+        return codes, 'kmeans'
+
+    km.fit(data)
+    return km.cluster_centers_, 'kmeans'
+
+
+# ---------------------------------------------------------------------------
 # AF spectra identification (training step)
 # ---------------------------------------------------------------------------
+
+def _row_normalise(m: np.ndarray) -> np.ndarray:
+    """Scale each row to unit L2 length (zero rows left as zero)."""
+    norms = np.linalg.norm(m, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-12, 1.0, norms)
+    return m / norms
+
 
 def _cosine_similarity_matrix(a: np.ndarray) -> np.ndarray:
     """
     Compute pairwise cosine similarity for rows of a.
     Returns an (n, n) matrix in [-1, 1].
     """
-    norms = np.linalg.norm(a, axis=1, keepdims=True)
-    norms = np.where(norms < 1e-12, 1.0, norms)
-    a_norm = a / norms
+    a_norm = _row_normalise(a)
     return a_norm @ a_norm.T
 
 
 def _deduplicate_spectra(
     spectra: np.ndarray,
-    cosine_threshold: float = 0.99,
+    cosine_threshold: float = 0.995,
 ) -> np.ndarray:
     """
     Greedy cosine-similarity deduplication.
 
     Iterates through rows in order, keeping a row only if its cosine
-    similarity to every already-kept row is below cosine_threshold.
+    similarity to every already-kept row is below cosine_threshold. Row 0 is
+    always kept.
 
     Parameters
     ----------
     spectra : ndarray, shape (n, n_channels)
         L-inf-normalised spectra.
     cosine_threshold : float
-        Rows more similar than this to any kept row are dropped.
+        Rows at or above this similarity to any kept row are dropped.
 
     Returns
     -------
@@ -452,26 +658,18 @@ def _qc_af_spectra(
     if len(af_spectra) == 0:
         return af_spectra
 
-    # Normalise both sets
-    def _row_normalise(m):
-        norms = np.linalg.norm(m, axis=1, keepdims=True)
-        norms = np.where(norms < 1e-12, 1.0, norms)
-        return m / norms
-
-    af_norm    = _row_normalise(af_spectra)
-    fluor_norm = _row_normalise(fluor_spectra)
-
     # sim[i, j] = cosine similarity of af_spectra[i] to fluor_spectra[j]
-    sim = af_norm @ fluor_norm.T   # (n_af, n_fluors)
-    contaminated = (sim >= cosine_threshold).any(axis=1)
+    sim = _row_normalise(af_spectra) @ _row_normalise(fluor_spectra).T
+    contaminated = (sim > cosine_threshold).any(axis=1)
     n_removed = contaminated.sum()
     if n_removed:
         logger.warning(
             f'get_af_spectra: removed {n_removed} AF spectrum/spectra '
-            f'with cosine similarity >= {cosine_threshold} to a fluorophore '
+            f'with cosine similarity > {cosine_threshold} to a fluorophore '
             f'(likely control contamination in unstained sample).'
         )
     return af_spectra[~contaminated]
+
 
 def _filter_contaminant_events(
     event_mat: np.ndarray,
@@ -512,37 +710,46 @@ def _filter_contaminant_events(
 def get_af_spectra(
     unstained_raw: np.ndarray,
     fluor_spectra: np.ndarray,
-    n_clusters: int = 100,
-    min_cells: int = 200,
+    som_dim: int = 10,
+    min_cells: int = 100,
     random_state: int = 42,
-    cosine_threshold: float = 0.99,
+    deduplicate: bool = True,
+    duplication_threshold: float = 0.995,
     refine: bool = True,
     problem_quantile: float = 0.99,
+    k_neighbors: int = 15,
+    refine_improvement_threshold: float = 0.005,
+    refine_min_shift_n: int = 8,
+    remove_contaminants: bool = True,
     contaminant_threshold: float = 0.99,
 ) -> np.ndarray:
     """
-    Identify AF spectral profiles from an unstained sample.
+    Identify AF spectral profiles from an unstained sample. Port of
+    AutoSpectral's get.af.spectra().
 
     Stage 1 — Base spectra
     ----------------------
-    KMeans clusters the unstained events in raw+OLS-unmixed space, as before.
-    After L-inf normalisation the centroids are deduplicated by cosine
-    similarity (threshold cosine_threshold) to remove near-identical profiles
-    that cause spurious matching of near-zero events.  A contamination QC
-    filter then removes any spectrum resembling a fluorophore.  The population
-    mean is prepended as row 0.
+    Events whose background-subtracted cosine similarity to any fluorophore
+    reaches contaminant_threshold are dropped. The remaining events are
+    clustered in raw + OLS-unmixed space with a som_dim x som_dim SOM
+    (KMeans fallback, see get_som_codes). Node codes are L-inf normalised,
+    their mean is prepended as row 0, spectra resembling a fluorophore are
+    removed, and near-duplicates are collapsed by cosine similarity.
 
     Stage 2 — Refine
-    -----------------------------------------
-    Runs a first-pass AF unmixing on the unstained sample using the base
-    spectra.  Cells whose post-correction fluorophore L2 norm exceeds
-    problem_quantile are "problem cells" — inadequately corrected events still
-    far from zero.  Their per-channel error is normalised by the AF scale
-    factor (spill ratios) and re-clustered.  For each error cluster, modulated
-    versions of the contributing base spectra are created:
-        updated = base_spec * (1 + median_ratio),  re-normalised L-inf
-    These targeted spectra are appended to the base library and the full set
-    is passed through contamination QC again.
+    ----------------
+    Every event is assigned an AF variant (assign_af_joint_l2) and unmixed.
+    Cells whose post-correction fluorophore L2 norm is above problem_quantile
+    are "problem cells". They are grouped by the pattern of their
+    detector-space error (normalised by AF abundance) with a second SOM, and
+    each group's cells seed a k_neighbors nearest-neighbour search across the
+    whole population, so a candidate spectrum is built from a density-boosted
+    set rather than from the sparse seeds alone. A candidate is appended only
+    when, added to the library, the per-cell solver moves at least
+    refine_min_shift_n of its seeds onto it and those cells' cosine
+    similarity to their assigned spectrum improves: median gain at least
+    refine_improvement_threshold and 25th-percentile gain above zero, paired
+    per cell.
 
     Parameters
     ----------
@@ -550,265 +757,290 @@ def get_af_spectra(
         Raw fluorescence channel data from the unstained control.
     fluor_spectra : ndarray, shape (n_fluors, n_channels)
         L-infinity-normalised fluorophore spectra (from spectral model).
-    n_clusters : int
-        Target KMeans cluster count for the base stage (capped by sample
-        size).  After deduplication the actual count will typically be much
-        lower.
+    som_dim : int
+        SOM grid side length; up to som_dim**2 base spectra before QC and
+        deduplication. Shrunk automatically below 500 events.
     min_cells : int
-        Minimum number of events required; raises ValueError if not met.
+        Minimum events required after contaminant filtering.
     random_state : int
         Random seed for reproducibility.
-    cosine_threshold : float
-        Cosine similarity threshold for deduplicating base spectra.
-        Rows more similar than this to any already-kept row are dropped.
-        Default 0.99.
+    deduplicate : bool
+        Whether to collapse near-identical base spectra.
+    duplication_threshold : float
+        Cosine similarity at or above which a spectrum counts as a duplicate
+        of one already kept; also the novelty bar for refine candidates.
     refine : bool
-        Whether to run the second-pass refinement stage.  Default False.
+        Whether to run the refinement stage.
     problem_quantile : float
-        Quantile of post-correction fluorophore L2 norm used to define
-        "problem cells" for the refine stage.  Default 0.99 (top 1%).
+        Quantile of post-correction fluorophore L2 norm defining problem
+        cells; stepped down by 0.05 until at least 500 cells qualify.
+    k_neighbors : int
+        Nearest neighbours recruited per seed cell for each candidate.
+    refine_improvement_threshold : float
+        Minimum median paired cosine gain for a candidate to be accepted.
+    refine_min_shift_n : int
+        Minimum seed cells that must switch to a candidate before it is
+        evaluated.
+    remove_contaminants : bool
+        Whether to filter fluorophore-like events and spectra.
     contaminant_threshold : float
-        Used twice: (1) per-event pre-clustering filter — events in the
-        mean-background-subtracted unstained sample whose cosine similarity
-        to any fluorophore spectrum meets or exceeds this value are dropped
-        before clustering; (2) post-clustering QC — cosine similarity to a
-        fluorophore above which a resulting AF spectrum is considered
-        contamination and removed.  Default 0.99.
+        Cosine similarity to a fluorophore for the per-event filter (>=) and
+        for rejecting refine candidates (>=).
 
     Returns
     -------
     ndarray, shape (n_af, n_channels)
         Row 0 is the population mean of the base spectra; subsequent rows
-        are deduplicated base spectra and (if refine=True) modulated spectra
-        for problem cells.
+        are the retained base spectra followed by any accepted refine
+        spectra.
     """
-    from sklearn.cluster import KMeans, MiniBatchKMeans
+    unstained_raw = np.asarray(unstained_raw, dtype=np.float64)
+    fluor_spectra = np.asarray(fluor_spectra, dtype=np.float64)
+    n_channels = unstained_raw.shape[1]
 
-    n_cells, n_channels = unstained_raw.shape
-    n_fluors = fluor_spectra.shape[0]
+    # -------------------------------------------------------------------------
+    # Stage 1 — Base spectra
+    # -------------------------------------------------------------------------
 
+    # Per-event contaminant filter, on mean-background-subtracted data so the
+    # check targets contamination spikes rather than the baseline AF shape.
+    if remove_contaminants:
+        unstained_orth = unstained_raw - unstained_raw.mean(axis=0)[np.newaxis, :]
+        keep = _filter_contaminant_events(unstained_orth, fluor_spectra, contaminant_threshold)
+        n_removed = int((~keep).sum())
+        if n_removed > 0:
+            logger.info(
+                f'get_af_spectra: removed {n_removed} event(s) prior to clustering '
+                f'(cosine similarity >= {contaminant_threshold} to a fluorophore spectrum '
+                f'on background-subtracted data)'
+            )
+            unstained_raw = unstained_raw[keep]
+
+    n_cells = unstained_raw.shape[0]
     if n_cells < min_cells:
         raise ValueError(
             f'Insufficient cells in unstained sample: {n_cells} < {min_cells}. '
             f'Provide a larger unstained control.'
         )
-
-    n_clusters = max(2, min(n_clusters, n_cells // 3))
-
-    # -------------------------------------------------------------------------
-    # Stage 1 — Base spectra via KMeans
-    # -------------------------------------------------------------------------
+    if n_cells < 500:
+        som_dim = max(2, int(np.floor(np.sqrt(n_cells / 3))))
 
     # OLS unmix without AF — used as additional clustering features
     P = np.linalg.solve(fluor_spectra @ fluor_spectra.T, fluor_spectra)
-    unmixed_no_af = unstained_raw @ P.T   # (n_cells, n_fluors)
+    unmixed_no_af = unstained_raw @ P.T
+    cluster_input = np.concatenate([unstained_raw, unmixed_no_af], axis=1)
 
-    # Per-event contaminant filter before clustering.
-    # Subtract mean background first so the cosine-similarity check targets
-    # contamination spikes rather than the baseline AF shape itself.
-    sample_mean = unstained_raw.mean(axis=0)
-    unstained_orth = unstained_raw - sample_mean[np.newaxis, :]
-    keep = _filter_contaminant_events(unstained_orth, fluor_spectra, contaminant_threshold)
-    n_removed = int((~keep).sum())
-    if n_removed > 0:
-        logger.info(
-            f'get_af_spectra: removed {n_removed} event(s) prior to clustering '
-            f'(cosine similarity >= {contaminant_threshold} to a fluorophore spectrum '
-            f'on background-subtracted data)'
-        )
-    unstained_raw_cl = unstained_raw[keep]
-    unmixed_no_af_cl = unmixed_no_af[keep]
+    codes, engine = get_som_codes(cluster_input, som_dim, dist=2, random_state=random_state)
+    logger.info(f'get_af_spectra: {som_dim}x{som_dim} codebook via {engine}')
 
-    cluster_input = np.concatenate([unstained_raw_cl, unmixed_no_af_cl], axis=1)
-
-    if n_cells > 200_000:
-        km = MiniBatchKMeans(n_clusters=n_clusters, random_state=random_state, n_init='auto')
-    else:
-        km = KMeans(n_clusters=n_clusters, random_state=random_state, n_init='auto')
-
-    km.fit(cluster_input)
-    centres_spectral = km.cluster_centers_[:, :n_channels]
-
-    # L-infinity normalise
-    peak_vals = np.abs(centres_spectral).max(axis=1, keepdims=True)
-    peak_vals = np.where(peak_vals < 1e-12, 1.0, peak_vals)
-    af_candidates = centres_spectral / peak_vals
+    # L-infinity normalise; codes with no signal are dropped
+    centres_spectral = codes[:, :n_channels]
+    peak_vals = np.abs(centres_spectral).max(axis=1)
+    usable = peak_vals > 1e-12
+    af_candidates = centres_spectral[usable] / peak_vals[usable, np.newaxis]
     af_candidates = af_candidates[~np.isnan(af_candidates).any(axis=1)]
 
-    # Deduplicate: collapse near-identical spectral shapes
-    af_candidates = _deduplicate_spectra(af_candidates, cosine_threshold)
-    logger.info(
-        f'get_af_spectra: {len(af_candidates)} base spectra after deduplication '
-        f'(cosine_threshold={cosine_threshold})'
-    )
-
-    # Contamination QC: remove any spectrum resembling a fluorophore
-    af_candidates = _qc_af_spectra(af_candidates, fluor_spectra, contaminant_threshold)
-
-    if len(af_candidates) == 0:
-        raise ValueError(
-            'All AF candidate spectra were removed by contamination QC. '
-            'Check whether the unstained sample contains single-stained events.'
-        )
-
-    # Prepend population mean of the deduplicated base spectra
+    # Prepend the population mean of all node spectra
     mean_af = af_candidates.mean(axis=0)
     mean_peak = np.abs(mean_af).max()
     if mean_peak > 1e-12:
         mean_af = mean_af / mean_peak
     af_spectra = np.vstack([mean_af[np.newaxis, :], af_candidates])
 
+    # Contamination QC: remove any spectrum resembling a fluorophore
+    if remove_contaminants:
+        af_spectra = _qc_af_spectra(af_spectra, fluor_spectra, contaminant_threshold)
+        if len(af_spectra) == 0:
+            raise ValueError(
+                'All AF candidate spectra were removed by contamination QC. '
+                'Check whether the unstained sample contains single-stained events.'
+            )
+
+    if deduplicate:
+        n_before = len(af_spectra)
+        af_spectra = _deduplicate_spectra(af_spectra, duplication_threshold)
+        logger.info(
+            f'get_af_spectra: {len(af_spectra)} base spectra retained after '
+            f'deduplication (dropped {n_before - len(af_spectra)})'
+        )
+
     logger.info(f'get_af_spectra: {af_spectra.shape[0]} spectra after stage 1')
 
     # -------------------------------------------------------------------------
-    # Stage 2 — Refine: targeted modulation for problem cells
+    # Stage 2 — Refine
     # -------------------------------------------------------------------------
 
     if refine:
-
-        # First-pass per-cell unmixing on the unstained sample using base spectra
-        precomputed = precompute_af_matrices(fluor_spectra, af_spectra)
-        first_pass  = apply_af_unmixing(unstained_raw, precomputed, af_spectra)
-
-        unmixed_fluors = first_pass['unmixed']   # (n_cells, n_fluors)
-        af_scale       = first_pass['af_scale']  # (n_cells,)  — scalar k per cell
-        af_idx_0based  = first_pass['af_idx'] - 1  # convert to 0-based
-
-        # Error magnitude: L2 norm of fluorophore channels after correction.
-        # In an unstained sample any residual fluorophore signal is correction error.
-        error_magnitude = np.sqrt(np.sum(unmixed_fluors ** 2, axis=1))  # (n_cells,)
-
-        # Identify problem cells — those still furthest from zero.
-        # Step the quantile down in 5% increments until we have enough cells,
-        # mirroring the R fallback loop.
-        pq = problem_quantile
-        while True:
-            threshold   = np.quantile(error_magnitude, pq)
-            problem_idx = np.where(error_magnitude > threshold)[0]
-            problem_n   = len(problem_idx)
-            if problem_n >= 500:
-                break
-            pq -= 0.05
-            if pq < 0.5:
-                # Accept whatever we have at the 50% mark
-                threshold   = np.quantile(error_magnitude, pq)
-                problem_idx = np.where(error_magnitude > threshold)[0]
-                problem_n   = len(problem_idx)
-                break
-
-        if problem_n > 10:
-            # Per-channel error for the problem cells.
-            # error = residuals + proj_fluor in R; here we use the unmixed
-            # fluorophore values directly — in an unstained sample these are
-            # purely error (no true fluorophore signal present).
-            # Shape: (problem_n, n_fluors)
-            fluor_error = unmixed_fluors[problem_idx]
-
-            # Normalise by AF scale to get dimensionless spill ratios,
-            # matching R: spill.ratios = error[problem.idx, ] / af.abundance
-            af_scale_problem = af_scale[problem_idx]
-            af_scale_problem = np.where(
-                np.abs(af_scale_problem) < 1e-6, 1e-6, af_scale_problem
-            )
-            spill_ratios = fluor_error / af_scale_problem[:, np.newaxis]  # (problem_n, n_fluors)
-
-            # Re-cluster the spill ratios to find distinct error patterns
-            error_som_dim = max(2, int(np.floor(np.sqrt(problem_n / 3))))
-            n_error_clusters = error_som_dim ** 2
-
-            if problem_n > 200_000:
-                km_err = MiniBatchKMeans(
-                    n_clusters=n_error_clusters, random_state=random_state, n_init='auto'
-                )
-            else:
-                km_err = KMeans(
-                    n_clusters=n_error_clusters, random_state=random_state, n_init='auto'
-                )
-            km_err.fit(spill_ratios)
-            error_labels = km_err.labels_   # (problem_n,)
-
-            # For each error cluster: find contributing base AF indices,
-            # compute the median spill ratio, modulate each contributing spectrum.
-            modulated = []
-            for cl in np.unique(error_labels):
-                cl_mask    = error_labels == cl
-                cl_ratios  = spill_ratios[cl_mask]            # (cl_n, n_fluors)
-                global_idx = problem_idx[cl_mask]
-
-                # Median correction pattern for this cluster
-                median_ratio = np.median(cl_ratios, axis=0)   # (n_fluors,)
-
-                # Which base AF spectra were assigned to these problem cells?
-                contributing = np.unique(af_idx_0based[global_idx])
-
-                for base_idx in contributing:
-                    base_spec = af_spectra[base_idx]                        # (n_channels,)
-                    # The spill_ratios are in fluorophore space (n_fluors),
-                    # but we need to modulate in detector space (n_channels).
-                    # Project the median ratio back to detector space via S_t.
-                    # ratio_detector = S_t @ median_ratio  (n_channels,)
-                    ratio_detector = fluor_spectra.T @ median_ratio          # (n_channels,)
-                    updated = base_spec * (1.0 + ratio_detector)
-                    peak = np.abs(updated).max()
-                    if peak > 1e-12:
-                        updated = updated / peak
-                    if not np.isnan(updated).any():
-                        modulated.append(updated)
-
-            if modulated:
-                modulated_arr = np.vstack(modulated)   # (n_modulated, n_channels)
-
-                # Step 1: deduplicate modulated spectra against each other
-                modulated_arr = _deduplicate_spectra(modulated_arr, cosine_threshold)
-
-                # Step 2: drop any modulated spectrum too similar to an
-                # already-kept base spectrum.
-                # Build cross-similarity: (n_modulated, n_af_existing)
-                def _row_normalise(m):
-                    norms = np.linalg.norm(m, axis=1, keepdims=True)
-                    norms = np.where(norms < 1e-12, 1.0, norms)
-                    return m / norms
-
-                mod_norm      = _row_normalise(modulated_arr)
-                existing_norm = _row_normalise(af_spectra)
-                cross_sim     = mod_norm @ existing_norm.T   # (n_modulated, n_af_existing)
-                novel_mask    = (cross_sim < cosine_threshold).all(axis=1)
-                modulated_arr = modulated_arr[novel_mask]
-
-                n_novel = len(modulated_arr)
-                logger.info(
-                    f'get_af_spectra refine: {n_novel} novel modulated spectra after '
-                    f'deduplication (dropped {len(modulated) - n_novel} redundant)'
-                )
-
-                if n_novel > 0:
-                    af_spectra = np.vstack([af_spectra, modulated_arr])
-
-                    # NA guard
-                    af_spectra = af_spectra[~np.isnan(af_spectra).any(axis=1)]
-
-                    # Contamination QC on the expanded set
-                    af_spectra = _qc_af_spectra(
-                        af_spectra, fluor_spectra, contaminant_threshold
-                    )
-
-                    if len(af_spectra) == 0:
-                        raise ValueError(
-                            'All AF spectra were removed by contamination QC '
-                            'after refine stage.'
-                        )
-                else:
-                    logger.info(
-                        'get_af_spectra refine: all modulated spectra were '
-                        'duplicates of existing base spectra — nothing appended.'
-                    )
-
-        else:
-            logger.info(
-                f'get_af_spectra refine: only {problem_n} problem cells found — '
-                f'skipping modulation (need > 10).'
-            )
+        af_spectra = _refine_af_spectra(
+            unstained_raw, fluor_spectra, af_spectra,
+            problem_quantile=problem_quantile,
+            k_neighbors=k_neighbors,
+            improvement_threshold=refine_improvement_threshold,
+            min_shift_n=refine_min_shift_n,
+            duplication_threshold=duplication_threshold,
+            remove_contaminants=remove_contaminants,
+            contaminant_threshold=contaminant_threshold,
+            random_state=random_state,
+        )
 
     logger.info(f'get_af_spectra: returning {af_spectra.shape[0]} AF spectra total')
     return af_spectra
 
+
+def _refine_af_spectra(
+    unstained_raw: np.ndarray,
+    fluor_spectra: np.ndarray,
+    af_spectra: np.ndarray,
+    problem_quantile: float,
+    k_neighbors: int,
+    improvement_threshold: float,
+    min_shift_n: int,
+    duplication_threshold: float,
+    remove_contaminants: bool,
+    contaminant_threshold: float,
+    random_state: int,
+) -> np.ndarray:
+    """
+    Refinement stage of get_af_spectra(): discover AF spectra for cells the
+    base library under-corrects, keeping only candidates the per-cell solver
+    demonstrably prefers. Returns the (possibly extended) library.
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    # First-pass per-cell AF assignment and unmixing
+    precomputed = precompute_af_matrices(fluor_spectra, af_spectra)
+    precomputed.update(precompute_joint_cov_extras(precomputed, af_spectra))
+    first_pass = apply_af_unmixing(unstained_raw, precomputed, af_spectra)
+
+    unmixed_fluors = first_pass['unmixed']
+    af_abundance   = first_pass['af_scale']
+    af_assign      = first_pass['af_idx'].astype(np.int64) - 1
+
+    # Detector-space error: raw minus fitted AF, i.e. residual plus the
+    # fluorophore projection — all of it is error in an unstained sample.
+    error = unstained_raw - af_abundance[:, np.newaxis] * af_spectra[af_assign]
+
+    # Problem cells: still furthest from zero after correction. Step the
+    # quantile down in 5% increments until at least 500 cells qualify.
+    error_magnitude = np.sqrt(np.sum(unmixed_fluors ** 2, axis=1))
+    pq = problem_quantile
+    while True:
+        threshold   = np.quantile(error_magnitude, pq)
+        problem_idx = np.where(error_magnitude > threshold)[0]
+        if len(problem_idx) >= 500:
+            break
+        pq -= 0.05
+        if pq < 0.5:
+            threshold   = np.quantile(error_magnitude, pq)
+            problem_idx = np.where(error_magnitude > threshold)[0]
+            break
+    problem_n = len(problem_idx)
+
+    logger.info(
+        f'get_af_spectra refine: {problem_n} problem cells selected '
+        f'(quantile = {pq:.2f}, threshold = {threshold:.2f})'
+    )
+    if problem_n <= 10:
+        logger.info('get_af_spectra refine: insufficient problem cells - skipping.')
+        return af_spectra
+
+    # Group problem cells by their error pattern (spill ratios)
+    af_abundance_problem = af_abundance[problem_idx].copy()
+    af_abundance_problem[af_abundance_problem == 0] = 1e-6
+    spill_ratios = error[problem_idx] / af_abundance_problem[:, np.newaxis]
+
+    som_dim_error = min(10, max(2, int(np.floor(np.sqrt(problem_n / 3)))))
+    codes_error, _engine = get_som_codes(
+        spill_ratios, som_dim_error, dist=2, random_state=random_state,
+    )
+    sq_dist = (
+        np.sum(spill_ratios ** 2, axis=1)[:, np.newaxis]
+        - 2.0 * spill_ratios @ codes_error.T
+        + np.sum(codes_error ** 2, axis=1)[np.newaxis, :]
+    )
+    error_assign = np.argmin(sq_dist, axis=1)
+    _, first_seen = np.unique(error_assign, return_index=True)
+    cluster_ids = error_assign[np.sort(first_seen)]
+
+    # Density boost: each seed recruits its nearest neighbours (unit-length
+    # spectra) from the whole population.
+    pool_unit = _row_normalise(unstained_raw)
+    k_eff = min(int(k_neighbors), len(pool_unit))
+    nn_index = NearestNeighbors(n_neighbors=k_eff).fit(pool_unit).kneighbors(
+        pool_unit[problem_idx], return_distance=False
+    )
+
+    accepted_n = 0
+    for cl in cluster_ids:
+        cl_sub_idx = np.where(error_assign == cl)[0]
+        seed_idx   = problem_idx[cl_sub_idx]
+        enriched_idx = np.unique(np.concatenate([seed_idx, nn_index[cl_sub_idx].ravel()]))
+
+        candidate = pool_unit[enriched_idx].mean(axis=0)
+        peak = np.abs(candidate).max()
+        if peak <= 1e-12:
+            continue
+        candidate = candidate / peak
+        candidate_unit = candidate / np.linalg.norm(candidate)
+
+        # Cheap novelty and contamination filters before the solver check
+        if np.max(_row_normalise(af_spectra) @ candidate_unit) >= duplication_threshold:
+            continue
+        if remove_contaminants and \
+                np.max(_row_normalise(fluor_spectra) @ candidate_unit) >= contaminant_threshold:
+            continue
+
+        # Does the solver prefer this candidate for its own seeds?
+        trial_spectra = np.vstack([af_spectra, candidate[np.newaxis, :]])
+        candidate_row = trial_spectra.shape[0] - 1
+        trial_assign = assign_af_joint_l2(unstained_raw[seed_idx], fluor_spectra, trial_spectra)
+        shifted = np.where(trial_assign == candidate_row)[0]
+        if len(shifted) < min_shift_n:
+            continue
+
+        # Paired before/after cosine similarity of each switching cell to its
+        # assigned spectrum
+        shifted_global  = seed_idx[shifted]
+        raw_shifted     = unstained_raw[shifted_global]
+        before_spectrum = af_spectra[af_assign[shifted_global]]
+        raw_norm = np.linalg.norm(raw_shifted, axis=1)
+
+        before_denom = raw_norm * np.linalg.norm(before_spectrum, axis=1)
+        after_denom  = raw_norm * np.linalg.norm(candidate)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            before_cos = np.where(
+                before_denom > 0,
+                np.einsum('ij,ij->i', raw_shifted, before_spectrum) / before_denom,
+                np.nan,
+            )
+            after_cos = np.where(after_denom > 0, (raw_shifted @ candidate) / after_denom, np.nan)
+        delta = after_cos - before_cos
+        if not np.isfinite(delta).any():
+            continue
+        median_delta = float(np.nanmedian(delta))
+        q25_delta    = float(np.nanquantile(delta, 0.25))
+
+        # The typical switching cell must clear the margin, and the worse-off
+        # quarter must still gain, so a few large gains cannot carry the rest.
+        if median_delta < improvement_threshold or q25_delta <= 0:
+            continue
+
+        af_spectra = trial_spectra
+        accepted_n += 1
+        logger.info(
+            f'get_af_spectra refine: group {cl} accepted - {len(shifted)}/{len(seed_idx)} '
+            f'seed cells shifted (n={len(enriched_idx)} enriched), median cosine gain '
+            f'{median_delta:.4f}.'
+        )
+
+    if accepted_n > 0:
+        if remove_contaminants:
+            af_spectra = _qc_af_spectra(af_spectra, fluor_spectra, contaminant_threshold)
+        logger.info(
+            f'get_af_spectra refine: {af_spectra.shape[0]} total AF spectra '
+            f'after discovery and QC'
+        )
+    else:
+        logger.info('get_af_spectra refine: no candidate spectra cleared validation - nothing appended.')
+
+    return af_spectra
