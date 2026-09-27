@@ -78,7 +78,6 @@ jobs:
           security unlock-keychain -p "" build.keychain
 
           brew install libomp
-          python src/honeychrome/controller_components/build_af_kernel.py
 
           make build
           brew install create-dmg
@@ -96,14 +95,6 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-
-      - name: Build AF C kernel (Windows)
-        if: matrix.os == 'windows-2022'
-        shell: cmd
-        env:
-          HONEYCHROME_OPENMP: "1"
-        run: |
-          python src/honeychrome/controller_components/build_af_kernel.py
 
       - name: Build Windows
         if: matrix.os == 'windows-2022'

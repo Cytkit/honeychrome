@@ -67,8 +67,7 @@ option(HONEYCHROME_OPENMP "Enable OpenMP in the AutoSpectral Optimization kernel
 
 if(HONEYCHROME_OPENMP)
   if(APPLE)
-    # Reuses the same Homebrew-libomp detection approach as
-    # build_af_kernel.py's macOS branch (lines 62-74), translated to CMake.
+    # Homebrew libomp detection, same approach as build_som_kernel.py.
     execute_process(
       COMMAND brew --prefix libomp
       OUTPUT_VARIABLE LIBOMP_PREFIX

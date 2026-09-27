@@ -35,35 +35,9 @@ def get_project_files():
     label_data_destination = os.path.join('honeychrome', 'data')
     assets.append((label_data_path, label_data_destination))
 
-    # C kernel extension (compiled before this script runs)
-    kernel_dir = os.path.join(
-        project_root, 'src', 'honeychrome', 'controller_components'
-    )
-    kernel_dest = os.path.join('honeychrome', 'controller_components')
-    for fname in os.listdir(kernel_dir):
-        if fname.startswith('_af_kernel') and fname.split('.')[-1] in ('so', 'pyd', 'dylib'):
-            assets.append((os.path.join(kernel_dir, fname), kernel_dest))
-
-    # macOS: bundle libomp.dylib explicitly — Homebrew path is non-standard
-    # and PyInstaller will not find it via normal shared-library scanning.
-    # On Windows/Linux the OpenMP runtime (vcomp.dll / libgomp.so) is found
-    # automatically and needs no explicit entry here.
-    if platform.system() == 'Darwin':
-        try:
-            libomp_prefix = subprocess.check_output(
-                ['brew', '--prefix', 'libomp'], stderr=subprocess.DEVNULL
-            ).decode().strip()
-            libomp_path = os.path.join(libomp_prefix, 'lib', 'libomp.dylib')
-            if os.path.exists(libomp_path):
-                # Place alongside the kernel extension so @loader_path resolves it
-                assets.append((libomp_path, kernel_dest))
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            print('WARNING: libomp not found via brew — OpenMP will not be '
-                  'available in the built app; falling back to NumPy path.')
-
-    # AutoSpectral Optimization kernel (bundled_plugins/) also links OpenMP on
-    # macOS, but unlike _af_kernel it is never hidden-imported (loaded
-    # dynamically by plugin_loaders.py), so PyInstaller's Analysis phase never
+    # AutoSpectral Optimization kernel (bundled_plugins/) links OpenMP on
+    # macOS, but it is never hidden-imported (loaded dynamically by
+    # plugin_loaders.py), so PyInstaller's Analysis phase never
     # sees it as a binary dependency and never applies its automatic
     # @loader_path rewrite. Copying libomp.dylib alongside it is not sufficient
     # on its own — the compiled extension's own load command still points at
@@ -148,7 +122,6 @@ def main():
     args.append('--hidden-import=honeychrome')
     args.append('--hidden-import=honeychrome.settings')
     args.append('--hidden-import=honeychrome.plugin_loaders')
-    args.append('--hidden-import=honeychrome.controller_components.af_kernel_wrapper')
     args.append('--runtime-hook=hooks/runtime-patch-syspath.py')
 
     # Add project files

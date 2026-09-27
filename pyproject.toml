@@ -86,9 +86,6 @@ where = ["src"]
 "honeychrome" = [
     "data/*.csv",
     "**/*.svg", "**/*.png", "**/*.ico", "**/*.fcs",
-    "controller_components/_af_kernel*.so",
-    "controller_components/_af_kernel*.dylib",
-    "controller_components/_af_kernel*.pyd",
 ]
 
 # Optional: Testing configuration
