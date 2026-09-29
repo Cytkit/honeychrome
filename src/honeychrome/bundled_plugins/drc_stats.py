@@ -1,47 +1,48 @@
 """
-drc_stats.py — Differential statistics (inmoose/limma) for the DR/Clustering plugin
-===================================================================================
+drc_stats.py — Differential statistics for the DR/Clustering plugin
+===================================================================
 Companion to ``dr_clustering_tab.py`` (filename intentionally NOT ``*_tab.py``).
 
-Computes cluster-frequency and cluster-MFI differential statistics between two
-sample groups via ``inmoose.limma`` (lmFit → eBayes → topTable).
+Tests cluster abundance and per-cluster marker expression between sample
+groups:
 
-Added a parallel negative-binomial GLM (statsmodels) path for cluster
-differential ABUNDANCE on raw counts, run alongside the Frequency/limma test. 
-Both remain independently selectable so the two can be
-compared on the same data. MFI/differential-expression testing is unaffected;
-it stays on the limma/InMoose path either way.
+* Frequencies — log2 of each cluster's share of a sample's events, tested
+  with a moderated linear model (``moderated_stats``: least squares per
+  cluster, empirical Bayes variance moderation after Smyth 2004).
+* Counts — raw event counts per cluster, tested with a negative-binomial
+  GLM (statsmodels) with a log(total events) offset.
+* MFIs — mean transformed intensity of each marker within each cluster,
+  tested with the same moderated linear model. A cluster with no events in
+  a sample is missing (NaN) for that sample, not 0.
 
-Fixes baked in (see the diagnosis docs):
-  • S0 — inmoose ``topTable`` returns a DEResults object whose columns are
-         ``log2FoldChange / AveExpr / stat / pvalue / adj_pvalue / B``. These are
-         normalised to the R/limma names (``logFC / P.Value / adj.P.Val / t``)
-         the rest of the plugin (volcano/heatmap/significant) already expects.
-  • S1 — feature labels are recovered via ``tt.index`` (not row position), so
-         ``topTable``'s sort order never causes a relabelling mismatch.
-  • S2 — MFI channel values come from drc_pipeline (correct channel→column map),
-         not a filtered-index lookup against full-width data.
-  • S6 — each sample's FCS is loaded ONCE, not once per channel.
+Every test builds one design matrix: an intercept, one indicator per
+non-baseline group, optional pairing (blocking) levels, and optional
+adjustment covariates — numeric columns enter as centred continuous
+terms, anything else as treatment-coded factors.
 
-Group bookkeeping note: ``state.sample_groups`` values are the
-group's own name (a free-form user-defined string) or the reserved
-'Unassigned' sentinel — there is no longer a slot/display-name split (that
-indirection, and the S3 bug it existed to guard against, are both gone: a
-rename now rewrites every affected sample_groups entry directly).
+Significance is set by ``apply_significance``:
 
-Phase 2 adds true N-group testing: ``state.testing_group_selection`` picks
-which groups participate in Frequency/Counts/MFI/Confusion-Matrix/
-Composition-by-group, ``state.contrast_mode`` ('reference' | 'pairwise')
-plus ``state.reference_group`` decide the contrast(s), and
-``state.paired``/``state.pairing_variable`` add an optional fixed-effect
-blocking term (patsy formula ``+ C(pair_id)`` — InMoose documents no
-``duplicateCorrelation``-style random-effect blocking, so this is a
-fixed-effect-only approach). Results carry
-a ``comparison`` column when more than one contrast was run.
+* TREAT (McCarthy & Smyth 2009): with ``use_treat`` the p-value tests
+  whether |effect| exceeds the threshold, instead of filtering on the
+  estimate after testing for a non-zero effect.
+* FDR: Benjamini–Hochberg, pooled over every comparison ('global') or
+  within each comparison ('per_comparison').
+* Cluster-first MFI testing (``hierarchical=True``): clusters are screened
+  first (Simes-combined p-value of their markers, BH across clusters);
+  markers are then tested only inside selected clusters, at the level
+  adjusted for the number of clusters selected (Benjamini & Bogomolov
+  2014).
 
-``state.compare_group_a``/``state.compare_group_b`` remain — but only for
-T-REX now (its neighbour-fraction score is only defined for two
-conditions), not for anything in this module.
+Results carry the estimate's standard error and degrees of freedom, so a
+threshold change re-derives p-values and significance without refitting.
+
+Contrasts: ``state.contrast_mode`` 'reference' fits once across every
+tested group and reads one coefficient per non-reference group;
+'pairwise' fits each pair of groups separately. Results carry a
+``comparison`` column.
+
+``state.compare_group_a``/``state.compare_group_b`` are used only by
+T-REX, not by this module.
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ from sklearn.decomposition import PCA
 
 import drc_pipeline
 from drc_logging import get_logger, log_stage
+from honeychrome.controller_components import moderated_stats as ms
 
 log = get_logger(__name__)
 
@@ -273,6 +275,151 @@ def build_contrasts(group_names: list[str], mode: str,
         raise ValueError(f"contrast_mode must be 'reference' or 'pairwise', got {mode!r}")
 
 
+# ---------------------------------------------------------------------------
+# Design matrix and covariates
+# ---------------------------------------------------------------------------
+
+def _is_numeric_column(values) -> bool:
+    """True when every non-blank value parses as a finite float."""
+    seen = False
+    for v in values:
+        text = str(v).strip()
+        if not text:
+            continue
+        try:
+            if not np.isfinite(float(text)):
+                return False
+        except ValueError:
+            return False
+        seen = True
+    return seen
+
+
+def covariate_kind(values) -> str:
+    """'numeric' when every filled value is a number, else 'categorical'."""
+    return 'numeric' if _is_numeric_column(values) else 'categorical'
+
+
+def missing_covariate_values(state, all_rel: list[str], names: list[str]) -> dict[str, list[str]]:
+    """
+    {covariate name: [rel paths with no value]} for each of ``names``
+    that is missing (or blank) for at least one sample in ``all_rel``.
+    """
+    missing: dict[str, list[str]] = {}
+    cov = state.covariates
+    for name in names:
+        bad = [
+            rel for rel in all_rel
+            if cov is None or name not in cov.columns or rel not in cov.index
+            or not str(cov.loc[rel, name]).strip()
+        ]
+        if bad:
+            missing[name] = bad
+    return missing
+
+
+def covariate_frame(state, all_rel: list[str], names: list[str]) -> pd.DataFrame | None:
+    """
+    Adjustment covariates for ``all_rel`` (rows in that order), as strings.
+    Returns None when ``names`` is empty. Raises RuntimeError if any sample
+    lacks a value.
+    """
+    names = [n for n in names if n]
+    if not names:
+        return None
+    missing = missing_covariate_values(state, all_rel, names)
+    if missing:
+        detail = "; ".join(
+            f"'{name}': " + ", ".join(Path(r).stem for r in rels[:5])
+            + (" …" if len(rels) > 5 else "")
+            for name, rels in missing.items()
+        )
+        raise RuntimeError(f"Adjustment covariates have missing values — {detail}")
+    return pd.DataFrame(
+        {name: [str(state.covariates.loc[rel, name]).strip() for rel in all_rel]
+         for name in names},
+        index=list(all_rel),
+    )
+
+
+def build_design(group_vec: list[str], baseline: str,
+                 pairing_vec: list[str] | None = None,
+                 covariates: pd.DataFrame | None = None):
+    """
+    Treatment-coded design matrix.
+
+    Columns, in order: intercept; one indicator per non-baseline group (in
+    order of first appearance); one indicator per pairing level except the
+    first in sorted order; then each covariate — numeric columns centred,
+    categorical columns as indicators for every level except the first in
+    sorted order. Covariates that are constant over these samples are
+    dropped.
+
+    Returns (X, column_names, group_columns) where group_columns maps each
+    non-baseline group to its column index. Raises RuntimeError naming the
+    term that makes the design rank-deficient.
+    """
+    n = len(group_vec)
+    cols = [np.ones(n)]
+    names = ['(Intercept)']
+    group_cols: dict[str, int] = {}
+    for g in dict.fromkeys(group_vec):
+        if g == baseline:
+            continue
+        group_cols[g] = len(cols)
+        cols.append(np.array([1.0 if x == g else 0.0 for x in group_vec]))
+        names.append(f"group[{g}]")
+    if baseline not in group_vec:
+        raise RuntimeError(f"Baseline group {baseline!r} has no samples in this comparison.")
+
+    def _rank_ok() -> bool:
+        return np.linalg.matrix_rank(np.column_stack(cols)) == len(cols)
+
+    if pairing_vec is not None:
+        levels = sorted(set(pairing_vec))
+        for lvl in levels[1:]:
+            cols.append(np.array([1.0 if x == lvl else 0.0 for x in pairing_vec]))
+            names.append(f"pair[{lvl}]")
+        if not _rank_ok():
+            raise RuntimeError(
+                "The design is rank-deficient with the pairing variable — check "
+                "for missing values, or pairing levels confounded with group."
+            )
+
+    if covariates is not None:
+        for name in covariates.columns:
+            values = covariates[name].tolist()
+            if len(set(values)) < 2:
+                log.info("covariate %r is constant over these samples — dropped", name)
+                continue
+            added = []
+            if covariate_kind(values) == 'numeric':
+                x = np.array([float(v) for v in values])
+                added.append((x - x.mean(), f"{name}"))
+            else:
+                for lvl in sorted(set(values))[1:]:
+                    added.append((np.array([1.0 if v == lvl else 0.0 for v in values]),
+                                  f"{name}[{lvl}]"))
+            for col, label in added:
+                cols.append(col)
+                names.append(label)
+            if not _rank_ok():
+                raise RuntimeError(
+                    f"Covariate '{name}' is confounded with group or pairing in this "
+                    "comparison (e.g. every sample of one group shares one level). "
+                    "Remove it from the adjustment list."
+                )
+
+    X = np.column_stack(cols)
+    if not _rank_ok():
+        raise RuntimeError("The design matrix is rank-deficient.")
+    return X, names, group_cols
+
+
+def _subset_rows(values, mask):
+    return None if values is None else [v for v, m in zip(values, mask) if m]
+
+
 def n_clusters_from_labels(state, all_rel, cluster_labels_override=None) -> int:
     """Number of (non-noise) clusters across the given samples. 0-based labels,
     so result = max_label + 1. Guards the all-noise case."""
@@ -348,6 +495,40 @@ def compute_counts(state, all_rel, n_clusters, cluster_labels_override=None,
     return df
 
 
+def sample_event_totals(state, all_rel, cluster_labels_override=None) -> np.ndarray:
+    """Events per sample, including noise (-1) labels — the frequency denominator."""
+    cluster_labels = cluster_labels_override if cluster_labels_override is not None \
+        else state.cluster_labels
+    return np.array([len(np.asarray(cluster_labels[rel])) for rel in all_rel], dtype=float)
+
+
+def log2_frequencies(counts_df: pd.DataFrame, totals) -> pd.DataFrame:
+    """
+    log2 of each cluster's percentage of the sample's events, with half an
+    event added to every count (and one to every total) so empty clusters
+    stay finite: log2((count + 0.5) / (total + 1) · 100). Differences on
+    this scale are log2 fold changes of frequency.
+    """
+    totals = np.asarray(totals, dtype=float)[:, None]
+    vals = np.log2((counts_df.values.astype(float) + 0.5) / (totals + 1.0) * 100.0)
+    return pd.DataFrame(vals, index=counts_df.index, columns=counts_df.columns)
+
+
+def mfi_feature_table(state, n_clusters: int, channels: list[str],
+                      names_override: dict | None = None) -> pd.DataFrame:
+    """
+    One row per compute_mfis() column, in the same order: feature name,
+    cluster display label, cluster index and channel.
+    """
+    rows = []
+    for ch in channels:
+        for cl in range(n_clusters):
+            label = _label_for(state, cl, names_override)
+            rows.append({'feature': f'{label}_{ch}', 'cluster': label,
+                         'cluster_id': cl, 'channel': ch})
+    return pd.DataFrame(rows)
+
+
 def resolve_mfi_channels(state, include_type_markers: bool = False) -> list[str]:
     """
     Return the channel list MFI significance testing should use, filtered
@@ -370,11 +551,13 @@ def compute_mfis(controller, state, all_rel, n_clusters,
     """
     Per-sample mean intensity of each selected channel within each cluster.
 
-    Returns (n_samples by (n_clusters · n_channels)). Loads each sample's
-    selected-channel values ONCE via drc_pipeline, each channel on its own
-    configured Transforms-tab scale (Logicle/biexponential/linear — the
-    same scale the main cytometry plots and Transforms tab use), then
-    iterates channels in memory.
+    Returns (n_samples by (n_clusters · n_channels)), columns ordered
+    channel-major (every cluster for the first channel, then the next).
+    Loads each sample's selected-channel values ONCE via drc_pipeline, each
+    channel on its own configured Transforms-tab scale (Logicle/
+    biexponential/linear — the same scale the main cytometry plots and
+    Transforms tab use), then iterates channels in memory. A cluster with
+    no events in a sample is NaN there: it has no intensity to compare.
 
     channels: explicit channel list to test. Defaults to every
               selected channel when not supplied,
@@ -399,7 +582,7 @@ def compute_mfis(controller, state, all_rel, n_clusters,
 
     frames = []
     for ch in channels:
-        mfi_mat = np.zeros((len(all_rel), n_clusters), dtype=float)
+        mfi_mat = np.full((len(all_rel), n_clusters), np.nan, dtype=float)
         for i, rel in enumerate(all_rel):
             mv = sample_vals.get(rel)
             if mv is None:
@@ -551,7 +734,8 @@ def compute_sample_pca(state, use_freq: bool, use_counts: bool, use_mfi: bool,
 
     means = combined.mean(axis=0)
     stds = combined.std(axis=0, ddof=0)
-    z = (combined - means) / stds
+    # Missing MFIs (cluster absent from a sample) sit at the column mean.
+    z = ((combined - means) / stds).fillna(0.0)
 
     n_comp = min(2, z.shape[0], z.shape[1])
     pca = PCA(n_components=n_comp)
@@ -608,7 +792,7 @@ def compute_confusion_matrix(controller, state, cluster_labels_override=None,
     Pools each group's events across its samples, normalizes each group's
     total event count to ``normalize_to``, then for every cluster returns
     the normalized share contributed by each group. Independent of any
-    limma results — usable as soon as groups are assigned and a clustering
+    differential test results — usable as soon as groups are assigned and a clustering
     run is selected (same availability gate as run_statistics(), via
     resolve_test_groups()'s ≥3-per-group check).
 
@@ -709,183 +893,131 @@ def get_frequency_table(controller, state, group_var: str = 'sample',
 
 
 # ---------------------------------------------------------------------------
-# limma
+# Moderated linear model
 # ---------------------------------------------------------------------------
 
-def _limma_fit_one(data_df: pd.DataFrame, group_vec: list[str], baseline: str,
-                   other: str, pairing_vec: list[str] | None) -> pd.DataFrame:
+_TOO_FEW_FEATURES = (
+    "Only {n} feature(s) to test (need >= 3) for {other!r} vs {base!r} — this "
+    "usually means the current clustering run produced too few clusters for "
+    "differential testing. Increase clustering granularity (e.g. lower "
+    "HDBSCAN's min_cluster_size) and re-run, or test a space/run with more "
+    "clusters."
+)
+
+
+def _moderated_fit_contrasts(data_df: pd.DataFrame, group_vec: list[str],
+                             contrasts: list[tuple[str, str]],
+                             pairing_vec: list[str] | None,
+                             covariates: pd.DataFrame | None) -> pd.DataFrame:
     """
-    One lmFit → eBayes → topTable call for a single baseline-vs-other
-    coefficient, against whatever samples/groups are already in data_df/
-    group_vec (the caller decides whether that's the full N-group set —
-    'reference' mode, calling this once per contrast against ONE shared
-    fit — or a 2-group subset — 'pairwise' mode, calling this once per
-    pair with its own fit). Shared by both modes in run_limma() below.
+    One moderated fit over data_df's samples, read out for every contrast
+    in ``contrasts`` (all sharing one baseline). Returns the stacked
+    per-contrast tables with 'feature' and 'comparison' columns.
     """
-    from inmoose.limma import lmFit, eBayes, topTable
-    import patsy
-
-    sample_info = pd.DataFrame({'group': group_vec})
-    formula = f"~ C(group, Treatment({baseline!r}))"
-    if pairing_vec is not None:
-        sample_info['pair_id'] = pairing_vec
-        formula += " + C(pair_id)"
-    design = patsy.dmatrix(formula, sample_info, return_type='dataframe')
-
-    if np.linalg.matrix_rank(design.values) < design.shape[1]:
-        raise RuntimeError(
-            f"Design matrix for {other!r} vs {baseline!r} is rank-deficient — "
-            "check the pairing variable for missing or group-confounded values."
-        )
-
-    expr = data_df.values.T.astype(float)        # (features, samples)
+    base = contrasts[0][0]
+    X, _names, group_cols = build_design(group_vec, base, pairing_vec, covariates)
+    expr = data_df.values.T.astype(float)            # (features, samples)
     n_features = expr.shape[0]
     if n_features < 3:
-        # See eBayes' Infdf/squeezeVar note — fails
-        # clearly here instead of a bare KeyError deep inside inmoose.
-        raise RuntimeError(
-            f"Only {n_features} feature(s) to test (need >= 3) for "
-            f"{other!r} vs {baseline!r} — this usually means the current "
-            "clustering run produced too few clusters for differential "
-            "testing. Increase clustering granularity (e.g. lower HDBSCAN's "
-            "min_cluster_size) and re-run, or test a space/run with more "
-            "clusters."
-        )
-
-    design_col_name = f"C(group, Treatment({baseline!r}))[T.{other}]"
+        raise RuntimeError(_TOO_FEW_FEATURES.format(n=n_features, other=contrasts[0][1], base=base))
     try:
-        coef_idx = list(design.columns).index(design_col_name)
-    except ValueError:
+        fit = ms.e_bayes(ms.lm_fit(expr, X))
+    except ValueError as exc:
         raise RuntimeError(
-            f"Could not find expected coefficient {design_col_name!r} among "
-            f"design columns {list(design.columns)!r} — patsy named this "
-            "contrast differently than expected; the fit cannot proceed."
-        )
+            f"{exc} ({contrasts[0][1]!r} vs {base!r}). Too few clusters/features "
+            "have enough observed samples to fit."
+        ) from exc
+    log.info("moderated fit: %d features, %d samples, d0=%.3g, s0²=%.3g",
+             n_features, X.shape[0], fit.df_prior, fit.s2_prior)
 
-    fit = eBayes(lmFit(expr, design=design))
-    # inmoose's fit.coefficients doesn't carry patsy's column names — it
-    # labels columns generically as 'column0', 'column1', ... in the same
-    # order as the design matrix, so translate position -> that name.
-    coef_col = f"column{coef_idx}"
-    tt = topTable(fit, coef=coef_col, number=np.inf, adjust_method='fdr_bh',
-                 sort_by='p', confint=True)
-
-    # normalise inmoose DEResults columns → R/limma names used downstream.
-    tt = pd.DataFrame(tt).rename(columns={
-        'log2FoldChange': 'logFC',
-        'pvalue':         'P.Value',
-        'adj_pvalue':     'adj.P.Val',
-        'stat':           't',
-    })
-    if 'CI.L' not in tt.columns or 'CI.R' not in tt.columns:
-        log.warning(
-            "topTable(confint=True) did not return 'CI.L'/'CI.R' for %r vs "
-            "%r (got columns: %s) — CI bands will be blank for this "
-            "comparison until the actual column names are confirmed.",
-            other, baseline, list(tt.columns),
-        )
-        tt['CI.L'] = np.nan
-        tt['CI.R'] = np.nan
-    feature_names = np.asarray(data_df.columns)
-    tt.insert(0, 'feature', feature_names[tt.index.to_numpy()])
-    tt = tt.reset_index(drop=True)
-    tt['comparison'] = f"{other} vs {baseline}"
-    return tt
-
-
-def run_limma(data_df: pd.DataFrame, group_vec: list[str],
-              contrasts: list[tuple[str, str]], mode: str,
-              pval_threshold: float, fc_threshold: float,
-              pairing_vec: list[str] | None = None,
-              fdr_scope: str = 'global') -> pd.DataFrame:
-    """
-    lmFit → eBayes → topTable, generalised to N groups and multiple contrasts.
-
-    data_df   : rows = samples (index aligned to group_vec/pairing_vec),
-                columns = features (clusters / channel-clusters)
-    group_vec : group name per row, aligned to data_df.index
-    contrasts : list of (baseline, other) pairs from build_contrasts()
-    mode      : 'reference' — ONE joint fit across every sample in
-                  data_df/group_vec (borrows variance-shrinkage strength
-                  across all selected groups at once); one topTable() call
-                  per contrast against that single fit.
-                'pairwise'  — each contrast gets its OWN independent fit,
-                  with data_df/group_vec/pairing_vec subset to just that
-                  pair's samples first. No documented InMoose equivalent to
-                  limma's makeContrasts for extracting custom linear
-                  combinations from one N-level fit, so each pairwise
-                  comparison is a fresh, self-contained 2-group test.
-    pairing_vec: optional per-row blocking id (e.g. donor), same order as
-                group_vec; added as a fixed-effect term in the formula.
-    fdr_scope: 'global' (default) — 'significant' is based on the BH-FDR
-                correction pooled across every displayed comparison.
-                'per_comparison' — uses each comparison's own correction
-                instead. Both corrected columns (adj.P.Val,
-                adj.P.Val.global) are always present regardless.
-
-    Returns one combined DataFrame — feature, logFC, AveExpr, t, P.Value,
-    adj.P.Val, B, CI.L, CI.R, comparison, significant — concatenated across
-    every requested contrast. A single 2-group call returns
-    the exact same rows as before, with one added 'comparison' column.
-    """
     frames = []
+    for b, other in contrasts:
+        tt = ms.top_table(fit, group_cols[other])
+        tt.insert(0, 'feature', list(data_df.columns))
+        tt['comparison'] = f"{other} vs {b}"
+        frames.append(tt)
+    return pd.concat(frames, ignore_index=True)
 
+
+def _pair_subsets(data_df, group_vec, contrasts, pairing_vec, covariates):
+    """Yield (sub_df, sub_groups, sub_pairing, sub_covariates, base, other) per pair."""
+    for base, other in contrasts:
+        mask = [g in (base, other) for g in group_vec]
+        sub_df = data_df.loc[[rel for rel, m in zip(data_df.index, mask) if m]]
+        sub_groups = _subset_rows(group_vec, mask)
+        n_a, n_b = sub_groups.count(base), sub_groups.count(other)
+        if n_a < 3 or n_b < 3:
+            raise RuntimeError(
+                f"Not enough samples for {other} vs {base}: {base}={n_a}, {other}={n_b}."
+            )
+        sub_cov = covariates.loc[sub_df.index] if covariates is not None else None
+        yield sub_df, sub_groups, _subset_rows(pairing_vec, mask), sub_cov, base, other
+
+
+def run_moderated(data_df: pd.DataFrame, group_vec: list[str],
+                  contrasts: list[tuple[str, str]], mode: str,
+                  pval_threshold: float, fc_threshold: float,
+                  pairing_vec: list[str] | None = None,
+                  fdr_scope: str = 'global',
+                  covariates: pd.DataFrame | None = None,
+                  use_treat: bool = True,
+                  feature_meta: pd.DataFrame | None = None,
+                  hierarchical: bool = False) -> pd.DataFrame:
+    """
+    Moderated linear model test of every feature, for N groups and
+    multiple contrasts.
+
+    data_df   : rows = samples (aligned to group_vec/pairing_vec/covariates),
+                columns = features
+    contrasts : (baseline, other) pairs from build_contrasts()
+    mode      : 'reference' — one fit across all samples, one coefficient
+                  read per contrast (the variance prior is shared).
+                'pairwise'  — each contrast fitted on its two groups only.
+    covariates: optional adjustment covariates (covariate_frame()).
+    feature_meta: optional columns merged onto the results by 'feature'
+                (MFI: cluster, cluster_id, channel).
+    use_treat, hierarchical, fdr_scope: see apply_significance().
+
+    Returns one row per (feature, comparison): feature, logFC, CI.L, CI.R,
+    AveExpr, t, P.Value, adj.P.Val, SE, df.total, comparison,
+    adj.P.Val.global, threshold, significant (plus the cluster-level
+    columns when hierarchical).
+    """
     if mode == 'reference':
         baseline = contrasts[0][0]
-        for base, other in contrasts:
-            assert base == baseline, "reference mode expects a shared baseline"
-            frames.append(_limma_fit_one(data_df, group_vec, base, other, pairing_vec))
-        # NOTE: this still calls lmFit/eBayes fresh per contrast rather than
-        # sharing ONE fit object across coefficients — see the caveat below.
-
+        if any(b != baseline for b, _o in contrasts):
+            raise ValueError("reference mode expects a shared baseline")
+        combined = _moderated_fit_contrasts(data_df, group_vec, contrasts, pairing_vec, covariates)
     elif mode == 'pairwise':
-        for base, other in contrasts:
-            mask = [g in (base, other) for g in group_vec]
-            sub_rel = [rel for rel, m in zip(data_df.index, mask) if m]
-            sub_df = data_df.loc[sub_rel]
-            sub_group_vec = [g for g, m in zip(group_vec, mask) if m]
-            sub_pairing_vec = (
-                [p for p, m in zip(pairing_vec, mask) if m] if pairing_vec is not None else None
-            )
-            n_a, n_b = sub_group_vec.count(base), sub_group_vec.count(other)
-            if n_a < 3 or n_b < 3:
-                raise RuntimeError(
-                    f"Not enough samples for {other} vs {base}: "
-                    f"{base}={n_a}, {other}={n_b}."
-                )
-            frames.append(_limma_fit_one(sub_df, sub_group_vec, base, other, sub_pairing_vec))
+        frames = [
+            _moderated_fit_contrasts(sub_df, sub_groups, [(base, other)], sub_pair, sub_cov)
+            for sub_df, sub_groups, sub_pair, sub_cov, base, other
+            in _pair_subsets(data_df, group_vec, contrasts, pairing_vec, covariates)
+        ]
+        combined = pd.concat(frames, ignore_index=True)
     else:
         raise ValueError(f"mode must be 'reference' or 'pairwise', got {mode!r}")
 
-    combined = pd.concat(frames, ignore_index=True)
+    if feature_meta is not None:
+        combined = combined.merge(feature_meta, on='feature', how='left', sort=False)
 
-    # adj.P.Val above is corrected SEPARATELY per contrast (topTable's 
-    # own per-call default). Add a GLOBAL correction -- one BH-FDR pass 
-    # over every finite P.Value in the whole combined table -- and use 
-    # that for 'significant' instead. Identical to adj.P.Val when there's
-    #  only one contrast, so this changes nothing for that path.
-    from statsmodels.stats.multitest import multipletests
-    combined['adj.P.Val.global'] = np.nan
-    valid = np.isfinite(combined['P.Value'].values.astype(float))
-    if valid.any():
-        combined.loc[valid, 'adj.P.Val.global'] = multipletests(
-            combined.loc[valid, 'P.Value'].values.astype(float), method='fdr_bh'
-        )[1]
-
-    sig_col = 'adj.P.Val.global' if fdr_scope == 'global' else 'adj.P.Val'
-    combined['significant'] = (
-        (combined[sig_col] <= pval_threshold) &
-        (combined['logFC'].abs() >= fc_threshold)
-    )
-    log.info("limma: %d rows across %d comparison(s), %d significant (%s FDR)",
+    combined = apply_significance(combined, pval_threshold, fc_threshold,
+                                  fdr_scope=fdr_scope, use_treat=use_treat,
+                                  hierarchical=hierarchical)
+    log.info("moderated test: %d rows across %d comparison(s), %d significant (%s FDR%s%s)",
              len(combined), combined['comparison'].nunique(),
-             int(combined['significant'].sum()), fdr_scope)
+             int(combined['significant'].sum()), fdr_scope,
+             ", TREAT" if use_treat else "", ", cluster-first" if hierarchical else "")
     return combined
 
 
+# ---------------------------------------------------------------------------
+# Negative-binomial GLM on counts
+# ---------------------------------------------------------------------------
+
 def _glm_fit_one_cluster(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
-    """Poisson-then-NB fit for one cluster's raw counts (unchanged
-    Cameron & Trivedi auxiliary-OLS alpha estimate.
+    """Poisson-then-NB fit for one cluster's raw counts, with the NB
+    dispersion from the Cameron & Trivedi auxiliary-OLS estimate.
     ``offset`` is log(per-sample total classified events) — a library-size
     term so the fit compares cluster rates, not raw totals, across samples
     with different total event counts.
@@ -909,158 +1041,162 @@ def _glm_fit_one_cluster(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
         return poisson_fit
 
 
-def _glm_counts_one_contrast(counts_df: pd.DataFrame, group_vec: list[str],
-                             baseline: str, other: str,
-                             pairing_vec: list[str] | None) -> pd.DataFrame:
-    """One design + per-cluster NB/Poisson fit + FDR correction for a single
-    baseline-vs-other coefficient. Shared by both contrast modes in
-    run_glm_counts() below, mirroring _limma_fit_one().
-
-    Each cluster's fit includes a log(total classified events for that
-    sample) offset — a library-size term, so the coefficient reflects a
-    per-cluster RATE difference between groups rather than being confounded
-    by samples with different total event counts.
+def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
+                          contrasts: list[tuple[str, str]],
+                          pairing_vec: list[str] | None,
+                          covariates: pd.DataFrame | None) -> pd.DataFrame:
     """
-    import patsy
-    from statsmodels.stats.multitest import multipletests
+    One design + per-cluster NB/Poisson fit, read out for every contrast in
+    ``contrasts`` (shared baseline). Each cluster's fit includes a
+    log(total classified events) offset, so the coefficient is a
+    per-cluster RATE difference between groups. Estimates are reported on
+    the log2 scale with Wald standard errors (df.total = inf).
+    """
+    base = contrasts[0][0]
+    design_mat, _names, group_cols = build_design(group_vec, base, pairing_vec, covariates)
 
-    sample_info = pd.DataFrame({'group': group_vec})
-    formula = f"~ C(group, Treatment({baseline!r}))"
-    if pairing_vec is not None:
-        sample_info['pair_id'] = pairing_vec
-        formula += " + C(pair_id)"
-    design = patsy.dmatrix(formula, sample_info, return_type='dataframe')
-
-    if np.linalg.matrix_rank(design.values) < design.shape[1]:
-        raise RuntimeError(
-            f"Design matrix for {other!r} vs {baseline!r} is rank-deficient — "
-            "check the pairing variable for missing or group-confounded values."
-        )
-    coef_idx = list(design.columns).index(f"C(group, Treatment({baseline!r}))[T.{other}]")
-    design_mat = design.values
-
-    # Library-size offset: log(total classified events) per sample, floored
-    # at 1 event so a sample with zero tested-cluster events doesn't produce
-    # log(0). Same row order as design_mat and every counts_df column.
+    # Library-size offset: log(total classified events), floored at 1.
     totals = counts_df.sum(axis=1).values.astype(float)
     offset = np.log(np.maximum(totals, 1.0))
 
     LN2 = np.log(2.0)
-    Z95 = 1.959963985
+    Z95 = 1.959963984540054
     clusters = list(counts_df.columns)
-    logfc = np.full(len(clusters), np.nan)
-    tvals = np.full(len(clusters), np.nan)
-    pvals = np.full(len(clusters), np.nan)
-    ci_lo = np.full(len(clusters), np.nan)
-    ci_hi = np.full(len(clusters), np.nan)
+    fits = [_glm_fit_one_cluster(counts_df[cl].values.astype(float), design_mat, offset)
+            for cl in clusters]
 
-    for i, cl in enumerate(clusters):
-        y = counts_df[cl].values.astype(float)
-        fit = _glm_fit_one_cluster(y, design_mat, offset)
-        if fit is None:
-            continue
-        logfc[i] = fit.params[coef_idx] / LN2
-        tvals[i] = fit.tvalues[coef_idx]
-        pvals[i] = fit.pvalues[coef_idx]
-        se_log2 = fit.bse[coef_idx] / LN2
-        ci_lo[i] = logfc[i] - Z95 * se_log2
-        ci_hi[i] = logfc[i] + Z95 * se_log2
-
-    adj_pvals = np.full(len(clusters), np.nan)
-    valid = np.isfinite(pvals)
-    if valid.any():
-        adj_pvals[valid] = multipletests(pvals[valid], method='fdr_bh')[1]
-
-    tt = pd.DataFrame({
-        'feature':   clusters,
-        'logFC':     logfc,
-        't':         tvals,
-        'P.Value':   pvals,
-        'adj.P.Val': adj_pvals,
-        'CI.L':      ci_lo,
-        'CI.R':      ci_hi,
-    })
-    tt['comparison'] = f"{other} vs {baseline}"
-    return tt
+    frames = []
+    for b, other in contrasts:
+        j = group_cols[other]
+        logfc = np.full(len(clusters), np.nan)
+        se = np.full(len(clusters), np.nan)
+        tvals = np.full(len(clusters), np.nan)
+        for i, fit in enumerate(fits):
+            if fit is None:
+                continue
+            logfc[i] = fit.params[j] / LN2
+            se[i] = fit.bse[j] / LN2
+            tvals[i] = fit.tvalues[j]
+        p = ms.treat_pvalues(logfc, se, np.inf, 0.0)
+        frames.append(pd.DataFrame({
+            'feature':   clusters,
+            'logFC':     logfc,
+            'CI.L':      logfc - Z95 * se,
+            'CI.R':      logfc + Z95 * se,
+            't':         tvals,
+            'P.Value':   p,
+            'adj.P.Val': ms.bh_adjust(p),
+            'SE':        se,
+            'df.total':  np.inf,
+            'comparison': f"{other} vs {b}",
+        }))
+    return pd.concat(frames, ignore_index=True)
 
 
 def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
                    contrasts: list[tuple[str, str]], mode: str,
                    pval_threshold: float, fc_threshold: float,
                    pairing_vec: list[str] | None = None,
-                   fdr_scope: str = 'global') -> pd.DataFrame:
+                   fdr_scope: str = 'global',
+                   covariates: pd.DataFrame | None = None,
+                   use_treat: bool = True) -> pd.DataFrame:
     """
     Per-cluster negative-binomial GLM differential abundance test on raw
-    event counts, generalised to N groups/multiple contrasts —
-    same contrasts/mode/pairing_vec semantics as run_limma().
+    event counts, with the same contrasts/mode/pairing/covariate semantics
+    as run_moderated(). In 'reference' mode each cluster is fitted once and
+    every contrast is read from that fit; 'pairwise' fits each pair
+    separately.
 
-    Unlike run_limma()'s single shared eBayes fit in 'reference' mode, each
-    (cluster, contrast) pair here is its own independent per-cluster GLM —
-    there's no cross-contrast fit to share, since statsmodels' GLM doesn't
-    have an eBayes-style moderation step that would benefit from it. In
-    'reference' mode this still means ONE design matrix built once (all
-    selected groups' samples, one column per non-reference group), reused
-    across every cluster; 'pairwise' mode subsets samples/design per pair,
-    same as run_limma().
-
-    fdr_scope: 'global' (default) — 'significant' is based on the BH-FDR
-        correction pooled across every displayed comparison. 'per_comparison'
-        — uses each comparison's own correction instead. Both corrected
-        columns (adj.P.Val, adj.P.Val.global) are always present regardless.
-
-    Returns the same feature/logFC/P.Value/adj.P.Val/t/CI.L/CI.R/comparison/
-    significant schema run_limma() produces.
+    Returns the same schema as run_moderated() minus AveExpr.
     """
-    frames = []
-
     if mode == 'reference':
-        for base, other in contrasts:
-            frames.append(_glm_counts_one_contrast(counts_df, group_vec, base, other, pairing_vec))
-
+        combined = _glm_counts_contrasts(counts_df, group_vec, contrasts, pairing_vec, covariates)
     elif mode == 'pairwise':
-        for base, other in contrasts:
-            mask = [g in (base, other) for g in group_vec]
-            sub_rel = [rel for rel, m in zip(counts_df.index, mask) if m]
-            sub_df = counts_df.loc[sub_rel]
-            sub_group_vec = [g for g, m in zip(group_vec, mask) if m]
-            sub_pairing_vec = (
-                [p for p, m in zip(pairing_vec, mask) if m] if pairing_vec is not None else None
-            )
-            n_a, n_b = sub_group_vec.count(base), sub_group_vec.count(other)
-            if n_a < 3 or n_b < 3:
-                raise RuntimeError(
-                    f"Not enough samples for {other} vs {base}: "
-                    f"{base}={n_a}, {other}={n_b}."
-                )
-            frames.append(_glm_counts_one_contrast(sub_df, sub_group_vec, base, other, sub_pairing_vec))
+        frames = [
+            _glm_counts_contrasts(sub_df, sub_groups, [(base, other)], sub_pair, sub_cov)
+            for sub_df, sub_groups, sub_pair, sub_cov, base, other
+            in _pair_subsets(counts_df, group_vec, contrasts, pairing_vec, covariates)
+        ]
+        combined = pd.concat(frames, ignore_index=True)
     else:
         raise ValueError(f"mode must be 'reference' or 'pairwise', got {mode!r}")
 
-    combined = pd.concat(frames, ignore_index=True)
-
-    # same global-vs-separate fix as
-    # run_limma(): adj.P.Val above is corrected separately per contrast
-    # (each _glm_counts_one_contrast() call runs its own multipletests()
-    # over just that contrast's clusters). Add a global BH-FDR pass over
-    # every finite P.Value in the whole combined table for 'significant'.
-    from statsmodels.stats.multitest import multipletests
-    combined['adj.P.Val.global'] = np.nan
-    valid = np.isfinite(combined['P.Value'].values.astype(float))
-    if valid.any():
-        combined.loc[valid, 'adj.P.Val.global'] = multipletests(
-            combined.loc[valid, 'P.Value'].values.astype(float), method='fdr_bh'
-        )[1]
-
-    sig_col = 'adj.P.Val.global' if fdr_scope == 'global' else 'adj.P.Val'
-    combined['significant'] = (
-        (combined[sig_col] <= pval_threshold) &
-        (combined['logFC'].abs() >= fc_threshold)
-    )
+    combined = apply_significance(combined, pval_threshold, fc_threshold,
+                                  fdr_scope=fdr_scope, use_treat=use_treat)
     log.info("GLM counts: %d rows across %d comparison(s), %d significant (%s FDR), %d untestable",
              len(combined), combined['comparison'].nunique(),
              int(combined['significant'].sum()), fdr_scope, int(combined['logFC'].isna().sum()))
     return combined
 
+
+# ---------------------------------------------------------------------------
+# Significance
+# ---------------------------------------------------------------------------
+
+def apply_significance(results: pd.DataFrame, pval_threshold: float,
+                       fc_threshold: float, fdr_scope: str = 'global',
+                       use_treat: bool = True,
+                       hierarchical: bool = False) -> pd.DataFrame:
+    """
+    Recompute p-values, FDR and the 'significant' flag of a results table
+    for the given thresholds, without refitting. Returns a new DataFrame.
+
+    use_treat   : True — P.Value is the TREAT p-value for |logFC| >
+                  fc_threshold (McCarthy & Smyth 2009). False — P.Value
+                  tests logFC ≠ 0 and fc_threshold only filters estimates.
+    fdr_scope   : 'global' — BH pooled over every comparison in the table
+                  decides significance; 'per_comparison' — each
+                  comparison's own BH. Both adj.P.Val (per comparison) and
+                  adj.P.Val.global are always written.
+    hierarchical: cluster-first testing for tables with a 'cluster_id'
+                  column (MFI). Adds cluster.P.Value (Simes over the
+                  cluster's markers), cluster.adj.P.Val (BH over clusters)
+                  and stagewise.adj.P.Val; a marker is significant when its
+                  stage-wise value ≤ pval_threshold.
+
+    Tables without SE/df.total columns (results saved before these columns
+    existed) keep their stored p-values and use fc_threshold as a filter.
+    """
+    df = results.copy()
+    tau = float(fc_threshold) if use_treat else 0.0
+    can_retest = {'SE', 'df.total', 'logFC'}.issubset(df.columns)
+    if can_retest:
+        df['P.Value'] = ms.treat_pvalues(df['logFC'].values, df['SE'].values,
+                                         df['df.total'].values.astype(float), tau)
+        df['threshold'] = tau
+        adj = np.full(len(df), np.nan)
+        for _comp, idx in df.groupby('comparison', sort=False).indices.items():
+            adj[idx] = ms.bh_adjust(df['P.Value'].values[idx])
+        df['adj.P.Val'] = adj
+    df['adj.P.Val.global'] = ms.bh_adjust(df['P.Value'].values.astype(float))
+
+    q_col = 'adj.P.Val.global' if fdr_scope == 'global' else 'adj.P.Val'
+    passes_fc = df['logFC'].abs() >= fc_threshold
+
+    if hierarchical and 'cluster_id' in df.columns:
+        fam_p = np.full(len(df), np.nan)
+        fam_adj = np.full(len(df), np.nan)
+        stage = np.full(len(df), np.nan)
+        groups = ({'all': np.arange(len(df))} if fdr_scope == 'global'
+                  else df.groupby('comparison', sort=False).indices)
+        for _key, idx in groups.items():
+            family = [f"{c}\x1f{k}" for c, k in
+                      zip(df['comparison'].values[idx], df['cluster_id'].values[idx])]
+            res = ms.stagewise_adjust(df['P.Value'].values[idx].astype(float), family,
+                                      pval_threshold)
+            fam_p[idx] = res['family_p']
+            fam_adj[idx] = res['family_adj']
+            stage[idx] = res['adjusted']
+        df['cluster.P.Value'] = fam_p
+        df['cluster.adj.P.Val'] = fam_adj
+        df['stagewise.adj.P.Val'] = stage
+        df['significant'] = (df['stagewise.adj.P.Val'] <= pval_threshold) & passes_fc
+    else:
+        for col in ('cluster.P.Value', 'cluster.adj.P.Val', 'stagewise.adj.P.Val'):
+            if col in df.columns:
+                df = df.drop(columns=[col])
+        df['significant'] = (df[q_col] <= pval_threshold) & passes_fc
+    return df
 
 # ---------------------------------------------------------------------------
 # Orchestrator
@@ -1073,30 +1209,36 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
                    names_override: dict | None = None,
                    run_counts: bool = False,
                    af_state=None,
-                   fdr_scope: str = 'global'):
+                   fdr_scope: str = 'global',
+                   covariate_names: list[str] | None = None,
+                   use_treat: bool = True,
+                   mfi_threshold: float | None = None,
+                   mfi_hierarchical: bool = True):
     """
     Run the requested differential tests. Writes results onto ``state`` and
     returns ``(freq_results, mfi_results, counts_results)`` (any may be
     None).
 
-    Resolves state.testing_group_selection (falling back
-    to every defined group), builds the contrast list from
-    state.contrast_mode/reference_group, and — if state.paired is set and
-    state.pairing_variable names a real state.covariates column — builds a
-    per-sample blocking vector, all shared across freq/counts/mfi so the
-    three tests always report the exact same set of comparisons.
+    Resolves state.testing_group_selection (falling back to every defined
+    group), builds the contrast list from state.contrast_mode/
+    reference_group, the pairing vector (if state.paired and
+    state.pairing_variable names a covariates column) and the adjustment
+    covariates, all shared across freq/counts/mfi so the three tests
+    report the same comparisons from the same design.
 
-    include_type_markers: when False (default), the MFI branch
-        tests 'state'-role channels only, excluding whichever channels
-        drove the clustering assignment. When True, tests every selected channel.
-
-    run_counts: when True, additionally runs the negative-
-        binomial GLM abundance test on raw cluster counts (run_glm_counts),
-        alongside (not instead of) the Frequency/limma test controlled by
-        run_freq. Independent of run_freq/run_mfi — any combination of the
-        three may be requested in the same call.
+    fc_threshold  : |log2 fold change| threshold for Frequencies and Counts.
+    mfi_threshold : |difference| threshold for MFIs, in transformed units
+                    (defaults to fc_threshold).
+    covariate_names: state.covariates columns to adjust for.
+    use_treat     : test against the thresholds (TREAT) rather than zero.
+    mfi_hierarchical: cluster-first testing of MFIs.
+    include_type_markers: when False, the MFI branch tests 'state'-role
+        channels only. When True, tests every selected channel.
+    run_counts: also run the negative-binomial GLM on raw counts.
     """
     log_stage(log, "DIFFERENTIAL STATISTICS")
+    if mfi_threshold is None:
+        mfi_threshold = fc_threshold
 
     group_rel = resolve_test_groups(controller, state, cluster_labels_override=cluster_labels_override)
     qualifying = [g for g in (state.testing_group_selection or state.group_names) if g in group_rel]
@@ -1110,10 +1252,15 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
             and state.pairing_variable in state.covariates.columns:
         cov = state.covariates[state.pairing_variable]
         # Any rel missing a covariate value gets its own singleton blocking
-        # level (via the f-string fallback) rather than crashing the whole
-        # run — it simply gets no pairing benefit, instead of no results.
+        # level rather than failing the whole run.
         pairing_vec = [str(cov[rel]) if rel in cov.index else f"__unpaired_{rel}"
                        for rel in all_rel]
+
+    adjust = [c for c in (covariate_names or [])
+              if not (pairing_vec is not None and c == state.pairing_variable)]
+    covariates = covariate_frame(state, all_rel, adjust)
+    if covariates is not None:
+        log.info("adjusting for covariates: %s", list(covariates.columns))
 
     n_clusters = n_clusters_from_labels(
         state, all_rel, cluster_labels_override=cluster_labels_override
@@ -1121,11 +1268,17 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
 
     freq_results = mfi_results = counts_results = None
 
-    # Store group metadata so the heatmap can reconstruct per-sample columns
-    # and so the tab can populate its 'Viewing comparison:' selector.
+    # Group metadata for the heatmap and the 'Viewing comparison' selector.
     state.stats_all_rel = all_rel
     state.stats_group_vec = group_vec
     state.stats_comparisons = contrasts
+
+    if run_freq or run_counts:
+        counts_df = compute_counts(
+            state, all_rel, n_clusters,
+            cluster_labels_override=cluster_labels_override,
+            names_override=names_override,
+        )
 
     if run_freq:
         freq_df = compute_frequencies(
@@ -1133,23 +1286,22 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
             cluster_labels_override=cluster_labels_override,
             names_override=names_override,
         )
-        freq_results = run_limma(freq_df, group_vec, contrasts, state.contrast_mode,
-                                 pval_threshold, fc_threshold, pairing_vec=pairing_vec,
-                                 fdr_scope=fdr_scope)
+        totals = sample_event_totals(state, all_rel, cluster_labels_override)
+        freq_results = run_moderated(
+            log2_frequencies(counts_df, totals), group_vec, contrasts, state.contrast_mode,
+            pval_threshold, fc_threshold, pairing_vec=pairing_vec, fdr_scope=fdr_scope,
+            covariates=covariates, use_treat=use_treat,
+        )
         state.freq_results = freq_results
-        state.freq_df = freq_df          # raw (samples × features) matrix
+        state.freq_df = freq_df          # % per cluster (display)
 
     if run_counts:
-        counts_df = compute_counts(
-            state, all_rel, n_clusters,
-            cluster_labels_override=cluster_labels_override,
-            names_override=names_override,
-        )
         counts_results = run_glm_counts(counts_df, group_vec, contrasts, state.contrast_mode,
                                         pval_threshold, fc_threshold, pairing_vec=pairing_vec,
-                                        fdr_scope=fdr_scope)
+                                        fdr_scope=fdr_scope, covariates=covariates,
+                                        use_treat=use_treat)
         state.counts_results = counts_results
-        state.counts_df = counts_df      # raw (samples × features) count matrix
+        state.counts_df = counts_df      # raw (samples × clusters) counts
 
     if run_mfi:
         mfi_channels = resolve_mfi_channels(state, include_type_markers=include_type_markers)
@@ -1166,11 +1318,16 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
             af_state=af_state,
         )
         if mfi_df is not None:
-            mfi_results = run_limma(mfi_df, group_vec, contrasts, state.contrast_mode,
-                                    pval_threshold, fc_threshold, pairing_vec=pairing_vec,
-                                    fdr_scope=fdr_scope)
+            meta = mfi_feature_table(state, n_clusters, mfi_channels, names_override)
+            meta = meta[meta['feature'].isin(mfi_df.columns)].drop_duplicates('feature')
+            mfi_results = run_moderated(
+                mfi_df, group_vec, contrasts, state.contrast_mode,
+                pval_threshold, mfi_threshold, pairing_vec=pairing_vec, fdr_scope=fdr_scope,
+                covariates=covariates, use_treat=use_treat,
+                feature_meta=meta, hierarchical=mfi_hierarchical,
+            )
             state.mfi_results = mfi_results
-            state.mfi_df = mfi_df        # raw (samples × features) matrix
+            state.mfi_df = mfi_df        # raw (samples × cluster·channel) MFIs
 
         state.mfi_sample_df = compute_sample_mfis(
             controller, state, all_rel, channels=mfi_channels, af_state=af_state,

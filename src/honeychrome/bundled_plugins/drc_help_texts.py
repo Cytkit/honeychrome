@@ -32,7 +32,7 @@ the main Honeychrome window and want this tab to pick them up.</li>
 
 <h4>Working with the preview</h4>
 <ul>
-<li>Select a channel from the list on the left to see its 1-D histogram
+<li>Select a channel from the <b>Channels</b> list on the right to see its 1-D histogram
 and current transform type.</li>
 <li><b>Drag the histogram's x-axis</b> to adjust the transform, exactly
 as in the main Honeychrome cytometry plots (lower half of the axis
@@ -59,6 +59,10 @@ configuration_tab_help_text = '''
 dimensionality-reduction (DR) embeddings and run clustering on the
 result. Runs produced here are archived and become available for
 annotation, statistics, and plotting in the other tabs.</p>
+<p>The four sections below open one at a time. While a DR or clustering
+run is in progress, its section and Data Selection are locked (Cancel
+stays available), so the run is archived with the settings it was
+actually trained on.</p>
 
 <h4>1. Data Selection</h4>
 <ul>
@@ -74,7 +78,7 @@ picker.</li>
 </ul>
 
 <h4>2. Dimensionality Reduction</h4>
-<p>Four algorithms are available, each trading off preservation of local
+<p>Three algorithms are available, each trading off preservation of local
 structure (relationships within a "blob" of similar cells) against
 global structure (distances between blobs):</p>
 <ul>
@@ -84,9 +88,6 @@ preservation.</li>
 distances across white space between islands are not meaningful.</li>
 <li><b>PaCMAP</b> — aims to balance local and global structure in a
 single embedding.</li>
-<li><b>PHATE</b> — designed for developmental/continuous data;
-represents transitions between related populations as branches or
-connections rather than gaps.</li>
 </ul>
 <p>None of these algorithms preserves inter-cluster distances in an
 absolute sense — they are useful for visual grouping and getting a feel
@@ -126,6 +127,43 @@ to rename it, or any other cell to view its full configuration. Renaming
 or deleting a run here updates every run selector elsewhere in the
 plugin (Cluster Annotation, Stats, Workspace) immediately.</p>
 
+<h4>6. Predictive Analysis (optional)</h4>
+<p>The differential tests ask, one feature at a time, "does this differ
+between groups?". <b>Predictive Analysis</b> asks the complementary
+question: "which small set of features best tells two groups apart, and
+how well?" — the approach used in several systems-immunology studies of
+flow cytometry cohorts [10, 11]. It uses the Frequency and/or MFI
+matrices from the last Run Statistics, for the comparison you pick.</p>
+<ul>
+<li><b>Models:</b> lasso (L1-penalised) logistic regression, which keeps
+a sparse set of features, and random forest, which can capture
+non-linear effects and interactions.</li>
+<li><b>Nested cross-validation:</b> samples are split into 5 folds; each
+fold is predicted by models trained on the other four, with every tuning
+choice (lasso strength, forest depth, feature ranking) made on the
+training folds only. The split is repeated (<i>Repeats</i>) and results
+are averaged, so each reported number reflects performance on samples
+the model never saw.</li>
+<li><b>ROC</b> tab: cross-validated ROC curve and AUC (0.5 = chance,
+1 = perfect separation) with its SD over repeats, and balanced
+accuracy.</li>
+<li><b>Features</b> tab: how often the lasso selected each feature across
+all fits, and the forest's mean importance; bar colour shows which group
+has the higher value.</li>
+<li><b>Panel Size</b> tab: cross-validated AUC using only the top-N
+features (ranked within each training split), for increasing N. The
+<i>minimal panel</i> is the smallest N reaching 95% of the best AUC — a
+guide to how many features carry the signal.</li>
+</ul>
+<p><b>Sample size:</b> at least 10 samples per group are required, and 30
+or more are recommended. With small groups, cross-validated AUCs vary a
+lot from one split to the next, even when there is no real difference.
+Correlated features (e.g. a population and its largest subset) share
+importance: the lasso tends to keep one of them, so a feature it drops
+may still differ between groups. Treat the selected features as a
+predictive summary, and use the differential tests for claims about
+individual features.</p>
+
 <h4>Further Reading and Background</h4>
 <p>Documentation:</p>
 <ul>
@@ -137,13 +175,12 @@ plugin (Cluster Annotation, Stats, Workspace) immediately.</p>
 [1]<a href="https://arxiv.org/abs/1802.03426">McInnes, Healy and Melville 2018 (UMAP)</a><br/>
 [2]<a href="https://doi.org/10.1101/731877">Poličar, Stražar and Zupan 2019 (openTSNE)</a><br/>
 [3]<a href="https://arxiv.org/abs/2012.04456">Wang, Huang, Rudin and Shaposhnik 2021, JMLR (PaCMAP)</a><br/>
-[4]<a href="https://doi.org/10.1038/s41587-019-0336-3">Moon et al. 2019, Nat Biotechnol (PHATE)</a><br/>
-[5]<a href="https://doi.org/10.1002/cyto.a.22625">Van Gassen et al. 2015, Cytometry A (FlowSOM)</a><br/>
-[6]<a href="https://doi.org/10.1038/s41598-019-41695-z">Traag, Waltman and van Eck 2019, Sci Rep (Leiden)</a><br/>
-[7]<a href="https://doi.org/10.1007/978-3-642-37456-2_14">Campello, Moulavi and Sander 2013, PAKDD (HDBSCAN)</a><br/>
-[8]<a href="https://doi.org/10.12688/f1000research.21642.2">Kratochvil, Koladiya and Vondrasek 2020, F100Res (EmbedSOM)</a><br/>
-[9]<a href="https://doi.org/10.1016/j.cell.2015.05.047">Levine et al. 2015, Cell (Phenograph)</a><br/>
-[10]<a href="https://doi.org/10.1038/s41467-019-13055-y">Belkina et al. 2019, Nature Communications (OptSNE)</a><br/>
+[4]<a href="https://doi.org/10.1002/cyto.a.22625">Van Gassen et al. 2015, Cytometry A (FlowSOM)</a><br/>
+[5]<a href="https://doi.org/10.1038/s41598-019-41695-z">Traag, Waltman and van Eck 2019, Sci Rep (Leiden)</a><br/>
+[6]<a href="https://doi.org/10.1007/978-3-642-37456-2_14">Campello, Moulavi and Sander 2013, PAKDD (HDBSCAN)</a><br/>
+[7]<a href="https://doi.org/10.12688/f1000research.21642.2">Kratochvil, Koladiya and Vondrasek 2020, F100Res (EmbedSOM)</a><br/>
+[8]<a href="https://doi.org/10.1016/j.cell.2015.05.047">Levine et al. 2015, Cell (Phenograph)</a><br/>
+[9]<a href="https://doi.org/10.1038/s41467-019-13055-y">Belkina et al. 2019, Nature Communications (OptSNE)</a><br/>
 </p>
 '''
 
@@ -177,13 +214,14 @@ describes what the cluster's data actually shows, it is safe to adopt
 automatically; use <b>Adopt All MEM Labels</b> to do so. Set the
 <i>MEM threshold</i> to control how large a score has to be before a
 marker is reported in the label.</li>
-<li><b>Cell-type scoring</b>: matches each cluster's MEM profile
-against a database of expected marker signatures for named cell types
+<li><b>Cell-type scoring</b>: compares each cluster's median marker
+expression, relative to each channel's positivity threshold, against a
+database of expected marker signatures for named cell types
 (<i>species</i> selector, plus <tt>drc_cell_type_database.csv</tt>). This
 is a <b>biological claim</b>, not a computed statistic — treat it as a
 starting suggestion, not ground truth, and always check it against what
-you know about your panel and biology. The approach is adapted from
-ScType (see reference below), the same idea underlying the "What's that
+you know about your panel and biology. The score is the one published
+for ScType (see reference below), the same idea underlying the "What's that
 cluster?" posts linked below: if your panel doesn't include the markers
 needed to distinguish two cell types, the suggestion can't distinguish
 them either, and uncorrected autofluorescence, unmixing errors, or
@@ -247,61 +285,53 @@ include under <b>Groups to Test</b>.</li>
 <i>Reference group</i>, or run <i>All pairwise</i> comparisons.</li>
 <li><b>Paired design:</b> tick this if your samples are matched across
 groups (e.g. before/after the same subject) — see "Using Paired design"
-below for how this changes the model and what it requires.</li>
-<li><b>Tests</b> — Cluster Frequencies (limma), Cluster Counts
-(negative-binomial GLM), and Cluster MFIs (limma) can each be ticked
-independently; see the dedicated sections below for what each is
-actually doing and how to read its result. MFI values (here and in the
-MFI Heatmap) are each channel's Transforms-tab scale (Logicle/
-biexponential, or linear where configured) — the same scale you see in
-the main cytometry plots and Transforms tab, not a separate fixed
-transform.</li>
-<li>Set the <i>p-value</i> and <i>|log₂FC|</i> thresholds used to flag
-significant hits in the volcano plot and heatmap, and choose the
-<b>FDR</b> correction scope (see "FDR correction scope" below), then
-click <b>Run Statistics</b>.</li>
+below.</li>
+<li><b>Adjust for:</b> tick covariate columns from the sample table (age,
+sex, batch, …) to include them in every test's model — see "Adjusting for
+covariates" below.</li>
+<li><b>Tests</b> — Cluster Frequencies (moderated linear model), Cluster
+Counts (negative-binomial GLM) and Cluster MFIs (moderated linear model)
+can each be ticked independently. MFI values (here and in the MFI
+Heatmap) are each channel's Transforms-tab scale (Logicle/biexponential,
+or linear where configured) — the same scale as the main cytometry plots.
+A cluster with no events in a sample has no MFI there and is left out of
+that sample, rather than counted as zero.</li>
+<li>Set the <b>FDR</b> level, the smallest effect worth reporting for
+Frequencies/Counts (<i>|log₂FC|</i>) and for MFIs (<i>|Δ|</i>, in
+transformed units), whether to <b>Test against thresholds (TREAT)</b>,
+whether to use <b>Cluster-first MFI testing</b>, and the <b>FDR</b>
+scope, then click <b>Run Statistics</b>. Changing thresholds and clicking
+Run Statistics again recomputes p-values from the stored fits without
+refitting.</li>
 </ul>
 
-<h4>What is limma, and what does its p-value actually mean?</h4>
-<p><b>limma</b> ("linear models for microarray data") was originally
-built for detecting differentially-expressed genes, and is repurposed
-here to treat each cluster's frequency, or each cluster's MFI for a
-given channel, the way limma would treat one gene: it fits a linear
-model per cluster (comparable to a t-test or one-way ANOVA, but
-generalised via a design matrix so it can also express a reference-group
-contrast, all-pairwise contrasts, or the paired blocking term described
-below) and reports a fold-change and a p-value for the group effect.</p>
-<p>The reason to use limma rather than a plain per-cluster t-test is its
-<b>empirical Bayes moderation</b> step. With a modest number of samples,
-a per-cluster variance estimated from that cluster alone is noisy — some
-clusters will look "significant" purely because their observed variance
-happened to be unusually small by chance, not because the group effect
-is real. limma addresses this by borrowing information across every
-cluster (or every channel, for MFIs) being tested in the same run: it
-estimates the typical spread of variances across all of them and shrinks
-each individual cluster's variance estimate toward that common trend,
-producing a "moderated t-statistic" that is markedly more stable, and
-better calibrated, than treating each cluster in isolation.</p>
-<p>This moderation step is the "Bayes" part of limma's name — it uses a
-prior built from the data itself (an <i>empirical</i> Bayes prior, rather
-than one specified in advance) purely to stabilise the variance term. The
-hypothesis test and p-value that come out the other end are still
-ordinary frequentist ones — see below.</p>
-<p>Where available, the volcano plot also draws a thin horizontal error
-bar through each significant point, showing the 95% confidence interval
-of its log₂ fold-change (a wider bar means the fold-change estimate is
-less precise — typically fewer events, more sample-to-sample variability,
-or fewer samples in that comparison). The CI is a separate quantity from
-the p-value: a point can have a wide CI and still cross the significance
-threshold if the underlying effect is large, or a narrow CI and still be
-non-significant if the effect itself is small.</p>
+<h4>The moderated linear model (Frequencies and MFIs)</h4>
+<p>Each cluster's frequency, or each cluster's MFI for one marker, is
+fitted with its own linear model — comparable to a t-test or one-way
+ANOVA, but written as a design matrix so it can also express reference
+or pairwise contrasts, a pairing term and adjustment covariates. The
+reported effect (logFC) is the group coefficient: for Frequencies, the
+difference in log₂ percentage (a log₂ fold change); for MFIs, the
+difference in mean transformed intensity.</p>
+<p>The model uses <b>empirical Bayes moderation</b> of the variances
+(Smyth 2004 [2], the method behind the limma package [1]). With few
+samples, a cluster's variance estimated from that cluster alone is noisy,
+and some clusters look "significant" only because their variance happened
+to come out small. Moderation estimates the typical spread of variances
+across every feature in the run and shrinks each feature's variance
+towards it, giving a moderated t-statistic that is more stable and better
+calibrated. The prior comes from the data itself (an <i>empirical</i>
+Bayes prior); the p-values that come out are ordinary frequentist ones.</p>
+<p>The volcano plot draws a thin horizontal bar through each significant
+point: the 95% confidence interval of its effect. A wider bar means a
+less precise estimate (fewer events, more sample-to-sample variation, or
+fewer samples).</p>
 
-
-<h4>Frequentist vs Bayesian statistics (and where limma sits between them)</h4>
+<h4>Frequentist vs Bayesian statistics (and where empirical Bayes moderation sits)</h4>
 <p>These are two different ways of assigning meaning to "probability" in
 a statistical test, and it matters for how you should read a result:</p>
 <ul>
-<li><b>Frequentist</b> — the framework behind limma's p-values (and
+<li><b>Frequentist</b> — the framework behind the p-values here (and
 most classical statistics: t-tests, ANOVA, linear regression). A p-value
 is the probability of seeing data at least this extreme, in a
 hypothetical infinite series of repeated experiments, <i>if the null
@@ -317,54 +347,86 @@ groups?" The cost is that a genuinely Bayesian analysis requires
 specifying a prior, which is itself a modelling choice open to
 disagreement (reference [5] gives a practical introduction to this style
  of analysis and how it compares to the frequentist "New Statistics").</li>
+</ul>
+
+<h4>Testing against a threshold (TREAT)</h4>
+<p>With many clusters and markers, very small but consistent shifts can
+reach significance, and filtering on the estimated fold change afterwards
+does not control the error rate for "changed by at least this much".
+With <b>Test against thresholds (TREAT)</b> ticked (default), each
+p-value instead tests whether the true effect is <i>larger</i> than the
+threshold (McCarthy &amp; Smyth 2009 [8]). Results then focus on changes
+big enough to matter; set the thresholds to the smallest change you would
+consider biologically meaningful. With TREAT off, p-values test for any
+non-zero effect and the thresholds only filter the estimates, as in a
+classical volcano plot.</p>
+
+<h4>Cluster-first MFI testing</h4>
+<p>Testing every cluster × marker combination produces a long, flat list
+that is hard to interpret and, with hundreds of tests, costs power. With
+<b>Cluster-first MFI testing</b> ticked (default), the question is asked
+in two stages (Benjamini &amp; Bogomolov 2014 [9]):</p>
+<ol>
+<li><b>Which clusters change?</b> Each cluster gets one screening p-value
+combining all its markers (Simes' method), and clusters are selected by
+Benjamini–Hochberg FDR across clusters.</li>
+<li><b>Which markers drive each selected cluster?</b> Markers are tested
+only inside selected clusters, at an FDR level scaled down by the
+fraction of clusters selected, which keeps the average error rate across
+the selected clusters at your FDR level.</li>
+</ol>
+<p>The MFI Volcano then plots the stage-wise adjusted p-value (markers in
+unselected clusters sit at the bottom), and the <b>MFI Clusters</b> tab
+shows a cluster × marker grid of the changes in each selected cluster,
+with significant markers marked. The exported table carries each
+cluster's screening p-value (<tt>cluster.P.Value</tt>), its FDR
+(<tt>cluster.adj.P.Val</tt>) and each marker's stage-wise value.</p>
 
 <h4>FDR correction scope: pooled vs per-comparison</h4>
-<p>Every comparison (from either "Reference" or "All pairwise" contrast
-mode) already gets its own Benjamini-Hochberg FDR correction across the
-clusters/channels tested within that comparison. The <b>FDR</b> selector
-controls a second, optional layer on top of that, used only to decide
-which p-value feeds the "significant" flag shown in the volcano plot and
-heatmap:</p>
+<p>Every comparison gets its own Benjamini-Hochberg FDR correction
+(<tt>adj.P.Val</tt>). The <b>FDR</b> selector chooses which correction
+decides the "significant" flag:</p>
 <ul>
-<li><b>Pooled (all comparisons)</b> (default) — one BH-FDR correction is
-run across every finite p-value from every comparison currently
-displayed, and that pooled adjusted p-value decides significance. This is
-the more conservative choice once more than one comparison is on screen
-at once (e.g. "All pairwise" with several groups), since it treats the
-whole set of comparisons as one combined multiple-testing problem.</li>
-<li><b>Per comparison</b> — each comparison's own correction (computed
-over just that comparison's clusters/channels) is used instead, without
-pooling across comparisons. This matches running each comparison as a
-fully separate analysis, and is the more standard choice if you plan to
-report each comparison independently rather than as one combined
-test.</li>
+<li><b>Pooled (all comparisons)</b> (default) — one correction across
+every p-value from every comparison in the run
+(<tt>adj.P.Val.global</tt>). The more conservative choice when several
+comparisons are reported together (e.g. "All pairwise" with several
+groups). For cluster-first MFI testing, clusters from all comparisons are
+screened together.</li>
+<li><b>Per comparison</b> — each comparison's own correction, as if each
+were a separate analysis.</li>
 </ul>
-<p>Both p-values are always computed and included in the exported CSV
-regardless of which is selected here — this toggle only changes which one
-drives the "significant" flag and coloured points in the plots.</p>
+<p>Both corrected values are always included in the exported CSV.</p>
+
+<h4>Adjusting for covariates</h4>
+<p>Ticking a column under <b>Adjust for</b> adds it to every test's model,
+so group differences are estimated with that variable held fixed — for
+example comparing disease vs control at the same age and sex. Columns
+whose values are all numbers enter as a continuous term (a straight-line
+effect); any other column enters as categories, compared against its
+first level. Every tested sample needs a value. A covariate that is
+completely confounded with group (e.g. all controls from one batch and all
+cases from another) cannot be separated from the group effect, and the
+run stops with a message naming it. Each covariate uses up degrees of
+freedom, so with few samples adjust only for variables you have reason to
+think matter.</p>
 
 <h4>What does the negative-binomial GLM do? (Cluster Counts)</h4>
 <p>Raw event counts per cluster per sample are <i>count</i> data, not
 continuous measurements — small clusters can have very few or zero
-events, and the variance of a count generally grows with its mean (a
-cluster with a mean count of 5,000 across samples will naturally vary by
-more, in absolute terms, than one with a mean count of 50) — a property
-called <b>overdispersion</b> that a plain linear model/t-test's
-constant-variance assumption doesn't accommodate. Cluster Counts instead
-fits a <b>negative-binomial generalized linear model (GLM)</b>, run
-alongside (not instead of) the limma Frequency test: it models the count
-directly with a log link, using each sample's total event count as an
-offset (so it compares <i>rates</i>, not raw totals, across samples with
-different numbers of events), and fits a separate dispersion term per
-cluster to absorb the extra variance rather than mistaking it for a real
-group difference. This is the same broad approach used for RNA-seq
-read-count data by tools like edgeR and DESeq2. Because Frequencies
-(limma) and Counts (GLM) make different statistical assumptions about
-the same underlying event counts, running both and comparing the results
-is a useful cross-check: broad agreement between the two is stronger
-evidence than either alone, and a disagreement is itself worth a closer
-look (it often points to a cluster with very few total events, where the
-two methods' different assumptions matter most).</p>
+events, and the variance of a count generally grows with its mean
+(<b>overdispersion</b>), which a constant-variance linear model doesn't
+accommodate. Cluster Counts instead fits a <b>negative-binomial
+generalized linear model (GLM)</b>: it models the count directly with a
+log link, using each sample's total event count as an offset (so it
+compares <i>rates</i>, not raw totals), and fits a dispersion term per
+cluster to absorb the extra variance. This is the same broad approach
+used for RNA-seq read counts by edgeR [7] and DESeq2. It uses the same
+design (pairing, covariates) and the same TREAT and FDR settings as the
+other tests. Frequencies and Counts make different assumptions about the
+same events, so running both is a useful cross-check: agreement is
+stronger evidence than either alone, and disagreement often points to a
+cluster with very few events.</p>
 
 <h4>Using Paired design</h4>
 <p>Tick <b>Paired design</b> when your samples have a genuine matched
@@ -375,29 +437,19 @@ conditions. Choose the <b>Pairing variable</b>: a column in your Sample
 Group Assignment table (e.g. "PatientID" or "Subject") whose value
 identifies which samples belong to the same pair or block.</p>
 <ul>
-<li><b>What it does:</b> pairing adds a fixed-effect blocking
-term to the underlying design (<tt>+ C(pair_id)</tt> in the model
-formula) — in effect, it fits and removes a separate baseline offset per
-pair before testing the group effect, so the comparison is driven by
-<i>within-pair</i> differences rather than being diluted by
-between-subject variability that has nothing to do with the group effect
-you actually care about.</li>
-<li><b>What it is not:</b> this is a fixed-effect approach, not a true
-random-effects/repeated-measures design of the kind limma's own
-<tt>duplicateCorrelation()</tt> provides for correlated technical
-replicates — InMoose does not currently implement that style of
-random-effect blocking, so each pair consumes one degree of freedom of
-its own. This works well with a moderate number of pairs, but can leave
-you underpowered if you have many pairs each with very few samples.</li>
+<li><b>What it does:</b> pairing adds a fixed-effect blocking term to the
+design — a separate baseline per pair — so the comparison is driven by
+<i>within-pair</i> differences rather than diluted by between-subject
+variability.</li>
+<li><b>What it is not:</b> this is a fixed-effect term, not a
+random-effects/repeated-measures model, so each pair uses one degree of
+freedom. This works well with a moderate number of pairs, but can leave
+you underpowered with many pairs each with very few samples.</li>
 <li><b>Requirement:</b> every sample in every checked group needs a
-value for the chosen pairing variable, and that value must correctly
-identify its partner sample(s) in the other group(s) — if the pairing
-column doesn't line up across groups, the design matrix can't be built
-correctly.</li>
-<li><b>When to skip it:</b> if your samples are genuinely independent
-(unrelated subjects, no shared batch/individual across groups), leave
-Paired design unticked — forcing a pairing structure onto unrelated
-samples doesn't help and can distort the result.</li>
+value for the pairing variable, and each value must appear in more than
+one group.</li>
+<li><b>When to skip it:</b> if your samples are genuinely independent,
+leave Paired design unticked.</li>
 </ul>
 
 <h4>4. Confusion Matrix, Composition Barplot, and Export</h4>
@@ -476,13 +528,16 @@ above.</p>
 <h4>Further Reading and Background</h4>
 <p>References:<br/>
 [1]<a href="https://doi.org/10.1093/nar/gkv007">Ritchie et al. 2015, Nucleic Acids Research (limma software)</a><br/>
-[2]<a href="https://doi.org/10.2202/1544-6115.1027">Smyth 2004, Stat Appl Genet Mol Biol (limma's empirical Bayes moderation)</a><br/>
+[2]<a href="https://doi.org/10.2202/1544-6115.1027">Smyth 2004, Stat Appl Genet Mol Biol (empirical Bayes moderation)</a><br/>
 [3]<a href="https://doi.org/10.1080/00031305.2016.1154108">Wasserstein and Lazar 2016, The American Statistician (ASA statement on p-values)</a><br/>
 [4]<a href="https://doi.org/10.1038/506150a">Nuzzo 2014, Nature (statistical errors and the misuse of p-values)</a><br/>
 [5]<a href="https://doi.org/10.3758/s13423-016-1221-4">Kruschke and Liddell 2018, Psychon Bull Rev (a Bayesian alternative framework)</a><br/>
 [6]<a href="https://doi.org/10.1038/s42003-019-0415-5">Weber et al. 2019, Communications Biology (diffcyt)</a><br/>
 [7]<a href="https://doi.org/10.1093/bioinformatics/btp616">Robinson, McCarthy and Smyth 2009, Bioinformatics (edgeR)</a><br/>
-[8]<a href="https://doi.org/10.1038/s41598-025-03376-y">Colange et al. 2025, Scientific Reports (InMoose)</a><br/>
+[8]<a href="https://doi.org/10.1093/bioinformatics/btp053">McCarthy and Smyth 2009, Bioinformatics (TREAT)</a><br/>
+[9]<a href="https://doi.org/10.1111/rssb.12028">Benjamini and Bogomolov 2014, J R Stat Soc B (selective inference on families of hypotheses)</a><br/>
+[10]<a href="https://doi.org/10.1002/alz.70952">Humblet-Baron et al. 2025, Alzheimer's &amp; Dementia (systems immunology of Alzheimer's disease)</a><br/>
+[11]<a href="https://doi.org/10.1038/s41467-026-70895-1">Veiga et al. 2026, Nature Communications (autoinflammation of unknown origin)</a><br/>
 </p>
 '''
 
