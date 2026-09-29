@@ -65,6 +65,9 @@ class MainWindow(QMainWindow):
         self.controller = controller
         # connect to QSettings
         self.settings = QSettings("honeychrome", "MainWindow")
+        # Splitter layout captured when a plugin hides the sample panel, so
+        # closing on that tab doesn't persist a zero-width left pane.
+        self._splitter_state_with_browser = None
 
         # autosave if window closed
         self.destroyed.connect(lambda: self.controller.save_experiment())
@@ -215,8 +218,8 @@ class MainWindow(QMainWindow):
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # Left panel (samples list, acquisition panel, gains, dock)
-        left_container = QWidget()
-        left_layout = QVBoxLayout(left_container)
+        self.left_container = QWidget()
+        left_layout = QVBoxLayout(self.left_container)
 
         left_layout.addWidget(self.sample_tree)
         left_layout.addWidget(self.acquisition_widget)
@@ -225,7 +228,7 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
 
-        self.splitter.addWidget(left_container)
+        self.splitter.addWidget(self.left_container)
 
         # Right panel (tab widget)
         self.tabs = QTabWidget()
@@ -426,6 +429,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)  # Hide initially
         self.bus.progress.connect(self.update_progress)
         self.bus.statusMessage.connect(self.status_message)
+        self.bus.sampleBrowserVisibilityRequested.connect(self._set_sample_browser_visible)
 
         # widgets visibility state
         self._restore_visibility_state()
@@ -500,7 +504,19 @@ class MainWindow(QMainWindow):
     def on_tab_changed(self, index):
         tab_name = self.tabs.tabText(index)
         logger.info(f'View: tab changed {tab_name}')
+        # Every tab starts with the sample panel shown; a plugin that wants
+        # it hidden re-requests that from its modeChangeRequested handler.
+        self._set_sample_browser_visible(True)
         self.bus.modeChangeRequested.emit(tab_name)
+
+    @Slot(bool)
+    def _set_sample_browser_visible(self, visible: bool):
+        """Show or hide the left panel (sample browser, acquisition, gains)."""
+        if visible == (not self.left_container.isHidden()):
+            return
+        if not visible:
+            self._splitter_state_with_browser = self.splitter.saveState()
+        self.left_container.setHidden(not visible)
 
     def closeEvent(self, event):
         self.save_state()
@@ -559,7 +575,10 @@ class MainWindow(QMainWindow):
 
     def save_state(self):
         # QByteArray returned by saveState() — stored directly in QSettings
-        self.settings.setValue("main_splitter_state", self.splitter.saveState())
+        if self.left_container.isHidden() and self._splitter_state_with_browser is not None:
+            self.settings.setValue("main_splitter_state", self._splitter_state_with_browser)
+        else:
+            self.settings.setValue("main_splitter_state", self.splitter.saveState())
         self.settings.setValue("raw_splitter_state", self.raw_splitter.saveState())
         self.settings.setValue("unmixed_splitter_state", self.unmixed_splitter.saveState())
         """Save window geometry and maximized state to QSettings."""
@@ -615,7 +634,9 @@ class MainWindow(QMainWindow):
 
     def _save_visibility_state(self):
         for name, widget in {"gains": self.gains_widget, "acquisition": self.acquisition_widget}.items():
-            self.settings.setValue(f"{name}_visible", widget.isVisible())
+            # isHidden(), not isVisible(): the latter is also False while a
+            # plugin has hidden the whole left panel.
+            self.settings.setValue(f"{name}_visible", not widget.isHidden())
 
     def _restore_visibility_state(self):
         for name, widget in {"gains": self.gains_widget, "acquisition": self.acquisition_widget}.items():
