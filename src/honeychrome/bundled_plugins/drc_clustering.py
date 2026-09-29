@@ -428,14 +428,15 @@ def build_flowsom_tree(node_weights: np.ndarray, node_to_meta: np.ndarray,
                        node_counts: np.ndarray) -> dict:
     """
     Classic FlowSOM tree: minimum spanning tree over SOM codebook vectors
-    (Euclidean distance), laid out with igraph's Kamada-Kawai algorithm —
-    the same approach R FlowSOM's BuildMST/PlotStars uses.
+    (Euclidean distance), laid out with the Kamada-Kawai spring layout
+    (Kamada and Kawai 1989, via networkx) on the unweighted tree — the same
+    approach R FlowSOM's BuildMST/PlotStars uses.
 
     Returns {'positions': (n_nodes, 2) ndarray, 'edges': list[(i, j)]}.
-    Pure function — no state access, safe to call from the Workspace tab's
-    render path directly.
+    Positions are scaled to [-1, 1]. Pure function — no state access, safe
+    to call from the Workspace tab's render path directly.
     """
-    import igraph
+    import networkx as nx
     from scipy.spatial.distance import pdist, squareform
     from scipy.sparse.csgraph import minimum_spanning_tree
 
@@ -445,15 +446,72 @@ def build_flowsom_tree(node_weights: np.ndarray, node_to_meta: np.ndarray,
     edges = list(zip(mst_coo.row.tolist(), mst_coo.col.tolist()))
 
     n_nodes = node_weights.shape[0]
-    g = igraph.Graph(n=n_nodes, edges=edges)
-    layout = g.layout_kamada_kawai()
-    positions = np.array(layout.coords)
+    graph = nx.Graph()
+    graph.add_nodes_from(range(n_nodes))
+    graph.add_edges_from(edges)
+    layout = nx.kamada_kawai_layout(graph)
+    positions = np.array([layout[i] for i in range(n_nodes)], dtype=float).reshape(n_nodes, 2)
     return {'positions': positions, 'edges': edges}
 
 
 # ---------------------------------------------------------------------------
 # Leiden
 # ---------------------------------------------------------------------------
+
+def knn_adjacency(neigh: np.ndarray):
+    """
+    Symmetric, unweighted kNN graph as a scipy CSR matrix.
+
+    neigh: (n, k) neighbour ids from a kNN query of the n points against
+        an index of those same n points. Each point's own id, if present,
+        is dropped; an edge found from both ends is stored once with
+        weight 1.
+    """
+    from scipy import sparse
+
+    n, k = neigh.shape
+    rows = np.repeat(np.arange(n, dtype=np.int64), k)
+    cols = neigh.reshape(-1).astype(np.int64)
+    keep = rows != cols
+    adj = sparse.csr_matrix(
+        (np.ones(int(keep.sum())), (rows[keep], cols[keep])), shape=(n, n))
+    adj = (adj + adj.T).tocsr()
+    adj.data[:] = 1.0
+    adj.sort_indices()
+    return adj
+
+
+def leiden_labels(adj, resolution: float, seed: int = 42,
+                  iterations: int = 2) -> np.ndarray:
+    """
+    Leiden community detection (Traag, Waltman and van Eck 2019) on a
+    symmetric CSR adjacency matrix, maximising modularity with resolution
+    `resolution`, via graspologic-native.
+
+    Returns int32 labels 0..k-1 ordered by descending community size
+    (ties: community of the lowest node id first).
+    """
+    from graspologic_native import leiden_csr
+
+    n = adj.shape[0]
+    _quality, membership = leiden_csr(
+        indptr=adj.indptr.astype(np.int64),
+        indices=adj.indices.astype(np.int32),
+        data=adj.data.astype(np.float64),
+        n_nodes=n,
+        resolution=float(resolution),
+        iterations=iterations,
+        use_modularity=True,
+        seed=seed,
+    )
+    raw = np.fromiter((membership[i] for i in range(n)), dtype=np.int64, count=n)
+    _ids, first, inverse, counts = np.unique(
+        raw, return_index=True, return_inverse=True, return_counts=True)
+    order = np.lexsort((first, -counts))
+    rank = np.empty_like(order)
+    rank[order] = np.arange(len(order))
+    return rank[inverse].astype(np.int32)
+
 
 def get_training_embeddings(controller, state, algo: str | None, event_cap: int | None,
                             af_state=None, seed: int = 42):
@@ -487,6 +545,24 @@ def get_training_embeddings(controller, state, algo: str | None, event_cap: int 
     return _pool_training_data_with_boundaries(controller, state, event_cap, af_state=af_state)
 
 
+def _umap_index_matches(state, data: np.ndarray) -> bool:
+    """
+    True when state.umap_knn_index was built on exactly `data`, row for
+    row. hnswlib returns neighbour ids as row numbers of the array the
+    index was built on, so the index is only usable for Leiden when its
+    training pool is this one. UMAP's pool caps every sample at
+    n_training_events; Leiden's pool, by default, is every gated event.
+    """
+    index = getattr(state, 'umap_knn_index', None)
+    fingerprint = getattr(state, 'umap_knn_fingerprint', None)
+    if index is None or fingerprint is None:
+        return False
+    shape, digest = fingerprint
+    if tuple(shape) != data.shape:
+        return False
+    return digest == drc_pipeline.array_digest(data)
+
+
 def run_leiden(controller, state, params: dict, progress=None, af_state=None) -> None:
     """Build a kNN graph and run Leiden community detection.
 
@@ -502,8 +578,6 @@ def run_leiden(controller, state, params: dict, progress=None, af_state=None) ->
     af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()
         docstring. Must be passed when called from a background worker thread.
     """
-    import igraph
-    import leidenalg
     import hnswlib
     from scipy.stats import mode as _scipy_mode
 
@@ -529,9 +603,7 @@ def run_leiden(controller, state, params: dict, progress=None, af_state=None) ->
     resolution = params['resolution']
     n_neighbors = params['n_neighbors']
 
-    if space != 'dr' and state.umap_knn_index is not None:
-        # Only reuse the UMAP index when clustering the raw feature space it was
-        # built on. (Building on a DR embedding uses a fresh index below.)
+    if space != 'dr' and _umap_index_matches(state, data):
         _progress(progress, "Reusing UMAP hnswlib kNN index for Leiden …")
         index = state.umap_knn_index
     else:
@@ -545,16 +617,8 @@ def run_leiden(controller, state, params: dict, progress=None, af_state=None) ->
     _progress(progress, "Querying kNN …")
     neigh, _ = index.knn_query(data, k=n_neighbors)
 
-    _progress(progress, "Building igraph and running Leiden …")
-    n = len(data)
-    edges = [(i, int(j)) for i, row in enumerate(neigh) for j in row if int(j) != i]
-    g = igraph.Graph(n=n, edges=edges, directed=False)
-    g.simplify()
-
-    partition = leidenalg.find_partition(
-        g, leidenalg.RBConfigurationVertexPartition,
-        resolution_parameter=resolution, seed=42)
-    train_labels = np.array(partition.membership, dtype=np.int32)
+    _progress(progress, "Running Leiden …")
+    train_labels = leiden_labels(knn_adjacency(neigh), resolution)
 
     def _predict(sample_data):
         neigh_ids, _dists = index.knn_query(sample_data, k=n_neighbors)

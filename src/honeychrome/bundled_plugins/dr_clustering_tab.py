@@ -2,10 +2,11 @@
 dr_clustering_tab.py — Honeycluster Plugin for Honeychrome
 ===========================================================================
 Honeychrome plugin providing:
-  • Dimensionality reduction  — UMAP, PaCMAP, tSNE, PHATE
+  • Dimensionality reduction  — UMAP, PaCMAP, tSNE
   • Clustering               — FlowSOM, Leiden, HDBSCAN
   • Transform inspector      — read-only preview of Logicle parameters
-  • Group & statistics       — sample grouping, limma differential analysis
+  • Group & statistics       — sample grouping, differential statistics,
+                               optional predictive modelling
   • Workspace                — customisable matplotlib scatter-plot canvas
 
 Plugin contract (required by plugin_loaders.py):
@@ -21,8 +22,8 @@ Distribution:
   Users enable it in App Configuration → restart → tab appears.
 
 Dependencies:
-  Heavy ML packages (umap-learn, openTSNE, pacmap, phate, leidenalg,
-  igraph, hnswlib, inmoose, hdbscan) are ordinary Honeychrome dependencies
+  Heavy ML packages (umap-learn, openTSNE, pacmap, graspologic-native,
+  networkx, hnswlib, statsmodels, hdbscan) are ordinary Honeychrome dependencies
   now (requirements.in) — installed as part of the app's own build, same
   as pandas or scikit-learn. All ML imports stay LAZY (inside method
   bodies), unchanged from before; this only removes the runtime
@@ -41,14 +42,19 @@ Clustering:
   ConfigTab clustering section: FlowSOM / Leiden / HDBSCAN radio buttons
   with per-algorithm hyperparameter panels.
   FlowSOM: SOM grid, manual metacluster count (2-200).
-  Leiden: reuses UMAP hnswlib kNN; igraph + leidenalg community detection.
+  Leiden: hnswlib kNN graph (UMAP's index when built on the same events);
+  graspologic-native community detection.
   HDBSCAN: applied to UMAP embedding if available, else raw feature space.
   All algorithms assign labels to every sample via nearest-centroid.
   Cluster colours from cc.glasbey; noise label −1 → grey.
 
 Groups & Stats:
-  GroupsStatsTab: named groups with regex auto-population, limma statistics
-  (inmoose), heatmap+dendrogram, volcano plot, CSV result export.
+  GroupsStatsTab: named groups with regex auto-population; moderated
+  linear models (controller_components/moderated_stats.py) with TREAT
+  thresholds, covariate adjustment and cluster-first MFI testing;
+  negative-binomial GLM on counts; heatmap+dendrogram, volcano plot, MFI
+  cluster summary, CSV result export; optional nested cross-validated
+  predictive models (drc_predictive.py).
 
 Workspace:
   Per-marker scatter colouring, per-cluster colour pickers (right-click), magic-wand
@@ -146,7 +152,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QFileDialog, QMessageBox, QSizePolicy,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QColorDialog, QProgressBar, QSlider,
-    QDialog, QTextEdit, QApplication,
+    QDialog, QTextEdit, QApplication, QStackedWidget, QToolBox,
 )
 
 from honeychrome.controller_components.functions import (
@@ -158,6 +164,7 @@ from honeychrome.view_components.clear_layout import clear_layout
 from honeychrome.view_components.ordered_multi_sample_picker import OrderedMultiSamplePicker
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
+from honeychrome.view_components.icon_loader import icon
 import honeychrome.settings as hc_settings
 
 # ---------------------------------------------------------------------------
@@ -175,12 +182,14 @@ import drc_logging
 import drc_pipeline
 import drc_clustering
 import drc_stats
+import drc_persist
 import drc_run_archive
 import drc_gate_tree
 import drc_scatter
 import drc_cluster_id
 import drc_report
 import drc_help_texts
+import drc_predictive
 
 _log = drc_logging.get_logger(__name__)
 
@@ -767,6 +776,87 @@ class _FrozenScrollArea(QScrollArea):
         event.ignore()
 
 
+class _SideTabWidget(QWidget):
+    """
+    Vertical navigation list beside a page stack.
+
+    Replaces a QTabWidget so the plugin's own sections read as distinct
+    from the main window's top-level tab bar: labels stay horizontal and
+    each entry carries an icon. Exposes the subset of the QTabWidget API
+    the plugin uses (addTab, currentIndex, setCurrentIndex, currentWidget,
+    widget, count, currentChanged).
+    """
+
+    currentChanged = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._nav = QListWidget()
+        self._nav.setIconSize(QSize(20, 20))
+        self._nav.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._nav.setFrameShape(QFrame.NoFrame)
+        self._nav.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self._nav.setStyleSheet(
+            "QListWidget::item { padding: 8px 14px 8px 8px; }"
+        )
+
+        self._stack = QStackedWidget()
+
+        divider = QFrame()
+        divider.setFrameShape(QFrame.VLine)
+        divider.setFrameShadow(QFrame.Sunken)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(self._nav)
+        layout.addWidget(divider)
+        layout.addWidget(self._stack, stretch=1)
+
+        self._nav.currentRowChanged.connect(self._on_row_changed)
+
+    def addTab(self, widget: QWidget, label: str, icon_name: str | None = None) -> int:
+        index = self._stack.addWidget(widget)
+        item = QListWidgetItem(label)
+        if icon_name:
+            item.setIcon(icon(icon_name))
+        self._nav.addItem(item)
+        if self._nav.currentRow() < 0:
+            self._nav.setCurrentRow(0)
+        # Polish first so the item padding from the style sheet is measured.
+        self._nav.ensurePolished()
+        self._nav.setFixedWidth(
+            self._nav.sizeHintForColumn(0) + 2 * self._nav.frameWidth() + 12
+        )
+        return index
+
+    def currentIndex(self) -> int:
+        return self._stack.currentIndex()
+
+    def setCurrentIndex(self, index: int):
+        self._nav.setCurrentRow(index)
+
+    def currentWidget(self) -> QWidget | None:
+        return self._stack.currentWidget()
+
+    def widget(self, index: int) -> QWidget | None:
+        return self._stack.widget(index)
+
+    def count(self) -> int:
+        return self._stack.count()
+
+    def _on_row_changed(self, row: int):
+        # Clearing the list's current row (e.g. ctrl-click) must not blank the page.
+        if row < 0:
+            self._nav.setCurrentRow(self._stack.currentIndex())
+            return
+        if row == self._stack.currentIndex():
+            return
+        self._stack.setCurrentIndex(row)
+        self.currentChanged.emit(row)
+
+
 def _apply_channel_transform(state, ch: str, values: np.ndarray) -> np.ndarray:
     """
     Apply the SAME transform configured in the Transforms tab to raw
@@ -886,7 +976,10 @@ class PipelineState:
 
     # --- Dimensionality reduction ---
     trained_reducers: dict[str, Any] = field(default_factory=dict)
-    # {algorithm_name: fitted reducer object} — current/most-recent model
+    # {algorithm_name: fitted reducer object} — current/most-recent model.
+    # DR entries (UMAP/tSNE/PaCMAP) exist only in the session they
+    # were trained in; FlowSOM/Leiden/HDBSCAN entries are plain tree-data
+    # array dicts and are persisted with the sidecar.
     dr_status: dict[str, str] = field(default_factory=dict)
     # {algorithm_name: 'idle' | 'done' | 'error'}
     dr_timestamps: dict[str, str] = field(default_factory=dict)
@@ -899,17 +992,11 @@ class PipelineState:
     # from (same feature space the reducer was fit on). Cached alongside
     # embeddings precisely so T-REX (or anything else needing true
     # marker-space neighbours) never has to re-derive them from live data.
-    embedding_event_indices: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
-    # {algorithm_name: {sample_path: np.ndarray}} -- only populated for a DR
-    # run whose embedding is a downsampled subset of a sample's full gated
-    # events (currently PHATE only, which has no out-of-sample transform).
-    # Indices into that sample's FULL gated/transformed feature array, same
-    # row order as the embedding. Lets the Cluster Map align a downsampled
-    # embedding to cluster labels (which always cover every gated event) by
-    # real event identity instead of greying the sample out -- see
-    # drc_scatter.align_labels_to_embedding.
     umap_knn_index: Any | None = None
     # hnswlib index built during UMAP training; reused by Leiden and T-REX
+    umap_knn_fingerprint: tuple | None = None
+    # (shape, drc_pipeline.array_digest) of the array umap_knn_index was
+    # built on; Leiden reuses the index only for that exact array
     dr_runs: list[dict] = field(default_factory=list)
     # Ordered archive of completed DR training runs, parallel to
     # clustering_runs below.  Each entry (manifest fields + heavy payload):
@@ -918,7 +1005,8 @@ class PipelineState:
     #   'gates': list[str], 'training_sample_ids': list[str],
     #   'n_samples': int, 'n_events': int, 'channels': list[str],
     #   'params': dict, 'timestamp': str, 'n_clusters': None,
-    #   'reducer': Any, 'embeddings': dict[str, np.ndarray],
+    #   'storage': str, 'embeddings': dict[str, np.ndarray],
+    #   'embedding_features': dict[str, np.ndarray],
     # }
     # Archived automatically each time a DR algorithm finishes training
     # (see PluginWidget._archive_dr_run); 'Apply to All Samples' afterwards
@@ -1009,6 +1097,16 @@ class PipelineState:
     #   across every comparison currently displayed (default).
     # 'per_comparison' -- 'significant' uses each comparison's own
     #   correction instead, without pooling across comparisons.
+    stats_adjust_covariates: list[str] = field(default_factory=list)
+    # state.covariates columns added to every test's design as adjustment
+    # terms (numeric -> continuous, otherwise categorical).
+    stats_use_treat: bool = True
+    # True: p-values test |effect| > threshold (TREAT). False: test
+    #   effect != 0 and use the threshold only as a filter.
+    stats_mfi_threshold: float = 0.03
+    # |difference| threshold for MFIs, in transformed (Transforms-tab) units.
+    stats_mfi_hierarchical: bool = True
+    # Cluster-first MFI testing: screen clusters, then markers within them.
     stats_comparisons: list[tuple[str, str]] = field(default_factory=list)
     # (baseline, other) pairs actually tested by the last Run Statistics
     # call, aligned 1:1 with the unique values of freq_results/mfi_results/
@@ -1018,16 +1116,16 @@ class PipelineState:
 
     # --- Statistics ---
     freq_results: pd.DataFrame | None = None
-    # limma output for cluster frequencies
+    # moderated linear model output for cluster frequencies (log2 scale)
     freq_df: pd.DataFrame | None = None
-    # raw (samples × clusters) frequency matrix
+    # raw (samples × clusters) frequency matrix, % of events
     counts_results: pd.DataFrame | None = None
     # negative-binomial GLM output for cluster raw counts
     # a parallel abundance test alongside freq_results, not a replacement.
     counts_df: pd.DataFrame | None = None
     # raw (samples x clusters) count matrix
     mfi_results: pd.DataFrame | None = None
-    # limma output for per-cluster marker MFIs
+    # moderated linear model output for per-cluster marker MFIs
     mfi_df: pd.DataFrame | None = None
     # raw (samples x cluster·channel) MFI matrix, each channel on its
     # configured Transforms-tab scale (Logicle/biexponential/linear)
@@ -1097,12 +1195,15 @@ class PipelineState:
     pca_run_label: str = ''
     pca_groups: list = field(default_factory=list)
     pca_sources: list = field(default_factory=list)
+    predictive_result: dict | None = None
+    # drc_predictive.run_predictive() output for the last Predictive
+    # Analysis run (session only), plus 'run_label'.
     # groups/sources -- the last two pieces _make_pca_figure needs that
     # weren't already cached above -- so a fully-persisted PCA result can
     # be rebuilt into the dict shape it expects without recomputing (see
     # _pca_result_from_state).
     stats_all_rel: list = field(default_factory=list)
-    # sample rel-paths in limma row order
+    # sample rel-paths in test-matrix row order
     stats_group_vec: list = field(default_factory=list)
     # 'A'/'B' per row, aligned to stats_all_rel
     stats_run_label: str = ''
@@ -1556,7 +1657,7 @@ class RunManagementTable(CopyableTableWidget):
     def delete_selected(self) -> bool:
         """
         Confirm-then-delete the currently selected run: removes the
-        manifest entry, unlinks its pickle, and drops it from
+        manifest entry, deletes its payload bundle, and drops it from
         state.dr_runs/clustering_runs (all via drc_run_archive.delete_run),
         then refreshes this table and emits runsChanged.  Returns True if
         a run was actually deleted.
@@ -1608,40 +1709,47 @@ class ConfigTab(QWidget):
     clustering algorithm + hyperparameter panels.
     """
 
+    _PAGE_DATA, _PAGE_DR, _PAGE_CL, _PAGE_RUNS = range(4)
+
     def __init__(self, state: PipelineState, bus, controller, parent=None):
         super().__init__(parent)
         self.state = state
         self.bus = bus
         self.controller = controller
+        # {'dr' | 'cl': True while that kind of run is in progress}
+        self._run_locked = {'dr': False, 'cl': False}
+        self._page_titles: list[str] = []
         self._build_ui()
 
-    def _build_ui(self):
-        # Outer scrollable container — config panels can be tall
-        self.content_widget = QWidget()
-        self.main_layout = QVBoxLayout(self.content_widget)
-        self.main_layout.setAlignment(Qt.AlignTop)
-        self.main_layout.setSpacing(10)
-
+    def _add_page(self, page: QWidget, title: str) -> int:
+        """Add *page* to the accordion inside its own scroll area."""
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(self.content_widget)
+        scroll.setWidget(page)
+        self._page_titles.append(title)
+        return self.toolbox.addItem(scroll, title)
 
+    def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
+        outer.setSpacing(6)
 
         self.help_widget = HelpToggleWidget(
             text=drc_help_texts.configuration_tab_help_text
         )
-        self.main_layout.addWidget(self.help_widget)
+        outer.addWidget(self.help_widget)
+
+        # One section open at a time; each page scrolls on its own.
+        self.toolbox = QToolBox()
+        outer.addWidget(self.toolbox, stretch=1)
 
         # ------------------------------------------------------------------
-        # Shared controls
+        # Data Selection
         # ------------------------------------------------------------------
-        shared_box = QGroupBox("Data Selection")
-        shared_layout = QVBoxLayout(shared_box)
+        self._data_page = QWidget()
+        shared_layout = QVBoxLayout(self._data_page)
 
         # Gate selector — checkable multi-select tree.  Same tree
         # class as TransformTab's; this one is documented as the override —
@@ -1687,22 +1795,26 @@ class ConfigTab(QWidget):
         self.picker = OrderedMultiSamplePicker(title="Choose Training Samples")
         self.picker.changed.connect(self._on_training_samples_changed)
         shared_layout.addWidget(self.picker)
+        shared_layout.addStretch()
 
-        self.main_layout.addWidget(shared_box)
+        self._add_page(self._data_page, "Data Selection")
 
         # ------------------------------------------------------------------
         # Dimensionality Reduction
         # ------------------------------------------------------------------
-        dr_box = QGroupBox("Dimensionality Reduction")
-        dr_box.setCheckable(True)
-        dr_box.setChecked(True)
-        dr_layout = QVBoxLayout(dr_box)
+        dr_page = QWidget()
+        dr_page_layout = QVBoxLayout(dr_page)
+        # Everything a DR run reads; locked while one is in progress.
+        self._dr_controls = QWidget()
+        dr_layout = QVBoxLayout(self._dr_controls)
+        dr_layout.setContentsMargins(0, 0, 0, 0)
+        dr_page_layout.addWidget(self._dr_controls)
 
         # Algorithm radio buttons
         algo_row = QHBoxLayout()
         algo_row.addWidget(QLabel("Algorithm:"))
         self._dr_algo_group = QButtonGroup(self)
-        for algo in ('UMAP', 'tSNE', 'PaCMAP', 'PHATE'):
+        for algo in ('UMAP', 'tSNE', 'PaCMAP'):
             rb = QRadioButton(algo)
             if algo == 'UMAP':
                 rb.setChecked(True)
@@ -1855,45 +1967,6 @@ class ConfigTab(QWidget):
         dr_layout.addWidget(self._pacmap_params)
         self._pacmap_params.setVisible(False)
 
-        # ---- PHATE params ----
-        self._phate_params = QWidget()
-        phate_grid = QGridLayout(self._phate_params)
-        phate_grid.setContentsMargins(0, 0, 0, 0)
-        phate_grid.setSpacing(4)
-
-        phate_grid.addWidget(QLabel("knn:"), 0, 0)
-        self.phate_knn = QSpinBox()
-        self.phate_knn.setRange(2, 200)
-        self.phate_knn.setValue(5)
-        self.phate_knn.setToolTip(
-            "Number of nearest neighbours for the initial affinity graph.\n"
-            "Default: 5"
-        )
-        phate_grid.addWidget(self.phate_knn, 0, 1)
-
-        phate_grid.addWidget(QLabel("decay:"), 0, 2)
-        self.phate_decay = QSpinBox()
-        self.phate_decay.setRange(1, 200)
-        self.phate_decay.setValue(40)
-        self.phate_decay.setToolTip(
-            "Rate of alpha-decay kernel decay. Default: 40"
-        )
-        phate_grid.addWidget(self.phate_decay, 0, 3)
-
-        phate_grid.addWidget(QLabel("t (0 = auto):"), 1, 0)
-        self.phate_t = QSpinBox()
-        self.phate_t.setRange(0, 500)
-        self.phate_t.setValue(0)
-        self.phate_t.setSpecialValueText("auto")
-        self.phate_t.setToolTip(
-            "Diffusion time-scale. 0 = PHATE picks it automatically "
-            "via the von Neumann entropy heuristic (recommended)."
-        )
-        phate_grid.addWidget(self.phate_t, 1, 1)
-
-        dr_layout.addWidget(self._phate_params)
-        self._phate_params.setVisible(False)
-
         # ---- Run button + status ----
         dr_run_row = QHBoxLayout()
         self.dr_run_btn = QPushButton("▶  Train DR Model")
@@ -1911,29 +1984,34 @@ class ConfigTab(QWidget):
         self.dr_apply_btn.setEnabled(False)
         dr_run_row.addWidget(self.dr_apply_btn)
 
+        dr_run_row.addStretch()
+        dr_layout.addLayout(dr_run_row)
+
+        # Status, Cancel and progress sit outside _dr_controls so they stay
+        # live during a run.
+        dr_status_row = QHBoxLayout()
+        self.dr_status_label = QLabel("No model trained.")
+        self.dr_status_label.setStyleSheet("color: grey;")
+        dr_status_row.addWidget(self.dr_status_label, stretch=1)
+
         self.dr_cancel_btn = QPushButton("✕  Cancel")
         self.dr_cancel_btn.setFixedHeight(30)
         self.dr_cancel_btn.setToolTip("Cancel the running DR job.")
         self.dr_cancel_btn.clicked.connect(self._on_cancel_dr_clicked)
         self.dr_cancel_btn.setEnabled(False)
         self.dr_cancel_btn.setStyleSheet("color: #c0392b;")
-        dr_run_row.addWidget(self.dr_cancel_btn)
-
-        dr_run_row.addStretch()
-        dr_layout.addLayout(dr_run_row)
-
-        self.dr_status_label = QLabel("No model trained.")
-        self.dr_status_label.setStyleSheet("color: grey;")
-        dr_layout.addWidget(self.dr_status_label)
+        dr_status_row.addWidget(self.dr_cancel_btn)
+        dr_page_layout.addLayout(dr_status_row)
 
         self.dr_progress_bar = QProgressBar()
         self.dr_progress_bar.setRange(0, 100)
         self.dr_progress_bar.setTextVisible(True)
         self.dr_progress_bar.setFixedHeight(14)
         self.dr_progress_bar.setVisible(False)
-        dr_layout.addWidget(self.dr_progress_bar)
+        dr_page_layout.addWidget(self.dr_progress_bar)
+        dr_page_layout.addStretch()
 
-        self.main_layout.addWidget(dr_box)
+        self._add_page(dr_page, "Dimensionality Reduction")
 
         # Connect algo radio buttons → show/hide param panels + update note
         self._dr_algo_group.buttonClicked.connect(self._on_dr_algo_changed)
@@ -1942,10 +2020,13 @@ class ConfigTab(QWidget):
         # ------------------------------------------------------------------
         # Clustering
         # ------------------------------------------------------------------
-        cl_box = QGroupBox("Clustering")
-        cl_box.setCheckable(True)
-        cl_box.setChecked(True)
-        cl_layout = QVBoxLayout(cl_box)
+        cl_page = QWidget()
+        cl_page_layout = QVBoxLayout(cl_page)
+        # Everything a clustering run reads; locked while one is in progress.
+        self._cl_controls = QWidget()
+        cl_layout = QVBoxLayout(self._cl_controls)
+        cl_layout.setContentsMargins(0, 0, 0, 0)
+        cl_page_layout.addWidget(self._cl_controls)
 
         # Algorithm radio buttons
         cl_algo_row = QHBoxLayout()
@@ -2024,8 +2105,10 @@ class ConfigTab(QWidget):
         self.leiden_n_neighbors.setRange(2, 500)
         self.leiden_n_neighbors.setValue(15)
         self.leiden_n_neighbors.setToolTip(
-            "Neighbours for the kNN graph.\n"
-            "If UMAP was run, its hnswlib index is reused and this value is ignored."
+            "Neighbours per event in the kNN graph. Default: 15\n"
+            "UMAP's hnswlib index is reused when it was built on exactly the\n"
+            "same training events (same samples, gate, channels and\n"
+            "downsampling); otherwise a new index is built."
         )
         leiden_grid.addWidget(self.leiden_n_neighbors, 0, 3)
 
@@ -2146,20 +2229,21 @@ class ConfigTab(QWidget):
 
         self.cl_status_label = QLabel("No clustering run.")
         self.cl_status_label.setStyleSheet("color: grey;")
-        cl_layout.addWidget(self.cl_status_label)
+        cl_page_layout.addWidget(self.cl_status_label)
 
         self.cl_progress_bar = QProgressBar()
         self.cl_progress_bar.setRange(0, 0)   # indeterminate by default
         self.cl_progress_bar.setTextVisible(False)
         self.cl_progress_bar.setFixedHeight(14)
         self.cl_progress_bar.setVisible(False)
-        cl_layout.addWidget(self.cl_progress_bar)
+        cl_page_layout.addWidget(self.cl_progress_bar)
+        cl_page_layout.addStretch()
 
-        self.main_layout.addWidget(cl_box)
+        self._add_page(cl_page, "Clustering")
 
         # ---- Archived Runs ----
-        runs_box = QGroupBox("Archived Runs")
-        runs_box_layout = QVBoxLayout(runs_box)
+        runs_page = QWidget()
+        runs_box_layout = QVBoxLayout(runs_page)
 
         runs_hint = QLabel(
             "Double-click a run's label to rename it, or any other cell to "
@@ -2171,7 +2255,7 @@ class ConfigTab(QWidget):
         runs_box_layout.addWidget(runs_hint)
 
         self.run_table = RunManagementTable(self.controller, self.state)
-        runs_box_layout.addWidget(self.run_table)
+        runs_box_layout.addWidget(self.run_table, stretch=1)
 
         runs_btn_row = QHBoxLayout()
         runs_btn_row.addStretch()
@@ -2184,8 +2268,7 @@ class ConfigTab(QWidget):
 
         self.run_table.itemSelectionChanged.connect(self._on_run_table_selection_changed)
 
-        self.main_layout.addWidget(runs_box)
-        self.main_layout.addStretch()
+        self._add_page(runs_page, "Archived Runs")
 
         # Connect clustering algo buttons
         self._cl_algo_group.buttonClicked.connect(self._on_cl_algo_changed)
@@ -2203,6 +2286,31 @@ class ConfigTab(QWidget):
         for widget in _scroll_guarded:
             widget.setFocusPolicy(Qt.StrongFocus)
             widget.wheelEvent = _make_scroll_guard(widget)
+
+    def set_run_lock(self, kind: str, running: bool):
+        """
+        Lock the controls a run depends on while it is in progress.
+
+        *kind* is 'dr' or 'cl'. That section's controls are disabled (its
+        status line, progress bar and Cancel stay live), and Data Selection
+        is disabled while either kind is running, because a finished run is
+        archived with the gates, channels and training samples current at
+        that moment.
+        """
+        self._run_locked[kind] = running
+        controls, page = ((self._dr_controls, self._PAGE_DR) if kind == 'dr'
+                          else (self._cl_controls, self._PAGE_CL))
+        controls.setEnabled(not running)
+        title = self._page_titles[page]
+        self.toolbox.setItemText(page, f"{title}  —  ⏳ running" if running else title)
+        locked = self.is_run_in_progress()
+        self._data_page.setEnabled(not locked)
+        self.toolbox.setItemToolTip(
+            self._PAGE_DATA, "Locked while a run is in progress." if locked else ""
+        )
+
+    def is_run_in_progress(self) -> bool:
+        return any(self._run_locked.values())
 
     def _on_training_samples_changed(self, ordered_list: list):
         """Keep state.training_sample_ids in sync with the picker."""
@@ -2240,7 +2348,6 @@ class ConfigTab(QWidget):
         self._umap_params.setVisible(algo == 'UMAP')
         self._tsne_params.setVisible(algo == 'tSNE')
         self._pacmap_params.setVisible(algo == 'PaCMAP')
-        self._phate_params.setVisible(algo == 'PHATE')
 
         notes = {
             'UMAP': (
@@ -2255,12 +2362,6 @@ class ConfigTab(QWidget):
                 "PaCMAP: pair-centric MA embedding; balances local and global "
                 "structure without perplexity tuning."
             ),
-            'PHATE': (
-                "PHATE: diffusion-based embedding, strong for trajectory/"
-                "continuum structure. No out-of-sample projection — trains "
-                "and embeds the training samples only; 'Apply to All "
-                "Samples' is disabled for this algorithm."
-            ),
         }
         self._dr_algo_note.setText(notes.get(algo, ''))
 
@@ -2273,19 +2374,29 @@ class ConfigTab(QWidget):
         status = self.state.dr_status.get(algo, 'idle')
         ts     = self.state.dr_timestamps.get(algo, '')
         running = (status == 'running')
-        if status == 'done':
+        # Fitted DR models are not saved, so after a restart only the
+        # embeddings of a 'done' algorithm are available.
+        model_in_memory = self.state.trained_reducers.get(algo) is not None
+        if self._run_locked['dr']:
+            # Covers 'Apply to All Samples' too, where status stays 'done'.
+            running = True
+            self.dr_status_label.setText("⏳ Running …")
+            self.dr_status_label.setStyleSheet("color: orange;")
+            self.dr_apply_btn.setEnabled(False)
+        elif status == 'done':
             n_emb = len(self.state.embeddings.get(algo, {}))
+            model_note = '' if model_in_memory else "  —  model not kept after restart"
             self.dr_status_label.setText(
-                f"✓ Trained  ({ts})  —  embeddings: {n_emb} sample(s)"
+                f"✓ Trained  ({ts})  —  embeddings: {n_emb} sample(s){model_note}"
             )
             self.dr_status_label.setStyleSheet("color: green;")
-            self.dr_apply_btn.setEnabled(True)
+            self.dr_apply_btn.setEnabled(model_in_memory)
         elif status == 'error':
             self.dr_status_label.setText(f"✗ Error during last run  ({ts})")
             self.dr_status_label.setStyleSheet("color: red;")
             self.dr_apply_btn.setEnabled(False)
         elif status == 'running':
-            self.dr_status_label.setText("⏳ Running — Honeychrome remains usable …")
+            self.dr_status_label.setText("⏳ Running …")
             self.dr_status_label.setStyleSheet("color: orange;")
             self.dr_apply_btn.setEnabled(False)
         else:
@@ -2295,14 +2406,11 @@ class ConfigTab(QWidget):
         self.dr_run_btn.setEnabled(not running)
         self.dr_cancel_btn.setEnabled(running)
 
-        # PHATE has no out-of-sample transform — training already embeds
-        # every training sample, so "Apply to All Samples" never applies.
-        if algo == 'PHATE':
-            self.dr_apply_btn.setEnabled(False)
+        if status == 'done' and not model_in_memory:
             self.dr_apply_btn.setToolTip(
-                "PHATE has no out-of-sample projection. Training already "
-                "embeds every training sample; new samples require "
-                "re-training with them included in the training set."
+                f"The fitted {algo} model is only kept for the session it was\n"
+                "trained in. Its embeddings were restored, but projecting more\n"
+                f"samples needs the model: re-train {algo} to use this."
             )
         else:
             self.dr_apply_btn.setToolTip(
@@ -2346,13 +2454,6 @@ class ConfigTab(QWidget):
                 'MN_ratio':    self.pacmap_mn_ratio.value(),
                 'FP_ratio':    self.pacmap_fp_ratio.value(),
             }
-        elif algo == 'PHATE':
-            t_val = self.phate_t.value()
-            return {
-                'knn':   self.phate_knn.value(),
-                'decay': self.phate_decay.value(),
-                't':     'auto' if t_val == 0 else t_val,
-            }
         return {}
 
     # ------------------------------------------------------------------
@@ -2389,7 +2490,8 @@ class ConfigTab(QWidget):
                 "FlowSOM: self-organising map → metaclustering."
             ),
             'Leiden': (
-                "Leiden: graph community detection.  Reuses UMAP kNN if available.\n"
+                "Leiden: graph community detection (graspologic-native).\n"
+                "Reuses UMAP's kNN index when built on the same events.\n"
                 "Higher resolution = more fine-grained clusters."
             ),
             'HDBSCAN': (
@@ -2406,7 +2508,10 @@ class ConfigTab(QWidget):
     def _refresh_cl_status(self):
         algo = self.state.active_clustering_algorithm
         n_cl = self.state.n_clusters
-        if algo and n_cl is not None:
+        if self._run_locked['cl']:
+            self.cl_status_label.setText("⏳ Running …")
+            self.cl_status_label.setStyleSheet("color: orange;")
+        elif algo and n_cl is not None:
             self.cl_status_label.setText(
                 f"✓ Last run: {algo}  —  {n_cl} cluster(s)"
             )
@@ -2828,6 +2933,15 @@ class TransformTab(QWidget):
         )
         outer.addWidget(self.help_widget)
 
+        # Body: gates, controls and plots flow down the left; the channel
+        # list sits at full height on the right.
+        body = QHBoxLayout()
+        body.setSpacing(8)
+        outer.addLayout(body, stretch=1)
+        main_col = QVBoxLayout()
+        main_col.setSpacing(6)
+        body.addLayout(main_col, stretch=1)
+
         # --- Gate selection — primary tree ---
         gate_box = QGroupBox("Gate(s)")
         gate_box_layout = QVBoxLayout(gate_box)
@@ -2841,7 +2955,7 @@ class TransformTab(QWidget):
         self.gate_tree.setMaximumHeight(220)
         self.gate_tree.selectionChanged.connect(self._on_gate_tree_changed)
         gate_box_layout.addWidget(self.gate_tree)
-        outer.addWidget(gate_box)
+        main_col.addWidget(gate_box)
 
         # --- Top toolbar ---
         toolbar = QHBoxLayout()
@@ -2881,43 +2995,37 @@ class TransformTab(QWidget):
         toolbar.addWidget(self.load_csv_btn)
 
         toolbar.addStretch()
-        outer.addLayout(toolbar)
+        main_col.addLayout(toolbar)
 
-        # --- Splitter: channel list | plots ---
-        splitter = QSplitter(Qt.Horizontal)
+        # Plots: scrollable area holding histogram + biplots
+        plots_scroll = QScrollArea()
+        plots_scroll.setWidgetResizable(True)
+        plots_scroll.setFrameShape(QFrame.NoFrame)
+        plots_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.plots_widget = QWidget()
+        self.plots_layout = QVBoxLayout(self.plots_widget)
+        self.plots_layout.setContentsMargins(0, 0, 0, 0)
+        self.plots_layout.setSpacing(8)
+        plots_scroll.setWidget(self.plots_widget)
+        main_col.addWidget(plots_scroll, stretch=1)
 
-        # Left: channel list + transform type label
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(QLabel("Channels"))
+        # Channel list + transform type label, full height on the right
+        channels_col = QVBoxLayout()
+        channels_col.setContentsMargins(0, 0, 0, 0)
+        channels_col.addWidget(QLabel("Channels"))
         self.channel_list = QListWidget()
-        self.channel_list.setMaximumWidth(180)
+        self.channel_list.setFixedWidth(180)
         self.channel_list.currentItemChanged.connect(self._on_channel_item_changed)
-        left_layout.addWidget(self.channel_list)
+        channels_col.addWidget(self.channel_list, stretch=1)
         self.xform_type_label = QLabel("—")
         self.xform_type_label.setStyleSheet("font-style: italic; color: grey; padding: 4px;")
-        left_layout.addWidget(self.xform_type_label)
-        splitter.addWidget(left)
-
-        # Right: scrollable area holding histogram + biplot
-        right_scroll = QScrollArea()
-        right_scroll.setWidgetResizable(True)
-        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.right_widget = QWidget()
-        self.right_layout = QVBoxLayout(self.right_widget)
-        self.right_layout.setContentsMargins(6, 0, 0, 0)
-        self.right_layout.setSpacing(8)
-        right_scroll.setWidget(self.right_widget)
-        splitter.addWidget(right_scroll)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        outer.addWidget(splitter, stretch=1)
+        channels_col.addWidget(self.xform_type_label)
+        body.addLayout(channels_col)
 
         # ------------------------------------------------------------------
         # 1-D Histogram — built once, updated in-place each redraw
         # ------------------------------------------------------------------
-        self.right_layout.addWidget(QLabel("1-D Histogram  (drag axis to adjust transform)"))
+        self.plots_layout.addWidget(QLabel("1-D Histogram  (drag axis to adjust transform)"))
 
         self._hist_gw = TransparentGraphicsLayoutWidget()
         self._hist_gw.setMinimumHeight(180)
@@ -2953,7 +3061,7 @@ class TransformTab(QWidget):
         self._hist_axis_x.zoom_timer.timeout.connect(self._apply_hist_zoom)
         self._hist_axis_y.zoom_timer.timeout.connect(lambda: None)  # y auto-ranges
 
-        self.right_layout.addWidget(self._hist_gw)
+        self.plots_layout.addWidget(self._hist_gw)
 
         # ------------------------------------------------------------------
         # Biplot grid — multiple square tiles, Add/Remove buttons
@@ -2970,7 +3078,7 @@ class TransformTab(QWidget):
         remove_btn.setFixedHeight(24)
         remove_btn.clicked.connect(self._remove_biplot)
         biplot_header.addWidget(remove_btn)
-        self.right_layout.addLayout(biplot_header)
+        self.plots_layout.addLayout(biplot_header)
 
         # Scrollable area for biplot tiles — tiles wrap based on available width
         self._biplot_scroll = QScrollArea()
@@ -2989,7 +3097,7 @@ class TransformTab(QWidget):
         self._biplot_grid.setContentsMargins(0, 0, 0, 0)
         self._biplot_grid.setSpacing(4)
         self._biplot_scroll.setWidget(self._biplot_container)
-        self.right_layout.addWidget(self._biplot_scroll)
+        self.plots_layout.addWidget(self._biplot_scroll)
 
         # Debounce timer for tile reflow on resize (mirrors CytometryGridWidget)
         self._tile_relayout_timer = QTimer(self)
@@ -2999,7 +3107,7 @@ class TransformTab(QWidget):
         self._biplot_scroll.viewport().installEventFilter(self)
 
         self._biplot_tiles: list[BiplotTile] = []
-        self.right_layout.addStretch()
+        self.plots_layout.addStretch()
 
     # ------------------------------------------------------------------
     # Refresh — called on tab activation
@@ -3914,10 +4022,13 @@ class GroupsStatsTab(QWidget):
       • Sample-to-group assignment table with combo boxes
       • Covariate entry (arbitrary named columns)
       • CSV import / export
-      • Statistics controls: cluster frequencies (limma), cluster counts
-        (GLM), and/or MFIs, p-value and log2FC thresholds
-      • Background limma statistics via inmoose
-      • Results: heatmap+dendrogram and volcano plot, CSV export
+      • Statistics controls: cluster frequencies (moderated linear
+        model), cluster counts (GLM) and/or MFIs; FDR level, effect
+        thresholds, TREAT, covariate adjustment, cluster-first MFIs
+      • Background statistics worker
+      • Results: heatmap+dendrogram, volcano plot, MFI cluster summary,
+        CSV export
+      • Optional predictive analysis (nested cross-validation)
     """
 
     def __init__(self, state: PipelineState, bus, controller, parent=None):
@@ -3932,7 +4043,7 @@ class GroupsStatsTab(QWidget):
         self._stats_worker = None
         # (run_id, run_freq, run_mfi, groups_fingerprint) for the last
         # successfully computed Run Statistics — lets _run_statistics
-        # replot instead of re-running limma when only thresholds changed.
+        # replot instead of refitting when only thresholds changed.
         self._last_stats_data_key = None
         # the _ResultsDrawWorker currently building figures, if
         # any, and whether another _draw_results() call arrived while it
@@ -4176,10 +4287,8 @@ class GroupsStatsTab(QWidget):
         self.chk_paired = QCheckBox("Paired design")
         self.chk_paired.setToolTip(
             "Add the pairing variable below as a fixed-effect blocking "
-            "term (e.g. donor ID). InMoose has no duplicateCorrelation-"
-            "style random-effect blocking documented -- this is a fixed-"
-            "effect term, which needs a full-rank design (each pairing "
-            "level shouldn't be unique to one group)."
+            "term (e.g. donor ID). Each pairing level should appear in "
+            "more than one group, or the design cannot be fitted."
         )
         self.chk_paired.toggled.connect(self._on_paired_toggled)
         paired_row.addWidget(self.chk_paired)
@@ -4196,6 +4305,24 @@ class GroupsStatsTab(QWidget):
         paired_row.addWidget(self.pairing_variable_combo)
         paired_row.addStretch()
         test_groups_layout.addLayout(paired_row)
+
+        adjust_row = QHBoxLayout()
+        adjust_label = QLabel("Adjust for:")
+        adjust_label.setAlignment(Qt.AlignTop)
+        adjust_row.addWidget(adjust_label)
+        self.adjust_covariates_list = QListWidget()
+        self.adjust_covariates_list.setFixedHeight(70)
+        self.adjust_covariates_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.adjust_covariates_list.setToolTip(
+            "Covariate columns from the table above to include in every "
+            "test's model (e.g. age, sex, batch). Columns whose values are "
+            "all numbers are fitted as continuous terms; anything else as "
+            "categories. Every tested sample needs a value. The pairing "
+            "variable is already in the model when 'Paired design' is on."
+        )
+        self.adjust_covariates_list.itemChanged.connect(self._on_adjust_covariate_changed)
+        adjust_row.addWidget(self.adjust_covariates_list, stretch=1)
+        test_groups_layout.addLayout(adjust_row)
 
         stats_layout.addWidget(test_groups_box)
 
@@ -4255,9 +4382,12 @@ class GroupsStatsTab(QWidget):
         # Config row: what to test
         config_row = QHBoxLayout()
         config_row.addWidget(QLabel("Test:"))
-        self.chk_freq = QCheckBox("Cluster Frequencies (limma)")
+        self.chk_freq = QCheckBox("Cluster Frequencies")
         self.chk_freq.setChecked(True)
-        self.chk_freq.setToolTip("% events per cluster per sample → limma lmFit + eBayes")
+        self.chk_freq.setToolTip(
+            "log2 % of events per cluster per sample → moderated linear "
+            "model (empirical Bayes variance moderation)"
+        )
         self.chk_counts = QCheckBox("Cluster Counts (GLM)")
         self.chk_counts.setChecked(False)
         self.chk_counts.setToolTip(
@@ -4267,29 +4397,56 @@ class GroupsStatsTab(QWidget):
         )
         self.chk_mfi = QCheckBox("Cluster MFIs")
         self.chk_mfi.setChecked(True)
-        self.chk_mfi.setToolTip("Mean channel intensity per cluster per sample → limma")
+        self.chk_mfi.setToolTip(
+            "Mean transformed intensity of each marker within each cluster, "
+            "per sample → moderated linear model. Clusters with no events "
+            "in a sample are left out for that sample."
+        )
         config_row.addWidget(self.chk_freq)
         config_row.addWidget(self.chk_counts)
         config_row.addWidget(self.chk_mfi)
         config_row.addSpacing(20)
 
-        config_row.addWidget(QLabel("p-value ≤"))
+        config_row.addWidget(QLabel("FDR ≤"))
         self.pval_spin = QDoubleSpinBox()
         self.pval_spin.setRange(0.001, 1.0)
         self.pval_spin.setSingleStep(0.01)
         self.pval_spin.setDecimals(3)
         self.pval_spin.setValue(0.05)
         self.pval_spin.setFixedWidth(70)
+        self.pval_spin.setToolTip(
+            "Benjamini–Hochberg adjusted p-value cut-off. For cluster-first "
+            "MFI testing this is the level used at both stages."
+        )
         config_row.addWidget(self.pval_spin)
 
-        config_row.addWidget(QLabel("|log₂FC| ≥"))
+        config_row.addWidget(QLabel("Freq/Counts |log₂FC| ≥"))
         self.fc_spin = QDoubleSpinBox()
         self.fc_spin.setRange(0.0, 10.0)
         self.fc_spin.setSingleStep(0.1)
         self.fc_spin.setDecimals(2)
         self.fc_spin.setValue(0.5)
         self.fc_spin.setFixedWidth(70)
+        self.fc_spin.setToolTip(
+            "Smallest log2 fold change in cluster frequency (or count rate) "
+            "worth reporting. 0.5 is a 1.4-fold change, 1 a 2-fold change."
+        )
         config_row.addWidget(self.fc_spin)
+
+        config_row.addWidget(QLabel("MFI |Δ| ≥"))
+        self.mfi_fc_spin = QDoubleSpinBox()
+        self.mfi_fc_spin.setRange(0.0, 1.0e6)
+        self.mfi_fc_spin.setSingleStep(0.01)
+        self.mfi_fc_spin.setDecimals(3)
+        self.mfi_fc_spin.setValue(self.state.stats_mfi_threshold)
+        self.mfi_fc_spin.setFixedWidth(80)
+        self.mfi_fc_spin.setToolTip(
+            "Smallest difference in mean transformed intensity worth "
+            "reporting, in Transforms-tab units. Logicle/arcsinh scales run "
+            "0–1, so on a 4.5-decade Logicle 0.067 is about a 2-fold "
+            "change and 0.03 about 1.4-fold. Linear channels use raw units."
+        )
+        config_row.addWidget(self.mfi_fc_spin)
 
         config_row.addSpacing(20)
         config_row.addWidget(QLabel("FDR:"))
@@ -4305,6 +4462,31 @@ class GroupsStatsTab(QWidget):
 
         config_row.addStretch()
         stats_layout.addLayout(config_row)
+
+        method_row = QHBoxLayout()
+        self.chk_treat = QCheckBox("Test against thresholds (TREAT)")
+        self.chk_treat.setChecked(self.state.stats_use_treat)
+        self.chk_treat.setToolTip(
+            "On: each p-value tests whether the effect is LARGER than the "
+            "threshold (McCarthy & Smyth 2009), so small but consistent "
+            "shifts are not reported. Off: p-values test for any non-zero "
+            "effect and the threshold only filters the estimates."
+        )
+        method_row.addWidget(self.chk_treat)
+        method_row.addSpacing(20)
+        self.chk_mfi_hierarchical = QCheckBox("Cluster-first MFI testing")
+        self.chk_mfi_hierarchical.setChecked(self.state.stats_mfi_hierarchical)
+        self.chk_mfi_hierarchical.setToolTip(
+            "On: clusters are tested first (all their markers combined); "
+            "markers are then tested only inside clusters that pass, with "
+            "the FDR level adjusted for how many clusters were selected "
+            "(Benjamini & Bogomolov 2014). Reports which clusters change "
+            "and the markers that drive them. Off: every cluster × marker "
+            "is corrected as one flat list."
+        )
+        method_row.addWidget(self.chk_mfi_hierarchical)
+        method_row.addStretch()
+        stats_layout.addLayout(method_row)
 
         # ---- Marker roles: type (clustering) vs state (tested) ----
         roles_box = QGroupBox("Marker Roles — MFI Testing")
@@ -4569,6 +4751,79 @@ class GroupsStatsTab(QWidget):
         self.pca_chk_grid.stateChanged.connect(self._on_pca_option_changed)
 
         bottom_layout.addWidget(pca_box)
+
+        # ============================================================
+        # Predictive analysis (optional)
+        # ============================================================
+        pred_box = QGroupBox("Predictive Analysis (optional)")
+        pred_layout = QVBoxLayout(pred_box)
+        pred_hint = QLabel(
+            "Which small set of cluster features best tells two groups apart, "
+            "and how well? Lasso logistic regression and random forest models "
+            "are trained and scored by nested cross-validation on the "
+            "matrices from Run Statistics. Needs at least "
+            f"{drc_predictive.MIN_PER_GROUP} samples per group; "
+            f"{drc_predictive.RECOMMENDED_PER_GROUP}+ per group is recommended. "
+            "This complements the differential tests: a feature can differ "
+            "between groups without being picked, e.g. when a correlated "
+            "feature carries the same information."
+        )
+        pred_hint.setWordWrap(True)
+        pred_hint.setStyleSheet(HINT_STYLE)
+        pred_layout.addWidget(pred_hint)
+
+        pred_row = QHBoxLayout()
+        pred_row.addWidget(QLabel("Comparison:"))
+        self.pred_comparison_combo = QComboBox()
+        self.pred_comparison_combo.setMinimumWidth(200)
+        pred_row.addWidget(self.pred_comparison_combo)
+        pred_row.addSpacing(12)
+        pred_row.addWidget(QLabel("Features:"))
+        self.pred_chk_freq = QCheckBox("Frequencies")
+        self.pred_chk_freq.setChecked(True)
+        self.pred_chk_mfi = QCheckBox("MFIs")
+        self.pred_chk_mfi.setToolTip(
+            "Adds every cluster × marker MFI. Many more features: slower, and "
+            "needs more samples to learn from."
+        )
+        pred_row.addWidget(self.pred_chk_freq)
+        pred_row.addWidget(self.pred_chk_mfi)
+        pred_row.addSpacing(12)
+        pred_row.addWidget(QLabel("Models:"))
+        self.pred_chk_lasso = QCheckBox("Lasso logistic")
+        self.pred_chk_lasso.setChecked(True)
+        self.pred_chk_forest = QCheckBox("Random forest")
+        self.pred_chk_forest.setChecked(True)
+        pred_row.addWidget(self.pred_chk_lasso)
+        pred_row.addWidget(self.pred_chk_forest)
+        pred_row.addSpacing(12)
+        pred_row.addWidget(QLabel("Repeats"))
+        self.pred_repeats_spin = QSpinBox()
+        self.pred_repeats_spin.setRange(1, 50)
+        self.pred_repeats_spin.setValue(5)
+        self.pred_repeats_spin.setFixedWidth(55)
+        self.pred_repeats_spin.setToolTip(
+            "How many times the outer 5-fold cross-validation is repeated with "
+            "a different split. More repeats give steadier estimates."
+        )
+        pred_row.addWidget(self.pred_repeats_spin)
+        pred_row.addStretch()
+        pred_layout.addLayout(pred_row)
+
+        pred_btn_row = QHBoxLayout()
+        self.pred_run_btn = QPushButton("▶  Run Predictive Analysis")
+        self.pred_run_btn.setEnabled(False)
+        self.pred_run_btn.setToolTip("Run Statistics first.")
+        self.pred_run_btn.clicked.connect(self._run_predictive)
+        pred_btn_row.addWidget(self.pred_run_btn)
+        self.pred_status_label = QLabel("")
+        self.pred_status_label.setWordWrap(True)
+        self.pred_status_label.setStyleSheet("color: grey;")
+        pred_btn_row.addWidget(self.pred_status_label, stretch=1)
+        pred_layout.addLayout(pred_btn_row)
+        self._predictive_worker = None
+
+        bottom_layout.addWidget(pred_box)
 
         # Results area: one tab per plot
         self._results_tabs = QTabWidget()
@@ -4856,9 +5111,40 @@ class GroupsStatsTab(QWidget):
         self.pairing_variable_combo.setCurrentIndex(max(0, idx))
         self.pairing_variable_combo.blockSignals(False)
         self.state.pairing_variable = self.pairing_variable_combo.currentText()
+        self._populate_adjust_covariates_list()
 
     def _on_pairing_variable_changed(self, text: str):
         self.state.pairing_variable = text
+        self._last_stats_data_key = None
+
+    def _populate_adjust_covariates_list(self):
+        """One checkable row per covariate column, ticked if it is in
+        state.stats_adjust_covariates. Drops selections whose column no
+        longer exists."""
+        cols = list(self.state.covariates.columns) if self.state.covariates is not None else []
+        self.state.stats_adjust_covariates = [
+            c for c in self.state.stats_adjust_covariates if c in cols
+        ]
+        self.adjust_covariates_list.blockSignals(True)
+        self.adjust_covariates_list.clear()
+        for col in cols:
+            values = self.state.covariates[col].tolist()
+            kind = drc_stats.covariate_kind(values)
+            item = QListWidgetItem(f"{col}  ({kind})")
+            item.setData(Qt.UserRole, col)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.Checked if col in self.state.stats_adjust_covariates else Qt.Unchecked
+            )
+            self.adjust_covariates_list.addItem(item)
+        self.adjust_covariates_list.blockSignals(False)
+
+    def _on_adjust_covariate_changed(self, _item):
+        self.state.stats_adjust_covariates = [
+            self.adjust_covariates_list.item(i).data(Qt.UserRole)
+            for i in range(self.adjust_covariates_list.count())
+            if self.adjust_covariates_list.item(i).checkState() == Qt.Checked
+        ]
         self._last_stats_data_key = None
 
     def _refresh_viewing_comparison_combo(self):
@@ -5026,6 +5312,9 @@ class GroupsStatsTab(QWidget):
         self.chk_paired.setChecked(self.state.paired)
         self.chk_paired.blockSignals(False)
         self.pairing_variable_combo.setEnabled(self.state.paired)
+        self.chk_treat.setChecked(self.state.stats_use_treat)
+        self.chk_mfi_hierarchical.setChecked(self.state.stats_mfi_hierarchical)
+        self.mfi_fc_spin.setValue(self.state.stats_mfi_threshold)
         self.radio_reference.blockSignals(True)
         self.radio_pairwise.blockSignals(True)
         if self.state.contrast_mode == 'pairwise':
@@ -5043,6 +5332,7 @@ class GroupsStatsTab(QWidget):
         self._populate_trex_dr_combo()
         self._populate_marker_roles_list()
         self._update_run_button()
+        self._refresh_predictive_controls()
 
         # Redraw plots if results are present and haven't been rendered yet
         # (_last_drawn_cluster_names == {} after load_state resets it) or if
@@ -5668,8 +5958,10 @@ class GroupsStatsTab(QWidget):
 
         if self.state.stats_run_id and self.state.stats_run_id not in valid_ids:
             for key in ('freq_heatmap', 'freq_volcano', 'counts_heatmap',
-                       'counts_volcano', 'mfi_heatmap', 'mfi_volcano', 'sample_pca'):
+                       'counts_volcano', 'mfi_heatmap', 'mfi_volcano', 'mfi_clusters',
+                       'sample_pca', 'pred_performance', 'pred_importance', 'pred_panel'):
                 self._remove_results_tab_by_key(key)
+            self.state.predictive_result = None
             self.state.freq_results = None
             self.state.counts_results = None
             self.state.mfi_results = None
@@ -6008,10 +6300,10 @@ class GroupsStatsTab(QWidget):
 
     def _run_statistics(self):
         """
-        Launch background limma/GLM statistics — or, if the same run and
+        Launch background differential statistics — or, if the same run and
         group assignment already produced results and only the
         significance thresholds changed, just re-flag significance and
-        replot without re-running the (intensive) limma/GLM calls.
+        replot without refitting.
         """
         if self._stats_worker is not None and self._stats_worker.isRunning():
             return
@@ -6059,16 +6351,62 @@ class GroupsStatsTab(QWidget):
                 )
                 return
 
+        adjust_covariates = [
+            c for c in self.state.stats_adjust_covariates
+            if not (self.state.paired and c == self.state.pairing_variable)
+        ]
+        if adjust_covariates:
+            try:
+                group_rel = drc_stats.resolve_test_groups(
+                    self.controller, self.state, cluster_labels_override=labels_for_stats
+                )
+            except Exception:
+                group_rel = {}
+            qualifying = [g for g in (self.state.testing_group_selection or self.state.group_names)
+                         if g in group_rel]
+            all_rel = [rel for g in qualifying for rel in group_rel[g]]
+            missing = drc_stats.missing_covariate_values(self.state, all_rel, adjust_covariates)
+            if missing:
+                lines = []
+                for name, rels in missing.items():
+                    shown = ", ".join(Path(r).stem for r in rels[:8])
+                    more = " …" if len(rels) > 8 else ""
+                    lines.append(f"'{name}' ({len(rels)}): {shown}{more}")
+                QMessageBox.warning(
+                    self, "Missing Covariate Values",
+                    "These adjustment covariates have no value for some tested "
+                    "samples:\n\n" + "\n".join(lines) + "\n\nFill them in on the "
+                    "Sample Group Assignment table, or untick them under 'Adjust for'."
+                )
+                return
+
         pval_threshold = self.pval_spin.value()
         fc_threshold   = self.fc_spin.value()
+        mfi_threshold  = self.mfi_fc_spin.value()
         fdr_scope = 'per_comparison' if self.fdr_scope_combo.currentIndex() == 1 else 'global'
         self.state.stats_fdr_scope = fdr_scope
+        self.state.stats_use_treat = self.chk_treat.isChecked()
+        self.state.stats_mfi_threshold = mfi_threshold
+        self.state.stats_mfi_hierarchical = self.chk_mfi_hierarchical.isChecked()
+        use_treat = self.state.stats_use_treat
+        mfi_hierarchical = self.state.stats_mfi_hierarchical
 
         include_type_markers = self.chk_include_type_markers.isChecked()
         groups_fingerprint = tuple(sorted(self.state.sample_groups.items()))
+        design_columns = list(adjust_covariates)
+        if self.state.paired and self.state.pairing_variable:
+            design_columns.append(self.state.pairing_variable)
+        covariate_values = ()
+        if self.state.covariates is not None:
+            present = [c for c in design_columns if c in self.state.covariates.columns]
+            covariate_values = tuple(
+                (rel, tuple(str(v) for v in row))
+                for rel, row in self.state.covariates[present].iterrows()
+            )
         test_fingerprint = (
             tuple(self.state.testing_group_selection), self.state.contrast_mode,
             self.state.reference_group, self.state.paired, self.state.pairing_variable,
+            tuple(adjust_covariates), covariate_values,
         )
         roles_fingerprint  = tuple(sorted(self.state.marker_roles.items()))
         data_key = (run_id, run_freq, run_counts, run_mfi, groups_fingerprint,
@@ -6082,8 +6420,8 @@ class GroupsStatsTab(QWidget):
 
         if data_key == self._last_stats_data_key and have_results:
             # Same run, same groups, same tests already computed — only the
-            # thresholds may have changed. Re-flag significance in place
-            # and replot instead of re-running limma/GLM.
+            # thresholds may have changed. Recompute p-values/significance
+            # from the stored estimates and replot without refitting.
             self._apply_significance_thresholds(pval_threshold, fc_threshold)
             self.stats_status_label.setText("✓ Statistics complete (replotted — run unchanged).")
             self.stats_status_label.setStyleSheet("color: green;")
@@ -6117,7 +6455,8 @@ class GroupsStatsTab(QWidget):
 
             def __init__(self_, run_freq, run_mfi, group_names, labels_override,
                         include_type_markers, names_override, run_counts, af_state,
-                        fdr_scope):
+                        fdr_scope, adjust_covariates, use_treat, mfi_threshold,
+                        mfi_hierarchical):
                 super().__init__()
                 self_._run_freq = run_freq
                 self_._run_mfi  = run_mfi
@@ -6128,6 +6467,10 @@ class GroupsStatsTab(QWidget):
                 self_._names_override = names_override
                 self_._af_state = af_state
                 self_._fdr_scope = fdr_scope
+                self_._adjust_covariates = adjust_covariates
+                self_._use_treat = use_treat
+                self_._mfi_threshold = mfi_threshold
+                self_._mfi_hierarchical = mfi_hierarchical
 
             def run(self_):
                 try:
@@ -6148,17 +6491,22 @@ class GroupsStatsTab(QWidget):
                     run_counts=self_._run_counts,
                     af_state=self_._af_state,
                     fdr_scope=self_._fdr_scope,
+                    covariate_names=self_._adjust_covariates,
+                    use_treat=self_._use_treat,
+                    mfi_threshold=self_._mfi_threshold,
+                    mfi_hierarchical=self_._mfi_hierarchical,
                 )
                 if freq is not None:
-                    self_.progress.emit(f"Frequency limma: {len(freq)} clusters tested.")
+                    self_.progress.emit(f"Frequencies: {len(freq)} rows tested.")
                 if counts is not None:
-                    self_.progress.emit(f"Counts GLM: {len(counts)} clusters tested.")
+                    self_.progress.emit(f"Counts GLM: {len(counts)} rows tested.")
                 if mfi is not None:
-                    self_.progress.emit(f"MFI limma: {len(mfi)} features tested.")
+                    self_.progress.emit(f"MFIs: {len(mfi)} rows tested.")
 
         worker = _StatsWorker(run_freq, run_mfi, list(self.state.group_names), labels_for_stats,
                              include_type_markers, names_for_stats, run_counts, af_state,
-                             fdr_scope)
+                             fdr_scope, adjust_covariates, use_treat, mfi_threshold,
+                             mfi_hierarchical)
         worker.progress.connect(lambda msg: print(f"[DR Stats] {msg}"))
         worker.finished.connect(lambda success, err, key=data_key: self._on_stats_finished(success, err, key))
         self._stats_worker = worker
@@ -6166,29 +6514,23 @@ class GroupsStatsTab(QWidget):
 
     def _apply_significance_thresholds(self, pval_threshold: float, fc_threshold: float):
         """
-        Recompute the 'significant' column on already-computed freq/counts/
-        mfi results in place, without re-running limma/GLM. logFC/p-values
-        are threshold-independent, so this is all that's needed when only
-        the thresholds or FDR scope changed since the last run.
+        Recompute p-values, FDR and 'significant' on the stored freq/counts/
+        mfi results for the current thresholds, TREAT and cluster-first
+        settings, without refitting (drc_stats.apply_significance works from
+        each row's estimate, SE and df).
         """
-        per_comparison = self.state.stats_fdr_scope == 'per_comparison'
         for attr in ('freq_results', 'counts_results', 'mfi_results'):
             df = getattr(self.state, attr)
             if df is None or 'logFC' not in df.columns:
                 continue
-            # Prefer the global (all-contrasts-pooled) correction unless
-            # 'Per comparison' is selected, matching run_limma()/
-            # run_glm_counts()'s own fdr_scope handling.
-            if not per_comparison and 'adj.P.Val.global' in df.columns:
-                pval_col = 'adj.P.Val.global'
-            elif 'adj.P.Val' in df.columns:
-                pval_col = 'adj.P.Val'
-            else:
-                pval_col = 'P.Value'
-            df['significant'] = (
-                (df[pval_col] <= pval_threshold) &
-                (df['logFC'].abs() >= fc_threshold)
-            )
+            is_mfi = attr == 'mfi_results'
+            setattr(self.state, attr, drc_stats.apply_significance(
+                df, pval_threshold,
+                self.state.stats_mfi_threshold if is_mfi else fc_threshold,
+                fdr_scope=self.state.stats_fdr_scope,
+                use_treat=self.state.stats_use_treat,
+                hierarchical=is_mfi and self.state.stats_mfi_hierarchical,
+            ))
 
     def _resolve_stats_source(self):
         """
@@ -6397,7 +6739,7 @@ class GroupsStatsTab(QWidget):
                     f"{', '.join(missing)} checked under 'Build from', but not "
                     "yet computed. Run Statistics first with the matching "
                     "'Test:' box(es) checked (Frequencies → 'Cluster "
-                    "Frequencies (limma)', Counts → 'Cluster Counts (GLM)', "
+                    "Frequencies', Counts → 'Cluster Counts (GLM)', "
                     "MFIs → 'Cluster MFIs')."
                 )
                 return
@@ -6749,7 +7091,243 @@ class GroupsStatsTab(QWidget):
         self.stats_status_label.setStyleSheet("color: green;")
         self.export_results_btn.setEnabled(True)
         self._update_pca_source_availability()
+        self._refresh_predictive_controls()
         self._draw_results()
+
+    # ------------------------------------------------------------------
+    # Predictive analysis
+    # ------------------------------------------------------------------
+
+    def _refresh_predictive_controls(self):
+        """Comparison list from the last Run Statistics; feature boxes
+        enabled only for matrices that run computed."""
+        prev = self.pred_comparison_combo.currentText()
+        self.pred_comparison_combo.blockSignals(True)
+        self.pred_comparison_combo.clear()
+        labels = [f"{other} vs {base}" for base, other in self.state.stats_comparisons]
+        self.pred_comparison_combo.addItems(labels)
+        idx = self.pred_comparison_combo.findText(prev)
+        self.pred_comparison_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.pred_comparison_combo.blockSignals(False)
+
+        have_freq = self.state.freq_df is not None and not self.state.freq_df.empty
+        have_mfi = self.state.mfi_df is not None and not self.state.mfi_df.empty
+        self.pred_chk_freq.setEnabled(have_freq)
+        self.pred_chk_mfi.setEnabled(have_mfi)
+        runnable = bool(labels) and (have_freq or have_mfi)
+        busy = self._predictive_worker is not None and self._predictive_worker.isRunning()
+        self.pred_run_btn.setEnabled(runnable and not busy)
+        self.pred_run_btn.setToolTip(
+            "" if runnable else
+            "Run Statistics first, with Cluster Frequencies and/or Cluster MFIs ticked."
+        )
+
+    def _run_predictive(self):
+        if self._predictive_worker is not None and self._predictive_worker.isRunning():
+            return
+        idx = self.pred_comparison_combo.currentIndex()
+        if idx < 0 or idx >= len(self.state.stats_comparisons):
+            return
+        negative, positive = self.state.stats_comparisons[idx]
+        models = []
+        if self.pred_chk_lasso.isChecked():
+            models.append('l1_logistic')
+        if self.pred_chk_forest.isChecked():
+            models.append('random_forest')
+        if not models:
+            QMessageBox.warning(self, "Predictive Analysis", "Tick at least one model.")
+            return
+        use_freq = self.pred_chk_freq.isChecked() and self.pred_chk_freq.isEnabled()
+        use_mfi = self.pred_chk_mfi.isChecked() and self.pred_chk_mfi.isEnabled()
+        if not (use_freq or use_mfi):
+            QMessageBox.warning(self, "Predictive Analysis",
+                                "Tick Frequencies and/or MFIs (computed by Run Statistics).")
+            return
+
+        rel_list = [rel for rel, g in zip(self.state.stats_all_rel, self.state.stats_group_vec)
+                    if g in (negative, positive)]
+        groups = [g for g in self.state.stats_group_vec if g in (negative, positive)]
+        n_per_group = {positive: groups.count(positive), negative: groups.count(negative)}
+        status, message = drc_predictive.sample_size_status(n_per_group)
+        if status == 'block':
+            QMessageBox.warning(self, "Predictive Analysis", message)
+            return
+
+        X = drc_predictive.build_feature_matrix(
+            self.state.freq_df if use_freq else None,
+            self.state.mfi_df if use_mfi else None,
+            rel_list,
+        )
+        repeats = self.pred_repeats_spin.value()
+        run_label = self.state.stats_run_label or 'Active (unsaved)'
+
+        class _PredictiveWorker(QThread):
+            finished = Signal(bool, str)
+            progress = Signal(str)
+
+            def __init__(self_):
+                super().__init__()
+                self_.result = None
+
+            def run(self_):
+                try:
+                    self_.result = drc_predictive.run_predictive(
+                        X, groups, positive, negative, models=tuple(models),
+                        repeats=repeats, progress=self_.progress.emit,
+                    )
+                    self_.result['run_label'] = run_label
+                    self_.finished.emit(True, '')
+                except Exception as exc:
+                    traceback.print_exc()
+                    self_.finished.emit(False, str(exc))
+
+        worker = _PredictiveWorker()
+        worker.progress.connect(self.pred_status_label.setText)
+        worker.finished.connect(
+            lambda ok, err, w=worker, st=status, msg=message:
+            self._on_predictive_finished(ok, err, w, st, msg))
+        self._predictive_worker = worker
+        self.pred_run_btn.setEnabled(False)
+        self.pred_status_label.setStyleSheet("color: orange;")
+        self.pred_status_label.setText(
+            f"⏳ Running on {X.shape[1]} features, {len(rel_list)} samples …")
+        worker.start()
+
+    def _on_predictive_finished(self, success: bool, error_msg: str, worker,
+                                status: str, message: str):
+        self._predictive_worker = None
+        self._refresh_predictive_controls()
+        if not success:
+            self.pred_status_label.setStyleSheet("color: red;")
+            self.pred_status_label.setText(f"Error: {error_msg}")
+            QMessageBox.critical(self, "Predictive Analysis Error", error_msg)
+            return
+        self.state.predictive_result = worker.result
+        summary = worker.result['summary']
+        text = (f"✓ Done. Minimal panel: {summary['minimal_panel']} feature(s) "
+                f"(best panel AUC {summary['best_panel_auc']:.2f}).")
+        if status == 'warn':
+            text += f"  ⚠ {message}"
+            self.pred_status_label.setStyleSheet("color: orange;")
+        else:
+            self.pred_status_label.setStyleSheet("color: green;")
+        self.pred_status_label.setText(text)
+        self._draw_predictive_results()
+
+    def _draw_predictive_results(self):
+        res = self.state.predictive_result
+        if not res:
+            return
+        run_label = res.get('run_label', '')
+        summary = res['summary']
+        for key, title, maker, kwargs in (
+            ('pred_performance', "Predictive: ROC", self._make_predictive_roc_figure,
+             dict(performance=res['performance'], roc=res['roc'], summary=summary,
+                  run_label=run_label)),
+            ('pred_importance', "Predictive: Features", self._make_predictive_importance_figure,
+             dict(importance=res['importance'], summary=summary, run_label=run_label)),
+            ('pred_panel', "Predictive: Panel Size", self._make_predictive_panel_figure,
+             dict(panel=res['panel'], summary=summary, run_label=run_label)),
+        ):
+            try:
+                fig = maker(**kwargs)
+            except Exception as e:
+                traceback.print_exc()
+                QMessageBox.warning(self, "Predictive Analysis", f"{title}: {e}")
+                continue
+            self._add_results_tab(fig, title, key, maker=maker, maker_kwargs=kwargs, key=key)
+
+    def _predictive_subtitle(self, summary: dict) -> str:
+        n = ", ".join(f"{g} n={k}" for g, k in summary['n_per_group'].items())
+        text = (f"{summary['positive']} vs {summary['negative']} ({n}); "
+                f"{summary['repeats']}× repeated {summary['outer_folds']}-fold CV")
+        if summary.get('status') == 'warn':
+            text += (f"\nfewer than {drc_predictive.RECOMMENDED_PER_GROUP} per group: "
+                     "estimates are noisy")
+        return text
+
+    def _make_predictive_roc_figure(self, performance, roc, summary: dict, run_label: str = ''):
+        """Mean out-of-fold ROC curve per model, AUC ± SD over repeats in the legend."""
+        from matplotlib.figure import Figure
+
+        is_dark = _resolve_is_dark(self.state)
+        fig = Figure(figsize=(5.5, 5), constrained_layout=True)
+        ax = fig.add_subplot(111)
+        ax.plot([0, 1], [0, 1], color='grey', linestyle='--', linewidth=0.8)
+        for _, row in performance.iterrows():
+            curve = roc[roc['model'] == row['model']]
+            ax.plot(curve['fpr'], curve['tpr'], linewidth=1.6,
+                    label=(f"{row['model']}: AUC {row['auc_mean']:.2f} ± {row['auc_sd']:.2f}, "
+                           f"bal. acc. {row['balanced_accuracy_mean']:.2f}"))
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1.02)
+        ax.set_xlabel("False positive rate")
+        ax.set_ylabel("True positive rate")
+        ax.legend(loc='lower right', fontsize=7)
+        ax.set_title(f"Cross-validated ROC\n{self._predictive_subtitle(summary)}", fontsize=9)
+        _style_figure_theme(fig, is_dark)
+        self._stamp_run_label(fig, run_label)
+        return fig
+
+    def _make_predictive_importance_figure(self, importance, summary: dict,
+                                           run_label: str = '', top_n: int = 20):
+        """Top features: lasso selection frequency and/or forest importance,
+        coloured by which group has the higher value."""
+        from matplotlib.figure import Figure
+
+        is_dark = _resolve_is_dark(self.state)
+        metrics = [(c, lbl) for c, lbl in (
+            ('lasso_selection', 'Lasso: fraction of fits selecting'),
+            ('forest_importance', 'Random forest: mean importance'),
+        ) if c in importance.columns]
+        top = importance.head(top_n).iloc[::-1]
+        colours = ['#EE6677' if d > 0 else '#4477AA' for d in top['direction']]
+        fig = Figure(figsize=(4.5 * len(metrics) + 2.5, max(3.5, 0.28 * len(top) + 1.8)),
+                     constrained_layout=True)
+        for i, (col, label) in enumerate(metrics):
+            ax = fig.add_subplot(1, len(metrics), i + 1)
+            xerr = top['forest_importance_sd'] if col == 'forest_importance' else None
+            ax.barh(range(len(top)), top[col], color=colours, xerr=xerr,
+                    error_kw={'elinewidth': 0.6})
+            ax.set_yticks(range(len(top)))
+            ax.set_yticklabels(top['feature'] if i == 0 else [''] * len(top), fontsize=7)
+            ax.set_xlabel(label, fontsize=8)
+        import matplotlib.patches as mpatches
+        fig.legend(handles=[
+            mpatches.Patch(color='#EE6677', label=f"higher in {summary['positive']}"),
+            mpatches.Patch(color='#4477AA', label=f"higher in {summary['negative']}"),
+        ], loc='outside lower center', ncol=2, fontsize=7)
+        fig.suptitle(f"Most informative features\n{self._predictive_subtitle(summary)}", fontsize=9)
+        _style_figure_theme(fig, is_dark)
+        self._stamp_run_label(fig, run_label)
+        return fig
+
+    def _make_predictive_panel_figure(self, panel, summary: dict, run_label: str = ''):
+        """Cross-validated AUC against the number of top-ranked features."""
+        from matplotlib.figure import Figure
+
+        is_dark = _resolve_is_dark(self.state)
+        fig = Figure(figsize=(5.5, 4.5), constrained_layout=True)
+        ax = fig.add_subplot(111)
+        x = panel['n_features'].values
+        m = panel['auc_mean'].values
+        sd = panel['auc_sd'].values
+        ax.fill_between(x, m - sd, m + sd, alpha=0.25)
+        ax.plot(x, m, marker='o', markersize=3, linewidth=1.4)
+        ax.axhline(0.5, color='grey', linestyle='--', linewidth=0.8)
+        ax.axvline(summary['minimal_panel'], color='grey', linestyle=':', linewidth=1.0)
+        ax.annotate(f"minimal panel: {summary['minimal_panel']}",
+                    xy=(summary['minimal_panel'], 0.5), xytext=(4, 4),
+                    textcoords='offset points', fontsize=7)
+        ax.set_xscale('log')
+        ax.set_xlabel("Number of top-ranked features (log scale)")
+        ax.set_ylabel("Cross-validated AUC (mean ± SD)")
+        ax.set_ylim(0, 1.02)
+        ax.set_title(f"How many features are needed?\n{self._predictive_subtitle(summary)}",
+                     fontsize=9)
+        _style_figure_theme(fig, is_dark)
+        self._stamp_run_label(fig, run_label)
+        return fig
 
     # ------------------------------------------------------------------
     # Results visualisation
@@ -7038,6 +7616,8 @@ class GroupsStatsTab(QWidget):
                 maker_kwargs=dict(pca_result=pca_result, run_label=self.state.pca_run_label),
                 key="sample_pca",
             )
+        if self.state.predictive_result and self._has_results_tab('pred_performance'):
+            self._draw_predictive_results()
 
     def _remove_results_tab_by_key(self, key: str):
         """Remove the results tab whose container carries this key, if
@@ -7081,7 +7661,7 @@ class GroupsStatsTab(QWidget):
         # previous comparison's plots don't linger while the new ones
         # are being built.
         for key in ('freq_heatmap', 'freq_volcano', 'counts_heatmap', 'counts_volcano',
-                   'mfi_heatmap', 'mfi_volcano'):
+                   'mfi_heatmap', 'mfi_volcano', 'mfi_clusters'):
             self._remove_results_tab_by_key(key)
 
         self._refresh_viewing_comparison_combo()
@@ -7099,6 +7679,8 @@ class GroupsStatsTab(QWidget):
                   self.state.counts_results is not None)
         pval_threshold = self.pval_spin.value()
         fc_threshold = self.fc_spin.value()
+        mfi_threshold = self.state.stats_mfi_threshold
+        channel_names = _antigen_or_label_map(self.controller)
 
         # Snapshot the current result DataFrames NOW, on the main thread.
         # The background worker must never read self.state live --
@@ -7123,6 +7705,7 @@ class GroupsStatsTab(QWidget):
                 counts_results_snap, counts_df_snap,
                 mfi_results_snap, mfi_df_snap, mfi_sample_df_snap,
                 stats_all_rel_snap, stats_group_vec_snap,
+                mfi_threshold=mfi_threshold, channel_names=channel_names,
             )
 
         worker = _ResultsDrawWorker(_build)
@@ -7135,7 +7718,9 @@ class GroupsStatsTab(QWidget):
                                 freq_results, freq_df,
                                 counts_results, counts_df,
                                 mfi_results, mfi_df, mfi_sample_df,
-                                stats_all_rel, stats_group_vec) -> dict:
+                                stats_all_rel, stats_group_vec,
+                                mfi_threshold: float | None = None,
+                                channel_names: dict | None = None) -> dict:
         """
         Pure compute: build every results Figure from the snapshotted
         DataFrames passed in (no self.state reads, no Qt) -- runs on
@@ -7212,10 +7797,18 @@ class GroupsStatsTab(QWidget):
                 mfi_sample_df=mfi_sample_df_view,
                 group_a=name_a, group_b=name_b, run_label=run_label,
             ))
+        if mfi_results_view is not None:
+            mfi_fc = fc_threshold if mfi_threshold is None else mfi_threshold
             _build('mfi_volcano', "MFI Volcano", self._make_volcano_figure, dict(
                 results_df=mfi_results_view,
                 title=f"Cluster MFI Volcano: {name_b} vs {name_a}",
-                pval_threshold=pval_threshold, fc_threshold=fc_threshold,
+                pval_threshold=pval_threshold, fc_threshold=mfi_fc,
+                run_label=run_label,
+            ))
+            _build('mfi_clusters', "MFI Clusters", self._make_mfi_cluster_summary_figure, dict(
+                results_df=mfi_results_view,
+                title=f"Marker changes in significant clusters: {name_b} vs {name_a}",
+                channel_names=channel_names or {},
                 run_label=run_label,
             ))
 
@@ -7412,7 +8005,7 @@ class GroupsStatsTab(QWidget):
         """
         Per-sample heatmap with row + column dendrograms.
 
-        results_df : limma/GLM output for ONE comparison (feature, logFC,
+        results_df : test output for ONE comparison (feature, logFC,
                      significant, …): the caller has
                      already filtered a multi-comparison result down to a
                      single comparison's rows before calling this.
@@ -7621,18 +8214,30 @@ class GroupsStatsTab(QWidget):
     def _make_volcano_figure(self, results_df, title: str,
                               pval_threshold: float, fc_threshold: float,
                               run_label: str = ''):
-        """Volcano plot: x=logFC, y=-log10(adj.P.Val). Significant points
-        are coloured via viridis, scaled by -log10(adj. P-value).
-        Previously flat red for every significant point); non-
-        significant points stay flat grey. Significant points also get a
-        thin horizontal error bar showing the log2FC's 95% confidence
-        interval (CI.L/CI.R), when present. run_label is stamped in the
-        upper-left corner (plot provenance)."""
+        """Volcano plot: x = effect (log2FC, or ΔMFI for MFI results), y =
+        -log10 of the adjusted p-value that decides significance: the
+        stage-wise value for cluster-first MFI results, otherwise the
+        pooled or per-comparison BH value matching the FDR setting.
+        Significant points are coloured via viridis by that value and get
+        a thin horizontal bar for the effect's 95% confidence interval
+        (CI.L/CI.R); non-significant points are grey. run_label is
+        stamped in the upper-left corner (plot provenance)."""
         from matplotlib.figure import Figure
 
         is_dark = _resolve_is_dark(self.state)
 
-        pval_col = 'adj.P.Val' if 'adj.P.Val' in results_df.columns else 'P.Value'
+        if 'stagewise.adj.P.Val' in results_df.columns:
+            pval_col = 'stagewise.adj.P.Val'
+            y_label = "-log10(stage-wise adj. P)"
+        elif self.state.stats_fdr_scope == 'global' and 'adj.P.Val.global' in results_df.columns:
+            pval_col = 'adj.P.Val.global'
+            y_label = "-log10(adj. P, pooled)"
+        elif 'adj.P.Val' in results_df.columns:
+            pval_col = 'adj.P.Val'
+            y_label = "-log10(adj. P-value)"
+        else:
+            pval_col = 'P.Value'
+            y_label = "-log10(P-value)"
         logfc  = results_df['logFC'].values.astype(float)
         neg_lp = -np.log10(np.maximum(results_df[pval_col].values.astype(float), 1e-300))
         sig    = results_df['significant'].values if 'significant' in results_df.columns else (
@@ -7683,7 +8288,7 @@ class GroupsStatsTab(QWidget):
         if sig.any():
             sig_scatter = ax.scatter(logfc[sig], neg_lp[sig], c=neg_lp[sig], cmap='viridis',
                             s=25, alpha=0.9, linewidths=0)
-            fig.colorbar(sig_scatter, ax=ax, shrink=0.7, label='-log10(adj. P-value)')
+            fig.colorbar(sig_scatter, ax=ax, shrink=0.7, label=y_label)
 
         ax.axhline(-np.log10(pval_threshold), color='grey', linestyle='--', linewidth=0.8)
         ax.axvline( fc_threshold,              color='grey', linestyle='--', linewidth=0.8)
@@ -7730,10 +8335,106 @@ class GroupsStatsTab(QWidget):
         x_lim = max(np.abs(logfc).max() * 1.05, fc_threshold * 1.5, ci_extent * 1.05)
         ax.set_xlim(-x_lim, x_lim)
 
-        ax.set_xlabel("log2 Fold Change")
-        ax.set_ylabel("-log10(adj. P-value)")
+        if 'MFI' in title:
+            ax.set_xlabel("Δ mean intensity (transformed units)")
+        else:
+            ax.set_xlabel("log2 Fold Change")
+        ax.set_ylabel(y_label)
         display_title = title
         ax.set_title(display_title, fontsize=10)
+        _style_figure_theme(fig, is_dark)
+        self._stamp_run_label(fig, run_label)
+        return fig
+
+    def _make_mfi_cluster_summary_figure(self, results_df, title: str,
+                                         channel_names: dict, run_label: str = ''):
+        """
+        Cluster × marker grid for ONE comparison's MFI results, limited to
+        clusters with at least one significant marker. Cell colour is the
+        difference in mean transformed intensity (diverging, centred on 0);
+        a dot marks significant markers. Row labels carry each cluster's
+        FDR from the cluster-level screen when cluster-first testing was
+        used.
+        """
+        import matplotlib
+        from matplotlib.figure import Figure
+        from matplotlib.colors import TwoSlopeNorm
+
+        is_dark = _resolve_is_dark(self.state)
+        fg = 'white' if is_dark else 'black'
+
+        def _message(text):
+            fig = Figure(figsize=(5, 2), constrained_layout=True)
+            ax = fig.add_subplot(111)
+            ax.axis('off')
+            ax.text(0.5, 0.5, text, ha='center', va='center', fontsize=10,
+                    transform=ax.transAxes)
+            ax.set_title(title, fontsize=10)
+            _style_figure_theme(fig, is_dark)
+            self._stamp_run_label(fig, run_label)
+            return fig
+
+        needed = {'cluster', 'channel', 'logFC', 'significant'}
+        if results_df is None or not needed.issubset(results_df.columns):
+            return _message('Re-run statistics to see the cluster summary')
+        sig = results_df[results_df['significant'].astype(bool)]
+        if sig.empty:
+            return _message('No significant markers at current thresholds')
+
+        clusters_df = results_df[results_df['cluster'].isin(sig['cluster'].unique())]
+        order_key = ('cluster.adj.P.Val' if 'cluster.adj.P.Val' in results_df.columns
+                     else 'P.Value')
+        cluster_order = (clusters_df.groupby('cluster', sort=False)[order_key].min()
+                         .sort_values(kind='mergesort').index.tolist())
+        channels = list(dict.fromkeys(results_df['channel'].tolist()))
+
+        grid = clusters_df.pivot_table(index='cluster', columns='channel',
+                                       values='logFC', aggfunc='first')
+        grid = grid.reindex(index=cluster_order, columns=channels)
+        sig_grid = clusters_df.pivot_table(index='cluster', columns='channel',
+                                           values='significant', aggfunc='first')
+        sig_grid = sig_grid.reindex(index=cluster_order, columns=channels)
+        sig_mask = sig_grid.eq(True).values
+
+        row_labels = []
+        for cl in cluster_order:
+            if 'cluster.adj.P.Val' in clusters_df.columns:
+                q = clusters_df.loc[clusters_df['cluster'] == cl, 'cluster.adj.P.Val'].min()
+                row_labels.append(f"{cl}  (cluster FDR {q:.2g})")
+            else:
+                row_labels.append(str(cl))
+        col_labels = [channel_names.get(ch, ch) for ch in channels]
+
+        values = grid.values.astype(float)
+        vmax = float(np.nanmax(np.abs(values))) if np.isfinite(values).any() else 1.0
+        vmax = vmax if vmax > 0 else 1.0
+
+        n_rows, n_cols = values.shape
+        label_w = max(len(r) for r in row_labels) * 0.07 + 0.4
+        fig_w = max(5.0, n_cols * 0.45 + label_w + 1.5)
+        fig_h = max(3.0, n_rows * 0.35 + 2.0)
+        fig = Figure(figsize=(fig_w, fig_h), constrained_layout=True)
+        ax = fig.add_subplot(111)
+        cmap = matplotlib.colormaps['RdBu_r'].copy()
+        cmap.set_bad('#bbbbbb')
+        im = ax.imshow(np.ma.masked_invalid(values), aspect='auto', cmap=cmap,
+                       norm=TwoSlopeNorm(vcenter=0.0, vmin=-vmax, vmax=vmax),
+                       interpolation='nearest')
+        ys, xs = np.nonzero(sig_mask)
+        ax.scatter(xs, ys, s=14, c=fg, marker='o', linewidths=0)
+        ax.set_xticks(range(n_cols))
+        ax.set_xticklabels(col_labels, rotation=45, ha='right', fontsize=7)
+        ax.set_yticks(range(n_rows))
+        ax.set_yticklabels(row_labels, fontsize=7)
+        ax.grid(False)
+        ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
+        ax.grid(which='minor', color='white', linestyle='-', linewidth=0.6)
+        ax.tick_params(which='minor', bottom=False, left=False)
+        cb = fig.colorbar(im, ax=ax, shrink=0.8)
+        cb.set_label('Δ mean intensity (● significant)', fontsize=7)
+        cb.ax.tick_params(labelsize=7)
+        ax.set_title(title, fontsize=10)
         _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
         return fig
@@ -8062,10 +8763,10 @@ class _ClusterTreeLayoutWorker(QThread):
     Computes the MST + Kamada-Kawai layout for a Cluster Tree view on a
     background thread. HDBSCAN in particular can produce far more nodes
     (final clusters) than FlowSOM's usual handful of metaclusters, and
-    igraph's layout_kamada_kawai() cost grows fast with node count --
+    the Kamada-Kawai layout's cost grows fast with node count --
     easily long enough to freeze the UI if called straight from
     refresh() on the main thread. Pure computation only (numpy/scipy/
-    igraph, via drc_clustering.build_flowsom_tree) -- no Qt widget
+    networkx, via drc_clustering.build_flowsom_tree) -- no Qt widget
     access, so unlike most workers in this file it needs no AF/
     transfer-matrix snapshot.
     """
@@ -8622,7 +9323,6 @@ class PlotCard(QFrame):
 
         cl_run = self._selected_cluster_run()
         labels_dict = cl_run.get('labels', {}) if cl_run else {}
-        indices_dict = run.get('embedding_event_indices', {}) or {}
         unaligned_samples: list[str] = []
 
         # Gather data (plus the sample-of-origin per row, needed for Marker mode)
@@ -8636,8 +9336,7 @@ class PlotCard(QFrame):
                 return
             xy = emb
             lbl_raw = labels_dict.get(rel_path)
-            lab, aligned_ok = drc_scatter.align_labels_to_embedding(
-                lbl_raw, len(emb), indices_dict.get(rel_path))
+            lab, aligned_ok = drc_scatter.align_labels_to_embedding(lbl_raw, len(emb))
             if lbl_raw is not None and not aligned_ok:
                 unaligned_samples.append(rel_path)
             origin = np.array([rel_path] * len(emb), dtype=object)
@@ -8654,8 +9353,7 @@ class PlotCard(QFrame):
                 xys.append(emb)
                 origins.append(np.array([rel] * n, dtype=object))
                 lbl_raw = labels_dict.get(rel)
-                lbl, aligned_ok = drc_scatter.align_labels_to_embedding(
-                    lbl_raw, n, indices_dict.get(rel))
+                lbl, aligned_ok = drc_scatter.align_labels_to_embedding(lbl_raw, n)
                 if lbl_raw is None:
                     _log.debug("workspace: no cluster labels for %s — greyed", rel)
                 elif not aligned_ok:
@@ -8888,7 +9586,7 @@ class PlotCard(QFrame):
             )
             return
 
-        # The MST/layout computation (igraph's layout_kamada_kawai, in
+        # The MST/layout computation (the Kamada-Kawai layout, in
         # particular) can be slow for runs with many nodes -- HDBSCAN
         # especially -- so it's computed on a background thread and
         # cached per run_id (tree_data is frozen at archive time, so a
@@ -9573,10 +10271,7 @@ class _DrWorker(QThread):
             if self._cancelled:
                 return
             if self._task == 'train':
-                if self._algo == 'PHATE':
-                    self._do_train_phate()
-                else:
-                    self._do_train()
+                self._do_train()
             elif self._task == 'apply':
                 self._do_apply(training_only=self._training_only)
         except Exception as exc:
@@ -9640,62 +10335,6 @@ class _DrWorker(QThread):
 
         self._emit(f"{algo} training complete.  Embedding training samples …")
         self._do_apply(training_only=True)
-
-    def _do_train_phate(self):
-        """
-        PHATE-specific training path. Unlike _do_train(), this does not
-        call the shared _do_apply() afterwards — PHATE produces the
-        embedding for every training-pool row as a side effect of fit,
-        so per-sample embeddings are sliced directly from that single
-        result using the known sample boundaries.
-        """
-        plugin = self._plugin
-
-        self._emit("Loading training pool for PHATE …")
-        self._emit_progress(0, 0)
-        result = drc_pipeline.load_training_pool_with_sample_bounds(
-            plugin.controller, plugin.state, af_state=self._af_state)
-        if result is None:
-            self.finished.emit(False, "No training data could be loaded.")
-            return
-        pooled_data, sample_bounds = result
-
-        if self._cancelled:
-            self.finished.emit(False, "Cancelled.")
-            return
-
-        self._emit(f"Training PHATE on {len(pooled_data):,} pooled events "
-                   f"({len(sample_bounds)} sample(s)) …")
-        try:
-            reducer, embedding = plugin._run_phate(self._params, pooled_data)
-        except Exception as exc:
-            traceback.print_exc()
-            self.finished.emit(False, str(exc))
-            return
-
-        if self._cancelled:
-            self.finished.emit(False, "Cancelled.")
-            return
-
-        plugin.state.trained_reducers['PHATE'] = reducer
-        plugin.state.dr_status['PHATE'] = 'done'
-        plugin.state.dr_timestamps['PHATE'] = datetime.now().isoformat(timespec='seconds')
-
-        embeddings: dict[str, np.ndarray] = {}
-        features: dict[str, np.ndarray] = {}
-        event_indices: dict[str, np.ndarray] = {}
-        offset = 0
-        for rel_path, n_events, idx in sample_bounds:
-            embeddings[rel_path] = embedding[offset:offset + n_events].astype(np.float32)
-            features[rel_path] = pooled_data[offset:offset + n_events].astype(np.float32)
-            event_indices[rel_path] = idx
-            offset += n_events
-        plugin.state.embeddings['PHATE'] = embeddings
-        plugin.state.embedding_features['PHATE'] = features
-        plugin.state.embedding_event_indices['PHATE'] = event_indices
-
-        self._emit("PHATE training complete.")
-        self.finished.emit(True, "")
 
     def _do_apply(self, training_only: bool):
         plugin = self._plugin
@@ -9966,7 +10605,7 @@ class _MarkerSummaryWorker(QThread):
 
 class _RunHydrateWorker(QThread):
     """
-    Unpickles a clustering/DR run's heavy payload (see
+    Reads a clustering/DR run's heavy payload (see
     drc_run_archive.hydrate_run) on a background thread. The first time a
     run is selected in a session, its manifest entry only carries
     metadata (drc_run_archive.load_manifest_entries loads lazily) --
@@ -10483,7 +11122,7 @@ class ClusterAnnotationTab(QWidget):
         self._populate_channel_list()
         # The rest of refresh() below (via _selected_cluster_run() /
         # _selected_dr_run()) needs the selected run(s)' heavy payload
-        # unpickled from disk. Do that on a background thread first if
+        # read from disk. Do that on a background thread first if
         # it hasn't happened yet this session; _on_hydrate_finished
         # re-enters refresh() once it's ready, at which point
         # hydrate_run() is a cheap no-op and this proceeds normally.
@@ -10505,17 +11144,21 @@ class ClusterAnnotationTab(QWidget):
         if cache:
             self._populate_violin_channel_combo(cache['channels'])
             self._draw_current_violin()
-        self._restore_marker_summary_from_archive(run_id, self._selected_cluster_run())
         if self.annotation_sub_tabs.currentIndex() == getattr(self, '_marker_summary_tab_index', -1):
             ms_cache = self._marker_summary_cache.get(run_id)
+            ms_worker = getattr(self, '_marker_summary_worker', None)
             if ms_cache:
                 self._draw_marker_summary()
+            elif run_id is not None and not (ms_worker is not None and ms_worker.isRunning()):
+                # Figures are not persisted: first view after reopening
+                # the experiment rebuilds them.
+                self._recompute_marker_summary()
 
     def _start_hydrate_worker_if_needed(self) -> bool:
         """
         Kick a background _RunHydrateWorker for the currently-selected
         clustering/DR run entries if either still needs its heavy
-        payload unpickled from disk (see drc_run_archive.hydrate_run).
+        payload read from disk (see drc_run_archive.hydrate_run).
         Returns True if a worker was started or one is already in
         flight -- callers should stop the rest of refresh() in that
         case and let _on_hydrate_finished re-enter it once ready.
@@ -10667,7 +11310,6 @@ class ClusterAnnotationTab(QWidget):
         # Marker Summary sub-tab: only touch it if it's the
         # currently visible sub-tab -- same lazy-when-visible rule
         # _on_annotation_sub_tab_changed uses.
-        self._restore_marker_summary_from_archive(run_id, cl_run)
         if self.annotation_sub_tabs.currentIndex() == getattr(self, '_marker_summary_tab_index', -1):
             ms_cache = self._marker_summary_cache.get(run_id)
             if ms_cache:
@@ -10983,7 +11625,6 @@ class ClusterAnnotationTab(QWidget):
         labels_dict = cl_run.get('labels', {}) if cl_run else {}
         own_positions = (cl_run.get('dr_positions', {}) if cl_run else {}) or {}
         cl_params = (cl_run.get('params', {}) if cl_run else {}) or {}
-        indices_dict = dr_run.get('embedding_event_indices', {}) or {}
         # Only trust the run's own frozen positions as a substitute when
         # they're nominally the SAME embedding space as what's on screen --
         # mixing two different algorithms' coordinates would be meaningless.
@@ -10994,8 +11635,7 @@ class ClusterAnnotationTab(QWidget):
         for rel, emb in emb_dict.items():
             n = len(emb)
             lbl_raw = labels_dict.get(rel)
-            lbl, aligned_ok = drc_scatter.align_labels_to_embedding(
-                lbl_raw, n, indices_dict.get(rel))
+            lbl, aligned_ok = drc_scatter.align_labels_to_embedding(lbl_raw, n)
             if aligned_ok:
                 xys.append(emb)
                 labs.append(lbl)
@@ -11563,28 +12203,6 @@ class ClusterAnnotationTab(QWidget):
         self._rebuild_map_legend(cl_run)
         self._populate_label_table()
 
-    def _restore_marker_summary_from_archive(self, run_id, cl_run: dict | None):
-        """
-        If *cl_run* carries a persisted Marker Summary
-        (drc_run_archive.save_marker_summary) and it isn't already in the
-        in-memory cache, populate the cache from it -- restores the
-        already-rendered heatmap/ridgeline figures after reopening the
-        experiment, without repeating the ~10s ridgeline build. cl_run is
-        already hydrated by _selected_cluster_run(), so this is just a
-        dict copy, no disk I/O of its own beyond what hydrate_run() did.
-
-        Deliberately does NOT restore a 'pooled' key -- only the rendered
-        figures are archived (see save_marker_summary's docstring), so a
-        later theme change against a purely-restored cache entry falls
-        back to a full repool (see _draw_marker_summary).
-        """
-        if run_id is None or run_id in self._marker_summary_cache or not cl_run:
-            return
-        saved = cl_run.get('marker_summary')
-        if not saved:
-            return
-        self._marker_summary_cache[run_id] = dict(saved)
-
     def _on_annotation_sub_tab_changed(self, index: int):
         """Lazily compute the Marker Summary sub-tab only when it becomes
         visible, and only if this run hasn't been computed yet -- same
@@ -11592,7 +12210,6 @@ class ClusterAnnotationTab(QWidget):
         if index != getattr(self, '_marker_summary_tab_index', -1):
             return
         run_id = self.run_combo.currentData()
-        self._restore_marker_summary_from_archive(run_id, self._selected_cluster_run())
         if run_id in self._marker_summary_cache:
             self._draw_marker_summary()
         elif run_id is not None:
@@ -11662,28 +12279,10 @@ class ClusterAnnotationTab(QWidget):
             'cbar_fig': payload['cbar_fig'],
             'ridge_fig': payload['ridge_fig'],
         }
-        # Persist the rendered figures to this run's own archive entry --
-        # MUST happen before _apply_marker_summary_figures below attaches
-        # each Figure to a Qt canvas (FigureCanvasQTAgg isn't picklable),
-        # so a reopened experiment can restore the already-rendered
-        # heatmap/ridgeline instead of repeating the ~10s build.
-        drc_run_archive.save_marker_summary(self.controller, self.state, run_id, {
-            'is_dark': is_dark,
-            'channels': payload['channels'],
-            'cluster_order': payload['cluster_order'],
-            'names_map': payload['names_map'],
-            'colors_map': payload['colors_map'],
-            'main_fig': payload['main_fig'],
-            'col_fig': payload['col_fig'],
-            'row_fig': payload['row_fig'],
-            'cbar_fig': payload['cbar_fig'],
-            'ridge_fig': payload['ridge_fig'],
-        })
         if self.run_combo.currentData() != run_id:
             # The user switched to a different run while this was
-            # computing -- the result is cached (and now archived) for
-            # later, but don't draw it over whatever run is now actually
-            # selected.
+            # computing -- the result is cached for later, but don't draw
+            # it over whatever run is now actually selected.
             return
         self._marker_summary_last_drawn = (run_id, is_dark)
         self._apply_marker_summary_figures(
@@ -11720,10 +12319,8 @@ class ClusterAnnotationTab(QWidget):
             return
 
         if cache.get('main_fig') is not None and cache.get('is_dark') == is_dark:
-            # Figures already exist for this run at the CURRENT theme --
-            # either built earlier this session or restored from this
-            # run's archived payload (drc_run_archive.save_marker_summary)
-            # -- reuse them directly instead of rebuilding via the worker.
+            # Figures already built this session at the CURRENT theme --
+            # reuse them directly instead of rebuilding via the worker.
             self._marker_summary_last_drawn = draw_key
             self._apply_marker_summary_figures(
                 cache['main_fig'], cache['col_fig'], cache['row_fig'],
@@ -11742,10 +12339,8 @@ class ClusterAnnotationTab(QWidget):
                 pooled=cache['pooled'], run_id=run_id,
             )
         else:
-            # This entry came from the archive (figures only, no pooled
-            # arrays -- see save_marker_summary's docstring) and the
-            # theme no longer matches what was rendered -- needs a full
-            # repool, same cost as the very first view of this run.
+            # No pooled arrays cached -- needs a full repool, same cost
+            # as the very first view of this run.
             self._recompute_marker_summary()
 
     def _apply_marker_summary_figures(self, main_fig, col_fig, row_fig, cbar_fig, ridge_fig):
@@ -12276,10 +12871,9 @@ class PluginWidget(QWidget):
         overall_layout.addWidget(scroll)
 
         # ------------------------------------------------------------------
-        # Inner tab widget — four tabs
+        # Inner sections — vertical navigation beside a page stack
         # ------------------------------------------------------------------
-        self.inner_tabs = QTabWidget()
-        self.inner_tabs.setDocumentMode(True)
+        self.inner_tabs = _SideTabWidget()
 
         self.config_tab = ConfigTab(self.state, bus, controller)
         self.transform_tab = TransformTab(self.state, bus, controller)
@@ -12296,12 +12890,12 @@ class PluginWidget(QWidget):
             cluster_annotation_tab=self.cluster_annotation_tab,
         )
 
-        self.inner_tabs.addTab(self.transform_tab,    "Transforms")
-        self.inner_tabs.addTab(self.config_tab,       "Configuration")
-        self.inner_tabs.addTab(self.cluster_annotation_tab, "Cluster Annotation")
-        self.inner_tabs.addTab(self.groups_stats_tab, "Stats")
-        self.inner_tabs.addTab(self.workspace_tab,    "Workspace")
-        self.inner_tabs.addTab(self.report_tab,       "Report")
+        self.inner_tabs.addTab(self.transform_tab,    "Transforms",    'wave-sine')
+        self.inner_tabs.addTab(self.config_tab,       "Configuration", 'settings')
+        self.inner_tabs.addTab(self.cluster_annotation_tab, "Cluster Annotation", 'shape')
+        self.inner_tabs.addTab(self.groups_stats_tab, "Stats",         'table')
+        self.inner_tabs.addTab(self.workspace_tab,    "Workspace",     'border-all')
+        self.inner_tabs.addTab(self.report_tab,       "Report",        'file-description')
 
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
 
@@ -12376,6 +12970,7 @@ class PluginWidget(QWidget):
         if self.controller.experiment.process.get('unmixing_matrix') is not None:
             self.label_disabled.setVisible(False)
             self.content_widget.setVisible(True)
+            self._update_sample_browser_visibility()
 
             # Sync state with current experiment
             self._loading = True
@@ -12443,7 +13038,7 @@ class PluginWidget(QWidget):
         """
         Lightweight persistence for just the Workspace layout, fired
         immediately on every plot add/remove (see plots_changed connection
-        in __init__). Deliberately skips the pickled model sidecar that the
+        in __init__). Deliberately skips the model sidecar bundle that the
         full save_state() writes (trained reducers, embeddings, cluster
         labels) — that would be far too expensive to redo on every click.
         """
@@ -12464,8 +13059,9 @@ class PluginWidget(QWidget):
         pick up where they left off next time this experiment is opened.
 
         Lightweight scalar/list values go to QSettings.
-        Fitted models, embeddings, and cluster labels are pickled to a
-        sidecar file alongside the experiment (avoids QSettings size limits).
+        Embeddings, cluster labels and stats results are written to a
+        sidecar bundle in the experiment's cache folder (avoids QSettings
+        size limits); see _save_model_sidecar.
 
         self.controller.experiment can already point at a DIFFERENT
         experiment than the one self.state actually belongs to (e.g.
@@ -12543,6 +13139,10 @@ class PluginWidget(QWidget):
             s.setValue('reference_group',   self.state.reference_group)
             s.setValue('paired',            self.state.paired)
             s.setValue('pairing_variable',  self.state.pairing_variable)
+            s.setValue('stats_adjust_covariates', list(self.state.stats_adjust_covariates))
+            s.setValue('stats_use_treat',   self.state.stats_use_treat)
+            s.setValue('stats_mfi_threshold', self.state.stats_mfi_threshold)
+            s.setValue('stats_mfi_hierarchical', self.state.stats_mfi_hierarchical)
             s.setValue('covariate_columns',
                       list(self.state.covariates.columns)
                       if self.state.covariates is not None else [])
@@ -12668,7 +13268,7 @@ class PluginWidget(QWidget):
         finally:
             s.endGroup()
 
-        # Pickle heavy state (models, embeddings, cluster labels) to sidecar
+        # Heavy state (embeddings, cluster labels, stats) to the sidecar bundle
         self._save_model_sidecar(sidecar_dir)
         print(f"[DR Plugin] State saved for experiment: {key}")
 
@@ -12780,6 +13380,19 @@ class PluginWidget(QWidget):
             paired_val = s.value('paired', False)
             self.state.paired = paired_val in (True, 'true', 'True', 1, '1')
             self.state.pairing_variable = s.value('pairing_variable', '')
+            self.state.stats_adjust_covariates = _qs_list(s, 'stats_adjust_covariates')
+            use_treat = s.value('stats_use_treat', None)
+            if use_treat is not None:
+                self.state.stats_use_treat = use_treat in (True, 'true', 'True', 1, '1')
+            mfi_threshold = s.value('stats_mfi_threshold', None)
+            if mfi_threshold is not None:
+                try:
+                    self.state.stats_mfi_threshold = float(mfi_threshold)
+                except (ValueError, TypeError):
+                    pass
+            mfi_hier = s.value('stats_mfi_hierarchical', None)
+            if mfi_hier is not None:
+                self.state.stats_mfi_hierarchical = mfi_hier in (True, 'true', 'True', 1, '1')
             pca_use_freq = s.value('pca_use_freq', None)
             if pca_use_freq is not None:
                 self.state.pca_use_freq = pca_use_freq in (True, 'true', 'True', 1, '1')
@@ -13011,14 +13624,13 @@ class PluginWidget(QWidget):
                 self.groups_stats_tab._last_drawn_cluster_names = {}
 
     # ------------------------------------------------------------------
-    # Sidecar persistence — pickle for heavy objects
+    # Sidecar persistence — JSON + npz + CSV bundle for heavy state
     # ------------------------------------------------------------------
 
     def _sidecar_path(self, experiment_dir: Path | None = None) -> Path | None:
         """
-        Return the path for the pickle sidecar file, or None if unavailable.
-        Moved under experiment_dir/cache/dr_clustering/ (§0.2) — one-time
-        migration from the old loose file happens in _load_model_sidecar().
+        Return the bundle directory for the live-state sidecar, or None if
+        unavailable.
 
         experiment_dir: explicit override, used by save_state() to flush a
         PREVIOUS experiment's state after self.controller has already
@@ -13027,7 +13639,7 @@ class PluginWidget(QWidget):
         in that situation. Falls back to that live lookup otherwise.
         """
         if experiment_dir is not None:
-            return experiment_dir / 'cache' / 'dr_clustering' / 'current_state.pkl'
+            return drc_run_archive.current_state_path_for(experiment_dir)
         try:
             return drc_run_archive.current_state_path(self.controller)
         except Exception:
@@ -13035,12 +13647,17 @@ class PluginWidget(QWidget):
 
     def _save_model_sidecar(self, experiment_dir: Path | None = None):
         """
-        Pickle trained reducers, embeddings, and cluster labels alongside
-        the experiment file.  Silently skips on failure (e.g. a reducer that
-        is not picklable — the user will need to retrain).
+        Write embeddings, cluster labels, clustering tree data and stats
+        results to the experiment's current_state bundle (see drc_persist).
+        A field that cannot be stored is skipped with a log line rather than
+        failing the save.
+
+        Fitted UMAP/openTSNE/PaCMAP model objects are not written;
+        only trained_reducers entries that are plain array dicts (the
+        FlowSOM/Leiden/HDBSCAN tree data) are kept.
 
         clustering_runs / dr_runs are not included here — those are
-        archived individually (their own pickle + manifest entry) at the
+        archived individually (their own bundle + manifest entry) at the
         moment each run completes; see drc_run_archive.py.
 
         experiment_dir: see _sidecar_path() -- passed through from
@@ -13063,10 +13680,10 @@ class PluginWidget(QWidget):
             len(self.state.sample_groups),
             list(self.state.group_names),
         )
-        import pickle
-        payload = {}
-        for key, obj in (
-            ('trained_reducers',  self.state.trained_reducers),
+        tree_data = {algo: model for algo, model in self.state.trained_reducers.items()
+                     if isinstance(model, dict)}
+        payload = dict((
+            ('trained_reducers',  tree_data),
             ('embeddings',        self.state.embeddings),
             ('cluster_labels',    self.state.cluster_labels),
             ('trex_scores',       self.state.trex_scores),
@@ -13099,36 +13716,37 @@ class PluginWidget(QWidget):
             ('pca_run_label',           self.state.pca_run_label),
             ('pca_groups',              self.state.pca_groups),
             ('pca_sources',             self.state.pca_sources),
-        ):
-            try:
-                pickle.dumps(obj)   # probe before writing
-                payload[key] = obj
-            except Exception as e:
-                print(f"[DR Plugin] Sidecar: skipping '{key}' (not picklable: {e})")
+        ))
         try:
-            with open(path, 'wb') as f:
-                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+            skipped = drc_persist.save_bundle(path, payload, skip_unstorable=True)
+            for key in skipped:
+                print(f"[DR Plugin] Sidecar: skipped '{key}' (type cannot be stored)")
             print(f"[DR Plugin] Model sidecar saved → {path.name} "
-                  f"(keys: {list(payload.keys())})")
+                  f"(keys: {[k for k in payload if k not in skipped]})")
         except Exception as e:
             print(f"[DR Plugin] Could not save model sidecar: {e}")
 
     def _load_model_sidecar(self):
         """
-        Restore trained reducers, embeddings, and cluster labels from the
-        pickle sidecar, and rebuild state.dr_runs / state.clustering_runs
-        from the run archive's manifest.  Missing or corrupt files are
-        silently ignored.
+        Restore embeddings, cluster labels, clustering tree data and stats
+        results from the current_state bundle, and rebuild state.dr_runs /
+        state.clustering_runs from the run archive's manifest.  Missing or
+        corrupt files are logged and otherwise ignored.
+
+        Any pickle-era files and manifest entries are deleted first (see
+        drc_run_archive.purge_legacy_pickles).
         """
+        try:
+            n_files, n_runs = drc_run_archive.purge_legacy_pickles(self.controller)
+            if n_files or n_runs:
+                msg = (f"Removed {n_files} file(s) and {n_runs} archived run(s) "
+                       "saved in the old pickle format.")
+                print(f"[DR Plugin] {msg}")
+                self.progress_message(msg)
+        except Exception as e:
+            print(f"[DR Plugin] Could not remove pickle-era files: {e}")
+
         path = self._sidecar_path()
-        if path is not None and not path.exists():
-            legacy = drc_run_archive.legacy_current_state_path(self.controller)
-            if legacy.exists():
-                try:
-                    legacy.replace(path)
-                    print(f"[DR Plugin] Migrated legacy sidecar → {path}")
-                except OSError as e:
-                    print(f"[DR Plugin] Could not migrate legacy sidecar: {e}")
 
         # temporary diagnostic
         _log.info("_load_model_sidecar: path=%s exists=%s cache_root=%s",
@@ -13153,12 +13771,10 @@ class PluginWidget(QWidget):
         except Exception as e:
             print(f"[DR Plugin] Could not load run archive: {e}")
 
-        if path is None or not path.exists():
+        if path is None or not drc_persist.bundle_exists(path):
             return
-        import pickle
         try:
-            with open(path, 'rb') as f:
-                payload = pickle.load(f)
+            payload = drc_persist.load_bundle(path) or {}
             if isinstance(payload.get('trained_reducers'), dict):
                 self.state.trained_reducers = payload['trained_reducers']
             if isinstance(payload.get('embeddings'), dict):
@@ -13491,7 +14107,18 @@ class PluginWidget(QWidget):
     def _on_inner_tab_changed(self, index: int):
         """Save state when leaving a tab, then refresh the newly activated one."""
         self.save_state()
+        self._update_sample_browser_visibility()
         self._refresh_tab_at(index)
+
+    def _update_sample_browser_visibility(self):
+        """
+        Show the main window's sample browser only on the Transforms tab,
+        the one section that previews the clicked sample. The main window
+        re-shows it whenever the user leaves this plugin.
+        """
+        signal = getattr(self.bus, 'sampleBrowserVisibilityRequested', None)
+        if signal is not None:
+            signal.emit(self.inner_tabs.currentWidget() is self.transform_tab)
 
     def _refresh_active_tab(self):
         self._refresh_tab_at(self.inner_tabs.currentIndex())
@@ -13636,10 +14263,9 @@ class PluginWidget(QWidget):
     def _load_training_data(self, af_state=None) -> np.ndarray | None:
         """
         Pool transformed, gated, downsampled events from all training samples.
-        Delegates to drc_pipeline.load_training_pool_with_sample_bounds
-        (correct channel alignment, correct FlowKit transform, no silent
-        arcsinh fallback, full logging), discarding the per-sample bounds —
-        UMAP/tSNE/PaCMAP don't need them; only PHATE's training path does.
+        Delegates to drc_pipeline.load_training_pool (correct channel
+        alignment, correct FlowKit transform, no silent arcsinh fallback,
+        full logging).
 
         Must be callable from a background thread — contains no Qt GUI calls.
         Pre-flight validation (empty samples / channels / gate) is performed
@@ -13648,12 +14274,8 @@ class PluginWidget(QWidget):
         af_state: optional AF snapshot captured on the main thread before the
         worker started — see drc_pipeline.apply_unmixing_af_aware() docstring.
         """
-        result = drc_pipeline.load_training_pool_with_sample_bounds(
+        return drc_pipeline.load_training_pool(
             self.controller, self.state, af_state=af_state)
-        if result is None:
-            return None
-        data, _bounds = result
-        return data
 
     def _get_sample_data(self, rel_path: str, algo: str, af_state=None) -> np.ndarray | None:
         """
@@ -13705,6 +14327,8 @@ class PluginWidget(QWidget):
         index.add_items(training_data, num_threads=n_jobs)
         index.set_ef(50)
         self.state.umap_knn_index = index
+        self.state.umap_knn_fingerprint = (
+            training_data.shape, drc_pipeline.array_digest(training_data))
 
         self.progress_message(
             f"Training UMAP  (n_neighbors={n_neighbors}, "
@@ -13731,11 +14355,8 @@ class PluginWidget(QWidget):
 
         # Drop the tqdm hook now training is done. UMAP (sklearn
         # BaseEstimator) stores constructor kwargs as attributes, so
-        # reducer.tqdm_kwds otherwise keeps a live reference to the
-        # _UMAPTqdmHook instance — a class that lives in the synthetic
-        # "bundled_plugins.*" module namespace, which isn't a real
-        # importable package. pickle can't re-import it to save a
-        # reference, so any object holding this hook fails to pickle.
+        # reducer.tqdm_kwds would otherwise keep a live reference to the
+        # _UMAPTqdmHook and, through it, the finished training worker.
         # The hook has no purpose after fit() returns.
         reducer.tqdm_kwds = {}
 
@@ -13807,40 +14428,6 @@ class PluginWidget(QWidget):
         return _PaCMAPWrapper(reducer, training_data)
 
     # ------------------------------------------------------------------
-    # PHATE
-    # ------------------------------------------------------------------
-
-    def _run_phate(self, params: dict, pooled_data: np.ndarray):
-        """
-        Fit PHATE on the full pooled training array in one call and return
-        both the fitted operator and its embedding of that same array.
-
-        PHATE has no out-of-sample transform (see module note above), so
-        unlike UMAP/tSNE/PaCMAP there is no separate train/apply split:
-        the embedding produced here IS the final per-sample result, sliced
-        by the caller using the sample boundaries from
-        drc_pipeline.load_training_pool_with_sample_bounds().
-        """
-        import phate
-
-        self.progress_message(
-            f"Training PHATE  (knn={params['knn']}, decay={params['decay']}, "
-            f"t={params['t']}) …"
-        )
-        reducer = phate.PHATE(
-            n_components=2,
-            knn=params['knn'],
-            decay=params['decay'],
-            t=params['t'],
-            n_jobs=-1,
-            random_state=42,
-            verbose=False,
-        )
-        embedding = reducer.fit_transform(pooled_data)
-        self.progress_message("PHATE training complete.")
-        return reducer, embedding
-
-    # ------------------------------------------------------------------
     # Public DR entry points
     # ------------------------------------------------------------------
 
@@ -13893,17 +14480,18 @@ class PluginWidget(QWidget):
 
     def _apply_dr_to_all_samples(self, algo: str):
         """Start background embedding of ALL samples.  Returns immediately."""
-        if algo == 'PHATE':
-            QMessageBox.information(
-                self, "Not Available for PHATE",
-                "PHATE has no out-of-sample projection. Training already "
-                "embeds every training sample; to include additional "
-                "samples, add them to the training set and re-train."
-            )
-            return
         if self.state.trained_reducers.get(algo) is None:
-            QMessageBox.warning(self, "No Trained Model",
-                                f"Train a {algo} model first.")
+            if self.state.embeddings.get(algo):
+                QMessageBox.information(
+                    self, "Model Not Available",
+                    f"The fitted {algo} model is only kept for the session it "
+                    f"was trained in. Its embeddings were restored, but "
+                    f"projecting more samples needs the model: re-train {algo} "
+                    f"first."
+                )
+            else:
+                QMessageBox.warning(self, "No Trained Model",
+                                    f"Train a {algo} model first.")
             return
         if self._dr_worker is not None and self._dr_worker.isRunning():
             QMessageBox.information(self, "DR Running",
@@ -13951,20 +14539,31 @@ class PluginWidget(QWidget):
         bar.setVisible(True)
 
     def _set_dr_buttons_running(self, running: bool):
-        """Toggle Train/Apply/Cancel button states during a DR run."""
+        """Toggle Train/Apply/Cancel button states and the run lock during a DR run."""
         if not hasattr(self, 'config_tab'):
             return
         ct = self.config_tab
         ct.dr_run_btn.setEnabled(not running)
         ct.dr_apply_btn.setEnabled(not running)
         ct.dr_cancel_btn.setEnabled(running)
+        self._set_run_lock('dr', running)
         if not running and hasattr(ct, 'dr_progress_bar'):
             ct.dr_progress_bar.setVisible(False)
         elif running and hasattr(ct, 'dr_progress_bar'):
+            ct._refresh_dr_status()
             # Show indeterminate bar immediately; UMAP will switch to determinate
             ct.dr_progress_bar.setRange(0, 0)
             ct.dr_progress_bar.setTextVisible(False)
             ct.dr_progress_bar.setVisible(True)
+
+    def _set_run_lock(self, kind: str, running: bool):
+        """
+        Lock the inputs of a DR ('dr') or clustering ('cl') run while it is
+        in progress: the Configuration controls, and the Transforms gate
+        tree, which edits the same shared gate selection.
+        """
+        self.config_tab.set_run_lock(kind, running)
+        self.transform_tab.gate_tree.setEnabled(not self.config_tab.is_run_in_progress())
 
     def _on_dr_finished(self, algo: str, success: bool, error_msg: str,
                         task: str = 'train', params: dict | None = None):
@@ -13994,37 +14593,17 @@ class PluginWidget(QWidget):
         reducer = self.state.trained_reducers.get(algo)
         embeddings = self.state.embeddings.get(algo, {})
         embedding_features = self.state.embedding_features.get(algo, {})
-        embedding_event_indices = self.state.embedding_event_indices.get(algo, {})
         if reducer is None:
             return
         channels = [c for c in self.state.selected_channels
                     if c not in drc_pipeline.META_CHANNELS]
         n_events = sum(len(e) for e in embeddings.values())
-        # _PaCMAPWrapper is defined in THIS plugin module, which is loaded
-        # dynamically by plugin_loaders.py under a synthetic module name
-        # ('bundled_plugins.dr_clustering_tab') -- pickle can't re-import
-        # that name to save a class reference, so an instance of a
-        # locally-defined class can never be archived directly (same
-        # class of issue as _UMAPTqdmHook just above, which is dropped
-        # before pickling for the same reason). Unwrap into its two
-        # plain, real-package pieces instead of dropping the training
-        # data entirely -- PaCMAP.transform() needs both, so a future
-        # consumer of a hydrated run's 'reducer' field could still
-        # re-wrap them into a _PaCMAPWrapper.
-        reducer_to_archive = reducer
-        if isinstance(reducer, _PaCMAPWrapper):
-            reducer_to_archive = {
-                'pacmap_reducer': reducer._reducer,
-                'pacmap_training_data': reducer._training_data,
-            }
         try:
             entry = drc_run_archive.archive_dr_run(
                 self.controller, self.state,
                 algorithm=algo,
-                reducer=reducer_to_archive,
                 embeddings=dict(embeddings),
                 embedding_features=dict(embedding_features),
-                embedding_event_indices=dict(embedding_event_indices),
                 gates=list(self.state.selected_gates),
                 training_sample_ids=list(self.state.training_sample_ids),
                 channels=channels,
@@ -14096,6 +14675,7 @@ class PluginWidget(QWidget):
 
         if hasattr(self, 'config_tab'):
             self.config_tab.cl_run_btn.setEnabled(False)
+            self._set_run_lock('cl', True)
             self.config_tab.cl_status_label.setText("⏳ Running …")
             self.config_tab.cl_status_label.setStyleSheet("color: orange;")
             if hasattr(self.config_tab, 'cl_progress_bar'):
@@ -14177,6 +14757,7 @@ class PluginWidget(QWidget):
                     )
             if hasattr(self, 'config_tab'):
                 self.config_tab.cl_run_btn.setEnabled(True)
+                self._set_run_lock('cl', False)
                 self.config_tab._refresh_cl_status()
                 self.config_tab.run_table.refresh()
                 if hasattr(self.config_tab, 'cl_progress_bar'):
