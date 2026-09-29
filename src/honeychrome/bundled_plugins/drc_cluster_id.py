@@ -11,8 +11,9 @@ Two independent scoring mechanisms feed the Cluster Annotation tab's Item 15
   1. MEM (Marker Enrichment Modeling) -- ported from cluster_id.md.
      calculate_mem_scores() -> generate_mem_labels(). A descriptive
      statistic of the cluster's own data; safe to auto-adopt.
-  2. Cell-type scoring -- ported from flow_cluster_id_score.R (original scType
-     by Aleksandr Ianevski, GNU GPL-3.0, https://github.com/IanevskiAleksandr/sc-type).
+  2. Cell-type scoring -- score_cell_types(), using the marker-signature
+     score published for ScType (Ianevski, Giri and Aittokallio 2022,
+     Nat Commun 13:1246) against drc_cell_type_database.csv.
 
 Values are TRANSFORMED using each channel's configured transform
 (state.channel_transform_params -- the same logicle/log/linear transform
@@ -42,6 +43,7 @@ scoring, canonicalised at lookup time):
 from __future__ import annotations
 
 import csv
+import math
 import re
 from collections import Counter
 from copy import deepcopy
@@ -799,11 +801,11 @@ def build_channel_marker_map(controller, channels: list[str]) -> tuple[dict[str,
       unmatched          -- [(channel, antigen_text), ...] for every
                             channel whose antigen text did NOT match
                             anything in marker_database.csv. The tab
-                            surfaces this as a warning (Change 10) rather
-                            than letting it fail silently -- these
-                            channels are skipped entirely by
-                            score_cell_types(), same as the R original's
-                            "subset to markers found in the data."
+                            surfaces this as a warning rather than
+                            letting it fail silently -- no
+                            cell_type_database.csv row names these
+                            markers, so score_cell_types() never uses
+                            them.
 
     Callers are expected to have already run channels_missing_antigen() and
     refused to proceed if it returned anything -- this function assumes
@@ -913,154 +915,172 @@ def filter_cell_type_db_by_species(cell_type_db: list[dict],
 
 
 # ---------------------------------------------------------------------------
-# Cell-type scoring (ported from flow_cluster_id_score.R)
+# Cell-type scoring
 # ---------------------------------------------------------------------------
+
+def _marker_value_matrix(scores: pd.DataFrame,
+                         channel_marker_map: dict[str, str]) -> dict[str, np.ndarray]:
+    """
+    Per-marker cluster values: marker -> array over scores.index.
+
+    A marker mapped from more than one channel uses the first of those
+    channels in column order.
+    """
+    values = scores.to_numpy(dtype=float)
+    out: dict[str, np.ndarray] = {}
+    for col, channel in enumerate(scores.columns):
+        marker = channel_marker_map.get(channel)
+        if marker and marker not in out:
+            out[marker] = values[:, col]
+    return out
+
+
+def _signature_term(markers: list[str], marker_values: dict[str, np.ndarray],
+                    n_clusters: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Sum of the markers' finite values divided by the square root of how
+    many are finite, per cluster. Returns (term, n_finite); a cluster with
+    no finite value for any of the markers gets term 0.
+
+    Sums are exactly rounded (math.fsum), so two cell types whose present
+    markers read the same values tie exactly whatever order they are
+    listed in.
+    """
+    term = np.zeros(n_clusters)
+    n = np.zeros(n_clusters, dtype=int)
+    present = [marker_values[m] for m in dict.fromkeys(markers) if m in marker_values]
+    if not present:
+        return term, n
+    block = np.column_stack(present)
+    for i, row in enumerate(block):
+        finite = row[np.isfinite(row)]
+        if finite.size:
+            n[i] = finite.size
+            term[i] = math.fsum(finite) / math.sqrt(finite.size)
+    return term, n
+
 
 def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
                       cell_type_db: list[dict],
                       min_score: float = 0.3,
                       pos_evidence_floor: float = 0.0) -> pd.DataFrame:
     """
-    Python port of flow_cluster_id_score.R (scType-derived), realigned
-    with the R original's actual shape:
+    Suggest a cell type for each cluster from a marker-signature database.
 
-        score(type) = sum(scores[pos markers]) / sqrt(n_pos)
-                      - sum(scores[neg markers]) / sqrt(n_neg)
+    The score is the one published for ScType (Ianevski, Giri and
+    Aittokallio 2022, Nat Commun 13:1246). For a cluster and a cell type
+    with positive markers P and negative markers N present in the panel:
 
-    `scores` is calculate_cluster_medians's output with each channel's
-    calculate_channel_thresholds() threshold subtracted (done by the
-    caller, compute_cluster_id_suggestions) -- each cluster's OWN median
-    transformed value, centred so "off" reads near/below zero and "on"
-    reads clearly positive, matching the R function's "thresholded flow
-    expression matrix" input. This is NOT MEM and NOT a z-score, and
-    critically, NOT compared to other clusters at all -- a marker with
-    zero cross-cluster variation (e.g. CD3 in an all-CD3+ pre-gated run)
-    still reads as strongly positive here, since the threshold is a
-    property of the channel's overall distribution, not of what's
-    different between clusters -- something neither MEM nor a z-score
-    can do. Without the threshold subtraction, "off" markers still read
-    as a small positive number rather than ~0, which biases scoring
-    toward cell types with longer positive-marker lists regardless of
-    whether those markers are actually on -- see calculate_channel_thresholds's
-    docstring for the concrete numbers that exposed this.
+        score = sum(v_p for p in P) / sqrt(|P|)  -  sum(v_q for q in N) / sqrt(|N|)
 
-    Deliberate deviation from the R original (unchanged from previous
-    ports): a missing marker contributes 0 to its side rather than
-    resolving to NaN, and a cell type is skipped ENTIRELY only if NEITHER
-    its positive nor negative markers have any representation in
-    channel_marker_map.
+    where v is the cluster's value for that marker. A side with no markers
+    present contributes 0.
 
-    ABSENCE-ONLY GUARD (pos_evidence_floor) -- RE-INTRODUCED: the
-    negative-marker term is a REWARD when those markers read absent (as
-    expected, i.e. below their threshold) and a PENALTY when they
-    unexpectedly read present -- both are real signal on their own. The
-    problem is the reward half: since `scores` is already
-    threshold-subtracted, a cluster with a low value on EVERY channel in
-    the panel (debris, dying cells, unmixing noise near the threshold
-    everywhere) reads as "absent" for every negative marker of every cell
-    type, and that absence reward alone can outscore a type with genuine
-    positive evidence. So the reward component only counts when this cell
-    type ALSO has net-positive support from its OWN positive markers in
-    this cluster (sum_pos > pos_evidence_floor); the penalty component
-    (neg markers unexpectedly PRESENT) always counts regardless, since
-    that's real contradicting evidence, not an artifact of "everything
-    reads low here." This was implemented once already against the old
-    MEM-then-z-score scoring inputs and dropped when scoring switched to
-    the (unrelated) threshold-subtracted absolute values below -- same
-    guard, reapplied to the current input.
+    scores: (cluster x channel) DataFrame of each cluster's median
+        transformed value minus that channel's positivity threshold
+        (calculate_cluster_medians minus calculate_channel_thresholds, done
+        by compute_cluster_id_suggestions). Positive reads "on", negative
+        reads "off", independently of the other clusters. NaN means no
+        data for that cluster and channel; that marker is left out of
+        the cluster's sums and counts.
+    channel_marker_map: channel -> canonical marker name
+        (build_channel_marker_map). Channels without an entry are ignored.
+        A marker on several channels uses the first of them.
+    cell_type_db: entries with 'cell_type', 'positive' and 'negative'
+        (load_cell_type_database). Order matters: see ties below.
+    min_score: a cluster whose best score is below this gets no
+        suggestion.
+    pos_evidence_floor: see the absence reward guard below.
 
-    MINIMUM SCORE (min_score, default 0.3): a cluster with
-    nothing scoring at least this gets 'Uncharacterized' rather than
-    whatever happened to be least-negative -- several unrelated types
-    tying at or near 0 (none of their positive markers are even in this
-    panel) is an absence of a suggestion, not one.
+    Rules:
+      - A cell type with none of its markers in the panel is not scored.
+        A marker listed twice for the same side counts once.
+      - Absence reward guard. The negative-marker term, -sum/sqrt(|N|), is
+        split into a reward (its positive part: negative markers read
+        off, as expected) and a penalty (its negative part: negative
+        markers read on). The penalty always counts. The reward only
+        counts when at least one positive marker has a value in this
+        cluster and the positive term exceeds pos_evidence_floor, so a
+        cluster that reads low on every channel (debris, dead cells)
+        cannot win on absent markers alone.
+      - Ties: an exactly equal score keeps the entry listed first in
+        cell_type_db. drc_cell_type_database.csv lists parent populations
+        before their children, so a tie resolves to the less specific
+        type.
+      - low_confidence is True when the winning cell type has no positive
+        evidence in this cluster (no positive marker present, or a
+        positive term not above pos_evidence_floor), so the guard
+        withheld its absence reward. Such a score is at most
+        max(pos_evidence_floor, 0), so with the defaults (floor 0,
+        min_score 0.3) a low-confidence suggestion never survives.
 
-    HIERARCHY TIE-BREAK (unchanged): an exact tie resolves to whichever
-    entry was seen FIRST in cell_type_db -- drc_cell_type_database.csv
-    lists parent/less-resolved populations before their children, so keep
-    new entries appended in that order, not alphabetised, or this
-    silently starts preferring whatever sorts first instead.
-
-    scores columns are CHANNEL names; cell_type_db positive/negative
-    lists are CANONICAL MARKER names -- channel_marker_map bridges the
-    two. Returns a DataFrame indexed by cluster id with columns
-    ['suggested_type', 'score', 'low_confidence']. A cluster with no cell
-    type scoreable at all, or nothing clearing min_score, gets
-    suggested_type='', score=None, low_confidence=False.
+    Returns a DataFrame indexed like `scores` with columns
+    'suggested_type' (str), 'score' (float, rounded to 2 decimals) and
+    'low_confidence' (bool). Selection and the min_score test use the
+    unrounded score. A cluster with no scoreable cell type, or whose best
+    score is below min_score, gets suggested_type '', score NaN and
+    low_confidence False.
     """
-    marker_to_channel: dict[str, str] = {}
-    for ch, marker in channel_marker_map.items():
-        marker_to_channel.setdefault(marker, ch)
-    log.info(
-        "score_cell_types: %d cell-type entries to check, %d canonical marker(s) "
-        "resolved from this panel's channels: %s",
-        len(cell_type_db), len(marker_to_channel), sorted(marker_to_channel),
-    )
+    columns = ['suggested_type', 'score', 'low_confidence']
+    n_clusters = len(scores.index)
+    marker_values = _marker_value_matrix(scores, channel_marker_map)
 
-    n_evaluable = 0  # entries with at least one marker present in this panel
+    best_score = np.full(n_clusters, -np.inf)
+    best_entry = np.full(n_clusters, -1, dtype=int)
+    best_low = np.zeros(n_clusters, dtype=bool)
+    n_scoreable_types = 0
 
-    records = []
-    for cl in scores.index:
-        row = scores.loc[cl]
-        best_score = -np.inf
-        best_type = ''
-        best_has_pos_evidence = False
+    for k, entry in enumerate(cell_type_db):
+        positive = entry.get('positive', [])
+        negative = entry.get('negative', [])
+        if not any(m in marker_values for m in (*positive, *negative)):
+            continue
+        n_scoreable_types += 1
+        pos_term, n_pos = _signature_term(positive, marker_values, n_clusters)
+        neg_term, _n_neg = _signature_term(negative, marker_values, n_clusters)
 
-        for entry in cell_type_db:
-            pos_channels = [marker_to_channel[m] for m in entry['positive'] if m in marker_to_channel]
-            neg_channels = [marker_to_channel[m] for m in entry['negative'] if m in marker_to_channel]
-            if not pos_channels and not neg_channels:
-                continue  # no evidence either way in this panel -- skip entirely
-            n_evaluable += 1
+        absence = -neg_term
+        reward = np.maximum(absence, 0.0)
+        penalty = np.minimum(absence, 0.0)
+        reward_counts = (n_pos > 0) & (pos_term > pos_evidence_floor)
+        total = pos_term + penalty + np.where(reward_counts, reward, 0.0)
 
-            pos_vals = [row[ch] for ch in pos_channels if ch in row.index and pd.notna(row[ch])]
-            neg_vals = [row[ch] for ch in neg_channels if ch in row.index and pd.notna(row[ch])]
-            sum_pos = (sum(pos_vals) / np.sqrt(len(pos_vals))) if pos_vals else 0.0
-            sum_neg = (sum(neg_vals) / np.sqrt(len(neg_vals))) if neg_vals else 0.0
+        better = total > best_score
+        best_score[better] = total[better]
+        best_entry[better] = k
+        best_low[better] = ~reward_counts[better]
 
-            has_pos_evidence = bool(pos_vals) and sum_pos > pos_evidence_floor
-            neg_contribution = -sum_neg
-            neg_reward = max(neg_contribution, 0.0)   # markers absent as expected
-            neg_penalty = min(neg_contribution, 0.0)  # markers unexpectedly present -- always counts
-            score = float(sum_pos + neg_penalty + (neg_reward if has_pos_evidence else 0.0))
-
-            if score > best_score:
-                best_score = score
-                best_type = entry['cell_type']
-                best_has_pos_evidence = has_pos_evidence
-            # exact ties: keep whichever was seen FIRST (higher in the
-            # hierarchy, per cell_type_db's own row order) -- do not
-            # overwrite on score == best_score.
-
-        cleared = best_type and best_score >= min_score
-        log.info(
-            "  cluster=%-3s best=%-20s score=%s%s%s",
-            cl, best_type or '(none evaluable)',
-            f"{best_score:.3f}" if best_score > -np.inf else 'n/a',
-            '' if cleared else f"  <- below min_score={min_score}",
-            '  [low_confidence]' if cleared and not best_has_pos_evidence else '',
-        )
-
-        if not best_type or best_score < min_score:
-            records.append({
-                'cluster': int(cl), 'suggested_type': '', 'score': None,
-                'low_confidence': False,
-            })
+    suggested: list[str] = []
+    score_out: list[float] = []
+    low_out: list[bool] = []
+    for i in range(n_clusters):
+        k = best_entry[i]
+        if k < 0 or best_score[i] < min_score:
+            suggested.append('')
+            score_out.append(np.nan)
+            low_out.append(False)
         else:
-            records.append({
-                'cluster': int(cl),
-                'suggested_type': best_type,
-                'score': round(float(best_score), 2),
-                'low_confidence': not best_has_pos_evidence,
-            })
+            suggested.append(cell_type_db[k]['cell_type'])
+            score_out.append(round(float(best_score[i]), 2))
+            low_out.append(bool(best_low[i]))
 
-    log.info(
-        "score_cell_types: %d/%d (cluster, cell-type entry) pair(s) had at least "
-        "one marker present in this panel",
-        n_evaluable, len(scores.index) * len(cell_type_db),
+    index = pd.Index(scores.index, name='cluster')
+    result = pd.DataFrame(
+        {
+            'suggested_type': pd.Series(suggested, index=index, dtype=object),
+            'score': pd.Series(score_out, index=index, dtype=float),
+            'low_confidence': pd.Series(low_out, index=index, dtype=bool),
+        },
+        columns=columns,
     )
-    return pd.DataFrame.from_records(records).set_index('cluster') if records \
-        else pd.DataFrame(columns=['suggested_type', 'score', 'low_confidence'])
+    n_suggested = sum(1 for s in suggested if s)
+    log.info(
+        "score_cell_types: %d cluster(s), %d/%d cell type(s) scoreable in this "
+        "panel, %d suggestion(s) at min_score=%.3g (%d low confidence)",
+        n_clusters, n_scoreable_types, len(cell_type_db), n_suggested,
+        min_score, sum(low_out),
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1138,7 +1158,7 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
                            ['suggested_type', 'score', 'low_confidence']
                            -- see score_cell_types for how ties are
                            resolved (hierarchy order, not reported) and
-                           what low_confidence means (absence-only guard)
+                           what low_confidence means
       unmatched_markers -- [(channel, antigen_text), ...] from
                            build_channel_marker_map -- Antigen entries that
                            didn't match marker_database.csv and so will
