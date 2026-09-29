@@ -4,45 +4,45 @@ drc_run_archive.py — Per-run cache/archive for the DR/Clustering plugin
 Companion module to ``dr_clustering_tab.py`` (filename intentionally does
 NOT end in ``_tab.py``, so it is not picked up as a separate plugin tab).
 
-Implements the cache/run-archive redesign: replaces the single monolithic
-``dr_clustering_state.pkl`` blob (which overwrote DR results on every rerun
-and gave clustering only a partial, un-queryable history) with:
+Layout under the experiment folder:
 
   cache/dr_clustering/
-      current_state.pkl       — "live" in-progress state (current
-                                 trained_reducers, embeddings, cluster_labels,
-                                 stats results, …) — the same kind of thing
-                                 the old sidecar held, just relocated under
-                                 the cache/ convention already used by
-                                 Controller.cleaned_npz_path.
-      manifest.json            — lightweight, human-readable list of every
-                                 archived DR / clustering run's metadata.
-      runs/<run_id>.pkl         — ONE file per archived run, holding only
-                                 that run's heavy payload (fitted reducer +
-                                 embeddings for a DR run; per-sample label
-                                 arrays for a clustering run).
+      current_state/     — "live" in-progress state (tree data for
+                           FlowSOM/Leiden/HDBSCAN, embeddings,
+                           cluster_labels, stats results, …).
+      manifest.json      — lightweight, human-readable list of every
+                           archived DR / clustering run's metadata.
+      runs/<run_id>/     — one directory per archived run, holding only
+                           that run's heavy payload (embeddings for a DR
+                           run; per-sample label arrays, colours, names,
+                           marker snapshots for a clustering run).
+
+current_state/ and each runs/<run_id>/ are drc_persist bundles (JSON +
+npz + CSV); nothing is pickled. Fitted UMAP/openTSNE/PaCMAP model
+objects are never written, so "Apply to All Samples" is only available
+in the session a DR model was trained in.
 
 state.dr_runs / state.clustering_runs hold the manifest fields PLUS the
-heavy payload merged in — the same shape existing consumers
-(GroupsStatsTab's run combo) already expect from clustering_runs entries.
-Runs are loaded eagerly at experiment-open (load_all_runs()) so those
-existing consumers keep working unchanged; the management table can
-switch to lazy loading (only the manifest fields, hydrating a run's payload
-on first selection) once it exists, since a table only needs metadata to
-populate its rows.
+heavy payload merged in. At experiment-open only the manifest fields are
+loaded (load_manifest_entries); a run's payload is read the first time
+something selects it (hydrate_run).
 """
 
 from __future__ import annotations
 
 import json
-import pickle
 import uuid
 from datetime import datetime
 from pathlib import Path
 
+import drc_persist
 from drc_logging import get_logger, log_stage
 
 log = get_logger(__name__)
+
+# Manifest 'storage' value for runs whose payload is a drc_persist bundle.
+# Entries without it predate the bundle format and are purged on load.
+STORAGE_FORMAT = 'bundle'
 
 
 # ---------------------------------------------------------------------------
@@ -67,20 +67,55 @@ def manifest_path(controller) -> Path:
 
 
 def current_state_path(controller) -> Path:
+    """Bundle directory for the 'live' in-progress state."""
+    return current_state_path_for(Path(controller.experiment_dir))
+
+
+def current_state_path_for(experiment_dir: Path) -> Path:
+    """current_state_path() for an explicit experiment folder."""
+    return Path(experiment_dir) / 'cache' / 'dr_clustering' / 'current_state'
+
+
+def run_payload_path(controller, run_id: str) -> Path:
+    """Bundle directory holding one archived run's heavy payload."""
+    return runs_dir(controller) / run_id
+
+
+def purge_legacy_pickles(controller) -> tuple[int, int]:
     """
-    Path for the 'live' in-progress state pickle — replaces the old loose
-    ``dr_clustering_state.pkl`` that used to sit directly in experiment_dir.
+    Remove everything left over from the pickle-based format.
+
+    Deletes the pickled live state (both its cache/ location and the older
+    loose file beside the experiment), every runs/*.pkl payload, and every
+    manifest entry not marked with the current 'storage' format, so the
+    run pickers start from a clean slate. Pickles are never read. Once
+    nothing pickle-era remains this is a no-op, so it is safe to call on
+    every experiment load.
+
+    Returns (files_removed, runs_removed).
     """
-    return cache_root(controller) / 'current_state.pkl'
+    root = cache_root(controller)
+    candidates = [
+        root / 'current_state.pkl',
+        Path(controller.experiment_dir) / 'dr_clustering_state.pkl',
+        *sorted(runs_dir(controller).glob('*.pkl')),
+    ]
+    files_removed = 0
+    for path in candidates:
+        if path.is_file():
+            path.unlink()
+            files_removed += 1
 
+    manifest = read_manifest(controller)
+    kept = [e for e in manifest if e.get('storage') == STORAGE_FORMAT]
+    runs_removed = len(manifest) - len(kept)
+    if runs_removed:
+        write_manifest(controller, kept)
 
-def legacy_current_state_path(controller) -> Path:
-    """Pre-migration location, alongside the .kit file (loose at experiment root)."""
-    return Path(controller.experiment_dir) / 'dr_clustering_state.pkl'
-
-
-def run_pickle_path(controller, run_id: str) -> Path:
-    return runs_dir(controller) / f"{run_id}.pkl"
+    if files_removed or runs_removed:
+        log.info("purged pickle-era data: %d file(s), %d manifest entr%s",
+                 files_removed, runs_removed, 'y' if runs_removed == 1 else 'ies')
+    return files_removed, runs_removed
 
 
 # ---------------------------------------------------------------------------
@@ -144,25 +179,24 @@ def _manifest_entry(run_id, kind, label, algorithm, gates, training_sample_ids,
         'params': dict(params),
         'timestamp': timestamp,
         'n_clusters': n_clusters,
+        'storage': STORAGE_FORMAT,
     }
 
 
 # ---------------------------------------------------------------------------
-# Per-run pickle payload
+# Per-run payload
 # ---------------------------------------------------------------------------
 
 def save_run_payload(controller, run_id: str, payload: dict) -> None:
-    """Pickle *payload* (the heavy, non-JSON part of one run) to its own file."""
-    path = run_pickle_path(controller, run_id)
-    with open(path, 'wb') as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    """Write *payload* (the heavy, non-manifest part of one run) to its bundle."""
+    drc_persist.save_bundle(run_payload_path(controller, run_id), payload)
 
 
 # The full set of heavy per-run fields hydrate_run() restores from disk --
 # keep this in sync with hydrate_run()'s 'clustering' branch below.
 _CLUSTERING_RUN_PAYLOAD_FIELDS = (
     'labels', 'colors', 'names', 'marker_values', 'dr_positions',
-    'mem_labels', 'cell_type_suggestions', 'marker_summary', 'tree_data',
+    'mem_labels', 'cell_type_suggestions', 'tree_data',
 )
 
 
@@ -174,7 +208,7 @@ def update_run_payload(controller, cl_run: dict) -> None:
     full overwrite, not a merge, so building a payload with only one or
     two changed fields (as rename_cluster/recolor_cluster used to)
     silently drops the rest from disk (tree_data, marker_values,
-    mem_labels, cell_type_suggestions, marker_summary, dr_positions) --
+    mem_labels, cell_type_suggestions, dr_positions) --
     invisible in the current session, since the in-memory dict is
     untouched, but gone the next time this run is hydrated fresh from
     the manifest (experiment reopen / app relaunch).
@@ -188,37 +222,33 @@ def update_run_payload(controller, cl_run: dict) -> None:
 
 
 def load_run_payload(controller, run_id: str) -> dict | None:
-    """Unpickle a run's heavy payload.  Returns None if missing/corrupt."""
-    path = run_pickle_path(controller, run_id)
-    if not path.exists():
-        return None
+    """Read a run's heavy payload.  Returns None if missing/corrupt."""
     try:
-        with open(path, 'rb') as f:
-            return pickle.load(f)
-    except (pickle.PickleError, EOFError, OSError, AttributeError) as exc:
+        return drc_persist.load_bundle(run_payload_path(controller, run_id))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         log.warning("could not load run payload %s (%s)", run_id, exc)
         return None
 
 
 def delete_run_payload(controller, run_id: str) -> None:
-    path = run_pickle_path(controller, run_id)
-    if path.exists():
-        path.unlink()
+    drc_persist.delete_bundle(run_payload_path(controller, run_id))
 
 
 # ---------------------------------------------------------------------------
 # Archiving
 # ---------------------------------------------------------------------------
 
-def archive_dr_run(controller, state, *, algorithm, reducer, embeddings,
+def archive_dr_run(controller, state, *, algorithm, embeddings,
                     gates, training_sample_ids, channels, params,
-                    n_events, label=None, embedding_features=None,
-                    embedding_event_indices=None) -> dict:
+                    n_events, label=None, embedding_features=None) -> dict:
     """
-    Archive a completed DR training run: pickle the reducer + embeddings to
-    ``cache/dr_clustering/runs/<run_id>.pkl``, append a lightweight entry to
+    Archive a completed DR training run: write the embeddings to
+    ``cache/dr_clustering/runs/<run_id>/``, append a lightweight entry to
     ``manifest.json``, and append the full (manifest fields + heavy payload)
     entry to ``state.dr_runs``.  Returns the in-memory entry.
+
+    The fitted reducer itself is not archived; the live model stays in
+    state.trained_reducers for the rest of the session.
 
     embedding_features: optional {sample_path: np.ndarray} of the ORIGINAL
         high-dimensional feature vectors each embedding row came from (same
@@ -226,15 +256,6 @@ def archive_dr_run(controller, state, *, algorithm, reducer, embeddings,
         compute true marker-space neighbours with guaranteed row-for-row
         alignment to what's plotted, without re-deriving anything from live
         (re-gate-able) data. Optional for callers that don't have it.
-    embedding_event_indices: optional {sample_path: np.ndarray} -- only
-        meaningful for a DR run whose embedding is a downsampled subset of
-        a sample's full gated events (currently PHATE only). Indices into
-        that sample's FULL gated/transformed feature array, in the same
-        row order as the embedding. Lets the Cluster Map (Workspace and
-        Cluster Annotation) align a downsampled embedding to cluster
-        labels -- which always cover every gated event -- by real event
-        identity instead of greying the sample out. See
-        drc_scatter.align_labels_to_embedding.
     """
     log_stage(log, "ARCHIVE DR RUN")
     run_id = _new_run_id()
@@ -242,10 +263,8 @@ def archive_dr_run(controller, state, *, algorithm, reducer, embeddings,
     run_label = label or make_run_label('dr', algorithm, gates)
 
     save_run_payload(controller, run_id, {
-        'reducer': reducer,
         'embeddings': embeddings,
         'embedding_features': embedding_features or {},
-        'embedding_event_indices': embedding_event_indices or {},
     })
 
     entry = _manifest_entry(
@@ -257,10 +276,8 @@ def archive_dr_run(controller, state, *, algorithm, reducer, embeddings,
     write_manifest(controller, manifest)
 
     full_entry = dict(entry)
-    full_entry['reducer'] = reducer
     full_entry['embeddings'] = embeddings
     full_entry['embedding_features'] = embedding_features or {}
-    full_entry['embedding_event_indices'] = embedding_event_indices or {}
     state.dr_runs.append(full_entry)
     log.info("archived DR run %r (run_id=%s, %d embedded sample(s))",
              run_label, run_id, len(embeddings))
@@ -270,7 +287,7 @@ def archive_dr_run(controller, state, *, algorithm, reducer, embeddings,
 def update_dr_run_embeddings(controller, state, run_id: str, embeddings: dict,
                               embedding_features: dict | None = None) -> None:
     """
-    Refresh the pickled payload and in-memory entry for an already-archived
+    Refresh the stored payload and in-memory entry for an already-archived
     DR run after 'Apply to All Samples' embeds additional samples under the
     same trained model.  Does NOT create a new manifest entry or run_id —
     it is still the same run, just covering more samples.
@@ -301,20 +318,20 @@ def update_cluster_id_suggestions(controller, state, run_id: str,
     same reason: suggestions are computed in a LATER step than
     archive_clustering_run() (the user clicks "Compute Cluster ID
     Suggestions" after the run already exists in the picker), so this is
-    the only path that ever writes them into the pickle --
+    the only path that ever writes them into the payload --
     archive_clustering_run() itself always writes the empty placeholders.
 
     mem_labels: dict[cluster_id -> str], as returned by
         compute_cluster_id_suggestions.
     cell_type_df: the DataFrame returned by compute_cluster_id_suggestions
-        (score_cell_types's output) -- pickled as-is, same as any other
-        non-JSON payload value here (reducer, labels, etc.).
+        (score_cell_types's output) -- stored as a CSV table in the
+        run's bundle.
 
     Does NOT create a new manifest entry or run_id, and does NOT touch
     manifest.json -- mem_labels/cell_type_df are small enough, and
     specific enough to THIS payload, that they don't need their own
     manifest fields (same reasoning as 'names'/'colors' living only in
-    the pickle, never in the lightweight JSON manifest).
+    the payload, never in the lightweight JSON manifest).
     """
     payload = load_run_payload(controller, run_id) or {}
     payload['mem_labels'] = mem_labels
@@ -324,47 +341,6 @@ def update_cluster_id_suggestions(controller, state, run_id: str,
         if entry.get('run_id') == run_id:
             entry['mem_labels'] = mem_labels
             entry['cell_type_suggestions'] = cell_type_df
-            break
-
-
-def save_marker_summary(controller, state, run_id: str, summary: dict) -> None:
-    """
-    Persist Cluster Annotation's Marker MFI heatmap + ridgeline grid for an
-    already-archived clustering run -- same "update after the fact" pattern
-    as update_cluster_id_suggestions() above, needed for the same reason:
-    these are computed in a LATER step ("Recompute Marker Summary") than
-    archive_clustering_run() itself.
-
-    summary keys: 'is_dark' (bool, the theme these figures were rendered
-    for), 'channels', 'cluster_order', 'names_map', 'colors_map', and the
-    five matplotlib Figures ('main_fig', 'col_fig', 'row_fig', 'cbar_fig',
-    'ridge_fig'). Deliberately does NOT include the pooled per-event arrays
-    that fed them -- those are reconstructible from the run's own already-
-    archived 'marker_values' snapshot, and would roughly double this
-    payload's size for data that's only needed on a theme change.
-
-    Each value is probed with pickle.dumps() before being written, same
-    defensive pattern _save_model_sidecar() already uses elsewhere -- a
-    Figure that turns out not to be picklable (e.g. one still attached to
-    a Qt canvas) just means this run falls back to on-demand recompute next
-    time, not a crash. Figures passed in here MUST be canvas-less (call
-    this before attaching them to any FigureCanvasQTAgg) or the probe will
-    fail for all of them.
-    """
-    safe_summary = {}
-    for key, value in summary.items():
-        try:
-            pickle.dumps(value)
-            safe_summary[key] = value
-        except Exception as exc:
-            log.warning("marker summary: skipping '%s' for run %s (not picklable: %s)",
-                        key, run_id, exc)
-    payload = load_run_payload(controller, run_id) or {}
-    payload['marker_summary'] = safe_summary or None
-    save_run_payload(controller, run_id, payload)
-    for entry in state.clustering_runs:
-        if entry.get('run_id') == run_id:
-            entry['marker_summary'] = payload['marker_summary']
             break
 
 
@@ -414,8 +390,6 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
         'mem_labels': {},
         'cell_type_suggestions': None,
         'tree_data': tree_data,
-        # Marker Heatmap/Ridgeline figures -- also computed later
-        'marker_summary': None,
     })
 
     entry = _manifest_entry(
@@ -435,7 +409,6 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
     full_entry['mem_labels'] = {}
     full_entry['cell_type_suggestions'] = None
     full_entry['tree_data'] = tree_data
-    full_entry['marker_summary'] = None
     state.clustering_runs.append(full_entry)
     log.info("archived clustering run %r (run_id=%s, %s cluster(s))",
              run_label, run_id, n_clusters)
@@ -460,7 +433,7 @@ def rename_run(controller, run_id: str, new_label: str) -> None:
 
 def delete_run(controller, state, run_id: str) -> None:
     """
-    Remove a run everywhere: manifest entry, pickle file, and the matching
+    Remove a run everywhere: manifest entry, payload bundle, and the matching
     in-memory entry in state.dr_runs / state.clustering_runs.  Self-contained
     so Item 6's management table only has to call this one function.
     """
@@ -476,14 +449,12 @@ def load_manifest_entries(controller) -> tuple[list[dict], list[dict]]:
     """
     Rebuild (dr_entries, clustering_entries) from manifest.json ONLY —
     metadata fields, no heavy payload.  This is what experiment-open calls
-    (replaces the old load_all_runs(), which eagerly unpickled every run's
-    payload — fine for a couple of runs, doesn't scale once Item 6 lets
-    these accumulate across a session).
+    (payloads are read lazily, since runs accumulate across a session).
 
     Every consumer that just needs to populate a combo/table row (run
     label, kind, algorithm, gates, sample/event/channel counts, timestamp)
     can work from these entries directly.  Anything that needs the actual
-    reducer/embeddings/labels/colors/names must call hydrate_run() on the
+    embeddings/labels/colors/names must call hydrate_run() on the
     specific entry it cares about, the moment it's actually selected.
     """
     manifest = read_manifest(controller)
@@ -495,10 +466,10 @@ def load_manifest_entries(controller) -> tuple[list[dict], list[dict]]:
 
 
 def run_payload_exists(controller, run_id: str) -> bool:
-    """Cheap existence check (no unpickling) — a run whose pickle has gone
-    missing from disk (e.g. manually deleted, or a corrupted experiment
+    """Cheap existence check (no payload read) — a run whose payload has
+    gone missing from disk (e.g. manually deleted, or a corrupted experiment
     folder) can be flagged as invalid before anything tries to hydrate it."""
-    return run_pickle_path(controller, run_id).exists()
+    return drc_persist.bundle_exists(run_payload_path(controller, run_id))
 
 
 def hydrate_run(controller, entry: dict) -> dict:
@@ -514,7 +485,7 @@ def hydrate_run(controller, entry: dict) -> dict:
     what makes this double as the in-session cache: once hydrated, a run
     reselected later in the same session doesn't touch disk again.
 
-    Missing/corrupt pickles (see load_run_payload's own handling) resolve
+    Missing/corrupt payloads (see load_run_payload's own handling) resolve
     to empty dicts rather than raising — callers see a hydrated-but-empty
     entry (e.g. embeddings == {}) and should treat that as "nothing to
     plot" rather than crash.
@@ -522,10 +493,8 @@ def hydrate_run(controller, entry: dict) -> dict:
     kind = entry.get('kind')
     if kind == 'dr' and 'embeddings' not in entry:
         payload = load_run_payload(controller, entry['run_id']) or {}
-        entry['reducer'] = payload.get('reducer')
         entry['embeddings'] = payload.get('embeddings', {})
         entry['embedding_features'] = payload.get('embedding_features', {})
-        entry['embedding_event_indices'] = payload.get('embedding_event_indices', {})
     elif kind == 'clustering' and 'labels' not in entry:
         payload = load_run_payload(controller, entry['run_id']) or {}
         entry['labels'] = payload.get('labels', {})
@@ -535,6 +504,5 @@ def hydrate_run(controller, entry: dict) -> dict:
         entry['dr_positions'] = payload.get('dr_positions', {})
         entry['mem_labels'] = payload.get('mem_labels', {})
         entry['cell_type_suggestions'] = payload.get('cell_type_suggestions')
-        entry['marker_summary'] = payload.get('marker_summary')
         entry['tree_data'] = payload.get('tree_data')
     return entry
