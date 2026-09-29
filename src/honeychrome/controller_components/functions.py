@@ -562,7 +562,7 @@ def write_fcs(
         kw['$BEGINDATA'] = str(DATA_START)
         kw['$ENDDATA']   = str(DATA_END)
         text = _build_text(kw)
-        text_bytes = text.encode('latin-1')
+        text_bytes = text.encode('utf-8')
         new_TEXT_END = TEXT_START + len(text_bytes) - 1
         new_DATA_START = new_TEXT_END + 1
         new_DATA_END   = new_DATA_START + data_bytes - 1

@@ -45,6 +45,7 @@ class _CytParams:
     scatter_extra_pat: list[str]   # additional channel name patterns to include as scatter
     singlet_y_preference: str      # 'FSC-W' or 'FSC-H'
     scatter_display_ceiling: Optional[dict[str, float]] = None  # per-channel display limit override; None = use PNR
+    db_col_bare_names: bool = False  # True when cytometer_database.csv stores this cytometer's detector names WITHOUT the -A/-H/-W suffix (CytoStellar only)
 
 
 _CYTOMETER_PARAMS: dict[str, _CytParams] = {
@@ -183,6 +184,34 @@ _CYTOMETER_PARAMS: dict[str, _CytParams] = {
         scatter_extra_pat = ["FSC56", "FSC57", "SSC59"],
         singlet_y_preference = "FSC07-H",
     ),
+
+    "CytoStellar": _CytParams(
+        cyt_label       = "CytoStellar",
+        # NOTE: current CytoStellar firmware writes a "default" placeholder
+        # (Chinese "默认", not literal ASCII "default") into $CYT instead of
+        # an instrument name; engineers expect this fixed in a future
+        # release. This pattern matches once that ships -- the literal
+        # placeholder is matched separately in _match_cytometer() below as
+        # an interim workaround (confirmed value from Oliver, 2026-09-27).
+        cyt_kw_pattern  = r"CytoStellar",
+        creator_pattern = None,
+        non_spectral_pat = ["FSC", "SSC", "Time"],
+        spectral_pat    = None,
+        db_col          = "CytoStellar",
+        scatter_param = ["FSC-A", "BSSC-A"],
+        sat_value = 4000000,
+        scatter_extra_pat = ["FSC", "SSC"],
+        singlet_y_preference = "FSC-H",
+        scatter_display_ceiling = {"FSC-A": 4e6, "BSSC-A": 4e6, "FSC-H": 4e6},
+        # cytometer_database.csv's CytoStellar column stores bare
+        # (unsuffixed) detector names -- the actual -A/-H suffix is chosen
+        # per acquisition, and a detector acquired as BOTH -A and -H is
+        # deliberately NOT deduplicated here: that choice belongs to
+        # experiment.process['fluorescence_channel_filter'] ('area_only' vs
+        # not) via Controller.filter_raw_fluorescence_channels(), which
+        # already does -A-only filtering downstream of this module.
+        db_col_bare_names = True,
+    ),
 }
 
 # Path to the bundled cytometer_database.csv
@@ -245,7 +274,7 @@ def resolve_cytometer_params(
         return None
 
     detector_names = _derive_detector_cols(all_pnn, matched)
-    detector_names = _order_detectors(detector_names, matched.db_col)
+    detector_names = _order_detectors(detector_names, matched.db_col, bare_names=matched.db_col_bare_names)
 
     # Map back to indices in the original all_pnn list
     name_to_idx = {name: i for i, name in enumerate(all_pnn)}
@@ -304,6 +333,16 @@ def _match_cytometer(
     if kw_match(r"Bigfoot"):
         return _CYTOMETER_PARAMS["Bigfoot"]
 
+    if kw_match(r"CytoStellar"):
+        return _CYTOMETER_PARAMS["CytoStellar"]
+
+    # Current-firmware bug workaround: $CYT is written as a "default"
+    # placeholder in Chinese (默认: default / tacit consent / take for
+    # granted) instead of an instrument name. Distinctive enough to match
+    # directly until the firmware fix ships.
+    if cyt_kw.strip() == "默认":
+        return _CYTOMETER_PARAMS["CytoStellar"]
+
     # Aurora / NL share $CYT = "Aurora"; distinguished by presence of UV channels
     if re.match(r"^Aurora$", cyt_kw, re.IGNORECASE):
         has_uv = any(re.match(r"^UV[0-9]+-A$", ch) for ch in all_pnn)
@@ -358,11 +397,19 @@ def _derive_detector_cols(all_pnn: list[str], params: _CytParams) -> list[str]:
     return cols
 
 
-def _order_detectors(detector_names: list[str], db_col: str) -> list[str]:
+def _order_detectors(detector_names: list[str], db_col: str, bare_names: bool = False) -> list[str]:
     """
     Re-order detector_names to match the canonical excitation/emission order
     defined in cytometer_database.csv.  Channels not present in the database
     are appended at the end in their original order.
+
+    bare_names : when True, the database column stores detector names
+        WITHOUT an acquisition-parameter suffix (-A/-H/-W) -- currently
+        CytoStellar only, where the suffix actually acquired varies per
+        file and both suffixes may legitimately be present for the same
+        detector. Ordering then matches on each channel's suffix-stripped
+        name; channels sharing a bare name (e.g. both "V7-A" and "V7-H")
+        stay adjacent, in their original relative order.
     """
     if not _DB_PATH.exists():
         logger.warning(
@@ -383,6 +430,19 @@ def _order_detectors(detector_names: list[str], db_col: str) -> list[str]:
             return detector_names
 
         ref_order = [v for v in db[db_col].dropna() if str(v).strip()]
+
+        if bare_names:
+            suffix_re = re.compile(r"-(A|H|W)$")
+            bare_lookup: dict[str, list[str]] = {}
+            for ch in detector_names:
+                bare_lookup.setdefault(suffix_re.sub('', ch), []).append(ch)
+            ordered = []
+            for ref in ref_order:
+                ordered.extend(bare_lookup.get(ref, []))
+            ordered_set = set(ordered)
+            remainder = [ch for ch in detector_names if ch not in ordered_set]
+            return ordered + remainder
+
         ordered   = [ch for ch in ref_order   if ch in set(detector_names)]
         remainder = [ch for ch in detector_names if ch not in set(ref_order)]
         return ordered + remainder
