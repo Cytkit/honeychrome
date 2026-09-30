@@ -84,8 +84,8 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
     background thread, since loading + unmixing each sample from disk is
     the dominant cost here, not the in-memory MEM math afterward.
 
-    af_state: optional AF snapshot (transfer_matrix, af_precomputed,
-    af_spectra) -- see drc_pipeline.apply_unmixing_af_aware()'s docstring.
+    af_state: optional unmixing snapshot -- see
+    drc_pipeline.apply_unmixing_af_aware()'s docstring.
     Pass this when calling from a background worker thread; leave as None
     only for main-thread callers.
 
@@ -405,8 +405,9 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
          same way count as the same combination rather than splitting
          across their individual profile names.
       3. If none of the training samples have ANY AF profile assigned,
-         that unstained sample gets af_state=None -- unmixed WITHOUT
-         per-cell AF correction, matching the run itself having none.
+         that unstained sample gets (transfer_matrix, None, None) --
+         unmixed WITHOUT per-cell AF correction, matching the run itself
+         having none.
 
     Returns {unstained_rel_path: af_state_or_None} for every unstained
     cell sample _resolve_unstained_cell_sample_paths finds --
@@ -471,9 +472,13 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
             profile_names = most_common_combo
 
         if profile_names not in af_state_cache:
-            af_state_cache[profile_names] = (
+            resolved = (
                 drc_pipeline.resolve_af_state_for_profiles(controller, list(profile_names))
                 if profile_names else None
+            )
+            af_state_cache[profile_names] = (
+                resolved if resolved is not None
+                else (controller.transfer_matrix, None, None)
             )
         result[rel] = af_state_cache[profile_names]
 
@@ -1133,8 +1138,8 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
     min_score, pos_evidence_floor: forwarded to score_cell_types -- see
     its docstring.
 
-    af_state: optional AF snapshot (transfer_matrix, af_precomputed,
-    af_spectra), forwarded straight through to pool_cluster_marker_values --
+    af_state: optional unmixing snapshot, forwarded straight through to
+    pool_cluster_marker_values --
     see its docstring. Pass this when calling from a background worker
     thread.
 
