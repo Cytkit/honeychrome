@@ -29,6 +29,8 @@ Usage:
 """
 
 import multiprocessing as mp
+import os
+import shutil
 import tempfile
 from copy import deepcopy
 from pathlib import Path
@@ -339,37 +341,77 @@ def test_get_af_spectra_raises_on_too_few_cells():
         get_af_spectra(tiny, fluor_spectra)
 
 
+def _contaminated_unstained(seed, n_cells=1000, contaminated_fraction=0.15):
+    """Unstained events from two AF spectra, with a fraction of the events
+    also carrying a bright fluorophore-0 signal (a single-stained control
+    mixed into the unstained sample)."""
+    rng = np.random.default_rng(seed)
+    fluor_spectra = _make_fluor_spectra()
+    af = _make_af_spectra(n_af=2, rng=np.random.default_rng(seed + 100))
+    abundance = rng.lognormal(np.log(1500), 0.3, n_cells)
+    events = (abundance[:, None] * af[rng.integers(0, 2, n_cells)]
+              + rng.normal(0, 20, (n_cells, N_CHANNELS)))
+    k = int(contaminated_fraction * n_cells)
+    events[:k] += rng.lognormal(np.log(100000), 0.2, k)[:, None] * fluor_spectra[0]
+    return events.clip(0), fluor_spectra
+
+
+def _max_fluor_cosine(af_spectra, fluor_spectra):
+    a = af_spectra / np.linalg.norm(af_spectra, axis=1, keepdims=True)
+    f = fluor_spectra / np.linalg.norm(fluor_spectra, axis=1, keepdims=True)
+    return float((a @ f.T).max())
+
+
 @pytest.mark.numpy_only
-def test_get_af_spectra_removes_fluorophore_contaminants():
+@pytest.mark.parametrize('seed', [0, 1, 2])
+def test_get_af_spectra_removes_fluorophore_contaminants(seed):
     """
-    If an AF candidate is almost identical to a known fluorophore it must be
-    removed by the contamination QC filter.  Only the population mean (row 0)
-    is always kept.
+    Events contaminated with a fluorophore must not produce an AF spectrum
+    resembling that fluorophore. Without the contamination filter the same
+    data does (cosine similarity above 0.99), so the filter is what removes it.
+    """
+    from honeychrome.controller_components.autospectral_functions import get_af_spectra
+
+    unstained, fluor_spectra = _contaminated_unstained(seed)
+
+    filtered = get_af_spectra(unstained, fluor_spectra, som_dim=4)
+    assert filtered.shape[0] >= 1
+    assert _max_fluor_cosine(filtered, fluor_spectra) < 0.9
+
+    unfiltered = get_af_spectra(unstained, fluor_spectra, som_dim=4,
+                                remove_contaminants=False, refine=False)
+    assert _max_fluor_cosine(unfiltered, fluor_spectra) > 0.99
+
+
+@pytest.mark.numpy_only
+def test_get_af_spectra_rejects_fluorophore_only_unstained():
+    """
+    An "unstained" sample whose every event looks like one fluorophore has no
+    AF signal to extract: every candidate spectrum, including the population
+    mean, fails contamination QC and get_af_spectra raises.
     """
     from honeychrome.controller_components.autospectral_functions import get_af_spectra
 
     rng = np.random.default_rng(5)
     fluor_spectra = _make_fluor_spectra()
-
-    # Build an unstained dataset that will cluster near fluorophore 0
     n_cells = 500
-    # Most events look like fluor 0 + noise
     fluor0_signal = np.tile(fluor_spectra[0] * 1000, (n_cells, 1))
     noise = rng.normal(0, 10, size=(n_cells, N_CHANNELS))
     unstained = (fluor0_signal + noise).clip(0)
 
-    af_spectra = get_af_spectra(
-        unstained, fluor_spectra,
-        som_dim=3,
-    )
+    with pytest.raises(ValueError, match='contamination QC'):
+        get_af_spectra(unstained, fluor_spectra, som_dim=3)
 
 
 # ---------------------------------------------------------------------------
 # GROUP B — Controller-level integration tests (require experiment on disk)
 # ---------------------------------------------------------------------------
 
+# Set HONEYCHROME_TEST_EXPERIMENT to a .kit file to run this group on another
+# experiment.
 BASE_DIR = Path.home() / 'Experiments'
-EXPERIMENT_PATH = BASE_DIR / '7C panel 2.kit'
+EXPERIMENT_PATH = Path(os.environ.get('HONEYCHROME_TEST_EXPERIMENT',
+                                      str(BASE_DIR / '7C panel 2.kit'))).expanduser()
 
 # Skip the whole group if the experiment file isn't present
 requires_experiment = pytest.mark.skipif(
@@ -379,16 +421,38 @@ requires_experiment = pytest.mark.skipif(
 
 
 @pytest.fixture(scope='module')
-def loaded_controller():
+def experiment_copy(tmp_path_factory):
     """
-    Module-scoped fixture: opens the experiment, runs the spectral process,
-    and loads the first sample.  Shared across all controller-level tests to
-    avoid redundant disk I/O.
+    A copy of the test experiment's .kit file, so nothing a test does can
+    change the original. The experiment folder (FCS files) is linked beside
+    the copy rather than copied. Opening the copy does not add it to the
+    app's recent-files list.
+    """
+    import honeychrome.controller as controller_module
+
+    tmp = tmp_path_factory.mktemp('experiment')
+    kit = tmp / EXPERIMENT_PATH.name
+    shutil.copy2(EXPERIMENT_PATH, kit)
+    data_dir = EXPERIMENT_PATH.parent / EXPERIMENT_PATH.stem
+    if data_dir.is_dir():
+        (tmp / EXPERIMENT_PATH.stem).symlink_to(data_dir, target_is_directory=True)
+    patcher = pytest.MonkeyPatch()
+    patcher.setattr(controller_module, 'add_recent_file', lambda path: None)
+    yield kit
+    patcher.undo()
+
+
+@pytest.fixture(scope='module')
+def loaded_controller(experiment_copy):
+    """
+    Module-scoped fixture: opens the experiment copy, runs the spectral
+    process, and loads the first sample.  Shared across all controller-level
+    tests to avoid redundant disk I/O.
     """
     from honeychrome.controller import Controller
 
     kc = Controller()
-    kc.load_experiment(EXPERIMENT_PATH)
+    kc.load_experiment(experiment_copy)
     kc.regenerate_spectral_model()
     kc.refresh_spectral_process()
     kc.set_mode('Unmixed Data')
@@ -397,6 +461,19 @@ def loaded_controller():
     kc.load_sample(first_sample)
 
     return kc
+
+
+def _raw_fluor_columns(kc):
+    """Positions of the filtered fluorescence channels in kc.raw_event_data.
+
+    filtered_raw_fluorescence_channel_ids index the full raw channel list,
+    but raw_event_data holds only the whitelisted channels, in whitelist
+    order (as in Controller._apply_unmixing).
+    """
+    raw = kc.experiment.settings['raw']
+    pnn_loaded = raw.get('whitelisted_pnn') or raw['event_channels_pnn']
+    return [pnn_loaded.index(raw['event_channels_pnn'][i])
+            for i in kc.filtered_raw_fluorescence_channel_ids]
 
 
 @requires_experiment
@@ -416,7 +493,7 @@ def test_controller_af_assignment_changes_unmixed_output(loaded_controller):
 
     # Build a synthetic AF profile from the current sample's raw fluorescence data
     fluor_ids = kc.filtered_raw_fluorescence_channel_ids
-    raw_fl    = kc.raw_event_data[:, fluor_ids]
+    raw_fl    = kc.raw_event_data[:, _raw_fluor_columns(kc)]
     fluor_spectra = kc._build_fluor_spectra()
 
     from honeychrome.controller_components.autospectral_functions import get_af_spectra
@@ -477,8 +554,7 @@ def test_controller_af_unmixing_preserves_scatter_channels(loaded_controller):
     assert kc.raw_event_data is not None
     assert kc.transfer_matrix is not None
 
-    fluor_ids     = kc.filtered_raw_fluorescence_channel_ids
-    raw_fl        = kc.raw_event_data[:, fluor_ids]
+    raw_fl        = kc.raw_event_data[:, _raw_fluor_columns(kc)]
     fluor_spectra = kc._build_fluor_spectra()
 
     from honeychrome.controller_components.autospectral_functions import (
@@ -495,13 +571,13 @@ def test_controller_af_unmixing_preserves_scatter_channels(loaded_controller):
         precomputed,
         af_spectra,
         kc.experiment.settings,
-        filtered_fl_ids_raw=fluor_ids,
+        filtered_fl_ids_raw=_raw_fluor_columns(kc),
     )
 
     sc_ids = np.array(kc.experiment.settings['unmixed']['scatter_channel_ids'])
     np.testing.assert_array_equal(
         ols_result[:, sc_ids],
-        af_result[:,  sc_ids],
+        af_result['unmixed'][:, sc_ids],
         err_msg="Scatter columns must not be modified by AF unmixing",
     )
 
@@ -523,7 +599,7 @@ def test_controller_clear_af_reverts_to_ols(loaded_controller):
     assert kc.transfer_matrix is not None
 
     fluor_ids     = kc.filtered_raw_fluorescence_channel_ids
-    raw_fl        = kc.raw_event_data[:, fluor_ids]
+    raw_fl        = kc.raw_event_data[:, _raw_fluor_columns(kc)]
     fluor_spectra = kc._build_fluor_spectra()
     af_spectra    = get_af_spectra(raw_fl, fluor_spectra, som_dim=4)
     channel_names = [kc.experiment.settings['raw']['event_channels_pnn'][i] for i in fluor_ids]
@@ -580,7 +656,7 @@ def test_controller_regenerate_spectral_process_with_af_assigned(loaded_controll
     assert kc.transfer_matrix is not None
 
     fluor_ids     = kc.filtered_raw_fluorescence_channel_ids
-    raw_fl        = kc.raw_event_data[:, fluor_ids]
+    raw_fl        = kc.raw_event_data[:, _raw_fluor_columns(kc)]
     fluor_spectra = kc._build_fluor_spectra()
     af_spectra    = get_af_spectra(raw_fl, fluor_spectra, som_dim=4)
     channel_names = [kc.experiment.settings['raw']['event_channels_pnn'][i] for i in fluor_ids]
@@ -624,7 +700,7 @@ def test_controller_regenerate_spectral_process_with_af_assigned(loaded_controll
 
 @requires_experiment
 @pytest.mark.controller
-def test_experiment_save_load_preserves_af_state():
+def test_experiment_save_load_preserves_af_state(experiment_copy):
     """
     AF profiles and per-sample assignments survive a save/load cycle.
     Uses DeepDiff, matching the pattern of test_experiment_model.py.
@@ -635,7 +711,7 @@ def test_experiment_save_load_preserves_af_state():
     from honeychrome.controller_components.autospectral_functions import get_af_spectra
 
     kc = Controller()
-    kc.load_experiment(EXPERIMENT_PATH)
+    kc.load_experiment(experiment_copy)
     kc.regenerate_spectral_model()
     kc.refresh_spectral_process()
 
@@ -643,7 +719,7 @@ def test_experiment_save_load_preserves_af_state():
     kc.load_sample(first_sample)
 
     fluor_ids     = kc.filtered_raw_fluorescence_channel_ids
-    raw_fl        = kc.raw_event_data[:, fluor_ids]
+    raw_fl        = kc.raw_event_data[:, _raw_fluor_columns(kc)]
     fluor_spectra = kc._build_fluor_spectra()
     af_spectra    = get_af_spectra(raw_fl, fluor_spectra, som_dim=4)
     channel_names = [kc.experiment.settings['raw']['event_channels_pnn'][i] for i in fluor_ids]
@@ -679,8 +755,3 @@ def test_experiment_save_load_preserves_af_state():
         reloaded_spectra, original_spectra, rtol=1e-6,
         err_msg="AF spectra changed during experiment save/load",
     )
-
-    # Cleanup: restore experiment to its pre-test state
-    kc.experiment.process['af_profiles'].pop(profile_name, None)
-    kc.experiment.samples['sample_af_profiles'][first_sample] = []
-    kc.save_experiment(EXPERIMENT_PATH)
