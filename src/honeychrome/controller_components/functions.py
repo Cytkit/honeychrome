@@ -9,6 +9,9 @@ from functools import wraps
 from pathlib import Path
 from honeychrome.controller_components.transform import Transform
 from honeychrome.settings import linear_a, logicle_w, logicle_m, logicle_a, log_m
+from honeychrome.settings import (
+    af_abundance_channel, af_index_channel, af_channels, default_af_index_range,
+)
 
 q_settings = QSettings("honeychrome", "ExperimentSelector")
 
@@ -619,7 +622,53 @@ def timer(func):
         return result
     return wrapper
 
-def assign_default_transforms(settings, channels=None):
+def af_channel_transform(label, magnitude_ceiling, n_af_spectra=None):
+    """Default transform for an AF channel.
+
+    AF Abundance: logicle with the fluorescence channels' parameters.
+    AF Index: linear from 0 to the number of AF spectra (n_af_spectra, or
+    default_af_index_range when unknown), so each library variant has its
+    own position on the axis.
+    """
+    if label == af_index_channel:
+        n = int(n_af_spectra) if n_af_spectra else default_af_index_range
+        return {'scale_t': max(n, 1), 'linear_a': 0, 'logicle_w': logicle_w, 'logicle_m': logicle_m,
+                'logicle_a': logicle_a, 'log_m': log_m, 'id': 0, 'limits': [0, 1]}
+    return {'scale_t': magnitude_ceiling, 'linear_a': linear_a, 'logicle_w': logicle_w,
+            'logicle_m': logicle_m, 'logicle_a': logicle_a, 'log_m': log_m, 'id': 1,
+            'limits': [0, 1]}
+
+
+def ensure_af_channels(unmixed_settings, transforms=None, n_af_spectra=None):
+    """Add the AF channels to an unmixed channel list that lacks them.
+
+    Appends AF Abundance and AF Index to ``event_channels_pnn`` (after every
+    existing channel, so no existing channel index changes), records their
+    positions in ``af_channel_ids``, and adds default transforms for them to
+    *transforms* when given. Idempotent. Returns True when anything changed.
+    """
+    pnn = unmixed_settings.get('event_channels_pnn')
+    if not pnn:
+        return False
+    changed = False
+    for label in af_channels:
+        if label not in pnn:
+            pnn.append(label)
+            changed = True
+    ids = [pnn.index(label) for label in af_channels]
+    if unmixed_settings.get('af_channel_ids') != ids:
+        unmixed_settings['af_channel_ids'] = ids
+        changed = True
+    if transforms is not None:
+        for label in af_channels:
+            if label not in transforms:
+                transforms[label] = af_channel_transform(
+                    label, unmixed_settings.get('magnitude_ceiling'), n_af_spectra)
+                changed = True
+    return changed
+
+
+def assign_default_transforms(settings, channels=None, n_af_spectra=None):
     if channels is None:
         channels = settings['event_channels_pnn']
     transforms = {}
@@ -629,6 +678,9 @@ def assign_default_transforms(settings, channels=None):
                             'logicle_a': logicle_a, 'log_m': log_m, 'id': 1, 'limits': [0, 1]}
 
     for label in channels:
+        if label in af_channels:
+            transforms[label] = af_channel_transform(label, settings['magnitude_ceiling'], n_af_spectra)
+            continue
         index = settings['event_channels_pnn'].index(label)
         channel_pnr = settings.get('channel_pnr')
         if index in settings['scatter_channel_ids']:
@@ -1147,3 +1199,16 @@ def build_display_label_map(pnn, spectral_model):
         antigen = label_to_antigen.get(name, '')
         result[name] = f'{antigen} {name}'.strip() if antigen else name
     return result
+
+
+def build_antigen_map(pnn, spectral_model):
+    """
+    Returns a dict {pnn_name: antigen} for all channels, from the spectral
+    model's controls. Channels without an antigen (scatter, time, AF
+    channels, unlabelled fluorophores) map to ''.
+    """
+    label_to_antigen = {
+        control['label']: (control.get('antigen') or '').strip()
+        for control in (spectral_model or [])
+    }
+    return {name: label_to_antigen.get(name, '') for name in (pnn or [])}

@@ -248,7 +248,8 @@ def apply_af_transfer(raw_event_data, transfer_matrix, af_precomputed, af_spectr
                       filtered_fl_ids_raw=None, spillover=None):
     """
     Assemble a full unmixed event array with AF-corrected fluorescence columns.
-    Scatter, time, and event_id columns come from the standard transfer_matrix path.
+    Scatter, time, and event_id columns come from the standard transfer_matrix path;
+    the AF Abundance and AF Index columns, when present, hold af_scale and af_idx.
 
     The AF unmixing (apply_af_unmixing) produces abundances in plain OLS fluorophore
     space. If a spillover matrix is provided, compensation (inv(spillover).T) is applied
@@ -279,6 +280,15 @@ def apply_af_transfer(raw_event_data, transfer_matrix, af_precomputed, af_spectr
         af_unmixed_fl = (compensation @ af_unmixed_fl.T).T
 
     unmixed[:, fl_ids_unmixed] = af_unmixed_fl
+
+    # Per-cell AF abundance and library index go in the AF channels when the
+    # unmixed channel list has them (the transfer matrix leaves them at 0).
+    from honeychrome.settings import af_abundance_channel, af_index_channel
+    pnn_unmixed = unmixed_settings.get('event_channels_pnn') or []
+    for label, values in ((af_abundance_channel, result['af_scale']),
+                          (af_index_channel, result['af_idx'])):
+        if label in pnn_unmixed and pnn_unmixed.index(label) < unmixed.shape[1]:
+            unmixed[:, pnn_unmixed.index(label)] = values
 
     return {
         'unmixed': unmixed,

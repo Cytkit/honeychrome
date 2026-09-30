@@ -261,17 +261,17 @@ class UnmixedExporter(QObject):
                             filtered_fl_ids_raw=_fl_ids_remapped,
                             spillover=None,
                         )
-                        unmixed_event_data_without_fine_tuning = af_result['unmixed']
-                        af_cols = np.column_stack([
-                            af_result['af_scale'],
-                            af_result['af_idx'].astype(np.float64),
-                        ])
-                        export_event_data = np.hstack([unmixed_event_data_without_fine_tuning, af_cols])
-                        export_pnn = pnn_unmixed + ['AF Abundance', 'AF Index']
+                        # apply_af_transfer fills the AF Abundance and AF Index columns.
+                        export_event_data = af_result['unmixed']
+                        export_pnn = list(pnn_unmixed)
                         logger.info(f'UnmixedExporter: using AF unmixing for {sample_path} ({len(active_profiles)} profile(s))')
                     else:
-                        export_event_data = apply_transfer_matrix(transfer_matrix, raw_event_data)
-                        export_pnn = pnn_unmixed
+                        # Without AF correction the AF channels carry no information,
+                        # so they are left out of the exported file.
+                        unmixed_all = apply_transfer_matrix(transfer_matrix, raw_event_data)
+                        keep = [i for i, ch in enumerate(pnn_unmixed) if ch not in settings.af_channels]
+                        export_event_data = unmixed_all[:, keep]
+                        export_pnn = [pnn_unmixed[i] for i in keep]
 
                     # Retrieve the unmixing spectra matrix (n_fluor × n_detectors).
                     # stored in experiment.process after unmixing is computed.

@@ -199,10 +199,15 @@ class AfComparisonPlotWidget(QWidget):
     # Emitted when a zoom/scaling is applied on one axis, so the sibling can mirror.
     scalingChanged = Signal(str, object)  # (axis_name, Transform)
 
-    def __init__(self, title: str, controller, parent=None):
+    def __init__(self, title: str, controller, parent=None, has_af_channels: bool = True):
         super().__init__(parent)
         self.controller = controller
         self._title_text = title
+        # False for plain (OLS) unmixed data, which has no AF Abundance or AF
+        # Index values: a source gate drawn on those channels cannot be
+        # applied, and the plot says so instead of drawing.
+        self._has_af_channels = has_af_channels
+        self._af_gate_message = ''
 
         # Local copies of Transform objects (not shared with Unmixed Data tab)
         self._transformations: dict[str, Transform] = {}
@@ -471,6 +476,18 @@ class AfComparisonPlotWidget(QWidget):
         x_col = pnn.index(self._channel_x)
         y_col = pnn.index(self._channel_y)
 
+        blocked = None if self._has_af_channels else self._gate_using_af_channels()
+        if blocked is not None:
+            gate_name, channel = blocked
+            self._af_gate_message = (f"Gate '{gate_name}' uses {channel}, which unmixing "
+                                     f"without AF correction does not produce.")
+            self.img.clear()
+            self.set_status(self._af_gate_message)
+            return
+        if self._af_gate_message:
+            self._af_gate_message = ''
+            self.set_status('')
+
         # Start with all events; gate masking will narrow this down if needed.
         event_data = self._event_data
 
@@ -522,6 +539,34 @@ class AfComparisonPlotWidget(QWidget):
     # ------------------------------------------------------------------
     # Internal: gate membership computation
     # ------------------------------------------------------------------
+
+    def _gate_using_af_channels(self) -> tuple[str, str] | None:
+        """(gate, channel) for the first gate from root to the source gate
+        that is drawn on an AF channel, or None."""
+        if self._source_gate == 'root':
+            return None
+        gating = self.controller.unmixed_gating
+        if gating is None:
+            return None
+        try:
+            paths = gating.find_matching_gate_paths(self._source_gate)
+        except Exception:
+            return None
+        if not paths:
+            return None
+        for gate_name in [g for g in paths[0] if g != 'root'] + [self._source_gate]:
+            try:
+                gate = gating.get_gate(gate_name)
+                if gate.gate_type == 'QuadrantGate':
+                    channels = [d.dimension_ref for d in gate.dimensions]
+                else:
+                    channels = list(gate.get_dimension_ids())
+            except Exception:
+                continue
+            for ch in channels:
+                if ch in settings.af_channels:
+                    return gate_name, ch
+        return None
 
     def _compute_gate_mask(self, event_data: np.ndarray) -> np.ndarray | None:
         """
@@ -1030,7 +1075,7 @@ class AutoSpectralTab(QWidget):
         plot_splitter = QSplitter(Qt.Horizontal)
 
         self._plot_ols = AfComparisonPlotWidget(
-            'OLS (no AF)', self.controller, parent=self
+            'OLS (no AF)', self.controller, parent=self, has_af_channels=False
         )
         self._plot_ols.sourceGateChanged.connect(self._on_ols_gate_changed)
         self._plot_ols.channelChanged.connect(self._on_ols_channel_changed)

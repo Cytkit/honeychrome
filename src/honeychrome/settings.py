@@ -160,6 +160,16 @@ logicle_m = 4.5
 logicle_a = 0
 log_m = 6
 
+# Per-cell autofluorescence channels, appended to every unmixed channel list.
+# AF-corrected unmixing fills them; plain unmixing (no AF profile assigned)
+# leaves them at 0. AF Index is 1-based into the sample's combined AF spectra
+# library (0 = no AF correction); its default linear range is the number of
+# AF spectra in the experiment, or default_af_index_range when there are none.
+af_abundance_channel = 'AF Abundance'
+af_index_channel = 'AF Index'
+af_channels = (af_abundance_channel, af_index_channel)
+default_af_index_range = 100
+
 raw_settings = {
     'raw_samples_subdirectory': 'Raw',
     'single_stain_controls_subdirectory': 'Raw/Single stain controls',

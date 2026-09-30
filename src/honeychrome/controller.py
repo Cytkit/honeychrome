@@ -41,7 +41,7 @@ from multiprocessing import shared_memory
 import time
 
 from honeychrome.experiment_model import ExperimentModel, check_fcs_matches_experiment
-from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map
+from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml
 from honeychrome.settings import traces_cache_size, traces_cache_dtype, adc_rate
 import honeychrome.settings as settings
@@ -670,6 +670,11 @@ class Controller(QObject):
         # recreate transfer matrix and compensated_unmixing_matrix if unmixing matrix is not None
         if 'unmixed' in scope:
             if self.experiment.process['unmixing_matrix']:
+                # Experiments created before the AF channels existed gain them
+                # here, before the transfer matrix and transforms are built.
+                ensure_af_channels(self.experiment.settings['unmixed'],
+                                   self.experiment.cytometry['transforms'],
+                                   self.n_af_spectra())
                 self.unmixed_gating = from_gml(self.experiment.cytometry['gating'])
                 self.unmixed_transformations = generate_transformations(self.experiment.cytometry['transforms'])
                 # Call the plain impl, not reapply_fine_tuning(): this method
@@ -912,6 +917,13 @@ class Controller(QObject):
             f'{len(self.af_precomputed_cache)}/{len(af_profiles)} profiles cached.'
         )
 
+
+    def n_af_spectra(self) -> int | None:
+        """Number of AF spectra across all of the experiment's AF profiles
+        (the largest possible AF Index), or None when there are none."""
+        profiles = self.experiment.process.get('af_profiles') or {}
+        n = sum(len(p.get('spectra') or []) for p in profiles.values())
+        return n or None
 
     def get_combined_af_spectra_for_sample(self, sample_path) -> np.ndarray | None:
         """
@@ -1475,7 +1487,8 @@ class Controller(QObject):
         else:
             settings = None
 
-        transforms = assign_default_transforms(settings, channels=channels)
+        transforms = assign_default_transforms(settings, channels=channels,
+                                               n_af_spectra=self.n_af_spectra())
         transformations = generate_transformations(transforms)
 
         for channel in channels:
@@ -1500,7 +1513,7 @@ class Controller(QObject):
 
         if self.experiment.process['unmixing_matrix']:
             settings = self.experiment.settings['unmixed']
-            transforms = assign_default_transforms(settings)
+            transforms = assign_default_transforms(settings, n_af_spectra=self.n_af_spectra())
             transformations = generate_transformations(transforms)
             self.unmixed_transformations.update(transformations)
 
@@ -1724,12 +1737,20 @@ class Controller(QObject):
             )
             self.experiment.process.update(spectral_process)
 
+            # An experiment whose channel list predates the AF channels gains
+            # them first, so their addition alone does not reset the unmixed
+            # transforms, gates and plots below.
+            ensure_af_channels(self.experiment.settings['unmixed'],
+                               self.experiment.cytometry.get('transforms'),
+                               self.n_af_spectra())
+
             # update cytometry only if channels have changed
             if self.experiment.settings['unmixed']['event_channels_pnn'] != unmixed_settings['event_channels_pnn']:
                 self.experiment.settings['unmixed'].update(unmixed_settings)
 
                 # set up unmixed channels with default transforms, copy raw transformation if it does not belong to a fl channel
-                self.experiment.cytometry['transforms'] = assign_default_transforms(unmixed_settings)
+                self.experiment.cytometry['transforms'] = assign_default_transforms(
+                    unmixed_settings, n_af_spectra=self.n_af_spectra())
                 fl_pnn = [self.experiment.settings['raw']['event_channels_pnn'][n] for n in self.experiment.settings['raw']['fluorescence_channel_ids']]
                 update_transforms(self.experiment.cytometry['raw_transforms'], self.raw_transformations)
                 for label in self.experiment.cytometry['raw_transforms']:

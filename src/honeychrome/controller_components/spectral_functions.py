@@ -405,7 +405,8 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
         pnn_raw[raw_settings['time_channel_id']]
         if raw_settings['time_channel_id'] is not None else 'Time'
     )
-    event_channels_pnn = [time_channel_name_raw, 'event_id'] + scatter_channels_pnn + fluorescence_channels_pnn
+    event_channels_pnn = ([time_channel_name_raw, 'event_id'] + scatter_channels_pnn
+                          + fluorescence_channels_pnn + list(settings.af_channels))
     area_channels = [s.removesuffix('-A') for s in event_channels_pnn if s.endswith("-A")]
     height_channels = [s.removesuffix('-H') for s in event_channels_pnn if s.endswith("-H")]
     width_channels = [s.removesuffix('-W') for s in event_channels_pnn if s.endswith("-W")]
@@ -417,6 +418,7 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
     n_scatter_channels = len(scatter_channel_ids)
     fluorescence_channel_ids = [event_channels_pnn.index(c) for c in fluorescence_channels_pnn]
     n_fluorophore_channels = len(fluorescence_channel_ids)
+    af_channel_ids = [event_channels_pnn.index(c) for c in settings.af_channels]
 
     unmixed_settings = {
         'unmixed_samples_subdirectory': 'Unmixed',
@@ -434,7 +436,8 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
         'scatter_channel_ids': scatter_channel_ids,
         'n_scatter_channels': n_scatter_channels,
         'fluorescence_channel_ids': fluorescence_channel_ids,
-        'n_fluorophore_channels': n_fluorophore_channels
+        'n_fluorophore_channels': n_fluorophore_channels,
+        'af_channel_ids': af_channel_ids,
     }
 
     # Preserve existing spillover if it is the right size; otherwise reset to identity.
