@@ -27,11 +27,9 @@ Corrections relative to the original in-line implementation
     indices line up with the actual unmixed event matrix.
 3.  Adds an untransformed channel reader so the Workspace "Marker" colour mode
     can display real, full-scale intensities (not embedding-scale values).
-4.  load_unmixed_gated() now goes through the same AF-corrected unmixing
-    path as the main app's active sample (Controller._apply_unmixing) instead
-    of always calling apply_transfer_matrix() directly — previously every
-    background-loaded sample (training pools, per-sample features) bypassed
-    AF correction entirely, even when an AF profile was active.
+4.  load_unmixed_gated() unmixes each sample with its own AF profile
+    assignment through the shared ``sample_loader`` module, so background
+    loads match what the main window shows for that sample.
 
 All functions take ``controller`` and ``state`` explicitly so they can be
 unit-tested without a live ``PluginWidget``.
@@ -48,10 +46,17 @@ from honeychrome.controller_components.functions import (
     apply_transfer_matrix,
     apply_gates_in_place,
 )
+from honeychrome.settings import af_index_channel
 from honeychrome.controller_components.autospectral_functions import (
     apply_af_transfer,
-    combine_af_precomputed,
-    precompute_joint_cov_extras,
+)
+from honeychrome.controller_components.sample_loader import (
+    UnmixSnapshot,
+    af_profile_names,
+    resolve_af_for_profiles,
+    sample_key_for_path,
+    snapshot_unmix_state,
+    unmix_events,
 )
 
 from drc_logging import (
@@ -63,8 +68,9 @@ log = get_logger(__name__)
 
 # Meta channels that are never used as DR/clustering features. They are still
 # PRESENT as columns in the unmixed event matrix, so they must be excluded by
-# *name selection*, never by deleting them from the index map.
-META_CHANNELS = ("event_id", "Time", "ribbon")
+# *name selection*, never by deleting them from the index map. AF Index is a
+# library position, not an intensity, so it is a label rather than a feature.
+META_CHANNELS = ("event_id", "Time", "ribbon", af_index_channel)
 
 
 # ---------------------------------------------------------------------------
@@ -308,36 +314,35 @@ def select_untransformed_channels(controller, state, gated_data: np.ndarray) -> 
 # Per-sample loading
 # ---------------------------------------------------------------------------
 
-def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray, af_state=None) -> np.ndarray:
+def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray, af_state=None,
+                            sample_key=None) -> np.ndarray:
     """
-    Unmix *raw_event_data*, using AF correction if the controller currently
-    has AF matrices set for the active sample — mirroring the branching in
-    Controller._apply_unmixing() — but WITHOUT that method's side effect of
-    overwriting controller.af_sidecar_data.
+    Unmix *raw_event_data* with the AF library assigned to *sample_key*,
+    without the side effects of Controller._apply_unmixing() (which would
+    overwrite the AF sidecar data of the sample shown in the main window).
 
-    Public (no leading underscore): used both by load_unmixed_gated() below
-    and by TransformTab._load_all_training_samples() in dr_clustering_tab.py
-    (see that file's changes), so every place the DR plugin background-loads
-    and unmixes an FCS file goes through the same AF-aware path.
+    af_state selects where the unmixing state comes from:
 
-    The DR plugin loads OTHER samples in the background (training pools,
-    per-sample features) while the main app may have a different sample
-    loaded; calling controller._apply_unmixing() directly would stomp on the
-    AF sidecar data for whatever sample the user is actually looking at in
-    the main window.  This is a local, side-effect-free copy of the same
-    branching logic instead — keeps the plugin's "no side effects on main
-    app" design principle intact.
+    * ``UnmixSnapshot`` (from ``snapshot_unmix_state`` on the main thread) —
+      the normal case for background workers. The sample's own AF
+      assignment is looked up in the snapshot by *sample_key*.
+    * ``(transfer_matrix, af_precomputed, af_spectra)`` — an explicit AF
+      library, used for unstained samples that borrow a stand-in library
+      (see drc_cluster_id.resolve_unstained_af_states).
+    * ``None`` — main-thread callers only. The sample's assignment is
+      resolved from the live controller when *sample_key* is given;
+      otherwise the currently loaded sample's AF matrices are used.
 
-    af_state: optional (transfer_matrix, af_precomputed, af_spectra) snapshot
-        captured on the main thread BEFORE a background worker starts.
-        Background callers (DR/clustering/stats worker threads) MUST pass
-        this — reading controller.transfer_matrix/af_precomputed/af_spectra
-        live races against the main thread's controller.load_sample()/
-        initialise_af_matrices(), which reassign these same attributes
-        whenever the user loads/reloads a sample in the main window while
-        the worker is still running, so a live read could pair one sample's
-        transfer matrix with another sample's AF library.
+    Background workers must pass a snapshot: the main thread reassigns the
+    controller's transfer and AF matrices whenever a sample is (re)loaded.
     """
+    if isinstance(af_state, UnmixSnapshot):
+        return unmix_events(raw_event_data, af_state, af_state.af_for(sample_key))['unmixed']
+
+    if af_state is None and sample_key is not None:
+        snap = snapshot_unmix_state(controller, [sample_key], include_qc=False)
+        return unmix_events(raw_event_data, snap, snap.af_for(sample_key))['unmixed']
+
     if af_state is not None:
         transfer_matrix, af_precomputed, af_spectra = af_state
     else:
@@ -368,64 +373,32 @@ def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray, af_state=Non
 
 def resolve_af_state_for_profiles(controller, profile_names: list[str]):
     """
-    Build an (transfer_matrix, af_precomputed, af_spectra) AF snapshot for
-    an EXPLICIT list of AF profile names, mirroring
-    Controller.initialise_af_matrices()'s cache-combining logic (dict
-    lookups + hstack only, no linalg -- see that method's own docstring)
-    for a profile list that isn't necessarily
-    controller.current_sample_path's own assignment (e.g. an unstained
-    sample, which never has one -- see
-    drc_cluster_id.resolve_unstained_af_states, the caller this exists
-    for).
-
-    MAIN-THREAD ONLY. Reads controller.af_precomputed_cache and
-    controller.experiment.process['af_profiles'], both of which the main
-    thread can reassign (editing/deleting an AF profile in the
-    AutoSpectral AF tab, or cache_all_af_profiles() after a spectral
-    process refresh) -- a caller needing this from a background worker
-    MUST call this HERE, on the main thread, before the worker starts, and
-    pass the returned tuple through as a snapshot, exactly like any other
-    af_state (see apply_unmixing_af_aware's docstring above for why a
-    concurrent reassignment while a worker reads these is a
-    memory-corruption hazard, not just stale data).
-
-    Returns (transfer_matrix, af_precomputed, af_spectra), or None if
-    profile_names is empty or none of them have a cache hit (mirrors
-    initialise_af_matrices's own "no cache hit" fallback) -- callers
-    should treat None as "AF-unaware" and pass
-    (transfer_matrix, None, None) to apply_unmixing_af_aware instead.
+    ``(transfer_matrix, af_precomputed, af_spectra)`` for an explicit list of
+    AF profile names, or None when none of them can be used. Main thread
+    only — see sample_loader.resolve_af_for_profiles.
     """
-    if not profile_names:
+    af = resolve_af_for_profiles(controller, profile_names)
+    if af is None:
         return None
-    cached = [
-        controller.af_precomputed_cache[name]
-        for name in profile_names
-        if name in controller.af_precomputed_cache
-    ]
-    if not cached:
-        log.warning(
-            "resolve_af_state_for_profiles: no cache hit for profile(s) %s "
-            "(cache has: %s)", profile_names, list(controller.af_precomputed_cache),
-        )
-        return None
+    return (controller.transfer_matrix, af.precomputed, af.spectra)
 
-    af_profiles = controller.experiment.process.get('af_profiles', {})
-    spectra_mats = [
-        np.array(af_profiles[name]['spectra'])
-        for name in profile_names
-        if name in af_profiles and name in controller.af_precomputed_cache
-    ]
-    if not spectra_mats:
-        return None
-    af_spectra = np.vstack(spectra_mats)
 
-    if len(cached) == 1:
-        combined = cached[0]
-    else:
-        combined = combine_af_precomputed(cached)
-        combined.update(precompute_joint_cov_extras(combined, af_spectra))
+def snapshot_af_state(controller, sample_keys=None) -> UnmixSnapshot:
+    """
+    Main-thread snapshot of per-sample unmixing state for a background
+    worker. Pass the result as ``af_state`` to the loading functions below;
+    each sample is then unmixed with its own AF profile assignment.
+    """
+    return snapshot_unmix_state(controller, sample_keys, include_qc=False)
 
-    return (controller.transfer_matrix, combined, af_spectra)
+
+def _af_cache_token(controller, af_state, sample_key) -> tuple:
+    """Cache-key component describing how a sample is unmixed."""
+    if isinstance(af_state, UnmixSnapshot):
+        return (id(af_state.transfer_matrix), af_state.af_profile_key(sample_key))
+    if af_state is not None:
+        return (id(af_state[0]), id(af_state[1]))
+    return (id(controller.transfer_matrix), tuple(af_profile_names(controller, sample_key)))
 
 
 def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray:
@@ -439,18 +412,19 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray
     Workspace Marker-colour path — without caching it re-reads and
     re-unmixes the FCS file from disk on every PlotCard refresh.
 
-    af_state: optional (transfer_matrix, af_precomputed, af_spectra) snapshot —
-        see apply_unmixing_af_aware() docstring. Pass this from any
-        background worker thread; leave as None only for main-thread callers.
+    af_state: optional unmixing snapshot — see apply_unmixing_af_aware()
+        docstring. Pass this from any background worker thread; leave as
+        None only for main-thread callers. Each sample is unmixed with its
+        own AF profile assignment.
     """
     from copy import deepcopy
 
-    transfer_matrix = af_state[0] if af_state is not None else controller.transfer_matrix
+    sample_key = sample_key_for_path(controller.experiment_dir, abs_path)
 
     cache_key = (
         str(abs_path),
         tuple(sorted(state.selected_gates)),
-        id(transfer_matrix),
+        _af_cache_token(controller, af_state, sample_key),
     )
     cached = state.gated_data_cache.get(cache_key)
     if cached is not None:
@@ -476,7 +450,8 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray
         "loaded %s: %d raw events × %d raw channels",
         getattr(abs_path, 'name', abs_path), raw.shape[0], raw.shape[1],
     )
-    unmixed = apply_unmixing_af_aware(controller, raw, af_state=af_state)
+    unmixed = apply_unmixing_af_aware(controller, raw, af_state=af_state,
+                                      sample_key=sample_key)
     log.debug(
         "  unmixed → %d events × %d channels (gates=%r)",
         unmixed.shape[0], unmixed.shape[1], state.selected_gates,
@@ -573,9 +548,9 @@ def load_training_pool(controller, state, seed: int = 42,
     Pool gated, transformed events from every training sample, each
     downsampled to state.n_training_events, into one float32 array.
 
-    af_state: optional (transfer_matrix, af_precomputed, af_spectra) snapshot —
-        see apply_unmixing_af_aware() docstring. Pass this from any
-        background worker thread; leave as None only for main-thread callers.
+    af_state: optional unmixing snapshot — see apply_unmixing_af_aware()
+        docstring. Pass this from any background worker thread; leave as
+        None only for main-thread callers.
     """
     log_stage(log, "LOAD TRAINING POOL")
     if not state.training_sample_ids:
