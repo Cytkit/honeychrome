@@ -294,6 +294,30 @@ def resolve_cytometer_params(
     )
 
 
+def singlet_channels(cytometer: str) -> Optional[tuple[str, str]]:
+    """
+    Canonical forward-scatter singlet pair for a cytometer.
+
+    Parameters
+    ----------
+    cytometer : str
+        The cytometer label stored in ``experiment.settings['raw']['cytometer']``
+        (e.g. "Cytek Aurora") or its registry key (e.g. "Aurora").
+
+    Returns
+    -------
+    (area_channel, singlet_y_channel), e.g. ("FSC-A", "FSC-H"), or None when
+    the cytometer is not recognised.
+    """
+    name = str(cytometer or "").strip()
+    params = _CYTOMETER_PARAMS.get(name)
+    if params is None:
+        params = next((p for p in _CYTOMETER_PARAMS.values() if p.cyt_label == name), None)
+    if params is None or not params.scatter_param:
+        return None
+    return params.scatter_param[0], params.singlet_y_preference
+
+
 # ---------------------------------------------------------------------------
 # Internal matching logic  (mirrors .match_cytometer in R)
 # ---------------------------------------------------------------------------
