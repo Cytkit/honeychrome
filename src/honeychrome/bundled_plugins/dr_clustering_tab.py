@@ -159,12 +159,21 @@ from honeychrome.controller_components.functions import (
     sample_from_fcs,
     apply_gates_in_place,
 )
+from honeychrome.controller_components.sample_loader import sample_key_for_path
 from honeychrome.controller_components.transform import Transform
 from honeychrome.view_components.clear_layout import clear_layout
 from honeychrome.view_components.ordered_multi_sample_picker import OrderedMultiSamplePicker
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 from honeychrome.view_components.icon_loader import icon
+from honeychrome.view_components.differential_plots import (
+    make_heatmap_figure,
+    make_marker_summary_figure,
+    make_scatter_hover_handler as _make_scatter_hover_handler,
+    make_volcano_figure,
+    stamp_run_label,
+    style_figure_theme as _style_figure_theme,
+)
 import honeychrome.settings as hc_settings
 
 # ---------------------------------------------------------------------------
@@ -541,37 +550,6 @@ def _resolve_is_dark(state: 'PipelineState') -> bool:
     return palette.color(QPalette.ColorRole.Base).value() < 128
 
 
-def _style_figure_theme(fig, is_dark: bool, axes=None) -> str:
-    """
-    Apply Honeychrome's dark/light figure background styling in one place:
-    single source of truth instead of every figure-maker
-    duplicating its own is_dark branch (which is exactly why several
-    figures had no dark-mode handling at all). Returns the foreground
-    colour string so callers can reuse it (e.g. for violin means).
-
-    axes defaults to fig.axes (every subplot, including dendrogram /
-    colourbar / legend axes for the multi-panel heatmaps) so this is safe
-    to call once per figure regardless of how many axes it has.
-    """
-    if axes is None:
-        axes = fig.axes
-    if is_dark:
-        fig.patch.set_facecolor('#1e1e1e')
-        fg, bg = 'white', '#2b2b2b'
-    else:
-        fig.patch.set_facecolor('white')
-        fg, bg = 'black', 'white'
-    for ax in axes:
-        ax.set_facecolor(bg)
-        ax.tick_params(colors=fg)
-        ax.xaxis.label.set_color(fg)
-        ax.yaxis.label.set_color(fg)
-        ax.title.set_color(fg)
-        for spine in ax.spines.values():
-            spine.set_edgecolor(fg)
-    return fg
-
-
 def _style_combo_popup(combo: 'QComboBox'):
     """
     Force readable dropdown-list colours on a QComboBox. Row
@@ -672,52 +650,6 @@ def _new_scrollable_canvas(fig):
             ev.ignore()
 
     return _ScrollableFigureCanvas(fig)
-
-
-def _make_scatter_hover_handler(fig, ax, scatter, labels: list[str], is_dark: bool):
-    """
-    Build a matplotlib 'motion_notify_event' handler that shows
-    labels[i] in a small annotation box whenever the mouse hovers over
-    point i of *scatter* -- lets a plot identify every point on
-    demand without drawing (or de-overlapping) hundreds of static text
-    labels up front.
-
-    Returns the handler function; the CALLER connects it once a canvas
-    actually exists (fig.canvas.mpl_connect('motion_notify_event', ...) --
-    see _add_results_tab / GroupsStatsTab._pop_out), since a bare Figure
-    has no canvas yet at the point a figure-maker like _make_volcano_figure
-    runs. Stash the returned handler on the figure itself
-    (fig._hover_handler = ...) so callers can find and connect it
-    generically without knowing which figure-maker produced it.
-    """
-    annot = ax.annotate(
-        '', xy=(0, 0), xytext=(12, 12), textcoords='offset points',
-        fontsize=7,
-        bbox=dict(boxstyle='round', fc='#333333' if is_dark else '#ffffe0',
-                  ec='#888888', alpha=0.95),
-        color='white' if is_dark else 'black',
-        arrowprops=dict(arrowstyle='-', color='#888888'),
-    )
-    annot.set_visible(False)
-
-    def _on_hover(event):
-        if event.inaxes != ax:
-            if annot.get_visible():
-                annot.set_visible(False)
-                fig.canvas.draw_idle()
-            return
-        cont, ind = scatter.contains(event)
-        if cont:
-            idx = ind['ind'][0]
-            annot.xy = scatter.get_offsets()[idx]
-            annot.set_text(labels[idx])
-            annot.set_visible(True)
-            fig.canvas.draw_idle()
-        elif annot.get_visible():
-            annot.set_visible(False)
-            fig.canvas.draw_idle()
-
-    return _on_hover
 
 
 class _AspectCanvasHolder(QWidget):
@@ -3909,7 +3841,10 @@ class TransformTab(QWidget):
 
                 # Replicate controller.load_sample unmixing (AF-corrected if
                 # an AF profile is active — see drc_pipeline.apply_unmixing_af_aware).
-                unmixed = drc_pipeline.apply_unmixing_af_aware(self.controller, raw)
+                unmixed = drc_pipeline.apply_unmixing_af_aware(
+                    self.controller, raw,
+                    sample_key=sample_key_for_path(self.controller.experiment_dir, path),
+                )
 
                 # Apply gate(s) if selected
                 if selected_gates and selected_gates != ['root']:
@@ -6443,11 +6378,7 @@ class GroupsStatsTab(QWidget):
         # worker and a main-window sample load race on the same mutable
         # numpy arrays, and a reload mid-run could pair one sample's
         # transfer matrix with another sample's AF library.
-        af_state = (
-            self.controller.transfer_matrix,
-            self.controller.af_precomputed,
-            self.controller.af_spectra,
-        )
+        af_state = drc_pipeline.snapshot_af_state(self.controller)
 
         class _StatsWorker(QThread):
             finished = Signal(bool, str)
@@ -7845,15 +7776,7 @@ class GroupsStatsTab(QWidget):
         """Stamp the source run's label in the upper-left corner of a
         results figure, so a popped-out or exported plot stays traceable
         to the run it came from."""
-        if not run_label:
-            return
-        fig.text(
-            0.01, 0.99, run_label,
-            ha='left', va='top', fontsize=8, color='#555555',
-            transform=fig.transFigure,
-            bbox=dict(boxstyle='round,pad=0.25', facecolor='white',
-                      edgecolor='#cccccc', alpha=0.85),
-        )
+        stamp_run_label(fig, run_label)
 
     def _make_sample_mfi_heatmap_figure(self, mfi_sample_df, group_a: str = '',
                                         group_b: str = '', run_label: str = ''):
@@ -8003,253 +7926,35 @@ class GroupsStatsTab(QWidget):
     def _make_heatmap_figure(self, results_df, sample_df, title: str,
                              group_a: str = '', group_b: str = '', run_label: str = ''):
         """
-        Per-sample heatmap with row + column dendrograms.
+        Per-sample heatmap with row + column dendrograms for ONE comparison.
 
-        results_df : test output for ONE comparison (feature, logFC,
-                     significant, …): the caller has
-                     already filtered a multi-comparison result down to a
-                     single comparison's rows before calling this.
-        sample_df  : raw feature matrix for that SAME comparison's samples
-                     only (rows=samples, cols=features), index=rel-paths.
+        results_df : that comparison's test output (feature, logFC,
+                     significant, …).
+        sample_df  : raw feature matrix for the same comparison's samples
+                     (rows=samples, cols=features), index=rel-paths.
         group_a/group_b : the two group names this comparison represents
-                     passed explicitly rather than read
-                     from state.compare_group_a/b, since that pair now
-                     belongs to T-REX and may be completely unrelated to
-                     whichever comparison is being drawn here).
+                     (not state.compare_group_a/b, which belong to T-REX).
         run_label  : stamped in the upper-left corner (plot provenance)
         """
-        from matplotlib.figure import Figure
-        from matplotlib.gridspec import GridSpec
-        from scipy.cluster.hierarchy import linkage, dendrogram
-        from scipy.spatial.distance import pdist
-
-        name_a = group_a
-        name_b = group_b
-        COLOR_A = '#4477AA'
-        COLOR_B = '#EE6677'
-
-        is_dark = _resolve_is_dark(self.state)
-
-        # ---- Select significant features ----
-        sig = results_df[results_df['significant']].copy() if 'significant' in results_df.columns else pd.DataFrame()
-        if sig.empty:
-            fig = Figure(figsize=(5, 2), constrained_layout=True)
-            ax  = fig.add_subplot(111)
-            ax.axis('off')
-            ax.text(0.5, 0.5, 'No significant features at current thresholds',
-                    ha='center', va='center', fontsize=10, transform=ax.transAxes)
-            ax.set_title(title, fontsize=10)
-            _style_figure_theme(fig, is_dark)
-            self._stamp_run_label(fig, run_label)
-            return fig
-
-        sig_features = sig['feature'].tolist()
-
-        # Subset sample_df to significant feature columns only
-        cols_present = [c for c in sig_features if c in sample_df.columns]
-        if not cols_present:
-            fig = Figure(figsize=(5, 2), constrained_layout=True)
-            ax  = fig.add_subplot(111)
-            ax.axis('off')
-            ax.text(0.5, 0.5, 'Feature columns not found in sample matrix',
-                    ha='center', va='center', fontsize=10, transform=ax.transAxes)
-            ax.set_title(title, fontsize=10)
-            _style_figure_theme(fig, is_dark)
-            self._stamp_run_label(fig, run_label)
-            return fig
-
-        mat = sample_df[cols_present].values.astype(float)   # (n_samples, n_sig_features)
-        sample_labels = list(sample_df.index)
-
-        # Build rel-path → group-slot lookup so row order doesn't matter.
-        rel_to_group: dict[str, str] = {
-            rel: grp
-            for rel, grp in zip(self.state.stats_all_rel, self.state.stats_group_vec)
-        }
-
-        n_samples, n_features = mat.shape
-
-        # ---- Hierarchical clustering ----
-        def _hclust(data, metric='euclidean', method='ward'):
-            """Returns (leaf_order, linkage_matrix_or_None). Z is reused
-            below to draw the dendrogram -- previously a second
-            pdist+linkage call recomputed it from scratch purely to plot
-            it, doubling the cost of the single most expensive step in
-            this figure."""
-            if data.shape[0] < 2:
-                return list(range(data.shape[0])), None
-            try:
-                Z    = linkage(pdist(data, metric=metric), method=method)
-                dend = dendrogram(Z, no_plot=True)
-                return dend['leaves'], Z
-            except Exception:
-                return list(range(data.shape[0])), None
-
-        row_order, Zr = _hclust(mat.T)              # cluster features (rows of heatmap)
-        col_order, Zc = _hclust(mat)                # cluster samples  (cols of heatmap)
-
-        mat_ord     = mat[:, row_order][col_order, :].T   # (n_features, n_samples)
-        feat_labels = [cols_present[i] for i in row_order]
-        samp_labels = [sample_labels[i] for i in col_order]
-        grp_ord     = [rel_to_group.get(sample_labels[i], name_a) for i in col_order]
-
-        # ---- Figure sizing ----
-        col_w   = 0.55          # inches per sample column
-        row_h   = 0.30          # inches per feature row
-        dend_h  = 1.2           # column dendrogram height
-        grp_h   = 0.18          # group colour bar height
-        xlabel_h = 0.8
-        label_w = max(len(f) for f in feat_labels) * 0.07 + 0.3   # y-tick space
-        cbar_w  = 0.5
-        fig_w   = max(5.0, n_samples * col_w + label_w + cbar_w + 1.2)
-        fig_h   = max(4.0, n_features * row_h + dend_h + grp_h + xlabel_h + 1.5)
-
-        xlabel_h = 0.8          # extra room for rotated x-tick labels
-
-        fig = Figure(figsize=(fig_w, fig_h), layout='constrained')
-
-        gs = GridSpec(
-            4, 3,
-            figure=fig,
-            height_ratios=[dend_h, grp_h, n_features * row_h, xlabel_h],
-            width_ratios=[label_w, n_samples * col_w, cbar_w],
-            hspace=0.02,
-            wspace=0.02,
+        group_by_sample = dict(zip(self.state.stats_all_rel, self.state.stats_group_vec))
+        return make_heatmap_figure(
+            results_df, sample_df, title, group_by_sample,
+            group_a=group_a, group_b=group_b,
+            is_dark=_resolve_is_dark(self.state), run_label=run_label,
         )
-
-        # ---- Column dendrogram (top-centre) ----
-        ax_cdend = fig.add_subplot(gs[0, 1])
-        ax_cdend.axis('off')
-        if n_samples > 1 and Zc is not None:
-            try:
-                dendrogram(Zc, ax=ax_cdend, color_threshold=0,
-                           above_threshold_color='#555555',
-                           link_color_func=lambda _: '#555555',
-                           no_labels=True)
-                ax_cdend.set_xlim(-0.5, n_samples * 10 - 0.5)
-            except Exception:
-                pass
-        ax_cdend.set_title(title, fontsize=10, pad=4)
-
-        # ---- Group colour bar (middle-centre) ----
-        ax_grp = fig.add_subplot(gs[1, 1])
-        ax_grp.set_xlim(0, n_samples)
-        ax_grp.set_ylim(0, 1)
-        ax_grp.axis('off')
-        for xi, grp in enumerate(grp_ord):
-            color = COLOR_A if grp == name_a else COLOR_B
-            ax_grp.add_patch(
-                __import__('matplotlib.patches', fromlist=['Rectangle']).Rectangle(
-                    (xi, 0), 1, 1, color=color, transform=ax_grp.transData
-                )
-            )
-        # Group legend patches
-        import matplotlib.patches as mpatches
-        handles = [
-            mpatches.Patch(color=COLOR_A, label=name_a),
-            mpatches.Patch(color=COLOR_B, label=name_b),
-        ]
-        ax_cdend.legend(handles=handles, loc='lower right', fontsize=7,
-                        frameon=True, ncol=2)
-
-        # ---- Row dendrogram (main-left) ----
-        ax_rdend = fig.add_subplot(gs[2, 0])
-        ax_rdend.axis('off')
-        if n_features > 1 and Zr is not None:
-            try:
-                dendrogram(Zr, ax=ax_rdend, orientation='left',
-                           color_threshold=0,
-                           above_threshold_color='#555555',
-                           link_color_func=lambda _: '#555555',
-                           no_labels=True)
-            except Exception:
-                pass
-
-        # ---- Heatmap (main-centre) ----
-        ax_hm = fig.add_subplot(gs[2, 1])
-        # Raw per-sample values (log1p-MFI / % / counts) — always non-negative,
-        # never a delta, so normalize from the data's own range rather than
-        # forcing a zero-centered diverging scale (that's what was washing
-        # out low-value samples like the reference group).
-        vmin = float(np.percentile(mat_ord, 5))
-        vmax = max(float(np.percentile(mat_ord, 95)), vmin + 0.01)
-        im = ax_hm.imshow(
-            mat_ord,
-            aspect='auto',
-            cmap='viridis',
-            vmin=vmin, vmax=vmax,
-            interpolation='nearest',
-        )
-        ax_hm.set_xticks(range(n_samples))
-        ax_hm.set_xticklabels(
-            [Path(s).stem for s in samp_labels],
-            rotation=45, ha='right', fontsize=7,
-        )
-        ax_hm.set_yticks(range(n_features))
-        ax_hm.set_yticklabels(feat_labels, fontsize=7)
-        ax_hm.yaxis.set_label_position('right')
-        ax_hm.yaxis.tick_right()
-        ax_hm.grid(False)   # suppress inherited seaborn 'whitegrid' (draws through tick/cell centres)
-        ax_hm.set_xticks(np.arange(-0.5, n_samples, 1), minor=True)
-        ax_hm.set_yticks(np.arange(-0.5, n_features, 1), minor=True)
-        ax_hm.grid(which='minor', color='white', linestyle='-', linewidth=0.6)
-        ax_hm.tick_params(which='minor', bottom=False, left=False, right=False)
-
-        # ---- Colorbar (main-right) ----
-        ax_cb = fig.add_subplot(gs[2, 2])
-        cb = fig.colorbar(im, cax=ax_cb)
-        cb.ax.tick_params(labelsize=7)
-        if 'MFI' in title:
-            cb_label = 'MFI (Transforms-tab scale)'
-        elif 'Counts' in title:
-            cb_label = 'Event count'
-        else:
-            cb_label = '% frequency'
-        cb.set_label(cb_label, fontsize=7)
-
-        _style_figure_theme(fig, is_dark)
-        self._stamp_run_label(fig, run_label)
-        return fig
 
     def _make_volcano_figure(self, results_df, title: str,
                               pval_threshold: float, fc_threshold: float,
                               run_label: str = ''):
-        """Volcano plot: x = effect (log2FC, or ΔMFI for MFI results), y =
-        -log10 of the adjusted p-value that decides significance: the
-        stage-wise value for cluster-first MFI results, otherwise the
-        pooled or per-comparison BH value matching the FDR setting.
-        Significant points are coloured via viridis by that value and get
-        a thin horizontal bar for the effect's 95% confidence interval
-        (CI.L/CI.R); non-significant points are grey. run_label is
-        stamped in the upper-left corner (plot provenance)."""
-        from matplotlib.figure import Figure
-
-        is_dark = _resolve_is_dark(self.state)
-
-        if 'stagewise.adj.P.Val' in results_df.columns:
-            pval_col = 'stagewise.adj.P.Val'
-            y_label = "-log10(stage-wise adj. P)"
-        elif self.state.stats_fdr_scope == 'global' and 'adj.P.Val.global' in results_df.columns:
-            pval_col = 'adj.P.Val.global'
-            y_label = "-log10(adj. P, pooled)"
-        elif 'adj.P.Val' in results_df.columns:
-            pval_col = 'adj.P.Val'
-            y_label = "-log10(adj. P-value)"
-        else:
-            pval_col = 'P.Value'
-            y_label = "-log10(P-value)"
-        logfc  = results_df['logFC'].values.astype(float)
-        neg_lp = -np.log10(np.maximum(results_df[pval_col].values.astype(float), 1e-300))
-        sig    = results_df['significant'].values if 'significant' in results_df.columns else (
-            (results_df['P.Value'] <= pval_threshold) & (results_df['logFC'].abs() >= fc_threshold)
-        ).values
+        """Volcano plot of one comparison's results (see
+        differential_plots.make_volcano_figure). MFI features are
+        "{cluster_label}_{channel}"; their channel suffix is shown as the
+        Antigen (falling back to Label)."""
         features = results_df['feature'].tolist()
-
-        # MFI features are "{cluster_label}_{channel}" -- remap the channel
-        # suffix to Antigen (falling back to Label) for point labels/hover.
         if 'MFI' in title:
             disp_map = _antigen_or_label_map(self.controller)
             known_channels = set(disp_map.keys())
+
             def _remap_feat(feat: str) -> str:
                 for ch in known_channels:
                     suffix = f'_{ch}'
@@ -8258,186 +7963,25 @@ class GroupsStatsTab(QWidget):
                         return f'{cluster_part}_{disp_map[ch]}'
                 return feat
             features = [_remap_feat(f) for f in features]
-
-        fig = Figure(figsize=(5, 5), constrained_layout=True)
-        ax  = fig.add_subplot(111)
-        fg = 'white' if is_dark else 'black'
-
-        non_sig = ~sig
-        ax.scatter(logfc[non_sig], neg_lp[non_sig], c='#aaaaaa', s=25, alpha=0.8, linewidths=0)
-
-        # 95% CI error bars for significant points (log2FC uncertainty) --
-        # drawn before the markers (low zorder) so the dots sit on top;
-        # skipped wherever CI.L/CI.R weren't available for that row.
-        if 'CI.L' in results_df.columns and 'CI.R' in results_df.columns and sig.any():
-            ci_lo = results_df['CI.L'].values.astype(float)[sig]
-            ci_hi = results_df['CI.R'].values.astype(float)[sig]
-            valid_ci = np.isfinite(ci_lo) & np.isfinite(ci_hi)
-            if valid_ci.any():
-                xerr = np.vstack([
-                    np.maximum(logfc[sig][valid_ci] - ci_lo[valid_ci], 0.0),
-                    np.maximum(ci_hi[valid_ci] - logfc[sig][valid_ci], 0.0),
-                ])
-                ax.errorbar(
-                    logfc[sig][valid_ci], neg_lp[sig][valid_ci],
-                    xerr=xerr, fmt='none', ecolor=fg, elinewidth=0.6,
-                    alpha=0.35, capsize=0, zorder=1,
-                )
-
-        sig_scatter = None
-        if sig.any():
-            sig_scatter = ax.scatter(logfc[sig], neg_lp[sig], c=neg_lp[sig], cmap='viridis',
-                            s=25, alpha=0.9, linewidths=0)
-            fig.colorbar(sig_scatter, ax=ax, shrink=0.7, label=y_label)
-
-        ax.axhline(-np.log10(pval_threshold), color='grey', linestyle='--', linewidth=0.8)
-        ax.axvline( fc_threshold,              color='grey', linestyle='--', linewidth=0.8)
-        ax.axvline(-fc_threshold,              color='grey', linestyle='--', linewidth=0.8)
-
-        # Static labels: only the _MAX_STATIC_LABELS most significant
-        # points, with a small fixed offset. EVERY
-        # significant point still gets identified via a mouse-hover
-        # tooltip (_make_scatter_hover_handler) instead, which scales to
-        # any number of points at effectively zero draw cost.
-        _MAX_STATIC_LABELS = 10
-        sig_x = logfc[sig]
-        sig_y = neg_lp[sig]
-        sig_labels = [lbl for lbl, is_pt_sig in zip(features, sig) if is_pt_sig]
-        n_sig_total = len(sig_labels)
-        if n_sig_total > _MAX_STATIC_LABELS:
-            # Most significant first (largest -log10 adj. P-value).
-            top_idx = np.argsort(sig_y)[::-1][:_MAX_STATIC_LABELS]
-        else:
-            top_idx = np.arange(n_sig_total)
-        for i in top_idx:
-            ax.annotate(sig_labels[i], xy=(sig_x[i], sig_y[i]),
-                        xytext=(4, 4), textcoords='offset points',
-                        fontsize=6, color=fg)
-
-        # Hover tooltip covers EVERY significant point (not just the
-        # _MAX_STATIC_LABELS statically-labelled ones). No canvas exists
-        # yet here, so the handler is stashed on the Figure for
-        # _add_results_tab/_pop_out to connect once one does.
-        if sig_scatter is not None:
-            fig._hover_handler = _make_scatter_hover_handler(
-                fig, ax, sig_scatter, sig_labels, is_dark,
-            )
-
-        ci_extent = 0.0
-        if 'CI.L' in results_df.columns and 'CI.R' in results_df.columns:
-            finite_ci = np.concatenate([
-                results_df['CI.L'].values.astype(float),
-                results_df['CI.R'].values.astype(float),
-            ])
-            finite_ci = np.abs(finite_ci[np.isfinite(finite_ci)])
-            if finite_ci.size:
-                ci_extent = float(finite_ci.max())
-        x_lim = max(np.abs(logfc).max() * 1.05, fc_threshold * 1.5, ci_extent * 1.05)
-        ax.set_xlim(-x_lim, x_lim)
-
-        if 'MFI' in title:
-            ax.set_xlabel("Δ mean intensity (transformed units)")
-        else:
-            ax.set_xlabel("log2 Fold Change")
-        ax.set_ylabel(y_label)
-        display_title = title
-        ax.set_title(display_title, fontsize=10)
-        _style_figure_theme(fig, is_dark)
-        self._stamp_run_label(fig, run_label)
-        return fig
+        return make_volcano_figure(
+            results_df, title, pval_threshold, fc_threshold,
+            is_dark=_resolve_is_dark(self.state),
+            fdr_scope=self.state.stats_fdr_scope,
+            feature_labels=features, run_label=run_label,
+        )
 
     def _make_mfi_cluster_summary_figure(self, results_df, title: str,
                                          channel_names: dict, run_label: str = ''):
         """
         Cluster × marker grid for ONE comparison's MFI results, limited to
-        clusters with at least one significant marker. Cell colour is the
-        difference in mean transformed intensity (diverging, centred on 0);
-        a dot marks significant markers. Row labels carry each cluster's
-        FDR from the cluster-level screen when cluster-first testing was
-        used.
+        clusters with at least one significant marker (see
+        differential_plots.make_marker_summary_figure).
         """
-        import matplotlib
-        from matplotlib.figure import Figure
-        from matplotlib.colors import TwoSlopeNorm
-
-        is_dark = _resolve_is_dark(self.state)
-        fg = 'white' if is_dark else 'black'
-
-        def _message(text):
-            fig = Figure(figsize=(5, 2), constrained_layout=True)
-            ax = fig.add_subplot(111)
-            ax.axis('off')
-            ax.text(0.5, 0.5, text, ha='center', va='center', fontsize=10,
-                    transform=ax.transAxes)
-            ax.set_title(title, fontsize=10)
-            _style_figure_theme(fig, is_dark)
-            self._stamp_run_label(fig, run_label)
-            return fig
-
-        needed = {'cluster', 'channel', 'logFC', 'significant'}
-        if results_df is None or not needed.issubset(results_df.columns):
-            return _message('Re-run statistics to see the cluster summary')
-        sig = results_df[results_df['significant'].astype(bool)]
-        if sig.empty:
-            return _message('No significant markers at current thresholds')
-
-        clusters_df = results_df[results_df['cluster'].isin(sig['cluster'].unique())]
-        order_key = ('cluster.adj.P.Val' if 'cluster.adj.P.Val' in results_df.columns
-                     else 'P.Value')
-        cluster_order = (clusters_df.groupby('cluster', sort=False)[order_key].min()
-                         .sort_values(kind='mergesort').index.tolist())
-        channels = list(dict.fromkeys(results_df['channel'].tolist()))
-
-        grid = clusters_df.pivot_table(index='cluster', columns='channel',
-                                       values='logFC', aggfunc='first')
-        grid = grid.reindex(index=cluster_order, columns=channels)
-        sig_grid = clusters_df.pivot_table(index='cluster', columns='channel',
-                                           values='significant', aggfunc='first')
-        sig_grid = sig_grid.reindex(index=cluster_order, columns=channels)
-        sig_mask = sig_grid.eq(True).values
-
-        row_labels = []
-        for cl in cluster_order:
-            if 'cluster.adj.P.Val' in clusters_df.columns:
-                q = clusters_df.loc[clusters_df['cluster'] == cl, 'cluster.adj.P.Val'].min()
-                row_labels.append(f"{cl}  (cluster FDR {q:.2g})")
-            else:
-                row_labels.append(str(cl))
-        col_labels = [channel_names.get(ch, ch) for ch in channels]
-
-        values = grid.values.astype(float)
-        vmax = float(np.nanmax(np.abs(values))) if np.isfinite(values).any() else 1.0
-        vmax = vmax if vmax > 0 else 1.0
-
-        n_rows, n_cols = values.shape
-        label_w = max(len(r) for r in row_labels) * 0.07 + 0.4
-        fig_w = max(5.0, n_cols * 0.45 + label_w + 1.5)
-        fig_h = max(3.0, n_rows * 0.35 + 2.0)
-        fig = Figure(figsize=(fig_w, fig_h), constrained_layout=True)
-        ax = fig.add_subplot(111)
-        cmap = matplotlib.colormaps['RdBu_r'].copy()
-        cmap.set_bad('#bbbbbb')
-        im = ax.imshow(np.ma.masked_invalid(values), aspect='auto', cmap=cmap,
-                       norm=TwoSlopeNorm(vcenter=0.0, vmin=-vmax, vmax=vmax),
-                       interpolation='nearest')
-        ys, xs = np.nonzero(sig_mask)
-        ax.scatter(xs, ys, s=14, c=fg, marker='o', linewidths=0)
-        ax.set_xticks(range(n_cols))
-        ax.set_xticklabels(col_labels, rotation=45, ha='right', fontsize=7)
-        ax.set_yticks(range(n_rows))
-        ax.set_yticklabels(row_labels, fontsize=7)
-        ax.grid(False)
-        ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
-        ax.grid(which='minor', color='white', linestyle='-', linewidth=0.6)
-        ax.tick_params(which='minor', bottom=False, left=False)
-        cb = fig.colorbar(im, ax=ax, shrink=0.8)
-        cb.set_label('Δ mean intensity (● significant)', fontsize=7)
-        cb.ax.tick_params(labelsize=7)
-        ax.set_title(title, fontsize=10)
-        _style_figure_theme(fig, is_dark)
-        self._stamp_run_label(fig, run_label)
-        return fig
+        return make_marker_summary_figure(
+            results_df, title, channel_names,
+            is_dark=_resolve_is_dark(self.state), run_label=run_label,
+            family_label='cluster',
+        )
 
     def _export_figure(self, fig, stem: str):
         """Save a matplotlib Figure to disk."""
@@ -9497,11 +9041,7 @@ class PlotCard(QFrame):
         memory-corruption hazard, not just a stale-data one)."""
         if self._marker_worker is not None:
             return   # already loading; its finish will re-trigger refresh()
-        af_state = (
-            self.controller.transfer_matrix,
-            self.controller.af_precomputed,
-            self.controller.af_spectra,
-        )
+        af_state = drc_pipeline.snapshot_af_state(self.controller)
         worker = _MarkerValuesWorker(self.controller, self.state, samples, af_state)
         worker.finished.connect(
             lambda ok, err, payload, key=cache_key:
@@ -11418,10 +10958,9 @@ class ClusterAnnotationTab(QWidget):
                     )
                     continue
             else:
-                # af_state, when given, is a main-thread
-                # snapshot of (transfer_matrix, af_precomputed,
-                # af_spectra) so a background worker never reads these
-                # live off the controller while the main window could be
+                # af_state, when given, is a main-thread unmixing
+                # snapshot so a background worker never reads the
+                # controller's matrices while the main window could be
                 # reassigning them (see apply_unmixing_af_aware()).
                 mv = drc_pipeline.load_sample_marker_values(
                     self.controller, self.state, rel, af_state=af_state,
@@ -12066,11 +11605,7 @@ class ClusterAnnotationTab(QWidget):
         # window, and the AF kernel touches them via raw C pointers, so a
         # concurrent reassignment is a memory-corruption hazard, not just
         # stale data.
-        af_state = (
-            self.controller.transfer_matrix,
-            self.controller.af_precomputed,
-            self.controller.af_spectra,
-        )
+        af_state = drc_pipeline.snapshot_af_state(self.controller)
         # The unstained sample(s) used to derive positivity
         # thresholds have no AF profile of their own; resolve a stand-in
         # per unstained sample (name match, or the run's most common
@@ -12239,11 +11774,7 @@ class ClusterAnnotationTab(QWidget):
         # comment for why reading it live off the controller from a
         # background thread is a memory-corruption hazard, not just a
         # stale-data one.
-        af_state = (
-            self.controller.transfer_matrix,
-            self.controller.af_precomputed,
-            self.controller.af_spectra,
-        )
+        af_state = drc_pipeline.snapshot_af_state(self.controller)
         self._marker_summary_last_drawn = None
         self._start_marker_summary_worker(
             cl_run, channels, cluster_order, af_state, pooled=None, run_id=run_id,
@@ -14463,11 +13994,7 @@ class PluginWidget(QWidget):
 
         # Snapshot AF/transfer-matrix state on the main thread before the
         # worker starts — see apply_unmixing_af_aware() docstring.
-        af_state = (
-            self.controller.transfer_matrix,
-            self.controller.af_precomputed,
-            self.controller.af_spectra,
-        )
+        af_state = drc_pipeline.snapshot_af_state(self.controller)
 
         worker = _DrWorker('train', self, algo, params, training_only=True, af_state=af_state)
         worker.progress.connect(self.progress_message)
@@ -14502,11 +14029,7 @@ class PluginWidget(QWidget):
         self._set_dr_buttons_running(True)
         # Snapshot AF/transfer-matrix state on the main thread before the
         # worker starts — see apply_unmixing_af_aware() docstring.
-        af_state = (
-            self.controller.transfer_matrix,
-            self.controller.af_precomputed,
-            self.controller.af_spectra,
-        )
+        af_state = drc_pipeline.snapshot_af_state(self.controller)
         worker = _DrWorker('apply', self, algo, {}, training_only=False, af_state=af_state)
         worker.progress.connect(self.progress_message)
         worker.progress_value.connect(
@@ -14686,11 +14209,7 @@ class PluginWidget(QWidget):
 
         # Snapshot AF/transfer-matrix state on the main thread before the
         # worker starts — see drc_pipeline.apply_unmixing_af_aware() docstring.
-        af_state = (
-            self.controller.transfer_matrix,
-            self.controller.af_precomputed,
-            self.controller.af_spectra,
-        )
+        af_state = drc_pipeline.snapshot_af_state(self.controller)
 
         class _ClWorker(QThread):
             finished = Signal(bool, str)
