@@ -86,8 +86,8 @@ def _positive_control(n=3000, seed=3):
     return pos, rng.normal(1e5, 1e4, (n, 2)), neg, rng.normal(1e5, 1e4, (4000, 2))
 
 
-def _discover_f1(**overrides):
-    pos, pos_sc, neg, neg_sc = _positive_control()
+def _discover_f1(n=3000, **overrides):
+    pos, pos_sc, neg, neg_sc = _positive_control(n=n)
     fl = syn.fluor_spectra()
     kwargs = dict(
         label='F1', pos_events_raw=pos, pos_scatter=pos_sc,
@@ -233,6 +233,169 @@ def test_discover_all_variants_uses_the_cytometer_saturation_ceiling(monkeypatch
     monkeypatch.setattr(aof, 'discover_fluor_variants', fake_discover)
     aof.discover_all_variants(controller)
     assert captured['saturation_ceiling'] == 4194304.0
+
+
+# ---------------------------------------------------------------------------
+# Variant deduplication
+# ---------------------------------------------------------------------------
+
+def _shifted(ref, shift, channel):
+    v = ref.copy()
+    v[channel] += shift
+    return v
+
+
+@pytest.mark.numpy_only
+def test_deduplicate_variants_drops_reference_matches_and_keeps_the_more_populated():
+    ref = syn.fluor_spectra()[0]
+    v = np.vstack([
+        ref,
+        _shifted(ref, 0.005, 0),    # within 0.02 of the reference
+        _shifted(ref, 0.050, 1),    # distinct
+        _shifted(ref, 0.052, 1),    # within 0.02 of the row above
+    ])
+    kept, threshold = aof.deduplicate_variants(v, np.array([0, 10, 40, 90]), 0.02, 10, min_variants=0)
+    assert kept.tolist() == [0, 3]
+    assert threshold == 0.02
+
+
+@pytest.mark.numpy_only
+def test_deduplicate_variants_adds_back_the_furthest_to_reach_the_floor():
+    ref = syn.fluor_spectra()[0]
+    v = np.vstack([ref, _shifted(ref, 0.001, 0), _shifted(ref, 0.004, 1), _shifted(ref, 0.003, 2), _shifted(ref, 0.002, 3)])
+    kept, threshold = aof.deduplicate_variants(v, np.ones(len(v)), 0.01, 10)
+    assert kept.tolist() == [0, 2, 3]
+    assert threshold == 0.01
+    one, _ = aof.deduplicate_variants(v, np.ones(len(v)), 0.01, 10, min_variants=1)
+    assert one.tolist() == [0, 2]
+
+
+@pytest.mark.numpy_only
+@pytest.mark.parametrize('min_distance', [0.0, 0.02])
+def test_deduplicate_variants_raises_the_threshold_to_meet_the_cap(min_distance):
+    ref = syn.fluor_spectra()[0]
+    v = np.vstack([ref] + [_shifted(ref, 0.03 * (i + 1), 1) for i in range(30)])
+    kept, threshold = aof.deduplicate_variants(v, np.ones(len(v)), min_distance, 5)
+    assert kept[0] == 0
+    assert 1 < len(kept) <= 6
+    assert threshold > min_distance
+    sub = v[kept]
+    pair = np.abs(sub[:, None, :] - sub[None, :, :]).max(axis=2)
+    assert pair[np.triu_indices(len(kept), 1)].min() >= threshold - 1e-12
+
+
+@pytest.mark.numpy_only
+def test_discover_fluor_variants_caps_and_deduplicates():
+    uncapped = _discover_f1(dedup_threshold=0.0, max_variants=100)
+    capped = _discover_f1(dedup_threshold=0.0, max_variants=3)
+    assert uncapped is not None and capped is not None
+    assert len(capped['v_mats']) - 1 <= 3 < len(uncapped['v_mats']) - 1
+    ref = syn.fluor_spectra()[0]
+    np.testing.assert_allclose(capped['v_mats'][0], ref)
+    np.testing.assert_allclose(capped['delta'], capped['v_mats'] - ref)
+    assert capped['dedup_threshold_used'] > 0.0
+
+
+@pytest.mark.numpy_only
+def test_discover_fluor_variants_keeps_the_two_most_distinct_when_all_match_the_reference():
+    result = _discover_f1(dedup_threshold=2.0)
+    assert result is not None
+    assert len(result['v_mats']) == 3
+    everything = _discover_f1(dedup_threshold=0.0, max_variants=100)
+    ref = syn.fluor_spectra()[0]
+    reach = np.abs(everything['v_mats'] - ref).max(axis=1)
+    kept_reach = np.abs(result['v_mats'][1:] - ref).max(axis=1)
+    assert kept_reach.min() >= np.sort(reach)[-2] - 1e-9
+
+
+@pytest.mark.numpy_only
+def test_discover_fluor_variants_small_sample_never_enlarges_the_som_grid(monkeypatch):
+    """With under 500 qualifying events the grid is shrunk toward three
+    events per node, but never beyond the requested som_dim."""
+    grids = []
+    real = aof.get_som_codes
+
+    def spy(data, som_dim, **kw):
+        grids.append(som_dim)
+        return real(data, som_dim, **kw)
+
+    monkeypatch.setattr(aof, 'get_som_codes', spy)
+    result = _discover_f1(n=420, som_dim=3)
+    assert result is not None and result['n_events_used'] < 500
+    assert grids == [3]
+
+
+# ---------------------------------------------------------------------------
+# Stored AF profiles reused for the unstained thresholds
+# ---------------------------------------------------------------------------
+
+def _stored_af_controller(tmp_path, monkeypatch, profile, name='Unstained cells AutoSpectral AF'):
+    rng = np.random.default_rng(0)
+    controller = syn.FakeController(tmp_path)
+    controller.experiment.samples['all_samples'] = {
+        'Raw/Unstained cells.fcs': 'Unstained cells', 'Raw/F1.fcs': 'F1 control',
+    }
+    controller.experiment.process['spectral_model'] = [
+        {'label': 'F1', 'sample_name': 'F1 control', 'particle_type': 'Cells'},
+        {'label': 'F2', 'particle_type': 'Cells'},
+        {'label': 'F3', 'particle_type': 'Cells'},
+    ]
+    if profile is not None:
+        controller.experiment.process['af_profiles'][name] = profile
+
+    extractions = []
+
+    def fake_get_af_spectra(raw, fluor_spectra, **kw):
+        extractions.append(raw.shape)
+        return syn.af_spectra()
+
+    monkeypatch.setattr(aof, 'sample_from_fcs', lambda path: None)
+    monkeypatch.setattr(
+        aof, 'get_raw_events',
+        lambda sample, fl_ids, **kw: (rng.random((500, len(fl_ids))) * 100.0, rng.random((500, 2))),
+    )
+    monkeypatch.setattr(aof, 'get_af_spectra', fake_get_af_spectra)
+    monkeypatch.setattr(aof, 'discover_fluor_variants', lambda **kw: None)
+    return controller, extractions
+
+
+def _stored_profile(**overrides):
+    entry = {
+        'spectra': syn.af_spectra().tolist(),
+        'source_fcs': 'Raw/Unstained cells.fcs',
+        'channel_names': list(syn.DET_PNN),
+    }
+    entry.update(overrides)
+    return entry
+
+
+@pytest.mark.numpy_only
+def test_discover_all_variants_reuses_the_stored_af_profile(tmp_path, monkeypatch):
+    controller, extractions = _stored_af_controller(tmp_path, monkeypatch, _stored_profile())
+    out = aof.discover_all_variants(controller)
+    assert extractions == []
+    assert np.isfinite(out['unmixed_pos_thresholds']).all()
+
+
+@pytest.mark.numpy_only
+def test_discover_all_variants_matches_a_stored_profile_on_its_source_file(tmp_path, monkeypatch):
+    controller, extractions = _stored_af_controller(
+        tmp_path, monkeypatch, _stored_profile(), name='Renamed profile')
+    aof.discover_all_variants(controller)
+    assert extractions == []
+
+
+@pytest.mark.numpy_only
+@pytest.mark.parametrize('profile, name', [
+    (None, None),
+    (_stored_profile(channel_names=list(reversed(syn.DET_PNN))), 'Unstained cells AutoSpectral AF'),
+    (_stored_profile(spectra=syn.af_spectra()[:, :-1].tolist()), 'Unstained cells AutoSpectral AF'),
+    (_stored_profile(source_fcs='Raw/Other.fcs'), 'Other AutoSpectral AF'),
+], ids=['absent', 'other-detectors', 'other-width', 'other-source'])
+def test_discover_all_variants_extracts_af_when_no_usable_profile_exists(tmp_path, monkeypatch, profile, name):
+    controller, extractions = _stored_af_controller(tmp_path, monkeypatch, profile, name=name)
+    aof.discover_all_variants(controller)
+    assert len(extractions) == 1
 
 
 # ---------------------------------------------------------------------------
