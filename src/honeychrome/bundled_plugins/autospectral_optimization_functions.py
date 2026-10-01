@@ -25,6 +25,10 @@ unmix_autospectral_optimization(...)
     compiled joint kernel. Used by both the Compare and Unmix
     sections.
 
+active_variant_labels / cached_unmixed_thresholds / make_optimization_unmix_fn
+    Inputs and per-chunk unmixing function for batch export through
+    joint_unmix_export.JointUnmixExporter.
+
 """
 
 from __future__ import annotations
@@ -515,11 +519,7 @@ def discover_all_variants(
     # arrays — same pattern as controller.py::initialise_transfer_matrix().
     fl_ids = [pnn_raw.index(full_pnn_raw[i]) for i in controller.filtered_raw_fluorescence_channel_ids]
     sc_ids = [pnn_raw.index(full_pnn_raw[i]) for i in raw_settings['scatter_channel_ids']]
-    saturation_ceiling = (
-        raw_settings.get('expr_data_max')
-        or raw_settings.get('range_max')
-        or 2 ** 18
-    )
+    saturation_ceiling = raw_settings.get('magnitude_ceiling') or 2 ** 18
 
     spectral_model = controller.experiment.process.get('spectral_model', [])
     profiles = controller.experiment.process.get('profiles', {})
@@ -886,3 +886,71 @@ def unmix_autospectral_optimization(
         'af_scale': result[:, F],
         'af_idx':   result[:, F + 1].astype(np.int64),
     }
+
+
+# ---------------------------------------------------------------------------
+# Batch export inputs — used with joint_unmix_export.JointUnmixExporter
+# ---------------------------------------------------------------------------
+
+def active_variant_labels(process: dict) -> set:
+    """Fluorophores marked Active in the Table section."""
+    meta = process.get('autospectral_variants_meta', {}) or {}
+    return {label for label, m in meta.items() if m.get('active')}
+
+
+def has_active_variants(variants_meta: dict, active_labels) -> bool:
+    """True when at least one Active fluorophore has computed variants, i.e.
+    the kernel does per-cell variant optimisation rather than AF only."""
+    return any(label in variants_meta for label in active_labels)
+
+
+def cached_unmixed_thresholds(controller, reference_spectra: np.ndarray) -> np.ndarray:
+    """
+    The unstained-derived unmixed-space positivity thresholds cached by
+    Setup, or all-zero thresholds (with a warning) when Setup has not been
+    run or the cache no longer matches the spectral model. Thresholds are
+    never recomputed from the stained samples being exported.
+    """
+    cached = getattr(controller, 'autospectral_unmixed_pos_thresholds', None)
+    if (cached is not None and reference_spectra is not None
+            and len(cached) == reference_spectra.shape[0]):
+        return np.asarray(cached, dtype=np.float64)
+    logger.warning(
+        'AutoSpectral Optimization export: no cached unstained-derived '
+        'thresholds (run Setup first) — falling back to all-zero '
+        'thresholds rather than recomputing from each exported (stained) sample.'
+    )
+    n_fluors = 0 if reference_spectra is None else reference_spectra.shape[0]
+    return np.zeros(n_fluors)
+
+
+def make_optimization_unmix_fn(
+    reference_spectra: np.ndarray,
+    fluor_names: list,
+    variants_meta: dict,
+    active_labels,
+    unmixed_pos_thresholds: np.ndarray,
+    kernel_kwargs: dict,
+):
+    """
+    Per-chunk unmixing function for JointUnmixExporter:
+    ``unmix_fn(raw_fl_chunk, raw_chunk, af)`` runs
+    unmix_autospectral_optimization() with the sample's AF library
+    (``af.spectra``). ``raw_chunk`` is not used.
+    """
+    fluor_names = list(fluor_names)
+    active_labels = set(active_labels)
+
+    def unmix_fn(raw_fl_chunk, raw_chunk, af):
+        return unmix_autospectral_optimization(
+            raw_fl_events=raw_fl_chunk,
+            reference_spectra=reference_spectra,
+            fluor_names=fluor_names,
+            af_spectra=af.spectra,
+            variants_meta=variants_meta,
+            active_labels=active_labels,
+            unmixed_pos_thresholds=unmixed_pos_thresholds,
+            **kernel_kwargs,
+        )
+
+    return unmix_fn

@@ -88,18 +88,23 @@ static py::array_t<double> unmix_autospectral_joint(
   if (!noise_floor.is_none())
     nf = np_to_arma_vec(noise_floor.cast<ContigArray>());
 
-  arma::mat result = unmix_autospectral_joint_core(
-      np_to_arma_mat(raw_data_in),
-      np_to_arma_mat(spectra),
-      np_to_arma_mat(af_spectra),
-      fluor_names,
-      np_to_arma_vec(pos_thresholds),
-      cpp_variants,
-      n_passes, n_threads, cell_weight,
-      &nf,
-      alpha, collinear_thresh, joint_pair_resolution,
-      n_af_passes, refine_af_quantile, exact_variant_scan
-  );
+  // Inputs are copied into Armadillo types before the GIL is released.
+  const arma::mat raw_mat     = np_to_arma_mat(raw_data_in);
+  const arma::mat spectra_mat = np_to_arma_mat(spectra);
+  const arma::mat af_mat      = np_to_arma_mat(af_spectra);
+  const arma::vec pos_vec     = np_to_arma_vec(pos_thresholds);
+
+  arma::mat result;
+  {
+    py::gil_scoped_release release;   // lets the Qt main thread run during the solve
+    result = unmix_autospectral_joint_core(
+        raw_mat, spectra_mat, af_mat, fluor_names, pos_vec, cpp_variants,
+        n_passes, n_threads, cell_weight,
+        &nf,
+        alpha, collinear_thresh, joint_pair_resolution,
+        n_af_passes, refine_af_quantile, exact_variant_scan
+    );
+  }
 
   return arma_to_np(result);
 }

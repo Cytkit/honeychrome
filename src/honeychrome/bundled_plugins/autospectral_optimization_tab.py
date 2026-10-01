@@ -19,12 +19,9 @@ Sections
 
 from __future__ import annotations
 
-import gc
 import logging
-import math
 import os
 import sys
-from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
@@ -74,13 +71,17 @@ from autospectral_optimization_functions import (   # noqa: E402
     calculate_optimize_necessity,
     unmix_autospectral_optimization,
     fluorescence_channel_names,
+    active_variant_labels,
+    cached_unmixed_thresholds,
+    has_active_variants,
+    make_optimization_unmix_fn,
 )
 from autospectral_opt_kernel_wrapper import AUTOSPECTRAL_OPT_KERNEL_AVAILABLE  # noqa: E402
-
-# Events per chunk for AutoSpectralOptExporter. Mirrors unmix_fcs.R's
-# chunk.size default (2e6) — bounds the per-cell variant-search buffers
-# in unmix_autospectral_optimization() regardless of total file size.
-_UNMIX_CHUNK_SIZE = 2_000_000
+from joint_unmix_export import (   # noqa: E402
+    JointUnmixExporter,
+    JointUnmixRun,
+    build_export_layout,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +131,8 @@ class JointComparisonWorker(QObject):
     def __init__(self, raw_event_data, transfer_matrix, filtered_fl_ids_raw,
                  fl_ids_unmixed, reference_spectra, fluor_names, af_spectra,
                  variants_meta, active_labels, unmixed_pos_thresholds,
-                 spillover, max_events, kernel_kwargs):
+                 spillover, max_events, kernel_kwargs,
+                 unmixed_pnn=None, af_index_map=None):
         super().__init__()
         self.raw_event_data = raw_event_data
         self.transfer_matrix = transfer_matrix
@@ -145,6 +147,18 @@ class JointComparisonWorker(QObject):
         self.spillover = spillover
         self.max_events = max_events
         self.kernel_kwargs = kernel_kwargs
+        self.unmixed_pnn = list(unmixed_pnn or [])
+        self.af_index_map = af_index_map
+
+    def _fill_af_channels(self, data, af_scale, af_idx):
+        """Write per-cell AF abundance and AF Index into data's AF channels."""
+        af_index = af_idx
+        if self.af_index_map is not None:
+            af_index = np.asarray(self.af_index_map)[np.asarray(af_idx, dtype=np.int64) - 1]
+        for label, values in ((settings.af_abundance_channel, af_scale),
+                              (settings.af_index_channel, af_index)):
+            if label in self.unmixed_pnn:
+                data[:, self.unmixed_pnn.index(label)] = values
 
     def run(self):
         try:
@@ -171,6 +185,7 @@ class JointComparisonWorker(QObject):
 
             af_data = plain_ols_data.copy()
             af_data[:, self.fl_ids_unmixed] = af_unmixed_fl
+            self._fill_af_channels(af_data, af_result['af_scale'], af_result['af_idx'])
 
             # Panel 3: AutoSpectral Optimization (per-fluorophore variant optimization).
             opt_result = unmix_autospectral_optimization(
@@ -190,6 +205,7 @@ class JointComparisonWorker(QObject):
 
             opt_data = plain_ols_data.copy()
             opt_data[:, self.fl_ids_unmixed] = opt_unmixed_fl
+            self._fill_af_channels(opt_data, opt_result['af_scale'], opt_result['af_idx'])
 
             self.finished.emit(plain_ols_data, af_data, opt_data)
         except Exception as e:
@@ -197,282 +213,36 @@ class JointComparisonWorker(QObject):
             self.error.emit(str(e))
 
 
-class AutoSpectralOptExporter(QObject):
+class AutoSpectralOptExporter(JointUnmixExporter):
     """
-    Batch FCS export using the joint AF + variant pipeline. Close
-    structural sibling of unmixed_exporter.py::UnmixedExporter, simplified
-    since the Unmix section supplies an explicit sample list (via
-    OrderedMultiSamplePicker) rather than a folder to scan.
+    Batch FCS export with the joint AF + fluorophore-variant kernel for the
+    samples picked in the Unmix section.
 
-    FACSDiscover imaging channels are now detected and carried through via
-    an identity block on the transfer matrix, same approach as
-    unmixed_exporter.py. Note this widens the raw channel space back out
-    from whitelisted-only to whitelisted + imaging, so per-sample memory
-    for FACSDiscover experiments is close to UnmixedExporter's footprint.
-    Per-sample processing below is chunked (_UNMIX_CHUNK_SIZE) to keep the
-    AutoSpectral Optimization per-cell variant-search buffers bounded
-    regardless of file size — this does NOT stream the FCS read itself
-    (FlowKit/flowio load the whole file eagerly; there's no partial-read
-    API exposed here), it only bounds the compute-side buffers.
+    Construct on the main thread: the export layout, the computed variants,
+    the Active set and the cached positivity thresholds are snapshotted
+    here. ``probe_fn`` is set when per-cell variant optimisation is on (at
+    least one Active fluorophore has variants), so JointUnmixRun can time the
+    run before it starts; AF-only unmixing is fast and is not timed.
     """
-    progress = Signal(int, int)
-    finished = Signal()
-    error = Signal(str)
 
     def __init__(self, sample_paths, controller, bus, kernel_kwargs):
-        super().__init__()
-        self.sample_paths = sample_paths
-        self.controller = controller
-        self.bus = bus
-        self.kernel_kwargs = kernel_kwargs
-
-    def run(self):
-        try:
-            from honeychrome.controller_components.functions import (
-                export_unmixed_sample, sample_from_fcs,
-            )
-            from honeychrome.__init__ import __version__
-
-            c = self.controller
-            exp = c.experiment
-            raw_settings = exp.settings['raw']
-            unmixed_settings = exp.settings['unmixed']
-
-            exp_dir = c.experiment_dir
-            raw_subdir_abs = (exp_dir / raw_settings['raw_samples_subdirectory']).resolve()
-
-            def sample_key_to_abs(key):
-                """Resolved absolute path for a sample key, mirroring
-                unmixed_exporter.py::UnmixedExporter.sample_key_to_abs."""
-                p = Path(key)
-                if p.is_absolute():
-                    return p.resolve()
-                return (exp_dir / p).resolve()
-
-            pnn_raw_full = raw_settings['event_channels_pnn']
-            pnn_raw = raw_settings.get('whitelisted_pnn') or pnn_raw_full
-            pnn_unmixed = unmixed_settings['event_channels_pnn']
-
-            # FACSDiscover imaging channels: detected against the FULL raw pnn
-            # list (not the whitelisted subset used for unmixing), then carried
-            # through via an identity block appended to both the raw and
-            # unmixed channel spaces. Mirrors unmixed_exporter.py's approach.
-            cytometer = raw_settings.get('cytometer', '')
-            imaging_pnn = []
-            if 'FACSDiscover' in cytometer:
-                from honeychrome.controller_components.cytometer_whitelist import _CYTOMETER_PARAMS
-                import re as _re
-
-                params = _CYTOMETER_PARAMS.get('FACSDiscover')
-                if params is not None:
-                    EXCLUDE_FROM_IMAGING = {'FSC', 'SSC', 'Time'}
-                    imaging_prefixes = [
-                        p for p in params.non_spectral_pat
-                        if not p.startswith('-')
-                        and p not in EXCLUDE_FROM_IMAGING
-                    ]
-                    imaging_pat = _re.compile(
-                        '|'.join(rf'(?:^|\b){_re.escape(p)}' for p in imaging_prefixes)
-                    )
-                    already_whitelisted = set(pnn_raw)
-                    if raw_settings.get('event_id_channel_id') is not None:
-                        already_whitelisted = already_whitelisted | {
-                            pnn_raw_full[raw_settings['event_id_channel_id']]
-                        }
-                    imaging_pnn = [
-                        ch for ch in pnn_raw_full
-                        if _re.search(imaging_pat, ch) and ch not in already_whitelisted
-                    ]
-
-            # Widen the raw and unmixed channel spaces to carry imaging
-            # channels straight through (identity mapping), appended after
-            # the existing whitelisted / unmixed channels so every index
-            # computed below (fl_ids_raw, sc_ids_raw, etc.) stays valid.
-            pnn_raw_export = pnn_raw + imaging_pnn
-            n_imaging = len(imaging_pnn)
-            n_unmixed_before_imaging = len(pnn_unmixed)
-            pnn_unmixed = pnn_unmixed + imaging_pnn
-
-            fl_ids_raw = [pnn_raw_export.index(pnn_raw_full[i]) for i in c.filtered_raw_fluorescence_channel_ids]
-            sc_ids_raw = [pnn_raw_export.index(pnn_raw_full[i]) for i in raw_settings['scatter_channel_ids']]
-            fl_ids_unmixed = np.array(unmixed_settings['fluorescence_channel_ids'])
-            sc_ids_unmixed = np.array(unmixed_settings['scatter_channel_ids'])
-            n_scatter = unmixed_settings['n_scatter_channels']
-
-            unmixing_matrix = np.array(exp.process['unmixing_matrix'])
-            spillover = np.array(exp.process['spillover'])
-            compensation = np.linalg.inv(spillover).T
-
-            transfer_matrix = np.zeros((len(pnn_unmixed), len(pnn_raw_export)))
-            transfer_matrix[np.ix_(fl_ids_unmixed, fl_ids_raw)] = compensation @ unmixing_matrix
-            transfer_matrix[np.ix_(sc_ids_unmixed, sc_ids_raw)] = np.eye(n_scatter)
-            if raw_settings.get('time_channel_id') is not None:
-                raw_time_id = pnn_raw_export.index(pnn_raw_full[raw_settings['time_channel_id']])
-                transfer_matrix[unmixed_settings['time_channel_id'], raw_time_id] = 1
-            if n_imaging:
-                for k in range(n_imaging):
-                    transfer_matrix[n_unmixed_before_imaging + k, len(pnn_raw) + k] = 1.0
-            transfer_matrix = transfer_matrix.T   # raw @ transfer_matrix -> unmixed
-
-            reference_spectra = c._build_fluor_spectra()
-            fluor_names = [ctl['label'] for ctl in exp.process.get('spectral_model', [])
-                           if ctl['label'] in exp.process.get('profiles', {})]
-            # Prefer the cached unstained-derived threshold from Setup — only
-            # falls back per-sample if Setup hasn't been run this session.
-            cached_thresholds = getattr(c, 'autospectral_unmixed_pos_thresholds', None)
-            use_cached_thresholds = (
-                cached_thresholds is not None
-                and reference_spectra is not None
-                and len(cached_thresholds) == reference_spectra.shape[0]
-            )
-            if not use_cached_thresholds:
-                logger.warning(
-                    'AutoSpectral Optimization export: no cached unstained-derived '
-                    'thresholds (run Setup first) — falling back to all-zero '
-                    'thresholds rather than recomputing from each exported (stained) sample.'
-                )
-            variants_meta_meta = exp.process.get('autospectral_variants_meta', {})
-            active_labels = {lbl for lbl, m in variants_meta_meta.items() if m.get('active')}
-
-            all_samples = exp.samples.get('all_samples', {})
-            sample_af_profiles = exp.samples.get('sample_af_profiles', {})
-            all_af_profiles = exp.process.get('af_profiles', {})
-
-            total = len(self.sample_paths)
-            for n, sample_path in enumerate(self.sample_paths):
-                self.progress.emit(n, total)
-
-                assigned = sample_af_profiles.get(sample_path, [])
-                active_profiles = [all_af_profiles[name] for name in assigned if name in all_af_profiles]
-                if not active_profiles:
-                    logger.warning(f'AutoSpectral Optimization export: "{sample_path}" has no AF profile assigned — skipping.')
-                    continue
-
-                af_spectra = np.vstack([np.array(p['spectra']) for p in active_profiles])
-                if af_spectra.shape[0] < 2:
-                    logger.warning(f'AutoSpectral Optimization export: "{sample_path}" AF profile has < 2 spectra — skipping.')
-                    continue
-
-                full_sample_path = c.experiment_dir / sample_path
-                sample_name = all_samples.get(sample_path, Path(sample_path).stem)
-                sample = sample_from_fcs(full_sample_path, self.bus)
-                all_events = sample.get_events(source='raw')
-                sample_ch_idx = {ch: i for i, ch in enumerate(sample.pnn_labels)}
-                if set(pnn_raw_export) <= set(sample.pnn_labels):
-                    raw_event_data = all_events[:, [sample_ch_idx[ch] for ch in pnn_raw_export]]
-                else:
-                    raw_event_data = np.zeros((all_events.shape[0], len(pnn_raw_export)), dtype=all_events.dtype)
-                    for dst, ch in enumerate(pnn_raw_export):
-                        if ch in sample_ch_idx:
-                            raw_event_data[:, dst] = all_events[:, sample_ch_idx[ch]]
-                np.nan_to_num(raw_event_data, copy=False, nan=0.0)
-                del all_events, sample_ch_idx
-                raw_keywords = sample.get_metadata()
-                n_events = sample.event_count
-                if n_events == 0:
-                    continue
-
-                sample_thresholds = (
-                    cached_thresholds if use_cached_thresholds
-                    else np.zeros(reference_spectra.shape[0])
-                )
-
-                # Pre-allocate the export array once; each chunk writes
-                # directly into its row-slice, so at most one chunk's worth
-                # of unmixing intermediates (raw_fl_chunk, opt_result, etc.)
-                # is held at a time — the per-cell variant search is the
-                # main memory multiplier on large FACSDiscover S8 files.
-                export_pnn = pnn_unmixed + ['AF Abundance', 'AF Index']
-                export_event_data = np.zeros((n_events, len(export_pnn)), dtype=np.float64)
-                n_unmixed_cols = len(pnn_unmixed)
-
-                n_chunks = math.ceil(n_events / _UNMIX_CHUNK_SIZE)
-                for chunk_i in range(n_chunks):
-                    s_row = chunk_i * _UNMIX_CHUNK_SIZE
-                    e_row = min((chunk_i + 1) * _UNMIX_CHUNK_SIZE, n_events)
-                    if n_chunks > 1:
-                        logger.debug(
-                            f'AutoSpectral Optimization export: "{sample_path}" '
-                            f'chunk {chunk_i + 1}/{n_chunks} (events {s_row}-{e_row})'
-                        )
-
-                    raw_chunk = raw_event_data[s_row:e_row]
-                    raw_fl_chunk = raw_chunk[:, fl_ids_raw]
-
-                    opt_result = unmix_autospectral_optimization(
-                        raw_fl_events=raw_fl_chunk,
-                        reference_spectra=reference_spectra,
-                        fluor_names=fluor_names,
-                        af_spectra=af_spectra,
-                        variants_meta=c.autospectral_variants,
-                        active_labels=active_labels,
-                        unmixed_pos_thresholds=sample_thresholds,
-                        **self.kernel_kwargs,
-                    )
-                    opt_unmixed_fl = (compensation @ opt_result['unmixed'].T).T
-
-                    unmixed_chunk = apply_transfer_matrix(transfer_matrix, raw_chunk)
-                    unmixed_chunk[:, fl_ids_unmixed] = opt_unmixed_fl
-
-                    export_event_data[s_row:e_row, :n_unmixed_cols] = unmixed_chunk
-                    export_event_data[s_row:e_row, n_unmixed_cols] = opt_result['af_scale']
-                    export_event_data[s_row:e_row, n_unmixed_cols + 1] = opt_result['af_idx'].astype(np.float64)
-
-                    del raw_chunk, raw_fl_chunk, opt_result, opt_unmixed_fl, unmixed_chunk
-                    if n_chunks > 1 and chunk_i % 5 == 4:
-                        gc.collect()
-
-                del raw_event_data
-
-                sample_abs = sample_key_to_abs(sample_path)
-                sample_rel_suffix = None
-                for parent in [sample_abs] + list(sample_abs.parents):
-                    try:
-                        if parent.samefile(raw_subdir_abs):
-                            sample_rel_suffix = sample_abs.relative_to(parent)
-                            break
-                    except OSError:
-                        pass
-                if sample_rel_suffix is None:
-                    # Fallback: strip by component count if samefile matching fails
-                    sample_rel_suffix = Path(*sample_abs.parts[len(raw_subdir_abs.parts):])
-
-                unmixed_rel = Path(unmixed_settings['unmixed_samples_subdirectory']) / sample_rel_suffix
-                full_unmixed_path = c.experiment_dir / unmixed_rel
-                full_unmixed_path.parent.mkdir(parents=True, exist_ok=True)
-
-                unmixing_spectra = np.array(exp.process.get('spectra_matrix')) \
-                    if exp.process.get('spectra_matrix') is not None else None
-
-                export_unmixed_sample(
-                        sample_name=sample_name,
-                        unmixed_folder=full_unmixed_path.parent,
-                        export_event_data=export_event_data,
-                        export_pnn=export_pnn,
-                        spillover=spillover,
-                        raw_keywords=raw_keywords,
-                        spectral_model=exp.process.get('spectral_model', []),
-                        unmixed_settings=unmixed_settings,
-                        raw_settings=raw_settings,
-                        af_spectra=af_spectra,
-                        unmixing_spectra=unmixing_spectra,
-                        version=__version__,
-                        subsample=None,
-                        extra_null_channels=None,
-                        unmixing_method='AutoSpectral Optimization',
-                        unmixing_weights=None,
-                    )
-
-            self.progress.emit(total, total)
-            if self.bus:
-                self.bus.popupMessage.emit(
-                    f'Exported {total} sample(s) with AutoSpectral Optimization unmixing, to \n'
-                    f'"{unmixed_settings["unmixed_samples_subdirectory"]}" folder in experiment folder'
-                )
-            self.finished.emit()
-        except Exception as e:
-            logger.exception('AutoSpectral Optimization: export failed')
-            self.error.emit(str(e))
+        layout = build_export_layout(controller)
+        variants_meta = dict(getattr(controller, 'autospectral_variants', None) or {})
+        active_labels = active_variant_labels(controller.experiment.process)
+        unmix_fn = make_optimization_unmix_fn(
+            layout.reference_spectra,
+            list(layout.fluor_names),
+            variants_meta,
+            active_labels,
+            cached_unmixed_thresholds(controller, layout.reference_spectra),
+            kernel_kwargs,
+        )
+        super().__init__(sample_paths, layout, unmix_fn, bus=bus,
+                         unmixing_method='AutoSpectral Optimization')
+        if has_active_variants(variants_meta, active_labels):
+            self.probe_fn = lambda raw_fl, af: unmix_fn(raw_fl, None, af)
+        else:
+            self.probe_fn = None
 
 
 # ---------------------------------------------------------------------------
@@ -501,8 +271,7 @@ class PluginWidget(QWidget):
         self._opt_data = None
 
         # Unmix state
-        self._unmix_thread = None
-        self._unmix_worker = None
+        self._unmix_run = None
 
         self._build_ui()
 
@@ -1038,7 +807,8 @@ class PluginWidget(QWidget):
         layout.addLayout(row)
 
         plots_row = QHBoxLayout()
-        self._plot_ols = AfComparisonPlotWidget('Standard OLS (No AF Correction)', self.controller)
+        self._plot_ols = AfComparisonPlotWidget('Standard OLS (No AF Correction)', self.controller,
+                                                has_af_channels=False)
         self._plot_af = AfComparisonPlotWidget('AutoSpectral AF-Corrected', self.controller)
         self._plot_opt = AfComparisonPlotWidget('AutoSpectral Optimization', self.controller)
         plots_row.addWidget(self._plot_ols)
@@ -1144,6 +914,8 @@ class PluginWidget(QWidget):
             reference_spectra, fluor_names, af_spectra, variants_meta, active_labels,
             unmixed_pos_thresholds, c.experiment.process.get('spillover'),
             self._comparison_max_events_spin.value(), self._kernel_kwargs(),
+            unmixed_pnn=c.experiment.settings['unmixed']['event_channels_pnn'],
+            af_index_map=c.get_af_index_map_for_sample(c.current_sample_path),
         )
         self._cmp_worker.moveToThread(self._cmp_thread)
         self._cmp_thread.started.connect(self._cmp_worker.run)
@@ -1313,7 +1085,7 @@ class PluginWidget(QWidget):
         self._unmix_btn.setEnabled(bool(eligible) and self._setup_done() and AUTOSPECTRAL_OPT_KERNEL_AVAILABLE)
 
     def _run_unmix_export(self):
-        if self._unmix_thread is not None:
+        if self._unmix_run is not None:
             self._unmix_status.setText('Export already running — please wait.')
             return
         display_names = self._unmix_picker.get_ordered_list()
@@ -1322,23 +1094,27 @@ class PluginWidget(QWidget):
             self._unmix_status.setText('No samples selected.')
             return
 
+        try:
+            exporter = AutoSpectralOptExporter(
+                sample_paths, self.controller, self.bus, self._kernel_kwargs()
+            )
+        except Exception as e:
+            logger.exception('AutoSpectral Optimization: could not prepare the export')
+            self._unmix_status.setText(f'Error: {e}')
+            return
+
         self._unmix_btn.setEnabled(False)
         self._unmix_status.setText(f'Exporting {len(sample_paths)} sample(s)...')
 
-        self._unmix_thread = QThread()
-        self._unmix_worker = AutoSpectralOptExporter(
-            sample_paths, self.controller, self.bus, self._kernel_kwargs()
+        self._unmix_run = JointUnmixRun(
+            exporter, parent_widget=self, probe_fn=exporter.probe_fn, bus=self.bus,
         )
-        self._unmix_worker.moveToThread(self._unmix_thread)
-        self._unmix_thread.started.connect(self._unmix_worker.run)
-        self._unmix_worker.progress.connect(self._on_unmix_progress)
-        self._unmix_worker.finished.connect(self._on_unmix_finished)
-        self._unmix_worker.error.connect(self._on_unmix_error)
-        self._unmix_worker.finished.connect(self._unmix_thread.quit)
-        self._unmix_worker.error.connect(self._unmix_thread.quit)
-        self._unmix_thread.finished.connect(self._unmix_thread.deleteLater)
-        self._unmix_thread.finished.connect(self._on_unmix_thread_finished)
-        self._unmix_thread.start()
+        self._unmix_run.status.connect(self._unmix_status.setText)
+        self._unmix_run.progress.connect(self._on_unmix_progress)
+        self._unmix_run.finished.connect(self._on_unmix_finished)
+        self._unmix_run.error.connect(self._on_unmix_error)
+        self._unmix_run.done.connect(self._on_unmix_run_done)
+        self._unmix_run.start()
 
     def _on_unmix_progress(self, n, total):
         self._unmix_status.setText(f'Exporting... ({n}/{total})')
@@ -1350,9 +1126,8 @@ class PluginWidget(QWidget):
         self._unmix_status.setText(f'Error: {msg}')
         logger.error(f'AutoSpectral Optimization export error: {msg}')
 
-    def _on_unmix_thread_finished(self):
-        self._unmix_thread = None
-        self._unmix_worker = None
+    def _on_unmix_run_done(self):
+        self._unmix_run = None
         self._unmix_btn.setEnabled(True)
 
     # ------------------------------------------------------------------

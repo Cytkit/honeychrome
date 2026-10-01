@@ -41,7 +41,7 @@ if(NOT _pybind11_dir_result EQUAL 0)
   message(FATAL_ERROR
     "Could not run '${Python3_EXECUTABLE} -m pybind11 --cmakedir' — "
     "is pybind11 installed for this interpreter? "
-    "Try: ${Python3_EXECUTABLE} -m pip install pybind11 --break-system-packages")
+    "Try, from the repository root: ${Python3_EXECUTABLE} -m pip install -r requirements.txt")
 endif()
 
 # Static OpenBLAS on Windows/Linux — single binary, nothing extra to track through the PyInstaller
