@@ -94,13 +94,16 @@ class VariantSetupWorker(QObject):
     error = Signal(str)
     progress = Signal(int, int, str)
 
-    def __init__(self, controller, n_cells, som_dim, k_neighbors, sim_threshold):
+    def __init__(self, controller, n_cells, som_dim, k_neighbors, sim_threshold,
+                 dedup_threshold=0.01, max_variants=10):
         super().__init__()
         self.controller = controller
         self.n_cells = n_cells
         self.som_dim = som_dim
         self.k_neighbors = k_neighbors
         self.sim_threshold = sim_threshold
+        self.dedup_threshold = dedup_threshold
+        self.max_variants = max_variants
 
     def run(self):
         try:
@@ -113,6 +116,8 @@ class VariantSetupWorker(QObject):
                 som_dim=self.som_dim,
                 k_neighbors=self.k_neighbors,
                 sim_threshold=self.sim_threshold,
+                dedup_threshold=self.dedup_threshold,
+                max_variants=self.max_variants,
                 progress_callback=_progress,
             )
             self.finished.emit(
@@ -392,12 +397,27 @@ class PluginWidget(QWidget):
         self._k_neighbors_spin = QSpinBox(); self._k_neighbors_spin.setRange(1, 50); self._k_neighbors_spin.setValue(3)
         self._sim_threshold_spin = QDoubleSpinBox(); self._sim_threshold_spin.setRange(0.0, 1.0)
         self._sim_threshold_spin.setDecimals(3); self._sim_threshold_spin.setSingleStep(0.005); self._sim_threshold_spin.setValue(0.985)
-        for w in (self._n_cells_spin, self._som_dim_spin, self._k_neighbors_spin, self._sim_threshold_spin):
+        self._dedup_threshold_spin = QDoubleSpinBox(); self._dedup_threshold_spin.setRange(0.0, 1.0)
+        self._dedup_threshold_spin.setDecimals(3); self._dedup_threshold_spin.setSingleStep(0.005); self._dedup_threshold_spin.setValue(0.01)
+        self._dedup_threshold_spin.setToolTip(
+            'Variants whose largest single-detector difference from the reference, or from a '
+            'better-populated variant, is below this fraction of the peak are dropped. '
+            'The two variants furthest from the reference are always kept.'
+        )
+        self._max_variants_spin = QSpinBox(); self._max_variants_spin.setRange(1, 100); self._max_variants_spin.setValue(10)
+        self._max_variants_spin.setToolTip(
+            'Most variants kept per fluorophore (excluding the reference). The dedup threshold '
+            'is raised for a fluorophore until it fits.'
+        )
+        for w in (self._n_cells_spin, self._som_dim_spin, self._k_neighbors_spin, self._sim_threshold_spin,
+                  self._dedup_threshold_spin, self._max_variants_spin):
             w.installEventFilter(WheelBlocker(w)); w.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         setup_form.addRow('n.cells:', self._n_cells_spin)
         setup_form.addRow('som.dim:', self._som_dim_spin)
         setup_form.addRow('k.neighbors:', self._k_neighbors_spin)
         setup_form.addRow('sim.threshold:', self._sim_threshold_spin)
+        setup_form.addRow('dedup.threshold:', self._dedup_threshold_spin)
+        setup_form.addRow('max.variants:', self._max_variants_spin)
         adv_layout.addWidget(setup_grp)
 
         # --- Necessity group ---
@@ -544,6 +564,8 @@ class PluginWidget(QWidget):
             som_dim=self._som_dim_spin.value(),
             k_neighbors=self._k_neighbors_spin.value(),
             sim_threshold=self._sim_threshold_spin.value(),
+            dedup_threshold=self._dedup_threshold_spin.value(),
+            max_variants=self._max_variants_spin.value(),
         )
         self._setup_worker.moveToThread(self._setup_thread)
         self._setup_thread.started.connect(self._setup_worker.run)
@@ -709,7 +731,7 @@ class PluginWidget(QWidget):
             self._variant_plot_axis.setTicks(None)
             self._variant_plot_axis.tick_colors = {}
 
-        low_alpha_pen = pg.mkPen(color=(200, 80, 80, 110), width=2)
+        low_alpha_pen = pg.mkPen(color=(200, 80, 80, 110), width=4)
         for row in v_mats:
             self._variant_plot.plot(x, np.maximum(row, 0), pen=low_alpha_pen)
         # Reference spectrum drawn last, solid, on top — blue so it reads
