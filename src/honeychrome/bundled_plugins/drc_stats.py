@@ -3,6 +3,10 @@ drc_stats.py — Differential statistics for the DR/Clustering plugin
 ===================================================================
 Companion to ``dr_clustering_tab.py`` (filename intentionally NOT ``*_tab.py``).
 
+The test engine (design matrices, moderated fits, GLMs, significance) is
+shared with other plugins in ``controller_components/differential_stats.py``;
+this module assembles the DR/Clustering feature tables and runs it.
+
 Tests cluster abundance and per-cluster marker expression between sample
 groups:
 
@@ -55,7 +59,16 @@ from sklearn.decomposition import PCA
 
 import drc_pipeline
 from drc_logging import get_logger, log_stage
-from honeychrome.controller_components import moderated_stats as ms
+from honeychrome.controller_components import differential_stats as _ds
+from honeychrome.controller_components.differential_stats import (
+    apply_significance,
+    build_contrasts,
+    build_design,
+    covariate_kind,
+    log2_frequencies,
+    run_glm_counts,
+    run_moderated,
+)
 
 log = get_logger(__name__)
 
@@ -248,74 +261,12 @@ def resolve_test_groups(controller, state, cluster_labels_override=None):
     return result
 
 
-def build_contrasts(group_names: list[str], mode: str,
-                    reference: str | None) -> list[tuple[str, str]]:
-    """
-    Returns the list of (baseline, other) pairs to test.
-
-    mode='reference': (reference, other) for every OTHER qualifying group —
-        one joint fit, multiple coefficients.
-    mode='pairwise':  every unique pair among group_names, in group_names
-        order — each pair gets its own independent fit.
-    """
-    if mode == 'reference':
-        if reference not in group_names:
-            raise RuntimeError(
-                f"Reference group {reference!r} is not one of the groups "
-                f"qualifying for this run ({group_names!r})."
-            )
-        return [(reference, g) for g in group_names if g != reference]
-    elif mode == 'pairwise':
-        pairs = []
-        for i, g1 in enumerate(group_names):
-            for g2 in group_names[i + 1:]:
-                pairs.append((g1, g2))
-        return pairs
-    else:
-        raise ValueError(f"contrast_mode must be 'reference' or 'pairwise', got {mode!r}")
-
-
-# ---------------------------------------------------------------------------
-# Design matrix and covariates
-# ---------------------------------------------------------------------------
-
-def _is_numeric_column(values) -> bool:
-    """True when every non-blank value parses as a finite float."""
-    seen = False
-    for v in values:
-        text = str(v).strip()
-        if not text:
-            continue
-        try:
-            if not np.isfinite(float(text)):
-                return False
-        except ValueError:
-            return False
-        seen = True
-    return seen
-
-
-def covariate_kind(values) -> str:
-    """'numeric' when every filled value is a number, else 'categorical'."""
-    return 'numeric' if _is_numeric_column(values) else 'categorical'
-
-
 def missing_covariate_values(state, all_rel: list[str], names: list[str]) -> dict[str, list[str]]:
     """
     {covariate name: [rel paths with no value]} for each of ``names``
     that is missing (or blank) for at least one sample in ``all_rel``.
     """
-    missing: dict[str, list[str]] = {}
-    cov = state.covariates
-    for name in names:
-        bad = [
-            rel for rel in all_rel
-            if cov is None or name not in cov.columns or rel not in cov.index
-            or not str(cov.loc[rel, name]).strip()
-        ]
-        if bad:
-            missing[name] = bad
-    return missing
+    return _ds.missing_covariate_values(state.covariates, all_rel, names)
 
 
 def covariate_frame(state, all_rel: list[str], names: list[str]) -> pd.DataFrame | None:
@@ -324,100 +275,7 @@ def covariate_frame(state, all_rel: list[str], names: list[str]) -> pd.DataFrame
     Returns None when ``names`` is empty. Raises RuntimeError if any sample
     lacks a value.
     """
-    names = [n for n in names if n]
-    if not names:
-        return None
-    missing = missing_covariate_values(state, all_rel, names)
-    if missing:
-        detail = "; ".join(
-            f"'{name}': " + ", ".join(Path(r).stem for r in rels[:5])
-            + (" …" if len(rels) > 5 else "")
-            for name, rels in missing.items()
-        )
-        raise RuntimeError(f"Adjustment covariates have missing values — {detail}")
-    return pd.DataFrame(
-        {name: [str(state.covariates.loc[rel, name]).strip() for rel in all_rel]
-         for name in names},
-        index=list(all_rel),
-    )
-
-
-def build_design(group_vec: list[str], baseline: str,
-                 pairing_vec: list[str] | None = None,
-                 covariates: pd.DataFrame | None = None):
-    """
-    Treatment-coded design matrix.
-
-    Columns, in order: intercept; one indicator per non-baseline group (in
-    order of first appearance); one indicator per pairing level except the
-    first in sorted order; then each covariate — numeric columns centred,
-    categorical columns as indicators for every level except the first in
-    sorted order. Covariates that are constant over these samples are
-    dropped.
-
-    Returns (X, column_names, group_columns) where group_columns maps each
-    non-baseline group to its column index. Raises RuntimeError naming the
-    term that makes the design rank-deficient.
-    """
-    n = len(group_vec)
-    cols = [np.ones(n)]
-    names = ['(Intercept)']
-    group_cols: dict[str, int] = {}
-    for g in dict.fromkeys(group_vec):
-        if g == baseline:
-            continue
-        group_cols[g] = len(cols)
-        cols.append(np.array([1.0 if x == g else 0.0 for x in group_vec]))
-        names.append(f"group[{g}]")
-    if baseline not in group_vec:
-        raise RuntimeError(f"Baseline group {baseline!r} has no samples in this comparison.")
-
-    def _rank_ok() -> bool:
-        return np.linalg.matrix_rank(np.column_stack(cols)) == len(cols)
-
-    if pairing_vec is not None:
-        levels = sorted(set(pairing_vec))
-        for lvl in levels[1:]:
-            cols.append(np.array([1.0 if x == lvl else 0.0 for x in pairing_vec]))
-            names.append(f"pair[{lvl}]")
-        if not _rank_ok():
-            raise RuntimeError(
-                "The design is rank-deficient with the pairing variable — check "
-                "for missing values, or pairing levels confounded with group."
-            )
-
-    if covariates is not None:
-        for name in covariates.columns:
-            values = covariates[name].tolist()
-            if len(set(values)) < 2:
-                log.info("covariate %r is constant over these samples — dropped", name)
-                continue
-            added = []
-            if covariate_kind(values) == 'numeric':
-                x = np.array([float(v) for v in values])
-                added.append((x - x.mean(), f"{name}"))
-            else:
-                for lvl in sorted(set(values))[1:]:
-                    added.append((np.array([1.0 if v == lvl else 0.0 for v in values]),
-                                  f"{name}[{lvl}]"))
-            for col, label in added:
-                cols.append(col)
-                names.append(label)
-            if not _rank_ok():
-                raise RuntimeError(
-                    f"Covariate '{name}' is confounded with group or pairing in this "
-                    "comparison (e.g. every sample of one group shares one level). "
-                    "Remove it from the adjustment list."
-                )
-
-    X = np.column_stack(cols)
-    if not _rank_ok():
-        raise RuntimeError("The design matrix is rank-deficient.")
-    return X, names, group_cols
-
-
-def _subset_rows(values, mask):
-    return None if values is None else [v for v, m in zip(values, mask) if m]
+    return _ds.covariate_frame(state.covariates, all_rel, names)
 
 
 def n_clusters_from_labels(state, all_rel, cluster_labels_override=None) -> int:
@@ -502,18 +360,6 @@ def sample_event_totals(state, all_rel, cluster_labels_override=None) -> np.ndar
     return np.array([len(np.asarray(cluster_labels[rel])) for rel in all_rel], dtype=float)
 
 
-def log2_frequencies(counts_df: pd.DataFrame, totals) -> pd.DataFrame:
-    """
-    log2 of each cluster's percentage of the sample's events, with half an
-    event added to every count (and one to every total) so empty clusters
-    stay finite: log2((count + 0.5) / (total + 1) · 100). Differences on
-    this scale are log2 fold changes of frequency.
-    """
-    totals = np.asarray(totals, dtype=float)[:, None]
-    vals = np.log2((counts_df.values.astype(float) + 0.5) / (totals + 1.0) * 100.0)
-    return pd.DataFrame(vals, index=counts_df.index, columns=counts_df.columns)
-
-
 def mfi_feature_table(state, n_clusters: int, channels: list[str],
                       names_override: dict | None = None) -> pd.DataFrame:
     """
@@ -563,8 +409,8 @@ def compute_mfis(controller, state, all_rel, n_clusters,
               selected channel when not supplied,
               so any other caller keeps working unchanged.
 
-    af_state: optional (transfer_matrix, af_precomputed, af_spectra) snapshot,
-        captured on the main thread before this (background-thread) call —
+    af_state: optional unmixing snapshot, captured on the main thread
+        before this (background-thread) call —
         see drc_pipeline.apply_unmixing_af_aware() docstring for why this
         must not be read live off ``controller`` from a worker thread.
     """
@@ -892,311 +738,13 @@ def get_frequency_table(controller, state, group_var: str = 'sample',
     return freq_df
 
 
-# ---------------------------------------------------------------------------
-# Moderated linear model
-# ---------------------------------------------------------------------------
-
-_TOO_FEW_FEATURES = (
-    "Only {n} feature(s) to test (need >= 3) for {other!r} vs {base!r} — this "
-    "usually means the current clustering run produced too few clusters for "
-    "differential testing. Increase clustering granularity (e.g. lower "
+_TOO_FEW_CLUSTERS_HINT = (
+    "This usually means the current clustering run produced too few clusters "
+    "for differential testing. Increase clustering granularity (e.g. lower "
     "HDBSCAN's min_cluster_size) and re-run, or test a space/run with more "
     "clusters."
 )
 
-
-def _moderated_fit_contrasts(data_df: pd.DataFrame, group_vec: list[str],
-                             contrasts: list[tuple[str, str]],
-                             pairing_vec: list[str] | None,
-                             covariates: pd.DataFrame | None) -> pd.DataFrame:
-    """
-    One moderated fit over data_df's samples, read out for every contrast
-    in ``contrasts`` (all sharing one baseline). Returns the stacked
-    per-contrast tables with 'feature' and 'comparison' columns.
-    """
-    base = contrasts[0][0]
-    X, _names, group_cols = build_design(group_vec, base, pairing_vec, covariates)
-    expr = data_df.values.T.astype(float)            # (features, samples)
-    n_features = expr.shape[0]
-    if n_features < 3:
-        raise RuntimeError(_TOO_FEW_FEATURES.format(n=n_features, other=contrasts[0][1], base=base))
-    try:
-        fit = ms.e_bayes(ms.lm_fit(expr, X))
-    except ValueError as exc:
-        raise RuntimeError(
-            f"{exc} ({contrasts[0][1]!r} vs {base!r}). Too few clusters/features "
-            "have enough observed samples to fit."
-        ) from exc
-    log.info("moderated fit: %d features, %d samples, d0=%.3g, s0²=%.3g",
-             n_features, X.shape[0], fit.df_prior, fit.s2_prior)
-
-    frames = []
-    for b, other in contrasts:
-        tt = ms.top_table(fit, group_cols[other])
-        tt.insert(0, 'feature', list(data_df.columns))
-        tt['comparison'] = f"{other} vs {b}"
-        frames.append(tt)
-    return pd.concat(frames, ignore_index=True)
-
-
-def _pair_subsets(data_df, group_vec, contrasts, pairing_vec, covariates):
-    """Yield (sub_df, sub_groups, sub_pairing, sub_covariates, base, other) per pair."""
-    for base, other in contrasts:
-        mask = [g in (base, other) for g in group_vec]
-        sub_df = data_df.loc[[rel for rel, m in zip(data_df.index, mask) if m]]
-        sub_groups = _subset_rows(group_vec, mask)
-        n_a, n_b = sub_groups.count(base), sub_groups.count(other)
-        if n_a < 3 or n_b < 3:
-            raise RuntimeError(
-                f"Not enough samples for {other} vs {base}: {base}={n_a}, {other}={n_b}."
-            )
-        sub_cov = covariates.loc[sub_df.index] if covariates is not None else None
-        yield sub_df, sub_groups, _subset_rows(pairing_vec, mask), sub_cov, base, other
-
-
-def run_moderated(data_df: pd.DataFrame, group_vec: list[str],
-                  contrasts: list[tuple[str, str]], mode: str,
-                  pval_threshold: float, fc_threshold: float,
-                  pairing_vec: list[str] | None = None,
-                  fdr_scope: str = 'global',
-                  covariates: pd.DataFrame | None = None,
-                  use_treat: bool = True,
-                  feature_meta: pd.DataFrame | None = None,
-                  hierarchical: bool = False) -> pd.DataFrame:
-    """
-    Moderated linear model test of every feature, for N groups and
-    multiple contrasts.
-
-    data_df   : rows = samples (aligned to group_vec/pairing_vec/covariates),
-                columns = features
-    contrasts : (baseline, other) pairs from build_contrasts()
-    mode      : 'reference' — one fit across all samples, one coefficient
-                  read per contrast (the variance prior is shared).
-                'pairwise'  — each contrast fitted on its two groups only.
-    covariates: optional adjustment covariates (covariate_frame()).
-    feature_meta: optional columns merged onto the results by 'feature'
-                (MFI: cluster, cluster_id, channel).
-    use_treat, hierarchical, fdr_scope: see apply_significance().
-
-    Returns one row per (feature, comparison): feature, logFC, CI.L, CI.R,
-    AveExpr, t, P.Value, adj.P.Val, SE, df.total, comparison,
-    adj.P.Val.global, threshold, significant (plus the cluster-level
-    columns when hierarchical).
-    """
-    if mode == 'reference':
-        baseline = contrasts[0][0]
-        if any(b != baseline for b, _o in contrasts):
-            raise ValueError("reference mode expects a shared baseline")
-        combined = _moderated_fit_contrasts(data_df, group_vec, contrasts, pairing_vec, covariates)
-    elif mode == 'pairwise':
-        frames = [
-            _moderated_fit_contrasts(sub_df, sub_groups, [(base, other)], sub_pair, sub_cov)
-            for sub_df, sub_groups, sub_pair, sub_cov, base, other
-            in _pair_subsets(data_df, group_vec, contrasts, pairing_vec, covariates)
-        ]
-        combined = pd.concat(frames, ignore_index=True)
-    else:
-        raise ValueError(f"mode must be 'reference' or 'pairwise', got {mode!r}")
-
-    if feature_meta is not None:
-        combined = combined.merge(feature_meta, on='feature', how='left', sort=False)
-
-    combined = apply_significance(combined, pval_threshold, fc_threshold,
-                                  fdr_scope=fdr_scope, use_treat=use_treat,
-                                  hierarchical=hierarchical)
-    log.info("moderated test: %d rows across %d comparison(s), %d significant (%s FDR%s%s)",
-             len(combined), combined['comparison'].nunique(),
-             int(combined['significant'].sum()), fdr_scope,
-             ", TREAT" if use_treat else "", ", cluster-first" if hierarchical else "")
-    return combined
-
-
-# ---------------------------------------------------------------------------
-# Negative-binomial GLM on counts
-# ---------------------------------------------------------------------------
-
-def _glm_fit_one_cluster(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
-    """Poisson-then-NB fit for one cluster's raw counts, with the NB
-    dispersion from the Cameron & Trivedi auxiliary-OLS estimate.
-    ``offset`` is log(per-sample total classified events) — a library-size
-    term so the fit compares cluster rates, not raw totals, across samples
-    with different total event counts.
-    Returns the fitted GLM result, or None if even the Poisson fit fails."""
-    import statsmodels.api as sm
-
-    try:
-        poisson_fit = sm.GLM(y, design, family=sm.families.Poisson(), offset=offset).fit()
-    except Exception as e:
-        log.warning("Poisson GLM failed (%s) — marking untestable", e)
-        return None
-    try:
-        mu = poisson_fit.mu
-        aux_y = ((y - mu) ** 2 - y) / mu
-        alpha = float(sm.OLS(aux_y, mu).fit().params[0])
-        if not np.isfinite(alpha) or alpha <= 0:
-            raise ValueError("non-positive alpha estimate")
-        return sm.GLM(y, design, family=sm.families.NegativeBinomial(alpha=alpha), offset=offset).fit()
-    except Exception as e:
-        log.warning("NB GLM failed (%s), falling back to Poisson", e)
-        return poisson_fit
-
-
-def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
-                          contrasts: list[tuple[str, str]],
-                          pairing_vec: list[str] | None,
-                          covariates: pd.DataFrame | None) -> pd.DataFrame:
-    """
-    One design + per-cluster NB/Poisson fit, read out for every contrast in
-    ``contrasts`` (shared baseline). Each cluster's fit includes a
-    log(total classified events) offset, so the coefficient is a
-    per-cluster RATE difference between groups. Estimates are reported on
-    the log2 scale with Wald standard errors (df.total = inf).
-    """
-    base = contrasts[0][0]
-    design_mat, _names, group_cols = build_design(group_vec, base, pairing_vec, covariates)
-
-    # Library-size offset: log(total classified events), floored at 1.
-    totals = counts_df.sum(axis=1).values.astype(float)
-    offset = np.log(np.maximum(totals, 1.0))
-
-    LN2 = np.log(2.0)
-    Z95 = 1.959963984540054
-    clusters = list(counts_df.columns)
-    fits = [_glm_fit_one_cluster(counts_df[cl].values.astype(float), design_mat, offset)
-            for cl in clusters]
-
-    frames = []
-    for b, other in contrasts:
-        j = group_cols[other]
-        logfc = np.full(len(clusters), np.nan)
-        se = np.full(len(clusters), np.nan)
-        tvals = np.full(len(clusters), np.nan)
-        for i, fit in enumerate(fits):
-            if fit is None:
-                continue
-            logfc[i] = fit.params[j] / LN2
-            se[i] = fit.bse[j] / LN2
-            tvals[i] = fit.tvalues[j]
-        p = ms.treat_pvalues(logfc, se, np.inf, 0.0)
-        frames.append(pd.DataFrame({
-            'feature':   clusters,
-            'logFC':     logfc,
-            'CI.L':      logfc - Z95 * se,
-            'CI.R':      logfc + Z95 * se,
-            't':         tvals,
-            'P.Value':   p,
-            'adj.P.Val': ms.bh_adjust(p),
-            'SE':        se,
-            'df.total':  np.inf,
-            'comparison': f"{other} vs {b}",
-        }))
-    return pd.concat(frames, ignore_index=True)
-
-
-def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
-                   contrasts: list[tuple[str, str]], mode: str,
-                   pval_threshold: float, fc_threshold: float,
-                   pairing_vec: list[str] | None = None,
-                   fdr_scope: str = 'global',
-                   covariates: pd.DataFrame | None = None,
-                   use_treat: bool = True) -> pd.DataFrame:
-    """
-    Per-cluster negative-binomial GLM differential abundance test on raw
-    event counts, with the same contrasts/mode/pairing/covariate semantics
-    as run_moderated(). In 'reference' mode each cluster is fitted once and
-    every contrast is read from that fit; 'pairwise' fits each pair
-    separately.
-
-    Returns the same schema as run_moderated() minus AveExpr.
-    """
-    if mode == 'reference':
-        combined = _glm_counts_contrasts(counts_df, group_vec, contrasts, pairing_vec, covariates)
-    elif mode == 'pairwise':
-        frames = [
-            _glm_counts_contrasts(sub_df, sub_groups, [(base, other)], sub_pair, sub_cov)
-            for sub_df, sub_groups, sub_pair, sub_cov, base, other
-            in _pair_subsets(counts_df, group_vec, contrasts, pairing_vec, covariates)
-        ]
-        combined = pd.concat(frames, ignore_index=True)
-    else:
-        raise ValueError(f"mode must be 'reference' or 'pairwise', got {mode!r}")
-
-    combined = apply_significance(combined, pval_threshold, fc_threshold,
-                                  fdr_scope=fdr_scope, use_treat=use_treat)
-    log.info("GLM counts: %d rows across %d comparison(s), %d significant (%s FDR), %d untestable",
-             len(combined), combined['comparison'].nunique(),
-             int(combined['significant'].sum()), fdr_scope, int(combined['logFC'].isna().sum()))
-    return combined
-
-
-# ---------------------------------------------------------------------------
-# Significance
-# ---------------------------------------------------------------------------
-
-def apply_significance(results: pd.DataFrame, pval_threshold: float,
-                       fc_threshold: float, fdr_scope: str = 'global',
-                       use_treat: bool = True,
-                       hierarchical: bool = False) -> pd.DataFrame:
-    """
-    Recompute p-values, FDR and the 'significant' flag of a results table
-    for the given thresholds, without refitting. Returns a new DataFrame.
-
-    use_treat   : True — P.Value is the TREAT p-value for |logFC| >
-                  fc_threshold (McCarthy & Smyth 2009). False — P.Value
-                  tests logFC ≠ 0 and fc_threshold only filters estimates.
-    fdr_scope   : 'global' — BH pooled over every comparison in the table
-                  decides significance; 'per_comparison' — each
-                  comparison's own BH. Both adj.P.Val (per comparison) and
-                  adj.P.Val.global are always written.
-    hierarchical: cluster-first testing for tables with a 'cluster_id'
-                  column (MFI). Adds cluster.P.Value (Simes over the
-                  cluster's markers), cluster.adj.P.Val (BH over clusters)
-                  and stagewise.adj.P.Val; a marker is significant when its
-                  stage-wise value ≤ pval_threshold.
-
-    Tables without SE/df.total columns (results saved before these columns
-    existed) keep their stored p-values and use fc_threshold as a filter.
-    """
-    df = results.copy()
-    tau = float(fc_threshold) if use_treat else 0.0
-    can_retest = {'SE', 'df.total', 'logFC'}.issubset(df.columns)
-    if can_retest:
-        df['P.Value'] = ms.treat_pvalues(df['logFC'].values, df['SE'].values,
-                                         df['df.total'].values.astype(float), tau)
-        df['threshold'] = tau
-        adj = np.full(len(df), np.nan)
-        for _comp, idx in df.groupby('comparison', sort=False).indices.items():
-            adj[idx] = ms.bh_adjust(df['P.Value'].values[idx])
-        df['adj.P.Val'] = adj
-    df['adj.P.Val.global'] = ms.bh_adjust(df['P.Value'].values.astype(float))
-
-    q_col = 'adj.P.Val.global' if fdr_scope == 'global' else 'adj.P.Val'
-    passes_fc = df['logFC'].abs() >= fc_threshold
-
-    if hierarchical and 'cluster_id' in df.columns:
-        fam_p = np.full(len(df), np.nan)
-        fam_adj = np.full(len(df), np.nan)
-        stage = np.full(len(df), np.nan)
-        groups = ({'all': np.arange(len(df))} if fdr_scope == 'global'
-                  else df.groupby('comparison', sort=False).indices)
-        for _key, idx in groups.items():
-            family = [f"{c}\x1f{k}" for c, k in
-                      zip(df['comparison'].values[idx], df['cluster_id'].values[idx])]
-            res = ms.stagewise_adjust(df['P.Value'].values[idx].astype(float), family,
-                                      pval_threshold)
-            fam_p[idx] = res['family_p']
-            fam_adj[idx] = res['family_adj']
-            stage[idx] = res['adjusted']
-        df['cluster.P.Value'] = fam_p
-        df['cluster.adj.P.Val'] = fam_adj
-        df['stagewise.adj.P.Val'] = stage
-        df['significant'] = (df['stagewise.adj.P.Val'] <= pval_threshold) & passes_fc
-    else:
-        for col in ('cluster.P.Value', 'cluster.adj.P.Val', 'stagewise.adj.P.Val'):
-            if col in df.columns:
-                df = df.drop(columns=[col])
-        df['significant'] = (df[q_col] <= pval_threshold) & passes_fc
-    return df
 
 # ---------------------------------------------------------------------------
 # Orchestrator
@@ -1291,6 +839,7 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
             log2_frequencies(counts_df, totals), group_vec, contrasts, state.contrast_mode,
             pval_threshold, fc_threshold, pairing_vec=pairing_vec, fdr_scope=fdr_scope,
             covariates=covariates, use_treat=use_treat,
+            too_few_hint=_TOO_FEW_CLUSTERS_HINT,
         )
         state.freq_results = freq_results
         state.freq_df = freq_df          # % per cluster (display)
@@ -1325,6 +874,7 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
                 pval_threshold, mfi_threshold, pairing_vec=pairing_vec, fdr_scope=fdr_scope,
                 covariates=covariates, use_treat=use_treat,
                 feature_meta=meta, hierarchical=mfi_hierarchical,
+                too_few_hint=_TOO_FEW_CLUSTERS_HINT,
             )
             state.mfi_results = mfi_results
             state.mfi_df = mfi_df        # raw (samples × cluster·channel) MFIs

@@ -1157,6 +1157,8 @@ class Plot3DPlotWidget(QtWidgets.QFrame):
             tr = self.transformations[channel]
             col_idx = self.id_channels[axis_i]
             channel_min, channel_max = np.percentile(self.event_data[:, col_idx], [1, 99])
+            if not channel_max > 0:  # e.g. AF channels on a sample without AF correction
+                continue
 
             if tr.id == 1:  # logicle
                 tr.scale_t = 1.5 * channel_max
@@ -1195,7 +1197,8 @@ class Plot3DPlotWidget(QtWidgets.QFrame):
         # Data tab's cached histograms get recalculated next time it's
         # visited.
         settings_unmixed = self.controller.experiment.settings['unmixed']
-        new_transforms = generate_transformations(assign_default_transforms(settings_unmixed, channels=self.channels))
+        new_transforms = generate_transformations(assign_default_transforms(
+            settings_unmixed, channels=self.channels, n_af_spectra=self.controller.n_af_spectra()))
 
         for channel in self.channels:
             if self.controller.current_sample_path != self.controller.live_sample_path:

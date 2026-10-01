@@ -25,6 +25,10 @@ unmix_autospectral_optimization(...)
     compiled joint kernel. Used by both the Compare and Unmix
     sections.
 
+active_variant_labels / cached_unmixed_thresholds / make_optimization_unmix_fn
+    Inputs and per-chunk unmixing function for batch export through
+    joint_unmix_export.JointUnmixExporter.
+
 """
 
 from __future__ import annotations
@@ -33,8 +37,10 @@ import logging
 import os
 import re
 import sys
+from pathlib import Path
 
 import numpy as np
+from scipy.spatial.distance import cdist
 
 from honeychrome.controller_components.autospectral_functions import (
     apply_af_unmixing,
@@ -178,21 +184,24 @@ def compute_af_extracted_unmixed_thresholds(
     reference_spectra: np.ndarray,
     fluor_names: list,
     percentile: float = 99.5,
+    af_spectra: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Per-fluorophore unmixed-space positivity threshold, AF-extracted.
 
-    Port of get_spectral_variants.R's `unmixed.thresholds`: AF spectra are
-    extracted from the unstained sample (get_af_spectra, base stage only),
-    the unstained sample is unmixed with per-cell AF extraction, and the
-    `percentile` of each fluorophore column is taken. Plain OLS would leave
-    autofluorescence smeared across every fluorophore column and inflate the
-    threshold.
+    Port of get_spectral_variants.R's `unmixed.thresholds`: the unstained
+    sample is unmixed with per-cell AF extraction and the `percentile` of
+    each fluorophore column is taken. Plain OLS would leave autofluorescence
+    smeared across every fluorophore column and inflate the threshold.
 
     unstained_raw       : (N, D) all unstained events, for AF extraction
     unstained_subsample : (n, D) events to unmix for the percentile
+    af_spectra          : (nAF, D) AF library already extracted from this
+                          unstained sample; when None, it is extracted here
+                          (get_af_spectra, base stage only)
     """
-    af_spectra = get_af_spectra(unstained_raw, reference_spectra, refine=False)
+    if af_spectra is None:
+        af_spectra = get_af_spectra(unstained_raw, reference_spectra, refine=False)
 
     if AUTOSPECTRAL_OPT_KERNEL_AVAILABLE and af_spectra.shape[0] >= 2:
         result = unmix_autospectral_joint(
@@ -211,6 +220,81 @@ def compute_af_extracted_unmixed_thresholds(
         fluor_unmixed = apply_af_unmixing(unstained_subsample, precomputed, af_spectra)['unmixed']
 
     return np.percentile(fluor_unmixed, percentile, axis=0)
+
+
+# ---------------------------------------------------------------------------
+# Variant deduplication
+# ---------------------------------------------------------------------------
+
+def _node_populations(events: np.ndarray, centres: np.ndarray) -> np.ndarray:
+    """Events assigned to each centre by cosine similarity, (n_centres,)."""
+    ev = events / (np.linalg.norm(events, axis=1, keepdims=True) + 1e-12)
+    ce = centres / (np.linalg.norm(centres, axis=1, keepdims=True) + 1e-12)
+    return np.bincount(np.argmax(ev @ ce.T, axis=1), minlength=len(centres))
+
+
+def deduplicate_variants(
+    v_mats: np.ndarray,
+    weights: np.ndarray,
+    min_distance: float = 0.01,
+    max_variants: int = 10,
+    min_variants: int = 2,
+    growth: float = 1.1,
+) -> tuple[np.ndarray, float]:
+    """
+    Collapse near-identical variant spectra.
+
+    Distance is the largest absolute difference in any detector between two
+    peak-normalised spectra, i.e. a fraction of the peak signal. Row 0 (the
+    reference) is always kept, so a variant within `min_distance` of the
+    reference is dropped as well as one within `min_distance` of an earlier
+    variant. Rows are visited from the most to the least populated, so a
+    spectrum is represented by the node that holds the most events.
+
+    When more than `max_variants` rows survive, the distance threshold is
+    raised by a factor of `growth` and the pass repeated until the cap is
+    met. The threshold therefore varies by fluorophore: only controls with
+    more spectral spread than the cap allows are thinned harder.
+
+    When fewer than `min_variants` survive, the remaining candidates
+    furthest from the reference are added back, so a fluorophore always
+    keeps its most distinct variants even when all are close to the reference.
+
+    Parameters
+    ----------
+    v_mats       : (n, D) peak-normalised spectra, row 0 the reference
+    weights      : (n,) events per row; row 0 is ignored
+    min_distance : starting distance threshold (fraction of peak)
+    max_variants : cap on kept rows excluding the reference
+    min_variants : floor on kept rows excluding the reference (at most
+                   max_variants)
+    growth       : multiplier applied to the threshold per retry
+
+    Returns
+    -------
+    (kept, threshold_used) — kept is a row-index array starting with 0,
+    then the surviving variants from most to least populated, then any
+    variants added to reach `min_variants`, furthest from the reference first.
+    """
+    dist = cdist(v_mats, v_mats, metric='chebyshev')
+    order = np.argsort(-np.asarray(weights, dtype=np.float64)[1:], kind='stable') + 1
+    min_variants = min(min_variants, max_variants)
+    threshold = float(min_distance)
+    while True:
+        kept = [0]
+        for i in order:
+            if dist[i, kept].min() >= threshold:
+                kept.append(int(i))
+        if len(kept) - 1 <= max_variants:
+            break
+        threshold = max(threshold * growth, 1e-3)
+
+    shortfall = min_variants - (len(kept) - 1)
+    if shortfall > 0:
+        spare = [i for i in range(1, len(dist)) if i not in kept]
+        spare.sort(key=lambda i: -dist[0, i])
+        kept += spare[:shortfall]
+    return np.array(kept), threshold
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +322,8 @@ def discover_fluor_variants(
     sim_threshold: float = 0.985,
     sim_threshold_floor: float = 0.90,
     af_collinear_threshold: float = 0.95,
+    dedup_threshold: float = 0.01,
+    max_variants: int = 10,
     random_state: int = 0,
 ) -> dict | None:
     """
@@ -251,6 +337,14 @@ def discover_fluor_variants(
     clustered with a som_dim x som_dim cosine-distance SOM (KMeans fallback,
     see get_som_codes). Each node's spectral code, L-inf normalised and
     shrunk toward the reference in off-peak channels, is a candidate variant.
+    Candidates are then deduplicated (see deduplicate_variants): any within
+    `dedup_threshold` (fraction of peak, largest single-detector difference)
+    of the reference or of a better-populated candidate are dropped, and the
+    threshold is raised for this fluorophore until at most `max_variants`
+    remain; at least the two candidates furthest from the reference are
+    always kept. Near-identical variants let the per-cell solver pick whichever
+    one zeroes each cell's residual, which compresses the unmixed values
+    around zero.
     Row 0 of the result is always the reference spectrum itself.
 
     AF projection is skipped when the reference spectrum's cosine
@@ -263,7 +357,8 @@ def discover_fluor_variants(
     spectrum. Otherwise:
         {'v_mats': (n_variants, D), 'delta': (n_variants, D),
          'delta_norms': (n_variants,), 'n_events_used': int,
-         'cosine_threshold_used': float, 'af_collinear': bool}
+         'cosine_threshold_used': float, 'af_collinear': bool,
+         'dedup_threshold_used': float}
     """
     reference_vec = np.asarray(reference_spectra[fluor_idx], dtype=np.float64)
 
@@ -342,9 +437,10 @@ def discover_fluor_variants(
     final_idx = keep_idx[cosine_idx]
     event_n = len(final_idx)
 
-    # 7. SOM clustering (cosine distance), grid shrunk for small event counts.
+    # 7. SOM clustering (cosine distance), grid shrunk for small event counts
+    #    (about three events per node at minimum, never larger than som_dim).
     if event_n < 500:
-        som_dim = max(2, int(np.floor(np.sqrt(event_n / 3))))
+        som_dim = min(som_dim, max(2, int(np.floor(np.sqrt(event_n / 3)))))
 
     cluster_input = np.concatenate(
         [unmixed_full[final_idx], spectral_sub[final_idx]], axis=1
@@ -364,6 +460,7 @@ def discover_fluor_variants(
     if len(v_mats) == 0:
         logger.info(f'discover_fluor_variants: "{label}" — no valid SOM codes, falling back to reference spectrum.')
         return None
+    node_events = _node_populations(spectral_sub[final_idx], v_mats)
 
     # 8. Off-peak shrinkage: blend 50/50 toward the reference in channels
     #    where the reference contributes < 5% of its own peak.
@@ -373,14 +470,26 @@ def discover_fluor_variants(
 
     # Row 0 is always the reference spectrum itself.
     v_mats_shrunk = np.vstack([reference_vec[np.newaxis, :], v_mats_shrunk])
+    n_candidates = len(v_mats_shrunk) - 1
 
-    # 9. Delta matrix + norms.
+    # 9. Deduplicate against the reference and each other, capped per fluorophore.
+    kept, dedup_used = deduplicate_variants(
+        v_mats_shrunk, np.concatenate([[0], node_events]),
+        min_distance=dedup_threshold, max_variants=max_variants,
+    )
+    if len(kept) < 2:
+        logger.info(f'discover_fluor_variants: "{label}" — no variant candidates, falling back to reference spectrum.')
+        return None
+    v_mats_shrunk = v_mats_shrunk[kept]
+
+    # 10. Delta matrix + norms.
     delta = v_mats_shrunk - reference_vec[np.newaxis, :]
     delta_norms = np.linalg.norm(delta, axis=1)
 
     logger.info(
         f'discover_fluor_variants: "{label}" — {len(v_mats_shrunk) - 1} variant(s) '
-        f'from {event_n} qualifying events ({som_dim}x{som_dim} {engine}).'
+        f'kept of {n_candidates} candidate(s) from {event_n} qualifying events '
+        f'({som_dim}x{som_dim} {engine}), dedup threshold {dedup_used:.3f}.'
     )
     return {
         'v_mats': v_mats_shrunk,
@@ -389,6 +498,7 @@ def discover_fluor_variants(
         'n_events_used': event_n,
         'cosine_threshold_used': threshold_used,
         'af_collinear': af_collinear,
+        'dedup_threshold_used': dedup_used,
     }
 
 
@@ -442,13 +552,15 @@ def _unstained_threshold_entry(
     n_af_pcs: int,
     subsample_n: int = 100_000,
     random_state: int = 0,
+    af_spectra: np.ndarray | None = None,
 ) -> dict:
     """
     Positivity thresholds and AF-PC basis from one unstained sample.
 
     Raw thresholds, AF PCs and the unmixed percentile use at most
-    `subsample_n` events (get_spectral_variants.R's gate.downsample.n.cells);
-    AF spectra for the unmixed thresholds are extracted from every event.
+    `subsample_n` events (get_spectral_variants.R's gate.downsample.n.cells).
+    The AF spectra for the unmixed thresholds are `af_spectra` when supplied
+    (a stored profile for this sample), otherwise extracted from every event.
     Cell samples get AF-extracted unmixed thresholds; bead samples plain OLS,
     since AF extraction on beads isn't meaningful and discover_fluor_variants()
     never projects AF out of bead controls.
@@ -462,6 +574,7 @@ def _unstained_threshold_entry(
         af_pcs = compute_af_pcs_from_unstained(subsample, n_pcs=n_af_pcs)
         unmixed = compute_af_extracted_unmixed_thresholds(
             unstained_raw, subsample, reference_spectra, fluor_names,
+            af_spectra=af_spectra,
         )
     else:
         af_pcs = None
@@ -474,6 +587,48 @@ def _unstained_threshold_entry(
     }
 
 
+def _stored_af_spectra(controller, sample_path, channel_names: list) -> np.ndarray | None:
+    """
+    AF spectra already extracted from the unstained sample at `sample_path`,
+    from experiment.process['af_profiles'], or None when there is no such
+    profile or its detectors differ from `channel_names`. A profile matches
+    on its source file, or failing that on the default profile name
+    ("<sample stem> AutoSpectral AF").
+    """
+    if not sample_path:
+        return None
+    profiles = controller.experiment.process.get('af_profiles') or {}
+    experiment_dir = Path(controller.experiment_dir)
+
+    def _relative(p) -> str:
+        p = Path(p)
+        if p.is_absolute():
+            try:
+                p = p.relative_to(experiment_dir)
+            except ValueError:
+                pass
+        return p.as_posix()
+
+    target = _relative(sample_path)
+    default_name = f'{Path(sample_path).stem} AutoSpectral AF'
+    for name, entry in profiles.items():
+        source = entry.get('source_fcs')
+        if name != default_name and (not source or _relative(source) != target):
+            continue
+        spectra = np.asarray(entry.get('spectra', []), dtype=np.float64)
+        stored_channels = entry.get('channel_names')
+        if spectra.ndim != 2 or spectra.shape[0] < 1 or spectra.shape[1] != len(channel_names):
+            continue
+        if stored_channels is not None and list(stored_channels) != list(channel_names):
+            continue
+        logger.info(
+            f'discover_all_variants: using stored AF profile "{name}" '
+            f'({spectra.shape[0]} spectra) for "{sample_path}".'
+        )
+        return spectra
+    return None
+
+
 def discover_all_variants(
     controller,
     n_cells: int = 10_000,
@@ -483,13 +638,21 @@ def discover_all_variants(
     sim_threshold_floor: float = 0.90,
     af_collinear_threshold: float = 0.95,
     n_af_pcs: int = 4,
+    dedup_threshold: float = 0.01,
+    max_variants: int = 10,
     progress_callback=None,
 ) -> dict:
     """
     Setup section orchestration. Loops
     experiment.process['spectral_model'] (excluding AF and any
     "Unstained"-labelled entries) and runs discover_fluor_variants() for
-    each fluorophore.
+    each fluorophore. `dedup_threshold` and `max_variants` are passed
+    through to its variant deduplication.
+
+    Cell-control unmixed thresholds need an AF library per unstained
+    sample. A profile already stored for that sample in
+    experiment.process['af_profiles'] is reused; AF spectra are extracted
+    only for unstained samples without one.
 
     progress_callback(n, total, label), if supplied, is called once per
     fluorophore — safe to connect to bus.progress.emit from a QThread run()
@@ -515,11 +678,8 @@ def discover_all_variants(
     # arrays — same pattern as controller.py::initialise_transfer_matrix().
     fl_ids = [pnn_raw.index(full_pnn_raw[i]) for i in controller.filtered_raw_fluorescence_channel_ids]
     sc_ids = [pnn_raw.index(full_pnn_raw[i]) for i in raw_settings['scatter_channel_ids']]
-    saturation_ceiling = (
-        raw_settings.get('expr_data_max')
-        or raw_settings.get('range_max')
-        or 2 ** 18
-    )
+    channel_names = [pnn_raw[i] for i in fl_ids]
+    saturation_ceiling = raw_settings.get('magnitude_ceiling') or 2 ** 18
 
     spectral_model = controller.experiment.process.get('spectral_model', [])
     profiles = controller.experiment.process.get('profiles', {})
@@ -563,6 +723,7 @@ def discover_all_variants(
             continue
         threshold_cache[name] = _unstained_threshold_entry(
             unstained_raw, reference_spectra, fluor_names_all, True, n_af_pcs,
+            af_spectra=_stored_af_spectra(controller, all_samples_rev.get(name), channel_names),
         )
 
     if not threshold_cache:
@@ -607,6 +768,8 @@ def discover_all_variants(
             return None
         entry = _unstained_threshold_entry(
             paired_raw, reference_spectra, fluor_names_all, is_cell_control, n_af_pcs,
+            af_spectra=(_stored_af_spectra(controller, all_samples_rev.get(sample_name), channel_names)
+                        if is_cell_control else None),
         )
         threshold_cache[cache_key] = entry
         return entry
@@ -684,6 +847,7 @@ def discover_all_variants(
             n_cells=n_cells, som_dim=som_dim, k_neighbors=k_neighbors,
             sim_threshold=sim_threshold, sim_threshold_floor=sim_threshold_floor,
             af_collinear_threshold=af_collinear_threshold,
+            dedup_threshold=dedup_threshold, max_variants=max_variants,
         )
         if variant_result is not None:
             results[label] = variant_result
@@ -886,3 +1050,71 @@ def unmix_autospectral_optimization(
         'af_scale': result[:, F],
         'af_idx':   result[:, F + 1].astype(np.int64),
     }
+
+
+# ---------------------------------------------------------------------------
+# Batch export inputs — used with joint_unmix_export.JointUnmixExporter
+# ---------------------------------------------------------------------------
+
+def active_variant_labels(process: dict) -> set:
+    """Fluorophores marked Active in the Table section."""
+    meta = process.get('autospectral_variants_meta', {}) or {}
+    return {label for label, m in meta.items() if m.get('active')}
+
+
+def has_active_variants(variants_meta: dict, active_labels) -> bool:
+    """True when at least one Active fluorophore has computed variants, i.e.
+    the kernel does per-cell variant optimisation rather than AF only."""
+    return any(label in variants_meta for label in active_labels)
+
+
+def cached_unmixed_thresholds(controller, reference_spectra: np.ndarray) -> np.ndarray:
+    """
+    The unstained-derived unmixed-space positivity thresholds cached by
+    Setup, or all-zero thresholds (with a warning) when Setup has not been
+    run or the cache no longer matches the spectral model. Thresholds are
+    never recomputed from the stained samples being exported.
+    """
+    cached = getattr(controller, 'autospectral_unmixed_pos_thresholds', None)
+    if (cached is not None and reference_spectra is not None
+            and len(cached) == reference_spectra.shape[0]):
+        return np.asarray(cached, dtype=np.float64)
+    logger.warning(
+        'AutoSpectral Optimization export: no cached unstained-derived '
+        'thresholds (run Setup first) — falling back to all-zero '
+        'thresholds rather than recomputing from each exported (stained) sample.'
+    )
+    n_fluors = 0 if reference_spectra is None else reference_spectra.shape[0]
+    return np.zeros(n_fluors)
+
+
+def make_optimization_unmix_fn(
+    reference_spectra: np.ndarray,
+    fluor_names: list,
+    variants_meta: dict,
+    active_labels,
+    unmixed_pos_thresholds: np.ndarray,
+    kernel_kwargs: dict,
+):
+    """
+    Per-chunk unmixing function for JointUnmixExporter:
+    ``unmix_fn(raw_fl_chunk, raw_chunk, af)`` runs
+    unmix_autospectral_optimization() with the sample's AF library
+    (``af.spectra``). ``raw_chunk`` is not used.
+    """
+    fluor_names = list(fluor_names)
+    active_labels = set(active_labels)
+
+    def unmix_fn(raw_fl_chunk, raw_chunk, af):
+        return unmix_autospectral_optimization(
+            raw_fl_events=raw_fl_chunk,
+            reference_spectra=reference_spectra,
+            fluor_names=fluor_names,
+            af_spectra=af.spectra,
+            variants_meta=variants_meta,
+            active_labels=active_labels,
+            unmixed_pos_thresholds=unmixed_pos_thresholds,
+            **kernel_kwargs,
+        )
+
+    return unmix_fn

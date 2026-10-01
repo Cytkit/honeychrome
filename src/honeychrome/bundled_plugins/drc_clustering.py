@@ -752,8 +752,8 @@ def run_clustering(controller, state, algo: str, params: dict,
                    progress=None, af_state=None) -> None:
     """Run the selected clustering algorithm (called from the worker thread).
 
-    af_state: optional (transfer_matrix, af_precomputed, af_spectra) snapshot,
-        captured on the main thread before the worker started — see
+    af_state: optional unmixing snapshot, captured on the main thread
+        before the worker started — see
         drc_pipeline.apply_unmixing_af_aware() docstring.
     """
     if algo == 'FlowSOM':

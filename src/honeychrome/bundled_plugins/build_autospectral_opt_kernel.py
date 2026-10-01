@@ -7,7 +7,7 @@ autospectral_opt_kernel_wrapper.py's same-directory import can find it.
 
 Prerequisites (macOS, Apple Silicon, local dev):
     brew install armadillo libomp cmake
-    pip install pybind11 --break-system-packages   # for `python -m pybind11 --cmakedir`
+    python -m pip install -r requirements.txt       # from the repository root; includes pybind11
 
 Usage:
     python build_autospectral_opt_kernel.py

@@ -18,6 +18,9 @@ Provides:
                               — matplotlib PdfPages helpers (no new PDF
                                 dependency -- matplotlib is already a
                                 hard dependency of this plugin)
+  • export_report_item        — write one item's PNG / CSV files and add
+                                it to the PDF (also used by the Automated
+                                Gating plugin's report)
   • ReportTab(QWidget)        — the tab itself: three sections (Workspace,
                                 Cluster Annotation, Stats), each populated
                                 from that tab's own get_report_items().
@@ -629,25 +632,32 @@ class ReportTab(QWidget):
         self.refresh()
 
     def _export_item(self, item: ReportItem, subfolder, pdf):
-        safe_label = sanitize_filename(item.label)
-        if item.get_figure is not None:
-            try:
-                fig = item.get_figure()
-            except Exception as e:
-                fig = None
-                log.warning("figure build failed for %r: %s", item.label, e)
-            if fig is not None:
-                fig.savefig(subfolder / f"{safe_label}.png", dpi=200, bbox_inches='tight')
-                pdf.savefig(fig, bbox_inches='tight')
-        if item.get_tables is not None:
-            try:
-                tables = item.get_tables() or {}
-            except Exception as e:
-                tables = {}
-                log.warning("table build failed for %r: %s", item.label, e)
-            for table_name, df in tables.items():
-                if df is None:
-                    continue
-                csv_name = sanitize_filename(f"{item.label}_{table_name}")
-                df.to_csv(subfolder / f"{csv_name}.csv")
-                add_dataframe_pages(pdf, df, f"{item.label} -- {table_name}")
+        export_report_item(item, subfolder, pdf)
+
+
+def export_report_item(item: ReportItem, subfolder, pdf) -> None:
+    """Write one report item: its figure as PNG and its tables as CSV into
+    *subfolder*, and both into the open PdfPages *pdf*. A figure or table
+    that fails to build is logged and skipped."""
+    safe_label = sanitize_filename(item.label)
+    if item.get_figure is not None:
+        try:
+            fig = item.get_figure()
+        except Exception as e:
+            fig = None
+            log.warning("figure build failed for %r: %s", item.label, e)
+        if fig is not None:
+            fig.savefig(subfolder / f"{safe_label}.png", dpi=200, bbox_inches='tight')
+            pdf.savefig(fig, bbox_inches='tight')
+    if item.get_tables is not None:
+        try:
+            tables = item.get_tables() or {}
+        except Exception as e:
+            tables = {}
+            log.warning("table build failed for %r: %s", item.label, e)
+        for table_name, df in tables.items():
+            if df is None:
+                continue
+            csv_name = sanitize_filename(f"{item.label}_{table_name}")
+            df.to_csv(subfolder / f"{csv_name}.csv")
+            add_dataframe_pages(pdf, df, f"{item.label} -- {table_name}")
