@@ -542,6 +542,8 @@ class CytometryPlotWidget(QFrame):
 
             for channel in channels:
                 channel_min, channel_max = np.percentile(self.data_for_cytometry_plots['event_data'][:,self.pnn.index(channel)], [1, 99])
+                if not channel_max > 0:  # e.g. AF channels on a sample without AF correction
+                    continue
                 if self.transformations[channel].id == 1:
                     self.transformations[channel].scale_t = 1.5 * channel_max
                     if channel_min < -10**self.transformations[channel].logicle_w:
@@ -557,16 +559,11 @@ class CytometryPlotWidget(QFrame):
                     self.transformations[channel].logicle_a = logicle_a
                     self.transformations[channel].set_transform(limits=[0, 1])
 
-                    print([channel, channel_min, channel_max, self.transformations[channel].scale_t, logicle_a])
-
-
                 elif self.transformations[channel].id == 0:
                     self.transformations[channel].scale_t = 1.5 * channel_max
                     linear_a = max([-channel_min * 2, 0])
                     self.transformations[channel].linear_a = linear_a
                     self.transformations[channel].set_transform(limits=[0, 1])
-
-                    print([channel, channel_min, channel_max, self.transformations[channel].scale_t, linear_a])
 
         for channel in channels:
             if self.bus is not None:
