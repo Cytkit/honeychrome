@@ -1550,6 +1550,7 @@ class SpectralControlsEditor(QFrame):
 
         self.setEnabled(False)
         self.clean_controls_btn.setText("Cleaning…")
+        self.controller.warning_collector = []
 
         self.cleaner_thread = QThread()
         self.spectral_cleaner = SpectralCleaner(self.bus, self.controller)
@@ -1595,17 +1596,29 @@ class SpectralControlsEditor(QFrame):
         if self.bus:
             self.bus.cleaningResultsReady.emit()
         logger.info('SpectralControlsEditor: Clean Controls run complete.')
-        self._warn_low_cosine_controls()
 
-    def _warn_low_cosine_controls(self):
-        """Show a single warning popup listing controls with cosine similarity
-        below COSINE_QC_WARNING_THRESHOLD.  Controls without a reference entry
-        are silently skipped."""
+        # One dialog for everything raised during the run
+        messages = list(self.spectral_cleaner.warnings)
+        messages += self.controller.warning_collector or []
+        self.controller.warning_collector = None
+        low_cosine_text = self._low_cosine_warning_text()
+        if low_cosine_text:
+            messages.append(low_cosine_text)
+        if messages and self.bus:
+            self.bus.warningMessage.emit('Clean Controls:\n\n' + '\n\n'.join(messages))
+
+    def _low_cosine_warning_text(self) -> str | None:
+        """Text listing spectral-model controls with cosine similarity below
+        COSINE_QC_WARNING_THRESHOLD, or None.  Controls without a reference
+        entry are silently skipped."""
         cleaned = self.controller.cleaned_events
         pnn     = self.controller.experiment.settings['raw']['event_channels_pnn']
+        model_labels = {control.get('label') for control in self.model._data}
 
         low: list[tuple[str, float]] = []
         for label, entry in cleaned.items():
+            if label not in model_labels:
+                continue
             if not entry.get('spectrum'):
                 continue
             cytometer_key = entry.get('cytometer_key')
@@ -1626,24 +1639,20 @@ class SpectralControlsEditor(QFrame):
                 low.append((label, cs))
 
         if not low:
-            return
+            return None
 
         lines = '\n'.join(
             f'  • {label}  (cosine = {cs:.4f})'
             for label, cs in low
         )
-        msg = QMessageBox(self)
-        msg.setWindowTitle('Cosine QC Warning')
-        msg.setIcon(QMessageBox.Icon.Warning)
-        msg.setText(
-            f'The following {len(low)} control(s) have a cosine similarity to the '
+        return (
+            f'Cosine QC: the following {len(low)} control(s) have a cosine similarity to the '
             f'reference library below {COSINE_QC_WARNING_THRESHOLD}:\n\n'
             f'{lines}\n\n'
             f'Check the Cosine QC plots for details. If the Major Channel is '
             f'incorrect, update it in the Spectral Model table and re-run '
             f'Clean Controls.'
         )
-        msg.exec()
 
 
     @Slot(list)
