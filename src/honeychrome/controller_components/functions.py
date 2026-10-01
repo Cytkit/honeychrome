@@ -188,6 +188,9 @@ def export_unmixed_sample(
     unmixing_method: str = 'OLS',
     unmixing_weights: 'np.ndarray | None' = None,
     extra_whitelist: 'frozenset | set' = frozenset(),
+    af_index_map: 'np.ndarray | None' = None,
+    n_af_index: 'int | None' = None,
+    extra_keywords: 'dict | None' = None,
 ) -> None:
     """
     Write an unmixed FCS file with full FCS 3.1 compliant metadata.
@@ -212,6 +215,13 @@ def export_unmixed_sample(
     unmixing_method   : written to UNMIXINGMETHOD keyword.
     extra_whitelist   : additional channel names to carry through from the raw file
                         verbatim. Pass imaging_carry_through_set for FACSDiscover.
+    af_index_map      : experiment-wide AF Index of each af_spectra row
+                        (af_index_lookup); labels the AUTOFLUORESCENCE rows.
+    n_af_index        : largest experiment-wide AF Index (the total number of
+                        AF spectra in the experiment); sets the AF Index range.
+    extra_keywords    : additional TEXT keywords (name -> value), written after
+                        the standard ones; a name matching a standard keyword
+                        replaces it.
     """
     # Optional subsampling
     if subsample is not None and subsample < export_event_data.shape[0]:
@@ -244,7 +254,11 @@ def export_unmixed_sample(
         unmixing_method=unmixing_method,
         unmixing_weights=unmixing_weights,
         extra_whitelist=extra_whitelist,
+        af_index_map=af_index_map,
+        n_af_index=n_af_index,
     )
+    if extra_keywords:
+        keywords.update({str(k): str(v) for k, v in extra_keywords.items()})
 
     write_fcs(export_event_data, keywords, file_path)
 
@@ -263,6 +277,8 @@ def define_fcs_keywords(
     unmixing_method: str = 'OLS',
     unmixing_weights: 'np.ndarray | None' = None,
     extra_whitelist: 'frozenset | set' = frozenset(),
+    af_index_map: 'np.ndarray | None' = None,
+    n_af_index: 'int | None' = None,
 ) -> dict:
     """
     Build a complete FCS 3.1 TEXT keyword dict for an unmixed export file.
@@ -286,6 +302,10 @@ def define_fcs_keywords(
     extra_whitelist   : additional channel names to carry through from the raw file
                         verbatim (same treatment as scatter/time). Used for FACSDiscover
                         imaging channels: pass imaging_carry_through_set from the caller.
+    af_index_map      : experiment-wide AF Index of each af_spectra row, or None
+                        to number the rows 1..n in stored order.
+    n_af_index        : largest AF Index value the AF Index channel can hold;
+                        defaults to the number of af_spectra rows.
     """
     import re
     from datetime import datetime, timezone
@@ -363,13 +383,16 @@ def define_fcs_keywords(
             })
 
         elif ch == 'AF Index':
-            n_profiles = af_spectra.shape[0] if af_spectra is not None else 1
+            if n_af_index:
+                n_index = int(n_af_index)
+            else:
+                n_index = af_spectra.shape[0] if af_spectra is not None else 1
             param_keywords.update({
                 f'{prefix}N': 'AF Index',
                 f'{prefix}S': 'Autofluorescence Index',
                 f'{prefix}B': BIT_DEPTH,
                 f'{prefix}E': '0,0',
-                f'{prefix}R': str(n_profiles),
+                f'{prefix}R': str(n_index + 1),  # indices run 1..n_index
                 f'{prefix}G': '1',
                 f'{prefix}DISPLAY': 'LIN',
             })
@@ -429,9 +452,16 @@ def define_fcs_keywords(
             spectra_kw['FLUOROCHROMES'] = ','.join(fluor_names_short)
 
     if af_spectra is not None and af_spectra.ndim == 2:
-        af_row_names = [f'AF{i + 1}' for i in range(af_spectra.shape[0])]
+        # Rows are named by the value the AF Index channel holds for them,
+        # and written in AF Index order.
+        if af_index_map is not None and len(af_index_map) == af_spectra.shape[0]:
+            af_row_index = np.asarray(af_index_map, dtype=np.int64)
+        else:
+            af_row_index = np.arange(1, af_spectra.shape[0] + 1)
+        row_order = np.argsort(af_row_index, kind='stable')
+        af_row_names = [f'AF{int(i)}' for i in af_row_index[row_order]]
         if af_spectra.shape[1] == len(det_names):
-            spectra_kw['AUTOFLUORESCENCE'] = _fmt_matrix(af_spectra, af_row_names, det_names)
+            spectra_kw['AUTOFLUORESCENCE'] = _fmt_matrix(af_spectra[row_order], af_row_names, det_names)
 
     if unmixing_weights is not None and unmixing_weights.ndim == 1:
         if len(unmixing_weights) == len(det_names):
@@ -666,6 +696,24 @@ def ensure_af_channels(unmixed_settings, transforms=None, n_af_spectra=None):
                     label, unmixed_settings.get('magnitude_ceiling'), n_af_spectra)
                 changed = True
     return changed
+
+
+def sync_af_index_transform(transforms, n_af_spectra=None):
+    """Size the stored AF Index axis to the experiment-wide AF Index range.
+
+    Sets the AF Index transform's scale_t to n_af_spectra (the total number
+    of AF spectra across the experiment's profiles), or to
+    default_af_index_range when there are none. Other settings of the
+    transform are kept. Returns True when anything changed.
+    """
+    if not transforms or af_index_channel not in transforms:
+        return False
+    n = max(int(n_af_spectra), 1) if n_af_spectra else default_af_index_range
+    entry = transforms[af_index_channel]
+    if entry.get('scale_t') == n:
+        return False
+    entry['scale_t'] = n
+    return True
 
 
 def assign_default_transforms(settings, channels=None, n_af_spectra=None):

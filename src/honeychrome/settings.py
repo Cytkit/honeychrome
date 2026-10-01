@@ -162,9 +162,10 @@ log_m = 6
 
 # Per-cell autofluorescence channels, appended to every unmixed channel list.
 # AF-corrected unmixing fills them; plain unmixing (no AF profile assigned)
-# leaves them at 0. AF Index is 1-based into the sample's combined AF spectra
-# library (0 = no AF correction); its default linear range is the number of
-# AF spectra in the experiment, or default_af_index_range when there are none.
+# leaves them at 0. AF Index numbers every AF spectrum in the experiment 1..N
+# (profiles in stored order, spectra within a profile by spectral angle to the
+# profile mean; 0 = no AF correction); its linear range is N, or
+# default_af_index_range when there are no AF profiles.
 af_abundance_channel = 'AF Abundance'
 af_index_channel = 'AF Index'
 af_channels = (af_abundance_channel, af_index_channel)

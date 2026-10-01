@@ -41,7 +41,7 @@ from multiprocessing import shared_memory
 import time
 
 from honeychrome.experiment_model import ExperimentModel, check_fcs_matches_experiment
-from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels
+from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels, sync_af_index_transform
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml
 from honeychrome.settings import traces_cache_size, traces_cache_dtype, adc_rate
 import honeychrome.settings as settings
@@ -54,7 +54,9 @@ from honeychrome.controller_components.autospectral_functions import (
         combine_af_precomputed,
         apply_af_unmixing,
         apply_af_transfer,
+        af_index_lookup,
      )
+from honeychrome.settings import af_index_channel
 
 base_directory = Path.home() / experiments_folder
 
@@ -107,6 +109,7 @@ class Controller(QObject):
         self.transfer_matrix = None
         self.af_precomputed = None
         self.af_spectra = None
+        self.af_index_map = None   # experiment-wide AF Index per row of af_spectra
         self.af_precomputed_cache: dict = {}
         self.raw_transformations = None
         self.unmixed_transformations = None
@@ -675,6 +678,7 @@ class Controller(QObject):
                 ensure_af_channels(self.experiment.settings['unmixed'],
                                    self.experiment.cytometry['transforms'],
                                    self.n_af_spectra())
+                sync_af_index_transform(self.experiment.cytometry['transforms'], self.n_af_spectra())
                 self.unmixed_gating = from_gml(self.experiment.cytometry['gating'])
                 self.unmixed_transformations = generate_transformations(self.experiment.cytometry['transforms'])
                 # Call the plain impl, not reapply_fine_tuning(): this method
@@ -802,6 +806,7 @@ class Controller(QObject):
         if af_spectra is None:
             self.af_precomputed = None
             self.af_spectra = None
+            self.af_index_map = None
             return
 
         # Combine per-profile cached precomputed dicts
@@ -824,6 +829,7 @@ class Controller(QObject):
             )
             self.af_precomputed = None
             self.af_spectra = None
+            self.af_index_map = None
             return
         
         if len(cached) == 1:
@@ -837,6 +843,7 @@ class Controller(QObject):
         self.af_precomputed = combined
         assert af_spectra is not None
         self.af_spectra = af_spectra
+        self.af_index_map = self.get_af_index_map_for_sample(self.current_sample_path)
         logger.info(
         f'Controller: AF matrices set for {self.current_sample_path} '
         f'({af_spectra.shape[0]} AF spectra, '
@@ -925,6 +932,43 @@ class Controller(QObject):
         n = sum(len(p.get('spectra') or []) for p in profiles.values())
         return n or None
 
+    def get_af_index_map_for_sample(self, sample_path) -> np.ndarray | None:
+        """Experiment-wide AF Index of each row of the sample's combined AF
+        library (see get_combined_af_spectra_for_sample), or None when the
+        sample has no stored profile assigned."""
+        if sample_path is None:
+            return None
+        profile_names = (
+            self.experiment.samples
+            .get('sample_af_profiles', {})
+            .get(sample_path, [])
+        )
+        return af_index_lookup(self.experiment.process.get('af_profiles', {}), profile_names)
+
+    def on_af_profiles_changed(self):
+        """Bring AF-dependent state up to date after AF profiles are added or removed.
+
+        The AF Index numbering spans every profile in the experiment, so the
+        AF Index axis is resized to the new total, the current sample's AF
+        matrices and unmixed data are rebuilt, and cached histograms are
+        cleared so the plots regenerate.
+        """
+        transforms = self.experiment.cytometry.get('transforms')
+        if sync_af_index_transform(transforms, self.n_af_spectra()) and self.unmixed_transformations:
+            tr = self.unmixed_transformations.get(af_index_channel)
+            if tr is not None:
+                tr.scale_t = transforms[af_index_channel]['scale_t']
+                tr.set_transform()
+                if self.unmixed_gating is not None:
+                    self.unmixed_gating.transformations[af_index_channel] = tr.xform
+                self.calculate_lookup_tables(mode='unmixed')
+
+        self.initialise_af_matrices()
+        if self.raw_event_data is not None and self.transfer_matrix is not None:
+            self.unmixed_event_data = self._apply_unmixing(self.raw_event_data)
+        self.clear_data_for_cytometry_plots()
+        self.initialise_data_for_cytometry_plots()
+
     def get_combined_af_spectra_for_sample(self, sample_path) -> np.ndarray | None:
         """
         Return the vertically concatenated AF spectra ndarray for sample_path,
@@ -1002,6 +1046,7 @@ class Controller(QObject):
                 self.experiment.settings,
                 filtered_fl_ids_raw=fl_ids_remapped,
                 spillover=self.experiment.process.get('spillover'),
+                af_index_map=self.af_index_map,
             )
             # result is now a dict; store the sidecar columns
             self.af_sidecar_data = np.column_stack(

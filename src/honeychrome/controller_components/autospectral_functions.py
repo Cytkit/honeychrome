@@ -30,6 +30,11 @@ apply_af_transfer(raw_event_data, transfer_matrix, af_precomputed, af_spectra, s
     Assembles a full unmixed event array, overwriting fluorescence columns
     with AF-corrected OLS values.
 
+rank_af_spectra(af_spectra) / af_index_lookup(af_profiles, profile_names)
+    Experiment-wide AF Index numbering: every spectrum of every stored
+    profile gets one index, ranked within its profile by spectral angle to
+    the profile's mean spectrum.
+
 save_af_profile_csv(af_spectra, channel_names, source_fcs_path, experiment_dir)
     Saves an AF profile as a CSV file in the experiment's AutoSpectral folder.
     Returns the profile name (str) used as the key in experiment.process['af_profiles'].
@@ -244,12 +249,76 @@ def combine_af_precomputed(precomputed_list: list) -> dict:
 # Helper: assemble full unmixed event array
 # ---------------------------------------------------------------------------
 
+def rank_af_spectra(af_spectra: np.ndarray) -> np.ndarray:
+    """
+    Order of one AF profile's spectra by spectral angle to the profile's mean
+    spectrum, closest first.
+
+    The spectral angle between two spectra is arccos of their cosine
+    similarity, so ranking by descending cosine similarity to the mean is
+    ranking by ascending angle. Ties keep their stored order.
+
+    Returns an int array of row indices into af_spectra.
+    """
+    spectra = np.asarray(af_spectra, dtype=np.float64)
+    if spectra.ndim != 2 or spectra.shape[0] == 0:
+        return np.zeros(0, dtype=np.int64)
+    norms = np.linalg.norm(spectra, axis=1)
+    norms = np.where(norms < 1e-12, 1.0, norms)
+    mean = spectra.mean(axis=0)
+    mean_norm = max(float(np.linalg.norm(mean)), 1e-12)
+    cosine = (spectra @ mean) / (norms * mean_norm)
+    return np.argsort(-cosine, kind='stable')
+
+
+def af_index_lookup(af_profiles: dict, profile_names) -> np.ndarray | None:
+    """
+    Experiment-wide AF Index for each row of a sample's combined AF library.
+
+    Every spectrum of every stored profile gets one index, 1..N, where N is
+    the total number of AF spectra in the experiment. Profiles are numbered
+    in their stored order (af_profiles is insertion ordered), and within a
+    profile the spectra are numbered by rank_af_spectra(), so index order
+    follows spectral angle from that profile's mean.
+
+    Parameters
+    ----------
+    af_profiles   : experiment.process['af_profiles']
+    profile_names : the sample's assigned profile names, in the order their
+                    spectra are stacked into its combined library. Names not
+                    in af_profiles are skipped, as they are when the library
+                    is built.
+
+    Returns
+    -------
+    int64 ndarray, one experiment-wide index per combined-library row (so
+    lookup[af_idx - 1] converts a per-sample af_idx), or None when none of
+    the names is stored.
+    """
+    af_profiles = af_profiles or {}
+    offsets = {}
+    offset = 0
+    for name, entry in af_profiles.items():
+        spectra = np.asarray(entry.get('spectra') or [], dtype=np.float64)
+        rank = np.empty(len(spectra), dtype=np.int64)
+        rank[rank_af_spectra(spectra)] = np.arange(len(spectra))
+        offsets[name] = offset + rank + 1
+        offset += len(spectra)
+    parts = [offsets[name] for name in (profile_names or []) if name in offsets]
+    if not parts:
+        return None
+    return np.concatenate(parts)
+
+
 def apply_af_transfer(raw_event_data, transfer_matrix, af_precomputed, af_spectra, settings,
-                      filtered_fl_ids_raw=None, spillover=None):
+                      filtered_fl_ids_raw=None, spillover=None, af_index_map=None):
     """
     Assemble a full unmixed event array with AF-corrected fluorescence columns.
     Scatter, time, and event_id columns come from the standard transfer_matrix path;
-    the AF Abundance and AF Index columns, when present, hold af_scale and af_idx.
+    the AF Abundance and AF Index columns, when present, hold af_scale and the
+    AF Index. With af_index_map (from af_index_lookup) the AF Index column holds
+    the experiment-wide index; otherwise it holds af_idx. The returned 'af_idx'
+    is always the per-sample index into af_spectra.
 
     The AF unmixing (apply_af_unmixing) produces abundances in plain OLS fluorophore
     space. If a spillover matrix is provided, compensation (inv(spillover).T) is applied
@@ -285,8 +354,11 @@ def apply_af_transfer(raw_event_data, transfer_matrix, af_precomputed, af_spectr
     # unmixed channel list has them (the transfer matrix leaves them at 0).
     from honeychrome.settings import af_abundance_channel, af_index_channel
     pnn_unmixed = unmixed_settings.get('event_channels_pnn') or []
+    af_index = result['af_idx']
+    if af_index_map is not None:
+        af_index = np.asarray(af_index_map)[result['af_idx'] - 1]
     for label, values in ((af_abundance_channel, result['af_scale']),
-                          (af_index_channel, result['af_idx'])):
+                          (af_index_channel, af_index)):
         if label in pnn_unmixed and pnn_unmixed.index(label) < unmixed.shape[1]:
             unmixed[:, pnn_unmixed.index(label)] = values
 
@@ -311,8 +383,10 @@ def _joint_l2_library_terms(precomputed: dict, af_spectra: np.ndarray):
         k_denom : (n_af,) r_dots floored at 1% of the largest. An AF variant
                   lying almost inside the fluorophore span has a vanishing
                   out-of-span residual, so its abundance is not identifiable
-                  and the raw ratio explodes; the floor caps that. Used only
-                  for the abundance estimate inside the score.
+                  and the raw ratio explodes; the floor caps that. Used for
+                  the abundance estimate both inside the score and in the
+                  reported abundance (apply_af_unmixing), as in the compiled
+                  joint kernel.
         c_fluor : (n_af,) sum_f w_f * v_library[f, j]^2, the curvature of the
                   weighted squared fluorophore error.
     """
@@ -429,7 +503,11 @@ def apply_af_unmixing(
     abundance is the projection of the cell onto the variant's out-of-span
     residual direction, and the fluorophore abundances are the AF-free OLS
     solution minus that abundance times the variant's in-span projection.
-    Identical to an OLS solve against [fluor_spectra; af_spectra[j]] per cell.
+    As in the compiled joint kernel, the AF abundance is clamped at 0 and its
+    denominator is floored (see _joint_l2_library_terms) so a variant lying
+    almost inside the fluorophore span cannot receive an exploding abundance.
+    Where neither applies this is identical to an OLS solve against
+    [fluor_spectra; af_spectra[j]].
 
     Parameters
     ----------
@@ -446,7 +524,6 @@ def apply_af_unmixing(
                     af_idx (n_cells,) 1-based
     """
     v_library = precomputed['v_library']   # (n_fluors, n_af)
-    r_dots    = precomputed['r_dots']      # (n_af,)
     w, k_denom, c_fluor = _joint_l2_library_terms(precomputed, af_spectra)
 
     n_cells  = raw_data.shape[0]
@@ -465,7 +542,7 @@ def apply_af_unmixing(
             chunk, precomputed, w, k_denom, c_fluor
         )
 
-        best_k = numerator[np.arange(end - start), best_j] / r_dots[best_j]
+        best_k = np.maximum(numerator[np.arange(end - start), best_j], 0.0) / k_denom[best_j]
         unmixed_out[start:end]  = unmixed - best_k[:, np.newaxis] * v_library_t[best_j]
         af_scale_out[start:end] = best_k
         af_idx_out[start:end]   = best_j + 1
