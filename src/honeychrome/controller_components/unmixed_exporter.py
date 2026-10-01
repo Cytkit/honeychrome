@@ -9,7 +9,7 @@ from flowkit import Sample
 from typing import cast
 
 from honeychrome.controller_components.functions import apply_transfer_matrix, export_unmixed_sample, sample_from_fcs
-from honeychrome.controller_components.autospectral_functions import precompute_af_matrices, combine_af_precomputed, apply_af_transfer
+from honeychrome.controller_components.autospectral_functions import precompute_af_matrices, combine_af_precomputed, apply_af_transfer, af_index_lookup
 import honeychrome.settings as settings
 from honeychrome.__init__ import __version__
 
@@ -171,6 +171,7 @@ class UnmixedExporter(QObject):
             # the whitelist is built from raw scatter+time, and imaging channels
             # are added by passing them explicitly via a new key.
             imaging_carry_through_set = set(imaging_pnn)  # consumed in define_fcs_keywords
+            n_af_index = self.controller.n_af_spectra()
 
 
             for n, sample_path in enumerate(samples_to_calculate):
@@ -225,6 +226,7 @@ class UnmixedExporter(QObject):
                     assigned_profile_names = sample_af_profiles.get(sample_path, [])
                     all_af_profiles = self.controller.experiment.process.get('af_profiles', {})
                     active_profiles = [all_af_profiles[name] for name in assigned_profile_names if name in all_af_profiles]
+                    af_index_map = af_index_lookup(all_af_profiles, assigned_profile_names) if active_profiles else None
 
                     if active_profiles:
                         # Build combined AF precomputed matrices for this sample's assigned profiles
@@ -260,6 +262,7 @@ class UnmixedExporter(QObject):
                             self.controller.experiment.settings,
                             filtered_fl_ids_raw=_fl_ids_remapped,
                             spillover=None,
+                            af_index_map=af_index_map,
                         )
                         # apply_af_transfer fills the AF Abundance and AF Index columns.
                         export_event_data = af_result['unmixed']
@@ -300,6 +303,8 @@ class UnmixedExporter(QObject):
                         unmixing_method=unmixing_method,
                         unmixing_weights=unmixing_weights,
                         extra_whitelist=imaging_carry_through_set,
+                        af_index_map=af_index_map,
+                        n_af_index=n_af_index,
                     )
 
             logger.info(f'UnmixedExporter: finished')
