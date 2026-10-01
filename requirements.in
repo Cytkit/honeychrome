@@ -18,6 +18,7 @@ openTSNE==1.0.4
 pacmap==0.8.0
 pandas==3.0.2
 pathvalidate==3.3.1
+pybind11==3.1.0
 pyqtgraph==0.14.0
 PyOpenGL==3.1.9
 pytz==2025.2

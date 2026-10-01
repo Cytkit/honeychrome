@@ -142,6 +142,8 @@ psutil==7.2.1
     # via flowkit
 pyarrow==22.0.0
     # via flowkit
+pybind11==3.1.0
+    # via -r /Users/oliverburton/honeychrome/requirements.in
 pycparser==3.0
     # via cffi
 pynndescent==0.6.0
