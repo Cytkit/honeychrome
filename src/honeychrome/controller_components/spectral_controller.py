@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import warnings
 
 import numpy as np
@@ -12,6 +13,9 @@ from honeychrome.controller_components.spectral_functions import get_profile, ge
 from honeychrome.controller_components.label_matching import match_fluorophore, match_marker, get_fluorophore_db, get_marker_db
 from honeychrome.controller_components.spectral_librarian import SpectralLibrary
 from honeychrome.controller_components.spectral_cleaning import find_empirical_peak, cosine_filter, knn_scatter_match, exclude_saturated, CleanResult
+from honeychrome.controller_components.spectral_refinement import (
+    RefineSettings, refine_row, subsample_negative, make_check_pool, crosstalk_check,
+)
 from honeychrome.controller_components.functions import sample_from_fcs
 from honeychrome.experiment_model import check_fcs_matches_experiment
 from honeychrome.view_components.busy_cursor import with_busy_cursor
@@ -917,9 +921,18 @@ class SpectralCleaner(QObject):
     Runs the AutoSpectral cleaning pipeline (saturation exclusion +
     brightest-event selection) for every eligible cell control.
 
+    With refinement enabled (settings.spectral_cleaning_refine), each cleaned
+    spectrum is then re-measured on the control's whole gated population
+    (spectral_refinement.refine_row), and once every control is done the full
+    panel is checked for residual spillover from each refined control, before
+    and after refinement (spectral_refinement.crosstalk_check). The check
+    reuses events kept from the cleaning pass, so files are only re-read for
+    controls whose cleaning was already current.
+
     Instantiate, optionally move to a QThread, then call run().
     The caller is responsible for emitting bus.spectralModelUpdated after run()
-    completes (e.g. via a QThread.finished signal).
+    completes (e.g. via a QThread.finished signal), and for showing
+    self.warnings, which run() never emits itself.
     """
     cleaningFinished = Signal()
 
@@ -937,14 +950,32 @@ class SpectralCleaner(QObject):
         self.fluor_ch_ids    = controller.filtered_raw_fluorescence_channel_ids
         self.ceiling         = controller.experiment.settings['raw']['magnitude_ceiling']
         self._cytometer_key: str | None = controller.experiment.settings['raw'].get('cytometer_db_col')
-        self._collected_warnings: list[str] = []   # gathered across run(), emitted as one dialog at the end
+        self._collected_warnings: list[str] = []   # gathered across run()
+        self.warnings: list[str] = []              # final list for the caller, read after cleaningFinished
+        self.refine = settings.spectral_cleaning_refine_retrieved
+        self.refine_settings = RefineSettings()
+        self._check_pools: dict = {}         # label -> CheckPool, for this run only
+        self._negative_refs: dict = {}       # unstained tube -> (float32 subsample, mean spectrum)
+        self._rng = np.random.default_rng(0)
+        self._refine_seconds = 0.0
 
     @with_busy_cursor
     def run(self):
         self._collected_warnings = []
+        self._check_pools = {}
+        self._negative_refs = {}
+        self._refine_seconds = 0.0
+        t_start = time.perf_counter()
+
+        model_controls = []
+        seen_labels = set()
+        for c in self.spectral_model:
+            if c.get('label') and c['label'] not in seen_labels:
+                seen_labels.add(c['label'])
+                model_controls.append(c)
 
         eligible_external = [
-            c for c in self.spectral_model
+            c for c in model_controls
             if c.get('control_type') == 'Single Stained Spectral Control'
             and c.get('particle_type') == 'Cells'
             and c.get('universal_negative_name')
@@ -952,7 +983,7 @@ class SpectralCleaner(QObject):
         ]
 
         eligible_internal = [
-            c for c in self.spectral_model
+            c for c in model_controls
             if c.get('control_type') == 'Single Stained Spectral Control'
             and (
                 c.get('particle_type') == 'Beads'
@@ -961,7 +992,7 @@ class SpectralCleaner(QObject):
         ]
 
         all_eligible = eligible_external + eligible_internal
-        total = len(all_eligible)
+        total = len(all_eligible) * (2 if self.refine else 1)
 
         for n, control in enumerate(eligible_external):
             if self.bus:
@@ -979,24 +1010,27 @@ class SpectralCleaner(QObject):
             else:
                 logger.info(f'SpectralCleaner: skipping "{control["label"]}" — result already current.')
 
+        t_cleaned = time.perf_counter()
+        if self.refine:
+            self._check_panel(progress_offset=len(all_eligible), progress_total=total)
+        t_checked = time.perf_counter()
+
         if self.bus:
             self.bus.progress.emit(total, total)
 
         logger.info(f'SpectralCleaner: cleaned {len(eligible_external)} cell controls '
                     f'and {len(eligible_internal)} internal/bead controls.')
+        logger.info(
+            f'SpectralCleaner: timing — cleaning {t_cleaned - t_start:.1f} s '
+            f'(of which row refinement {self._refine_seconds:.1f} s), '
+            f'residual spillover check {t_checked - t_cleaned:.1f} s.'
+        )
+        self._check_pools = {}
+        self._negative_refs = {}
 
-        # Emit all collected skip/failure messages as a single dialog, rather
-        # than one QMessageBox per control (which can crash Qt on macOS when
-        # fired repeatedly from a worker thread).
-        if self._collected_warnings and self.bus:
-            if len(self._collected_warnings) == 1:
-                combined = f'Control Cleaning: {self._collected_warnings[0]}'
-            else:
-                combined = (
-                    f'Control Cleaning: {len(self._collected_warnings)} control(s) had issues:\n\n'
-                    + '\n'.join(f'- {w}' for w in self._collected_warnings)
-                )
-            self.bus.warningMessage.emit(combined)
+        # Warnings are handed to the caller, which shows them in one dialog
+        # together with the profile QC warnings once recalculation is done.
+        self.warnings = list(self._collected_warnings)
         self._collected_warnings = []
 
         self.cleaningFinished.emit()
@@ -1010,6 +1044,7 @@ class SpectralCleaner(QObject):
             'universal_negative_name': control.get('universal_negative_name'),
             'particle_type': control.get('particle_type'),
             'fluor_ch_ids': list(self.fluor_ch_ids),
+            'refine': bool(self.refine),
         }
 
     def _is_cleaning_current(self, control: dict) -> bool:
@@ -1024,143 +1059,172 @@ class SpectralCleaner(QObject):
             return False
         return stored_fp == self._cleaning_fingerprint(control)
     
-    def _clean_one(self, control: dict):
+    def _load_events(self, control: dict) -> dict | None:
+        """Base-gated, saturation-excluded events of a control and its negative.
+
+        Returns None, with a collected warning, when the control cannot be
+        cleaned: no negative assigned or found, or too few events. Raises on
+        a missing sample file.
+        """
         label = control['label']
-        try:
-            # --- load base-gate fluorescence + scatter events ---
-            # Use the base gate (same pool as the autogenerator), not the narrow per-control positive gate.
-            # The cleaner selects its own positives via  cosine filter.
-            all_samples_rev = {v: k for k, v in self.samples['all_samples'].items()}
-            rel_path = all_samples_rev.get(control['sample_name'])
-            if rel_path is None:
-                raise ValueError(f'Sample "{control["sample_name"]}" not found.')
-            full_path = str(self.experiment_dir / rel_path)
-            sample = sample_from_fcs(full_path)
+        # --- load base-gate fluorescence + scatter events ---
+        # Use the base gate (same pool as the autogenerator), not the narrow per-control positive gate.
+        # The cleaner selects its own positives via  cosine filter.
+        all_samples_rev = {v: k for k, v in self.samples['all_samples'].items()}
+        rel_path = all_samples_rev.get(control['sample_name'])
+        if rel_path is None:
+            raise ValueError(f'Sample "{control["sample_name"]}" not found.')
+        full_path = str(self.experiment_dir / rel_path)
+        sample = sample_from_fcs(full_path)
 
-            base_gate_label = 'root'
-            raw_gate_names = [g[0].lower() for g in self.raw_gating.get_gate_ids()]
-            for gate in self.controller.experiment.process.get('base_gate_priority_order', []):
-                if gate.lower() in raw_gate_names:
-                    base_gate_label = gate
-                    break
+        base_gate_label = 'root'
+        raw_gate_names = [g[0].lower() for g in self.raw_gating.get_gate_ids()]
+        for gate in self.controller.experiment.process.get('base_gate_priority_order', []):
+            if gate.lower() in raw_gate_names:
+                base_gate_label = gate
+                break
 
-            scatter_ch_ids = self.controller.experiment.settings['raw']['scatter_channel_ids']
-            scatter_ch_pnn = self.controller.experiment.settings['raw']['event_channels_pnn']
+        scatter_ch_ids = self.controller.experiment.settings['raw']['scatter_channel_ids']
+        scatter_ch_pnn = self.controller.experiment.settings['raw']['event_channels_pnn']
 
-            pos_events, pos_scatter_all = get_raw_events(
-                sample, self.fluor_ch_ids,
+        pos_events, pos_scatter_all = get_raw_events(
+            sample, self.fluor_ch_ids,
+            gate_label=base_gate_label,
+            gating_strategy=self.raw_gating,
+            extra_channel_ids=scatter_ch_ids,
+        )
+
+        # Reduce scatter to the canonical morphology pair (scatter_param[0], scatter_param[1]).
+        scatter_param = self.controller.experiment.settings['raw'].get('scatter_param', ['FSC-A', 'SSC-A'])
+        morph_x_name, morph_y_name = scatter_param[0], scatter_param[1]
+
+        def _fsc_ssc_cols(all_scatter: np.ndarray) -> np.ndarray:
+            col_x = next((col for col, ch_id in enumerate(scatter_ch_ids)
+                        if scatter_ch_pnn[ch_id] == morph_x_name), None)
+            col_y = next((col for col, ch_id in enumerate(scatter_ch_ids)
+                        if scatter_ch_pnn[ch_id] == morph_y_name), None)
+            if col_x is None:
+                col_x = next((col for col, ch_id in enumerate(scatter_ch_ids)
+                            if 'FSC' in scatter_ch_pnn[ch_id]), 0)
+            if col_y is None:
+                col_y = next((col for col, ch_id in enumerate(scatter_ch_ids)
+                            if 'SSC' in scatter_ch_pnn[ch_id]), 1)
+            return all_scatter[:, [col_x, col_y]]
+            
+        pos_scatter = _fsc_ssc_cols(pos_scatter_all) if pos_scatter_all.shape[1] > 2 else pos_scatter_all
+
+        # --- load negative events ---
+        neg_name = control.get('universal_negative_name')
+        has_external_neg = (
+            neg_name
+            and neg_name != INTERNAL_NEGATIVE_SENTINEL
+            and self.controller.experiment.process.get('negative_type') != 'internal'
+        )
+        use_internal = not has_external_neg
+
+        logger.info(
+            f'SpectralCleaner: loading "{label}" particle_type={control.get("particle_type")!r} '
+            f'universal_negative_name={control.get("universal_negative_name")!r} '
+            f'use_internal={use_internal}'
+        )
+
+        if use_internal:
+            # Load the negative gate from the same positive sample file.
+            neg_gate_lbl = f'Neg {label}'
+            try:
+                if (self.raw_gating and
+                        self.raw_gating.find_matching_gate_paths(neg_gate_lbl)):
+                    neg_events_internal, _ = get_raw_events(
+                        sample, self.fluor_ch_ids,
+                        gate_label=neg_gate_lbl,
+                        gating_strategy=self.raw_gating,
+                    )
+                else:
+                    neg_events_internal = np.empty((0, pos_events.shape[1]))
+            except Exception:
+                neg_events_internal = np.empty((0, pos_events.shape[1]))
+            neg_events = neg_events_internal
+            neg_scatter = np.empty((0, 2))     # no scatter matching for internal
+        else:
+            neg_events_internal = None
+            tube_name = control.get('universal_negative_name') or ''
+            if not tube_name:
+                msg = f'"{label}": no negative assigned — skipping cleaning.'
+                logger.warning(f'SpectralCleaner: {msg}')
+                self._collected_warnings.append(msg)
+                return None
+            all_samples_rev2 = {v: k for k, v in self.samples['all_samples'].items()}
+            neg_rel_path = all_samples_rev2.get(tube_name)
+            if not neg_rel_path:
+                msg = f'"{label}": negative tube "{tube_name}" not found — skipping cleaning.'
+                logger.warning(f'SpectralCleaner: {msg}')
+                self._collected_warnings.append(msg)
+                return None
+            neg_full_path = str(self.experiment_dir / neg_rel_path)
+            neg_sample = sample_from_fcs(neg_full_path)
+            neg_events, neg_scatter_all = get_raw_events(
+                neg_sample, self.fluor_ch_ids,
                 gate_label=base_gate_label,
                 gating_strategy=self.raw_gating,
                 extra_channel_ids=scatter_ch_ids,
             )
-
-            # Reduce scatter to the canonical morphology pair (scatter_param[0], scatter_param[1]).
-            scatter_param = self.controller.experiment.settings['raw'].get('scatter_param', ['FSC-A', 'SSC-A'])
-            morph_x_name, morph_y_name = scatter_param[0], scatter_param[1]
-
-            def _fsc_ssc_cols(all_scatter: np.ndarray) -> np.ndarray:
-                col_x = next((col for col, ch_id in enumerate(scatter_ch_ids)
-                            if scatter_ch_pnn[ch_id] == morph_x_name), None)
-                col_y = next((col for col, ch_id in enumerate(scatter_ch_ids)
-                            if scatter_ch_pnn[ch_id] == morph_y_name), None)
-                if col_x is None:
-                    col_x = next((col for col, ch_id in enumerate(scatter_ch_ids)
-                                if 'FSC' in scatter_ch_pnn[ch_id]), 0)
-                if col_y is None:
-                    col_y = next((col for col, ch_id in enumerate(scatter_ch_ids)
-                                if 'SSC' in scatter_ch_pnn[ch_id]), 1)
-                return all_scatter[:, [col_x, col_y]]
-            
-            pos_scatter = _fsc_ssc_cols(pos_scatter_all) if pos_scatter_all.shape[1] > 2 else pos_scatter_all
-
-            # --- load negative events ---
-            neg_name = control.get('universal_negative_name')
-            has_external_neg = (
-                neg_name
-                and neg_name != INTERNAL_NEGATIVE_SENTINEL
-                and self.controller.experiment.process.get('negative_type') != 'internal'
-            )
-            use_internal = not has_external_neg
-
-            logger.info(
-                f'_clean_one: "{label}" particle_type={control.get("particle_type")!r} '
-                f'universal_negative_name={control.get("universal_negative_name")!r} '
-                f'use_internal={use_internal}'
-            )
-
-            if use_internal:
-                # Load the negative gate from the same positive sample file.
-                neg_gate_lbl = f'Neg {label}'
-                try:
-                    if (self.raw_gating and
-                            self.raw_gating.find_matching_gate_paths(neg_gate_lbl)):
-                        neg_events_internal, _ = get_raw_events(
-                            sample, self.fluor_ch_ids,
-                            gate_label=neg_gate_lbl,
-                            gating_strategy=self.raw_gating,
-                        )
-                    else:
-                        neg_events_internal = np.empty((0, pos_events.shape[1]))
-                except Exception:
-                    neg_events_internal = np.empty((0, pos_events.shape[1]))
-                neg_events = neg_events_internal
-                neg_scatter = np.empty((0, 2))     # no scatter matching for internal
-            else:
-                neg_events_internal = None
-                tube_name = control.get('universal_negative_name') or ''
-                if not tube_name:
-                    msg = f'"{label}": no negative assigned — skipping cleaning.'
-                    logger.warning(f'SpectralCleaner: {msg}')
-                    self._collected_warnings.append(msg)
-                    return
-                all_samples_rev2 = {v: k for k, v in self.samples['all_samples'].items()}
-                neg_rel_path = all_samples_rev2.get(tube_name)
-                if not neg_rel_path:
-                    msg = f'"{label}": negative tube "{tube_name}" not found — skipping cleaning.'
-                    logger.warning(f'SpectralCleaner: {msg}')
-                    self._collected_warnings.append(msg)
-                    return
-                neg_full_path = str(self.experiment_dir / neg_rel_path)
-                neg_sample = sample_from_fcs(neg_full_path)
-                neg_events, neg_scatter_all = get_raw_events(
-                    neg_sample, self.fluor_ch_ids,
-                    gate_label=base_gate_label,
-                    gating_strategy=self.raw_gating,
-                    extra_channel_ids=scatter_ch_ids,
-                )
-                if len(neg_events) < MIN_EVENTS_FOR_CLEANING:
-                    msg = (f'"{label}": only {len(neg_events)} negative event(s) — '
-                           f'skipping cleaning, need at least {MIN_EVENTS_FOR_CLEANING}.')
-                    logger.warning(f'SpectralCleaner: {msg}')
-                    self._collected_warnings.append(msg)
-                    return
-                neg_scatter = _fsc_ssc_cols(neg_scatter_all) if neg_scatter_all.shape[1] > 2 else neg_scatter_all
-
-            # Expected peak from spectral model table (fallback / QC only)
-            peak_ch_name = control.get('gate_channel', '')
-            try:
-                expected_peak_ch_idx = self.fluor_ch_ids.index(
-                    self.event_channels_pnn.index(peak_ch_name)
-                )
-            except (ValueError, IndexError):
-                expected_peak_ch_idx = int(np.argmax(pos_events.mean(axis=0)))
-
-            # --- Saturation exclusion ---
-            pos_events, n_sat_pos, sat_mask_pos = exclude_saturated(pos_events, self.ceiling)
-            pos_scatter = pos_scatter[~sat_mask_pos]
-            if not use_internal:
-                neg_events, n_sat_neg, sat_mask_neg = exclude_saturated(neg_events, self.ceiling)
-                neg_scatter = neg_scatter[~sat_mask_neg]
-            else:
-                n_sat_neg = 0
-
-            if len(pos_events) < MIN_EVENTS_FOR_CLEANING:
-                msg = (f'"{label}": only {len(pos_events)} positive event(s) after saturation '
-                       f'exclusion — skipping cleaning (need at least {MIN_EVENTS_FOR_CLEANING}). '
-                       f'Existing profile, if any, is unaffected.')
+            if len(neg_events) < MIN_EVENTS_FOR_CLEANING:
+                msg = (f'"{label}": only {len(neg_events)} negative event(s) — '
+                       f'skipping cleaning, need at least {MIN_EVENTS_FOR_CLEANING}.')
                 logger.warning(f'SpectralCleaner: {msg}')
                 self._collected_warnings.append(msg)
+                return None
+            neg_scatter = _fsc_ssc_cols(neg_scatter_all) if neg_scatter_all.shape[1] > 2 else neg_scatter_all
+
+        # Expected peak from spectral model table (fallback / QC only)
+        peak_ch_name = control.get('gate_channel', '')
+        try:
+            expected_peak_ch_idx = self.fluor_ch_ids.index(
+                self.event_channels_pnn.index(peak_ch_name)
+            )
+        except (ValueError, IndexError):
+            expected_peak_ch_idx = int(np.argmax(pos_events.mean(axis=0)))
+
+        # --- Saturation exclusion ---
+        pos_events, n_sat_pos, sat_mask_pos = exclude_saturated(pos_events, self.ceiling)
+        pos_scatter = pos_scatter[~sat_mask_pos]
+        if not use_internal:
+            neg_events, n_sat_neg, sat_mask_neg = exclude_saturated(neg_events, self.ceiling)
+            neg_scatter = neg_scatter[~sat_mask_neg]
+        else:
+            n_sat_neg = 0
+
+        if len(pos_events) < MIN_EVENTS_FOR_CLEANING:
+            msg = (f'"{label}": only {len(pos_events)} positive event(s) after saturation '
+                   f'exclusion — skipping cleaning (need at least {MIN_EVENTS_FOR_CLEANING}). '
+                   f'Existing profile, if any, is unaffected.')
+            logger.warning(f'SpectralCleaner: {msg}')
+            self._collected_warnings.append(msg)
+            return None
+
+        return {
+            'pos_events': pos_events,
+            'pos_scatter': pos_scatter,
+            'neg_events': neg_events,
+            'neg_scatter': neg_scatter,
+            'use_internal': use_internal,
+            'negative_name': None if use_internal else tube_name,
+            'n_removed_saturation': n_sat_pos + n_sat_neg,
+            'expected_peak_ch_idx': expected_peak_ch_idx,
+        }
+
+    def _clean_one(self, control: dict):
+        label = control['label']
+        try:
+            loaded = self._load_events(control)
+            if loaded is None:
                 return  # leave cleaned_events untouched; profiles[label] is the fallback
+            pos_events           = loaded['pos_events']
+            pos_scatter          = loaded['pos_scatter']
+            neg_events           = loaded['neg_events']
+            neg_scatter          = loaded['neg_scatter']
+            use_internal         = loaded['use_internal']
+            expected_peak_ch_idx = loaded['expected_peak_ch_idx']
 
             if use_internal:
                 # --- Internal-negative path: top-100 minus bottom-10% mean ---
@@ -1215,11 +1279,36 @@ class SpectralCleaner(QObject):
                 logger.warning(f'SpectralCleaner: {msg}')
                 self._collected_warnings.append(msg)
 
+            spectrum_initial = spectrum
+            refine_log = []
+            if self.refine and spectrum.max() > 0:
+                t0 = time.perf_counter()
+                try:
+                    refined = refine_row(pos_events, spectrum, settings=self.refine_settings)
+                    refined_spectrum = refined.row
+                    refine_log = refined.log
+                    pool = self._make_check_pool(loaded, refined_spectrum, control)
+                except Exception as e:
+                    logger.warning(f'SpectralCleaner: "{label}" refinement failed ({e}) — kept cleaned spectrum.')
+                    refined = None
+                else:
+                    spectrum = refined_spectrum
+                    self._check_pools[label] = pool
+                self._refine_seconds += time.perf_counter() - t0
+                if refined is not None:
+                    last = refine_log[-1] if refine_log else {}
+                    logger.info(
+                        f'SpectralCleaner: "{label}" refined on {len(pos_events)} events — '
+                        f'{"accepted" if refined.accepted else "kept cleaned spectrum"}'
+                        f'{"" if last.get("reject") is None else " (rejected: " + last["reject"] + ")"}, '
+                        f'{len(refine_log)} pass(es).'
+                    )
+
             result = CleanResult(
                 spectral_sub          = spectral_sub,
                 scatter_pos           = pos_scatter_sel,
                 scatter_neg_matched   = matched_neg_scatter,
-                n_removed_saturation  = n_sat_pos + n_sat_neg,
+                n_removed_saturation  = loaded['n_removed_saturation'],
                 n_surviving_positive  = n_surviving,
                 empirical_peak_ch_idx = peak_ch_idx,
                 expected_peak_ch_idx  = expected_peak_ch_idx,
@@ -1230,6 +1319,8 @@ class SpectralCleaner(QObject):
             # --- store result ---
             self.cleaned_events[label] = {
                 'spectrum':              spectrum.tolist(),
+                'spectrum_initial':      spectrum_initial.tolist(),
+                'refine_log':            refine_log,
                 'n_removed_saturation':  result.n_removed_saturation,
                 'n_surviving_positive':  result.n_surviving_positive,
                 'empirical_peak_ch_idx': result.empirical_peak_ch_idx,
@@ -1255,3 +1346,93 @@ class SpectralCleaner(QObject):
             msg = f'"{label}": failed to clean: {e}'
             logger.error(f'SpectralCleaner: {msg}')
             self._collected_warnings.append(msg)
+
+    def _make_check_pool(self, loaded: dict, row: np.ndarray, control: dict):
+        """Events kept from a loaded control for the full-panel check. Cell
+        controls with an unstained tube carry its subsample and mean
+        spectrum, shared between controls using the same tube."""
+        negative = af_basis = None
+        tube = loaded.get('negative_name')
+        if tube and control.get('particle_type') == 'Cells' and len(loaded['neg_events']):
+            if tube not in self._negative_refs:
+                self._negative_refs[tube] = (
+                    subsample_negative(loaded['neg_events'], self.refine_settings, self._rng),
+                    loaded['neg_events'].mean(axis=0),
+                )
+            negative, af_basis = self._negative_refs[tube]
+        return make_check_pool(loaded['pos_events'], row, negative, af_basis,
+                               self.refine_settings, self._rng)
+
+    def _check_panel(self, progress_offset: int = 0, progress_total: int = 0):
+        """Residual spillover from every refined control into the rest of the
+        panel, before and after refinement, stored as
+        cleaned_events[label]['crosstalk']. Needs a profile for every control
+        in the spectral model; cleaned rows use their cleaned spectrum unless
+        the control opts out of it, exactly as the profile recalculation will."""
+        profiles = self.controller.experiment.process.get('profiles', {})
+        n_det = len(self.fluor_ch_ids)
+        labels, before, after, checked = [], [], [], []
+        for control in self.spectral_model:
+            label = control.get('label') or ''
+            cleaned = self.cleaned_events.get(label)
+            if cleaned and cleaned.get('spectrum') and control.get('use_cleaned') is not False:
+                row_after = cleaned['spectrum']
+                row_before = cleaned.get('spectrum_initial') or row_after
+                checked.append(control)
+            else:
+                row_after = row_before = profiles.get(label)
+            if row_after is None or len(row_after) != n_det or len(row_before) != n_det:
+                logger.info(f'SpectralCleaner: no profile for "{label}" yet — '
+                            f'residual spillover check skipped.')
+                return
+            labels.append(label)
+            before.append(row_before)
+            after.append(row_after)
+
+        spectra_before = np.asarray(before, dtype=float)
+        spectra_after = np.asarray(after, dtype=float)
+        spectra_before /= np.maximum(spectra_before.max(axis=1, keepdims=True), np.finfo(float).eps)
+        spectra_after /= np.maximum(spectra_after.max(axis=1, keepdims=True), np.finfo(float).eps)
+        changed = not np.allclose(spectra_before, spectra_after)
+        if np.linalg.matrix_rank(spectra_after) < len(labels):
+            logger.warning('SpectralCleaner: spectral profiles are rank-deficient — '
+                           'residual spillover check skipped.')
+            return
+
+        for n, control in enumerate(checked):
+            if self.bus:
+                self.bus.progress.emit(progress_offset + n, progress_total)
+            label = control['label']
+            try:
+                pool = self._check_pools.get(label)
+                if pool is None:
+                    loaded = self._load_events(control)
+                    if loaded is None:
+                        continue
+                    pool = self._make_check_pool(
+                        loaded, np.asarray(self.cleaned_events[label]['spectrum'], dtype=float), control)
+                rows_after = crosstalk_check(pool, spectra_after, labels, label,
+                                             self.refine_settings, self._rng)
+                rows_before = (crosstalk_check(pool, spectra_before, labels, label,
+                                               self.refine_settings, self._rng)
+                               if changed else rows_after)
+            except Exception as e:
+                logger.warning(f'SpectralCleaner: residual spillover check failed for "{label}": {e}')
+                continue
+
+            slope_before = {r['target']: r['slope'] for r in rows_before}
+            self.cleaned_events[label]['crosstalk'] = [{
+                'target': r['target'],
+                'slope_before': slope_before.get(r['target']),
+                'slope_after': r['slope'],
+                'converged': r['converged'],
+                'flagged': r['flagged'],
+            } for r in rows_after]
+
+            flagged = sorted((r for r in rows_after if r['flagged']), key=lambda r: -abs(r['slope']))
+            if flagged:
+                listing = ', '.join(f'{r["target"]} ({r["slope"]:+.3f})' for r in flagged[:4])
+                more = f' and {len(flagged) - 4} more' if len(flagged) > 4 else ''
+                msg = (f'"{label}": residual spillover after refinement into {listing}{more} '
+                       f'(robust slope above {self.refine_settings.max_crosstalk}).')
+                logger.info(f'SpectralCleaner: {msg}')

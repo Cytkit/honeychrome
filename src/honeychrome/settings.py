@@ -107,6 +107,7 @@ spectral_negative_gate_percent = 25 # take the bottom few percent of events
 
 spectral_cleaning_n_candidates = 1000 # cosine filter: top-N events by peak channel, ranked before AF-similarity filtering
 spectral_cleaning_n_spectral = 200 # cosine filter: number of least-AF-similar events kept for the cleaned profile
+spectral_cleaning_refine = True # re-measure cleaned spectra on all gated events and check the panel for residual spillover
 
 spectral_model_column_labels = {
     "label": "Label",
@@ -268,6 +269,7 @@ spectral_negative_gate_percent_retrieved = q_settings.value("spectral_negative_g
 
 spectral_cleaning_n_candidates_retrieved = q_settings.value("spectral_cleaning_n_candidates", spectral_cleaning_n_candidates, type=int)
 spectral_cleaning_n_spectral_retrieved = q_settings.value("spectral_cleaning_n_spectral", spectral_cleaning_n_spectral, type=int)
+spectral_cleaning_refine_retrieved = q_settings.value("spectral_cleaning_refine", spectral_cleaning_refine, type=bool)
 
 report_include_raw_retrieved = q_settings.value("report_include_raw", report_include_raw, type=bool)
 report_include_unmixed_retrieved = q_settings.value("report_include_unmixed", report_include_unmixed, type=bool)

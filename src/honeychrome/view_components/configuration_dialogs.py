@@ -12,7 +12,8 @@ from honeychrome.settings import (colourmap_choice, graphics_export_formats, his
                       tile_size_nxn_grid, subsample, max_display_events, hist_bins, density_cutoff, trigger_channel, adc_channels, width_channels, height_channels,
                       use_dummy_instrument, magnitude_ceilings, magnitude_ceiling, raw_settings, unmixed_settings, experiments_folder,
                       magnitude_ceilings_int, spectral_positive_gate_percent, spectral_negative_gate_percent, report_include_raw, report_include_unmixed, report_include_process, send_debug_data,
-                      heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral)
+                      heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral,
+                      spectral_cleaning_refine)
 import honeychrome.settings as settings
 
 
@@ -224,6 +225,12 @@ class AppConfigDialog(QDialog):
         form.addRow("Control cleaning: events retained (least AF-similar):", self.spectral_cleaning_n_spectral_spin)
         self.spectral_cleaning_n_spectral_spin.setToolTip('Number of candidate events retained for the cleaned spectral profile, ranked by lowest cosine similarity to the unstained AF reference.')
 
+        self.spectral_cleaning_refine_cb = QCheckBox()
+        form.addRow("Control cleaning: refine spectra on all gated events:", self.spectral_cleaning_refine_cb)
+        self.spectral_cleaning_refine_cb.setToolTip(
+            'After cleaning, re-measure each spectrum on the whole gated population of its control and '
+            'check the full panel for residual spillover (robust fit).')
+
         self.report_include_raw_cb = QCheckBox("Raw Data")
         self.report_include_unmixed_cb = QCheckBox("Unmixed Data")
         self.report_include_process_cb = QCheckBox("Spectral Process")
@@ -328,6 +335,7 @@ class AppConfigDialog(QDialog):
         self.spectral_negative_gate_percent_spin.setValue(self.settings.value("spectral_negative_gate_percent", spectral_negative_gate_percent, type=int))
         self.spectral_cleaning_n_candidates_spin.setValue(self.settings.value("spectral_cleaning_n_candidates", spectral_cleaning_n_candidates, type=int))
         self.spectral_cleaning_n_spectral_spin.setValue(self.settings.value("spectral_cleaning_n_spectral", spectral_cleaning_n_spectral, type=int))
+        self.spectral_cleaning_refine_cb.setChecked(self.settings.value("spectral_cleaning_refine", spectral_cleaning_refine, type=bool))
 
         self.report_include_raw_cb.setChecked(self.settings.value("report_include_raw", report_include_raw, type=bool))
         self.report_include_unmixed_cb.setChecked(self.settings.value("report_include_unmixed", report_include_unmixed, type=bool))
@@ -357,6 +365,7 @@ class AppConfigDialog(QDialog):
         self.settings.setValue("spectral_negative_gate_percent", self.spectral_negative_gate_percent_spin.value())
         self.settings.setValue("spectral_cleaning_n_candidates", self.spectral_cleaning_n_candidates_spin.value())
         self.settings.setValue("spectral_cleaning_n_spectral", self.spectral_cleaning_n_spectral_spin.value())
+        self.settings.setValue("spectral_cleaning_refine", self.spectral_cleaning_refine_cb.isChecked())
         self.settings.setValue("report_include_raw", self.report_include_raw_cb.isChecked())
         self.settings.setValue("report_include_unmixed", self.report_include_unmixed_cb.isChecked())
         self.settings.setValue("report_include_process", self.report_include_process_cb.isChecked())
@@ -398,6 +407,7 @@ class AppConfigDialog(QDialog):
         self.spectral_negative_gate_percent_spin.setValue(spectral_negative_gate_percent)
         self.spectral_cleaning_n_candidates_spin.setValue(spectral_cleaning_n_candidates)
         self.spectral_cleaning_n_spectral_spin.setValue(spectral_cleaning_n_spectral)
+        self.spectral_cleaning_refine_cb.setChecked(spectral_cleaning_refine)
         self.report_include_raw_cb.setChecked(report_include_raw)
         self.report_include_unmixed_cb.setChecked(report_include_unmixed)
         self.report_include_process_cb.setChecked(report_include_process)

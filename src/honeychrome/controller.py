@@ -313,6 +313,7 @@ class Controller(QObject):
             'spectrum', 'n_removed_saturation', 'n_surviving_positive',
             'empirical_peak_ch_idx', 'expected_peak_ch_idx',
             'fluor_ch_ids', 'cytometer_key', 'warnings', '_fingerprint',
+            'spectrum_initial', 'refine_log', 'crosstalk',
         }
         _ARRAY_KEYS = {
             'spectral_sub', 'scatter_pos', 'scatter_neg_matched',
@@ -617,6 +618,7 @@ class Controller(QObject):
         self.raw_gating = GatingStrategy()
         self.unmixed_gating = GatingStrategy()
         self.cleaned_events: dict = {}
+        self.warning_collector: list[str] | None = None   # when a list, deferred warnings are appended instead of shown
         self.autospectral_variants: dict = {}
         self.autospectral_raw_pos_thresholds = None
         self.autospectral_unmixed_pos_thresholds = None
@@ -1876,9 +1878,11 @@ class Controller(QObject):
             # via a queued connection from a worker-thread emit (SpectralAutoGenerator,
             # SpectralCleaner) and must never pop a QMessageBox from that thread.
             if conditioning_warnings:
-                self.bus.warningMessage.emit(
-                    'Spectral Profile QC:\n\n' + '\n\n'.join(conditioning_warnings)
-                )
+                qc_text = 'Spectral Profile QC:\n\n' + '\n\n'.join(conditioning_warnings)
+                if self.warning_collector is not None:
+                    self.warning_collector.append(qc_text)
+                else:
+                    self.bus.warningMessage.emit(qc_text)
 
         logger.info(f'Controller: refreshed spectral process, unmixed settings, unmixed cytometry')
 
