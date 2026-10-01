@@ -26,7 +26,9 @@ Sample keys are the keys of ``experiment.samples['all_samples']``: paths
 relative to the experiment directory, e.g. ``'Raw/Spleen/S1.fcs'``.
 
 AF index convention: ``af_idx`` is 1-based into the sample's combined AF
-library; 0 means the event was unmixed without AF correction.
+library; 0 means the event was unmixed without AF correction. The AF Index
+channel of the unmixed array holds the experiment-wide index instead (see
+``autospectral_functions.af_index_lookup``).
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from pathlib import Path
 import numpy as np
 
 from honeychrome.controller_components.autospectral_functions import (
+    af_index_lookup,
     apply_af_transfer,
     combine_af_precomputed,
     precompute_joint_cov_extras,
@@ -61,10 +64,14 @@ __all__ = [
 
 @dataclass(frozen=True)
 class AFState:
-    """Combined AF library for one profile assignment."""
+    """Combined AF library for one profile assignment.
+
+    ``index_map`` holds the experiment-wide AF Index of each library row.
+    """
     profile_names: tuple
     precomputed: dict
     spectra: np.ndarray
+    index_map: np.ndarray | None = None
 
     @property
     def n_spectra(self) -> int:
@@ -191,7 +198,8 @@ def resolve_af_for_profiles(controller, profile_names) -> AFState | None:
     else:
         combined = combine_af_precomputed(cached)
         combined.update(precompute_joint_cov_extras(combined, spectra))
-    return AFState(profile_names=tuple(usable), precomputed=combined, spectra=spectra)
+    return AFState(profile_names=tuple(usable), precomputed=combined, spectra=spectra,
+                   index_map=af_index_lookup(af_profiles, usable))
 
 
 def _time_qc_masks(controller, sample_keys) -> dict:
@@ -313,6 +321,7 @@ def unmix_events(raw_event_data: np.ndarray, snap: UnmixSnapshot,
             snap.settings,
             filtered_fl_ids_raw=list(snap.fl_ids_raw),
             spillover=snap.spillover,
+            af_index_map=af.index_map,
         )
         out = {'unmixed': result['unmixed'], 'af_scale': None, 'af_idx': None}
         if return_af:
