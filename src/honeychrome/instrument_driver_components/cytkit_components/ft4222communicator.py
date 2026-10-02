@@ -13,6 +13,8 @@ class Ft4222Communicator:
     def __init__(self):
         self.devA = None
         self.devB = None
+        self.buffer = 0
+        self.bytes_read = 0
 
     def connected(self):
         return self.devA and self.devB
@@ -77,13 +79,17 @@ class Ft4222Communicator:
             return
         self.register_read_modify_write(address, 1 << bit_pos, 1 << bit_pos)
 
-    def register_big_clear(self, address, bit_pos):
+    def register_bit_clear(self, address, bit_pos):
         # Set the specified bit in a register
         if bit_pos >> 8:
             return
         self.register_read_modify_write(address, 0x0000, 1 << bit_pos)
 
-    def memory_read(self, total_bytes, chunk_size=65535):
+    def register_bit_get(self, address, bit_pos):
+        return self.register_read(address) & (1 << bit_pos)
+
+
+    def sample_read_buffer(self, total_bytes, chunk_size=65535):
         # read out block of memory in chunks
         data = bytearray(total_bytes)
         bytes_read = 0
@@ -92,43 +98,67 @@ class Ft4222Communicator:
             remaining = total_bytes - bytes_read
             current_chunk = min(chunk_size, remaining)
 
-            # Write address and read the chunk
-            chunk = self.devB.spiMaster_MultiReadWrite(b'', b'', current_chunk)
+            # Write three bytes and read the current chunk
+            chunk = self.devB.spiMaster_MultiReadWrite(b'', operation_read + dummy_bytes, current_chunk)
             data.extend(chunk)
             bytes_read += len(chunk)
 
         return bytes(data)
 
-
-    def get_memory_head_tail_n_events(self):
-
-        byte_string_to_write = operation_write + registers_map['MEM_ADDR_L'].to_bytes(2) + dummy_bytes
-        byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
-        memory_head = int.from_bytes(byte_string_output)
-
-        byte_string_to_write = operation_write + registers_map['MEM_ADDR_H'].to_bytes(2) + dummy_bytes
-        byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
-        memory_tail = int.from_bytes(byte_string_output)
-
-        byte_string_to_write = operation_write + registers_map['MEM_ADDR_U'].to_bytes(2) + dummy_bytes
-        byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
-        n_events_in_memory = int.from_bytes(byte_string_output)
-
-        return memory_head, memory_tail, n_events_in_memory
-
-    def pop_from_memory(self, memory_head, memory_tail):
-        """
-        Read out memory starting at memory_head, keep going until memory_tail read, wrap if necessary
-        return numpy array blob
-        """
-        if memory_tail > memory_head:
-            blob_np = np.frombuffer(self.memory_read(memory_head, memory_tail - memory_head), dtype=traces_cache_dtype)
-        elif memory_tail < memory_head:
-            blob_np = np.concatenate((
-                np.frombuffer(self.memory_read(memory_head, memory_end_address - memory_head), dtype=traces_cache_dtype),
-                np.frombuffer(self.memory_read(memory_start_address, memory_tail), dtype=traces_cache_dtype)
-            ))
-        else:
-            blob_np = empty_array
-
+    def pop_from_memory(self):
+        fifo_words = self.register_read('BULK_LEVEL')
+        blob_np = empty_array
+        if fifo_words > 0:
+            bytes_to_read = fifo_words * 2
+            blob_np = np.frombuffer(self.sample_read_buffer(bytes_to_read), dtype=traces_cache_dtype)
         return blob_np
+
+    # def memory_read(self, total_bytes, chunk_size=65535):
+    #     # read out block of memory in chunks
+    #     data = bytearray(total_bytes)
+    #     bytes_read = 0
+    #     while bytes_read < total_bytes:
+    #         # Calculate how many bytes to read in this chunk
+    #         remaining = total_bytes - bytes_read
+    #         current_chunk = min(chunk_size, remaining)
+    #
+    #         # Write address and read the chunk
+    #         chunk = self.devB.spiMaster_MultiReadWrite(b'', b'', current_chunk)
+    #         data.extend(chunk)
+    #         bytes_read += len(chunk)
+    #
+    #     return bytes(data)
+    #
+    #
+    # def get_memory_head_tail_n_events(self):
+    #
+    #     byte_string_to_write = operation_write + registers_map['MEM_ADDR_L'].to_bytes(2) + dummy_bytes
+    #     byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
+    #     memory_head = int.from_bytes(byte_string_output)
+    #
+    #     byte_string_to_write = operation_write + registers_map['MEM_ADDR_H'].to_bytes(2) + dummy_bytes
+    #     byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
+    #     memory_tail = int.from_bytes(byte_string_output)
+    #
+    #     byte_string_to_write = operation_write + registers_map['MEM_ADDR_U'].to_bytes(2) + dummy_bytes
+    #     byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
+    #     n_events_in_memory = int.from_bytes(byte_string_output)
+    #
+    #     return memory_head, memory_tail, n_events_in_memory
+    #
+    # def pop_from_memory(self, memory_head, memory_tail):
+    #     """
+    #     Read out memory starting at memory_head, keep going until memory_tail read, wrap if necessary
+    #     return numpy array blob
+    #     """
+    #     if memory_tail > memory_head:
+    #         blob_np = np.frombuffer(self.memory_read(memory_head, memory_tail - memory_head), dtype=traces_cache_dtype)
+    #     elif memory_tail < memory_head:
+    #         blob_np = np.concatenate((
+    #             np.frombuffer(self.memory_read(memory_head, memory_end_address - memory_head), dtype=traces_cache_dtype),
+    #             np.frombuffer(self.memory_read(memory_start_address, memory_tail), dtype=traces_cache_dtype)
+    #         ))
+    #     else:
+    #         blob_np = empty_array
+    #
+    #     return blob_np

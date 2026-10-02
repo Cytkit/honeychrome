@@ -629,9 +629,9 @@ class CytkitDevice:
 
 
     def read_out_traces(self):
-        memory_head, memory_tail, n_events_in_memory = self.ft4222.get_memory_head_tail_n_events()
+        blob_np = self.ft4222.pop_from_memory()
+
         self.event_rate_counter.update(n_events_in_memory)
-        blob_of_traces_as_array = self.ft4222.pop_from_memory(memory_head, memory_tail)
         return blob_of_traces_as_array
 
 

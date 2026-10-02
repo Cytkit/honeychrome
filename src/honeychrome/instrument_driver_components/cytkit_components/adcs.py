@@ -5,50 +5,24 @@ class ADCs:
     def __init__(self, ft4222_communicator):
         self.ft4222 = ft4222_communicator
 
-    def capture_configure(self, channel, num_samples):
-        register_base = adc_dictionary[channel]['register_base']
-        # TBD
+    def set_mode_select(self, channel, virtual):
+        if virtual:
+            self.ft4222.register_bit_set('ADC_SELECT', channel)
+        else:
+            self.ft4222.register_bit_clear('ADC_SELECT', channel)
 
-    def capture_start(self, channel):
-        register_base = adc_dictionary[channel]['register_base']
+    def get_mode_select(self, channel):
+        return self.ft4222.register_bit_get('ADC_SELECT', channel)
 
-        # Start the capture
-        self.ft4222.register_write(register_base, 0x0001)
+    def real_set_enable(self, channel, enable):
+        if enable:
+            self.ft4222.register_bit_set('ADC_ENABLE', channel)
+        else:
+            self.ft4222.register_bit_clear('ADC_ENABLE', channel)
 
-    def capture_flush(self, channel):
-        register_base = adc_dictionary[channel]['register_base']
+    def real_get_enable(self, channel):
+        return self.ft4222.register_bit_get('ADC_ENABLE', channel)
 
-        # Start the capture
-        self.ft4222.register_write(register_base, 0x0002)
-
-    def get_capture_size(self, channel):
-        register_base = adc_dictionary[channel]['register_base']
-
-        # Get the FIFO level
-        fifo_level = self.ft4222.register_read(register_base + 0x0002) & 0x3FFF
-
-        return fifo_level
-
-    def fetch_data(self, buffer, max_buffer_size, channel):
-        register_base = adc_dictionary[channel]['register_base']
-
-        # Buffer safety check
-        if buffer is None:
-            return 0
-
-        # Get the FIFO level
-        fifo_level = self.ft4222.register_read(register_base + 0x0002) & 0x3FFF
-
-        # Limit check
-        if fifo_level > max_buffer_size:
-            fifo_level = max_buffer_size
-
-        # Read the samples
-        for count in range(fifo_level):
-            buffer[count] = self.ft4222.register_read(register_base + 0x0001)
-
-        # Flush any remaining
-        self.ft4222.register_write(register_base + 0x0000, 0x0002)
-
-        # Success
-        return fifo_level
+    def real_read_value(self, channel):
+        register_base_real = adc_dictionary[channel]['reg_base_real']
+        return self.ft4222.register_read(register_base_real)
