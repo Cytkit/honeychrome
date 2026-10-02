@@ -352,11 +352,12 @@ class CytkitDevice:
 
     def start_acquisition(self):
         self.display.action_message(["Acquisition", "Priming..."])
+        self.sample_pump.stop()
         self.sample_pump.ramp_to(self.sample_pump_priming_speed)
         time.sleep(self.sample_pump_priming_time)
 
         self.display.action_message(["Acquisition", f"Settling rate {self.sample_pump_acquisition_rate} uL/min"])
-        self.sample_pump.set_speed(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
+        self.sample_pump.ramp_to(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
         time.sleep(self.sample_pump_settle_time)
 
         self.display.action_message(["Acquisition", f"Started!"])
@@ -364,7 +365,8 @@ class CytkitDevice:
 
     def stop_acquisition(self):
         self.display.action_message(["Sample flow stopped", "Unpriming..."])
-        self.sample_pump.ramp_to(self.sample_pump_unpriming_speed)
+        self.sample_pump.stop()
+        self.sample_pump.ramp_to(-self.sample_pump_unpriming_speed)
         time.sleep(self.sample_pump_unpriming_time)
         self.sample_pump.stop()
         self.display.action_message("Acquisition finished.")

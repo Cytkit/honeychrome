@@ -122,3 +122,5 @@ class SamplePump:
         self.set_enable(False)
         self.set_ramp(False)
         self.set_speed(min_speed)
+        time.sleep(0.1)
+
