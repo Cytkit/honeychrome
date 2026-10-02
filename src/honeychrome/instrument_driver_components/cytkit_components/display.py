@@ -88,7 +88,7 @@ class SSD1309:
 
         print("Initializing SPI Master on FT4222 A...")
         self.dev_spi.spiMaster_Init(
-            MasterSingle.SINGLE, Clock.DIV_32, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0
+            MasterSingle.SINGLE, Clock.DIV_16, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0
         )
 
         print("Initializing GPIOs on FT4222 B...")
@@ -181,13 +181,16 @@ class SSD1309:
             self._last_buf = new_buf
             return
 
+        # dirty rectangles method
         rects = _dirty_rects(new_buf, self._last_buf)
         if not rects:
             return  # nothing changed
-
         for rect in rects:
             x0, x1, page0, page1 = rect
             self._send_rect(new_buf, x0, x1, page0, page1)
+
+        # individual pixels method
+
         self._last_buf = new_buf
 
     def close(self):

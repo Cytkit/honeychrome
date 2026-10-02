@@ -1,5 +1,7 @@
 import time
 
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import min_speed, max_speed
+
 
 class SamplePump:
     def __init__(self, ft4222_communicator):
@@ -25,30 +27,35 @@ class SamplePump:
 
     def set_reverse(self, reverse):
         # direction is bit 4
-        mask = 0x0010
+        mask = 0b0000_0000_0001_0000
         if reverse:
-            value = 0x0010
+            value = 0b0000_0000_0001_0000
         else:
-            value = 0x0000
+            value = 0b0000_0000_0000_0000
 
         self.ft4222.register_read_modify_write('SMPMP_CTRL', value, mask)
 
     def get_reverse(self):
-        mask = 0x0010
+        mask = 0b0000_0000_0001_0000
         return self.ft4222.register_read('SMPMP_CTRL') & mask == 1
 
     def set_ramp(self, ramp):
-        # direction is bit 4
-        mask = 0x1000
+        # ramp is bit 12
+        mask = 0b0001_0000_0000_0000
         if ramp:
-            value = 0x1000
+            value = 0b0001_0000_0000_0000
         else:
-            value = 0x0000
+            value = 0b0000_0000_0000_0000
 
         self.ft4222.register_read_modify_write('SMPMP_CTRL', value, mask)
 
     def get_ramp(self):
-        mask = 0x1000
+        mask = 0b0001_0000_0000_0000
+        return self.ft4222.register_read('SMPMP_CTRL') & mask == 1
+
+    def get_ramp_complete(self):
+        # ramp complete is bit 13
+        mask = 0b0010_0000_0000_0000
         return self.ft4222.register_read('SMPMP_CTRL') & mask == 1
 
 
@@ -73,6 +80,9 @@ class SamplePump:
 
     def ramp_to(self, speed):
         reverse = speed < 0
+        # guard against speed 0
+        if speed == 0:
+            speed = min_speed
         current_speed = self.get_speed()
         current_ramp = self.get_ramp()
         current_reverse = self.get_reverse()
@@ -80,31 +90,35 @@ class SamplePump:
 
         change_direction = current_reverse != reverse
 
-        stage_speed = min(abs(speed), 10000)
+        stage_speed = min(abs(speed), max_speed)
 
         if change_direction or not current_enable:
-            # disable first, then ramp from zero
-            self.set_enable(False)
-            self.set_ramp(False)
-            self.set_speed(0)
+            # stop then ramp
+            self.stop()
             self.set_reverse(reverse)
-            self.set_ramp(True)
             self.set_enable(True)
+            self.set_ramp(True)
             self.set_speed(stage_speed)
         else:
             # not starting from zero, pump is currently enabled, and direction is not changing
+            self.set_ramp(True)
             self.set_speed(stage_speed)
 
-        # for n in range(10):
-        #     print(self.get_speed(), bin(self.ft4222.register_read('SMPMP_CTRL')))
-        #     time.sleep(0.0001)
-        #
+        time_start = time.perf_counter()
+        while not self.get_ramp_complete() and not time.perf_counter() - time_start > 2:
+            # print(self.get_speed(), bin(self.ft4222.register_read('SMPMP_CTRL')))
+            time.sleep(0.001)
+
         # while abs(speed) != stage_speed:
-        #     stage_speed = min(abs(speed), stage_speed + 10000)
+        #     stage_speed = min(abs(speed), stage_speed + max_speed)
         #     print(stage_speed)
         #     self.set_speed(stage_speed)
-        #     time.sleep(1)
-        #
-        # time.sleep(1)
-        # if speed == 0:
-        #     self.set_enable(False)
+        #     time.sleep(0.001)
+
+        if speed == min_speed:
+            self.stop()
+
+    def stop(self):
+        self.set_enable(False)
+        self.set_ramp(False)
+        self.set_speed(min_speed)

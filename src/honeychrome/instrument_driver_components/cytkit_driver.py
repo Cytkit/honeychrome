@@ -294,9 +294,7 @@ class CytkitDevice:
         self.laser.set_interlock_mask(1) # currently should be 1, i.e. only one interlock circuit
 
         self.get_state(['zero_pressure']) # calibrate assuming pressure zero before start
-        self.sample_pump.set_ramp(True)
-        self.sample_pump.set_enable(False)
-        self.sample_pump.set_speed(0)
+        self.sample_pump.stop()
         self.sample_pump.set_steps_per_cycle(settings.sample_pump_steps_per_cycle)
         self.sample_pump.set_clocks_per_cycle(settings.sample_pump_clocks_per_cycle)
         self.fan.set_pwm_frequency(25000)
@@ -366,10 +364,9 @@ class CytkitDevice:
 
     def stop_acquisition(self):
         self.display.action_message(["Sample flow stopped", "Unpriming..."])
-        self.sample_pump.ramp_to(0)
         self.sample_pump.ramp_to(self.sample_pump_unpriming_speed)
         time.sleep(self.sample_pump_unpriming_time)
-        self.sample_pump.ramp_to(0)
+        self.sample_pump.stop()
         self.display.action_message("Acquisition finished.")
         return 'OK', 'Cytkit stopped acquisition'
 
@@ -593,7 +590,7 @@ class CytkitDevice:
 
         self.sample_pump.ramp_to(self.sample_pump_flush_speed)
         time.sleep(self.sample_pump_flush_time)
-        self.sample_pump.ramp_to(0)
+        self.sample_pump.stop()
 
         self.display.action_message("Flush complete")
         return 'OK', 'Cytkit SIP flushed'
@@ -603,7 +600,7 @@ class CytkitDevice:
 
         self.sample_pump.ramp_to(-self.sample_pump_backflush_speed)
         time.sleep(self.sample_pump_backflush_time)
-        self.sample_pump.ramp_to(0)
+        self.sample_pump.stop()
 
         self.display.action_message("Backflush complete")
         return 'OK', 'Cytkit SIP flushed'
@@ -666,7 +663,7 @@ if __name__ == '__main__':
     print(cytkit_device.get_state(['sheath_pump_state']))
 
     print('test sample pump')
-    print(cytkit_device.set_state({'sample_pump_state': {'enable': True, 'reverse': False, 'ramp': True, 'speed': 6000, 'steps_per_cycle': 1, 'clocks_per_cycle': 100_000}}))
+    print(cytkit_device.set_state({'sample_pump_state': {'enable': False, 'reverse': False, 'ramp': True, 'speed': 100, 'steps_per_cycle': 1, 'clocks_per_cycle': 2_000}}))
     print(cytkit_device.get_state(['sample_pump_state']))
 
     print('test dacs')
