@@ -5,7 +5,7 @@ class Trigger:
     def __init__(self, ft4222_communicator):
         self.ft4222 = ft4222_communicator
 
-    def merge_set_enable(self, channel, enable):
+    def merge_set_enable(self, enable):
         if enable:
             self.ft4222.register_bit_set('TRG_MRG_CTRL', 0)
         else:

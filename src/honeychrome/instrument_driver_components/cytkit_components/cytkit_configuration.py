@@ -496,9 +496,10 @@ adc_dictionary = {
 for adc in adc_dictionary.keys():
     adc_dictionary[adc]['reg_base_dc_sample'] = 0x0110 + adc
     adc_dictionary[adc]['reg_base_real'] = 0x0120 + adc
-    adc_dictionary[adc]['reg_base_virt'] = (0x030 + adc) << 4 #### todo collision here!!!
+    adc_dictionary[adc]['reg_base_virt'] = (0x030 + adc) << 4 #### todo collision here??
     adc_dictionary[adc]['offset_corrector'] = (0x030 + adc) << 4
     adc_dictionary[adc]['trigger'] = (0x030 + adc) << 4
+    adc_dictionary[adc]['capture'] = (0x030 + adc) << 4
 
 monitor_dictionary = {
     0: {'name': 'MON_ID_P_36_0V', 'i2_c_address': 0x80, 'i2_c_bus':'A'},
