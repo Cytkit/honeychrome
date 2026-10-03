@@ -263,6 +263,10 @@ class JointUnmixExporter(QObject):
     subdirectory, named ``<sample><name_suffix> (Unmixed).fcs``. Samples
     without an AF library of at least 2 spectra are skipped.
 
+    ``sample_done(sample_path, n_events)``, when given, is called on the
+    export thread after each sample's file is written, so a caller can
+    attribute per-chunk results of ``unmix_fn`` to their sample.
+
     FlowKit loads each file whole; chunking bounds only the unmixing
     buffers.
     """
@@ -273,7 +277,8 @@ class JointUnmixExporter(QObject):
     def __init__(self, sample_paths, layout: ExportLayout, unmix_fn, bus=None,
                  extra_channels=(), output_root=None, name_suffix: str = '',
                  unmixing_method: str = 'AutoSpectral Optimization',
-                 extra_keywords: dict | None = None, chunk_size: int = UNMIX_CHUNK_SIZE):
+                 extra_keywords: dict | None = None, chunk_size: int = UNMIX_CHUNK_SIZE,
+                 sample_done=None):
         super().__init__()
         self.sample_paths = list(sample_paths)
         self.layout = layout
@@ -285,6 +290,7 @@ class JointUnmixExporter(QObject):
         self.unmixing_method = unmixing_method
         self.extra_keywords = dict(extra_keywords) if extra_keywords else None
         self.chunk_size = int(chunk_size)
+        self.sample_done = sample_done
 
     def _export_pnn(self) -> list:
         export_pnn = list(self.layout.pnn_unmixed)
@@ -390,6 +396,8 @@ class JointUnmixExporter(QObject):
                     extra_keywords=self.extra_keywords,
                 )
                 n_exported += 1
+                if self.sample_done is not None:
+                    self.sample_done(sample_path, n_events)
 
             self.progress.emit(total, total)
             if self.bus:
