@@ -49,6 +49,9 @@ class ProfileUpdater:
         self.fluorescence_channels_pnn = []
         self.unstained_negative = None          # legacy mean-vector cache — kept for existing generate() path
         self._negative_events_cache: dict[str, np.ndarray] = {}
+        # Labels of controls with a negative profile. When a list, generate()
+        # appends to it for the caller to report; when None, it warns at once.
+        self.negative_profile_warnings: list[str] | None = None
         self.refresh()
 
     def refresh(self):
@@ -372,7 +375,10 @@ class ProfileUpdater:
                                 f'Run Control Cleaning to fix this.'
                             )
                             warnings.warn(profile_warning)
-                            self.negative_profile_warnings.append(control['label'])
+                            if self.negative_profile_warnings is not None:
+                                self.negative_profile_warnings.append(control['label'])
+                            elif self.bus:
+                                self.bus.warningMessage.emit(profile_warning)
                             abs_max = np.abs(profile).max()
                             profile = np.abs(profile) / abs_max if abs_max > 0 else positive_profile
 
