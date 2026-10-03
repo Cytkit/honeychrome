@@ -2,7 +2,10 @@ import time
 
 from threading import Thread, Event, Lock
 
+import numpy as np
+
 from honeychrome.instrument_driver_components.cytkit_components.adcs import ADCs
+from honeychrome.instrument_driver_components.cytkit_components.capture_decoder import CaptureDecoder
 from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max
 from honeychrome.instrument_driver_components.cytkit_components.dacs import DACs
 from honeychrome.instrument_driver_components.cytkit_components.display import Display
@@ -255,6 +258,8 @@ class CytkitDevice:
         self.display = None
         self.initialised = False
 
+        self.decoder = CaptureDecoder()
+
         self.pressure_set_point = settings.pressure_set_point_retrieved
         self.temperature_set_point = settings.temperature_set_point_retrieved
 
@@ -359,6 +364,7 @@ class CytkitDevice:
         self.display.action_message(["Acquisition", f"Settling rate {self.sample_pump_acquisition_rate} uL/min"])
         self.sample_pump.ramp_to(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
         time.sleep(self.sample_pump_settle_time)
+        self.decoder.reset()
 
         self.display.action_message(["Acquisition", f"Started!"])
         return 'OK', 'Cytkit started acquisition'
@@ -370,6 +376,9 @@ class CytkitDevice:
         time.sleep(self.sample_pump_unpriming_time)
         self.sample_pump.stop()
         self.display.action_message("Acquisition finished.")
+        logger.info(f"[CytkitDriver] communication errors={self.decoder.error_count}")
+
+        self.decoder.reset()
         return 'OK', 'Cytkit stopped acquisition'
 
     def set_state(self, dict_of_parameter_value):
@@ -629,10 +638,31 @@ class CytkitDevice:
 
 
     def read_out_traces(self):
-        blob_np = self.ft4222.pop_from_memory()
+        buffer_np = self.ft4222.pop_from_memory()
+        packets = self.decoder.decode(buffer_np)
+        if packets:
+            N = len({p.timestamp for p in packets}) # number of events
+            traces = np.zeros((N, settings.n_channels_trace, settings.n_time_points_in_event), dtype=np.uint16)
 
-        self.event_rate_counter.update(n_events_in_memory)
-        return blob_of_traces_as_array
+            # Map timestamp -> event index, assigning indices in first-seen order.
+            event_index = {}
+            for packet in packets:
+                idx = event_index.get(packet.timestamp)
+                if idx is None:
+                    idx = len(event_index)
+                    event_index[packet.timestamp] = idx
+
+                n = min(packet.samples.size, settings.n_time_points_in_event)
+                if n > 0:
+                    traces[idx, packet.channel, :n] = packet.samples[:n]
+
+                n_decoded_events = len(event_index)
+                self.event_rate_counter.update(n_decoded_events) # this is the number of events for which at least some data was recovered
+                # todo count trigger rate instead
+                blob_of_traces_as_array = traces.reshape(-1)
+                return blob_of_traces_as_array
+
+        return None
 
 
 if __name__ == '__main__':

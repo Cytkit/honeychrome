@@ -107,11 +107,11 @@ class Ft4222Communicator:
 
     def pop_from_memory(self):
         fifo_words = self.register_read('BULK_LEVEL')
-        blob_np = empty_array
+        buffer_np = empty_array
         if fifo_words > 0:
             bytes_to_read = fifo_words * 2
-            blob_np = np.frombuffer(self.sample_read_buffer(bytes_to_read), dtype=traces_cache_dtype)
-        return blob_np
+            buffer_np = np.frombuffer(self.sample_read_buffer(bytes_to_read), dtype=traces_cache_dtype)
+        return buffer_np
 
     # def memory_read(self, total_bytes, chunk_size=65535):
     #     # read out block of memory in chunks
