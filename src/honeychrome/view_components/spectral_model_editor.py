@@ -1577,6 +1577,9 @@ class SpectralControlsEditor(QFrame):
         # Rebuild comboboxes now so that spectral_library_search_results is populated before the recalc worker runs
         self.refresh_comboboxes()
 
+        # Negative-profile warnings from the recalculation are reported with the rest
+        self.profile_updater.negative_profile_warnings = []
+
         # Run profile regeneration in a background thread so the main thread
         # stays responsive. _on_force_recalc is not thread-safe (it touches Qt
         # widgets directly), so we do only the pure computation here and defer
@@ -1599,6 +1602,14 @@ class SpectralControlsEditor(QFrame):
 
         # One dialog for everything raised during the run
         messages = list(self.spectral_cleaner.warnings)
+        negative_labels = self.profile_updater.negative_profile_warnings or []
+        self.profile_updater.negative_profile_warnings = None
+        if negative_labels:
+            labels = ', '.join(f'"{label}"' for label in negative_labels)
+            messages.append(
+                f'Negative profile: the negative gate has higher mean fluorescence than the '
+                f'positive for {labels}. Check the negative assigned to these controls.'
+            )
         messages += self.controller.warning_collector or []
         self.controller.warning_collector = None
         low_cosine_text = self._low_cosine_warning_text()
