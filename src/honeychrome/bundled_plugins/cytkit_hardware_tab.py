@@ -604,7 +604,225 @@ class TriggerChannelTable(QWidget):
     def all_states(self) -> list[dict]:
         return [self.row_state(r) for r in range(len(adc_channels))]
 
+from PySide6.QtCore import Qt, Signal, QSettings
+from PySide6.QtWidgets import (
+    QTableWidget, QCheckBox, QSpinBox, QLabel, QWidget,
+    QHBoxLayout, QVBoxLayout, QPushButton, QHeaderView,
+)
 
+
+class CaptureChannelTable(QWidget):
+    enable_changed = Signal(int, str, bool)
+    pre_trigger_changed = Signal(int, str, int)
+    post_trigger_changed = Signal(int, str, int)
+
+    SETTINGS_GROUP = "capture_channels"
+
+    # defaults (also used by reset())
+    DEFAULT_ENABLED = False
+    DEFAULT_PRE = 400
+    DEFAULT_POST = 400
+
+    # uint range for the trigger spinboxes — adjust to taste
+    PRE_MIN, PRE_MAX = 0, 10000
+    POST_MIN, POST_MAX = 0, 10000
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._loading = False   # suppress auto-save during load/reset
+
+        # ---- table ----
+        self.table = QTableWidget(len(adc_channels), 3)
+        self.table.setHorizontalHeaderLabels(
+            ["Enable", "Pre-trigger", "Post-trigger"]
+        )
+        self.table.verticalHeader().setVisible(True)
+        self.table.setVerticalHeaderLabels(adc_channels)
+        self.table.setSelectionMode(QTableWidget.NoSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        total_height = (self.table.verticalHeader().length() + self.table.horizontalHeader().height() + (self.table.frameWidth() * 2))
+        self.table.setFixedHeight(total_height)
+
+        # ---- per-row widgets ----
+        self.enable_boxes: list[QCheckBox] = []
+        self.pre_spins: list[QSpinBox] = []
+        self.post_spins: list[QSpinBox] = []
+
+        for row, name in enumerate(adc_channels):
+            enable = QCheckBox()
+            enable.toggled.connect(
+                lambda checked, r=row, n=name: self._on_enable(r, n, checked)
+            )
+            self.enable_boxes.append(enable)
+            self.table.setCellWidget(row, 0, self._centered(enable))
+
+            pre = QSpinBox()
+            pre.setRange(self.PRE_MIN, self.PRE_MAX)
+            pre.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            pre.valueChanged.connect(
+                lambda value, r=row, n=name: self._on_pre(r, n, value)
+            )
+            self.pre_spins.append(pre)
+            self.table.setCellWidget(row, 1, pre)
+
+            post = QSpinBox()
+            post.setRange(self.POST_MIN, self.POST_MAX)
+            post.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            post.valueChanged.connect(
+                lambda value, r=row, n=name: self._on_post(r, n, value)
+            )
+            self.post_spins.append(post)
+            self.table.setCellWidget(row, 2, post)
+
+        # ---- reset button ----
+        self.reset_button = QPushButton("Reset")
+        self.reset_button.clicked.connect(self.reset)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(self.reset_button)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.table)
+        layout.addLayout(button_row)
+
+        # load the saved settings
+        self.load_state()
+
+    # ---------- change handlers (auto-save) ----------
+
+    def _on_enable(self, row: int, name: str, checked: bool) -> None:
+        self._save_channel(name)
+        self.enable_changed.emit(row, name, checked)
+
+    def _on_pre(self, row: int, name: str, value: int) -> None:
+        self._save_channel(name)
+        self.pre_trigger_changed.emit(row, name, value)
+
+    def _on_post(self, row: int, name: str, value: int) -> None:
+        self._save_channel(name)
+        self.post_trigger_changed.emit(row, name, value)
+
+    # ---------- helpers ----------
+
+    @staticmethod
+    def _centered(widget: QWidget) -> QWidget:
+        container = QWidget()
+        h = QHBoxLayout(container)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setAlignment(Qt.AlignCenter)
+        h.addWidget(widget)
+        return container
+
+    def _row_for(self, name: str) -> int:
+        return adc_channels.index(name)
+
+    # ---------- persistence ----------
+
+    def _save_channel(self, name: str) -> None:
+        if self._loading:
+            return
+        row = self._row_for(name)
+        s = q_settings
+        s.beginGroup(self.SETTINGS_GROUP)
+        s.beginGroup(name)
+        s.setValue("enabled", self.enable_boxes[row].isChecked())
+        s.setValue("pre_trigger", self.pre_spins[row].value())
+        s.setValue("post_trigger", self.post_spins[row].value())
+        s.endGroup()
+        s.endGroup()
+
+    def save_state(self) -> None:
+        s = q_settings
+        s.beginGroup(self.SETTINGS_GROUP)
+        for row, name in enumerate(adc_channels):
+            s.beginGroup(name)
+            s.setValue("enabled", self.enable_boxes[row].isChecked())
+            s.setValue("pre_trigger", self.pre_spins[row].value())
+            s.setValue("post_trigger", self.post_spins[row].value())
+            s.endGroup()
+        s.endGroup()
+        s.sync()
+
+    def load_state(self) -> None:
+        self._loading = True
+        try:
+            s = q_settings
+            s.beginGroup(self.SETTINGS_GROUP)
+            for row, name in enumerate(adc_channels):
+                s.beginGroup(name)
+                enabled = s.value("enabled", self.DEFAULT_ENABLED, type=bool)
+                pre = s.value("pre_trigger", self.DEFAULT_PRE, type=int)
+                post = s.value("post_trigger", self.DEFAULT_POST, type=int)
+                s.endGroup()
+                self._set_row_silently(row, enabled, pre, post)
+            s.endGroup()
+        finally:
+            self._loading = False
+
+    def _set_row_silently(
+        self, row: int, enabled: bool, pre: int, post: int
+    ) -> None:
+        widgets = (
+            self.enable_boxes[row],
+            self.pre_spins[row],
+            self.post_spins[row],
+        )
+        for w in widgets:
+            w.blockSignals(True)
+        self.enable_boxes[row].setChecked(enabled)
+        self.pre_spins[row].setValue(pre)
+        self.post_spins[row].setValue(post)
+        for w in widgets:
+            w.blockSignals(False)
+
+    # ---------- reset ----------
+
+    def reset(self) -> None:
+        self._loading = True
+        try:
+            for row in range(len(adc_channels)):
+                self._set_row_silently(
+                    row,
+                    self.DEFAULT_ENABLED,
+                    self.DEFAULT_PRE,
+                    self.DEFAULT_POST,
+                )
+        finally:
+            self._loading = False
+
+        self.save_state()
+        for row, name in enumerate(adc_channels):
+            self.enable_changed.emit(row, name, self.DEFAULT_ENABLED)
+            self.pre_trigger_changed.emit(row, name, self.DEFAULT_PRE)
+            self.post_trigger_changed.emit(row, name, self.DEFAULT_POST)
+
+    # ---------- accessors ----------
+
+    def is_enabled(self, row: int) -> bool:
+        return self.enable_boxes[row].isChecked()
+
+    def pre_trigger(self, row: int) -> int:
+        return self.pre_spins[row].value()
+
+    def post_trigger(self, row: int) -> int:
+        return self.post_spins[row].value()
+
+    def row_state(self, row: int) -> dict:
+        return {
+            "channel": adc_channels[row],
+            "enabled": self.is_enabled(row),
+            "pre_trigger": self.pre_trigger(row),
+            "post_trigger": self.post_trigger(row),
+        }
+
+    def all_states(self) -> list[dict]:
+        return [self.row_state(r) for r in range(len(adc_channels))]
 
 class LabeledSpinBox(QWidget):
     def __init__(self, text, min=0, max=100, default=1, step=1, parent=None, label_right=False, double_spin=False):
@@ -938,16 +1156,16 @@ class PluginWidget(QWidget):
         toolbox.addTab(tab, "Triggers")
 
         # Capture tab:
+        # Capture table by channel: enable, pre-trigger, post-trigger
+        # aggregator: enable cb, clear fifo btn, fifo level, fifo status
+        # capture stream collector: enable, auto_reset, decode error level, auto reset error level
         tab = QWidget()
         layout = QVBoxLayout(tab)
         title = QLabel('Capture')
         title.setStyleSheet(heading_style)
         layout.addWidget(title)
-
-        # Capture table by channel: enable, pre-trigger, post-trigger
-        # aggregator: enable cb, clear fifo btn, fifo level, fifo status
-        # capture stream collector: enable, auto_reset, decode error level, auto reset error level
-
+        self.capture_table = CaptureChannelTable()
+        layout.addWidget(self.capture_table)
         layout.addStretch()
         toolbox.addTab(tab, "Capture")
 
