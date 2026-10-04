@@ -249,6 +249,362 @@ class AdcChannelTable(QWidget):
     def all_states(self) -> list[dict]:
         return [self.row_state(r) for r in range(len(adc_channels))]
 
+class TriggerChannelTable(QWidget):
+    enable_changed = Signal(int, str, bool)
+    mask_changed = Signal(int, str, bool)
+    edge_changed = Signal(int, str, bool)
+    level_changed = Signal(int, str, int)
+    hyst_changed = Signal(int, str, int)
+    delay_changed = Signal(int, str, int)
+    h_off_changed = Signal(int, str, int)
+    skew_changed = Signal(int, str, int)
+
+    SETTINGS_GROUP = "trigger_channels"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # guard so programmatic changes (load_state / reset) don't trigger saves
+        self._loading = False
+
+        # ---- table ----
+        self.table = QTableWidget(len(adc_channels), 9)
+        self.table.setHorizontalHeaderLabels(
+            ["Enable", "Mask", "Edge", "Level", "Hyst", "Delay", "H.Off", "Skew", "Events"]
+        )
+        self.table.verticalHeader().setVisible(True)
+        self.table.setVerticalHeaderLabels(adc_channels)
+        self.table.setSelectionMode(QTableWidget.NoSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        total_height = (self.table.verticalHeader().length() + self.table.horizontalHeader().height() + (self.table.frameWidth() * 2))
+        self.table.setFixedHeight(total_height)
+
+        # ---- per-row widgets ----
+        self.enable_boxes: list[QCheckBox] = []
+        self.mask_boxes: list[QCheckBox] = []
+        self.edge_boxes: list[QCheckBox] = []
+        self.level_spins: list[QSpinBox] = []
+        self.hyst_spins: list[QSpinBox] = []
+        self.delay_spins: list[QSpinBox] = []
+        self.h_off_spins: list[QSpinBox] = []
+        self.skew_spins: list[QSpinBox] = []
+        self.events_labels: list[QLabel] = []
+
+        for row, name in enumerate(adc_channels):
+            enable = QCheckBox()
+            enable.toggled.connect(
+                lambda checked, r=row, n=name: self._on_enable(r, n, checked)
+            )
+            self.enable_boxes.append(enable)
+            self.table.setCellWidget(row, 0, self._centered(enable))
+
+            mask = QCheckBox()
+            mask.toggled.connect(
+                lambda checked, r=row, n=name: self._on_mask(r, n, checked)
+            )
+            self.mask_boxes.append(mask)
+            self.table.setCellWidget(row, 1, self._centered(mask))
+
+            edge = QCheckBox()
+            edge.toggled.connect(
+                lambda checked, r=row, n=name: self._on_edge(r, n, checked)
+            )
+            self.edge_boxes.append(edge)
+            self.table.setCellWidget(row, 2, self._centered(edge))
+
+            level = QSpinBox()
+            level.setRange(0, 16383)
+            level.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            level.valueChanged.connect(
+                lambda value, r=row, n=name: self._on_level(r, n, value)
+            )
+            self.level_spins.append(level)
+            self.table.setCellWidget(row, 3, level)
+
+            hyst = QSpinBox()
+            hyst.setRange(0, 65535)
+            hyst.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            hyst.valueChanged.connect(
+                lambda value, r=row, n=name: self._on_hyst(r, n, value)
+            )
+            self.hyst_spins.append(hyst)
+            self.table.setCellWidget(row, 4, hyst)
+
+            delay = QSpinBox()
+            delay.setRange(0, 65535)
+            delay.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            delay.valueChanged.connect(
+                lambda value, r=row, n=name: self._on_delay(r, n, value)
+            )
+            self.delay_spins.append(delay)
+            self.table.setCellWidget(row, 5, delay)
+
+            h_off = QSpinBox()
+            h_off.setRange(0, 65535)
+            h_off.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            h_off.valueChanged.connect(
+                lambda value, r=row, n=name: self._on_h_off(r, n, value)
+            )
+            self.h_off_spins.append(h_off)
+            self.table.setCellWidget(row, 6, h_off)
+
+            skew = QSpinBox()
+            skew.setRange(0, 65535)
+            skew.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            skew.valueChanged.connect(
+                lambda value, r=row, n=name: self._on_skew(r, n, value)
+            )
+            self.skew_spins.append(skew)
+            self.table.setCellWidget(row, 7, skew)
+
+            events = QLabel("—")
+            events.setAlignment(Qt.AlignCenter)
+            self.events_labels.append(events)
+            self.table.setCellWidget(row, 8, events)
+
+        # ---- reset button ----
+        self.reset_button = QPushButton("Reset to defaults")
+        self.reset_button.clicked.connect(self.reset)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(self.reset_button)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.table)
+        layout.addLayout(button_row)
+
+        # load the saved settings
+        self.load_state()
+
+    # ---------- change handlers (auto-save) ----------
+
+    def _on_enable(self, row: int, name: str, checked: bool) -> None:
+        self._save_channel(name)
+        self.enable_changed.emit(row, name, checked)
+
+    def _on_mask(self, row: int, name: str, checked: bool) -> None:
+        self._save_channel(name)
+        self.mask_changed.emit(row, name, checked)
+
+    def _on_edge(self, row: int, name: str, checked: bool) -> None:
+        self._save_channel(name)
+        self.edge_changed.emit(row, name, checked)
+
+    def _on_level(self, row: int, name: str, value: int) -> None:
+        self._save_channel(name)
+        self.level_changed.emit(row, name, value)
+
+    def _on_hyst(self, row: int, name: str, value: int) -> None:
+        self._save_channel(name)
+        self.hyst_changed.emit(row, name, value)
+
+    def _on_delay(self, row: int, name: str, value: int) -> None:
+        self._save_channel(name)
+        self.delay_changed.emit(row, name, value)
+
+    def _on_h_off(self, row: int, name: str, value: int) -> None:
+        self._save_channel(name)
+        self.h_off_changed.emit(row, name, value)
+
+    def _on_skew(self, row: int, name: str, value: int) -> None:
+        self._save_channel(name)
+        self.skew_changed.emit(row, name, value)
+
+
+
+    # ---------- helpers ----------
+
+    @staticmethod
+    def _centered(widget: QWidget) -> QWidget:
+        container = QWidget()
+        h = QHBoxLayout(container)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setAlignment(Qt.AlignCenter)
+        h.addWidget(widget)
+        return container
+
+    def _row_for(self, name: str) -> int:
+        return adc_channels.index(name)
+
+    # ---------- persistence ----------
+        self.enable_boxes: list[QCheckBox] = []
+        self.mask_boxes: list[QCheckBox] = []
+        self.edge_boxes: list[QCheckBox] = []
+        self.level_spins: list[QSpinBox] = []
+        self.hyst_spins: list[QSpinBox] = []
+        self.delay_spins: list[QSpinBox] = []
+        self.h_off_spins: list[QSpinBox] = []
+        self.skew_spins: list[QSpinBox] = []
+        self.events_labels: list[QLabel] = []
+
+    def _save_channel(self, name: str) -> None:
+        """Persist a single channel's state. Skipped while loading/resetting."""
+        if self._loading:
+            return
+        row = self._row_for(name)
+        s = q_settings
+        s.beginGroup(self.SETTINGS_GROUP)
+        s.beginGroup(name)
+        s.setValue("enabled", self.enable_boxes[row].isChecked())
+        s.setValue("mask", self.mask_boxes[row].isChecked())
+        s.setValue("edge", self.edge_boxes[row].isChecked())
+        s.setValue("level", self.level_spins[row].value())
+        s.setValue("hyst", self.hyst_spins[row].value())
+        s.setValue("delay", self.delay_spins[row].value())
+        s.setValue("h_off", self.h_off_spins[row].value())
+        s.setValue("skew", self.skew_spins[row].value())
+        s.endGroup()
+        s.endGroup()
+
+    def save_state(self) -> None:
+        """Write state for every channel (e.g. on app close)."""
+        s = q_settings
+        s.beginGroup(self.SETTINGS_GROUP)
+        for row, name in enumerate(adc_channels):
+            s.beginGroup(name)
+            s.setValue("enabled", self.enable_boxes[row].isChecked())
+            s.setValue("mask", self.mask_boxes[row].isChecked())
+            s.setValue("edge", self.edge_boxes[row].isChecked())
+            s.setValue("level", self.level_spins[row].value())
+            s.setValue("hyst", self.hyst_spins[row].value())
+            s.setValue("delay", self.delay_spins[row].value())
+            s.setValue("h_off", self.h_off_spins[row].value())
+            s.setValue("skew", self.skew_spins[row].value())
+            s.endGroup()
+        s.endGroup()
+        s.endGroup()
+        s.sync()
+
+    def load_state(self) -> None:
+        """Read state from QSettings; programmatic changes are not re-saved."""
+        self._loading = True
+        try:
+            s = q_settings
+            s.beginGroup(self.SETTINGS_GROUP)
+            for row, name in enumerate(adc_channels):
+                s.beginGroup(name)
+                enabled = s.value("enabled", False, type=bool)
+                mask = s.value("mask", False, type=bool)
+                edge = s.value("edge", False, type=bool)
+                level = s.value("level", 3000, type=int)
+                hyst = s.value("hyst", 16, type=int)
+                delay = s.value("delay", 0, type=int)
+                h_off = s.value("h_off", 0, type=int)
+                skew = s.value("skew", 0, type=int)
+                s.endGroup()
+                self._set_row_silently(row, enabled, mask, edge, level, hyst, delay, h_off, skew)
+            s.endGroup()
+        finally:
+            self._loading = False
+
+    def _set_row_silently(
+        self, row: int, enabled: bool, mask: bool, edge: bool, level: int, hyst: int, delay: int, h_off: int, skew: int
+    ) -> None:
+        widgets = (
+            self.enable_boxes[row],
+            self.mask_boxes[row],
+            self.edge_boxes[row],
+            self.level_spins[row],
+            self.hyst_spins[row],
+            self.delay_spins[row],
+            self.h_off_spins[row],
+            self.skew_spins[row],
+        )
+        for w in widgets:
+            w.blockSignals(True)
+        self.enable_boxes[row].setChecked(enabled)
+        self.mask_boxes[row].setChecked(mask)
+        self.edge_boxes[row].setChecked(edge)
+        self.level_spins[row].setValue(level)
+        self.hyst_spins[row].setValue(hyst)
+        self.delay_spins[row].setValue(delay)
+        self.h_off_spins[row].setValue(h_off)
+        self.skew_spins[row].setValue(skew)
+        for w in widgets:
+            w.blockSignals(False)
+
+    # ---------- reset ----------
+
+    def reset(self) -> None:
+        """Restore defaults (disabled, not inverted, offset 0) and persist."""
+        self._loading = True
+        try:
+            for row in range(len(adc_channels)):
+                self._set_row_silently(row, enabled=False, mask=False, edge=False, level=3000, hyst=16, delay=0, h_off=0, skew=0)
+        finally:
+            self._loading = False
+
+        # persist the reset state and notify listeners
+        self.save_state()
+        for row, name in enumerate(adc_channels):
+            self.enable_changed.emit(row, name, False)
+            self.mask_changed.emit(row, name, False)
+            self.edge_changed.emit(row, name, False)
+            self.level_changed.emit(row, name, 3000)
+            self.hyst_changed.emit(row, name, 16)
+            self.delay_changed.emit(row, name, 0)
+            self.h_off_changed.emit(row, name, 0)
+            self.skew_changed.emit(row, name, 0)
+
+    # ---------- events labels ----------
+
+    def update_all_events(self, all_events) -> None:
+        values = [all_events.get(name, "—") for name in adc_channels]
+        for label, value in zip(self.events_labels, values):
+            label.setText("—" if value is None else str(value))
+
+    def update_events(self, row: int, value) -> None:
+        self.events_labels[row].setText("—" if value is None else str(value))
+
+    # ---------- accessors ----------
+
+    def is_enabled(self, row: int) -> bool:
+        return self.enable_boxes[row].isChecked()
+
+    def is_mask(self, row: int) -> bool:
+        return self.mask_boxes[row].isChecked()
+
+    def is_edge(self, row: int) -> bool:
+        return self.edge_boxes[row].isChecked()
+
+    def level(self, row: int) -> int:
+        return self.level_spins[row].value()
+
+    def hyst(self, row: int) -> int:
+        return self.hyst_spins[row].value()
+
+    def delay(self, row: int) -> int:
+        return self.delay_spins[row].value()
+
+    def h_off(self, row: int) -> int:
+        return self.h_off_spins[row].value()
+
+    def skew(self, row: int) -> int:
+        return self.skew_spins[row].value()
+
+    def row_state(self, row: int) -> dict:
+        return {
+            "channel": adc_channels[row],
+            "enabled": self.is_enabled(row),
+            "mask": self.is_mask(row),
+            "edge": self.is_edge(row),
+            "level": self.level(row),
+            "hyst": self.hyst(row),
+            "delay": self.delay(row),
+            "h_off": self.h_off(row),
+            "skew": self.skew(row),
+            "events": self.events_labels[row].text(),
+        }
+
+    def all_states(self) -> list[dict]:
+        return [self.row_state(r) for r in range(len(adc_channels))]
+
+
 
 class LabeledSpinBox(QWidget):
     def __init__(self, text, min=0, max=100, default=1, step=1, parent=None, label_right=False, double_spin=False):
@@ -566,16 +922,17 @@ class PluginWidget(QWidget):
 
 
         # Triggers tab:
+        # Triggers table by channel: enable, mask, edge, level, hyst, delay, h.off, skew, events
+        # merge events number
+        # clear all
+        # force
         tab = QWidget()
         layout = QVBoxLayout(tab)
         title = QLabel('Triggers')
         title.setStyleSheet(heading_style)
         layout.addWidget(title)
-
-        # Triggers table by channel: enable, mask, edge, level, hyst, delay, h.off, skew, events
-        # merge events number
-        # clear all
-        # force
+        self.trigger_table = TriggerChannelTable()
+        layout.addWidget(self.trigger_table)
 
         layout.addStretch()
         toolbox.addTab(tab, "Triggers")
