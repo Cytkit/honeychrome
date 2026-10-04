@@ -73,7 +73,7 @@ library_file = 'spectral_controls_library.db'
 
 ### define default channels for trace analyser and experiment model - these should match the channels in the instrument
 max_events_in_cache = 10_000_000
-adc_channels = ['FSC', 'SSC', 'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14']
+adc_channels = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14', 'FSC', 'SSC']
 area_channels = ['FSC', 'SSC', 'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14'] # make sure there is equal number to n_channels_trace in instrument config
 height_channels = ['FSC']
 width_channels = [trigger_channel]

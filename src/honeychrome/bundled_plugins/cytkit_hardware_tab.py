@@ -8,18 +8,246 @@ from PySide6.QtWidgets import QApplication
 
 import logging
 
-from honeychrome.controller import Controller
 from honeychrome.instrument_driver_components.cytkit_components.alignment_camera import AlignmentCameraWidget
 from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import monitor_dictionary, dac_dictionary, number_of_dacs_pairs, registers_map
 from honeychrome.main import configure_multiprocessing
-from honeychrome.settings import heading_style
+from honeychrome.settings import heading_style, adc_channels
 from honeychrome.view_components.event_bus import EventBus
 from honeychrome.view_components.icon_loader import icon
 from honeychrome import settings
 
+q_settings = QSettings("honeychrome", "cytkit_hardware")
+
 logger = logging.getLogger(__name__)
 
 plugin_name = 'Cytkit Hardware'
+
+class AdcChannelTable(QWidget):
+    enable_changed = Signal(int, str, bool)
+    invert_changed = Signal(int, str, bool)
+    offset_changed = Signal(int, str, int)
+
+    SETTINGS_GROUP = "adc_channels"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # guard so programmatic changes (load_state / reset) don't trigger saves
+        self._loading = False
+
+        # ---- table ----
+        self.table = QTableWidget(len(adc_channels), 4)
+        self.table.setHorizontalHeaderLabels(
+            ["Enable", "Current Sample", "Invert", "Offset"]
+        )
+        self.table.verticalHeader().setVisible(True)
+        self.table.setVerticalHeaderLabels(adc_channels)
+        self.table.setSelectionMode(QTableWidget.NoSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        total_height = (self.table.verticalHeader().length() + self.table.horizontalHeader().height() + (self.table.frameWidth() * 2))
+        self.table.setFixedHeight(total_height)
+
+        # ---- per-row widgets ----
+        self.enable_boxes: list[QCheckBox] = []
+        self.sample_labels: list[QLabel] = []
+        self.invert_boxes: list[QCheckBox] = []
+        self.offset_spins: list[QSpinBox] = []
+
+        for row, name in enumerate(adc_channels):
+            enable = QCheckBox()
+            enable.toggled.connect(
+                lambda checked, r=row, n=name: self._on_enable(r, n, checked)
+            )
+            self.enable_boxes.append(enable)
+            self.table.setCellWidget(row, 0, self._centered(enable))
+
+            sample = QLabel("—")
+            sample.setAlignment(Qt.AlignCenter)
+            self.sample_labels.append(sample)
+            self.table.setCellWidget(row, 1, sample)
+
+            invert = QCheckBox()
+            invert.toggled.connect(
+                lambda checked, r=row, n=name: self._on_invert(r, n, checked)
+            )
+            self.invert_boxes.append(invert)
+            self.table.setCellWidget(row, 2, self._centered(invert))
+
+            offset = QSpinBox()
+            offset.setRange(0, 65535)
+            offset.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            offset.valueChanged.connect(
+                lambda value, r=row, n=name: self._on_offset(r, n, value)
+            )
+            self.offset_spins.append(offset)
+            self.table.setCellWidget(row, 3, offset)
+
+        # ---- reset button ----
+        self.reset_button = QPushButton("Reset to defaults")
+        self.reset_button.clicked.connect(self.reset)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(self.reset_button)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.table)
+        layout.addLayout(button_row)
+
+        # load the saved settings
+        self.load_state()
+
+    # ---------- change handlers (auto-save) ----------
+
+    def _on_enable(self, row: int, name: str, checked: bool) -> None:
+        self._save_channel(name)
+        self.enable_changed.emit(row, name, checked)
+
+    def _on_invert(self, row: int, name: str, checked: bool) -> None:
+        self._save_channel(name)
+        self.invert_changed.emit(row, name, checked)
+
+    def _on_offset(self, row: int, name: str, value: int) -> None:
+        self._save_channel(name)
+        self.offset_changed.emit(row, name, value)
+
+    # ---------- helpers ----------
+
+    @staticmethod
+    def _centered(widget: QWidget) -> QWidget:
+        container = QWidget()
+        h = QHBoxLayout(container)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setAlignment(Qt.AlignCenter)
+        h.addWidget(widget)
+        return container
+
+    def _row_for(self, name: str) -> int:
+        return adc_channels.index(name)
+
+    # ---------- persistence ----------
+
+    def _save_channel(self, name: str) -> None:
+        """Persist a single channel's state. Skipped while loading/resetting."""
+        if self._loading:
+            return
+        row = self._row_for(name)
+        s = q_settings
+        s.beginGroup(self.SETTINGS_GROUP)
+        s.beginGroup(name)
+        s.setValue("enabled", self.enable_boxes[row].isChecked())
+        s.setValue("inverted", self.invert_boxes[row].isChecked())
+        s.setValue("offset", self.offset_spins[row].value())
+        s.endGroup()
+        s.endGroup()
+
+    def save_state(self) -> None:
+        """Write state for every channel (e.g. on app close)."""
+        s = q_settings
+        s.beginGroup(self.SETTINGS_GROUP)
+        for row, name in enumerate(adc_channels):
+            s.beginGroup(name)
+            s.setValue("enabled", self.enable_boxes[row].isChecked())
+            s.setValue("inverted", self.invert_boxes[row].isChecked())
+            s.setValue("offset", self.offset_spins[row].value())
+            s.endGroup()
+        s.endGroup()
+        s.sync()
+
+    def load_state(self) -> None:
+        """Read state from QSettings; programmatic changes are not re-saved."""
+        self._loading = True
+        try:
+            s = q_settings
+            s.beginGroup(self.SETTINGS_GROUP)
+            for row, name in enumerate(adc_channels):
+                s.beginGroup(name)
+                enabled = s.value("enabled", False, type=bool)
+                inverted = s.value("inverted", False, type=bool)
+                offset = s.value("offset", 0, type=int)
+                s.endGroup()
+                self._set_row_silently(row, enabled, inverted, offset)
+            s.endGroup()
+        finally:
+            self._loading = False
+
+    def _set_row_silently(
+        self, row: int, enabled: bool, inverted: bool, offset: int
+    ) -> None:
+        widgets = (
+            self.enable_boxes[row],
+            self.invert_boxes[row],
+            self.offset_spins[row],
+        )
+        for w in widgets:
+            w.blockSignals(True)
+        self.enable_boxes[row].setChecked(enabled)
+        self.invert_boxes[row].setChecked(inverted)
+        self.offset_spins[row].setValue(offset)
+        for w in widgets:
+            w.blockSignals(False)
+
+    # ---------- reset ----------
+
+    def reset(self) -> None:
+        """Restore defaults (disabled, not inverted, offset 0) and persist."""
+        self._loading = True
+        try:
+            for row in range(len(adc_channels)):
+                self._set_row_silently(row, enabled=False, inverted=False, offset=0)
+        finally:
+            self._loading = False
+
+        # persist the reset state and notify listeners
+        self.save_state()
+        for row, name in enumerate(adc_channels):
+            self.enable_changed.emit(row, name, False)
+            self.invert_changed.emit(row, name, False)
+            self.offset_changed.emit(row, name, 0)
+
+    # ---------- sample labels ----------
+
+    def update_samples(self, samples) -> None:
+        if isinstance(samples, dict):
+            values = [samples.get(name, "—") for name in adc_channels]
+        else:
+            values = list(samples)
+            if len(values) != len(adc_channels):
+                raise ValueError(
+                    f"expected {len(adc_channels)} samples, got {len(values)}"
+                )
+        for label, value in zip(self.sample_labels, values):
+            label.setText("—" if value is None else str(value))
+
+    def update_sample(self, row: int, value) -> None:
+        self.sample_labels[row].setText("—" if value is None else str(value))
+
+    # ---------- accessors ----------
+
+    def is_enabled(self, row: int) -> bool:
+        return self.enable_boxes[row].isChecked()
+
+    def is_inverted(self, row: int) -> bool:
+        return self.invert_boxes[row].isChecked()
+
+    def offset(self, row: int) -> int:
+        return self.offset_spins[row].value()
+
+    def row_state(self, row: int) -> dict:
+        return {
+            "channel": adc_channels[row],
+            "enabled": self.is_enabled(row),
+            "inverted": self.is_inverted(row),
+            "offset": self.offset(row),
+            "sample": self.sample_labels[row].text(),
+        }
+
+    def all_states(self) -> list[dict]:
+        return [self.row_state(r) for r in range(len(adc_channels))]
 
 
 class LabeledSpinBox(QWidget):
@@ -72,7 +300,6 @@ class PluginWidget(QWidget):
         super().__init__(parent)
         self.bus = bus
         self.controller = controller
-        self.settings = QSettings("honeychrome", "cytkit_hardware")
 
         # --- Create widget, scroll area and layouts to hold the plugin content ---
 
@@ -326,15 +553,47 @@ class PluginWidget(QWidget):
         toolbox.addTab(tab, "DACs")
 
         # ADCs tab:
-        # checkboxes: enable x chanels, select all, select none
-        # buttons: clear, capture
-        # spinbox: capture samples
-        # pg graph
+        # ADC table by channel: ADC enable, current sample, invert, offset
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.addWidget(QLabel("Content for adcs_tab"))
+        title = QLabel('ADCs')
+        title.setStyleSheet(heading_style)
+        layout.addWidget(title)
+        self.adc_table = AdcChannelTable()
+        layout.addWidget(self.adc_table)
         layout.addStretch()
         toolbox.addTab(tab, "ADCs")
+
+
+        # Triggers tab:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        title = QLabel('Triggers')
+        title.setStyleSheet(heading_style)
+        layout.addWidget(title)
+
+        # Triggers table by channel: enable, mask, edge, level, hyst, delay, h.off, skew, events
+        # merge events number
+        # clear all
+        # force
+
+        layout.addStretch()
+        toolbox.addTab(tab, "Triggers")
+
+        # Capture tab:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        title = QLabel('Capture')
+        title.setStyleSheet(heading_style)
+        layout.addWidget(title)
+
+        # Capture table by channel: enable, pre-trigger, post-trigger
+        # aggregator: enable cb, clear fifo btn, fifo level, fifo status
+        # capture stream collector: enable, auto_reset, decode error level, auto reset error level
+
+        layout.addStretch()
+        toolbox.addTab(tab, "Capture")
+
 
         # Monitoring tab:
         # label for each reading V, I
@@ -400,13 +659,13 @@ class PluginWidget(QWidget):
         layout.addStretch()
         toolbox.addTab(tab, "Monitoring")
 
-        # Front panel display:
-        # file load dialog, upload button
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.addWidget(QLabel("Content for display_tab"))
-        layout.addStretch()
-        toolbox.addTab(tab, "Display")
+        # # Front panel display:
+        # # file load dialog, upload button
+        # tab = QWidget()
+        # layout = QVBoxLayout(tab)
+        # layout.addWidget(QLabel("Content for display_tab"))
+        # layout.addStretch()
+        # toolbox.addTab(tab, "Display")
 
         # Registers tab:
         # write: register field, data field
@@ -466,31 +725,35 @@ class PluginWidget(QWidget):
 
         # Connect the signal to a slot
         toolbox.currentChanged.connect(self.on_tab_changed)
+        self.toolbox = toolbox
 
         # update everything
         self.device_name = None
         # self.update_connection_status()
 
     def on_tab_changed(self, index):
-        match index:
-            case 0: # connection
+        name = self.toolbox.tabText(index)
+        match name:
+            case "Connection":
                 self.get_instrument_state(['version','datetime'])
                 self.update_initialised()
-            case 1: # light
+            case "Light":
                 self.get_instrument_state(['laser'])
-            case 2: # fluidics
+            case "Fluidics":
                 self.get_instrument_state(['pressure'])
-            case 3: # DACs
+            case "DACs":
                 self.get_instrument_state(['dacs'])
-            case 4: # ADCs
+            case "ADCs":
                 pass
-            case 5: # monitoring
+            case "Triggers":
+                pass
+            case "Capture":
+                pass
+            case "Monitoring":
                 self.get_instrument_state(['vi_monitors','temperatures','fan_tacho'])
-            case 6: # display
+            case "Registers":
                 pass
-            case 7: # registers
-                pass
-            case 8: # alignment camera
+            case "Alignment Camera":
                 pass
 
     @Slot()
@@ -602,7 +865,7 @@ class PluginWidget(QWidget):
 
     @Slot(int)
     def set_pressure_set_point(self, set_point):
-        self.settings.setValue("pressure_set_point", set_point)
+        q_settings.setValue("pressure_set_point", set_point)
         self.set_instrument_state({'pressure_set_point': set_point})
 
     @Slot(int)
@@ -612,7 +875,7 @@ class PluginWidget(QWidget):
     @Slot(dict)
     def set_pump_controls(self, dict_of_parameter_value):
         for parameter, value in dict_of_parameter_value.items():
-            self.settings.setValue(parameter, value)
+            q_settings.setValue(parameter, value)
         self.set_instrument_state(dict_of_parameter_value)
 
 
