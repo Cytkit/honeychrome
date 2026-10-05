@@ -93,10 +93,25 @@ class CommsThroughMainBoard:
         else:
             self.ft4222.register_bit_clear('DISP_CTRL', 0)
 
+    def set_dc(self, is_data):
+        pass #todo
 
-class SSD1309:
+    def command(self, *cmds):
+        self.set_dc(False)
+        for cmd in cmds:
+            self.spi_write_4bytes(bytes([cmd]))
+
+    def write_data(self, data_bytes):
+        self.set_dc(True)
+
+        data_bytes = bytes(data_bytes)
+        for i in range(0, len(data_bytes), 4): # transmit in 4-byte chunks
+            chunk = data_bytes[i:i + 4]
+            self.spi_write_4bytes(chunk)
+
+
+class CommsThroughEvalBoard:
     def __init__(self):
-
         print("Opening FT4222 devices...")
         # Open Channel A for SPI Master transfers
         self.dev_spi = ft4222.openByDescription('FT4222 A')
@@ -113,13 +128,6 @@ class SSD1309:
 
         print("Resetting OLED...")
         self.reset()
-        print("Sending SSD1309 initialization commands...")
-        self.init_display()
-        print("Initialization complete! Starting render loop...\n")
-
-        # Cache of the last transmitted buffer for diffing
-        self._last_buf = None
-        self.byte_tally = 0
 
     def set_dc(self, is_data: bool):
         # Write DC signal to Channel B
@@ -149,6 +157,30 @@ class SSD1309:
             chunk = data_bytes[i:i + 4]
             self.dev_spi.spiMaster_SingleWrite(chunk, True)
 
+    def close(self):
+        try:
+            self.dev_spi.spiMaster_Uninit()
+        except Exception:
+            pass
+        self.dev_spi.close()
+        self.dev_gpio.close()
+
+
+class SSD1309:
+    def __init__(self):
+        self.comms = CommsThroughEvalBoard()
+        # self.comms = CommsThroughMainBoard()
+
+        time.sleep(0.1)  # Wait for internal power-on reset to complete
+
+        print("Sending SSD1309 initialization commands...")
+        self.init_display()
+        print("Initialization complete! Starting render loop...\n")
+
+        # Cache of the last transmitted buffer for diffing
+        self._last_buf = None
+        self.byte_tally = 0
+
     def init_display(self):
         init_cmds = [0xAE,  # Display OFF
             0xD5, 0x80,  # Set Clock Divide Ratio
@@ -166,7 +198,7 @@ class SSD1309:
             0xA6,  # Normal Display
             0xAF  # Display ON
         ]
-        self.command(*init_cmds)
+        self.comms.command(*init_cmds)
         time.sleep(0.1)  # Allow power supply rail to stabilize
         self._last_buf = None
 
@@ -183,15 +215,15 @@ class SSD1309:
         buf_arr = np.frombuffer(buf, dtype=np.uint8).reshape(PAGES, WIDTH)
 
         # Restrict the column and page windows
-        self.command(0x21, x0, x1)
-        self.command(0x22, page0, page1)
+        self.comms.command(0x21, x0, x1)
+        self.comms.command(0x22, page0, page1)
 
         # Extract the sub-array and flatten row-major (page-major), matching
         # the SSD1309's horizontal addressing auto-increment order.
         region = buf_arr[page0:page1 + 1, x0:x1 + 1]
         region_bytes = region.tobytes()
         self.byte_tally += len(region_bytes)
-        self.write_data(region_bytes)
+        self.comms.write_data(region_bytes)
 
     def display(self, image: Image.Image, force_full: bool = False):
         """Send only the changed region of the framebuffer to the SSD1309."""
@@ -214,13 +246,6 @@ class SSD1309:
 
         self._last_buf = new_buf
 
-    def close(self):
-        try:
-            self.dev_spi.spiMaster_Uninit()
-        except Exception:
-            pass
-        self.dev_spi.close()
-        self.dev_gpio.close()
 
 class SimProxy:
     """Drop-in replacement for SSD1309 that ships frames to a subprocess."""
