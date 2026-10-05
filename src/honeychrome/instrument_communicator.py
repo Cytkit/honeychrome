@@ -216,8 +216,8 @@ class Instrument(mp.Process):
         return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
     def stop_acquisition(self):
-        status, message = self.device.stop_acquisition()
         self.stop_transfer.set()
+        status, message = self.device.stop_acquisition()
         return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
     def set_instrument_state(self, data):

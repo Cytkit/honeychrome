@@ -265,6 +265,9 @@ class CytkitDevice:
         self.initialised = False
 
         self.decoder = CaptureDecoder()
+        self.auto_resets = 0
+        self.fifo_flooded = None
+        self.fifo_level = None
 
         self.pressure_set_point = settings.pressure_set_point_retrieved
         self.temperature_set_point = settings.temperature_set_point_retrieved
@@ -416,6 +419,7 @@ class CytkitDevice:
         self.display.action_message(["Acquisition", f"Settling rate {self.sample_pump_acquisition_rate} uL/min"])
         self.sample_pump.ramp_to(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
         time.sleep(self.sample_pump_settle_time)
+        self.capture.aggr_fifo_clear()
         self.decoder.reset()
 
         self.display.action_message(["Acquisition", f"Started!"])
@@ -430,6 +434,7 @@ class CytkitDevice:
         self.display.action_message("Acquisition finished.")
         logger.info(f"[CytkitDriver] communication errors={self.decoder.error_count}")
 
+        self.capture.aggr_fifo_clear()
         self.decoder.reset()
         return 'OK', 'Cytkit stopped acquisition'
 
@@ -696,6 +701,21 @@ class CytkitDevice:
                 message['dacs']['bias'][index] = self.dacs.get_value_bias(index)
                 message['dacs']['ref'][index] = self.dacs.get_value_ref(index)
 
+        if 'adcs' in list_of_parameters:
+            message['adcs'] = {'level':{}}
+            for index in range(16):
+                message['adcs']['level'][index] = self.adcs.real_read_value(index)
+
+        if 'trigger' in list_of_parameters:
+            message['trigger'] = {'events':{}}
+            for index in range(16):
+                message['trigger']['events'][index] = self.trigger.channel_get_event_count(index)
+            message['trigger']['events']['merge'] = self.trigger.merge_get_event_count()
+
+        if 'capture' in list_of_parameters:
+            self.fifo_level = self.capture.aggr_get_fifo_level()
+            message['capture'] = {'fifo_level':self.fifo_level, 'fifo_status':'Flooded!' if self.fifo_flooded else 'OK', 'decode_errors':self.decoder.error_count, 'auto_resets':self.auto_resets}
+
         if 'register_getter' in list_of_parameters:
             if type(list_of_parameters) is dict:
                 if type(list_of_parameters['register_getter']) is int:
@@ -748,6 +768,13 @@ class CytkitDevice:
     def read_out_traces(self):
         buffer_np = self.ft4222.pop_from_memory()
         packets = self.decoder.decode(buffer_np)
+
+        self.fifo_flooded = self.capture.aggr_get_flooded()
+        if self.fifo_flooded:
+            self.capture.aggr_fifo_clear()
+            self.decoder.reset()
+            self.auto_resets += 1
+
         if packets:
             N = len({p.timestamp for p in packets}) # number of events
             traces = np.zeros((N, settings.n_channels_trace, settings.n_time_points_in_event), dtype=np.uint16)

@@ -1333,11 +1333,11 @@ class PluginWidget(QWidget):
             case "DACs":
                 self.get_instrument_state(['dacs'])
             case "ADCs":
-                pass
+                self.get_instrument_state(['adcs'])
             case "Triggers":
-                pass
+                self.get_instrument_state(['trigger'])
             case "Capture":
-                pass
+                self.get_instrument_state(['capture'])
             case "Monitoring":
                 self.get_instrument_state(['vi_monitors','temperatures','fan_tacho'])
             case "Registers":
