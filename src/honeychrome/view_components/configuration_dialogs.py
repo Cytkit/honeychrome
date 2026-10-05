@@ -431,9 +431,9 @@ class InstrumentConfigDialog(QDialog):
         form.setSpacing(10)
 
         # --- Settings Widgets ---
-        self.trigger_channel_combo = QComboBox()
-        self.trigger_channel_combo.addItems(adc_channels)
-        form.addRow("Trigger Channel:", self.trigger_channel_combo)
+        # self.trigger_channel_combo = QComboBox()
+        # self.trigger_channel_combo.addItems(adc_channels)
+        # form.addRow("Trigger Channel:", self.trigger_channel_combo)
 
         self.width_channel_combo = QComboBox()
         self.width_channel_combo.addItems(adc_channels)
@@ -473,10 +473,10 @@ class InstrumentConfigDialog(QDialog):
     # ----------------------------
 
     def load_settings(self):
-        trigger_channel_retrieved = str(self.settings.value("trigger_channel", trigger_channel)) # there can only be one trigger channel
-        index = self.trigger_channel_combo.findText(trigger_channel_retrieved)
-        if index >= 0:
-            self.trigger_channel_combo.setCurrentIndex(index)
+        # trigger_channel_retrieved = str(self.settings.value("trigger_channel", trigger_channel)) # there can only be one trigger channel
+        # index = self.trigger_channel_combo.findText(trigger_channel_retrieved)
+        # if index >= 0:
+        #     self.trigger_channel_combo.setCurrentIndex(index)
 
         width_channel_retrieved = str(self.settings.value("width_channel", width_channels[0])) # there can be more than one width channel, but currently only allowing one
         index = self.width_channel_combo.findText(width_channel_retrieved)
@@ -494,12 +494,10 @@ class InstrumentConfigDialog(QDialog):
         # self.use_dummy_instrument.setChecked(self.settings.value("use_dummy_instrument", use_dummy_instrument, type=bool))
 
     def save_settings(self):
-        self.settings.setValue("trigger_channel", self.trigger_channel_combo.currentText())
+        # self.settings.setValue("trigger_channel", self.trigger_channel_combo.currentText())
         self.settings.setValue("width_channel", self.width_channel_combo.currentText())
         self.settings.setValue("height_channel", self.height_channel_combo.currentText())
         self.settings.setValue("sample_pump_steps_per_microlitre", self.steps_per_microlitre_spin.value())
-        self.settings.setValue("temperature_set_point", self.steps_per_microlitre_spin.value())
-        self.settings.setValue("", self.steps_per_microlitre_spin.value())
 
         if self.bus:
             self.bus.setSamplePumpFlowRate.emit(0)
@@ -511,9 +509,9 @@ class InstrumentConfigDialog(QDialog):
         self.accept()
 
     def reset_to_defaults(self):
-        index = self.trigger_channel_combo.findText(trigger_channel)
-        if index >= 0:
-            self.trigger_channel_combo.setCurrentIndex(index)
+        # index = self.trigger_channel_combo.findText(trigger_channel)
+        # if index >= 0:
+        #     self.trigger_channel_combo.setCurrentIndex(index)
         index = self.width_channel_combo.findText(width_channels[0])
         if index >= 0:
             self.width_channel_combo.setCurrentIndex(index)
