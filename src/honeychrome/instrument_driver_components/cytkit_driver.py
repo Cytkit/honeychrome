@@ -5,6 +5,7 @@ from threading import Thread, Event, Lock
 import numpy as np
 
 from honeychrome.instrument_driver_components.cytkit_components.adcs import ADCs
+from honeychrome.instrument_driver_components.cytkit_components.capture import Capture
 from honeychrome.instrument_driver_components.cytkit_components.capture_decoder import CaptureDecoder
 from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max
 from honeychrome.instrument_driver_components.cytkit_components.dacs import DACs
@@ -14,9 +15,11 @@ from honeychrome.instrument_driver_components.cytkit_components.fan import Fan
 from honeychrome.instrument_driver_components.cytkit_components.i2c import I2C
 from honeychrome.instrument_driver_components.cytkit_components.id_data import IDData
 from honeychrome.instrument_driver_components.cytkit_components.laser import Laser
+from honeychrome.instrument_driver_components.cytkit_components.offset_corrector import OffsetCorrector
 from honeychrome.instrument_driver_components.cytkit_components.pressure import Pressure
 from honeychrome.instrument_driver_components.cytkit_components.sample_pump import SamplePump
 from honeychrome.instrument_driver_components.cytkit_components.sheath_pump import SheathPump
+from honeychrome.instrument_driver_components.cytkit_components.trigger import Trigger
 from honeychrome.instrument_driver_components.cytkit_components.vi_monitor import VIMonitor
 from honeychrome import settings
 
@@ -250,6 +253,9 @@ class CytkitDevice:
         self.vi_monitor = None
         self.dacs = None
         self.adcs = None
+        self.offset_corrector = None
+        self.trigger = None
+        self.capture = None
         self.pressure_control_worker = None
         self.temperature_control_worker = None
         self.event_rate_counter = None
@@ -291,6 +297,9 @@ class CytkitDevice:
         self.vi_monitor = VIMonitor(self.i2c_bus_a, self.i2c_bus_b)
         self.dacs = DACs(self.i2c_bus_a)
         self.adcs = ADCs(self.ft4222)
+        self.offset_corrector = OffsetCorrector(self.ft4222)
+        self.trigger = Trigger(self.ft4222)
+        self.capture = Capture(self.ft4222)
         logger.info('[Cytkit driver] Connected')
 
         # set initial settings
@@ -304,7 +313,7 @@ class CytkitDevice:
         self.sample_pump.set_clocks_per_cycle(settings.sample_pump_clocks_per_cycle)
         self.fan.set_pwm_frequency(25000)
         self.fan.set_pwm_duty(0)
-        self.sheath_pump.set_pwm_frequency(25000)
+        self.sheath_pump.set_pwm_frequency(30)
         self.sheath_pump.set_pwm_duty(0)
         self.pressure_control_worker = PressureControlWorker(self.pressure, self.sheath_pump, self.pressure_set_point, pump_max, control_loop_interval)
         self.temperature_control_worker = TemperatureControlWorker(self.pressure, self.fan, self.temperature_set_point, fan_max, control_loop_interval)
@@ -318,6 +327,49 @@ class CytkitDevice:
         self.laser_getter.start()
         self.display = Display(transfer_object=self.event_rate_counter, sample_pump_object=self.sample_pump_flow_rate_getter, pressure_object=self.pressure_control_worker, temperature_object=self.temperature_control_worker, laser_object=self.laser_getter)
         self.display.start()
+
+        # adc state
+        for row, name in enumerate(settings.adc_channels):
+            enabled = settings.adc_enabled_retrieved[name]
+            inverted = settings.adc_inverted_retrieved[name]
+            offset = settings.adc_offset_retrieved[name]
+            self.set_state({'adcs':{
+                'enable': {row: enabled},
+                'inverted': {row: inverted},
+                'offset': {row: offset},
+            }})
+
+        # trigger state
+        for row, name in enumerate(settings.adc_channels):
+            enabled = settings.trigger_enabled_retrieved[name]
+            mask = settings.trigger_mask_retrieved[name]
+            edge = settings.trigger_edge_retrieved[name]
+            level = settings.trigger_level_retrieved[name]
+            hyst = settings.trigger_hyst_retrieved[name]
+            delay = settings.trigger_delay_retrieved[name]
+            h_off = settings.trigger_h_off_retrieved[name]
+            skew = settings.trigger_skew_retrieved[name]
+            self.set_state({'trigger':{
+                'enable': {row: enabled},
+                'mask': {row: mask},
+                'edge': {row: edge},
+                'level': {row: level},
+                'hyst': {row: hyst},
+                'delay': {row: delay},
+                'h_off': {row: h_off},
+                'skew': {row: skew}
+            }})
+
+        # capture state
+        for row, name in enumerate(settings.adc_channels):
+            enabled = settings.capture_enabled_retrieved[name]
+            pre = settings.capture_pre_trigger_retrieved[name]
+            post = settings.capture_post_trigger_retrieved[name]
+            self.set_state({'trigger':{
+                'enable': {row: enabled},
+                'pre_trigger': {row: pre},
+                'post_trigger': {row: post}
+            }})
 
         return  'OK', 'Connected to Cytkit'
 
@@ -439,6 +491,62 @@ class CytkitDevice:
                     for index in value['ref']:
                         self.dacs.set_value_ref(index, value['ref'][index])
                 message['dacs'] = value
+
+            if parameter == 'adcs':
+                if 'enable' in value:
+                    for index in value['enable']:
+                        self.adcs.real_set_enable(index, value['enable'][index])
+                if 'invert' in value:
+                    for index in value['invert']:
+                        self.offset_corrector.set_invert(index, value['invert'][index])
+                if 'offset' in value:
+                    for index in value['offset']:
+                        self.offset_corrector.set_level(index, value['offset'][index])
+
+            if parameter == 'trigger':
+                if 'enable' in value:
+                    for index in value['enable']:
+                        self.trigger.channel_set_enable(index, value['enable'][index])
+                if 'mask' in value:
+                    for index in value['mask']:
+                        self.trigger.channel_set_mask(index, value['mask'][index])
+                if 'edge' in value:
+                    for index in value['edge']:
+                        self.trigger.channel_set_edge(index, value['edge'][index])
+                if 'level' in value:
+                    for index in value['level']:
+                        self.trigger.channel_set_level(index, value['level'][index])
+                if 'hyst' in value:
+                    for index in value['hyst']:
+                        self.trigger.channel_set_hysteresis(index, value['hyst'][index])
+                if 'delay' in value:
+                    for index in value['delay']:
+                        self.trigger.channel_set_delay(index, value['delay'][index])
+                if 'h_off' in value:
+                    for index in value['h_off']:
+                        self.trigger.channel_set_holdoff(index, value['h_off'][index])
+                if 'skew' in value:
+                    for index in value['skew']:
+                        self.capture.channel_set_trigger_skew(index, value['skew'][index])
+
+                if 'force' == value:
+                    self.trigger.merge_force_trigger()
+                if 'clear' == value:
+                    self.trigger.clear_all_counts()
+
+            if parameter == 'capture':
+                if 'enable' in value:
+                    for index in value['enable']:
+                        self.capture.channel_set_enable(index, value['enable'][index])
+                if 'pre_trigger' in value:
+                    for index in value['enable']:
+                        self.capture.channel_set_pre_trig_samples(index, value['pre_trigger'][index])
+                if 'post_trigger' in value:
+                    for index in value['enable']:
+                        self.capture.channel_set_post_trig_samples(index, value['post_trigger'][index])
+
+                if 'clear_fifo' == value:
+                    self.capture.aggr_fifo_clear()
 
             if parameter == 'register_setter':
                 try:

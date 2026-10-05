@@ -13,6 +13,7 @@ transfer_target_repeat_time = 0.05 #s
 n_channels_trace = 16
 adc_rate = 2.5  # [MHz]
 max_event_time = 120  # [us]
+n_time_points_in_event = int(adc_rate * max_event_time)
 deltaT = 1/adc_rate # [us]
 adc_scale_mv = 30 # the adc level for 1 mV
 
@@ -49,9 +50,13 @@ window_extension_length_pre = int(window_extension_time_pre * adc_rate * 1e6)
 window_extension_length_post = int(window_extension_time_post * adc_rate * 1e6)
 timeout_length = int(max_event_time * adc_rate)
 
+capture_enabled_default = True
+capture_pre_trigger_default = n_time_points_in_event//2
+capture_post_trigger_default = n_time_points_in_event - capture_pre_trigger_default
+trigger_default_hysteresis = 16
+
 ### define traces cache
 max_events_in_traces_cache = 100_000
-n_time_points_in_event = int(adc_rate * max_event_time)
 bytes_per_value = 2
 traces_cache_dtype = 'uint16'
 trace_n_points = n_channels_trace * n_time_points_in_event
@@ -295,3 +300,51 @@ sample_pump_flush_time_retrieved = q_settings.value('sample_pump_flush_time', sa
 sample_pump_backflush_speed_retrieved = q_settings.value('sample_pump_backflush_speed', sample_pump_backflush_speed, type=int)
 sample_pump_backflush_time_retrieved = q_settings.value('sample_pump_backflush_time', sample_pump_backflush_time, type=float)
 sample_pump_acquisition_rate_retrieved = q_settings.value('sample_pump_acquisition_speed', sample_pump_acquisition_rate, type=float)
+
+q_settings.beginGroup("adc_channels")
+adc_enabled_retrieved = {}
+adc_inverted_retrieved = {}
+adc_offset_retrieved = {}
+for row, name in enumerate(adc_channels):
+    q_settings.beginGroup(name)
+    adc_enabled_retrieved[name] = q_settings.value("enabled", True, type=bool)
+    adc_inverted_retrieved[name] = q_settings.value("inverted", False if name=='SSC' else True, type=bool)
+    adc_offset_retrieved[name] = q_settings.value("offset", 0, type=int)
+    q_settings.endGroup()
+q_settings.endGroup()
+
+q_settings.beginGroup("trigger_channels")
+trigger_enabled_retrieved = {}
+trigger_mask_retrieved = {}
+trigger_edge_retrieved = {}
+trigger_level_retrieved = {}
+trigger_hyst_retrieved = {}
+trigger_delay_retrieved = {}
+trigger_h_off_retrieved = {}
+trigger_skew_retrieved = {}
+for row, name in enumerate(adc_channels):
+    q_settings.beginGroup(name)
+    trigger_enabled_retrieved[name] = q_settings.value("enabled", True if name=='FSC' else False, type=bool)
+    trigger_mask_retrieved[name] = q_settings.value("mask", True if name=='FSC' else False, type=bool)
+    trigger_edge_retrieved[name] = q_settings.value("edge", True if name=='FSC' else False, type=bool)
+    trigger_level_retrieved[name] = q_settings.value("level", threshold * adc_scale_mv, type=int)
+    trigger_hyst_retrieved[name] = q_settings.value("hyst", trigger_default_hysteresis, type=int)
+    trigger_delay_retrieved[name] = q_settings.value("delay", 0, type=int)
+    trigger_h_off_retrieved[name] = q_settings.value("h_off", 0, type=int)
+    trigger_skew_retrieved[name] = q_settings.value("skew", 0, type=int)
+    q_settings.endGroup()
+q_settings.endGroup()
+
+
+q_settings.beginGroup("capture_channels")
+capture_enabled_retrieved = {}
+capture_pre_trigger_retrieved = {}
+capture_post_trigger_retrieved = {}
+for row, name in enumerate(adc_channels):
+    q_settings.beginGroup(name)
+    capture_enabled_retrieved[name] = q_settings.value("enabled", capture_enabled_default, type=bool)
+    capture_pre_trigger_retrieved[name] = q_settings.value("pre_trigger", capture_pre_trigger_default, type=int)
+    capture_post_trigger_retrieved[name] = q_settings.value("post_trigger", capture_post_trigger_default, type=int)
+    q_settings.endGroup()
+q_settings.endGroup()
+

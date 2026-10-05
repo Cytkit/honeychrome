@@ -38,17 +38,17 @@ class Capture:
     def channel_set_pre_trig_samples(self, channel, num_samples):
         self.ft4222.register_write(adc_dictionary[channel]['capture'] + 0x0009, num_samples)
 
-    def channel_get_pre_trig_samples(self, channel, num_samples):
+    def channel_get_pre_trig_samples(self, channel):
         return self.ft4222.register_write(adc_dictionary[channel]['capture'] + 0x0009)
 
     def channel_set_post_trig_samples(self, channel, num_samples):
         self.ft4222.register_write(adc_dictionary[channel]['capture'] + 0x000A, num_samples)
 
-    def channel_get_post_trig_samples(self, channel, num_samples):
+    def channel_get_post_trig_samples(self, channel):
         return self.ft4222.register_write(adc_dictionary[channel]['capture'] + 0x000A)
 
     def channel_set_trigger_skew(self, channel, num_samples):
         self.ft4222.register_write(adc_dictionary[channel]['capture'] + 0x000B, num_samples)
 
-    def channel_get_trigger_skew(self, channel, num_samples):
+    def channel_get_trigger_skew(self, channel):
         return self.ft4222.register_write(adc_dictionary[channel]['capture'] + 0x000B)

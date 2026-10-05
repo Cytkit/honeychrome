@@ -99,3 +99,7 @@ class Trigger:
     def channel_reset_event_count(self, channel):
         self.ft4222.register_bit_set(adc_dictionary[channel]['trigger'] + 0x0001, 8)
 
+    def clear_all_counts(self):
+        for channel in adc_dictionary.keys():
+            self.channel_reset_event_count(channel)
+        self.merge_reset_event_count()

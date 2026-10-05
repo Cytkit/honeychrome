@@ -16,7 +16,7 @@ from honeychrome.view_components.event_bus import EventBus
 from honeychrome.view_components.icon_loader import icon
 from honeychrome import settings
 
-q_settings = QSettings("honeychrome", "cytkit_hardware")
+q_settings = settings.q_settings
 
 logger = logging.getLogger(__name__)
 
@@ -160,20 +160,12 @@ class AdcChannelTable(QWidget):
 
     def load_state(self) -> None:
         """Read state from QSettings; programmatic changes are not re-saved."""
-        self._loading = True
-        try:
-            s = q_settings
-            s.beginGroup(self.SETTINGS_GROUP)
-            for row, name in enumerate(adc_channels):
-                s.beginGroup(name)
-                enabled = s.value("enabled", False, type=bool)
-                inverted = s.value("inverted", False, type=bool)
-                offset = s.value("offset", 0, type=int)
-                s.endGroup()
-                self._set_row_silently(row, enabled, inverted, offset)
-            s.endGroup()
-        finally:
-            self._loading = False
+        for row, name in enumerate(adc_channels):
+            enabled = settings.adc_enabled_retrieved[name]
+            inverted = settings.adc_inverted_retrieved[name]
+            offset = settings.adc_offset_retrieved[name]
+            self._set_row_silently(row, enabled, inverted, offset)
+
 
     def _set_row_silently(
         self, row: int, enabled: bool, inverted: bool, offset: int
@@ -197,16 +189,16 @@ class AdcChannelTable(QWidget):
         """Restore defaults (disabled, not inverted, offset 0) and persist."""
         self._loading = True
         try:
-            for row in range(len(adc_channels)):
-                self._set_row_silently(row, enabled=False, inverted=False, offset=0)
+            for row, name in enumerate(adc_channels):
+                self._set_row_silently(row, enabled=True, inverted=False if name=='SSC' else True, offset=0)
         finally:
             self._loading = False
 
         # persist the reset state and notify listeners
         self.save_state()
         for row, name in enumerate(adc_channels):
-            self.enable_changed.emit(row, name, False)
-            self.invert_changed.emit(row, name, False)
+            self.enable_changed.emit(row, name, True)
+            self.invert_changed.emit(row, name, False if name=='SSC' else True)
             self.offset_changed.emit(row, name, 0)
 
     # ---------- sample labels ----------
@@ -270,7 +262,7 @@ class TriggerChannelTable(QWidget):
         # ---- table ----
         self.table = QTableWidget(len(adc_channels), 9)
         self.table.setHorizontalHeaderLabels(
-            ["Enable", "Mask", "Edge", "Level", "Hyst", "Delay", "H.Off", "Skew", "Events"]
+            ["Enable", "Mask", "Edge", "Level", "Hysteresis", "Delay", "Hold-off", "Skew", "Events"]
         )
         self.table.verticalHeader().setVisible(True)
         self.table.setVerticalHeaderLabels(adc_channels)
@@ -482,25 +474,19 @@ class TriggerChannelTable(QWidget):
 
     def load_state(self) -> None:
         """Read state from QSettings; programmatic changes are not re-saved."""
-        self._loading = True
-        try:
-            s = q_settings
-            s.beginGroup(self.SETTINGS_GROUP)
-            for row, name in enumerate(adc_channels):
-                s.beginGroup(name)
-                enabled = s.value("enabled", False, type=bool)
-                mask = s.value("mask", False, type=bool)
-                edge = s.value("edge", False, type=bool)
-                level = s.value("level", 3000, type=int)
-                hyst = s.value("hyst", 16, type=int)
-                delay = s.value("delay", 0, type=int)
-                h_off = s.value("h_off", 0, type=int)
-                skew = s.value("skew", 0, type=int)
-                s.endGroup()
-                self._set_row_silently(row, enabled, mask, edge, level, hyst, delay, h_off, skew)
-            s.endGroup()
-        finally:
-            self._loading = False
+
+        for row, name in enumerate(adc_channels):
+            enabled = settings.trigger_enabled_retrieved[name]
+            mask = settings.trigger_mask_retrieved[name]
+            edge = settings.trigger_edge_retrieved[name]
+            level = settings.trigger_level_retrieved[name]
+            hyst = settings.trigger_hyst_retrieved[name]
+            delay = settings.trigger_delay_retrieved[name]
+            h_off = settings.trigger_h_off_retrieved[name]
+            skew = settings.trigger_skew_retrieved[name]
+
+            self._set_row_silently(row, enabled, mask, edge, level, hyst, delay, h_off, skew)
+
 
     def _set_row_silently(
         self, row: int, enabled: bool, mask: bool, edge: bool, level: int, hyst: int, delay: int, h_off: int, skew: int
@@ -534,19 +520,19 @@ class TriggerChannelTable(QWidget):
         """Restore defaults (disabled, not inverted, offset 0) and persist."""
         self._loading = True
         try:
-            for row in range(len(adc_channels)):
-                self._set_row_silently(row, enabled=False, mask=False, edge=False, level=3000, hyst=16, delay=0, h_off=0, skew=0)
+            for row, name in enumerate(adc_channels):
+                self._set_row_silently(row, enabled=True if name=='FSC' else False, mask=True if name=='FSC' else False, edge=True if name=='FSC' else False, level=settings.threshold * settings.adc_scale_mv, hyst=settings.trigger_default_hysteresis, delay=0, h_off=0, skew=0)
         finally:
             self._loading = False
 
         # persist the reset state and notify listeners
         self.save_state()
         for row, name in enumerate(adc_channels):
-            self.enable_changed.emit(row, name, False)
-            self.mask_changed.emit(row, name, False)
-            self.edge_changed.emit(row, name, False)
-            self.level_changed.emit(row, name, 3000)
-            self.hyst_changed.emit(row, name, 16)
+            self.enable_changed.emit(row, name, True if name=='FSC' else False)
+            self.mask_changed.emit(row, name, True if name=='FSC' else False)
+            self.edge_changed.emit(row, name, True if name=='FSC' else False)
+            self.level_changed.emit(row, name, settings.threshold * settings.adc_scale_mv)
+            self.hyst_changed.emit(row, name, settings.trigger_default_hysteresis)
             self.delay_changed.emit(row, name, 0)
             self.h_off_changed.emit(row, name, 0)
             self.skew_changed.emit(row, name, 0)
@@ -617,11 +603,6 @@ class CaptureChannelTable(QWidget):
     post_trigger_changed = Signal(int, str, int)
 
     SETTINGS_GROUP = "capture_channels"
-
-    # defaults (also used by reset())
-    DEFAULT_ENABLED = False
-    DEFAULT_PRE = 400
-    DEFAULT_POST = 400
 
     # uint range for the trigger spinboxes — adjust to taste
     PRE_MIN, PRE_MAX = 0, 10000
@@ -750,20 +731,11 @@ class CaptureChannelTable(QWidget):
         s.sync()
 
     def load_state(self) -> None:
-        self._loading = True
-        try:
-            s = q_settings
-            s.beginGroup(self.SETTINGS_GROUP)
-            for row, name in enumerate(adc_channels):
-                s.beginGroup(name)
-                enabled = s.value("enabled", self.DEFAULT_ENABLED, type=bool)
-                pre = s.value("pre_trigger", self.DEFAULT_PRE, type=int)
-                post = s.value("post_trigger", self.DEFAULT_POST, type=int)
-                s.endGroup()
-                self._set_row_silently(row, enabled, pre, post)
-            s.endGroup()
-        finally:
-            self._loading = False
+        for row, name in enumerate(adc_channels):
+            enabled = settings.capture_enabled_retrieved[name]
+            pre = settings.capture_pre_trigger_retrieved[name]
+            post = settings.capture_post_trigger_retrieved[name]
+            self._set_row_silently(row, enabled, pre, post)
 
     def _set_row_silently(
         self, row: int, enabled: bool, pre: int, post: int
@@ -789,18 +761,18 @@ class CaptureChannelTable(QWidget):
             for row in range(len(adc_channels)):
                 self._set_row_silently(
                     row,
-                    self.DEFAULT_ENABLED,
-                    self.DEFAULT_PRE,
-                    self.DEFAULT_POST,
+                    settings.capture_enabled_default,
+                    settings.capture_pre_trigger_default,
+                    settings.capture_post_trigger_default,
                 )
         finally:
             self._loading = False
 
         self.save_state()
         for row, name in enumerate(adc_channels):
-            self.enable_changed.emit(row, name, self.DEFAULT_ENABLED)
-            self.pre_trigger_changed.emit(row, name, self.DEFAULT_PRE)
-            self.post_trigger_changed.emit(row, name, self.DEFAULT_POST)
+            self.enable_changed.emit(row, name, settings.capture_enabled_default)
+            self.pre_trigger_changed.emit(row, name, settings.capture_pre_trigger_default)
+            self.post_trigger_changed.emit(row, name, settings.capture_post_trigger_default)
 
     # ---------- accessors ----------
 
@@ -1134,6 +1106,10 @@ class PluginWidget(QWidget):
         title.setStyleSheet(heading_style)
         layout.addWidget(title)
         self.adc_table = AdcChannelTable()
+        self.adc_table.enable_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'adcs': {'enable': {channel_id: value}}}))
+        self.adc_table.invert_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'adcs': {'invert': {channel_id: value}}}))
+        self.adc_table.offset_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'adcs': {'offset': {channel_id: value}}}))
+
         layout.addWidget(self.adc_table)
         layout.addStretch()
         toolbox.addTab(tab, "ADCs")
@@ -1148,17 +1124,30 @@ class PluginWidget(QWidget):
         layout = QVBoxLayout(tab)
         title = QLabel('Triggers')
         title.setStyleSheet(heading_style)
+        title.setStyleSheet(heading_style)
         layout.addWidget(title)
         self.trigger_table = TriggerChannelTable()
+        self.trigger_table.enable_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'trigger': {'enable': {channel_id: value}}}))
+        self.trigger_table.mask_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'trigger': {'mask': {channel_id: value}}}))
+        self.trigger_table.edge_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'trigger': {'edge': {channel_id: value}}}))
+        self.trigger_table.level_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'trigger': {'level': {channel_id: value}}}))
+        self.trigger_table.hyst_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'trigger': {'hyst': {channel_id: value}}}))
+        self.trigger_table.delay_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'trigger': {'delay': {channel_id: value}}}))
+        self.trigger_table.h_off_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'trigger': {'h_off': {channel_id: value}}}))
+        self.trigger_table.skew_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'trigger': {'skew': {channel_id: value}}}))
         layout.addWidget(self.trigger_table)
+
         form = QFormLayout()
         self.merged_count = QLabel('—')
         form.addRow('Merged:', self.merged_count)
         layout.addLayout(form)
         self.force_btn = QPushButton('Force trigger')
+        self.force_btn.clicked.connect(lambda: self.set_instrument_state({'trigger': 'force'}))
         layout.addWidget(self.force_btn)
         self.clear_btn = QPushButton('Clear counts')
+        self.clear_btn.clicked.connect(lambda: self.set_instrument_state({'trigger': 'clear'}))
         layout.addWidget(self.clear_btn)
+
         layout.addStretch()
         toolbox.addTab(tab, "Triggers")
 
@@ -1172,6 +1161,10 @@ class PluginWidget(QWidget):
         title.setStyleSheet(heading_style)
         layout.addWidget(title)
         self.capture_table = CaptureChannelTable()
+        self.capture_table.enable_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'capture': {'enable': {channel_id: value}}}))
+        self.capture_table.pre_trigger_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'capture': {'pre_trigger': {channel_id: value}}}))
+        self.capture_table.post_trigger_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'capture': {'post_trigger': {channel_id: value}}}))
+
         layout.addWidget(self.capture_table)
         form = QFormLayout()
         self.fifo_level = QLabel('—')
@@ -1183,8 +1176,9 @@ class PluginWidget(QWidget):
         self.auto_resets = QLabel('—')
         form.addRow('Auto resets:', self.auto_resets)
         layout.addLayout(form)
-        self.clear_btn = QPushButton('Clear FIFO')
-        layout.addWidget(self.clear_btn)
+        self.clear_fifo_btn = QPushButton('Clear FIFO')
+        self.clear_fifo_btn.clicked.connect(lambda: self.set_instrument_state({'capture': 'clear_fifo'}))
+        layout.addWidget(self.clear_fifo_btn)
 
         layout.addStretch()
         toolbox.addTab(tab, "Capture")
