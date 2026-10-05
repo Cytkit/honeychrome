@@ -3,7 +3,7 @@ Cytkit State plugin (hardware monitor and settings)
 """
 from PySide6.QtGui import QCursor, QIntValidator
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QTabWidget, QToolBox, QFormLayout, QComboBox, QCheckBox, QSpinBox, QHBoxLayout, QFrame, QTableWidget, QHeaderView, QLineEdit, QDoubleSpinBox
-from PySide6.QtCore import Qt, Slot, Signal, QSize, QSettings
+from PySide6.QtCore import Qt, Slot, Signal, QSize, QSettings, QTimer
 from PySide6.QtWidgets import QApplication
 
 import logging
@@ -1312,16 +1312,31 @@ class PluginWidget(QWidget):
         # toolbox.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         main_layout.addWidget(toolbox)
 
+        # Timer for periodic updates
+        self.timer = QTimer(self)
+        self.timer.setInterval(500)
+        self.timer.timeout.connect(self._on_timer)
+        self.timer.start()
+
         # Connect the signal to a slot
-        toolbox.currentChanged.connect(self.on_tab_changed)
+        toolbox.currentChanged.connect(self._on_tab_changed)
         self.toolbox = toolbox
 
         # update everything
         self.device_name = None
         # self.update_connection_status()
 
-    def on_tab_changed(self, index):
-        name = self.toolbox.tabText(index)
+    def _on_tab_changed(self, index):
+        self._on_timer()
+
+    def _on_timer(self):
+        if not self.toolbox.isVisible():
+            return
+
+        tab_name = self.toolbox.tabText(self.toolbox.currentIndex())
+        self.update_tab(tab_name)
+
+    def update_tab(self, name):
         match name:
             case "Connection":
                 self.get_instrument_state(['version','datetime'])
@@ -1428,6 +1443,34 @@ class PluginWidget(QWidget):
                     for index in response['message']['dacs']['ref']:
                         value = response['message']['dacs']['bias'][index]
                         self.dac_table.cellWidget(index, 1).spinbox.setValue(value)
+
+        if 'adcs' in response['message']:
+            if response['message']['adcs']:
+                if 'level' in response['message']['adcs']:
+                    for index in response['message']['adcs']['level']:
+                        value = response['message']['adcs']['level'][index]
+                        self.adc_table.update_sample(index, value)
+
+        if 'trigger' in response['message']:
+            if response['message']['trigger']:
+                if 'events' in response['message']['trigger']:
+                    for index in response['message']['trigger']['events']:
+                        value = response['message']['trigger']['events'][index]
+                        if type(index) is int:
+                            self.trigger_table.update_events(index, value)
+                        elif index == 'merge':
+                            self.merged_count.setText(value if value else "—")
+
+        if 'capture' in response['message']:
+            if response['message']['capture']:
+                if 'fifo_level' in response['message']['capture']:
+                    self.fifo_level.setText(response['message']['capture']['fifo_level'])
+                if 'fifo_status' in response['message']['capture']:
+                    self.fifo_status.setText(response['message']['capture']['fifo_status'])
+                if 'decode_errors' in response['message']['capture']:
+                    self.decode_errors.setText(response['message']['capture']['decode_errors'])
+                if 'auto_resets' in response['message']['capture']:
+                    self.auto_resets.setText(response['message']['capture']['auto_resets'])
 
         if 'register_getter' in response['message']:
             value = response['message']['register_getter']

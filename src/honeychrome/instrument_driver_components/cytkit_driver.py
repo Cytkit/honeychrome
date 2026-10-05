@@ -714,7 +714,7 @@ class CytkitDevice:
 
         if 'capture' in list_of_parameters:
             self.fifo_level = self.capture.aggr_get_fifo_level()
-            message['capture'] = {'fifo_level':self.fifo_level, 'fifo_status':'Flooded!' if self.fifo_flooded else 'OK', 'decode_errors':self.decoder.error_count, 'auto_resets':self.auto_resets}
+            message['capture'] = {'fifo_level':self.fifo_level, 'fifo_status':'🔴 Flooded!' if self.fifo_flooded else '🟢 OK', 'decode_errors':self.decoder.error_count, 'auto_resets':self.auto_resets}
 
         if 'register_getter' in list_of_parameters:
             if type(list_of_parameters) is dict:
