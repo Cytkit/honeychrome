@@ -77,6 +77,23 @@ def _dirty_rects(new: bytes, old: bytes):
         rects.append((int(cols[0]), int(cols[-1]), start, end))
     return rects
 
+class CommsThroughMainBoard:
+    def __init__(self, ft4222communicator):
+        self.ft4222 = ft4222communicator
+        self.ft4222.register_write('DISP_TXFR_SIZE', 32)
+
+    def spi_write_4bytes(self, data):
+        while not self.ft4222.register_bit_get('DISP_CTRL', 4):
+            time.sleep(0.0001)
+        self.ft4222.register_2reg_write('DISP_DATA_L', 'DISP_DATA_H', data)
+
+    def dc_write(self, is_data):
+        if is_data:
+            self.ft4222.register_bit_set('DISP_CTRL', 0)
+        else:
+            self.ft4222.register_bit_clear('DISP_CTRL', 0)
+
+
 class SSD1309:
     def __init__(self):
 
@@ -125,8 +142,12 @@ class SSD1309:
 
     def write_data(self, data_bytes):
         self.set_dc(True)
-        # SPI write on Channel A
-        self.dev_spi.spiMaster_SingleWrite(bytes(data_bytes), True)
+        # self.dev_spi.spiMaster_SingleWrite(bytes(data_bytes), True) # transmit in one go
+
+        data_bytes = bytes(data_bytes)
+        for i in range(0, len(data_bytes), 4): # transmit in 4-byte chunks
+            chunk = data_bytes[i:i + 4]
+            self.dev_spi.spiMaster_SingleWrite(chunk, True)
 
     def init_display(self):
         init_cmds = [0xAE,  # Display OFF
