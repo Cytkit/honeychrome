@@ -419,8 +419,12 @@ class CytkitDevice:
         self.display.action_message(["Acquisition", f"Settling rate {self.sample_pump_acquisition_rate} uL/min"])
         self.sample_pump.ramp_to(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
         time.sleep(self.sample_pump_settle_time)
+        self.trigger.clear_all_counts()
         self.capture.aggr_fifo_clear()
+        self.trigger.merge_set_enable(True)
+        self.capture.aggr_set_enable(True)
         self.decoder.reset()
+        self.event_rate_counter.reset()
 
         self.display.action_message(["Acquisition", f"Started!"])
         return 'OK', 'Cytkit started acquisition'
@@ -434,8 +438,12 @@ class CytkitDevice:
         self.display.action_message("Acquisition finished.")
         logger.info(f"[CytkitDriver] communication errors={self.decoder.error_count}")
 
+        self.trigger.merge_set_enable(False)
+        self.capture.aggr_set_enable(False)
         self.capture.aggr_fifo_clear()
+        self.trigger.clear_all_counts()
         self.decoder.reset()
+        self.event_rate_counter.reset()
         return 'OK', 'Cytkit stopped acquisition'
 
     def set_state(self, dict_of_parameter_value):
@@ -710,7 +718,7 @@ class CytkitDevice:
             message['trigger'] = {'events':{}}
             for index in range(16):
                 message['trigger']['events'][index] = self.trigger.channel_get_event_count(index)
-            message['trigger']['events']['merge'] = self.trigger.merge_get_event_count()
+            message['trigger']['events']['merge'] = self.trigger_event_count
 
         if 'capture' in list_of_parameters:
             self.fifo_level = self.capture.aggr_get_fifo_level()
@@ -792,8 +800,11 @@ class CytkitDevice:
                     traces[idx, packet.channel, :n] = packet.samples[:n]
 
                 n_decoded_events = len(event_index)
-                self.event_rate_counter.update(n_decoded_events) # this is the number of events for which at least some data was recovered
-                # todo count trigger rate instead
+                # self.event_rate_counter.update(n_decoded_events) # this is the number of events for which at least some data was recovered
+                old_trigger_event_count = self.trigger_event_count
+                self.trigger_event_count = self.trigger.merge_get_event_count()
+                new_events = self.trigger_event_count - old_trigger_event_count
+                self.event_rate_counter.update(new_events) # this is the number of merge trigger events
                 blob_of_traces_as_array = traces.reshape(-1)
                 return blob_of_traces_as_array
 
