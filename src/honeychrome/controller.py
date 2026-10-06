@@ -40,9 +40,10 @@ from copy import deepcopy
 from multiprocessing import shared_memory
 import time
 
+from honeychrome.controller_components.per_sample_gating_functions import install_custom_gate, copy_gate_geometry, serialize_custom_sample_gates
 from honeychrome.experiment_model import ExperimentModel, check_fcs_matches_experiment
 from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels, sync_af_index_transform
-from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml
+from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml, gate_to_gml, gate_from_gml
 from honeychrome.settings import traces_cache_size, traces_cache_dtype, adc_rate
 import honeychrome.settings as settings
 from honeychrome.settings import max_events_in_cache, n_channels_per_event, experiments_folder, live_data_process_repeat_time, settings_default, samples_default, channel_dict
@@ -78,7 +79,8 @@ cytometry_data_dictionary = {
     'gating': GatingStrategy(), # flowkit.GatingStrategy object used to define the gating lookup tables
     'plots': [], # set of cytometry plot definitions (1D histograms, 2D histograms, ribbon plots referencing the channel names, source gates and child gates
     'histograms': [], # set of 1D and 2D histograms for plotting on the plots
-    'gate_membership': {} # dictionary of gate membership for each gate, boolean array corresponding to event_data
+    'gate_membership': {}, # dictionary of gate membership for each gate, boolean array corresponding to event_data
+    'sample_id': None
 }
 
 class Controller(QObject):
@@ -115,6 +117,9 @@ class Controller(QObject):
         self.unmixed_transformations = None
         self.raw_gating = GatingStrategy()
         self.unmixed_gating = GatingStrategy()
+        # per-sample custom gates: {scope: {sample_path: {gate_name: flowkit Gate}}}
+        # all samples share one hierarchy; a sample may override a single gate.
+        self.custom_sample_gates = {'raw': {}, 'unmixed': {}}
         self.data_for_cytometry_plots = deepcopy(cytometry_data_dictionary)
         self.data_for_cytometry_plots_raw = deepcopy(self.data_for_cytometry_plots)
         self.data_for_cytometry_plots_process = deepcopy(self.data_for_cytometry_plots)
@@ -425,6 +430,11 @@ class Controller(QObject):
             self.experiment.cytometry['gating'] = to_gml(self.unmixed_gating)
             update_transforms(self.experiment.cytometry['transforms'], self.unmixed_transformations)
 
+        # Persist per-sample custom gates as GML fragments (one per overridden
+        # gate) in additive, optional .kit fields — old readers ignore them.
+        self.experiment.cytometry['raw_custom_sample_gates'] = serialize_custom_sample_gates(self.custom_sample_gates.get('raw', {}))
+        self.experiment.cytometry['unmixed_custom_sample_gates'] = serialize_custom_sample_gates(self.custom_sample_gates.get('unmixed', {}))
+
         if not experiment_path:
             self._save_cleaned_events()
             self._save_autospectral_variants()
@@ -454,6 +464,10 @@ class Controller(QObject):
         # the change happens on a tab the user isn't currently viewing —
         # otherwise apply_gates_in_place crashes when that tab is later shown.
         self.calculate_lookup_tables(mode=mode, top_gate=top_gate)
+
+        # if the edited gate is customised for the current sample, refresh the
+        # stored per-sample copy so the in-place ROI edit survives reloads.
+        self._sync_custom_gate_from_strategy(mode, top_gate)
 
         if mode == self.current_mode:
             # recalculate histograms and stats
@@ -508,7 +522,9 @@ class Controller(QObject):
                     if top_gate == gate_id[0] or top_gate in gate_id[1]:
 
                         if gating._get_gate_node(gate_id[0], gate_id[1]).gate_type != 'Quadrant': # bit of a hack. Can't find a better way of excluding Quadrants
-                            gate = gating.get_gate(gate_id[0])
+                            # use the current sample's effective gate: FlowKit returns the
+                            # custom sample gate if one exists, otherwise the template gate.
+                            gate = gating.get_gate(gate_id[0], sample_id=self.current_sample_path)
                             # gate = gating.get_gate(gate_id[0], gate_id[1]) # include gate path? no
                             channels = gate.get_dimension_ids()
 
@@ -592,6 +608,180 @@ class Controller(QObject):
             warnings.warn('No events bus connected')
 
 
+    def _rebuild_per_sample_lookup_tables(self):
+        """Rebuild lookup tables only for gates that touch a per-sample (default,
+        e.g. Time) transform, so they match THIS sample's scale.
+
+        Gates on fixed transforms (fluorescence, FSC/SSC) keep their cached table
+        — so a normal sample switch stays fast; only Time-involving gates pay the
+        rebuild cost (and the Time transform's bins are capped so it stays cheap).
+        """
+        scope = 'raw' if self.current_mode == 'raw' else 'unmixed'
+        if not self.data_for_cytometry_plots:
+            return
+        gating = self.data_for_cytometry_plots.get('gating')
+        transforms = self.data_for_cytometry_plots.get('transformations')
+        if gating is None:
+            return
+        for gate_id, gate_path in gating.get_gate_ids():
+            try:
+                channels = gating.get_gate(gate_id).get_dimension_ids()
+            except Exception:
+                continue
+            if any(getattr(transforms.get(ch), 'id', None) == 'default' for ch in channels):
+                self.calculate_lookup_tables(mode=scope, top_gate=gate_id)
+
+
+    def apply_custom_sample_gates(self, scope=None):
+        """Install this sample's overrides and refresh every affected lookup table."""
+        if not self.current_sample_path:
+            return
+        scope = scope or self.current_mode
+        gating = self.raw_gating if scope == 'raw' else self.unmixed_gating
+        all_overrides = self.custom_sample_gates.get(scope, {})
+        overrides = all_overrides.get(self.current_sample_path, {})
+
+        if gating is None:
+            return
+        existing = [g[0] for g in gating.get_gate_ids()]
+
+        for gate_name, gate in overrides.items():
+            if gate_name not in existing:
+                continue  # template no longer has this gate
+            # use FlowKit custom sample gating to add gate to gating hierarchy. it will then be used in calculate lookup tables
+            install_custom_gate(gating, gate_name, gate, self.current_sample_path)
+
+        for gate_name in {name for gates in all_overrides.values() for name in gates}:
+            if gate_name not in existing:
+                continue
+            self.calculate_lookup_tables(mode=scope, top_gate=gate_name)
+
+    def customise_gate(self, scope, gate_name):
+        """Start customising ``gate_name`` for the current sample.
+
+        Copies the template gate's geometry into a per-sample custom gate; later
+        ROI edits update this custom gate instead of the template."""
+        if not self.current_sample_path:
+            logger.warning('customise_gate: no sample loaded')
+            return
+        gating = self.raw_gating if scope == 'raw' else self.unmixed_gating
+        transformations = self.raw_transformations if scope == 'raw' else self.unmixed_transformations
+        sample_id = self.current_sample_path
+        if gating.is_custom_gate(sample_id, gate_name):
+            return
+        try:
+            template_gate = gating.get_gate(gate_name)
+        except Exception as e:
+            logger.warning(f'customise_gate: {gate_name!r} not found ({e})')
+            return
+        custom = deepcopy(template_gate)
+        self.custom_sample_gates.setdefault(scope, {}).setdefault(sample_id, {})[gate_name] = custom
+        install_custom_gate(gating, gate_name, custom, sample_id)
+
+        gate = gating.get_gate(gate_name, sample_id=sample_id)
+        channels = gate.get_dimension_ids()
+        for n, channel in enumerate(channels):
+            if channel == 'Time':
+                x1, x2 = transformations['Time'].limits
+                x1 = min(0.1 * x2, settings.default_time_gate_ignore_start_seconds)
+                dim_x = define_range_gate(x1, x2, channel, transformations)
+                gate.dimensions[n] = dim_x
+
+        if self.bus is not None:
+            self.bus.changedGatingHierarchy.emit(scope, gate_name)
+        self.refresh_custom_gates_on_current_tab_for_current_sample(scope)
+        logger.info(f'Controller: customised {scope} gate {gate_name!r} for {sample_id}')
+
+    def revert_gate_to_template(self, scope, gate_name):
+        """Drop the current sample's custom gate for ``gate_name`` (back to template)."""
+        if not self.current_sample_path:
+            return
+        gating = self.raw_gating if scope == 'raw' else self.unmixed_gating
+        sample_id = self.current_sample_path
+        self.custom_sample_gates.get(scope, {}).get(sample_id, {}).pop(gate_name, None)
+        try:
+            if gating.is_custom_gate(sample_id, gate_name):
+                gating.remove_gate(gate_name, sample_id=sample_id)
+        except Exception as e:
+            logger.warning(f'revert_gate_to_template: {gate_name!r} ({e})')
+        if self.bus is not None:
+            self.bus.changedGatingHierarchy.emit(scope, gate_name)
+        self.refresh_custom_gates_on_current_tab_for_current_sample(scope)
+        logger.info(f'Controller: reverted {scope} gate {gate_name!r} to template for {sample_id}')
+
+    def adopt_custom_gate_as_template(self, scope, gate_name):
+        """Promote the current sample's custom ``gate_name`` geometry into the
+        template gate, so non-customised samples follow it. The sample's own
+        override is then cleared (it now matches the template)."""
+        if not self.current_sample_path:
+            return
+        gating = self.raw_gating if scope == 'raw' else self.unmixed_gating
+        sample_id = self.current_sample_path
+        if not gating.is_custom_gate(sample_id, gate_name):
+            return
+        custom_gate = gating.get_gate(gate_name, sample_id=sample_id)
+        try:
+            gating.remove_gate(gate_name, sample_id=sample_id)
+        except Exception:
+            pass
+        template_gate = gating.get_gate(gate_name)
+        copy_gate_geometry(custom_gate, template_gate)
+        self.custom_sample_gates.get(scope, {}).get(sample_id, {}).pop(gate_name, None)
+        if self.bus is not None:
+            self.bus.changedGatingHierarchy.emit(scope, gate_name)
+        self.refresh_custom_gates_on_current_tab_for_current_sample(scope)
+        logger.info(f'Controller: adopted custom {scope} gate {gate_name!r} as template')
+
+    def refresh_custom_gates_on_current_tab_for_current_sample(self, scope=None):
+        """Tell the UI which gates are customised for the current sample in ``scope``."""
+        if self.bus is None:
+            return
+        scope = scope or self.current_mode
+        names = []
+        if self.current_sample_path:
+            names = list(self.custom_sample_gates.get(scope, {}).get(self.current_sample_path, {}).keys())
+        self.bus.customGatesChanged.emit(scope, names)
+
+        ## bad to update here... interferes with plot updates in other signal
+        # for n, plot in enumerate(self.data_for_cytometry_plots['plots']):
+        #     # if set(names) & set(plot['child_gates']):
+        #     self.bus.updateRois.emit(scope, n)
+        self.bus.refreshCustomRois.emit(scope)
+
+    def _load_custom_sample_gates(self):
+        """Rebuild ``custom_sample_gates`` from the .kit's GML fragments. Missing
+        fields (old .kit files) simply yield no custom gates."""
+        self.custom_sample_gates = {'raw': {}, 'unmixed': {}}
+        for scope, key in (('raw', 'raw_custom_sample_gates'),
+                           ('unmixed', 'unmixed_custom_sample_gates')):
+            stored = self.experiment.cytometry.get(key) or {}
+            for sample_path, gates in stored.items():
+                for gate_name, xml in gates.items():
+                    try:
+                        gate = gate_from_gml(xml, gate_name)
+                        self.custom_sample_gates.setdefault(scope, {}).setdefault(
+                            sample_path, {})[gate_name] = gate
+                    except Exception as e:
+                        logger.warning(f'_load_custom_sample_gates: {gate_name!r} for {sample_path} ({e})')
+
+    def _sync_custom_gate_from_strategy(self, scope, gate_name):
+        """Refresh the stored per-sample custom gate for ``gate_name`` from the
+        live strategy, so an in-place ROI edit on a customised gate persists
+        (the ROI edits the strategy's gate object directly)."""
+        if not self.current_sample_path or gate_name in (None, 'root'):
+            return
+        scope = scope or self.current_mode
+        gating = self.raw_gating if scope == 'raw' else self.unmixed_gating
+        if gating is None:
+            return
+        try:
+            if gating.is_custom_gate(self.current_sample_path, gate_name):
+                gate = gating.get_gate(gate_name, sample_id=self.current_sample_path)
+                self.custom_sample_gates.setdefault(scope, {}).setdefault(
+                    self.current_sample_path, {})[gate_name] = deepcopy(gate)
+        except Exception:
+            pass
+
     def filter_raw_fluorescence_channels(self):
         if self.experiment.process['fluorescence_channel_filter'] == 'area_only':
             self.filtered_raw_fluorescence_channel_ids = [c for c in self.experiment.settings['raw']['fluorescence_channel_ids']
@@ -617,6 +807,7 @@ class Controller(QObject):
         self.unmixed_transformations = None
         self.raw_gating = GatingStrategy()
         self.unmixed_gating = GatingStrategy()
+        self.custom_sample_gates = {'raw': {}, 'unmixed': {}}
         self.cleaned_events: dict = {}
         self.warning_collector: list[str] | None = None   # when a list, deferred warnings are appended instead of shown
         self.autospectral_variants: dict = {}
@@ -706,6 +897,8 @@ class Controller(QObject):
                 self.unmixed_lookup_tables = {}
                 process_plots = []
 
+            self._load_custom_sample_gates()
+
             unmixed_pnn = self.experiment.settings['unmixed']['event_channels_pnn']
             unmixed_pnn_labels = build_display_label_map(
                 unmixed_pnn or [], self.experiment.process.get('spectral_model') # guard in case unmixed_pnn is None
@@ -747,6 +940,7 @@ class Controller(QObject):
             logger.warning(self.raw_gating)
             logger.warning(self.data_for_cytometry_plots_raw['transformations'] is self.raw_transformations)
             logger.warning(self.data_for_cytometry_plots_raw['gating'] is self.raw_gating)
+
 
     def initialise_transfer_matrix(self):
         # run in intitialisation of ephemeral data or if spillover changed
@@ -1407,9 +1601,9 @@ class Controller(QObject):
 
         if self.data_for_cytometry_plots:
             # make sure data for cytometry plots is pointing at correct data
-            self.data_for_cytometry_plots_raw.update({'event_data': self.raw_event_data})
-            self.data_for_cytometry_plots_process.update({'event_data': self.unmixed_event_data})
-            self.data_for_cytometry_plots_unmixed.update({'event_data': self.unmixed_event_data})
+            self.data_for_cytometry_plots_raw.update({'event_data': self.raw_event_data, 'sample_id': self.current_sample_path})
+            self.data_for_cytometry_plots_process.update({'event_data': self.unmixed_event_data, 'sample_id': self.current_sample_path})
+            self.data_for_cytometry_plots_unmixed.update({'event_data': self.unmixed_event_data, 'sample_id': self.current_sample_path})
 
             # recalculate everything if it isn't already present
             if force_recalc_histograms or not self.data_for_cytometry_plots['statistics'] or not self.data_for_cytometry_plots['histograms']:
@@ -1426,6 +1620,9 @@ class Controller(QObject):
                                 upper_limit = max(self.data_for_cytometry_plots['event_data'][:, index]) * 1.05
                                 transformation.set_transform(limits=[0, upper_limit])
 
+                # Refresh every gate whose geometry can vary by sample.
+                self.apply_custom_sample_gates()
+
                 self.data_for_cytometry_plots['statistics'] = initialise_stats(self.data_for_cytometry_plots['gating'])
                 self.data_for_cytometry_plots['histograms'] = initialise_hists(self.data_for_cytometry_plots['plots'], self.data_for_cytometry_plots)
 
@@ -1434,7 +1631,12 @@ class Controller(QObject):
                     self.bus.statusMessage.emit(f'Calculating {len(self.data_for_cytometry_plots['plots'])} histograms...')
                 self.calc_hists_and_stats(status_message_signal=(self.bus.statusMessage if self.bus else None))
 
+                # refresh custom-gate highlighting on current tabs for this sample
+                self.refresh_custom_gates_on_current_tab_for_current_sample()
+
                 logger.info(f'Controller: prepared hists and stats, mode: {self.current_mode}')
+
+
                 if self.bus:
                     self.bus.statusMessage.emit(f'Ready.')
 
@@ -1607,6 +1809,13 @@ class Controller(QObject):
                 gating = self.data_for_cytometry_plots['gating']
                 if gating is None:
                     return
+
+                # Full recalculation: rebuild lookup tables ONLY for gates that use
+                # a per-sample (default, e.g. Time) transform, so they match this
+                # sample's scale. Fixed-transform gates (fluorescence, FSC/SSC) keep
+                # their cached table — rebuilding everything here was slow (laggy).
+                self._rebuild_per_sample_lookup_tables()
+
                 gate_membership = {'root': np.ones(len(self.data_for_cytometry_plots['event_data']), dtype=np.bool_)}
                 self.data_for_cytometry_plots.update({'gate_membership': gate_membership})
                 # self.data_for_cytometry_plots['gate_membership']['root'] = np.ones(len(self.data_for_cytometry_plots['event_data']), dtype=np.bool_)

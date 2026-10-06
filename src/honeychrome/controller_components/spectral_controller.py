@@ -501,7 +501,7 @@ class SpectralAutoGenerator(QObject):
                 self.bus.updateRois.emit('raw', index)
 
         logger.info('SpectralAutoGenerator: regenerated spectral model and raw gating hierarchy:')
-        logger.info(self.raw_gating.get_gate_hierarchy(output='json'))
+        logger.info(self.raw_gating.get_gate_hierarchy(output='ascii'))
 
         if self.bus and self.negative_profile_warnings:
             labels = ', '.join(f'"{label}"' for label in self.negative_profile_warnings)
@@ -650,6 +650,14 @@ class SpectralAutoGenerator(QObject):
     @timer
     def generate_spectral_control(self, n):
         sample_path = self.samples['single_stain_controls'][n]
+
+        if (self.base_gate_label != 'root'
+                and not self.raw_gating.find_matching_gate_paths(self.base_gate_label)):
+            warnings.warn(
+                f'Autogenerate: base gate "{self.base_gate_label}" not found in the '
+                f'shared raw gating hierarchy.'
+            )
+            return False
 
         nevents = self.samples['all_sample_nevents'][sample_path]
         tubename = self.samples['all_samples'][sample_path]

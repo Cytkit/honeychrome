@@ -116,6 +116,7 @@ class CytometryPlotWidget(QFrame):
             self.bus.updateSourceChildGates.connect(self.refresh_source_child_gates)
             self.bus.histsStatsRecalculated.connect(self.update_axes_stats_hist)
             self.bus.updateRois.connect(self.configure_rois)
+            self.bus.refreshCustomRois.connect(self.refresh_custom_rois)
 
         # Create main layout
         main_layout = QVBoxLayout(self)
@@ -211,6 +212,7 @@ class CytometryPlotWidget(QFrame):
         # configure rois associated with child gates
         # initialise dict of rois, gate_id:roi
         self.rois = []
+        self.customised_gates = set()
         self.configure_rois(self.mode, self.n_in_plot_sequence)
 
         self._mouse_events_enabled = True
@@ -593,6 +595,31 @@ class CytometryPlotWidget(QFrame):
         self.bus.showNewPlot.emit(self.mode)
 
     @Slot(str, int)
+    def refresh_custom_rois(self, mode):
+        if mode == self.mode:
+            gates_to_refresh = []
+            # first collect gates to revert
+            for gate_name in self.customised_gates:
+                if gate_name in self.plot['child_gates']:
+                    gates_to_refresh.append(gate_name)
+
+            # second collect gates to customise
+            for gate_name in self.plot['child_gates']:
+                is_custom = self._is_gate_custom(gate_name)
+                if is_custom:
+                    self.customised_gates = self.customised_gates | {gate_name}
+                    gates_to_refresh.append(gate_name)
+                else:
+                    self.customised_gates = self.customised_gates - {gate_name}
+
+            # regenerate rois
+            for gate_name in gates_to_refresh:
+                index_roi = self.plot['child_gates'].index(gate_name)
+                self.rois[index_roi].request_remove(delete_gate=False)
+                roi = self._generate_roi(gate_name)
+                self.rois[index_roi] = roi
+
+    @Slot(str, int)
     def configure_rois(self, mode, index):
         if mode == self.mode and index == self.n_in_plot_sequence:
 
@@ -603,76 +630,93 @@ class CytometryPlotWidget(QFrame):
             self.rois.clear()
 
             for gate_name in self.plot['child_gates']:
-                try:
-                    gate = self.gating.get_gate(gate_name)
-                except Exception:
-                    logger.warning(f'configure_rois: gate "{gate_name}" not found in gating strategy — skipping ROI.')
-                    continue
-                label_offset = get_set_or_initialise_label_offset(self.plot, gate_name)
-
-                if gate.gate_type == 'PolygonGate':
-                    vertices = gate.vertices
-                    roi = PolygonROI(vertices, gate_name, self.gating, self.mode, self.vb, label_offset=label_offset)
-                    roi.sigRegionChangeFinished.connect(lambda *args, r=roi: self.update_polygon(r))
-
-                elif gate.gate_type == 'RectangleGate' and len(gate.dimensions)==2: # i.e. true rectangle
-                    dim_x, dim_y = gate.dimensions
-                    pos = [dim_x.min, dim_y.min]
-                    size = [dim_x.max - dim_x.min, dim_y.max - dim_y.min]
-                    roi = RectangleROI(pos, size, gate_name, self.gating, self.mode, self.vb, label_offset=label_offset)
-                    roi.sigRegionChangeFinished.connect(lambda *args, r=roi: self.update_rectangle(r))
-
-                elif gate.gate_type == 'RectangleGate' and len(gate.dimensions)==1: #i.e. range gate
-                    dim_x = gate.dimensions[0]
-                    roi = RangeROI(dim_x.min, dim_x.max, gate_name, self.gating, self.mode, self.vb, label_offset=label_offset)
-                    roi.sigRangeChanged.connect(lambda *args, r=roi: self.update_range(r))
-
-                elif gate.gate_type == 'EllipsoidGate':
-                    coordinates = gate.coordinates
-                    covariance_matrix = gate.covariance_matrix
-                    distance_square = gate.distance_square
-
-                    # Eigen decomposition
-                    eigvals, eigvecs = np.linalg.eigh(covariance_matrix)
-
-                    # Sort by descending eigenvalue
-                    order = np.argsort(eigvals)[::-1]
-                    eigvals = eigvals[order]
-                    eigvecs = eigvecs[:, order]
-
-                    # Axis lengths
-                    w, h = eigvals
-
-                    # Rotation angle (in radians → degrees)
-                    theta = np.arctan2(eigvecs[1, 0], eigvecs[0, 0])
-                    R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
-                    angle = np.rad2deg(theta)
-
-                    # Reconstruct size and position
-                    size = np.array([w, h])
-                    pos = np.array(coordinates) - 0.5 * R @ size
-
-                    # Consistency check
-                    if not np.isclose(distance_square, w * h):
-                        print("Warning: distance_square inconsistent with covariance")
-
-                    roi = EllipseROI(pos, size, angle, gate_name, self.gating, self.mode, self.vb, label_offset=label_offset)
-                    roi.sigRegionChangeFinished.connect(lambda *args, r=roi: self.update_ellipse(r))
-
-                elif gate.gate_type == 'QuadrantGate':
-                    quadrants = gate.quadrants
-                    divider_double_positive = quadrants[list(quadrants)[0]]._divider_ranges
-                    x = max([val if val else 0 for val in divider_double_positive['xdiv']])
-                    y = max([val if val else 0 for val in divider_double_positive['ydiv']])
-                    roi = QuadROI(x, y, gate_name, self.gating, self.mode, self.vb)
-                    roi.sigPosChanged.connect(lambda *args, r=roi: self.update_quad(r))
-
-                else:
-                    warnings.warn('Wrong gate type')
-
-                # set up the signal for deletion of the gate, but don't run it here
-                roi.sigRemoveRequested.connect(self.remove_gate_and_roi)
+                roi = self._generate_roi(gate_name)
                 self.rois.append(roi)
+
+    def _generate_roi(self, gate_name):
+        label_offset = get_set_or_initialise_label_offset(self.plot, gate_name)
+        try:
+            gate = self._effective_gate(gate_name)
+        except Exception:
+            logger.warning(f'configure_rois: gate "{gate_name}" not found in gating strategy — skipping ROI.')
+            return None
+
+        if gate.gate_type == 'PolygonGate':
+            vertices = gate.vertices
+            roi = PolygonROI(vertices, gate_name, self.gating, self.mode, self.vb, label_offset=label_offset)
+            roi.sigRegionChangeFinished.connect(lambda *args, r=roi: self.update_polygon(r))
+
+        elif gate.gate_type == 'RectangleGate' and len(gate.dimensions) == 2:  # i.e. true rectangle
+            dim_x, dim_y = gate.dimensions
+            pos = [dim_x.min, dim_y.min]
+            size = [dim_x.max - dim_x.min, dim_y.max - dim_y.min]
+            roi = RectangleROI(pos, size, gate_name, self.gating, self.mode, self.vb, label_offset=label_offset)
+            roi.sigRegionChangeFinished.connect(lambda *args, r=roi: self.update_rectangle(r))
+
+        elif gate.gate_type == 'RectangleGate' and len(gate.dimensions) == 1:  # i.e. range gate
+            dim_x = gate.dimensions[0]
+            roi = RangeROI(dim_x.min, dim_x.max, gate_name, self.gating, self.mode, self.vb, label_offset=label_offset)
+            roi.sigRangeChanged.connect(lambda *args, r=roi: self.update_range(r))
+
+        elif gate.gate_type == 'EllipsoidGate':
+            coordinates = gate.coordinates
+            covariance_matrix = gate.covariance_matrix
+            distance_square = gate.distance_square
+
+            # Eigen decomposition
+            eigvals, eigvecs = np.linalg.eigh(covariance_matrix)
+
+            # Sort by descending eigenvalue
+            order = np.argsort(eigvals)[::-1]
+            eigvals = eigvals[order]
+            eigvecs = eigvecs[:, order]
+
+            # Axis lengths
+            w, h = eigvals
+
+            # Rotation angle (in radians → degrees)
+            theta = np.arctan2(eigvecs[1, 0], eigvecs[0, 0])
+            R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+            angle = np.rad2deg(theta)
+
+            # Reconstruct size and position
+            size = np.array([w, h])
+            pos = np.array(coordinates) - 0.5 * R @ size
+
+            # Consistency check
+            if not np.isclose(distance_square, w * h):
+                print("Warning: distance_square inconsistent with covariance")
+
+            roi = EllipseROI(pos, size, angle, gate_name, self.gating, self.mode, self.vb, label_offset=label_offset)
+            roi.sigRegionChangeFinished.connect(lambda *args, r=roi: self.update_ellipse(r))
+
+        elif gate.gate_type == 'QuadrantGate':
+            quadrants = gate.quadrants
+            divider_double_positive = quadrants[list(quadrants)[0]]._divider_ranges
+            x = max([val if val else 0 for val in divider_double_positive['xdiv']])
+            y = max([val if val else 0 for val in divider_double_positive['ydiv']])
+            roi = QuadROI(x, y, gate_name, self.gating, self.mode, self.vb)
+            roi.sigPosChanged.connect(lambda *args, r=roi: self.update_quad(r))
+
+        else:
+            warnings.warn('Wrong gate type')
+
+        # set up the signal for deletion of the gate, but don't run it here
+        roi.sigRemoveRequested.connect(self.remove_gate_and_roi)
+
+        return roi
+
+    def _effective_gate(self, gate_name):
+        """Gate to edit for the current sample: its custom sample gate if one
+        exists, otherwise the shared template gate. Editing what this returns
+        keeps a customised gate per-sample and leaves others on the template."""
+        sample_id = (self.data_for_cytometry_plots or {}).get('sample_id')
+        return self.gating.get_gate(gate_name, sample_id=sample_id)
+
+    def _is_gate_custom(self, gate_name):
+        sample_id = (self.data_for_cytometry_plots or {}).get('sample_id')
+        is_custom = bool(self.gating.is_custom_gate(sample_id, gate_name))
+        return is_custom
 
     def initiate_polygon_roi(self):
         polygon_roi_constructor = PolygonROIConstructor(self)
@@ -709,7 +753,7 @@ class CytometryPlotWidget(QFrame):
         # convert QPointF to list of pairs
         vertices = [(origin.x() + v.x(), origin.y() + v.y()) for v in vertices]
         vertices, dim_x, dim_y = define_polygon_gate(vertices, self.plot['channel_x'], self.plot['channel_y'], self.transformations)
-        gate = self.gating.get_gate(roi.label.gate_name)
+        gate = self._effective_gate(roi.label.gate_name)
         gate.vertices = vertices
 
         if self.bus is not None:
@@ -752,7 +796,7 @@ class CytometryPlotWidget(QFrame):
         size = roi_state['size']
 
         dim_x, dim_y = define_rectangle_gate(pos, size, self.plot['channel_x'], self.plot['channel_y'], self.transformations)
-        gate = self.gating.get_gate(roi.label.gate_name)
+        gate = self._effective_gate(roi.label.gate_name)
         gate.dimensions = [dim_x, dim_y]
 
         if self.bus is not None:
@@ -799,7 +843,7 @@ class CytometryPlotWidget(QFrame):
 
         dim_x, dim_y, coordinates, covariance_matrix, distance_square = define_ellipse_gate(pos, size, angle, self.plot['channel_x'], self.plot['channel_y'], self.transformations)
 
-        gate = self.gating.get_gate(roi.label.gate_name)
+        gate = self._effective_gate(roi.label.gate_name)
         gate.coordinates = coordinates
         gate.covariance_matrix = covariance_matrix
         gate.distance_square = distance_square
@@ -817,7 +861,9 @@ class CytometryPlotWidget(QFrame):
 
         # create ROI
         if self.data_for_cytometry_plots['transformations'][self.plot['channel_x']].id == 'default':
-            x1, x2 = 0.35 * settings.default_ceiling, 0.65 * settings.default_ceiling
+            # x1, x2 = 0.35 * settings.default_ceiling, 0.65 * settings.default_ceiling
+            x1 = 0
+            x2 = settings.default_time_max_bins
         else:
             x1, x2 = 0.35, 0.65
 
@@ -841,7 +887,7 @@ class CytometryPlotWidget(QFrame):
         x2 = roi.v2.value()
         dim_x = define_range_gate(x1, x2, self.plot['channel_x'], self.transformations)
 
-        gate = self.gating.get_gate(roi.label.gate_name)
+        gate = self._effective_gate(roi.label.gate_name)
         gate.dimensions = [dim_x]
 
         if self.bus is not None:
@@ -878,7 +924,7 @@ class CytometryPlotWidget(QFrame):
         y = roi.vy.value()
         quad_divs, quadrants = define_quad_gates(x, y, self.plot['channel_x'], self.plot['channel_y'], self.transformations)
 
-        gate = self.gating.get_gate(roi.gate_name)
+        gate = self._effective_gate(roi.gate_name)
         gate.quadrants = {q.id: q for q in quadrants}
         gate.dimensions = quad_divs
 
@@ -1030,6 +1076,9 @@ class CytometryPlotWidget(QFrame):
 
     def plot_hist2d(self):
         heatmap = self.data_for_cytometry_plots['histograms'][self.n_in_plot_sequence]
+        # A redraw can briefly observe a histogram calculated for another plot.
+        if getattr(heatmap, 'ndim', 0) != 2:
+            return
         self.img.setImage(heatmap)
 
         # Set the position and scale of the image
@@ -1041,5 +1090,8 @@ class CytometryPlotWidget(QFrame):
 
     def plot_hist1d(self):
         count = self.data_for_cytometry_plots['histograms'][self.n_in_plot_sequence]
-        # count[:-1] = count
-        self.hist.setData(self.transformations[self.plot['channel_x']].step_scale, count)
+        step_scale = self.transformations[self.plot['channel_x']].step_scale
+        # Pyqtgraph step mode requires one more x edge than y values.
+        if getattr(count, 'ndim', 0) != 1 or len(step_scale) != len(count) + 1:
+            return
+        self.hist.setData(step_scale, count)

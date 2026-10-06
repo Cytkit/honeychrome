@@ -159,6 +159,9 @@ class ExperimentModel:
         self.cytometry['raw_gating'] = to_gml(raw_gating)
         self.cytometry['raw_plots'] = raw_plots
 
+        self.cytometry.setdefault('raw_custom_sample_gates', {})
+        self.cytometry.setdefault('unmixed_custom_sample_gates', {})
+
         ### save ###
         self.save()
 
@@ -173,6 +176,9 @@ class ExperimentModel:
         self.samples.setdefault('unstained_samples', [])  # not present in older .kit files
         self.cytometry = file_data['cytometry']
         self.statistics = file_data['statistics']
+
+        self.cytometry.setdefault('raw_custom_sample_gates', {})
+        self.cytometry.setdefault('unmixed_custom_sample_gates', {})
 
     def save(self):
         if self.experiment_path is None:

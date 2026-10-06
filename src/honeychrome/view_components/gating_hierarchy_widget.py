@@ -11,13 +11,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 class TreeItem:
-    def __init__(self, name, event_count, p_root, p_parent, event_conc, parent=None):
+    def __init__(self, name, event_count, p_root, p_parent, event_conc, parent=None, gate_type=None):
         self.name = name
         self.event_count = event_count
         self.event_conc = event_conc
         self.p_root = p_root
         self.p_parent = p_parent
         self.parent_item = parent
+        self.gate_type = gate_type   # flowkit gate type, e.g. 'RectangleGate' | 'Quadrant'
         self.child_items = []
 
     def append_child(self, item):
@@ -83,7 +84,8 @@ class DictTreeModel(QAbstractItemModel):
                 p_parent = ''
                 event_conc = ''
 
-            item = TreeItem(name, n_events_gate, p_root, p_parent, event_conc, parent_item)
+            item = TreeItem(name, n_events_gate, p_root, p_parent, event_conc, parent_item,
+                            gate_type=hierarchy_dict_node.get('gate_type'))
             parent_item.append_child(item)
 
             if 'children' in hierarchy_dict_node.keys():
@@ -298,6 +300,9 @@ class GatingHierarchyWidget(QWidget):
         self.tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.show_context_menu)
 
+        # gate names customised for the current sample (per-sample custom gates)
+        self._custom_gates = set()
+
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -327,9 +332,18 @@ class GatingHierarchyWidget(QWidget):
         if self.bus is not None:
             self.bus.changedGatingHierarchy.connect(self.update_hierarchy)
             self.bus.histsStatsRecalculated.connect(self.update_data)
+            self.bus.customGatesChanged.connect(self.on_custom_gates_changed)
 
         # Install event filter on tree view
         self.tree_view.installEventFilter(self)
+
+    @Slot(str, list)
+    def on_custom_gates_changed(self, scope, names):
+        """Track which gates are customised for the current sample in this scope,
+        so the context menu offers Customise vs Revert/Adopt for each gate."""
+        if scope != self.mode:
+            return
+        self._custom_gates = set(names or [])
 
     def eventFilter(self, obj, event):
         if obj == self.tree_view and event.type() == event.Type.KeyPress:
@@ -365,6 +379,28 @@ class GatingHierarchyWidget(QWidget):
             menu = QMenu(self)
             copy_action = menu.addAction(f"Copy hierarchy statistics from {item_name} downwards")
             copy_action.triggered.connect(lambda : self.model.copy_hierarchy(index))
+
+            # Per-sample custom gates: customise this gate for the current sample,
+            # or (if already customised) revert to / adopt as the shared template.
+            # A QuadrantGate's four quadrants are not gates in their own right —
+            # FlowKit refuses to return them ("specify the owning QuadrantGate"),
+            # and their geometry comes entirely from the parent's dividers — so
+            # customise the parent instead of offering a dead action here.
+            item = index.internalPointer()
+            is_quadrant = getattr(item, 'gate_type', None) == 'Quadrant'
+            if self.bus is not None and item_name and item_name != 'root' and not is_quadrant:
+                menu.addSeparator()
+                if item_name in self._custom_gates:
+                    revert_action = menu.addAction(f"Revert '{item_name}' to template")
+                    revert_action.triggered.connect(
+                        lambda: self.bus.revertGateRequested.emit(self.mode, item_name))
+                    adopt_action = menu.addAction(f"Adopt '{item_name}' custom gate as template")
+                    adopt_action.triggered.connect(
+                        lambda: self.bus.adoptGateRequested.emit(self.mode, item_name))
+                else:
+                    customise_action = menu.addAction(f"Customise '{item_name}' for this sample")
+                    customise_action.triggered.connect(
+                        lambda: self.bus.customiseGateRequested.emit(self.mode, item_name))
 
         # todo add delete/rename, should be integrated with delete/rename menus on plots
         #

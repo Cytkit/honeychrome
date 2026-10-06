@@ -1,4 +1,5 @@
 import networkx as nx
+from copy import deepcopy
 from flowkit import GatingStrategy
 from flowkit._models.gates import QuadrantGate, BooleanGate
 # from flowkit._resources import gml_schema
@@ -213,6 +214,25 @@ def from_gml(xml):
         gating_strategy.add_gate(gate.convert_to_parent_class(), gate_path)
 
     return gating_strategy
+
+
+def gate_to_gml(gate):
+    """Serialize a single gate to a standalone GatingML 2.0 string.
+
+    Reuses :func:`to_gml` by placing the gate alone (at root) in a throwaway
+    GatingStrategy — so a per-sample custom gate is persisted with the exact
+    same serializer as the template, with no bespoke per-gate-type code.
+    """
+    mini = GatingStrategy()
+    mini.add_gate(deepcopy(gate), gate_path=('root',))
+    return to_gml(mini)
+
+
+def gate_from_gml(xml, gate_name):
+    """Reconstruct a single gate (by name) from a GatingML string produced by
+    :func:`gate_to_gml`."""
+    return from_gml(xml).get_gate(gate_name)
+
 
 # otb: have added this here. if you prefer, move to spectral_model_editor.py
 def _rename_channel_in_gml(gml_string: str, old_name: str, new_name: str) -> str:
