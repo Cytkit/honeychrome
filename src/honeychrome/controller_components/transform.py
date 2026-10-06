@@ -4,6 +4,10 @@ import honeychrome.settings as settings
 
 transforms_menu_items = ['Linear', 'Logicle', 'Log']
 
+# Linear axes spanning at most this many raw units get plain-number ticks
+# (see Transform._small_range_ticks); wider ones keep the 10^n labels.
+SMALL_LINEAR_RANGE = 1000
+
 class Transform:
     def __init__(self, scale_t=262144, linear_a=100, logicle_w=0.5, logicle_m=4.5, logicle_a=0, log_m=6):
         self.xform = None
@@ -175,6 +179,9 @@ class Transform:
         return [minor_ticks, major_ticks]
 
     def linear_ticks(self):
+        lo_raw, hi_raw = (float(v) for v in self.xform.inverse(np.asarray(self.limits, dtype=float)))
+        if 0 < hi_raw - lo_raw <= SMALL_LINEAR_RANGE:
+            return self._small_range_ticks(lo_raw, hi_raw)
         top_tick = 10**(int(np.log10(self.xform.inverse(self.limits[1]))) + 1)
         major_values = np.linspace(0,top_tick,10)
         minor_values = np.linspace(0,top_tick,50)
@@ -208,6 +215,21 @@ class Transform:
             major_ticks.append((val, label))
 
         minor_ticks = [(val, '') for val in trans_minor_values]
+        return [minor_ticks, major_ticks]
+
+    def _small_range_ticks(self, lo_raw, hi_raw):
+        """Plain-number ticks for a linear axis spanning a small range, such
+        as AF Index (0 to the number of AF spectra): about eight major ticks
+        at a 1, 2 or 5 x 10^n step, with five minor ticks per step."""
+        raw_step = (hi_raw - lo_raw) / 8
+        magnitude = 10 ** np.floor(np.log10(raw_step))
+        step = next(m * magnitude for m in (1, 2, 5, 10) if m * magnitude >= raw_step)
+        major = np.arange(np.ceil(lo_raw / step) * step, hi_raw + step * 1e-9, step)
+        minor_step = step / 5
+        minor = np.arange(np.ceil(lo_raw / minor_step) * minor_step, hi_raw + minor_step * 1e-9, minor_step)
+        label = (lambda v: f"{v:.0f}") if step >= 1 else (lambda v: f"{v:g}")
+        major_ticks = [(float(t), label(v)) for t, v in zip(self.xform.apply(major), major)]
+        minor_ticks = [(float(t), '') for t in self.xform.apply(minor)]
         return [minor_ticks, major_ticks]
 
     def default_ticks(self):

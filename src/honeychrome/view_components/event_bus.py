@@ -29,6 +29,7 @@ class EventBus(QObject):
     batchExportRequested = Signal(str, bool)
     generateSampleReport = Signal()
     openImportFCSWidget = Signal(bool)
+    sampleBrowserVisibilityRequested = Signal(bool)  # a plugin hides/shows the left sample panel for its own tab
 
     ### view
     aboutHoneychrome = Signal()

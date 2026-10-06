@@ -107,6 +107,7 @@ spectral_negative_gate_percent = 25 # take the bottom few percent of events
 
 spectral_cleaning_n_candidates = 1000 # cosine filter: top-N events by peak channel, ranked before AF-similarity filtering
 spectral_cleaning_n_spectral = 200 # cosine filter: number of least-AF-similar events kept for the cleaned profile
+spectral_cleaning_refine = True # re-measure cleaned spectra on all gated events and check the panel for residual spillover
 
 spectral_model_column_labels = {
     "label": "Label",
@@ -159,6 +160,17 @@ logicle_w = 0.5
 logicle_m = 4.5
 logicle_a = 0
 log_m = 6
+
+# Per-cell autofluorescence channels, appended to every unmixed channel list.
+# AF-corrected unmixing fills them; plain unmixing (no AF profile assigned)
+# leaves them at 0. AF Index numbers every AF spectrum in the experiment 1..N
+# (profiles in stored order, spectra within a profile by spectral angle to the
+# profile mean; 0 = no AF correction); its linear range is N, or
+# default_af_index_range when there are no AF profiles.
+af_abundance_channel = 'AF Abundance'
+af_index_channel = 'AF Index'
+af_channels = (af_abundance_channel, af_index_channel)
+default_af_index_range = 100
 
 raw_settings = {
     'raw_samples_subdirectory': 'Raw',
@@ -257,6 +269,7 @@ spectral_negative_gate_percent_retrieved = q_settings.value("spectral_negative_g
 
 spectral_cleaning_n_candidates_retrieved = q_settings.value("spectral_cleaning_n_candidates", spectral_cleaning_n_candidates, type=int)
 spectral_cleaning_n_spectral_retrieved = q_settings.value("spectral_cleaning_n_spectral", spectral_cleaning_n_spectral, type=int)
+spectral_cleaning_refine_retrieved = q_settings.value("spectral_cleaning_refine", spectral_cleaning_refine, type=bool)
 
 report_include_raw_retrieved = q_settings.value("report_include_raw", report_include_raw, type=bool)
 report_include_unmixed_retrieved = q_settings.value("report_include_unmixed", report_include_unmixed, type=bool)

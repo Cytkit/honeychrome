@@ -13,30 +13,63 @@ def _load_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def _best_match(name: str, database: list[dict], canonical_col: str, synonym_cols: list[str]) -> str | None:
-    """
-    Return the canonical value from `canonical_col` for the longest synonym
-    that appears as a word-boundary match inside `name`.
-    Returns None if nothing matches.
-    """
-    delim = r'(?<![A-Za-z0-9\-]){}(?![A-Za-z0-9\-])'
-    best_text = ''
-    best_canonical = None
+_DELIM = r'(?<![A-Za-z0-9\-]){}(?![A-Za-z0-9\-])'
 
+# Cache of precompiled (pattern, value, canonical) triples, keyed by
+# (id(database), canonical_col, tuple(synonym_cols)) -- see
+# _compiled_patterns(). Stable across calls because both call sites
+# (drc_cluster_id.build_channel_marker_map, spectral_controller) fetch
+# the database via get_marker_db()/get_fluorophore_db(), which each
+# cache and return the SAME list object every time -- id() doesn't
+# change between calls.
+_pattern_cache: dict[tuple, list[tuple]] = {}
+
+
+def _compiled_patterns(database: list[dict], canonical_col: str,
+                        synonym_cols: list[str]) -> list[tuple]:
+    """
+    Precompile every (pattern, value, canonical) triple for this
+    database/column-set ONCE, sorted longest-value-first so _best_match
+    can return on the first hit. Building each row's regex (re.escape +
+    string-format + re.compile) here instead of inside _best_match turns
+    an O(channels x rows x cols) recompile storm into a one-time cost
+    amortised across every call for this database.
+    """
+    key = (id(database), canonical_col, tuple(synonym_cols))
+    cached = _pattern_cache.get(key)
+    if cached is not None:
+        return cached
+
+    entries = []
     for row in database:
+        canonical = row.get(canonical_col)
         for col in [canonical_col] + synonym_cols:
             val = row.get(col, '') or ''
             if not val:
                 continue
             escaped = re.escape(val)
             escaped = escaped.replace(r'\ ', r'\s*')   # mirror R's gsub(" ", "\\s*", ...)
-            pattern = delim.format(escaped)
-            if re.search(pattern, name, flags=re.IGNORECASE):
-                if len(val) > len(best_text):
-                    best_text = val
-                    best_canonical = row[canonical_col]
+            pattern = re.compile(_DELIM.format(escaped), flags=re.IGNORECASE)
+            entries.append((pattern, val, canonical))
 
-    return best_canonical
+    # Longest value first -- ties keep original row/column order via
+    # Python's stable sort, matching the old strict len(val) > len(best_text)
+    # tie-break (first max-length match wins, not last).
+    entries.sort(key=lambda e: len(e[1]), reverse=True)
+    _pattern_cache[key] = entries
+    return entries
+
+
+def _best_match(name: str, database: list[dict], canonical_col: str, synonym_cols: list[str]) -> str | None:
+    """
+    Return the canonical value from `canonical_col` for the longest synonym
+    that appears as a word-boundary match inside `name`.
+    Returns None if nothing matches.
+    """
+    for pattern, _val, canonical in _compiled_patterns(database, canonical_col, synonym_cols):
+        if pattern.search(name):
+            return canonical
+    return None
 
 
 def match_fluorophore(name: str, fluorophore_db: list[dict]) -> str | None:

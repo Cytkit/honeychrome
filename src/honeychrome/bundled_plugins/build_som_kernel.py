@@ -1,13 +1,15 @@
 """
-build_af_kernel.py
-------------------
-Compile af_kernel.c into a cffi extension module (_af_kernel).
+build_som_kernel.py
+--------------------
+Compile som_kernel.c into a cffi extension module (_som_kernel).
 
 Run once at build time (or during development setup):
-    python build_af_kernel.py
+    python build_som_kernel.py
 
-The output is _af_kernel.<platform>.so (Linux) or
-_af_kernel.<platform>.dylib (macOS), placed alongside this script.
+The output is _som_kernel.<platform>.so (Linux) or
+_som_kernel.<platform>.dylib (macOS), placed alongside this script
+(honeychrome/bundled_plugins/) -- where som_kernel_wrapper.py's
+same-directory import trick finds it.
 
 OpenMP
 ------
@@ -15,10 +17,10 @@ Enabled by default on Linux (gcc -fopenmp).
 On macOS, requires libomp:
     brew install libomp
 then set the environment variable:
-    HONEYCHROME_OPENMP=1 python build_af_kernel.py
+    HONEYCHROME_OPENMP=1 python build_som_kernel.py
 
 Without OpenMP the kernel still compiles and runs correctly,
-single-threaded.  The Python wrapper (_af_kernel_wrapper.py)
+single-threaded.  The Python wrapper (som_kernel_wrapper.py)
 works identically either way.
 """
 
@@ -30,28 +32,35 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ffi = cffi.FFI()
 
 ffi.cdef("""
-void joint_cov_l1_argmin(
-    const double *init_fluor,
-    const double *K,
-    const double *v_library,
-    const double *w,
-    const double *base_e_fluor,
-    const double *e_resid,
-    const double *base_e_resid,
-    int32_t      *best_j,
-    int B,
-    int n_fluors,
-    int n_af
+void som_train_batch(
+    const double *data,
+    const double *init_codes,
+    const double *nhbrdist,
+    const double *radii,
+    double       *codes_out,
+    int n, int px, int ncodes, int n_epochs,
+    int dist, int n_threads
+);
+void som_map_to_codes(
+    const double *data,
+    const double *codes,
+    int32_t      *out_node_id,
+    double       *out_dist,
+    int n, int px, int ncodes,
+    int dist, int n_threads
 );
 """)
 
-with open(os.path.join(HERE, 'af_kernel.c'), 'r') as f:
+with open(os.path.join(HERE, 'som_kernel.c'), 'r') as f:
     source = f.read()
 
 use_openmp = os.environ.get('HONEYCHROME_OPENMP', '').strip() not in ('', '0', 'false', 'False')
 
-# On Linux, default to OpenMP on; on macOS, default off unless explicitly set
-if sys.platform.startswith('linux') and 'HONEYCHROME_OPENMP' not in os.environ:
+# Default to OpenMP on for both platforms unless explicitly disabled
+# (HONEYCHROME_OPENMP=0). macOS's libomp check below already falls back to
+# single-threaded with a warning if libomp isn't installed, so there's no
+# need to gate the attempt behind an explicit opt-in.
+if 'HONEYCHROME_OPENMP' not in os.environ:
     use_openmp = True
 
 if sys.platform == 'win32':
@@ -82,7 +91,7 @@ if not use_openmp:
     print('[build] Building single-threaded (no OpenMP).')
 
 ffi.set_source(
-    '_af_kernel',
+    '_som_kernel',
     source,
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
@@ -91,4 +100,4 @@ ffi.set_source(
 
 if __name__ == '__main__':
     ffi.compile(tmpdir=HERE, verbose=True)
-    print('[build] _af_kernel extension built successfully.')
+    print('[build] _som_kernel extension built successfully.')

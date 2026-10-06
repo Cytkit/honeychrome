@@ -29,6 +29,7 @@ Sends and receives signals to GUI
 '''
 
 import warnings
+import hashlib
 from datetime import datetime
 import numpy as np
 from pathlib import Path
@@ -40,7 +41,7 @@ from multiprocessing import shared_memory
 import time
 
 from honeychrome.experiment_model import ExperimentModel, check_fcs_matches_experiment
-from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map
+from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels, sync_af_index_transform
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml
 from honeychrome.settings import traces_cache_size, traces_cache_dtype, adc_rate
 import honeychrome.settings as settings
@@ -53,7 +54,9 @@ from honeychrome.controller_components.autospectral_functions import (
         combine_af_precomputed,
         apply_af_unmixing,
         apply_af_transfer,
+        af_index_lookup,
      )
+from honeychrome.settings import af_index_channel
 
 base_directory = Path.home() / experiments_folder
 
@@ -106,6 +109,7 @@ class Controller(QObject):
         self.transfer_matrix = None
         self.af_precomputed = None
         self.af_spectra = None
+        self.af_index_map = None   # experiment-wide AF Index per row of af_spectra
         self.af_precomputed_cache: dict = {}
         self.raw_transformations = None
         self.unmixed_transformations = None
@@ -203,6 +207,82 @@ class Controller(QObject):
         if meta:
             logger.info(f'Controller: loaded cleaned_events for {len(meta)} controls.')
 
+    def _load_autospectral_variants(self):
+        """Restore autospectral_variants from .kit autospectral_variants_data
+        and .autospectral_variants.npz sidecar. Backs the AutoSpectral
+        Optimization bundled plugin's Setup section (bundled_plugins/
+        autospectral_optimization_tab.py). Mirrors _load_cleaned_events
+        with one addition: each label is only restored if its saved profile_fingerprint
+        still matches the current experiment.process['profiles'][label] — if the reference
+        spectrum has changed since Setup was run, the cached variants no
+        longer describe it and are skipped (falls back to needing Setup
+        re-run for that fluorophore, same as if it had never been computed).
+        Note: the *scoring* state (optimize_score/optimize_recommended/active)
+        lives separately in experiment.process['autospectral_variants_meta'],
+        written directly by the plugin — this method only restores the
+        variant/delta arrays themselves plus their small JSON fields
+        (n_events_used, profile_fingerprint).
+
+        Also restores the unstained-derived positivity thresholds
+        (autospectral_raw_pos_thresholds / autospectral_unmixed_pos_thresholds)
+        from the same npz sidecar, gated on a fingerprint of the full
+        reference-spectra matrix (see _save_autospectral_variants) — if the
+        spectral model has changed since Setup was run, the cached
+        thresholds are discarded and Setup must be re-run."""
+        self.autospectral_raw_pos_thresholds = None
+        self.autospectral_unmixed_pos_thresholds = None
+        _ARRAY_KEYS = {'v_mats', 'delta', 'delta_norms'}
+        meta = self.experiment.process.get('autospectral_variants_data', {})
+        profiles = self.experiment.process.get('profiles', {})
+        arrays = {}
+        npz_path = self.autospectral_variants_npz_path
+        if npz_path.exists():
+            try:
+                npz = np.load(str(npz_path), allow_pickle=False)
+                arrays = dict(npz)
+            except Exception as e:
+                logger.warning(f'Controller: failed to load autospectral_variants.npz: {e}')
+
+        self.autospectral_variants.clear()
+        n_skipped_stale = 0
+        for label, json_fields in meta.items():
+            profile_vec = profiles.get(label)
+            saved_fingerprint = json_fields.get('profile_fingerprint')
+            if profile_vec is None or saved_fingerprint is None or self._profile_fingerprint(profile_vec) != saved_fingerprint:
+                n_skipped_stale += 1
+                continue
+            entry = dict(json_fields)
+            safe = label.replace('/', '_').replace(' ', '_')
+            for k in _ARRAY_KEYS:
+                key = f'{safe}__{k}'
+                if key in arrays:
+                    entry[k] = arrays[key]
+            self.autospectral_variants[label] = entry
+        if self.autospectral_variants:
+            logger.info(f'Controller: loaded autospectral_variants for {len(self.autospectral_variants)} fluorophore(s).')
+        if n_skipped_stale:
+            logger.info(
+                f'Controller: skipped {n_skipped_stale} cached autospectral_variants '
+                f'entrie(s) whose profile has changed since Setup was run — re-run Setup for these.'
+            )
+
+        thresholds_meta = self.experiment.process.get('autospectral_thresholds_meta', {})
+        saved_thresholds_fingerprint = thresholds_meta.get('reference_spectra_fingerprint')
+        reference_spectra = self._build_fluor_spectra()
+        if (saved_thresholds_fingerprint is not None and reference_spectra is not None
+                and self._profile_fingerprint(reference_spectra) == saved_thresholds_fingerprint):
+            if 'autospectral_thresholds_raw' in arrays:
+                self.autospectral_raw_pos_thresholds = arrays['autospectral_thresholds_raw']
+            if 'autospectral_thresholds_unmixed' in arrays:
+                self.autospectral_unmixed_pos_thresholds = arrays['autospectral_thresholds_unmixed']
+            if self.autospectral_unmixed_pos_thresholds is not None:
+                logger.info('Controller: loaded cached unstained-derived AutoSpectral Optimization thresholds.')
+        elif saved_thresholds_fingerprint is not None:
+            logger.info(
+                'Controller: skipped cached AutoSpectral Optimization thresholds — '
+                'reference spectra have changed since Setup was run; re-run Setup.'
+            )
+
     @with_busy_cursor
     def load_experiment(self, experiment_path):
         self.experiment.load(experiment_path)
@@ -212,6 +292,7 @@ class Controller(QObject):
         self.current_mode = 'raw'
         self.initialise_ephemeral_data()
         self._load_cleaned_events()
+        self._load_autospectral_variants()
         self.cache_all_af_profiles()
         self.initialise_af_matrices()
 
@@ -232,6 +313,7 @@ class Controller(QObject):
             'spectrum', 'n_removed_saturation', 'n_surviving_positive',
             'empirical_peak_ch_idx', 'expected_peak_ch_idx',
             'fluor_ch_ids', 'cytometer_key', 'warnings', '_fingerprint',
+            'spectrum_initial', 'refine_log', 'crosstalk',
         }
         _ARRAY_KEYS = {
             'spectral_sub', 'scatter_pos', 'scatter_neg_matched',
@@ -263,7 +345,74 @@ class Controller(QObject):
     def _legacy_cleaned_npz_path(self) -> Path:
         """Pre-migration location, alongside the .kit file."""
         return Path(self.experiment.experiment_path).with_suffix('.cleaned.npz')
-    
+
+    @staticmethod
+    def _profile_fingerprint(vec) -> str:
+        """Stable fingerprint of a fluorophore profile vector, used to detect
+        whether cached autospectral_variants still describe the current
+        reference spectrum (see _load_autospectral_variants)."""
+        arr = np.round(np.asarray(vec, dtype=np.float64), 8)
+        return hashlib.sha1(arr.tobytes()).hexdigest()
+
+    def _save_autospectral_variants(self):
+        """Write autospectral_variants to JSON meta (.kit) and numpy sidecar
+        (.autospectral_variants.npz). Mirrors _save_cleaned_events exactly.
+        See _load_autospectral_variants() for the counterpart and the note
+        on where the scoring state (separate from the arrays saved here)
+        lives. Each label's meta is stamped with a fingerprint of the profile
+        vector used to compute it, so a later load can tell whether the
+        reference spectrum has since changed.
+
+        Also persists the unstained-derived positivity thresholds
+        (autospectral_raw_pos_thresholds / autospectral_unmixed_pos_thresholds)
+        computed by the Setup section, into the same npz sidecar, stamped
+        with a fingerprint of the full reference-spectra matrix so a later
+        load can tell whether the spectral model has since changed and
+        discard the cache accordingly."""
+        _JSON_KEYS = {'n_events_used'}
+        _ARRAY_KEYS = {'v_mats', 'delta', 'delta_norms'}
+        profiles = self.experiment.process.get('profiles', {})
+        meta = {}
+        arrays = {}
+        for label, entry in self.autospectral_variants.items():
+            profile_vec = profiles.get(label)
+            if profile_vec is None:
+                continue
+            safe = label.replace('/', '_').replace(' ', '_')
+            meta[label] = {k: v for k, v in entry.items() if k in _JSON_KEYS}
+            meta[label]['profile_fingerprint'] = self._profile_fingerprint(profile_vec)
+            for k in _ARRAY_KEYS:
+                arr = entry.get(k)
+                if arr is not None and isinstance(arr, np.ndarray) and arr.size:
+                    arrays[f'{safe}__{k}'] = arr
+
+        raw_thresholds = self.autospectral_raw_pos_thresholds
+        unmixed_thresholds = self.autospectral_unmixed_pos_thresholds
+        if isinstance(raw_thresholds, np.ndarray) and raw_thresholds.size:
+            arrays['autospectral_thresholds_raw'] = raw_thresholds
+        if isinstance(unmixed_thresholds, np.ndarray) and unmixed_thresholds.size:
+            arrays['autospectral_thresholds_unmixed'] = unmixed_thresholds
+        if raw_thresholds is not None or unmixed_thresholds is not None:
+            reference_spectra = self._build_fluor_spectra()
+            if reference_spectra is not None:
+                self.experiment.process['autospectral_thresholds_meta'] = {
+                    'reference_spectra_fingerprint': self._profile_fingerprint(reference_spectra),
+                }
+        elif 'autospectral_thresholds_meta' in self.experiment.process:
+            del self.experiment.process['autospectral_thresholds_meta']
+
+        self.experiment.process['autospectral_variants_data'] = meta
+        if arrays:
+            np.savez_compressed(str(self.autospectral_variants_npz_path), **arrays)
+        elif self.autospectral_variants_npz_path.exists():
+            self.autospectral_variants_npz_path.unlink()
+
+    @property
+    def autospectral_variants_npz_path(self) -> Path:
+        cache_dir = self.experiment_dir / 'cache'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / 'autospectral_variants.npz'
+
     @Slot(str)
     def save_experiment(self, experiment_path=None):
         if self.raw_transformations is None:
@@ -278,6 +427,7 @@ class Controller(QObject):
 
         if not experiment_path:
             self._save_cleaned_events()
+            self._save_autospectral_variants()
             self.experiment.save()
             logger.info(f'Controller: experiment saved {self.experiment_dir}')
             if self.bus:
@@ -468,6 +618,10 @@ class Controller(QObject):
         self.raw_gating = GatingStrategy()
         self.unmixed_gating = GatingStrategy()
         self.cleaned_events: dict = {}
+        self.warning_collector: list[str] | None = None   # when a list, deferred warnings are appended instead of shown
+        self.autospectral_variants: dict = {}
+        self.autospectral_raw_pos_thresholds = None
+        self.autospectral_unmixed_pos_thresholds = None
         self.data_for_cytometry_plots = {'pnn': None, 'fluoro_indices': None, 'lookup_tables': None, 'event_data': None, 'transformations': None, 'statistics': {}, 'gating': GatingStrategy(), 'plots': [], 'histograms': [], 'gate_membership': {}}
         self.data_for_cytometry_plots_raw = deepcopy(self.data_for_cytometry_plots)
         self.data_for_cytometry_plots_process = deepcopy(self.data_for_cytometry_plots)
@@ -521,6 +675,12 @@ class Controller(QObject):
         # recreate transfer matrix and compensated_unmixing_matrix if unmixing matrix is not None
         if 'unmixed' in scope:
             if self.experiment.process['unmixing_matrix']:
+                # Experiments created before the AF channels existed gain them
+                # here, before the transfer matrix and transforms are built.
+                ensure_af_channels(self.experiment.settings['unmixed'],
+                                   self.experiment.cytometry['transforms'],
+                                   self.n_af_spectra())
+                sync_af_index_transform(self.experiment.cytometry['transforms'], self.n_af_spectra())
                 self.unmixed_gating = from_gml(self.experiment.cytometry['gating'])
                 self.unmixed_transformations = generate_transformations(self.experiment.cytometry['transforms'])
                 # Call the plain impl, not reapply_fine_tuning(): this method
@@ -648,6 +808,7 @@ class Controller(QObject):
         if af_spectra is None:
             self.af_precomputed = None
             self.af_spectra = None
+            self.af_index_map = None
             return
 
         # Combine per-profile cached precomputed dicts
@@ -670,6 +831,7 @@ class Controller(QObject):
             )
             self.af_precomputed = None
             self.af_spectra = None
+            self.af_index_map = None
             return
         
         if len(cached) == 1:
@@ -683,6 +845,7 @@ class Controller(QObject):
         self.af_precomputed = combined
         assert af_spectra is not None
         self.af_spectra = af_spectra
+        self.af_index_map = self.get_af_index_map_for_sample(self.current_sample_path)
         logger.info(
         f'Controller: AF matrices set for {self.current_sample_path} '
         f'({af_spectra.shape[0]} AF spectra, '
@@ -764,6 +927,50 @@ class Controller(QObject):
         )
 
 
+    def n_af_spectra(self) -> int | None:
+        """Number of AF spectra across all of the experiment's AF profiles
+        (the largest possible AF Index), or None when there are none."""
+        profiles = self.experiment.process.get('af_profiles') or {}
+        n = sum(len(p.get('spectra') or []) for p in profiles.values())
+        return n or None
+
+    def get_af_index_map_for_sample(self, sample_path) -> np.ndarray | None:
+        """Experiment-wide AF Index of each row of the sample's combined AF
+        library (see get_combined_af_spectra_for_sample), or None when the
+        sample has no stored profile assigned."""
+        if sample_path is None:
+            return None
+        profile_names = (
+            self.experiment.samples
+            .get('sample_af_profiles', {})
+            .get(sample_path, [])
+        )
+        return af_index_lookup(self.experiment.process.get('af_profiles', {}), profile_names)
+
+    def on_af_profiles_changed(self):
+        """Bring AF-dependent state up to date after AF profiles are added or removed.
+
+        The AF Index numbering spans every profile in the experiment, so the
+        AF Index axis is resized to the new total, the current sample's AF
+        matrices and unmixed data are rebuilt, and cached histograms are
+        cleared so the plots regenerate.
+        """
+        transforms = self.experiment.cytometry.get('transforms')
+        if sync_af_index_transform(transforms, self.n_af_spectra()) and self.unmixed_transformations:
+            tr = self.unmixed_transformations.get(af_index_channel)
+            if tr is not None:
+                tr.scale_t = transforms[af_index_channel]['scale_t']
+                tr.set_transform()
+                if self.unmixed_gating is not None:
+                    self.unmixed_gating.transformations[af_index_channel] = tr.xform
+                self.calculate_lookup_tables(mode='unmixed')
+
+        self.initialise_af_matrices()
+        if self.raw_event_data is not None and self.transfer_matrix is not None:
+            self.unmixed_event_data = self._apply_unmixing(self.raw_event_data)
+        self.clear_data_for_cytometry_plots()
+        self.initialise_data_for_cytometry_plots()
+
     def get_combined_af_spectra_for_sample(self, sample_path) -> np.ndarray | None:
         """
         Return the vertically concatenated AF spectra ndarray for sample_path,
@@ -841,6 +1048,7 @@ class Controller(QObject):
                 self.experiment.settings,
                 filtered_fl_ids_raw=fl_ids_remapped,
                 spillover=self.experiment.process.get('spillover'),
+                af_index_map=self.af_index_map,
             )
             # result is now a dict; store the sidecar columns
             self.af_sidecar_data = np.column_stack(
@@ -1326,7 +1534,8 @@ class Controller(QObject):
         else:
             settings = None
 
-        transforms = assign_default_transforms(settings, channels=channels)
+        transforms = assign_default_transforms(settings, channels=channels,
+                                               n_af_spectra=self.n_af_spectra())
         transformations = generate_transformations(transforms)
 
         for channel in channels:
@@ -1351,7 +1560,7 @@ class Controller(QObject):
 
         if self.experiment.process['unmixing_matrix']:
             settings = self.experiment.settings['unmixed']
-            transforms = assign_default_transforms(settings)
+            transforms = assign_default_transforms(settings, n_af_spectra=self.n_af_spectra())
             transformations = generate_transformations(transforms)
             self.unmixed_transformations.update(transformations)
 
@@ -1542,6 +1751,7 @@ class Controller(QObject):
         raw_settings = self.experiment.settings['raw']
         spectral_model = self.experiment.process['spectral_model']
         profiles = self.experiment.process['profiles']
+        conditioning_warnings = []
 
         # Sort spectral model by major-channel position so fluorescence_channels
         # and all downstream structures (NxN grid, heatmaps) use the correct order.
@@ -1564,7 +1774,7 @@ class Controller(QObject):
                 self.bus.statusMessage.emit(f'Refreshing spectral process...')
             existing_spillover = self.experiment.process.get('spillover')
             unmixing_method = self.experiment.settings.get('unmixing_method', 'OLS')
-            unmixed_settings, spectral_process = calculate_spectral_process(
+            unmixed_settings, spectral_process, conditioning_warnings = calculate_spectral_process(
                 raw_settings, spectral_model, profiles,
                 existing_spillover=existing_spillover,
                 unmixing_method=unmixing_method,
@@ -1574,12 +1784,20 @@ class Controller(QObject):
             )
             self.experiment.process.update(spectral_process)
 
+            # An experiment whose channel list predates the AF channels gains
+            # them first, so their addition alone does not reset the unmixed
+            # transforms, gates and plots below.
+            ensure_af_channels(self.experiment.settings['unmixed'],
+                               self.experiment.cytometry.get('transforms'),
+                               self.n_af_spectra())
+
             # update cytometry only if channels have changed
             if self.experiment.settings['unmixed']['event_channels_pnn'] != unmixed_settings['event_channels_pnn']:
                 self.experiment.settings['unmixed'].update(unmixed_settings)
 
                 # set up unmixed channels with default transforms, copy raw transformation if it does not belong to a fl channel
-                self.experiment.cytometry['transforms'] = assign_default_transforms(unmixed_settings)
+                self.experiment.cytometry['transforms'] = assign_default_transforms(
+                    unmixed_settings, n_af_spectra=self.n_af_spectra())
                 fl_pnn = [self.experiment.settings['raw']['event_channels_pnn'][n] for n in self.experiment.settings['raw']['fluorescence_channel_ids']]
                 update_transforms(self.experiment.cytometry['raw_transforms'], self.raw_transformations)
                 for label in self.experiment.cytometry['raw_transforms']:
@@ -1655,6 +1873,16 @@ class Controller(QObject):
             self.bus.spectralProcessRefreshed.emit()
             # self.bus.changedGatingHierarchy.emit('unmixed', 'root')
             self.bus.statusMessage.emit(f'Spectral process refreshed.')
+            # Single consolidated dialog for both profile-QC checks — piped through
+            # the bus rather than shown directly, since this method can be entered
+            # via a queued connection from a worker-thread emit (SpectralAutoGenerator,
+            # SpectralCleaner) and must never pop a QMessageBox from that thread.
+            if conditioning_warnings:
+                qc_text = 'Spectral Profile QC:\n\n' + '\n\n'.join(conditioning_warnings)
+                if self.warning_collector is not None:
+                    self.warning_collector.append(qc_text)
+                else:
+                    self.bus.warningMessage.emit(qc_text)
 
         logger.info(f'Controller: refreshed spectral process, unmixed settings, unmixed cytometry')
 

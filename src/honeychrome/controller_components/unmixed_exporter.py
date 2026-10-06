@@ -9,7 +9,7 @@ from flowkit import Sample
 from typing import cast
 
 from honeychrome.controller_components.functions import apply_transfer_matrix, export_unmixed_sample, sample_from_fcs
-from honeychrome.controller_components.autospectral_functions import precompute_af_matrices, combine_af_precomputed, apply_af_transfer
+from honeychrome.controller_components.autospectral_functions import precompute_af_matrices, combine_af_precomputed, apply_af_transfer, af_index_lookup
 import honeychrome.settings as settings
 from honeychrome.__init__ import __version__
 
@@ -171,6 +171,7 @@ class UnmixedExporter(QObject):
             # the whitelist is built from raw scatter+time, and imaging channels
             # are added by passing them explicitly via a new key.
             imaging_carry_through_set = set(imaging_pnn)  # consumed in define_fcs_keywords
+            n_af_index = self.controller.n_af_spectra()
 
 
             for n, sample_path in enumerate(samples_to_calculate):
@@ -225,6 +226,7 @@ class UnmixedExporter(QObject):
                     assigned_profile_names = sample_af_profiles.get(sample_path, [])
                     all_af_profiles = self.controller.experiment.process.get('af_profiles', {})
                     active_profiles = [all_af_profiles[name] for name in assigned_profile_names if name in all_af_profiles]
+                    af_index_map = af_index_lookup(all_af_profiles, assigned_profile_names) if active_profiles else None
 
                     if active_profiles:
                         # Build combined AF precomputed matrices for this sample's assigned profiles
@@ -260,18 +262,19 @@ class UnmixedExporter(QObject):
                             self.controller.experiment.settings,
                             filtered_fl_ids_raw=_fl_ids_remapped,
                             spillover=None,
+                            af_index_map=af_index_map,
                         )
-                        unmixed_event_data_without_fine_tuning = af_result['unmixed']
-                        af_cols = np.column_stack([
-                            af_result['af_scale'],
-                            af_result['af_idx'].astype(np.float64),
-                        ])
-                        export_event_data = np.hstack([unmixed_event_data_without_fine_tuning, af_cols])
-                        export_pnn = pnn_unmixed + ['AF Abundance', 'AF Index']
+                        # apply_af_transfer fills the AF Abundance and AF Index columns.
+                        export_event_data = af_result['unmixed']
+                        export_pnn = list(pnn_unmixed)
                         logger.info(f'UnmixedExporter: using AF unmixing for {sample_path} ({len(active_profiles)} profile(s))')
                     else:
-                        export_event_data = apply_transfer_matrix(transfer_matrix, raw_event_data)
-                        export_pnn = pnn_unmixed
+                        # Without AF correction the AF channels carry no information,
+                        # so they are left out of the exported file.
+                        unmixed_all = apply_transfer_matrix(transfer_matrix, raw_event_data)
+                        keep = [i for i, ch in enumerate(pnn_unmixed) if ch not in settings.af_channels]
+                        export_event_data = unmixed_all[:, keep]
+                        export_pnn = [pnn_unmixed[i] for i in keep]
 
                     # Retrieve the unmixing spectra matrix (n_fluor × n_detectors).
                     # stored in experiment.process after unmixing is computed.
@@ -300,6 +303,8 @@ class UnmixedExporter(QObject):
                         unmixing_method=unmixing_method,
                         unmixing_weights=unmixing_weights,
                         extra_whitelist=imaging_carry_through_set,
+                        af_index_map=af_index_map,
+                        n_af_index=n_af_index,
                     )
 
             logger.info(f'UnmixedExporter: finished')

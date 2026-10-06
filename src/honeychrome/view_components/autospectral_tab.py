@@ -7,7 +7,7 @@ Location: src/honeychrome/view_components/autospectral_tab.py
 
 Sections
 --------
-1  Extract AF profile from an unstained sample (KMeans).
+1  Extract AF profile from an unstained sample (SOM, KMeans fallback).
 2  Manage stored AF profiles (spectral plot, CSV load/save/delete).
 3  Assign AF profiles to samples (grid: rows=non-SSC samples, columns=profiles).
 4  Side-by-side OLS vs AF-corrected biplot comparison, using the same
@@ -42,6 +42,7 @@ from honeychrome.controller_components.autospectral_functions import (
     apply_af_transfer,
     save_af_profile_csv,
     load_af_profile_csv,
+    af_index_lookup,
 )
 from honeychrome.controller_components.transform import Transform
 from honeychrome.view_components.cytometry_plot_components import (
@@ -76,20 +77,20 @@ class AfTrainingWorker(QObject):
     error = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, unstained_raw, fluor_spectra, n_clusters, source_fcs_path):
+    def __init__(self, unstained_raw, fluor_spectra, som_dim, source_fcs_path):
         super().__init__()
         self.unstained_raw = unstained_raw
         self.fluor_spectra = fluor_spectra
-        self.n_clusters = n_clusters
+        self.som_dim = som_dim
         self.source_fcs_path = source_fcs_path   # stored so the slot can read it
 
     def run(self):
         try:
-            self.progress.emit('Fitting KMeans clusters to unstained sample...')
+            self.progress.emit('Clustering unstained sample and refining AF spectra...')
             af_spectra = get_af_spectra(
                 self.unstained_raw,
                 self.fluor_spectra,
-                n_clusters=self.n_clusters,
+                som_dim=self.som_dim,
             )
             self.finished.emit(af_spectra)
         except Exception as e:
@@ -103,7 +104,7 @@ class ComparisonWorker(QObject):
 
     def __init__(self, raw_event_data, transfer_matrix,
                  af_precomputed, af_spectra, exp_settings,
-                 filtered_fl_ids_raw, spillover=None):
+                 filtered_fl_ids_raw, spillover=None, af_index_map=None):
         super().__init__()
         self.raw_event_data = raw_event_data
         self.transfer_matrix = transfer_matrix
@@ -112,6 +113,7 @@ class ComparisonWorker(QObject):
         self.exp_settings = exp_settings
         self.filtered_fl_ids_raw = filtered_fl_ids_raw
         self.spillover = spillover
+        self.af_index_map = af_index_map
 
     def run(self):
         try:
@@ -126,10 +128,50 @@ class ComparisonWorker(QObject):
                 self.exp_settings,
                 filtered_fl_ids_raw=self.filtered_fl_ids_raw,
                 spillover=self.spillover,
+                af_index_map=self.af_index_map,
             )
             self.finished.emit(ols_data, af_result['unmixed'])
         except Exception as e:
             self.error.emit(str(e))
+
+
+def pick_most_affected_channels(
+    data_a: np.ndarray,
+    data_b: np.ndarray,
+    pnn: list[str],
+    fl_names: list[str],
+    min_scale: float = 1e-6,
+) -> tuple[str, str] | None:
+    """
+    Return the two fluorescence channels with the largest *proportional*
+    change between data_a and data_b (e.g. OLS vs AF-corrected, or
+    AF-corrected vs Optimization).
+
+    Raw mean(|a - b|) is biased toward whichever channels happen to have the
+    largest dynamic range. Instead, each channel's mean absolute difference
+    is normalised by that channel's own robust spread (5th-95th percentile
+    of data_a), so a small absolute shift in an otherwise quiet channel can
+    outrank a larger absolute shift in a channel that is naturally bright/
+    noisy. min_scale floors the denominator to avoid blow-ups on flat or
+    all-zero channels.
+
+    Returns None if fewer than two fluorescence channels are available or the
+    arrays don't align with pnn.
+    """
+    if len(fl_names) < 2:
+        return None
+    try:
+        cols = [pnn.index(ch) for ch in fl_names]
+    except ValueError:
+        return None
+    a = data_a[:, cols]
+    b = data_b[:, cols]
+    diff = np.abs(a - b).mean(axis=0)
+    scale = np.percentile(a, 95, axis=0) - np.percentile(a, 5, axis=0)
+    scale = np.maximum(scale, min_scale)
+    proportional_diff = diff / scale
+    top2 = np.argsort(proportional_diff)[-2:][::-1]
+    return fl_names[top2[0]], fl_names[top2[1]]
 
 
 # ---------------------------------------------------------------------------
@@ -160,10 +202,15 @@ class AfComparisonPlotWidget(QWidget):
     # Emitted when a zoom/scaling is applied on one axis, so the sibling can mirror.
     scalingChanged = Signal(str, object)  # (axis_name, Transform)
 
-    def __init__(self, title: str, controller, parent=None):
+    def __init__(self, title: str, controller, parent=None, has_af_channels: bool = True):
         super().__init__(parent)
         self.controller = controller
         self._title_text = title
+        # False for plain (OLS) unmixed data, which has no AF Abundance or AF
+        # Index values: a source gate drawn on those channels cannot be
+        # applied, and the plot says so instead of drawing.
+        self._has_af_channels = has_af_channels
+        self._af_gate_message = ''
 
         # Local copies of Transform objects (not shared with Unmixed Data tab)
         self._transformations: dict[str, Transform] = {}
@@ -432,6 +479,18 @@ class AfComparisonPlotWidget(QWidget):
         x_col = pnn.index(self._channel_x)
         y_col = pnn.index(self._channel_y)
 
+        blocked = None if self._has_af_channels else self._gate_using_af_channels()
+        if blocked is not None:
+            gate_name, channel = blocked
+            self._af_gate_message = (f"Gate '{gate_name}' uses {channel}, which unmixing "
+                                     f"without AF correction does not produce.")
+            self.img.clear()
+            self.set_status(self._af_gate_message)
+            return
+        if self._af_gate_message:
+            self._af_gate_message = ''
+            self.set_status('')
+
         # Start with all events; gate masking will narrow this down if needed.
         event_data = self._event_data
 
@@ -483,6 +542,34 @@ class AfComparisonPlotWidget(QWidget):
     # ------------------------------------------------------------------
     # Internal: gate membership computation
     # ------------------------------------------------------------------
+
+    def _gate_using_af_channels(self) -> tuple[str, str] | None:
+        """(gate, channel) for the first gate from root to the source gate
+        that is drawn on an AF channel, or None."""
+        if self._source_gate == 'root':
+            return None
+        gating = self.controller.unmixed_gating
+        if gating is None:
+            return None
+        try:
+            paths = gating.find_matching_gate_paths(self._source_gate)
+        except Exception:
+            return None
+        if not paths:
+            return None
+        for gate_name in [g for g in paths[0] if g != 'root'] + [self._source_gate]:
+            try:
+                gate = gating.get_gate(gate_name)
+                if gate.gate_type == 'QuadrantGate':
+                    channels = [d.dimension_ref for d in gate.dimensions]
+                else:
+                    channels = list(gate.get_dimension_ids())
+            except Exception:
+                continue
+            for ch in channels:
+                if ch in settings.af_channels:
+                    return gate_name, ch
+        return None
 
     def _compute_gate_mask(self, event_data: np.ndarray) -> np.ndarray | None:
         """
@@ -813,15 +900,17 @@ class AutoSpectralTab(QWidget):
         self._sample_combo.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         layout.addRow('Unstained sample:', self._sample_combo)
 
-        self._n_clusters_spin = QSpinBox()
-        self._n_clusters_spin.setRange(4, 1000)
-        self._n_clusters_spin.setValue(200)
-        self._n_clusters_spin.setToolTip(
-            'KMeans cluster count (equivalent to som.dim² in R AutoSpectral).'
+        self._som_dim_spin = QSpinBox()
+        self._som_dim_spin.setRange(2, 30)
+        self._som_dim_spin.setValue(10)
+        self._som_dim_spin.setToolTip(
+            'Side length of the square SOM grid (som.dim in R AutoSpectral); '
+            'the grid has som.dim² nodes. KMeans with the same number of '
+            'clusters is used when the compiled SOM kernel is unavailable.'
         )
-        self._n_clusters_spin.installEventFilter(WheelBlocker(self._n_clusters_spin))
-        self._n_clusters_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        layout.addRow('AF clusters:', self._n_clusters_spin)
+        self._som_dim_spin.installEventFilter(WheelBlocker(self._som_dim_spin))
+        self._som_dim_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        layout.addRow('SOM grid size:', self._som_dim_spin)
 
         self._extract_btn = QPushButton('Extract AF Profile')
         self._extract_btn.clicked.connect(self._run_extraction)
@@ -989,7 +1078,7 @@ class AutoSpectralTab(QWidget):
         plot_splitter = QSplitter(Qt.Horizontal)
 
         self._plot_ols = AfComparisonPlotWidget(
-            'OLS (no AF)', self.controller, parent=self
+            'OLS (no AF)', self.controller, parent=self, has_af_channels=False
         )
         self._plot_ols.sourceGateChanged.connect(self._on_ols_gate_changed)
         self._plot_ols.channelChanged.connect(self._on_ols_channel_changed)
@@ -1147,11 +1236,11 @@ class AutoSpectralTab(QWidget):
             return
 
         self._extract_btn.setEnabled(False)
-        self._extract_status.setText('Running KMeans clustering...')
+        self._extract_status.setText('Extracting AF spectra...')
 
         self._train_thread = QThread()
         self._train_worker = AfTrainingWorker(
-            raw_fl, fluor_spectra, self._n_clusters_spin.value(), sample_path
+            raw_fl, fluor_spectra, self._som_dim_spin.value(), sample_path
         )
         self._train_worker.moveToThread(self._train_thread)
         self._train_thread.started.connect(self._train_worker.run)
@@ -1173,6 +1262,7 @@ class AutoSpectralTab(QWidget):
         fl_ids = self.controller.filtered_raw_fluorescence_channel_ids
         channel_names = [pnn_raw[i] for i in fl_ids]
 
+        csv_save_error = None
         try:
             profile_name = save_af_profile_csv(
                 af_spectra, channel_names, source_fcs_path,
@@ -1180,6 +1270,7 @@ class AutoSpectralTab(QWidget):
             )
         except Exception as e:
             logger.error(f'AutoSpectral: failed to save CSV: {e}')
+            csv_save_error = str(e)
             profile_name = Path(source_fcs_path).stem + ' AutoSpectral AF'
 
         af_profiles = self.controller.experiment.process.get('af_profiles', {})
@@ -1194,11 +1285,18 @@ class AutoSpectralTab(QWidget):
         # Cache precomputed matrices for the new profile immediately —
         # this is the only linalg.solve call needed; sample loading just does hstack.
         self.controller.cache_af_profile(profile_name)
+        self.controller.on_af_profiles_changed()
 
-        self._extract_status.setText(
-            f'Done. Profile "{profile_name}" stored ({n_af} AF spectra).'
-        )
-        self._refresh_profile_list()
+        if csv_save_error:
+            self._extract_status.setText(
+                f'Profile "{profile_name}" stored in-memory, but saving its CSV '
+                f'failed: {csv_save_error}'
+            )
+        else:
+            self._extract_status.setText(
+                f'Done. Profile "{profile_name}" stored ({n_af} AF spectra).'
+            )
+        self._refresh_profile_list(select_name=profile_name)
         self._rebuild_assignment_grid()
 
         if self.bus:
@@ -1215,9 +1313,18 @@ class AutoSpectralTab(QWidget):
     # Section 2 — profile list and spectral plot
     # ======================================================================
 
-    def _refresh_profile_list(self):
-        """Rebuild profile list, restore or default selection, and draw the plot."""
-        current_name = (
+    def _refresh_profile_list(self, select_name: str | None = None):
+        """Rebuild profile list, restore or default selection, and draw the plot.
+
+        select_name, when given, takes priority over whatever was previously
+        selected. Callers that just (re-)created or loaded a specific profile
+        (extraction, CSV load) pass it here so that profile is the one shown —
+        otherwise, if a *different* profile happened to be selected in the
+        list already, the "restore previous selection" behaviour below would
+        silently keep showing that unrelated profile and the just-updated
+        spectra would never appear on screen.
+        """
+        current_name = select_name or (
             self._profile_list.currentItem().text()
             if self._profile_list.currentItem() else None
         )
@@ -1362,8 +1469,9 @@ class AutoSpectralTab(QWidget):
 
         # Cache precomputed matrices for the loaded profile.
         self.controller.cache_af_profile(profile_name)
+        self.controller.on_af_profiles_changed()
 
-        self._refresh_profile_list()
+        self._refresh_profile_list(select_name=profile_name)
         self._rebuild_assignment_grid()
         if self.bus:
             self.bus.statusMessage.emit(
@@ -1387,7 +1495,7 @@ class AutoSpectralTab(QWidget):
         self.controller.experiment.samples['sample_af_profiles'] = sample_af
         self.bus.autoSaveRequested.emit()
 
-        self.controller.initialise_af_matrices()
+        self.controller.on_af_profiles_changed()
         self._refresh_profile_list()
         self._rebuild_assignment_grid()
         if self.bus:
@@ -1707,9 +1815,14 @@ class AutoSpectralTab(QWidget):
             af_spectra = self.controller.get_combined_af_spectra_for_sample(
                 self.controller.current_sample_path
             )
+            af_index_map = self.controller.get_af_index_map_for_sample(
+                self.controller.current_sample_path
+            )
         else:
-            entry = self.controller.experiment.process.get('af_profiles', {}).get(profile_key)
+            af_profiles = self.controller.experiment.process.get('af_profiles', {})
+            entry = af_profiles.get(profile_key)
             af_spectra = np.array(entry['spectra']) if entry else None
+            af_index_map = af_index_lookup(af_profiles, [profile_key])
 
         if af_spectra is None:
             self._cmp_status.setText(
@@ -1749,9 +1862,15 @@ class AutoSpectralTab(QWidget):
         # valid — skip the worker and just redraw.
         spillover = self.controller.experiment.process.get('spillover')
         spillover_key = tuple(np.array(spillover).ravel()) if spillover is not None else None
-        # Use a content hash of the precomputed P matrix rather than id()
-        p_matrix = af_precomputed.get('P') if af_precomputed is not None else None
-        af_key = bytes(p_matrix.data) if p_matrix is not None else None
+        # Use a content hash of the AF spectra actually being applied, not P:
+        # P = solve(fluor_spectra @ fluor_spectra.T, fluor_spectra) depends only
+        # on the fluorophore library, not on which AF profile(s) are assigned
+        # (see combine_af_precomputed's docstring — P is shared across profiles),
+        # so keying on P made this cache blind to AF-assignment changes while
+        # staying on "Assigned to sample": ticking a different profile changed
+        # af_spectra but never af_key, so a stale cached result was reused and
+        # "No change — redrawing..." was reported incorrectly.
+        af_key = bytes(np.ascontiguousarray(af_spectra).data) if af_spectra is not None else None
         state_key = (
             self.controller.current_sample_path,
             profile_key,
@@ -1784,6 +1903,7 @@ class AutoSpectralTab(QWidget):
             self.controller.experiment.settings,
             _fl_ids_remapped,
             spillover=self.controller.experiment.process.get('spillover'),
+            af_index_map=af_index_map,
         )
         self._cmp_worker.moveToThread(self._cmp_thread)
         self._cmp_thread.started.connect(self._cmp_worker.run)
@@ -1836,6 +1956,17 @@ class AutoSpectralTab(QWidget):
         # Default: first two fluorescence channels
         ch_x = fl_names[0]
         ch_y = fl_names[1]
+
+        # Better default: the two channels most affected by AF correction
+        # (largest mean |OLS - AF| difference).
+        try:
+            picked = pick_most_affected_channels(
+                self._ols_data, self._af_data, pnn, fl_names
+            )
+            if picked is not None:
+                ch_x, ch_y = picked
+        except Exception as e:
+            logger.debug(f'AutoSpectral comparison: channel auto-pick failed: {e}')
 
         # Preserve existing channel selections if both plots already have them
         if (self._plot_ols._channel_x in fl_names

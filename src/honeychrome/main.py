@@ -103,6 +103,7 @@ def setup_logging(log_file):
 
     # Silence specific libraries
     logging.getLogger('matplotlib').setLevel(logging.WARNING)
+    logging.getLogger('numba').setLevel(logging.WARNING)
     # logging.getLogger('PIL').setLevel(logging.WARNING)  # Often useful to block PIL too
 
     # Redirect warnings module to logging

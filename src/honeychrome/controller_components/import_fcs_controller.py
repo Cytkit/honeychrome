@@ -9,7 +9,7 @@ from flowio import FlowData
 
 from honeychrome.controller_components.functions import timer, apply_gates_in_place, apply_transfer_matrix, calc_stats, all_same, assign_default_transforms, generate_transformations
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import to_gml
-from honeychrome.settings import settings_default, process_default, cytometry_default
+from honeychrome.settings import settings_default, process_default, cytometry_default, af_channels
 from honeychrome.view_components.busy_cursor import with_busy_cursor
 from honeychrome.controller_components.cytometer_whitelist import resolve_cytometer_params
 
@@ -20,6 +20,30 @@ logger = logging.getLogger(__name__)
 # equivalent per-channel setting under $PnG (gain) instead. Either is
 # accepted as "the detector setting for channel n".
 _PNV_PATTERN = re.compile(r'^p(\d+)[vg]$', re.IGNORECASE)
+
+
+# Scatter, time and width channels by name, for cytometers not in the database.
+_NON_FLUOR_PATTERN = re.compile(r'FSC|SSC|Time|Width', re.IGNORECASE)
+# Channels Honeychrome writes into its unmixed FCS exports; never detectors.
+_HONEYCHROME_DERIVED_CHANNELS = frozenset({'event_id', *af_channels})
+
+
+def unrecognised_fluorescence_ids(pnn, whitelisted):
+    """Positions in pnn of the fluorescence detectors of an unrecognised cytometer.
+
+    flowio's own classification only excludes literal "FSC"/"SSC", so
+    detectors like SSC_1-4 or VSSC1-Width would count as fluorescence.
+    Channels are taken as detectors when they are whitelisted, are not
+    scatter, time or width by name, and are not event_id or AF Abundance /
+    AF Index (present when a Honeychrome unmixed export is imported).
+    """
+    whitelisted = set(whitelisted)
+    return [
+        i for i, ch in enumerate(pnn)
+        if ch in whitelisted
+        and ch not in _HONEYCHROME_DERIVED_CHANNELS
+        and not _NON_FLUOR_PATTERN.search(ch)
+    ]
 
 
 def _extract_pnv_values(text_dict, n_channels):
@@ -216,15 +240,9 @@ class ImportFCSController(QObject):
                         self.experiment.settings['raw']['scatter_param'] = cyt_info.scatter_param
                     else:
                         _whitelisted_set = set(whitelisted_pnn)
-                        # flowio's own classification only excludes literal "FSC"/"SSC",
-                        # so detectors like SSC_1-4 or VSSC1-Width get misclassified as
-                        # fluorescence. Derive fluorescence channels by name pattern
-                        # instead, matching the convention used for recognised cytometers.
-                        _non_fluor_pat = re.compile(r'FSC|SSC|Time|Width', re.IGNORECASE)
-                        fluorescence_channel_ids = [
-                            i for i, ch in enumerate(representative_pnn)
-                            if ch in _whitelisted_set and not _non_fluor_pat.search(ch)
-                        ]
+                        fluorescence_channel_ids = unrecognised_fluorescence_ids(
+                            representative_pnn, _whitelisted_set,
+                        )
                         scatter_channel_ids = [
                             i for i in scatter_channel_ids
                             if representative_pnn[i] in _whitelisted_set
