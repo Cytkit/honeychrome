@@ -120,6 +120,11 @@ class Controller(QObject):
         # per-sample custom gates: {scope: {sample_path: {gate_name: flowkit Gate}}}
         # all samples share one hierarchy; a sample may override a single gate.
         self.custom_sample_gates = {'raw': {}, 'unmixed': {}}
+        self.cleaned_events: dict = {}
+        self.warning_collector: list[str] | None = None   # when a list, deferred warnings are appended instead of shown
+        self.autospectral_variants: dict = {}
+        self.autospectral_raw_pos_thresholds = None
+        self.autospectral_unmixed_pos_thresholds = None
         self.data_for_cytometry_plots = deepcopy(cytometry_data_dictionary)
         self.data_for_cytometry_plots_raw = deepcopy(self.data_for_cytometry_plots)
         self.data_for_cytometry_plots_process = deepcopy(self.data_for_cytometry_plots)

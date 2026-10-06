@@ -39,9 +39,9 @@ def test_open_experiment_view_sample_add_gates_add_plots():
     kc.initialise_data_for_cytometry_plots()
 
     # add gates
-    kc.create_or_update_gate(gate_name='activated', gate_type='rectangle', gate_path=('root', 'Cells', 'Singlets'), gate_data={'pos':[0.2, 0.2], 'size':[0.5, 0.5]}, channel_x='A2 Spark UV 387', channel_y='SSC-A')
-    kc.create_or_update_gate(gate_name='quaddy', gate_type='quad', gate_path=('root', 'Cells', 'Singlets'), gate_data={'pos':[0.2, 0.2], 'size':[0.5, 0.5]}, channel_x='A2 Spark UV 387', channel_y='A10 BUV805')
-    kc.create_or_update_gate(gate_name='sub++', gate_type='ellipse', gate_path=('root', 'Cells', 'Singlets', 'quaddy', 'A2 Spark UV 387+ A10 BUV805+'), gate_data={'pos':[0.2, 0.2], 'size':[0.2, 0.2], 'angle':30}, channel_x='A12 eFluor 450', channel_y='A10 BUV805')
+    kc.create_or_update_gate(gate_name='activated', gate_type='rectangle', gate_path=('root', 'Cells', 'Singlets'), gate_data={'pos':[0.2, 0.2], 'size':[0.5, 0.5]}, channel_x='Spark UV 387', channel_y='SSC-A')
+    kc.create_or_update_gate(gate_name='quaddy', gate_type='quad', gate_path=('root', 'Cells', 'Singlets'), gate_data={'pos':[0.2, 0.2], 'size':[0.5, 0.5]}, channel_x='Spark UV 387', channel_y='BUV805')
+    kc.create_or_update_gate(gate_name='sub++', gate_type='ellipse', gate_path=('root', 'Cells', 'Singlets', 'quaddy', 'Spark UV 387+ BUV805+'), gate_data={'pos':[0.2, 0.2], 'size':[0.2, 0.2], 'angle':30}, channel_x='eFluor 450', channel_y='BUV805')
 
     kc.calculate_lookup_tables()  # (re)create all lookup tabels
 
@@ -50,9 +50,9 @@ def test_open_experiment_view_sample_add_gates_add_plots():
 
     # add plots
     kc.data_for_cytometry_plots['plots'] += [
-        {'type': 'hist2d', 'channel_x': 'A2 Spark UV 387', 'channel_y': 'SSC-A', 'source_gate': 'Singlets', 'child_gates': ['activated']},
-        {'type': 'hist2d', 'channel_x': 'A2 Spark UV 387', 'channel_y': 'A10 BUV805', 'source_gate': 'Singlets', 'child_gates': ['quaddy']},
-        {'type': 'hist2d', 'channel_x': 'A12 eFluor 450', 'channel_y': 'A10 BUV805', 'source_gate': 'A2 Spark UV 387+ A10 BUV805+', 'child_gates': ['sub++']}
+        {'type': 'hist2d', 'channel_x': 'Spark UV 387', 'channel_y': 'SSC-A', 'source_gate': 'Singlets', 'child_gates': ['activated']},
+        {'type': 'hist2d', 'channel_x': 'Spark UV 387', 'channel_y': 'BUV805', 'source_gate': 'Singlets', 'child_gates': ['quaddy']},
+        {'type': 'hist2d', 'channel_x': 'eFluor 450', 'channel_y': 'BUV805', 'source_gate': 'Spark UV 387+ BUV805+', 'child_gates': ['sub++']}
     ]
 
     kc.set_mode('Raw Data')
