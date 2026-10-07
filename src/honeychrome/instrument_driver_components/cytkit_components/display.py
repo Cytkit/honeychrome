@@ -280,7 +280,7 @@ class SimProxy:
 
 
 class Display(Thread):
-    def __init__(self, transfer_object=None, sample_pump_object=None, pressure_object=None, temperature_object=None, laser_object=None):
+    def __init__(self, event_rate_object=None, sample_pump_object=None, pressure_object=None, temperature_object=None, laser_object=None):
         super().__init__(daemon=True)
         try:
             self.oled = SSD1309()
@@ -301,7 +301,7 @@ class Display(Thread):
         self._lock = Lock()
         self._closed = False
 
-        self.transfer_object = transfer_object
+        self.event_rate_object = event_rate_object
         self.sample_pump_object = sample_pump_object
         self.pressure_object = pressure_object
         self.temperature_object = temperature_object
@@ -388,7 +388,7 @@ class Display(Thread):
         self.frame = deepcopy(frame_info)
         self.draw = ImageDraw.Draw(self.frame)
 
-        event_rate = self.transfer_object.event_rate if self.transfer_object else 0
+        event_rate = self.event_rate_object.event_rate if self.event_rate_object else 0
         sample_flow_rate = self.sample_pump_object.flow_rate if self.sample_pump_object else 0
         pressure = self.pressure_object.pressure if self.pressure_object and self.pressure_object.pressure else 0
         temperature = self.temperature_object.temperature if self.temperature_object and self.temperature_object.temperature else 0

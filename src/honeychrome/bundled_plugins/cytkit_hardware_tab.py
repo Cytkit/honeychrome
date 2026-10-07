@@ -1622,7 +1622,7 @@ class PluginWidget(QWidget):
                         if type(index) is int:
                             self.trigger_table.update_events(index, value)
                         elif index == 'merge':
-                            self.merged_count.setText(value if value else "—")
+                            self.merged_count.setText(f'{value}' if value else "—")
 
         if 'capture' in response['message']:
             if response['message']['capture']:

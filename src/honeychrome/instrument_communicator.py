@@ -32,7 +32,7 @@ import warnings
 
 from honeychrome.settings import devices_boot_order, traces_cache_size, traces_cache_dtype, max_events_in_traces_cache, trace_n_points, transfer_target_repeat_time
 
-debug = False
+debug = True
 
 class Instrument(mp.Process):
     def __init__(self, use_dummy_instrument=False,

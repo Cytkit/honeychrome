@@ -140,26 +140,50 @@ class TemperatureControlWorker(Thread):
         self.fan.set_enable(False)
         self._stop_event.set()
 
-class EventRateCounter:
-    def __init__(self):
+class EventRateCounter(Thread):
+    def __init__(self, trigger, interval):
+        super().__init__(daemon=True)
         self.time_last = None
         self.event_rate = 0
+        self.trigger_event_count = 0
+        self.trigger = trigger
+        self.smoothing_time = 2
 
-    def update(self, number_of_new_events):
+        self._stop_event = Event()
+        self._lock = Lock()
+        self.interval = interval
+
+    def run(self):
+        while not self._stop_event.is_set():
+            with self._lock:
+                old_trigger_event_count = self.trigger_event_count
+                self.trigger_event_count = self.trigger.merge_get_event_count()
+                new_events = self.trigger_event_count - old_trigger_event_count
+                self.recount(new_events)  # this is the number of merge trigger events
+
+            logger.info(f"[EventRateCounter] trigger event count={self.trigger_event_count} event rate={self.event_rate}")
+            self._stop_event.wait(self.interval)   # interruptible sleep
+
+    def recount(self, number_of_new_events):
         time_now = time.perf_counter()
-        if not self.time_last or time_now - self.time_last > 1.0:
+        if not self.time_last or time_now - self.time_last > self.smoothing_time:
             self.event_rate = 0
         elif self.event_rate == 0:
-            interval = time_now - self.time_last
-            self.event_rate = number_of_new_events/interval
+            perf_interval = time_now - self.time_last
+            self.event_rate = number_of_new_events/perf_interval
         else:
-            interval = time_now - self.time_last
-            self.event_rate = self.event_rate * (1.0-interval) + number_of_new_events
+            perf_interval = time_now - self.time_last
+            self.event_rate = self.event_rate * (self.smoothing_time-perf_interval) + number_of_new_events
         self.time_last = time_now
 
     def reset(self):
-        self.time_last = None
+        self.trigger.clear_all_counts()
+        self.time_last = time.perf_counter()
         self.event_rate = 0
+
+    def stop(self):
+        self.reset()
+        self._stop_event.set()
 
 class SamplePumpFlowRateGetter(Thread):
     def __init__(self, parent, sample_pump):
@@ -268,7 +292,6 @@ class CytkitDevice:
         self.auto_resets = 0
         self.fifo_flooded = None
         self.fifo_level = None
-        self.trigger_event_count = None
 
         self.pressure_set_point = settings.pressure_set_point_retrieved
         self.temperature_set_point = settings.temperature_set_point_retrieved
@@ -318,17 +341,18 @@ class CytkitDevice:
         self.fan.set_pwm_duty(0)
         self.sheath_pump.set_pwm_frequency(30)
         self.sheath_pump.set_pwm_duty(0)
+
         self.pressure_control_worker = PressureControlWorker(self.pressure, self.sheath_pump, self.pressure_set_point, pump_max, control_loop_interval)
         self.temperature_control_worker = TemperatureControlWorker(self.pressure, self.fan, self.temperature_set_point, fan_max, control_loop_interval)
         self.pressure_control_worker.start()
         self.temperature_control_worker.start()
-
-        self.event_rate_counter = EventRateCounter()
+        self.event_rate_counter = EventRateCounter(self.trigger, control_loop_interval)
+        self.event_rate_counter.start()
         self.sample_pump_flow_rate_getter = SamplePumpFlowRateGetter(self, self.sample_pump)
         self.sample_pump_flow_rate_getter.start()
         self.laser_getter = LaserGetter(self.laser)
         self.laser_getter.start()
-        self.display = Display(transfer_object=self.event_rate_counter, sample_pump_object=self.sample_pump_flow_rate_getter, pressure_object=self.pressure_control_worker, temperature_object=self.temperature_control_worker, laser_object=self.laser_getter)
+        self.display = Display(event_rate_object=self.event_rate_counter, sample_pump_object=self.sample_pump_flow_rate_getter, pressure_object=self.pressure_control_worker, temperature_object=self.temperature_control_worker, laser_object=self.laser_getter)
         self.display.start()
 
         # dac state
@@ -339,7 +363,7 @@ class CytkitDevice:
                 'bias': {row: bias},
                 'ref': {row: ref}
             }})
-            logger.info(f'[CytkitDriver] connect to device: {message}')
+            logger.info(f'[CytkitDriver] setup: {message}')
 
         # adc state
         for row, name in enumerate(settings.adc_channels):
@@ -351,8 +375,7 @@ class CytkitDevice:
                 'inverted': {row: inverted},
                 'offset': {row: offset},
             }})
-            logger.info(f'[CytkitDriver] connect to device: {message}')
-
+            logger.info(f'[CytkitDriver] setup: {message}')
 
         # trigger state
         for row, name in enumerate(settings.adc_channels):
@@ -374,8 +397,8 @@ class CytkitDevice:
                 'h_off': {row: h_off},
                 'skew': {row: skew}
             }})
-            logger.info(f'[CytkitDriver] connect to device: {message}')
-
+            logger.info(f'[CytkitDriver] setup: {message}')
+        self.trigger.merge_set_enable(True)
 
         # capture state
         for row, name in enumerate(settings.adc_channels):
@@ -387,15 +410,14 @@ class CytkitDevice:
                 'pre_trigger': {row: pre},
                 'post_trigger': {row: post}
             }})
-            logger.info(f'[CytkitDriver] connect to device: {message}')
-
+            logger.info(f'[CytkitDriver] setup: {message}')
 
         return  'OK', 'Connected to Cytkit'
 
     def disconnect(self):
         self.laser.set_state(0)  # always send command to switch off laser just in case
 
-        workers = [self.temperature_control_worker, self.pressure_control_worker]
+        workers = [self.temperature_control_worker, self.pressure_control_worker, self.event_rate_counter]
 
         for w in workers:
             w.stop()
@@ -435,9 +457,7 @@ class CytkitDevice:
         self.display.action_message(["Acquisition", f"Settling rate {self.sample_pump_acquisition_rate} uL/min"])
         self.sample_pump.ramp_to(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
         time.sleep(self.sample_pump_settle_time)
-        self.trigger.clear_all_counts()
         self.capture.aggr_fifo_clear()
-        self.trigger.merge_set_enable(True)
         self.capture.aggr_set_enable(True)
         self.decoder.reset()
         self.event_rate_counter.reset()
@@ -454,10 +474,8 @@ class CytkitDevice:
         self.display.action_message("Acquisition finished.")
         logger.info(f"[CytkitDriver] communication errors={self.decoder.error_count}")
 
-        self.trigger.merge_set_enable(False)
         self.capture.aggr_set_enable(False)
         self.capture.aggr_fifo_clear()
-        self.trigger.clear_all_counts()
         self.decoder.reset()
         self.event_rate_counter.reset()
         return 'OK', 'Cytkit stopped acquisition'
@@ -735,7 +753,7 @@ class CytkitDevice:
             message['trigger'] = {'events':{}}
             for index in range(16):
                 message['trigger']['events'][index] = self.trigger.channel_get_event_count(index)
-            message['trigger']['events']['merge'] = self.trigger_event_count
+            message['trigger']['events']['merge'] = self.event_rate_counter.trigger_event_count
 
         if 'capture' in list_of_parameters:
             self.fifo_level = self.capture.aggr_get_fifo_level()
@@ -817,17 +835,12 @@ class CytkitDevice:
                 if n > 0:
                     traces[idx, packet.channel, :n] = packet.samples[:n]
 
-                n_decoded_events = len(event_index)
+                # n_decoded_events = len(event_index)
                 # self.event_rate_counter.update(n_decoded_events) # this is the number of events for which at least some data was recovered
-                old_trigger_event_count = self.trigger_event_count
-                self.trigger_event_count = self.trigger.merge_get_event_count()
-                new_events = self.trigger_event_count - old_trigger_event_count
-                self.event_rate_counter.update(new_events) # this is the number of merge trigger events
                 blob_of_traces_as_array = traces.reshape(-1)
                 return blob_of_traces_as_array
 
         return None
-
 
 if __name__ == '__main__':
     # test connection and id
