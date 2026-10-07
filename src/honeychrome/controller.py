@@ -1173,6 +1173,14 @@ class Controller(QObject):
 
     @Slot(str, int)
     def on_gain_change(self, ch_name, value):
+        # store value in qsettings
+        s = settings.q_settings
+        s.beginGroup('dac_channels')
+        s.beginGroup(ch_name)
+        s.setValue("bias", value)
+        s.endGroup()
+        s.endGroup()
+
         # send set_gain command and wait for response
         self.pipe_connection_instrument.send({'command': 'set_gain', 'data': {ch_name: value}})
         response = self.pipe_connection_instrument.recv()

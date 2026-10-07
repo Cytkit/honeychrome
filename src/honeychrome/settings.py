@@ -50,6 +50,10 @@ window_extension_length_pre = int(window_extension_time_pre * adc_rate * 1e6)
 window_extension_length_post = int(window_extension_time_post * adc_rate * 1e6)
 timeout_length = int(max_event_time * adc_rate)
 
+gain_range = 255
+dac_bias_default = 155
+dac_ref_default = 1023
+
 capture_enabled_default = True
 capture_pre_trigger_default = n_time_points_in_event//2
 capture_post_trigger_default = n_time_points_in_event - capture_pre_trigger_default
@@ -89,8 +93,8 @@ n_channels_per_event = len(event_channels_pnn)
 use_dummy_instrument = True
 
 ### settings for controller and gui
-default_gains_immuno = {channel: 100 for channel in fluorescence_channels}
-default_gains_xfp = {channel: 50 for channel in fluorescence_channels}
+default_gains_immuno = {channel: 155 for channel in fluorescence_channels}
+default_gains_xfp = {channel: 130 for channel in fluorescence_channels}
 cytometry_plot_width_target = 350 # pixels
 cytometry_plot_width_export = 70 # mm
 tile_size_nxn_grid = 100 # pixels
@@ -300,6 +304,16 @@ sample_pump_flush_time_retrieved = q_settings.value('sample_pump_flush_time', sa
 sample_pump_backflush_speed_retrieved = q_settings.value('sample_pump_backflush_speed', sample_pump_backflush_speed, type=int)
 sample_pump_backflush_time_retrieved = q_settings.value('sample_pump_backflush_time', sample_pump_backflush_time, type=float)
 sample_pump_acquisition_rate_retrieved = q_settings.value('sample_pump_acquisition_speed', sample_pump_acquisition_rate, type=float)
+
+q_settings.beginGroup("dac_channels")
+dac_bias_retrieved = {}
+dac_ref_retrieved = {}
+for row, name in enumerate(adc_channels):
+    q_settings.beginGroup(name)
+    dac_bias_retrieved[name] = q_settings.value("bias", dac_bias_default if name not in ['FSC', 'SSC'] else 0, type=int)
+    dac_ref_retrieved[name] = q_settings.value("ref", dac_ref_default, type=int)
+    q_settings.endGroup()
+q_settings.endGroup()
 
 q_settings.beginGroup("adc_channels")
 adc_enabled_retrieved = {}

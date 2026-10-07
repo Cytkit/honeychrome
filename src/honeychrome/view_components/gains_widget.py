@@ -2,7 +2,7 @@ import sys
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QSpinBox, QLabel, QPushButton,
                                QFrame)
 from PySide6.QtCore import Qt
-from honeychrome.settings import fluorescence_channels, default_gains_immuno, default_gains_xfp
+from honeychrome.settings import fluorescence_channels, default_gains_immuno, default_gains_xfp, gain_range, dac_bias_retrieved
 
 class GainsWidget(QWidget):
     def __init__(self, bus, *args, **kwargs):
@@ -60,14 +60,14 @@ class GainsWidget(QWidget):
 
         # Horizontal slider
         slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(0, 256)
-        slider.setValue(0)
+        slider.setRange(0, gain_range)
+        slider.setValue(dac_bias_retrieved[ch_name])
         slider.valueChanged.connect(lambda value: self.bus.gainChanged.emit(ch_name, value))
 
         # Spin box
         spinbox = QSpinBox()
-        spinbox.setRange(0, 256)
-        spinbox.setValue(0)
+        spinbox.setRange(0, gain_range)
+        spinbox.setValue(dac_bias_retrieved[ch_name])
         spinbox.valueChanged.connect(slider.setValue)
         slider.valueChanged.connect(spinbox.setValue)
 

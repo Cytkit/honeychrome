@@ -24,5 +24,5 @@ class ADCs:
         return self.ft4222.register_bit_get('ADC_ENABLE', channel)
 
     def real_read_value(self, channel):
-        register_base_real = adc_dictionary[channel]['reg_base_real']
+        register_base_real = adc_dictionary[channel]['reg_base_dc_sample']
         return self.ft4222.register_read(register_base_real)

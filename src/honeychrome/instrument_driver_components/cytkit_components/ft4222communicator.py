@@ -75,13 +75,13 @@ class Ft4222Communicator:
 
     def register_bit_set(self, address, bit_pos):
         # Set the specified bit in a register
-        if bit_pos >= 8:
+        if bit_pos >= 16:
             return
         self.register_read_modify_write(address, 1 << bit_pos, 1 << bit_pos)
 
     def register_bit_clear(self, address, bit_pos):
         # Set the specified bit in a register
-        if bit_pos >> 8:
+        if bit_pos >> 16:
             return
         self.register_read_modify_write(address, 0x0000, 1 << bit_pos)
 

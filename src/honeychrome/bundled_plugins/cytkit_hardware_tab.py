@@ -22,6 +22,191 @@ logger = logging.getLogger(__name__)
 
 plugin_name = 'Cytkit Hardware'
 
+class DacChannelTable(QWidget):
+    bias_changed = Signal(int, str, int)
+    ref_changed = Signal(int, str, int)
+
+    SETTINGS_GROUP = "dac_channels"
+
+    # uint range for the spinboxes
+    BIAS_MIN, BIAS_MAX = 0, 255
+    REF_MIN, REF_MAX = 0, 1023
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._loading = False   # suppress auto-save during load/reset
+
+        # ---- table ----
+        self.table = QTableWidget(len(adc_channels), 2)
+        self.table.setHorizontalHeaderLabels(
+            ["Bias (range 0..255 maps onto 27..36 V)", "Reference (range 0..1023 maps onto 0..3 V)"]
+        )
+        self.table.verticalHeader().setVisible(True)
+        self.table.setVerticalHeaderLabels(adc_channels)
+        self.table.setSelectionMode(QTableWidget.NoSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        total_height = (self.table.verticalHeader().length() + self.table.horizontalHeader().height() + (self.table.frameWidth() * 2))
+        self.table.setFixedHeight(total_height)
+
+        # ---- per-row widgets ----
+        self.bias_spins: list[QSpinBox] = []
+        self.ref_spins: list[QSpinBox] = []
+
+        for row, name in enumerate(adc_channels):
+            bias = QSpinBox()
+            bias.setRange(self.BIAS_MIN, self.BIAS_MAX)
+            bias.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            bias.valueChanged.connect(
+                lambda value, r=row, n=name: self._on_bias(r, n, value)
+            )
+            self.bias_spins.append(bias)
+            self.table.setCellWidget(row, 0, bias)
+
+            ref = QSpinBox()
+            ref.setRange(self.REF_MIN, self.REF_MAX)
+            ref.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            ref.valueChanged.connect(
+                lambda value, r=row, n=name: self._on_ref(r, n, value)
+            )
+            self.ref_spins.append(ref)
+            self.table.setCellWidget(row, 1, ref)
+
+        # ---- reset button ----
+        self.reset_button = QPushButton("Reset")
+        self.reset_button.clicked.connect(self.reset)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(self.reset_button)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.table)
+        layout.addLayout(button_row)
+
+        # load the saved settings
+        self.load_state()
+
+    # ---------- change handlers (auto-save) ----------
+
+    def _on_bias(self, row: int, name: str, value: int) -> None:
+        self._save_channel(name)
+        self.bias_changed.emit(row, name, value)
+
+    def _on_ref(self, row: int, name: str, value: int) -> None:
+        self._save_channel(name)
+        self.ref_changed.emit(row, name, value)
+
+    # ---------- helpers ----------
+
+    @staticmethod
+    def _centered(widget: QWidget) -> QWidget:
+        container = QWidget()
+        h = QHBoxLayout(container)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setAlignment(Qt.AlignCenter)
+        h.addWidget(widget)
+        return container
+
+    def _row_for(self, name: str) -> int:
+        return adc_channels.index(name)
+
+    # ---------- persistence ----------
+
+    def _save_channel(self, name: str) -> None:
+        if self._loading:
+            return
+        row = self._row_for(name)
+        s = q_settings
+        s.beginGroup(self.SETTINGS_GROUP)
+        s.beginGroup(name)
+        s.setValue("bias", self.bias_spins[row].value())
+        s.setValue("ref", self.ref_spins[row].value())
+        s.endGroup()
+        s.endGroup()
+
+    def save_state(self) -> None:
+        s = q_settings
+        s.beginGroup(self.SETTINGS_GROUP)
+        for row, name in enumerate(adc_channels):
+            s.beginGroup(name)
+            s.setValue("bias", self.bias_spins[row].value())
+            s.setValue("ref", self.ref_spins[row].value())
+            s.endGroup()
+        s.endGroup()
+        s.sync()
+
+    def load_state(self) -> None:
+        for row, name in enumerate(adc_channels):
+            bias = settings.dac_bias_retrieved[name]
+            ref = settings.dac_ref_retrieved[name]
+            self._set_row_silently(row, bias, ref)
+
+    def update_bias(self, row, bias):
+        self.bias_spins[row].blockSignals(True)
+        self.bias_spins[row].setValue(bias)
+        self.bias_spins[row].blockSignals(False)
+
+    def update_ref(self, row, ref):
+        self.ref_spins[row].blockSignals(True)
+        self.ref_spins[row].setValue(ref)
+        self.ref_spins[row].blockSignals(False)
+
+    def _set_row_silently(
+        self, row: int, bias: int, ref: int
+    ) -> None:
+        widgets = (
+            self.bias_spins[row],
+            self.ref_spins[row],
+        )
+        for w in widgets:
+            w.blockSignals(True)
+        self.bias_spins[row].setValue(bias)
+        self.ref_spins[row].setValue(ref)
+        for w in widgets:
+            w.blockSignals(False)
+
+    # ---------- reset ----------
+
+    def reset(self) -> None:
+        self._loading = True
+        try:
+            for row in range(len(adc_channels)):
+                self._set_row_silently(
+                    row,
+                    settings.dac_bias_default,
+                    settings.dac_ref_default,
+                )
+        finally:
+            self._loading = False
+
+        self.save_state()
+        for row, name in enumerate(adc_channels):
+            self.bias_changed.emit(row, name, settings.dac_bias_default)
+            self.ref_changed.emit(row, name, settings.dac_ref_default)
+
+    # ---------- accessors ----------
+
+    def bias(self, row: int) -> int:
+        return self.bias_spins[row].value()
+
+    def ref(self, row: int) -> int:
+        return self.ref_spins[row].value()
+
+    def row_state(self, row: int) -> dict:
+        return {
+            "channel": adc_channels[row],
+            "bias": self.bias(row),
+            "ref": self.ref(row),
+        }
+
+    def all_states(self) -> list[dict]:
+        return [self.row_state(r) for r in range(len(adc_channels))]
+
 class AdcChannelTable(QWidget):
     enable_changed = Signal(int, str, bool)
     invert_changed = Signal(int, str, bool)
@@ -590,13 +775,6 @@ class TriggerChannelTable(QWidget):
     def all_states(self) -> list[dict]:
         return [self.row_state(r) for r in range(len(adc_channels))]
 
-from PySide6.QtCore import Qt, Signal, QSettings
-from PySide6.QtWidgets import (
-    QTableWidget, QCheckBox, QSpinBox, QLabel, QWidget,
-    QHBoxLayout, QVBoxLayout, QPushButton, QHeaderView,
-)
-
-
 class CaptureChannelTable(QWidget):
     enable_changed = Signal(int, str, bool)
     pre_trigger_changed = Signal(int, str, int)
@@ -1070,31 +1248,17 @@ class PluginWidget(QWidget):
         toolbox.addTab(tab, "Fluidics")
 
         # DACs tab:
-        # dac bias, dac ref x chanels
+        # dac bias, dac ref x channels
         tab = QWidget()
         layout = QVBoxLayout(tab)
-
-        layout.addWidget(QLabel("DACs for each channel (DAC units 0..255)"))
-        self.dac_table = QTableWidget(number_of_dacs_pairs, 2)
-        self.dac_table.setHorizontalHeaderLabels(["Bias", "Ref"])
-        for row in range(number_of_dacs_pairs):
-            for col in range(2):
-                dac_index = row + col * number_of_dacs_pairs
-                dac_type = 'bias' if col == 0 else 'ref'
-                spin = LabeledSpinBox(min=0, max=255, text=dac_dictionary[dac_index]['channel_name'], label_right=True)
-                spin.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'dacs': {dac_type: {row: value}}}))
-                self.dac_table.setCellWidget(row, col, spin)
-                # value = dac_table.cellWidget(0, 1).value()
-                # self.dac_table.cellWidget(0, 1).spinbox.setValue(value)
-
-        self.dac_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.dac_table.verticalHeader().setVisible(False)  # Hide row numbers
-        self.dac_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        total_height = (self.dac_table.verticalHeader().length() + self.dac_table.horizontalHeader().height() + (self.dac_table.frameWidth() * 2))
-        self.dac_table.setFixedHeight(total_height)
-        # dac_table.setVerticalHeaderLabels([dac_dictionary[n]['channel_name'] for n in range(number_of_dacs_pairs)])
+        title = QLabel('DACs')
+        title.setStyleSheet(heading_style)
+        layout.addWidget(title)
+        self.dac_table = DacChannelTable()
+        self.dac_table.bias_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'dacs': {'bias': {channel_id: value}}}))
+        self.dac_table.ref_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'dacs': {'ref': {channel_id: value}}}))
         layout.addWidget(self.dac_table)
-
+        layout.addWidget(QLabel('Note bias is not used for photodetector channels (FSC and SSC)'))
         layout.addStretch()
         toolbox.addTab(tab, "DACs")
 
@@ -1109,7 +1273,6 @@ class PluginWidget(QWidget):
         self.adc_table.enable_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'adcs': {'enable': {channel_id: value}}}))
         self.adc_table.invert_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'adcs': {'invert': {channel_id: value}}}))
         self.adc_table.offset_changed.connect(lambda channel_id, channel_name, value: self.set_instrument_state({'adcs': {'offset': {channel_id: value}}}))
-
         layout.addWidget(self.adc_table)
         layout.addStretch()
         toolbox.addTab(tab, "ADCs")
@@ -1314,7 +1477,7 @@ class PluginWidget(QWidget):
 
         # Timer for periodic updates
         self.timer = QTimer(self)
-        self.timer.setInterval(500)
+        self.timer.setInterval(1000)
         self.timer.timeout.connect(self._on_timer)
         self.timer.start()
 
@@ -1405,7 +1568,7 @@ class PluginWidget(QWidget):
 
         if 'temperatures' in response['message']:
             if response['message']['temperatures']:
-                self.temp_p_sensor_label.setText(f'{response['message']['temperatures']['temp_p_sensor']} C')
+                self.temp_p_sensor_label.setText(f'{response['message']['temperatures']['temp_p_sensor']:0.2f} C')
 
         if 'vi_monitors' in response['message']:
             if response['message']['vi_monitors']:
@@ -1438,11 +1601,11 @@ class PluginWidget(QWidget):
                 if 'bias' in response['message']['dacs']:
                     for index in response['message']['dacs']['bias']:
                         value = response['message']['dacs']['bias'][index]
-                        self.dac_table.cellWidget(index, 0).spinbox.setValue(value)
+                        self.dac_table.update_bias(index, value)
                 if 'ref' in response['message']['dacs']:
                     for index in response['message']['dacs']['ref']:
-                        value = response['message']['dacs']['bias'][index]
-                        self.dac_table.cellWidget(index, 1).spinbox.setValue(value)
+                        value = response['message']['dacs']['ref'][index]
+                        self.dac_table.update_ref(index, value)
 
         if 'adcs' in response['message']:
             if response['message']['adcs']:
@@ -1464,13 +1627,13 @@ class PluginWidget(QWidget):
         if 'capture' in response['message']:
             if response['message']['capture']:
                 if 'fifo_level' in response['message']['capture']:
-                    self.fifo_level.setText(response['message']['capture']['fifo_level'])
+                    self.fifo_level.setText(f'{response['message']['capture']['fifo_level']}')
                 if 'fifo_status' in response['message']['capture']:
-                    self.fifo_status.setText(response['message']['capture']['fifo_status'])
+                    self.fifo_status.setText(f'{response['message']['capture']['fifo_status']}')
                 if 'decode_errors' in response['message']['capture']:
-                    self.decode_errors.setText(response['message']['capture']['decode_errors'])
+                    self.decode_errors.setText(f'{response['message']['capture']['decode_errors']}')
                 if 'auto_resets' in response['message']['capture']:
-                    self.auto_resets.setText(response['message']['capture']['auto_resets'])
+                    self.auto_resets.setText(f'{response['message']['capture']['auto_resets']}')
 
         if 'register_getter' in response['message']:
             value = response['message']['register_getter']

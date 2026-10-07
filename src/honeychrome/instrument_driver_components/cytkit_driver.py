@@ -268,6 +268,7 @@ class CytkitDevice:
         self.auto_resets = 0
         self.fifo_flooded = None
         self.fifo_level = None
+        self.trigger_event_count = None
 
         self.pressure_set_point = settings.pressure_set_point_retrieved
         self.temperature_set_point = settings.temperature_set_point_retrieved
@@ -309,7 +310,6 @@ class CytkitDevice:
         self.laser.set_interlock_effects(force=False, stop_fan=False, stop_sheath=False, stop_sample=False, stop_laser=True)
         self.laser.set_interlock_inversion(1) # 1 is normally closed, i.e. break circuit to trigger interlock stop laser
         self.laser.set_interlock_mask(1) # currently should be 1, i.e. only one interlock circuit
-
         self.get_state(['zero_pressure']) # calibrate assuming pressure zero before start
         self.sample_pump.stop()
         self.sample_pump.set_steps_per_cycle(settings.sample_pump_steps_per_cycle)
@@ -331,16 +331,28 @@ class CytkitDevice:
         self.display = Display(transfer_object=self.event_rate_counter, sample_pump_object=self.sample_pump_flow_rate_getter, pressure_object=self.pressure_control_worker, temperature_object=self.temperature_control_worker, laser_object=self.laser_getter)
         self.display.start()
 
+        # dac state
+        for row, name in enumerate(settings.adc_channels):
+            bias = settings.dac_bias_retrieved[name]
+            ref = settings.dac_ref_retrieved[name]
+            message = self.set_state({'dacs':{
+                'bias': {row: bias},
+                'ref': {row: ref}
+            }})
+            logger.info(f'[CytkitDriver] connect to device: {message}')
+
         # adc state
         for row, name in enumerate(settings.adc_channels):
             enabled = settings.adc_enabled_retrieved[name]
             inverted = settings.adc_inverted_retrieved[name]
             offset = settings.adc_offset_retrieved[name]
-            self.set_state({'adcs':{
+            message = self.set_state({'adcs':{
                 'enable': {row: enabled},
                 'inverted': {row: inverted},
                 'offset': {row: offset},
             }})
+            logger.info(f'[CytkitDriver] connect to device: {message}')
+
 
         # trigger state
         for row, name in enumerate(settings.adc_channels):
@@ -352,7 +364,7 @@ class CytkitDevice:
             delay = settings.trigger_delay_retrieved[name]
             h_off = settings.trigger_h_off_retrieved[name]
             skew = settings.trigger_skew_retrieved[name]
-            self.set_state({'trigger':{
+            message = self.set_state({'trigger':{
                 'enable': {row: enabled},
                 'mask': {row: mask},
                 'edge': {row: edge},
@@ -362,17 +374,21 @@ class CytkitDevice:
                 'h_off': {row: h_off},
                 'skew': {row: skew}
             }})
+            logger.info(f'[CytkitDriver] connect to device: {message}')
+
 
         # capture state
         for row, name in enumerate(settings.adc_channels):
             enabled = settings.capture_enabled_retrieved[name]
             pre = settings.capture_pre_trigger_retrieved[name]
             post = settings.capture_post_trigger_retrieved[name]
-            self.set_state({'trigger':{
+            message = self.set_state({'trigger':{
                 'enable': {row: enabled},
                 'pre_trigger': {row: pre},
                 'post_trigger': {row: post}
             }})
+            logger.info(f'[CytkitDriver] connect to device: {message}')
+
 
         return  'OK', 'Connected to Cytkit'
 
@@ -499,7 +515,7 @@ class CytkitDevice:
             if parameter == 'dacs':
                 if 'bias' in value:
                     for index in value['bias']:
-                        self.dacs.set_value_bias(index, value['bias'][index])
+                        self.dacs.set_value_bias(index, value['bias'][index] + 3*256)
                 if 'ref' in value:
                     for index in value['ref']:
                         self.dacs.set_value_ref(index, value['ref'][index])
@@ -515,6 +531,7 @@ class CytkitDevice:
                 if 'offset' in value:
                     for index in value['offset']:
                         self.offset_corrector.set_level(index, value['offset'][index])
+                message['adcs'] = value
 
             if parameter == 'trigger':
                 if 'enable' in value:
@@ -541,11 +558,11 @@ class CytkitDevice:
                 if 'skew' in value:
                     for index in value['skew']:
                         self.capture.channel_set_trigger_skew(index, value['skew'][index])
-
                 if 'force' == value:
                     self.trigger.merge_force_trigger()
                 if 'clear' == value:
                     self.trigger.clear_all_counts()
+                message['trigger'] = value
 
             if parameter == 'capture':
                 if 'enable' in value:
@@ -557,9 +574,9 @@ class CytkitDevice:
                 if 'post_trigger' in value:
                     for index in value['enable']:
                         self.capture.channel_set_post_trig_samples(index, value['post_trigger'][index])
-
                 if 'clear_fifo' == value:
                     self.capture.aggr_fifo_clear()
+                message['capture'] = value
 
             if parameter == 'register_setter':
                 try:
@@ -706,7 +723,7 @@ class CytkitDevice:
         if 'dacs' in list_of_parameters:
             message['dacs'] = {'bias':{}, 'ref':{}}
             for index in range(16):
-                message['dacs']['bias'][index] = self.dacs.get_value_bias(index)
+                message['dacs']['bias'][index] = max(self.dacs.get_value_bias(index) - 3*256, 0) # floor of 768
                 message['dacs']['ref'][index] = self.dacs.get_value_ref(index)
 
         if 'adcs' in list_of_parameters:
@@ -725,9 +742,10 @@ class CytkitDevice:
             message['capture'] = {'fifo_level':self.fifo_level, 'fifo_status':'🔴 Flooded!' if self.fifo_flooded else '🟢 OK', 'decode_errors':self.decoder.error_count, 'auto_resets':self.auto_resets}
 
         if 'register_getter' in list_of_parameters:
+            print(list_of_parameters)
             if type(list_of_parameters) is dict:
-                if type(list_of_parameters['register_getter']) is int:
-                    value = self.ft4222.register_read(message['register_getter'])
+                if list_of_parameters['register_getter'] in registers_map.keys():
+                    value = self.ft4222.register_read(list_of_parameters['register_getter'])
                     message['register_getter'] = value
 
         return 'OK', message
