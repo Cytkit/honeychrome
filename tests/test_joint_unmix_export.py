@@ -371,6 +371,29 @@ def test_exporter_chunking_does_not_change_the_output(tmp_path):
 
 
 @pytest.mark.numpy_only
+def test_exporter_reports_each_written_sample_after_its_chunks(tmp_path):
+    controller = _three_af_samples(tmp_path, (1500, 400, 900))
+    controller.experiment.samples['all_samples'][syn.PLAIN_SAMPLE] = 'plain_sample'
+    layout = jue.build_export_layout(controller)
+    base = _ols_unmix_fn(layout)
+    calls = []
+
+    def unmix_fn(raw_fl_chunk, raw_chunk, af):
+        calls.append(('chunk', len(raw_fl_chunk)))
+        return base(raw_fl_chunk, raw_chunk, af)
+
+    exporter = jue.JointUnmixExporter(
+        [syn.AF_SAMPLE, syn.PLAIN_SAMPLE, EXTRA_SAMPLE_2, EXTRA_SAMPLE_3], layout, unmix_fn,
+        output_root=tmp_path / 'Out', chunk_size=700,
+        sample_done=lambda path, n: calls.append(('done', path, n)),
+    )
+    assert not _run_exporter(exporter)
+    assert calls == [('chunk', 700), ('chunk', 700), ('chunk', 100), ('done', syn.AF_SAMPLE, 1500),
+                     ('chunk', 400), ('done', EXTRA_SAMPLE_2, 400),
+                     ('chunk', 700), ('chunk', 200), ('done', EXTRA_SAMPLE_3, 900)]
+
+
+@pytest.mark.numpy_only
 def test_exporter_rejects_an_extra_channel_with_an_existing_name(tmp_path):
     controller = syn.make_experiment(tmp_path, n_events=100)
     layout = jue.build_export_layout(controller)
