@@ -12,7 +12,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel,
+    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel,
     QSizePolicy, QSplitter, QVBoxLayout, QWidget,
 )
 
@@ -439,8 +439,6 @@ class ScatterCleaningViewer(QFrame):
         pos_rel = all_samples_rev.get(control.get('sample_name', ''))
         if pos_rel:
             try:
-                from PySide6.QtWidgets import QApplication
-                from PySide6.QtCore import Qt
                 QApplication.setOverrideCursor(Qt.WaitCursor)
                 pos_sample = sample_from_fcs(str(experiment_dir / pos_rel))
                 all_ev = pos_sample.get_events('raw')
@@ -452,6 +450,8 @@ class ScatterCleaningViewer(QFrame):
                     pos_scatter_gated = all_ev[mask][:, [abs_x, abs_y]].astype(float)
             except Exception as exc:
                 logger.warning(f'ScatterCleaningViewer: pos load failed for "{label}": {exc}')
+            finally:
+                QApplication.restoreOverrideCursor()
 
         # Cleaned & selected positive from stored scatter_pos
         pos_scatter_clean = None
@@ -482,6 +482,7 @@ class ScatterCleaningViewer(QFrame):
             neg_rel = all_samples_rev.get(neg_name)
             if neg_rel:
                 try:
+                    QApplication.setOverrideCursor(Qt.WaitCursor)
                     neg_sample = sample_from_fcs(str(experiment_dir / neg_rel))
                     all_neg_ev = neg_sample.get_events('raw')
                     neg_scatter_all = all_neg_ev[:, [abs_x, abs_y]].astype(float)

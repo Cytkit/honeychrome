@@ -252,6 +252,9 @@ class CytometryPlotWidget(QFrame):
             if parent == self.axis_bottom:
                 channel = 'channel_x'
             else:
+                # 'Intensity' is the only y-axis option on a ribbon plot
+                if self.plot['type'] == 'ribbon':
+                    return
                 channel = 'channel_y'
 
             self.plot[channel] = self.pnn[n]
@@ -490,18 +493,31 @@ class CytometryPlotWidget(QFrame):
             warnings.warn('Signals bus not connected')
 
     def set_source_gate(self, n, parent):
-        self.plot['source_gate'] = self.plot_title.leftClickMenuItems[n]
+        new_source_gate = self.plot_title.leftClickMenuItems[n]
+        if new_source_gate == 'root':
+            new_parent_node = self.gating._gate_tree
+        else:
+            new_parent_node = self.gating._get_gate_node(new_source_gate)
+        child_nodes = [self.gating._get_gate_node(gate_name) for gate_name in self.plot['child_gates']]
+
+        # a gate drawn on this plot cannot become its own ancestor
+        if any(node is new_parent_node or node in new_parent_node.ancestors for node in child_nodes):
+            if self.bus is not None:
+                self.bus.statusMessage.emit(f'Cannot use "{new_source_gate}" as the source gate: it is inside a gate drawn on this plot.')
+            return
+
+        self.plot['source_gate'] = new_source_gate
         self.configure_axes()
         print(f'CytometryPlotWidget {self.mode} {self.n_in_plot_sequence}: set source gate {self.plot['source_gate']}')
 
-        for gate_name in self.plot['child_gates']:
-            #todo seek some guidance on how to do this properly
-            # gate = self.gating.get_gate(gate_name)
-            node = self.gating._get_gate_node(gate_name)
-            new_parent_node = self.gating._get_gate_node(self.plot['source_gate'])
+        for node in child_nodes:
             node.parent = new_parent_node
+        # FlowKit tracks gate paths in a separate graph; re-parenting via anytree bypasses it
+        self.gating._rebuild_dag()
+        self.gating.clear_cache()
 
         self.bus.changedGatingHierarchy.emit(self.mode, 'root')
+
 
     def get_gate_path(self):
         # return source gate path to add gate to hierarchy

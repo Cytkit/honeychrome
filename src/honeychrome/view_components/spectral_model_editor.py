@@ -7,7 +7,7 @@ from PySide6 import QtCore
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QThread, Slot, QObject, QEvent, QSize, Signal, QSettings
 from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QStyledItemDelegate, QComboBox, QLineEdit, QMessageBox, QHeaderView, QLabel, QWidget, QCheckBox)
 
-from honeychrome.controller_components.functions import raw_gates_list
+from honeychrome.controller_components.functions import raw_gates_list, resolve_base_gate
 from honeychrome.controller_components.spectral_controller import SpectralAutoGenerator, ProfileUpdater, SpectralCleaner, spectral_library
 from honeychrome.controller_components.spectral_reference_library import cosine_similarity_to_reference
 from honeychrome.view_components.cosine_qc_viewer import COSINE_QC_WARNING_THRESHOLD
@@ -123,7 +123,7 @@ class ListTableModel(QtCore.QAbstractTableModel):
         return len(COLUMNS)
 
     def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid():
+        if not index.isValid() or index.row() >= len(self._data):
             return None
         row, col = index.row(), index.column()
         key = COLUMNS[col]
@@ -261,7 +261,6 @@ class SpectralControlsEditor(QFrame):
         self.bus.spectralControlAdded.connect(self.view.resizeToFit) #extends the table as autogeneration runs... looks interesting but a bit wonky
         self.bus.sampleTreeUpdated.connect(self.refresh_comboboxes) # check for changes to unstained samples
         self.bus.rawGateRenamed.connect(self._on_raw_gate_renamed)
-        self.bus.rawGateRenamed.connect(lambda old_name, new_name: self.refresh_comboboxes())
         self.view.selectionModel().selectionChanged.connect(self._show_selected_profiles)
 
         # Different resize modes for different columns
@@ -1263,18 +1262,7 @@ class SpectralControlsEditor(QFrame):
             return
 
         # Resolve base gate (same priority order as SpectralAutoGenerator)
-        base_gate_priority = self.controller.experiment.process.get('base_gate_priority_order', [])
-        raw_gate_names = [g[0].lower() for g in raw_gating.get_gate_ids()]
-        base_gate_label = 'root'
-        for gate in base_gate_priority:
-            if gate.lower() in raw_gate_names:
-                base_gate_label = gate
-                break
-
-        if base_gate_label != 'root' and raw_gating.find_matching_gate_paths(base_gate_label):
-            base_path = tuple(list(raw_gating.find_matching_gate_paths(base_gate_label)[0]) + [base_gate_label])
-        else:
-            base_path = ('root',)
+        base_gate_label, base_path = resolve_base_gate(raw_gating, self.controller.experiment.process.get('base_gate_priority_order', []))
 
         # Derive gate bounds from the control sample on the new channel
         all_samples_reverse = {v: k for k, v in self.controller.experiment.samples['all_samples'].items()}
@@ -1488,6 +1476,7 @@ class SpectralControlsEditor(QFrame):
                 self.model.index(0, 0),
                 self.model.index(self.model.rowCount() - 1, self.model.columnCount() - 1),
             )
+            self.refresh_comboboxes()
 
     @Slot()
     def _on_force_recalc(self):

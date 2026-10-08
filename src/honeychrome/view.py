@@ -325,8 +325,12 @@ class View(QObject):
                 self.load_main_window_with_experiment_and_template(file, new=True, template_path=template)
 
     @Slot()
-    def new_from_this_template(self):
-        path = self.controller.experiment_dir.with_suffix('.kit')
+    def new_from_this_template(self, template_path=None):
+        if template_path:
+            path = Path(template_path)
+        else:
+            path = self.controller.experiment_dir.with_suffix('.kit')
+
         new_file, _ = QFileDialog.getSaveFileName(self.current_window, f"New Experiment from \"{Path(path)}\"", base_directory, f"Experiment File (*.{file_extension})")
         if new_file:
             file = Path(new_file).with_suffix('.kit')

@@ -198,12 +198,14 @@ class ExperimentModel:
     def generate_subdirs(self):
         experiment_pl = Path(self.experiment_path)
         experiment_dir = experiment_pl.parent / experiment_pl.stem
-        experiment_dir_single_stain_controls = self.settings['raw']['single_stain_controls_subdirectory']
-        (experiment_dir / experiment_dir_single_stain_controls).mkdir(parents=True, exist_ok=True)
-        experiment_dir_raw_samples = self.settings['raw']['raw_samples_subdirectory']
-        (experiment_dir / experiment_dir_raw_samples).mkdir(parents=True, exist_ok=True)
-        experiment_dir_unmixed_samples = self.settings['unmixed']['unmixed_samples_subdirectory']
-        (experiment_dir / experiment_dir_unmixed_samples).mkdir(parents=True, exist_ok=True)
+
+        for subdir in (self.settings['raw']['single_stain_controls_subdirectory'], self.settings['raw']['raw_samples_subdirectory'], self.settings['unmixed']['unmixed_samples_subdirectory']):
+            subdir_path = experiment_dir / subdir
+            if os.path.lexists(subdir_path) and not subdir_path.exists():
+                # link to a folder that is not currently available (e.g. unsynced or unmapped)
+                logger.warning(f'Linked folder {subdir_path} points to a location that is not available')
+                continue
+            subdir_path.mkdir(parents=True, exist_ok=True)
 
         return experiment_dir
 
@@ -216,10 +218,11 @@ class ExperimentModel:
         experiment_dir_raw_samples = self.settings['raw']['raw_samples_subdirectory']
         experiment_dir_unmixed_samples = self.settings['unmixed']['unmixed_samples_subdirectory']
 
+        # '._*' files are macOS AppleDouble metadata, not FCS data
         single_stain_controls = [str(p.relative_to(experiment_dir)) for p in
-                                 sorted((experiment_dir / experiment_dir_single_stain_controls).glob('**/*.fcs'))]
+                                 sorted((experiment_dir / experiment_dir_single_stain_controls).glob('**/*.fcs')) if not p.name.startswith('._')]
         raw_samples = [str(p.relative_to(experiment_dir)) for p in
-                       sorted((experiment_dir / experiment_dir_raw_samples).glob('**/*.fcs'))]
+                       sorted((experiment_dir / experiment_dir_raw_samples).glob('**/*.fcs')) if not p.name.startswith('._')]
 
         # add all single stain controls to raw samples if not already present
         for sample_path in single_stain_controls:
@@ -229,8 +232,15 @@ class ExperimentModel:
         # load samples one by one, print name, datetime, number of events, file location
         all_sample_nevents = {}
         all_samples = {}
+        unreadable = set()
         for sample_path in raw_samples:
-            sample_metadata = FlowData(experiment_dir / sample_path, only_text=True, use_header_offsets=True)
+            try:
+                sample_metadata = FlowData(experiment_dir / sample_path, only_text=True, use_header_offsets=True)
+            except Exception as e:
+                logger.warning(f'scan_sample_tree: skipping unreadable file {sample_path}: {e}')
+                unreadable.add(sample_path)
+                continue
+
             all_sample_nevents[sample_path] = sample_metadata.event_count
             if sample_name_source_instance == 'tubename':
                 all_samples[sample_path] = sample_metadata.text['tubename']
@@ -239,6 +249,7 @@ class ExperimentModel:
             else:  # use filenames
                 all_samples[sample_path] = Path(sample_path).stem
 
+        single_stain_controls = [p for p in single_stain_controls if p not in unreadable]
         for sample_path in single_stain_controls:
             if sample_path not in self.samples['single_stain_controls']:
                 self.samples['single_stain_controls'].append(sample_path)

@@ -89,8 +89,8 @@ def _load_fcs_with_repaired_delimiter(path):
         col_names.append(keywords.get(f'$P{i}N', f'Channel_{i}'))
 
     sample = Sample(arr, channel_labels=col_names, sample_id=str(Path(path).name))
-    # Attach keywords so get_metadata() callers see them
-    sample._flowdata_object.text.update(keywords)
+    # Attach keywords so get_metadata() callers see them (FlowIO key convention)
+    sample.metadata.update({k.lstrip('$').lower(): v for k, v in keywords.items()})
     return sample
 
 
@@ -926,6 +926,22 @@ def apply_gates_in_place(data_for_cytometry_plots, gates_to_calculate=None):
                     parent_id = ('root',)
 
                 channels = gate.get_dimension_ids()
+                # guard against skipped parents, missing channels and stale masks
+                if gate.gate_type == 'QuadrantGate':
+                    gate_channels = [dim.dimension_ref for dim in gate.dimensions]
+                else:
+                    gate_channels = channels
+                missing_channels = [ch for ch in gate_channels if ch not in pnn]
+                if parent_id[0] not in gate_membership or missing_channels:
+                    if missing_channels:
+                        logger.warning(f'apply_gates_in_place: gate "{gate_id[0]}" uses channels {missing_channels} not in this data - skipped')
+                    # an unevaluable gate must not keep a mask from a previous sample
+                    gate_membership.pop(gate_id[0], None)
+                    if gate.gate_type == 'QuadrantGate':
+                        for name in gate.quadrants:
+                            gate_membership.pop(name, None)
+                    continue
+
                 if len(channels) == 1:
                     xchan = channels[0]
                     ix = pnn.index(xchan)
@@ -968,6 +984,7 @@ def apply_gates_in_place(data_for_cytometry_plots, gates_to_calculate=None):
                     quadrant_names = gate.quadrants.keys()
                     for name in quadrant_names:
                         if name not in lookup_tables: # guard: lookup table may not exist yet if called before calculate_lookup_tables
+                            gate_membership.pop(name, None)
                             continue
                         table = lookup_tables[name]
                         idx = indices_data_digitized_flattened
@@ -978,6 +995,7 @@ def apply_gates_in_place(data_for_cytometry_plots, gates_to_calculate=None):
                         gate_membership[name] = mask * gate_membership[parent_id[0]]
                 else:
                     if gate_id[0] not in lookup_tables:
+                        gate_membership.pop(gate_id[0], None)
                         continue
                     table = lookup_tables[gate_id[0]]
                     idx = indices_data_digitized_flattened
@@ -1152,6 +1170,9 @@ def calc_stats(data_for_cytometry_plots, initialise=True):
     return statistics
 
 def calc_ribbon_plot(event_data, mask, fluoro_indices, transform, density_cutoff):
+    if len(fluoro_indices) == 0:
+        return np.zeros((len(transform.scale) - 1, 0))
+
     heatmap = np.apply_along_axis(lambda x: np.histogram(x, bins=transform.scale)[0], axis=0, arr=event_data[mask][:, fluoro_indices])
 
     # make sure all unit bins get lowest LUT
@@ -1229,6 +1250,24 @@ def raw_gates_list(gating):
     gate_ids = gating.get_gate_ids()
     gate_list = [g[0] for g in gate_ids]
     return gate_list
+
+def resolve_base_gate(gating, priority_order):
+    """
+    Return (gate_name, gate_path) for the first gate in priority_order present in gating.
+
+    Matching is case-insensitive, but the returned name is the gate's actual name, so it
+    can be passed to FlowKit lookups. gate_path is the full path to use as the parent
+    path when adding a child gate. Falls back to ('root', ('root',)).
+    """
+    if gating is not None:
+        actual_names = {g[0].lower(): g[0] for g in gating.get_gate_ids()}
+        for candidate in priority_order or []:
+            name = actual_names.get(candidate.lower())
+            if name is not None:
+                paths = gating.find_matching_gate_paths(name)
+                if paths:
+                    return name, tuple(paths[0]) + (name,)
+    return 'root', ('root',)
 
 def get_set_or_initialise_label_offset(plot, gate_name, label_offset=None):
     if 'label_offsets' not in plot:

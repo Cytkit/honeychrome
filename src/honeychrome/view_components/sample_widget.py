@@ -472,7 +472,11 @@ class SampleWidget(QWidget):
         menu.exec(self.tree_view.viewport().mapToGlobal(position))
 
     def open_item(self, selected):
-        datum = self.model.data(selected.indexes()[2])
+        indexes = selected.indexes()
+        if len(indexes) < 3:
+            return
+        datum = self.model.data(indexes[2])
+
         if isinstance(datum, str):
             if datum: # i.e. not empty
                 path = datum
@@ -496,9 +500,10 @@ class SampleWidget(QWidget):
         sample_name = str(sample_path.stem)
         dlg = SampleRenameDialog(sample_name, existing_names=self.model.full_data['all_samples'].values(), parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_name = dlg.getText()
+            # a path separator would move the file into a non-existent subfolder
+            new_name = dlg.getText().replace('/', '_').replace('\\', '_')
             if new_name.strip():
-                sample_path.rename((sample_path.parent / new_name).with_suffix('.fcs'))
+                sample_path.rename(sample_path.parent / f'{new_name}.fcs')
                 self.refresh_sample_tree()
 
     def delete_item(self, path):

@@ -69,9 +69,19 @@ def create_folder_link(experiment_path, link_name, target_path):
     if not target.is_dir():
         raise ValueError(f"Target is not a directory: {target}")
 
-    if link.exists():
+    if os.path.lexists(link):
         print(f"Link path already exists: {link}.")
-        link.replace(link.with_suffix('.old'))
+        if link.is_symlink():
+            link.unlink()  # removes the link only, not its target
+        elif sys.platform == "win32" and link.is_junction():
+            os.rmdir(link)  # removes the junction only, not its target
+        else:
+            backup = link.with_name(link.name + '.old')
+            n = 1
+            while os.path.lexists(backup):
+                backup = link.with_name(f'{link.name}.old{n}')
+                n += 1
+            link.replace(backup)
 
     # 2. Try Standard Symlink (Works on Linux, macOS, and Windows with Dev Mode/Admin)
     try:

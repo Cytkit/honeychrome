@@ -8,7 +8,7 @@ from PySide6.QtCore import QObject, Signal, QTimer
 # from PySide6.QtWidgets import QApplication
 from flowkit import Dimension, gates
 
-from honeychrome.controller_components.functions import timer, sample_from_fcs
+from honeychrome.controller_components.functions import timer, sample_from_fcs, resolve_base_gate
 from honeychrome.controller_components.spectral_functions import get_profile, get_raw_events
 from honeychrome.controller_components.label_matching import match_fluorophore, match_marker, get_fluorophore_db, get_marker_db
 from honeychrome.controller_components.spectral_librarian import SpectralLibrary
@@ -122,17 +122,7 @@ class ProfileUpdater:
                                                     range_max=(0.7 if target_gate_label == positive_gate_label else 0.9),
                                                     transformation_ref=channel_y)
                         target_gate = gates.RectangleGate(target_gate_label, dimensions=[dim_x, dim_y])
-                        base_gate_priority = self.controller.experiment.process.get('base_gate_priority_order', [])
-                        raw_gate_names = [g[0].lower() for g in self.controller.raw_gating.get_gate_ids()]
-                        base_gate_label = 'root'
-                        for gate in base_gate_priority:
-                            if gate.lower() in raw_gate_names:
-                                base_gate_label = gate
-                                break
-                        if base_gate_label != 'root' and self.raw_gating.find_matching_gate_paths(base_gate_label):
-                            base_path = tuple(list(self.raw_gating.find_matching_gate_paths(base_gate_label)[0]) + [base_gate_label])
-                        else:
-                            base_path = ('root',)
+                        base_gate_label, base_path = resolve_base_gate(self.raw_gating, self.controller.experiment.process.get('base_gate_priority_order', []))
                         self.raw_gating.add_gate(target_gate, gate_path=base_path)
 
                         target_plot = None
@@ -469,12 +459,7 @@ class SpectralAutoGenerator(QObject):
         # self.progress_target = len(self.samples['single_stain_controls'][:5]) # quick test
 
         # (sample name, label, sample path, particle_type (cells/beads), control_type (positive only, positive and negative, autofluorescence), gate channel
-        self.base_gate_label = 'root'
-        raw_gate_names = [g[0].lower() for g in self.controller.raw_gating.get_gate_ids()]
-        for gate in self.controller.experiment.process['base_gate_priority_order']:
-            if gate.lower() in raw_gate_names:
-                self.base_gate_label = gate
-                break
+        self.base_gate_label, _ = resolve_base_gate(self.controller.raw_gating, self.controller.experiment.process['base_gate_priority_order'])
 
     @with_busy_cursor
     def run(self):
@@ -779,8 +764,9 @@ class SpectralAutoGenerator(QObject):
                             self.raw_gating.remove_gate(positive_gate_label)
                         if self.raw_gating.find_matching_gate_paths(negative_gate_label):
                             self.raw_gating.remove_gate(negative_gate_label)
-                        self.raw_gating.add_gate(positive_gate, gate_path=tuple(list(self.raw_gating.find_matching_gate_paths(self.base_gate_label)[0]) + [self.base_gate_label]))
-                        self.raw_gating.add_gate(negative_gate, gate_path=tuple(list(self.raw_gating.find_matching_gate_paths(self.base_gate_label)[0]) + [self.base_gate_label]))
+                        _, base_path = resolve_base_gate(self.raw_gating, [self.base_gate_label])
+                        self.raw_gating.add_gate(positive_gate, gate_path=base_path)
+                        self.raw_gating.add_gate(negative_gate, gate_path=base_path)
                         target_plot = None
                         for n, plot in enumerate(self.raw_plots):
                             if plot['type'] == 'hist1d' and plot['channel_x'] == channel_x:
@@ -991,6 +977,7 @@ class SpectralCleaner(QObject):
         eligible_external = [
             c for c in model_controls
             if c.get('control_type') == 'Single Stained Spectral Control'
+            and c.get('sample_name')
             and c.get('particle_type') == 'Cells'
             and c.get('universal_negative_name')
             and c.get('universal_negative_name') != INTERNAL_NEGATIVE_SENTINEL
@@ -999,6 +986,7 @@ class SpectralCleaner(QObject):
         eligible_internal = [
             c for c in model_controls
             if c.get('control_type') == 'Single Stained Spectral Control'
+            and c.get('sample_name')
             and (
                 c.get('particle_type') == 'Beads'
                 or c.get('universal_negative_name') == INTERNAL_NEGATIVE_SENTINEL
@@ -1091,12 +1079,7 @@ class SpectralCleaner(QObject):
         full_path = str(self.experiment_dir / rel_path)
         sample = sample_from_fcs(full_path)
 
-        base_gate_label = 'root'
-        raw_gate_names = [g[0].lower() for g in self.raw_gating.get_gate_ids()]
-        for gate in self.controller.experiment.process.get('base_gate_priority_order', []):
-            if gate.lower() in raw_gate_names:
-                base_gate_label = gate
-                break
+        base_gate_label, _ = resolve_base_gate(self.raw_gating, self.controller.experiment.process.get('base_gate_priority_order', []))
 
         scatter_ch_ids = self.controller.experiment.settings['raw']['scatter_channel_ids']
         scatter_ch_pnn = self.controller.experiment.settings['raw']['event_channels_pnn']

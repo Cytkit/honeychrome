@@ -42,7 +42,7 @@ import time
 
 from honeychrome.controller_components.per_sample_gating_functions import install_custom_gate, copy_gate_geometry, serialize_custom_sample_gates
 from honeychrome.experiment_model import ExperimentModel, check_fcs_matches_experiment
-from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels, sync_af_index_transform
+from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels, sync_af_index_transform, resolve_base_gate
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml, gate_to_gml, gate_from_gml
 from honeychrome.settings import traces_cache_size, traces_cache_dtype, adc_rate
 import honeychrome.settings as settings
@@ -549,7 +549,10 @@ class Controller(QObject):
                                 temp_gating_strategy = GatingStrategy()
                                 temp_gating_strategy.add_gate(gate, gate_path=('root',))
                                 for channel in gate.dimensions:
-                                    temp_gating_strategy.transformations[channel.id] = transformations[channel.id].xform
+                                    xform = transformations[channel.id].xform
+                                    temp_gating_strategy.transformations[channel.id] = xform
+                                    if channel.transformation_ref and channel.transformation_ref != channel.id: # fix for stale transformation_ref references
+                                        temp_gating_strategy.transformations[channel.transformation_ref] = xform
                                 results_for_lookup_table = temp_gating_strategy.gate_sample(mask_as_fksample, verbose=True)
                                 lookup_table = {gate_id[0]: results_for_lookup_table.get_gate_membership(gate_id[0])}
 
@@ -575,7 +578,10 @@ class Controller(QObject):
                                 temp_gating_strategy = GatingStrategy()
                                 temp_gating_strategy.add_gate(gate, gate_path=('root',))
                                 for channel in gate.dimensions:
+                                    xform = transformations[channel.id].xform
                                     temp_gating_strategy.transformations[channel.id] = transformations[channel.id].xform
+                                    if channel.transformation_ref and channel.transformation_ref != channel.id: # fix for stale transformation_ref references
+                                        temp_gating_strategy.transformations[channel.transformation_ref] = xform
 
                                 results_for_lookup_table = temp_gating_strategy.gate_sample(mask_as_fksample, verbose=True)
                                 lookup_table = {gate_id[0]: results_for_lookup_table.get_gate_membership(gate_id[0])}
@@ -602,6 +608,10 @@ class Controller(QObject):
                                 temp_gating_strategy.add_gate(gate, gate_path=('root',))
                                 temp_gating_strategy.transformations[xchan] = transformations[xchan].xform
                                 temp_gating_strategy.transformations[ychan] = transformations[ychan].xform
+
+                                for divider in gate.dimensions:
+                                    if divider.transformation_ref and divider.transformation_ref not in (xchan, ychan): # fix for stale transformation_ref references
+                                        temp_gating_strategy.transformations[divider.transformation_ref] = transformations[divider.dimension_ref].xform
 
                                 results_for_lookup_table = temp_gating_strategy.gate_sample(mask_as_fksample, verbose=True)
                                 quadrant_names = gate.quadrants.keys()
@@ -888,12 +898,7 @@ class Controller(QObject):
                 # and a nested QEventLoop off the main thread
                 self._reapply_fine_tuning_impl()
 
-                source_gate = 'root'
-                unmixed_gate_names = [g[0].lower() for g in self.unmixed_gating.get_gate_ids()]
-                for gate in self.experiment.process['base_gate_priority_order']:
-                    if gate.lower() in unmixed_gate_names:
-                        source_gate = gate
-                        break
+                source_gate, _ = resolve_base_gate(self.unmixed_gating, self.experiment.process['base_gate_priority_order'])
                 logger.info(f'Controller: using {source_gate} as base gate for process NxN plots')
                 process_plots = define_process_plots(self.experiment.settings['unmixed']['fluorescence_channels'], self.experiment.settings['unmixed']['fluorescence_channels'], source_gate=source_gate)
             else:

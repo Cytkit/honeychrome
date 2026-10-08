@@ -234,16 +234,16 @@ def gate_from_gml(xml, gate_name):
     return from_gml(xml).get_gate(gate_name)
 
 
-# otb: have added this here. if you prefer, move to spectral_model_editor.py
 def _rename_channel_in_gml(gml_string: str, old_name: str, new_name: str) -> str:
     """
     Rename a single fluorescence channel in a GatingML 2.0 XML string.
 
     Channel names appear as the 'data-type:name' attribute on
     'data-type:fcs-dimension' elements, and as the 'id' attribute on
-    'transforms:*' transform elements (which are also keyed by channel name).
-    Both are renamed by exact attribute-value match, so "PE" never touches
-    "PE-Cy7", "PE-CF594", etc.
+    'transforms:*' transform elements (which are also keyed by channel name),
+    and as the 'gating:transformation-ref' attribute on gate dimensions and
+    quadrant dividers that point at those transforms. All are renamed by exact
+    attribute-value match, so "PE" never touches "PE-Cy7", "PE-CF594", etc.
 
     Returns the serialised XML string unchanged if old_name is not found.
     """
@@ -253,6 +253,8 @@ def _rename_channel_in_gml(gml_string: str, old_name: str, new_name: str) -> str
     NS_XFORM = 'http://www.isac-net.org/std/Gating-ML/v2.0/transformations'
     DT_NAME = f'{{{NS_DT}}}name'
     XFORM_ID = f'{{{NS_XFORM}}}id'  # transforms:id is namespace-qualified
+    NS_GATING = 'http://www.isac-net.org/std/Gating-ML/v2.0/gating'
+    GATING_XFORM_REF = f'{{{NS_GATING}}}transformation-ref'
 
     root = etree.fromstring(gml_string.encode())
     changed = False
@@ -267,6 +269,12 @@ def _rename_channel_in_gml(gml_string: str, old_name: str, new_name: str) -> str
     for elem in root.iter():
         if elem.get(XFORM_ID) == old_name and elem.tag.startswith(f'{{{NS_XFORM}}}'):
             elem.set(XFORM_ID, new_name)
+            changed = True
+
+    # 3. gate dimension / quadrant divider references to those transforms
+    for elem in root.iter():
+        if elem.get(GATING_XFORM_REF) == old_name:
+            elem.set(GATING_XFORM_REF, new_name)
             changed = True
 
     if not changed:

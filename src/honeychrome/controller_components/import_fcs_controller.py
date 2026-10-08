@@ -394,6 +394,10 @@ class ImportFCSController(QObject):
                             else:
                                 morph_y = None
 
+                    # default gates need a raw transform, which exists only for whitelisted channels
+                    if morph_x not in whitelisted_pnn or morph_y not in whitelisted_pnn:
+                        morph_x = morph_y = None
+
                     if (morph_x is not None) and (morph_y is not None):
                         sing_x = morph_x
                         sing_y = None
@@ -409,6 +413,8 @@ class ImportFCSController(QObject):
                         elif 'FSC' in height_channels and 'FSC-H' in event_channels_pnn:
                             sing_y = 'FSC-H'
                         else:
+                            sing_y = None
+                        if sing_y not in whitelisted_pnn:
                             sing_y = None
 
                     time_plot = None
