@@ -21,6 +21,7 @@ help:
 venv:
 	python3 -m venv .venv
 	$(PYTHON) -m pip install --upgrade pip
+	$(PYTHON) install_annoy.py
 	$(PYTHON) -m pip install -r requirements.txt
 	$(PYTHON) -m pip install pyinstaller
 
