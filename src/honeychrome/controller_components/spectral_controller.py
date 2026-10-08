@@ -526,7 +526,7 @@ class SpectralAutoGenerator(QObject):
                 f'These controls have been added but will not unmix correctly. '
                 f'Run Control Cleaning to fix this.'
             )
-            self.bus.warningMessage.emit(combined_warning)
+            self._report_warning(combined_warning)
 
         if self.bus and self.insufficient_events_warnings:
             tubenames = ', '.join(f'"{name}"' for name in self.insufficient_events_warnings)
@@ -537,12 +537,21 @@ class SpectralAutoGenerator(QObject):
                 f'Adjust the "{self.base_gate_label}" gate to make sure the relevant events '
                 f'for all your single stain control samples are within it.'
             )
-            self.bus.warningMessage.emit(combined_insufficient)
+            self._report_warning(combined_insufficient)
 
         if self.bus:
             self.bus.progress.emit(self.progress_target, self.progress_target)
             self.bus.spectralModelUpdated.emit()
             self.bus.showSelectedProfiles.emit([])
+
+    def _report_warning(self, text: str):
+        """Hold the warning in the controller's collector when one is active, so the
+        caller can show everything in one dialog after the run; otherwise show it at once."""
+        collector = self.controller.warning_collector
+        if collector is not None:
+            collector.append(text)
+        elif self.bus:
+            self.bus.warningMessage.emit(text)
 
     def get_unstained_negative(self, particle_type: str = 'Cells') -> bool:
         """
