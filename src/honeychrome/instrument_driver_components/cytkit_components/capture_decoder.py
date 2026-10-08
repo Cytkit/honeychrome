@@ -133,4 +133,6 @@ if __name__ == "__main__":
         data = f.read()
 
     decoder = CaptureDecoder()
+    packets = decoder.extract_packets(data)
+    print(packets)
     decoder.decode(data)
