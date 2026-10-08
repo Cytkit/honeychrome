@@ -7,6 +7,8 @@ import pytest
 
 from honeychrome.controller_components.spectral_reference_library import (
     compute_config_key,
+    describe_profile,
+    profile_id_from_description,
     ReferenceProfile,
     SpectralReferenceLibrary,
     CONFIG_KEY_UNKNOWN_CYTOMETER,
@@ -323,3 +325,44 @@ def test_export_csv_pads_mixed_configurations_with_zero(lib, tmp_path):
 def test_export_csv_with_no_profiles_raises(lib, tmp_path):
     with pytest.raises(ValueError):
         lib.export_csv(tmp_path / 'out.csv', [])
+
+
+# --- loading a library profile into a spectral model ------------------------
+
+def test_find_matches_is_case_insensitive_and_scoped_to_config(lib):
+    mine = _save(lib, fluor='BUV805')
+    _save(lib, fluor='BUV805', channels=('B1-A',))          # other detector configuration
+    _save(lib, fluor='FITC')
+    cfg = compute_config_key('Aurora', ['B1-A', 'B2-A'])
+    assert [p.id for p in lib.find_matches(' buv805 ', cfg)] == [mine.id]
+    assert lib.find_matches('', cfg) == []
+    assert lib.find_matches('PE', cfg) == []
+
+
+def test_find_matches_matches_display_name(lib):
+    saved = _save(lib, fluor='BUV805', display_name='CD3-BUV805')
+    cfg = compute_config_key('Aurora', ['B1-A', 'B2-A'])
+    assert [p.id for p in lib.find_matches('cd3-buv805', cfg)] == [saved.id]
+
+
+def test_find_matches_lists_reference_first(lib):
+    first = _save(lib, fluor='BUV805')
+    second = _save(lib, fluor='BUV805')
+    lib.set_reference(first.id)
+    cfg = compute_config_key('Aurora', ['B1-A', 'B2-A'])
+    assert [p.id for p in lib.find_matches('BUV805', cfg)] == [first.id, second.id]
+
+
+def test_description_round_trips_profile_id_after_rename(lib):
+    saved = _save(lib, fluor='BUV805', gate_channel='B2-A')
+    text = describe_profile(saved)
+    assert text.startswith('[Reference Library] BUV805')
+    lib.rename_profile(saved.id, 'renamed')
+    assert profile_id_from_description(text) == saved.id
+    assert profile_id_from_description(describe_profile(lib.get_profile(saved.id))) == saved.id
+
+
+def test_profile_id_from_description_rejects_other_strings():
+    assert profile_id_from_description('') is None
+    assert profile_id_from_description(None) is None
+    assert profile_id_from_description('BUV805 (Cells)') is None

@@ -180,6 +180,8 @@ class ReferenceLibraryWidget(QWidget):
         self.bus = bus
         self.library = SpectralReferenceLibrary()
         self.library.ensure_honeychrome_rows_populated()
+        if self.bus is not None:
+            self.bus.referenceLibraryChanged.connect(self._reload_instruments)
 
         self._profiles_by_id = {}    # id -> ReferenceProfile
         self._colour_overrides = {}  # display_name -> '#RRGGBB' chosen by the user
@@ -284,11 +286,27 @@ class ReferenceLibraryWidget(QWidget):
 
     # --- populate ------------------------------------------------------------
     def _reload_instruments(self):
+        """Refill the instrument list and table from the database, keeping the
+        current instrument selected (else the experiment's instrument)."""
+        previous = self.instrument_combo.currentText()
+        keys = self.library.list_cytometer_keys()
+        try:
+            experiment_key = self.controller.experiment.settings['raw'].get('cytometer_db_col')
+        except Exception:
+            experiment_key = None
         self.instrument_combo.blockSignals(True)
         self.instrument_combo.clear()
-        self.instrument_combo.addItems(self.library.list_cytometer_keys())
+        self.instrument_combo.addItems(keys)
+        for wanted in (previous, experiment_key):
+            if wanted in keys:
+                self.instrument_combo.setCurrentText(wanted)
+                break
         self.instrument_combo.blockSignals(False)
         self._reload_table()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._reload_instruments()  # pick up profiles saved while hidden
 
     def _reload_table(self):
         self._loading = True

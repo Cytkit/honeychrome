@@ -17,9 +17,11 @@ which lists all FCS files within the Single Stain Controls subfolder. Under <i>p
 
 <li>
 <b>Single Stained Control from Library:</b> 
-if the required single stained control sample is not present in the current experiment, it may be loaded from previous experiments, if available. 
-(Note that all single stained spectral controls are stored in the <tt>spectral_controls_library.db</tt> database in the Experiments folder.) 
-Enter the <i>label</i> to search for a match in the database (exact matches only).
+if the required single stained control sample is not present in the current experiment, it may be loaded from the Reference Library. 
+To add a control to the Reference Library, right-click it in this table and choose <i>Save to Reference Library</i>. 
+The library also ships with reference spectra for supported instruments, and can be browsed from <i>View &gt; Reference Library</i>. 
+Enter the <i>label</i> (matching the fluorophore name, ignoring case) and choose a match under <i>sample name</i>. 
+Only profiles recorded with the same instrument and detector configuration are listed.
 </li>
 
 <li>
@@ -55,9 +57,9 @@ minus the fluorescence of the negatively gated <i>unstained</i> sample. "Pos Uns
 </li>
 
 <li>
-If any singly stained spectral control is missing, you may load it from previous experiments (if an exact match is available). 
+If any singly stained spectral control is missing, you may load it from the Reference Library. 
 Select <i>control type</i> as "Single Stained Control from Library", and enter the label name. 
-Exact matches from previously processed data will be returned under <i>sample name</i>.
+Matching profiles for this instrument configuration will be listed under <i>sample name</i>.
 </li>
 </ol>
 

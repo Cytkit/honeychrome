@@ -5,8 +5,10 @@ from pathlib import Path
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
+from datetime import datetime
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -92,6 +94,9 @@ def compute_config_key(cytometer_key: str | None, channel_names: list[str]) -> s
     return f'{key}::{channel_sig}::{len(normalised)}ch'
 
 
+PROFILE_ID_SUFFIX = re.compile(r'\(#(\d+)\)\s*$')
+
+
 @dataclass
 class ReferenceProfile:
     """In-memory representation of one saved reference spectrum."""
@@ -115,6 +120,30 @@ class ReferenceProfile:
     is_deletable: bool = True            # False for origin == 'honeychrome'
     is_reference: bool = False           # "the" profile for (fluorophore, config_key)
     is_qc_target: bool = False           # "the" profile for (fluorophore, cytometer_key)
+
+
+def describe_profile(profile: ReferenceProfile) -> str:
+    """One-line description used to choose a profile in the Spectral Model editor.
+
+    The row id is appended as ``(#id)`` so the string is unique and a saved
+    control can still be resolved after the profile is renamed or re-dated.
+    """
+    parts = [f'[Reference Library] {profile.display_name}']
+    if profile.gate_channel:
+        parts.append(f'Major Channel: {profile.gate_channel}')
+    if profile.antigen:
+        parts.append(f'Antigen: {profile.antigen}')
+    parts.append('Shipped' if profile.origin == 'honeychrome' else 'User')
+    if profile.source_experiment_dir:
+        parts.append(f'Experiment: {profile.source_experiment_dir}')
+    parts.append(datetime.fromtimestamp(profile.created_at).strftime('%Y-%m-%d %H:%M'))
+    return ', '.join(parts) + f' (#{profile.id})'
+
+
+def profile_id_from_description(text: str | None) -> int | None:
+    """Recover the row id from a string made by ``describe_profile``."""
+    match = PROFILE_ID_SUFFIX.search(text or '')
+    return int(match.group(1)) if match else None
 
 
 _SCHEMA = """
@@ -360,6 +389,20 @@ class SpectralReferenceLibrary:
                 'ORDER BY fluorophore, display_name', (config_key,)
             ).fetchall()
         return [self._row_to_profile(r) for r in rows]
+
+    def find_matches(self, label: str, config_key: str) -> list[ReferenceProfile]:
+        """Profiles for this exact channel configuration whose fluorophore or
+        display name equals ``label`` (case-insensitive). Profiles marked as the
+        reference come first, then the most recently updated."""
+        wanted = (label or '').strip().casefold()
+        if not wanted:
+            return []
+        matches = [
+            p for p in self.list_profiles_for_config(config_key)
+            if p.fluorophore.strip().casefold() == wanted
+            or p.display_name.strip().casefold() == wanted
+        ]
+        return sorted(matches, key=lambda p: (not p.is_reference, -p.updated_at))
 
     def get_reference_for_config(self, fluorophore: str, config_key: str) -> ReferenceProfile | None:
         with self._connect() as conn:

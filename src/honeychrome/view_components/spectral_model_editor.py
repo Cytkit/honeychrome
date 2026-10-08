@@ -1,16 +1,16 @@
 import json
 import sys
 import re
-from datetime import datetime
 from typing import List, Any, Dict
 from PySide6 import QtCore
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QThread, Slot, QObject, QEvent, QSize, Signal, QSettings
 from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QStyledItemDelegate, QComboBox, QLineEdit, QMessageBox, QHeaderView, QLabel, QWidget, QCheckBox, QMenu, QInputDialog)
 
 from honeychrome.controller_components.functions import raw_gates_list
-from honeychrome.controller_components.spectral_controller import SpectralAutoGenerator, ProfileUpdater, SpectralCleaner, spectral_library
+from honeychrome.controller_components.spectral_controller import SpectralAutoGenerator, ProfileUpdater, SpectralCleaner
 from honeychrome.controller_components.spectral_reference_library import (
-    cosine_similarity_to_reference, SpectralReferenceLibrary, compute_config_key,
+    cosine_similarity_to_reference, SpectralReferenceLibrary, compute_config_key, describe_profile,
+    profile_id_from_description,
 )
 from honeychrome.view_components.cosine_qc_viewer import COSINE_QC_WARNING_THRESHOLD
 from honeychrome.controller_components.spectral_functions import sanitise_control_in_place, _find_default_unstained
@@ -25,7 +25,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 COLUMNS = list(spectral_model_column_labels.keys())
-CONTROL_TYPES = ["Single Stained Spectral Control", "Single Stained Spectral Control from Library", "Channel Assignment"]
+SSC_CONTROL_TYPE = "Single Stained Spectral Control"
+CONTROL_TYPES = [SSC_CONTROL_TYPE, "Single Stained Spectral Control from Library", "Channel Assignment"]
+# Fields kept aside when a single stained control is switched to another type,
+# and put back if it is switched back.
+SSC_BACKUP_FIELDS = ("particle_type", "gate_channel", "gate_channel_locked", "sample_name", "sample_path",
+                     "gate_label", "neg_gate_label", "universal_negative_name", "use_cleaned")
 PARTICLE_TYPES = ["Beads", "Cells"]
 NEGATIVE_TYPES = ["Internal Negative", "Unstained Negative"]
 
@@ -173,7 +178,15 @@ class ListTableModel(QtCore.QAbstractTableModel):
         #         value = int(value)
         #     except ValueError:
         #         return False
-        self._data[row][key] = value
+        if key == "control_type":
+            previous = self._data[row].get(key)
+            if previous == SSC_CONTROL_TYPE and value != SSC_CONTROL_TYPE:
+                self._data[row]["ssc_backup"] = {k: self._data[row][k] for k in SSC_BACKUP_FIELDS if k in self._data[row]}
+            self._data[row][key] = value
+            if value == SSC_CONTROL_TYPE and previous != SSC_CONTROL_TYPE:
+                self._data[row].update(self._data[row].pop("ssc_backup", None) or {})
+        else:
+            self._data[row][key] = value
         self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
         # changed to return col so we can track cosmetic vs functional changes
         self.dataEditedSignal.emit(row, col)
@@ -457,6 +470,11 @@ class SpectralControlsEditor(QFrame):
         layout.addLayout(btn_layout)
         self.setLayout(layout)
 
+        # curated reference library; maps profile id -> profile for "from Library" controls
+        self.reference_library = SpectralReferenceLibrary()
+        self.reference_library.ensure_honeychrome_rows_populated()
+        self.spectral_library_search_results = {}
+
         # Build combobox widgets after layout setup
         self.refresh_comboboxes()
         # Hide cleaning columns by default
@@ -464,7 +482,6 @@ class SpectralControlsEditor(QFrame):
         self.thread = None
         self.spectral_auto_generator = None
         self.profile_updater = ProfileUpdater(self.controller, self.bus)
-        self.spectral_library_search_results = None
         # Populate bulk-negative combo now that all widgets exist
         self._refresh_bulk_negative_combo()
 
@@ -770,6 +787,7 @@ class SpectralControlsEditor(QFrame):
         if getattr(self, '_refreshing_comboboxes', False):
             return
         self._refreshing_comboboxes = True
+        self.spectral_library_search_results = {}  # rebuilt row by row below
         try:
             for row in range(self.model.rowCount()):
                 self._add_comboboxes_to_row(row)
@@ -823,6 +841,42 @@ class SpectralControlsEditor(QFrame):
                 cb.currentTextChanged.connect(lambda val, i=idx: self.model.setData(i, val))
 
 
+    def _reference_library_matches(self, label):
+        """Reference library profiles matching this label for the current
+        instrument and channel configuration."""
+        label = (label or '').strip()
+        if not label:
+            return []
+        raw = self.controller.experiment.settings['raw']
+        config_key = compute_config_key(raw.get('cytometer_db_col') or '', list(self.fluorescence_channels_pnn))
+        try:
+            return self.reference_library.find_matches(label, config_key)
+        except Exception as exc:
+            logger.warning(f'SpectralControlsEditor: reference library lookup failed: {exc}')
+            return []
+
+    def _select_default_library_profile(self, control):
+        """Give a "from Library" control a valid Reference Library profile and
+        take its major channel from that profile.
+
+        Switching a control to this type leaves the earlier sample name behind,
+        which names no library profile. If the current choice is not among the
+        matches for this label, select the first match (the profile marked as
+        the reference, else the most recently updated) so a profile is
+        available immediately. The major channel is the profile's own, so the
+        control keeps its place in the table, which is ordered by major
+        channel. With no match the sample name and major channel are cleared."""
+        matches = self._reference_library_matches(control.get('label'))
+        self.spectral_library_search_results.update({p.id: p.profile for p in matches})
+        selected_id = profile_id_from_description(control.get('sample_name'))
+        chosen = next((p for p in matches if p.id == selected_id), matches[0] if matches else None)
+        if chosen is None:
+            control['sample_name'] = ''
+            control['gate_channel'] = ''
+            return
+        control['sample_name'] = describe_profile(chosen)
+        control['gate_channel'] = chosen.gate_channel or max(chosen.profile, key=chosen.profile.get)
+
     def _add_comboboxes_to_row(self, row):
         current_control_list = []
         unused_raw_channels = []
@@ -851,40 +905,12 @@ class SpectralControlsEditor(QFrame):
         elif self.model._data[row]['control_type'] == 'Single Stained Spectral Control from Library':
             enable_particle_types_cb = False
             enable_gate_channel_cb = False
-            if self.model._data[row]['label']:
-                enable_gate_label_cb = False
-                search_results = spectral_library.search_for_label(self.model._data[row]['label'].strip())
-                if search_results:
-                    enable_sample_name_cb = True
-                    # Annotate each result with its display string (or None if channels
-                    # don't match this instrument), then derive the combobox list from
-                    # those annotations.  Using a single loop avoids the index-mismatch
-                    # that occurred when results were filtered but indices weren't remapped.
-                    for index in search_results:
-                        if list(json.loads(search_results[index]['profile_dict']).keys()) == self.fluorescence_channels_pnn:
-                            search_results[index]['current_control_list'] = (
-                                '[Spectral Library] '
-                                + search_results[index]['sample_name'] + ', '
-                                + ('Major Channel: ' + search_results[index]['gate_channel'] + ', ' if search_results[index]['gate_channel'] else '')
-                                + 'Experiment: ' + search_results[index]['experiment_root_directory'] + ', '
-                                + datetime.fromtimestamp(search_results[index]['timestamp']).strftime('%Y-%m-%d %H:%M:%S') + ' '
-                            )
-                        else:
-                            search_results[index]['current_control_list'] = None
-
-                    current_control_list = [
-                        search_results[index]['current_control_list']
-                        for index in search_results
-                        if search_results[index]['current_control_list'] is not None
-                    ]
-                    self.spectral_library_search_results = search_results # store search_results for profile generator
-                else:
-                    enable_sample_name_cb = False
-            else:
-                enable_particle_types_cb = False
-                enable_gate_channel_cb = False
-                enable_sample_name_cb = False
-                enable_gate_label_cb = False
+            enable_gate_label_cb = False
+            matches = self._reference_library_matches(self.model._data[row]['label'])
+            # profile id -> profile, merged across rows for the profile generator
+            self.spectral_library_search_results.update({p.id: p.profile for p in matches})
+            current_control_list = [describe_profile(p) for p in matches]
+            enable_sample_name_cb = bool(matches)
 
         else:
             enable_particle_types_cb = False
@@ -959,7 +985,8 @@ class SpectralControlsEditor(QFrame):
 
         # "Use Cleaned" checkbox — visible only when cleaned data exist for this control
         label = self.model._data[row].get('label') or ''
-        cleaned_available = label in self.controller.cleaned_events
+        cleaned_available = (label in self.controller.cleaned_events
+                             and self.model._data[row].get('control_type') == SSC_CONTROL_TYPE)
         uc_col = COLUMNS.index("use_cleaned")
         uc_idx = self.model.index(row, uc_col)
         proxy_uc_idx = self.proxy.mapFromSource(uc_idx)
@@ -1227,6 +1254,8 @@ class SpectralControlsEditor(QFrame):
                 self._move_pos_neg_gates_to_channel(control)
 
         sanitise_control_in_place(control)
+        if control['control_type'] == 'Single Stained Spectral Control from Library':
+            self._select_default_library_profile(control)
         self.profile_updater.flush()
         control_valid = self.profile_updater.generate(control, self.spectral_library_search_results)
         self.refresh_comboboxes()
@@ -1665,6 +1694,7 @@ class SpectralControlsEditor(QFrame):
             message += ' (Instrument not identified — saved as "unknown".)'
         if self.bus is not None:
             self.bus.statusMessage.emit(message)
+            self.bus.referenceLibraryChanged.emit()  # refresh an open Reference Library window
         logger.info(f'SpectralControlsEditor: {message}')
 
     def _warn_low_cosine_controls(self):

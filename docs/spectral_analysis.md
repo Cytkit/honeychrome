@@ -51,7 +51,7 @@ In this example, there are duplicate cell and bead controls. Select the bead con
 
 ![correct_spectral_controls.png](/assets/correct_spectral_controls.png)
 
-If a control has failed, you can use a previous control of the same name. From Control Type, select Single Stained Spectral Control from Library. The library is a database (in your Experiments folder) of all the previous spectral profiles that you have processed in Honeychrome.
+If a control has failed, you can use a profile from the Reference Library. To add a control to the library, right-click it in the spectral model editor and choose Save to Reference Library. To use a saved (or shipped) profile, set Control Type to Single Stained Spectral Control from Library, enter the fluorophore as the label, and pick a match under Sample Name. Only profiles recorded for the same instrument and detector configuration are offered. Browse and manage the library from View > Reference Library.
 
 > **Tip:** Selecting one or more controls shows only these in the spectral viewer (and lines of the matrices below), which makes it easier to work with large panels.
 

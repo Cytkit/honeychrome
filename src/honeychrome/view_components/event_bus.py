@@ -71,6 +71,7 @@ class EventBus(QObject):
     showSelectedProfiles = Signal(list)
     spectralControlAdded = Signal()
     spectralModelUpdated = Signal()
+    referenceLibraryChanged = Signal()  # a profile was added to the Reference Library
     cleaningActivated = Signal(bool)   # True = cleaning UI active, False = hidden
     cleaningResultsReady = Signal()    # emitted after Clean Controls recalc finishes
     spectralProcessRefreshed = Signal()
