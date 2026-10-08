@@ -42,7 +42,7 @@ import time
 
 from honeychrome.controller_components.per_sample_gating_functions import install_custom_gate, copy_gate_geometry, serialize_custom_sample_gates
 from honeychrome.experiment_model import ExperimentModel, check_fcs_matches_experiment
-from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels, sync_af_index_transform, resolve_base_gate
+from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels, sync_af_index_transform, resolve_base_gate, gate_channels, prune_gating_to_channels, prune_plots_to_channels
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml, gate_to_gml, gate_from_gml
 from honeychrome.settings import traces_cache_size, traces_cache_dtype, adc_rate
 import honeychrome.settings as settings
@@ -2012,6 +2012,7 @@ class Controller(QObject):
 
             # update cytometry only if channels have changed
             if self.experiment.settings['unmixed']['event_channels_pnn'] != unmixed_settings['event_channels_pnn']:
+                previous_unmixed = self._unmixed_cytometry_snapshot()
                 self.experiment.settings['unmixed'].update(unmixed_settings)
 
                 # set up unmixed channels with default transforms, copy raw transformation if it does not belong to a fl channel
@@ -2068,6 +2069,10 @@ class Controller(QObject):
 
                     if self.bus:
                         self.bus.changedGatingHierarchy.emit('unmixed', 'root')
+
+                # keep the existing unmixed gating strategy where its channels still exist
+                if previous_unmixed is not None:
+                    self._carry_over_unmixed_cytometry(previous_unmixed)
         else:
             unmixed_settings = settings_default['unmixed'].copy()
             self.experiment.settings['unmixed'].update(unmixed_settings)
@@ -2104,6 +2109,79 @@ class Controller(QObject):
                     self.bus.warningMessage.emit(qc_text)
 
         logger.info(f'Controller: refreshed spectral process, unmixed settings, unmixed cytometry')
+
+    def _unmixed_cytometry_snapshot(self):
+        """The unmixed gating, plots, axis transforms and per-sample gate overrides
+        as they stand, read from the live state so edits not yet autosaved are
+        included. None when there is no unmixed gating strategy to carry over."""
+        if not self.experiment.settings['unmixed'].get('event_channels_pnn') or not self.experiment.cytometry.get('gating'):
+            return None
+        try:
+            gating_gml = self.experiment.cytometry['gating']
+            if self.unmixed_gating is not None and self.unmixed_gating.get_gate_ids():
+                gating_gml = to_gml(self.unmixed_gating)
+            transforms = deepcopy(self.experiment.cytometry.get('transforms') or {})
+            if self.unmixed_transformations:
+                update_transforms(transforms, {label: t for label, t in self.unmixed_transformations.items()
+                                               if label in transforms})
+            return {
+                'pnn': list(self.experiment.settings['unmixed']['event_channels_pnn']),
+                'gating': gating_gml,
+                'transforms': transforms,
+                'plots': deepcopy(self.experiment.cytometry.get('plots') or []),
+                'custom_sample_gates': deepcopy(self.custom_sample_gates.get('unmixed', {})),
+            }
+        except Exception as e:
+            logger.warning(f'Controller: could not read the unmixed gating to carry over ({e})')
+            return None
+
+    def _carry_over_unmixed_cytometry(self, previous):
+        """Apply a snapshot from _unmixed_cytometry_snapshot to the new unmixed
+        channels. Gates drawn on a channel that is no longer in the spectral model
+        are removed with their descendants, and so are the plots of those channels
+        or populations; axis settings are kept for every channel still present.
+        If the snapshot cannot be applied, the gating copied from raw stands."""
+        pnn = self.experiment.settings['unmixed']['event_channels_pnn']
+        try:
+            gating = from_gml(previous['gating'])
+            removed = prune_gating_to_channels(gating, pnn)
+            transforms = deepcopy(self.experiment.cytometry['transforms'])
+            transforms.update({label: t for label, t in previous['transforms'].items() if label in transforms})
+            transformations = generate_transformations(transforms)
+            gating.transformations.clear()
+            for label in pnn:
+                gating.transformations[label] = transformations[label].xform
+            gate_names = [name for name, _ in gating.get_gate_ids()]
+            plots = prune_plots_to_channels(previous['plots'], pnn, gate_names)
+            custom_sample_gates = {}
+            for sample_path, overrides in previous['custom_sample_gates'].items():
+                kept = {name: gate for name, gate in overrides.items()
+                        if name in gate_names and set(gate_channels(gate)) <= set(pnn)}
+                if kept:
+                    custom_sample_gates[sample_path] = kept
+            gating_gml = to_gml(gating)
+        except Exception as e:
+            logger.warning(f'Controller: could not carry the unmixed gating over to the new channels ({e}); '
+                           f'unmixed gating rebuilt from the raw scatter gates')
+            return
+
+        self.experiment.cytometry['gating'] = gating_gml
+        self.experiment.cytometry['transforms'] = transforms
+        self.experiment.cytometry['plots'] = plots
+        self.experiment.cytometry['unmixed_custom_sample_gates'] = serialize_custom_sample_gates(custom_sample_gates)
+
+        added = [c for c in pnn if c not in previous['pnn']]
+        dropped = [c for c in previous['pnn'] if c not in pnn]
+        logger.info(f'Controller: unmixed channels changed (added {added}, removed {dropped}); '
+                    f'kept {len(gate_names)} unmixed gates, removed {removed}')
+        if removed:
+            text = (f'These unmixed gates used channels that are no longer in the spectral model '
+                    f'({", ".join(dropped) or "none listed"}) and were removed, along with the gates '
+                    f'below them: {", ".join(removed)}.')
+            if self.warning_collector is not None:
+                self.warning_collector.append(text)
+            elif self.bus is not None:
+                self.bus.warningMessage.emit(text)
 
 
 
