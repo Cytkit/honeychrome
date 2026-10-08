@@ -38,6 +38,23 @@ else:
     BUNDLED_PLUGIN_DIR = Path(__file__).resolve().parent.parent / "bundled_plugins"
 bundled_plugins_path = Path(BUNDLED_PLUGIN_DIR)
 
+_PLUGIN_NAME_PATTERN = re.compile(r"^plugin_name\s*=\s*(['\"])([^'\"\\\n]+)\1", re.MULTILINE)
+
+
+def plugin_display_name(file_path):
+    """Name a tabbed plugin gives itself (its module-level ``plugin_name``),
+    read from the source without importing it; the file name if it has none."""
+    try:
+        match = _PLUGIN_NAME_PATTERN.search(Path(file_path).read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError):
+        match = None
+    return match.group(2).strip() if match else Path(file_path).stem
+
+
+def sorted_plugin_files(folder):
+    """Tabbed plugin files in a folder, ordered by display name."""
+    return sorted(Path(folder).glob("*_tab.py"), key=lambda path: plugin_display_name(path).lower())
+
 def path_to_folder_name_readable(original_path):
     # 1. Convert to string and resolve
     path_str = str(Path(original_path).resolve())
@@ -250,15 +267,17 @@ class AppConfigDialog(QDialog):
 
         # Bundled/approved plugins — always shown, dev and frozen
         self.enable_bundled_plugin = {}
-        for file_path in bundled_plugins_path.glob("*_tab.py"):
-            self.enable_bundled_plugin[file_path] = QCheckBox(f"Enable {file_path.stem}")
+        for file_path in sorted_plugin_files(bundled_plugins_path):
+            self.enable_bundled_plugin[file_path] = QCheckBox(f"Enable {plugin_display_name(file_path)}")
+            self.enable_bundled_plugin[file_path].setToolTip(file_path.name)
             form.addRow("Bundled plugin", self.enable_bundled_plugin[file_path])
 
         # Arbitrary user-added plugins — full Python (dev) environment only
         if not meipass:
             self.enable_plugin = {}
-            for file_path in plugins_path.glob("*_tab.py"):
-                self.enable_plugin[file_path] = QCheckBox(f"Enable {file_path.stem}")
+            for file_path in sorted_plugin_files(plugins_path):
+                self.enable_plugin[file_path] = QCheckBox(f"Enable {plugin_display_name(file_path)}")
+                self.enable_plugin[file_path].setToolTip(file_path.name)
                 form.addRow(f"Tabbed plugin", self.enable_plugin[file_path])
         else:
             form.addRow(QLabel("Note: custom user plugins require running Honeychrome in a full Python environment. Bundled plugins above are still available."))
