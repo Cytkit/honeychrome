@@ -1,5 +1,6 @@
 import numpy as np
 import struct
+from copy import deepcopy
 from flowio.exceptions import FCSParsingError
 from flowkit import Sample, QuadrantDivider, Dimension, gates
 from PySide6.QtCore import QSettings
@@ -1268,6 +1269,42 @@ def resolve_base_gate(gating, priority_order):
                 if paths:
                     return name, tuple(paths[0]) + (name,)
     return 'root', ('root',)
+
+def gate_channels(gate):
+    """Channels a gate is drawn on (for a quadrant gate, its dividers' channels)."""
+    return [getattr(dim, 'dimension_ref', None) or dim.id for dim in getattr(gate, 'dimensions', None) or []]
+
+def prune_gating_to_channels(gating, channels):
+    """Remove from ``gating`` every gate drawn on a channel not in ``channels``,
+    together with its descendants. Returns the names of all removed gates."""
+    available = set(channels)
+    removed = []
+    for gate_name, gate_path in gating.get_gate_ids():
+        if gate_name in removed:
+            continue
+        gate = gating._get_gate_node(gate_name, gate_path).gate
+        if isinstance(gate, gates.Quadrant) or set(gate_channels(gate)) <= available:
+            continue
+        branch = gate_path + (gate_name,)
+        removed.append(gate_name)
+        removed += [name for name, path in gating.get_gate_ids() if path[:len(branch)] == branch]
+        gating.remove_gate(gate_name, gate_path=gate_path)
+    return removed
+
+def prune_plots_to_channels(plots, channels, gate_names):
+    """Copies of the plots whose axes are all in ``channels`` and whose source
+    gate is in ``gate_names``, keeping only child gates in ``gate_names``."""
+    available = set(channels)
+    valid_gates = set(gate_names) | {'root'}
+    kept = []
+    for plot in plots:
+        axes = [plot[key] for key in ('channel_x', 'channel_y', 'channel_z') if plot.get(key)]
+        if not set(axes) <= available or plot.get('source_gate', 'root') not in valid_gates:
+            continue
+        new_plot = deepcopy(plot)
+        new_plot['child_gates'] = [g for g in new_plot.get('child_gates', []) if g in valid_gates]
+        kept.append(new_plot)
+    return kept
 
 def get_set_or_initialise_label_offset(plot, gate_name, label_offset=None):
     if 'label_offsets' not in plot:

@@ -2,6 +2,7 @@ import json
 import re
 import time
 import warnings
+from collections import Counter
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal, QTimer
@@ -31,6 +32,36 @@ def _find_default_unstained_tube(all_samples: dict) -> str | None:
         if re.search(r'unstained', path, re.IGNORECASE) or re.search(r'unstained', name, re.IGNORECASE):
             return name
     return None
+
+def restore_user_labels(spectral_model, profiles, previous_controls):
+    """Give each regenerated control the label and antigen it had in the previous
+    model, matched by control tube (sample path, else a unique sample name), so
+    the unmixed channel names and the gates drawn on them carry over. A label is
+    left as generated where restoring it would duplicate another control's.
+    Renames the profiles to match. Returns {generated label: restored label}."""
+    by_path, by_name = {}, {}
+    for previous in previous_controls or []:
+        for index, key in ((by_path, previous.get('sample_path')), (by_name, previous.get('sample_name'))):
+            if key:
+                index[key] = None if key in index else previous  # None: ambiguous
+    matches = [by_path.get(control.get('sample_path')) or by_name.get(control.get('sample_name'))
+               for control in spectral_model]
+    targets = [(previous.get('label') or control['label']) if previous else control['label']
+               for control, previous in zip(spectral_model, matches)]
+    counts = Counter(targets)
+    renamed = {}
+    for control, previous, target in zip(spectral_model, matches, targets):
+        if previous is None:
+            continue
+        if target != control['label'] and counts[target] == 1:
+            renamed[control['label']] = target
+            control['label'] = target
+        control['antigen'] = previous.get('antigen') or ''
+    if renamed:
+        restored = {renamed.get(label, label): profile for label, profile in profiles.items()}
+        profiles.clear()
+        profiles.update(restored)
+    return renamed
 
 class ProfileUpdater:
     def __init__(self, controller, bus):
@@ -418,7 +449,8 @@ class ProfileUpdater:
         self.profiles.pop(label)
 
 class SpectralAutoGenerator(QObject):
-    def __init__(self, bus, controller, preferred_unstained: str | None = None):
+    def __init__(self, bus, controller, preferred_unstained: str | None = None,
+                 previous_controls: list[dict] | None = None):
         super().__init__()
 
         # connect
@@ -438,6 +470,7 @@ class SpectralAutoGenerator(QObject):
         self.samples = self.controller.experiment.samples
         self.experiment_dir = self.controller.experiment_dir
         self.preferred_unstained = preferred_unstained  # tube name hint from editor
+        self.previous_controls = previous_controls or []  # model being replaced, for label restore
 
         self.spectral_model.clear()
         self.profiles.clear()
@@ -472,6 +505,11 @@ class SpectralAutoGenerator(QObject):
                 continue
             if self.bus:
                 self.bus.spectralControlAdded.emit()
+
+        renamed = restore_user_labels(self.spectral_model, self.profiles, self.previous_controls)
+        if renamed:
+            logger.info(f'SpectralAutoGenerator: restored previous labels {renamed}')
+            self.negative_profile_warnings = [renamed.get(label, label) for label in self.negative_profile_warnings]
 
         for index, plot in enumerate(self.raw_plots):
             if self.bus:
