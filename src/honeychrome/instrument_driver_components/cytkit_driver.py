@@ -93,6 +93,7 @@ class PressureControlWorker(Thread):
                     self.sheath_pump.set_pwm_duty(output)
                     logger.info(f"[PressureControlWorker] pressure={self.pressure:0.2f} error={error:0.2f} output={output}")
                 else:
+                    self.sheath_pump.set_pwm_duty(0)
                     logger.info(f"[PressureControlWorker] pressure={self.pressure:0.2f}")
 
             self._stop_event.wait(self.interval)   # interruptible sleep
@@ -587,10 +588,10 @@ class CytkitDevice:
                     for index in value['enable']:
                         self.capture.channel_set_enable(index, value['enable'][index])
                 if 'pre_trigger' in value:
-                    for index in value['enable']:
+                    for index in value['pre_trigger']:
                         self.capture.channel_set_pre_trig_samples(index, value['pre_trigger'][index])
                 if 'post_trigger' in value:
-                    for index in value['enable']:
+                    for index in value['post_trigger']:
                         self.capture.channel_set_post_trig_samples(index, value['post_trigger'][index])
                 if 'clear_fifo' == value:
                     self.capture.aggr_fifo_clear()
@@ -759,6 +760,29 @@ class CytkitDevice:
             self.fifo_level = self.capture.aggr_get_fifo_level()
             message['capture'] = {'fifo_level':self.fifo_level, 'fifo_status':'🔴 Flooded!' if self.fifo_flooded else '🟢 OK', 'decode_errors':self.decoder.error_count, 'auto_resets':self.auto_resets}
 
+        if 'test_capture_and_read_memory' in list_of_parameters:
+            self.capture.aggr_fifo_clear()
+            if self.capture.aggr_get_enable():
+                already_acquiring = True
+            else:
+                already_acquiring = False
+
+            if not already_acquiring:
+                self.capture.aggr_set_enable(True)
+
+            self.decoder.reset()
+            time.sleep(1)
+            blob_of_traces_as_array = self.read_out_traces()
+
+            if not already_acquiring:
+                self.capture.aggr_set_enable(False)
+
+            print(blob_of_traces_as_array)
+            self.fifo_level = self.capture.aggr_get_fifo_level()
+
+            message['capture'] = {'fifo_level':self.fifo_level, 'fifo_status':'🔴 Flooded!' if self.fifo_flooded else '🟢 OK', 'decode_errors':self.decoder.error_count, 'auto_resets':self.auto_resets}
+            message['test_capture_and_read_memory'] = blob_of_traces_as_array
+
         if 'register_getter' in list_of_parameters:
             print(list_of_parameters)
             if type(list_of_parameters) is dict:
@@ -810,8 +834,8 @@ class CytkitDevice:
 
 
     def read_out_traces(self):
-        buffer_np = self.ft4222.pop_from_memory()
-        packets = self.decoder.decode(buffer_np)
+        buffer = self.ft4222.pop_from_memory()
+        traces = self.decoder.decode(buffer)
 
         self.fifo_flooded = self.capture.aggr_get_flooded()
         if self.fifo_flooded:
@@ -819,22 +843,7 @@ class CytkitDevice:
             self.decoder.reset()
             self.auto_resets += 1
 
-        if packets:
-            N = len({p.timestamp for p in packets}) # number of events
-            traces = np.zeros((N, settings.n_channels_trace, settings.n_time_points_in_event), dtype=np.uint16)
-
-            # Map timestamp -> event index, assigning indices in first-seen order.
-            event_index = {}
-            for packet in packets:
-                idx = event_index.get(packet.timestamp)
-                if idx is None:
-                    idx = len(event_index)
-                    event_index[packet.timestamp] = idx
-
-                n = min(packet.samples.size, settings.n_time_points_in_event)
-                if n > 0:
-                    traces[idx, packet.channel, :n] = packet.samples[:n]
-
+            if traces:
                 # n_decoded_events = len(event_index)
                 # self.event_rate_counter.update(n_decoded_events) # this is the number of events for which at least some data was recovered
                 blob_of_traces_as_array = traces.reshape(-1)

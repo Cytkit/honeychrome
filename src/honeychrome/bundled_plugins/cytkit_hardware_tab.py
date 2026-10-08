@@ -1342,6 +1342,9 @@ class PluginWidget(QWidget):
         self.clear_fifo_btn = QPushButton('Clear FIFO')
         self.clear_fifo_btn.clicked.connect(lambda: self.set_instrument_state({'capture': 'clear_fifo'}))
         layout.addWidget(self.clear_fifo_btn)
+        self.read_memory_btn = QPushButton('Capture and read memory once')
+        self.read_memory_btn.clicked.connect(lambda: self.get_instrument_state({'test_capture_and_read_memory'}))
+        layout.addWidget(self.read_memory_btn)
 
         layout.addStretch()
         toolbox.addTab(tab, "Capture")
@@ -1634,6 +1637,9 @@ class PluginWidget(QWidget):
                     self.decode_errors.setText(f'{response['message']['capture']['decode_errors']}')
                 if 'auto_resets' in response['message']['capture']:
                     self.auto_resets.setText(f'{response['message']['capture']['auto_resets']}')
+
+        if 'test_read_memory' in response['message']:
+            pass
 
         if 'register_getter' in response['message']:
             value = response['message']['register_getter']

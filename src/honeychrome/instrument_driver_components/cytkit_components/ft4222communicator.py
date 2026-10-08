@@ -1,9 +1,12 @@
+import re
+import time
+
 import numpy as np
 import ft4222
 from ft4222.SPI import Cpha, Cpol
 from ft4222.SPIMaster import Mode, Clock, SlaveSelect
 
-from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import operation_write, operation_read, dummy_bytes, memory_start_address, memory_end_address, registers_map, lookup_address
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import operation_write, operation_read, dummy_bytes, lookup_address
 from honeychrome.settings import traces_cache_dtype
 
 empty_array = np.array([], dtype=np.uint16)
@@ -40,10 +43,10 @@ class Ft4222Communicator:
             raise ConnectionError(f'Connection did not succeed FT4222 A: {self.devA}, and B: {self.devB}')
 
     def _register_init(self):
-        self.devA.spiMaster_Init(Mode.QUAD, Clock.DIV_4, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0) # for registers
+        self.devA.spiMaster_Init(Mode.QUAD, Clock.DIV_4, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0 | SlaveSelect.SS1 | SlaveSelect.SS2 | SlaveSelect.SS3) # for registers
 
     def _memory_init(self):
-        self.devB.spiMaster_Init(Mode.QUAD, Clock.DIV_4, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0) # for memory
+        self.devB.spiMaster_Init(Mode.QUAD, Clock.DIV_4, Cpol.IDLE_LOW, Cpha.CLK_LEADING, SlaveSelect.SS0 | SlaveSelect.SS1 | SlaveSelect.SS2 | SlaveSelect.SS3) # for memory
 
     def register_write(self, register, data_to_write):
         if type(data_to_write) != int:
@@ -91,7 +94,7 @@ class Ft4222Communicator:
 
     def sample_read_buffer(self, total_bytes, chunk_size=65535):
         # read out block of memory in chunks
-        data = bytearray(total_bytes)
+        data = bytearray()
         bytes_read = 0
         while bytes_read < total_bytes:
             # Calculate how many bytes to read in this chunk
@@ -99,7 +102,8 @@ class Ft4222Communicator:
             current_chunk = min(chunk_size, remaining)
 
             # Write three bytes and read the current chunk
-            chunk = self.devB.spiMaster_MultiReadWrite(b'', operation_read + dummy_bytes, current_chunk)
+            chunk = self.devB.spiMaster_MultiReadWrite(b'', b'\x00\x00\x00', current_chunk)
+            # chunk = self.devB.spiMaster_MultiReadWrite(b'', b'', current_chunk)
             data.extend(chunk)
             bytes_read += len(chunk)
 
@@ -107,11 +111,12 @@ class Ft4222Communicator:
 
     def pop_from_memory(self):
         fifo_words = self.register_read('BULK_LEVEL')
-        buffer_np = empty_array
+        buffer = None
         if fifo_words > 0:
             bytes_to_read = fifo_words * 2
-            buffer_np = np.frombuffer(self.sample_read_buffer(bytes_to_read), dtype=traces_cache_dtype)
-        return buffer_np
+            buffer = self.sample_read_buffer(bytes_to_read)
+
+        return buffer
 
     # def memory_read(self, total_bytes, chunk_size=65535):
     #     # read out block of memory in chunks
