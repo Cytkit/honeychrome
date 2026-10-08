@@ -8,6 +8,7 @@
 
 from typing import List, Optional
 import numpy as np
+import struct
 from typing import NamedTuple
 from honeychrome import settings
 from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import adc_dictionary
@@ -17,7 +18,7 @@ SYNC_WORD_1 = b'\xF0\x0D'
 SAMPLE_INVALID_MASK = 0xC000
 MAX_SAMPLES = 10000
 HEADER_LEN = 16  # sync0, sync1, ts0..ts3, channel, count
-N_CHANNELS = len(adc_dictionary)
+N_CHANNELS = 16
 
 
 class CapturePacket(NamedTuple):
@@ -28,9 +29,6 @@ class CapturePacket(NamedTuple):
 class CaptureDecoder:
     def __init__(self) -> None:
         self.error_count: int = 0
-        # Carry-over state between decode() calls: a partial header/payload
-        # at the tail of the previous block.
-        self._pending: Optional[np.ndarray] = None
 
     def reset(self) -> None:
         self.error_count = 0
@@ -41,7 +39,7 @@ class CaptureDecoder:
         `words` must be a 1-D numpy array of dtype uint16. Any partial packet
         at the end of the block is retained for the next call.
         """
-        if buffer is None or buffer.size == 0:
+        if buffer is None or len(buffer) == 0:
             return None
 
         packets = self.extract_packets(buffer)
@@ -82,7 +80,7 @@ class CaptureDecoder:
             pos = buffer.find(SYNC_WORD_0, pos)
             if pos == -1:
                 break
-            if buffer[pos + 2] != SYNC_WORD_1:
+            if buffer[pos + 2: pos +4] != SYNC_WORD_1:
                 continue
 
             # ---- 2. Do we have a full header in this buffer?
@@ -90,10 +88,10 @@ class CaptureDecoder:
                 break
 
             # ---- 3. Parse header fields (vectorized, tiny).
-            ts_words = buffer[pos + 4: pos + 12].astype(np.uint64)
+            ts_words = struct.unpack('>HHHH', buffer[pos + 4: pos + 12])
             timestamp = int(ts_words[0] | (ts_words[1] << 16) | (ts_words[2] << 32) | (ts_words[3] << 48))
-            channel = int(buffer[pos + 12])
-            count = int(buffer[pos + 14])
+            channel = struct.unpack('>H', buffer[pos + 12: pos + 14])[0]
+            count = struct.unpack('>H', buffer[pos + 14: pos + 16])[0]
 
             # ---- 4. Validate header.
             if channel >= N_CHANNELS or count > MAX_SAMPLES:
@@ -104,11 +102,11 @@ class CaptureDecoder:
 
             # ---- 5. Do we have the full payload?
             payload_start = pos + HEADER_LEN
-            payload_end = payload_start + count
+            payload_end = payload_start + count*2
             if payload_end > n:
                 break
 
-            payload = buffer[payload_start:payload_end]
+            payload = np.frombuffer(buffer[payload_start:payload_end], dtype='>u2')
 
             # ---- 6. Validate payload in bulk: any word with bits 15:14 set?
             if count > 0:
@@ -126,3 +124,13 @@ class CaptureDecoder:
             pos = payload_end
 
         return packets
+
+
+if __name__ == "__main__":
+    from pathlib import Path
+    test_data = Path(__file__).resolve().parent.parent.parent.parent.parent / 'tests' / 'test_data' / 'fpga_test_buffer.bin'
+    with open(test_data, 'rb') as f:
+        data = f.read()
+
+    decoder = CaptureDecoder()
+    decoder.decode(data)

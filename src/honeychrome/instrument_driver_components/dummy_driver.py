@@ -235,7 +235,7 @@ class DummyDevice:
         self.temperature_control_worker.start()
         self.laser_getter = LaserGetter(self.laser)
         self.laser_getter.start()
-        self.display = Display(transfer_object=self.event_rate_counter, sample_pump_object=self.sample_pump_flow_rate_getter, pressure_object=self.pressure_control_worker, temperature_object=self.temperature_control_worker, laser_object=self.laser_getter)
+        self.display = Display(event_rate_object=self.event_rate_counter, sample_pump_object=self.sample_pump_flow_rate_getter, pressure_object=self.pressure_control_worker, temperature_object=self.temperature_control_worker, laser_object=self.laser_getter)
         self.display.start()
 
     def find_and_connect_to_device(self):

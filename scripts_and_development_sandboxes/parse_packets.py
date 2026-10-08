@@ -1,3 +1,7 @@
+import re
+import numpy as np
+from pathlib import Path
+import time
 
 def by_find(data, needle=b'\xCA\xFE\xF0\x0D'):
     out, i = [], 0
@@ -14,8 +18,11 @@ def by_np_even(data):
     return np.where(mask)[0] * 2
 
 
-bytes_to_read = fifo_words * 2
-buffer = self.sample_read_buffer(bytes_to_read)
+test_data = Path(__file__).resolve().parent.parent / 'tests' / 'test_data' / 'fpga_test_buffer.bin'
+with open(test_data, 'rb') as f:
+    buffer = f.read()
+
+
 buffer_np = np.frombuffer(buffer, dtype='>u2')
 buffer_np_odd = np.frombuffer(buffer[1:-1], dtype='>u2')
 
