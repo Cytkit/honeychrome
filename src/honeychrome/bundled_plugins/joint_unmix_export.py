@@ -267,6 +267,11 @@ class JointUnmixExporter(QObject):
     export thread after each sample's file is written, so a caller can
     attribute per-chunk results of ``unmix_fn`` to their sample.
 
+    ``prepare_fn(raw_fl, raw, af)``, when given, is called once per sample
+    with all its events (fluorescence detectors, every exported raw
+    channel) and its AF library before the first chunk, for estimates that
+    need the whole sample.
+
     FlowKit loads each file whole; chunking bounds only the unmixing
     buffers.
     """
@@ -278,7 +283,7 @@ class JointUnmixExporter(QObject):
                  extra_channels=(), output_root=None, name_suffix: str = '',
                  unmixing_method: str = 'AutoSpectral Optimization',
                  extra_keywords: dict | None = None, chunk_size: int = UNMIX_CHUNK_SIZE,
-                 sample_done=None):
+                 sample_done=None, prepare_fn=None):
         super().__init__()
         self.sample_paths = list(sample_paths)
         self.layout = layout
@@ -291,6 +296,7 @@ class JointUnmixExporter(QObject):
         self.extra_keywords = dict(extra_keywords) if extra_keywords else None
         self.chunk_size = int(chunk_size)
         self.sample_done = sample_done
+        self.prepare_fn = prepare_fn
 
     def _export_pnn(self) -> list:
         export_pnn = list(self.layout.pnn_unmixed)
@@ -340,6 +346,8 @@ class JointUnmixExporter(QObject):
                     n_skipped += 1
                     continue
 
+                if self.prepare_fn is not None:
+                    self.prepare_fn(raw_event_data[:, fl_ids_raw], raw_event_data, af)
                 export_event_data = np.zeros((n_events, len(export_pnn)), dtype=np.float64)
                 n_chunks = math.ceil(n_events / self.chunk_size)
                 for chunk_i in range(n_chunks):
