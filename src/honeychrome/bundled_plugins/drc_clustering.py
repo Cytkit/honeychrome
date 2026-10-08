@@ -748,19 +748,72 @@ def run_hdbscan(controller, state, params: dict, progress=None, af_state=None) -
 # Dispatcher
 # ---------------------------------------------------------------------------
 
-def run_clustering(controller, state, algo: str, params: dict,
-                   progress=None, af_state=None) -> None:
-    """Run the selected clustering algorithm (called from the worker thread).
+class StagedResult:
+    """
+    The result fields of one clustering run, held apart from the plugin state
+    until the run is committed (commit_clustering_result).
+
+    A clustering function given a StagedResult instead of the state reads
+    everything else (embeddings, selected channels, caches) through to the
+    real state, but writes its labels, colours, cluster count and tree data
+    only here.  A run that is cancelled, or fails, therefore leaves the
+    plugin state exactly as it was, even if its worker thread is still
+    finishing an uninterruptible step.
+    """
+
+    def __init__(self, state):
+        self._state = state
+        self.cluster_labels = dict(state.cluster_labels)
+        self.cluster_marker_values = dict(state.cluster_marker_values)
+        self.cluster_dr_positions = dict(state.cluster_dr_positions)
+        self.cluster_colors = dict(state.cluster_colors)
+        self.n_clusters = state.n_clusters
+        self.active_clustering_algorithm = state.active_clustering_algorithm
+        self.trained_reducers = {}
+
+    def __getattr__(self, name):
+        return getattr(self._state, name)
+
+
+def run_clustering_staged(controller, state, algo: str, params: dict,
+                          progress=None, af_state=None) -> StagedResult:
+    """Run the selected clustering algorithm (called from the worker thread)
+    and return its results without touching *state*.
+
+    progress may raise to abort the run; it is called at every stage and
+    every sample.
 
     af_state: optional unmixing snapshot, captured on the main thread
         before the worker started — see
         drc_pipeline.apply_unmixing_af_aware() docstring.
     """
+    staged = StagedResult(state)
     if algo == 'FlowSOM':
-        run_flowsom(controller, state, params, progress, af_state=af_state)
+        run_flowsom(controller, staged, params, progress, af_state=af_state)
     elif algo == 'Leiden':
-        run_leiden(controller, state, params, progress, af_state=af_state)
+        run_leiden(controller, staged, params, progress, af_state=af_state)
     elif algo == 'HDBSCAN':
-        run_hdbscan(controller, state, params, progress, af_state=af_state)
+        run_hdbscan(controller, staged, params, progress, af_state=af_state)
     else:
         raise ValueError(f"Unknown clustering algorithm: {algo}")
+    return staged
+
+
+def commit_clustering_result(state, staged: StagedResult, algo: str) -> None:
+    """Publish a finished run's results to the plugin state (main thread)."""
+    state.cluster_labels = staged.cluster_labels
+    state.cluster_marker_values = staged.cluster_marker_values
+    state.cluster_dr_positions = staged.cluster_dr_positions
+    state.cluster_colors = staged.cluster_colors
+    state.n_clusters = staged.n_clusters
+    state.active_clustering_algorithm = staged.active_clustering_algorithm
+    if algo in staged.trained_reducers:
+        state.trained_reducers[algo] = staged.trained_reducers[algo]
+
+
+def run_clustering(controller, state, algo: str, params: dict,
+                   progress=None, af_state=None) -> None:
+    """Run the selected clustering algorithm and commit its results to *state*."""
+    staged = run_clustering_staged(controller, state, algo, params,
+                                   progress=progress, af_state=af_state)
+    commit_clustering_result(state, staged, algo)

@@ -76,6 +76,7 @@ Report tab:
 # ---------------------------------------------------------------------------
 import os as _os
 import sys
+import threading
 import warnings
 
 # Set Numba threading layer at module-import time, before any JIT compilation.
@@ -84,8 +85,44 @@ import warnings
 # functions (e.g. UMAP and FlowSOM) are running concurrently on separate
 # QThreads.  Must be set before the first numba import, which is why it lives
 # here at module scope.
-if 'NUMBA_THREADING_LAYER' not in _os.environ:
+_NUMBA_LAYER_FROM_USER = 'NUMBA_THREADING_LAYER' in _os.environ
+if not _NUMBA_LAYER_FROM_USER:
     _os.environ['NUMBA_THREADING_LAYER'] = 'omp'
+
+_numba_layer_lock = threading.Lock()
+_numba_layer_checked = False
+
+
+def _ensure_numba_threading_layer():
+    """
+    Make sure Numba's 'omp' threading layer can load before PaCMAP or UMAP
+    compile or load cached parallel code, and fall back to 'workqueue' if not.
+
+    Numba's OpenMP pool links against '@rpath/libomp.dylib' on macOS, which
+    wheel installs do not provide; it resolves only if a libomp of that name
+    is already loaded into the process (scikit-learn's bundled copy is
+    imported first to supply one).  Without a loadable layer Numba raises
+    'No threading layer could be loaded'.  A threading layer the user set
+    through NUMBA_THREADING_LAYER is left alone.  Safe to call repeatedly
+    from any thread.
+    """
+    global _numba_layer_checked
+    with _numba_layer_lock:
+        if _numba_layer_checked or _NUMBA_LAYER_FROM_USER:
+            _numba_layer_checked = True
+            return
+        _numba_layer_checked = True
+        try:
+            import sklearn.utils._openmp_helpers  # noqa: F401  (loads a libomp)
+        except Exception:
+            pass
+        try:
+            from numba.np.ufunc import omppool  # noqa: F401
+        except ImportError:
+            import numba
+            numba.config.THREADING_LAYER = 'workqueue'
+            _log.warning("Numba's OpenMP threading layer could not be loaded; "
+                         "using 'workqueue' (PaCMAP and UMAP may run slower).")
 
 
 def _suppress_third_party_warnings():
@@ -199,6 +236,7 @@ import drc_cluster_id
 import drc_report
 import drc_help_texts
 import drc_predictive
+import drc_time_estimate
 
 _log = drc_logging.get_logger(__name__)
 
@@ -2159,9 +2197,21 @@ class ConfigTab(QWidget):
         cl_run_row.addStretch()
         cl_layout.addLayout(cl_run_row)
 
+        # Status, Cancel and progress sit outside _cl_controls so they stay
+        # live while a run locks the controls.
+        cl_status_row = QHBoxLayout()
         self.cl_status_label = QLabel("No clustering run.")
         self.cl_status_label.setStyleSheet("color: grey;")
-        cl_page_layout.addWidget(self.cl_status_label)
+        cl_status_row.addWidget(self.cl_status_label, stretch=1)
+
+        self.cl_cancel_btn = QPushButton("✕  Cancel")
+        self.cl_cancel_btn.setFixedHeight(30)
+        self.cl_cancel_btn.setToolTip("Cancel the running clustering job.")
+        self.cl_cancel_btn.clicked.connect(self._on_cancel_clustering_clicked)
+        self.cl_cancel_btn.setEnabled(False)
+        self.cl_cancel_btn.setStyleSheet("color: #c0392b;")
+        cl_status_row.addWidget(self.cl_cancel_btn)
+        cl_page_layout.addLayout(cl_status_row)
 
         self.cl_progress_bar = QProgressBar()
         self.cl_progress_bar.setRange(0, 0)   # indeterminate by default
@@ -2304,6 +2354,10 @@ class ConfigTab(QWidget):
         """Update DR status label from PipelineState."""
         algo = self._selected_dr_algo()
         status = self.state.dr_status.get(algo, 'idle')
+        if status == 'running' and not self._run_locked['dr']:
+            # A run exists only while its lock is held; anything else is a
+            # stale status (e.g. restored from a session that ended mid-run).
+            status = self.state.dr_status[algo] = 'idle'
         ts     = self.state.dr_timestamps.get(algo, '')
         running = (status == 'running')
         # Fitted DR models are not saved, so after a restart only the
@@ -2440,6 +2494,7 @@ class ConfigTab(QWidget):
     def _refresh_cl_status(self):
         algo = self.state.active_clustering_algorithm
         n_cl = self.state.n_clusters
+        self.cl_cancel_btn.setEnabled(self._run_locked['cl'])
         if self._run_locked['cl']:
             self.cl_status_label.setText("⏳ Running …")
             self.cl_status_label.setStyleSheet("color: orange;")
@@ -2505,6 +2560,11 @@ class ConfigTab(QWidget):
                 'cluster_selection_epsilon': self.hdbscan_cluster_selection_epsilon.value(),
             }
         return {}
+
+    def _on_cancel_clustering_clicked(self):
+        plugin = self._plugin_widget()
+        if plugin:
+            plugin._cancel_clustering()
 
     def _on_cancel_dr_clicked(self):
         plugin = self._plugin_widget()
@@ -9680,6 +9740,49 @@ class PlotCard(QFrame):
 
 # ---------------------------------------------------------------------------
 
+_annoy_checked = False
+
+
+def _check_annoy_build():
+    """
+    Raise a clear error if the installed Annoy returns no neighbours.
+
+    PaCMAP finds neighbours with Annoy, and an Annoy compiled with
+    -ffast-math (its default on non-Windows platforms) can return only the
+    queried item, which PaCMAP then reports as an array-shape error.  The
+    check builds a tiny index once per session.
+    """
+    global _annoy_checked
+    if _annoy_checked:
+        return
+    from annoy import AnnoyIndex
+    points = np.random.default_rng(0).normal(size=(200, 5)).astype(np.float32)
+    index = AnnoyIndex(5, 'euclidean')
+    for i, point in enumerate(points):
+        index.add_item(i, point)
+    index.build(10)
+    if len(index.get_nns_by_item(0, 20)) < 20:
+        raise RuntimeError(
+            "The installed Annoy library returns no nearest neighbours, so PaCMAP "
+            "cannot run.  Rebuild it without -ffast-math: run 'python "
+            "install_annoy.py' from the Honeychrome source folder.")
+    _annoy_checked = True
+
+
+def _array_summary(data) -> str:
+    """One-line description of an event array for diagnostic logging."""
+    arr = np.asarray(data)
+    if arr.size == 0:
+        return f"shape={arr.shape} (empty)"
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return f"shape={arr.shape} dtype={arr.dtype} all values non-finite"
+    unique_rows = len(np.unique(arr, axis=0)) if arr.ndim == 2 else -1
+    return (f"shape={arr.shape} dtype={arr.dtype} non-finite={int(arr.size - finite.sum())} "
+            f"unique rows={unique_rows} min={float(arr[finite].min()):.6g} "
+            f"max={float(arr[finite].max()):.6g}")
+
+
 class _PaCMAPWrapper:
     """
     Thin wrapper around a fitted PaCMAP reducer that stores the training
@@ -9696,12 +9799,22 @@ class _PaCMAPWrapper:
         self._training_data = training_data
 
     def transform(self, new_data: np.ndarray) -> np.ndarray:
-        return self._reducer.transform(new_data, basis=self._training_data)
+        try:
+            return self._reducer.transform(new_data, basis=self._training_data)
+        except ValueError as exc:
+            _log.error(
+                "PaCMAP transform failed (%s): %s | training: %s",
+                exc, _array_summary(new_data), _array_summary(self._training_data))
+            raise
 
 
 # ---------------------------------------------------------------------------
 # DR background worker
 # ---------------------------------------------------------------------------
+
+
+class _RunCancelled(Exception):
+    """Raised inside a DR fit, at a point where it can stop, after Cancel."""
 
 
 class _UMAPTqdmHook:
@@ -9727,26 +9840,34 @@ class _UMAPTqdmHook:
         umap_lib.UMAP(..., tqdm_kwds={'tqdm_class': hook}).fit(data)
     """
 
-    def __init__(self, callback, total_override: int | None = None):
+    def __init__(self, callback, total_override: int | None = None,
+                 should_cancel=None):
         self._cb = callback          # callable(current: int, total: int)
         self._total_override = total_override
+        self._should_cancel = should_cancel   # callable() -> bool; raises _RunCancelled
 
     # tqdm is instantiated as tqdm_class(iterable, **kw); we capture total.
     def __call__(self, iterable=None, total=None, **_kw):
         eff_total = self._total_override if self._total_override else (total or 0)
-        return self._Iter(iterable, eff_total, self._cb)
+        return self._Iter(iterable, eff_total, self._cb, self._should_cancel)
 
     class _Iter:
-        def __init__(self, iterable, total, cb):
+        def __init__(self, iterable, total, cb, should_cancel=None):
             self._it   = iter(iterable) if iterable is not None else iter([])
             self._total = total or 0
             self._n    = 0
             self._cb   = cb
+            self._should_cancel = should_cancel
+
+        def _check_cancel(self):
+            if self._should_cancel is not None and self._should_cancel():
+                raise _RunCancelled()
 
         def __iter__(self):
             return self
 
         def __next__(self):
+            self._check_cancel()
             val = next(self._it)      # raises StopIteration when done
             self._n += 1
             self._cb(self._n, self._total)
@@ -9754,6 +9875,7 @@ class _UMAPTqdmHook:
 
         # tqdm interface stubs so UMAP doesn't fail on attribute access
         def update(self, n=1):
+            self._check_cancel()
             self._n += n
             self._cb(self._n, self._total)
 
@@ -9806,6 +9928,24 @@ class _DrWorker(QThread):
     def cancel(self):
         self._cancelled = True
 
+    @property
+    def algo(self) -> str:
+        return self._algo
+
+    @property
+    def task(self) -> str:
+        return self._task
+
+    def detach(self):
+        """Cancel and disconnect every signal, so a step that cannot be
+        interrupted may finish in the background without touching the UI."""
+        self._cancelled = True
+        for signal in (self.progress, self.finished, self.progress_value):
+            try:
+                signal.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+
     def run(self):
         try:
             if self._cancelled:
@@ -9814,6 +9954,8 @@ class _DrWorker(QThread):
                 self._do_train()
             elif self._task == 'apply':
                 self._do_apply(training_only=self._training_only)
+        except _RunCancelled:
+            self.finished.emit(False, "Cancelled.")
         except Exception as exc:
             traceback.print_exc()
             self.finished.emit(False, str(exc))
@@ -9848,11 +9990,14 @@ class _DrWorker(QThread):
             # configured n_epochs, instead of whatever total UMAP's own
             # tqdm call happens to report.
             n_epochs = self._params.get('n_epochs', 500)
-            hook = _UMAPTqdmHook(callback=self._emit_progress, total_override=n_epochs)
+            hook = _UMAPTqdmHook(callback=self._emit_progress, total_override=n_epochs,
+                                 should_cancel=lambda: self._cancelled)
             reducer = plugin._run_umap(self._params, training_data,
-                                       progress_hook=hook)
+                                       progress_hook=hook,
+                                       should_cancel=lambda: self._cancelled)
         elif algo == 'tSNE':
-            reducer = plugin._run_opentsne(self._params, training_data)
+            reducer = plugin._run_opentsne(self._params, training_data,
+                                           should_cancel=lambda: self._cancelled)
         elif algo == 'PaCMAP':
             reducer = plugin._run_pacmap(self._params, training_data)
         else:
@@ -9913,6 +10058,7 @@ class _DrWorker(QThread):
             plugin.state.embedding_features[algo] = {}
 
         n_total = len(all_sample_keys)
+        first_error = ''
         for i, (abs_key, rel_path) in enumerate(all_sample_keys):
             if self._cancelled:
                 self.finished.emit(False, "Cancelled.")
@@ -9933,6 +10079,9 @@ class _DrWorker(QThread):
                     emb = reducer.transform(sample_data)
                 else:
                     continue
+                if self._cancelled:
+                    self.finished.emit(False, "Cancelled.")
+                    return
                 plugin.state.embeddings[algo][rel_path] = emb.astype(np.float32)
                 # Same feature vectors that produced this embedding --
                 # cached so T-REX can align to them row-for-row later,
@@ -9940,11 +10089,107 @@ class _DrWorker(QThread):
                 plugin.state.embedding_features[algo][rel_path] = sample_data.astype(np.float32)
             except Exception as e:
                 self._emit(f"    Could not embed {rel_path}: {e}")
+                first_error = first_error or f"{rel_path}: {e}"
 
         n = len(plugin.state.embeddings[algo])
+        if n == 0 and n_total > 0:
+            self.finished.emit(
+                False, f"No samples could be embedded with {algo}.  {first_error}".strip())
+            return
         label = "training " if training_only else ""
         self._emit(f"Embeddings complete: {n} {label}sample(s) projected.")
         self.finished.emit(True, "")
+
+
+class _RunEstimateWorker(QThread):
+    """
+    Counts the events of a DR or clustering run and, above the event
+    threshold, times a probe of them (drc_time_estimate.estimate_run) so the
+    UI stays responsive.  Emits *estimated* with a RunTimeEstimate; if
+    counting itself fails, the estimate has no events and the run goes ahead
+    to report its own error.
+    """
+
+    estimated = Signal(object)   # RunTimeEstimate
+
+    @property
+    def kind(self) -> str:
+        return self._kind
+
+    def detach(self):
+        """Stop delivering the estimate; the probe finishes in the background."""
+        try:
+            self.estimated.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+
+    def __init__(self, controller, state, kind: str, algo: str, params: dict,
+                 probe_fn, af_state=None, probe_repeats: int = 1, parent=None):
+        super().__init__(parent)
+        self._probe_repeats = probe_repeats
+        self._controller = controller
+        self._state = state
+        self._kind = kind
+        self._algo = algo
+        self._params = params
+        self._probe_fn = probe_fn
+        # Snapshot captured on the main thread — see
+        # drc_pipeline.apply_unmixing_af_aware() docstring.
+        self._af_state = af_state
+
+    def run(self):
+        try:
+            estimate = drc_time_estimate.estimate_run(
+                self._controller, self._state, self._kind, self._algo,
+                self._params, self._probe_fn, af_state=self._af_state,
+                probe_repeats=self._probe_repeats)
+        except Exception:
+            traceback.print_exc()
+            estimate = drc_time_estimate.RunTimeEstimate(kind=self._kind, algo=self._algo)
+        self.estimated.emit(estimate)
+
+
+class _ClusterWorker(QThread):
+    """
+    Runs a clustering fit off the UI thread.  *fn* returns the run's
+    staged result (drc_clustering.StagedResult), kept in *result*; the plugin
+    commits it to the state only if the run was not cancelled.  Cancelling
+    takes effect at the next progress report (fn's progress callback raises
+    _RunCancelled); a step that cannot be interrupted finishes in the
+    background with its result discarded.
+    """
+
+    finished = Signal(bool, str)   # (success, error_message)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+        self._cancelled = False
+        self.result = None
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def detach(self):
+        """Cancel and disconnect, so the UI is free while this winds down."""
+        self._cancelled = True
+        try:
+            self.finished.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+
+    def run(self):
+        try:
+            self.result = self._fn()
+            if self._cancelled:
+                self.result = None      # cancelled too late; drop the arrays
+            self.finished.emit(True, '')
+        except _RunCancelled:
+            self.finished.emit(False, 'Cancelled.')
+        except Exception as e:
+            traceback.print_exc()
+            self.finished.emit(False, str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -12346,6 +12591,10 @@ class PluginWidget(QWidget):
         # in THIS session (see _archive_dr_run / _update_archived_dr_run).
         self._active_dr_run_id: dict[str, str] = {}
 
+        # Cancelled workers (DR, clustering, run-time estimates) still
+        # finishing an uninterruptible step; kept referenced until they end.
+        self._detached_workers: list = []
+
         # QSettings instance — keyed per experiment in save_state/load_state
         self._qsettings = QSettings('honeychrome', _SETTINGS_APP_KEY)
 
@@ -12681,7 +12930,9 @@ class PluginWidget(QWidget):
                       repr(self.state.covariates.to_dict(orient='index'))
                       if self.state.covariates is not None else '')
             # Honeycluster status (lightweight — no arrays)
-            s.setValue('dr_status',         repr(self.state.dr_status))
+            s.setValue('dr_status',         repr({
+                algo: ('idle' if status == 'running' else status)
+                for algo, status in self.state.dr_status.items()}))
             s.setValue('dr_timestamps',     repr(self.state.dr_timestamps))
             s.setValue('n_clusters',        self.state.n_clusters if self.state.n_clusters is not None else '')
             s.setValue('active_cl_algo',    self.state.active_clustering_algorithm or '')
@@ -13003,6 +13254,11 @@ class PluginWidget(QWidget):
                     self.state.dr_status = eval(dr_status_repr)  # noqa: S307
                 except Exception:
                     pass
+                # A run cannot outlive the session it was started in
+                self.state.dr_status = {
+                    algo: ('idle' if status == 'running' else status)
+                    for algo, status in self.state.dr_status.items()
+                }
 
             dr_ts_repr = s.value('dr_timestamps', '')
             if dr_ts_repr:
@@ -13788,6 +14044,145 @@ class PluginWidget(QWidget):
             self.bus.statusMessage.emit(text)
 
     # ==================================================================
+    # Run-time estimate for large runs
+    # ==================================================================
+
+    # _estimate_worker holds the active _RunEstimateWorker (or None).
+    _estimate_worker = None
+
+    # DR algorithms that JIT-compile on first use; their probes are repeated
+    _JIT_DR_ALGOS = ('UMAP', 'PaCMAP')
+
+    # openTSNE uses FFT-accelerated gradients from this many events up
+    _TSNE_FFT_MIN_EVENTS = 10_000
+
+    def _dr_probe_fn(self, algo: str, params: dict):
+        """Function timing a DR fit and then the embedding of an event array;
+        returns the seconds taken by each stage."""
+        def probe(data, run_events):
+            start = time.perf_counter()
+            if algo == 'UMAP':
+                reducer = self._run_umap(params, data, keep_index=False)
+            elif algo == 'tSNE':
+                # openTSNE's 'auto' picks the method from the event count, so
+                # the probe names the one the full run will use
+                method = 'fft' if run_events >= self._TSNE_FFT_MIN_EVENTS else 'bh'
+                reducer = self._run_opentsne(params, data, negative_gradient_method=method)
+            elif algo == 'PaCMAP':
+                reducer = self._run_pacmap(params, data)
+            else:
+                raise ValueError(f"Unknown algorithm: {algo}")
+            fitted = time.perf_counter()
+            reducer.transform(data)
+            return {'fit': fitted - start, 'embed': time.perf_counter() - fitted}
+        return probe
+
+    def _confirm_large_run(self, kind: str, algo: str, params: dict, proceed):
+        """
+        Call proceed() to start a 'dr' or 'cl' run.  A run on more than
+        drc_time_estimate.TIMING_EVENT_THRESHOLD events is first timed on a
+        small probe, and proceed() is called only if the user confirms the
+        estimated time.  Runs at or below the threshold start immediately.
+        """
+        if self._estimate_worker is not None:
+            QMessageBox.information(self, "Estimating Run Time",
+                                    "A run time estimate is already in progress.")
+            return
+        if kind == 'dr':
+            probe_fn = self._dr_probe_fn(algo, params)
+        else:
+            probe_fn = drc_time_estimate.clustering_probe_fn(algo, params)
+        af_state = drc_pipeline.snapshot_af_state(self.controller)
+        self._set_estimating(kind, True)
+        repeats = 2 if kind == 'dr' and algo in self._JIT_DR_ALGOS else 1
+        worker = _RunEstimateWorker(self.controller, self.state, kind, algo,
+                                    dict(params), probe_fn, af_state=af_state,
+                                    probe_repeats=repeats)
+        worker.estimated.connect(
+            lambda estimate: self._on_run_estimated(estimate, proceed, worker))
+        worker.finished.connect(lambda: self._on_estimate_thread_finished(worker))
+        self._estimate_worker = worker
+        worker.start()
+
+    def _on_estimate_thread_finished(self, worker):
+        if self._estimate_worker is worker:
+            self._estimate_worker = None
+
+    def _cancel_estimate(self, kind: str) -> bool:
+        """Abandon a run-time estimate in progress for *kind*; True if there was one."""
+        worker = self._estimate_worker
+        if worker is None or worker.kind != kind:
+            return False
+        worker.detach()
+        self._detached_workers = [w for w in self._detached_workers if w.isRunning()]
+        self._detached_workers.append(worker)
+        self._estimate_worker = None
+        self._set_estimating(kind, False)
+        self.progress_message("Run cancelled before it started.")
+        return True
+
+    def _on_run_estimated(self, estimate, proceed, worker=None):
+        """Main thread: start the run, or ask first when it was timed."""
+        if worker is not None and worker is not self._estimate_worker:
+            return
+        if not estimate.needs_confirmation:
+            proceed()
+            return
+        label = drc_time_estimate.KIND_NOUNS[estimate.kind]
+        if estimate.error:
+            text = (f"The {label} time could not be estimated for "
+                    f"{estimate.total_events:,} events.\n\n"
+                    f"Start {label} anyway?")
+        else:
+            self.progress_message(
+                f"Estimated {label} time: about "
+                f"{drc_time_estimate.format_duration(estimate.seconds)}")
+            text = drc_time_estimate.estimate_message(estimate)
+            if any(w.isRunning() for w in self._detached_workers):
+                text += ("\n\nA cancelled DR job is still finishing in the "
+                         "background and slowed the timing, so the estimate "
+                         "is probably too high.")
+        reply = QMessageBox.question(
+            self, "Run time estimate", text,
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
+        if reply == QMessageBox.Yes:
+            proceed()
+        else:
+            self._set_estimating(estimate.kind, False)
+            self.progress_message(
+                f"{drc_time_estimate.KIND_LABELS[estimate.kind]} cancelled.")
+
+    def _set_estimating(self, kind: str, estimating: bool):
+        """Lock the inputs of a 'dr' or 'cl' run and show an indeterminate
+        progress bar while its time is being estimated; undo both when not."""
+        if not hasattr(self, 'config_tab'):
+            return
+        ct = self.config_tab
+        self._set_run_lock(kind, estimating)
+        if kind == 'dr':
+            status_label = ct.dr_status_label
+            bar = getattr(ct, 'dr_progress_bar', None)
+        else:
+            status_label = ct.cl_status_label
+            bar = getattr(ct, 'cl_progress_bar', None)
+        cancel_btn = ct.dr_cancel_btn if kind == 'dr' else ct.cl_cancel_btn
+        cancel_btn.setEnabled(estimating)
+        if estimating:
+            status_label.setText("⏳ Estimating run time …")
+            status_label.setStyleSheet("color: orange;")
+            if bar is not None:
+                bar.setRange(0, 0)
+                bar.setTextVisible(False)
+                bar.setVisible(True)
+        else:
+            if bar is not None:
+                bar.setVisible(False)
+            if kind == 'dr':
+                ct._refresh_dr_status()
+            else:
+                ct._refresh_cl_status()
+
+    # ==================================================================
     # Dimensionality Reduction
     # ==================================================================
 
@@ -13823,8 +14218,16 @@ class PluginWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _run_umap(self, params: dict, training_data: np.ndarray,
-                  progress_hook=None):
-        """Train a UMAP reducer and store the kNN index in state."""
+                  progress_hook=None, keep_index: bool = True,
+                  should_cancel=None):
+        """Train a UMAP reducer and store the kNN index in state.
+
+        keep_index=False leaves the state untouched (used for timing probes).
+        should_cancel (callable() -> bool) is checked after the kNN index
+        build, the first point where the fit can stop; the epoch loop is
+        stopped through progress_hook.
+        """
+        _ensure_numba_threading_layer()
         import umap as umap_lib
         import hnswlib
         import os
@@ -13857,9 +14260,12 @@ class PluginWidget(QWidget):
                          ef_construction=200, M=16, random_seed=42)
         index.add_items(training_data, num_threads=n_jobs)
         index.set_ef(50)
-        self.state.umap_knn_index = index
-        self.state.umap_knn_fingerprint = (
-            training_data.shape, drc_pipeline.array_digest(training_data))
+        if should_cancel is not None and should_cancel():
+            raise _RunCancelled()
+        if keep_index:
+            self.state.umap_knn_index = index
+            self.state.umap_knn_fingerprint = (
+                training_data.shape, drc_pipeline.array_digest(training_data))
 
         self.progress_message(
             f"Training UMAP  (n_neighbors={n_neighbors}, "
@@ -13897,9 +14303,12 @@ class PluginWidget(QWidget):
     # openTSNE
     # ------------------------------------------------------------------
 
-    def _run_opentsne(self, params: dict, training_data: np.ndarray):
+    def _run_opentsne(self, params: dict, training_data: np.ndarray,
+                      should_cancel=None, negative_gradient_method: str = 'auto'):
         """
-        Train tSNE using openTSNE.
+        Train tSNE using openTSNE.  should_cancel (callable() -> bool) is
+        polled during the optimisation and stops the fit by raising
+        _RunCancelled.
 
         openTSNE.TSNE.fit() returns a TSNEEmbedding object which has a
         native .transform(new_data) method for out-of-sample projection.
@@ -13918,6 +14327,13 @@ class PluginWidget(QWidget):
             f"n_iter={n_iter}, n_jobs={n_jobs}) …"
         )
 
+        def _poll_cancel(iteration, error, embedding):
+            if should_cancel():
+                raise _RunCancelled()
+
+        cancel_kwds = ({'callbacks': _poll_cancel, 'callbacks_every_iters': 10}
+                       if should_cancel is not None else {})
+
         tsne = openTSNE.TSNE(
             n_components=2,
             perplexity=perplexity,
@@ -13925,6 +14341,8 @@ class PluginWidget(QWidget):
             n_iter=n_iter,
             random_state=42,
             verbose=True,
+            negative_gradient_method=negative_gradient_method,
+            **cancel_kwds,
         )
         # fit() returns a TSNEEmbedding that supports .transform()
         embedding = tsne.fit(training_data)
@@ -13936,6 +14354,8 @@ class PluginWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _run_pacmap(self, params: dict, training_data: np.ndarray):
+        _ensure_numba_threading_layer()
+        _check_annoy_build()
         import pacmap
         self.progress_message(
             f"Training PaCMAP  (n_neighbors={params['n_neighbors']}, "
@@ -13951,7 +14371,11 @@ class PluginWidget(QWidget):
         # fit_transform trains and returns the embedding of the training data.
         # We don't use the training embedding directly here — it's reproduced
         # per-sample in _do_apply via reducer.transform(new, basis=train_data).
-        reducer.fit_transform(training_data)
+        try:
+            reducer.fit_transform(training_data)
+        except ValueError as exc:
+            _log.error("PaCMAP fit failed (%s): %s", exc, _array_summary(training_data))
+            raise
 
         # Wrap reducer + training_data together so the worker can pass 'basis'
         # to transform().  PaCMAP requires the original data for out-of-sample
@@ -13989,6 +14413,11 @@ class PluginWidget(QWidget):
                                 "Select a gate in the Configuration tab.")
             return
 
+        self._confirm_large_run(
+            'dr', algo, params, lambda: self._start_dr_training(algo, params))
+
+    def _start_dr_training(self, algo: str, params: dict):
+        """Start the background DR training worker (inputs already validated)."""
         self.state.dr_status[algo] = 'running'
         self._set_dr_buttons_running(True)
 
@@ -14040,10 +14469,24 @@ class PluginWidget(QWidget):
         worker.start()
 
     def _cancel_dr(self):
-        """Request cancellation of the running DR worker."""
-        if self._dr_worker and self._dr_worker.isRunning():
-            self._dr_worker.cancel()
-            self.progress_message("DR job cancellation requested …")
+        """
+        Cancel the running DR worker.  UMAP and tSNE stop at their next
+        epoch/iteration check; a step that cannot be interrupted (graph
+        building, PaCMAP) finishes in the background with its result
+        discarded.  Either way the UI is released immediately.
+        """
+        if self._cancel_estimate('dr'):
+            return
+        worker = self._dr_worker
+        if worker is None or not worker.isRunning():
+            return
+        worker.detach()
+        self._detached_workers = [w for w in self._detached_workers if w.isRunning()]
+        self._detached_workers.append(worker)
+        self.progress_message(
+            "DR job cancelled.  A step that cannot be interrupted may keep "
+            "running in the background; its result is discarded.")
+        self._on_dr_finished(worker.algo, False, 'Cancelled.', task=worker.task)
 
     def _on_dr_progress(self, current: int, total: int):
         """Update the DR progress bar from the worker thread (via signal)."""
@@ -14106,7 +14549,8 @@ class PluginWidget(QWidget):
                 self.state.dr_timestamps[algo] = datetime.now().isoformat(timespec='seconds')
                 QMessageBox.critical(self, "DR Error", error_msg)
             else:
-                self.state.dr_status[algo] = 'idle'
+                # A cancelled apply leaves the trained model as it was
+                self.state.dr_status[algo] = 'done' if task == 'apply' else 'idle'
         if hasattr(self, 'config_tab'):
             self.config_tab._refresh_dr_status()
         self._dr_worker = None
@@ -14196,6 +14640,26 @@ class PluginWidget(QWidget):
                                 "Select a gate in the Configuration tab.")
             return
 
+        # Clustering in a DR space needs that DR's embedding of every training
+        # sample; a partial embedding would silently cluster a subset.
+        if params.get('_space') == 'dr':
+            dr_algo = params.get('_dr_algo') or ''
+            embedded = self.state.embeddings.get(dr_algo) or {}
+            missing = [rel for rel in self.state.training_sample_ids if rel not in embedded]
+            if missing:
+                QMessageBox.warning(
+                    self, "DR Embedding Incomplete",
+                    f"Clustering in {dr_algo or 'DR'} space needs a {dr_algo or 'DR'} "
+                    f"embedding of every training sample, but {len(missing)} of "
+                    f"{len(self.state.training_sample_ids)} are missing.\n\n"
+                    "Run (or re-run) the DR first, or cluster in marker space.")
+                return
+
+        self._confirm_large_run(
+            'cl', algo, params, lambda: self._start_clustering(algo, params))
+
+    def _start_clustering(self, algo: str, params: dict):
+        """Start the background clustering worker (inputs already validated)."""
         if hasattr(self, 'config_tab'):
             self.config_tab.cl_run_btn.setEnabled(False)
             self._set_run_lock('cl', True)
@@ -14211,32 +14675,28 @@ class PluginWidget(QWidget):
         # worker starts — see drc_pipeline.apply_unmixing_af_aware() docstring.
         af_state = drc_pipeline.snapshot_af_state(self.controller)
 
-        class _ClWorker(QThread):
-            finished = Signal(bool, str)
-            progress = Signal(str)
-            def __init__(self_, fn):
-                super().__init__()
-                self_._fn = fn
-            def run(self_):
-                try:
-                    self_._fn()
-                    self_.finished.emit(True, '')
-                except Exception as e:
-                    traceback.print_exc()
-                    self_.finished.emit(False, str(e))
+        def _checked_progress(msg):
+            # Raises in the worker thread once the run is cancelled
+            if worker.cancelled:
+                raise _RunCancelled()
+            self.progress_message(msg)
 
         def _do_cluster():
-            drc_clustering.run_clustering(
+            return drc_clustering.run_clustering_staged(
                 self.controller, self.state, algo, params,
-                progress=self.progress_message,
+                progress=_checked_progress,
                 af_state=af_state,
             )
 
         def _on_cl_done(ok, err):
+            if worker is not self._cl_worker or worker.cancelled:
+                return
             if not ok:
-                self.progress_message(f"Clustering error: {err}")
-                QMessageBox.critical(self, "Clustering Error", err)
+                if err != 'Cancelled.':
+                    self.progress_message(f"Clustering error: {err}")
+                    QMessageBox.critical(self, "Clustering Error", err)
             else:
+                drc_clustering.commit_clustering_result(self.state, worker.result, algo)
                 # Archive this run so GroupsStatsTab can select it later.
                 if self.state.cluster_labels:
                     channels = [c for c in self.state.selected_channels
@@ -14274,21 +14734,51 @@ class PluginWidget(QWidget):
                     self.progress_message(
                         f"Run archived as \"{entry['label']}\""
                     )
+            self._release_clustering_ui()
             if hasattr(self, 'config_tab'):
-                self.config_tab.cl_run_btn.setEnabled(True)
-                self._set_run_lock('cl', False)
-                self.config_tab._refresh_cl_status()
                 self.config_tab.run_table.refresh()
-                if hasattr(self.config_tab, 'cl_progress_bar'):
-                    self.config_tab.cl_progress_bar.setVisible(False)
             self._on_runs_changed()
             self._cl_worker = None
 
-        worker = _ClWorker(_do_cluster)
+        worker = _ClusterWorker(_do_cluster)
         worker.finished.connect(_on_cl_done)
-        worker.progress.connect(self.progress_message)
         self._cl_worker = worker
+        if hasattr(self, 'config_tab'):
+            self.config_tab.cl_cancel_btn.setEnabled(True)
         worker.start()
+
+    def _release_clustering_ui(self):
+        """Unlock the clustering controls and hide its progress after a run ends."""
+        if not hasattr(self, 'config_tab'):
+            return
+        ct = self.config_tab
+        ct.cl_run_btn.setEnabled(True)
+        self._set_run_lock('cl', False)
+        ct._refresh_cl_status()
+        if hasattr(ct, 'cl_progress_bar'):
+            ct.cl_progress_bar.setVisible(False)
+
+    def _cancel_clustering(self):
+        """
+        Cancel the running clustering job.  The fit stops at its next progress
+        report; a step that cannot be interrupted (SOM training, kNN build,
+        Leiden, HDBSCAN) finishes in the background.  A run's results are
+        committed to the state only when it completes uncancelled, so a
+        cancelled run changes nothing.  The UI is released immediately.
+        """
+        if self._cancel_estimate('cl'):
+            return
+        worker = self._cl_worker
+        if worker is None or not worker.isRunning():
+            return
+        worker.detach()
+        self._detached_workers = [w for w in self._detached_workers if w.isRunning()]
+        self._detached_workers.append(worker)
+        self._cl_worker = None
+        self._release_clustering_ui()
+        self.progress_message(
+            "Clustering cancelled.  A step that cannot be interrupted may keep "
+            "running in the background; its result is discarded.")
 
     # ==================================================================
     # T-REX (walled off)
