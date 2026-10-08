@@ -166,9 +166,9 @@ class EventRateCounter(Thread):
 
     def recount(self, number_of_new_events):
         time_now = time.perf_counter()
-        if not self.time_last or time_now - self.time_last > self.smoothing_time:
-            self.event_rate = 0
-        elif self.event_rate == 0:
+        if not self.time_last:
+            self.time_last = time_now
+        elif self.event_rate == 0 or time_now - self.time_last > self.smoothing_time:
             perf_interval = time_now - self.time_last
             self.event_rate = number_of_new_events/perf_interval
         else:
@@ -881,7 +881,7 @@ if __name__ == '__main__':
 
     # test adcs
 
-    time.sleep(5)
+    time.sleep(15)
     print('quit')
     print(cytkit_device.set_state({'laser_enable' : False}))
     print(cytkit_device.set_state({'sheath_pump_state': {'enable': False}}))
