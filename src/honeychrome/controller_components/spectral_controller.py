@@ -11,7 +11,7 @@ from flowkit import Dimension, gates
 from honeychrome.controller_components.functions import timer, sample_from_fcs, resolve_base_gate
 from honeychrome.controller_components.spectral_functions import get_profile, get_raw_events
 from honeychrome.controller_components.label_matching import match_fluorophore, match_marker, get_fluorophore_db, get_marker_db
-from honeychrome.controller_components.spectral_librarian import SpectralLibrary
+from honeychrome.controller_components.spectral_reference_library import profile_id_from_description
 from honeychrome.controller_components.spectral_cleaning import find_empirical_peak, cosine_filter, knn_scatter_match, exclude_saturated, CleanResult
 from honeychrome.controller_components.spectral_refinement import (
     RefineSettings, refine_row, subsample_negative, make_check_pool, crosstalk_check,
@@ -24,9 +24,6 @@ from honeychrome.settings import INTERNAL_NEGATIVE_SENTINEL
 
 import logging
 logger = logging.getLogger(__name__)
-
-# connect to spectral library
-spectral_library = SpectralLibrary()
 
 def _find_default_unstained_tube(all_samples: dict) -> str | None:
     """Return tube name of the first sample whose path or name contains 'unstained'."""
@@ -245,9 +242,6 @@ class ProfileUpdater:
                             if not control.get('gate_channel_locked'):
                                 control['gate_channel'] = self.fluorescence_channels_pnn[int(np.argmax(profile))]
                             self.profiles[control['label']] = profile.tolist()
-                            profile_dict = dict(zip(self.fluorescence_channels_pnn, profile.tolist()))
-                            spectral_library.deposit_control_with_profile_and_experiment_dir(
-                                control, profile_dict, str(self.experiment_dir))
                             return True
 
                         # FCS load only needed for non-cleaned path
@@ -389,8 +383,6 @@ class ProfileUpdater:
                             control['gate_channel'] = self.fluorescence_channels_pnn[peak_idx]
                         profile = profile.tolist()
                         self.profiles[control['label']] = profile
-                        profile_dict = dict(zip(self.fluorescence_channels_pnn, profile))
-                        spectral_library.deposit_control_with_profile_and_experiment_dir(control, profile_dict, str(self.experiment_dir))
                         return True
 
             except Exception as e:
@@ -401,12 +393,12 @@ class ProfileUpdater:
                 return False
 
         elif control['control_type'] == 'Single Stained Spectral Control from Library':
-            if control['sample_name'] and search_results:
-                for n in search_results:
-                    if control['sample_name'] == search_results[n]['current_control_list']:
-                        profile = list(json.loads(search_results[n]['profile_dict']).values())
-                        self.profiles[control['label']] = profile
-                        return True
+            # search_results maps reference library profile id -> {channel: value}
+            profile_id = profile_id_from_description(control['sample_name'])
+            by_channel = search_results.get(profile_id) if search_results else None
+            if by_channel and all(ch in by_channel for ch in self.fluorescence_channels_pnn):
+                self.profiles[control['label']] = [float(by_channel[ch]) for ch in self.fluorescence_channels_pnn]
+                return True
 
         elif control['control_type'] == 'Channel Assignment':
             if control['gate_channel']:
@@ -886,9 +878,6 @@ class SpectralAutoGenerator(QObject):
 
                     profile = profile.tolist()
                     self.profiles[control['label']] = profile
-
-                    profile_dict = dict(zip(self.fluorescence_channels_pnn, profile))
-                    spectral_library.deposit_control_with_profile_and_experiment_dir(control, profile_dict, str(self.experiment_dir))
                     return True
                 else:
                     warnings.warn('Control sample file does not match experiment')

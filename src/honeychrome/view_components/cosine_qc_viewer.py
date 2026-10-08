@@ -102,7 +102,7 @@ class CosineQCViewer(QFrame):
         content_layout.addLayout(legend_row)
 
         # Plot — same axis class and widget type as ProfilesViewer
-        self._axis_bottom = BottomAxisVerticalTickLabels()
+        self._axis_bottom = BottomAxisVerticalTickLabels(angle=45)
         self._plot_widget = TransparentPlotWidget(
             axisItems={'bottom': self._axis_bottom}
         )
