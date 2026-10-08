@@ -1059,6 +1059,12 @@ class SpectralControlsEditor(QFrame):
             self.bus.showSelectedProfiles.emit(None)
 
     def auto_generate(self):
+        # labels and antigens to restore on the regenerated controls
+        previous_controls = [
+            {key: control.get(key) for key in ('label', 'antigen', 'sample_path', 'sample_name')}
+            for control in self.model._data
+        ]
+
         # if spectral model already exists, ask if user wants it cleared
         if self.model.rowCount():
             reply = QMessageBox.question(self, "Auto generate spectral model", f"This will overwrite the spectral model. Are you sure you wish to continue?", QMessageBox.Yes | QMessageBox.No)
@@ -1099,14 +1105,27 @@ class SpectralControlsEditor(QFrame):
         if not preferred or preferred == INTERNAL_NEGATIVE_SENTINEL:
             preferred = None
         self.spectral_auto_generator = SpectralAutoGenerator(self.bus, self.controller,
-                                                             preferred_unstained=preferred)
+                                                             preferred_unstained=preferred,
+                                                             previous_controls=previous_controls)
 
+        # Profile QC warnings raised by the recalculation are held and shown in one
+        # dialog once the run has finished and the plots have been rebuilt.
+        self.controller.warning_collector = []
         self.spectral_auto_generator.moveToThread(self.thread)
         self.bus.spectralControlAdded.connect(self._on_spectral_control_added_by_autogenerator)
         self.thread.started.connect(self.spectral_auto_generator.run)
         self.bus.spectralModelUpdated.connect(self.thread.quit)
         self.thread.finished.connect(self.refresh_table_and_enable)
+        self.thread.finished.connect(self._on_autogenerate_finished)
         self.thread.start()
+
+    @Slot()
+    def _on_autogenerate_finished(self):
+        """Show the warnings collected during auto-generation in a single dialog."""
+        messages = self.controller.warning_collector or []
+        self.controller.warning_collector = None
+        if messages and self.bus:
+            self.bus.warningMessage.emit('\n\n'.join(messages))
 
     def auto_conventional(self):
         # first make sure all channels selected
