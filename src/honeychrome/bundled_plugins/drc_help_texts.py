@@ -82,13 +82,19 @@ picker.</li>
 structure (relationships within a "blob" of similar cells) against
 global structure (distances between blobs):</p>
 <ul>
-<li><b>UMAP</b> — fast, widely used, strong local-structure
+<li><b>UMAP</b> [1] — fast, widely used, strong local-structure
 preservation.</li>
-<li><b>tSNE</b> (via openTSNE) — excellent local-structure preservation;
-distances across white space between islands are not meaningful.</li>
-<li><b>PaCMAP</b> — aims to balance local and global structure in a
+<li><b>tSNE</b> [2] (via openTSNE [4], which implements the fast FIt-SNE
+algorithm [3]) — excellent local-structure preservation; distances across
+white space between islands are not meaningful.</li>
+<li><b>PaCMAP</b> [5] — aims to balance local and global structure in a
 single embedding.</li>
 </ul>
+<p>Two related methods are not run by Honeychrome but inform these options:
+opt-SNE [11] tunes the iteration count, early exaggeration and learning
+rate of tSNE for large cytometry datasets, and EmbedSOM [10] places cells
+in a 2-D embedding guided by a self-organising map, the same structure
+FlowSOM uses for clustering.</p>
 <p>None of these algorithms preserves inter-cluster distances in an
 absolute sense — they are useful for visual grouping and getting a feel
 for the data, not for treating on-plot distances as a quantitative
@@ -100,19 +106,18 @@ training pool, then <b>Apply to All Samples</b> to project every sample
 
 <h4>3. Clustering</h4>
 <ul>
-<li><b>FlowSOM</b> — self-organising map followed by metaclustering; set
+<li><b>FlowSOM</b> [6] — self-organising map followed by metaclustering; set
 the SOM grid size and number of metaclusters. Honeychrome uses a batched
-FlowSOM training for fast processing of even millions of events.
-tab.</li>
-<li><b>Leiden</b> — graph-based community detection; reuses UMAP's
+FlowSOM training for fast processing of even millions of events.</li>
+<li><b>Leiden</b> [7] — graph-based community detection; reuses UMAP's
 neighbour graph if one is available. Leiden was designed specifically to
 fix a defect in the Louvain-based algorithms behind classic
-Phenograph-style clustering, which can produce badly-connected or even
+Phenograph-style clustering [9], which can produce badly-connected or even
 disconnected "communities" and can be sensitive to how many cells and
 which kNN implementation are used — see the Phenograph link below for
 examples of this in practice. Leiden guarantees well-connected
 communities and is deterministic for a given random seed.</li>
-<li><b>HDBSCAN</b> — density-based clustering; automatically flags
+<li><b>HDBSCAN</b> [8] — density-based clustering; automatically flags
 sparse events as noise (label −1, shown in grey) rather than forcing
 every event into a cluster.</li>
 </ul>
@@ -127,12 +132,12 @@ to rename it, or any other cell to view its full configuration. Renaming
 or deleting a run here updates every run selector elsewhere in the
 plugin (Cluster Annotation, Stats, Workspace) immediately.</p>
 
-<h4>6. Predictive Analysis (optional)</h4>
+<h4>5. Predictive Analysis (optional)</h4>
 <p>The differential tests ask, one feature at a time, "does this differ
 between groups?". <b>Predictive Analysis</b> asks the complementary
 question: "which small set of features best tells two groups apart, and
 how well?" — the approach used in several systems-immunology studies of
-flow cytometry cohorts [10, 11]. It uses the Frequency and/or MFI
+flow cytometry cohorts [12, 13]. It uses the Frequency and/or MFI
 matrices from the last Run Statistics, for the comparison you pick.</p>
 <ul>
 <li><b>Models:</b> lasso (L1-penalised) logistic regression, which keeps
@@ -170,17 +175,22 @@ individual features.</p>
 <li><a href="https://www.colibri-cytometry.com/post/data-analysis-dimensionality-reduction">Data Analysis: Dimensionality Reduction</a> — Colibri Cytometry blog</li>
 <li><a href="https://www.colibri-cytometry.com/post/data-analysis-comparing-dimensionality-reductions">Data Analysis: Comparing Dimensionality Reductions</a> — Colibri Cytometry blog</li>
 <li><a href="https://www.colibri-cytometry.com/post/the-peculiarities-of-phenograph">The peculiarities of Phenograph</a> — Colibri Cytometry blog</li>
+<li><a href="https://www.colibri-cytometry.com/references">Useful Publications</a> — curated reference library, Colibri Cytometry</li>
 </ul>
 <p>References:<br/>
 [1]<a href="https://arxiv.org/abs/1802.03426">McInnes, Healy and Melville 2018 (UMAP)</a><br/>
-[2]<a href="https://doi.org/10.1101/731877">Poličar, Stražar and Zupan 2019 (openTSNE)</a><br/>
-[3]<a href="https://arxiv.org/abs/2012.04456">Wang, Huang, Rudin and Shaposhnik 2021, JMLR (PaCMAP)</a><br/>
-[4]<a href="https://doi.org/10.1002/cyto.a.22625">Van Gassen et al. 2015, Cytometry A (FlowSOM)</a><br/>
-[5]<a href="https://doi.org/10.1038/s41598-019-41695-z">Traag, Waltman and van Eck 2019, Sci Rep (Leiden)</a><br/>
-[6]<a href="https://doi.org/10.1007/978-3-642-37456-2_14">Campello, Moulavi and Sander 2013, PAKDD (HDBSCAN)</a><br/>
-[7]<a href="https://doi.org/10.12688/f1000research.21642.2">Kratochvil, Koladiya and Vondrasek 2020, F100Res (EmbedSOM)</a><br/>
-[8]<a href="https://doi.org/10.1016/j.cell.2015.05.047">Levine et al. 2015, Cell (Phenograph)</a><br/>
-[9]<a href="https://doi.org/10.1038/s41467-019-13055-y">Belkina et al. 2019, Nature Communications (OptSNE)</a><br/>
+[2]<a href="https://jmlr.org/papers/v9/vandermaaten08a.html">van der Maaten and Hinton 2008, JMLR (tSNE)</a><br/>
+[3]<a href="https://doi.org/10.1038/s41592-018-0308-4">Linderman et al. 2019, Nature Methods (FIt-SNE)</a><br/>
+[4]<a href="https://doi.org/10.18637/jss.v109.i03">Poličar, Stražar and Zupan 2024, J Stat Softw (openTSNE)</a><br/>
+[5]<a href="https://arxiv.org/abs/2012.04456">Wang, Huang, Rudin and Shaposhnik 2021, JMLR (PaCMAP)</a><br/>
+[6]<a href="https://doi.org/10.1002/cyto.a.22625">Van Gassen et al. 2015, Cytometry A (FlowSOM)</a><br/>
+[7]<a href="https://doi.org/10.1038/s41598-019-41695-z">Traag, Waltman and van Eck 2019, Sci Rep (Leiden)</a><br/>
+[8]<a href="https://doi.org/10.1007/978-3-642-37456-2_14">Campello, Moulavi and Sander 2013, PAKDD (HDBSCAN)</a><br/>
+[9]<a href="https://doi.org/10.1016/j.cell.2015.05.047">Levine et al. 2015, Cell (Phenograph)</a><br/>
+[10]<a href="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7255855/">Kratochvil et al. 2019, F1000Research (EmbedSOM)</a><br/>
+[11]<a href="https://doi.org/10.1038/s41467-019-13055-y">Belkina et al. 2019, Nature Communications (opt-SNE)</a><br/>
+[12]<a href="https://doi.org/10.1002/alz.70952">Humblet-Baron et al. 2025, Alzheimer's &amp; Dementia (systems immunology of Alzheimer's disease)</a><br/>
+[13]<a href="https://doi.org/10.1038/s41467-026-70895-1">Veiga et al. 2026, Nature Communications (autoinflammation of unknown origin)</a><br/>
 </p>
 '''
 

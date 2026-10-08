@@ -13,7 +13,10 @@ BUILDER_HIERARCHY = '''
 <h3>Hierarchy — define the gates the model will learn</h3>
 <p>A gating model is a hierarchy of gates. Each gate is calculated from its
 parent population only, so a child gate adapts to whatever its parent
-selects.</p>
+selects. This is automation for targeted analysis of well-characterised
+populations in a defined panel, as opposed to discovery by clustering
+[1, 3]; benchmarks of manual gating, clustering and automated gating are
+reviewed in [2].</p>
 
 <h4>Getting gates in</h4>
 <ul>
@@ -38,14 +41,18 @@ ellipse).</li>
 parent.</li>
 </ul>
 <p>Threshold algorithms: <b>tail</b> (the upper tail of a symmetric negative
-population), <b>kde_min</b> and <b>bimodal</b> (the density minimum between
+population; negative populations are symmetric on a logicle or biexponential
+axis [6]), <b>kde_min</b> and <b>bimodal</b> (the density minimum between
 two peaks), <b>mixture</b> (where two Gaussian components cross), and
-<b>otsu</b> (the split that best separates two classes). After an import,
+<b>otsu</b> (the split that best separates two classes [7]). After an import,
 each threshold gate is given a suggested algorithm: <i>mixture</i> when its
 channel looks bimodal (a two-component Gaussian mixture fits clearly better
 than one), otherwise <i>tail</i>.</p>
 <p>Threshold populations are open-ended: every event beyond the threshold
 belongs to the population, however far outside the plotted range.</p>
+<p>Thresholds are calculated once, on the pooled training samples, rather than
+recalculated for each sample as OpenCyto [4] and flowDensity [5] do; the Setup
+tab offers per-sample recalculation as an option.</p>
 
 <h4>Editing</h4>
 <p>Double-click a gate, or right-click it, to change its type, channels,
@@ -53,6 +60,22 @@ populations or algorithm. <b>Advanced…</b> exposes the algorithm
 parameters: tail fraction, number of mixture components, quantile trimming,
 the part of the axis used for the calculation and, for singlets gates, the
 band width in standard deviations.</p>
+
+<h4>Further Reading and Background</h4>
+<p>Documentation:</p>
+<ul>
+<li><a href="https://github.com/DrCytometer/AutoGating">AutoGating</a> — R package implementing the gating algorithms (GitHub)</li>
+<li><a href="https://www.colibri-cytometry.com/references">Useful Publications</a> — curated reference library, Colibri Cytometry</li>
+</ul>
+<p>References:<br/>
+[1]<a href="https://doi.org/10.1002/cyto.a.24320">Cheung et al. 2021, Cytometry A (current trends in automated analysis software)</a><br/>
+[2]<a href="https://doi.org/10.1093/bib/bbae633">Liu et al. 2025, Briefings in Bioinformatics (evaluation of gating methods)</a><br/>
+[3]<a href="https://doi.org/10.1038/nri.2016.56">Saeys, Van Gassen and Lambrecht 2016, Nature Reviews Immunology (computational flow cytometry)</a><br/>
+[4]<a href="https://doi.org/10.1371/journal.pcbi.1003806">Finak et al. 2014, PLOS Computational Biology (OpenCyto)</a><br/>
+[5]<a href="https://doi.org/10.1093/bioinformatics/btu677">Malek et al. 2015, Bioinformatics (flowDensity)</a><br/>
+[6]<a href="https://doi.org/10.1002/cyto.a.20258">Parks, Roederer and Moore 2006, Cytometry A (Logicle display)</a><br/>
+[7]<a href="https://doi.org/10.1109/TSMC.1979.4310076">Otsu 1979, IEEE Trans Syst Man Cybern (threshold selection)</a><br/>
+</p>
 '''
 
 BUILDER_TRAIN = '''
@@ -116,7 +139,9 @@ converted.</li>
 <li><b>Fixed</b> (default) — the stored boundary is applied to every sample
 as it is.</li>
 <li><b>Recalculate</b> — the gate's algorithm is run again on each sample's
-own parent population, with the model's parameters. If the result moves
+own parent population, with the model's parameters (the per-sample approach
+of <a href="https://doi.org/10.1371/journal.pcbi.1003806">OpenCyto</a> and
+<a href="https://doi.org/10.1093/bioinformatics/btu677">flowDensity</a>). If the result moves
 further than the <b>drift limit</b> from the stored boundary (in transformed
 axis units, on an axis spanning about 0 to 1) the sample is flagged, and
 either keeps its recalculated boundary or uses the stored one, as chosen.
@@ -162,20 +187,22 @@ by hand. Covariates hold per-sample values: use one to <b>pair</b> samples
 compared needs at least 3 samples.</p>
 
 <h4>Statistics</h4>
+<p>The same framework has been applied in systems-immunology studies of flow
+cytometry cohorts [6, 7].</p>
 <ul>
 <li><b>Population frequencies</b> — each population's share of its parent (or
 its stats parent) as log odds, with half an event added to the population and
-to the rest of the parent so 0% and 100% stay finite; moderated linear model.
-Effects are log2 odds ratios.</li>
-<li><b>Population counts</b> — negative-binomial model of event counts with
+to the rest of the parent so 0% and 100% stay finite; moderated linear model
+[1, 2]. Effects are log2 odds ratios.</li>
+<li><b>Population counts</b> — negative-binomial model of event counts [5] with
 the parent count as offset. Effects are log2 fold changes.</li>
 <li><b>Marker medians</b> — each population's median of each marker (and of
 AF Abundance, the per-cell autofluorescence level), in transformed units. Populations are screened first and markers are tested
-only within populations that pass (stage-wise FDR). By default a population
+only within populations that pass (stage-wise FDR [4]). By default a population
 is not tested on the markers of its own and its ancestors' gates, which
 differ by construction.</li>
 </ul>
-<p>With <b>TREAT</b> on, p-values test whether the effect exceeds the
+<p>With <b>TREAT</b> [3] on, p-values test whether the effect exceeds the
 threshold; with it off, they test for any difference and the threshold only
 filters. FDR is pooled over all comparisons or taken within each. Changing a
 threshold updates significance without refitting.</p>
@@ -193,4 +220,15 @@ marker tables as CSV, a settings document, a PNG or CSV per ticked item
 (sample tables, one plot per gate, and each comparison's figures and results)
 and one PDF with all of them. Gate plots need the display events, so they are
 offered only for samples gated in this session.</p>
+
+<h4>Further Reading and Background</h4>
+<p>References:<br/>
+[1]<a href="https://doi.org/10.1093/nar/gkv007">Ritchie et al. 2015, Nucleic Acids Research (limma software)</a><br/>
+[2]<a href="https://doi.org/10.2202/1544-6115.1027">Smyth 2004, Stat Appl Genet Mol Biol (empirical Bayes moderation)</a><br/>
+[3]<a href="https://doi.org/10.1093/bioinformatics/btp053">McCarthy and Smyth 2009, Bioinformatics (TREAT)</a><br/>
+[4]<a href="https://doi.org/10.1111/rssb.12028">Benjamini and Bogomolov 2014, J R Stat Soc B (selective inference on families of hypotheses)</a><br/>
+[5]<a href="https://doi.org/10.1093/bioinformatics/btp616">Robinson, McCarthy and Smyth 2009, Bioinformatics (edgeR)</a><br/>
+[6]<a href="https://doi.org/10.1002/alz.70952">Humblet-Baron et al. 2025, Alzheimer's &amp; Dementia (systems immunology of Alzheimer's disease)</a><br/>
+[7]<a href="https://doi.org/10.1038/s41467-026-70895-1">Veiga et al. 2026, Nature Communications (autoinflammation of unknown origin)</a><br/>
+</p>
 '''
