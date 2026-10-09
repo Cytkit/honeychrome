@@ -827,26 +827,44 @@ class _SideTabWidget(QWidget):
         self.currentChanged.emit(row)
 
 
-def _apply_channel_transform(state, ch: str, values: np.ndarray) -> np.ndarray:
+# Events kept per (marker, cluster) cell in the Marker Heatmap / Ridgelines
+# summary. Cells larger than this are thinned by even systematic sampling
+# (deterministic) before the transform is applied. The median and the
+# 200-bin histogram of 100,000 events agree with the full cell to well
+# within the resolution of the plots. None keeps every event.
+MARKER_SUMMARY_MAX_EVENTS_PER_CELL = 100_000
+
+
+def _channel_xform(state, ch: str):
     """
-    Apply the SAME transform configured in the Transforms tab to raw
-    values, for display purposes (e.g. violin plots) -- builds a Transform
-    from state.channel_transform_params[ch] and uses its xform.apply(),
-    the same conversion TransformTab itself uses to go from raw to
-    displayed scale. Returns values unchanged if no transform is configured
-    for this channel yet.
+    The Transforms-tab transform for *ch* as an object with .apply(), or
+    None if no transform is configured or the channel uses the
+    'default'/time-gate scale. Build it once per channel and reuse it
+    across clusters.
     """
     params = state.channel_transform_params.get(ch)
     if not params:
-        return values
+        return None
     tr = Transform(
         scale_t=params['T'], logicle_w=params['W'],
         logicle_m=params['M'], logicle_a=params['A'],
     )
     tr.set_transform(id=params['id'], limits=params.get('limits', [0, 1]))
-    if tr.xform is None:      # 'default'/time-gate case -- no transform to apply
+    return tr.xform
+
+
+def _apply_channel_transform(state, ch: str, values: np.ndarray) -> np.ndarray:
+    """
+    Apply the SAME transform configured in the Transforms tab to raw
+    values, for display purposes (e.g. violin plots) -- uses the xform
+    built by _channel_xform, the same conversion TransformTab itself uses
+    to go from raw to displayed scale. Returns values unchanged if no
+    transform is configured for this channel yet.
+    """
+    xform = _channel_xform(state, ch)
+    if xform is None:
         return values
-    return tr.xform.apply(values)
+    return xform.apply(values)
 
 def _channel_axis_ticks(state, ch: str):
     """
@@ -10780,6 +10798,12 @@ class ClusterAnnotationTab(QWidget):
         # skip rebuilding both figures from scratch on every sub-tab visit
         # when nothing has changed since the last render.
         self._marker_summary_last_drawn: tuple | None = None
+        # At most one _MarkerSummaryWorker exists at a time; a request that
+        # arrives while it runs sets the pending flag and is replayed from
+        # the finished handler.
+        self._marker_summary_worker = None
+        self._marker_summary_rerun_pending = False
+        self._marker_summary_busy = False
 
         page = QWidget()
         page_layout = QVBoxLayout(page)
@@ -11259,7 +11283,11 @@ class ClusterAnnotationTab(QWidget):
             self._show_violin_placeholder("Check at least one channel to plot.")
             return
 
-        pooled = self._pool_violin_data(cl_run, channels)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            pooled = self._pool_violin_data(cl_run, channels)
+        finally:
+            QApplication.restoreOverrideCursor()
         self._violin_cache[run_id] = {
             'pooled': pooled,
             'channels': list(channels),
@@ -12027,17 +12055,62 @@ class ClusterAnnotationTab(QWidget):
 
     def _start_marker_summary_worker(self, cl_run: dict, channels: list[str],
                                      cluster_order: list[int], af_state, pooled, run_id):
+        running = self._marker_summary_worker
+        if running is not None and running.isRunning():
+            _log.info("marker summary: worker already running, request deferred")
+            self._marker_summary_rerun_pending = True
+            return
         self.marker_summary_recompute_btn.setEnabled(False)
+        self._set_marker_summary_busy(True)
         self._show_marker_summary_placeholder("⏳ Computing marker summary …")
         worker = _MarkerSummaryWorker(self, cl_run, channels, cluster_order, af_state, pooled)
         worker.finished.connect(
-            lambda ok, err, payload, rid=run_id: self._on_marker_summary_finished(ok, err, payload, rid)
+            lambda ok, err, payload, rid=run_id, w=worker:
+                self._on_marker_summary_finished(ok, err, payload, rid, w)
         )
         self._marker_summary_worker = worker
         worker.start()
 
-    def _on_marker_summary_finished(self, success: bool, error: str, payload: dict, run_id):
-        self.marker_summary_recompute_btn.setEnabled(True)
+    def _set_marker_summary_busy(self, busy: bool):
+        """Busy cursor while the summary computes and draws."""
+        if busy == self._marker_summary_busy:
+            return
+        self._marker_summary_busy = busy
+        if busy:
+            QApplication.setOverrideCursor(Qt.BusyCursor)
+        else:
+            QApplication.restoreOverrideCursor()
+
+    def _on_marker_summary_finished(self, success: bool, error: str, payload: dict,
+                                    run_id, worker=None):
+        # The thread has returned from run(); wait() lets it finish before
+        # the last reference to the QThread is dropped.
+        if worker is not None:
+            worker.wait()
+            if self._marker_summary_worker is worker:
+                self._marker_summary_worker = None
+        try:
+            self._store_and_draw_marker_summary(success, error, payload, run_id)
+        finally:
+            self._set_marker_summary_busy(False)
+            self.marker_summary_recompute_btn.setEnabled(True)
+            if self._marker_summary_rerun_pending:
+                self._marker_summary_rerun_pending = False
+                QTimer.singleShot(0, self._resume_marker_summary)
+
+    def _resume_marker_summary(self):
+        """Handle a request that arrived while a worker was running."""
+        if self.annotation_sub_tabs.currentIndex() != getattr(self, '_marker_summary_tab_index', -1):
+            return
+        run_id = self.run_combo.currentData()
+        if run_id is None:
+            return
+        if run_id in self._marker_summary_cache:
+            self._draw_marker_summary()
+        else:
+            self._recompute_marker_summary()
+
+    def _store_and_draw_marker_summary(self, success: bool, error: str, payload: dict, run_id):
         if not success:
             self._show_marker_summary_placeholder(f"Failed to compute marker summary: {error}")
             return
@@ -12188,19 +12261,24 @@ class ClusterAnnotationTab(QWidget):
         """
         Concatenate + transform each (channel, cluster) cell's pooled raw
         values exactly ONCE, shared between the heatmap matrix (median per
-        cell) and the ridgeline KDE grid -- previously each did this
-        independently, so every cell's transform + concatenation ran
-        twice for no reason.
+        cell) and the ridgeline histogram grid. The channel's transform is
+        built once and applied to every cluster; cells larger than
+        MARKER_SUMMARY_MAX_EVENTS_PER_CELL are thinned first.
         """
+        cap = MARKER_SUMMARY_MAX_EVENTS_PER_CELL
         out: dict[str, dict[int, np.ndarray]] = {}
         for ch in channels:
+            xform = _channel_xform(self.state, ch)
             by_cluster = pooled_by_channel.get(ch, {})
             out[ch] = {}
             for cl_id in cluster_order:
                 vals = by_cluster.get(cl_id)
                 if vals:
-                    out[ch][cl_id] = _apply_channel_transform(
-                        self.state, ch, np.concatenate(vals))
+                    arr = np.concatenate(vals)
+                    if cap is not None and len(arr) > cap:
+                        keep = (np.arange(cap, dtype=np.int64) * len(arr)) // cap
+                        arr = arr[keep]
+                    out[ch][cl_id] = arr if xform is None else xform.apply(arr)
         return out
     
     def _compute_marker_heatmap_matrix(self, transformed: dict, channels: list[str],
@@ -13835,7 +13913,11 @@ class PluginWidget(QWidget):
             idx = cat.species_combo.findData(getattr(self, '_pending_cluster_id_species', 'human'))
             if idx >= 0:
                 cat.species_combo.setCurrentIndex(idx)
-        if cat.run_combo.currentData() is not None and cat._checked_channels():
+        run_id = cat.run_combo.currentData()
+        checked_now = cat._checked_channels()
+        cached = cat._violin_cache.get(run_id)
+        if run_id is not None and checked_now and (
+                cached is None or cached['channels'] != checked_now):
             cat._recompute_violins()
 
     def _apply_pending_state_to_transform_tab(self):
