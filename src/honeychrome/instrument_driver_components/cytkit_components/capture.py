@@ -18,13 +18,15 @@ class Capture:
         return self.ft4222.register_bit_get('BULK_CTRL', 8)
 
     def aggr_fifo_clear(self):
-        enabled = self.aggr_get_enable()
-        self.aggr_set_enable(False)
-        self.ft4222.register_bit_set('BULK_CTRL', 4)
-        self.aggr_set_enable(enabled)
+        # must be disabled while clearing; hold the lock so the transfer thread can't read in between
+        with self.ft4222.lock:
+            enabled = self.aggr_get_enable()
+            self.aggr_set_enable(False)
+            self.ft4222.register_bit_set('BULK_CTRL', 4)
+            self.aggr_set_enable(enabled)
 
     def aggr_get_fifo_level(self):
-        self.ft4222.register_read('BULK_LEVEL')
+        return self.ft4222.register_read('BULK_LEVEL')
 
     def channel_set_enable(self, channel, enable):
         if enable:
@@ -39,16 +41,16 @@ class Capture:
         self.ft4222.register_write(adc_dictionary[channel]['capture'] + 0x0009, num_samples)
 
     def channel_get_pre_trig_samples(self, channel):
-        return self.ft4222.register_write(adc_dictionary[channel]['capture'] + 0x0009)
+        return self.ft4222.register_read(adc_dictionary[channel]['capture'] + 0x0009)
 
     def channel_set_post_trig_samples(self, channel, num_samples):
         self.ft4222.register_write(adc_dictionary[channel]['capture'] + 0x000A, num_samples)
 
     def channel_get_post_trig_samples(self, channel):
-        return self.ft4222.register_write(adc_dictionary[channel]['capture'] + 0x000A)
+        return self.ft4222.register_read(adc_dictionary[channel]['capture'] + 0x000A)
 
     def channel_set_trigger_skew(self, channel, num_samples):
         self.ft4222.register_write(adc_dictionary[channel]['capture'] + 0x000B, num_samples)
 
     def channel_get_trigger_skew(self, channel):
-        return self.ft4222.register_write(adc_dictionary[channel]['capture'] + 0x000B)
+        return self.ft4222.register_read(adc_dictionary[channel]['capture'] + 0x000B)

@@ -8,13 +8,12 @@
 
 from typing import List, Optional
 import numpy as np
-import struct
 from typing import NamedTuple
 from honeychrome import settings
 from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import adc_dictionary
 
-SYNC_WORD_0 = b'\xCA\xFE'
-SYNC_WORD_1 = b'\xF0\x0D'
+SYNC_WORD_0 = 0xCAFE
+SYNC_WORD_1 = 0xF00D
 SAMPLE_INVALID_MASK = 0xC000
 MAX_SAMPLES = 10000
 HEADER_LEN = 16  # sync0, sync1, ts0..ts3, channel, count
@@ -29,20 +28,23 @@ class CapturePacket(NamedTuple):
 class CaptureDecoder:
     def __init__(self) -> None:
         self.error_count: int = 0
+        self._carry = b''  # trailing bytes of an incomplete packet, prepended to the next read
 
     def reset(self) -> None:
         self.error_count = 0
+        self._carry = b''
 
     def decode(self, buffer):
-        """Decode the buffer, assemble a list of traces.
+        """Decode the buffer, assemble an array of traces.
 
-        `words` must be a 1-D numpy array of dtype uint16. Any partial packet
-        at the end of the block is retained for the next call.
+        `buffer` is the raw byte stream from the device (big-endian 16-bit words). Any partial packet
+        at the end of the block is retained and prepended to the next call, so a packet that straddles
+        two reads is not lost.
         """
         if buffer is None or len(buffer) == 0:
             return None
 
-        packets = self.extract_packets(buffer)
+        packets = self.extract_packets(bytes(buffer), carry=True)
 
         if packets:
             N = len({p.timestamp for p in packets}) # number of events
@@ -64,49 +66,63 @@ class CaptureDecoder:
         else:
             return None
 
-    def extract_packets(self, buffer):
-        """Scan `buf`, return packets.
+    def extract_packets(self, buffer, carry=False):
+        """Scan `buffer` (bytes), return packets.
 
-        `buf` is a uint16 numpy array. Called with the concatenation of any
-        pending data and the new block.
+        The stream is a sequence of big-endian 16-bit words, so every search and step is done in whole
+        words (a byte-wise search can false-match across a word boundary). If `carry` is True the unused
+        tail is kept for the next call, otherwise it is discarded.
         """
-        n = len(buffer)
+        if carry:
+            buffer = self._carry + buffer
+            self._carry = b''
+
+        n = len(buffer) // 2  # whole words only
+        words = np.frombuffer(buffer, dtype='>u2', count=n)
         pos = 0
         packets = []
+        keep_from = None  # word index of an incomplete packet to carry over
 
         while pos < n:
-            # ---- 1. Find next candidate header at or after `pos`.
-            #        We search for SYNC0, then verify SYNC1 follows.
-            pos = buffer.find(SYNC_WORD_0, pos)
-            if pos == -1:
+            # ---- 1. Find next candidate header at or after `pos`: SYNC0 followed by SYNC1.
+            candidates = np.flatnonzero(words[pos:] == SYNC_WORD_0)
+            if candidates.size == 0:
                 break
-            if buffer[pos + 2: pos +4] != SYNC_WORD_1:
+            pos += int(candidates[0])
+
+            if pos + 1 >= n:
+                keep_from = pos  # SYNC0 is the last word, wait for more data
+                break
+            if words[pos + 1] != SYNC_WORD_1:
+                pos += 1  # not a header; keep hunting from the next word
                 continue
 
             # ---- 2. Do we have a full header in this buffer?
-            if pos + HEADER_LEN > n:
+            if pos + HEADER_LEN // 2 > n:
+                keep_from = pos
                 break
 
-            # ---- 3. Parse header fields (vectorized, tiny).
-            ts_words = struct.unpack('>HHHH', buffer[pos + 4: pos + 12])
-            timestamp = int(ts_words[0] | (ts_words[1] << 16) | (ts_words[2] << 32) | (ts_words[3] << 48))
-            channel = struct.unpack('>H', buffer[pos + 12: pos + 14])[0]
-            count = struct.unpack('>H', buffer[pos + 14: pos + 16])[0]
+            # ---- 3. Parse header fields.
+            timestamp = (int(words[pos + 2]) | (int(words[pos + 3]) << 16) |
+                         (int(words[pos + 4]) << 32) | (int(words[pos + 5]) << 48))
+            channel = int(words[pos + 6])
+            count = int(words[pos + 7])
 
             # ---- 4. Validate header.
             if channel >= N_CHANNELS or count > MAX_SAMPLES:
-                # Bad header. Re-sync from the word *after* the first sync word,
-                # so we can still find a header that overlaps the bad one.
+                # Bad header. Re-sync from the word after the first sync word.
                 self.error_count += 1
+                pos += 1
                 continue
 
             # ---- 5. Do we have the full payload?
-            payload_start = pos + HEADER_LEN
-            payload_end = payload_start + count*2
+            payload_start = pos + HEADER_LEN // 2
+            payload_end = payload_start + count
             if payload_end > n:
+                keep_from = pos
                 break
 
-            payload = np.frombuffer(buffer[payload_start:payload_end], dtype='>u2')
+            payload = words[payload_start:payload_end]
 
             # ---- 6. Validate payload in bulk: any word with bits 15:14 set?
             if count > 0:
@@ -119,9 +135,15 @@ class CaptureDecoder:
                     continue
 
             # ---- 7. Emit packet.
-            packets.append(CapturePacket(timestamp, channel, payload.copy()))
+            packets.append(CapturePacket(timestamp, channel, payload.astype(np.uint16)))
 
             pos = payload_end
+
+        if carry:
+            if keep_from is not None:
+                self._carry = buffer[keep_from * 2:]  # includes any odd trailing byte
+            elif len(buffer) % 2:
+                self._carry = buffer[-1:]  # odd trailing byte belongs to the next word
 
         return packets
 

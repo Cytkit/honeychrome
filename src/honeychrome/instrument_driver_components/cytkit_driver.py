@@ -373,7 +373,7 @@ class CytkitDevice:
             offset = settings.adc_offset_retrieved[name]
             message = self.set_state({'adcs':{
                 'enable': {row: enabled},
-                'inverted': {row: inverted},
+                'invert': {row: inverted},
                 'offset': {row: offset},
             }})
             logger.info(f'[CytkitDriver] setup: {message}')
@@ -406,7 +406,7 @@ class CytkitDevice:
             enabled = settings.capture_enabled_retrieved[name]
             pre = settings.capture_pre_trigger_retrieved[name]
             post = settings.capture_post_trigger_retrieved[name]
-            message = self.set_state({'trigger':{
+            message = self.set_state({'capture':{
                 'enable': {row: enabled},
                 'pre_trigger': {row: pre},
                 'post_trigger': {row: post}
@@ -843,11 +843,10 @@ class CytkitDevice:
             self.decoder.reset()
             self.auto_resets += 1
 
-            if traces:
-                # n_decoded_events = len(event_index)
-                # self.event_rate_counter.update(n_decoded_events) # this is the number of events for which at least some data was recovered
-                blob_of_traces_as_array = traces.reshape(-1)
-                return blob_of_traces_as_array
+        if traces is not None:
+            # n_decoded_events = len(event_index)
+            # self.event_rate_counter.update(n_decoded_events) # this is the number of events for which at least some data was recovered
+            return traces.reshape(-1)
 
         return None
 
