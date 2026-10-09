@@ -102,8 +102,7 @@ class Ft4222Communicator:
             current_chunk = min(chunk_size, remaining)
 
             # Write three bytes and read the current chunk
-            chunk = self.devB.spiMaster_MultiReadWrite(b'', b'\x00\x00\x00', current_chunk)
-            # chunk = self.devB.spiMaster_MultiReadWrite(b'', b'', current_chunk)
+            chunk = self.devB.spiMaster_MultiReadWrite(b'', b'', current_chunk)
             data.extend(chunk)
             bytes_read += len(chunk)
 

@@ -72,12 +72,16 @@ class CaptureDecoder:
         """
         n = len(buffer)
         pos = 0
+        last_pos = 0
         packets = []
 
         while pos < n:
             # ---- 1. Find next candidate header at or after `pos`.
             #        We search for SYNC0, then verify SYNC1 follows.
-            pos = buffer.find(SYNC_WORD_0, pos)
+            new_pos = buffer.find(SYNC_WORD_0, pos)
+            print(new_pos, new_pos - last_pos)
+            pos = new_pos
+
             if pos == -1:
                 break
             if buffer[pos + 2: pos +4] != SYNC_WORD_1:
@@ -121,6 +125,7 @@ class CaptureDecoder:
             # ---- 7. Emit packet.
             packets.append(CapturePacket(timestamp, channel, payload.copy()))
 
+            last_pos = pos
             pos = payload_end
 
         return packets

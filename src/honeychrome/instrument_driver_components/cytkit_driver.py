@@ -843,7 +843,7 @@ class CytkitDevice:
             self.decoder.reset()
             self.auto_resets += 1
 
-            if traces:
+            if traces is not None:
                 # n_decoded_events = len(event_index)
                 # self.event_rate_counter.update(n_decoded_events) # this is the number of events for which at least some data was recovered
                 blob_of_traces_as_array = traces.reshape(-1)
