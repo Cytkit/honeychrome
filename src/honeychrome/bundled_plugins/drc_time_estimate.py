@@ -69,8 +69,16 @@ TIMING_PROBE_SMALL_EVENTS = 1_000  # events in the smaller timed probe
 # the run itself below this size.
 ALGO_EVENT_THRESHOLDS = {('cl', 'FlowSOM'): 2_000_000}
 
-# Multipliers for algorithms whose probe is known to underestimate the run.
-RUN_TIME_FACTORS = {('cl', 'Leiden'): 2.0, ('cl', 'HDBSCAN'): 2.0, ('dr', 'PaCMAP'): 5.0}
+# Multipliers for algorithms whose probe is known to underestimate the run,
+# either because the algorithm costs more than its probe suggests or because
+# the probe leaves out work such as loading and transforming the data.
+RUN_TIME_FACTORS = {
+    ('cl', 'Leiden'): 2.0,
+    ('cl', 'HDBSCAN'): 2.0,
+    ('cl', 'FlowSOM'): 5.0,
+    ('dr', 'UMAP'): 2.0,
+    ('dr', 'PaCMAP'): 5.0,
+}
 
 KIND_LABELS = {'dr': 'DR training', 'cl': 'Clustering'}
 KIND_NOUNS = {'dr': 'DR training', 'cl': 'clustering'}   # for use mid-sentence
@@ -321,7 +329,8 @@ def estimate_message(estimate: RunTimeEstimate) -> str:
                      'is likely an overestimate.')
     if estimate.factor != 1.0:
         lines.append(f'{estimate.algo} estimates are multiplied by {estimate.factor:g}, as the '
-                     'probes underestimate its run time.')
+                     'probes do not capture all of its run time (loading and transforming the '
+                     'data, for example).')
     lines += [
         'The cost per event usually rises with the size of the run (FlowSOM is the exception '
         'and scales close to linearly), so the real time may be longer.',
