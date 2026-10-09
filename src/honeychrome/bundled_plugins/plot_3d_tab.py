@@ -1076,6 +1076,10 @@ class Plot3DPlotWidget(QtWidgets.QFrame):
                 "showing all events untriaged"
             )
             mask = np.ones(len(self.event_data), dtype=np.bool_)
+        if len(mask) != len(self.event_data):
+            # gate_membership still belongs to the previous sample
+            mask = np.ones(len(self.event_data), dtype=np.bool_)
+
         return mask
 
     def resample(self):

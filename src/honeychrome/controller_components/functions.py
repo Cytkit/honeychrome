@@ -771,12 +771,17 @@ def assign_default_transforms(settings, channels=None, n_af_spectra=None):
 
 def update_transforms(transforms, transformations):
     for label in transformations:
+        if label not in transforms:
+            logger.warning(f'update_transforms: no stored transform for "{label}" - not saved')
+            continue
+
         transformation = transformations[label]
         linear_a = transformation.linear_a
         logicle_w = transformation.logicle_w
         logicle_m = transformation.logicle_m
         logicle_a = transformation.logicle_a
         scale_t = transformation.scale_t
+        log_m = transformation.log_m
         id = transformation.id
         limits = transformation.limits
         if scale_t is not None:
@@ -1013,6 +1018,12 @@ def initialise_hists(plots, data_for_cytometry_plots):
     hists = []
     if plots:
         for n, plot in enumerate(plots):
+            missing = [plot[k] for k in ('channel_x', 'channel_y') if k in plot and plot[k] not in (transformations or {})]
+            if missing:
+                pnn = data_for_cytometry_plots.get('pnn') or []
+                logger.error(f'initialise_hists: plot {n} {plot} has no transform for {missing} '
+                             f'(in pnn: {[ch in pnn for ch in missing]}; {len(transformations or {})} transforms, {len(plots)} plots)')
+
             if plot['type'] == 'hist1d':
                 bins = transformations[plot['channel_x']].scale_bins
                 histogram = np.zeros(bins+1)
@@ -1061,6 +1072,7 @@ def calc_hists(data_for_cytometry_plots, indices_plots_to_calculate=None, status
         mask = gate_membership.get(source_gate)
         if mask is None:
             logger.warning(f"calc_hists: gate '{source_gate}' not in gate_membership — skipping plot {n}] - is this due to _reinitialise_process_plots_worker from a background thread and gate_membership is only partially built when calc_hists is called concurrently?")
+            hists.append(None)  # keep results aligned with plots
             continue
 
         if plot['type'] == 'hist1d':
@@ -1233,8 +1245,9 @@ def calc_hist2d(event_data, mask, id_channel_x, id_channel_y, transform_x, trans
             mask_1 = (heatmap >= density_cutoff)
             heatmap[mask_1] += inside_max_value//255+1  # Maps to LUT[1]
 
-            global_max_value = np.percentile(heatmap[mask_1], 99.9)
-            np.clip(heatmap, 0, global_max_value, out=heatmap)
+            if mask_1.any():
+                global_max_value = np.percentile(heatmap[mask_1], 99.9)
+                np.clip(heatmap, 0, global_max_value, out=heatmap)
 
     return heatmap
 

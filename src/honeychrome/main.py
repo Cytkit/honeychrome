@@ -71,6 +71,7 @@ View:
 from honeychrome.view import View, logo_icon
 
 import logging
+import re
 import warnings
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
@@ -127,6 +128,24 @@ def configure_multiprocessing():
         if os.name == 'posix':
             mp.set_start_method('spawn', force=True)
 
+_HOME_PATH_PATTERN = re.compile(r'(?i)([A-Z]:\\{1,2}Users\\{1,2}|/Users/|/home/)[^\\/\'"\s]+')
+
+def _scrub_paths(value):
+    # replace the user-name part of home-folder paths anywhere in the event
+    if isinstance(value, str):
+        return _HOME_PATH_PATTERN.sub(r'\1~', value)
+    if isinstance(value, dict):
+        return {k: _scrub_paths(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_paths(v) for v in value]
+    return value
+
+def _sentry_before_send(event, hint):
+    exc_info = hint.get('exc_info')
+    if exc_info and issubclass(exc_info[0], KeyboardInterrupt):
+        return None
+    return _scrub_paths(event)
+
 def init_sentry():
     try:
 
@@ -139,6 +158,8 @@ def init_sentry():
                         shutdown_timeout=1,
                         integrations=[sentry_logging],
                         release=f"honeychrome@{__version__}",
+                        environment='production' if getattr(sys, 'frozen', False) else 'development',
+                        before_send=_sentry_before_send,
                         send_default_pii=False)
         sentry_sdk.set_tag("os_name", platform.system())
         sentry_sdk.set_tag("os_release", platform.release())

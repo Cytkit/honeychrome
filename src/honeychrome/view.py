@@ -59,6 +59,7 @@ from honeychrome.view_components.new_file_dialog import NewFileDialog
 from honeychrome import __version__
 
 import pyqtgraph as pg
+from shiboken6 import isValid
 
 base_directory = str(Path.home() / experiments_folder)
 
@@ -243,7 +244,7 @@ class View(QObject):
 
     @Slot(str)
     def init_plot_grids_and_gating_trees(self, scope=''):
-        if self.main_window is None:
+        if self.main_window is None or not isValid(self.main_window):
             return
         # reinitialises widgets
         # called for new/load experiment, or on spectral process updated (just for scope = 'unmixed')
