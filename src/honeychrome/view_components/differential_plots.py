@@ -22,6 +22,7 @@ the figure is on a canvas.
 
 from __future__ import annotations
 
+import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -31,11 +32,46 @@ __all__ = [
     'style_figure_theme', 'make_scatter_hover_handler', 'stamp_run_label',
     'message_figure', 'make_heatmap_figure', 'make_volcano_figure',
     'make_marker_summary_figure', 'significance_column',
+    'wrap_label', 'text_width_inches',
 ]
 
 GROUP_COLOUR_A = '#4477AA'
 GROUP_COLOUR_B = '#EE6677'
 MAX_STATIC_LABELS = 10
+VOLCANO_LABEL_WRAP = 24     # characters per line for volcano point labels
+
+
+def wrap_label(text: str, width: int, max_lines: int | None = None) -> str:
+    """
+    Break *text* onto lines of at most *width* characters, splitting at
+    spaces (long cluster labels such as MEM labels are space-separated).
+    A single word longer than *width* stays whole. With *max_lines*, the
+    words that do not fit are folded into the last line instead of
+    adding further lines.
+    """
+    text = str(text)
+    lines = textwrap.wrap(text, width=max(1, width), break_long_words=False,
+                          break_on_hyphens=False) or [text]
+    if max_lines is not None and len(lines) > max_lines:
+        lines = lines[:max_lines - 1] + [' '.join(lines[max_lines - 1:])]
+    return '\n'.join(lines)
+
+
+def text_width_inches(text: str, fontsize: float) -> float:
+    """
+    Rendered width in inches of the widest line of *text* at *fontsize*
+    points, measured with matplotlib's default font. Needs no canvas, so
+    it is safe on a worker thread.
+    """
+    from matplotlib.textpath import TextPath
+
+    widest = 0.0
+    for line in str(text).split('\n'):
+        if not line:
+            continue
+        extent = TextPath((0, 0), line, size=fontsize).get_extents()
+        widest = max(widest, float(extent.width))
+    return widest / 72.0
 
 
 def style_figure_theme(fig, is_dark: bool, axes=None) -> str:
@@ -77,6 +113,7 @@ def make_scatter_hover_handler(fig, ax, scatter, labels: list[str], is_dark: boo
         arrowprops=dict(arrowstyle='-', color='#888888'),
     )
     annot.set_visible(False)
+    annot.set_in_layout(False)
 
     def _on_hover(event):
         if event.inaxes != ax:
@@ -88,7 +125,7 @@ def make_scatter_hover_handler(fig, ax, scatter, labels: list[str], is_dark: boo
         if cont:
             idx = ind['ind'][0]
             annot.xy = scatter.get_offsets()[idx]
-            annot.set_text(labels[idx])
+            annot.set_text(wrap_label(labels[idx], VOLCANO_LABEL_WRAP * 2))
             annot.set_visible(True)
             fig.canvas.draw_idle()
         elif annot.get_visible():
@@ -355,6 +392,7 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
     ax.axvline(fc_threshold, color='grey', linestyle='--', linewidth=0.8)
     ax.axvline(-fc_threshold, color='grey', linestyle='--', linewidth=0.8)
 
+    ax.margins(y=0.15)     # room above the top points for wrapped labels
     sig_x = logfc[sig]
     sig_y = neg_lp[sig]
     sig_labels = [lbl for lbl, is_pt_sig in zip(features, sig) if is_pt_sig]
@@ -363,9 +401,15 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
     else:
         top_idx = np.arange(len(sig_labels))
     for i in top_idx:
-        ax.annotate(sig_labels[i], xy=(sig_x[i], sig_y[i]),
-                    xytext=(4, 4), textcoords='offset points',
-                    fontsize=6, color=fg)
+        # Labels on the right half extend leftwards so they stay inside the axes.
+        on_right = sig_x[i] > 0
+        note = ax.annotate(wrap_label(sig_labels[i], VOLCANO_LABEL_WRAP),
+                           xy=(sig_x[i], sig_y[i]),
+                           xytext=(-4 if on_right else 4, 4),
+                           textcoords='offset points',
+                           ha='right' if on_right else 'left', va='bottom',
+                           fontsize=6, color=fg)
+        note.set_in_layout(False)
 
     if sig_scatter is not None:
         fig._hover_handler = make_scatter_hover_handler(fig, ax, sig_scatter, sig_labels, is_dark)
