@@ -165,7 +165,7 @@ def _suppress_third_party_warnings():
 # Safe at module level (no Qt object creation on import)
 # ---------------------------------------------------------------------------
 from dataclasses import dataclass, field
-from copy import deepcopy
+from copy import copy as _shallow_copy, deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -210,6 +210,8 @@ from honeychrome.view_components.differential_plots import (
     make_volcano_figure,
     stamp_run_label,
     style_figure_theme as _style_figure_theme,
+    text_width_inches,
+    wrap_label,
 )
 import honeychrome.settings as hc_settings
 
@@ -477,10 +479,36 @@ def _cluster_display_name(names: dict, label: int) -> str:
 
 
 # Muted italic styling for inline hint labels. Deliberately sets no
-# font-size: an absolute px size ignores the user's font scaling, and
-# palette(mid) tracks the active light/dark palette where a fixed
-# 'grey' would not.
-HINT_STYLE = "color: palette(mid); font-style: italic;"
+# font-size: an absolute px size ignores the user's font scaling. On a
+# dark palette palette(mid) is grey on dark grey, so dark mode uses a
+# light grey instead.
+def _hint_style() -> str:
+    app = QApplication.instance()
+    is_dark = (app is not None
+               and app.palette().color(QPalette.ColorRole.Base).value() < 128)
+    colour = '#d0d0d0' if is_dark else 'palette(mid)'
+    return f"color: {colour}; font-style: italic;"
+
+
+class _HintLabel(QLabel):
+    """Word-wrapped italic hint text that follows the light/dark palette."""
+
+    def __init__(self, text: str = '', parent=None):
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+        self._style = ''
+        self._apply_hint_style()
+
+    def _apply_hint_style(self):
+        style = _hint_style()
+        if style != self._style:
+            self._style = style
+            self.setStyleSheet(style)
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.PaletteChange:
+            self._apply_hint_style()
+        super().changeEvent(event)
 
 
 def _channel_antigens(controller) -> dict[str, str]:
@@ -1095,6 +1123,16 @@ class PipelineState:
     # |difference| threshold for MFIs, in transformed (Transforms-tab) units.
     stats_mfi_hierarchical: bool = True
     # Cluster-first MFI testing: screen clusters, then markers within them.
+    stats_pval_threshold: float = 0.05
+    stats_fc_threshold: float = 0.5
+    # Significance level and |log2 fold change| threshold of the last
+    # Run Statistics call, so restored plots are drawn with them.
+    stats_data_key: tuple | None = None
+    # Fingerprint of everything the current stats results were computed
+    # from (run, tests, groups, pairing, covariates, marker roles and
+    # transform parameters). Saved with the results; a restored result
+    # is only treated as current while GroupsStatsTab._current_data_key()
+    # still returns it.
     stats_comparisons: list[tuple[str, str]] = field(default_factory=list)
     # (baseline, other) pairs actually tested by the last Run Statistics
     # call, aligned 1:1 with the unique values of freq_results/mfi_results/
@@ -2245,13 +2283,12 @@ class ConfigTab(QWidget):
         runs_page = QWidget()
         runs_box_layout = QVBoxLayout(runs_page)
 
-        runs_hint = QLabel(
+        runs_hint = _HintLabel(
             "Double-click a run's label to rename it, or any other cell to "
             "view its full configuration. Renaming or deleting here updates "
             "every run selector elsewhere in the plugin immediately."
         )
         runs_hint.setWordWrap(True)
-        runs_hint.setStyleSheet(HINT_STYLE)
         runs_box_layout.addWidget(runs_hint)
 
         self.run_table = RunManagementTable(self.controller, self.state)
@@ -4044,6 +4081,12 @@ class GroupsStatsTab(QWidget):
       • Optional predictive analysis (nested cross-validation)
     """
 
+    # Emitted when new statistics or predictive results should be written
+    # to the experiment's saved state.
+    results_computed = Signal()
+    # Emitted once the result figures have been built and shown as tabs.
+    results_drawn = Signal()
+
     def __init__(self, state: PipelineState, bus, controller, parent=None):
         super().__init__(parent)
         self.state = state
@@ -4054,9 +4097,12 @@ class GroupsStatsTab(QWidget):
         # state.compare_group_a / state.compare_group_b) — no local mirror
         # to keep in sync.
         self._stats_worker = None
-        # (run_id, run_freq, run_mfi, groups_fingerprint) for the last
-        # successfully computed Run Statistics — lets _run_statistics
-        # replot instead of refitting when only thresholds changed.
+        self._predictive_worker = None
+        # Names of the long-running jobs that currently hold a busy cursor.
+        self._busy_cursor_owners: set[str] = set()
+        # _current_data_key() of the last computed (or verified restored)
+        # Run Statistics — lets _run_statistics replot instead of
+        # refitting when only thresholds changed.
         self._last_stats_data_key = None
         # the _ResultsDrawWorker currently building figures, if
         # any, and whether another _draw_results() call arrived while it
@@ -4117,14 +4163,13 @@ class GroupsStatsTab(QWidget):
         group_box = QGroupBox("Comparison Groups")
         group_box_layout = QVBoxLayout(group_box)
 
-        name_hint = QLabel(
+        name_hint = _HintLabel(
             "Define one or more comparison groups. Double-click a group's "
             "name or match pattern below to edit it in place. Assign "
             "samples to a group in the table beneath, or set a match "
             "pattern per group and use 'Auto-assign by pattern'."
         )
         name_hint.setWordWrap(True)
-        name_hint.setStyleSheet(HINT_STYLE)
         group_box_layout.addWidget(name_hint)
 
         self.groups_table = QTableWidget(0, 3)
@@ -4263,12 +4308,11 @@ class GroupsStatsTab(QWidget):
         test_groups_box = QGroupBox("Groups to Test")
         test_groups_layout = QVBoxLayout(test_groups_box)
 
-        test_groups_hint = QLabel(
+        test_groups_hint = _HintLabel(
             "Check every group to include in Frequency/Counts/MFI testing, "
             "Confusion Matrix, and Composition-by-group."
         )
         test_groups_hint.setWordWrap(True)
-        test_groups_hint.setStyleSheet(HINT_STYLE)
         test_groups_layout.addWidget(test_groups_hint)
 
         self.test_groups_list = QListWidget()
@@ -4360,13 +4404,12 @@ class GroupsStatsTab(QWidget):
         self.compare_group_a_combo.currentTextChanged.connect(self._on_compare_group_changed)
         self.compare_group_b_combo.currentTextChanged.connect(self._on_compare_group_changed)
 
-        compare_hint = QLabel(
+        compare_hint = _HintLabel(
             "T-REX's neighbour-fraction score only works for exactly two "
             "conditions, so it uses this dedicated pair regardless of how "
             "many groups are checked above."
         )
         compare_hint.setWordWrap(True)
-        compare_hint.setStyleSheet(HINT_STYLE)
         compare_container_layout.addWidget(compare_hint)
         stats_layout.addWidget(self.trex_compare_container)
         self.trex_compare_container.setVisible(False)
@@ -4504,7 +4547,7 @@ class GroupsStatsTab(QWidget):
         # ---- Marker roles: type (clustering) vs state (tested) ----
         roles_box = QGroupBox("Marker Roles — MFI Testing")
         roles_layout = QVBoxLayout(roles_box)
-        roles_hint = QLabel(
+        roles_hint = _HintLabel(
             "Every channel defaults to 'state' (tested) and is included in "
             "MFI significance testing. Check a channel to keep it included; "
             "uncheck a channel to mark it 'type' (a clustering marker) and "
@@ -4513,7 +4556,6 @@ class GroupsStatsTab(QWidget):
             "assignment and its own significance call."
         )
         roles_hint.setWordWrap(True)
-        roles_hint.setStyleSheet(HINT_STYLE)
         roles_layout.addWidget(roles_hint)
 
         roles_btn_row = QHBoxLayout()
@@ -4643,14 +4685,13 @@ class GroupsStatsTab(QWidget):
         pca_box = QGroupBox("Sample PCA")
         pca_layout = QVBoxLayout(pca_box)
 
-        pca_hint = QLabel(
+        pca_hint = _HintLabel(
             "PCA over every sample in the checked 'Groups to Test' "
             "(not one comparison at a time) — pick which computed source(s) "
             "to build it from below. Requires Run Statistics to have been "
             "run first with the matching 'Test:' box(es) checked."
         )
         pca_hint.setWordWrap(True)
-        pca_hint.setStyleSheet(HINT_STYLE)
         pca_layout.addWidget(pca_hint)
 
         pca_source_row = QHBoxLayout()
@@ -4770,7 +4811,7 @@ class GroupsStatsTab(QWidget):
         # ============================================================
         pred_box = QGroupBox("Predictive Analysis (optional)")
         pred_layout = QVBoxLayout(pred_box)
-        pred_hint = QLabel(
+        pred_hint = _HintLabel(
             "Which small set of cluster features best tells two groups apart, "
             "and how well? Lasso logistic regression and random forest models "
             "are trained and scored by nested cross-validation on the "
@@ -4782,7 +4823,6 @@ class GroupsStatsTab(QWidget):
             "feature carries the same information."
         )
         pred_hint.setWordWrap(True)
-        pred_hint.setStyleSheet(HINT_STYLE)
         pred_layout.addWidget(pred_hint)
 
         pred_row = QHBoxLayout()
@@ -5346,6 +5386,7 @@ class GroupsStatsTab(QWidget):
         self._populate_marker_roles_list()
         self._update_run_button()
         self._refresh_predictive_controls()
+        self._update_stats_freshness()
 
         # Redraw plots if results are present and haven't been rendered yet
         # (_last_drawn_cluster_names == {} after load_state resets it) or if
@@ -5837,12 +5878,13 @@ class GroupsStatsTab(QWidget):
         dr_only_selected = self._selected_run_kind() == 'dr'
         n_group_ok = self.state.n_group_stats_runnable(shown)
         runnable = n_group_ok and any_clustering and not dr_only_selected
-        self.run_stats_btn.setEnabled(runnable)
+        stats_running = self._stats_worker is not None and self._stats_worker.isRunning()
+        self.run_stats_btn.setEnabled(runnable and not self._analysis_busy())
         self.run_trex_btn.setEnabled(self.state.stats_runnable(shown))
-        self.confusion_btn.setEnabled(runnable)
-        self.composition_btn.setEnabled(runnable)
+        self.confusion_btn.setEnabled(runnable and not stats_running)
+        self.composition_btn.setEnabled(runnable and not stats_running)
         if hasattr(self, 'pca_btn'):
-            self.pca_btn.setEnabled(runnable)
+            self.pca_btn.setEnabled(runnable and not stats_running)
             self._update_pca_source_availability()
         if dr_only_selected:
             self.run_stats_btn.setToolTip(
@@ -6318,7 +6360,7 @@ class GroupsStatsTab(QWidget):
         significance thresholds changed, just re-flag significance and
         replot without refitting.
         """
-        if self._stats_worker is not None and self._stats_worker.isRunning():
+        if self._analysis_busy():
             return
 
         resolved = self._resolve_stats_source()
@@ -6405,48 +6447,38 @@ class GroupsStatsTab(QWidget):
         mfi_hierarchical = self.state.stats_mfi_hierarchical
 
         include_type_markers = self.chk_include_type_markers.isChecked()
-        groups_fingerprint = tuple(sorted(self.state.sample_groups.items()))
-        design_columns = list(adjust_covariates)
-        if self.state.paired and self.state.pairing_variable:
-            design_columns.append(self.state.pairing_variable)
-        covariate_values = ()
-        if self.state.covariates is not None:
-            present = [c for c in design_columns if c in self.state.covariates.columns]
-            covariate_values = tuple(
-                (rel, tuple(str(v) for v in row))
-                for rel, row in self.state.covariates[present].iterrows()
-            )
-        test_fingerprint = (
-            tuple(self.state.testing_group_selection), self.state.contrast_mode,
-            self.state.reference_group, self.state.paired, self.state.pairing_variable,
-            tuple(adjust_covariates), covariate_values,
-        )
-        roles_fingerprint  = tuple(sorted(self.state.marker_roles.items()))
-        data_key = (run_id, run_freq, run_counts, run_mfi, groups_fingerprint,
-                   test_fingerprint, include_type_markers, roles_fingerprint)
+        self.state.stats_pval_threshold = pval_threshold
+        self.state.stats_fc_threshold = fc_threshold
+        data_key = self._current_data_key(run_id, run_freq, run_counts, run_mfi)
         have_results = (not run_freq or self.state.freq_results is not None) and \
                        (not run_counts or self.state.counts_results is not None) and \
                        (not run_mfi or self.state.mfi_results is not None)
 
-        self.state.stats_run_label = run_label
-        self.state.stats_run_id = run_id
-
         if data_key == self._last_stats_data_key and have_results:
+            self.state.stats_run_label = run_label
+            self.state.stats_run_id = run_id
             # Same run, same groups, same tests already computed — only the
             # thresholds may have changed. Recompute p-values/significance
             # from the stored estimates and replot without refitting.
+            self.state.stats_data_key = data_key
             self._apply_significance_thresholds(pval_threshold, fc_threshold)
             self.stats_status_label.setText("✓ Statistics complete (replotted — run unchanged).")
             self.stats_status_label.setStyleSheet("color: green;")
             self.export_results_btn.setEnabled(True)
             self._draw_results()
+            self.results_computed.emit()
             return
 
-        self.run_stats_btn.setEnabled(False)
+        self._set_stats_busy(True)
         self.stats_status_label.setText("⏳ Computing statistics …")
         self.stats_status_label.setStyleSheet("color: orange;")
 
-        plugin_ref = self
+        # The worker reads and writes its own copy of the state, so edits
+        # made in the UI while it runs cannot change the design under it
+        # and half-written results are never visible. The results are
+        # copied back in _on_stats_finished.
+        stats_state = self._snapshot_stats_state()
+        controller_ref = self.controller
         # Snapshot AF/transfer-matrix state HERE, on the main thread, before
         # the worker starts. compute_mfis() reads these via
         # drc_pipeline.apply_unmixing_af_aware(); the live controller
@@ -6465,8 +6497,10 @@ class GroupsStatsTab(QWidget):
             def __init__(self_, run_freq, run_mfi, group_names, labels_override,
                         include_type_markers, names_override, run_counts, af_state,
                         fdr_scope, adjust_covariates, use_treat, mfi_threshold,
-                        mfi_hierarchical):
+                        mfi_hierarchical, state):
                 super().__init__()
+                self_.state = state
+                self_.ran = (run_freq, run_counts, run_mfi)
                 self_._run_freq = run_freq
                 self_._run_mfi  = run_mfi
                 self_._run_counts = run_counts
@@ -6480,6 +6514,7 @@ class GroupsStatsTab(QWidget):
                 self_._use_treat = use_treat
                 self_._mfi_threshold = mfi_threshold
                 self_._mfi_hierarchical = mfi_hierarchical
+                self_.controller = controller_ref
 
             def run(self_):
                 try:
@@ -6491,7 +6526,7 @@ class GroupsStatsTab(QWidget):
 
             def _do_stats(self_):
                 freq, mfi, counts = drc_stats.run_statistics(
-                    plugin_ref.controller, plugin_ref.state,
+                    self_.controller, self_.state,
                     self_._run_freq, self_._run_mfi,
                     pval_threshold, fc_threshold,
                     cluster_labels_override=self_._labels_override,
@@ -6515,11 +6550,182 @@ class GroupsStatsTab(QWidget):
         worker = _StatsWorker(run_freq, run_mfi, list(self.state.group_names), labels_for_stats,
                              include_type_markers, names_for_stats, run_counts, af_state,
                              fdr_scope, adjust_covariates, use_treat, mfi_threshold,
-                             mfi_hierarchical)
+                             mfi_hierarchical, stats_state)
         worker.progress.connect(lambda msg: print(f"[DR Stats] {msg}"))
-        worker.finished.connect(lambda success, err, key=data_key: self._on_stats_finished(success, err, key))
+        worker.finished.connect(
+            lambda success, err, key=data_key, w=worker:
+                self._on_stats_finished(success, err, key, w)
+        )
+        worker.run_meta = (run_label, run_id)
         self._stats_worker = worker
         worker.start()
+
+    def _snapshot_stats_state(self) -> 'PipelineState':
+        """
+        Copy of the state with its own copies of every input the
+        statistics read, for the worker thread. Large caches (gated data)
+        stay shared.
+        """
+        snap = _shallow_copy(self.state)
+        for attr in ('sample_groups', 'group_names', 'group_patterns',
+                     'testing_group_selection', 'stats_adjust_covariates',
+                     'marker_roles', 'channel_transform_params', 'selected_channels',
+                     'cluster_names'):
+            setattr(snap, attr, deepcopy(getattr(self.state, attr)))
+        if self.state.covariates is not None:
+            snap.covariates = self.state.covariates.copy()
+        return snap
+
+    def _adopt_stats_results(self, ran: tuple, snap: 'PipelineState'):
+        """
+        Copy a finished job's results from its private state onto the live
+        state. Results of tests the job did not run are cleared, so the
+        stored tables always come from one run.
+        """
+        ran_freq, ran_counts, ran_mfi = ran
+        self.state.stats_all_rel = snap.stats_all_rel
+        self.state.stats_group_vec = snap.stats_group_vec
+        self.state.stats_comparisons = snap.stats_comparisons
+        self.state.freq_results = snap.freq_results if ran_freq else None
+        self.state.freq_df = snap.freq_df if ran_freq else None
+        self.state.counts_results = snap.counts_results if ran_counts else None
+        self.state.counts_df = snap.counts_df if ran_counts else None
+        self.state.mfi_results = snap.mfi_results if ran_mfi else None
+        self.state.mfi_df = snap.mfi_df if ran_mfi else None
+        self.state.mfi_sample_df = snap.mfi_sample_df if ran_mfi else None
+
+    def _set_stats_busy(self, busy: bool):
+        """
+        Busy cursor, and every control that starts or reads a statistics
+        job disabled while one runs; re-enabled from the usual
+        availability rules when it ends.
+        """
+        self._set_cursor_busy('stats', busy)
+        controls = [self.run_stats_btn, self.confusion_btn, self.composition_btn,
+                    self.export_results_btn]
+        if hasattr(self, 'pca_btn'):
+            controls.append(self.pca_btn)
+        if busy:
+            for control in controls:
+                control.setEnabled(False)
+            self.pred_run_btn.setEnabled(False)
+        else:
+            self._update_run_button()
+            self._refresh_predictive_controls()
+
+    def restore_stats_controls(self):
+        """Show the thresholds and FDR scope the saved results were computed with."""
+        self.pval_spin.setValue(self.state.stats_pval_threshold)
+        self.fc_spin.setValue(self.state.stats_fc_threshold)
+        self.fdr_scope_combo.setCurrentIndex(
+            1 if self.state.stats_fdr_scope == 'per_comparison' else 0
+        )
+
+    def _current_data_key(self, run_id: str, run_freq: bool, run_counts: bool,
+                          run_mfi: bool) -> tuple:
+        """
+        Fingerprint of every input the statistics depend on: the clustering
+        run, which tests are on, sample-to-group assignment, the test
+        design (groups tested, contrast mode, reference, pairing,
+        adjustment covariates and their values), the type-marker choice,
+        marker roles and, for MFIs, the transform parameters of every
+        channel. Two equal keys mean the stored results answer the
+        current settings.
+        """
+        paired = bool(self.state.paired and self.state.pairing_variable)
+        adjust_covariates = [
+            c for c in self.state.stats_adjust_covariates
+            if not (self.state.paired and c == self.state.pairing_variable)
+        ]
+        design_columns = list(adjust_covariates)
+        if paired:
+            design_columns.append(self.state.pairing_variable)
+        covariate_values = ()
+        if self.state.covariates is not None:
+            present = [c for c in design_columns if c in self.state.covariates.columns]
+            covariate_values = tuple(
+                (rel, tuple(str(v) for v in row))
+                for rel, row in self.state.covariates[present].iterrows()
+            )
+        groups_fingerprint = tuple(sorted(self.state.sample_groups.items()))
+        test_fingerprint = (
+            tuple(self.state.testing_group_selection), self.state.contrast_mode,
+            self.state.reference_group, self.state.paired, self.state.pairing_variable,
+            tuple(adjust_covariates), covariate_values,
+        )
+        roles_fingerprint = tuple(sorted(self.state.marker_roles.items()))
+        transform_fingerprint = ()
+        if run_mfi:
+            transform_fingerprint = tuple(
+                (ch, round(float(v.get('T', 0.0)), 4), round(float(v.get('W', 0.0)), 4),
+                 round(float(v.get('M', 0.0)), 4), round(float(v.get('A', 0.0)), 4),
+                 str(v.get('id', '')))
+                for ch, v in sorted(self.state.channel_transform_params.items())
+            )
+        return (run_id, run_freq, run_counts, run_mfi, groups_fingerprint,
+                test_fingerprint, self.chk_include_type_markers.isChecked(),
+                roles_fingerprint, transform_fingerprint)
+
+    def _update_stats_freshness(self):
+        """
+        After results are restored from a saved experiment, check that the
+        groups, pairing, covariates, marker roles and transforms they were
+        computed from are unchanged. Unchanged: the results count as
+        current, so Run Statistics only replots. Changed: they stay
+        visible, flagged as out of date, and Run Statistics refits.
+        """
+        if self._analysis_busy():
+            return
+        if (self.state.freq_results is None and self.state.counts_results is None
+                and self.state.mfi_results is None):
+            return
+        saved = self.state.stats_data_key
+        if not saved:
+            self._last_stats_data_key = None
+            self.stats_status_label.setText(
+                "Restored results have no recorded settings — Run Statistics to confirm them."
+            )
+            self.stats_status_label.setStyleSheet("color: orange;")
+            return
+        try:
+            current = self._current_data_key(saved[0], saved[1], saved[2], saved[3])
+        except Exception:
+            _log.exception("_update_stats_freshness: could not build the current key")
+            return
+        if current == saved:
+            if self._last_stats_data_key != saved:
+                self._last_stats_data_key = saved
+                for box, flag in ((self.chk_freq, saved[1]), (self.chk_counts, saved[2]),
+                                  (self.chk_mfi, saved[3])):
+                    box.setChecked(bool(flag))
+                self.stats_status_label.setText(
+                    "✓ Restored statistics — groups, pairing and transforms unchanged."
+                )
+                self.stats_status_label.setStyleSheet("color: green;")
+        else:
+            self._last_stats_data_key = None
+            self.stats_status_label.setText(
+                "⚠ Results are out of date: groups, pairing, covariates, marker "
+                "roles or transforms changed since they were computed. "
+                "Run Statistics to update."
+            )
+            self.stats_status_label.setStyleSheet("color: orange;")
+
+    def _analysis_busy(self) -> bool:
+        """True while a statistics or predictive-analysis job is running."""
+        return any(w is not None and w.isRunning()
+                   for w in (self._stats_worker, self._predictive_worker))
+
+    def _set_cursor_busy(self, owner: str, busy: bool):
+        """Hold or release the busy cursor for one named job, at most once each."""
+        if busy == (owner in self._busy_cursor_owners):
+            return
+        if busy:
+            self._busy_cursor_owners.add(owner)
+            QApplication.setOverrideCursor(Qt.BusyCursor)
+        else:
+            self._busy_cursor_owners.discard(owner)
+            QApplication.restoreOverrideCursor()
 
     def _apply_significance_thresholds(self, pval_threshold: float, fc_threshold: float):
         """
@@ -6644,7 +6850,7 @@ class GroupsStatsTab(QWidget):
         ax.set_xticks(range(len(disp_df.columns)))
         ax.set_xticklabels(disp_df.columns, rotation=0)
         ax.set_yticks(range(n_clusters))
-        ax.set_yticklabels(disp_df.index)
+        ax.set_yticklabels([wrap_label(name, 30) for name in disp_df.index])
         ax.grid(False)   # suppress inherited seaborn 'whitegrid' (draws through tick/cell centres)
         ax.set_xticks(np.arange(-0.5, len(disp_df.columns), 1), minor=True)
         ax.set_yticks(np.arange(-0.5, n_clusters, 1), minor=True)
@@ -7085,9 +7291,17 @@ class GroupsStatsTab(QWidget):
         self._stamp_run_label(fig, run_label)
         return fig
 
-    def _on_stats_finished(self, success: bool, error_msg: str, data_key=None):
-        self._stats_worker = None
-        self.run_stats_btn.setEnabled(True)
+    def _on_stats_finished(self, success: bool, error_msg: str, data_key=None, worker=None):
+        # The signal is emitted from inside run(); wait() lets the thread
+        # finish before the last reference to it is dropped.
+        if worker is not None:
+            worker.wait()
+        if worker is None or self._stats_worker is worker:
+            self._stats_worker = None
+        self._set_stats_busy(False)
+        if success and worker is not None:
+            self._adopt_stats_results(worker.ran, worker.state)
+            self.state.stats_run_label, self.state.stats_run_id = worker.run_meta
         if not success:
             self.stats_status_label.setText(f"Error: {error_msg}")
             self.stats_status_label.setStyleSheet("color: red;")
@@ -7096,12 +7310,14 @@ class GroupsStatsTab(QWidget):
 
         if data_key is not None:
             self._last_stats_data_key = data_key
+            self.state.stats_data_key = data_key
         self.stats_status_label.setText("✓ Statistics complete.")
         self.stats_status_label.setStyleSheet("color: green;")
         self.export_results_btn.setEnabled(True)
         self._update_pca_source_availability()
         self._refresh_predictive_controls()
         self._draw_results()
+        self.results_computed.emit()
 
     # ------------------------------------------------------------------
     # Predictive analysis
@@ -7124,15 +7340,14 @@ class GroupsStatsTab(QWidget):
         self.pred_chk_freq.setEnabled(have_freq)
         self.pred_chk_mfi.setEnabled(have_mfi)
         runnable = bool(labels) and (have_freq or have_mfi)
-        busy = self._predictive_worker is not None and self._predictive_worker.isRunning()
-        self.pred_run_btn.setEnabled(runnable and not busy)
+        self.pred_run_btn.setEnabled(runnable and not self._analysis_busy())
         self.pred_run_btn.setToolTip(
             "" if runnable else
             "Run Statistics first, with Cluster Frequencies and/or Cluster MFIs ticked."
         )
 
     def _run_predictive(self):
-        if self._predictive_worker is not None and self._predictive_worker.isRunning():
+        if self._analysis_busy():
             return
         idx = self.pred_comparison_combo.currentIndex()
         if idx < 0 or idx >= len(self.state.stats_comparisons):
@@ -7196,7 +7411,9 @@ class GroupsStatsTab(QWidget):
             lambda ok, err, w=worker, st=status, msg=message:
             self._on_predictive_finished(ok, err, w, st, msg))
         self._predictive_worker = worker
+        self._set_cursor_busy('predictive', True)
         self.pred_run_btn.setEnabled(False)
+        self.run_stats_btn.setEnabled(False)
         self.pred_status_label.setStyleSheet("color: orange;")
         self.pred_status_label.setText(
             f"⏳ Running on {X.shape[1]} features, {len(rel_list)} samples …")
@@ -7204,7 +7421,13 @@ class GroupsStatsTab(QWidget):
 
     def _on_predictive_finished(self, success: bool, error_msg: str, worker,
                                 status: str, message: str):
-        self._predictive_worker = None
+        # The signal is emitted from inside run(); wait() lets the thread
+        # finish before the last reference to it is dropped.
+        worker.wait()
+        if self._predictive_worker is worker:
+            self._predictive_worker = None
+        self._set_cursor_busy('predictive', False)
+        self._update_run_button()
         self._refresh_predictive_controls()
         if not success:
             self.pred_status_label.setStyleSheet("color: red;")
@@ -7654,6 +7877,10 @@ class GroupsStatsTab(QWidget):
         (_ResultsDrawWorker). Only tab add/remove (Qt) happens here and in
         _on_results_figures_built, on the main thread.
         """
+        if self._stats_worker is not None and self._stats_worker.isRunning():
+            # The result tables are still being written; the stats job
+            # redraws when it finishes.
+            return
         if self._results_draw_worker is not None:
             # A build is already in flight -- don't start a second one
             # against a moving target; remember to redraw once more as
@@ -7848,6 +8075,8 @@ class GroupsStatsTab(QWidget):
         if self._results_draw_pending:
             self._results_draw_pending = False
             self._draw_results()
+        else:
+            self.results_drawn.emit()
 
     @staticmethod
     def _stamp_run_label(fig, run_label: str):
@@ -12336,9 +12565,21 @@ class ClusterAnnotationTab(QWidget):
         core_w = max(5.0, 0.55 * n_channels)
         label_margin_in = 1.1
         main_w = core_w + 2 * label_margin_in
-        main_h = max(4.0, 0.35 * n_clusters)
+
+        # Long cluster names wrap onto two lines; the row strip is then
+        # sized to the widest wrapped line, so no name is cut off.
+        row_labels = [wrap_label(names_map.get(cl, str(cl)), 30, max_lines=2)
+                      for cl in cluster_order]
+        row_font = 8.0
+        row_label_w = max((text_width_inches(t, row_font) for t in row_labels), default=0.0)
+        max_row_header_w = 4.5
+        if row_label_w + 0.3 > max_row_header_w:
+            row_font = max(5.0, row_font * (max_row_header_w - 0.3) / row_label_w)
+            row_label_w = max(text_width_inches(t, row_font) for t in row_labels)
+        row_header_w = max(1.6, row_label_w + 0.3)
+        row_h = 0.42 if any('\n' in t for t in row_labels) else 0.35
+        main_h = max(4.0, row_h * n_clusters)
         col_header_h = 1.8
-        row_header_w = 1.6
         # Horizontal placement shared by main_fig and col_fig -- same
         # left offset and same width fraction, so column i is at the
         # identical pixel x in both.
@@ -12375,9 +12616,10 @@ class ClusterAnnotationTab(QWidget):
         rax.set_ylim(n_clusters - 0.5, -0.5)
         rax.set_xlim(0, 1)
         rax.axis('off')
-        for row, cl in enumerate(cluster_order):
-            rax.text(0.92, row, names_map.get(cl, str(cl)), ha='right', va='center',
-                     fontsize=8, color=fg)
+        label_x = 1.0 - 0.12 / row_header_w
+        for row, text in enumerate(row_labels):
+            rax.text(label_x, row, text, ha='right', va='center',
+                     fontsize=row_font, color=fg, linespacing=1.1)
         _style_figure_theme(row_fig, is_dark)
 
         return main_fig, col_fig, row_fig
@@ -12736,6 +12978,7 @@ class PluginWidget(QWidget):
         self.config_tab = ConfigTab(self.state, bus, controller)
         self.transform_tab = TransformTab(self.state, bus, controller)
         self.groups_stats_tab = GroupsStatsTab(self.state, bus, controller)
+        self.groups_stats_tab.results_computed.connect(self.save_state)
         self.workspace_tab = WorkspaceTab(self.state, bus, controller)
         self.cluster_annotation_tab = ClusterAnnotationTab(self.state, bus, controller)
         # Built last -- holds references to the four tabs above so it can
@@ -12747,6 +12990,10 @@ class PluginWidget(QWidget):
             groups_stats_tab=self.groups_stats_tab,
             cluster_annotation_tab=self.cluster_annotation_tab,
         )
+
+        # Result figures are built on a worker thread; list them in the
+        # report once they exist if it is the tab being shown.
+        self.groups_stats_tab.results_drawn.connect(self._refresh_report_if_shown)
 
         self.inner_tabs.addTab(self.transform_tab,    "Transforms",    'wave-sine')
         self.inner_tabs.addTab(self.config_tab,       "Configuration", 'settings')
@@ -13001,6 +13248,9 @@ class PluginWidget(QWidget):
             s.setValue('stats_use_treat',   self.state.stats_use_treat)
             s.setValue('stats_mfi_threshold', self.state.stats_mfi_threshold)
             s.setValue('stats_mfi_hierarchical', self.state.stats_mfi_hierarchical)
+            s.setValue('stats_fdr_scope', self.state.stats_fdr_scope)
+            s.setValue('stats_pval_threshold', self.state.stats_pval_threshold)
+            s.setValue('stats_fc_threshold', self.state.stats_fc_threshold)
             s.setValue('covariate_columns',
                       list(self.state.covariates.columns)
                       if self.state.covariates is not None else [])
@@ -13253,6 +13503,17 @@ class PluginWidget(QWidget):
             mfi_hier = s.value('stats_mfi_hierarchical', None)
             if mfi_hier is not None:
                 self.state.stats_mfi_hierarchical = mfi_hier in (True, 'true', 'True', 1, '1')
+            fdr_scope = s.value('stats_fdr_scope', None)
+            if fdr_scope in ('global', 'per_comparison'):
+                self.state.stats_fdr_scope = fdr_scope
+            for qs_key, attr in (('stats_pval_threshold', 'stats_pval_threshold'),
+                                 ('stats_fc_threshold', 'stats_fc_threshold')):
+                stored = s.value(qs_key, None)
+                if stored is not None:
+                    try:
+                        setattr(self.state, attr, float(stored))
+                    except (ValueError, TypeError):
+                        pass
             pca_use_freq = s.value('pca_use_freq', None)
             if pca_use_freq is not None:
                 self.state.pca_use_freq = pca_use_freq in (True, 'true', 'True', 1, '1')
@@ -13481,6 +13742,7 @@ class PluginWidget(QWidget):
         # button would otherwise stay greyed out until the user switches away
         # and back.
         if hasattr(self, 'groups_stats_tab'):
+            self.groups_stats_tab.restore_stats_controls()
             self.groups_stats_tab._update_run_button()
             if (self.state.freq_results is not None or self.state.mfi_results is not None
                     or self.state.counts_results is not None):
@@ -13564,6 +13826,7 @@ class PluginWidget(QWidget):
             ('stats_comparisons', self.state.stats_comparisons),
             ('stats_run_label',   self.state.stats_run_label),
             ('stats_run_id',      self.state.stats_run_id),
+            ('stats_data_key',    self.state.stats_data_key),
             ('confusion_df',          self.state.confusion_df),
             ('confusion_run_label',   self.state.confusion_run_label),
             ('confusion_run_id',      self.state.confusion_run_id),
@@ -13748,6 +14011,8 @@ class PluginWidget(QWidget):
                 self.state.stats_run_label = payload['stats_run_label']
             if isinstance(payload.get('stats_run_id'), str):
                 self.state.stats_run_id = payload['stats_run_id']
+            if isinstance(payload.get('stats_data_key'), tuple):
+                self.state.stats_data_key = payload['stats_data_key']
             print(f"[DR Plugin] Model sidecar loaded ← {path.name} "
                   f"({list(self.state.trained_reducers.keys())} trained, "
                   f"{sum(len(v) for v in self.state.embeddings.values())} embeddings, "
@@ -13973,6 +14238,10 @@ class PluginWidget(QWidget):
             if tree is not sender_tree:
                 tree.set_checked_names(gates)
 
+    def _refresh_report_if_shown(self):
+        if self.inner_tabs.currentWidget() is self.report_tab:
+            self.report_tab.refresh()
+
     def _on_inner_tab_changed(self, index: int):
         """Save state when leaving a tab, then refresh the newly activated one."""
         self.save_state()
@@ -14067,6 +14336,12 @@ class PluginWidget(QWidget):
                 id(s.freq_results), id(s.counts_results), id(s.mfi_results),
                 id(s.confusion_df), id(s.composition_df),
                 s.composition_as_pct, s.composition_group_var,
+                tuple(sorted(s.marker_roles.items())),
+                tuple(
+                    (ch, round(v.get('W', 0.0), 4), round(v.get('A', 0.0), 4),
+                     round(v.get('T', 0.0), 4), round(v.get('M', 0.0), 4))
+                    for ch, v in sorted(s.channel_transform_params.items())
+                ),
             )
         elif index == 4:    # WorkspaceTab
             return (
@@ -14090,6 +14365,11 @@ class PluginWidget(QWidget):
         (e.g. GroupsStatsTab's _last_drawn_cluster_names / _has_results_tab
         checks), which still apply whenever refresh() does run.
         """
+        if index == 5:
+            # The report lists what these tabs hold, and they build it
+            # from the restored state on refresh.
+            for source_index in (2, 3):
+                self._refresh_tab_at(source_index)
         key = self._tab_refresh_key(index)
         if key is not None and self._last_tab_refresh_key.get(index) == key:
             return
