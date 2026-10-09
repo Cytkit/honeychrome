@@ -896,6 +896,15 @@ class Controller(QObject):
                 sync_af_index_transform(self.experiment.cytometry['transforms'], self.n_af_spectra())
                 self.unmixed_gating = from_gml(self.experiment.cytometry['gating'])
                 self.unmixed_transformations = generate_transformations(self.experiment.cytometry['transforms'])
+                # Call the plain impl, not reapply_fine_tuning(): this method
+                # (initialise_ephemeral_data) is itself called from inside the
+                # worker thread of @with_busy_cursor methods (load_experiment,
+                # refresh_spectral_process). Calling the decorated
+                # reapply_fine_tuning() here would re-enter with_busy_cursor
+                # from a background thread — QApplication.setOverrideCursor()
+                # and a nested QEventLoop off the main thread
+                self._reapply_fine_tuning_impl()
+
 
                 source_gate, _ = resolve_base_gate(self.unmixed_gating, self.experiment.process['base_gate_priority_order'])
                 logger.info(f'Controller: using {source_gate} as base gate for process NxN plots')
@@ -950,13 +959,6 @@ class Controller(QObject):
             logger.warning(self.data_for_cytometry_plots_raw['transformations'] is self.raw_transformations)
             logger.warning(self.data_for_cytometry_plots_raw['gating'] is self.raw_gating)
 
-            # Re-unmix only once the plot data, gating and lookup tables match the new model.
-            # Call the plain impl, not reapply_fine_tuning(): this method is itself called
-            # from inside the worker thread of @with_busy_cursor methods (load_experiment,
-            # refresh_spectral_process), and the decorated version would re-enter
-            # with_busy_cursor (setOverrideCursor and a nested QEventLoop) off the main thread.
-            if 'unmixed' in scope and self.experiment.process['unmixing_matrix']:
-                self._reapply_fine_tuning_impl()
 
     def initialise_transfer_matrix(self):
         # run in intitialisation of ephemeral data or if spillover changed
