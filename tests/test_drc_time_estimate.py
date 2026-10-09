@@ -93,7 +93,8 @@ def test_dr_extrapolates_fit_and_embed_separately(gated):
     assert sizes == [(1000, 80_000)] * 2 + [(2000, 80_000)] * 2
     assert est.total_events == 80_000 and est.embed_events == 80_000
     # fit: 2s + 1ms/event; embed: 0.5s per sample (2 samples) + 0.2ms/event
-    assert est.seconds == pytest.approx((2.0 + 80.0) + (1.0 + 16.0))
+    factor = te.RUN_TIME_FACTORS[('dr', 'UMAP')]
+    assert est.seconds == pytest.approx(factor * ((2.0 + 80.0) + (1.0 + 16.0)))
 
 
 def test_dr_counts_fit_pool_and_embedded_events(gated):
@@ -153,6 +154,8 @@ def test_run_time_factors_scale_the_estimate(gated):
         assert scaled.seconds == pytest.approx(100.0 * factor)
         assert f'multiplied by {factor}' in te.estimate_message(scaled)
     assert te.RUN_TIME_FACTORS[('dr', 'PaCMAP')] == 5.0
+    assert te.RUN_TIME_FACTORS[('dr', 'UMAP')] == 2.0
+    assert te.RUN_TIME_FACTORS[('cl', 'FlowSOM')] == 5.0
 
 
 @pytest.mark.parametrize('repeats', [1, 2])
