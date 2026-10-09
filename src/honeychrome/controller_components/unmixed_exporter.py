@@ -173,7 +173,7 @@ class UnmixedExporter(QObject):
             imaging_carry_through_set = set(imaging_pnn)  # consumed in define_fcs_keywords
             n_af_index = self.controller.n_af_spectra()
 
-
+            skipped_missing = []
             for n, sample_path in enumerate(samples_to_calculate):
                 logger.info(f'UnmixedExporter: sample {n+1}/{len(samples_to_calculate)}')
                 if self.bus:
@@ -204,6 +204,10 @@ class UnmixedExporter(QObject):
                 full_sample_path = self.controller.experiment_dir / sample_path
                 full_unmixed_sample_path = self.controller.experiment_dir / unmixed_rel_path
                 full_unmixed_sample_path.parent.mkdir(parents=True, exist_ok=True)
+                if not full_sample_path.exists():
+                    logger.warning(f'UnmixedExporter: {full_sample_path} not found - skipped')
+                    skipped_missing.append(sample_name)
+                    continue
                 sample = sample_from_fcs(full_sample_path, self.bus)
                 _all_events = sample.get_events(source='raw')
                 _sample_ch_idx = {ch: i for i, ch in enumerate(sample.pnn_labels)}
@@ -311,11 +315,13 @@ class UnmixedExporter(QObject):
 
             if self.bus:
                 self.bus.progress.emit(len(samples_to_calculate), len(samples_to_calculate))
-                # self.bus.popupMessage.emit(f'Exported {len(samples_to_calculate)} unmixed samples as FCS files. \n\n'
-                #                            f'Open <a href="file:///{self.controller.experiment_dir / self.controller.experiment.settings['unmixed']['unmixed_samples_subdirectory']}">'
-                #                            f'{self.controller.experiment.settings['unmixed']['unmixed_samples_subdirectory']}</a> folder.')
-                self.bus.popupMessage.emit(f'Exported {len(samples_to_calculate)} unmixed samples as FCS files, to \n'
-                                           f'"{self.controller.experiment.settings['unmixed']['unmixed_samples_subdirectory']}" folder in experiment folder')
+
+                message = (f'Exported {len(samples_to_calculate) - len(skipped_missing)} unmixed samples as FCS files, to \n'
+                           f'"{self.controller.experiment.settings['unmixed']['unmixed_samples_subdirectory']}" folder in experiment folder')
+                if skipped_missing:
+                    message += '\n\nSkipped (file not found):\n' + '\n'.join(skipped_missing)
+                self.bus.popupMessage.emit(message)
+
         self.finished.emit()
 
 

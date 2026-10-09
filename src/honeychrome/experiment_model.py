@@ -40,6 +40,7 @@ from flowkit import GatingStrategy, Dimension, gates
 import numpy as np
 import warnings
 import os
+import uuid
 from flowio import FlowData
 from typing import Optional
 
@@ -56,7 +57,8 @@ def check_for_windows_junction(path):
     return False
 
 def safe_save(content, filename):
-    temp_name = filename + '.tmp'
+    # unique per save, so overlapping saves cannot consume each other's temp file
+    temp_name = f'{filename}.{uuid.uuid4().hex[:8]}.tmp'
 
     # Write to temp file
     with open(temp_name, 'w') as f:

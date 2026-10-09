@@ -475,6 +475,13 @@ class Controller(QObject):
         self._sync_custom_gate_from_strategy(mode, top_gate)
 
         if mode == self.current_mode:
+            if len(self.data_for_cytometry_plots['histograms']) != len(self.data_for_cytometry_plots['plots']):
+                # histograms were cleared (e.g. spectral process refreshed): recalculate everything
+                self.data_for_cytometry_plots['histograms'] = initialise_hists(self.data_for_cytometry_plots['plots'], self.data_for_cytometry_plots)
+                self.data_for_cytometry_plots['statistics'] = initialise_stats(self.data_for_cytometry_plots['gating'])
+                self.calc_hists_and_stats()
+                return
+
             # recalculate histograms and stats
             # which gates and plots have changed?
             # but recalculate everything if using dotplots coloured by gate
@@ -897,6 +904,7 @@ class Controller(QObject):
                 # from a background thread — QApplication.setOverrideCursor()
                 # and a nested QEventLoop off the main thread
                 self._reapply_fine_tuning_impl()
+
 
                 source_gate, _ = resolve_base_gate(self.unmixed_gating, self.experiment.process['base_gate_priority_order'])
                 logger.info(f'Controller: using {source_gate} as base gate for process NxN plots')
@@ -1745,6 +1753,8 @@ class Controller(QObject):
             settings = self.experiment.settings['unmixed']
         else:
             settings = None
+        if not settings or not settings.get('event_channels_pnn'):
+            return
 
         transforms = assign_default_transforms(settings, channels=channels,
                                                n_af_spectra=self.n_af_spectra())
@@ -1845,7 +1855,10 @@ class Controller(QObject):
             # calc_hists skips plots whose source_gate is missing from
             # gate_membership, so hists may be shorter than indices_plots_to_calculate.
             # Zip stops at the shorter sequence, preventing an IndexError.
+            # calc_hists returns None for plots whose source gate could not be evaluated
             for n, hist in zip(indices_plots_to_calculate, hists):
+                if hist is None or n >= len(self.data_for_cytometry_plots['histograms']):
+                    continue
                 if self.data_for_cytometry_plots['histograms'][n].shape == hist.shape:
                     self.data_for_cytometry_plots['histograms'][n] += hist
                 else:
