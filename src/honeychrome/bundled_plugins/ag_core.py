@@ -86,11 +86,15 @@ GATE_TYPES: tuple[str, ...] = ('singlets', '1dsep', '2dsep', 'free', 'replicate'
 THRESHOLD_TYPES = frozenset({'1dsep', '2dsep'})
 POLYGON_TYPES = frozenset({'singlets', 'free'})
 
+# 'imported' keeps the boundary stored in the gate definition's ``template``
+# (e.g. a gate imported from a FlowJo workspace) instead of calculating one.
+ALGORITHM_IMPORTED = 'imported'
+
 ALGORITHMS_BY_GATE_TYPE: dict[str, list[str]] = {
-    'singlets':  ['singlets'],
-    '1dsep':     ['tail', 'kde_min', 'mixture', 'otsu', 'bimodal'],
-    '2dsep':     ['tail', 'kde_min', 'mixture', 'otsu', 'bimodal'],
-    'free':      ['all', 'ellipse'],
+    'singlets':  ['singlets', ALGORITHM_IMPORTED],
+    '1dsep':     ['tail', 'kde_min', 'mixture', 'otsu', 'bimodal', ALGORITHM_IMPORTED],
+    '2dsep':     ['tail', 'kde_min', 'mixture', 'otsu', 'bimodal', ALGORITHM_IMPORTED],
+    'free':      ['all', 'ellipse', ALGORITHM_IMPORTED],
     'replicate': ['replicate'],
 }
 
@@ -520,11 +524,39 @@ class GateCalculator:
             '2dsep': self._calc_2dsep,
             'free': self._calc_free,
         }
-        result = dispatch.get(gate_type, self._calc_free)(np.asarray(data), gate_def, channel_index)
+        if gate_def.get('algorithm') == ALGORITHM_IMPORTED:
+            calc = self._calc_imported
+        else:
+            calc = dispatch.get(gate_type, self._calc_free)
+        result = calc(np.asarray(data), gate_def, channel_index)
         pops = gate_def.get('populations') or {}
         for pop_name, entry in result.items():
             entry['label'] = (pops.get(pop_name) or {}).get('label', pop_name)
         return result
+
+    def _calc_imported(self, data, gate_def, channel_index) -> dict:
+        """The boundary stored in the gate's ``template``. Threshold gates
+        keep their thresholds and redraw their rectangles to the axis limits."""
+        template = gate_def.get('template') or {}
+        if not template:
+            return {}
+        if gate_def.get('gate_type') in THRESHOLD_TYPES:
+            first = next(iter(template.values()))
+            tx, ty = first.get('threshold_x'), first.get('threshold_y')
+            if tx is None or (gate_def.get('gate_type') == '2dsep' and ty is None):
+                return {}
+            x = data[:, channel_index[gate_def['gate_marker_x']]] if len(data) else None
+            y = None
+            if gate_def.get('gate_type') == '2dsep' and len(data):
+                y = data[:, channel_index[gate_def['gate_marker_y']]]
+            return self.threshold_boundaries(gate_def, float(tx),
+                                             None if ty is None else float(ty), x, y)
+        out = {}
+        for pop, entry in template.items():
+            keep = {k: deepcopy(entry[k]) for k in ('boundary', 'range', 'threshold_x',
+                                                     'threshold_y', 'region') if k in entry}
+            out[pop] = keep
+        return out
 
     def _calc_singlets(self, data, gate_def, channel_index) -> dict:
         """Line fit through the main diagonal of the two scatter channels,
@@ -1159,12 +1191,23 @@ def remap_model(model: dict, dst_params: dict,
     src = model.get('transforms') or {}
     if not src:
         return model, []
+    gate_defs = model.get('gate_definitions') or []
     new_boundaries, report = remap_boundaries(
-        model.get('gate_definitions') or [], model.get('trained_boundaries') or {},
+        gate_defs, model.get('trained_boundaries') or {},
         src, dst_params, transform_factory=transform_factory,
     )
     out = deepcopy(model)
     out['trained_boundaries'] = new_boundaries
+    templates = {g['gate_name']: g['template'] for g in gate_defs if g.get('template')}
+    if templates:
+        new_templates, template_report = remap_boundaries(
+            gate_defs, templates, src, dst_params, transform_factory=transform_factory,
+        )
+        for ch, status in template_report.items():
+            report.setdefault(ch, status)
+        for g in out['gate_definitions']:
+            if g.get('gate_name') in new_templates:
+                g['template'] = new_templates[g['gate_name']]
     remapped = sorted(ch for ch, s in report.items() if s == 'remapped')
     for ch in remapped:
         out['transforms'][ch] = deepcopy(dst_params[ch])

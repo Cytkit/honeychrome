@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import math
 import re
+import textwrap
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
@@ -330,33 +331,112 @@ def _format_cell(value) -> str:
     return '' if value is None else str(value)
 
 
+_TABLE_PAGE_W_IN = 11.69       # A4 landscape
+_TABLE_PAGE_H_IN = 8.27
+_TABLE_MARGIN_IN = 0.4
+_TABLE_TITLE_H_IN = 0.7
+_TABLE_FONT_PT = 7.0
+_TABLE_MIN_FONT_PT = 4.5
+_TABLE_WRAP_CHARS = 28         # text wraps onto extra lines beyond this width
+
+
+def table_page_title(label: str, table_name: str) -> str:
+    """Page title for an exported table: the item label followed by the
+    table name with its DataFrame suffix dropped, e.g. ('MFI Clusters',
+    'results_df') -> 'MFI Clusters results'."""
+    name = table_name[:-3] if table_name.endswith('_df') else table_name
+    return f"{label} {name.replace('_', ' ')}".strip()
+
+
+def _wrap_cell(text: str) -> str:
+    return textwrap.fill(text, width=_TABLE_WRAP_CHARS, break_long_words=True)
+
+
 def add_dataframe_pages(pdf, df, title: str, max_rows_per_page: int = 35) -> None:
     """Paginate *df* into one or more table pages of *pdf* (a
-    matplotlib.backends.backend_pdf.PdfPages already open)."""
+    matplotlib.backends.backend_pdf.PdfPages already open).
+
+    Long text is wrapped inside its cell, column widths follow the widest
+    line in each column, the font shrinks (to a floor) when the columns
+    would not fit the page width, and rows are packed onto each page by
+    height. The title sits above the table in its own band."""
     if df is None or df.empty:
         return
     from matplotlib.figure import Figure
 
     df_display = df.reset_index() if df.index.name is not None else df.reset_index(drop=True)
-    n_rows = len(df_display)
-    n_pages = max(1, math.ceil(n_rows / max_rows_per_page))
-    for page in range(n_pages):
-        chunk = df_display.iloc[page * max_rows_per_page:(page + 1) * max_rows_per_page]
-        formatted = chunk.map(_format_cell)
-        page_title = title if n_pages == 1 else f"{title} (page {page + 1}/{n_pages})"
+    headers = [_wrap_cell(str(c)) for c in df_display.columns]
+    body = [[_wrap_cell(cell) for cell in row]
+            for row in df_display.map(_format_cell).values.tolist()]
 
-        fig = Figure(figsize=(11.69, 8.27))  # A4 landscape
-        ax = fig.add_subplot(111)
+    def n_lines(text: str) -> int:
+        return text.count('\n') + 1
+
+    def widest(text: str) -> int:
+        return max(len(line) for line in text.split('\n'))
+
+    n_cols = len(headers)
+    col_chars = [max([widest(headers[c])] + [widest(row[c]) for row in body])
+                 for c in range(n_cols)]
+
+    avail_w = _TABLE_PAGE_W_IN - 2 * _TABLE_MARGIN_IN
+    axes_h = _TABLE_PAGE_H_IN - 2 * _TABLE_MARGIN_IN - _TABLE_TITLE_H_IN
+
+    def col_widths_in(font_pt: float) -> list[float]:
+        char_in = font_pt * 0.6 / 72.0
+        return [(chars + 2) * char_in for chars in col_chars]
+
+    font_pt = _TABLE_FONT_PT
+    widths = col_widths_in(font_pt)
+    if sum(widths) > avail_w:
+        font_pt = max(_TABLE_MIN_FONT_PT, font_pt * avail_w / sum(widths))
+        widths = col_widths_in(font_pt)
+    if sum(widths) > avail_w:
+        scale = avail_w / sum(widths)
+        widths = [w * scale for w in widths]
+
+    def row_height_in(lines: int) -> float:
+        return lines * font_pt * 1.25 / 72.0 + 0.08
+
+    header_h = row_height_in(max(n_lines(h) for h in headers))
+    row_heights = [row_height_in(max(n_lines(cell) for cell in row)) for row in body]
+
+    pages: list[list[int]] = []
+    current: list[int] = []
+    used = header_h
+    for i, h in enumerate(row_heights):
+        if current and (used + h > axes_h or len(current) >= max_rows_per_page):
+            pages.append(current)
+            current, used = [], header_h
+        current.append(i)
+        used += h
+    if current:
+        pages.append(current)
+
+    for page, rows in enumerate(pages):
+        page_title = title if len(pages) == 1 else f"{title} (page {page + 1}/{len(pages)})"
+        fig = Figure(figsize=(_TABLE_PAGE_W_IN, _TABLE_PAGE_H_IN))
+        fig.text(0.5, 1 - (_TABLE_MARGIN_IN + _TABLE_TITLE_H_IN / 2) / _TABLE_PAGE_H_IN,
+                 page_title, ha='center', va='center', fontsize=12, weight='bold')
+        ax = fig.add_axes([_TABLE_MARGIN_IN / _TABLE_PAGE_W_IN,
+                           _TABLE_MARGIN_IN / _TABLE_PAGE_H_IN,
+                           avail_w / _TABLE_PAGE_W_IN,
+                           axes_h / _TABLE_PAGE_H_IN])
         ax.axis('off')
-        ax.set_title(page_title, fontsize=12, weight='bold', pad=12)
         table = ax.table(
-            cellText=formatted.values.tolist(),
-            colLabels=[str(c) for c in formatted.columns],
-            loc='center', cellLoc='center',
+            cellText=[body[i] for i in rows],
+            colLabels=headers,
+            colWidths=[w / avail_w for w in widths],
+            loc='upper center', cellLoc='center',
         )
         table.auto_set_font_size(False)
-        table.set_fontsize(7)
-        table.scale(1, 1.3)
+        table.set_fontsize(font_pt)
+        heights = [header_h] + [row_heights[i] for i in rows]
+        for (r, c), cell in table.get_celld().items():
+            cell.set_height(heights[r] / axes_h)
+            if r == 0:
+                cell.set_facecolor('#e6e6e6')
+                cell.set_text_props(weight='bold')
         pdf.savefig(fig)
 
 
@@ -660,4 +740,4 @@ def export_report_item(item: ReportItem, subfolder, pdf) -> None:
                 continue
             csv_name = sanitize_filename(f"{item.label}_{table_name}")
             df.to_csv(subfolder / f"{csv_name}.csv")
-            add_dataframe_pages(pdf, df, f"{item.label} -- {table_name}")
+            add_dataframe_pages(pdf, df, table_page_title(item.label, table_name))
