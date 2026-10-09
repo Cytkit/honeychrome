@@ -2107,19 +2107,21 @@ class Controller(QObject):
         self.data_for_cytometry_plots_unmixed['histograms'].clear()
         self.data_for_cytometry_plots_unmixed['statistics'].clear()
         if self.bus is not None:
-            self.bus.spectralProcessRefreshed.emit()
-            # self.bus.changedGatingHierarchy.emit('unmixed', 'root')
-            self.bus.statusMessage.emit(f'Spectral process refreshed.')
             # Single consolidated dialog for both profile-QC checks — piped through
             # the bus rather than shown directly, since this method can be entered
             # via a queued connection from a worker-thread emit (SpectralAutoGenerator,
             # SpectralCleaner) and must never pop a QMessageBox from that thread.
+            # The text is collected before spectralProcessRefreshed is emitted, so a
+            # listener on that signal can rely on the collector being complete.
             if conditioning_warnings:
                 qc_text = 'Spectral Profile QC:\n\n' + '\n\n'.join(conditioning_warnings)
                 if self.warning_collector is not None:
                     self.warning_collector.append(qc_text)
                 else:
                     self.bus.warningMessage.emit(qc_text)
+            self.bus.spectralProcessRefreshed.emit()
+            # self.bus.changedGatingHierarchy.emit('unmixed', 'root')
+            self.bus.statusMessage.emit(f'Spectral process refreshed.')
 
         logger.info(f'Controller: refreshed spectral process, unmixed settings, unmixed cytometry')
 

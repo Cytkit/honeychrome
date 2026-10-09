@@ -273,6 +273,8 @@ class SpectralControlsEditor(QFrame):
         self.view.setModel(self.proxy)
         self.bus.spectralModelUpdated.connect(self.view.resizeToFit)
         self.bus.spectralModelUpdated.connect(self._sort_model_by_gate_channel)
+        self._autogenerate_state = None  # set while auto-generation is holding warnings for one dialog
+        self.bus.spectralProcessRefreshed.connect(self._on_autogenerate_refreshed)
         self.bus.spectralControlAdded.connect(self.view.resizeToFit) #extends the table as autogeneration runs... looks interesting but a bit wonky
         self.bus.sampleTreeUpdated.connect(self.refresh_comboboxes) # check for changes to unstained samples
         self.bus.rawGateRenamed.connect(self._on_raw_gate_renamed)
@@ -1111,6 +1113,7 @@ class SpectralControlsEditor(QFrame):
         # Profile QC warnings raised by the recalculation are held and shown in one
         # dialog once the run has finished and the plots have been rebuilt.
         self.controller.warning_collector = []
+        self._autogenerate_state = {'finished': False, 'refreshed': False}
         self.spectral_auto_generator.moveToThread(self.thread)
         self.bus.spectralControlAdded.connect(self._on_spectral_control_added_by_autogenerator)
         self.thread.started.connect(self.spectral_auto_generator.run)
@@ -1121,7 +1124,32 @@ class SpectralControlsEditor(QFrame):
 
     @Slot()
     def _on_autogenerate_finished(self):
+        """The auto-generation thread has ended. The warnings are shown once the
+        spectral process refresh has also completed, with a fallback in case it never does."""
+        if self._autogenerate_state is None:
+            return
+        self._autogenerate_state['finished'] = True
+        self._show_autogenerate_warnings_when_ready()
+        QTimer.singleShot(5000, self._release_autogenerate_warnings)
+
+    @Slot()
+    def _on_autogenerate_refreshed(self):
+        """The spectral process refresh has completed and has already added its warnings."""
+        if self._autogenerate_state is None:
+            return
+        self._autogenerate_state['refreshed'] = True
+        self._show_autogenerate_warnings_when_ready()
+
+    def _show_autogenerate_warnings_when_ready(self):
+        state = self._autogenerate_state
+        if state is not None and state['finished'] and state['refreshed']:
+            self._release_autogenerate_warnings()
+
+    def _release_autogenerate_warnings(self):
         """Show the warnings collected during auto-generation in a single dialog."""
+        if self._autogenerate_state is None:
+            return
+        self._autogenerate_state = None
         messages = self.controller.warning_collector or []
         self.controller.warning_collector = None
         if messages and self.bus:
