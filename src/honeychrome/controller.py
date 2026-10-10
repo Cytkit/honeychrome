@@ -654,11 +654,15 @@ class Controller(QObject):
                 self.calculate_lookup_tables(mode=scope, top_gate=gate_id)
 
 
+    def _scope_for_mode(self, mode=None):
+        # the statistics and process tabs show unmixed data, so they use the unmixed gating
+        return 'raw' if (mode or self.current_mode) == 'raw' else 'unmixed'
+
     def apply_custom_sample_gates(self, scope=None):
         """Install this sample's overrides and refresh every affected lookup table."""
         if not self.current_sample_path:
             return
-        scope = scope or self.current_mode
+        scope = self._scope_for_mode(scope)
         gating = self.raw_gating if scope == 'raw' else self.unmixed_gating
         all_overrides = self.custom_sample_gates.get(scope, {})
         overrides = all_overrides.get(self.current_sample_path, {})
@@ -758,7 +762,7 @@ class Controller(QObject):
         """Tell the UI which gates are customised for the current sample in ``scope``."""
         if self.bus is None:
             return
-        scope = scope or self.current_mode
+        scope = self._scope_for_mode(scope)
         names = []
         if self.current_sample_path:
             names = list(self.custom_sample_gates.get(scope, {}).get(self.current_sample_path, {}).keys())
@@ -792,7 +796,7 @@ class Controller(QObject):
         (the ROI edits the strategy's gate object directly)."""
         if not self.current_sample_path or gate_name in (None, 'root'):
             return
-        scope = scope or self.current_mode
+        scope = self._scope_for_mode(scope)
         gating = self.raw_gating if scope == 'raw' else self.unmixed_gating
         if gating is None:
             return
