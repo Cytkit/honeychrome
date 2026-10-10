@@ -1085,7 +1085,7 @@ class PipelineState:
     compare_group_a: str = ''
     compare_group_b: str = ''
     # T-REX's own two-group pair.
-    # Run Statistics/Confusion Matrix/Composition-by-group
+    # Run Statistics/Composition-by-group
     # use testing_group_selection below instead.
     covariates: pd.DataFrame | None = None
     # rows = samples (rel-path index), columns = covariate names, all
@@ -1094,8 +1094,8 @@ class PipelineState:
 
     # --- N-group testing ---
     testing_group_selection: list[str] = field(default_factory=list)
-    # Which defined groups participate in Frequency/Counts/MFI testing,
-    # Confusion Matrix, and Composition-by-group. Empty means "not yet
+    # Which defined groups participate in Frequency/Counts/MFI testing
+    # and Composition-by-group. Empty means "not yet
     # chosen" -- the UI defaults every currently-defined group to checked.
     contrast_mode: str = 'reference'
     # 'reference' -- one joint fit; every other selected group vs
@@ -1161,23 +1161,17 @@ class PipelineState:
     # (no cluster breakdown, no significance filter). mfi_df/mfi_results
     # stay cluster-level, for the MFI Volcano.
 
-    # Confusion Matrix / Composition Barplot — independent
-    # of Run Statistics, so persisted separately so they survive reopen
-    # the same way freq/mfi results already do.
-    confusion_df: pd.DataFrame | None = None
-    confusion_run_label: str = ''
-    confusion_run_id: str = ''
-    # run_id of the clustering_runs entry the confusion matrix was
-    # computed against -- authoritative match key, same idea as
-    # stats_run_id above (confusion_run_label alone can't detect a
-    # deleted run, since labels are just display text).
-    confusion_names: dict[int, str] = field(default_factory=dict)
+    # Composition Barplot -- independent of Run Statistics, so persisted
+    # separately so it survives reopen the same way freq/mfi results do.
     composition_df: pd.DataFrame | None = None
     composition_as_pct: bool = True
     composition_group_var: str = 'sample'
     composition_run_label: str = ''
     composition_run_id: str = ''
-    # see confusion_run_id above -- same purpose, for Composition Barplot.
+    # run_id of the clustering_runs entry composition_df was computed
+    # against -- authoritative match key, same idea as stats_run_id above
+    # (composition_run_label alone can't detect a deleted run, since
+    # labels are just display text).
     composition_names: dict[int, str] = field(default_factory=dict)
     composition_colors: dict[int, str] = field(default_factory=dict)
     # cluster colours FROZEN from the run composition_df was computed
@@ -1311,8 +1305,8 @@ class PipelineState:
     def n_group_stats_runnable(self, sample_keys: set[str] | None = None) -> bool:
         """
         True if at least 2 of the checked 'Groups to Test'
-        each have >= 3 assigned samples. Governs Run Statistics/Confusion
-        Matrix/Composition-by-group -- separate from stats_runnable(),
+        each have >= 3 assigned samples. Governs Run Statistics/
+        Composition-by-group -- separate from stats_runnable(),
         which still gates T-REX's fixed Compare pair. Pass sample_keys to
         restrict the count to a specific run's samples (see n_per_group);
         omitting it counts across the whole experiment.
@@ -4309,8 +4303,8 @@ class GroupsStatsTab(QWidget):
         test_groups_layout = QVBoxLayout(test_groups_box)
 
         test_groups_hint = _HintLabel(
-            "Check every group to include in Frequency/Counts/MFI testing, "
-            "Confusion Matrix, and Composition-by-group."
+            "Check every group to include in Frequency/Counts/MFI testing "
+            "and Composition-by-group."
         )
         test_groups_hint.setWordWrap(True)
         test_groups_layout.addWidget(test_groups_hint)
@@ -4615,16 +4609,6 @@ class GroupsStatsTab(QWidget):
         self.run_trex_btn.clicked.connect(self._run_trex)
         run_row.addWidget(self.run_trex_btn)
         self.run_trex_btn.setVisible(False)  # walled off
-
-        self.confusion_btn = QPushButton("Confusion Matrix")
-        self.confusion_btn.setEnabled(False)
-        self.confusion_btn.setToolTip(
-            "Per-group-normalized cluster composition heatmap.\n"
-            "Available as soon as groups are assigned and a clustering run "
-            "is selected — no Frequency/MFI stats required first."
-        )
-        self.confusion_btn.clicked.connect(self._show_confusion_matrix)
-        run_row.addWidget(self.confusion_btn)
 
         self.composition_btn = QPushButton("Composition Barplot")
         self.composition_btn.setEnabled(False)
@@ -5381,7 +5365,7 @@ class GroupsStatsTab(QWidget):
         matched = self._scoped_sample_groups()
         self._populate_table(matched)
         self._populate_run_combo()
-        self._sync_confusion_composition_to_run()
+        self._sync_composition_to_run()
         self._populate_trex_dr_combo()
         self._populate_marker_roles_list()
         self._update_run_button()
@@ -5408,20 +5392,9 @@ class GroupsStatsTab(QWidget):
                           "_last_drawn_cluster_names (%r) already matches current state",
                           self._last_drawn_cluster_names)
 
-        # Confusion Matrix / Composition Barplot are independent of Run
-        # Statistics and of each other — redraw each once per load if its
-        # own persisted data is present and it isn't already showing.
-        if self.state.confusion_df is not None and not self._has_results_tab('confusion_matrix'):
-            fig = self._make_confusion_matrix_figure(
-                self.state.confusion_df, run_label=self.state.confusion_run_label,
-            )
-            self._add_results_tab(
-                fig, "Confusion Matrix", "confusion_matrix",
-                maker=self._make_confusion_matrix_figure,
-                maker_kwargs=dict(conf_df=self.state.confusion_df,
-                                  run_label=self.state.confusion_run_label),
-                key="confusion_matrix",
-            )
+        # Composition Barplot is independent of Run Statistics -- redraw it
+        # once per load if its persisted data is present and it isn't
+        # already showing.
         if self.state.composition_df is not None and not self._has_results_tab('composition_barplot'):
             self.composition_pct_chk.setChecked(self.state.composition_as_pct)
             self.composition_by_group_chk.setChecked(self.state.composition_group_var == 'group')
@@ -5468,7 +5441,7 @@ class GroupsStatsTab(QWidget):
         self._update_pca_source_availability()
 
         # Redraw the PCA tab too, same "persisted + not already showing"
-        # rule as Confusion Matrix / Composition Barplot above.
+        # rule as the Composition Barplot above.
         pca_result = self._pca_result_from_state()
         if pca_result is not None and not self._has_results_tab('sample_pca'):
             fig_pca = self._make_pca_figure(pca_result, run_label=self.state.pca_run_label)
@@ -5881,7 +5854,6 @@ class GroupsStatsTab(QWidget):
         stats_running = self._stats_worker is not None and self._stats_worker.isRunning()
         self.run_stats_btn.setEnabled(runnable and not self._analysis_busy())
         self.run_trex_btn.setEnabled(self.state.stats_runnable(shown))
-        self.confusion_btn.setEnabled(runnable and not stats_running)
         self.composition_btn.setEnabled(runnable and not stats_running)
         if hasattr(self, 'pca_btn'):
             self.pca_btn.setEnabled(runnable and not stats_running)
@@ -5926,7 +5898,7 @@ class GroupsStatsTab(QWidget):
         """
         Rebuild the Differential Statistics run combo -- clustering runs
         only. DR runs have no cluster labels, so Run Statistics /
-        Confusion Matrix / Composition / PCA can never operate on one;
+        Composition / PCA can never operate on one;
         listing them here was a T-REX-era holdover from before T-REX got
         its own dedicated trex_dr_run_combo (see below) -- it used to
         share this combo instead. A run is included only if its recorded
@@ -6005,9 +5977,9 @@ class GroupsStatsTab(QWidget):
         (unsaved)" cluster_labels case -- see _resolve_stats_source) is
         never archived and therefore never stale by this check.
 
-        Confusion Matrix / Composition Barplot are handled separately,
-        by _sync_confusion_composition_to_run() -- they're also meant to
-        go stale on a plain combo-selection change, not just a delete.
+        The Composition Barplot is handled separately, by
+        _sync_composition_to_run() -- it is also meant to go stale on a
+        plain combo-selection change, not just a delete.
         """
         valid_ids = {e.get('run_id') for e in self.state.clustering_runs}
 
@@ -6044,31 +6016,22 @@ class GroupsStatsTab(QWidget):
             )
             self.stats_status_label.setStyleSheet("color: #d9822b;")
 
-    def _sync_confusion_composition_to_run(self):
+    def _sync_composition_to_run(self):
         """
         Unlike Freq/MFI/Counts/PCA (see
-        _clear_stale_run_results), Confusion Matrix and Composition
-        Barplot are meant to go stale on a plain combo-selection change
-        too, not just a run deletion -- a deletion just happens to also
-        change what's selected here, once the deleted entry falls out of
-        the combo. Called from _on_run_combo_changed (user picks a
-        different run), refresh() (tab reactivation), and PluginWidget.
-        _on_runs_changed (AFTER _populate_run_combo() has re-settled on
-        whatever's still there post-delete/rename).
+        _clear_stale_run_results), the Composition Barplot is meant to go
+        stale on a plain combo-selection change too, not just a run
+        deletion -- a deletion just happens to also change what's
+        selected here, once the deleted entry falls out of the combo.
+        Called from _on_run_combo_changed (user picks a different run),
+        refresh() (tab reactivation), and PluginWidget._on_runs_changed
+        (AFTER _populate_run_combo() has re-settled on whatever's still
+        there post-delete/rename).
         """
         current_run_id = self._run_combo.currentData()
 
-        if self.state.confusion_run_id and self.state.confusion_run_id != current_run_id:
-            _log.info("_sync_confusion_composition_to_run: clearing confusion_matrix "
-                      "(was %r)", self.state.confusion_run_id)
-            self._remove_results_tab_by_key('confusion_matrix')
-            self.state.confusion_df = None
-            self.state.confusion_run_label = ''
-            self.state.confusion_run_id = ''
-            self.state.confusion_names = {}
-
         if self.state.composition_run_id and self.state.composition_run_id != current_run_id:
-            _log.info("_sync_confusion_composition_to_run: clearing composition_barplot "
+            _log.info("_sync_composition_to_run: clearing composition_barplot "
                       "(was %r)", self.state.composition_run_id)
             self._remove_results_tab_by_key('composition_barplot')
             self.state.composition_df = None
@@ -6145,15 +6108,15 @@ class GroupsStatsTab(QWidget):
         it doesn't retroactively invalidate a previous run's results,
         which are still valid for that run and still exportable.
 
-        Confusion Matrix / Composition Barplot are the exception -- they
-        persist without a "Run Statistics" click, so a stale one left
-        showing for a run no longer selected here is easy to miss (round
-        4). _sync_confusion_composition_to_run() clears each the moment
-        this combo's selection stops matching the run it came from.
+        The Composition Barplot is the exception -- it persists without a
+        "Run Statistics" click, so a stale one left showing for a run no
+        longer selected here is easy to miss. _sync_composition_to_run()
+        clears it the moment this combo's selection stops matching the
+        run it came from.
         """
         run_id = self._run_combo.currentData()
         self._update_run_button()
-        self._sync_confusion_composition_to_run()
+        self._sync_composition_to_run()
         if run_id is None:
             return
         have_results = (self.state.freq_results is not None
@@ -6601,7 +6564,7 @@ class GroupsStatsTab(QWidget):
         availability rules when it ends.
         """
         self._set_cursor_busy('stats', busy)
-        controls = [self.run_stats_btn, self.confusion_btn, self.composition_btn,
+        controls = [self.run_stats_btn, self.composition_btn,
                     self.export_results_btn]
         if hasattr(self, 'pca_btn'):
             controls.append(self.pca_btn)
@@ -6750,11 +6713,10 @@ class GroupsStatsTab(QWidget):
     def _resolve_stats_source(self):
         """
         Resolve which run's cluster labels to use for Run Statistics /
-        Confusion Matrix / Composition Barplot, plus a short label to stamp
-        on the resulting plot(s), a stable run id for cache/run-change
-        checks, and that SAME run's own names dict (never the ambient
-        state.cluster_names — see the "bleeding across runs" fix). All
-        three views share this one validation path.
+        Composition Barplot, plus a short label to stamp on the resulting
+        plot(s), a stable run id for cache/run-change checks, and that
+        SAME run's own names dict (never the ambient state.cluster_names).
+        Both views share this one validation path.
 
         Returns (labels_dict, run_label, run_id, names_dict) or None (after
         showing the appropriate warning) if nothing usable is selected.
@@ -6780,97 +6742,6 @@ class GroupsStatsTab(QWidget):
             return (run_entry['labels'], run_entry['label'], run_entry['run_id'],
                     run_entry.get('names', {}))
         return self.state.cluster_labels, 'Active (unsaved)', '', dict(self.state.cluster_names)
-
-    def _show_confusion_matrix(self):
-        """
-        Compute and display the confusion-matrix heatmap.
-        Independent of Run Statistics — usable as soon as groups are
-        assigned and a clustering run is selected. Re-clicking replaces
-        the existing Confusion Matrix tab in place rather than adding
-        another.
-        """
-        resolved = self._resolve_stats_source()
-        if resolved is None:
-            return
-        labels_for_stats, run_label, run_id, names_for_stats = resolved
-
-        try:
-            conf_df = drc_stats.compute_confusion_matrix(
-                self.controller, self.state, cluster_labels_override=labels_for_stats,
-                names_override=names_for_stats,
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Confusion Matrix Error", str(e))
-            return
-
-        self.state.confusion_df = conf_df
-        self.state.confusion_run_label = run_label
-        self.state.confusion_run_id = run_id
-        self.state.confusion_names = dict(names_for_stats)
-
-        fig = self._make_confusion_matrix_figure(conf_df, run_label=run_label)
-        self._add_results_tab(
-            fig, "Confusion Matrix", "confusion_matrix",
-            maker=self._make_confusion_matrix_figure,
-            maker_kwargs=dict(conf_df=conf_df, run_label=run_label),
-            key="confusion_matrix",
-        )
-
-    def _make_confusion_matrix_figure(self, conf_df: 'pd.DataFrame', run_label: str = ''):
-        """
-        Per-group-normalized cluster composition heatmap (CyCONDOR's
-        plot_confusion_HM). Each cell = that group's normalized share of a
-        cluster.
-        """
-        from matplotlib.figure import Figure
-
-        is_dark = _resolve_is_dark(self.state)
-
-        if conf_df.empty:
-            fig = Figure(figsize=(5, 2), constrained_layout=True)
-            ax = fig.add_subplot(111)
-            ax.axis('off')
-            ax.text(0.5, 0.5, 'No clusters to display',
-                    ha='center', va='center', fontsize=10, transform=ax.transAxes)
-            _style_figure_theme(fig, is_dark)
-            self._stamp_run_label(fig, run_label)
-            return fig
-
-        # drc_stats.compute_confusion_matrix() now returns the
-        # real selected group names as columns directly — no rename needed.
-        disp_df = conf_df
-        n_clusters = len(disp_df)
-
-        fig_w = max(4.0, 1.2 + len(disp_df.columns) * 1.2)
-        fig_h = max(3.0, 0.35 * n_clusters + 1.2)
-        fig = Figure(figsize=(fig_w, fig_h), layout='constrained')
-        ax = fig.add_subplot(111)
-
-        im = ax.imshow(disp_df.values, aspect='auto', cmap='viridis')
-        ax.set_xticks(range(len(disp_df.columns)))
-        ax.set_xticklabels(disp_df.columns, rotation=0)
-        ax.set_yticks(range(n_clusters))
-        ax.set_yticklabels([wrap_label(name, 30) for name in disp_df.index])
-        ax.grid(False)   # suppress inherited seaborn 'whitegrid' (draws through tick/cell centres)
-        ax.set_xticks(np.arange(-0.5, len(disp_df.columns), 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, n_clusters, 1), minor=True)
-        ax.grid(which='minor', color='white', linestyle='-', linewidth=0.6)
-        ax.tick_params(which='minor', bottom=False, left=False)
-        ax.set_title("Cluster Composition by Group\n(normalized per-group event count)",
-                    fontsize=10)
-
-        vmax = disp_df.values.max() if disp_df.values.size else 0.0
-        for i in range(n_clusters):
-            for j in range(len(disp_df.columns)):
-                val = disp_df.values[i, j]
-                ax.text(j, i, f"{val:.0f}", ha='center', va='center',
-                        color='white' if val < vmax * 0.6 else 'black',
-                        fontsize=8)
-
-        fig.colorbar(im, ax=ax, shrink=0.7, label='Normalized events')
-        _style_figure_theme(fig, is_dark)
-        self._stamp_run_label(fig, run_label)
-        return fig
 
     def _pick_pca_arrow_color(self):
         colour = QColorDialog.getColor(QColor(self.state.pca_arrow_color), self, "Arrow colour")
@@ -6904,8 +6775,8 @@ class GroupsStatsTab(QWidget):
         Compute and display the Sample PCA plot. Independent of
         Run Statistics' per-comparison "Viewing comparison" — always uses
         every sample across every checked 'Groups to Test'. Re-clicking
-        replaces the existing PCA tab in place, same as Confusion Matrix /
-        Composition Barplot.
+        replaces the existing PCA tab in place, same as the Composition
+        Barplot.
         """
         resolved = self._resolve_stats_source()
         if resolved is None:
@@ -7008,8 +6879,8 @@ class GroupsStatsTab(QWidget):
         Rebuild the dict _make_pca_figure() expects from persisted
         state.pca_* fields, so the PCA tab gets the same "already
         computed -- redraw it without recomputing" treatment refresh()/
-        refresh_theme_dependent_result_tabs() already give Confusion
-        Matrix and Composition Barplot. Returns None if nothing's been
+        refresh_theme_dependent_result_tabs() already give the
+        Composition Barplot. Returns None if nothing's been
         computed yet this session/experiment.
         """
         if self.state.pca_scores_df is None or self.state.pca_loadings_df is None:
@@ -7177,7 +7048,8 @@ class GroupsStatsTab(QWidget):
     def _show_composition_barplot(self):
         """
         Compute and display the stacked composition barplot.
-        Same availability gate as the confusion matrix. Re-clicking
+        Available once groups are assigned and a clustering run is
+        selected, independent of Run Statistics. Re-clicking
         (or toggling %/By-group) replaces the existing Composition tab in
         place rather than adding another.
         """
@@ -7574,15 +7446,15 @@ class GroupsStatsTab(QWidget):
         maker_kwargs: dict of keyword args to pass to maker (excluding positional args
                       already captured in the lambda at call site)
         key         : stable identifier for "this same plot, regenerated" (e.g.
-                      'confusion_matrix'). If a tab with the same key already
+                      'composition_barplot'). If a tab with the same key already
                       exists it's replaced in place (same position, refocused)
                       instead of appended — so re-clicking a button doesn't pile
                       up duplicate tabs. Every tab (keyed or not) can still be
                       closed manually via its close button.
 
         Extracted from the old _draw_results-local `_add_tab` closure so
-        it can add standalone result tabs (Confusion Matrix,
-        Composition) outside of _draw_results, using the same pop-out/
+        it can add standalone result tabs (Composition Barplot,
+        Sample PCA) outside of _draw_results, using the same pop-out/
         export machinery as the heatmap/volcano tabs.
         """
         from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
@@ -7756,7 +7628,7 @@ class GroupsStatsTab(QWidget):
 
     def _on_results_tab_close_requested(self, index: int):
         """Manually close any results tab (Freq/MFI heatmap/volcano,
-        Confusion Matrix, or Composition Barplot)."""
+        Composition Barplot, or Sample PCA)."""
         widget = self._results_tabs.widget(index)
         key = widget.property('_tab_key') if widget is not None else None
         self._results_tabs.removeTab(index)
@@ -7767,7 +7639,7 @@ class GroupsStatsTab(QWidget):
 
     def get_report_items(self) -> list:
         """One drc_report.ReportItem per currently-open results tab
-        (Freq/Counts/MFI heatmap+volcano, Confusion Matrix, Composition,
+        (Freq/Counts/MFI heatmap+volcano, Composition,
         Sample PCA) -- covers every result kind automatically since they
         all go through _add_results_tab's maker/maker_kwargs registry."""
         items = []
@@ -7792,7 +7664,7 @@ class GroupsStatsTab(QWidget):
 
     def _has_results_tab(self, key: str) -> bool:
         """True if a results tab carrying this key is already showing —
-        avoids adding a duplicate Confusion Matrix / Composition tab on
+        avoids adding a duplicate Composition tab on
         every refresh() once it's been drawn once this session."""
         for i in range(self._results_tabs.count()):
             widget = self._results_tabs.widget(i)
@@ -7802,25 +7674,13 @@ class GroupsStatsTab(QWidget):
 
     def refresh_theme_dependent_result_tabs(self):
         """
-        Confusion Matrix / Composition Barplot aren't tied to a single
-        cached 'last drawn from' call the way Stats' Freq/MFI/Counts
-        results are (_draw_results), so a plain theme change wouldn't
-        otherwise touch them. Re-render each in place, using exactly the
-        same persisted state (state.confusion_df / state.composition_df,
-        etc.) the startup tab-restore logic already uses, only if that
-        tab is actually currently open.
+        The Composition Barplot isn't tied to a single cached 'last drawn
+        from' call the way Stats' Freq/MFI/Counts results are
+        (_draw_results), so a plain theme change wouldn't otherwise touch
+        it. Re-render it in place, using exactly the same persisted state
+        (state.composition_df, etc.) the startup tab-restore logic
+        already uses, only if that tab is actually currently open.
         """
-        if self.state.confusion_df is not None and self._has_results_tab('confusion_matrix'):
-            fig_cm = self._make_confusion_matrix_figure(
-                self.state.confusion_df, run_label=self.state.confusion_run_label,
-            )
-            self._add_results_tab(
-                fig_cm, "Confusion Matrix", "confusion_matrix",
-                maker=self._make_confusion_matrix_figure,
-                maker_kwargs=dict(conf_df=self.state.confusion_df,
-                                  run_label=self.state.confusion_run_label),
-                key="confusion_matrix",
-            )
         if self.state.composition_df is not None and self._has_results_tab('composition_barplot'):
             fig_comp = self._make_composition_figure(
                 self.state.composition_df, as_pct=self.state.composition_as_pct,
@@ -7854,9 +7714,9 @@ class GroupsStatsTab(QWidget):
     def _remove_results_tab_by_key(self, key: str):
         """Remove the results tab whose container carries this key, if
         present. Used by _draw_results to clear only its own four tabs
-        (Freq/MFI heatmap/volcano) rather than every tab — Confusion
-        Matrix and Composition Barplot are independent and must survive a
-        Run Statistics (re-)run."""
+        (Freq/MFI heatmap/volcano) rather than every tab — the
+        Composition Barplot is independent and must survive a Run
+        Statistics (re-)run."""
         for i in range(self._results_tabs.count()):
             widget = self._results_tabs.widget(i)
             if widget is not None and widget.property('_tab_key') == key:
@@ -7891,8 +7751,8 @@ class GroupsStatsTab(QWidget):
             return
 
         self._last_drawn_cluster_names = dict(self.state.cluster_names)
-        # Remove only this method's own tabs (by key) — leaves Confusion
-        # Matrix / Composition Barplot (and anything else) untouched.
+        # Remove only this method's own tabs (by key) — leaves the
+        # Composition Barplot (and anything else) untouched.
         # Done immediately (not after the background build) so a stale
         # previous comparison's plots don't linger while the new ones
         # are being built.
@@ -13043,7 +12903,7 @@ class PluginWidget(QWidget):
         if hasattr(self, 'groups_stats_tab'):
             self.groups_stats_tab._clear_stale_run_results()
             self.groups_stats_tab._populate_run_combo()
-            self.groups_stats_tab._sync_confusion_composition_to_run()
+            self.groups_stats_tab._sync_composition_to_run()
             self.groups_stats_tab._populate_trex_dr_combo()
             self.groups_stats_tab._update_run_button()
         if hasattr(self, 'workspace_tab'):
@@ -13827,10 +13687,6 @@ class PluginWidget(QWidget):
             ('stats_run_label',   self.state.stats_run_label),
             ('stats_run_id',      self.state.stats_run_id),
             ('stats_data_key',    self.state.stats_data_key),
-            ('confusion_df',          self.state.confusion_df),
-            ('confusion_run_label',   self.state.confusion_run_label),
-            ('confusion_run_id',      self.state.confusion_run_id),
-            ('confusion_names',       self.state.confusion_names),
             ('composition_df',        self.state.composition_df),
             ('composition_as_pct',    self.state.composition_as_pct),
             ('composition_group_var', self.state.composition_group_var),
@@ -13931,14 +13787,6 @@ class PluginWidget(QWidget):
                 self.state.stats_group_vec = payload['stats_group_vec']
             if isinstance(payload.get('stats_comparisons'), list):
                 self.state.stats_comparisons = payload['stats_comparisons']
-            if isinstance(payload.get('confusion_df'), pd.DataFrame):
-                self.state.confusion_df = payload['confusion_df']
-            if isinstance(payload.get('confusion_run_label'), str):
-                self.state.confusion_run_label = payload['confusion_run_label']
-            if isinstance(payload.get('confusion_run_id'), str):
-                self.state.confusion_run_id = payload['confusion_run_id']
-            if isinstance(payload.get('confusion_names'), dict):
-                self.state.confusion_names = payload['confusion_names']
             if isinstance(payload.get('composition_df'), pd.DataFrame):
                 self.state.composition_df = payload['composition_df']
             if isinstance(payload.get('composition_as_pct'), bool):
@@ -13954,30 +13802,14 @@ class PluginWidget(QWidget):
             if isinstance(payload.get('composition_colors'), dict):
                 self.state.composition_colors = payload['composition_colors']
 
-            # migration for sidecars saved before
-            # confusion_run_id/composition_run_id existed: confusion_df/
-            # composition_df loaded fine above, but the id came back ''
-            # even though confusion_run_label/composition_run_label is a
-            # real (non-"Active (unsaved)") run name. Best-effort
-            # backfill by matching that label against a still-archived
-            # run; if none matches (renamed or deleted since), the id is
-            # unverifiable, so drop the data rather than risk showing it
-            # forever with no way to detect it's gone stale.
-            if (self.state.confusion_df is not None and not self.state.confusion_run_id
-                    and self.state.confusion_run_label not in ('', 'Active (unsaved)')):
-                match = next((e for e in self.state.clustering_runs
-                             if e.get('label') == self.state.confusion_run_label), None)
-                if match is not None:
-                    self.state.confusion_run_id = match.get('run_id', '')
-                    _log.info("_load_model_sidecar: backfilled confusion_run_id=%r "
-                              "from label %r", self.state.confusion_run_id,
-                              self.state.confusion_run_label)
-                else:
-                    _log.info("_load_model_sidecar: dropping unverifiable confusion_df "
-                              "(label %r, no matching run)", self.state.confusion_run_label)
-                    self.state.confusion_df = None
-                    self.state.confusion_run_label = ''
-                    self.state.confusion_names = {}
+            # migration for sidecars saved before composition_run_id
+            # existed: composition_df loaded fine above, but the id came
+            # back '' even though composition_run_label is a real
+            # (non-"Active (unsaved)") run name. Best-effort backfill by
+            # matching that label against a still-archived run; if none
+            # matches (renamed or deleted since), the id is unverifiable,
+            # so drop the data rather than risk showing it forever with
+            # no way to detect it's gone stale.
             if (self.state.composition_df is not None and not self.state.composition_run_id
                     and self.state.composition_run_label not in ('', 'Active (unsaved)')):
                 match = next((e for e in self.state.clustering_runs
@@ -14334,7 +14166,7 @@ class PluginWidget(QWidget):
                 s.stats_run_id,
                 tuple(sorted(s.cluster_names.items())),
                 id(s.freq_results), id(s.counts_results), id(s.mfi_results),
-                id(s.confusion_df), id(s.composition_df),
+                id(s.composition_df),
                 s.composition_as_pct, s.composition_group_var,
                 tuple(sorted(s.marker_roles.items())),
                 tuple(
