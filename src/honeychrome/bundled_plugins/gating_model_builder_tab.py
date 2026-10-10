@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QTreeWidget, QTreeWidgetItem,
     QAbstractItemView, QMenu,
-    QDialog, QDialogButtonBox, QGridLayout,
+    QDialog, QDialogButtonBox, QGridLayout, QTextEdit, QGroupBox,
 )
 
 import honeychrome
@@ -68,6 +68,8 @@ if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
 import ag_core  # noqa: E402
+import ag_flowjo  # noqa: E402
+import ag_review  # noqa: E402
 from ag_core import (  # noqa: E402
     ALGORITHMS_BY_GATE_TYPE,
     ALWAYS_EXCLUDED_CHANNELS,
@@ -230,182 +232,6 @@ def _axis_limits(transforms: dict) -> dict:
         if lim is not None and len(lim) >= 2:
             out[ch] = (float(lim[0]), float(lim[1]))
     return out
-
-
-def _is_singlet_pair(controller, channels: list[str]) -> bool:
-    """True when two channels are the cytometer's forward-scatter singlet
-    pair (area vs height or width).
-
-    Uses the cytometer's canonical names from cytometer_whitelist; for an
-    unrecognised cytometer, falls back to two scatter channels sharing a
-    base name (e.g. 'FSC-A' / 'FSC-H').
-    """
-    if len(channels) < 2:
-        return False
-    pair = set(channels[:2])
-    try:
-        raw = controller.experiment.settings.get('raw', {})
-        canonical = singlet_channels(raw.get('cytometer', ''))
-    except Exception:
-        canonical = None
-    if canonical is not None:
-        area, singlet_y = canonical
-        stem = area.rsplit('-', 1)[0]
-        alternatives = {singlet_y, f'{stem}-H', f'{stem}-W'} - {area}
-        return area in pair and bool(pair & alternatives)
-    unmixed = controller.experiment.settings.get('unmixed', {})
-    pnn = unmixed.get('event_channels_pnn') or []
-    scatter = {pnn[i] for i in unmixed.get('scatter_channel_ids') or [] if 0 <= i < len(pnn)}
-    a, b = channels[:2]
-    return (a in scatter and b in scatter and a != b
-            and a.rsplit('-', 1)[0] == b.rsplit('-', 1)[0])
-
-
-def _infer_gate_type_from_flowkit(gate, controller) -> str:
-    """Infer the gate type ('singlets', '1dsep', '2dsep', 'free') of a
-    FlowKit gate.
-
-        PolygonGate           → 'singlets' on the forward-scatter singlet
-                                pair, otherwise 'free'
-        RectangleGate, 1 dim  → '1dsep'
-        RectangleGate, 2 dims → '1dsep' if one dimension is open-ended,
-                                otherwise '2dsep'
-        QuadrantGate          → '2dsep'
-
-    Other gate types (ellipsoid, Boolean) become 'free'; the user can
-    change the type afterwards.
-    """
-    gtype = getattr(gate, 'gate_type', '')
-    channels = list(gate.get_dimension_ids()) if hasattr(gate, 'get_dimension_ids') else []
-
-    if gtype == 'PolygonGate':
-        return 'singlets' if _is_singlet_pair(controller, channels) else 'free'
-    if gtype == 'QuadrantGate':
-        return '2dsep'
-    if gtype == 'RectangleGate':
-        dims = list(getattr(gate, 'dimensions', []) or [])
-        n_unbounded = sum(1 for d in dims if _is_unbounded(d))
-        if len(dims) == 1 or n_unbounded == 1:
-            return '1dsep'
-        return '2dsep'
-    return 'free'
-
-
-def _quadrant_divider_range(quadrant, divider_id):
-    """(lo, hi) range of one divider in a FlowKit Quadrant, or None."""
-    getter = getattr(quadrant, 'get_divider_range', None)
-    if callable(getter):
-        try:
-            return getter(divider_id)
-        except Exception:
-            pass
-    ranges = getattr(quadrant, '_divider_ranges', None)
-    if isinstance(ranges, dict):
-        return ranges.get(divider_id)
-    return None
-
-
-def _quadrant_populations(gate) -> tuple[dict, list[str]]:
-    """Populations for an imported QuadrantGate, one per quadrant.
-
-    Each quadrant's region (x-y-, x+y-, x-y+, x+y+) comes from its divider
-    ranges: a quadrant bounded below on a divider lies on that divider's
-    positive side. Returns (populations, [x channel, y channel]).
-    """
-    dividers = list(getattr(gate, 'dimensions', []) or [])[:2]
-    channels = [getattr(d, 'dimension_ref', None) for d in dividers]
-    positions = {'x-y-': 3, 'x+y-': 4, 'x-y+': 1, 'x+y+': 2}
-    order = {'x-y-': 0, 'x+y-': 1, 'x-y+': 2, 'x+y+': 3}
-    pops = {}
-    for qid, quadrant in (getattr(gate, 'quadrants', {}) or {}).items():
-        signs = []
-        for div in dividers:
-            rng = _quadrant_divider_range(quadrant, getattr(div, 'id', None))
-            lo = rng[0] if isinstance(rng, (list, tuple)) and rng else None
-            signs.append('+' if lo is not None else '-')
-        if len(signs) != 2:
-            continue
-        region = f'x{signs[0]}y{signs[1]}'
-        pops[str(qid)] = {'label': str(qid), 'label_pos': positions[region], 'region': region}
-    pops = dict(sorted(pops.items(), key=lambda kv: order[kv[1]['region']]))
-    return pops, [c for c in channels if c]
-
-
-def _range_gate_population(gate, transforms: dict) -> str | None:
-    """Which default population ('neg'/'pos', or a quadrant region) a
-    Honeychrome range or rectangle gate encloses, judged from where its
-    bounds sit on the display axis. Used to point child gates at the
-    right parent population."""
-    dims = list(getattr(gate, 'dimensions', []) or [])
-    regions = []
-    for d in dims:
-        lo = getattr(d, 'min', None)
-        ch = getattr(d, 'id', None)
-        lim = getattr(transforms.get(ch), 'limits', None) if ch else None
-        if lo is None or (isinstance(lo, float) and not np.isfinite(lo)):
-            regions.append('-')
-            continue
-        if lim is not None and len(lim) >= 2:
-            span = float(lim[1]) - float(lim[0])
-            regions.append('-' if float(lo) <= float(lim[0]) + 0.02 * span else '+')
-        else:
-            regions.append('+')
-    if len(regions) == 1:
-        return 'pos' if regions[0] == '+' else 'neg'
-    if len(regions) == 2:
-        return {'--': 'DN', '+-': 'X+', '-+': 'Y+', '++': 'DP'}[''.join(regions)]
-    return None
-
-
-def _is_unbounded(dim) -> bool:
-    """Return True if a flowkit Dimension is open on at least one side.
-
-    A dimension is considered open if either ``min`` or ``max`` is
-    ``None``, NaN, or ±infinity.  flowkit's exact representation varies
-    by version (some serialise unbounded sides as None; some as ±inf),
-    so all three spellings are accepted.
-    """
-    lo = getattr(dim, 'min', None)
-    hi = getattr(dim, 'max', None)
-
-    def _open(v) -> bool:
-        if v is None:
-            return True
-        try:
-            vf = float(v)
-        except (TypeError, ValueError):
-            return False
-        return (vf != vf) or (vf == float('inf')) or (vf == float('-inf'))
-
-    return _open(lo) or _open(hi)
-
-
-def _polygon_vertices(gate) -> list[tuple[float, float]] | None:
-    """Return the vertex list for a PolygonGate, or None for non-polygon gates."""
-    if getattr(gate, 'gate_type', '') != 'PolygonGate':
-        return None
-    v = getattr(gate, 'vertices', None) or []
-    return [(float(p[0]), float(p[1])) for p in v]
-
-
-def _rectangle_corners(gate) -> list[tuple[float, float]] | None:
-    """Return the four corners of a RectangleGate as a closed-style list.
-
-    Returns ``None`` for non-rectangle gates, single-dim gates (which
-    have no rectangle to draw), or rectangles where one or both
-    dimensions are unbounded.  Used by the Hierarchy tab's preview plot
-    to overlay the original gate geometry on a density heatmap.
-    """
-    if getattr(gate, 'gate_type', '') != 'RectangleGate':
-        return None
-    dims = list(getattr(gate, 'dimensions', []) or [])
-    if len(dims) != 2:
-        return None
-    if _is_unbounded(dims[0]) or _is_unbounded(dims[1]):
-        return None
-    x0, x1 = float(dims[0].min), float(dims[0].max)
-    y0, y1 = float(dims[1].min), float(dims[1].max)
-    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
 
 
 def _sample_label(key: str) -> str:
@@ -998,7 +824,10 @@ class GateEditDialog(QDialog):
     def _populate_algorithm_combo(self):
         """Populate the algorithm combo from the current gate type."""
         gate_type = self.cb_type.currentText()
-        algos = ALGORITHMS_BY_GATE_TYPE.get(gate_type, [])
+        algos = list(ALGORITHMS_BY_GATE_TYPE.get(gate_type, []))
+        # 'imported' applies the stored boundary, so it needs a boundary of this gate type.
+        if not self.gate_def.get('template') or self.gate_def.get('gate_type') != gate_type:
+            algos = [a for a in algos if a != ag_core.ALGORITHM_IMPORTED]
         prev = self.cb_algorithm.currentText() or self.gate_def.get('algorithm', '')
         self.cb_algorithm.blockSignals(True)
         try:
@@ -1278,6 +1107,339 @@ class _RecommendWorker(QThread):
             self.finished.emit(False, str(exc), {})
 
 
+def _flowjo_experiment_channels(controller) -> 'ag_flowjo.ExperimentChannels':
+    """The experiment's unmixed channels in the form ag_flowjo aligns against."""
+    import honeychrome.settings as hc_settings
+    channels = _experiment_channels(controller)
+    fluorescence = _fluorescence_channels(controller)
+    excluded = set(ALWAYS_EXCLUDED_CHANNELS) | set(getattr(hc_settings, 'af_channels', ()) or ())
+    scatter = [c for c in channels if c not in fluorescence and c not in excluded]
+    cytometer = ''
+    try:
+        cytometer = controller.experiment.settings.get('raw', {}).get('cytometer', '')
+    except Exception:
+        pass
+    transforms = {}
+    for ch, tr in (controller.unmixed_transformations or {}).items():
+        try:
+            transforms[ch] = ag_core.transform_params(tr)
+        except Exception:
+            continue
+    return ag_flowjo.ExperimentChannels(
+        channels=channels,
+        fluorescence=fluorescence,
+        scatter=scatter,
+        antigens=_antigen_map(controller),
+        transforms=transforms,
+        singlet_pair=singlet_channels(cytometer),
+    )
+
+
+def _flowjo_matchers():
+    """(fluorophore matcher, marker matcher) from the label databases."""
+    from honeychrome.controller_components.label_matching import (
+        get_fluorophore_db, get_marker_db, match_fluorophore, match_marker,
+    )
+    try:
+        fluor_db, marker_db = get_fluorophore_db(), get_marker_db()
+    except Exception:
+        return None, None
+    return (lambda n: match_fluorophore(n, fluor_db),
+            lambda n: match_marker(n, marker_db))
+
+
+class FlowJoImportPanel(QGroupBox):
+    """Expandable section of the Hierarchy tab for importing a FlowJo workspace.
+
+    Opens when a workspace is chosen. It shows the gating source, the
+    proposed channel for every FlowJo parameter the gates use (green:
+    confident, amber: check, red: unmatched and not yet resolved, grey:
+    dropped), and inline messages about populations that cannot be imported
+    and conversions that change a gate. Unmatched parameters must be
+    assigned a channel or dropped before the import buttons enable.
+    Populations using a dropped parameter, and those below them, are not
+    imported. The model changes only when an import button is pressed,
+    which emits ``importRequested(gate_defs, report, replace, name)``.
+    """
+
+    importRequested = Signal(object, object, bool, str)
+
+    _DROP = "(drop)"
+    _DROPPED = "__dropped__"
+    _UNSET = "__unset__"
+    _COLUMNS = ["FlowJo parameter", "Label", "Experiment channel", "Match", "Note"]
+    _GREEN = QColor(222, 244, 226)
+    _AMBER = QColor(255, 243, 205)
+    _RED = QColor(250, 218, 218)
+    _GREY = QColor(236, 236, 236)
+
+    def __init__(self, controller, existing_names, parent=None):
+        super().__init__("FlowJo import", parent)
+        self.controller = controller
+        self._existing_names = existing_names
+        self.workspace = None
+        self.exp = None
+        self._fluor_match = self._marker_match = None
+        self._combos: dict = {}
+        self._matches: dict = {}
+        self._params: list = []
+        self._name = ''
+        self.setCheckable(True)
+        self.setChecked(True)
+
+        self._body = QWidget()
+        body = QVBoxLayout(self._body)
+        body.setContentsMargins(0, 0, 0, 0)
+        outer = QVBoxLayout(self)
+        outer.addWidget(self._body)
+        self.toggled.connect(self._body.setVisible)
+
+        self.lbl_status = QLabel()
+        self.lbl_status.setWordWrap(True)
+        self.lbl_status.setTextFormat(Qt.RichText)
+        body.addWidget(self.lbl_status)
+
+        form = QFormLayout()
+        self.combo_source = QComboBox()
+        form.addRow("Gating source:", self.combo_source)
+        body.addLayout(form)
+
+        self.tbl = QTableWidget(0, len(self._COLUMNS))
+        self.tbl.setHorizontalHeaderLabels(self._COLUMNS)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        for col, width in enumerate((160, 110, 190, 90)):
+            self.tbl.setColumnWidth(col, width)
+        self.tbl.setMinimumHeight(150)
+        self.tbl.setMaximumHeight(260)
+        body.addWidget(self.tbl)
+
+        opts = QHBoxLayout()
+        self.btn_drop_unmatched = QPushButton("Drop all unmatched")
+        self.btn_drop_unmatched.setToolTip(
+            "Drop every unmatched parameter, and with it the populations that use it.")
+        self.chk_merge = QCheckBox("Merge sibling gates that share thresholds")
+        self.chk_merge.setChecked(True)
+        self.chk_merge.setToolTip(
+            "Sibling rectangles on the same axes whose kept thresholds agree "
+            "(FlowJo quadrants, split gates) become one gate with one "
+            "population each.")
+        self.spin_tol = QDoubleSpinBox()
+        self.spin_tol.setDecimals(3)
+        self.spin_tol.setRange(0.0, 1.0)
+        self.spin_tol.setSingleStep(0.005)
+        self.spin_tol.setValue(0.01)
+        self.spin_tol.setToolTip("Largest difference, in display units, between merged thresholds.")
+        opts.addWidget(self.btn_drop_unmatched)
+        opts.addWidget(self.chk_merge)
+        opts.addWidget(QLabel("Tolerance:"))
+        opts.addWidget(self.spin_tol)
+        opts.addStretch()
+        body.addLayout(opts)
+
+        self.txt_notes = QTextEdit()
+        self.txt_notes.setReadOnly(True)
+        self.txt_notes.setMaximumHeight(110)
+        self.txt_notes.setPlaceholderText("Populations that cannot be imported and gate conversions are listed here.")
+        body.addWidget(self.txt_notes)
+
+        buttons = QHBoxLayout()
+        self.btn_add = QPushButton("Import all — add")
+        self.btn_replace = QPushButton("Import all — replace")
+        self.btn_cancel = QPushButton("Close")
+        self.btn_add.setToolTip("Add the imported gates to the model's existing gates.")
+        self.btn_replace.setToolTip("Replace the model's gates with the imported ones.")
+        buttons.addStretch()
+        for b in (self.btn_add, self.btn_replace, self.btn_cancel):
+            buttons.addWidget(b)
+        body.addLayout(buttons)
+
+        self.combo_source.currentIndexChanged.connect(self._load_source)
+        self.chk_merge.toggled.connect(self._refresh)
+        self.spin_tol.valueChanged.connect(self._refresh)
+        self.btn_drop_unmatched.clicked.connect(self._drop_unmatched)
+        self.btn_add.clicked.connect(lambda: self._import(replace=False))
+        self.btn_replace.clicked.connect(lambda: self._import(replace=True))
+        self.btn_cancel.clicked.connect(self.close_section)
+        self.setVisible(False)
+
+    # -- opening and closing ------------------------------------------------
+
+    def open_workspace(self, path: str):
+        """Read *path* and show its alignment for review."""
+        self._name = Path(path).name
+        self.setVisible(True)
+        self.setChecked(True)
+        self.setTitle(f"FlowJo import — {self._name}")
+        self.workspace = None
+        self.combo_source.blockSignals(True)
+        self.combo_source.clear()
+        self.combo_source.blockSignals(False)
+        self.tbl.setRowCount(0)
+        self.txt_notes.clear()
+        try:
+            workspace = ag_flowjo.read_workspace(path)
+        except Exception as exc:
+            self._fail(f"Could not read the workspace: {exc}")
+            return
+        default = workspace.default_source()
+        if default is None:
+            self._fail("The workspace contains no gated populations.")
+            return
+        self.workspace = workspace
+        self.exp = _flowjo_experiment_channels(self.controller)
+        self._fluor_match, self._marker_match = _flowjo_matchers()
+        self.combo_source.blockSignals(True)
+        for s in workspace.sources:
+            if s.n_populations:
+                self.combo_source.addItem(s.title, s)
+        for i in range(self.combo_source.count()):
+            if self.combo_source.itemData(i) is default:
+                self.combo_source.setCurrentIndex(i)
+        self.combo_source.blockSignals(False)
+        self._load_source()
+
+    def close_section(self):
+        self.setVisible(False)
+
+    def collapse(self, summary: str):
+        """Collapse to a one-line summary after an import."""
+        self.setTitle(f"FlowJo import — {self._name}: {summary}")
+        self.setChecked(False)
+
+    def _fail(self, message: str):
+        self.lbl_status.setText(f"<span style='color:#a00000'>{message}</span>")
+        for w in (self.btn_add, self.btn_replace, self.btn_drop_unmatched):
+            w.setEnabled(False)
+
+    # -- mapping table ------------------------------------------------------
+
+    def _source(self):
+        return self.combo_source.currentData()
+
+    def _load_source(self):
+        """Propose a mapping for the selected source and fill the table."""
+        source = self._source()
+        self.tbl.setRowCount(0)
+        self._combos, self._matches, self._params = {}, {}, []
+        if source is None or self.workspace is None:
+            return
+        self._params = ag_flowjo.gated_parameters(source)
+        proposal = ag_flowjo.align_parameters(
+            self._params, source.labels, self.exp, affixes=self.workspace.affixes,
+            fluor_match=self._fluor_match, marker_match=self._marker_match)
+        self.tbl.setRowCount(len(self._params))
+        for row, param in enumerate(self._params):
+            hit = proposal.get(param, {})
+            channel = hit.get('channel')
+            self._matches[param] = hit.get('method') if channel else None
+            self.tbl.setItem(row, 0, QTableWidgetItem(param))
+            self.tbl.setItem(row, 1, QTableWidgetItem(hit.get('label') or source.labels.get(param, '') or ''))
+            combo = QComboBox()
+            if not channel:
+                combo.addItem("— choose a channel or drop —", self._UNSET)
+            combo.addItem(self._DROP, self._DROPPED)
+            for ch in self.exp.channels:
+                if ch not in ALWAYS_EXCLUDED_CHANNELS or ch == channel:
+                    combo.addItem(ch, ch)
+            combo.setCurrentIndex(max(combo.findData(channel), 0) if channel else 0)
+            combo.currentIndexChanged.connect(lambda _i, p=param: self._on_edited(p))
+            self.tbl.setCellWidget(row, 2, combo)
+            self._combos[param] = combo
+            self.tbl.setItem(row, 3, QTableWidgetItem(hit.get('method') or 'unmatched'))
+            self.tbl.setItem(row, 4, QTableWidgetItem(hit.get('note') or ''))
+        for param in self._params:
+            self._colour_row(param)
+        self._refresh()
+
+    def _on_edited(self, param: str):
+        row = self._params.index(param)
+        value = self._combos[param].currentData()
+        if value not in (self._UNSET, self._DROPPED):
+            self._matches[param] = ag_flowjo.MATCH_MANUAL
+            self.tbl.item(row, 3).setText(ag_flowjo.MATCH_MANUAL)
+        self._colour_row(param)
+        self._refresh()
+
+    def _colour_row(self, param: str):
+        row = self._params.index(param)
+        value = self._combos[param].currentData()
+        if value == self._UNSET:
+            colour = self._RED
+        elif value == self._DROPPED:
+            colour = self._GREY
+        elif self._matches.get(param) in ag_flowjo.CONFIDENT_MATCHES:
+            colour = self._GREEN
+        else:
+            colour = self._AMBER
+        for col in (0, 1, 3, 4):
+            self.tbl.item(row, col).setBackground(colour)
+
+    def _drop_unmatched(self):
+        for param, combo in self._combos.items():
+            if combo.currentData() == self._UNSET:
+                combo.setCurrentIndex(combo.findData(self._DROPPED))
+
+    def mapping(self) -> dict:
+        """{FlowJo parameter: experiment channel, or None when dropped or unresolved}."""
+        return {p: (None if c.currentData() in (self._UNSET, self._DROPPED) else c.currentData())
+                for p, c in self._combos.items()}
+
+    def _unresolved(self) -> list:
+        return [p for p, c in self._combos.items() if c.currentData() == self._UNSET]
+
+    # -- summary and messages ----------------------------------------------
+
+    def _build(self, replace: bool = True):
+        source = self._source()
+        return ag_flowjo.build_gate_definitions(
+            source, self.mapping(), self.exp,
+            merge_siblings=self.chk_merge.isChecked(),
+            merge_tolerance=float(self.spin_tol.value()),
+            existing_names=set() if replace else set(self._existing_names()),
+            workspace_name=self._name)
+
+    def _refresh(self):
+        source = self._source()
+        if source is None or self.workspace is None:
+            return
+        unresolved = self._unresolved()
+        problems = ag_flowjo.mapping_problems(self.mapping())
+        plan = ag_flowjo.plan_import(source, self.mapping())
+        lines = [f"{len(plan.keep)} of {source.n_populations} populations will be imported."]
+        if unresolved:
+            lines.append(f"<span style='color:#a00000'>{len(unresolved)} parameter(s) unmatched: "
+                         "choose a channel or drop them to continue.</span>")
+        lines += [f"<span style='color:#a00000'>{p}</span>" for p in problems]
+        self.lbl_status.setText("<br>".join(lines))
+        messages = list(plan.messages())
+        if not unresolved and not problems and plan.keep:
+            try:
+                _gate_defs, report = self._build()
+                for gate, notes in report['notes'].items():
+                    messages += [f"{gate}: {note}" for note in notes]
+            except Exception as exc:
+                messages.append(f"Conversion failed: {exc}")
+        self.txt_notes.setPlainText("\n".join(messages))
+        ready = bool(plan.keep) and not unresolved and not problems
+        self.btn_add.setEnabled(ready)
+        self.btn_replace.setEnabled(ready)
+        self.btn_drop_unmatched.setEnabled(bool(unresolved))
+
+    def _import(self, replace: bool):
+        try:
+            gate_defs, report = self._build(replace)
+        except Exception as exc:
+            self._fail(f"Import failed: {exc}")
+            return
+        if not gate_defs:
+            self.lbl_status.setText("No populations could be converted to gates.")
+            return
+        self.importRequested.emit(gate_defs, report, replace, self._name)
+
+
 class HierarchyTab(QWidget):
     """Tab 0 — Gate Hierarchy.
 
@@ -1312,11 +1474,15 @@ class HierarchyTab(QWidget):
     COL_PARENT_POP = 6
     COL_ALGORITHM  = 7
     COL_STATUS     = 8
+    COL_CONVERT    = 9
 
     _COLUMN_LABELS = [
         "#", "Gate name", "Type", "X axis", "Y axis",
-        "Parent gate", "Parent population", "Algorithm", "Status",
+        "Parent gate", "Parent population", "Algorithm", "Status", "Imported boundary",
     ]
+
+    # Emitted after gates are imported, so the plugin can open the Review tab.
+    gatesImported = Signal()
 
     def __init__(self, state: GatingModelState, bus, controller, parent=None):
         super().__init__(parent)
@@ -1350,14 +1516,21 @@ class HierarchyTab(QWidget):
         # Control bar.
         ctrl_row = QHBoxLayout()
         self.btn_import   = QPushButton("Import from Hierarchy")
+        self.btn_flowjo   = QPushButton("Import FlowJo…")
+        self.btn_convert_all = QPushButton("Convert all to trainable")
+        self.btn_convert_all.setToolTip(
+            "Switch every gate that uses its imported boundary to a learning "
+            "algorithm, so Train calculates it from the training samples. "
+            "Free polygons keep their drawn boundary: no algorithm reproduces a drawn shape."
+        )
         self.btn_refresh  = QPushButton("Refresh from Hierarchy")
         self.btn_add      = QPushButton("Add gate manually")
         self.btn_advanced = QPushButton("Advanced…")
         self.btn_delete   = QPushButton("Delete")
 
         self.btn_import.setToolTip(
-            "Snapshot the current controller.unmixed_gating into the model. "
-            "Replaces any existing gates in the model."
+            "Copy the gates drawn on the main plots into the model, as drawn "
+            "(algorithm 'imported'). Replaces any existing gates in the model."
         )
         self.btn_refresh.setToolTip(
             "Merge new gates from controller.unmixed_gating into the model. "
@@ -1365,17 +1538,31 @@ class HierarchyTab(QWidget):
             "from the source hierarchy are marked Stale."
         )
 
+        self.btn_flowjo.setToolTip(
+            "Import the gating strategy of a FlowJo workspace (.wsp) or "
+            "template (.wspt), matching its parameters to this experiment's "
+            "channels. Gates keep their FlowJo boundaries (algorithm 'imported')."
+        )
         self.btn_import.clicked.connect(self._on_import_clicked)
+        self.btn_flowjo.clicked.connect(self._on_import_flowjo_clicked)
+        self.btn_convert_all.clicked.connect(self._convert_all_gates)
         self.btn_refresh.clicked.connect(self._on_refresh_clicked)
         self.btn_add.clicked.connect(self._on_add_clicked)
         self.btn_advanced.clicked.connect(self._on_advanced_clicked)
         self.btn_delete.clicked.connect(self._on_delete_clicked)
 
-        for b in (self.btn_import, self.btn_refresh, self.btn_add,
+        for b in (self.btn_import, self.btn_flowjo, self.btn_convert_all, self.btn_refresh, self.btn_add,
                   self.btn_advanced, self.btn_delete):
             ctrl_row.addWidget(b)
         ctrl_row.addStretch()
         left_layout.addLayout(ctrl_row)
+
+        self.flowjo_panel = FlowJoImportPanel(
+            self.controller,
+            lambda: {g.get('gate_name') for g in self.state.gate_definitions},
+            parent=self)
+        self.flowjo_panel.importRequested.connect(self._on_flowjo_import_requested)
+        left_layout.addWidget(self.flowjo_panel)
 
         # Tree widget.
         self.tree = QTreeWidget()
@@ -1409,6 +1596,7 @@ class HierarchyTab(QWidget):
         self.tree.setColumnWidth(self.COL_PARENT_POP, 110)
         self.tree.setColumnWidth(self.COL_ALGORITHM,  100)
         self.tree.setColumnWidth(self.COL_STATUS,     90)
+        self.tree.setColumnWidth(self.COL_CONVERT,    130)
         left_layout.addWidget(self.tree)
 
         # Help / status text just under the tree.
@@ -1487,6 +1675,10 @@ class HierarchyTab(QWidget):
     # Public refresh hook — called by PluginWidget on tab activation.
     # ------------------------------------------------------------------
 
+    def refresh_preview(self):
+        """Redraw the preview for the selected gate."""
+        self._update_preview()
+
     def refresh(self):
         """Re-evaluate channel alignment and repopulate the tree.
 
@@ -1510,9 +1702,20 @@ class HierarchyTab(QWidget):
             for g in self._sorted_gate_defs():
                 item = self._build_tree_item(g, experiment_channels)
                 self.tree.addTopLevelItem(item)
+                if g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+                    button = QPushButton("Convert to trainable")
+                    button.setToolTip(
+                        "Use a learning algorithm for this gate instead of the "
+                        "boundary it was imported with.")
+                    button.clicked.connect(
+                        lambda _checked=False, name=g.get('gate_name', ''): self._convert_gate(name))
+                    self.tree.setItemWidget(item, self.COL_CONVERT, button)
         finally:
             self._suppress_item_changed = False
 
+        self.btn_convert_all.setEnabled(any(
+            g.get('algorithm') == ag_core.ALGORITHM_IMPORTED and not ag_review.is_free_shape(g)
+            for g in self.state.gate_definitions))
         n = self.state.n_gates()
         if n == 0:
             self.lbl_summary.setText("No gates loaded — click 'Import from Hierarchy'.")
@@ -1722,14 +1925,24 @@ class HierarchyTab(QWidget):
         act_child = QAction("Add child gate…", menu)
         act_param = QAction("Advanced parameters…", menu)
         act_split = QAction("Split into 1D gates…", menu)
+        act_convert = QAction("Convert to trainable", menu)
+        act_keep = QAction("Keep imported boundary", menu)
 
-        for a in (act_edit, act_dup, act_del, act_child, act_param, act_split):
+        for a in (act_edit, act_dup, act_del, act_child, act_param, act_split,
+                  act_convert, act_keep):
             a.setEnabled(item is not None)
 
         if item is not None:
             gate_name = item.data(0, Qt.UserRole)
             g = self.state.gate_by_name(gate_name)
             act_split.setEnabled(g is not None and g.get('gate_type') == '2dsep')
+            is_imported = g is not None and g.get('algorithm') == ag_core.ALGORITHM_IMPORTED
+            act_convert.setEnabled(is_imported)
+            act_keep.setEnabled(g is not None and not is_imported and bool(g.get('template'))
+                                and g.get('gate_type') in ag_core.ALGORITHMS_BY_GATE_TYPE
+                                and ag_core.ALGORITHM_IMPORTED in ag_core.ALGORITHMS_BY_GATE_TYPE[g['gate_type']])
+            act_convert.triggered.connect(lambda: self._convert_gate(gate_name))
+            act_keep.triggered.connect(lambda: self._keep_imported(gate_name))
 
             act_edit.triggered.connect(lambda: self._edit_gate(gate_name))
             act_dup.triggered.connect(lambda: self._duplicate_gate(gate_name))
@@ -1742,6 +1955,9 @@ class HierarchyTab(QWidget):
             menu.addAction(a)
         menu.addSeparator()
         menu.addAction(act_split)
+        menu.addSeparator()
+        menu.addAction(act_convert)
+        menu.addAction(act_keep)
 
         menu.exec(self.tree.viewport().mapToGlobal(pos))
 
@@ -1778,6 +1994,99 @@ class HierarchyTab(QWidget):
                 "from hierarchy."
             )
         self._recommend_algorithms()
+
+    def _on_import_flowjo_clicked(self):
+        """Choose a FlowJo workspace and expand the import section."""
+        start_dir = ''
+        try:
+            start_dir = str(self.controller.experiment_dir)
+        except Exception:
+            pass
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import FlowJo workspace", start_dir,
+            "FlowJo workspaces (*.wsp *.wspt);;All files (*)",
+        )
+        if path:
+            self.flowjo_panel.open_workspace(path)
+
+    def _on_flowjo_import_requested(self, gate_defs, report, replace: bool, name: str):
+        """Add or replace the model's gates with the imported ones."""
+        if replace:
+            self.state.gate_definitions = []
+            self.state.trained_boundaries = {}
+            self.state.algorithm_recommendations = {}
+        offset = max((int(g.get('gate_number', 0)) for g in self.state.gate_definitions), default=0)
+        for i, gate_def in enumerate(gate_defs, start=1):
+            gate_def['gate_number'] = offset + i
+            self.state.gate_definitions.append(gate_def)
+        self._repopulate_tree()
+        n_dropped = len(report['plan'].dropped)
+        tail = f", {n_dropped} population(s) not imported" if n_dropped else ''
+        self.flowjo_panel.collapse(f"{len(gate_defs)} gate(s) {'replaced' if replace else 'added'}{tail}")
+        self.bus.statusMessage.emit(
+            f"[Gating Model Builder] Imported {len(gate_defs)} gate(s) from {name}{tail}. "
+            "Review them on the Review tab before training."
+        )
+        self.gatesImported.emit()
+
+    def _descendant_names(self, gate_name: str) -> set:
+        out, frontier = set(), {gate_name}
+        while frontier:
+            frontier = {g['gate_name'] for g in self.state.gate_definitions
+                        if g.get('parent_gate') in frontier} - out
+            out |= frontier
+        return out
+
+    def _set_algorithm(self, gate_def: dict, algorithm: str):
+        """Change a gate's algorithm; its training and that of the gates
+        below it no longer applies."""
+        gate_def['algorithm'] = algorithm
+        for name in {gate_def['gate_name']} | self._descendant_names(gate_def['gate_name']):
+            self.state.trained_boundaries.pop(name, None)
+
+    def _convert_gate(self, gate_name: str):
+        """Switch one imported gate to a learning algorithm."""
+        gate_def = self.state.gate_by_name(gate_name)
+        if gate_def is None:
+            return
+        algorithm, note = ag_review.convert_target(
+            gate_def, self.state.algorithm_recommendations.get(gate_name))
+        if algorithm is None:
+            return
+        self._set_algorithm(gate_def, algorithm)
+        self._repopulate_tree()
+        self.bus.statusMessage.emit(
+            f"[Gating Model Builder] '{gate_name}' now uses '{algorithm}'; train to calculate it. {note}".strip())
+
+    def _convert_all_gates(self):
+        """Switch every imported gate that a learning algorithm can reproduce
+        to one; free polygons stay as drawn."""
+        converted, kept = 0, 0
+        for gate_def in self.state.gate_definitions:
+            if gate_def.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
+                continue
+            if ag_review.is_free_shape(gate_def):
+                kept += 1
+                continue
+            algorithm, _note = ag_review.convert_target(
+                gate_def, self.state.algorithm_recommendations.get(gate_def['gate_name']))
+            if algorithm is not None:
+                self._set_algorithm(gate_def, algorithm)
+                converted += 1
+        self._repopulate_tree()
+        tail = (f" {kept} free polygon(s) keep their drawn boundary; convert them one by one "
+                "if you want an ellipse fitted instead.") if kept else ''
+        self.bus.statusMessage.emit(
+            f"[Gating Model Builder] Converted {converted} gate(s) to learning algorithms; "
+            f"train to calculate them.{tail}")
+
+    def _keep_imported(self, gate_name: str):
+        """Return a converted gate to its imported boundary."""
+        gate_def = self.state.gate_by_name(gate_name)
+        if gate_def is None or not gate_def.get('template'):
+            return
+        self._set_algorithm(gate_def, ag_core.ALGORITHM_IMPORTED)
+        self._repopulate_tree()
 
     def _on_refresh_clicked(self):
         added, stale = self._merge_from_unmixed_gating()
@@ -2099,13 +2408,14 @@ class HierarchyTab(QWidget):
     # ------------------------------------------------------------------
 
     def _import_from_unmixed_gating(self, replace: bool = True) -> int:
-        """Snapshot ``controller.unmixed_gating`` into ``state.gate_definitions``.
+        """Copy ``controller.unmixed_gating`` into ``state.gate_definitions``.
 
-        Every gate becomes a gate definition with its type inferred from the
-        FlowKit gate (see _infer_gate_type_from_flowkit). A QuadrantGate
-        becomes one 2dsep gate whose populations are its quadrants; the
-        quadrant nodes themselves are not imported, and gates under a
-        quadrant get that quadrant as their parent population.
+        The hierarchy is converted the same way as a FlowJo workspace (see
+        ag_flowjo): each drawn gate keeps its shape as an ``imported``
+        boundary and its population names. Rectangles on fluorescence
+        channels become threshold gates, quadrants become one threshold gate
+        with a population per quadrant, other shapes stay as drawn, and a
+        gate's parent is the population it was drawn on.
 
         Parameters
         ----------
@@ -2122,22 +2432,18 @@ class HierarchyTab(QWidget):
         gating = getattr(self.controller, 'unmixed_gating', None)
         if gating is None:
             return 0
-
         try:
-            gate_ids = list(gating.get_gate_ids())
+            source = ag_flowjo.source_from_gating(gating)
+            exp = _flowjo_experiment_channels(self.controller)
+            mapping = {p: (p if p in exp.channels else None)
+                       for p in ag_flowjo.gated_parameters(source)}
+            gate_defs, report = ag_flowjo.build_gate_definitions(
+                source, mapping, exp, native_display=True, origin='Experiment hierarchy')
         except Exception as exc:
             self.bus.statusMessage.emit(
                 f"[Gating Model Builder] Could not read unmixed_gating: {exc}"
             )
             return 0
-
-        node_types = {}
-        for gate_name, gate_path in gate_ids:
-            try:
-                node_types[gate_name] = gating._get_gate_node(gate_name, gate_path).gate_type
-            except Exception:
-                node_types[gate_name] = None
-        quadrant_names = {n for n, t in node_types.items() if t == 'Quadrant'}
 
         if replace:
             self.state.gate_definitions = []
@@ -2145,102 +2451,27 @@ class HierarchyTab(QWidget):
             self.state.trained_boundaries = {}
             self.state.algorithm_recommendations = {}
 
-        existing_names = {g.get('gate_name') for g in self.state.gate_definitions}
+        existing = {g.get('gate_name') for g in self.state.gate_definitions}
         next_number = max(
             (int(g.get('gate_number', 0)) for g in self.state.gate_definitions),
             default=0,
         )
         imported = 0
-
-        # get_gate_ids() lists gates top-down, so parents are imported first.
-        for gate_name, gate_path in gate_ids:
-            if gate_name in existing_names or gate_name in quadrant_names:
+        for gate_def in gate_defs:
+            if gate_def['gate_name'] in existing:
                 continue
-            try:
-                gate = gating.get_gate(gate_name)
-            except Exception:
-                continue
-
-            try:
-                gate_def = self._build_gate_def_from_flowkit(
-                    gate, gate_name, tuple(gate_path), next_number + 1,
-                    gating, quadrant_names,
-                )
-            except Exception as exc:
-                self.bus.statusMessage.emit(
-                    f"[Gating Model Builder] Could not import '{gate_name}': {exc}"
-                )
-                continue
-            self.state.gate_definitions.append(gate_def)
-            existing_names.add(gate_name)
             next_number += 1
+            gate_def['gate_number'] = next_number
+            self.state.gate_definitions.append(gate_def)
             imported += 1
 
+        dropped = report['plan'].messages()
+        if dropped:
+            self.bus.statusMessage.emit(
+                f"[Gating Model Builder] {len(dropped)} branch(es) of the hierarchy not "
+                f"imported. First: {dropped[0]}"
+            )
         return imported
-
-    def _build_gate_def_from_flowkit(self, gate, gate_name: str, gate_path: tuple,
-                                     gate_number: int, gating=None,
-                                     quadrant_names: set | None = None) -> dict:
-        """Construct a gate definition from one FlowKit gate.
-
-        The parent population of a child gate is the region its source
-        parent gate covered: the enclosing quadrant, the 'pos' or 'neg'
-        side of a range gate, or the single population of a polygon.
-        """
-        quadrant_names = quadrant_names or set()
-        transforms = getattr(self.controller, 'unmixed_transformations', None) or {}
-        gate_type = _infer_gate_type_from_flowkit(gate, self.controller)
-        populations = _default_populations_for_type(gate_type)
-
-        if getattr(gate, 'gate_type', '') == 'QuadrantGate':
-            populations, channels = _quadrant_populations(gate)
-            if len(populations) != 4:
-                raise ValueError('quadrant gate without four quadrants')
-        else:
-            channels = list(gate.get_dimension_ids()) if hasattr(gate, 'get_dimension_ids') else []
-        marker_x = channels[0] if len(channels) > 0 else ''
-        marker_y = channels[1] if len(channels) > 1 else None
-        if gate_type == '1dsep':
-            # Keep only the bounded axis of a half-plane rectangle.
-            dims = list(getattr(gate, 'dimensions', []) or [])
-            bounded_idx = [i for i, d in enumerate(dims) if not _is_unbounded(d)]
-            if bounded_idx and len(channels) > bounded_idx[0]:
-                marker_x = channels[bounded_idx[0]]
-            marker_y = None
-
-        parent_gate: str | None = None
-        parent_popul = 'root'
-        tail = gate_path[-1] if gate_path else 'root'
-        if tail in quadrant_names and len(gate_path) >= 2:
-            parent_gate, parent_popul = str(gate_path[-2]), str(tail)
-        elif tail != 'root':
-            parent_gate = str(tail)
-            parent_def = self.state.gate_by_name(parent_gate)
-            pops = list((parent_def or {}).get('populations') or {})
-            parent_popul = pops[0] if pops else 'root'
-            if parent_def is not None and gating is not None \
-                    and parent_def.get('gate_type') in ag_core.THRESHOLD_TYPES:
-                try:
-                    source = _range_gate_population(gating.get_gate(parent_gate), transforms)
-                except Exception:
-                    source = None
-                if source in pops:
-                    parent_popul = source
-
-        return {
-            'gate_number':   gate_number,
-            'gate_name':     gate_name,
-            'gate_type':     gate_type,
-            'gate_marker_x': marker_x,
-            'gate_marker_y': marker_y,
-            'parent_gate':   parent_gate,
-            'parent_popul':  parent_popul,
-            'populations':   populations,
-            'algorithm':     _default_algorithm_for_type(gate_type),
-            'gate_param':    {},
-            'stats_parent':  {},
-            'origin_gate':   None,
-        }
 
     def _merge_from_unmixed_gating(self) -> tuple[int, int]:
         """Add new gates from the live hierarchy; mark removed ones Stale.
@@ -2367,7 +2598,6 @@ class HierarchyTab(QWidget):
         title_bits = [f"<b>{g.get('gate_name', '')}</b>",
                       f"type={g.get('gate_type', '')}",
                       f"algo={g.get('algorithm', '')}"]
-        self.lbl_preview_title.setText(" — ".join(title_bits))
 
         transforms = self.controller.unmixed_transformations or {}
         tr_x = transforms.get(ch_x)
@@ -2388,7 +2618,10 @@ class HierarchyTab(QWidget):
         self._preview_img.setLookupTable(rgba_lut)
 
         # --- Load raw unmixed events ---
-        raw_data = self._load_preview_events_raw()
+        raw_data, parent_note = self._preview_events(g)
+        if parent_note:
+            title_bits.append(parent_note)
+        self.lbl_preview_title.setText(" — ".join(title_bits))
 
         # --- Histogram / heatmap background ---
         if raw_data is not None and tr_x is not None and ch_x in pnn:
@@ -2434,12 +2667,7 @@ class HierarchyTab(QWidget):
                 self._preview_vb.enableAutoRange(axis=self._preview_vb.YAxis, enable=True)
 
         # --- Gate geometry overlay ---
-        flowkit_gate = self._lookup_flowkit_gate(g.get('gate_name', ''))
-        drew_geometry = False
-        if flowkit_gate is not None:
-            drew_geometry = self._draw_flowkit_geometry(flowkit_gate)
-        if not drew_geometry:
-            drew_geometry = self._draw_trained_boundary(g)
+        drew_geometry = self._draw_trained_boundary(g)
 
         if not drew_geometry and raw_data is None:
             txt = pg.TextItem(
@@ -2450,93 +2678,77 @@ class HierarchyTab(QWidget):
             )
             self._preview_vb.addItem(txt)
 
-    def _load_preview_events_raw(self) -> 'np.ndarray | None':
-        """Return the controller's currently-loaded unmixed event array.
+    def _preview_events(self, gate_def: dict) -> tuple:
+        """Events of the gate's parent population, and a note for the title.
 
-        Uses controller.unmixed_event_data directly — no file I/O, always
-        reflects the sample the user is actively looking at in the main window.
-        Returns float64 (n_events, n_channels) raw unmixed, no logicle applied.
-        Subsamples to settings.max_display_events if needed.
+        Returns ``(events, note)``. *events* is the displayed sample's
+        unmixed array restricted to the parent population (subsampled to
+        the display cap), or None when there is nothing to plot. The note
+        gives the parent and its event count, or says why the parent could
+        not be evaluated and all events are shown instead.
         """
         import honeychrome.settings as hc_settings
 
         data = getattr(self.controller, 'unmixed_event_data', None)
         if data is None or len(data) == 0:
-            return None
+            return None, ''
 
         cap = int(getattr(hc_settings, 'max_display_events', 500_000))
         if len(data) > cap:
             rng = np.random.default_rng(0)
-            data = data[rng.choice(len(data), cap, replace=False)]
-        return data
+            data = data[np.sort(rng.choice(len(data), cap, replace=False))]
 
-    def _lookup_flowkit_gate(self, gate_name: str):
-        """Return the flowkit gate object for *gate_name*, or None."""
-        if not gate_name:
-            return None
-        gating = getattr(self.controller, 'unmixed_gating', None)
-        if gating is None:
-            return None
+        parent_gate = gate_def.get('parent_gate')
+        parent_popul = gate_def.get('parent_popul') or 'root'
+        label = f"{parent_gate}/{parent_popul}" if parent_gate else 'root'
+        mask = self._parent_event_mask(gate_def, data)
+        if mask is None:
+            note = f"parent {label} could not be evaluated; showing all {len(data):,} events"
+        else:
+            data = data[mask]
+            note = f"parent {label}: {len(data):,} events"
+            if len(data) == 0:
+                return None, note + " (empty)"
+        return data, note
+
+    def _parent_event_mask(self, gate_def: dict, data: np.ndarray):
+        """Boolean mask over *data* of the events in the gate's parent
+        population, or None when the parent cannot be evaluated."""
+        if not gate_def.get('parent_gate'):
+            return np.ones(len(data), dtype=bool)
         try:
-            return gating.get_gate(gate_name)
-        except Exception:
+            return self._model_parent_mask(gate_def, data)
+        except Exception as exc:
+            log.warning("preview: parent population of %s not evaluated: %s",
+                        gate_def.get('gate_name'), exc)
             return None
 
-    def _draw_flowkit_geometry(self, gate) -> bool:
-        """Render a flowkit gate's geometry into the preview plot.
-
-        Returns True if anything was drawn, False if the gate type is
-        unrecognised or has nothing useful to show.
-        """
-        gtype = getattr(gate, 'gate_type', '')
-
-        if gtype == 'PolygonGate':
-            verts = _polygon_vertices(gate)
-            if not verts:
-                return False
-            # Close the polygon for a clean outline.
-            closed = list(verts) + [verts[0]]
-            xs = [p[0] for p in closed]
-            ys = [p[1] for p in closed]
-            line_item = pg.PlotDataItem(xs, ys, pen=pg.mkPen(color=(30, 160, 50), width=2))
-            self._preview_vb.addItem(line_item)
-            return True
-
-        if gtype == 'RectangleGate':
-            corners = _rectangle_corners(gate)
-            if corners is not None:
-                xs = [p[0] for p in corners]
-                ys = [p[1] for p in corners]
-                line_item = pg.PlotDataItem(xs, ys,
-                                            pen=pg.mkPen(color=(30, 160, 50), width=2))
-                self._preview_vb.addItem(line_item)
-                return True
-            dims = list(getattr(gate, 'dimensions', []) or [])
-            for d in dims:
-                if _is_unbounded(d):
-                    continue
-                if d.min is not None:
-                    line = pg.InfiniteLine(pos=float(d.min), angle=90,
-                                           pen=pg.mkPen(color=(30, 160, 50), width=2))
-                    self._preview_vb.addItem(line)
-                if d.max is not None:
-                    line = pg.InfiniteLine(pos=float(d.max), angle=90,
-                                           pen=pg.mkPen(color=(30, 160, 50), width=2,
-                                                        style=Qt.DashLine))
-                    self._preview_vb.addItem(line)
-            return True
-
-        if gtype == 'QuadrantGate':
-            dividers = list(getattr(gate, 'dimensions', []) or [])[:2]
-            for angle, div in zip((90, 0), dividers):
-                values = getattr(div, 'values', None) or []
-                for v in values:
-                    self._preview_vb.addItem(pg.InfiniteLine(
-                        pos=float(v), angle=angle,
-                        pen=pg.mkPen(color=(30, 160, 50), width=2)))
-            return bool(dividers)
-
-        return False
+    def _model_parent_mask(self, gate_def: dict, data: np.ndarray):
+        """Parent membership from the model's own boundaries: trained ones,
+        else those imported with the gate."""
+        chain = []
+        name, seen = gate_def.get('parent_gate'), set()
+        while name and name not in seen:
+            seen.add(name)
+            ancestor = self.state.gate_by_name(name)
+            if ancestor is None:
+                return None
+            chain.append(ancestor)
+            name = ancestor.get('parent_gate')
+        chain.reverse()
+        reference = {}
+        for ancestor in chain:
+            boundary = (self.state.trained_boundaries.get(ancestor['gate_name'])
+                        or ancestor.get('template'))
+            if boundary:
+                reference[ancestor['gate_name']] = boundary
+        pnn = _experiment_channels(self.controller)
+        transformed = ag_core.transform_columns(data, pnn, self.controller.unmixed_transformations or {})
+        result = ag_core.run_gating(
+            chain, transformed, {ch: i for i, ch in enumerate(pnn)},
+            reference=reference, default_mode=ag_core.MODE_FIXED,
+        )
+        return result.population_mask(gate_def['parent_gate'], gate_def.get('parent_popul'))
 
     def _draw_trained_boundary(self, gate_def: dict) -> bool:
         """Draw any TrainedBoundary entries for *gate_def*.
@@ -2544,7 +2756,7 @@ class HierarchyTab(QWidget):
         Returns True if anything was drawn.
         """
         gate_name = gate_def.get('gate_name', '')
-        entry = self.state.trained_boundaries.get(gate_name)
+        entry = self.state.trained_boundaries.get(gate_name) or gate_def.get('template')
         if not entry:
             return False
         drew = False
@@ -3409,6 +3621,572 @@ class TrainTab(QWidget):
         QMessageBox.information(self, "Training Complete", text)
 
 
+class _ReviewWorker(QThread):
+    """Load and unmix one sample for the Review tab."""
+
+    finished = Signal(bool, str, object)   # ok, message, unmixed events
+
+    def __init__(self, experiment_dir, sample_key, snapshot, max_events, parent=None):
+        super().__init__(parent)
+        self._experiment_dir = experiment_dir
+        self._key = sample_key
+        self._snap = snapshot
+        self._max_events = max_events
+
+    def run(self):
+        try:
+            out = load_unmixed(self._experiment_dir, self._key, self._snap,
+                               max_events=self._max_events, seed=TRAINING_SEED)
+            self.finished.emit(True, '', np.asarray(out['unmixed'], dtype=np.float32))
+        except Exception as exc:
+            log.exception("review sample load failed")
+            self.finished.emit(False, str(exc), None)
+
+
+_REVIEW_COLOURS = [(30, 160, 50), (210, 100, 20), (40, 100, 210), (170, 50, 170), (0, 150, 150)]
+_REVIEW_ALERT = (200, 30, 30)
+
+
+class _ReviewPlot(QWidget):
+    """One biplot (or histogram) of a parent population with the daughter
+    gates that use its parameters drawn on it.
+
+    ``gateEdited(gate_name, entries)`` is emitted after a threshold line,
+    range limit or polygon is moved in edit mode.
+    """
+
+    gateEdited = Signal(str, object)
+
+    def __init__(self, channels, gates, controller, tile_size, parent=None):
+        super().__init__(parent)
+        self.channels = tuple(channels)
+        self.gates = list(gates)
+        self.controller = controller
+        self._overlay: list = []
+        self._lines: dict = {}
+        self._rois: dict = {}
+        self._transforms = controller.unmixed_transformations or {}
+        self._pnn = _experiment_channels(controller)
+        labels = build_display_label_map(
+            self._pnn, controller.experiment.process.get('spectral_model') or [])
+        self._labels = [labels.get(c, c) for c in self.channels]
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        self.lbl_title = QLabel()
+        self.lbl_title.setAlignment(Qt.AlignCenter)
+        self.lbl_title.setWordWrap(True)
+        layout.addWidget(self.lbl_title)
+
+        self.gw = TransparentGraphicsLayoutWidget()
+        self.gw.setFixedSize(tile_size, tile_size)
+        gl = self.gw.ci.layout
+        gl.setHorizontalSpacing(0)
+        gl.setVerticalSpacing(0)
+        self.vb = NoPanViewBox()
+        self.vb.setMouseEnabled(x=False, y=False)
+        self.vb.raiseContextMenu = lambda ev: None
+        self.gw.addItem(self.vb, row=1, col=2)
+        self.axis_x = ZoomAxis('bottom', self.vb)
+        self.axis_y = ZoomAxis('left', self.vb)
+        self.gw.addItem(self.axis_y, row=1, col=1)
+        self.gw.addItem(self.axis_x, row=2, col=2)
+        self.axis_x.linkToView(self.vb)
+        self.axis_y.linkToView(self.vb)
+        self.axis_x.setLabel(self._labels[0])
+        self.axis_y.setLabel(self._labels[1] if len(self._labels) > 1 else 'Count')
+        self.img = pg.ImageItem()
+        self.vb.addItem(self.img)
+        self.hist = pg.PlotDataItem(stepMode='center', fillLevel=0, brush=(100, 100, 250, 150))
+        self.vb.addItem(self.hist)
+        layout.addWidget(self.gw, alignment=Qt.AlignCenter)
+
+    def _tr(self, i):
+        return self._transforms.get(self.channels[i]) if i < len(self.channels) else None
+
+    def set_events(self, raw, mask):
+        """Draw the density of the parent population (rows of *raw* in *mask*)."""
+        import honeychrome.settings as hc_settings
+        import colorcet as cc
+        from PySide6.QtCore import QRectF
+
+        self.img.clear()
+        self.hist.setData([], [])
+        tr_x, tr_y = self._tr(0), self._tr(1)
+        if raw is None or tr_x is None or self.channels[0] not in self._pnn:
+            return
+        ix = self._pnn.index(self.channels[0])
+        if len(self.channels) > 1 and tr_y is not None and self.channels[1] in self._pnn:
+            try:
+                colors = cc.palette[hc_settings.colourmap_name_retrieved]
+            except Exception:
+                colors = cc.palette['rainbow4']
+            cmap = pg.ColorMap(pos=0.9 * np.linspace(0, 1, len(colors)) ** 2
+                               + 0.1 * np.linspace(0, 1, len(colors)), color=colors)
+            lut = cmap.getLookupTable(alpha=True)
+            lut[0, 3] = 0
+            self.img.setLookupTable(lut)
+            iy = self._pnn.index(self.channels[1])
+            self.img.setImage(calc_hist2d(raw, mask, ix, iy, tr_x, tr_y,
+                                          density_cutoff=hc_settings.density_cutoff_retrieved))
+            self.img.setRect(QRectF(tr_x.limits[0], tr_y.limits[0],
+                                    tr_x.limits[1] - tr_x.limits[0],
+                                    tr_y.limits[1] - tr_y.limits[0]))
+            self._set_axis(self.axis_x, tr_x, x=True)
+            self._set_axis(self.axis_y, tr_y, x=False)
+        else:
+            self.hist.setData(tr_x.step_scale, calc_hist1d(raw, mask, ix, tr_x))
+            self._set_axis(self.axis_x, tr_x, x=True)
+            self.vb.enableAutoRange(axis=self.vb.YAxis, enable=True)
+
+    def _set_axis(self, axis, tr, x: bool):
+        if tr.ticks:
+            axis.setTicks(tr.ticks())
+        axis.zoomZero = tr.zero
+        axis.fullRange = (0, 1.1)
+        axis.limits = tuple(tr.limits)
+        (self.vb.setXRange if x else self.vb.setYRange)(tr.limits[0], tr.limits[1], padding=0)
+
+    # -- overlays -----------------------------------------------------------
+
+    def clear_overlays(self):
+        for item in self._overlay:
+            try:
+                self.vb.removeItem(item)
+            except Exception:
+                pass
+        self._overlay, self._lines, self._rois = [], {}, {}
+
+    def _add(self, item):
+        self.vb.addItem(item)
+        self._overlay.append(item)
+        return item
+
+    def draw_overlays(self, boundaries: dict, texts: dict, editable: set):
+        """Draw every daughter gate.
+
+        boundaries : {gate: {pop: entry}} to draw.
+        texts      : {(gate, pop): (text, alert)} label for each population.
+        editable   : names of the gates whose boundaries can be moved.
+        """
+        self.clear_overlays()
+        names = ", ".join(g['gate_name'] for g in self.gates)
+        axes = f"{self._labels[0]} vs {self._labels[1]}" if len(self._labels) > 1 else self._labels[0]
+        self.lbl_title.setText(f"<b>{axes}</b><br><small>{names}</small>")
+        for k, gate in enumerate(self.gates):
+            colour = _REVIEW_COLOURS[k % len(_REVIEW_COLOURS)]
+            entries = boundaries.get(gate['gate_name']) or {}
+            if not entries:
+                continue
+            movable = gate['gate_name'] in editable
+            gtype = gate.get('gate_type')
+            if gtype in ag_core.THRESHOLD_TYPES:
+                self._draw_thresholds(gate, entries, colour, movable)
+            else:
+                for pop, entry in entries.items():
+                    if entry.get('range') is not None and len(self.channels) == 1:
+                        self._draw_range(gate, pop, entry, colour, movable)
+                    else:
+                        self._draw_polygon(gate, pop, entry, colour, movable)
+            for pop, entry in entries.items():
+                text = texts.get((gate['gate_name'], pop))
+                if text is None:
+                    continue
+                pos = self._label_position(entry)
+                if pos is None:
+                    continue
+                label = pg.TextItem(text[0], color=_REVIEW_ALERT if text[1] else colour,
+                                    anchor=(0.5, 0.5))
+                label.setPos(*pos)
+                self._add(label)
+
+    def _label_position(self, entry):
+        coords = np.asarray(entry.get('boundary') or [], dtype=float)
+        if coords.ndim != 2 or coords.shape[0] < 2:
+            return None
+        x = float(np.mean(coords[:, 0]))
+        if len(self.channels) == 1:
+            return x, self._y_top()
+        return x, float(np.mean(coords[:, 1]))
+
+    def _y_top(self) -> float:
+        yr = self.vb.viewRange()[1]
+        return float(yr[0] + 0.9 * (yr[1] - yr[0]))
+
+    def _pen(self, colour, width=2):
+        return pg.mkPen(color=colour, width=width)
+
+    def _draw_thresholds(self, gate, entries, colour, movable):
+        first = next(iter(entries.values()))
+        tx, ty = first.get('threshold_x'), first.get('threshold_y')
+        lines = {}
+        if tx is not None:
+            lines['x'] = self._add(pg.InfiniteLine(pos=float(tx), angle=90, movable=movable,
+                                                   pen=self._pen(colour)))
+        if ty is not None and len(self.channels) > 1:
+            lines['y'] = self._add(pg.InfiniteLine(pos=float(ty), angle=0, movable=movable,
+                                                   pen=self._pen(colour)))
+        self._lines[gate['gate_name']] = lines
+        if movable:
+            for line in lines.values():
+                line.sigPositionChangeFinished.connect(
+                    lambda _l=None, g=gate: self._on_thresholds_moved(g))
+
+    def _on_thresholds_moved(self, gate):
+        try:
+            lines = self._lines.get(gate['gate_name']) or {}
+            tx = lines['x'].value() if 'x' in lines else None
+            ty = lines['y'].value() if 'y' in lines else None
+            limits = {c: tuple(self._transforms[c].limits) for c in self.channels
+                      if c in self._transforms}
+            self.gateEdited.emit(gate['gate_name'], ag_review.with_thresholds(gate, tx, ty, limits))
+        except Exception:
+            log.exception("threshold edit failed")
+
+    def _draw_range(self, gate, pop, entry, colour, movable):
+        lo, hi = entry['range']
+        pair = [self._add(pg.InfiniteLine(pos=float(v), angle=90, movable=movable,
+                                          pen=self._pen(colour))) for v in (lo, hi)]
+        self._lines[(gate['gate_name'], pop)] = pair
+        if movable:
+            for line in pair:
+                line.sigPositionChangeFinished.connect(
+                    lambda _l=None, g=gate, p=pop, pr=pair: self.gateEdited.emit(
+                        g['gate_name'],
+                        ag_review.with_range(g, p, pr[0].value(), pr[1].value())))
+
+    def _draw_polygon(self, gate, pop, entry, colour, movable):
+        coords = np.asarray(entry.get('boundary') or [], dtype=float)
+        if coords.ndim != 2 or coords.shape[1] != 2 or len(coords) < 3:
+            return
+        if not movable:
+            closed = coords if np.allclose(coords[0], coords[-1]) else np.vstack([coords, coords[:1]])
+            self._add(pg.PlotDataItem(closed[:, 0], closed[:, 1], pen=self._pen(colour)))
+            return
+        roi = pg.PolyLineROI(ag_review.polygon_vertices(coords), closed=True,
+                             pen=self._pen(colour), movable=True)
+        self._add(roi)
+        self._rois[(gate['gate_name'], pop)] = roi
+        roi.sigRegionChangeFinished.connect(
+            lambda _r=None, g=gate, p=pop, r=roi: self._on_polygon_moved(g, p, r))
+
+    def _on_polygon_moved(self, gate, pop, roi):
+        try:
+            pts = []
+            for _name, local in roi.getLocalHandlePositions():
+                mapped = roi.mapToParent(local)
+                pts.append((float(mapped.x()), float(mapped.y())))
+            self.gateEdited.emit(gate['gate_name'], ag_review.with_polygon(gate, pop, pts))
+        except Exception:
+            log.exception("polygon edit failed")
+
+
+class ReviewTab(QWidget):
+    """Review (and adjust) imported gates against a sample.
+
+    Pick a population from the imported gating strategy; the tab shows the
+    parent population's events with the gates drawn on them, one plot for
+    each distinct set of parameters among the population's daughter gates.
+    Each population is labelled with its fraction of parent as Honeychrome
+    applies the gate, and next to the fraction recorded at import when the
+    review sample is the sample the counts came from; a difference is shown
+    in red. With Edit gates on, threshold lines and polygon corners can be
+    moved; edits change the gate's imported boundary, and Reset restores the
+    boundary as imported. Gates trained from a changed boundary must be
+    trained again.
+    """
+
+    templatesChanged = Signal()
+    _MAX_EVENTS = 150_000
+
+    def __init__(self, state: GatingModelState, bus, controller, parent=None):
+        super().__init__(parent)
+        self.state = state
+        self.bus = bus
+        self.controller = controller
+        self._raw = None
+        self._data_t = None
+        self._loaded_key = None
+        self._loaded_dir = None
+        self._wanted_key = None
+        self._result = None
+        self._worker = None
+        self._plots: list = []
+        self._building = False
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.addWidget(HelpToggleWidget(text=ag_help_texts.BUILDER_REVIEW))
+        row = QHBoxLayout()
+        self.combo_pop = QComboBox()
+        self.combo_pop.setMinimumWidth(220)
+        self.combo_sample = QComboBox()
+        self.combo_sample.setMinimumWidth(220)
+        self.chk_edit = QCheckBox("Edit gates")
+        self.btn_reset = QPushButton("Reset to import")
+        self.btn_reset.setToolTip("Restore the gates shown to their boundaries as imported.")
+        row.addWidget(QLabel("Population:"))
+        row.addWidget(self.combo_pop)
+        row.addWidget(QLabel("Review sample:"))
+        row.addWidget(self.combo_sample)
+        row.addWidget(self.chk_edit)
+        row.addWidget(self.btn_reset)
+        row.addStretch()
+        layout.addLayout(row)
+        self.lbl_status = QLabel("Import a gating strategy to review it here.")
+        self.lbl_status.setWordWrap(True)
+        self.lbl_status.setStyleSheet("color: #555; font-style: italic;")
+        layout.addWidget(self.lbl_status)
+
+        self._host = QWidget()
+        self._grid = QGridLayout(self._host)
+        self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self._host)
+        layout.addWidget(scroll, stretch=1)
+
+        self.combo_pop.currentIndexChanged.connect(self._on_population_changed)
+        self.combo_sample.currentIndexChanged.connect(self._on_sample_changed)
+        self.chk_edit.toggled.connect(lambda _on: self._redraw_overlays())
+        self.btn_reset.clicked.connect(self._on_reset)
+
+    # -- population and sample pickers --------------------------------------
+
+    def refresh(self):
+        """Rebuild the pickers from the model; reload the sample if needed."""
+        self._building = True
+        try:
+            previous = self.combo_pop.currentData()
+            self.combo_pop.clear()
+            for choice in ag_review.population_choices(self.state.gate_definitions):
+                self.combo_pop.addItem(f"{choice['label']}  ({choice['n_gates']} gate"
+                                       f"{'s' if choice['n_gates'] != 1 else ''})",
+                                       (choice['gate'], choice['pop']))
+            if previous is not None:
+                i = self.combo_pop.findData(previous)
+                if i >= 0:
+                    self.combo_pop.setCurrentIndex(i)
+            self._fill_samples()
+        finally:
+            self._building = False
+        if self.combo_pop.count() == 0:
+            self._clear_plots()
+            self.lbl_status.setText("The model has no gates to review.")
+            return
+        self._ensure_sample()
+
+    def _import_sample_key(self):
+        """The experiment sample the imported counts were recorded on, if any."""
+        keys = analysis_sample_keys(self.controller, include_controls=True)
+        for g in self.state.gate_definitions:
+            for key in keys:
+                if ag_review.matches_import_sample(g, key):
+                    return key
+        return None
+
+    def _fill_samples(self):
+        keys = analysis_sample_keys(self.controller)
+        wanted = self.combo_sample.currentData() or self._import_sample_key()
+        if wanted is None:
+            current = getattr(self.controller, 'current_sample_path', None)
+            for key in keys:
+                if current and str(current).endswith(str(key)):
+                    wanted = key
+        self.combo_sample.clear()
+        all_keys = list(keys)
+        if wanted and wanted not in all_keys:
+            all_keys.insert(0, wanted)
+        for key in all_keys:
+            self.combo_sample.addItem(_sample_label(key), key)
+        i = self.combo_sample.findData(wanted) if wanted else 0
+        self.combo_sample.setCurrentIndex(max(i, 0))
+
+    def _on_population_changed(self, _index=None):
+        if not self._building:
+            self._rebuild_plots()
+
+    def _on_sample_changed(self, _index=None):
+        if not self._building:
+            self._ensure_sample()
+
+    # -- loading and gating -------------------------------------------------
+
+    def _ensure_sample(self):
+        key = self.combo_sample.currentData()
+        if key is None:
+            self.lbl_status.setText("No sample available for review.")
+            return
+        experiment_dir = getattr(self.controller, 'experiment_dir', None)
+        if experiment_dir != self._loaded_dir:
+            self._raw = self._data_t = self._result = self._loaded_key = None
+            self._loaded_dir = experiment_dir
+        if key == self._loaded_key and self._raw is not None:
+            self._regate()
+            self._rebuild_plots()
+            return
+        if self._worker is not None:
+            self._wanted_key = key
+            return
+        try:
+            snap = snapshot_unmix_state(self.controller, [key])
+        except Exception as exc:
+            self.lbl_status.setText(f"Cannot load {_sample_label(key)}: {exc}")
+            return
+        self.lbl_status.setText(f"Loading {_sample_label(key)} …")
+        self._wanted_key = key
+        worker = _ReviewWorker(self.controller.experiment_dir, key, snap,
+                               self._MAX_EVENTS, parent=self)
+        worker.finished.connect(lambda ok, msg, data, k=key: self._on_loaded(ok, msg, data, k))
+        self._worker = worker
+        worker.start()
+
+    def _on_loaded(self, ok, message, data, key):
+        self._worker = None
+        if not ok:
+            self.lbl_status.setText(f"Could not load {_sample_label(key)}: {message}")
+            return
+        self._raw = data
+        self._loaded_key = key
+        pnn = _experiment_channels(self.controller)
+        self._data_t = ag_core.transform_columns(data, pnn, self.controller.unmixed_transformations or {})
+        if self._wanted_key not in (None, key):
+            self._ensure_sample()
+            return
+        self._regate()
+        self._rebuild_plots()
+
+    def _regate(self):
+        pnn = _experiment_channels(self.controller)
+        reference = ag_review.reference_boundaries(self.state.gate_definitions,
+                                                   self.state.trained_boundaries)
+        self._result = ag_core.run_gating(
+            self.state.gate_definitions, self._data_t, {c: i for i, c in enumerate(pnn)},
+            reference=reference, default_mode=ag_core.MODE_FIXED)
+
+    # -- plots --------------------------------------------------------------
+
+    def _clear_plots(self):
+        for plot in self._plots:
+            plot.setParent(None)
+            plot.deleteLater()
+        self._plots = []
+
+    def _selected(self):
+        data = self.combo_pop.currentData()
+        return data if data is not None else (None, 'root')
+
+    def _rebuild_plots(self):
+        import honeychrome.settings as hc_settings
+        self._clear_plots()
+        if self._raw is None or self._result is None:
+            return
+        gate, pop = self._selected()
+        groups = ag_review.daughter_groups(self.state.gate_definitions, gate, pop)
+        if gate is None:
+            mask = np.ones(len(self._raw), dtype=bool)
+        else:
+            mask = self._result.population_mask(gate, pop)
+        if mask is None:
+            self.lbl_status.setText(
+                f"The parent population {gate}/{pop} could not be gated on this sample "
+                "(its gate has no boundary or its channels are missing).")
+            return
+        self._mask = mask
+        tile = hc_settings.cytometry_plot_width_target_retrieved
+        for n, group in enumerate(groups):
+            plot = _ReviewPlot(group['channels'], group['gates'], self.controller, tile, self)
+            plot.gateEdited.connect(self._on_gate_edited)
+            plot.set_events(self._raw, mask)
+            self._grid.addWidget(plot, n // 2, n % 2)
+            self._plots.append(plot)
+        self._redraw_overlays()
+        label = 'All events' if gate is None else f"{pop}"
+        self.lbl_status.setText(
+            f"{label}: {int(mask.sum()):,} of {len(self._raw):,} events on "
+            f"{_sample_label(self._loaded_key)}; {len(groups)} parameter set"
+            f"{'s' if len(groups) != 1 else ''}.")
+
+    def _label_texts(self, gate_def: dict, boundary: dict) -> dict:
+        """{(gate, pop): (text, alert)} for the populations worth labelling."""
+        src = gate_def.get('source') or {}
+        shown = set((src.get('populations') or {}).keys()) or set(boundary)
+        compare = ag_review.matches_import_sample(gate_def, self._loaded_key)
+        out = {}
+        for pop, entry in boundary.items():
+            if pop not in shown:
+                continue
+            frac = entry.get('fraction')
+            if frac is None:
+                continue
+            label = entry.get('label', pop)
+            text = f"{label}\n{frac * 100:.1f}%"
+            alert = False
+            ref = ag_review.imported_fraction(gate_def, pop) if compare else None
+            if ref is not None:
+                alert = ag_review.fraction_discrepancy(frac, ref)
+                text = f"{label}\n{frac * 100:.1f}% (import {ref * 100:.1f}%)"
+            out[(gate_def['gate_name'], pop)] = (text, alert)
+        return out
+
+    def _redraw_overlays(self):
+        if self._result is None:
+            return
+        editing = self.chk_edit.isChecked()
+        for plot in self._plots:
+            boundaries, texts, editable = {}, {}, set()
+            for g in plot.gates:
+                name = g['gate_name']
+                boundary = self._result.boundaries.get(name) or g.get('template') or {}
+                boundaries[name] = boundary
+                texts.update(self._label_texts(g, boundary))
+                if editing and g.get('template') and g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+                    editable.add(name)
+            plot.draw_overlays(boundaries, texts, editable)
+
+    # -- editing ------------------------------------------------------------
+
+    def _descendants(self, gate_name: str) -> set:
+        out, frontier = set(), {gate_name}
+        while frontier:
+            frontier = {g['gate_name'] for g in self.state.gate_definitions
+                        if g.get('parent_gate') in frontier} - out
+            out |= frontier
+        return out
+
+    def _apply_template(self, gate_name: str, entries: dict):
+        gate = self.state.gate_by_name(gate_name)
+        if gate is None:
+            return
+        gate['template'] = entries
+        for name in {gate_name} | self._descendants(gate_name):
+            self.state.trained_boundaries.pop(name, None)
+
+    def _on_gate_edited(self, gate_name: str, entries: dict):
+        self._apply_template(gate_name, entries)
+        QTimer.singleShot(0, self._after_edit)
+        self.bus.statusMessage.emit(
+            f"[Gating Model Builder] Adjusted '{gate_name}'. Train again to apply it to the training samples.")
+
+    def _after_edit(self):
+        self._regate()
+        self._redraw_overlays()
+        self.templatesChanged.emit()
+
+    def _on_reset(self):
+        gate, pop = self._selected()
+        changed = False
+        for group in ag_review.daughter_groups(self.state.gate_definitions, gate, pop):
+            for g in group['gates']:
+                original = ag_review.reset_template(g)
+                if original:
+                    self._apply_template(g['gate_name'], original)
+                    changed = True
+        if changed:
+            self._after_edit()
+
+
 class ExportTab(QWidget):
     """Tab 2 — Export.
 
@@ -3770,14 +4548,19 @@ class PluginWidget(QWidget):
         self.inner_tabs.setDocumentMode(True)
 
         self.hierarchy_tab = HierarchyTab(self.state, bus, controller)
+        self.review_tab    = ReviewTab(self.state, bus, controller)
         self.train_tab     = TrainTab(self.state, bus, controller)
         self.export_tab    = ExportTab(self.state, bus, controller)
 
         self.inner_tabs.addTab(self.hierarchy_tab, "Hierarchy")
+        self.inner_tabs.addTab(self.review_tab,    "Review")
         self.inner_tabs.addTab(self.train_tab,     "Train")
         self.inner_tabs.addTab(self.export_tab,    "Export")
 
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
+        self.hierarchy_tab.gatesImported.connect(
+            lambda: self.inner_tabs.setCurrentWidget(self.review_tab))
+        self.review_tab.templatesChanged.connect(self._write_session)
         self.train_tab.trained.connect(self._write_session)
         self.train_tab.boundaries_changed.connect(self._write_session)
         content_layout.addWidget(self.inner_tabs)
@@ -3875,9 +4658,11 @@ class PluginWidget(QWidget):
         """Run after the event loop has processed the load-sample event.
 
         The builder's views load their own training samples, so nothing
-        here depends on which sample the main window shows.
+        here depends on which sample the main window shows, except the
+        Hierarchy tab's preview, which redraws for the newly loaded sample.
         """
-        pass
+        if self.inner_tabs.currentWidget() is self.hierarchy_tab:
+            self.hierarchy_tab.refresh_preview()
 
     def _deferred_initial_refresh(self):
         """One-shot refresh called after construction to populate pickers
@@ -3904,7 +4689,7 @@ class PluginWidget(QWidget):
 
     def _refresh_tab_at(self, index: int):
         """Call refresh() on the tab at *index* if it exposes one."""
-        tabs = [self.hierarchy_tab, self.train_tab, self.export_tab]
+        tabs = [self.hierarchy_tab, self.review_tab, self.train_tab, self.export_tab]
         if 0 <= index < len(tabs):
             tab = tabs[index]
             if hasattr(tab, 'refresh'):
