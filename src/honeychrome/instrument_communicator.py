@@ -249,7 +249,7 @@ class Instrument(mp.Process):
             start_time = time.perf_counter()
 
             blob_of_traces_as_array = self.device.read_out_traces()
-            if blob_of_traces_as_array:
+            if blob_of_traces_as_array is not None:
                 self.push_to_traces_cache(blob_of_traces_as_array)
 
             if self.stop_transfer.is_set():

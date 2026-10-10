@@ -1,4 +1,5 @@
 import re
+import threading
 import time
 
 import numpy as np
@@ -18,6 +19,9 @@ class Ft4222Communicator:
         self.devB = None
         self.buffer = 0
         self.bytes_read = 0
+        # Serialises all device access between the command thread, the transfer thread and the worker threads.
+        # Re-entrant so a read-modify-write (or a level read + data read) can hold it across several calls.
+        self.lock = threading.RLock()
 
     def connected(self):
         return self.devA and self.devB
@@ -53,27 +57,33 @@ class Ft4222Communicator:
             raise TypeError
 
         byte_string = operation_write + lookup_address(register) + dummy_bytes + data_to_write.to_bytes(2, byteorder='big')
-        self.devA.spiMaster_MultiReadWrite(b'', byte_string, 0)
+        with self.lock:
+            self.devA.spiMaster_MultiReadWrite(b'', byte_string, 0)
 
     def register_read(self, register):
         byte_string = operation_read + lookup_address(register)
-        data_read = self.devA.spiMaster_MultiReadWrite(b'', byte_string, 4) # 2 bytes dummy, 2 bytes register
+        with self.lock:
+            data_read = self.devA.spiMaster_MultiReadWrite(b'', byte_string, 4) # 2 bytes dummy, 2 bytes register
         return int.from_bytes(data_read[2:], byteorder='big', signed=False)
 
     def register_2reg_write(self, register_low, register_high, data_to_write):
-        self.register_write(register_low, (data_to_write >> 0) & 0xFFFF)
-        self.register_write(register_high, (data_to_write >> 16) & 0xFFFF)
+        with self.lock:
+            self.register_write(register_low, (data_to_write >> 0) & 0xFFFF)
+            self.register_write(register_high, (data_to_write >> 16) & 0xFFFF)
 
     def register_2reg_read(self, register_low, register_high):
-        value = self.register_read(register_high) << 16
-        value |= self.register_read(register_low)
+        with self.lock:
+            value = self.register_read(register_high) << 16
+            value |= self.register_read(register_low)
         return value
 
     def register_read_modify_write(self, register_name, value, mask):
-        working_value = self.register_read(register_name)
-        working_value &= ~mask # sets masked bits to zero, keeps all other bits
-        working_value |= (value & mask) # sets masked bits to value, keeps all other bits
-        self.register_write(register_name, working_value)
+        # hold the lock across the read and the write so the RMW is atomic
+        with self.lock:
+            working_value = self.register_read(register_name)
+            working_value &= ~mask # sets masked bits to zero, keeps all other bits
+            working_value |= (value & mask) # sets masked bits to value, keeps all other bits
+            self.register_write(register_name, working_value)
 
 
     def register_bit_set(self, address, bit_pos):
@@ -83,13 +93,13 @@ class Ft4222Communicator:
         self.register_read_modify_write(address, 1 << bit_pos, 1 << bit_pos)
 
     def register_bit_clear(self, address, bit_pos):
-        # Set the specified bit in a register
-        if bit_pos >> 16:
+        # Clear the specified bit in a register
+        if bit_pos >= 16:
             return
         self.register_read_modify_write(address, 0x0000, 1 << bit_pos)
 
     def register_bit_get(self, address, bit_pos):
-        return self.register_read(address) & (1 << bit_pos)
+        return bool(self.register_read(address) & (1 << bit_pos))
 
 
     def sample_read_buffer(self, total_bytes, chunk_size=65535):
@@ -109,11 +119,13 @@ class Ft4222Communicator:
         return bytes(data)
 
     def pop_from_memory(self):
-        fifo_words = self.register_read('BULK_LEVEL')
         buffer = None
-        if fifo_words > 0:
-            bytes_to_read = fifo_words * 2
-            buffer = self.sample_read_buffer(bytes_to_read)
+        # hold the lock across the level read and the data read, so the FIFO can't be cleared in between
+        with self.lock:
+            fifo_words = self.register_read('BULK_LEVEL')
+            if fifo_words > 0:
+                bytes_to_read = fifo_words * 2
+                buffer = self.sample_read_buffer(bytes_to_read)
 
         return buffer
 
