@@ -39,6 +39,7 @@ import difflib
 import math
 import re
 import xml.etree.ElementTree as ET
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -52,7 +53,7 @@ __all__ = [
     'MATCH_NAME', 'MATCH_FLUOROPHORE', 'MATCH_FLUOROPHORE_LABEL_DIFFERS',
     'MATCH_ANTIGEN', 'MATCH_FUZZY', 'MATCH_MANUAL', 'CONFIDENT_MATCHES',
     'ImportPlan', 'plan_import', 'build_gate_definitions',
-    'ALGORITHM_IMPORTED',
+    'ALGORITHM_IMPORTED', 'source_from_gating',
 ]
 
 ALGORITHM_IMPORTED = ag_core.ALGORITHM_IMPORTED
@@ -208,6 +209,7 @@ class FJSource:
     labels: dict = field(default_factory=dict)
     transforms: dict = field(default_factory=dict)
     count: int | None = None
+    sample_name: str | None = None
 
     def iter_populations(self):
         """Every node, parents before children."""
@@ -302,11 +304,16 @@ def parse_workspace(root, path: str = '') -> FJWorkspace:
         if group is not None:
             sr = _child(group, 'SampleRefs')
             refs = [_attr(r, 'sampleID') for r in (_children(sr, 'SampleRef') if sr is not None else [])]
-        member = next((samples[r] for r in refs if r in samples), None)
+        members = [samples[r] for r in refs if r in samples]
+        member = members[0] if members else None
+        # A group's counts belong to a sample only when it has just one.
+        single = member if len(members) == 1 else None
         groups.append(FJSource(
             kind='group', name=_attr(gnode, 'name', '') or 'Group', roots=roots,
             labels=dict(member.labels) if member else {},
             transforms=dict(member.transforms) if member else dict(cyt_transforms),
+            count=single.count if single else None,
+            sample_name=single.name if single else None,
         ))
     ws.sources = groups + [s for s in samples.values()]
     return ws
@@ -669,6 +676,95 @@ def plan_import(source: FJSource, mapping: dict) -> ImportPlan:
 
 
 # ---------------------------------------------------------------------------
+# The experiment's own gating hierarchy as an import source
+# ---------------------------------------------------------------------------
+
+def _ellipsoid_vertices(gate, n_points: int = 96) -> list:
+    """Polygon tracing a FlowKit EllipsoidGate (coordinates are display units)."""
+    centre = np.asarray(gate.coordinates, dtype=float).ravel()
+    cov = np.asarray(gate.covariance_matrix, dtype=float)
+    chol = np.linalg.cholesky(cov * float(gate.distance_square))
+    t = np.linspace(0, 2 * np.pi, n_points, endpoint=False)
+    pts = centre + (chol @ np.vstack([np.cos(t), np.sin(t)])).T
+    return [tuple(p) for p in pts]
+
+
+def _kit_gate(gate) -> FJGate:
+    """FJGate (display-unit coordinates) from a FlowKit gate."""
+    kind = getattr(gate, 'gate_type', '')
+    channels = list(gate.get_dimension_ids())
+    if kind == 'RectangleGate':
+        bounds = [(_float(getattr(d, 'min', None)), _float(getattr(d, 'max', None)))
+                  for d in gate.dimensions]
+        return FJGate(kind='rectangle', channels=channels, bounds=bounds)
+    if kind == 'PolygonGate':
+        verts = [tuple(float(c) for c in v) for v in gate.vertices]
+        return FJGate(kind='polygon', channels=channels, vertices=verts)
+    if kind == 'EllipsoidGate':
+        return FJGate(kind='polygon', channels=channels, vertices=_ellipsoid_vertices(gate))
+    return FJGate(kind=kind or 'unknown', channels=channels)
+
+
+def _quadrant_gates(gate) -> dict:
+    """{quadrant name: FJGate rectangle} for a FlowKit QuadrantGate. Each
+    quadrant is the rectangle between its divider ranges, open at the ends."""
+    dividers = list(gate.dimensions)
+    channels = [d.dimension_ref for d in dividers]
+    out = {}
+    for qid, quadrant in gate.quadrants.items():
+        bounds = []
+        for div in dividers:
+            rng = None
+            getter = getattr(quadrant, 'get_divider_range', None)
+            if callable(getter):
+                try:
+                    rng = getter(div.id)
+                except Exception:
+                    rng = None
+            if rng is None:
+                rng = (getattr(quadrant, '_divider_ranges', None) or {}).get(div.id)
+            lo, hi = rng if isinstance(rng, (list, tuple)) and len(rng) == 2 else (None, None)
+            bounds.append((_float(lo), _float(hi)))
+        out[str(qid)] = FJGate(kind='rectangle', channels=channels, bounds=bounds)
+    return out
+
+
+def source_from_gating(gating, name: str = 'Experiment hierarchy') -> FJSource:
+    """An FJSource built from a FlowKit GatingStrategy whose coordinates
+    are Honeychrome display units (the experiment's own gating).
+
+    Each gate becomes a population named after the gate, ellipsoids are
+    traced as polygons, and a quadrant gate becomes one rectangle
+    population per quadrant, named after the quadrant, with the gates under
+    a quadrant as its children. Build gate definitions from it with
+    ``build_gate_definitions(..., native_display=True)``.
+    """
+    src = FJSource(kind='hierarchy', name=name)
+    nodes: dict = {}
+
+    def attach(pop: FJPopulation, parent):
+        (parent.children if parent is not None else src.roots).append(pop)
+
+    for gname, gpath in gating.get_gate_ids():
+        gpath = tuple(gpath)
+        if gating._get_gate_node(gname, gpath).gate_type == 'Quadrant':
+            continue
+        parent = nodes.get(gpath) if gpath != ('root',) else None
+        base = parent.path if parent is not None else ()
+        gate = gating.get_gate(gname)
+        if getattr(gate, 'gate_type', '') == 'QuadrantGate':
+            for qname, qgate in _quadrant_gates(gate).items():
+                pop = FJPopulation(name=qname, path=base + (qname,), gate=qgate)
+                attach(pop, parent)
+                nodes[gpath + (gname, qname)] = pop
+            continue
+        pop = FJPopulation(name=gname, path=base + (gname,), gate=_kit_gate(gate))
+        attach(pop, parent)
+        nodes[gpath + (gname,)] = pop
+    return src
+
+
+# ---------------------------------------------------------------------------
 # Conversion to gate definitions
 # ---------------------------------------------------------------------------
 
@@ -682,21 +778,29 @@ class _Axes:
     """Raw ↔ display conversions for one experiment channel and the FlowJo
     parameter mapped to it."""
 
-    def __init__(self, fj_param: str, channel: str, source: FJSource, exp: ExperimentChannels):
+    def __init__(self, fj_param: str, channel: str, source: FJSource, exp: ExperimentChannels,
+                 native: bool = False):
         self.fj_param = fj_param
         self.channel = channel
-        fjt = source.transforms.get(fj_param)
+        self.native = native
+        fjt = None if native else source.transforms.get(fj_param)
         self.fj = fjt.display() if fjt is not None else None
         params = exp.transforms.get(channel)
         self.hc = ag_core.make_transform(params) if params else None
-        self.hc_linear = not params or params.get('id') == 0
+        self.hc_linear = native or not params or params.get('id') == 0
         lim = (params or {}).get('limits')
         self.limits = (float(lim[0]), float(lim[1])) if lim and len(lim) >= 2 else None
-        self.zero = float(self.to_display([0.0])[0])
+        self.zero = float(self._raw_to_display(np.zeros(1))[0])
 
-    def to_display(self, raw):
+    def _raw_to_display(self, raw):
         raw = np.asarray(raw, dtype=float)
         return np.asarray(self.hc.apply(raw), dtype=float) if self.hc is not None else raw
+
+    def to_display(self, raw):
+        """Raw units → Honeychrome display units. Native coordinates are
+        already display units and pass through unchanged."""
+        raw = np.asarray(raw, dtype=float)
+        return raw if self.native else self._raw_to_display(raw)
 
     def to_fj(self, raw):
         raw = np.asarray(raw, dtype=float)
@@ -768,16 +872,26 @@ class _Piece:
     singlets: bool = False
 
 
+def _is_singlet_pair(chans: list, exp: ExperimentChannels) -> bool:
+    """True for the forward-scatter area against height or width pair."""
+    if not exp.singlet_pair or len(chans) != 2:
+        return False
+    area, other = exp.singlet_pair
+    stem = area.rsplit('-', 1)[0]
+    alternatives = {other, f'{stem}-H', f'{stem}-W'} - {area}
+    return area in chans and bool(set(chans) & alternatives)
+
+
 def _piece(pop: FJPopulation, source: FJSource, mapping: dict,
-           exp: ExperimentChannels) -> _Piece:
+           exp: ExperimentChannels, native: bool = False) -> _Piece:
     g = pop.gate
     chans = [mapping[c] for c in g.channels]
-    axes = [_Axes(fj, ch, source, exp) for fj, ch in zip(g.channels, chans)]
+    axes = [_Axes(fj, ch, source, exp, native) for fj, ch in zip(g.channels, chans)]
     scatter = set(exp.scatter)
     if g.kind in ('polygon', 'ellipse'):
         raw = g.vertices if g.kind == 'polygon' else _ellipse_raw(g, axes[0], axes[1])
         poly = _polygon_display(raw, axes[0], axes[1])
-        single = bool(exp.singlet_pair) and set(chans) == set(exp.singlet_pair)
+        single = _is_singlet_pair(chans, exp)
         notes = ['Ellipse traced as a polygon.'] if g.kind == 'ellipse' else []
         return _Piece(pop, 'polygon', chans, polygon=poly, notes=notes, singlets=single)
 
@@ -886,7 +1000,9 @@ def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChann
                            merge_siblings: bool = True,
                            merge_tolerance: float = 0.01,
                            existing_names: set | None = None,
-                           workspace_name: str = '') -> tuple[list[dict], dict]:
+                           workspace_name: str = '',
+                           native_display: bool = False,
+                           origin: str = 'FlowJo') -> tuple[list[dict], dict]:
     """Convert the importable populations of *source* into gate definitions.
 
     mapping : {FlowJo parameter: experiment channel or None}; populations
@@ -907,9 +1023,15 @@ def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChann
         Siblings whose bounds differ stay separate gates, so each keeps
         its own thresholds.
 
+    native_display : the source's coordinates are already Honeychrome display
+              units (see source_from_gating), so no transform is applied.
+    origin  : recorded in each gate's ``source`` ('FlowJo' or
+              'Experiment hierarchy').
+
     Every gate gets algorithm 'imported' and a ``template`` holding its
-    boundary entries in Honeychrome display units, plus ``source`` with the
-    FlowJo population paths and counts.
+    boundary entries in Honeychrome display units (``template_original``
+    keeps a copy for resetting), plus ``source`` with the population paths,
+    counts, and the count of the parent population.
 
     Returns (gate_defs, report) where report has 'plan' (ImportPlan),
     'notes' ({gate name: [str]}) and 'populations' ({FlowJo population key:
@@ -937,16 +1059,19 @@ def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChann
             return
         parent_gate, parent_pop = (pop_map[parent.key] if parent is not None
                                    else (None, 'root'))
-        pieces = [_piece(c, source, mapping, exp) for c in kids]
+        pieces = [_piece(c, source, mapping, exp, native_display) for c in kids]
         for grp in _group_siblings(pieces, merge_siblings, merge_tolerance):
             names = [p.pop.name for p in grp]
             gname = unique(names[0] if len(grp) == 1 else ' & '.join(names))
             gdef, gnotes, pops = _gate_def(grp, gname, parent_gate, parent_pop, exp)
             gdef['gate_number'] = len(gate_defs) + 1
+            gdef['template_original'] = deepcopy(gdef['template'])
             gdef['source'] = {
-                'origin': 'FlowJo',
+                'origin': origin,
                 'workspace': workspace_name,
                 'gating_source': source.title,
+                'sample': source.name if source.kind == 'sample' else source.sample_name,
+                'parent_count': parent.count if parent is not None else source.count,
                 'populations': {pname: p.pop.key for pname, p in pops.items()},
                 'counts': {pname: p.pop.count for pname, p in pops.items()},
                 'parameters': {ch: fj for p in grp for fj, ch in zip(p.pop.gate.channels, p.channels)},

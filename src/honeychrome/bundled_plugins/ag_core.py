@@ -1198,8 +1198,10 @@ def remap_model(model: dict, dst_params: dict,
     )
     out = deepcopy(model)
     out['trained_boundaries'] = new_boundaries
-    templates = {g['gate_name']: g['template'] for g in gate_defs if g.get('template')}
-    if templates:
+    for key in ('template', 'template_original'):
+        templates = {g['gate_name']: g[key] for g in gate_defs if g.get(key)}
+        if not templates:
+            continue
         new_templates, template_report = remap_boundaries(
             gate_defs, templates, src, dst_params, transform_factory=transform_factory,
         )
@@ -1207,7 +1209,7 @@ def remap_model(model: dict, dst_params: dict,
             report.setdefault(ch, status)
         for g in out['gate_definitions']:
             if g.get('gate_name') in new_templates:
-                g['template'] = new_templates[g['gate_name']]
+                g[key] = new_templates[g['gate_name']]
     remapped = sorted(ch for ch, s in report.items() if s == 'remapped')
     for ch in remapped:
         out['transforms'][ch] = deepcopy(dst_params[ch])

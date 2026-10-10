@@ -21,12 +21,32 @@ reviewed in [2].</p>
 <h4>Getting gates in</h4>
 <ul>
 <li><b>Import from Hierarchy</b> copies the gates you drew on the main
-cytometry plots. Quadrant gates become <i>2dsep</i> gates with one
-population per quadrant; a forward-scatter area against height (or width)
-polygon becomes a <i>singlets</i> gate.</li>
+cytometry plots, keeping the shapes as drawn (algorithm <i>imported</i>) and
+the names you gave the populations. Polygons and rectangles that involve a
+scatter channel stay as drawn; a forward-scatter area against height (or
+width) polygon becomes a <i>singlets</i> gate; rectangles on fluorescence
+channels become threshold gates (<i>1dsep</i>, <i>2dsep</i>) whose far
+bounds are not kept, and quadrant gates become one threshold gate with a
+population per quadrant. Imported gates keep their boundary fixed; to have
+Train calculate a gate from the training samples instead, use its
+<b>Convert to trainable</b> button, or <b>Convert all to trainable</b>.
+Threshold gates become <i>tail</i> (or the recommended algorithm) and
+singlet gates stay <i>singlets</i>. A free polygon cannot be learned, so
+<i>Convert all</i> leaves it as drawn; converting one by hand fits an
+ellipse to its parent population instead. <b>Keep imported boundary</b> in
+the right-click menu reverses a conversion.</li>
 <li><b>Refresh from Hierarchy</b> adds gates drawn since the last import and
 keeps any parameters you have changed. Gates that no longer exist on the
 main plots are marked stale rather than deleted.</li>
+<li><b>Import FlowJo…</b> opens a FlowJo workspace (.wsp) or template (.wspt).
+A section expands under the buttons: choose the group or sample whose gating
+to import, check how each FlowJo parameter maps to an experiment channel
+(matched by fluorophore name where possible), and assign or drop any
+parameter that could not be matched. Populations that use a dropped
+parameter, and those below them, are not imported. <b>Import all — add</b>
+adds the gates to the model; <b>Import all — replace</b> replaces its gates.
+The experiment's own gating is never changed. Review the imported gates on
+the Review tab before training.</li>
 <li><b>Add gate manually</b> creates a gate that is not on the main plots.</li>
 </ul>
 
@@ -231,4 +251,31 @@ offered only for samples gated in this session.</p>
 [6]<a href="https://doi.org/10.1002/alz.70952">Humblet-Baron et al. 2025, Alzheimer's &amp; Dementia (systems immunology of Alzheimer's disease)</a><br/>
 [7]<a href="https://doi.org/10.1038/s41467-026-70895-1">Veiga et al. 2026, Nature Communications (autoinflammation of unknown origin)</a><br/>
 </p>
+'''
+
+BUILDER_REVIEW = '''
+<h3>Review — check imported gates against a sample</h3>
+<p>Imported gates (from the experiment's hierarchy or a FlowJo workspace)
+keep the boundaries they were imported with. FlowJo coordinates are raw
+instrument units converted with this experiment's transforms, and unmixing
+here can differ from the unmixing the gates were drawn on, so look at them
+before training.</p>
+<ol>
+<li>Choose a <b>population</b>. The tab shows that population's events and,
+for each distinct set of parameters among its daughter gates, one plot with
+those gates drawn on it.</li>
+<li>Choose the <b>review sample</b>. When the imported counts came from a
+sample in this experiment it is selected for you, and each population label
+shows the fraction of its parent that Honeychrome now selects next to the
+fraction recorded at import. A label turns red when they differ by 2
+percentage points or by 5% of the imported fraction.</li>
+<li>Tick <b>Edit gates</b> to drag threshold lines, range limits and polygon
+corners (long polygons are thinned to 32 corners when edited). Edits change
+the gate's imported boundary. <b>Reset to import</b> restores the boundaries
+shown to their imported state.</li>
+</ol>
+<p>Threshold gates keep one threshold per axis, so a FlowJo rectangle's far
+bound is not kept. A gate whose algorithm is not <i>imported</i> is shown but
+cannot be edited here. Changing a gate clears the training of that gate and
+of the gates below it; train again to apply the change.</p>
 '''
