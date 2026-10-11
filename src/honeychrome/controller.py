@@ -458,40 +458,27 @@ class Controller(QObject):
             warnings.warn('No events bus connected')
 
 
-    def _rebuild_per_sample_lookup_tables(self):
-        """Rebuild lookup tables only for gates that touch a per-sample (default,
+    def _scope_for_mode(self, mode=None):
+        # the statistics and process tabs show unmixed data, so they use the unmixed gating
+        return 'raw' if (mode or self.current_mode) == 'raw' else 'unmixed'
+
+    def apply_custom_sample_gates(self, scope=None):
+        """Install this sample's overrides and refresh every affected lookup table.
+
+        Rebuild lookup tables only for gates that touch a per-sample (default,
         e.g. Time) transform, so they match THIS sample's scale.
 
         Gates on fixed transforms (fluorescence, FSC/SSC) keep their cached table
         — so a normal sample switch stays fast; only Time-involving gates pay the
         rebuild cost (and the Time transform's bins are capped so it stays cheap).
         """
-        scope = 'raw' if self.current_mode == 'raw' else 'unmixed'
-        if not self.data_for_cytometry_plots:
-            return
-        gating = self.data_for_cytometry_plots.get('gating')
-        transforms = self.data_for_cytometry_plots.get('transformations')
-        if gating is None:
-            return
-        for gate_id, gate_path in gating.get_gate_ids():
-            try:
-                channels = gating.get_gate(gate_id).get_dimension_ids()
-            except Exception:
-                continue
-            if any(getattr(transforms.get(ch), 'id', None) == 'default' for ch in channels):
-                self.calculate_lookup_tables(mode=scope, top_gate=gate_id)
 
-
-    def _scope_for_mode(self, mode=None):
-        # the statistics and process tabs show unmixed data, so they use the unmixed gating
-        return 'raw' if (mode or self.current_mode) == 'raw' else 'unmixed'
-
-    def apply_custom_sample_gates(self, scope=None):
-        """Install this sample's overrides and refresh every affected lookup table."""
         if not self.current_sample_path:
             return
         scope = self._scope_for_mode(scope)
         gating = self.raw_gating if scope == 'raw' else self.unmixed_gating
+        transforms = self.raw_transformations if scope == 'raw' else self.unmixed_transformations
+
         all_overrides = self.custom_sample_gates.get(scope, {})
         overrides = all_overrides.get(self.current_sample_path, {})
 
@@ -517,6 +504,18 @@ class Controller(QObject):
             for gate_path in gate_paths:
                 if any([ancestor in top_gates_to_recalculate for ancestor in gate_path]):
                     top_gates_to_recalculate -= {gate_name}
+
+        # Full recalculation: rebuild lookup tables for gates that use
+        # a per-sample (default, e.g. Time) transform, so they match this
+        # sample's scale. Fixed-transform gates (fluorescence, FSC/SSC) keep
+        # their cached table — rebuilding everything here was slow (laggy).
+        for gate_id, gate_path in gating.get_gate_ids():
+            try:
+                channels = gating.get_gate(gate_id).get_dimension_ids()
+            except Exception:
+                continue
+            if any(getattr(transforms.get(ch), 'id', None) == 'default' for ch in channels):
+                top_gates_to_recalculate |= {gate_id}
 
         for gate_name in top_gates_to_recalculate:
             self.calculate_lookup_tables(mode=scope, top_gate=gate_name)
@@ -1615,12 +1614,6 @@ class Controller(QObject):
                 gating = self.data_for_cytometry_plots['gating']
                 if gating is None:
                     return
-
-                # Full recalculation: rebuild lookup tables ONLY for gates that use
-                # a per-sample (default, e.g. Time) transform, so they match this
-                # sample's scale. Fixed-transform gates (fluorescence, FSC/SSC) keep
-                # their cached table — rebuilding everything here was slow (laggy).
-                self._rebuild_per_sample_lookup_tables()
 
                 gate_membership = {'root': np.ones(len(self.data_for_cytometry_plots['event_data']), dtype=np.bool_)}
                 self.data_for_cytometry_plots.update({'gate_membership': gate_membership})
