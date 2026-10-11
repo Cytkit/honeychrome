@@ -505,9 +505,20 @@ class Controller(QObject):
             # use FlowKit custom sample gating to add gate to gating hierarchy. it will then be used in calculate lookup tables
             install_custom_gate(gating, gate_name, gate, self.current_sample_path)
 
-        for gate_name in {name for gates in all_overrides.values() for name in gates}:
+        # run calculate lookup tables only once for each relevant top gate
+        # it is normally the top gates like the time range and the cells / singlets that are customised, therefore avoid running this repeatedly for every item
+        custom_gate_name_set = {name for gates in all_overrides.values() for name in gates}
+        top_gates_to_recalculate = custom_gate_name_set.copy()
+        for gate_name in custom_gate_name_set:
             if gate_name not in existing:
+                top_gates_to_recalculate -= {gate_name}
                 continue
+            gate_paths = gating.find_matching_gate_paths(gate_name)
+            for gate_path in gate_paths:
+                if any([ancestor in top_gates_to_recalculate for ancestor in gate_path]):
+                    top_gates_to_recalculate -= {gate_name}
+
+        for gate_name in top_gates_to_recalculate:
             self.calculate_lookup_tables(mode=scope, top_gate=gate_name)
 
     def customise_gate(self, scope, gate_name):
