@@ -261,9 +261,11 @@ instrument units converted with this experiment's transforms, and unmixing
 here can differ from the unmixing the gates were drawn on, so look at them
 before training.</p>
 <ol>
-<li>Choose a <b>population</b>. The tab shows that population's events and,
-for each distinct set of parameters among its daughter gates, one plot with
-those gates drawn on it.</li>
+<li>Choose a <b>population</b> in the gating hierarchy on the left (expand
+and collapse its branches) or in the population list above it; the two stay
+in step. The tab shows that population's events and, for each distinct set of
+parameters among its daughter gates, one plot with those gates drawn on it. A
+population with no gates below it shows the plot it is gated on.</li>
 <li>Choose the <b>review sample</b>. When the imported counts came from a
 sample in this experiment it is selected for you, and each population label
 shows the fraction of its parent that Honeychrome now selects next to the
@@ -273,6 +275,9 @@ percentage points or by 5% of the imported fraction.</li>
 corners (long polygons are thinned to 32 corners when edited). Edits change
 the gate's imported boundary. <b>Reset to import</b> restores the boundaries
 shown to their imported state.</li>
+<li>Drag an axis to rescale it, as on the main plots: the lower half of a
+biexponential axis changes its width basis, the upper half zooms. The gates
+move with the axis, so they stay on the same events.</li>
 </ol>
 <p>Threshold gates keep one threshold per axis, so a FlowJo rectangle's far
 bound is not kept. A gate whose algorithm is not <i>imported</i> is shown but

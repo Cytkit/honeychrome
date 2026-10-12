@@ -24,7 +24,7 @@ import ag_core
 
 __all__ = [
     'ROOT', 'ABS_TOLERANCE', 'REL_TOLERANCE',
-    'reference_boundaries', 'population_choices', 'daughter_groups',
+    'reference_boundaries', 'population_choices', 'population_tree', 'daughter_groups',
     'imported_fraction', 'fraction_discrepancy', 'matches_import_sample',
     'with_thresholds', 'with_polygon', 'with_range', 'reset_template',
     'polygon_vertices', 'convert_target', 'is_free_shape',
@@ -85,6 +85,53 @@ def population_choices(gate_defs: list[dict]) -> list[dict]:
             choices.append({'gate': gate_def['gate_name'], 'pop': pop,
                             'label': label, 'n_gates': n})
     return choices
+
+
+def population_tree(gate_defs: list[dict]) -> list[dict]:
+    """Every population of the hierarchy as tree nodes, parents before children.
+
+    Each node is ``{'gate', 'pop', 'label', 'parent', 'n_gates', 'view'}``.
+    ``parent`` is the ``(gate, pop)`` key of the population the node's gate is
+    drawn on, None for the root; the root has gate '' and pop 'root'.
+    ``n_gates`` counts the gates drawn on the population. ``view`` is the
+    ``(gate, pop)`` whose daughter gates are shown to review the node: the
+    node itself when gates are drawn on it, else its parent (the plot it is
+    gated on). Labels follow ``population_choices``.
+    """
+    ordered = ag_core.ordered_gate_defs(gate_defs)
+    by_name = ag_core.gates_by_name(gate_defs)
+    if not ordered:
+        return []
+
+    def key_of(gate, pop):
+        return (gate or '', pop or 'root')
+
+    counts: dict = {}
+    for g in ordered:
+        k = key_of(g.get('parent_gate'), g.get('parent_popul') if g.get('parent_gate') else 'root')
+        counts[k] = counts.get(k, 0) + 1
+
+    root = key_of(None, 'root')
+    nodes = [{'gate': '', 'pop': 'root', 'label': 'All events (root)', 'parent': None,
+              'n_gates': counts.get(root, 0), 'view': root}]
+    known = {root}
+    for g in ordered:
+        gate_def = by_name[g['gate_name']]
+        parent_gate = gate_def.get('parent_gate') or ''
+        parent = key_of(parent_gate, gate_def.get('parent_popul') if parent_gate else 'root')
+        if parent not in known:
+            parent = root
+        imported = bool(gate_def.get('source'))
+        for pop in (gate_def.get('populations') or {}):
+            key = key_of(gate_def['gate_name'], pop)
+            if key in known:
+                continue
+            n = counts.get(key, 0)
+            label = pop if imported else f"{gate_def['gate_name']} / {pop}"
+            nodes.append({'gate': gate_def['gate_name'], 'pop': pop, 'label': label,
+                          'parent': parent, 'n_gates': n, 'view': key if n else parent})
+            known.add(key)
+    return nodes
 
 
 def daughter_groups(gate_defs: list[dict], parent_gate, parent_pop) -> list[dict]:

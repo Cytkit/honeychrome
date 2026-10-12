@@ -78,6 +78,13 @@ from ag_core import (  # noqa: E402
     default_populations_for_type as _default_populations_for_type,
 )
 import ag_help_texts  # noqa: E402
+from ag_widgets import (  # noqa: E402
+    PopulationTree,
+    SquareHolder,
+    add_concertina_page,
+    make_concertina,
+    zoom_axis_transform,
+)
 
 log = ag_core.get_logger(__name__)
 
@@ -143,6 +150,9 @@ def _ensure_qt_imports():
 # Plugin identity
 # ---------------------------------------------------------------------------
 plugin_name = 'Gating Model Builder'
+
+# Main-window tabs whose plots show the unmixed data (see Controller.set_mode).
+_UNMIXED_DATA_TABS = {'Unmixed Data', 'Statistics'}
 
 DEFAULT_EVENTS_PER_SAMPLE = 50_000
 TRAINING_SEED = 42
@@ -1148,10 +1158,10 @@ def _flowjo_matchers():
             lambda n: match_marker(n, marker_db))
 
 
-class FlowJoImportPanel(QGroupBox):
-    """Expandable section of the Hierarchy tab for importing a FlowJo workspace.
+class FlowJoImportPanel(QWidget):
+    """Page of the Hierarchy tab for importing a FlowJo workspace.
 
-    Opens when a workspace is chosen. It shows the gating source, the
+    Opened when a workspace is chosen. It shows the gating source, the
     proposed channel for every FlowJo parameter the gates use (green:
     confident, amber: check, red: unmatched and not yet resolved, grey:
     dropped), and inline messages about populations that cannot be imported
@@ -1160,9 +1170,13 @@ class FlowJoImportPanel(QGroupBox):
     Populations using a dropped parameter, and those below them, are not
     imported. The model changes only when an import button is pressed,
     which emits ``importRequested(gate_defs, report, replace, name)``.
+    ``titleChanged(text)`` gives the heading for the page, and
+    ``closeRequested`` asks the host to leave the page.
     """
 
     importRequested = Signal(object, object, bool, str)
+    titleChanged = Signal(str)
+    closeRequested = Signal()
 
     _DROP = "(drop)"
     _DROPPED = "__dropped__"
@@ -1174,7 +1188,7 @@ class FlowJoImportPanel(QGroupBox):
     _GREY = QColor(236, 236, 236)
 
     def __init__(self, controller, existing_names, parent=None):
-        super().__init__("FlowJo import", parent)
+        super().__init__(parent)
         self.controller = controller
         self._existing_names = existing_names
         self.workspace = None
@@ -1184,15 +1198,9 @@ class FlowJoImportPanel(QGroupBox):
         self._matches: dict = {}
         self._params: list = []
         self._name = ''
-        self.setCheckable(True)
-        self.setChecked(True)
 
-        self._body = QWidget()
-        body = QVBoxLayout(self._body)
-        body.setContentsMargins(0, 0, 0, 0)
-        outer = QVBoxLayout(self)
-        outer.addWidget(self._body)
-        self.toggled.connect(self._body.setVisible)
+        body = QVBoxLayout(self)
+        body.setContentsMargins(6, 6, 6, 6)
 
         self.lbl_status = QLabel()
         self.lbl_status.setWordWrap(True)
@@ -1263,16 +1271,13 @@ class FlowJoImportPanel(QGroupBox):
         self.btn_add.clicked.connect(lambda: self._import(replace=False))
         self.btn_replace.clicked.connect(lambda: self._import(replace=True))
         self.btn_cancel.clicked.connect(self.close_section)
-        self.setVisible(False)
 
     # -- opening and closing ------------------------------------------------
 
     def open_workspace(self, path: str):
         """Read *path* and show its alignment for review."""
         self._name = Path(path).name
-        self.setVisible(True)
-        self.setChecked(True)
-        self.setTitle(f"FlowJo import — {self._name}")
+        self.titleChanged.emit(f"FlowJo import — {self._name}")
         self.workspace = None
         self.combo_source.blockSignals(True)
         self.combo_source.clear()
@@ -1302,12 +1307,12 @@ class FlowJoImportPanel(QGroupBox):
         self._load_source()
 
     def close_section(self):
-        self.setVisible(False)
+        self.closeRequested.emit()
 
     def collapse(self, summary: str):
-        """Collapse to a one-line summary after an import."""
-        self.setTitle(f"FlowJo import — {self._name}: {summary}")
-        self.setChecked(False)
+        """Leave the page with a one-line summary in its heading after an import."""
+        self.titleChanged.emit(f"FlowJo import — {self._name}: {summary}")
+        self.closeRequested.emit()
 
     def _fail(self, message: str):
         self.lbl_status.setText(f"<span style='color:#a00000'>{message}</span>")
@@ -1375,7 +1380,9 @@ class FlowJoImportPanel(QGroupBox):
         else:
             colour = self._AMBER
         for col in (0, 1, 3, 4):
-            self.tbl.item(row, col).setBackground(colour)
+            item = self.tbl.item(row, col)
+            item.setBackground(colour)
+            item.setForeground(QColor('#000000'))
 
     def _drop_unmatched(self):
         for param, combo in self._combos.items():
@@ -1483,6 +1490,8 @@ class HierarchyTab(QWidget):
 
     # Emitted after gates are imported, so the plugin can open the Review tab.
     gatesImported = Signal()
+    # Emitted when an axis drag changed a channel's transform: (channel, parameters before).
+    transformChanged = Signal(str, object)
 
     def __init__(self, state: GatingModelState, bus, controller, parent=None):
         super().__init__(parent)
@@ -1497,6 +1506,11 @@ class HierarchyTab(QWidget):
         # state doesn't trigger a feedback loop.
         self._suppress_item_changed = False
 
+        # Parent-population events of the previewed gate: (gate name, events, note).
+        # Kept while an axis is dragged so the data is not gated again for every step.
+        self._preview_cache = None
+        self._preview_channels = ('', '')
+
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -1504,7 +1518,7 @@ class HierarchyTab(QWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        # Horizontal splitter: tree+controls on left, preview on right.
+        # Horizontal splitter: concertina on left, preview on right.
         splitter = QSplitter(Qt.Horizontal)
 
         # ----- Left side -----
@@ -1512,6 +1526,15 @@ class HierarchyTab(QWidget):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.addWidget(HelpToggleWidget(text=ag_help_texts.BUILDER_HIERARCHY))
+
+        # One section open at a time; each page scrolls on its own.
+        self.toolbox = make_concertina()
+        left_layout.addWidget(self.toolbox, stretch=1)
+
+        # Gate hierarchy page: control bar above the gate list.
+        gates_page = QWidget()
+        page_layout = QVBoxLayout(gates_page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
 
         # Control bar.
         ctrl_row = QHBoxLayout()
@@ -1555,14 +1578,13 @@ class HierarchyTab(QWidget):
                   self.btn_advanced, self.btn_delete):
             ctrl_row.addWidget(b)
         ctrl_row.addStretch()
-        left_layout.addLayout(ctrl_row)
+        page_layout.addLayout(ctrl_row)
 
         self.flowjo_panel = FlowJoImportPanel(
             self.controller,
             lambda: {g.get('gate_name') for g in self.state.gate_definitions},
             parent=self)
         self.flowjo_panel.importRequested.connect(self._on_flowjo_import_requested)
-        left_layout.addWidget(self.flowjo_panel)
 
         # Tree widget.
         self.tree = QTreeWidget()
@@ -1597,12 +1619,21 @@ class HierarchyTab(QWidget):
         self.tree.setColumnWidth(self.COL_ALGORITHM,  100)
         self.tree.setColumnWidth(self.COL_STATUS,     90)
         self.tree.setColumnWidth(self.COL_CONVERT,    130)
-        left_layout.addWidget(self.tree)
+        self.tree.setMinimumHeight(240)
+        page_layout.addWidget(self.tree)
 
         # Help / status text just under the tree.
         self.lbl_summary = QLabel("No gates loaded.")
         self.lbl_summary.setStyleSheet("color: #555; font-style: italic;")
-        left_layout.addWidget(self.lbl_summary)
+        page_layout.addWidget(self.lbl_summary)
+
+        self._page_gates = add_concertina_page(self.toolbox, gates_page, "Gate hierarchy")
+        self._page_flowjo = add_concertina_page(self.toolbox, self.flowjo_panel, "FlowJo import")
+        self.toolbox.setItemEnabled(self._page_flowjo, False)
+        self.flowjo_panel.titleChanged.connect(
+            lambda text: self.toolbox.setItemText(self._page_flowjo, text))
+        self.flowjo_panel.closeRequested.connect(
+            lambda: self.toolbox.setCurrentIndex(self._page_gates))
 
         splitter.addWidget(left)
 
@@ -1619,7 +1650,6 @@ class HierarchyTab(QWidget):
         # NoPanViewBox + ZoomAxis — matches CytometryPlotWidget and BiplotTile.
         self._preview_gw = TransparentGraphicsLayoutWidget()
         self._preview_gw.setMinimumSize(280, 280)
-        self._preview_gw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         gl = self._preview_gw.ci.layout
         gl.setHorizontalSpacing(0)
         gl.setVerticalSpacing(0)
@@ -1636,6 +1666,8 @@ class HierarchyTab(QWidget):
         self._preview_gw.addItem(self._preview_axis_x, row=2, col=2)
         self._preview_axis_x.linkToView(self._preview_vb)
         self._preview_axis_y.linkToView(self._preview_vb)
+        self._preview_axis_x.zoom_timer.timeout.connect(lambda: self._on_preview_zoom('x'))
+        self._preview_axis_y.zoom_timer.timeout.connect(lambda: self._on_preview_zoom('y'))
         # No separate LabelItems — labels set via axis.setLabel() in _update_preview.
 
         # ImageItem for 2D density heatmap (colourmap set in _update_preview)
@@ -1649,7 +1681,7 @@ class HierarchyTab(QWidget):
         )
         self._preview_vb.addItem(self._preview_hist)
 
-        right_layout.addWidget(self._preview_gw, stretch=1)
+        right_layout.addWidget(SquareHolder(self._preview_gw, minimum=280), stretch=1)
 
         # Per-gate "Advanced…" shortcut also lives on the right pane.
         right_btn_row = QHBoxLayout()
@@ -1775,6 +1807,8 @@ class HierarchyTab(QWidget):
         if row_tint is not None:
             for col in range(self.tree.columnCount()):
                 item.setBackground(col, row_tint)
+                if col != self.COL_STATUS:
+                    item.setForeground(col, QBrush(QColor('#000000')))
 
         # Stash the gate_name on the item so context-menu / double-click
         # handlers can find the matching dict without a string compare
@@ -2007,7 +2041,9 @@ class HierarchyTab(QWidget):
             "FlowJo workspaces (*.wsp *.wspt);;All files (*)",
         )
         if path:
+            self.toolbox.setItemEnabled(self._page_flowjo, True)
             self.flowjo_panel.open_workspace(path)
+            self.toolbox.setCurrentIndex(self._page_flowjo)
 
     def _on_flowjo_import_requested(self, gate_defs, report, replace: bool, name: str):
         """Add or replace the model's gates with the imported ones."""
@@ -2562,8 +2598,12 @@ class HierarchyTab(QWidget):
     # Right-hand preview pane
     # ------------------------------------------------------------------
 
-    def _update_preview(self):
-        """Refresh the right-pane preview plot for the selected gate."""
+    def _update_preview(self, keep_events: bool = False):
+        """Refresh the right-pane preview plot for the selected gate.
+
+        With *keep_events* the parent-population events found by the last
+        full refresh are drawn again (used while an axis is being dragged).
+        """
         import honeychrome.settings as hc_settings
         import colorcet as cc
 
@@ -2577,6 +2617,8 @@ class HierarchyTab(QWidget):
 
         g = self._selected_gate()
         if g is None:
+            self._preview_cache = None
+            self._preview_channels = ('', '')
             self.lbl_preview_title.setText(
                 "<i>Select a gate to preview its geometry.</i>"
             )
@@ -2584,6 +2626,7 @@ class HierarchyTab(QWidget):
 
         ch_x = g.get('gate_marker_x', '')
         ch_y = g.get('gate_marker_y') or ''
+        self._preview_channels = (ch_x, ch_y)
 
         # Display labels via build_display_label_map
         pnn = _experiment_channels(self.controller)
@@ -2618,7 +2661,12 @@ class HierarchyTab(QWidget):
         self._preview_img.setLookupTable(rgba_lut)
 
         # --- Load raw unmixed events ---
-        raw_data, parent_note = self._preview_events(g)
+        cache = self._preview_cache
+        if keep_events and cache is not None and cache[0] == g.get('gate_name'):
+            _name, raw_data, parent_note = cache
+        else:
+            raw_data, parent_note = self._preview_events(g)
+            self._preview_cache = (g.get('gate_name'), raw_data, parent_note)
         if parent_note:
             title_bits.append(parent_note)
         self.lbl_preview_title.setText(" — ".join(title_bits))
@@ -2677,6 +2725,26 @@ class HierarchyTab(QWidget):
                 anchor=(0.5, 0.5),
             )
             self._preview_vb.addItem(txt)
+
+    def _on_preview_zoom(self, axis_name: str):
+        """Apply an axis drag on the preview to that channel's transform.
+
+        A change of the logicle width is announced with ``transformChanged``
+        so the model's boundaries are converted before the plot is redrawn.
+        """
+        channel = self._preview_channels[0 if axis_name == 'x' else 1]
+        axis = self._preview_axis_x if axis_name == 'x' else self._preview_axis_y
+        tr = (self.controller.unmixed_transformations or {}).get(channel) if channel else None
+        if tr is None:
+            axis._pending_delta = 0
+            return
+        before = ag_core.transform_params(tr)
+        changed = zoom_axis_transform(axis, self._preview_vb, axis_name, tr)
+        if changed is None:
+            return
+        if changed:
+            self.transformChanged.emit(channel, before)
+        self._update_preview(keep_events=True)
 
     def _preview_events(self, gate_def: dict) -> tuple:
         """Events of the gate's parent population, and a note for the title.
@@ -3186,12 +3254,17 @@ class TrainTab(QWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        splitter = QSplitter(Qt.Vertical)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(HelpToggleWidget(text=ag_help_texts.BUILDER_TRAIN))
+
+        # One section open at a time; each page scrolls on its own.
+        self.toolbox = make_concertina()
+        outer.addWidget(self.toolbox, stretch=1)
 
         top = QWidget()
         top_layout = QVBoxLayout(top)
         top_layout.setContentsMargins(4, 4, 4, 4)
-        top_layout.addWidget(HelpToggleWidget(text=ag_help_texts.BUILDER_TRAIN))
         top_layout.addWidget(QLabel("<b>Training samples</b>"))
 
         self.picker = OrderedMultiSamplePicker()
@@ -3233,12 +3306,7 @@ class TrainTab(QWidget):
         run_row.addWidget(self.btn_abort)
         run_row.addWidget(self.lbl_status, stretch=1)
         top_layout.addLayout(run_row)
-
-        splitter.addWidget(top)
-
-        bottom = QWidget()
-        bottom_layout = QVBoxLayout(bottom)
-        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.addStretch()
 
         self.grid_scroll = QScrollArea()
         self.grid_scroll.setWidgetResizable(True)
@@ -3250,15 +3318,9 @@ class TrainTab(QWidget):
         self.grid_layout.setContentsMargins(4, 4, 4, 4)
 
         self.grid_scroll.setWidget(self.grid_container)
-        bottom_layout.addWidget(self.grid_scroll)
-        splitter.addWidget(bottom)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(splitter)
+        add_concertina_page(self.toolbox, top, "Training")
+        self._page_tiles = self.toolbox.addItem(self.grid_scroll, "Gate boundaries")
 
     # ------------------------------------------------------------------
     # Public refresh hook
@@ -3606,6 +3668,7 @@ class TrainTab(QWidget):
         self._last_event_data = payload['display_events']
         self._last_gate_masks = payload['display_parent_masks']
         self._rebuild_grid()
+        self.toolbox.setCurrentIndex(self._page_tiles)
 
         n_trained = len(payload['boundaries'])
         problems = [
@@ -3656,6 +3719,8 @@ class _ReviewPlot(QWidget):
     """
 
     gateEdited = Signal(str, object)
+    # (channel, transform parameters before the drag, or None when only the range moved)
+    axisZoomed = Signal(str, object)
 
     def __init__(self, channels, gates, controller, tile_size, parent=None):
         super().__init__(parent)
@@ -3693,6 +3758,8 @@ class _ReviewPlot(QWidget):
         self.gw.addItem(self.axis_x, row=2, col=2)
         self.axis_x.linkToView(self.vb)
         self.axis_y.linkToView(self.vb)
+        self.axis_x.zoom_timer.timeout.connect(lambda: self._on_zoom('x'))
+        self.axis_y.zoom_timer.timeout.connect(lambda: self._on_zoom('y'))
         self.axis_x.setLabel(self._labels[0])
         self.axis_y.setLabel(self._labels[1] if len(self._labels) > 1 else 'Count')
         self.img = pg.ImageItem()
@@ -3703,6 +3770,19 @@ class _ReviewPlot(QWidget):
 
     def _tr(self, i):
         return self._transforms.get(self.channels[i]) if i < len(self.channels) else None
+
+    def _on_zoom(self, axis_name: str):
+        """Apply an axis drag to that channel's transform and announce it."""
+        i = 0 if axis_name == 'x' else 1
+        axis = self.axis_x if axis_name == 'x' else self.axis_y
+        tr = self._tr(i)
+        if tr is None:
+            axis._pending_delta = 0
+            return
+        before = ag_core.transform_params(tr)
+        changed = zoom_axis_transform(axis, self.vb, axis_name, tr)
+        if changed is not None:
+            self.axisZoomed.emit(self.channels[i], before if changed else None)
 
     def set_events(self, raw, mask):
         """Draw the density of the parent population (rows of *raw* in *mask*)."""
@@ -3897,6 +3977,8 @@ class ReviewTab(QWidget):
     """
 
     templatesChanged = Signal()
+    # Emitted when an axis drag changed a channel's transform: (channel, parameters before).
+    transformChanged = Signal(str, object)
     _MAX_EVENTS = 150_000
 
     def __init__(self, state: GatingModelState, bus, controller, parent=None):
@@ -3913,6 +3995,10 @@ class ReviewTab(QWidget):
         self._worker = None
         self._plots: list = []
         self._building = False
+        self._mask = None
+        self._data_signature = None
+        self._tree_views: dict = {}
+        self._tree_labels: dict = {}
         self._build_ui()
 
     def _build_ui(self):
@@ -3945,8 +4031,38 @@ class ReviewTab(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self._host)
-        layout.addWidget(scroll, stretch=1)
 
+        # Gating hierarchy on the left, inspection plots on the right.
+        tree_panel = QWidget()
+        tree_layout = QVBoxLayout(tree_panel)
+        tree_layout.setContentsMargins(0, 0, 0, 0)
+        tree_header = QHBoxLayout()
+        tree_header.addWidget(QLabel("<b>Gating hierarchy</b>"))
+        tree_header.addStretch()
+        self.btn_expand = QPushButton("Expand")
+        self.btn_collapse = QPushButton("Collapse")
+        self.btn_expand.setToolTip("Expand every node of the hierarchy.")
+        self.btn_collapse.setToolTip("Collapse the hierarchy to the root.")
+        tree_header.addWidget(self.btn_expand)
+        tree_header.addWidget(self.btn_collapse)
+        tree_layout.addLayout(tree_header)
+        self.pop_tree = PopulationTree()
+        self.pop_tree.setToolTip(
+            "Select a population to inspect the gates drawn on it. Populations "
+            "with no gates below them show the plot they are gated on.")
+        tree_layout.addWidget(self.pop_tree, stretch=1)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(tree_panel)
+        splitter.addWidget(scroll)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 4)
+        splitter.setSizes([240, 760])
+        layout.addWidget(splitter, stretch=1)
+
+        self.pop_tree.populationSelected.connect(self._on_tree_selected)
+        self.btn_expand.clicked.connect(self.pop_tree.expandAll)
+        self.btn_collapse.clicked.connect(self.pop_tree.collapseAll)
         self.combo_pop.currentIndexChanged.connect(self._on_population_changed)
         self.combo_sample.currentIndexChanged.connect(self._on_sample_changed)
         self.chk_edit.toggled.connect(lambda _on: self._redraw_overlays())
@@ -3968,6 +4084,7 @@ class ReviewTab(QWidget):
                 i = self.combo_pop.findData(previous)
                 if i >= 0:
                     self.combo_pop.setCurrentIndex(i)
+            self._fill_tree()
             self._fill_samples()
         finally:
             self._building = False
@@ -3976,6 +4093,33 @@ class ReviewTab(QWidget):
             self.lbl_status.setText("The model has no gates to review.")
             return
         self._ensure_sample()
+
+    def _fill_tree(self):
+        """Rebuild the hierarchy tree and select the population shown."""
+        nodes = ag_review.population_tree(self.state.gate_definitions)
+        self._tree_views = {(n['gate'], n['pop']): n['view'] for n in nodes}
+        self._tree_labels = {(n['gate'], n['pop']): n['label'] for n in nodes}
+        self.pop_tree.set_nodes(nodes)
+        self._select_in_tree()
+
+    def _select_in_tree(self):
+        gate, pop = self._selected()
+        self.pop_tree.select_population(gate, pop)
+
+    def _on_tree_selected(self, gate: str, pop: str):
+        """A node was picked in the tree: show its plots through the combobox."""
+        view = self._tree_views.get((gate, pop))
+        if view is None:
+            return
+        i = self.combo_pop.findData((view[0] or None, view[1]))
+        if i < 0:
+            return
+        self._building = True
+        try:
+            self.combo_pop.setCurrentIndex(i)
+        finally:
+            self._building = False
+        self._rebuild_plots()
 
     def _import_sample_key(self):
         """The experiment sample the imported counts were recorded on, if any."""
@@ -4005,6 +4149,7 @@ class ReviewTab(QWidget):
 
     def _on_population_changed(self, _index=None):
         if not self._building:
+            self._select_in_tree()
             self._rebuild_plots()
 
     def _on_sample_changed(self, _index=None):
@@ -4023,6 +4168,8 @@ class ReviewTab(QWidget):
             self._raw = self._data_t = self._result = self._loaded_key = None
             self._loaded_dir = experiment_dir
         if key == self._loaded_key and self._raw is not None:
+            if self._data_signature != self._transform_signature():
+                self._transform_events()
             self._regate()
             self._rebuild_plots()
             return
@@ -4049,13 +4196,39 @@ class ReviewTab(QWidget):
             return
         self._raw = data
         self._loaded_key = key
-        pnn = _experiment_channels(self.controller)
-        self._data_t = ag_core.transform_columns(data, pnn, self.controller.unmixed_transformations or {})
+        self._transform_events()
         if self._wanted_key not in (None, key):
             self._ensure_sample()
             return
         self._regate()
         self._rebuild_plots()
+
+    def _transform_signature(self):
+        """The transforms the events are shown in, as comparable values."""
+        live = self.controller.unmixed_transformations or {}
+        return tuple(sorted(
+            (ch, tuple(sorted((k, str(v)) for k, v in ag_core.transform_params(tr).items()
+                              if k != 'limits')))
+            for ch, tr in live.items()))
+
+    def _transform_events(self):
+        """Transform every column of the loaded events with the live transforms."""
+        pnn = _experiment_channels(self.controller)
+        self._data_t = ag_core.transform_columns(
+            self._raw, pnn, self.controller.unmixed_transformations or {})
+        self._data_signature = self._transform_signature()
+
+    def _retransform_channel(self, channel: str):
+        """Transform one column again after its transform changed."""
+        pnn = _experiment_channels(self.controller)
+        tr = (self.controller.unmixed_transformations or {}).get(channel)
+        xform = getattr(tr, 'xform', None)
+        if self._raw is None or self._data_t is None or xform is None or channel not in pnn:
+            return
+        col = pnn.index(channel)
+        self._data_t[:, col] = np.asarray(
+            xform.apply(self._raw[:, col].astype(np.float64)), dtype=np.float32)
+        self._data_signature = self._transform_signature()
 
     def _regate(self):
         pnn = _experiment_channels(self.controller)
@@ -4098,15 +4271,36 @@ class ReviewTab(QWidget):
         for n, group in enumerate(groups):
             plot = _ReviewPlot(group['channels'], group['gates'], self.controller, tile, self)
             plot.gateEdited.connect(self._on_gate_edited)
+            plot.axisZoomed.connect(self._on_axis_zoomed)
             plot.set_events(self._raw, mask)
             self._grid.addWidget(plot, n // 2, n % 2)
             self._plots.append(plot)
         self._redraw_overlays()
         label = 'All events' if gate is None else f"{pop}"
-        self.lbl_status.setText(
-            f"{label}: {int(mask.sum()):,} of {len(self._raw):,} events on "
-            f"{_sample_label(self._loaded_key)}; {len(groups)} parameter set"
-            f"{'s' if len(groups) != 1 else ''}.")
+        text = (f"{label}: {int(mask.sum()):,} of {len(self._raw):,} events on "
+                f"{_sample_label(self._loaded_key)}; {len(groups)} parameter set"
+                f"{'s' if len(groups) != 1 else ''}.")
+        node = self.pop_tree.current_population()
+        if node is not None and self._tree_views.get(node) not in (None, node):
+            text = f"{self._tree_labels.get(node, node[1])} is gated on this plot. " + text
+        self.lbl_status.setText(text)
+
+    def _on_axis_zoomed(self, channel: str, before):
+        """An axis of a review plot was dragged.
+
+        A change of the transform itself (*before* holds its earlier
+        parameters) converts the model's boundaries, then the events are
+        transformed and gated again; either way the plots using the channel
+        are drawn again.
+        """
+        if before is not None:
+            self.transformChanged.emit(channel, before)
+            self._retransform_channel(channel)
+            self._regate()
+        for plot in self._plots:
+            if channel in plot.channels:
+                plot.set_events(self._raw, self._mask)
+        self._redraw_overlays()
 
     def _label_texts(self, gate_def: dict, boundary: dict) -> dict:
         """{(gate, pop): (text, alert)} for the populations worth labelling."""
@@ -4511,6 +4705,10 @@ class PluginWidget(QWidget):
         self._loaded_experiment_key = None
         self._loaded_experiment_dir = None
 
+        # Channels whose axis transform was changed here and that the main
+        # window's plots have not been told about yet.
+        self._dirty_axes: set = set()
+
         # ------------------------------------------------------------------
         # Outer layout: disabled label + scrollable content area.
         # The disabled label is shown until the experiment has an
@@ -4561,6 +4759,8 @@ class PluginWidget(QWidget):
         self.hierarchy_tab.gatesImported.connect(
             lambda: self.inner_tabs.setCurrentWidget(self.review_tab))
         self.review_tab.templatesChanged.connect(self._write_session)
+        self.hierarchy_tab.transformChanged.connect(self._on_axis_transformed)
+        self.review_tab.transformChanged.connect(self._on_axis_transformed)
         self.train_tab.trained.connect(self._write_session)
         self.train_tab.boundaries_changed.connect(self._write_session)
         content_layout.addWidget(self.inner_tabs)
@@ -4603,6 +4803,8 @@ class PluginWidget(QWidget):
         only when the experiment has changed, so returning to the tab
         keeps whatever was trained or edited in the meantime.
         """
+        if mode in _UNMIXED_DATA_TABS and self._dirty_axes:
+            QTimer.singleShot(0, self._flush_axis_transforms)
         if mode != plugin_name:
             if self._plugin_was_active:
                 self.save_state()
@@ -4618,6 +4820,29 @@ class PluginWidget(QWidget):
         else:
             self.label_disabled.setVisible(True)
             self.content_widget.setVisible(False)
+
+    def _on_axis_transformed(self, channel: str, before: dict):
+        """A tab changed a channel's transform: keep the model's boundaries
+        in the same place in the data and note the change for the main plots."""
+        live = _live_transform_params(self.controller)
+        after = live.get(channel)
+        if after is None:
+            return
+        ag_core.remap_channel_transform(
+            self.state.gate_definitions, self.state.trained_boundaries,
+            channel, before, after)
+        self._dirty_axes.add(channel)
+
+    def _flush_axis_transforms(self):
+        """Tell the main window's plots about transforms changed here.
+
+        Emitted only once an unmixed data tab is showing: the controller
+        recalculates the plots of the active data tab, and recalculating
+        before the tab switch has completed would use the wrong data.
+        """
+        channels, self._dirty_axes = sorted(self._dirty_axes), set()
+        for channel in channels:
+            self.bus.axisTransformed.emit(channel)
 
     def _ensure_state_loaded(self):
         """Load persisted state when the controller's experiment is not the
