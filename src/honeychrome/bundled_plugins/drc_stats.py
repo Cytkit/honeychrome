@@ -628,50 +628,6 @@ def compute_sample_pca(state, use_freq: bool, use_counts: bool, use_mfi: bool,
 # Composition views
 # ---------------------------------------------------------------------------
 
-def compute_confusion_matrix(controller, state, cluster_labels_override=None,
-                             normalize_to: int = 1000,
-                             names_override: dict | None = None) -> pd.DataFrame:
-    """
-    Per-group-normalized cluster composition heatmap (CyCONDOR's
-    plot_confusion_HM).
-
-    Pools each group's events across its samples, normalizes each group's
-    total event count to ``normalize_to``, then for every cluster returns
-    the normalized share contributed by each group. Independent of any
-    differential test results — usable as soon as groups are assigned and a clustering
-    run is selected (same availability gate as run_statistics(), via
-    resolve_test_groups()'s ≥3-per-group check).
-
-    Returns (n_clusters by n_groups) DataFrame — one column per qualifying
-    group in state.testing_group_selection.
-    """
-    log_stage(log, "CONFUSION MATRIX")
-    group_rel = resolve_test_groups(controller, state, cluster_labels_override=cluster_labels_override)
-    qualifying = [g for g in (state.testing_group_selection or state.group_names) if g in group_rel]
-    all_rel = [rel for g in qualifying for rel in group_rel[g]]
-    cluster_labels = cluster_labels_override if cluster_labels_override is not None \
-        else state.cluster_labels
-    n_clusters = n_clusters_from_labels(
-        state, all_rel, cluster_labels_override=cluster_labels_override
-    )
-
-    conf = np.zeros((n_clusters, len(qualifying)), dtype=float)
-    for gi, grp in enumerate(qualifying):
-        rels = group_rel[grp]
-        pooled = np.concatenate([np.asarray(cluster_labels[rel]) for rel in rels])
-        total = len(pooled)
-        if total == 0:
-            continue
-        scale = normalize_to / total
-        for cl in range(n_clusters):
-            conf[cl, gi] = float(np.sum(pooled == cl)) * scale
-
-    df = pd.DataFrame(conf, columns=qualifying,
-                      index=[_label_for(state, cl, names_override) for cl in range(n_clusters)])
-    log.info("confusion matrix: %s", df.shape)
-    return df
-
-
 def get_counts_table(controller, state, group_var: str = 'sample',
                      cluster_labels_override=None,
                      names_override: dict | None = None) -> pd.DataFrame:

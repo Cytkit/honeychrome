@@ -86,6 +86,7 @@ import ag_core  # noqa: E402
 import ag_help_texts  # noqa: E402
 import ag_report  # noqa: E402
 import ag_results  # noqa: E402
+from ag_widgets import add_concertina_page, make_concertina  # noqa: E402
 
 log = ag_core.get_logger(__name__)
 
@@ -433,6 +434,18 @@ class SetupTab(QWidget):
         outer.setSpacing(8)
         outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_SETUP))
 
+        self.lbl_messages = QLabel("")
+        self.lbl_messages.setWordWrap(True)
+        self.lbl_messages.setStyleSheet("color: #856404;")
+        outer.addWidget(self.lbl_messages)
+
+        # One section open at a time; each page scrolls on its own.
+        self.toolbox = make_concertina()
+        outer.addWidget(self.toolbox, stretch=1)
+
+        # Model
+        model_page = QWidget()
+        ml = QVBoxLayout(model_page)
         load_row = QHBoxLayout()
         self.btn_load = QPushButton("Load Model…")
         self.btn_load.clicked.connect(self._on_load_clicked)
@@ -440,18 +453,16 @@ class SetupTab(QWidget):
         self.lbl_path = QLabel("No model loaded.")
         self.lbl_path.setWordWrap(True)
         load_row.addWidget(self.lbl_path, stretch=1)
-        outer.addLayout(load_row)
-
-        self.summary_group = QGroupBox("Model")
-        sl = QVBoxLayout(self.summary_group)
+        ml.addLayout(load_row)
         self.lbl_summary = QLabel("")
         self.lbl_summary.setWordWrap(True)
         self.lbl_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        sl.addWidget(self.lbl_summary)
-        outer.addWidget(self.summary_group)
+        ml.addWidget(self.lbl_summary)
+        ml.addStretch()
 
-        align_group = QGroupBox("Channel alignment (channels used by the gates)")
-        al = QVBoxLayout(align_group)
+        # Channel alignment
+        align_page = QWidget()
+        al = QVBoxLayout(align_page)
         note = QLabel("Each model channel is matched to this experiment by antigen. Green rows "
                       "matched by antigen; amber rows need checking; red rows need a channel.")
         note.setWordWrap(True)
@@ -463,7 +474,7 @@ class SetupTab(QWidget):
         self.align_table.verticalHeader().setVisible(False)
         self.align_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.align_table.setMinimumHeight(140)
-        al.addWidget(self.align_table)
+        al.addWidget(self.align_table, stretch=1)
         acc_row = QHBoxLayout()
         self.lbl_align_state = QLabel("")
         self.lbl_align_state.setWordWrap(True)
@@ -473,15 +484,10 @@ class SetupTab(QWidget):
         self.btn_accept.clicked.connect(self._on_accept_clicked)
         acc_row.addWidget(self.btn_accept)
         al.addLayout(acc_row)
-        outer.addWidget(align_group)
 
-        self.lbl_messages = QLabel("")
-        self.lbl_messages.setWordWrap(True)
-        self.lbl_messages.setStyleSheet("color: #856404;")
-        outer.addWidget(self.lbl_messages)
-
-        gates_group = QGroupBox("Gates")
-        gl = QVBoxLayout(gates_group)
+        # Gates
+        gates_page = QWidget()
+        gl = QVBoxLayout(gates_page)
         opts = QHBoxLayout()
         opts.addWidget(QLabel("Drift limit:"))
         self.sb_drift = QDoubleSpinBox()
@@ -513,8 +519,12 @@ class SetupTab(QWidget):
         self.gate_tree.setHeaderLabels(["Gate", "Type", "X axis", "Y axis", "Algorithm", "Application"])
         self.gate_tree.header().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.gate_tree.setMinimumHeight(160)
-        gl.addWidget(self.gate_tree)
-        outer.addWidget(gates_group, stretch=1)
+        gl.addWidget(self.gate_tree, stretch=1)
+
+        self._page_model = add_concertina_page(self.toolbox, model_page, "Model")
+        self._page_align = add_concertina_page(
+            self.toolbox, align_page, "Channel alignment (channels used by the gates)")
+        self._page_gates = add_concertina_page(self.toolbox, gates_page, "Gates")
 
     # ------------------------------------------------------------------
 
@@ -584,6 +594,8 @@ class SetupTab(QWidget):
             self._apply_alignment(quiet=True)
         self._show_messages()
         self._update_align_state()
+        self.toolbox.setCurrentIndex(self._page_gates if st.alignment_confirmed
+                                     else self._page_align)
         _status(self.bus, f"Model loaded: {Path(path).name}")
         return True
 
@@ -714,6 +726,7 @@ class SetupTab(QWidget):
         self._show_messages()
         self._update_align_state()
         if not quiet:
+            self.toolbox.setCurrentIndex(self._page_gates)
             _status(self.bus, "Channel alignment accepted.")
             self.model_ready.emit()
 
@@ -1040,8 +1053,9 @@ class RunTab(QWidget):
         cl.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self.content, stretch=1)
 
-        splitter = QSplitter(Qt.Vertical)
-        cl.addWidget(splitter)
+        # One section open at a time; each page scrolls on its own.
+        self.toolbox = make_concertina()
+        cl.addWidget(self.toolbox)
 
         top = QWidget()
         tl = QVBoxLayout(top)
@@ -1100,7 +1114,6 @@ class RunTab(QWidget):
         run_row.addWidget(self.progress_bar)
         run_row.addWidget(self.lbl_status, stretch=1)
         tl.addLayout(run_row)
-        splitter.addWidget(top)
 
         bottom = QWidget()
         bl = QVBoxLayout(bottom)
@@ -1113,6 +1126,7 @@ class RunTab(QWidget):
         bl.addLayout(view_row)
         self.tile_scroll = QScrollArea()
         self.tile_scroll.setWidgetResizable(True)
+        self.tile_scroll.setMinimumHeight(260)
         self.tile_canvas = QWidget()
         self.tile_grid = QGridLayout(self.tile_canvas)
         self.tile_grid.setSpacing(4)
@@ -1122,9 +1136,9 @@ class RunTab(QWidget):
         bl.addWidget(QLabel("<b>Samples gated</b>"))
         self.summary_holder = QVBoxLayout()
         bl.addLayout(self.summary_holder, stretch=1)
-        splitter.addWidget(bottom)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
+
+        self._page_samples = add_concertina_page(self.toolbox, top, "Samples and gating")
+        self._page_views = add_concertina_page(self.toolbox, bottom, "Gated views")
 
     # ------------------------------------------------------------------
 
@@ -1287,6 +1301,7 @@ class RunTab(QWidget):
         self._populate_views()
         self._draw_summary_table()
         if n:
+            self.toolbox.setCurrentIndex(self._page_views)
             self.gating_finished.emit()
 
     # ------------------------------------------------------------------
@@ -1514,24 +1529,25 @@ class ResultsTab(QWidget):
         self.cb_comparison.currentIndexChanged.connect(self._on_comparison_changed)
         cmp_row.addWidget(self.cb_comparison, stretch=1)
         outer.addLayout(cmp_row)
-        self.sub_tabs = QTabWidget()
-        self.sub_tabs.setDocumentMode(True)
-        outer.addWidget(self.sub_tabs, stretch=1)
+        # One section open at a time; each page scrolls on its own.
+        self.toolbox = make_concertina()
+        outer.addWidget(self.toolbox, stretch=1)
 
         self.groups_page = QWidget()
         self._build_groups_page()
-        self.sub_tabs.addTab(self.groups_page, "Groups")
+        add_concertina_page(self.toolbox, self.groups_page, "Groups")
         self.stats_page = QWidget()
         self._build_stats_page()
-        self.sub_tabs.addTab(self.stats_page, "Statistics")
+        add_concertina_page(self.toolbox, self.stats_page, "Statistics")
         self.figures_tabs = QTabWidget()
-        self.sub_tabs.addTab(self.figures_tabs, "Figures")
+        self.figures_tabs.setMinimumHeight(400)
+        add_concertina_page(self.toolbox, self.figures_tabs, "Figures")
         self.browser_page = QWidget()
         self._build_browser_page()
-        self.sub_tabs.addTab(self.browser_page, "Populations")
+        self._page_browser = add_concertina_page(self.toolbox, self.browser_page, "Populations")
         self.export_page = QWidget()
         self._build_export_page()
-        self.sub_tabs.addTab(self.export_page, "Export")
+        add_concertina_page(self.toolbox, self.export_page, "Export")
 
     # ------------------------------------------------------------------
     # Groups
@@ -2186,7 +2202,7 @@ class ResultsTab(QWidget):
             if self.pop_list.item(i).data(Qt.UserRole) == pop_key:
                 self.pop_list.setCurrentRow(i)
                 break
-        self.sub_tabs.setCurrentWidget(self.browser_page)
+        self.toolbox.setCurrentIndex(self._page_browser)
 
     def _draw_population(self, item):
         _clear_layout(self.browser_grid)

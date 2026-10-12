@@ -255,6 +255,9 @@ each marker, stacked for easy comparison.</li>
 </ul>
 <p>Click <b>Recompute Marker Summary</b> after changing the clustering
 run or channel selection.</p>
+<p>The per-cluster marker distribution views and the editable cluster
+names are in the spirit of the marker-distribution and cluster
+relabelling tools of the MARMOT pipeline [4].</p>
 
 <h4>Further Reading and Background</h4>
 <p>Documentation:</p>
@@ -266,13 +269,14 @@ run or channel selection.</p>
 [1]<a href="https://doi.org/10.1038/nmeth.4149">Diggins et al. 2017, Nat Methods (MEM)</a><br/>
 [2]<a href="https://doi.org/10.1038/s41467-022-28803-w">Ianevski, Giri and Aittokallio 2022, Nat Commun (ScType)</a><br/>
 [3]<a href="https://doi.org/10.1002/cyto.a.22625">Van Gassen et al. 2015, Cytometry A (FlowSOM)</a><br/>
+[4]<a href="https://doi.org/10.1016/j.jim.2025.113854">Kirsche et al. 2025, J Immunol Methods (MARMOT)</a><br/>
 </p>
 '''
 
 stats_tab_help_text = '''
 <h3>Stats — group comparisons, differential testing, and PCA</h3>
 <p><b>Prerequisite:</b> a clustering run must exist (Configuration tab)
-before you can run Frequency/Counts/MFI statistics, Confusion Matrix, or
+before you can run Frequency/Counts/MFI statistics or
 Composition-by-group. DR-only runs are shown in the Run selector but
 statistics stay disabled for them.</p>
 
@@ -462,36 +466,17 @@ one group.</li>
 leave Paired design unticked.</li>
 </ul>
 
-<h4>4. Confusion Matrix, Composition Barplot, and Export</h4>
-<p>Despite the name (borrowed from CyCONDOR, the R package this feature
-is modelled on), the <b>Confusion Matrix</b> here is <i>not</i> a
-classifier's predicted-vs-actual accuracy table — it's a
-per-group-normalized cluster composition heatmap. For each checked
-group, all of that group's samples' events are pooled and the group's
-total event count is rescaled to a fixed reference total (1000 events),
-so that groups with very different total cell counts can be compared on
-equal footing. Each cell then shows, for one cluster (row) and one group
-(column), how many of that group's rescaled 1000 events fall into that
-cluster.</p>
-<ul>
-<li><b>Reading a column</b> tells you that group's overall cluster
-composition — do most of its cells fall into a small number of clusters,
-or are they spread out?</li>
-<li><b>Reading a row</b> for one cluster lets you directly compare,
-cluster by cluster, whether one group contributes disproportionately
-more or fewer (rescaled) events to it than another — a large difference
-across columns in the same row is the same underlying signal that the
-Cluster Frequency test above assesses formally, but shown here as raw
-normalized counts rather than a p-value or fold-change, which makes it a
-good quick visual companion to that test, and a useful sanity check even
-before you've run any statistics.</li>
-</ul>
-<p>The <b>Composition Barplot</b> (with percent / by-group toggles) shows
-the same kind of information as bars rather than a heatmap — some people
-find bars easier to compare across many clusters at a glance, while the
-heatmap is often quicker for spotting one standout cluster/group
-combination. <b>Export Results CSV</b> writes out the full statistics
-table for the currently viewed comparison.</p>
+<h4>4. Composition Barplot and Export</h4>
+<p>The <b>Composition Barplot</b> shows, for each sample (or, with the
+by-group toggle, each group), how its events divide among the clusters of
+the selected run, as stacked bars of event counts or percentages. It
+needs no statistics to have been run first, so it makes a quick check
+before testing: does a cluster obviously skew toward one group, and does
+a percentage difference rest on a reasonable number of cells? The stacked
+counts and frequency barplots follow the equivalent summaries in
+cyCONDOR [12].</p>
+<p><b>Export Results CSV</b> writes out the full statistics table for the
+currently viewed comparison.</p>
 
 <h4>5. Sample PCA</h4>
 <p>PCA (Principal Component Analysis) takes the per-sample summary table
@@ -548,6 +533,7 @@ above.</p>
 [9]<a href="https://doi.org/10.1111/rssb.12028">Benjamini and Bogomolov 2014, J R Stat Soc B (selective inference on families of hypotheses)</a><br/>
 [10]<a href="https://doi.org/10.1002/alz.70952">Humblet-Baron et al. 2025, Alzheimer's &amp; Dementia (systems immunology of Alzheimer's disease)</a><br/>
 [11]<a href="https://doi.org/10.1038/s41467-026-70895-1">Veiga et al. 2026, Nature Communications (autoinflammation of unknown origin)</a><br/>
+[12]<a href="https://lorenzobonaguro.github.io/cyCONDOR">Bonaguro et al. 2025, R package version 0.3.1 (cyCONDOR)</a><br/>
 </p>
 '''
 

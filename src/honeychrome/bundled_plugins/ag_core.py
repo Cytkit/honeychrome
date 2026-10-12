@@ -1198,8 +1198,10 @@ def remap_model(model: dict, dst_params: dict,
     )
     out = deepcopy(model)
     out['trained_boundaries'] = new_boundaries
-    templates = {g['gate_name']: g['template'] for g in gate_defs if g.get('template')}
-    if templates:
+    for key in ('template', 'template_original'):
+        templates = {g['gate_name']: g[key] for g in gate_defs if g.get(key)}
+        if not templates:
+            continue
         new_templates, template_report = remap_boundaries(
             gate_defs, templates, src, dst_params, transform_factory=transform_factory,
         )
@@ -1207,7 +1209,7 @@ def remap_model(model: dict, dst_params: dict,
             report.setdefault(ch, status)
         for g in out['gate_definitions']:
             if g.get('gate_name') in new_templates:
-                g['template'] = new_templates[g['gate_name']]
+                g[key] = new_templates[g['gate_name']]
     remapped = sorted(ch for ch, s in report.items() if s == 'remapped')
     for ch in remapped:
         out['transforms'][ch] = deepcopy(dst_params[ch])
@@ -1231,6 +1233,41 @@ def remap_model(model: dict, dst_params: dict,
             + ". Boundaries on these channels are used as stored."
         )
     return out, messages
+
+
+def remap_channel_transform(gate_defs: list[dict], trained_boundaries: dict, channel: str,
+                            old_params: dict, new_params: dict,
+                            transform_factory=make_transform,
+                            points_per_edge: int = 1) -> bool:
+    """Convert, in place, every boundary on *channel* from one transform to another.
+
+    Used when the axis transform of a channel is changed while a model is
+    open, so that gates keep their place in the data. Covers the trained
+    boundaries and each gate's ``template`` and ``template_original``.
+    The transform is changed in many small steps (an axis being dragged), so
+    polygon edges are not subdivided by default: only the vertices move, and
+    repeated conversions do not multiply them.
+    Returns True when the two transforms differ and boundaries were converted.
+    """
+    if not old_params or not new_params or same_transform(old_params, new_params):
+        return False
+    src, dst = {channel: old_params}, {channel: new_params}
+    converted, _ = remap_boundaries(gate_defs, trained_boundaries, src, dst,
+                                    transform_factory=transform_factory,
+                                    points_per_edge=points_per_edge)
+    trained_boundaries.clear()
+    trained_boundaries.update(converted)
+    for key in ('template', 'template_original'):
+        templates = {g['gate_name']: g[key] for g in gate_defs if g.get(key)}
+        if not templates:
+            continue
+        converted, _ = remap_boundaries(gate_defs, templates, src, dst,
+                                        transform_factory=transform_factory,
+                                        points_per_edge=points_per_edge)
+        for g in gate_defs:
+            if g.get('gate_name') in converted:
+                g[key] = converted[g['gate_name']]
+    return True
 
 
 def rename_channels(gate_defs: list[dict], alignment: dict) -> list[dict]:
