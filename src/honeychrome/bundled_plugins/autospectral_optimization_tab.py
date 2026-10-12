@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 
 from honeychrome.controller_components.functions import apply_transfer_matrix
 from honeychrome.controller_components.autospectral_functions import (
-    precompute_af_matrices, precompute_joint_cov_extras, apply_af_unmixing,
+    build_af_precomputed, apply_af_unmixing,
 )
 from honeychrome.controller_components.cytometer_whitelist import (
     get_detector_laser_map, LASER_LABEL_COLORS,
@@ -75,6 +75,7 @@ from autospectral_optimization_functions import (   # noqa: E402
     cached_unmixed_thresholds,
     has_active_variants,
     make_optimization_unmix_fn,
+    af_envelope_for_profiles,
 )
 from autospectral_opt_kernel_wrapper import AUTOSPECTRAL_OPT_KERNEL_AVAILABLE  # noqa: E402
 from joint_unmix_export import (   # noqa: E402
@@ -137,8 +138,9 @@ class JointComparisonWorker(QObject):
                  fl_ids_unmixed, reference_spectra, fluor_names, af_spectra,
                  variants_meta, active_labels, unmixed_pos_thresholds,
                  spillover, max_events, kernel_kwargs,
-                 unmixed_pnn=None, af_index_map=None):
+                 unmixed_pnn=None, af_index_map=None, envelope=None):
         super().__init__()
+        self.envelope = envelope
         self.raw_event_data = raw_event_data
         self.transfer_matrix = transfer_matrix
         self.filtered_fl_ids_raw = filtered_fl_ids_raw
@@ -180,8 +182,7 @@ class JointComparisonWorker(QObject):
             plain_ols_data = apply_transfer_matrix(self.transfer_matrix, raw_sub)
 
             # Panel 2: AutoSpectral AF-corrected OLS (no variant optimization).
-            af_precomputed = precompute_af_matrices(self.reference_spectra, self.af_spectra)
-            af_precomputed.update(precompute_joint_cov_extras(af_precomputed, self.af_spectra))
+            af_precomputed = build_af_precomputed(self.reference_spectra, self.af_spectra, self.envelope)
             af_result = apply_af_unmixing(raw_fl, af_precomputed, self.af_spectra)
             af_unmixed_fl = af_result['unmixed']
             if self.spillover is not None:
@@ -201,6 +202,7 @@ class JointComparisonWorker(QObject):
                 variants_meta=self.variants_meta,
                 active_labels=self.active_labels,
                 unmixed_pos_thresholds=self.unmixed_pos_thresholds,
+                envelope=self.envelope,
                 **self.kernel_kwargs,
             )
             opt_unmixed_fl = opt_result['unmixed']
@@ -891,6 +893,8 @@ class PluginWidget(QWidget):
 
         active_labels = self._active_labels()
         variants_meta = getattr(c, 'autospectral_variants', {}) or {}
+        envelope = af_envelope_for_profiles(
+            c, c.experiment.samples.get('sample_af_profiles', {}).get(c.current_sample_path, []))
 
         raw_settings = c.experiment.settings['raw']
         pnn_raw_full = raw_settings['event_channels_pnn']
@@ -913,6 +917,9 @@ class PluginWidget(QWidget):
             c.current_sample_path,
             frozenset(active_labels),
             bytes(af_spectra.data),
+            None if envelope is None else (envelope['upper'].tobytes(), envelope['lower'].tobytes(),
+                                           np.asarray(envelope.get('noise_sd', ())).tobytes(),
+                                           None if envelope['spread'] is None else envelope['spread'].tobytes()),
             self._comparison_max_events_spin.value(),
             tuple(self._kernel_kwargs().items()),
         )
@@ -938,6 +945,7 @@ class PluginWidget(QWidget):
             self._comparison_max_events_spin.value(), self._kernel_kwargs(),
             unmixed_pnn=c.experiment.settings['unmixed']['event_channels_pnn'],
             af_index_map=c.get_af_index_map_for_sample(c.current_sample_path),
+            envelope=envelope,
         )
         self._cmp_worker.moveToThread(self._cmp_thread)
         self._cmp_thread.started.connect(self._cmp_worker.run)

@@ -50,12 +50,14 @@ from honeychrome.settings import max_events_in_cache, n_channels_per_event, expe
 from honeychrome.view_components.busy_cursor import with_busy_cursor
 from honeychrome.controller_components.autospectral_functions import (
         get_af_spectra,
-        precompute_af_matrices,
         precompute_joint_cov_extras,
         combine_af_precomputed,
         apply_af_unmixing,
         apply_af_transfer,
         af_index_lookup,
+        build_af_precomputed,
+        build_runtime_envelope,
+        refresh_envelope_entry,
      )
 from honeychrome.settings import af_index_channel
 
@@ -1078,6 +1080,56 @@ class Controller(QObject):
         f'{len(profile_names)} profile(s)) — from cache.'
     )
 
+    def _build_fluor_names(self) -> list | None:
+        """Labels of the rows of _build_fluor_spectra(), in the same order."""
+        profiles = self.experiment.process.get('profiles')
+        spectral_model = self.experiment.process.get('spectral_model', [])
+        if not profiles or not spectral_model:
+            return None
+        return [c['label'] for c in spectral_model if c['label'] in profiles]
+
+    def _magnitude_ceiling(self) -> float:
+        """Detector ceiling of the raw data (the value at which a detector saturates)."""
+        raw = self.experiment.settings.get('raw', {})
+        return float(raw.get('magnitude_ceiling') or settings.magnitude_ceiling)
+
+    def _precompute_profile(self, entry: dict, fluor_spectra: np.ndarray) -> dict:
+        """
+        Precomputed AF matrices for one stored AF profile. A profile with a
+        negative envelope is scored by it: the boundaries are rebuilt from the
+        profile's stored unstained subsample when a fluorophore spectrum has
+        moved beyond the tolerance, and an envelope stored without the
+        unstained SD gains it from that subsample (either way the refreshed
+        entry is stored back in the profile), and the spillover spread is
+        added while it still matches the current spectra. A profile without
+        an envelope is scored by joint L2.
+        """
+        af_spectra = np.array(entry['spectra'])
+        fluor_names = self._build_fluor_names()
+        envelope = None
+        if entry.get('envelope') and fluor_names is not None:
+            refreshed, changed = refresh_envelope_entry(
+                entry['envelope'], fluor_names, fluor_spectra, af_spectra, self.experiment_dir)
+            if changed:
+                entry['envelope'] = refreshed
+                if self.bus:
+                    self.bus.autoSaveRequested.emit()
+            if refreshed is not None:
+                envelope = build_runtime_envelope(
+                    refreshed, self.experiment.process.get('af_spread'), fluor_names,
+                    fluor_spectra, self._magnitude_ceiling())
+                if envelope['spread'] is None:
+                    logger.warning(
+                        'AF negative envelope: no spillover spread matches the current spectra; '
+                        'using flat boundaries. Extracting an AF profile estimates it again.')
+        return build_af_precomputed(fluor_spectra, af_spectra, envelope)
+
+    def precomputed_for_profile(self, profile_name: str) -> dict | None:
+        """Cached precomputed AF matrices for a profile, computing and caching them if absent."""
+        if profile_name not in self.af_precomputed_cache:
+            self.cache_af_profile(profile_name)
+        return self.af_precomputed_cache.get(profile_name)
+
     def cache_af_profile(self, profile_name: str) -> bool:
         """
         Compute and cache the precomputed AF matrices for a single named profile.
@@ -1107,9 +1159,7 @@ class Controller(QObject):
 
         try:
             af_spectra  = np.array(entry['spectra'])
-            precomputed = precompute_af_matrices(fluor_spectra, af_spectra)
-            precomputed.update(precompute_joint_cov_extras(precomputed, af_spectra))
-            self.af_precomputed_cache[profile_name] = precomputed
+            self.af_precomputed_cache[profile_name] = self._precompute_profile(entry, fluor_spectra)
             logger.info(
                 f'Controller: cached AF precomputed matrices for "{profile_name}" '
                 f'({af_spectra.shape[0]} AF spectra).'
@@ -1140,10 +1190,7 @@ class Controller(QObject):
 
         for name, entry in af_profiles.items():
             try:
-                af_spectra  = np.array(entry['spectra'])
-                precomputed = precompute_af_matrices(fluor_spectra, af_spectra)
-                precomputed.update(precompute_joint_cov_extras(precomputed, af_spectra))
-                self.af_precomputed_cache[name] = precomputed
+                self.af_precomputed_cache[name] = self._precompute_profile(entry, fluor_spectra)
             except Exception as e:
                 logger.error(f'cache_all_af_profiles: failed for "{name}": {e}')
 

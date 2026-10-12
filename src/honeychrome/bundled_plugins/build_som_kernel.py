@@ -99,5 +99,9 @@ ffi.set_source(
 )
 
 if __name__ == '__main__':
+    import sysconfig
+    existing = os.path.join(HERE, '_som_kernel' + (sysconfig.get_config_var('EXT_SUFFIX') or '.so'))
+    if os.path.exists(existing):
+        os.remove(existing)  # new inode; macOS kills on in-place overwrite of a signed binary
     ffi.compile(tmpdir=HERE, verbose=True)
     print('[build] _som_kernel extension built successfully.')

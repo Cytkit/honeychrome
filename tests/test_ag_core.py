@@ -442,6 +442,42 @@ def test_remap_model_converts_and_reports():
 
 
 @pytest.mark.numpy_only
+def test_remap_channel_transform_converts_in_place():
+    old = {'id': 1, 'scale_t': 262144.0, 'logicle_w': 0.5}
+    new = {'id': 1, 'scale_t': 262144.0, 'logicle_w': 2.0}
+    gate = _gate('Q', '2dsep', 'A', 'B')
+    calc = ag.GateCalculator({'A': (0, 1), 'B': (0, 1)})
+    gate['template'] = calc.threshold_boundaries(gate, 0.6, 0.3)
+    gate['template_original'] = calc.threshold_boundaries(gate, 0.6, 0.3)
+    gates = [gate]
+    trained = {'Q': calc.threshold_boundaries(gate, 0.6, 0.3)}
+
+    changed = ag.remap_channel_transform(gates, trained, 'A', old, new,
+                                         transform_factory=_ArcsinhTransform)
+    raw = _ArcsinhTransform(old).inverse([0.6])[0]
+    expected = _ArcsinhTransform(new).apply([raw])[0]
+    assert changed
+    assert trained['Q']['DP']['threshold_x'] == pytest.approx(expected)
+    assert trained['Q']['DP']['threshold_y'] == pytest.approx(0.3)
+    assert gates[0]['template']['DP']['threshold_x'] == pytest.approx(expected)
+    assert gates[0]['template_original']['DP']['threshold_x'] == pytest.approx(expected)
+
+    poly = _gate('F', 'free', 'A', 'B', number=2)
+    square = [[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8], [0.2, 0.2]]
+    poly['template'] = {'in': {'boundary': [list(p) for p in square]}}
+    for _ in range(3):
+        ag.remap_channel_transform([poly], {}, 'A', old, new, transform_factory=_ArcsinhTransform)
+        old, new = new, old
+    assert len(poly['template']['in']['boundary']) == len(square)
+    np.testing.assert_allclose(poly['template']['in']['boundary'][0][1], 0.2)
+    old, new = new, old
+
+    assert not ag.remap_channel_transform(gates, trained, 'A', new, dict(new),
+                                          transform_factory=_ArcsinhTransform)
+    assert trained['Q']['DP']['threshold_x'] == pytest.approx(expected)
+
+
+@pytest.mark.numpy_only
 def test_write_model_is_atomic(tmp_path):
     path = tmp_path / 'm.agmodel'
     ag.write_model(path, {'format_version': 2, 'x': np.float32(1.5)})
