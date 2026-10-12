@@ -26,6 +26,8 @@ from honeychrome import settings
 import logging
 logger = logging.getLogger(__name__)
 
+verbosity_divider = 5
+
 class PID:
     '''
     pid = PID(kp=1.0, ki=0.1, kd=0.05, out_min=0, out_max=255)
@@ -82,8 +84,10 @@ class PressureControlWorker(Thread):
         self.pressure = None
 
     def run(self):
+        n = 0
         self.sheath_pump.set_enable(True)
         while not self._stop_event.is_set():
+            n += 1
             with self._lock:
                 self.pressure = self.pressure_control.get_pressure('PRES_UNITS_PA', 10)
 
@@ -91,10 +95,12 @@ class PressureControlWorker(Thread):
                     error = self.pressure_set_point - self.pressure
                     output = self.pid.update(error, dt=self.interval)
                     self.sheath_pump.set_pwm_duty(output)
-                    logger.info(f"[PressureControlWorker] pressure={self.pressure:0.2f} error={error:0.2f} output={output}")
+                    if not n % verbosity_divider:
+                        logger.info(f"[PressureControlWorker] pressure={self.pressure:0.2f} error={error:0.2f} output={output}")
                 else:
                     self.sheath_pump.set_pwm_duty(0)
-                    logger.info(f"[PressureControlWorker] pressure={self.pressure:0.2f}")
+                    if not n % verbosity_divider:
+                        logger.info(f"[PressureControlWorker] pressure={self.pressure:0.2f}")
 
             self._stop_event.wait(self.interval)   # interruptible sleep
 
@@ -126,15 +132,18 @@ class TemperatureControlWorker(Thread):
         self.temperature = None
 
     def run(self):
+        n = 0
         self.fan.set_enable(True)
         while not self._stop_event.is_set():
+            n += 1
             with self._lock:
                 self.temperature = self.temperature_control.get_temperature()
                 error = self.temperature_set_point - self.temperature
                 output = self.pid.update(error, dt=self.interval)
                 self.fan.set_pwm_duty(output)
 
-            logger.info(f"[TemperatureControlWorker] temperature={self.temperature:0.2f} error={error:0.2f} output={output}")
+            if not n % verbosity_divider:
+                logger.info(f"[TemperatureControlWorker] temperature={self.temperature:0.2f} error={error:0.2f} output={output}")
             self._stop_event.wait(self.interval)   # interruptible sleep
 
     def stop(self):
@@ -155,14 +164,18 @@ class EventRateCounter(Thread):
         self.interval = interval
 
     def run(self):
+        n = 0
         while not self._stop_event.is_set():
+            n += 1
             with self._lock:
                 old_trigger_event_count = self.trigger_event_count
                 self.trigger_event_count = self.trigger.merge_get_event_count()
                 new_events = self.trigger_event_count - old_trigger_event_count
                 self.recount(new_events)  # this is the number of merge trigger events
 
-            logger.info(f"[EventRateCounter] trigger event count={self.trigger_event_count} event rate={self.event_rate}")
+            if not n % verbosity_divider:
+                logger.info(f"[EventRateCounter] trigger event count={self.trigger_event_count} event rate={self.event_rate}")
+
             self._stop_event.wait(self.interval)   # interruptible sleep
 
     def recount(self, number_of_new_events):
@@ -437,6 +450,7 @@ class CytkitDevice:
 
         if not self.initialised:
             self.laser.set_state(1)  # turn on laser
+            self.capture.start_clock()
             self.pressure_control_worker.control_on = True
             self.initialised = True
             self.display.action_message(["Initialised!", "Sheath on, laser on."])
@@ -450,14 +464,16 @@ class CytkitDevice:
 
 
     def start_acquisition(self):
-        self.display.action_message(["Acquisition", "Priming..."])
-        self.sample_pump.stop()
-        self.sample_pump.ramp_to(self.sample_pump_priming_speed)
-        time.sleep(self.sample_pump_priming_time)
+        # self.display.action_message(["Acquisition", "Priming..."])
+        # self.sample_pump.stop()
+        # self.sample_pump.ramp_to(self.sample_pump_priming_speed)
+        # time.sleep(self.sample_pump_priming_time)
+        #
+        # self.display.action_message(["Acquisition", f"Settling rate {self.sample_pump_acquisition_rate} uL/min"])
+        # self.sample_pump.ramp_to(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
+        # time.sleep(self.sample_pump_settle_time)
 
-        self.display.action_message(["Acquisition", f"Settling rate {self.sample_pump_acquisition_rate} uL/min"])
-        self.sample_pump.ramp_to(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
-        time.sleep(self.sample_pump_settle_time)
+        self.capture.reset_clock()
         self.capture.aggr_fifo_clear()
         self.capture.aggr_set_enable(True)
         self.decoder.reset()
@@ -467,11 +483,12 @@ class CytkitDevice:
         return 'OK', 'Cytkit started acquisition'
 
     def stop_acquisition(self):
-        self.display.action_message(["Sample flow stopped", "Unpriming..."])
-        self.sample_pump.stop()
-        self.sample_pump.ramp_to(-self.sample_pump_unpriming_speed)
-        time.sleep(self.sample_pump_unpriming_time)
-        self.sample_pump.stop()
+        # self.display.action_message(["Sample flow stopped", "Unpriming..."])
+        # self.sample_pump.stop()
+        # self.sample_pump.ramp_to(-self.sample_pump_unpriming_speed)
+        # time.sleep(self.sample_pump_unpriming_time)
+        # self.sample_pump.stop()
+
         self.display.action_message("Acquisition finished.")
         logger.info(f"[CytkitDriver] communication errors={self.decoder.error_count}")
 

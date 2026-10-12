@@ -246,7 +246,8 @@ def main():
         index_head_events_cache=index_head_events_cache,
         index_tail_events_cache=index_tail_events_cache,
         oscilloscope_traces_queue=oscilloscope_traces_queue,
-        pipe_connection=pipe_experiment_analyser_a
+        pipe_connection=pipe_experiment_analyser_a,
+        logging_queue=logging_queue
     )
     trace_analyser.start()
 

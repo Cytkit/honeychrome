@@ -12,6 +12,8 @@ from honeychrome.instrument_driver_components.cytkit_components.display import D
 from honeychrome.instrument_driver_components.cytkit_components.laser import Laser
 from honeychrome.settings import adc_channels, magnitude_ceiling, traces_cache_dtype, n_channels_trace, n_time_points_in_event, transfer_target_repeat_time
 
+debug_automation = False # set this true to run control loops and display
+
 fcs_file = Path(__file__).parent / 'data' / 'example_for_dummy_acquisition.fcs'
 dummy_event_rate = 1000
 trace_indices = np.arange(n_time_points_in_event)  # x positions
@@ -224,27 +226,29 @@ class DummyDevice:
         self.sample_pump_acquisition_rate = settings.sample_pump_acquisition_rate_retrieved
         self.sample_pump_steps_per_microlitre = settings.sample_pump_steps_per_microlitre_retrieved
 
-        self.event_rate_counter = EventRateCounter()
-        self.sample_pump = SamplePumpSim()
-        self.laser = LaserSim()
-        self.sample_pump_flow_rate_getter = SamplePumpFlowRateGetter(self, self.sample_pump)
-        self.sample_pump_flow_rate_getter.start()
-        self.pressure_control_worker = RandomPressureGenerator()
-        self.pressure_control_worker.start()
-        self.temperature_control_worker = RandomTemperatureGenerator()
-        self.temperature_control_worker.start()
-        self.laser_getter = LaserGetter(self.laser)
-        self.laser_getter.start()
-        self.display = Display(event_rate_object=self.event_rate_counter, sample_pump_object=self.sample_pump_flow_rate_getter, pressure_object=self.pressure_control_worker, temperature_object=self.temperature_control_worker, laser_object=self.laser_getter)
-        self.display.start()
+        if debug_automation:
+            self.event_rate_counter = EventRateCounter()
+            self.sample_pump = SamplePumpSim()
+            self.laser = LaserSim()
+            self.sample_pump_flow_rate_getter = SamplePumpFlowRateGetter(self, self.sample_pump)
+            self.sample_pump_flow_rate_getter.start()
+            self.pressure_control_worker = RandomPressureGenerator()
+            self.pressure_control_worker.start()
+            self.temperature_control_worker = RandomTemperatureGenerator()
+            self.temperature_control_worker.start()
+            self.laser_getter = LaserGetter(self.laser)
+            self.laser_getter.start()
+            self.display = Display(event_rate_object=self.event_rate_counter, sample_pump_object=self.sample_pump_flow_rate_getter, pressure_object=self.pressure_control_worker, temperature_object=self.temperature_control_worker, laser_object=self.laser_getter)
+            self.display.start()
 
     def find_and_connect_to_device(self):
         return 'OK', 'Dummy device connected'
 
     def disconnect(self):
-        self.display.close()
-        if self.display.is_alive():
-            self.display.join(timeout=2)
+        if debug_automation:
+            self.display.close()
+            if self.display.is_alive():
+                self.display.join(timeout=2)
 
         return 'OK', 'Dummy device disconnected'
 
@@ -252,28 +256,32 @@ class DummyDevice:
         self.logger.info("Example initialisation message to log")
         if not self.initialised:
             self.initialised = True
-            self.laser.enable = True
-            self.display.action_message(["Initialised!", "Sheath on, laser on."])
+            if debug_automation:
+                self.laser.enable = True
+                self.display.action_message(["Initialised!", "Sheath on, laser on."])
             return 'OK', 'Dummy device initialised'
         else:
             self.initialised = False
-            self.laser.enable = False
-            self.display.action_message(["Stand by", "Sheath off, laser off."])
+            if debug_automation:
+                self.laser.enable = False
+                self.display.action_message(["Stand by", "Sheath off, laser off."])
             return 'OK', 'Dummy device on standby'
 
     def start_acquisition(self):
-        self.display.action_message("Acquiring...")
-        self.sample_pump.enable = True
-        self.sample_pump.reverse = False
-        self.sample_pump.speed = int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre)
+        if debug_automation:
+            self.display.action_message("Acquiring...")
+            self.sample_pump.enable = True
+            self.sample_pump.reverse = False
+            self.sample_pump.speed = int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre)
         return 'OK', 'Dummy device started acquisition'
 
     def stop_acquisition(self):
         self.display.action_message("Acquisition stopped.")
-        self.sample_pump.enable = False
-        self.sample_pump.reverse = False
-        self.sample_pump.speed = 0
-        self.event_rate_counter.reset()
+        if debug_automation:
+            self.sample_pump.enable = False
+            self.sample_pump.reverse = False
+            self.sample_pump.speed = 0
+            self.event_rate_counter.reset()
         return 'OK', 'Dummy device stopped acquisition'
 
     def set_state(self, dict_of_parameter_value):
@@ -282,15 +290,18 @@ class DummyDevice:
 
         for parameter, value in dict_of_parameter_value.items():
             if parameter == 'laser_enable':
-                self.laser.set_state(value)
+                if debug_automation:
+                    self.laser.set_state(value)
                 message['laser_enable'] = value
 
             if parameter == 'interlock_enabled':
-                self.laser.set_interlock_mask(value)
+                if debug_automation:
+                    self.laser.set_interlock_mask(value)
                 message['interlock_enabled'] = value
 
             if parameter == 'interlock_forced':
-                self.laser.set_interlock_effects(forced=value)
+                if debug_automation:
+                    self.laser.set_interlock_effects(forced=value)
                 message['interlock_forced'] = value
 
         return 'OK', message
@@ -307,34 +318,41 @@ class DummyDevice:
         message = {parameter:None for parameter in list_of_parameters}
 
         if 'laser' in list_of_parameters:
-            state = self.laser.get_state()
-            interlock_mask = self.laser.get_interlock_mask()
-            interlock_state = self.laser.get_interlock_state()
-            interlock_forced = self.laser.get_interlock_effects()
-            message['laser'] = {'state': state, 'interlock_mask': interlock_mask, 'interlock_state': interlock_state, 'interlock_forced': interlock_forced}
+            if debug_automation:
+                state = self.laser.get_state()
+                interlock_mask = self.laser.get_interlock_mask()
+                interlock_state = self.laser.get_interlock_state()
+                interlock_forced = self.laser.get_interlock_effects()
+                message['laser'] = {'state': state, 'interlock_mask': interlock_mask, 'interlock_state': interlock_state, 'interlock_forced': interlock_forced}
+            else:
+                message['laser'] = {'state': False, 'interlock_mask': False, 'interlock_state': False, 'interlock_forced': False}
 
         return 'OK', message
 
 
     def flush_sip(self):
-        self.display.action_message("Flushing SIP.")
+        if debug_automation:
+            self.display.action_message("Flushing SIP.")
         return 'OK', 'Dummy device doesn''t have a sip to flush'
 
     def backflush_sip(self):
-        self.display.action_message("Backflushing SIP.")
+        if debug_automation:
+            self.display.action_message("Backflushing SIP.")
         return 'OK', 'Dummy device doesn''t have a sip to backflush'
 
     def set_gain(self, dict_of_gains):
-        self.display.action_message(f"{dict_of_gains}")
+        if debug_automation:
+            self.display.action_message(f"{dict_of_gains}")
         return 'OK', 'Dummy device doesn''t have gains'
 
     def set_sample_flow_rate(self, data):
-        if 'sample_flow_rate' in data:
-            self.display.action_message(f"Set flow {data['sample_flow_rate']:0.1f} uL/min")
-            self.sample_pump_acquisition_rate = data['sample_flow_rate']
-        if 'steps_per_microlitre' in data:
-            self.sample_pump_steps_per_microlitre = data['steps_per_microlitre']
-        self.sample_pump.speed = int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre)
+        if debug_automation:
+            if 'sample_flow_rate' in data:
+                self.display.action_message(f"Set flow {data['sample_flow_rate']:0.1f} uL/min")
+                self.sample_pump_acquisition_rate = data['sample_flow_rate']
+            if 'steps_per_microlitre' in data:
+                self.sample_pump_steps_per_microlitre = data['steps_per_microlitre']
+            self.sample_pump.speed = int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre)
 
         return 'OK', 'Dummy device doesn''t have a sample pump'
 

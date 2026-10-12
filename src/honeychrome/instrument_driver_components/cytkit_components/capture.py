@@ -54,3 +54,12 @@ class Capture:
 
     def channel_get_trigger_skew(self, channel):
         return self.ft4222.register_read(adc_dictionary[channel]['capture'] + 0x000B)
+
+    def start_clock(self):
+        self.ft4222.register_bit_set('SYSCLK_CTRL', 0)
+
+    def stop_clock(self):
+        self.ft4222.register_bit_clear('SYSCLK_CTRL', 0)
+
+    def reset_clock(self):
+        self.ft4222.register_bit_set('SYSCLK_CTRL', 4)

@@ -79,7 +79,7 @@ class CaptureDecoder:
             # ---- 1. Find next candidate header at or after `pos`.
             #        We search for SYNC0, then verify SYNC1 follows.
             new_pos = buffer.find(SYNC_WORD_0, pos)
-            print(new_pos, new_pos - last_pos)
+            # print(new_pos, new_pos - last_pos) # print buffer position and packet length for debug only
             pos = new_pos
 
             if pos == -1:

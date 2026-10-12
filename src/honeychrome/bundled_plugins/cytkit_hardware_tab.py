@@ -1024,6 +1024,7 @@ class PluginWidget(QWidget):
         super().__init__(parent)
         self.bus = bus
         self.controller = controller
+        self.device_name = self.controller.device_name
 
         # --- Create widget, scroll area and layouts to hold the plugin content ---
 
@@ -1489,8 +1490,7 @@ class PluginWidget(QWidget):
         self.toolbox = toolbox
 
         # update everything
-        self.device_name = None
-        # self.update_connection_status()
+        self.update_connection_status()
 
     def _on_tab_changed(self, index):
         self._on_timer()
@@ -1505,6 +1505,7 @@ class PluginWidget(QWidget):
     def update_tab(self, name):
         match name:
             case "Connection":
+                self.update_connection_status()
                 self.get_instrument_state(['version','datetime'])
                 self.update_initialised()
             case "Light":
@@ -1761,7 +1762,8 @@ if __name__ == "__main__":
         index_head_events_cache=index_head_events_cache,
         index_tail_events_cache=index_tail_events_cache,
         oscilloscope_traces_queue=oscilloscope_traces_queue,
-        pipe_connection=pipe_experiment_analyser_a
+        pipe_connection=pipe_experiment_analyser_a,
+        logging_queue=logging_queue
     )
     trace_analyser.start()
 

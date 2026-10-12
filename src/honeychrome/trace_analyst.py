@@ -20,6 +20,8 @@ from honeychrome.settings import max_events_in_cache, n_channels_per_event, chan
 baseline_length = int(1/baseline_decay_rate)
 gap = 10 # gap between start of end of baseline and start of peak
 
+default_baselines = np.zeros(n_channels_trace)
+
 def peak_start_stop_baseline(tr):
     # initialise peak detector
     baseline = tr[gap:baseline_length].mean()
@@ -75,8 +77,16 @@ class TraceAnalyser(mp.Process):
                  index_head_events_cache=None,
                  index_tail_events_cache=None,
                  oscilloscope_traces_queue=None,
-                 pipe_connection=None):
+                 pipe_connection=None,
+                 logging_queue=None):
         super().__init__()
+
+        # Route standard logs through the queue
+        import logging.handlers
+        qh = logging.handlers.QueueHandler(logging_queue)
+        self.logger = logging.getLogger(__name__)
+        self.logger.addHandler(qh)
+
         # pipe connection
         self.pipe_connection = pipe_connection
 
@@ -115,6 +125,7 @@ class TraceAnalyser(mp.Process):
         # Oscilloscope traces queue
         self.oscilloscope_traces_queue = oscilloscope_traces_queue
 
+        self.stop_analyser = None
 
     def run(self):
         # initialise the things that can't be pickled
@@ -139,7 +150,7 @@ class TraceAnalyser(mp.Process):
             try:
                 incoming_from_experiment_control = self.pipe_connection.recv()
             except EOFError:
-                print("Pipe closed by experiment control; shutting down gracefully.")
+                self.logger.info("Pipe closed by experiment control; shutting down gracefully.")
                 break
 
             if incoming_from_experiment_control['command'] == 'start':
@@ -150,10 +161,10 @@ class TraceAnalyser(mp.Process):
                     self.index_head_events_cache.value = 0
                 with self.index_tail_events_cache.get_lock():
                     self.index_tail_events_cache.value = 0
-                print('[Trace Analyser] Events cache flushed!')
+                self.logger.info('[Trace Analyser] Events cache flushed!')
                 self.set_channels()
                 while thread.is_alive():
-                    print('[Trace Analyser] Waiting until previous analysis thread ends')
+                    self.logger.info('[Trace Analyser] Waiting until previous analysis thread ends')
                     time.sleep(0.25)
                 # create analysis thread
                 thread = threading.Thread(
@@ -161,32 +172,35 @@ class TraceAnalyser(mp.Process):
                     daemon=True
                 )
                 thread.start()
-                print('[Trace Analyser] Started')
+                self.logger.info('[Trace Analyser] Started')
                 response_to_experiment_control = {'status': 'OK', 'message': '[Trace Analyser] started'}
 
             elif incoming_from_experiment_control['command'] == 'stop':
                 self.stop_analyser.set()
-                while thread.is_alive():
-                    print('[Trace Analyser] Waiting until analysis thread ends')
+                while self.stop_analyser.is_set():
+                    self.logger.info('[Trace Analyser] Waiting until analysis thread ends')
                     time.sleep(0.25)
                 response_to_experiment_control = {'status':'OK', 'message':'[Trace Analyser] stopped'}
 
             elif incoming_from_experiment_control['command'] == 'set_channels':
                 self.channel_dict = incoming_from_experiment_control['data']
                 self.stop_analyser.set()
-                while thread.is_alive():
-                    print('[Trace Analyser] Waiting until analysis thread ends')
+                while self.stop_analyser.is_set():
+                    self.logger.info('[Trace Analyser] Waiting until analysis thread ends')
                     time.sleep(0.25)
                 self.set_channels()
-                print('[Trace Analyser] Channel configuration set')
+                self.logger.info('[Trace Analyser] Channel configuration set')
                 response_to_experiment_control = {'status':'OK', 'message':'[Trace Analyser] channel configuration set'}
 
             elif incoming_from_experiment_control['command'] == 'quit':
                 self.stop_analyser.set()
-                while thread.is_alive():
-                    print('[Trace Analyser] Waiting until analysis thread ends')
-                    time.sleep(0.25)
-                response_to_experiment_control = {'status':'OK', 'message':'[Trace Analyser] quitting'}
+                if thread:
+                    if thread.is_alive():
+                        thread.join(0.1)
+                        while thread.is_alive():
+                            self.logger.info('[Trace Analyser] Waiting until analysis thread ends')
+                            time.sleep(0.25)
+                response_to_experiment_control = {'status':'OK', 'message':'[Trace Analyser] quit'}
                 self.pipe_connection.send(response_to_experiment_control)
                 break
 
@@ -195,7 +209,7 @@ class TraceAnalyser(mp.Process):
         shm_traces.close()
         shm_events.close()
         self.oscilloscope_traces_queue.cancel_join_thread()
-        print('[Trace Analyser] Quit')
+        self.logger.info('[Trace Analyser] Quit')
 
 
     def set_channels(self):
@@ -213,7 +227,9 @@ class TraceAnalyser(mp.Process):
 
     def analyse(self):
         start_time  = time.perf_counter()
-        while True:
+
+        # stop if stop analyser event is set
+        while not self.stop_analyser.is_set():
             cycle_start_time = time.perf_counter()
 
             '''
@@ -230,6 +246,7 @@ class TraceAnalyser(mp.Process):
             with self.index_tail_events_cache.get_lock():
                 events_tail = self.index_tail_events_cache.value
 
+            # extract the blob as numpy array
             n_new_events = traces_tail - traces_head
             if traces_head < traces_tail:
                 queue_begin_index = traces_head % self.max_events_in_traces_cache
@@ -244,11 +261,12 @@ class TraceAnalyser(mp.Process):
                         blob_np_front = self.traces_cache[:slice_end]  # get front of queue array
                         blob_np = np.concatenate((blob_np_back, blob_np_front))
 
+                # remove offset from the blob and convert to float
                 traces_batch_scaled = (blob_np  - nearly_floor_uint16).reshape(-1, self.n_channels_trace, self.n_time_points_in_event).astype(np.float32)/adc_scale_mv*1000 # now scale in uV, zeroed, float32
 
                 # calculate area, height, width as defined in channel_dict and write to events_cache
 
-                ### Simple calculation - if peaks already filtered and background-subtracted
+                ### Simple calculation - only good if peaks already filtered and background-subtracted
                 # areas = traces_batch_scaled[:, self.indices_area_channels_in_traces, :].sum(axis=2)
                 # heights = traces_batch_scaled[:, self.indices_height_channels_in_traces, :].max(axis=2)
                 # widths = self.calculate_width(traces_batch_scaled[:, self.indices_trigger_channel_in_traces, :])
@@ -272,11 +290,24 @@ class TraceAnalyser(mp.Process):
                 heights = heights[keep_mask]
                 widths = widths[keep_mask]
                 n_new_events = np.sum(keep_mask)
+                times = np.ones(n_new_events, dtype=np.int64) * int((time.perf_counter() - start_time) * 1000)
+                event_ids = np.array(range(events_tail, events_tail + n_new_events))
+
+                # if there were no peaks detected but at least one trace, push the last one to the oscilloscope queue
+                if last_event_index == 0:
+                    if n > 0:
+                        self.oscilloscope_traces_queue.put({'event_id': None, 'time': None,
+                                                            'traces': traces_batch_scaled[last_event_index],
+                                                            'n_start': n_start, 'n_end': n_end,
+                                                            'peak': None, 'baselines': default_baselines})
 
                 # if any above threshold, then push to events cache
                 if last_event_index > 0:
-                    times = np.ones(n_new_events, dtype=np.int64) * int((time.perf_counter() - start_time) * 1000)
-                    event_ids = np.array(range(events_tail, events_tail + n_new_events))
+
+                    self.oscilloscope_traces_queue.put({'event_id': event_ids[-1], 'time': times[-1],
+                                                        'traces': traces_batch_scaled[last_event_index],
+                                                        'n_start': n_start, 'n_end': n_end, 'peak': peak,
+                                                        'baselines': baselines})
                     with self.events_cache_lock:
                         self.events_cache[events_tail:events_tail + n_new_events, self.indices_area_channels_in_events] = areas
                         self.events_cache[events_tail:events_tail + n_new_events, self.indices_height_channels_in_events] = heights
@@ -285,32 +316,28 @@ class TraceAnalyser(mp.Process):
                         self.events_cache[events_tail:events_tail + n_new_events, self.index_event_id_in_events] = event_ids
 
                         ### debug print latest events
-                        #print(self.events_cache[events_tail:events_tail + n_new_events])
-
-                    # update head of traces cache and tail of events cache
-                    events_tail += n_new_events
-                    print(f'[Trace Analyser] analysed {n_new_events} events (traces cache old head:{traces_head}, new head and tail:{traces_tail}), (events cache head:{events_head}, tail:{events_tail})')
-                    traces_head = traces_tail
-
-                    with self.index_head_traces_cache.get_lock():
-                        self.index_head_traces_cache.value = traces_head
-                    with self.index_tail_events_cache.get_lock():
-                        self.index_tail_events_cache.value = events_tail
-
-                    self.oscilloscope_traces_queue.put({'event_id':event_ids[-1], 'time':times[-1], 'traces':traces_batch_scaled[last_event_index], 'n_start':n_start, 'n_end':n_end, 'peak':peak, 'baselines':baselines})
+                        #self.logger.info(self.events_cache[events_tail:events_tail + n_new_events])
 
                 else:
-                    print(f'[Trace Analyser] {len(keep_mask)} traces returned but none above threshold')
+                    self.logger.info(f'[Trace Analyser] {len(keep_mask)} traces returned but none above threshold')
+
+                # update head of traces cache and tail of events cache
+                events_tail += n_new_events
+                self.logger.info(f'[Trace Analyser] analysed {n_new_events} events (traces cache old head:{traces_head}, new head and tail:{traces_tail}), (events cache head:{events_head}, tail:{events_tail})')
+                traces_head = traces_tail
+
+                with self.index_head_traces_cache.get_lock():
+                    self.index_head_traces_cache.value = traces_head
+                with self.index_tail_events_cache.get_lock():
+                    self.index_tail_events_cache.value = events_tail
+
 
             else:
-                print(f'[Trace Analyser] awaiting traces (traces cache head:{traces_head}, tail:{traces_tail})')
+                self.logger.info(f'[Trace Analyser] awaiting traces (traces cache head:{traces_head}, tail:{traces_tail})')
 
-            # stop if stop analyser event is set
-            if self.stop_analyser.is_set():
-                break
             # stop if events cache full
             if events_tail + n_new_events > self.max_events_in_cache:
-                warnings.warn("[Trace Analyser] Events cache is full, stopping trace analyser")
+                self.logger.warning("[Trace Analyser] Events cache is full, stopping trace analyser")
                 break
 
             # Calculate elapsed time and sleep precisely
@@ -320,7 +347,7 @@ class TraceAnalyser(mp.Process):
             time.sleep(sleep_time)
 
         self.stop_analyser.clear()
-        print('[Trace Analyser] Stopped')
+        self.logger.info('[Trace Analyser] Stopped')
 
     def calculate_width(self, traces):
         n_traces, n_time_points = traces.shape

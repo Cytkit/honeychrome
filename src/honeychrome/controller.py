@@ -1118,11 +1118,10 @@ class Controller(QObject):
 
         # stop live update thread
         self.stop_live_data_processing.set()
+        logger.info('Controller: waiting until live data processing is complete')
         time.sleep(0.25)
-        while self.thread.is_alive():
-            logger.info('Controller: waiting until live data processing is complete')
-            time.sleep(0.25)
-        self.thread.join()
+        if self.thread:
+            self.thread.join()
 
         # save sample, load sample
         self.raw_event_data, _ = self.copy_live_data(extent='all')
