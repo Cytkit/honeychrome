@@ -244,6 +244,7 @@ cytometry_plot_width_target_retrieved = q_settings.value("cytometry_plot_size", 
 tile_size_nxn_grid_retrieved = q_settings.value("nxn_tile_size", tile_size_nxn_grid, type=int)
 subsample_retrieved = q_settings.value("subsample_number", subsample, type=int)
 max_display_events = q_settings.value("max_display_events", max_display_events, type=int)
+sample_cache_mb = max(0, q_settings.value("sample_cache_mb", 256, type=int))
 hist_bins_retrieved = q_settings.value("histogram_resolution", hist_bins, type=int)
 density_cutoff_retrieved = q_settings.value("density_cutoff", density_cutoff, type=int)
 

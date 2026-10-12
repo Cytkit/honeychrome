@@ -42,6 +42,8 @@ import time
 from honeychrome.experiment_model import ExperimentModel, check_fcs_matches_experiment
 from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml
+from honeychrome.controller_components.fcs_preview import read_preview_metadata, load_fcs_preview
+from honeychrome.controller_components.preview_cache import PreviewCache
 from honeychrome.settings import traces_cache_size, traces_cache_dtype, adc_rate
 import honeychrome.settings as settings
 from honeychrome.settings import max_events_in_cache, n_channels_per_event, experiments_folder, live_data_process_repeat_time, settings_default, samples_default, channel_dict
@@ -116,6 +118,7 @@ class Controller(QObject):
         self.data_for_cytometry_plots_process = deepcopy(self.data_for_cytometry_plots)
         self.data_for_cytometry_plots_unmixed = deepcopy(self.data_for_cytometry_plots)
         self.current_mode = 'raw'
+        self.preview_cache = PreviewCache(self)
         self.mode_switch_in_progress = False
 
         # pipe connections
@@ -205,6 +208,7 @@ class Controller(QObject):
 
     @with_busy_cursor
     def load_experiment(self, experiment_path):
+        self.preview_cache.clear()
         self.experiment.load(experiment_path)
         self.experiment_dir = self.experiment.generate_subdirs()
         add_recent_file(experiment_path)
@@ -450,6 +454,7 @@ class Controller(QObject):
             self.filtered_raw_fluorescence_channel_ids = self.experiment.settings['raw']['fluorescence_channel_ids']
 
     def flush_ephemeral_data(self):
+        self.preview_cache.clear()
         ###### reinitialise everything, just like in __init__
         self.current_sample = None
         self.current_sample_path = None
@@ -915,11 +920,52 @@ class Controller(QObject):
     @with_busy_cursor
     def load_sample(self, sample_path):
         logger.info(f'Controller: loading sample {sample_path}')
+        if sample_path != self.live_sample_path:
+            try:
+                if self.preview_cache.before_load(sample_path):
+                    return
+            except Exception:
+                logger.exception('Sample cache unavailable; loading sample normally')
+                self.preview_cache.clear()
         whitelisted_pnn = self.experiment.settings['raw'].get('whitelisted_pnn')
         check_pnn = whitelisted_pnn or self.experiment.settings['raw']['event_channels_pnn']
-        if check_fcs_matches_experiment(self.experiment_dir / sample_path, check_pnn, self.experiment.settings['raw']['magnitude_ceiling']):
+        sample_full_path = self.experiment_dir / sample_path
+        try:
+            metadata = read_preview_metadata(sample_full_path)
+        except Exception as error:
+            if self.bus:
+                self.bus.warningMessage.emit(f'Cannot read sample metadata: {error}')
+            logger.warning('Sample metadata read failed: %s', error)
+            return
+        if set(check_pnn).issubset(metadata.pnn_labels):
+            cap = settings.max_display_events
+            if sample_path != self.live_sample_path and cap and metadata.event_count > cap:
+                try:
+                    sample, event_data = load_fcs_preview(sample_full_path, cap, whitelisted_pnn, metadata)
+                except Exception as error:
+                    if self.bus:
+                        self.bus.warningMessage.emit(
+                            f'Cannot load preview: {error}. No full-file load was attempted.'
+                        )
+                    logger.warning('Streaming preview failed: %s', error)
+                    return
+                self.current_sample = None
+                self.raw_event_data = None
+                self.unmixed_event_data = None
+                self.af_sidecar_data = None
+                for data in self.preview_cache.plot_data():
+                    data['event_data'] = None
+                    data['gate_membership'] = {}
+                self.current_sample = sample
+                self.raw_event_data = event_data
+            else:
+                self.current_sample = sample_from_fcs(sample_full_path, self.bus)
+                self.unmixed_event_data = None
+                self.af_sidecar_data = None
+                for data in self.preview_cache.plot_data():
+                    data['event_data'] = None
+                    data['gate_membership'] = {}
             self.current_sample_path = sample_path
-            self.current_sample = sample_from_fcs(self.experiment_dir / self.current_sample_path, self.bus)
 
             if self.current_sample_path == self.live_sample_path:
                 self.raw_event_data, n_events = self.copy_live_data(extent='update')
@@ -974,6 +1020,14 @@ class Controller(QObject):
 
             self.clear_data_for_cytometry_plots()
             self.initialise_data_for_cytometry_plots()
+            if sample_path != self.live_sample_path:
+                try:
+                    self.preview_cache.remember_loaded()
+                except Exception:
+                    logger.exception('Sample cache signature unavailable')
+                    self.preview_cache.clear()
+                if self.bus and len(self.raw_event_data) < n_events:
+                    self.bus.statusMessage.emit(f'Preview: {len(self.raw_event_data):,} of {n_events:,} events. Gates and statistics use the subset.')
         else:
             if self.bus:
                 self.bus.openImportFCSWidget.emit(True)
