@@ -51,6 +51,10 @@ from honeychrome.controller_components.autospectral_functions import (
 )
 from honeychrome.controller_components.functions import sample_from_fcs
 from honeychrome.controller_components.spectral_functions import get_raw_events
+from honeychrome.controller_components.autospectral_functions import (
+    combine_envelopes,
+    fluorophores_identifiable,
+)
 from honeychrome.controller_components.spectral_cleaning import (
     exclude_saturated,
     knn_scatter_match,
@@ -967,10 +971,16 @@ def unmix_autospectral_optimization(
     n_af_passes: int = 1,
     refine_af_quantile: float = 0.5,
     exact_variant_scan: bool = False,
+    envelope: dict | None = None,
 ) -> dict:
     """
     Assembles the `variants` list from the Table section's active
     fluorophores and calls the compiled joint kernel.
+
+    With an envelope (af_envelope_for_profiles), AF candidates are scored by
+    the guarded negative-envelope term and events with saturated detectors are
+    re-fitted on the unsaturated detectors only; without one, AF candidates
+    are scored by joint L2.
 
     Parameters
     ----------
@@ -1026,30 +1036,95 @@ def unmix_autospectral_optimization(
         # function has its own callers (e.g. scripted batch export).
         n_threads = max(1, min(int(n_threads), cpu_count))
 
-    result = unmix_autospectral_joint(
-        raw_data_in=raw_fl_events,
-        spectra=reference_spectra,
-        af_spectra=af_spectra,
-        fluor_names=fluor_names,
-        pos_thresholds=unmixed_pos_thresholds,
-        variants=variants,
-        n_passes=n_passes,
-        n_threads=n_threads,
-        cell_weight=cell_weight,
-        noise_floor=noise_floor,
-        alpha=alpha,
-        collinear_thresh=collinear_thresh,
-        joint_pair_resolution=joint_pair_resolution,
-        n_af_passes=n_af_passes,
-        refine_af_quantile=refine_af_quantile,
-        exact_variant_scan=exact_variant_scan,
-    )
+    def run_kernel(raw, spectra, af, variant_list, noise):
+        return unmix_autospectral_joint(
+            raw_data_in=raw,
+            spectra=spectra,
+            af_spectra=af,
+            fluor_names=fluor_names,
+            pos_thresholds=unmixed_pos_thresholds,
+            variants=variant_list,
+            n_passes=n_passes,
+            n_threads=n_threads,
+            cell_weight=cell_weight,
+            noise_floor=noise,
+            alpha=alpha,
+            collinear_thresh=collinear_thresh,
+            joint_pair_resolution=joint_pair_resolution,
+            n_af_passes=n_af_passes,
+            refine_af_quantile=refine_af_quantile,
+            exact_variant_scan=exact_variant_scan,
+            envelope=envelope,
+        )
+
+    result = run_kernel(raw_fl_events, reference_spectra, af_spectra, variants, noise_floor)
+    if envelope is not None:
+        _refit_saturated_events(raw_fl_events, reference_spectra, af_spectra, variants,
+                                noise_floor, envelope, result, run_kernel)
     F = reference_spectra.shape[0]
     return {
         'unmixed':  result[:, :F],
         'af_scale': result[:, F],
         'af_idx':   result[:, F + 1].astype(np.int64),
     }
+
+
+def _refit_saturated_events(raw_fl, spectra, af_spectra, variants, noise_floor,
+                            envelope, result, run_kernel) -> None:
+    """
+    Re-fit events with saturated detectors on the unsaturated detectors only,
+    overwriting their rows of result in place. Events are grouped by their
+    pattern of saturated detectors and each group is one kernel call on the
+    remaining detector columns. A pattern that leaves a fluorophore
+    unidentifiable keeps its first result.
+    """
+    saturated = raw_fl >= envelope['saturated_frac'] * envelope['ceiling']
+    rows_any = np.flatnonzero(saturated.any(axis=1))
+    if rows_any.size == 0:
+        return
+    patterns, inverse = np.unique(saturated[rows_any], axis=0, return_inverse=True)
+    inverse = np.asarray(inverse).ravel()
+    noise = None if noise_floor is None else np.atleast_1d(np.asarray(noise_floor, dtype=np.float64))
+    n_refit = 0
+    for p, pattern in enumerate(patterns):
+        keep = ~pattern
+        if not fluorophores_identifiable(spectra, keep):
+            continue
+        rows = rows_any[inverse == p]
+        sub_variants = [
+            {'name': v['name'],
+             'v_mats': np.asarray(v['v_mats'])[:, keep],
+             'delta_obs': np.asarray(v['delta_obs'])[:, keep]}
+            for v in variants
+        ]
+        sub_noise = noise[keep] if noise is not None and noise.size == keep.size else noise
+        result[rows] = run_kernel(
+            np.ascontiguousarray(raw_fl[rows][:, keep]),
+            np.ascontiguousarray(spectra[:, keep]),
+            np.ascontiguousarray(af_spectra[:, keep]),
+            sub_variants, sub_noise)
+        n_refit += rows.size
+    if n_refit:
+        logger.info(f'AutoSpectral Optimization: {n_refit} event(s) with saturated detectors '
+                    f're-fitted in {len(patterns)} pattern(s).')
+
+
+def af_envelope_for_profiles(controller, profile_names) -> dict | None:
+    """
+    Negative envelope for a sample's assigned AF profiles, combined as in the
+    core AF unmixing, or None when any profile has no envelope (the AF library
+    is then scored by joint L2). Main thread only: the controller refreshes a
+    stale envelope and caches the result.
+    """
+    af_profiles = controller.experiment.process.get('af_profiles', {})
+    names = [n for n in (profile_names or []) if n in af_profiles]
+    if not names:
+        return None
+    precomputed = [controller.precomputed_for_profile(n) for n in names]
+    if any(p is None for p in precomputed):
+        return None
+    return combine_envelopes([p.get('envelope') for p in precomputed],
+                             [p['v_library'].shape[1] for p in precomputed])
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1189,7 @@ def make_optimization_unmix_fn(
             variants_meta=variants_meta,
             active_labels=active_labels,
             unmixed_pos_thresholds=unmixed_pos_thresholds,
+            envelope=getattr(af, 'envelope', None),
             **kernel_kwargs,
         )
 

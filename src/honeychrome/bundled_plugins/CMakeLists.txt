@@ -58,6 +58,7 @@ find_package(Armadillo REQUIRED)
 pybind11_add_module(_autospectral_opt_kernel
   autospectral_opt_pybind.cpp
   core_joint_unmix.cpp
+  af_negative_term.cpp
 )
 
 target_include_directories(_autospectral_opt_kernel PRIVATE ${ARMADILLO_INCLUDE_DIRS})

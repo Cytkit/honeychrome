@@ -25,6 +25,26 @@ struct FluorVariantInput {
                              // covariance-propagated leakage weight.
 };
 
+// Guarded negative-envelope AF scoring (see af_negative_term.hpp). upper and
+// lower are the flat per-fluorophore boundaries; spread, when non-empty, is
+// the F x F spillover-spread matrix SS[a, f] that widens them per event by
+// kappa * sqrt(sum_a SS[a, f] * max(x_a, 0)) at the abundances of the joint L2
+// choice. A channel's positivity is judged at the AF library row in mean_rows
+// with the smallest residual (each profile's mean AF spectrum), over
+// soft_width SDs of the negative, sqrt(noise_sd^2 + sum_a SS[a, f] * max(x_a, 0)),
+// either side of the upper boundary. Passing no envelope scores AF candidates
+// by joint L2.
+struct AfEnvelopeInput {
+  arma::vec  upper;             // F
+  arma::vec  lower;             // F
+  arma::vec  noise_sd;          // F, or empty for zero
+  arma::mat  spread;            // F x F, or empty for flat boundaries
+  arma::uvec mean_rows;         // AF library rows of the mean spectra; empty means row 0
+  double     kappa        = 2.0;
+  double     hyper_weight = 1.0;
+  double     soft_width   = 3.0;
+};
+
 // Joint per-cell AF + fluorophore-variant unmixing.
 //
 // Parameters
@@ -56,6 +76,9 @@ struct FluorVariantInput {
 //                     residual approximation. Candidates are still verified
 //                     by a full re-solve before acceptance. Ignored when
 //                     cell_weight is true.
+// envelope         : nullptr -> AF candidates scored by joint L2; otherwise
+//                     by the guarded negative-envelope fluorophore term, with
+//                     ties resolving to the lowest candidate index.
 //
 // Returns
 // -------
@@ -76,5 +99,6 @@ arma::mat unmix_autospectral_joint_core(
     bool                                    joint_pair_resolution   = true,
     int                                     n_af_passes             = 1,
     double                                  refine_af_quantile      = 0.5,
-    bool                                    exact_variant_scan      = false
+    bool                                    exact_variant_scan      = false,
+    const AfEnvelopeInput*                 envelope                = nullptr
 );
