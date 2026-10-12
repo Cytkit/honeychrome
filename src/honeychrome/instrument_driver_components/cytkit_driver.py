@@ -341,6 +341,8 @@ class CytkitDevice:
         self.offset_corrector = OffsetCorrector(self.ft4222)
         self.trigger = Trigger(self.ft4222)
         self.capture = Capture(self.ft4222)
+        self.capture.start_clock()
+
         logger.info('[Cytkit driver] Connected')
 
         # set initial settings
@@ -450,7 +452,6 @@ class CytkitDevice:
 
         if not self.initialised:
             self.laser.set_state(1)  # turn on laser
-            self.capture.start_clock()
             self.pressure_control_worker.control_on = True
             self.initialised = True
             self.display.action_message(["Initialised!", "Sheath on, laser on."])

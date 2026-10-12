@@ -5,7 +5,7 @@ from PySide6.QtGui import QCursor, QIntValidator
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QTabWidget, QToolBox, QFormLayout, QComboBox, QCheckBox, QSpinBox, QHBoxLayout, QFrame, QTableWidget, QHeaderView, QLineEdit, QDoubleSpinBox
 from PySide6.QtCore import Qt, Slot, Signal, QSize, QSettings, QTimer
 from PySide6.QtWidgets import QApplication
-
+import numpy as np
 import logging
 
 from honeychrome.instrument_driver_components.cytkit_components.alignment_camera import AlignmentCameraWidget
@@ -1345,7 +1345,9 @@ class PluginWidget(QWidget):
         layout.addWidget(self.clear_fifo_btn)
         self.read_memory_btn = QPushButton('Capture and read memory once')
         self.read_memory_btn.clicked.connect(lambda: self.get_instrument_state({'test_capture_and_read_memory'}))
+        self.read_memory_output = QLabel('')
         layout.addWidget(self.read_memory_btn)
+        layout.addWidget(self.read_memory_output)
 
         layout.addStretch()
         toolbox.addTab(tab, "Capture")
@@ -1639,8 +1641,10 @@ class PluginWidget(QWidget):
                 if 'auto_resets' in response['message']['capture']:
                     self.auto_resets.setText(f'{response['message']['capture']['auto_resets']}')
 
-        if 'test_read_memory' in response['message']:
-            pass
+        if 'test_capture_and_read_memory' in response['message']:
+            traces_blob_np = response['message']['test_capture_and_read_memory']
+            traces_blob_np = traces_blob_np.reshape(-1, len(adc_channels), settings.n_time_points_in_event)
+            self.read_memory_output.setText(f'Traces captured: {len(traces_blob_np)}, non-zero channels: {np.flatnonzero(traces_blob_np.sum(axis=2).sum(axis=0))}')
 
         if 'register_getter' in response['message']:
             value = response['message']['register_getter']
@@ -1704,7 +1708,7 @@ if __name__ == "__main__":
     define objects for communication between processes
     '''
     from honeychrome.settings import traces_cache_size, traces_cache_dtype
-    from honeychrome.settings import max_events_in_cache, n_channels_per_event
+    from honeychrome.settings import max_events_in_cache, n_channels_per_event, n_time_points_in_event
     import honeychrome.settings as settings
 
     # Allocate shared memory block, plus head and tail indices

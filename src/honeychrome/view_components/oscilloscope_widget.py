@@ -75,7 +75,7 @@ class OscilloscopeWidget(QWidget):
             self.trace = None
             self.timer = QTimer()
             self.timer.timeout.connect(self.check_queue)
-            self.timer.setInterval(int(analyser_target_repeat_time * 1000))
+            self.timer.setInterval(int(analyser_target_repeat_time * 1000 / 4))
             self.timer.start()
 
     @Slot()

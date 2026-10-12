@@ -19,7 +19,7 @@ SAMPLE_INVALID_MASK = 0xC000
 MAX_SAMPLES = 10000
 HEADER_LEN = 16  # sync0, sync1, ts0..ts3, channel, count
 N_CHANNELS = 16
-
+time_threshold_single_event_ns = 40
 
 class CapturePacket(NamedTuple):
     timestamp: int
@@ -45,20 +45,41 @@ class CaptureDecoder:
         packets = self.extract_packets(buffer)
 
         if packets:
-            N = len({p.timestamp for p in packets}) # number of events
+            # channel_sequence = np.array([packet.channel for packet in packets])
+            timestamps = np.array([packet.timestamp for packet in packets])
+            index_packets = np.concatenate((np.array([True]), np.diff(timestamps) > time_threshold_single_event_ns)) # ns
+            start_packets = np.cumsum(index_packets) - 1
+            index_start_packets = np.flatnonzero(index_packets)
+            # print(channel_sequence, start_packets, index_packets, timestamps, start_timestamps, time_good)
+
+            N = len(index_start_packets) # number of events
             traces = np.zeros((N, settings.n_channels_trace, settings.n_time_points_in_event), dtype=np.uint16)
 
-            # Map timestamp -> event index, assigning indices in first-seen order.
-            event_index = {}
-            for packet in packets:
-                idx = event_index.get(packet.timestamp)
-                if idx is None:
-                    idx = len(event_index)
-                    event_index[packet.timestamp] = idx
+            for n, start_packet_index in enumerate(index_start_packets):
+                packet_indices = np.flatnonzero(start_packets == n)
 
-                n = min(packet.samples.size, settings.n_time_points_in_event)
-                if n > 0:
-                    traces[idx, packet.channel, :n] = packet.samples[:n]
+                if len(np.unique(packet_indices)) == len(packet_indices):
+                    for index in packet_indices:
+                        packet = packets[index]
+                        length = min(packet.samples.size, settings.n_time_points_in_event)
+                        if length > 0:
+                            traces[n, packet.channel, :length] = packet.samples[:length]
+                else:
+                    self.error_count += 1 # incomplete event
+
+            # # Map timestamp -> event index, assigning indices in first-seen order.
+            # N = len({p.timestamp for p in packets}) # number of events
+            # traces = np.zeros((N, settings.n_channels_trace, settings.n_time_points_in_event), dtype=np.uint16)
+            # event_index = {}
+            # for packet in packets:
+            #     idx = event_index.get(packet.timestamp)
+            #     if idx is None:
+            #         idx = len(event_index)
+            #         event_index[packet.timestamp] = idx
+            #
+            #     n = min(packet.samples.size, settings.n_time_points_in_event)
+            #     if n > 0:
+            #         traces[idx, packet.channel, :n] = packet.samples[:n]
 
             return traces
         else:
