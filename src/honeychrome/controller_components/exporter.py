@@ -171,6 +171,8 @@ class ReportGenerator(QObject):
                     f"Event count: {current_sample.event_count}\n"
                     f'Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}\n')
             try:
+                if len(self.controller.raw_event_data) < current_sample.event_count:
+                    desc += f'Preview event count: {len(self.controller.raw_event_data)}; plotted gates and statistics use this subset.\n'
                 desc += f"Sample acquired: {current_sample.get_metadata()['date']}; begin time: {current_sample.get_metadata()['btim']}; end time: {current_sample.get_metadata()['etim']}"
             except:
                 logger.info('No acquisition date in metadata')
@@ -349,4 +351,3 @@ class ReportGenerator(QObject):
             QApplication.restoreOverrideCursor()
 
         self.finished.emit()
-
