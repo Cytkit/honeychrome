@@ -5,6 +5,7 @@ from PySide6.QtGui import QCursor, QIntValidator
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QTabWidget, QToolBox, QFormLayout, QComboBox, QCheckBox, QSpinBox, QHBoxLayout, QFrame, QTableWidget, QHeaderView, QLineEdit, QDoubleSpinBox
 from PySide6.QtCore import Qt, Slot, Signal, QSize, QSettings, QTimer
 from PySide6.QtWidgets import QApplication
+import pyqtgraph as pg
 import numpy as np
 import logging
 
@@ -15,12 +16,47 @@ from honeychrome.settings import heading_style, adc_channels
 from honeychrome.view_components.event_bus import EventBus
 from honeychrome.view_components.icon_loader import icon
 from honeychrome import settings
+from honeychrome.view_components.profiles_viewer import FlowLayout, LegendEntry
 
 q_settings = settings.q_settings
 
 logger = logging.getLogger(__name__)
 
 plugin_name = 'Cytkit Hardware'
+
+class PlotTracesWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        # self.setGeometry(10, 10, 800, 700)
+        self.layout = QVBoxLayout(self)
+
+        self.plot_widget1 = pg.PlotWidget()
+        self.plot_widget1.setLabel('left', 'ADC value', units='')
+        self.plot_widget1.setLabel('bottom', 'Time', units='us')
+        self.plot_widget1.showGrid(x=True, y=True, alpha=0.3)
+
+        # ---- Flowing Legend ----
+        self.legendContainer1 = QWidget()
+        self.legendLayout1 = FlowLayout(self.legendContainer1)
+
+        self.layout.addWidget(self.plot_widget1)
+        self.layout.addWidget(self.legendContainer1)
+
+        self.x = np.arange(settings.n_time_points_in_event) / settings.adc_rate
+
+    def set_traces(self, traces):
+        self.plot_widget1.clear()
+        self.legendLayout1.clear()
+        for i in range(len(adc_channels)):
+            if traces[:,i,:].any():
+                color = settings.line_colors[i % len(adc_channels)]
+                entry = LegendEntry(color, adc_channels[i])
+                self.legendLayout1.addWidget(entry)
+                solid_pen = pg.mkPen(color=color, width=1, style=Qt.SolidLine)
+
+                for n in range(len(traces)):
+                    self.plot_widget1.plot(self.x, traces[n,i,:], pen=solid_pen)
 
 class DacChannelTable(QWidget):
     bias_changed = Signal(int, str, int)
@@ -840,10 +876,18 @@ class CaptureChannelTable(QWidget):
         # ---- reset button ----
         self.reset_button = QPushButton("Reset")
         self.reset_button.clicked.connect(self.reset)
+        # ---- all button ----
+        self.all_button = QPushButton("All")
+        self.all_button.clicked.connect(self.all)
+        # ---- none button ----
+        self.clear_button = QPushButton("None")
+        self.clear_button.clicked.connect(self.none)
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
         button_row.addWidget(self.reset_button)
+        button_row.addWidget(self.clear_button)
+        button_row.addWidget(self.all_button)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -952,6 +996,34 @@ class CaptureChannelTable(QWidget):
             self.pre_trigger_changed.emit(row, name, settings.capture_pre_trigger_default)
             self.post_trigger_changed.emit(row, name, settings.capture_post_trigger_default)
 
+    def all(self) -> None:
+        self._loading = True
+        try:
+            for row in range(len(adc_channels)):
+                self._set_row_silently(row, True, settings.capture_pre_trigger_default, settings.capture_post_trigger_default, )
+        finally:
+            self._loading = False
+
+        self.save_state()
+        for row, name in enumerate(adc_channels):
+            self.enable_changed.emit(row, name, True)
+            self.pre_trigger_changed.emit(row, name, settings.capture_pre_trigger_default)
+            self.post_trigger_changed.emit(row, name, settings.capture_post_trigger_default)
+
+    def none(self) -> None:
+        self._loading = True
+        try:
+            for row in range(len(adc_channels)):
+                self._set_row_silently(row, False, settings.capture_pre_trigger_default, settings.capture_post_trigger_default, )
+        finally:
+            self._loading = False
+
+        self.save_state()
+        for row, name in enumerate(adc_channels):
+            self.enable_changed.emit(row, name, False)
+            self.pre_trigger_changed.emit(row, name, settings.capture_pre_trigger_default)
+            self.post_trigger_changed.emit(row, name, settings.capture_post_trigger_default)
+
     # ---------- accessors ----------
 
     def is_enabled(self, row: int) -> bool:
@@ -997,7 +1069,6 @@ class LabeledSpinBox(QWidget):
             self.spinbox.setAlignment(Qt.AlignRight)  # Right justify
             layout.addWidget(self.spinbox)
             layout.addWidget(self.label)
-
 
 class HLine(QFrame):
     def __init__(self, parent=None):
@@ -1346,8 +1417,11 @@ class PluginWidget(QWidget):
         self.read_memory_btn = QPushButton('Capture and read memory once')
         self.read_memory_btn.clicked.connect(lambda: self.get_instrument_state({'test_capture_and_read_memory'}))
         self.read_memory_output = QLabel('')
+        self.plot_traces_widget = PlotTracesWidget()
+        self.plot_traces_widget.setVisible(False)
         layout.addWidget(self.read_memory_btn)
         layout.addWidget(self.read_memory_output)
+        layout.addWidget(self.plot_traces_widget)
 
         layout.addStretch()
         toolbox.addTab(tab, "Capture")
@@ -1643,8 +1717,13 @@ class PluginWidget(QWidget):
 
         if 'test_capture_and_read_memory' in response['message']:
             traces_blob_np = response['message']['test_capture_and_read_memory']
-            traces_blob_np = traces_blob_np.reshape(-1, len(adc_channels), settings.n_time_points_in_event)
-            self.read_memory_output.setText(f'Traces captured: {len(traces_blob_np)}, non-zero channels: {np.flatnonzero(traces_blob_np.sum(axis=2).sum(axis=0))}')
+            if traces_blob_np is not None:
+                traces_blob_np = traces_blob_np.reshape(-1, len(adc_channels), settings.n_time_points_in_event)
+                self.read_memory_output.setText(f'Traces captured: {len(traces_blob_np)}, non-zero channels: {np.flatnonzero(traces_blob_np.sum(axis=2).sum(axis=0))}')
+                self.plot_traces_widget.set_traces(traces_blob_np)
+                self.plot_traces_widget.setVisible(True)
+            else:
+                self.read_memory_output.setText(f'No traces captured.')
 
         if 'register_getter' in response['message']:
             value = response['message']['register_getter']
