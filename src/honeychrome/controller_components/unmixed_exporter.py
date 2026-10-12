@@ -9,7 +9,7 @@ from flowkit import Sample
 from typing import cast
 
 from honeychrome.controller_components.functions import apply_transfer_matrix, export_unmixed_sample, sample_from_fcs
-from honeychrome.controller_components.autospectral_functions import precompute_af_matrices, combine_af_precomputed, apply_af_transfer, af_index_lookup
+from honeychrome.controller_components.autospectral_functions import combine_af_precomputed, apply_af_transfer, af_index_lookup
 import honeychrome.settings as settings
 from honeychrome.__init__ import __version__
 
@@ -234,13 +234,9 @@ class UnmixedExporter(QObject):
 
                     if active_profiles:
                         # Build combined AF precomputed matrices for this sample's assigned profiles
-                        fluor_spectra = self.controller._build_fluor_spectra()
                         precomputed_list = [
-                            precompute_af_matrices(
-                                fluor_spectra,
-                                np.array(p['spectra'])
-                            )
-                            for p in active_profiles
+                            self.controller.precomputed_for_profile(name)
+                            for name in assigned_profile_names if name in all_af_profiles
                         ]
                         af_precomputed = combine_af_precomputed(precomputed_list)
                         af_spectra = np.vstack([np.array(p['spectra']) for p in active_profiles])

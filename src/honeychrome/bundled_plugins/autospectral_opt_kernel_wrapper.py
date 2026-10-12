@@ -22,7 +22,7 @@ Usage
             n_passes=1, n_threads=1, cell_weight=False,
             noise_floor=None, alpha=0.5, collinear_thresh=0.5,
             joint_pair_resolution=True, n_af_passes=1, refine_af_quantile=0.5,
-            exact_variant_scan=False,
+            exact_variant_scan=False, envelope=None,
         )
         # result : ndarray (N, F+2) — [fluor abundances | AF abundance | AF index (1-based)]
 
@@ -57,6 +57,54 @@ except ImportError:
         'run build_autospectral_opt_kernel.py to enable.'
     )
 
+# Extensions built without guarded_fluor_term lack the function; callers fall back to NumPy.
+GUARDED_TERM_KERNEL_AVAILABLE = AUTOSPECTRAL_OPT_KERNEL_AVAILABLE and hasattr(_lib, 'guarded_fluor_term')
+
+
+# Extensions built before the joint kernel took a guarded envelope score AF by joint L2 here.
+ENVELOPE_KERNEL_AVAILABLE = (AUTOSPECTRAL_OPT_KERNEL_AVAILABLE
+                             and getattr(_lib, 'SUPPORTS_GUARDED_ENVELOPE', False))
+_warned_no_envelope = False
+
+
+def guarded_fluor_term(
+    u: np.ndarray,
+    k: np.ndarray,
+    v_t: np.ndarray,
+    w: np.ndarray,
+    upper: np.ndarray,
+    floor: np.ndarray,
+    keep: np.ndarray,
+    hyper_weight: float,
+    n_threads: int = 0,
+) -> np.ndarray:
+    """
+    Fluorophore term of the guarded negative-envelope AF score for every
+    event and AF candidate (autospectral_functions._guarded_fluor_term).
+
+    Parameters
+    ----------
+    u     : (N, F) AF-free unmix.
+    k     : (N, nAF) abundance of each candidate.
+    v_t   : (nAF, F) in-span projection of each candidate.
+    w     : (F,) fluorophore error weights.
+    upper : (N, F) per-event upper boundary.
+    floor : (N, F) per-event lower penalty boundary.
+    keep  : (N, F) how negative each channel is, 1 negative to 0 positive.
+    n_threads : OpenMP threads, 0 = all available.
+
+    Returns
+    -------
+    ndarray (N, nAF) proportional fluorophore error.
+    """
+    if not GUARDED_TERM_KERNEL_AVAILABLE:
+        raise ImportError(
+            'Compiled guarded-term kernel not available. '
+            'Run build_autospectral_opt_kernel.py first.'
+        )
+    arrays = [np.ascontiguousarray(a, dtype=np.float64) for a in (u, k, v_t, w, upper, floor, keep)]
+    return _lib.guarded_fluor_term(*arrays, float(hyper_weight), int(n_threads))
+
 
 def unmix_autospectral_joint(
     raw_data_in: np.ndarray,
@@ -75,6 +123,7 @@ def unmix_autospectral_joint(
     n_af_passes: int = 1,
     refine_af_quantile: float = 0.5,
     exact_variant_scan: bool = False,
+    envelope: dict | None = None,
 ) -> np.ndarray:
     """
     Call the compiled joint AF + fluorophore-variant unmixing kernel.
@@ -101,6 +150,13 @@ def unmix_autospectral_joint(
         single-endmember swap instead of the fixed-abundance residual
         approximation (unmix.autospectral.rcpp's exact.variant.scan). Ignored
         when cell_weight is True.
+    envelope : None or the runtime negative envelope of the AF profile(s)
+        (autospectral_functions.build_runtime_envelope): dict with 'upper',
+        'lower', 'noise_sd' (F,), 'spread' (F, F) or None, 'mean_rows' (AF
+        library rows of the mean spectra), 'kappa', 'hyper_weight' and
+        'soft_width'. AF candidates are then scored by the guarded
+        negative-envelope fluorophore term and ties resolve to the lowest AF
+        index; None scores them by joint L2.
 
     Returns
     -------
@@ -131,6 +187,31 @@ def unmix_autospectral_joint(
     if noise_floor is not None:
         nf_arg = np.ascontiguousarray(np.atleast_1d(noise_floor), dtype=np.float64)
 
+    global _warned_no_envelope
+    envelope_c = None
+    if envelope is not None and not ENVELOPE_KERNEL_AVAILABLE:
+        if not _warned_no_envelope:
+            logger.warning(
+                'Compiled kernel predates the guarded negative envelope; scoring AF by joint L2. '
+                'Run build_autospectral_opt_kernel.py to rebuild it.')
+            _warned_no_envelope = True
+    elif envelope is not None:
+        spread = envelope.get('spread')
+        noise_sd = envelope.get('noise_sd')
+        envelope_c = {
+            'upper': np.ascontiguousarray(envelope['upper'], dtype=np.float64),
+            'lower': np.ascontiguousarray(envelope['lower'], dtype=np.float64),
+            'noise_sd': None if noise_sd is None else np.ascontiguousarray(noise_sd, dtype=np.float64),
+            'spread': (None if spread is None or not np.any(spread)
+                       else np.ascontiguousarray(spread, dtype=np.float64)),
+            'mean_rows': [int(r) for r in np.atleast_1d(envelope.get('mean_rows', [0]))],
+            'kappa': float(envelope['kappa']),
+            'hyper_weight': float(envelope['hyper_weight']),
+        }
+        if 'soft_width' in envelope:
+            envelope_c['soft_width'] = float(envelope['soft_width'])
+
+    extra = (envelope_c,) if ENVELOPE_KERNEL_AVAILABLE else ()
     return _lib.unmix_autospectral_joint(
         raw_data_in,
         spectra,
@@ -148,4 +229,5 @@ def unmix_autospectral_joint(
         n_af_passes,
         refine_af_quantile,
         exact_variant_scan,
+        *extra,
     )

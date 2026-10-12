@@ -39,7 +39,7 @@ import math
 import time
 from collections import Counter
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -47,7 +47,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtWidgets import QMessageBox
 
 import honeychrome.settings as settings
-from honeychrome.controller_components.autospectral_functions import af_index_lookup
+from honeychrome.controller_components.autospectral_functions import af_index_lookup, combine_envelopes
 from honeychrome.controller_components.functions import (
     apply_transfer_matrix,
     export_unmixed_sample,
@@ -73,10 +73,13 @@ class AFLibrary:
     """Combined AF library for one sample's profile assignment.
 
     ``index_map`` holds the experiment-wide AF Index of each library row.
+    ``envelope`` is the combined negative envelope of the profiles, or None
+    when any of them has none (the library is then scored by joint L2).
     """
     profile_names: tuple
     spectra: np.ndarray
     index_map: np.ndarray
+    envelope: dict | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -109,6 +112,7 @@ class ExportLayout:
     sample_af_profiles: dict
     af_profiles: dict
     n_af_index: int | None
+    af_envelopes: dict = field(default_factory=dict)   # profile name -> runtime envelope or None
 
 
 def _imaging_channels(raw_settings: dict, pnn_raw: list, pnn_raw_full: list) -> list:
@@ -171,6 +175,16 @@ def build_export_layout(controller) -> ExportLayout:
     fluor_names = [c['label'] for c in exp.process.get('spectral_model', []) if c['label'] in profiles]
     spectra_matrix = exp.process.get('spectra_matrix')
 
+    # Runtime envelopes of the assigned AF profiles, built here because the
+    # controller refreshes a stale envelope and is main-thread only.
+    af_envelopes = {}
+    precomputed_for_profile = getattr(controller, 'precomputed_for_profile', None)
+    if precomputed_for_profile is not None:
+        assigned = {n for names in exp.samples.get('sample_af_profiles', {}).values() for n in (names or [])}
+        for name in assigned & set(exp.process.get('af_profiles', {})):
+            cached = precomputed_for_profile(name)
+            af_envelopes[name] = cached.get('envelope') if cached else None
+
     return ExportLayout(
         experiment_dir=experiment_dir,
         raw_subdir_abs=(experiment_dir / raw_settings['raw_samples_subdirectory']).resolve(),
@@ -191,6 +205,7 @@ def build_export_layout(controller) -> ExportLayout:
         sample_af_profiles=deepcopy(exp.samples.get('sample_af_profiles', {})),
         af_profiles=deepcopy(exp.process.get('af_profiles', {})),
         n_af_index=controller.n_af_spectra(),
+        af_envelopes=af_envelopes,
     )
 
 
@@ -200,13 +215,16 @@ def af_library_for_profiles(layout: ExportLayout, profile_names) -> AFLibrary | 
     stored = [n for n in names if n in layout.af_profiles]
     if not stored:
         return None
-    spectra = np.vstack([np.array(layout.af_profiles[n]['spectra']) for n in stored])
+    blocks = [np.array(layout.af_profiles[n]['spectra']) for n in stored]
+    spectra = np.vstack(blocks)
     if spectra.shape[0] < 2:
         return None
     return AFLibrary(
         profile_names=tuple(stored),
         spectra=spectra,
         index_map=af_index_lookup(layout.af_profiles, names),
+        envelope=combine_envelopes([layout.af_envelopes.get(n) for n in stored],
+                                   [b.shape[0] for b in blocks]),
     )
 
 

@@ -11,6 +11,7 @@
 //   - Rcpp::stop(...)                    -> std::invalid_argument
 // ---------------------------------------------------------------------------
 #include "core_joint_unmix.hpp"
+#include "af_negative_term.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -86,7 +87,8 @@ arma::mat unmix_autospectral_joint_core(
     bool   joint_pair_resolution,
     int    n_af_passes,
     double refine_af_quantile,
-    bool   exact_variant_scan
+    bool   exact_variant_scan,
+    const AfEnvelopeInput* envelope
 ) {
   const mat raw_data = raw_data_in.t();   // D x N
   const uword N   = raw_data.n_cols;
@@ -198,6 +200,41 @@ arma::mat unmix_autospectral_joint_core(
   // update instead of an O(F x nAF) abs() pass per cell.
   const mat v_lib_af_w = v_lib_af.each_col() % w_af;              // F x nAF
   const vec c_fluor_af = (sum(v_lib_af_w % v_lib_af_w, 0)).t();   // nAF
+
+  // Guarded negative-envelope AF scoring: boundaries, the squared unstained
+  // SD, the transposed spread matrix (so the per-event spread variance is one
+  // gemv) and the library rows of the mean AF spectra.
+  const bool use_envelope = (envelope != nullptr);
+  vec env_upper, env_lower, env_noise_sq;
+  mat env_spread_t;
+  uvec env_mean_rows;
+  double env_kappa = 0.0, env_hyper_weight = 0.0, env_soft_width = 0.0;
+  bool env_has_spread = false;
+  if (use_envelope) {
+    if (envelope->upper.n_elem != F || envelope->lower.n_elem != F)
+      throw std::invalid_argument("envelope upper and lower must have one entry per fluorophore.");
+    env_upper = envelope->upper;
+    env_lower = envelope->lower;
+    env_kappa = envelope->kappa;
+    env_hyper_weight = envelope->hyper_weight;
+    env_soft_width = envelope->soft_width;
+    if (envelope->noise_sd.is_empty()) {
+      env_noise_sq = zeros<vec>(F);
+    } else {
+      if (envelope->noise_sd.n_elem != F)
+        throw std::invalid_argument("envelope noise_sd must have one entry per fluorophore.");
+      env_noise_sq = square(envelope->noise_sd);
+    }
+    if (!envelope->spread.is_empty()) {
+      if (envelope->spread.n_rows != F || envelope->spread.n_cols != F)
+        throw std::invalid_argument("envelope spread must be F x F.");
+      env_spread_t = envelope->spread.t();
+      env_has_spread = true;
+    }
+    env_mean_rows = envelope->mean_rows.is_empty() ? uvec{0} : envelope->mean_rows;
+    if (env_mean_rows.max() >= nAF)
+      throw std::invalid_argument("envelope mean_rows must index the AF library.");
+  }
 
   // Determine whether endmember variant optimisation is requested.
   const bool af_only = variants.empty();
@@ -371,6 +408,13 @@ arma::mat unmix_autospectral_joint_core(
   static thread_local vec w_af_init;
   static thread_local vec cross_fluor_af;
   static thread_local vec fluor_sq_af;
+  static thread_local vec env_ref;        // abundances of the joint L2 choice (positive part)
+  static thread_local vec env_upper_ev;   // per-event boundaries
+  static thread_local vec env_lower_ev;
+  static thread_local vec env_floor_ev;
+  static thread_local vec env_sd;         // per-event SD of the negative
+  static thread_local vec env_at_mean;    // AF-free unmix less the mean AF
+  static thread_local vec env_keep;       // how negative each channel is
   static thread_local vec coeff_init;
   static thread_local vec other_unmixed;
   static thread_local vec trial_unmixed;
@@ -450,6 +494,13 @@ arma::mat unmix_autospectral_joint_core(
   w_af_init.set_size(F);
   cross_fluor_af.set_size(nAF);
   fluor_sq_af.set_size(nAF);
+  env_ref.set_size(F);
+  env_upper_ev.set_size(F);
+  env_lower_ev.set_size(F);
+  env_floor_ev.set_size(F);
+  env_sd.set_size(F);
+  env_at_mean.set_size(F);
+  env_keep.set_size(F);
   coeff_init.set_size(F);
   other_unmixed.set_size(F > 0 ? F - 1 : 0);
   trial_unmixed.set_size(F);
@@ -532,7 +583,51 @@ arma::mat unmix_autospectral_joint_core(
 
     score_af_vec = presid_af % pfluor_af;
 
-    const uword best_j = score_af_vec.index_min();
+    uword best_j = score_af_vec.index_min();
+
+    if (use_envelope) {
+      // The joint L2 choice sets the abundances that widen the boundaries.
+      env_ref = init_f - k_af_vec[best_j] * v_lib_af.col(best_j);
+      for (uword f = 0; f < F; ++f)
+        if (env_ref[f] < 0.0) env_ref[f] = 0.0;
+      env_upper_ev = env_upper;
+      env_lower_ev = env_lower;
+      if (env_has_spread) {
+        const vec spread_var = clamp(env_spread_t * env_ref, 0.0, arma::datum::inf);
+        const vec widen = env_kappa * sqrt(spread_var);
+        env_upper_ev += widen;
+        env_lower_ev -= widen;
+        env_sd = sqrt(env_noise_sq + spread_var);
+      } else {
+        env_sd = sqrt(env_noise_sq);
+      }
+      for (uword f = 0; f < F; ++f)
+        env_floor_ev[f] = std::min(env_lower_ev[f], init_f[f]);
+
+      // Positivity at the mean AF spectrum that best fits the residual.
+      uword mean_j = env_mean_rows[0];
+      for (uword r = 1; r < env_mean_rows.n_elem; ++r)
+        if (presid_af[env_mean_rows[r]] < presid_af[mean_j]) mean_j = env_mean_rows[r];
+      env_at_mean = init_f - k_af_vec[mean_j] * v_lib_af.col(mean_j);
+      guard_weight_event(env_at_mean.memptr(), env_upper_ev.memptr(), env_sd.memptr(),
+                         env_soft_width, env_keep.memptr(), (int)F);
+
+      // v_lib_af is F x nAF column-major, i.e. nAF rows of F values.
+      guarded_fluor_term_event(
+          init_f.memptr(), k_af_vec.memptr(), v_lib_af.memptr(), w_af.memptr(),
+          env_upper_ev.memptr(), env_floor_ev.memptr(), env_keep.memptr(),
+          env_hyper_weight, pfluor_af.memptr(), (int)nAF, (int)F);
+
+      // Product of the two proportional squared errors; lowest index wins ties.
+      for (uword j = 0; j < nAF; ++j)
+        score_af_vec[j] = (pfluor_af[j] + 1e-12) * (presid_af[j] * presid_af[j] + 1e-12);
+      best_j = score_af_vec.index_min();
+      const double cutoff = score_af_vec[best_j] * (1.0 + 1e-9);
+      for (uword j = 0; j < nAF; ++j) {
+        if (score_af_vec[j] <= cutoff) { best_j = j; break; }
+      }
+    }
+
     out_j = best_j;
     out_k = k_af_vec[best_j];
     return score_af_vec[best_j];

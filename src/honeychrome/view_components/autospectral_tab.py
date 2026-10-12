@@ -43,6 +43,14 @@ from honeychrome.controller_components.autospectral_functions import (
     save_af_profile_csv,
     load_af_profile_csv,
     af_index_lookup,
+    make_envelope_entry,
+    envelope_sample_name,
+    save_envelope_sample,
+)
+from honeychrome.controller_components.spread_model import (
+    spread_is_current,
+    spread_snapshot,
+    compute_spread_entry,
 )
 from honeychrome.controller_components.transform import Transform
 from honeychrome.view_components.cytometry_plot_components import (
@@ -72,17 +80,24 @@ TAB_NAME = 'AutoSpectral AF'
 # ---------------------------------------------------------------------------
 
 class AfTrainingWorker(QObject):
-    """Runs get_af_spectra in a QThread."""
+    """
+    Runs get_af_spectra in a QThread, then builds the negative envelope and,
+    when spread_job is given, estimates the spillover spread. Emits a dict
+    with af_spectra, envelope, envelope_sample and spread.
+    """
     finished = Signal(object)
     error = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, unstained_raw, fluor_spectra, som_dim, source_fcs_path):
+    def __init__(self, unstained_raw, fluor_spectra, som_dim, source_fcs_path,
+                 fluor_names=None, spread_job=None):
         super().__init__()
         self.unstained_raw = unstained_raw
         self.fluor_spectra = fluor_spectra
         self.som_dim = som_dim
         self.source_fcs_path = source_fcs_path   # stored so the slot can read it
+        self.fluor_names = fluor_names
+        self.spread_job = spread_job
 
     def run(self):
         try:
@@ -92,7 +107,18 @@ class AfTrainingWorker(QObject):
                 self.fluor_spectra,
                 som_dim=self.som_dim,
             )
-            self.finished.emit(af_spectra)
+            envelope, sample, spread = None, None, None
+            if self.fluor_names is not None:
+                self.progress.emit('Building the negative envelope')
+                envelope, sample = make_envelope_entry(
+                    self.unstained_raw, self.fluor_names, self.fluor_spectra, af_spectra)
+                if self.spread_job is not None:
+                    try:
+                        spread = self.spread_job(self.progress.emit)
+                    except Exception as e:
+                        logger.warning(f'AutoSpectral: spillover spread not estimated: {e}')
+            self.finished.emit({'af_spectra': af_spectra, 'envelope': envelope,
+                                'envelope_sample': sample, 'spread': spread})
         except Exception as e:
             self.error.emit(str(e))
 
@@ -1235,12 +1261,22 @@ class AutoSpectralTab(QWidget):
             )
             return
 
+        fluor_names = self.controller._build_fluor_names()
+        spread_job = None
+        if fluor_names is not None and not spread_is_current(
+                self.controller.experiment.process.get('af_spread'), fluor_names, fluor_spectra):
+            snapshot = spread_snapshot(self.controller, fluor_names, fluor_spectra, sample_path)
+
+            def spread_job(progress):
+                return compute_spread_entry(snapshot, progress)
+
         self._extract_btn.setEnabled(False)
         self._extract_status.setText('Extracting AF spectra...')
 
         self._train_thread = QThread()
         self._train_worker = AfTrainingWorker(
-            raw_fl, fluor_spectra, self._som_dim_spin.value(), sample_path
+            raw_fl, fluor_spectra, self._som_dim_spin.value(), sample_path,
+            fluor_names=fluor_names, spread_job=spread_job,
         )
         self._train_worker.moveToThread(self._train_thread)
         self._train_thread.started.connect(self._train_worker.run)
@@ -1252,10 +1288,11 @@ class AutoSpectralTab(QWidget):
         self._train_thread.finished.connect(self._train_thread.deleteLater)
         self._train_thread.start()
 
-    def _on_extraction_finished(self, af_spectra: np.ndarray):
+    def _on_extraction_finished(self, result: dict):
         # Read source_fcs_path from the worker object (set before thread started)
         source_fcs_path = self._train_worker.source_fcs_path
         self._extract_btn.setEnabled(True)
+        af_spectra = result['af_spectra']
         n_af = af_spectra.shape[0]
 
         pnn_raw = self.controller.experiment.settings['raw']['event_channels_pnn']
@@ -1279,12 +1316,26 @@ class AutoSpectralTab(QWidget):
             'source_fcs': str(source_fcs_path),
             'channel_names': channel_names,
         }
+        envelope = result['envelope']
+        if envelope is not None:
+            envelope['unstained_file'] = envelope_sample_name(profile_name)
+            try:
+                save_envelope_sample(result['envelope_sample'], self.controller.experiment_dir,
+                                     envelope['unstained_file'])
+            except OSError as e:
+                logger.warning(f'AutoSpectral: failed to save the unstained subsample: {e}')
+            af_profiles[profile_name]['envelope'] = envelope
+        if result['spread'] is not None:
+            self.controller.experiment.process['af_spread'] = result['spread']
         self.controller.experiment.process['af_profiles'] = af_profiles
         self.bus.autoSaveRequested.emit()
 
-        # Cache precomputed matrices for the new profile immediately —
-        # this is the only linalg.solve call needed; sample loading just does hstack.
-        self.controller.cache_af_profile(profile_name)
+        # Cache precomputed matrices for the new profile immediately; a new
+        # spread applies to every profile with an envelope.
+        if result['spread'] is not None:
+            self.controller.cache_all_af_profiles()
+        else:
+            self.controller.cache_af_profile(profile_name)
         self.controller.on_af_profiles_changed()
 
         if csv_save_error:
@@ -1293,8 +1344,10 @@ class AutoSpectralTab(QWidget):
                 f'failed: {csv_save_error}'
             )
         else:
+            spread_note = (f' Spillover spread estimated from {result["spread"]["n_estimated"]} controls.'
+                           if result['spread'] is not None else '')
             self._extract_status.setText(
-                f'Done. Profile "{profile_name}" stored ({n_af} AF spectra).'
+                f'Done. Profile "{profile_name}" stored ({n_af} AF spectra).{spread_note}'
             )
         self._refresh_profile_list(select_name=profile_name)
         self._rebuild_assignment_grid()

@@ -68,6 +68,8 @@ def main():
         )
 
     dest = os.path.join(HERE, os.path.basename(built))
+    if os.path.exists(dest):
+        os.remove(dest)  # new inode; macOS kills on in-place overwrite of a signed binary
     shutil.copy2(built, dest)
     print(f'[build] copied {built} -> {dest}')
     print('[build] _autospectral_opt_kernel extension built successfully.')
