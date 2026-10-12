@@ -90,7 +90,7 @@ class OscilloscopeWidget(QWidget):
     def _update_plot(self):
         """Thread-safe method to update the plot"""
         try:
-            print(self.trace)
+            # print(self.trace) # debug only
 
             start = self.trace['n_start']
             end = self.trace['n_end']

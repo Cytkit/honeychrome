@@ -562,6 +562,7 @@ class CytkitDevice:
                 if 'enable' in value:
                     for index in value['enable']:
                         self.adcs.real_set_enable(index, value['enable'][index])
+                        self.offset_corrector.set_enable(index, value['invert'][index])
                 if 'invert' in value:
                     for index in value['invert']:
                         self.offset_corrector.set_invert(index, value['invert'][index])
