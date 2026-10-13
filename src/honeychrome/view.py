@@ -129,6 +129,8 @@ class View(QObject):
         self.bus.findConnectInstrument.connect(self.controller.find_and_connect_instrument)
         self.bus.initialiseInstrument.connect(self.controller.initialise_instrument)
         self.bus.setSamplePumpFlowRate.connect(self.controller.set_sample_pump_flow_rate)
+        self.bus.setSamplePumpStepsPerMicrolitre.connect(self.controller.set_sample_pump_steps_per_microlitre)
+        self.bus.configPeakDetection.connect(self.controller.config_peak_detection)
         self.bus.startAcquisition.connect(self.controller.start_acquisition)
         self.bus.stopAcquisition.connect(self.controller.stop_acquisition)
         self.bus.restartAcquisition.connect(self.controller.restart_acquisition)

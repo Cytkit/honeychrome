@@ -742,7 +742,7 @@ class TriggerChannelTable(QWidget):
         self._loading = True
         try:
             for row, name in enumerate(adc_channels):
-                self._set_row_silently(row, enabled=True if name=='FSC' else False, mask=True if name=='FSC' else False, edge=True if name=='FSC' else False, level=settings.threshold * settings.adc_scale_mv, hyst=settings.trigger_default_hysteresis, delay=0, h_off=0, skew=0)
+                self._set_row_silently(row, enabled=True if name=='FSC' else False, mask=True if name=='FSC' else False, edge=True if name=='FSC' else False, level=settings.threshold, hyst=settings.trigger_default_hysteresis, delay=0, h_off=0, skew=0)
         finally:
             self._loading = False
 
@@ -752,7 +752,7 @@ class TriggerChannelTable(QWidget):
             self.enable_changed.emit(row, name, True if name=='FSC' else False)
             self.mask_changed.emit(row, name, True if name=='FSC' else False)
             self.edge_changed.emit(row, name, True if name=='FSC' else False)
-            self.level_changed.emit(row, name, settings.threshold * settings.adc_scale_mv)
+            self.level_changed.emit(row, name, settings.threshold)
             self.hyst_changed.emit(row, name, settings.trigger_default_hysteresis)
             self.delay_changed.emit(row, name, 0)
             self.h_off_changed.emit(row, name, 0)

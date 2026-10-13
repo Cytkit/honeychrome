@@ -276,8 +276,8 @@ class DummyDevice:
         return 'OK', 'Dummy device started acquisition'
 
     def stop_acquisition(self):
-        self.display.action_message("Acquisition stopped.")
         if debug_automation:
+            self.display.action_message("Acquisition stopped.")
             self.sample_pump.enable = False
             self.sample_pump.reverse = False
             self.sample_pump.speed = 0
@@ -374,7 +374,8 @@ class DummyDevice:
     def read_out_traces(self):
         n = dummy_event_rate * transfer_target_repeat_time
         n_events_in_memory = np.random.poisson(n)
-        self.event_rate_counter.update(n_events_in_memory)
+        if debug_automation:
+            self.event_rate_counter.update(n_events_in_memory)
         blob_of_traces_as_array, _ = self.generate_traces(n_events_in_memory)
         return blob_of_traces_as_array
 

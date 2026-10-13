@@ -67,8 +67,10 @@ class AcquisitionWidget(QWidget):
         slider_layout = QHBoxLayout()
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(10, 100)
+        self.slider.setValue(settings.sample_flow_rate_retrieved)
         self.spinbox = QSpinBox()
         self.spinbox.setRange(10, 100)
+        self.spinbox.setValue(settings.sample_flow_rate_retrieved)
 
         # Sync slider and spinbox
         self.slider.valueChanged.connect(self.spinbox.setValue)

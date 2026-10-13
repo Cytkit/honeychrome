@@ -3,11 +3,14 @@ import numpy as np
 from picosdk.ps5000a import ps5000a as ps
 from picosdk.functions import assert_pico_ok, PICO_STATUS_LOOKUP
 
-from honeychrome.settings import adc_channels, magnitude_ceiling, traces_cache_dtype, n_channels_trace, n_time_points_in_event, transfer_target_repeat_time, threshold, FSC_sense, adc_scale_mv, nearly_floor_uint16
+from honeychrome.settings import adc_channels, magnitude_ceiling, traces_cache_dtype, n_channels_trace, n_time_points_in_event, transfer_target_repeat_time, threshold, FSC_sense, adc_scale_mv
 
 index_channel_a = adc_channels.index('FSC')
 index_channel_b = adc_channels.index('B1')
 inject_signal = True
+nearly_floor_uint16 = 65536*0.01
+nearly_ceiling_uint16 = 65536*0.99
+half_uint16 = 65536*0.5
 
 # note timebases for ps5000aRunBlock command
 # 3→8 ns

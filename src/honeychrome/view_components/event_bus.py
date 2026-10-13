@@ -43,6 +43,8 @@ class EventBus(QObject):
     findConnectInstrument = Signal()
     initialiseInstrument = Signal()
     setSamplePumpFlowRate = Signal(int)
+    setSamplePumpStepsPerMicrolitre = Signal(int)
+    configPeakDetection = Signal(dict)
     startAcquisition = Signal()
     stopAcquisition = Signal()
     restartAcquisition = Signal()

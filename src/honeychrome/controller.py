@@ -44,7 +44,7 @@ from honeychrome.controller_components.functions import apply_gates_in_place, ap
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml
 from honeychrome.settings import traces_cache_size, traces_cache_dtype, adc_rate
 import honeychrome.settings as settings
-from honeychrome.settings import max_events_in_cache, n_channels_per_event, experiments_folder, live_data_process_repeat_time, settings_default, samples_default, channel_dict
+from honeychrome.settings import max_events_in_cache, n_channels_per_event, experiments_folder, live_data_process_repeat_time, settings_default, samples_default
 from honeychrome.view_components.busy_cursor import with_busy_cursor
 from honeychrome.controller_components.autospectral_functions import (
         get_af_spectra,
@@ -117,7 +117,7 @@ class Controller(QObject):
         self.data_for_cytometry_plots_unmixed = deepcopy(self.data_for_cytometry_plots)
         self.current_mode = 'raw'
         self.mode_switch_in_progress = False
-        self.sample_flow_rate = None
+        self.sample_flow_rate = settings.sample_flow_rate_retrieved
 
         # pipe connections to instrument
         self.pipe_connection_instrument = pipe_connection_instrument
@@ -477,7 +477,7 @@ class Controller(QObject):
 
     def initialise_ephemeral_data(self, scope=None):
         # called when an experiment is created or loaded (or spectral process is refreshed)
-        self.experiment_compatible_with_acquisition = channel_dict['event_channels_pnn'] == self.experiment.settings['raw']['event_channels_pnn'] #todo should refer to instrument/analyst/acq config rather than defaults
+        self.experiment_compatible_with_acquisition = settings.event_channels_pnn == self.experiment.settings['raw']['event_channels_pnn'] #todo should refer to instrument/analyst/acq config rather than defaults
         self.filter_raw_fluorescence_channels()
 
         if scope is None:
@@ -1050,6 +1050,19 @@ class Controller(QObject):
         if self.bus:
             self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
 
+    @Slot(int)
+    def set_sample_pump_steps_per_microlitre(self, value):
+        self.pipe_connection_instrument.send({'command': 'set_sample_flow_rate', 'data': {'sample_flow_rate': self.sample_flow_rate, 'steps_per_microlitre': value}})
+        response = self.pipe_connection_instrument.recv()
+
+        logger.info(response)
+        if self.bus:
+            self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
+
+    @Slot(dict)
+    def config_peak_detection(self, params):
+        self.pipe_connection_analyser.send({'command': 'configure', 'data': params})
+
     @Slot()
     def initialise_instrument(self):
         self.pipe_connection_instrument.send({'command': 'initialise'})
@@ -1131,7 +1144,7 @@ class Controller(QObject):
             sample_name = Path(self.current_sample_path).stem
             self.current_sample = Sample(self.raw_event_data, sample_id=sample_name, channel_labels=self.experiment.settings['raw']['event_channels_pnn'])
             self.current_sample.metadata['tubename'] = sample_name
-            self.current_sample.metadata['flow_rate'] = str(61.234) #todo get this flow rate (float)
+            self.current_sample.metadata['flow_rate'] = str(self.sample_flow_rate)
             self.current_sample.export(self.experiment_dir / self.current_sample_path, source='raw', include_metadata=True)
             self.load_sample(self.current_sample_path)
         else:

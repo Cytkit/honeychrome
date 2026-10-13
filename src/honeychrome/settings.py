@@ -9,7 +9,7 @@ devices_boot_order = [
   'pico5000',
   'dummy_device'
 ]
-transfer_target_repeat_time = 0.05 #s
+transfer_target_repeat_time = 0.01 #s
 n_channels_trace = 16
 adc_rate = 2.5  # [MHz]
 max_event_time = 120  # [us]
@@ -22,6 +22,7 @@ standby_time = 600_000 # ms to automatically put instrument to standby (switch o
 pressure_set_point = -20 # Pa
 temperature_set_point = 30 # degC
 sample_pump_steps_per_microlitre = 109 # measured value: at speed 20000*0.1Hz, took 54.5s to pump 1mL = 109 steps/uL
+sample_flow_rate = 30 # microlitres per minute
 
 sample_pump_priming_speed = 20000 # steps/0.1s
 sample_pump_priming_time = 10. # s
@@ -37,7 +38,7 @@ sample_pump_steps_per_cycle = 1
 sample_pump_clocks_per_cycle = 2000
 
 ### peak detection settings
-trigger_channel = 'FSC'
+peak_detection_channel = 'FSC'
 FSC_sense = -1
 threshold = 100 # mV
 baseline_time = 15e-6  # time in s, sets decay rate of exponentially moving average
@@ -65,9 +66,6 @@ bytes_per_value = 2
 traces_cache_dtype = 'uint16'
 trace_n_points = n_channels_trace * n_time_points_in_event
 traces_cache_size = max_events_in_traces_cache * trace_n_points  # e.g. 160_000_000 for 100_000 events, 16 channels, 20 us --> 50 time points, 2 bytes per value
-nearly_floor_uint16 = 65536*0.1
-nearly_ceiling_uint16 = 65536*0.9
-half_uint16 = 65536*0.5
 
 ### folder in home directory where experiments will be stored
 experiments_folder = 'Experiments'
@@ -85,7 +83,7 @@ max_events_in_cache = 10_000_000
 adc_channels = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14', 'FSC', 'SSC']
 area_channels = ['FSC', 'SSC', 'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14'] # make sure there is equal number to n_channels_trace in instrument config
 height_channels = ['FSC']
-width_channels = [trigger_channel]
+width_channels = [peak_detection_channel]
 scatter_channels = ['FSC', 'SSC']
 fluorescence_channels = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14']
 event_channels_pnn = ['Time', 'event_id'] + [c + '-A' for c in area_channels] + [c + '-H' for c in height_channels] + [c + '-W' for c in width_channels]
@@ -153,10 +151,10 @@ spectral_model_column_labels = {
 # wants the internal (same-sample) negative for a cell control.
 INTERNAL_NEGATIVE_SENTINEL = "[Internal Negative]"
 
-### put together channel_dict for controller + trace analyst
-channel_dict = {'adc_channels': adc_channels, 'trigger_channel': trigger_channel, 'area_channels': area_channels,
-                'height_channels': height_channels, 'width_channels': width_channels, 'scatter_channels': scatter_channels,
-                'fluorescence_channels': fluorescence_channels, 'event_channels_pnn': event_channels_pnn, 'n_channels_per_event':n_channels_per_event}
+# ### put together channel_dict for controller + trace analyst
+# channel_dict = {'adc_channels': adc_channels, 'trigger_channel': trigger_channel, 'area_channels': area_channels,
+#                 'height_channels': height_channels, 'width_channels': width_channels, 'scatter_channels': scatter_channels,
+#                 'fluorescence_channels': fluorescence_channels, 'event_channels_pnn': event_channels_pnn, 'n_channels_per_event':n_channels_per_event}
 
 ### settings for trace analyser
 analyser_target_repeat_time = 0.25 # seconds
@@ -275,7 +273,7 @@ max_display_events = q_settings.value("max_display_events", max_display_events, 
 hist_bins_retrieved = q_settings.value("histogram_resolution", hist_bins, type=int)
 density_cutoff_retrieved = q_settings.value("density_cutoff", density_cutoff, type=int)
 
-trigger_channel_retrieved = str(q_settings.value("trigger_channel", trigger_channel))  # there can only be one trigger channel
+peak_detection_channel_retrieved = str(q_settings.value("peak_detection_channel", peak_detection_channel))  # there can only be one peak detection channel
 width_channel_retrieved = str(q_settings.value("width_channel", width_channels[0]))  # there can be more than one width channel, but currently only allowing one
 height_channel_retrieved = str(q_settings.value("height_channel", height_channels))  # there can be more than one height channel, but currently only allowing one
 use_dummy_instrument_retrieved = q_settings.value("use_dummy_instrument", use_dummy_instrument, type=bool)
@@ -293,6 +291,7 @@ report_include_process_retrieved = q_settings.value("report_include_process", re
 pressure_set_point_retrieved = q_settings.value('pressure_set_point', pressure_set_point, type=int)
 temperature_set_point_retrieved = q_settings.value('temperature_set_point', temperature_set_point, type=int)
 sample_pump_steps_per_microlitre_retrieved = q_settings.value('sample_pump_steps_per_microlitre', sample_pump_steps_per_microlitre, type=int)
+sample_flow_rate_retrieved = q_settings.value('sample_flow_rate', sample_flow_rate, type=int)
 
 sample_pump_priming_speed_retrieved = q_settings.value('sample_pump_priming_speed', sample_pump_priming_speed, type=int)
 sample_pump_priming_time_retrieved = q_settings.value('sample_pump_priming_time', sample_pump_priming_time, type=float)
@@ -341,7 +340,7 @@ for row, name in enumerate(adc_channels):
     trigger_enabled_retrieved[name] = q_settings.value("enabled", True if name=='FSC' else False, type=bool)
     trigger_mask_retrieved[name] = q_settings.value("mask", True if name=='FSC' else False, type=bool)
     trigger_edge_retrieved[name] = q_settings.value("edge", True if name=='FSC' else False, type=bool)
-    trigger_level_retrieved[name] = q_settings.value("level", threshold * adc_scale_mv, type=int)
+    trigger_level_retrieved[name] = q_settings.value("level", threshold, type=int)
     trigger_hyst_retrieved[name] = q_settings.value("hyst", trigger_default_hysteresis, type=int)
     trigger_delay_retrieved[name] = q_settings.value("delay", 0, type=int)
     trigger_h_off_retrieved[name] = q_settings.value("h_off", 0, type=int)
@@ -362,3 +361,4 @@ for row, name in enumerate(adc_channels):
     q_settings.endGroup()
 q_settings.endGroup()
 
+threshold_retrieved = q_settings.value("threshold", threshold, type=int)

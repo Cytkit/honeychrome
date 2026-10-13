@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QWidget, 
 from PySide6.QtCore import Qt, QSettings
 
 from honeychrome.settings import (colourmap_choice, graphics_export_formats, hist2dtype, colormap_name, graphics_export_format, cytometry_plot_width_target,
-                                  tile_size_nxn_grid, subsample, max_display_events, hist_bins, density_cutoff, trigger_channel, adc_channels, width_channels, height_channels,
+                                  tile_size_nxn_grid, subsample, max_display_events, hist_bins, density_cutoff, peak_detection_channel, adc_channels, width_channels, height_channels,
                                   use_dummy_instrument, sample_pump_steps_per_microlitre, magnitude_ceilings, magnitude_ceiling, raw_settings, unmixed_settings, experiments_folder,
                                   magnitude_ceilings_int, spectral_positive_gate_percent, spectral_negative_gate_percent, report_include_raw, report_include_unmixed, report_include_process, send_debug_data,
                                   heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral)
@@ -416,7 +416,7 @@ class InstrumentConfigDialog(QDialog):
         super().__init__(parent)
         self.bus = bus
 
-        self.setWindowTitle("Instrument Configuration: restart application for changes to take effect")
+        self.setWindowTitle("Instrument Configuration")
         self.resize(700, 700)
         self.settings = QSettings("honeychrome", "instrument_configuration")
 
@@ -431,13 +431,13 @@ class InstrumentConfigDialog(QDialog):
         form.setSpacing(10)
 
         # --- Settings Widgets ---
-        # self.trigger_channel_combo = QComboBox()
-        # self.trigger_channel_combo.addItems(adc_channels)
-        # form.addRow("Trigger Channel:", self.trigger_channel_combo)
+        self.peak_detection_channel_combo = QComboBox()
+        self.peak_detection_channel_combo.addItems(adc_channels)
+        form.addRow("Peak Detection Channel:", self.peak_detection_channel_combo)
 
-        self.width_channel_combo = QComboBox()
-        self.width_channel_combo.addItems(adc_channels)
-        form.addRow("Width Channel:", self.width_channel_combo)
+        # self.width_channel_combo = QComboBox()
+        # self.width_channel_combo.addItems(adc_channels)
+        # form.addRow("Width Channel:", self.width_channel_combo)
 
         self.height_channel_combo = QComboBox()
         self.height_channel_combo.addItems(adc_channels)
@@ -449,6 +449,10 @@ class InstrumentConfigDialog(QDialog):
         self.steps_per_microlitre_spin = QDoubleSpinBox(minimum=0, maximum=10000, decimals=1)
         form.addRow("Volume calibration of the sample pump (steps per microlitre):", self.steps_per_microlitre_spin)
 
+        self.threshold_spin = QSpinBox(minimum=0, maximum=10000)
+        form.addRow("Peak detection threshold:", self.threshold_spin)
+
+        form.addRow(QLabel("Restart application for a change to the peak detection channel to be applied to the width channel"))
         form.addRow(QLabel("Additional settings for Cytkit can be found in the plugin tab Cytkit Hardware"))
 
         scroll.setWidget(container)
@@ -473,15 +477,15 @@ class InstrumentConfigDialog(QDialog):
     # ----------------------------
 
     def load_settings(self):
-        # trigger_channel_retrieved = str(self.settings.value("trigger_channel", trigger_channel)) # there can only be one trigger channel
-        # index = self.trigger_channel_combo.findText(trigger_channel_retrieved)
-        # if index >= 0:
-        #     self.trigger_channel_combo.setCurrentIndex(index)
-
-        width_channel_retrieved = str(self.settings.value("width_channel", width_channels[0])) # there can be more than one width channel, but currently only allowing one
-        index = self.width_channel_combo.findText(width_channel_retrieved)
+        peak_detection_channel_retrieved = str(self.settings.value("peak_detection_channel", peak_detection_channel)) # there can only be one peak_detection channel
+        index = self.peak_detection_channel_combo.findText(peak_detection_channel_retrieved)
         if index >= 0:
-            self.width_channel_combo.setCurrentIndex(index)
+            self.peak_detection_channel_combo.setCurrentIndex(index)
+
+        # width_channel_retrieved = str(self.settings.value("width_channel", width_channels[0])) # there can be more than one width channel, but currently only allowing one
+        # index = self.width_channel_combo.findText(width_channel_retrieved)
+        # if index >= 0:
+        #     self.width_channel_combo.setCurrentIndex(index)
 
         height_channel_retrieved = str(self.settings.value("height_channel", height_channels)) # there can be more than one height channel, but currently only allowing one
         index = self.height_channel_combo.findText(height_channel_retrieved)
@@ -491,16 +495,26 @@ class InstrumentConfigDialog(QDialog):
         sample_pump_steps_per_microlitre_retrieved = self.settings.value("sample_pump_steps_per_microlitre", sample_pump_steps_per_microlitre)
         self.steps_per_microlitre_spin.setValue(float(sample_pump_steps_per_microlitre_retrieved))
 
+        threshold_retrieved = self.settings.value("threshold", settings.threshold, type=int)
+        self.threshold_spin.setValue(threshold_retrieved)
+
         # self.use_dummy_instrument.setChecked(self.settings.value("use_dummy_instrument", use_dummy_instrument, type=bool))
 
     def save_settings(self):
-        # self.settings.setValue("trigger_channel", self.trigger_channel_combo.currentText())
-        self.settings.setValue("width_channel", self.width_channel_combo.currentText())
-        self.settings.setValue("height_channel", self.height_channel_combo.currentText())
-        self.settings.setValue("sample_pump_steps_per_microlitre", self.steps_per_microlitre_spin.value())
+        peak_detection_channel = self.peak_detection_channel_combo.currentText()
+        self.settings.setValue("peak_detection_channel", peak_detection_channel)
+        # width_channel = self.width_channel_combo.currentText()
+        # self.settings.setValue("width_channel", width_channel)
+        height_channel = self.height_channel_combo.currentText()
+        self.settings.setValue("height_channel", height_channel)
+        sample_pump_steps_per_microlitre = self.steps_per_microlitre_spin.value()
+        self.settings.setValue("sample_pump_steps_per_microlitre", sample_pump_steps_per_microlitre)
+        threshold = self.threshold_spin.value()
+        self.settings.setValue("threshold", threshold)
 
         if self.bus:
-            self.bus.setSamplePumpFlowRate.emit(0)
+            self.bus.configPeakDetection.emit({'peak_detection_channel':peak_detection_channel, 'threshold':threshold, 'height_channels':[height_channel]})
+            self.bus.setSamplePumpStepsPerMicrolitre.emit(sample_pump_steps_per_microlitre)
 
         # self.settings.setValue("use_dummy_instrument", self.use_dummy_instrument.isChecked())
 
@@ -509,16 +523,17 @@ class InstrumentConfigDialog(QDialog):
         self.accept()
 
     def reset_to_defaults(self):
-        # index = self.trigger_channel_combo.findText(trigger_channel)
-        # if index >= 0:
-        #     self.trigger_channel_combo.setCurrentIndex(index)
-        index = self.width_channel_combo.findText(width_channels[0])
+        index = self.peak_detection_channel_combo.findText(peak_detection_channel)
         if index >= 0:
-            self.width_channel_combo.setCurrentIndex(index)
+            self.peak_detection_channel_combo.setCurrentIndex(index)
+        # index = self.width_channel_combo.findText(width_channels[0])
+        # if index >= 0:
+        #     self.width_channel_combo.setCurrentIndex(index)
         index = self.height_channel_combo.findText(height_channels[0])
         if index >= 0:
             self.height_channel_combo.setCurrentIndex(index)
         self.steps_per_microlitre_spin.setValue(sample_pump_steps_per_microlitre)
+        self.threshold_spin.setValue(settings.threshold)
         # self.use_dummy_instrument.setChecked(use_dummy_instrument)
 
 
