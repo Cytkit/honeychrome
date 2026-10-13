@@ -450,7 +450,7 @@ class InstrumentConfigDialog(QDialog):
         form.addRow("Volume calibration of the sample pump (steps per microlitre):", self.steps_per_microlitre_spin)
 
         self.threshold_spin = QSpinBox(minimum=0, maximum=10000)
-        form.addRow("Peak detection threshold:", self.threshold_spin)
+        form.addRow("Peak detection threshold over baseline [mV]:", self.threshold_spin)
 
         form.addRow(QLabel("Restart application for a change to the peak detection channel to be applied to the width channel"))
         form.addRow(QLabel("Additional settings for Cytkit can be found in the plugin tab Cytkit Hardware"))

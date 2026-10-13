@@ -3,7 +3,7 @@ import numpy as np
 from picosdk.ps5000a import ps5000a as ps
 from picosdk.functions import assert_pico_ok, PICO_STATUS_LOOKUP
 
-from honeychrome.settings import adc_channels, magnitude_ceiling, traces_cache_dtype, n_channels_trace, n_time_points_in_event, transfer_target_repeat_time, threshold, FSC_sense, adc_scale_mv
+from honeychrome.settings import adc_channels, magnitude_ceiling, traces_cache_dtype, n_channels_trace, n_time_points_in_event, transfer_target_repeat_time, threshold, FSC_sense
 
 index_channel_a = adc_channels.index('FSC')
 index_channel_b = adc_channels.index('B1')
@@ -274,8 +274,8 @@ class Pico5000_Device:
         # Get traces
         # Convert to Numpy Arrays (float32)
         # Using np.frombuffer is the fastest way to cast ctypes to numpy
-        traces_a = np.array([np.frombuffer(b, dtype=np.int16) for b in self.buffer_list_a], dtype=np.float32) * A_range / self.max_adc.value * adc_scale_mv
-        traces_b = np.array([np.frombuffer(b, dtype=np.int16) for b in self.buffer_list_b], dtype=np.float32) * B_range / self.max_adc.value * adc_scale_mv
+        traces_a = np.array([np.frombuffer(b, dtype=np.int16) for b in self.buffer_list_a], dtype=np.float32)
+        traces_b = np.array([np.frombuffer(b, dtype=np.int16) for b in self.buffer_list_b], dtype=np.float32)
 
         N = len(traces_a)
         traces = np.zeros((N, n_channels_trace, n_time_points_in_event), dtype=np.uint16)

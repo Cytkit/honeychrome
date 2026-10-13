@@ -708,6 +708,8 @@ class TriggerChannelTable(QWidget):
 
             self._set_row_silently(row, enabled, mask, edge, level, hyst, delay, h_off, skew)
 
+    def set_level(self, row, level):
+        self.level_spins[row].setValue(level)
 
     def _set_row_silently(
         self, row: int, enabled: bool, mask: bool, edge: bool, level: int, hyst: int, delay: int, h_off: int, skew: int
@@ -1383,6 +1385,16 @@ class PluginWidget(QWidget):
         self.clear_btn.clicked.connect(lambda: self.set_instrument_state({'trigger': 'clear'}))
         layout.addWidget(self.clear_btn)
 
+        set_trigger_over_baseline_layout = QHBoxLayout()
+        set_trigger_over_baseline_layout.addWidget(QLabel('Set trigger over baseline by threshold [mV]:'))
+        self.set_trigger_over_baseline_spin = QSpinBox(minimum=0, maximum=3000, value=settings.threshold_retrieved)
+        set_trigger_over_baseline_layout.addWidget(self.set_trigger_over_baseline_spin)
+        self.set_trigger_over_baseline_btn = QPushButton('Set!')
+        self.set_trigger_over_baseline_btn.clicked.connect(self.set_trigger_over_baseline)
+        set_trigger_over_baseline_layout.addWidget(self.set_trigger_over_baseline_btn)
+        layout.addLayout(set_trigger_over_baseline_layout)
+        self.set_trigger_over_baseline_text = QLabel('')
+
         layout.addStretch()
         toolbox.addTab(tab, "Triggers")
 
@@ -1422,6 +1434,7 @@ class PluginWidget(QWidget):
         layout.addWidget(self.read_memory_btn)
         layout.addWidget(self.read_memory_output)
         layout.addWidget(self.plot_traces_widget)
+        self.traces_blob_np = None
 
         layout.addStretch()
         toolbox.addTab(tab, "Capture")
@@ -1604,6 +1617,21 @@ class PluginWidget(QWidget):
                 pass
 
     @Slot()
+    def set_trigger_over_baseline(self):
+        threshold = self.set_trigger_over_baseline_spin.value()
+        self.get_instrument_state(['test_capture_and_read_memory'])
+        if self.traces_blob_np is not None:
+            baselines = {}
+            triggers = {}
+            for row, name in enumerate(adc_channels):
+                if settings.trigger_enabled_retrieved[name]:
+                    pre = settings.capture_pre_trigger_retrieved[name]
+                    baselines[row] = np.median(self.traces_blob_np[:, row, :pre//2].reshape(-1))
+                    triggers[row] = baselines[row] + threshold * 1000 / settings.adc_scale_uv # convert mV to adc units
+                    self.trigger_table.set_level(row, triggers[row])
+            self.set_trigger_over_baseline_text.setText(f'Baselines: {baselines} (ADC scale) + threshold: {threshold} mV = {triggers} (ADC scale)')
+
+    @Slot()
     def update_connection_status(self):
         if self.controller:
             self.controller.find_and_connect_instrument()
@@ -1718,12 +1746,15 @@ class PluginWidget(QWidget):
         if 'test_capture_and_read_memory' in response['message']:
             traces_blob_np = response['message']['test_capture_and_read_memory']
             if traces_blob_np is not None:
-                traces_blob_np = traces_blob_np.reshape(-1, len(adc_channels), settings.n_time_points_in_event)
-                self.read_memory_output.setText(f'Traces captured: {len(traces_blob_np)}, non-zero channels: {np.flatnonzero(traces_blob_np.sum(axis=2).sum(axis=0))}')
-                self.plot_traces_widget.set_traces(traces_blob_np)
+                self.traces_blob_np = traces_blob_np.reshape(-1, len(adc_channels), settings.n_time_points_in_event)
+                self.read_memory_output.setText(f'Traces captured: {len(self.traces_blob_np)}, non-zero channels: {np.flatnonzero(traces_blob_np.sum(axis=2).sum(axis=0))}')
+                self.plot_traces_widget.set_traces(self.traces_blob_np)
                 self.plot_traces_widget.setVisible(True)
             else:
+                self.traces_blob_np = None
                 self.read_memory_output.setText(f'No traces captured.')
+                self.plot_traces_widget.setVisible(False)
+
 
         if 'register_getter' in response['message']:
             value = response['message']['register_getter']

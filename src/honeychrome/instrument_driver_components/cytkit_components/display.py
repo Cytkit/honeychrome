@@ -109,8 +109,18 @@ class CommsThroughMainBoard:
             chunk = data_bytes[i:i + 4]
             self.spi_write_4bytes(chunk)
 
+    def close(self):
+        pass
 
 class CommsThroughEvalBoard:
+    '''
+    UMFT4222EV SS0 → SSD1309 CS
+    UMFT4222EV SCK → SSD1309 SCLK
+    UMFT4222EV MOSI → SSD1309 SDIN (Data)
+    UMFT4222EV GPIO0 → SSD1309 D/C (Data/Command)
+    UMFT4222EV GND → SSD1309 GND
+    UMFT4222EV 3.3V → SSD1309 VCC
+    '''
     def __init__(self):
         print("Opening FT4222 devices...")
         # Open Channel A for SPI Master transfers
@@ -246,6 +256,8 @@ class SSD1309:
 
         self._last_buf = new_buf
 
+    def close(self):
+        self.comms.close()
 
 class SimProxy:
     """Drop-in replacement for SSD1309 that ships frames to a subprocess."""
@@ -368,7 +380,8 @@ class Display(Thread):
         draw_text_lr(self.draw, 3, 44, "Connect to host PC", font4x6, 1)
         draw_text_lr(self.draw, 3, 52, "then run Honeychrome.", font4x6, 1)
         self.oled.display(self.frame)
-
+        self.join(timeout=1.0)
+        self.oled.close()
         self._closed = True
         self.stop()
 
@@ -423,5 +436,5 @@ if __name__ == '__main__':
     display.start()
     time.sleep(4)
     # display.action_message('Acquiring!')
-    time.sleep(10)
+    time.sleep(5)
     display.close()

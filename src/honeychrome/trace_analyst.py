@@ -14,7 +14,7 @@ import numpy as np
 import time
 import warnings
 
-from honeychrome.settings import traces_cache_size, max_events_in_traces_cache, trace_n_points, n_channels_trace, adc_rate, threshold_retrieved, n_time_points_in_event, window_extension_length_pre, baseline_decay_rate, window_extension_length_post, timeout_length, deltaT, adc_scale_mv
+from honeychrome.settings import traces_cache_size, max_events_in_traces_cache, trace_n_points, n_channels_trace, adc_rate, threshold_retrieved, n_time_points_in_event, window_extension_length_pre, baseline_decay_rate, window_extension_length_post, timeout_length, deltaT, adc_scale_uv
 from honeychrome.settings import max_events_in_cache, n_channels_per_event, event_channels_pnn, analyser_target_repeat_time
 from honeychrome.settings import adc_channels, peak_detection_channel_retrieved, area_channels, height_channels, width_channels, scatter_channels, fluorescence_channels
 
@@ -120,7 +120,7 @@ class TraceAnalyser(mp.Process):
         self.indices_area_channels_in_events = [event_channels_pnn.index(c + '-A') for c in area_channels]
         self.indices_height_channels_in_events = [event_channels_pnn.index(c + '-H') for c in height_channels]
         self.n_channels_per_event = n_channels_per_event
-        self.threshold = threshold_retrieved
+        self.threshold = threshold_retrieved * 1000 # uV
 
         # Oscilloscope traces queue
         self.oscilloscope_traces_queue = oscilloscope_traces_queue
@@ -190,7 +190,7 @@ class TraceAnalyser(mp.Process):
                     self.indices_peak_detection_channel_in_traces = adc_channels.index(parameters['peak_detection_channel'])
                     # todo: this also redirects the width measurement without changing the width channel in the event data
                 if 'threshold' in parameters:
-                    self.threshold = parameters['threshold']
+                    self.threshold = parameters['threshold'] * 1000 # uV
 
                 self.logger.info('[Trace Analyser] Channel configuration set')
                 response_to_experiment_control = {'status':'OK', 'message':'[Trace Analyser] channel configuration set'}
@@ -251,8 +251,8 @@ class TraceAnalyser(mp.Process):
                         blob_np_front = self.traces_cache[:slice_end]  # get front of queue array
                         blob_np = np.concatenate((blob_np_back, blob_np_front))
 
-                # remove offset from the blob and convert to float
-                traces_batch_scaled = blob_np.reshape(-1, self.n_channels_trace, self.n_time_points_in_event).astype(np.float32)/adc_scale_mv*1000 # scale in uV, zeroed, float32
+                # scale to uV and convert to float
+                traces_batch_scaled = blob_np.reshape(-1, self.n_channels_trace, self.n_time_points_in_event).astype(np.float32) * adc_scale_uv # scale in uV, float32
 
                 # calculate area, height, width as defined in channel_dict and write to events_cache
 
