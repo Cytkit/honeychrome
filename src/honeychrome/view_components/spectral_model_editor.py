@@ -1146,8 +1146,19 @@ class SpectralControlsEditor(QFrame):
             self._release_autogenerate_warnings()
 
     def _release_autogenerate_warnings(self):
-        """Show the warnings collected during auto-generation in a single dialog."""
-        if self._autogenerate_state is None:
+        """Show the warnings collected during auto-generation in a single dialog.
+
+        The refresh that completes the run is wrapped in with_busy_cursor, whose
+        nested event loop is still running when the refresh signal arrives. A
+        modal dialog opened inside that loop loses its modality when the loop
+        exits, and can drop behind the main window, so the dialog waits until
+        the busy cursor has been released (for at most about 10 s)."""
+        state = self._autogenerate_state
+        if state is None:
+            return
+        if QApplication.overrideCursor() is not None and state.get('deferrals', 0) < 100:
+            state['deferrals'] = state.get('deferrals', 0) + 1
+            QTimer.singleShot(100, self._release_autogenerate_warnings)
             return
         self._autogenerate_state = None
         messages = self.controller.warning_collector or []
