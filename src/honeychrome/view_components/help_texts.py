@@ -135,6 +135,8 @@ autospectral_af_help_text = '''
 <li><a href="https://www.colibri-cytometry.com/post/introducing-autospectral-an-optimized-unmixing-workflow">AutoSpectral on the Colibri Cytometry blog</a></li>
 <li><a href="https://www.colibri-cytometry.com/post/autospectral-single-cell-autofluorescence">AutoSpectral AF on the Colibri Cytometry blog</a></li>
 <li><a href="https://github.com/DrCytometer/AutoSpectral">AutoSpectral package on Github</a></li>
+<li><a href="https://www.biorxiv.org/content/10.64898/2026.01.27.701929v2.full">The Residual Model of Spillover Spread, Cai et al.</a></li>
+<li><a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC3678531/">Quantifying Spillover Spread, Nguyen et al.</a></li>
 </ul>
 '''
 
