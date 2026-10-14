@@ -8,7 +8,14 @@ from PySide6.QtCore import QObject, Signal, QTimer, QSettings
 from flowkit import Sample
 from typing import cast
 
-from honeychrome.controller_components.functions import apply_transfer_matrix, export_unmixed_sample, sample_from_fcs
+from honeychrome.controller_components.functions import (
+    FCS_CHUNK_EVENTS,
+    FcsEventReader,
+    apply_transfer_matrix,
+    export_unmixed_sample_stream,
+    iter_event_blocks,
+    subsample_event_rows,
+)
 from honeychrome.controller_components.autospectral_functions import combine_af_precomputed, apply_af_transfer, af_index_lookup
 import honeychrome.settings as settings
 from honeychrome.__init__ import __version__
@@ -97,11 +104,6 @@ class UnmixedExporter(QObject):
 
 
             # --- One-time per-batch setup ---
-
-            # Build fluorophore spectra matrix for the SPECTRA keyword.
-            # controller._build_fluor_spectra() reads experiment.process['profiles']
-            # and stacks rows in spectral_model order → (n_fluor × n_raw_detectors).
-            unmixing_spectra = self.controller._build_fluor_spectra()  # may be None if model incomplete
 
             unmixing_method = self.controller.experiment.settings.get('unmixing_method', 'OLS')
             unmixing_weights_raw = self.controller.experiment.process.get('unmixing_weights')
@@ -208,104 +210,13 @@ class UnmixedExporter(QObject):
                     logger.warning(f'UnmixedExporter: {full_sample_path} not found - skipped')
                     skipped_missing.append(sample_name)
                     continue
-                sample = sample_from_fcs(full_sample_path, self.bus)
-                _all_events = sample.get_events(source='raw')
-                _sample_ch_idx = {ch: i for i, ch in enumerate(sample.pnn_labels)}
-                if set(pnn_raw) <= set(sample.pnn_labels):
-                    # Fast path: all pnn_raw channels present — slice in order
-                    raw_event_data = _all_events[:, [_sample_ch_idx[ch] for ch in pnn_raw]]
-                else:
-                    # Some pnn_raw channels absent in this file — build aligned array with zeros
-                    raw_event_data = np.zeros((_all_events.shape[0], len(pnn_raw)), dtype=_all_events.dtype)
-                    for dst, ch in enumerate(pnn_raw):
-                        if ch in _sample_ch_idx:
-                            raw_event_data[:, dst] = _all_events[:, _sample_ch_idx[ch]]
-                np.nan_to_num(raw_event_data, copy=False, nan=0.0)
-                raw_keywords: dict[str, str] = cast(dict[str, str], sample.get_metadata())
-                n_events = sample.event_count
-
-                if n_events > 0:
-                    # Check whether this sample has AutoSpectral AF profiles assigned
-                    sample_af_profiles = self.controller.experiment.samples.get('sample_af_profiles', {})
-                    assigned_profile_names = sample_af_profiles.get(sample_path, [])
-                    all_af_profiles = self.controller.experiment.process.get('af_profiles', {})
-                    active_profiles = [all_af_profiles[name] for name in assigned_profile_names if name in all_af_profiles]
-                    af_index_map = af_index_lookup(all_af_profiles, assigned_profile_names) if active_profiles else None
-
-                    if active_profiles:
-                        # Build combined AF precomputed matrices for this sample's assigned profiles
-                        precomputed_list = [
-                            self.controller.precomputed_for_profile(name)
-                            for name in assigned_profile_names if name in all_af_profiles
-                        ]
-                        af_precomputed = combine_af_precomputed(precomputed_list)
-                        af_spectra = np.vstack([np.array(p['spectra']) for p in active_profiles])
-
-                        # Remap fluorescence channel indices from full event_channels_pnn
-                        # to positions in pnn_raw (the column order of raw_event_data).
-                        # Profiles and af_spectra were computed in whitelisted-PNN space;
-                        # raw_event_data here is aligned to pnn_raw (event_channels_pnn).
-                        # For cytometers where pnn_raw == whitelisted_pnn this is a no-op.
-                        _raw_settings = self.controller.experiment.settings['raw']
-                        _full_pnn = _raw_settings['event_channels_pnn']
-                        _fl_ids_remapped = [
-                            pnn_raw.index(_full_pnn[i])
-                            for i in self.controller.filtered_raw_fluorescence_channel_ids
-                            if _full_pnn[i] in pnn_raw
-                        ]
-
-                        af_result = apply_af_transfer(
-                            raw_event_data,
-                            transfer_matrix,
-                            af_precomputed,
-                            af_spectra,
-                            self.controller.experiment.settings,
-                            filtered_fl_ids_raw=_fl_ids_remapped,
-                            spillover=None,
-                            af_index_map=af_index_map,
-                        )
-                        # apply_af_transfer fills the AF Abundance and AF Index columns.
-                        export_event_data = af_result['unmixed']
-                        export_pnn = list(pnn_unmixed)
-                        logger.info(f'UnmixedExporter: using AF unmixing for {sample_path} ({len(active_profiles)} profile(s))')
-                    else:
-                        # Without AF correction the AF channels carry no information,
-                        # so they are left out of the exported file.
-                        unmixed_all = apply_transfer_matrix(transfer_matrix, raw_event_data)
-                        keep = [i for i, ch in enumerate(pnn_unmixed) if ch not in settings.af_channels]
-                        export_event_data = unmixed_all[:, keep]
-                        export_pnn = [pnn_unmixed[i] for i in keep]
-
-                    # Retrieve the unmixing spectra matrix (n_fluor × n_detectors).
-                    # stored in experiment.process after unmixing is computed.
-                    unmixing_spectra = np.array(
-                        self.controller.experiment.process.get('spectra_matrix')
-                    ) if self.controller.experiment.process.get('spectra_matrix') is not None else None
-
-                    af_spectra_export = af_spectra if active_profiles else None
-                    extra_null = None
-
-                    export_unmixed_sample(
-                        sample_name=sample_name,
-                        unmixed_folder=full_unmixed_sample_path.parent,
-                        export_event_data=export_event_data,
-                        export_pnn=export_pnn,
-                        spillover=spillover,
-                        raw_keywords=raw_keywords,
-                        spectral_model=self.controller.experiment.process.get('spectral_model', []),
-                        unmixed_settings=self.controller.experiment.settings['unmixed'],
-                        raw_settings=self.controller.experiment.settings['raw'],
-                        af_spectra=af_spectra_export,
-                        unmixing_spectra=unmixing_spectra,
-                        version=__version__,
-                        subsample=self.subsample,
-                        extra_null_channels=extra_null,
-                        unmixing_method=unmixing_method,
-                        unmixing_weights=unmixing_weights,
-                        extra_whitelist=imaging_carry_through_set,
-                        af_index_map=af_index_map,
-                        n_af_index=n_af_index,
-                    )
+                reader = FcsEventReader(full_sample_path, pnn_raw, self.bus)
+                try:
+                    self._export_sample(reader, sample_path, sample_name, full_unmixed_sample_path.parent,
+                                        transfer_matrix, pnn_unmixed, spillover, unmixing_method,
+                                        unmixing_weights, imaging_carry_through_set, n_af_index)
+                finally:
+                    reader.close()
 
             logger.info(f'UnmixedExporter: finished')
 
@@ -319,6 +230,111 @@ class UnmixedExporter(QObject):
                 self.bus.popupMessage.emit(message)
 
         self.finished.emit()
+
+    def _export_sample(self, reader, sample_path, sample_name, unmixed_folder, transfer_matrix,
+                       pnn_unmixed, spillover, unmixing_method, unmixing_weights,
+                       imaging_carry_through_set, n_af_index):
+        """Unmix and write one sample, a block of FCS_CHUNK_EVENTS events at a time."""
+        raw_keywords: dict[str, str] = cast(dict[str, str], reader.keywords)
+        n_events = reader.n_events
+        if n_events == 0:
+            return
+
+        # Check whether this sample has AutoSpectral AF profiles assigned
+        sample_af_profiles = self.controller.experiment.samples.get('sample_af_profiles', {})
+        assigned_profile_names = sample_af_profiles.get(sample_path, [])
+        all_af_profiles = self.controller.experiment.process.get('af_profiles', {})
+        active_profiles = [all_af_profiles[name] for name in assigned_profile_names if name in all_af_profiles]
+        af_index_map = af_index_lookup(all_af_profiles, assigned_profile_names) if active_profiles else None
+
+        if active_profiles:
+            # Build combined AF precomputed matrices for this sample's assigned profiles
+            precomputed_list = [
+                self.controller.precomputed_for_profile(name)
+                for name in assigned_profile_names if name in all_af_profiles
+            ]
+            af_precomputed = combine_af_precomputed(precomputed_list)
+            af_spectra = np.vstack([np.array(p['spectra']) for p in active_profiles])
+
+            # Remap fluorescence channel indices from full event_channels_pnn
+            # to positions in pnn_raw (the column order of the raw events).
+            # Profiles and af_spectra were computed in whitelisted-PNN space;
+            # raw events here are aligned to pnn_raw (event_channels_pnn).
+            # For cytometers where pnn_raw == whitelisted_pnn this is a no-op.
+            _raw_settings = self.controller.experiment.settings['raw']
+            _full_pnn = _raw_settings['event_channels_pnn']
+            pnn_raw = reader.channels
+            _fl_ids_remapped = [
+                pnn_raw.index(_full_pnn[i])
+                for i in self.controller.filtered_raw_fluorescence_channel_ids
+                if _full_pnn[i] in pnn_raw
+            ]
+            # apply_af_transfer fills the AF Abundance and AF Index columns.
+            export_pnn = list(pnn_unmixed)
+            keep = None
+            logger.info(f'UnmixedExporter: using AF unmixing for {sample_path} ({len(active_profiles)} profile(s))')
+        else:
+            # Without AF correction the AF channels carry no information,
+            # so they are left out of the exported file.
+            keep = [i for i, ch in enumerate(pnn_unmixed) if ch not in settings.af_channels]
+            export_pnn = [pnn_unmixed[i] for i in keep]
+
+        # Retrieve the unmixing spectra matrix (n_fluor × n_detectors).
+        # stored in experiment.process after unmixing is computed.
+        unmixing_spectra = np.array(
+            self.controller.experiment.process.get('spectra_matrix')
+        ) if self.controller.experiment.process.get('spectra_matrix') is not None else None
+
+        rows = subsample_event_rows(n_events, self.subsample)
+        n_written = n_events if rows is None else len(rows)
+        n_blocks = -(-n_events // FCS_CHUNK_EVENTS)
+
+        def unmixed_blocks():
+            for block_i, (start, stop, local_rows) in enumerate(iter_event_blocks(n_events, rows, FCS_CHUNK_EVENTS)):
+                if n_blocks > 1:
+                    logger.info(f'UnmixedExporter: {sample_name} events {start:,}-{stop:,} of {n_events:,}')
+                    if self.bus:
+                        self.bus.statusMessage.emit(
+                            f'Exporting {sample_name}: events {start:,}-{stop:,} of {n_events:,}')
+                raw_block = reader.read(start, stop)
+                if local_rows is not None:
+                    raw_block = raw_block[local_rows]
+                if active_profiles:
+                    af_result = apply_af_transfer(
+                        raw_block,
+                        transfer_matrix,
+                        af_precomputed,
+                        af_spectra,
+                        self.controller.experiment.settings,
+                        filtered_fl_ids_raw=_fl_ids_remapped,
+                        spillover=None,
+                        af_index_map=af_index_map,
+                    )
+                    yield af_result['unmixed']
+                else:
+                    yield apply_transfer_matrix(transfer_matrix, raw_block)[:, keep]
+
+        export_unmixed_sample_stream(
+            sample_name=sample_name,
+            unmixed_folder=unmixed_folder,
+            chunks=unmixed_blocks(),
+            n_events=n_written,
+            export_pnn=export_pnn,
+            spillover=spillover,
+            raw_keywords=raw_keywords,
+            spectral_model=self.controller.experiment.process.get('spectral_model', []),
+            unmixed_settings=self.controller.experiment.settings['unmixed'],
+            raw_settings=self.controller.experiment.settings['raw'],
+            af_spectra=af_spectra if active_profiles else None,
+            unmixing_spectra=unmixing_spectra,
+            version=__version__,
+            extra_null_channels=None,
+            unmixing_method=unmixing_method,
+            unmixing_weights=unmixing_weights,
+            extra_whitelist=imaging_carry_through_set,
+            af_index_map=af_index_map,
+            n_af_index=n_af_index,
+        )
 
 
 if __name__ == "__main__":
