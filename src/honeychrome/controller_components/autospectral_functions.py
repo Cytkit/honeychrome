@@ -22,9 +22,9 @@ assign_af_joint_l2(raw_data, fluor_spectra, af_spectra)
 apply_af_unmixing(raw_data, precomputed, af_spectra)
     Per-cell AF extraction and OLS unmixing for fluorescence channels only.
     When precomputed carries a negative envelope, cells are scored with the
-    guarded negative-envelope fluorophore term and events with saturated
-    detectors are re-fitted on the remaining detectors; otherwise the joint
-    L2 score is used.
+    positivity-weighted fluorophore term and events with saturated detectors
+    are re-fitted on the remaining detectors; otherwise the joint L2 score
+    is used.
 
 build_af_precomputed(fluor_spectra, af_spectra, envelope)
     precompute_af_matrices plus the joint covariance weights and, when given,
@@ -32,8 +32,8 @@ build_af_precomputed(fluor_spectra, af_spectra, envelope)
 
 make_envelope_entry / refresh_envelope_entry / build_runtime_envelope
     Build, keep current and expand the negative envelope stored with an AF
-    profile (flat boundaries and the unstained SD from a 5,000-event
-    unstained sample).
+    profile (the variance of the negative at the profile's mean AF, from a
+    5,000-event unstained sample).
 
 precompute_af_matrices(fluor_spectra, af_spectra)
     Precomputes projection matrices; call once after spectral process refresh
@@ -59,10 +59,10 @@ load_af_profile_csv(csv_path)
 
 import logging
 import sys
-from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
+from scipy.special import erfc
 
 
 logger = logging.getLogger(__name__)
@@ -70,18 +70,16 @@ logger = logging.getLogger(__name__)
 # Sub-folder inside the experiment directory where CSV files are stored
 AF_SUBDIR = 'AutoSpectral'
 
-# Negative-envelope AF scoring
-ENVELOPE_QUANTILE = 0.99          # unstained quantile for the flat boundaries
-ENVELOPE_MARGIN = 1.3             # multiplier on those quantiles
-ENVELOPE_KAPPA = 2.0              # spread widening, in SD of the added variance
-ENVELOPE_HYPER_WEIGHT = 1.0       # penalty weight below the lower boundary
+# Negative-envelope (positivity-weighted) AF scoring
 ENVELOPE_SATURATED_FRAC = 0.999   # detector counts as saturated at this x ceiling
 ENVELOPE_SAMPLE_EVENTS = 5000     # unstained events stored per AF profile
-ENVELOPE_SOFT_WIDTH = 3.0         # SDs of the negative either side of the upper boundary
+NULL_VAR_BINS = 20                # quantile bins of the mean AF abundance
+NULL_VAR_MIN_BIN_EVENTS = 20      # events a bin needs to count
+NULL_VAR_FLOOR = 0.05             # constant term floored at this share of the overall variance
 SPECTRA_TOLERANCE_DEG = 2.0       # spectra may move this far before a rebuild
 _SCORE_EPS = 1e-12
 _TIE_TOLERANCE = 1e-9
-_SD_FLOOR = 1e-12
+_VAR_FLOOR = 1e-24
 
 
 # ---------------------------------------------------------------------------
@@ -283,20 +281,17 @@ def combine_af_precomputed(precomputed_list: list) -> dict:
 def combine_envelopes(envelopes: list, library_sizes: list) -> dict | None:
     """
     Envelope of a combined AF library whose profiles are stacked in the order
-    given, library_sizes[i] spectra each: the largest upper boundary, smallest
-    lower boundary and largest unstained SD of the profiles' envelopes, which
-    share one spread matrix, and the row of each profile's mean AF spectrum
-    in the combined library. None when the list is empty or any profile has
-    no envelope.
+    given, library_sizes[i] spectra each: the row of each profile's mean AF
+    spectrum in the combined library, with that profile's null variance in
+    the same order, and the spread matrix the profiles share. None when the
+    list is empty or any profile has no envelope.
     """
     if not envelopes or any(e is None for e in envelopes):
         return None
     if len(envelopes) == 1:
         return envelopes[0]
     merged = dict(envelopes[0])
-    merged['upper'] = np.max([e['upper'] for e in envelopes], axis=0)
-    merged['lower'] = np.min([e['lower'] for e in envelopes], axis=0)
-    merged['noise_sd'] = np.max([_envelope_noise_sd(e) for e in envelopes], axis=0)
+    merged['null_var'] = np.concatenate([np.asarray(e['null_var'], dtype=np.float64) for e in envelopes])
     offsets = np.concatenate([[0], np.cumsum(library_sizes)[:-1]]).astype(np.intp)
     merged['mean_rows'] = np.concatenate(
         [_envelope_mean_rows(e) + offset for e, offset in zip(envelopes, offsets)])
@@ -331,57 +326,73 @@ def spectra_unchanged(stored_names, stored_spectra, fluor_names, fluor_spectra,
     return bool(np.all(spectral_angles_deg(stored, current) <= tolerance_deg))
 
 
-def _unstained_unmix(unstained_raw: np.ndarray, fluor_spectra: np.ndarray,
-                     af_spectra: np.ndarray) -> np.ndarray:
-    """Unstained events unmixed with per-cell AF scored by joint L2."""
-    precomputed = precompute_af_matrices(fluor_spectra, af_spectra)
-    precomputed.update(precompute_joint_cov_extras(precomputed, af_spectra))
-    raw = np.ascontiguousarray(unstained_raw, dtype=np.float64)
-    return apply_af_unmixing(raw, precomputed, af_spectra)['unmixed']
+def _robust_var(x: np.ndarray) -> np.ndarray:
+    """Squared normalised MAD per column."""
+    median = np.median(x, axis=0)
+    return (1.4826 * np.median(np.abs(x - median), axis=0)) ** 2
 
 
-def _flat_boundaries(unmixed: np.ndarray) -> tuple:
-    upper = ENVELOPE_MARGIN * np.quantile(unmixed, ENVELOPE_QUANTILE, axis=0)
-    lower = ENVELOPE_MARGIN * np.quantile(unmixed, 1.0 - ENVELOPE_QUANTILE, axis=0)
-    return np.maximum(upper, 0.0), np.minimum(lower, 0.0)
-
-
-def _robust_sd(unmixed: np.ndarray) -> np.ndarray:
-    median = np.median(unmixed, axis=0)
-    return 1.4826 * np.median(np.abs(unmixed - median), axis=0)
-
-
-def envelope_thresholds(unstained_raw: np.ndarray, fluor_spectra: np.ndarray,
-                        af_spectra: np.ndarray) -> tuple:
+def mean_af_position(raw: np.ndarray, fluor_spectra: np.ndarray, af_spectra: np.ndarray) -> tuple:
     """
-    Flat upper and lower boundaries per fluorophore: ENVELOPE_MARGIN times
-    the ENVELOPE_QUANTILE and 1 - ENVELOPE_QUANTILE of the unstained events
-    unmixed by joint L2. The lower boundary is measured from the negative
-    tail itself, since AF stretches the positive tail only. Upper is floored
-    at 0 and lower capped at 0.
+    (position, k0): each event's AF-free OLS unmix with the library's mean
+    AF spectrum (row 0) removed, (n, n_fluors), and that spectrum's
+    abundance, (n,), estimated as in the per-cell AF score.
     """
-    return _flat_boundaries(_unstained_unmix(unstained_raw, fluor_spectra, af_spectra))
+    precomputed = build_af_precomputed(fluor_spectra, af_spectra)
+    _w, k_denom, _c = _joint_l2_library_terms(precomputed, af_spectra)
+    raw = np.ascontiguousarray(raw, dtype=np.float64)
+    k0 = np.maximum(raw @ precomputed['r_library'][:, 0] / k_denom[0], 0.0)
+    position = raw @ precomputed['P'].T - k0[:, np.newaxis] * precomputed['v_library'][:, 0]
+    return position, k0
 
 
-def envelope_noise_sd(unstained_raw: np.ndarray, fluor_spectra: np.ndarray,
-                      af_spectra: np.ndarray) -> np.ndarray:
+def positivity_null_variance(unstained_raw: np.ndarray, fluor_spectra: np.ndarray,
+                             af_spectra: np.ndarray) -> np.ndarray:
     """
-    Robust SD (1.4826 x MAD) per fluorophore of the unstained events unmixed
-    by joint L2: the width of the negative where no spillover spread
-    applies, which sets how gradually a channel turns positive in the
-    guarded score.
+    Variance of the negative at the profile's mean AF spectrum (row 0) as
+    c0 + c1 k + c2 k^2 in the mean AF abundance k, from unstained events.
+
+    The events' fluorophores with the mean AF removed (mean_af_position) are
+    split into NULL_VAR_BINS quantile bins of k, and the quadratic is fitted
+    to each bin's squared normalised MAD by non-negative least squares on
+    the relative error, so the variance never falls with brighter AF. The
+    linear part is photon noise of the AF, the quadratic part the AF spectra
+    varying in shape more than the library resolves. With fewer than 4
+    usable bins the variance is the overall MAD squared; c0 is floored at
+    NULL_VAR_FLOOR times that. Returns (3, n_fluors): c0, c1, c2.
     """
-    return _robust_sd(_unstained_unmix(unstained_raw, fluor_spectra, af_spectra))
+    from scipy.optimize import nnls
+
+    position, k0 = mean_af_position(unstained_raw, fluor_spectra, af_spectra)
+    overall = _robust_var(position)
+    n_fluors = position.shape[1]
+    coef = np.zeros((3, n_fluors))
+    coef[0] = overall
+    n_bins = int(max(1, min(NULL_VAR_BINS, len(k0) // NULL_VAR_MIN_BIN_EVENTS)))
+    if n_bins >= 4:
+        edges = np.quantile(k0, np.linspace(0.0, 1.0, n_bins + 1))
+        which = np.clip(np.searchsorted(edges, k0, side='right') - 1, 0, n_bins - 1)
+        centres, variances = [], []
+        for i in range(n_bins):
+            sel = which == i
+            if sel.sum() >= NULL_VAR_MIN_BIN_EVENTS:
+                centres.append(k0[sel].mean())
+                variances.append(_robust_var(position[sel]))
+        if len(centres) >= 4:
+            centres, variances = np.array(centres), np.array(variances)
+            scale = np.array([1.0, max(centres.max(), 1e-12), max(centres.max(), 1e-12) ** 2])
+            design = np.column_stack([np.ones_like(centres), centres, centres ** 2]) / scale
+            for f in range(n_fluors):
+                v = np.maximum(variances[:, f], _VAR_FLOOR)
+                coef[:, f] = nnls(design / v[:, np.newaxis], np.ones_like(v))[0] / scale
+    coef[0] = np.maximum(coef[0], NULL_VAR_FLOOR * overall)
+    return coef
 
 
 def _envelope_entry(sample: np.ndarray, fluor_names, fluor_spectra: np.ndarray,
                     af_spectra: np.ndarray, sample_file: str) -> dict:
-    unmixed = _unstained_unmix(sample, fluor_spectra, af_spectra)
-    upper, lower = _flat_boundaries(unmixed)
     return {
-        'upper': upper.tolist(),
-        'lower': lower.tolist(),
-        'noise_sd': _robust_sd(unmixed).tolist(),
+        'null_var': positivity_null_variance(sample, fluor_spectra, af_spectra).tolist(),
         'fluor_names': list(fluor_names),
         'fluor_spectra': np.asarray(fluor_spectra, dtype=np.float64).tolist(),
         'unstained_file': sample_file,
@@ -394,12 +405,11 @@ def make_envelope_entry(unstained_raw: np.ndarray, fluor_names, fluor_spectra: n
     Negative envelope for a newly extracted AF profile.
 
     Returns (entry, sample): entry is the JSON-ready dict stored as
-    af_profiles[name]['envelope'] (boundaries, unstained SD, the fluorophore
-    names and spectra they were built with, and the sidecar file name);
-    sample is the
+    af_profiles[name]['envelope'] (the null variance, the fluorophore names
+    and spectra it was built with, and the sidecar file name); sample is the
     ENVELOPE_SAMPLE_EVENTS-event float32 unstained subsample to save with
-    save_envelope_sample(). The boundaries are computed from that float32
-    sample so a later rebuild reproduces them exactly.
+    save_envelope_sample(). The null variance is computed from that float32
+    sample so a later rebuild reproduces it exactly.
     """
     raw = np.asarray(unstained_raw, dtype=np.float64)
     if len(raw) > ENVELOPE_SAMPLE_EVENTS:
@@ -430,18 +440,19 @@ def refresh_envelope_entry(entry: dict | None, fluor_names, fluor_spectra: np.nd
 
     The entry is kept as it is while the fluorophores are the same and no
     spectrum has moved more than tolerance_deg from the spectra it was built
-    with. Otherwise the boundaries are rebuilt from the stored unstained
-    subsample (changed is True). An entry stored without the unstained SD
-    gains it from the subsample, computed with the spectra the entry was
-    built with (changed is True). If the subsample cannot be read, the old
-    entry is kept when the fluorophores are unchanged (boundaries slightly
-    stale) and dropped (None) when they are not, which means joint L2 scoring.
+    with. Otherwise the null variance is rebuilt from the stored unstained
+    subsample (changed is True). An entry stored without a null variance (by
+    an earlier version, which stored boundaries instead) gains it from the
+    subsample, computed with the spectra the entry was built with (changed
+    is True). If the subsample cannot be read, the old entry is kept when the
+    fluorophores are unchanged and dropped (None) when they are not, which
+    means joint L2 scoring.
     """
     if not entry:
         return None, False
     unchanged = spectra_unchanged(entry['fluor_names'], entry['fluor_spectra'], fluor_names,
                                   fluor_spectra, tolerance_deg)
-    if unchanged and 'noise_sd' in entry:
+    if unchanged and 'null_var' in entry:
         return entry, False
     path = Path(experiment_dir) / AF_SUBDIR / str(entry.get('unstained_file', ''))
     try:
@@ -455,7 +466,7 @@ def refresh_envelope_entry(entry: dict | None, fluor_names, fluor_spectra: np.nd
         return None, False
     if unchanged:
         upgraded = dict(entry)
-        upgraded['noise_sd'] = envelope_noise_sd(
+        upgraded['null_var'] = positivity_null_variance(
             sample, np.asarray(entry['fluor_spectra'], dtype=np.float64), af_spectra).tolist()
         return upgraded, True
     return _envelope_entry(sample, fluor_names, fluor_spectra, af_spectra,
@@ -463,43 +474,31 @@ def refresh_envelope_entry(entry: dict | None, fluor_names, fluor_spectra: np.nd
 
 
 def build_runtime_envelope(entry: dict, spread_entry: dict | None, fluor_names,
-                           fluor_spectra: np.ndarray, ceiling: float) -> dict:
+                           fluor_spectra: np.ndarray, ceiling: float) -> dict | None:
     """
-    The envelope used in scoring: the stored boundaries and unstained SD plus
-    the spillover spread when spread_entry matches the current fluorophores
-    within the spectral tolerance (otherwise the boundaries are flat).
-    mean_rows holds the library row of the profile's mean AF spectrum (row 0,
-    as get_af_spectra() returns it), the reference for the positivity test.
+    The envelope used in scoring: the stored null variance, as (1, 3,
+    n_fluors), plus the spillover spread when spread_entry matches the
+    current fluorophores within the spectral tolerance (otherwise None, and
+    only the unstained variance applies). mean_rows holds the library row of
+    the profile's mean AF spectrum (row 0, as get_af_spectra() returns it),
+    where positivity is judged. None, meaning joint L2 scoring, for an entry
+    without a null variance.
     """
+    if 'null_var' not in entry:
+        logger.warning('AF negative envelope has no null variance and its unstained sample could not be '
+                       'read; the profile is scored by joint L2. Extracting the AF profile again stores it.')
+        return None
     spread = None
     if spread_entry and spectra_unchanged(spread_entry['fluor_names'], spread_entry['fluor_spectra'],
                                           fluor_names, fluor_spectra):
         spread = np.asarray(spread_entry['spread'], dtype=np.float64)
-    noise_sd = entry.get('noise_sd')
-    if noise_sd is None:
-        logger.warning('AF negative envelope has no unstained SD; channels switch between negative and '
-                       'positive at the boundary itself. Extracting the AF profile again stores it.')
-        noise_sd = np.zeros(len(entry['upper']))
     return {
-        'upper': np.asarray(entry['upper'], dtype=np.float64),
-        'lower': np.asarray(entry['lower'], dtype=np.float64),
-        'noise_sd': np.asarray(noise_sd, dtype=np.float64),
+        'null_var': np.asarray(entry['null_var'], dtype=np.float64)[np.newaxis],
         'spread': spread,
-        'kappa': ENVELOPE_KAPPA,
-        'hyper_weight': ENVELOPE_HYPER_WEIGHT,
-        'soft_width': ENVELOPE_SOFT_WIDTH,
         'mean_rows': np.array([0], dtype=np.intp),
         'ceiling': float(ceiling),
         'saturated_frac': ENVELOPE_SATURATED_FRAC,
     }
-
-
-def _envelope_noise_sd(envelope: dict) -> np.ndarray:
-    """Unstained SD of a runtime envelope; zeros when it has none."""
-    noise_sd = envelope.get('noise_sd')
-    if noise_sd is None:
-        return np.zeros(np.asarray(envelope['upper']).size)
-    return np.asarray(noise_sd, dtype=np.float64)
 
 
 def _envelope_mean_rows(envelope: dict) -> np.ndarray:
@@ -675,170 +674,80 @@ def _joint_l2_library_terms(precomputed: dict, af_spectra: np.ndarray):
     return w, k_denom, c_fluor
 
 
-@lru_cache(maxsize=1)
-def _load_negative_kernel():
+def _spread_variance(position: np.ndarray, envelope: dict) -> np.ndarray | None:
     """
-    Return the autospectral_opt_kernel_wrapper module from bundled_plugins/
-    when its compiled kernel provides the guarded negative-term function,
-    else None.
-    """
-    meipass = getattr(sys, '_MEIPASS', None)
-    if meipass:
-        plugin_dir = Path(meipass) / 'honeychrome' / 'bundled_plugins'
-    else:
-        plugin_dir = Path(__file__).resolve().parent.parent / 'bundled_plugins'
-    if not (plugin_dir / 'autospectral_opt_kernel_wrapper.py').exists():
-        return None
-    if str(plugin_dir) not in sys.path:
-        sys.path.append(str(plugin_dir))
-    try:
-        import autospectral_opt_kernel_wrapper as wrapper
-    except Exception as e:
-        logger.info(f'Negative-term kernel wrapper could not be imported ({e}).')
-        return None
-    return wrapper if getattr(wrapper, 'GUARDED_TERM_KERNEL_AVAILABLE', False) else None
-
-
-def _spread_variance(abundance: np.ndarray, envelope: dict) -> np.ndarray | None:
-    """
-    Spillover variance added to each fluorophore at the given abundances,
+    Spillover variance added to each fluorophore at the given positions,
     sum_a SS[a, f] * max(x_a, 0), (n, n_fluors); None without a spread matrix.
     """
-    spread = envelope['spread']
+    spread = envelope.get('spread')
     if spread is None or not np.any(spread):
         return None
-    return np.maximum(abundance, 0.0) @ spread
+    return np.maximum(position, 0.0) @ spread
 
 
-def _envelope_bounds(abundance: np.ndarray, envelope: dict, spread_var: np.ndarray | None = None) -> tuple:
+def positivity_weight(position: np.ndarray, var: np.ndarray) -> np.ndarray:
     """
-    Per-event boundaries (n, n_fluors) at the given abundances:
-    upper + kappa * sqrt(sum_a SS[a, f] * max(x_a, 0)), and the lower
-    boundary moved down by the same amount. Flat without a spread matrix.
-    spread_var, when given, is _spread_variance() at these abundances.
+    1 - p per channel, where p = erf(max(x, 0) / sqrt(2 var)) is the share of
+    the negative's distribution (normal, variance var) lying closer to zero
+    than x. The weight is 1 at and below zero and falls smoothly as the
+    channel turns positive (0.317, 0.046 and 0.0027 at 1, 2 and 3 SDs),
+    never reaching exactly 0.
     """
-    upper, lower = envelope['upper'], envelope['lower']
-    if spread_var is None:
-        spread_var = _spread_variance(abundance, envelope)
-    n = abundance.shape[0]
-    if spread_var is None:
-        return (np.broadcast_to(upper, (n, upper.size)).copy(),
-                np.broadcast_to(lower, (n, lower.size)).copy())
-    widen = envelope['kappa'] * np.sqrt(spread_var)
-    return upper[np.newaxis, :] + widen, lower[np.newaxis, :] - widen
+    z = np.maximum(position, 0.0)
+    z /= np.sqrt(np.maximum(var, _VAR_FLOOR))
+    z *= 1.0 / np.sqrt(2.0)
+    return erfc(z)
 
 
-def _negative_sd(abundance: np.ndarray, envelope: dict, spread_var: np.ndarray | None = None) -> np.ndarray:
+def _positivity_fluor_term(u, k, e_resid, v_library, w, envelope):
     """
-    SD of the negative per event and fluorophore (n, n_fluors) at the given
-    abundances: sqrt(noise_sd_f^2 + sum_a SS[a, f] * max(x_a, 0)).
-    spread_var, when given, is _spread_variance() at these abundances.
+    Fluorophore term of the positivity-weighted score for every candidate,
+    (n, n_af).
+
+    Positivity is judged once per event, at the library's mean AF spectrum
+    (of combined profiles, the mean with the smallest residual term), where
+    no candidate can move it: x = u - k_m v_m, with u the AF-free unmix. The
+    negative there is taken as normal with variance c0 + c1 k_m + c2 k_m^2
+    (that profile's null variance) plus sum_a SS[a, f] * max(x_a, 0), the
+    spillover spread at the event's abundances. Each channel then counts
+    with weight w_f (1 - p_f) (positivity_weight), and the term is
+
+        sum_f w_f (1 - p_f) (u_f - k_j v_jf)^2 / sum_f w_f (1 - p_f) u_f^2
+
+    so a negative channel rewards the candidate that brings it towards 0 and
+    a positive one counts less the more clearly positive it is, without a
+    boundary. As in the joint L2 term, the weighted error is a quadratic in
+    k_j, so the term is two matrix products.
     """
-    if spread_var is None:
-        spread_var = _spread_variance(abundance, envelope)
-    var = np.broadcast_to(_envelope_noise_sd(envelope) ** 2, abundance.shape).copy()
-    if spread_var is not None:
-        var += spread_var
-    return np.sqrt(var, out=var)
-
-
-def _guard_weight(position: np.ndarray, upper: np.ndarray, sd: np.ndarray,
-                 half_width: float) -> np.ndarray:
-    """
-    How negative each channel is, between 1 (negative) and 0 (positive).
-
-    d = (position - upper) / sd is how many SDs of the negative the channel
-    lies above its upper boundary. The weight is 1 for d <= -half_width, 0
-    for d >= half_width and a cubic smoothstep in between; half_width 0 is a
-    step at the boundary. The compiled kernel uses the same formula.
-    """
-    if half_width <= 0:
-        return (position <= upper).astype(np.float64)
-    t = np.subtract(position, upper)
-    t /= np.maximum(sd, _SD_FLOOR)
-    t *= 0.5 / half_width
-    t += 0.5
-    np.clip(t, 0.0, 1.0, out=t)
-    weight = t * t
-    t *= -2.0
-    t += 3.0
-    weight *= t
-    np.subtract(1.0, weight, out=weight)
-    return weight
-
-
-def _guarded_fluor_term_numpy(u, k, v_t, w, upper, floor, keep, hyper_weight, max_block=1_000_000):
-    """NumPy guarded fluorophore term, (n, n_af), in blocks that cap the (n, n_af, n_fluors) temporary."""
-    n, n_af = k.shape
-    n_fluors = u.shape[1]
-    out = np.empty((n, n_af))
-    step = max(256, int(max_block // max(n_af * n_fluors, 1)))
-    for start in range(0, n, step):
-        stop = min(start + step, n)
-        up = upper[start:stop, np.newaxis, :]
-        g = keep[start:stop, np.newaxis, :]
-        x = k[start:stop, :, np.newaxis] * v_t[np.newaxis, :, :]
-        np.subtract(u[start:stop, np.newaxis, :], x, out=x)
-        loss = np.minimum(x, up)
-        loss *= loss
-        loss *= g
-        pulled = np.maximum(up - x, 0.0)
-        pulled *= pulled
-        with np.errstate(invalid='ignore'):   # 0 x inf where a boundary is infinite (g = 1)
-            pulled *= 1.0 - g
-        loss += np.where(g < 1.0, pulled, 0.0)
-        if hyper_weight > 0:
-            np.subtract(floor[start:stop, np.newaxis, :], x, out=x)
-            np.maximum(x, 0.0, out=x)
-            x *= x
-            x *= hyper_weight
-            loss += x
-        out[start:stop] = loss @ w
-        g2 = keep[start:stop]
-        up2 = upper[start:stop]
-        with np.errstate(invalid='ignore'):
-            positive = np.where(g2 < 1.0, (1.0 - g2) * up2 * up2, 0.0)
-        base = (g2 * np.minimum(u[start:stop], up2) ** 2 + positive) @ w + 1e-6
-        out[start:stop] /= base[:, np.newaxis]
-    return out
-
-
-def _guarded_fluor_term(u, k, ref_j, v_t, w, envelope, e_resid):
-    """
-    Fluorophore term of the guarded negative-envelope score for every
-    candidate, (n, n_af). With x = u - k_j v_j (u the AF-free unmix) and g
-    how negative the channel is (_guard_weight), the loss per channel is
-
-        g * min(x, upper)^2 + (1 - g) * max(upper - x, 0)^2
-
-    plus hyper_weight * (floor - x)^2 below the lower boundary and below
-    where the channel sits without AF. A negative channel (g = 1) rewards a
-    candidate for bringing it towards 0, earning at most upper^2 from above
-    the boundary; a positive one (g = 0) costs nothing above the boundary and
-    is penalised for being pulled below it, so how far the candidates can
-    reach does not decide which dim positives are absorbed.
-
-    g is judged once per event at the library's mean AF spectrum (of the
-    combined profiles, the mean with the smallest residual term), over
-    soft_width SDs of the negative either side of the upper boundary.
-    Boundaries and SDs are per event, at the abundances of the joint L2
-    choice (ref_j). Uses the compiled kernel when it is built, NumPy
-    otherwise.
-    """
-    rows = np.arange(len(u))
-    reference = u - k[rows, ref_j][:, np.newaxis] * v_t[ref_j]
-    spread_var = _spread_variance(reference, envelope)
-    upper, lower = _envelope_bounds(reference, envelope, spread_var)
-    floor = np.minimum(lower, u)
+    n = len(u)
+    rows = np.arange(n)
     mean_rows = _envelope_mean_rows(envelope)
-    mean_j = mean_rows[np.argmin(e_resid[:, mean_rows], axis=1)] if mean_rows.size > 1 else mean_rows[0]
-    at_mean = u - k[rows, mean_j][:, np.newaxis] * v_t[mean_j]
-    keep = _guard_weight(at_mean, upper, _negative_sd(reference, envelope, spread_var),
-                        float(envelope.get('soft_width', ENVELOPE_SOFT_WIDTH)))
-    kernel = _load_negative_kernel()
-    if kernel is not None:
-        return kernel.guarded_fluor_term(u, k, v_t, w, upper, floor, keep, envelope['hyper_weight'])
-    return _guarded_fluor_term_numpy(u, k, v_t, w, upper, floor, keep, envelope['hyper_weight'])
+    null_var = np.asarray(envelope['null_var'], dtype=np.float64)        # (n_means, 3, n_fluors)
+    if mean_rows.size > 1:
+        pick = np.argmin(e_resid[:, mean_rows], axis=1)
+        coef = null_var[pick]                                            # (n, 3, n_fluors)
+        c0, c1, c2 = coef[:, 0], coef[:, 1], coef[:, 2]
+    else:
+        pick = np.zeros(n, dtype=np.intp)
+        c0, c1, c2 = null_var[0]
+    mean_j = mean_rows[pick]
+    k_mean = k[rows, mean_j][:, np.newaxis]
+    position = u - k_mean * v_library.T[mean_j]
+    var = c0 + k_mean * (c1 + k_mean * c2)
+    spread_var = _spread_variance(position, envelope)
+    if spread_var is not None:
+        var = var + spread_var
+    weight = positivity_weight(position, var)
+    weight *= w
+
+    base = np.einsum('ij,ij->i', weight, u * u) + 1e-6
+    e_fluor = (weight * u) @ v_library
+    e_fluor *= -2.0 * k
+    e_fluor += k * k * (weight @ (v_library * v_library))
+    e_fluor += base[:, np.newaxis]
+    np.maximum(e_fluor, 0.0, out=e_fluor)
+    e_fluor /= base[:, np.newaxis]
+    return e_fluor
 
 
 def _first_within_tolerance(score: np.ndarray) -> np.ndarray:
@@ -891,8 +800,8 @@ def _assign_af_chunk(chunk, precomputed, w, k_denom, c_fluor, envelope=None):
     """
     Joint covariance-weighted L2 fluorophore x L2 residual AF scoring for one
     chunk of cells (port of AutoSpectral's assign.af.joint.cov.l2()). With an
-    envelope the fluorophore term is the guarded negative-envelope term
-    instead (see _guarded_fluor_term) and ties resolve to the first variant.
+    envelope the fluorophore term is the positivity-weighted term instead
+    (see _positivity_fluor_term) and ties resolve to the first variant.
 
     For variant j with abundance k (clamped >= 0), both error terms are
     quadratics in k:
@@ -917,19 +826,11 @@ def _assign_af_chunk(chunk, precomputed, w, k_denom, c_fluor, envelope=None):
     unmixed = chunk @ P.T
     resid   = chunk - np.maximum(unmixed, 0.0) @ S_t.T
 
-    base_e_fluor = (unmixed * unmixed) @ w + 1e-6
     base_e_resid = np.einsum('ij,ij->i', resid, resid) + 1e-6
 
     numerator = chunk @ r_library
     k  = np.maximum(numerator / k_denom, 0.0)
     k2 = k * k
-
-    e_fluor = (unmixed * w) @ v_library
-    e_fluor *= -2.0 * k
-    e_fluor += k2 * c_fluor
-    e_fluor += base_e_fluor[:, np.newaxis]
-    np.maximum(e_fluor, 0.0, out=e_fluor)
-    e_fluor /= base_e_fluor[:, np.newaxis]
 
     e_resid = resid @ r_library
     e_resid *= -2.0 * k
@@ -939,11 +840,17 @@ def _assign_af_chunk(chunk, precomputed, w, k_denom, c_fluor, envelope=None):
     e_resid /= base_e_resid[:, np.newaxis]
 
     if envelope is not None:
-        ref_j = np.argmin(e_fluor * e_resid, axis=1)
-        e_fluor = _guarded_fluor_term(unmixed, k, ref_j, np.ascontiguousarray(v_library.T), w,
-                                      envelope, e_resid)
+        e_fluor = _positivity_fluor_term(unmixed, k, e_resid, v_library, w, envelope)
         score = np.log(e_fluor + _SCORE_EPS) + np.log(e_resid + _SCORE_EPS)
         return _first_within_tolerance(score), numerator, unmixed
+
+    base_e_fluor = (unmixed * unmixed) @ w + 1e-6
+    e_fluor = (unmixed * w) @ v_library
+    e_fluor *= -2.0 * k
+    e_fluor += k2 * c_fluor
+    e_fluor += base_e_fluor[:, np.newaxis]
+    np.maximum(e_fluor, 0.0, out=e_fluor)
+    e_fluor /= base_e_fluor[:, np.newaxis]
 
     e_fluor *= e_resid
     best_j = np.argmin(e_fluor, axis=1)
@@ -1007,13 +914,13 @@ def apply_af_unmixing(
     Where neither applies this is identical to an OLS solve against
     [fluor_spectra; af_spectra[j]].
 
-    When precomputed holds an 'envelope' (see build_af_precomputed), the
-    fluorophore term of the score is guarded by the spread-scaled negative
-    envelope (see _guarded_fluor_term), so a variant earns nothing for
-    cancelling real dye signal and is penalised for pulling a positive
-    channel below the boundary, and events with a detector at the ceiling
-    are re-fitted on the unsaturated detectors. The abundance estimate and
-    the residual term are unchanged.
+    When precomputed holds an 'envelope' (see build_af_precomputed), each
+    channel of the fluorophore term is weighted by how likely it is to be
+    negative (see _positivity_fluor_term), so a variant earns little for
+    cancelling real dye signal and no channel switches on or off at a
+    boundary, and events with a detector at the ceiling are re-fitted on the
+    unsaturated detectors. The abundance estimate and the residual term are
+    unchanged.
 
     Parameters
     ----------

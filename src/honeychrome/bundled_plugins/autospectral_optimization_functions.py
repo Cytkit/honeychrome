@@ -978,7 +978,7 @@ def unmix_autospectral_optimization(
     fluorophores and calls the compiled joint kernel.
 
     With an envelope (af_envelope_for_profiles), AF candidates are scored by
-    the guarded negative-envelope term and events with saturated detectors are
+    the positivity-weighted term and events with saturated detectors are
     re-fitted on the unsaturated detectors only; without one, AF candidates
     are scored by joint L2.
 

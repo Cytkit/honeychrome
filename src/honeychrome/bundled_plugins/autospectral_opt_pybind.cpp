@@ -13,7 +13,6 @@
 #include <string>
 #include <vector>
 
-#include "af_negative_term.hpp"
 #include "core_joint_unmix.hpp"
 
 namespace py = pybind11;
@@ -54,15 +53,12 @@ py::array_t<double> arma_to_np(const arma::mat& m) {
   return out;
 }
 
-// None -> joint L2 scoring; otherwise a dict with upper, lower, noise_sd (None
-// or length F), spread (None or an F x F array), mean_rows (list of AF library
-// rows), kappa, hyper_weight and soft_width.
+// None -> joint L2 scoring; otherwise a dict with null_var ((3 * n_mean_rows)
+// x F: c0, c1, c2 of each mean row in turn), spread (None or an F x F array)
+// and mean_rows (list of AF library rows).
 AfEnvelopeInput envelope_from_dict(const py::dict& d) {
   AfEnvelopeInput env;
-  env.upper = np_to_arma_vec(d["upper"].cast<ContigArray>());
-  env.lower = np_to_arma_vec(d["lower"].cast<ContigArray>());
-  if (d.contains("noise_sd") && !d["noise_sd"].is_none())
-    env.noise_sd = np_to_arma_vec(d["noise_sd"].cast<ContigArray>());
+  env.null_var = np_to_arma_mat(d["null_var"].cast<ContigArray>()).t();
   if (d.contains("spread") && !d["spread"].is_none())
     env.spread = np_to_arma_mat(d["spread"].cast<ContigArray>());
   if (d.contains("mean_rows") && !d["mean_rows"].is_none()) {
@@ -73,9 +69,6 @@ AfEnvelopeInput envelope_from_dict(const py::dict& d) {
       env.mean_rows[i] = static_cast<arma::uword>(rows[i]);
     }
   }
-  if (d.contains("kappa")) env.kappa = d["kappa"].cast<double>();
-  if (d.contains("hyper_weight")) env.hyper_weight = d["hyper_weight"].cast<double>();
-  if (d.contains("soft_width")) env.soft_width = d["soft_width"].cast<double>();
   return env;
 }
 
@@ -142,53 +135,6 @@ static py::array_t<double> unmix_autospectral_joint(
   return arma_to_np(result);
 }
 
-// Fluorophore term of the guarded negative-envelope AF score; see af_negative_term.hpp.
-static py::array_t<double> guarded_fluor_term(
-    ContigArray u,        // (n_events, n_fluor)
-    ContigArray k,        // (n_events, n_af)
-    ContigArray v_t,      // (n_af, n_fluor)
-    ContigArray w,        // (n_fluor)
-    ContigArray upper,    // (n_events, n_fluor)
-    ContigArray floor_,   // (n_events, n_fluor)
-    ContigArray keep,     // (n_events, n_fluor)
-    double      hyper_weight,
-    int         n_threads
-) {
-  const auto bu = u.request();
-  const auto bk = k.request();
-  const auto bv = v_t.request();
-  const auto bw = w.request();
-  const auto bup = upper.request();
-  const auto bfl = floor_.request();
-  const auto bke = keep.request();
-  if (bu.ndim != 2 || bk.ndim != 2 || bv.ndim != 2 || bup.ndim != 2 || bfl.ndim != 2 ||
-      bke.ndim != 2 || bw.ndim != 1)
-    throw std::invalid_argument("guarded_fluor_term: u, k, v_t, upper, floor and keep must be 2-D and w 1-D");
-  const py::ssize_t n_events = bu.shape[0];
-  const py::ssize_t n_fluor = bu.shape[1];
-  const py::ssize_t n_af = bk.shape[1];
-  if (bk.shape[0] != n_events || bv.shape[0] != n_af || bv.shape[1] != n_fluor ||
-      bw.shape[0] != n_fluor || bup.shape[0] != n_events || bup.shape[1] != n_fluor ||
-      bfl.shape[0] != n_events || bfl.shape[1] != n_fluor ||
-      bke.shape[0] != n_events || bke.shape[1] != n_fluor)
-    throw std::invalid_argument("guarded_fluor_term: array shapes are inconsistent");
-  if (n_af < 1)
-    throw std::invalid_argument("guarded_fluor_term: needs at least one AF candidate");
-
-  py::array_t<double> out({n_events, n_af});
-  double* out_ptr = static_cast<double*>(out.request().ptr);
-  {
-    py::gil_scoped_release release;
-    guarded_fluor_term_core(
-        static_cast<const double*>(bu.ptr), static_cast<const double*>(bk.ptr),
-        static_cast<const double*>(bv.ptr), static_cast<const double*>(bw.ptr),
-        static_cast<const double*>(bup.ptr), static_cast<const double*>(bfl.ptr),
-        static_cast<const double*>(bke.ptr), hyper_weight, out_ptr,
-        static_cast<int>(n_events), static_cast<int>(n_af), static_cast<int>(n_fluor), n_threads);
-  }
-  return out;
-}
-
 PYBIND11_MODULE(_autospectral_opt_kernel, m) {
   m.doc() = "Honeychrome AutoSpectral Optimization joint AF + variant "
             "unmixing kernel (pybind11 / Armadillo).";
@@ -203,15 +149,8 @@ PYBIND11_MODULE(_autospectral_opt_kernel, m) {
         py::arg("envelope") = py::none(),
         "Joint per-cell AF + fluorophore-variant unmixing. Returns an "
         "(N, F+2) array: [fluor abundances | AF abundance | AF index (1-based)]. "
-        "envelope (dict of upper, lower, noise_sd, spread, mean_rows, kappa, "
-        "hyper_weight, soft_width) scores AF candidates by the guarded "
-        "negative-envelope term; None scores them by joint L2.");
-  m.attr("SUPPORTS_ENVELOPE") = true;           // unmix_autospectral_joint takes an envelope
-  m.attr("SUPPORTS_GUARDED_ENVELOPE") = true;   // and scores it with the guarded term
-  m.def("guarded_fluor_term", &guarded_fluor_term,
-        py::arg("u"), py::arg("k"), py::arg("v_t"), py::arg("w"),
-        py::arg("upper"), py::arg("floor"), py::arg("keep"), py::arg("hyper_weight"),
-        py::arg("n_threads") = 0,
-        "Fluorophore term of the guarded negative-envelope AF score for every "
-        "event and AF candidate. Returns an (n_events, n_af) array.");
+        "envelope (dict of null_var, spread, mean_rows) scores AF candidates "
+        "by the positivity-weighted term; None scores them by joint L2.");
+  m.attr("SUPPORTS_ENVELOPE") = true;              // unmix_autospectral_joint takes an envelope
+  m.attr("SUPPORTS_POSITIVITY_ENVELOPE") = true;   // and scores it with the positivity-weighted term
 }

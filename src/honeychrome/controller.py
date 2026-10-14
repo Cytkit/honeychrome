@@ -1086,13 +1086,13 @@ class Controller(QObject):
     def _precompute_profile(self, entry: dict, fluor_spectra: np.ndarray) -> dict:
         """
         Precomputed AF matrices for one stored AF profile. A profile with a
-        negative envelope is scored by it: the boundaries are rebuilt from the
-        profile's stored unstained subsample when a fluorophore spectrum has
-        moved beyond the tolerance, and an envelope stored without the
-        unstained SD gains it from that subsample (either way the refreshed
-        entry is stored back in the profile), and the spillover spread is
-        added while it still matches the current spectra. A profile without
-        an envelope is scored by joint L2.
+        negative envelope is scored by it: the null variance is rebuilt from
+        the profile's stored unstained subsample when a fluorophore spectrum
+        has moved beyond the tolerance, and an envelope stored without one (by
+        an earlier version) gains it from that subsample (either way the
+        refreshed entry is stored back in the profile), and the spillover
+        spread is added while it still matches the current spectra. A profile
+        without a usable envelope is scored by joint L2.
         """
         af_spectra = np.array(entry['spectra'])
         fluor_names = self._build_fluor_names()
@@ -1108,10 +1108,11 @@ class Controller(QObject):
                 envelope = build_runtime_envelope(
                     refreshed, self.experiment.process.get('af_spread'), fluor_names,
                     fluor_spectra, self._magnitude_ceiling())
-                if envelope['spread'] is None:
+                if envelope is not None and envelope['spread'] is None:
                     logger.warning(
                         'AF negative envelope: no spillover spread matches the current spectra; '
-                        'using flat boundaries. Extracting an AF profile estimates it again.')
+                        'positivity is judged against the unstained variance alone. Extracting an '
+                        'AF profile estimates the spread again.')
         return build_af_precomputed(fluor_spectra, af_spectra, envelope)
 
     def precomputed_for_profile(self, profile_name: str) -> dict | None:
