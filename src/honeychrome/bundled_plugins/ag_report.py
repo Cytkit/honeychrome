@@ -72,8 +72,9 @@ def boundary_fractions(gate_def: dict, boundary: dict, events: np.ndarray | None
         else np.ones(len(events), dtype=bool)
     if not mask.any():
         return {}
-    gate_chans = [ch for ch in ag_core.gate_channels(gate_def) if ch in channels]
-    if len(gate_chans) != len(ag_core.gate_channels(gate_def)):
+    needed = ag_core.boundary_channels(gate_def, boundary)
+    gate_chans = [ch for ch in needed if ch in channels]
+    if len(gate_chans) != len(needed):
         return {}
     data = np.column_stack([_apply(transforms.get(ch), events[mask, channels.index(ch)])
                             for ch in gate_chans])
@@ -156,8 +157,10 @@ def make_gate_figure(gate_def: dict, boundary: dict, events: np.ndarray | None,
     fig = Figure(figsize=(4.6, 4.4), constrained_layout=True)
     ax = fig.add_subplot(111)
     gt = gate_def.get('gate_type', '')
-    ch_x = gate_def.get('gate_marker_x') or ''
-    ch_y = gate_def.get('gate_marker_y') or ''
+    shapes = ag_core.is_shape_boundary(boundary)
+    sep_y = ag_core.separation_axis(gate_def) == 'y' and not shapes
+    ch_x, ch_y = ag_core.boundary_plot_channels(gate_def, boundary)
+    ch_x, ch_y = ch_x or '', ch_y or ''
     tr_x = transforms.get(ch_x)
     tr_y = transforms.get(ch_y) if ch_y else None
     colour = '#1e9e32'
@@ -192,9 +195,15 @@ def make_gate_figure(gate_def: dict, boundary: dict, events: np.ndarray | None,
         label = (pops.get(pop) or {}).get('label', pop)
         frac = fractions.get(pop)
         text = f"{label}\n{frac * 100:.1f}%" if frac is not None else label
-        if gt == '1dsep':
+        if gt == '1dsep' and not shapes:
             tx = entry.get('threshold_x')
             if tx is None:
+                continue
+            if sep_y:
+                ax.axhline(float(tx), color=colour, linewidth=1.5)
+                ly, lx, va, ha = label_position(gt, regions.get(pop), entry, y_lim, (0.0, 1.0))
+                ax.text(lx, ly, text, color=colour, ha=ha, va=va, fontsize=8, bbox=bbox,
+                        transform=ax.get_yaxis_transform())
                 continue
             ax.axvline(float(tx), color=colour, linewidth=1.5)
             lx, ly, ha, va = label_position(gt, regions.get(pop), entry, x_lim, (0.0, 1.0))
@@ -206,7 +215,8 @@ def make_gate_figure(gate_def: dict, boundary: dict, events: np.ndarray | None,
             continue
         closed = np.vstack([coords, coords[:1]])
         ax.plot(closed[:, 0], closed[:, 1], color=colour, linewidth=1.5)
-        lx, ly, ha, va = label_position(gt, regions.get(pop), entry, x_lim, y_lim)
+        lx, ly, ha, va = label_position('free' if shapes else gt, regions.get(pop), entry,
+                                        x_lim, y_lim)
         ax.text(lx, ly, text, color=colour, ha=ha, va=va, fontsize=8, bbox=bbox)
 
     ax.set_xlabel(axis_labels.get(ch_x, ch_x))

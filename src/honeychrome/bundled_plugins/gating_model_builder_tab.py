@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QTabWidget, QTreeWidget, QTreeWidgetItem,
     QAbstractItemView, QMenu,
     QDialog, QDialogButtonBox, QGridLayout, QTextEdit, QGroupBox,
+    QRadioButton, QButtonGroup,
 )
 
 import honeychrome
@@ -244,6 +245,32 @@ def _axis_limits(transforms: dict) -> dict:
     return out
 
 
+def _axis_cells(g: dict) -> tuple[str, str]:
+    """Text of a gate's X and Y axis columns. A 1dsep gate's channels are
+    marked as the separation (sep) and view parameters, on the plot axes
+    they are drawn on; a view of None is a histogram."""
+    if g.get('gate_type') != '1dsep':
+        return str(g.get('gate_marker_x') or ''), str(g.get('gate_marker_y') or '')
+    sep = f"{g.get('gate_marker_x') or ''} (sep)"
+    view = f"{g['gate_marker_y']} (view)" if g.get('gate_marker_y') else "Histogram (view)"
+    return (view, sep) if ag_core.separation_axis(g) == 'y' else (sep, view)
+
+
+def _boundary_axes(gate_def: dict, boundary: dict | None) -> tuple[str, str]:
+    """(x, y) channels to draw *boundary* of *gate_def* on ('' for a
+    histogram's y); see ag_core.boundary_plot_channels."""
+    x, y = ag_core.boundary_plot_channels(gate_def, boundary)
+    return x or '', y or ''
+
+
+def _preview_axes(g: dict) -> tuple[str, str]:
+    """(x, y) channels a gate is previewed on: the plot its shapes were
+    drawn on while it applies them, else the plot its type is drawn on
+    ('' for a histogram's y)."""
+    template = g.get('template') if g.get('algorithm') == ag_core.ALGORITHM_IMPORTED else None
+    return _boundary_axes(g, template)
+
+
 def _sample_label(key: str) -> str:
     """Short display name for a sample key."""
     return Path(str(key)).stem
@@ -281,6 +308,9 @@ class GatingModelState:
         Free-form dict written into the .agmodel ``metadata`` block.
     algorithm_recommendations
         {gate_name: algorithm} from the bimodality check.
+    default_sep_axis
+        Plot axis ('x' or 'y') given to the separation channel of 1dsep
+        gates that are added or split here.
     """
 
     gate_definitions: list = field(default_factory=list)
@@ -291,6 +321,7 @@ class GatingModelState:
     training_summary: dict = field(default_factory=dict)
     model_metadata: dict = field(default_factory=dict)
     algorithm_recommendations: dict = field(default_factory=dict)
+    default_sep_axis: str = 'x'
 
     def is_trained(self, gate_name: str) -> bool:
         """Return True if a non-empty boundary exists for *gate_name*."""
@@ -668,9 +699,26 @@ class GateEditDialog(QDialog):
         self.cb_marker_y = QComboBox()
         self._populate_axis_combos()
 
-        form.addRow("X-axis channel", self.cb_marker_x)
-        form.addRow("Y-axis channel", self.cb_marker_y)
+        self.lbl_marker_x = QLabel("X-axis channel")
+        self.lbl_marker_y = QLabel("Y-axis channel")
+        form.addRow(self.lbl_marker_x, self.cb_marker_x)
+        form.addRow(self.lbl_marker_y, self.cb_marker_y)
+
+        # 1dsep only: which plot axis carries the separation parameter.
+        self.lbl_sep_axis = QLabel("Separation drawn on")
+        self.cb_sep_axis = QComboBox()
+        self.cb_sep_axis.addItem("X axis", 'x')
+        self.cb_sep_axis.addItem("Y axis", 'y')
+        sep_axis = self.gate_def.get('sep_axis') or (
+            self.state.default_sep_axis if self.is_new else 'x')
+        self._select_combo_by_data(self.cb_sep_axis, sep_axis)
+        self.cb_sep_axis.setToolTip(
+            "Plot axis the separation parameter is drawn on; the view parameter "
+            "takes the other axis. A histogram view always draws the separation "
+            "parameter on the x axis.")
+        form.addRow(self.lbl_sep_axis, self.cb_sep_axis)
         form.addRow("", self.cb_include_all_channels)
+        self.cb_marker_y.currentIndexChanged.connect(self._update_axis_labels)
 
         # --- Parent gate and population ---
         self.cb_parent_gate = QComboBox()
@@ -799,6 +847,20 @@ class GateEditDialog(QDialog):
         finally:
             self.cb_marker_x.blockSignals(False)
             self.cb_marker_y.blockSignals(False)
+        self._update_axis_labels()
+
+    def _update_axis_labels(self, *_args):
+        """Name the axis fields after their role: a 1dsep gate has a
+        separation parameter and a view parameter (or a histogram)."""
+        if not hasattr(self, 'lbl_sep_axis'):
+            return
+        one_d = self.cb_type.currentText() == '1dsep'
+        self.lbl_marker_x.setText("Separation parameter (sep)" if one_d else "X-axis channel")
+        self.lbl_marker_y.setText("View parameter (view)" if one_d else "Y-axis channel")
+        self.cb_marker_y.setItemText(0, "Histogram" if one_d else "(none)")
+        has_view = self.cb_marker_y.currentData() is not None
+        self.cb_sep_axis.setEnabled(one_d and has_view)
+        self.lbl_sep_axis.setEnabled(one_d and has_view)
 
     @staticmethod
     def _select_combo_by_data(combo: QComboBox, value: str):
@@ -880,6 +942,7 @@ class GateEditDialog(QDialog):
         # background rather than a histogram-only view.
         is_2d_like = new_type in ('1dsep', '2dsep', 'free', 'singlets')
         self.cb_marker_y.setEnabled(is_2d_like)
+        self._update_axis_labels()
 
         if new_type == self._last_seen_type:
             return
@@ -1004,7 +1067,9 @@ class GateEditDialog(QDialog):
         marker_y = self.cb_marker_y.currentData() or None
 
         if gate_type != 'replicate' and not marker_x:
-            QMessageBox.warning(self, "Validation", "X-axis channel is required.")
+            QMessageBox.warning(self, "Validation",
+                                "Separation parameter is required." if gate_type == '1dsep'
+                                else "X-axis channel is required.")
             return
         if gate_type in ('2dsep', 'free', 'singlets') and not marker_y:
             QMessageBox.warning(
@@ -1067,6 +1132,8 @@ class GateEditDialog(QDialog):
         self.gate_def['gate_type']     = gate_type
         self.gate_def['gate_marker_x'] = marker_x
         self.gate_def['gate_marker_y'] = marker_y
+        self.gate_def['sep_axis']      = (self.cb_sep_axis.currentData()
+                                          if gate_type == '1dsep' and marker_y else 'x')
         self.gate_def['parent_gate']   = parent_gate
         self.gate_def['parent_popul']  = parent_popul
         self.gate_def['algorithm']     = algorithm
@@ -1078,6 +1145,122 @@ class GateEditDialog(QDialog):
         self.gate_def.setdefault('stats_parent', {})
 
         super().accept()
+
+class SplitGateDialog(QDialog):
+    """Choose how a 2dsep gate is split into sequential 1dsep gates.
+
+    One row per step, first step first: the separation parameter, its
+    algorithm, its view parameter (the other channel, or a histogram) and
+    the plot axis the separation is drawn on. "Swap order" separates on
+    the other channel first. ``steps()`` gives the choices in order for
+    ``ag_review.split_2dsep``.
+    """
+
+    _COLUMNS = ["Step", "Separation parameter", "Algorithm", "View parameter", "Separation drawn on"]
+
+    def __init__(self, gate_def: dict, controller, default_algorithm: str, parent=None):
+        super().__init__(parent)
+        self.gate_def = gate_def
+        self.controller = controller
+        self.setWindowTitle(f"Split into 1D gates — {gate_def.get('gate_name', '')}")
+        self.setModal(True)
+        self.resize(720, 280)
+        x, y = gate_def.get('gate_marker_x'), gate_def.get('gate_marker_y')
+        params = gate_def.get('gate_param') or {}
+        algos = [a for a in ALGORITHMS_BY_GATE_TYPE['1dsep'] if a != ag_core.ALGORITHM_IMPORTED]
+        self._algorithms = algos
+        self._order = [x, y]
+        self._choices = {}
+        for ch, axis in ((x, 'x'), (y, 'y')):
+            algo = params.get(f'algorithm_{axis}') or default_algorithm
+            self._choices[ch] = {
+                'algorithm': algo if algo in algos else 'tail',
+                'view': y if ch == x else x,
+                'sep_axis': axis,
+            }
+
+        outer = QVBoxLayout(self)
+        intro = QLabel(
+            "The first step separates the parent population on its parameter; on each "
+            "side that holds a population of this gate, the second step separates on the "
+            "other parameter. Populations keep their names, so the gates below them stay "
+            "attached. The new gates use the algorithms chosen here and must be trained.")
+        intro.setWordWrap(True)
+        outer.addWidget(intro)
+        self.tbl = QTableWidget(2, len(self._COLUMNS))
+        self.tbl.setHorizontalHeaderLabels(self._COLUMNS)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        for col, width in enumerate((40, 190, 110, 190)):
+            self.tbl.setColumnWidth(col, width)
+        outer.addWidget(self.tbl)
+        row = QHBoxLayout()
+        self.btn_swap = QPushButton("Swap order")
+        self.btn_swap.setToolTip("Separate on the other parameter first.")
+        self.btn_swap.clicked.connect(self._swap)
+        row.addWidget(self.btn_swap)
+        row.addStretch()
+        outer.addLayout(row)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        outer.addWidget(buttons)
+        self._fill()
+
+    def _label(self, ch: str) -> str:
+        antigen = _channel_to_antigen(self.controller, ch)
+        return ch if antigen == ch else f"{ch} — {antigen}"
+
+    def _read(self):
+        for r, ch in enumerate(self._order):
+            algo = self.tbl.cellWidget(r, 2)
+            view = self.tbl.cellWidget(r, 3)
+            axis = self.tbl.cellWidget(r, 4)
+            if algo is None:
+                continue
+            self._choices[ch] = {'algorithm': algo.currentText(), 'view': view.currentData(),
+                                 'sep_axis': axis.currentData()}
+
+    def _swap(self):
+        self._read()
+        self._order.reverse()
+        self._fill()
+
+    def _fill(self):
+        for r, ch in enumerate(self._order):
+            choice = self._choices[ch]
+            other = self._order[1 - r]
+            self.tbl.setItem(r, 0, QTableWidgetItem(str(r + 1)))
+            self.tbl.setItem(r, 1, QTableWidgetItem(f"{self._label(ch)} (sep)"))
+            algo = QComboBox()
+            algo.addItems(self._algorithms)
+            algo.setCurrentText(choice['algorithm'])
+            view = QComboBox()
+            view.addItem(f"{self._label(other)} (view)", other)
+            view.addItem("Histogram", None)
+            view.setCurrentIndex(0 if choice['view'] else 1)
+            axis = QComboBox()
+            axis.addItem("X axis", 'x')
+            axis.addItem("Y axis", 'y')
+            axis.setCurrentIndex(1 if choice['sep_axis'] == 'y' else 0)
+            view.currentIndexChanged.connect(
+                lambda _i, v=view, a=axis: a.setEnabled(v.currentData() is not None))
+            axis.setEnabled(view.currentData() is not None)
+            self.tbl.setCellWidget(r, 2, algo)
+            self.tbl.setCellWidget(r, 3, view)
+            self.tbl.setCellWidget(r, 4, axis)
+
+    def steps(self) -> list[dict]:
+        """[{channel, algorithm, view, sep_axis}] in gating order."""
+        self._read()
+        out = []
+        for ch in self._order:
+            c = self._choices[ch]
+            out.append({'channel': ch, 'algorithm': c['algorithm'], 'view': c['view'],
+                        'sep_axis': c['sep_axis'] if c['view'] else 'x'})
+        return out
+
 
 # ---------------------------------------------------------------------------
 # Hierarchy tab
@@ -1228,29 +1411,22 @@ class FlowJoImportPanel(QWidget):
         self.btn_drop_unmatched = QPushButton("Drop all unmatched")
         self.btn_drop_unmatched.setToolTip(
             "Drop every unmatched parameter, and with it the populations that use it.")
-        self.chk_merge = QCheckBox("Merge sibling gates that share thresholds")
+        self.chk_merge = QCheckBox("Combine sibling gates drawn on the same parameters")
         self.chk_merge.setChecked(True)
         self.chk_merge.setToolTip(
-            "Sibling rectangles on the same axes whose kept thresholds agree "
-            "(FlowJo quadrants, split gates) become one gate with one "
-            "population each.")
-        self.spin_tol = QDoubleSpinBox()
-        self.spin_tol.setDecimals(3)
-        self.spin_tol.setRange(0.0, 1.0)
-        self.spin_tol.setSingleStep(0.005)
-        self.spin_tol.setValue(0.01)
-        self.spin_tol.setToolTip("Largest difference, in display units, between merged thresholds.")
+            "Sibling gates drawn on the same pair of parameters (CD4 and CD8, "
+            "quadrants) become one gate with one population each, trained "
+            "as one 2dsep gate. Each gate keeps its shape as drawn until it "
+            "is converted to trainable.")
         opts.addWidget(self.btn_drop_unmatched)
         opts.addWidget(self.chk_merge)
-        opts.addWidget(QLabel("Tolerance:"))
-        opts.addWidget(self.spin_tol)
         opts.addStretch()
         body.addLayout(opts)
 
         self.txt_notes = QTextEdit()
         self.txt_notes.setReadOnly(True)
         self.txt_notes.setMaximumHeight(110)
-        self.txt_notes.setPlaceholderText("Populations that cannot be imported and gate conversions are listed here.")
+        self.txt_notes.setPlaceholderText("Populations that cannot be imported and what each gate converts to are listed here.")
         body.addWidget(self.txt_notes)
 
         buttons = QHBoxLayout()
@@ -1266,7 +1442,6 @@ class FlowJoImportPanel(QWidget):
 
         self.combo_source.currentIndexChanged.connect(self._load_source)
         self.chk_merge.toggled.connect(self._refresh)
-        self.spin_tol.valueChanged.connect(self._refresh)
         self.btn_drop_unmatched.clicked.connect(self._drop_unmatched)
         self.btn_add.clicked.connect(lambda: self._import(replace=False))
         self.btn_replace.clicked.connect(lambda: self._import(replace=True))
@@ -1404,7 +1579,6 @@ class FlowJoImportPanel(QWidget):
         return ag_flowjo.build_gate_definitions(
             source, self.mapping(), self.exp,
             merge_siblings=self.chk_merge.isChecked(),
-            merge_tolerance=float(self.spin_tol.value()),
             existing_names=set() if replace else set(self._existing_names()),
             workspace_name=self._name)
 
@@ -1485,11 +1659,13 @@ class HierarchyTab(QWidget):
 
     _COLUMN_LABELS = [
         "#", "Gate name", "Type", "X axis", "Y axis",
-        "Parent gate", "Parent population", "Algorithm", "Status", "Imported boundary",
+        "Parent gate", "Parent population", "Algorithm", "Status", "Conversion",
     ]
 
     # Emitted after gates are imported, so the plugin can open the Review tab.
     gatesImported = Signal()
+    # Emitted after a 2dsep gate was split into 1dsep gates.
+    gatesSplit = Signal()
     # Emitted when an axis drag changed a channel's transform: (channel, parameters before).
     transformChanged = Signal(str, object)
 
@@ -1535,6 +1711,26 @@ class HierarchyTab(QWidget):
         gates_page = QWidget()
         page_layout = QVBoxLayout(gates_page)
         page_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Default plot axis of the separation parameter of 1dsep gates.
+        axis_row = QHBoxLayout()
+        axis_label = QLabel("1dsep separation axis:")
+        self.rb_sep_x = QRadioButton("X axis")
+        self.rb_sep_y = QRadioButton("Y axis")
+        self._sep_group = QButtonGroup(self)
+        self._sep_group.addButton(self.rb_sep_x)
+        self._sep_group.addButton(self.rb_sep_y)
+        (self.rb_sep_y if self.state.default_sep_axis == 'y' else self.rb_sep_x).setChecked(True)
+        tip = ("Plot axis that carries the separation parameter of 1dsep gates you "
+               "add or split; the other axis is the view parameter (or a "
+               "histogram). Imported gates take it from the shape as drawn, and "
+               "each gate can be changed in its Edit dialog.")
+        for w in (axis_label, self.rb_sep_x, self.rb_sep_y):
+            w.setToolTip(tip)
+            axis_row.addWidget(w)
+        axis_row.addStretch()
+        page_layout.addLayout(axis_row)
+        self.rb_sep_y.toggled.connect(self._on_default_sep_axis_toggled)
 
         # Control bar.
         ctrl_row = QHBoxLayout()
@@ -1634,11 +1830,13 @@ class HierarchyTab(QWidget):
             lambda text: self.toolbox.setItemText(self._page_flowjo, text))
         self.flowjo_panel.closeRequested.connect(
             lambda: self.toolbox.setCurrentIndex(self._page_gates))
+        self.toolbox.currentChanged.connect(self._on_page_changed)
 
         splitter.addWidget(left)
 
         # ----- Right side: preview plot -----
         right = QWidget()
+        self._preview_panel = right
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(4, 4, 4, 4)
 
@@ -1711,6 +1909,24 @@ class HierarchyTab(QWidget):
         """Redraw the preview for the selected gate."""
         self._update_preview()
 
+    def _on_page_changed(self, index: int):
+        """The gate preview follows the gate list, so it is hidden while
+        the FlowJo import page is open."""
+        self._preview_panel.setVisible(index != self._page_flowjo)
+
+    def _on_default_sep_axis_toggled(self, _checked: bool = False):
+        self.state.default_sep_axis = 'y' if self.rb_sep_y.isChecked() else 'x'
+
+    def sync_default_sep_axis(self):
+        """Show the state's default separation axis (after loading state)."""
+        self.rb_sep_x.blockSignals(True)
+        self.rb_sep_y.blockSignals(True)
+        try:
+            (self.rb_sep_y if self.state.default_sep_axis == 'y' else self.rb_sep_x).setChecked(True)
+        finally:
+            self.rb_sep_x.blockSignals(False)
+            self.rb_sep_y.blockSignals(False)
+
     def refresh(self):
         """Re-evaluate channel alignment and repopulate the tree.
 
@@ -1734,14 +1950,9 @@ class HierarchyTab(QWidget):
             for g in self._sorted_gate_defs():
                 item = self._build_tree_item(g, experiment_channels)
                 self.tree.addTopLevelItem(item)
-                if g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
-                    button = QPushButton("Convert to trainable")
-                    button.setToolTip(
-                        "Use a learning algorithm for this gate instead of the "
-                        "boundary it was imported with.")
-                    button.clicked.connect(
-                        lambda _checked=False, name=g.get('gate_name', ''): self._convert_gate(name))
-                    self.tree.setItemWidget(item, self.COL_CONVERT, button)
+                actions = self._conversion_buttons(g)
+                if actions is not None:
+                    self.tree.setItemWidget(item, self.COL_CONVERT, actions)
         finally:
             self._suppress_item_changed = False
 
@@ -1761,6 +1972,34 @@ class HierarchyTab(QWidget):
 
         self._update_preview()
 
+    def _conversion_buttons(self, g: dict):
+        """'Convert to trainable' for a gate using its imported shapes and
+        'Split…' for a 2dsep gate, or None when neither applies."""
+        name = g.get('gate_name', '')
+        buttons = []
+        if g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+            target, _note = ag_review.convert_target(g, self.state.algorithm_recommendations.get(name))
+            button = QPushButton("Convert to trainable")
+            button.setToolTip(
+                f"Train this gate with '{target}' instead of applying the shapes "
+                "it was imported with. Compare the two on the Review tab first.")
+            button.clicked.connect(lambda _checked=False, n=name: self._convert_gate(n))
+            buttons.append(button)
+        if g.get('gate_type') == '2dsep':
+            button = QPushButton("Split…")
+            button.setToolTip("Replace this 2dsep gate with sequential 1dsep gates.")
+            button.clicked.connect(lambda _checked=False, n=name: self._split_2dsep_gate(n))
+            buttons.append(button)
+        if not buttons:
+            return None
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+        for button in buttons:
+            row.addWidget(button)
+        return holder
+
     def _sorted_gate_defs(self) -> list[dict]:
         """Return `gate_definitions` sorted by `gate_number`, then by name."""
         return sorted(
@@ -1773,15 +2012,21 @@ class HierarchyTab(QWidget):
         gate_name_for_item = g.get('gate_name', '')
         rec = self.state.algorithm_recommendations.get(gate_name_for_item, '')
         algo_display = g.get('algorithm', '') or ''
+        if algo_display == ag_core.ALGORITHM_IMPORTED:
+            target, _note = ag_review.convert_target(g, rec)
+            if target:
+                algo_display = f"imported → {target}"
+                rec = ''
         if rec and rec != algo_display:
             algo_display = f"{algo_display} [rec: {rec}]" if algo_display else f"[rec: {rec}]"
 
+        x_text, y_text = _axis_cells(g)
         item = QTreeWidgetItem([
             str(g.get('gate_number', '')),
             str(gate_name_for_item),
             str(g.get('gate_type', '')),
-            str(g.get('gate_marker_x', '') or ''),
-            str(g.get('gate_marker_y') or ''),
+            x_text,
+            y_text,
             str(g.get('parent_gate') or 'root'),
             str(g.get('parent_popul', '') or ''),
             algo_display,
@@ -1913,8 +2158,8 @@ class HierarchyTab(QWidget):
 
     def _cell_value_for(self, g: dict, column: int) -> str:
         if column == self.COL_TYPE:        return str(g.get('gate_type', ''))
-        if column == self.COL_X:           return str(g.get('gate_marker_x', '') or '')
-        if column == self.COL_Y:           return str(g.get('gate_marker_y') or '')
+        if column == self.COL_X:           return _axis_cells(g)[0]
+        if column == self.COL_Y:           return _axis_cells(g)[1]
         if column == self.COL_PARENT:      return str(g.get('parent_gate') or 'root')
         if column == self.COL_PARENT_POP:  return str(g.get('parent_popul', '') or '')
         if column == self.COL_ALGORITHM:   return str(g.get('algorithm', '') or '')
@@ -2279,6 +2524,7 @@ class HierarchyTab(QWidget):
             'gate_type':     'free',
             'gate_marker_x': '',
             'gate_marker_y': None,
+            'sep_axis':      self.state.default_sep_axis,
             'parent_gate':   None,
             'parent_popul':  'root',
             'populations':   _default_populations_for_type('free'),
@@ -2296,149 +2542,38 @@ class HierarchyTab(QWidget):
                 return
 
     def _split_2dsep_gate(self, gate_name: str):
-        """Replace a 2dsep gate with two chained 1dsep gates.
-
-        Creates:
-          • ``{name}_x`` — 1dsep on gate_marker_x, same parent/parent_popul
-            as the original gate.
-          • ``{name}_y`` — 1dsep on gate_marker_y, parent = ``{name}_x``,
-            parent_popul = 'pos_x'.
-
-        Child gates of the original are re-targeted by quadrant: children
-        of the X+Y+ / X+Y− quadrants move to ``{name}_y`` 'pos_y' / 'neg_y';
-        children of the X− quadrants move to ``{name}_x`` 'neg_x', which
-        contains both.  Per-axis Advanced parameters (algorithm_x/y,
-        tail_fraction_x/y, etc.) are promoted to the respective 1dsep
-        gate_param dicts.  The original gate and its trained boundary are
-        removed; the two new gates must be re-trained.
-        """
+        """Replace a 2dsep gate with sequential 1dsep gates chosen in
+        SplitGateDialog (see ag_review.split_2dsep). The gate's training,
+        and that of the gates below it, no longer applies."""
         g = self.state.gate_by_name(gate_name)
         if g is None or g.get('gate_type') != '2dsep':
             return
-
-        name_x = f"{gate_name}_x"
-        name_y = f"{gate_name}_y"
-
-        # Collision check.
-        existing = {d.get('gate_name') for d in self.state.gate_definitions}
-        collisions = [n for n in (name_x, name_y) if n in existing]
-        if collisions:
-            QMessageBox.warning(
-                self, "Split gate",
-                "Cannot split: gate name(s) already exist: "
-                + ', '.join(f"'{c}'" for c in collisions)
-                + "\n\nRename them first or rename the 2dsep gate."
-            )
+        if g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+            default_algo, _note = ag_review.convert_target(
+                g, self.state.algorithm_recommendations.get(gate_name))
+        else:
+            default_algo = g.get('algorithm') or 'tail'
+        dlg = SplitGateDialog(g, self.controller, default_algo or 'tail', parent=self)
+        if dlg.exec() != QDialog.Accepted:
             return
-
-        ans = QMessageBox.question(
-            self, "Split into 1D gates",
-            f"Split '{gate_name}' into two sequential 1dsep gates?\n\n"
-            f"  • {name_x}  — 1dsep on {g.get('gate_marker_x', '?')}\n"
-            f"  • {name_y}  — 1dsep on {g.get('gate_marker_y', '?')}, "
-            f"child of {name_x}\n\n"
-            "The original gate and its trained boundary will be removed.\n"
-            f"Child gates of the X+ quadrants move under {name_y}; children "
-            f"of the X− quadrants move under {name_x} (neg).",
-        )
-        if ans != QMessageBox.Yes:
+        stale = {gate_name} | self._descendant_names(gate_name)
+        try:
+            new_defs, new_names = ag_review.split_2dsep(
+                self.state.gate_definitions, gate_name, dlg.steps())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Split gate", str(exc))
             return
-
-        orig_param = deepcopy(g.get('gate_param') or {})
-        orig_num   = int(g.get('gate_number', 0))
-        default_algo = g.get('algorithm', 'tail')
-
-        def _param_for_axis(axis: str) -> tuple[str, dict]:
-            """Return (algorithm, gate_param) for one axis of the split."""
-            algo = orig_param.get(f'algorithm_{axis}') or default_algo
-            p = {}
-            p['quantile_trim'] = orig_param.get('quantile_trim', 0.001)
-            p['tail_fraction'] = float(orig_param.get(f'tail_fraction_{axis}',
-                                                       orig_param.get('tail_fraction', 0.01)))
-            p['mixture_components'] = int(orig_param.get(f'mixture_components_{axis}',
-                                                          orig_param.get('mixture_components', 2)))
-            lo = orig_param.get(f'axis_lo_{axis}', 0.0)
-            hi = orig_param.get(f'axis_hi_{axis}', 0.0)
-            if lo != 0.0:
-                p['axis_lo'] = float(lo)
-            if hi != 0.0:
-                p['axis_hi'] = float(hi)
-            return algo, p
-
-        algo_x, param_x = _param_for_axis('x')
-        algo_y, param_y = _param_for_axis('y')
-
-        gate_x = {
-            'gate_number':   orig_num,
-            'gate_name':     name_x,
-            'gate_type':     '1dsep',
-            'gate_marker_x': g.get('gate_marker_x', ''),
-            'gate_marker_y': None,
-            'parent_gate':   g.get('parent_gate'),
-            'parent_popul':  g.get('parent_popul', 'root'),
-            'populations':   {
-                'neg_x': {'label': 'neg', 'label_pos': 1, 'region': 'below'},
-                'pos_x': {'label': 'pos', 'label_pos': 2, 'region': 'above'},
-            },
-            'algorithm':     algo_x,
-            'gate_param':    param_x,
-            'stats_parent':  {},
-            'origin_gate':   None,
-        }
-        gate_y = {
-            'gate_number':   orig_num + 1,
-            'gate_name':     name_y,
-            'gate_type':     '1dsep',
-            'gate_marker_x': g.get('gate_marker_y') or '',
-            'gate_marker_y': None,
-            'parent_gate':   name_x,
-            'parent_popul':  'pos_x',
-            'populations':   {
-                'neg_y': {'label': 'neg', 'label_pos': 1, 'region': 'below'},
-                'pos_y': {'label': 'pos', 'label_pos': 2, 'region': 'above'},
-            },
-            'algorithm':     algo_y,
-            'gate_param':    param_y,
-            'stats_parent':  {},
-            'origin_gate':   None,
-        }
-
-        # Bump gate numbers for everything that followed the original.
-        for other in self.state.gate_definitions:
-            if int(other.get('gate_number', 0)) > orig_num:
-                other['gate_number'] = int(other['gate_number']) + 1
-
-        # Re-parent children by the quadrant they were in: x+ quadrants map
-        # to the y gate (under pos_x); x- quadrants map to neg_x.
-        regions = ag_core.population_regions(g, self.state.trained_boundaries.get(gate_name))
-        for other in self.state.gate_definitions:
-            if other.get('parent_gate') != gate_name:
-                continue
-            region = regions.get(other.get('parent_popul'), 'x+y+')
-            if region.startswith('x+'):
-                other['parent_gate'] = name_y
-                other['parent_popul'] = 'pos_y' if region.endswith('y+') else 'neg_y'
-            else:
-                other['parent_gate'] = name_x
-                other['parent_popul'] = 'neg_x'
-
-        # Splice: remove original, insert gate_x then gate_y at same position.
-        idx = self.state.gate_definitions.index(g)
-        self.state.gate_definitions.pop(idx)
-        self.state.gate_definitions.insert(idx, gate_y)
-        self.state.gate_definitions.insert(idx, gate_x)
-
-        # Clean up orphaned state.
-        self.state.trained_boundaries.pop(gate_name, None)
+        self.state.gate_definitions = new_defs
+        for name in stale:
+            self.state.trained_boundaries.pop(name, None)
         self.state.algorithm_recommendations.pop(gate_name, None)
-
         self._repopulate_tree()
-        self._select_gate_by_name(name_x)
+        self._select_gate_by_name(new_names[0])
+        self.gatesSplit.emit()
         self.bus.statusMessage.emit(
             f"[Gating Model Builder] Replaced '{gate_name}' with "
-            f"'{name_x}' + '{name_y}'."
-        )
-        
+            + ", ".join(f"'{n}'" for n in new_names) + ". Train to calculate them.")
+
     # ------------------------------------------------------------------
     # Importing the live GatingStrategy
     # ------------------------------------------------------------------
@@ -2624,8 +2759,7 @@ class HierarchyTab(QWidget):
             )
             return
 
-        ch_x = g.get('gate_marker_x', '')
-        ch_y = g.get('gate_marker_y') or ''
+        ch_x, ch_y = _preview_axes(g)
         self._preview_channels = (ch_x, ch_y)
 
         # Display labels via build_display_label_map
@@ -2793,7 +2927,8 @@ class HierarchyTab(QWidget):
 
     def _model_parent_mask(self, gate_def: dict, data: np.ndarray):
         """Parent membership from the model's own boundaries: trained ones,
-        else those imported with the gate."""
+        else the shapes imported with a gate that still applies them; other
+        untrained gates are calculated on the displayed events."""
         chain = []
         name, seen = gate_def.get('parent_gate'), set()
         while name and name not in seen:
@@ -2804,17 +2939,23 @@ class HierarchyTab(QWidget):
             chain.append(ancestor)
             name = ancestor.get('parent_gate')
         chain.reverse()
-        reference = {}
+        reference, modes = {}, {}
         for ancestor in chain:
-            boundary = (self.state.trained_boundaries.get(ancestor['gate_name'])
-                        or ancestor.get('template'))
+            name = ancestor['gate_name']
+            boundary = self.state.trained_boundaries.get(name)
+            if not boundary and ancestor.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+                boundary = ancestor.get('template')
             if boundary:
-                reference[ancestor['gate_name']] = boundary
+                reference[name] = boundary
+            else:
+                modes[name] = ag_core.MODE_RECALCULATE
         pnn = _experiment_channels(self.controller)
-        transformed = ag_core.transform_columns(data, pnn, self.controller.unmixed_transformations or {})
+        transforms = self.controller.unmixed_transformations or {}
+        transformed = ag_core.transform_columns(data, pnn, transforms)
         result = ag_core.run_gating(
             chain, transformed, {ch: i for i, ch in enumerate(pnn)},
-            reference=reference, default_mode=ag_core.MODE_FIXED,
+            reference=reference, modes=modes, default_mode=ag_core.MODE_FIXED,
+            axis_limits=_axis_limits(transforms),
         )
         return result.population_mask(gate_def['parent_gate'], gate_def.get('parent_popul'))
 
@@ -2824,9 +2965,14 @@ class HierarchyTab(QWidget):
         Returns True if anything was drawn.
         """
         gate_name = gate_def.get('gate_name', '')
-        entry = self.state.trained_boundaries.get(gate_name) or gate_def.get('template')
+        trained = self.state.trained_boundaries.get(gate_name)
+        if trained and gate_def.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
+            entry = trained
+        else:
+            entry = gate_def.get('template') or trained
         if not entry:
             return False
+        entry = ag_core.display_entries(gate_def, entry)
         drew = False
         for pop_name, pop_data in entry.items():
             boundary = pop_data.get('boundary')
@@ -2894,6 +3040,8 @@ class GateDetailWidget(QDialog):
         self._parent_mask = parent_mask
 
         gate_name = gate_def.get('gate_name', '')
+        # Shapes as drawn are shown, not adjusted here.
+        self._shapes = ag_core.is_shape_boundary(state.trained_boundaries.get(gate_name))
         self.setWindowTitle(f"Gate detail — {gate_name}")
         self.setModal(False)
         self.resize(640, 540)
@@ -2962,7 +3110,7 @@ class GateDetailWidget(QDialog):
 
     def _build_controls(self):
         gt = self.gate_def.get('gate_type', '')
-        if gt == '1dsep':
+        if gt == '1dsep' and not self._shapes:
             entry = self._current_boundary_entry()
             tx = (entry.get('threshold_x') if entry else None) or 0.0
             lbl = QLabel("Threshold:")
@@ -2997,8 +3145,8 @@ class GateDetailWidget(QDialog):
 
         gate_name = self.gate_def.get('gate_name', '')
         gt = self.gate_def.get('gate_type', '')
-        ch_x = self.gate_def.get('gate_marker_x', '')
-        ch_y = self.gate_def.get('gate_marker_y') or ''
+        ch_x, ch_y = _boundary_axes(self.gate_def, self.state.trained_boundaries.get(gate_name))
+        sep_y = ag_core.separation_axis(self.gate_def) == 'y'
 
         transforms = getattr(self, '_transforms', {})
         # Try to get live transforms from parent TrainTab
@@ -3053,11 +3201,11 @@ class GateDetailWidget(QDialog):
 
         # Overlay boundary
         tb = self.state.trained_boundaries.get(gate_name, {})
-        if gt == '1dsep':
+        if gt == '1dsep' and not self._shapes:
             entry = self._current_boundary_entry()
             tx = (entry.get('threshold_x') if entry else None) or 0.0
             self._x_line = pg.InfiniteLine(
-                pos=float(tx), angle=90, movable=True,
+                pos=float(tx), angle=0 if sep_y else 90, movable=True,
                 pen=pg.mkPen(color=(30, 160, 50), width=2)
             )
             self._x_line.sigPositionChanged.connect(
@@ -3065,7 +3213,7 @@ class GateDetailWidget(QDialog):
                 if hasattr(self, '_sb_threshold') else None
             )
             self._vb.addItem(self._x_line)
-        elif gt == '2dsep':
+        elif gt == '2dsep' and not self._shapes:
             entry = self._current_boundary_entry()
             tx = (entry.get('threshold_x') if entry else None) or 0.0
             ty = (entry.get('threshold_y') if entry else None) or 0.0
@@ -3113,7 +3261,9 @@ class GateDetailWidget(QDialog):
         calc = ag_core.GateCalculator(_axis_limits(transforms))
 
         new_entries = None
-        if gt == '1dsep' and hasattr(self, '_sb_threshold') and tb:
+        if self._shapes:
+            pass
+        elif gt == '1dsep' and hasattr(self, '_sb_threshold') and tb:
             new_entries = calc.threshold_boundaries(self.gate_def, float(self._sb_threshold.value()), None)
         elif gt == '2dsep' and self._x_line and self._y_line and tb:
             new_entries = calc.threshold_boundaries(self.gate_def, float(self._x_line.value()),
@@ -3379,9 +3529,9 @@ class TrainTab(QWidget):
         eff = ag_core.effective_gate_def(
             gate_def, ag_core.gates_by_name(self.state.gate_definitions))
         gt = eff.get('gate_type', '')
-        ch_x = eff.get('gate_marker_x', '')
-        ch_y = eff.get('gate_marker_y') or ''
         tb = self.state.trained_boundaries.get(gate_name, {})
+        shapes = ag_core.is_shape_boundary(tb)
+        ch_x, ch_y = _boundary_axes(eff, tb)
 
         pnn = list(
             self.controller.experiment.settings.get('unmixed', {})
@@ -3504,28 +3654,34 @@ class TrainTab(QWidget):
 
         # --- Gate boundary overlay (green) + percentage labels ---
         if tb:
-            if gt == '1dsep':
+            if gt == '1dsep' and not shapes:
+                sep_y = ag_core.separation_axis(eff) == 'y'
                 entry = next(iter(tb.values()))
                 tx = entry.get('threshold_x') or 0.0
                 line = pg.InfiniteLine(
-                    pos=float(tx), angle=90,
+                    pos=float(tx), angle=0 if sep_y else 90,
                     pen=pg.mkPen(color=(30, 160, 50), width=1.5)
                 )
                 vb.addItem(line)
+                view_tr = tr_x if sep_y else tr_y
                 for pop_name, pop_data in tb.items():
                     frac = pop_data.get('fraction')
                     if frac is not None:
                         bd = pop_data.get('boundary', [])
-                        xs_bd = [p[0] for p in bd]
-                        cx = float(np.mean(xs_bd)) if xs_bd else float(tx)
-                        tr_lim = tr_x.limits if tr_x else [0, 1]
-                        cy = (tr_lim[0] + tr_lim[1]) * 0.5
+                        along = [p[0] for p in bd]
+                        at = float(np.mean(along)) if along else float(tx)
+                        lim = view_tr.limits if view_tr is not None else (
+                            tr_x.limits if tr_x is not None else [0, 1])
+                        across = (lim[0] + lim[1]) * 0.5
                         pop_label = pop_data.get('label', pop_name)
                         pct_txt = pg.TextItem(
                             f"{pop_label}\n{frac * 100:.1f}%",
                             color=(30, 160, 50), anchor=(0.5, 0.5),
                         )
-                        pct_txt.setPos(cx, cy)
+                        if sep_y:
+                            pct_txt.setPos(across, at)
+                        else:
+                            pct_txt.setPos(at, across)
                         vb.addItem(pct_txt)
             else:
                 for pop_name, pop_data in tb.items():
@@ -3722,11 +3878,12 @@ class _ReviewPlot(QWidget):
     # (channel, transform parameters before the drag, or None when only the range moved)
     axisZoomed = Signal(str, object)
 
-    def __init__(self, channels, gates, controller, tile_size, parent=None):
+    def __init__(self, channels, gates, controller, tile_size, parent=None, caption: str = ''):
         super().__init__(parent)
         self.channels = tuple(channels)
         self.gates = list(gates)
         self.controller = controller
+        self.caption = caption
         self._overlay: list = []
         self._lines: dict = {}
         self._rois: dict = {}
@@ -3852,7 +4009,8 @@ class _ReviewPlot(QWidget):
         self.clear_overlays()
         names = ", ".join(g['gate_name'] for g in self.gates)
         axes = f"{self._labels[0]} vs {self._labels[1]}" if len(self._labels) > 1 else self._labels[0]
-        self.lbl_title.setText(f"<b>{axes}</b><br><small>{names}</small>")
+        head = f"{self.caption} — {axes}" if self.caption else axes
+        self.lbl_title.setText(f"<b>{head}</b><br><small>{names}</small>")
         for k, gate in enumerate(self.gates):
             colour = _REVIEW_COLOURS[k % len(_REVIEW_COLOURS)]
             entries = boundaries.get(gate['gate_name']) or {}
@@ -3860,7 +4018,8 @@ class _ReviewPlot(QWidget):
                 continue
             movable = gate['gate_name'] in editable
             gtype = gate.get('gate_type')
-            if gtype in ag_core.THRESHOLD_TYPES:
+            if gtype in ag_core.THRESHOLD_TYPES and not ag_core.is_shape_boundary(entries):
+                entries = ag_core.display_entries(gate, entries)
                 self._draw_thresholds(gate, entries, colour, movable)
             else:
                 for pop, entry in entries.items():
@@ -3917,6 +4076,8 @@ class _ReviewPlot(QWidget):
             lines = self._lines.get(gate['gate_name']) or {}
             tx = lines['x'].value() if 'x' in lines else None
             ty = lines['y'].value() if 'y' in lines else None
+            if ag_core.separation_axis(gate) == 'y':
+                tx, ty = ty, None
             limits = {c: tuple(self._transforms[c].limits) for c in self.channels
                       if c in self._transforms}
             self.gateEdited.emit(gate['gate_name'], ag_review.with_thresholds(gate, tx, ty, limits))
@@ -3962,24 +4123,31 @@ class _ReviewPlot(QWidget):
 
 
 class ReviewTab(QWidget):
-    """Review (and adjust) imported gates against a sample.
+    """Review imported gates against a sample and convert them to trainable.
 
-    Pick a population from the imported gating strategy; the tab shows the
-    parent population's events with the gates drawn on them, one plot for
-    each distinct set of parameters among the population's daughter gates.
-    Each population is labelled with its fraction of parent as Honeychrome
-    applies the gate, and next to the fraction recorded at import when the
-    review sample is the sample the counts came from; a difference is shown
-    in red. With Edit gates on, threshold lines and polygon corners can be
-    moved; edits change the gate's imported boundary, and Reset restores the
-    boundary as imported. Gates trained from a changed boundary must be
-    trained again.
+    Pick a population from the gating hierarchy; for each distinct plot
+    among the population's daughter gates the tab shows one row: on the
+    left the gates as drawn (the imported shapes), on the right each gate's
+    trainable form, calculated on this sample's parent population with the
+    algorithm chosen above it (or the trained boundary once the gate is
+    trained). Each population is labelled with its fraction of parent, next
+    to the fraction recorded at import when the review sample is the sample
+    the counts came from; a difference is shown in red. The algorithm combo
+    sets the algorithm a gate converts to, Convert to trainable switches the
+    gate to it, and Split… replaces a 2dsep gate with sequential 1dsep
+    gates. With Edit gates on, the shapes as drawn can be moved; Reset
+    restores them as imported.
     """
 
     templatesChanged = Signal()
+    # A gate's algorithm or conversion changed: the hierarchy must be redrawn.
+    gatesChanged = Signal()
+    # Split of a 2dsep gate requested: (gate name).
+    splitRequested = Signal(str)
     # Emitted when an axis drag changed a channel's transform: (channel, parameters before).
     transformChanged = Signal(str, object)
     _MAX_EVENTS = 150_000
+    _PROPOSAL_EVENTS = 50_000
 
     def __init__(self, state: GatingModelState, bus, controller, parent=None):
         super().__init__(parent)
@@ -3999,6 +4167,8 @@ class ReviewTab(QWidget):
         self._data_signature = None
         self._tree_views: dict = {}
         self._tree_labels: dict = {}
+        self._proposals: dict = {}
+        self._trainable: list = []
         self._build_ui()
 
     def _build_ui(self):
@@ -4010,8 +4180,10 @@ class ReviewTab(QWidget):
         self.combo_sample = QComboBox()
         self.combo_sample.setMinimumWidth(220)
         self.chk_edit = QCheckBox("Edit gates")
+        self.chk_edit.setToolTip("Move the shapes as drawn (left-hand plots) of gates "
+                                 "that still apply them.")
         self.btn_reset = QPushButton("Reset to import")
-        self.btn_reset.setToolTip("Restore the gates shown to their boundaries as imported.")
+        self.btn_reset.setToolTip("Restore the shapes shown to their shapes as imported.")
         row.addWidget(QLabel("Population:"))
         row.addWidget(self.combo_pop)
         row.addWidget(QLabel("Review sample:"))
@@ -4231,12 +4403,26 @@ class ReviewTab(QWidget):
         self._data_signature = self._transform_signature()
 
     def _regate(self):
+        """Gate the review sample: trained gates and gates applying their
+        shapes as drawn use those boundaries; gates converted to a learning
+        algorithm but not yet trained are calculated on this sample."""
+        self._proposals = {}
+        if self._data_t is None:
+            return
         pnn = _experiment_channels(self.controller)
         reference = ag_review.reference_boundaries(self.state.gate_definitions,
                                                    self.state.trained_boundaries)
+        modes = {}
+        for g in self.state.gate_definitions:
+            name = g['gate_name']
+            if self.state.is_trained(name) or g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+                continue
+            reference.pop(name, None)
+            modes[name] = ag_core.MODE_RECALCULATE
         self._result = ag_core.run_gating(
             self.state.gate_definitions, self._data_t, {c: i for i, c in enumerate(pnn)},
-            reference=reference, default_mode=ag_core.MODE_FIXED)
+            reference=reference, modes=modes, default_mode=ag_core.MODE_FIXED,
+            axis_limits=_axis_limits(self.controller.unmixed_transformations or {}))
 
     # -- plots --------------------------------------------------------------
 
@@ -4245,6 +4431,7 @@ class ReviewTab(QWidget):
             plot.setParent(None)
             plot.deleteLater()
         self._plots = []
+        self._trainable = []
 
     def _selected(self):
         data = self.combo_pop.currentData()
@@ -4268,22 +4455,177 @@ class ReviewTab(QWidget):
             return
         self._mask = mask
         tile = hc_settings.cytometry_plot_width_target_retrieved
+        self._trainable = []
         for n, group in enumerate(groups):
-            plot = _ReviewPlot(group['channels'], group['gates'], self.controller, tile, self)
+            drawn = any(ag_review.has_drawn_shape(g) for g in group['gates'])
+            plot = _ReviewPlot(group['channels'], group['gates'], self.controller, tile, self,
+                               caption="As drawn" if drawn else "Current")
             plot.gateEdited.connect(self._on_gate_edited)
             plot.axisZoomed.connect(self._on_axis_zoomed)
             plot.set_events(self._raw, mask)
-            self._grid.addWidget(plot, n // 2, n % 2)
+            self._grid.addWidget(plot, n, 0, Qt.AlignTop)
             self._plots.append(plot)
+            column = QWidget()
+            col_layout = QVBoxLayout(column)
+            col_layout.setContentsMargins(0, 0, 0, 0)
+            for g in group['gates']:
+                col_layout.addWidget(self._trainable_panel(g, tile))
+            col_layout.addStretch()
+            self._grid.addWidget(column, n, 1, Qt.AlignTop)
+            self._plots.append(column)
         self._redraw_overlays()
         label = 'All events' if gate is None else f"{pop}"
         text = (f"{label}: {int(mask.sum()):,} of {len(self._raw):,} events on "
                 f"{_sample_label(self._loaded_key)}; {len(groups)} parameter set"
-                f"{'s' if len(groups) != 1 else ''}.")
+                f"{'s' if len(groups) != 1 else ''}. Left: gates as drawn; right: their "
+                "trainable form.")
         node = self.pop_tree.current_population()
         if node is not None and self._tree_views.get(node) not in (None, node):
             text = f"{self._tree_labels.get(node, node[1])} is gated on this plot. " + text
         self.lbl_status.setText(text)
+
+    def _trainable_algorithm(self, g: dict) -> str | None:
+        """The learning algorithm a gate uses, or converts to while imported."""
+        if g.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
+            return g.get('algorithm')
+        return ag_review.convert_target(
+            g, self.state.algorithm_recommendations.get(g['gate_name']))[0]
+
+    def _trainable_panel(self, g: dict, tile: int) -> QWidget:
+        """Controls and plot of one gate's trainable form."""
+        name = g['gate_name']
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(f"<b>{name}</b> → {g.get('gate_type', '')}"))
+        combo = QComboBox()
+        algos = ag_review.trainable_algorithms(g)
+        combo.addItems(algos)
+        current = self._trainable_algorithm(g)
+        if current in algos:
+            combo.setCurrentText(current)
+        combo.setToolTip("Algorithm that calculates this gate from the training samples. "
+                         "The plot below shows it calculated on the review sample.")
+        combo.currentTextChanged.connect(lambda algo, n=name: self._on_algorithm_chosen(n, algo))
+        row.addWidget(combo)
+        imported = g.get('algorithm') == ag_core.ALGORITHM_IMPORTED
+        if imported:
+            btn = QPushButton("Convert to trainable")
+            btn.setToolTip("Train this gate with the chosen algorithm instead of applying "
+                           "the shapes as drawn.")
+            btn.clicked.connect(lambda _c=False, n=name: self._convert(n))
+            row.addWidget(btn)
+        elif ag_review.has_drawn_shape(g):
+            btn = QPushButton("Use shapes as drawn")
+            btn.setToolTip("Apply the imported shapes again instead of training this gate.")
+            btn.clicked.connect(lambda _c=False, n=name: self._use_drawn(n))
+            row.addWidget(btn)
+        if g.get('gate_type') == '2dsep':
+            btn = QPushButton("Split…")
+            btn.setToolTip("Replace this gate with sequential 1dsep gates.")
+            btn.clicked.connect(lambda _c=False, n=name: self.splitRequested.emit(n))
+            row.addWidget(btn)
+        row.addStretch()
+        layout.addLayout(row)
+        chans = [c for c in ag_core.plot_channels(g) if c]
+        trained = (not imported) and self.state.is_trained(name)
+        caption = "Trained" if trained else "Calculated on this sample"
+        plot = _ReviewPlot(chans, [g], self.controller, tile, panel, caption=caption)
+        plot.axisZoomed.connect(self._on_axis_zoomed)
+        plot.set_events(self._raw, self._mask)
+        layout.addWidget(plot)
+        self._trainable.append((name, plot))
+        return panel
+
+    def _proposal(self, g: dict) -> dict:
+        """The gate's trainable boundary on the review sample's parent
+        population: the trained boundary once trained, else calculated with
+        its algorithm (cached until the events are gated again)."""
+        name = g['gate_name']
+        algo = self._trainable_algorithm(g)
+        if g.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
+            # Trained, or calculated on this sample when the events were gated.
+            boundary = deepcopy(self.state.trained_boundaries.get(name)
+                                or self._result.boundaries.get(name)) or None
+            key = (name, 'applied')
+        else:
+            key = (name, algo)
+            boundary = None
+        if key in self._proposals:
+            return self._proposals[key]
+        pnn = _experiment_channels(self.controller)
+        index = {c: i for i, c in enumerate(pnn)}
+        by_name = ag_core.gates_by_name(self.state.gate_definitions)
+        eff = ag_core.effective_gate_def(ag_review.trainable_definition(g, algo), by_name)
+        parent = self._data_t[self._mask] if self._mask is not None else self._data_t
+        if boundary is None:
+            sample = parent
+            if len(sample) > self._PROPOSAL_EVENTS:
+                rng = np.random.default_rng(TRAINING_SEED)
+                sample = sample[np.sort(rng.choice(len(sample), self._PROPOSAL_EVENTS, replace=False))]
+            calc = ag_core.GateCalculator(_axis_limits(self.controller.unmixed_transformations or {}))
+            try:
+                boundary = calc.calculate(sample, eff, index, trained=self._result.boundaries,
+                                          by_name=by_name)
+            except Exception as exc:
+                log.warning("review: %s could not be calculated with %s: %s", name, algo, exc)
+                boundary = {}
+        if boundary and len(parent):
+            masks = ag_core.population_masks(eff, boundary, parent, index)
+            for pop, m in masks.items():
+                if pop in boundary:
+                    boundary[pop]['fraction'] = float(m.mean())
+        self._proposals[key] = boundary
+        return boundary
+
+    def _on_algorithm_chosen(self, gate_name: str, algorithm: str):
+        g = self.state.gate_by_name(gate_name)
+        if g is None or not algorithm:
+            return
+        if g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+            g['proposed_algorithm'] = algorithm
+        else:
+            self._set_algorithm(g, algorithm)
+        # The combo that sent this is rebuilt, so wait until it has returned.
+        QTimer.singleShot(0, self._rebuild_plots)
+        self.gatesChanged.emit()
+        self.templatesChanged.emit()
+
+    def _set_algorithm(self, g: dict, algorithm: str):
+        """Change a gate's algorithm; its training and that of the gates
+        below it no longer applies."""
+        g['algorithm'] = algorithm
+        for name in {g['gate_name']} | self._descendants(g['gate_name']):
+            self.state.trained_boundaries.pop(name, None)
+
+    def _convert(self, gate_name: str):
+        g = self.state.gate_by_name(gate_name)
+        if g is None:
+            return
+        algorithm = self._trainable_algorithm(g)
+        if not algorithm:
+            return
+        self._set_algorithm(g, algorithm)
+        self.bus.statusMessage.emit(
+            f"[Gating Model Builder] '{gate_name}' now uses '{algorithm}'; train to calculate it.")
+        self._after_change()
+
+    def _use_drawn(self, gate_name: str):
+        g = self.state.gate_by_name(gate_name)
+        if g is None or not ag_review.has_drawn_shape(g):
+            return
+        if g.get('algorithm') in ag_review.trainable_algorithms(g):
+            g['proposed_algorithm'] = g['algorithm']
+        self._set_algorithm(g, ag_core.ALGORITHM_IMPORTED)
+        self._after_change()
+
+    def _after_change(self):
+        self._regate()
+        # The button that sent this is rebuilt, so wait until it has returned.
+        QTimer.singleShot(0, self._rebuild_plots)
+        self.gatesChanged.emit()
+        self.templatesChanged.emit()
 
     def _on_axis_zoomed(self, channel: str, before):
         """An axis of a review plot was dragged.
@@ -4297,8 +4639,8 @@ class ReviewTab(QWidget):
             self.transformChanged.emit(channel, before)
             self._retransform_channel(channel)
             self._regate()
-        for plot in self._plots:
-            if channel in plot.channels:
+        for plot in self._plots + [p for _n, p in self._trainable]:
+            if isinstance(plot, _ReviewPlot) and channel in plot.channels:
                 plot.set_events(self._raw, self._mask)
         self._redraw_overlays()
 
@@ -4324,20 +4666,49 @@ class ReviewTab(QWidget):
             out[(gate_def['gate_name'], pop)] = (text, alert)
         return out
 
+    def _drawn_boundary(self, g: dict) -> dict:
+        """A gate's boundary for the left-hand plot: its shapes as drawn, with
+        their fractions of the parent on this sample, else its boundary as
+        applied."""
+        name = g['gate_name']
+        applied = self._result.boundaries.get(name) or {}
+        template = g.get('template') or {}
+        if not ag_core.is_shape_boundary(template):
+            return applied or template
+        if ag_core.is_shape_boundary(applied):
+            return applied
+        out = deepcopy(template)
+        pnn = _experiment_channels(self.controller)
+        parent = self._data_t[self._mask] if self._mask is not None else self._data_t
+        if len(parent):
+            masks = ag_core.population_masks(g, out, parent, {c: i for i, c in enumerate(pnn)})
+            for pop, m in masks.items():
+                out[pop]['fraction'] = float(m.mean())
+        return out
+
     def _redraw_overlays(self):
         if self._result is None:
             return
         editing = self.chk_edit.isChecked()
+        by_plot = {id(plot): plot for _name, plot in self._trainable}
         for plot in self._plots:
+            if not isinstance(plot, _ReviewPlot) or id(plot) in by_plot:
+                continue
             boundaries, texts, editable = {}, {}, set()
             for g in plot.gates:
                 name = g['gate_name']
-                boundary = self._result.boundaries.get(name) or g.get('template') or {}
+                boundary = self._drawn_boundary(g)
                 boundaries[name] = boundary
                 texts.update(self._label_texts(g, boundary))
                 if editing and g.get('template') and g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
                     editable.add(name)
             plot.draw_overlays(boundaries, texts, editable)
+        for name, plot in self._trainable:
+            g = self.state.gate_by_name(name)
+            if g is None:
+                continue
+            boundary = self._proposal(g)
+            plot.draw_overlays({name: boundary}, self._label_texts(g, boundary), set())
 
     # -- editing ------------------------------------------------------------
 
@@ -4589,7 +4960,7 @@ def build_model_from_state(state: GatingModelState, controller) -> dict:
     by_name = ag_core.gates_by_name(state.gate_definitions)
     gated = []
     for g in state.gate_definitions:
-        for ch in ag_core.gate_channels(ag_core.effective_gate_def(g, by_name)):
+        for ch in ag_core.referenced_channels(ag_core.effective_gate_def(g, by_name)):
             if ch not in gated:
                 gated.append(ch)
     live = controller.unmixed_transformations or {}
@@ -4759,6 +5130,9 @@ class PluginWidget(QWidget):
         self.hierarchy_tab.gatesImported.connect(
             lambda: self.inner_tabs.setCurrentWidget(self.review_tab))
         self.review_tab.templatesChanged.connect(self._write_session)
+        self.review_tab.splitRequested.connect(self.hierarchy_tab._split_2dsep_gate)
+        self.hierarchy_tab.gatesSplit.connect(self._write_session)
+        self.hierarchy_tab.gatesSplit.connect(self._refresh_active_tab)
         self.hierarchy_tab.transformChanged.connect(self._on_axis_transformed)
         self.review_tab.transformChanged.connect(self._on_axis_transformed)
         self.train_tab.trained.connect(self._write_session)
@@ -4991,6 +5365,7 @@ class PluginWidget(QWidget):
         if self._loaded_experiment_key is None:
             return
         s = self._qsettings
+        s.setValue('default_sep_axis', self.state.default_sep_axis)
         s.beginGroup(self._loaded_experiment_key)
         try:
             s.setValue('training_samples_json', json.dumps(list(self.state.training_samples)))
@@ -5015,6 +5390,9 @@ class PluginWidget(QWidget):
         key = self._loaded_experiment_key or self._settings_key()
         gate_defs = None
         s = self._qsettings
+        if str(s.value('default_sep_axis', 'x')) in ('x', 'y'):
+            self.state.default_sep_axis = str(s.value('default_sep_axis', 'x'))
+        self.hierarchy_tab.sync_default_sep_axis()
         s.beginGroup(key)
         try:
             training = _settings_json(s.value('training_samples_json', ''), None)

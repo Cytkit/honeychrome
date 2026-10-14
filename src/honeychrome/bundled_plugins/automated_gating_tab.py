@@ -248,11 +248,12 @@ def _sample_label(key: str) -> str:
 
 
 def _gated_channels(gate_defs: list[dict]) -> list[str]:
-    """Channels used as an axis by any gate, in hierarchy order."""
+    """Channels used as an axis by any gate (including 1dsep view channels
+    and imported shapes), in hierarchy order."""
     by_name = ag_core.gates_by_name(gate_defs)
     out: list[str] = []
     for g in ag_core.ordered_gate_defs(gate_defs):
-        for ch in ag_core.gate_channels(ag_core.effective_gate_def(g, by_name)):
+        for ch in ag_core.referenced_channels(ag_core.effective_gate_def(g, by_name)):
             if ch and ch not in out:
                 out.append(ch)
     return out
@@ -795,8 +796,10 @@ def _make_gate_tile(gate_def: dict, boundary: dict, events: np.ndarray | None,
     from PySide6.QtCore import QRectF
 
     gt = gate_def.get('gate_type', '')
-    ch_x = gate_def.get('gate_marker_x') or ''
-    ch_y = gate_def.get('gate_marker_y') or ''
+    shapes = ag_core.is_shape_boundary(boundary)
+    sep_y = ag_core.separation_axis(gate_def) == 'y' and not shapes
+    ch_x, ch_y = ag_core.boundary_plot_channels(gate_def, boundary)
+    ch_x, ch_y = ch_x or '', ch_y or ''
     tr_x = transforms.get(ch_x)
     tr_y = transforms.get(ch_y) if ch_y else None
     tile_size = int(getattr(hc_settings, 'cytometry_plot_width_target_retrieved', 220) or 220)
@@ -879,7 +882,7 @@ def _make_gate_tile(gate_def: dict, boundary: dict, events: np.ndarray | None,
     anchor_y = {'top': 0.0, 'center': 0.5, 'bottom': 1.0}
     x_lim = tuple(tr_x.limits) if tr_x is not None else (0.0, 1.0)
     y_lim = tuple(tr_y.limits) if tr_y is not None else (0.0, 1.0)
-    if gt == '1dsep':
+    if gt == '1dsep' and not ch_y:
         counts = hist_curve.yData
         y_lim = (0.0, float(np.max(counts)) if counts is not None and len(counts) else 1.0)
     regions = ag_core.population_regions(gate_def, boundary)
@@ -889,11 +892,18 @@ def _make_gate_tile(gate_def: dict, boundary: dict, events: np.ndarray | None,
         label = (gate_def.get('populations') or {}).get(pop, {}).get('label', pop)
         frac = fractions.get(pop)
         text = f"{label}\n{frac * 100:.1f}%" if frac is not None else label
-        if gt == '1dsep':
+        if gt == '1dsep' and not shapes:
             tx = entry.get('threshold_x')
             if tx is None:
                 continue
-            vb.addItem(pg.InfiniteLine(pos=float(tx), angle=90, pen=pg.mkPen(color=colour, width=1.5)))
+            vb.addItem(pg.InfiniteLine(pos=float(tx), angle=0 if sep_y else 90,
+                                       pen=pg.mkPen(color=colour, width=1.5)))
+            if sep_y:
+                ly, lx, va_, ha_ = ag_report.label_position(gt, regions.get(pop), entry, y_lim, x_lim)
+                t = pg.TextItem(text, color=colour, fill=fill, anchor=(0.5, 0.5))
+                t.setPos(lx, ly)
+                vb.addItem(t)
+                continue
         else:
             coords = np.asarray(entry.get('boundary') or [], dtype=float)
             if coords.ndim != 2 or coords.shape[1] != 2 or not len(coords):
@@ -903,7 +913,8 @@ def _make_gate_tile(gate_def: dict, boundary: dict, events: np.ndarray | None,
                 xs_b.append(xs_b[0])
                 ys_b.append(ys_b[0])
             vb.addItem(pg.PlotDataItem(xs_b, ys_b, pen=pg.mkPen(color=colour, width=width)))
-        lx, ly, ha, va = ag_report.label_position(gt, regions.get(pop), entry, x_lim, y_lim)
+        lx, ly, ha, va = ag_report.label_position('free' if shapes else gt, regions.get(pop),
+                                                  entry, x_lim, y_lim)
         t = pg.TextItem(text, color=colour, fill=fill, anchor=(anchor_x[ha], anchor_y[va]))
         t.setPos(lx, ly)
         vb.addItem(t)
