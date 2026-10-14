@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import struct
 from copy import deepcopy
@@ -128,8 +129,12 @@ def sample_from_fcs(path, bus=None):
                         f'Attempting delimiter repair.')
         sample = _load_fcs_with_repaired_delimiter(path)
 
-    # Replace literal 'NA' keyword values (some FACSDiscover files write these).
-    meta = sample.get_metadata()
+    _blank_na_keywords(sample.get_metadata(), path)
+    return sample
+
+
+def _blank_na_keywords(meta, path):
+    """Replace literal 'NA' keyword values (some FACSDiscover files write these)."""
     if meta:
         na_keys = [k for k, v in meta.items() if str(v).strip().upper() == 'NA']
         for k in na_keys:
@@ -137,7 +142,154 @@ def sample_from_fcs(path, bus=None):
         if na_keys:
             logger.debug('sample_from_fcs: NA keywords zeroed in %s: %s', path, na_keys)
 
-    return sample
+
+# Events per block when reading, unmixing and writing large files.
+FCS_CHUNK_EVENTS = 2_000_000
+
+
+class FcsEventReader:
+    """
+    Raw events of one FCS file in a fixed channel order, read a block of
+    events at a time so a large file is never held in memory whole.
+
+    List-mode 32-bit float files (``$DATATYPE`` F, as spectral cytometers
+    write) are memory-mapped and pre-processed exactly as FlowKit's 'raw'
+    events are (via FlowIO): Time scaled by ``$TIMESTEP``, then PnE log
+    decades, then PnG gain (never on Time). Any other file, or one that FlowIO
+    reads only with offset corrections, is loaded whole through
+    sample_from_fcs() and served from memory in the same blocks.
+
+    Blocks are float64, with NaN replaced by 0; channels absent from the file
+    are 0.
+
+    path     : FCS file path.
+    channels : PnN names, in output column order.
+
+    Attributes: ``n_events``, ``keywords`` (TEXT keywords as
+    sample.get_metadata() returns them) and ``streamed`` (False when the file
+    was loaded whole).
+    """
+
+    def __init__(self, path, channels, bus=None):
+        self.path = Path(path)
+        self.channels = list(channels)
+        self.n_events = 0
+        self.keywords = {}
+        self._events = None       # memmap (n_events, n_par) or the loaded raw events
+        self._columns = None      # file column of each output channel, -1 if absent
+        self._scaling = []        # (output column, timestep, decades, pnr, log0, gain)
+        self.streamed = self._open_memmap()
+        if not self.streamed:
+            self._load_whole(bus)
+
+    def _open_memmap(self) -> bool:
+        import flowio
+        try:
+            fd = flowio.FlowData(str(self.path), only_text=True)
+            text = fd.text
+            n_par = int(text['par'])
+            n_tot = int(text['tot'])
+            byte_order = {'1,2,3,4': '<', '4,3,2,1': '>'}.get(text.get('byteord', ''))
+            if (text.get('mode', '').lower() != 'l' or text.get('datatype', '').lower() != 'f'
+                    or byte_order is None
+                    or any(int(text.get(f'p{i}b', 0)) != 32 for i in range(1, n_par + 1))):
+                return False
+            if fd.version == '2.0':
+                data_start, data_stop = int(fd.header['data_start']), int(fd.header['data_stop'])
+            else:
+                data_start, data_stop = int(text['begindata']), int(text['enddata'])
+            if data_start <= 0 or data_stop - data_start + 1 != n_tot * n_par * 4:
+                return False
+
+            time_step = None
+            if 'timestep' in text and fd.time_index is not None:
+                try:
+                    time_step = float(text['timestep'])
+                except ValueError:
+                    if text['timestep'].strip() != '':
+                        return False
+                    time_step = 1.0
+        except Exception as exc:
+            logger.debug(f'FcsEventReader: {self.path} will be loaded whole ({exc})')
+            return False
+
+        file_column = {label: i for i, label in enumerate(fd.pnn_labels)}
+        self._columns = np.array([file_column.get(ch, -1) for ch in self.channels], dtype=np.int64)
+        for j, c in enumerate(self._columns):
+            if c < 0:
+                continue
+            meta = fd.channels[int(c) + 1]
+            decades, log0 = meta['pne']
+            self._scaling.append((j, time_step if c == fd.time_index else None,
+                                  decades, meta['pnr'], log0, meta['png']))
+        self._events = np.memmap(str(self.path), dtype=np.dtype(f'{byte_order}f4'), mode='r',
+                                 offset=data_start, shape=(n_tot, n_par))
+        self.n_events = n_tot
+        self.keywords = fd.text
+        _blank_na_keywords(self.keywords, self.path)
+        return True
+
+    def _load_whole(self, bus):
+        sample = sample_from_fcs(self.path, bus)
+        self._events = sample.get_events(source='raw')
+        file_column = {label: i for i, label in enumerate(sample.pnn_labels)}
+        self._columns = np.array([file_column.get(ch, -1) for ch in self.channels], dtype=np.int64)
+        self.n_events = int(self._events.shape[0])
+        self.keywords = sample.get_metadata()
+
+    def read(self, start: int, stop: int) -> np.ndarray:
+        """Events start:stop as an (n, len(channels)) float64 array."""
+        block = self._events[start:stop]
+        out = np.zeros((len(block), len(self.channels)), dtype=np.float64)
+        present = self._columns >= 0
+        out[:, present] = block[:, self._columns[present]]
+        for j, time_step, decades, pnr, log0, gain in self._scaling:
+            col = out[:, j]
+            if time_step is not None:
+                col = col * time_step
+            if decades > 0:
+                col = (10 ** (decades * col / pnr)) * log0
+            if gain != 1.0 and gain != 0:
+                col = col / gain
+            out[:, j] = col
+        np.nan_to_num(out, copy=False, nan=0.0)
+        return out
+
+    def close(self):
+        """Release the file mapping or the loaded events."""
+        self._events = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def subsample_event_rows(n_events: int, subsample: 'int | None') -> 'np.ndarray | None':
+    """Sorted random event indices for a subsampled export, or None to keep every event."""
+    if subsample is None or subsample >= n_events:
+        return None
+    return np.sort(np.random.choice(n_events, subsample, replace=False))
+
+
+def iter_event_blocks(n_events: int, rows: 'np.ndarray | None' = None,
+                      chunk_events: int = FCS_CHUNK_EVENTS):
+    """
+    Yield (start, stop, local_rows) for consecutive blocks of a file's events.
+    local_rows indexes the events of *rows* (sorted, as from
+    subsample_event_rows) that fall in the block, or is None when every event
+    is kept. Blocks without a selected event are skipped.
+    """
+    for start in range(0, n_events, chunk_events):
+        stop = min(start + chunk_events, n_events)
+        if rows is None:
+            yield start, stop, None
+            continue
+        lo, hi = np.searchsorted(rows, [start, stop])
+        if hi > lo:
+            yield start, stop, rows[lo:hi] - start
 
 def define_process_plots(fluorescence_channels_x, fluorescence_channels_y, source_gate):
     process_plots = [{'type': 'hist2d', 'channel_x': x, 'channel_y': y, 'source_gate': source_gate, 'child_gates': []} if x != y
@@ -224,18 +376,76 @@ def export_unmixed_sample(
                         the standard ones; a name matching a standard keyword
                         replaces it.
     """
-    # Optional subsampling
-    if subsample is not None and subsample < export_event_data.shape[0]:
-        idx = np.sort(np.random.choice(export_event_data.shape[0], subsample, replace=False))
-        export_event_data = export_event_data[idx]
+    rows = subsample_event_rows(export_event_data.shape[0], subsample)
+    if rows is not None:
+        export_event_data = export_event_data[rows]
 
-    # Zero out null channels in a copy (event_id, AF Index when not meaningful, etc.)
-    null_set = {'event_id'} | set(extra_null_channels or [])
-    if null_set & set(export_pnn):
-        export_event_data = export_event_data.copy()
-        for col_name in null_set:
-            if col_name in export_pnn:
-                export_event_data[:, export_pnn.index(col_name)] = 0.0
+    export_unmixed_sample_stream(
+        sample_name=sample_name,
+        unmixed_folder=unmixed_folder,
+        chunks=[export_event_data],
+        n_events=export_event_data.shape[0],
+        export_pnn=export_pnn,
+        spillover=spillover,
+        raw_keywords=raw_keywords,
+        spectral_model=spectral_model,
+        unmixed_settings=unmixed_settings,
+        raw_settings=raw_settings,
+        af_spectra=af_spectra,
+        unmixing_spectra=unmixing_spectra,
+        version=version,
+        extra_null_channels=extra_null_channels,
+        unmixing_method=unmixing_method,
+        unmixing_weights=unmixing_weights,
+        extra_whitelist=extra_whitelist,
+        af_index_map=af_index_map,
+        n_af_index=n_af_index,
+        extra_keywords=extra_keywords,
+    )
+
+
+def export_unmixed_sample_stream(
+    sample_name: str,
+    unmixed_folder: 'Path | str',
+    chunks,
+    n_events: int,
+    export_pnn: list,
+    spillover: np.ndarray,
+    raw_keywords: 'dict[str, str]',
+    spectral_model: list,
+    unmixed_settings: dict,
+    raw_settings: dict,
+    af_spectra: 'np.ndarray | None',
+    unmixing_spectra: 'np.ndarray | None',
+    version: str,
+    extra_null_channels: 'list | None' = None,
+    unmixing_method: str = 'OLS',
+    unmixing_weights: 'np.ndarray | None' = None,
+    extra_whitelist: 'frozenset | set' = frozenset(),
+    af_index_map: 'np.ndarray | None' = None,
+    n_af_index: 'int | None' = None,
+    extra_keywords: 'dict | None' = None,
+) -> None:
+    """
+    Write an unmixed FCS file from blocks of events, so the whole file is
+    never held in memory. Same output as export_unmixed_sample().
+
+    chunks   : iterable of (n_i, len(export_pnn)) float arrays in event order,
+               consumed as the file is written (typically a generator that
+               reads and unmixes one block at a time).
+    n_events : total number of events across chunks; written to $TOT.
+
+    The other parameters are as for export_unmixed_sample().
+    """
+    null_columns = [export_pnn.index(name) for name in {'event_id'} | set(extra_null_channels or [])
+                    if name in export_pnn]
+
+    def zeroed(blocks):
+        for block in blocks:
+            if null_columns:
+                block = block.copy()
+                block[:, null_columns] = 0.0
+            yield block
 
     file_name = sample_name + ' (Unmixed).fcs'
     file_path = Path(unmixed_folder) / file_name
@@ -243,7 +453,8 @@ def export_unmixed_sample(
     keywords = define_fcs_keywords(
         raw_keywords=raw_keywords,
         pnn=export_pnn,
-        event_data=export_event_data,
+        event_data=None,
+        n_events=n_events,
         spectral_model=spectral_model,
         unmixed_settings=unmixed_settings,
         raw_settings=raw_settings,
@@ -261,12 +472,12 @@ def export_unmixed_sample(
     if extra_keywords:
         keywords.update({str(k): str(v) for k, v in extra_keywords.items()})
 
-    write_fcs(export_event_data, keywords, file_path)
+    write_fcs_stream(zeroed(chunks), n_events, len(export_pnn), keywords, file_path)
 
 def define_fcs_keywords(
     raw_keywords: 'dict[str, str]',
     pnn: list,
-    event_data: np.ndarray,
+    event_data: 'np.ndarray | None',
     spectral_model: list,
     unmixed_settings: dict,
     raw_settings: dict,
@@ -280,6 +491,7 @@ def define_fcs_keywords(
     extra_whitelist: 'frozenset | set' = frozenset(),
     af_index_map: 'np.ndarray | None' = None,
     n_af_index: 'int | None' = None,
+    n_events: 'int | None' = None,
 ) -> dict:
     """
     Build a complete FCS 3.1 TEXT keyword dict for an unmixed export file.
@@ -289,7 +501,8 @@ def define_fcs_keywords(
     ----------
     raw_keywords      : dict returned by sample.get_metadata()['text'] on the raw FCS.
     pnn               : ordered list of output channel names (the export column order).
-    event_data        : (n_events, n_channels) array — used only for $TOT.
+    event_data        : (n_events, n_channels) array — used only for $TOT; may be
+                        None when n_events is given.
     spectral_model    : controller.experiment.process['spectral_model'] list of dicts.
     unmixed_settings  : controller.experiment.settings['unmixed'].
     raw_settings      : controller.experiment.settings['raw'].
@@ -307,6 +520,7 @@ def define_fcs_keywords(
                         to number the rows 1..n in stored order.
     n_af_index        : largest AF Index value the AF Index channel can hold;
                         defaults to the number of af_spectra rows.
+    n_events          : event count for $TOT, in place of event_data.shape[0].
     """
     import re
     from datetime import datetime, timezone
@@ -474,7 +688,7 @@ def define_fcs_keywords(
     provenance = {
         '$FIL':           file_name,
         '$PAR':           str(len(pnn)),
-        '$TOT':           str(event_data.shape[0]),
+        '$TOT':           str(n_events if n_events is not None else event_data.shape[0]),
         '$DATATYPE':      'F',
         '$BYTEORD':       '1,2,3,4',
         '$MODE':          'L',
@@ -544,15 +758,66 @@ def write_fcs(
     Data written as little-endian float32, row-major (one event per row).
     Mirrors writeFCS.R from AutoSpectral.
     """
-    import struct
+    n_events = event_data.shape[0]
+    blocks = (event_data[start:start + chunk_rows] for start in range(0, n_events, chunk_rows))
+    write_fcs_stream(blocks, n_events, event_data.shape[1], keywords, file_path, write_rows=chunk_rows)
 
-    DELIM = '|'
+
+def write_fcs_stream(
+    chunks,
+    n_events: int,
+    n_channels: int,
+    keywords: dict[str, str],
+    file_path: Path | str,
+    write_rows: int = 131_072,
+) -> None:
+    """
+    Write a minimal FCS 3.1 file from blocks of events, as write_fcs() does
+    for a whole array. The event count must be known before the first block,
+    because $TOT and the DATA offsets precede the data.
+
+    chunks     : iterable of (n_i, n_channels) arrays in event order; each is
+                 written as little-endian float32, row-major.
+    n_events   : total number of events across chunks.
+    n_channels : number of channels ($PAR).
+
+    The file is written next to file_path with a '.part' suffix and renamed
+    once complete, so an interrupted export leaves no truncated FCS file.
+    """
     file_path = Path(file_path)
+    head = _fcs_header_and_text(keywords, n_events, n_channels, file_path)
+    part_path = file_path.with_name(file_path.name + '.part')
+    written = 0
+    try:
+        with open(part_path, 'wb') as fh:
+            fh.write(head)
+            for chunk in chunks:
+                if chunk.ndim != 2 or chunk.shape[1] != n_channels:
+                    raise ValueError(f'write_fcs_stream: block of shape {chunk.shape} '
+                                     f'does not have {n_channels} channels')
+                for start in range(0, chunk.shape[0], write_rows):
+                    fh.write(chunk[start:start + write_rows].astype('<f4').tobytes())  # little-endian float32
+                written += chunk.shape[0]
+            if written != n_events:
+                raise ValueError(f'write_fcs_stream: {written} events written, {n_events} declared '
+                                 f'for {file_path}')
+            fh.write(b'00000000')  # CRC placeholder
+        os.replace(part_path, file_path)
+    except BaseException:
+        part_path.unlink(missing_ok=True)
+        raise
+
+
+def _fcs_header_and_text(keywords: dict[str, str], n_events: int, n_channels: int,
+                         file_path: Path) -> bytes:
+    """HEADER and TEXT segments of an FCS 3.1 file whose float32 DATA segment
+    holds n_events x n_channels values and follows the TEXT directly."""
+    DELIM = '|'
 
     # Mandatory field overrides (ensure consistency)
     kw = dict(keywords)
-    kw['$TOT']           = str(event_data.shape[0])
-    kw['$PAR']           = str(event_data.shape[1])
+    kw['$TOT']           = str(n_events)
+    kw['$PAR']           = str(n_channels)
     kw['$DATATYPE']      = 'F'
     kw['$BYTEORD']       = '1,2,3,4'
     kw['$NEXTDATA']      = '0'
@@ -574,7 +839,7 @@ def write_fcs(
     text = _build_text(kw)
     text_bytes = text.encode('utf-8')
     TEXT_END = TEXT_START + len(text_bytes) - 1
-    data_bytes = event_data.shape[0] * event_data.shape[1] * 4  # float32
+    data_bytes = n_events * n_channels * 4  # float32
 
     # Iterative layout: grow TEXT_END until $BEGINDATA/$ENDDATA digit-lengths stabilise.
     # Seed with the actual encoded lengths of the placeholder values already in kw.
@@ -619,20 +884,7 @@ def write_fcs(
         + _h(DATA_START)  + _h(DATA_END)
         + '       0'      + '       0'   # STEXT always 0
     )
-
-    with open(file_path, 'wb') as fh:
-        fh.write(header.encode('ascii'))
-        fh.write(text_bytes)
-        # Write event data in chunks (row-major, float32 little-endian)
-        rows_remaining = event_data.shape[0]
-        offset = 0
-        while rows_remaining > 0:
-            rows = min(chunk_rows, rows_remaining)
-            chunk = event_data[offset:offset + rows, :]
-            fh.write(chunk.astype('<f4').tobytes())   # little-endian float32
-            offset         += rows
-            rows_remaining -= rows
-        fh.write(b'00000000')  # CRC placeholder
+    return header.encode('ascii') + text_bytes
 
 
 # All subfolders recursively

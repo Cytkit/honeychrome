@@ -49,8 +49,10 @@ from PySide6.QtWidgets import QMessageBox
 import honeychrome.settings as settings
 from honeychrome.controller_components.autospectral_functions import af_index_lookup, combine_envelopes
 from honeychrome.controller_components.functions import (
+    FcsEventReader,
     apply_transfer_matrix,
-    export_unmixed_sample,
+    export_unmixed_sample_stream,
+    iter_event_blocks,
     sample_from_fcs,
 )
 
@@ -290,8 +292,9 @@ class JointUnmixExporter(QObject):
     channel) and its AF library before the first chunk, for estimates that
     need the whole sample.
 
-    FlowKit loads each file whole; chunking bounds only the unmixing
-    buffers.
+    Each file is read, unmixed and written ``chunk_size`` events at a time
+    (FcsEventReader, export_unmixed_sample_stream), so memory use does not
+    grow with file size, except while ``prepare_fn`` holds a whole sample.
     """
     progress = Signal(int, int)
     finished = Signal()
@@ -327,6 +330,45 @@ class JointUnmixExporter(QObject):
             export_pnn.append(name)
         return export_pnn
 
+    def _unmixed_blocks(self, reader, af, export_pnn, sample_path):
+        """Read, unmix and yield one sample's export columns chunk by chunk."""
+        layout = self.layout
+        n_events = reader.n_events
+        n_unmixed_cols = len(layout.pnn_unmixed)
+        af_abundance_col = export_pnn.index(settings.af_abundance_channel)
+        af_index_col = export_pnn.index(settings.af_index_channel)
+        extra_start = len(export_pnn) - len(self.extra_channels)
+        fl_ids_raw = list(layout.fl_ids_raw)
+        n_chunks = math.ceil(n_events / self.chunk_size)
+
+        for chunk_i, (s_row, e_row, _) in enumerate(iter_event_blocks(n_events, chunk_events=self.chunk_size)):
+            if n_chunks > 1:
+                logger.debug(f'{self.unmixing_method} export: "{sample_path}" '
+                             f'chunk {chunk_i + 1}/{n_chunks} (events {s_row}-{e_row})')
+                if self.bus:
+                    self.bus.statusMessage.emit(f'{self.unmixing_method} export: {Path(sample_path).stem} '
+                                                f'events {s_row:,}-{e_row:,} of {n_events:,}')
+
+            raw_chunk = reader.read(s_row, e_row)
+            raw_fl_chunk = raw_chunk[:, fl_ids_raw]
+            result = self.unmix_fn(raw_fl_chunk, raw_chunk, af)
+
+            unmixed_chunk = apply_transfer_matrix(layout.transfer_matrix, raw_chunk)
+            unmixed_chunk[:, layout.fl_ids_unmixed] = result['unmixed']
+
+            block = np.zeros((e_row - s_row, len(export_pnn)), dtype=np.float64)
+            block[:, :n_unmixed_cols] = unmixed_chunk
+            block[:, af_abundance_col] = result['af_scale']
+            block[:, af_index_col] = af.index_map[np.asarray(result['af_idx'], dtype=np.int64) - 1]
+            if self.extra_channels:
+                block[:, extra_start:] = result['extra']
+
+            del raw_chunk, raw_fl_chunk, result, unmixed_chunk
+            yield block
+            del block
+            if n_chunks > 1 and chunk_i % 5 == 4:
+                gc.collect()
+
     def _output_folder(self, sample_path: str) -> Path:
         rel = export_relative_path(sample_path, self.layout)
         root = self.output_root or (self.layout.experiment_dir / self.layout.unmixed_subdirectory)
@@ -338,10 +380,6 @@ class JointUnmixExporter(QObject):
 
             layout = self.layout
             export_pnn = self._export_pnn()
-            n_unmixed_cols = len(layout.pnn_unmixed)
-            af_abundance_col = export_pnn.index(settings.af_abundance_channel)
-            af_index_col = export_pnn.index(settings.af_index_channel)
-            extra_start = len(export_pnn) - len(self.extra_channels)
             fl_ids_raw = list(layout.fl_ids_raw)
 
             total = len(self.sample_paths)
@@ -357,70 +395,45 @@ class JointUnmixExporter(QObject):
                     n_skipped += 1
                     continue
 
-                raw_event_data, raw_keywords, n_events = read_export_events(
-                    layout.experiment_dir / sample_path, layout, self.bus,
-                )
-                if n_events == 0:
-                    n_skipped += 1
-                    continue
+                reader = FcsEventReader(layout.experiment_dir / sample_path, layout.pnn_raw_export, self.bus)
+                try:
+                    n_events = reader.n_events
+                    if n_events == 0:
+                        n_skipped += 1
+                        continue
 
-                if self.prepare_fn is not None:
-                    self.prepare_fn(raw_event_data[:, fl_ids_raw], raw_event_data, af)
-                export_event_data = np.zeros((n_events, len(export_pnn)), dtype=np.float64)
-                n_chunks = math.ceil(n_events / self.chunk_size)
-                for chunk_i in range(n_chunks):
-                    s_row = chunk_i * self.chunk_size
-                    e_row = min((chunk_i + 1) * self.chunk_size, n_events)
-                    if n_chunks > 1:
-                        logger.debug(f'{self.unmixing_method} export: "{sample_path}" '
-                                     f'chunk {chunk_i + 1}/{n_chunks} (events {s_row}-{e_row})')
+                    if self.prepare_fn is not None:
+                        raw_event_data = reader.read(0, n_events)
+                        self.prepare_fn(raw_event_data[:, fl_ids_raw], raw_event_data, af)
+                        del raw_event_data
 
-                    raw_chunk = raw_event_data[s_row:e_row]
-                    raw_fl_chunk = raw_chunk[:, fl_ids_raw]
-                    result = self.unmix_fn(raw_fl_chunk, raw_chunk, af)
+                    output_folder = self._output_folder(sample_path)
+                    output_folder.mkdir(parents=True, exist_ok=True)
+                    sample_name = layout.all_samples.get(sample_path, Path(sample_path).stem)
 
-                    unmixed_chunk = apply_transfer_matrix(layout.transfer_matrix, raw_chunk)
-                    unmixed_chunk[:, layout.fl_ids_unmixed] = result['unmixed']
-
-                    export_event_data[s_row:e_row, :n_unmixed_cols] = unmixed_chunk
-                    export_event_data[s_row:e_row, af_abundance_col] = result['af_scale']
-                    export_event_data[s_row:e_row, af_index_col] = (
-                        af.index_map[np.asarray(result['af_idx'], dtype=np.int64) - 1]
+                    export_unmixed_sample_stream(
+                        sample_name=f'{sample_name}{self.name_suffix}',
+                        unmixed_folder=output_folder,
+                        chunks=self._unmixed_blocks(reader, af, export_pnn, sample_path),
+                        n_events=n_events,
+                        export_pnn=export_pnn,
+                        spillover=layout.spillover,
+                        raw_keywords=reader.keywords,
+                        spectral_model=layout.spectral_model,
+                        unmixed_settings=layout.unmixed_settings,
+                        raw_settings=layout.raw_settings,
+                        af_spectra=af.spectra,
+                        unmixing_spectra=layout.unmixing_spectra,
+                        version=__version__,
+                        extra_null_channels=None,
+                        unmixing_method=self.unmixing_method,
+                        unmixing_weights=None,
+                        af_index_map=af.index_map,
+                        n_af_index=layout.n_af_index,
+                        extra_keywords=self.extra_keywords,
                     )
-                    if self.extra_channels:
-                        export_event_data[s_row:e_row, extra_start:] = result['extra']
-
-                    del raw_chunk, raw_fl_chunk, result, unmixed_chunk
-                    if n_chunks > 1 and chunk_i % 5 == 4:
-                        gc.collect()
-
-                del raw_event_data
-
-                output_folder = self._output_folder(sample_path)
-                output_folder.mkdir(parents=True, exist_ok=True)
-                sample_name = layout.all_samples.get(sample_path, Path(sample_path).stem)
-
-                export_unmixed_sample(
-                    sample_name=f'{sample_name}{self.name_suffix}',
-                    unmixed_folder=output_folder,
-                    export_event_data=export_event_data,
-                    export_pnn=export_pnn,
-                    spillover=layout.spillover,
-                    raw_keywords=raw_keywords,
-                    spectral_model=layout.spectral_model,
-                    unmixed_settings=layout.unmixed_settings,
-                    raw_settings=layout.raw_settings,
-                    af_spectra=af.spectra,
-                    unmixing_spectra=layout.unmixing_spectra,
-                    version=__version__,
-                    subsample=None,
-                    extra_null_channels=None,
-                    unmixing_method=self.unmixing_method,
-                    unmixing_weights=None,
-                    af_index_map=af.index_map,
-                    n_af_index=layout.n_af_index,
-                    extra_keywords=self.extra_keywords,
-                )
+                finally:
+                    reader.close()
                 n_exported += 1
                 if self.sample_done is not None:
                     self.sample_done(sample_path, n_events)
