@@ -25,24 +25,18 @@ struct FluorVariantInput {
                              // covariance-propagated leakage weight.
 };
 
-// Guarded negative-envelope AF scoring (see af_negative_term.hpp). upper and
-// lower are the flat per-fluorophore boundaries; spread, when non-empty, is
-// the F x F spillover-spread matrix SS[a, f] that widens them per event by
-// kappa * sqrt(sum_a SS[a, f] * max(x_a, 0)) at the abundances of the joint L2
-// choice. A channel's positivity is judged at the AF library row in mean_rows
-// with the smallest residual (each profile's mean AF spectrum), over
-// soft_width SDs of the negative, sqrt(noise_sd^2 + sum_a SS[a, f] * max(x_a, 0)),
-// either side of the upper boundary. Passing no envelope scores AF candidates
-// by joint L2.
+// Positivity-weighted AF scoring (see af_negative_term.hpp). A channel's
+// positivity is judged at the AF library row in mean_rows with the smallest
+// residual (each profile's mean AF spectrum), at the AF-free unmix less that
+// row, x. There the negative is normal with variance c0 + c1 k + c2 k^2, with
+// k that row's abundance and c0, c1, c2 the columns 3r, 3r + 1 and 3r + 2 of
+// null_var for mean_rows[r], plus sum_a SS[a, f] * max(x_a, 0) when spread is
+// non-empty. Each channel then counts in the fluorophore term with weight
+// w_f (1 - p_f). Passing no envelope scores AF candidates by joint L2.
 struct AfEnvelopeInput {
-  arma::vec  upper;             // F
-  arma::vec  lower;             // F
-  arma::vec  noise_sd;          // F, or empty for zero
-  arma::mat  spread;            // F x F, or empty for flat boundaries
+  arma::mat  null_var;          // F x (3 * n_mean_rows)
+  arma::mat  spread;            // F x F, or empty
   arma::uvec mean_rows;         // AF library rows of the mean spectra; empty means row 0
-  double     kappa        = 2.0;
-  double     hyper_weight = 1.0;
-  double     soft_width   = 3.0;
 };
 
 // Joint per-cell AF + fluorophore-variant unmixing.
@@ -77,8 +71,8 @@ struct AfEnvelopeInput {
 //                     by a full re-solve before acceptance. Ignored when
 //                     cell_weight is true.
 // envelope         : nullptr -> AF candidates scored by joint L2; otherwise
-//                     by the guarded negative-envelope fluorophore term, with
-//                     ties resolving to the lowest candidate index.
+//                     by the positivity-weighted fluorophore term, with ties
+//                     resolving to the lowest candidate index.
 //
 // Returns
 // -------
