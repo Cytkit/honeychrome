@@ -25,6 +25,16 @@ Data conventions
   threshold gates, a ``region`` saying which side of the thresholds the
   population lies on, and ``n_events``/``fraction`` from the data it was
   computed on.
+* A ``1dsep`` gate separates on ``gate_marker_x``; ``gate_marker_y`` is the
+  view channel it is drawn against (None: a histogram of the separation
+  channel). ``sep_axis`` ('x' or 'y') is the plot axis the separation
+  channel is drawn on (see ``plot_channels``).
+* An imported gate's ``template`` may hold its shapes as drawn: entries
+  with ``shape_channels`` (the channels of the plot it was drawn on) and a
+  closed ``boundary`` polygon, or a ``range`` for a 1-D shape. While the
+  gate's algorithm is ``imported`` these shapes are applied exactly; the
+  gate's type, regions and ``proposed_algorithm`` describe the trainable
+  gate it converts to.
 
 Threshold gates are open-ended: a population is every event on its side of
 the thresholds, however far outside the display range. Polygon gates
@@ -448,6 +458,82 @@ def gate_channels(gate_def: dict) -> list[str]:
     return [c for c in chans if c]
 
 
+def separation_axis(gate_def: dict) -> str:
+    """Plot axis ('x' or 'y') a 1dsep gate's separation channel is drawn on.
+    Always 'x' for other gate types and for histograms."""
+    if gate_def.get('gate_type') != '1dsep' or not gate_def.get('gate_marker_y'):
+        return 'x'
+    return 'y' if gate_def.get('sep_axis') == 'y' else 'x'
+
+
+def plot_channels(gate_def: dict) -> tuple:
+    """(x channel, y channel or None) of the plot a gate is drawn on."""
+    x = gate_def.get('gate_marker_x') or None
+    y = gate_def.get('gate_marker_y') or None
+    if separation_axis(gate_def) == 'y':
+        return y, x
+    return x, y
+
+
+def is_shape_boundary(boundary: dict | None) -> bool:
+    """True when boundary entries are shapes as drawn (see module notes)."""
+    return bool(boundary) and all(
+        isinstance(e, dict) and e.get('shape_channels') for e in boundary.values())
+
+
+def shape_channels(gate_def: dict) -> tuple:
+    """Channels of the plot an imported gate's template was drawn on, or ()."""
+    template = gate_def.get('template') or {}
+    if not is_shape_boundary(template):
+        return ()
+    return tuple(c for c in next(iter(template.values()))['shape_channels'] if c)
+
+
+def boundary_channels(gate_def: dict, boundary: dict | None) -> list[str]:
+    """Channels *boundary* is applied on: a shape's own channels, else the
+    gate's (see gate_channels)."""
+    if is_shape_boundary(boundary):
+        return [c for c in next(iter(boundary.values()))['shape_channels'] if c]
+    return gate_channels(gate_def)
+
+
+def boundary_plot_channels(gate_def: dict, boundary: dict | None) -> tuple:
+    """(x channel, y channel or None) to draw *boundary* on: a shape's own
+    channels, else the gate's plot axes (see plot_channels)."""
+    if is_shape_boundary(boundary):
+        chans = [c for c in next(iter(boundary.values()))['shape_channels'] if c]
+        return chans[0], (chans[1] if len(chans) > 1 else None)
+    return plot_channels(gate_def)
+
+
+def referenced_channels(gate_def: dict) -> list[str]:
+    """Every channel a gate reads or is drawn on, including a 1dsep view
+    channel and the channels of an imported shape."""
+    out = list(gate_channels(gate_def))
+    for ch in (gate_def.get('gate_marker_y'),) + shape_channels(gate_def):
+        if ch and ch not in out:
+            out.append(ch)
+    return out
+
+
+def display_entries(gate_def: dict, entries: dict) -> dict:
+    """Boundary entries in plot coordinates (see plot_channels): a 1dsep
+    gate drawn with its separation channel on the y axis has its threshold
+    as ``threshold_y`` and its polygons transposed. Shapes as drawn and
+    every other gate are returned unchanged."""
+    if separation_axis(gate_def) != 'y' or is_shape_boundary(entries):
+        return entries
+    out = {}
+    for pop, entry in (entries or {}).items():
+        e = dict(entry)
+        e['threshold_y'], e['threshold_x'] = entry.get('threshold_x'), None
+        coords = np.asarray(entry.get('boundary') or [], dtype=float)
+        if coords.ndim == 2 and coords.shape[1] == 2:
+            e['boundary'] = coords[:, ::-1].tolist()
+        out[pop] = e
+    return out
+
+
 def population_regions(gate_def: dict, boundary: dict | None = None) -> dict[str, str]:
     """{population: region} for a gate.
 
@@ -535,11 +621,16 @@ class GateCalculator:
         return result
 
     def _calc_imported(self, data, gate_def, channel_index) -> dict:
-        """The boundary stored in the gate's ``template``. Threshold gates
-        keep their thresholds and redraw their rectangles to the axis limits."""
+        """The boundary stored in the gate's ``template``. Shapes as drawn
+        are kept as they are; threshold gates keep their thresholds and
+        redraw their rectangles to the axis limits."""
         template = gate_def.get('template') or {}
         if not template:
             return {}
+        if is_shape_boundary(template):
+            if any(ch not in channel_index for ch in shape_channels(gate_def)):
+                return {}
+            return deepcopy(template)
         if gate_def.get('gate_type') in THRESHOLD_TYPES:
             first = next(iter(template.values()))
             tx, ty = first.get('threshold_x'), first.get('threshold_y')
@@ -733,6 +824,8 @@ def population_masks(gate_def: dict, boundary: dict, data: np.ndarray,
     chans = gate_channels(gate_def)
     if any(ch not in channel_index for ch in chans):
         return {}
+    if is_shape_boundary(boundary):
+        return _shape_masks(boundary, data, channel_index)
     gate_type = gate_def.get('gate_type')
     n = len(data)
     x = data[:, channel_index[chans[0]]] if chans else np.zeros(n)
@@ -769,6 +862,31 @@ def population_masks(gate_def: dict, boundary: dict, data: np.ndarray,
             continue
         coords = np.asarray(entry.get('boundary') or [], dtype=float)
         if coords.ndim != 2 or coords.shape[0] < 3 or len(chans) < 2:
+            masks[pop] = np.zeros(n, dtype=bool)
+            continue
+        pts = np.column_stack([x, data[:, channel_index[chans[1]]]])
+        masks[pop] = MplPath(coords).contains_points(pts)
+    return masks
+
+
+def _shape_masks(boundary: dict, data: np.ndarray, channel_index: dict) -> dict[str, np.ndarray]:
+    """Masks of shapes as drawn: inside each polygon, or within each range,
+    on the entry's own ``shape_channels``. {} when a channel is missing."""
+    from matplotlib.path import Path as MplPath
+    n = len(data)
+    masks: dict[str, np.ndarray] = {}
+    for pop, entry in boundary.items():
+        chans = [c for c in entry['shape_channels'] if c]
+        if any(c not in channel_index for c in chans):
+            return {}
+        x = data[:, channel_index[chans[0]]]
+        if len(chans) == 1:
+            rng = entry.get('range')
+            masks[pop] = ((x >= float(rng[0])) & (x <= float(rng[1]))
+                          if rng is not None else np.zeros(n, dtype=bool))
+            continue
+        coords = np.asarray(entry.get('boundary') or [], dtype=float)
+        if coords.ndim != 2 or coords.shape[0] < 3:
             masks[pop] = np.zeros(n, dtype=bool)
             continue
         pts = np.column_stack([x, data[:, channel_index[chans[1]]]])
@@ -1156,10 +1274,11 @@ def remap_boundaries(gate_defs: list[dict], boundaries: dict, src_params: dict,
             continue
         eff = effective_gate_def(gdef, by_name)
         chans = gate_channels(eff)
-        convs = [converter(ch) for ch in chans]
-        if not any(convs):
-            continue
         for entry in entries.values():
+            shape = [c for c in (entry.get('shape_channels') or []) if c]
+            convs = [converter(ch) for ch in (shape or chans)]
+            if not any(convs):
+                continue
             for key, k in (('threshold_x', 0), ('threshold_y', 1)):
                 if entry.get(key) is not None and k < len(convs) and convs[k]:
                     entry[key] = float(_convert([entry[key]], *convs[k])[0])
@@ -1167,7 +1286,7 @@ def remap_boundaries(gate_defs: list[dict], boundaries: dict, src_params: dict,
                 entry['range'] = [float(v) for v in _convert(entry['range'], *convs[0])]
             coords = np.asarray(entry.get('boundary') or [], dtype=float)
             if coords.ndim == 2 and coords.shape[1] == 2 and len(coords):
-                if eff.get('gate_type') in POLYGON_TYPES:
+                if eff.get('gate_type') in POLYGON_TYPES or shape:
                     coords = densify_polygon(coords, points_per_edge)
                 for k in range(min(2, len(convs))):
                     if convs[k]:
@@ -1271,12 +1390,27 @@ def remap_channel_transform(gate_defs: list[dict], trained_boundaries: dict, cha
 
 
 def rename_channels(gate_defs: list[dict], alignment: dict) -> list[dict]:
-    """Copy of *gate_defs* with axis channels renamed via {old: new}."""
+    """Copy of *gate_defs* with axis channels, and the channels of imported
+    shapes, renamed via {old: new}."""
     out = deepcopy(gate_defs)
     for g in out:
         for key in ('gate_marker_x', 'gate_marker_y'):
             if g.get(key) in alignment:
                 g[key] = alignment[g[key]]
+        for key in ('template', 'template_original'):
+            if g.get(key):
+                g[key] = rename_boundary_channels({'g': g[key]}, alignment)['g']
+    return out
+
+
+def rename_boundary_channels(boundaries: dict, alignment: dict) -> dict:
+    """Copy of {gate: {pop: entry}} with each shape's channels renamed via
+    {old: new}."""
+    out = deepcopy(boundaries or {})
+    for entries in out.values():
+        for entry in (entries or {}).values():
+            if isinstance(entry, dict) and entry.get('shape_channels'):
+                entry['shape_channels'] = [alignment.get(c, c) for c in entry['shape_channels']]
     return out
 
 
