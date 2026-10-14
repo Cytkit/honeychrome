@@ -233,6 +233,10 @@ class CosineQCViewer(QFrame):
                         ref_vals = np.zeros(len(spectrum))
                         for c in common:
                             ref_vals[fluor_pnn.index(c)] = ref.loc[label, c]
+                        # Re-normalise (L-infinity) over detectors present
+                        ref_peak = ref_vals.max()
+                        if ref_peak > 0:
+                            ref_vals = ref_vals / ref_peak
                         self._plot_widget.plot(
                             x, ref_vals,
                             pen=pg.mkPen(self._COL_REF, width=2),

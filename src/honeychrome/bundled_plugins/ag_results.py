@@ -152,9 +152,12 @@ def alignment_problems(alignment: dict[str, str | None]) -> list[str]:
 
 def apply_alignment(model: dict, alignment: dict[str, str]) -> dict:
     """Copy of a normalised model with its channels renamed to the
-    experiment's (gate axes, channel map and transform keys)."""
+    experiment's (gate axes, imported shapes, channel map and transform
+    keys)."""
     out = dict(model)
     out['gate_definitions'] = ag_core.rename_channels(model.get('gate_definitions') or [], alignment)
+    out['trained_boundaries'] = ag_core.rename_boundary_channels(
+        model.get('trained_boundaries') or {}, alignment)
     out['channel_map'] = ag_core.rekey(model.get('channel_map'), alignment)
     out['transforms'] = ag_core.rekey(model.get('transforms'), alignment)
     return out
