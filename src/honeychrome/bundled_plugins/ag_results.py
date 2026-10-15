@@ -12,6 +12,11 @@ Pure computation for the Automated Gating plugin (no Qt, no controller):
   the differential tests in ``controller_components.differential_stats``.
 * ``sample_flags`` / ``population_export`` / ``marker_export`` — QC flags
   and long-format export tables.
+* ``read_sample_table`` / ``sample_table_frame`` — import and export of
+  group assignments and covariates as a table with one row per sample.
+* ``sample_pca`` / ``predictive_matrix`` — sample-level PCA and the feature
+  matrix for the predictive analysis (``drc_predictive``), both from the
+  per-sample values of the last statistics run.
 
 The file name does not end in ``_tab.py``, so the plugin loader does not
 treat it as a tab.
@@ -44,6 +49,7 @@ __all__ = [
     'summarise_sample', 'population_tables', 'marker_table', 'marker_feature',
     'sample_flags', 'population_export', 'marker_export',
     'MIN_SAMPLES_PER_GROUP', 'qualifying_groups', 'run_statistics', 'reapply_thresholds',
+    'read_sample_table', 'sample_table_frame', 'sample_pca', 'predictive_matrix',
 ]
 
 
@@ -459,3 +465,171 @@ def reapply_thresholds(stats: dict, pval_threshold: float, fc_threshold: float,
             out[key] = ds.apply_significance(out[key], pval_threshold, thr, fdr_scope=fdr_scope,
                                              use_treat=use_treat, hierarchical=hier)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Sample tables (groups and covariates)
+# ---------------------------------------------------------------------------
+
+_SAMPLE_COLUMNS = ('sample', 'file', 'filename', 'name')
+_GROUP_COLUMNS = ('group', 'condition')
+
+
+def _sample_names(key: str) -> list[str]:
+    """Ways a table may name a sample: its key, file name and stem (lower case)."""
+    path = str(key).replace('\\', '/')
+    name = path.rsplit('/', 1)[-1]
+    stem = name.rsplit('.', 1)[0] if '.' in name else name
+    return [path.lower(), name.lower(), stem.lower()]
+
+
+def read_sample_table(df: pd.DataFrame, sample_keys: list[str]) -> dict:
+    """Group assignments and covariates from a table with one row per sample.
+
+    The sample column is the first of 'sample', 'file', 'filename' or
+    'name' (any case); it may hold the sample key, the file name or the
+    file name without extension. A 'group' (or 'condition') column assigns
+    groups; every other column is a covariate. Empty cells are skipped.
+
+    Returns {'groups': {key: group}, 'covariates': {name: {key: value}},
+    'unmatched': [table rows' sample names with no sample], 'columns':
+    covariate names}. Raises ValueError without a sample column.
+    """
+    lower = {str(c).strip().lower(): c for c in df.columns}
+    sample_col = next((lower[c] for c in _SAMPLE_COLUMNS if c in lower), None)
+    if sample_col is None:
+        raise ValueError("The table needs a 'sample' column naming each sample.")
+    group_col = next((lower[c] for c in _GROUP_COLUMNS if c in lower), None)
+    cov_cols = [c for c in df.columns if c not in (sample_col, group_col)
+                and str(c).strip().lower() != 'full_path']
+    lookup: dict[str, str] = {}
+    for key in sample_keys:
+        for n in _sample_names(key):
+            lookup.setdefault(n, key)
+    groups: dict[str, str] = {}
+    covs: dict[str, dict[str, str]] = {str(c): {} for c in cov_cols}
+    unmatched = []
+    for _i, row in df.iterrows():
+        raw = row[sample_col]
+        if pd.isna(raw) or not str(raw).strip():
+            continue
+        name = str(raw).strip()
+        key = next((lookup[n] for n in _sample_names(name) if n in lookup), None)
+        if key is None:
+            unmatched.append(name)
+            continue
+        if group_col is not None and pd.notna(row[group_col]) and str(row[group_col]).strip():
+            groups[key] = str(row[group_col]).strip()
+        for c in cov_cols:
+            v = row[c]
+            if pd.notna(v) and str(v).strip():
+                covs[str(c)][key] = str(v).strip()
+    return {'groups': groups, 'covariates': covs, 'unmatched': unmatched,
+            'columns': [str(c) for c in cov_cols]}
+
+
+def sample_table_frame(samples: list[str], groups: dict, covariates: dict) -> pd.DataFrame:
+    """One row per sample: 'sample' (key), 'group' and each covariate; the
+    format read_sample_table reads back."""
+    rows = []
+    for key in samples:
+        row = {'sample': key, 'group': groups.get(key, '')}
+        for name, values in (covariates or {}).items():
+            row[name] = (values or {}).get(key, '')
+        rows.append(row)
+    return pd.DataFrame(rows, columns=['sample', 'group'] + list(covariates or {}))
+
+
+# ---------------------------------------------------------------------------
+# Sample PCA and predictive features
+# ---------------------------------------------------------------------------
+
+def _source_frames(stats: dict, use_freq: bool, use_counts: bool, use_markers: bool,
+                   labels: dict | None) -> tuple[list, list]:
+    labels = labels or {}
+
+    def named(df, prefix, label_of):
+        return df.rename(columns={c: f"{prefix}: {label_of(c)}" for c in df.columns})
+
+    def marker_label(feature):
+        pop, _sep, ch = str(feature).partition(FEATURE_SEP)
+        return f"{labels.get(pop, pop)} {labels.get(ch, ch)}"
+
+    sources, frames = [], []
+    for use, key, prefix, label_of in (
+            (use_freq, 'freq_values', 'Freq', lambda c: labels.get(c, c)),
+            (use_counts, 'counts_values', 'Counts', lambda c: labels.get(c, c)),
+            (use_markers, 'marker_values', 'Median', marker_label)):
+        df = stats.get(key) if use else None
+        if df is not None and not df.empty:
+            sources.append(prefix)
+            frames.append(named(df.astype(float), prefix, label_of))
+    return sources, frames
+
+
+def sample_pca(stats: dict, use_freq: bool = True, use_counts: bool = False,
+               use_markers: bool = False, n_loadings: int = 10,
+               labels: dict | None = None) -> dict | None:
+    """Two-component PCA of every sample of the last statistics run.
+
+    The chosen per-sample tables (population % of parent, counts, marker
+    medians) are z-scored column by column, so no table dominates on scale,
+    and joined. Loadings are scaled by the square root of each component's
+    variance (a correlation biplot) and reduced to the *n_loadings* longest.
+    *labels* maps population keys and channels to display names.
+
+    Returns None with fewer than 2 samples or 2 varying features, else
+    {'scores' (samples × PC1, PC2), 'loadings' (features × PC1, PC2),
+    'explained_variance_ratio' (PC1, PC2), 'groups' (per score row),
+    'sources'}.
+    """
+    from sklearn.decomposition import PCA
+
+    sources, frames = _source_frames(stats, use_freq, use_counts, use_markers, labels)
+    if not frames:
+        return None
+    combined = pd.concat(frames, axis=1, join='inner')
+    if combined.shape[0] < 2:
+        return None
+    std = combined.std(axis=0, ddof=0)
+    combined = combined.loc[:, std > 1e-12]
+    if combined.shape[1] < 2:
+        return None
+    z = ((combined - combined.mean(axis=0)) / combined.std(axis=0, ddof=0)).fillna(0.0)
+    n_comp = min(2, z.shape[0], z.shape[1])
+    pca = PCA(n_components=n_comp)
+    pcs = pca.fit_transform(z.values)
+    explained = list(pca.explained_variance_ratio_[:n_comp]) + [0.0] * (2 - n_comp)
+    if n_comp < 2:
+        pcs = np.hstack([pcs, np.zeros((pcs.shape[0], 2 - n_comp))])
+    scores = pd.DataFrame(pcs[:, :2], index=combined.index, columns=['PC1', 'PC2'])
+    load = np.zeros((z.shape[1], 2))
+    for c in range(n_comp):
+        load[:, c] = pca.components_[c] * np.sqrt(max(pca.explained_variance_[c], 0.0))
+    loadings = pd.DataFrame(load, index=combined.columns, columns=['PC1', 'PC2'])
+    length = np.hypot(loadings['PC1'], loadings['PC2'])
+    loadings = loadings.loc[length.sort_values(ascending=False).head(max(1, int(n_loadings))).index]
+    group_of = dict(zip(stats.get('samples') or [], stats.get('group_vec') or []))
+    return {'scores': scores, 'loadings': loadings,
+            'explained_variance_ratio': (float(explained[0]), float(explained[1])),
+            'groups': [group_of.get(s, '') for s in scores.index], 'sources': sources}
+
+
+def predictive_matrix(stats: dict, use_freq: bool = True, use_markers: bool = False,
+                      labels: dict | None = None) -> pd.DataFrame:
+    """Samples × features for the predictive analysis: log2(% of parent +
+    0.01) and/or marker medians, from the last statistics run, named for
+    display; missing or constant features are dropped (see
+    drc_predictive.build_feature_matrix)."""
+    import drc_predictive
+
+    _sources, frames = _source_frames(stats, use_freq, False, False, labels)
+    freq = frames[0] if frames else None
+    if freq is not None:
+        freq = freq.rename(columns=lambda c: c.split(': ', 1)[1])
+    _sources, mframes = _source_frames(stats, False, False, use_markers, labels)
+    med = mframes[0] if mframes else None
+    if med is not None:
+        med = med.rename(columns=lambda c: c.split(': ', 1)[1])
+    X = drc_predictive.build_feature_matrix(freq, med, list(stats.get('samples') or []))
+    return X.rename(columns=lambda c: c.replace('MFI: ', 'Median: '))

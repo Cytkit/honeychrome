@@ -9,7 +9,9 @@ Gating plugins
   • zoom_axis_transform — applies a ZoomAxis drag to a Honeychrome Transform,
                           as the main window's plots do.
   • PopulationTree      — collapsible tree of the populations of a gating
-                          hierarchy with single selection.
+                          hierarchy, with single or extended selection.
+  • block_wheel         — stops a combo or spin box taking mouse-wheel
+                          scrolling meant for the list or page around it.
 
 The file name does not end in ``_tab.py``, so the plugin loader does not
 treat it as a tab.
@@ -24,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 __all__ = ['make_concertina', 'add_concertina_page', 'SquareHolder',
-           'zoom_axis_transform', 'PopulationTree']
+           'zoom_axis_transform', 'PopulationTree', 'block_wheel']
 
 
 # ---------------------------------------------------------------------------
@@ -134,52 +136,94 @@ def zoom_axis_transform(axis, vb, axis_name: str, tr):
 
 
 # ---------------------------------------------------------------------------
+# Mouse wheel
+# ---------------------------------------------------------------------------
+
+def block_wheel(widget):
+    """Make *widget* ignore the mouse wheel, so scrolling over it scrolls
+    the table or page it sits in instead of changing its value."""
+    widget.setFocusPolicy(Qt.StrongFocus)
+    widget.wheelEvent = lambda event: event.ignore()
+    return widget
+
+
+# ---------------------------------------------------------------------------
 # Population tree
 # ---------------------------------------------------------------------------
 
+_SEP = '\x1f'
+
+
+def _encode(key) -> str:
+    return f"{key[0] or ''}{_SEP}{key[1]}"
+
+
+def _decode(value):
+    """(gate, pop) from a stored key. Stored as a string: PySide6 hands
+    tuples stored on items back as lists, which cannot be dictionary keys."""
+    if value is None:
+        return None
+    gate, _, pop = str(value).partition(_SEP)
+    return gate, pop
+
+
 class PopulationTree(QTreeWidget):
-    """Collapsible tree of populations with single selection.
+    """Collapsible tree of populations.
 
     ``populationSelected(gate, pop)`` is emitted when the user picks a node;
     the root node has gate '' and pop 'root'. Programmatic selection with
-    ``select_population`` does not emit.
+    ``select_population`` does not emit. With *multi_select* several nodes
+    can be selected (Ctrl/Shift-click); ``selected_populations`` lists them.
+    ``expansionChanged`` is emitted when the user expands or collapses a
+    node.
     """
 
     populationSelected = Signal(str, str)
+    expansionChanged = Signal()
 
     _KEY_ROLE = Qt.UserRole
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, multi_select: bool = False):
         super().__init__(parent)
         self.setHeaderHidden(True)
         self.setRootIsDecorated(True)
         self.setUniformRowHeights(True)
-        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection if multi_select
+                              else QAbstractItemView.SingleSelection)
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self._items: dict = {}
+        self._depth: dict = {}
+        self._parents: dict = {}
         self.itemSelectionChanged.connect(self._on_selection_changed)
+        self.itemExpanded.connect(lambda _item: self.expansionChanged.emit())
+        self.itemCollapsed.connect(lambda _item: self.expansionChanged.emit())
 
-    def set_nodes(self, nodes: list[dict]):
+    def set_nodes(self, nodes: list[dict], expand_depth: int | None = None):
         """Fill the tree from ag_review.population_tree() nodes.
 
-        Keeps the current selection and the expanded state of nodes that
-        survive the rebuild; new nodes start expanded.
+        Keeps the selection and the expanded state of nodes that survive
+        the rebuild. New nodes start expanded, or, with *expand_depth*, only
+        when they are fewer than *expand_depth* levels below the root (the
+        root is level 0).
         """
         expanded = {key for key, item in self._items.items() if item.isExpanded()}
         known = set(self._items)
-        selected = self.current_population()
+        selected = set(self.selected_populations())
+        current = self.current_population()
         self.blockSignals(True)
         try:
             self.clear()
-            self._items = {}
+            self._items, self._depth, self._parents = {}, {}, {}
             for node in nodes:
                 key = (node['gate'] or '', node['pop'])
                 parent_key = node.get('parent')
-                parent_item = self._items.get(
-                    (parent_key[0] or '', parent_key[1])) if parent_key else None
+                parent_key = (parent_key[0] or '', parent_key[1]) if parent_key else None
+                parent_item = self._items.get(parent_key) if parent_key else None
                 item = QTreeWidgetItem([node['label']])
-                item.setData(0, self._KEY_ROLE, key)
+                item.setData(0, self._KEY_ROLE, _encode(key))
+                self._depth[key] = (self._depth.get(parent_key, -1) + 1) if parent_item else 0
+                self._parents[key] = parent_key if parent_item else None
                 if node.get('n_gates'):
                     item.setToolTip(0, f"{node['n_gates']} gate(s) drawn on this population")
                 else:
@@ -191,16 +235,63 @@ class PopulationTree(QTreeWidget):
                     parent_item.addChild(item)
                 self._items[key] = item
             for key, item in self._items.items():
-                item.setExpanded(key in expanded or key not in known)
-            if selected in self._items:
-                self._items[selected].setSelected(True)
+                if key in known:
+                    item.setExpanded(key in expanded)
+                elif expand_depth is None:
+                    item.setExpanded(True)
+                else:
+                    item.setExpanded(self._depth.get(key, 0) < expand_depth)
+            for key in selected:
+                if key in self._items:
+                    self._items[key].setSelected(True)
+            if current in self._items:
+                self.setCurrentItem(self._items[current])
         finally:
             self.blockSignals(False)
 
+    def _key(self, item):
+        return _decode(item.data(0, self._KEY_ROLE)) if item is not None else None
+
     def current_population(self):
-        """(gate, pop) of the selected node, or None."""
+        """(gate, pop) of the current node (the one last clicked) when it is
+        selected, else of the first selected node, or None."""
+        item = self.currentItem()
+        if item is not None and item.isSelected():
+            return self._key(item)
         items = self.selectedItems()
-        return items[0].data(0, self._KEY_ROLE) if items else None
+        return self._key(items[0]) if items else None
+
+    def selected_populations(self) -> list:
+        """(gate, pop) of every selected node, in tree order."""
+        chosen = {id(i) for i in self.selectedItems()}
+        return [key for key, item in self._items.items() if id(item) in chosen]
+
+    def population_at(self, pos):
+        """(gate, pop) of the node at viewport position *pos*, or None."""
+        return self._key(self.itemAt(pos))
+
+    def depth(self, key) -> int:
+        return self._depth.get((key[0] or '', key[1]), 0)
+
+    def is_open(self, key) -> bool:
+        """True when the node and every node above it are expanded, so the
+        populations drawn on it are in view."""
+        key = (key[0] or '', key[1])
+        while key is not None:
+            item = self._items.get(key)
+            if item is None or not item.isExpanded():
+                return False
+            key = self._parents.get(key)
+        return True
+
+    def expand_population(self, gate, pop: str):
+        """Expand a node and every node above it."""
+        key = (gate or '', pop)
+        while key is not None:
+            item = self._items.get(key)
+            if item is not None:
+                item.setExpanded(True)
+            key = self._parents.get(key)
 
     def select_population(self, gate, pop: str):
         """Select a node without emitting, expanding its ancestors."""
