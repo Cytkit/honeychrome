@@ -3,6 +3,17 @@ import honeychrome.settings as settings
 from PySide6.QtCore import Qt
 
 
+def apply_plot_theme():
+    """Clean appearance for publication-like aesthetics: the seaborn
+    whitegrid theme with DejaVu Sans first in the font list."""
+    import seaborn as sns
+    import matplotlib as mpl
+    sns.set_theme(style="whitegrid", font_scale=1.2)
+    mpl.rcParams['font.sans-serif'] = ['DejaVu Sans'] + [
+        f for f in mpl.rcParams['font.sans-serif'] if f != 'DejaVu Sans'
+    ]
+
+
 class ExportablePlotWidget(QWidget):
     def __init__(self, figure, title='figure', experiment_dir='', parent=None):
         super().__init__(parent)
@@ -40,13 +51,7 @@ class ExportablePlotWidget(QWidget):
         layout.addLayout(buttons_layout)
         layout.addStretch()
 
-        # Clean appearance for publication-like aesthetics
-        import seaborn as sns
-        sns.set_theme(style="whitegrid", font_scale=1.2)
-        import matplotlib as mpl
-        mpl.rcParams['font.sans-serif'] = ['DejaVu Sans'] + [
-            f for f in mpl.rcParams['font.sans-serif'] if f != 'DejaVu Sans'
-        ]
+        apply_plot_theme()
 
         self.canvas.draw()
 
