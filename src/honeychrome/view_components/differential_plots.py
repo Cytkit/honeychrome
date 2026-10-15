@@ -10,7 +10,8 @@ can be built on a worker thread and embedded later (e.g. in
 * ``make_heatmap_figure`` — per-sample values of the significant features,
   with row and column dendrograms and a group colour bar.
 * ``make_volcano_figure`` — effect size against adjusted p-value, 95% CI
-  bars and a hover tooltip on significant points.
+  bars and a hover tooltip on significant points. Given the two groups, a
+  ramp below the x axis shows which side is higher in which group.
 * ``make_marker_summary_figure`` — population (or cluster) × marker grid of
   intensity differences, significant markers marked with a dot.
 * ``make_comparison_heatmap_figure`` — comparison × feature grid of effect
@@ -33,6 +34,7 @@ import pandas as pd
 __all__ = [
     'style_figure_theme', 'make_scatter_hover_handler', 'stamp_run_label',
     'message_figure', 'make_heatmap_figure', 'make_volcano_figure',
+    'group_pair_colours', 'draw_direction_ramp',
     'make_marker_summary_figure', 'make_comparison_heatmap_figure', 'significance_column',
     'wrap_label', 'text_width_inches',
 ]
@@ -76,13 +78,18 @@ def text_width_inches(text: str, fontsize: float) -> float:
     return widest / 72.0
 
 
-def _is_default_black(colour) -> bool:
-    """True when *colour* is matplotlib's default opaque black."""
+def _is_default_text_colour(colour) -> bool:
+    """True when *colour* is what text gets when nothing sets it: opaque
+    black, or the active style's ``text.color`` (the seaborn theme the
+    plot widgets apply makes this a dark grey)."""
+    import matplotlib
     from matplotlib.colors import to_rgba
     try:
-        return tuple(to_rgba(colour)) == (0.0, 0.0, 0.0, 1.0)
+        rgba = tuple(to_rgba(colour))
+        defaults = {(0.0, 0.0, 0.0, 1.0), tuple(to_rgba(matplotlib.rcParams['text.color']))}
     except ValueError:
         return False
+    return rgba in defaults
 
 
 def _recolour_default_text(fig, axes, fg: str, bg: str):
@@ -106,7 +113,7 @@ def _recolour_default_text(fig, axes, fg: str, bg: str):
         if legend is not None:
             legends.append(legend)
     for text in texts:
-        if text.get_bbox_patch() is None and _is_default_black(text.get_color()):
+        if text.get_bbox_patch() is None and _is_default_text_colour(text.get_color()):
             text.set_color(fg)
     for legend in legends:
         if legend.get_frame_on():
@@ -114,7 +121,7 @@ def _recolour_default_text(fig, axes, fg: str, bg: str):
             frame.set_facecolor(bg)
             frame.set_edgecolor('#888888')
         for text in list(legend.get_texts()) + [legend.get_title()]:
-            if _is_default_black(text.get_color()):
+            if _is_default_text_colour(text.get_color()):
                 text.set_color(fg)
 
 
@@ -182,10 +189,70 @@ def make_scatter_hover_handler(fig, ax, scatter, labels: list[str], is_dark: boo
     return _on_hover
 
 
+def group_pair_colours(group_a: str, group_b: str,
+                       group_colours: dict | None = None) -> tuple[str, str]:
+    """Colours of the two groups of a comparison: those in *group_colours*
+    ({group: colour}), otherwise the module's pair of defaults."""
+    colours = group_colours or {}
+    return (colours.get(group_a) or GROUP_COLOUR_A, colours.get(group_b) or GROUP_COLOUR_B)
+
+
+def _fit_text(text: str, fontsize: float, max_inches: float) -> str:
+    """*text* shortened with a trailing ellipsis character until it is at
+    most *max_inches* wide at *fontsize* points."""
+    text = str(text)
+    if text_width_inches(text, fontsize) <= max_inches:
+        return text
+    while len(text) > 1 and text_width_inches(text + '\u2026', fontsize) > max_inches:
+        text = text[:-1]
+    return text + '\u2026'
+
+
+def _text_colour_on(fill: str) -> str:
+    """Black or white, whichever reads better on the colour *fill*."""
+    from matplotlib.colors import to_rgb
+    r, g, b = to_rgb(fill)
+    return 'black' if 0.299 * r + 0.587 * g + 0.114 * b > 0.55 else 'white'
+
+
+def draw_direction_ramp(ax, x_limit: float, group_a: str, group_b: str,
+                        colour_a: str, colour_b: str, max_label_inches: float = 1.5):
+    """
+    Group key for an effect-size axis: a flat rectangle across *ax* split
+    along its diagonal into two ramps. Group A's ramp (the left side,
+    where the effect is lower) is fat at the left end, group B's (the
+    right side, where it is higher) fat at the right end, each in its
+    group's colour and named in its fat end. *ax* spans the effect axis
+    from -x_limit to x_limit.
+    """
+    from matplotlib.patches import Polygon
+
+    ax.set_xlim(-x_limit, x_limit)
+    ax.set_ylim(0.0, 1.0)
+    ax.axis('off')
+    ax.add_patch(Polygon([(-x_limit, 0.0), (-x_limit, 1.0), (x_limit, 1.0)], closed=True,
+                         facecolor=colour_a, edgecolor='none'))
+    ax.add_patch(Polygon([(-x_limit, 0.0), (x_limit, 0.0), (x_limit, 1.0)], closed=True,
+                         facecolor=colour_b, edgecolor='none'))
+    pad = 0.02 * x_limit
+    ax.text(-x_limit + pad, 0.68, _fit_text(f"higher in {group_a}", 7, max_label_inches),
+            ha='left', va='center', fontsize=7, color=_text_colour_on(colour_a))
+    ax.text(x_limit - pad, 0.32, _fit_text(f"higher in {group_b}", 7, max_label_inches),
+            ha='right', va='center', fontsize=7, color=_text_colour_on(colour_b))
+
+
+RUN_LABEL_BAND_INCHES = 0.3
+
+
 def stamp_run_label(fig, run_label: str):
-    """Write the source run's label in the figure's upper-left corner."""
+    """Write the source run's label in the figure's upper-left corner. A
+    figure laid out by constrained layout gives the label a band of its
+    own along the top, so it never covers a title or an axis."""
     if not run_label:
         return
+    engine = fig.get_layout_engine()
+    if engine is not None and type(engine).__name__ == 'ConstrainedLayoutEngine':
+        engine.set(rect=(0.0, 0.0, 1.0, 1.0 - RUN_LABEL_BAND_INCHES / fig.get_figheight()))
     fig.text(
         0.01, 0.99, run_label,
         ha='left', va='top', fontsize=8, color='#555555',
@@ -225,14 +292,43 @@ def significance_column(results_df: pd.DataFrame, fdr_scope: str = 'global') -> 
     return 'P.Value', "-log10(P-value)"
 
 
+def _fixed_margin_layout(gridspec, left: float, right: float, top: float, bottom: float):
+    """
+    Layout engine that keeps a figure's outer margins at fixed sizes in
+    inches (*left*, *right*, *top*, *bottom*) and lets *gridspec* fill the
+    rest. It places the axes directly from the current figure size on every
+    draw, so it stays valid at any canvas size and, unlike constrained
+    layout, never has to solve for a figure whose rows span a very wide
+    range of heights (a heatmap of several hundred rows).
+    """
+    from matplotlib.layout_engine import LayoutEngine
+
+    class _FixedMarginEngine(LayoutEngine):
+        _adjust_compatible = False
+        _colorbar_gridspec = False
+
+        def execute(self, fig):
+            width, height = fig.get_size_inches()
+            lo_x = min(left / width, 0.3)
+            hi_x = min(max(1.0 - right / width, lo_x + 0.1), 1.0)
+            lo_y = min(bottom / height, 0.3)
+            hi_y = min(max(1.0 - top / height, lo_y + 0.1), 1.0)
+            gridspec.update(left=lo_x, right=hi_x, bottom=lo_y, top=hi_y)
+
+    return _FixedMarginEngine()
+
+
 def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title: str,
                         group_by_sample: dict, group_a: str = '', group_b: str = '',
                         is_dark: bool = False, run_label: str = '',
                         value_label: str | None = None,
-                        feature_labels: dict | None = None):
+                        feature_labels: dict | None = None,
+                        group_colours: dict | None = None):
     """
     Per-sample heatmap of the significant features, with row and column
-    dendrograms and a two-group colour bar.
+    dendrograms and a two-group colour bar. The group key sits below the
+    plot, clear of the run label and the title.
+    Values that could not be measured in a sample (NaN) are drawn grey.
 
     results_df      : test output for ONE comparison (feature, significant, …).
     sample_df       : values for that comparison's samples (rows = samples,
@@ -242,6 +338,7 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
     value_label     : colour-bar label. Default: inferred from *title*
                       ('MFI', 'Counts', otherwise '% frequency').
     feature_labels  : optional {feature: display label} for the row labels.
+    group_colours   : optional {group: colour}; default two fixed colours.
     """
     from matplotlib.figure import Figure
     from matplotlib.gridspec import GridSpec
@@ -262,6 +359,12 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
                               title, is_dark, run_label)
 
     mat = sample_df[cols_present].values.astype(float)   # (n_samples, n_sig_features)
+    # Samples where a feature could not be measured are NaN: they are
+    # drawn grey, and filled with the feature's mean only to order the
+    # dendrograms.
+    with np.errstate(invalid='ignore'):
+        feature_means = np.where(np.isfinite(mat).any(axis=0), np.nanmean(mat, axis=0), 0.0)
+    mat_for_clustering = np.where(np.isfinite(mat), mat, feature_means[None, :])
     sample_labels = list(sample_df.index)
     n_samples, n_features = mat.shape
 
@@ -276,8 +379,8 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
         except Exception:
             return list(range(data.shape[0])), None
 
-    row_order, Zr = _hclust(mat.T)              # features
-    col_order, Zc = _hclust(mat)                # samples
+    row_order, Zr = _hclust(mat_for_clustering.T)   # features
+    col_order, Zc = _hclust(mat_for_clustering)     # samples
 
     mat_ord = mat[:, row_order][col_order, :].T   # (n_features, n_samples)
     labels = feature_labels or {}
@@ -285,25 +388,37 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
     samp_labels = [sample_labels[i] for i in col_order]
     grp_ord = [group_by_sample.get(sample_labels[i], group_a) for i in col_order]
 
+    # Sizes in inches: the plot's rows and columns, then the margins
+    # around them (title and run label above; colour bar labels on the
+    # right; the group key below).
     col_w = 0.55
     row_h = 0.30
     dend_h = 1.2
     grp_h = 0.18
     xlabel_h = 0.8
-    label_w = max(len(str(f)) for f in feat_labels) * 0.07 + 0.3
-    cbar_w = 0.5
-    fig_w = max(5.0, n_samples * col_w + label_w + cbar_w + 1.2)
-    fig_h = max(4.0, n_features * row_h + dend_h + grp_h + xlabel_h + 1.5)
+    dend_w = 1.0
+    label_w = max(text_width_inches(str(f), 7) for f in feat_labels) * 1.2 + 0.25
+    cbar_w = 0.3
+    title_text = wrap_label(title, max(20, int((5.0 + n_samples * col_w) / 0.09)))
+    left_m = 0.2
+    right_m = 1.0
+    top_m = (RUN_LABEL_BAND_INCHES if run_label else 0.1) + 0.22 * (title_text.count('\n') + 1) + 0.15
+    two_columns = text_width_inches(f"{group_a}        {group_b}", 7) + 1.0 < (
+        n_samples * col_w + dend_w + label_w + cbar_w)
+    bottom_m = 0.4 if two_columns else 0.65
+    fig_w = max(5.0, left_m + dend_w + n_samples * col_w + label_w + cbar_w + right_m)
+    fig_h = max(4.0, top_m + dend_h + grp_h + n_features * row_h + xlabel_h + bottom_m)
 
-    fig = Figure(figsize=(fig_w, fig_h), layout='constrained')
+    fig = Figure(figsize=(fig_w, fig_h))
     gs = GridSpec(
-        4, 3,
+        4, 4,
         figure=fig,
         height_ratios=[dend_h, grp_h, n_features * row_h, xlabel_h],
-        width_ratios=[label_w, n_samples * col_w, cbar_w],
+        width_ratios=[dend_w, n_samples * col_w, label_w, cbar_w],
         hspace=0.02,
-        wspace=0.02,
+        wspace=0.0,
     )
+    fig.set_layout_engine(_fixed_margin_layout(gs, left_m, right_m, top_m, bottom_m))
 
     ax_cdend = fig.add_subplot(gs[0, 1])
     ax_cdend.axis('off')
@@ -316,22 +431,23 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
             ax_cdend.set_xlim(-0.5, n_samples * 10 - 0.5)
         except Exception:
             pass
-    ax_cdend.set_title(title, fontsize=10, pad=4)
+    ax_cdend.set_title(title_text, fontsize=10, pad=4)
 
     ax_grp = fig.add_subplot(gs[1, 1])
     ax_grp.set_xlim(0, n_samples)
     ax_grp.set_ylim(0, 1)
     ax_grp.axis('off')
+    colour_a, colour_b = group_pair_colours(group_a, group_b, group_colours)
     for xi, grp in enumerate(grp_ord):
-        colour = GROUP_COLOUR_A if grp == group_a else GROUP_COLOUR_B
+        colour = colour_a if grp == group_a else colour_b
         ax_grp.add_patch(mpatches.Rectangle((xi, 0), 1, 1, color=colour,
                                             transform=ax_grp.transData))
     handles = [
-        mpatches.Patch(color=GROUP_COLOUR_A, label=group_a),
-        mpatches.Patch(color=GROUP_COLOUR_B, label=group_b),
+        mpatches.Patch(color=colour_a, label=group_a),
+        mpatches.Patch(color=colour_b, label=group_b),
     ]
-    ax_cdend.legend(handles=handles, loc='lower right', fontsize=7,
-                    frameon=True, ncol=2)
+    fig.legend(handles=handles, loc='lower center', fontsize=7,
+               frameon=True, ncol=2 if two_columns else 1)
 
     ax_rdend = fig.add_subplot(gs[2, 0])
     ax_rdend.axis('off')
@@ -347,9 +463,14 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
 
     ax_hm = fig.add_subplot(gs[2, 1])
     # Per-sample values, not differences: scale to the data's own range.
-    vmin = float(np.percentile(mat_ord, 5))
-    vmax = max(float(np.percentile(mat_ord, 95)), vmin + 0.01)
-    im = ax_hm.imshow(mat_ord, aspect='auto', cmap='viridis',
+    finite_values = mat_ord[np.isfinite(mat_ord)]
+    vmin = float(np.percentile(finite_values, 5)) if finite_values.size else 0.0
+    vmax = max(float(np.percentile(finite_values, 95)) if finite_values.size else 1.0,
+               vmin + 0.01)
+    import matplotlib
+    cmap = matplotlib.colormaps['viridis'].copy()
+    cmap.set_bad('#bdbdbd')
+    im = ax_hm.imshow(np.ma.masked_invalid(mat_ord), aspect='auto', cmap=cmap,
                       vmin=vmin, vmax=vmax, interpolation='nearest')
     ax_hm.set_xticks(range(n_samples))
     ax_hm.set_xticklabels([Path(str(s)).stem for s in samp_labels],
@@ -364,7 +485,7 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
     ax_hm.grid(which='minor', color='white', linestyle='-', linewidth=0.6)
     ax_hm.tick_params(which='minor', bottom=False, left=False, right=False)
 
-    ax_cb = fig.add_subplot(gs[2, 2])
+    ax_cb = fig.add_subplot(gs[2, 3])
     cb = fig.colorbar(im, cax=ax_cb)
     cb.ax.tick_params(labelsize=7)
     if value_label is None:
@@ -385,7 +506,9 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
                         pval_threshold: float, fc_threshold: float,
                         is_dark: bool = False, fdr_scope: str = 'global',
                         feature_labels: list[str] | None = None,
-                        x_label: str | None = None, run_label: str = ''):
+                        x_label: str | None = None, run_label: str = '',
+                        group_a: str = '', group_b: str = '',
+                        group_colours: dict | None = None):
     """
     Volcano plot: x = effect (log2 fold change, log2 odds ratio or intensity
     difference), y = -log10 of the adjusted p-value that decides
@@ -393,11 +516,22 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
     a 95% CI bar; the ten most significant are labelled, and every
     significant point has a hover tooltip. Non-significant points are grey.
 
+    The x axis is symmetric about zero and sized to the plotted points and
+    to the CI bars that are drawn (a bar far beyond the points is cut off
+    at the axis edge); the CIs of non-significant points are not drawn and
+    do not count.
+
     feature_labels : display label per row of results_df (default: 'feature').
     x_label        : default 'log2 Fold Change', or an intensity label
                      when 'MFI' is in the title.
+    group_a/group_b: the comparison's baseline and other group; the effect
+                     is higher in group_b on the right and in group_a on
+                     the left. When both are given, a ramp below the plot
+                     names them (see draw_direction_ramp).
+    group_colours  : optional {group: colour} for the ramp.
     """
     from matplotlib.figure import Figure
+    from matplotlib.gridspec import GridSpec
 
     pval_col, y_label = significance_column(results_df, fdr_scope)
     logfc = results_df['logFC'].values.astype(float)
@@ -407,8 +541,13 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
     ).values
     features = list(feature_labels) if feature_labels is not None else results_df['feature'].tolist()
 
-    fig = Figure(figsize=(5, 5), constrained_layout=True)
-    ax = fig.add_subplot(111)
+    show_ramp = bool(group_a and group_b)
+    fig = Figure(figsize=(5, 5.4 if show_ramp else 5), layout='constrained')
+    grid = GridSpec(2 if show_ramp else 1, 2 if sig.any() else 1, figure=fig,
+                    height_ratios=[14, 1] if show_ramp else [1],
+                    width_ratios=[1, 0.04] if sig.any() else [1])
+    ax = fig.add_subplot(grid[0, 0])
+    ax_ramp = fig.add_subplot(grid[1, 0]) if show_ramp else None
     fg = 'white' if is_dark else 'black'
 
     non_sig = ~sig
@@ -433,7 +572,7 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
     if sig.any():
         sig_scatter = ax.scatter(logfc[sig], neg_lp[sig], c=neg_lp[sig], cmap='viridis',
                                  s=25, alpha=0.9, linewidths=0)
-        fig.colorbar(sig_scatter, ax=ax, shrink=0.7, label=y_label)
+        fig.colorbar(sig_scatter, cax=fig.add_subplot(grid[0, 1]), label=y_label)
 
     ax.axhline(-np.log10(pval_threshold), color='grey', linestyle='--', linewidth=0.8)
     ax.axvline(fc_threshold, color='grey', linestyle='--', linewidth=0.8)
@@ -462,19 +601,23 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
         fig._hover_handler = make_scatter_hover_handler(fig, ax, sig_scatter, sig_labels, is_dark)
         fig._hover_labels = sig_labels
 
-    ci_extent = 0.0
-    if 'CI.L' in results_df.columns and 'CI.R' in results_df.columns:
-        finite_ci = np.concatenate([
-            results_df['CI.L'].values.astype(float),
-            results_df['CI.R'].values.astype(float),
-        ])
-        finite_ci = np.abs(finite_ci[np.isfinite(finite_ci)])
-        if finite_ci.size:
-            ci_extent = float(finite_ci.max())
     finite_fc = np.abs(logfc[np.isfinite(logfc)])
     max_fc = float(finite_fc.max()) if finite_fc.size else 0.0
+    ci_extent = 0.0
+    if 'CI.L' in results_df.columns and 'CI.R' in results_df.columns and sig.any():
+        drawn_ci = np.concatenate([
+            results_df['CI.L'].values.astype(float)[sig],
+            results_df['CI.R'].values.astype(float)[sig],
+        ])
+        drawn_ci = np.abs(drawn_ci[np.isfinite(drawn_ci)])
+        if drawn_ci.size:
+            ci_extent = float(drawn_ci.max())
+    ci_extent = min(ci_extent, 2.0 * max(max_fc, fc_threshold))
     x_lim = max(max_fc * 1.05, fc_threshold * 1.5, ci_extent * 1.05, 1e-6)
     ax.set_xlim(-x_lim, x_lim)
+    if ax_ramp is not None:
+        colour_a, colour_b = group_pair_colours(group_a, group_b, group_colours)
+        draw_direction_ramp(ax_ramp, x_lim, group_a, group_b, colour_a, colour_b)
 
     if x_label is None:
         x_label = "Δ mean intensity (transformed units)" if 'MFI' in title else "log2 Fold Change"

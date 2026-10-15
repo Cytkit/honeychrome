@@ -7925,7 +7925,7 @@ class GroupsStatsTab(QWidget):
                 results_df=freq_results_view,
                 title=f"Cluster Frequency Volcano: {name_b} vs {name_a}",
                 pval_threshold=pval_threshold, fc_threshold=fc_threshold,
-                run_label=run_label,
+                run_label=run_label, group_a=name_a, group_b=name_b,
             ))
 
         if counts_results_view is not None:
@@ -7938,7 +7938,7 @@ class GroupsStatsTab(QWidget):
                 results_df=counts_results_view,
                 title=f"Cluster Counts Volcano: {name_b} vs {name_a}",
                 pval_threshold=pval_threshold, fc_threshold=fc_threshold,
-                run_label=run_label,
+                run_label=run_label, group_a=name_a, group_b=name_b,
             ))
 
         if mfi_sample_df_view is not None:
@@ -7952,7 +7952,7 @@ class GroupsStatsTab(QWidget):
                 results_df=mfi_results_view,
                 title=f"Cluster MFI Volcano: {name_b} vs {name_a}",
                 pval_threshold=pval_threshold, fc_threshold=mfi_fc,
-                run_label=run_label,
+                run_label=run_label, group_a=name_a, group_b=name_b,
             ))
             _build('mfi_clusters', "MFI Clusters", self._make_mfi_cluster_summary_figure, dict(
                 results_df=mfi_results_view,
@@ -8161,15 +8161,20 @@ class GroupsStatsTab(QWidget):
             results_df, sample_df, title, group_by_sample,
             group_a=group_a, group_b=group_b,
             is_dark=_resolve_is_dark(self.state), run_label=run_label,
+            group_colours={name: _resolve_group_colour(self.state, name)
+                           for name in (group_a, group_b) if name},
         )
 
     def _make_volcano_figure(self, results_df, title: str,
                               pval_threshold: float, fc_threshold: float,
-                              run_label: str = ''):
+                              run_label: str = '', group_a: str = '',
+                              group_b: str = ''):
         """Volcano plot of one comparison's results (see
         differential_plots.make_volcano_figure). MFI features are
         "{cluster_label}_{channel}"; their channel suffix is shown as the
-        Antigen (falling back to Label)."""
+        Antigen (falling back to Label). group_a/group_b are the
+        comparison's baseline and other group, named on the plot in their
+        group colours."""
         features = results_df['feature'].tolist()
         if 'MFI' in title:
             disp_map = _antigen_or_label_map(self.controller)
@@ -8188,6 +8193,9 @@ class GroupsStatsTab(QWidget):
             is_dark=_resolve_is_dark(self.state),
             fdr_scope=self.state.stats_fdr_scope,
             feature_labels=features, run_label=run_label,
+            group_a=group_a, group_b=group_b,
+            group_colours={name: _resolve_group_colour(self.state, name)
+                           for name in (group_a, group_b) if name},
         )
 
     def _make_mfi_cluster_summary_figure(self, results_df, title: str,
@@ -12882,7 +12890,7 @@ class PluginWidget(QWidget):
         # ------------------------------------------------------------------
         self.label_disabled = QLabel(
             f"{plugin_name}: loading...  "
-            "Set up the spectral model first if you have not done so."
+            "Loading...Set up the spectral model first if you have not done so."
         )
         self.label_disabled.setWordWrap(True)
         self.label_disabled.setStyleSheet(
