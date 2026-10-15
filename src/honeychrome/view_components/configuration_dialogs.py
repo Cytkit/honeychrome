@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QWidget, 
 from PySide6.QtCore import Qt, QSettings
 
 from honeychrome.settings import (colourmap_choice, graphics_export_formats, hist2dtype, colormap_name, graphics_export_format, cytometry_plot_width_target,
-                                  tile_size_nxn_grid, subsample, max_display_events, hist_bins, density_cutoff, peak_detection_channel, adc_channels, width_channels, height_channels,
+                                  tile_size_nxn_grid, subsample, max_display_events, hist_bins, density_cutoff, peak_detection_channel, adc_channels, height_channels,
                                   use_dummy_instrument, sample_pump_steps_per_microlitre, magnitude_ceilings, magnitude_ceiling, raw_settings, unmixed_settings, experiments_folder,
                                   magnitude_ceilings_int, spectral_positive_gate_percent, spectral_negative_gate_percent, report_include_raw, report_include_unmixed, report_include_process, send_debug_data,
                                   heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral)

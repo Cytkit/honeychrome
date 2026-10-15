@@ -18,7 +18,7 @@ from honeychrome.view_components.icon_loader import icon
 from honeychrome import settings
 from honeychrome.view_components.profiles_viewer import FlowLayout, LegendEntry
 
-q_settings = settings.q_settings
+instrument_settings = settings.instrument_settings
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,7 @@ class DacChannelTable(QWidget):
         if self._loading:
             return
         row = self._row_for(name)
-        s = q_settings
+        s = instrument_settings
         s.beginGroup(self.SETTINGS_GROUP)
         s.beginGroup(name)
         s.setValue("bias", self.bias_spins[row].value())
@@ -166,7 +166,7 @@ class DacChannelTable(QWidget):
         s.endGroup()
 
     def save_state(self) -> None:
-        s = q_settings
+        s = instrument_settings
         s.beginGroup(self.SETTINGS_GROUP)
         for row, name in enumerate(adc_channels):
             s.beginGroup(name)
@@ -357,7 +357,7 @@ class AdcChannelTable(QWidget):
         if self._loading:
             return
         row = self._row_for(name)
-        s = q_settings
+        s = instrument_settings
         s.beginGroup(self.SETTINGS_GROUP)
         s.beginGroup(name)
         s.setValue("enabled", self.enable_boxes[row].isChecked())
@@ -368,7 +368,7 @@ class AdcChannelTable(QWidget):
 
     def save_state(self) -> None:
         """Write state for every channel (e.g. on app close)."""
-        s = q_settings
+        s = instrument_settings
         s.beginGroup(self.SETTINGS_GROUP)
         for row, name in enumerate(adc_channels):
             s.beginGroup(name)
@@ -660,7 +660,7 @@ class TriggerChannelTable(QWidget):
         if self._loading:
             return
         row = self._row_for(name)
-        s = q_settings
+        s = instrument_settings
         s.beginGroup(self.SETTINGS_GROUP)
         s.beginGroup(name)
         s.setValue("enabled", self.enable_boxes[row].isChecked())
@@ -676,7 +676,7 @@ class TriggerChannelTable(QWidget):
 
     def save_state(self) -> None:
         """Write state for every channel (e.g. on app close)."""
-        s = q_settings
+        s = instrument_settings
         s.beginGroup(self.SETTINGS_GROUP)
         for row, name in enumerate(adc_channels):
             s.beginGroup(name)
@@ -933,7 +933,7 @@ class CaptureChannelTable(QWidget):
         if self._loading:
             return
         row = self._row_for(name)
-        s = q_settings
+        s = instrument_settings
         s.beginGroup(self.SETTINGS_GROUP)
         s.beginGroup(name)
         s.setValue("enabled", self.enable_boxes[row].isChecked())
@@ -943,7 +943,7 @@ class CaptureChannelTable(QWidget):
         s.endGroup()
 
     def save_state(self) -> None:
-        s = q_settings
+        s = instrument_settings
         s.beginGroup(self.SETTINGS_GROUP)
         for row, name in enumerate(adc_channels):
             s.beginGroup(name)
@@ -978,11 +978,12 @@ class CaptureChannelTable(QWidget):
             w.blockSignals(False)
 
     # ---------- reset ----------
-
-    def reset(self) -> None:
+    def reset(self, rows=None) -> None:
         self._loading = True
+        if rows is None:
+            rows = range(len(adc_channels))
         try:
-            for row in range(len(adc_channels)):
+            for row in rows:
                 self._set_row_silently(
                     row,
                     settings.capture_enabled_default,
@@ -1394,6 +1395,7 @@ class PluginWidget(QWidget):
         set_trigger_over_baseline_layout.addWidget(self.set_trigger_over_baseline_btn)
         layout.addLayout(set_trigger_over_baseline_layout)
         self.set_trigger_over_baseline_text = QLabel('')
+        layout.addWidget(self.set_trigger_over_baseline_text)
 
         layout.addStretch()
         toolbox.addTab(tab, "Triggers")
@@ -1619,17 +1621,28 @@ class PluginWidget(QWidget):
     @Slot()
     def set_trigger_over_baseline(self):
         threshold = self.set_trigger_over_baseline_spin.value()
-        self.get_instrument_state(['test_capture_and_read_memory'])
-        if self.traces_blob_np is not None:
+        trigger_channels = [row for row in range(len(adc_channels)) if self.trigger_table.is_enabled(row)]
+        if trigger_channels:
+            self.set_instrument_state({'capture': 'clear_fifo'})
+            self.capture_table.reset(rows=trigger_channels) # make sure trigger channels selected with default pre and post
+            self.get_instrument_state(['test_capture_and_read_memory'])
+            if self.traces_blob_np is None:
+                for n in range(10):
+                    self.set_instrument_state({'trigger': 'force'})
+                self.get_instrument_state(['test_capture_and_read_memory'])
+
             baselines = {}
             triggers = {}
             for row, name in enumerate(adc_channels):
-                if settings.trigger_enabled_retrieved[name]:
+                if self.trigger_table.is_enabled(row):
                     pre = settings.capture_pre_trigger_retrieved[name]
                     baselines[row] = np.median(self.traces_blob_np[:, row, :pre//2].reshape(-1))
                     triggers[row] = baselines[row] + threshold * 1000 / settings.adc_scale_uv # convert mV to adc units
                     self.trigger_table.set_level(row, triggers[row])
-            self.set_trigger_over_baseline_text.setText(f'Baselines: {baselines} (ADC scale) + threshold: {threshold} mV = {triggers} (ADC scale)')
+            self.set_trigger_over_baseline_text.setText(f'Baselines: {[(adc_channels[row], baselines[row]) for row in baselines]} (ADC scale) + threshold: {threshold} mV = {[(adc_channels[row], triggers[row]) for row in triggers]} (ADC scale)')
+
+        else:
+            self.set_trigger_over_baseline_text.setText(f'No trigger channels selected.')
 
     @Slot()
     def update_connection_status(self):
@@ -1663,12 +1676,19 @@ class PluginWidget(QWidget):
             self.datetime.setText(f'Firmware datestamp: {response['message']['read_id_data']['datetime']}')
 
         if 'laser' in response['message']:
-            self.laser_cb.setChecked(response['message']['laser']['state'])
-            self.interlock_enable_cb.setChecked(response['message']['laser']['interlock_mask'])
-            if response['message']['laser']['interlock_state']:
-                self.interlock_status_label.setText('Interlock status: 🔴 Open')
+            laser_state = response['message']['laser']['state'] # True --> On
+            interlock_state = response['message']['laser']['interlock_state'] # True --> Open
+            interlock_enabled = response['message']['laser']['interlock_mask']
+            self.laser_cb.setChecked(laser_state)
+            self.interlock_enable_cb.setChecked(interlock_enabled)
+            if interlock_enabled:
+                if interlock_state:
+                    self.interlock_status_label.setText('Interlock status: 🔴 Open')
+                else:
+                    self.interlock_status_label.setText('Interlock status: 🟢 Closed')
             else:
-                self.interlock_status_label.setText('Interlock status: 🟢 Closed')
+                self.interlock_status_label.setText('Interlock status: 🔴 DISABLED!')
+
             self.interlock_force_cb.setChecked(response['message']['laser']['interlock_forced'])
 
         if 'pressure' in response['message']:
@@ -1747,7 +1767,7 @@ class PluginWidget(QWidget):
             traces_blob_np = response['message']['test_capture_and_read_memory']
             if traces_blob_np is not None:
                 self.traces_blob_np = traces_blob_np.reshape(-1, len(adc_channels), settings.n_time_points_in_event)
-                self.read_memory_output.setText(f'Traces captured: {len(self.traces_blob_np)}, non-zero channels: {np.flatnonzero(traces_blob_np.sum(axis=2).sum(axis=0))}')
+                self.read_memory_output.setText(f'Traces captured: {len(self.traces_blob_np)}, non-zero channels: {np.flatnonzero(self.traces_blob_np.sum(axis=2).sum(axis=0))}')
                 self.plot_traces_widget.set_traces(self.traces_blob_np)
                 self.plot_traces_widget.setVisible(True)
             else:
@@ -1781,7 +1801,7 @@ class PluginWidget(QWidget):
 
     @Slot(int)
     def set_pressure_set_point(self, set_point):
-        q_settings.setValue("pressure_set_point", set_point)
+        instrument_settings.setValue("pressure_set_point", set_point)
         self.set_instrument_state({'pressure_set_point': set_point})
 
     @Slot(int)
@@ -1791,7 +1811,7 @@ class PluginWidget(QWidget):
     @Slot(dict)
     def set_pump_controls(self, dict_of_parameter_value):
         for parameter, value in dict_of_parameter_value.items():
-            q_settings.setValue(parameter, value)
+            instrument_settings.setValue(parameter, value)
         self.set_instrument_state(dict_of_parameter_value)
 
 

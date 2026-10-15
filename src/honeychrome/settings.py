@@ -3,6 +3,11 @@ These are the default settings for the honeychrome software
 '''
 from PySide6.QtCore import QSettings
 
+# retrieve from QSettings
+q_settings = QSettings("honeychrome", "app_configuration")
+# instrument settings
+instrument_settings = QSettings("honeychrome", "instrument_configuration")
+
 ### instrument settings
 devices_boot_order = [
   'cytkit',
@@ -39,6 +44,7 @@ sample_pump_clocks_per_cycle = 2000
 
 ### peak detection settings
 peak_detection_channel = 'FSC'
+peak_detection_channel_retrieved = str(instrument_settings.value("peak_detection_channel", peak_detection_channel))  # there can only be one peak detection channel
 FSC_sense = -1
 threshold = 100 # mV
 baseline_time = 15e-6  # time in s, sets decay rate of exponentially moving average
@@ -83,7 +89,12 @@ max_events_in_cache = 10_000_000
 adc_channels = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14', 'FSC', 'SSC']
 area_channels = ['FSC', 'SSC', 'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14'] # make sure there is equal number to n_channels_trace in instrument config
 height_channels = ['FSC']
-width_channels = [peak_detection_channel]
+width_channels = ['FSC']
+height_channel_retrieved = str(instrument_settings.value("height_channel", height_channels))  # there can be more than one height channel, but currently only allowing one
+width_channel_retrieved = str(instrument_settings.value("width_channel", width_channels[0]))  # there can be more than one width channel, but currently only allowing one
+height_channels = [height_channel_retrieved]
+width_channels = [width_channel_retrieved]
+
 scatter_channels = ['FSC', 'SSC']
 fluorescence_channels = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14']
 event_channels_pnn = ['Time', 'event_id'] + [c + '-A' for c in area_channels] + [c + '-H' for c in height_channels] + [c + '-W' for c in width_channels]
@@ -261,8 +272,7 @@ cytometry_default = {
     'plots': None
 }
 
-# retrieve from QSettings
-q_settings = QSettings("honeychrome", "app_configuration")
+
 hist2dtype_retrieved = str(q_settings.value("hist2dtype", hist2dtype))
 colourmap_name_retrieved = str(q_settings.value("colourmap", colormap_name))
 graphics_export_format_retrieved = str(q_settings.value("graphics_export_format", graphics_export_format))
@@ -272,11 +282,6 @@ subsample_retrieved = q_settings.value("subsample_number", subsample, type=int)
 max_display_events = q_settings.value("max_display_events", max_display_events, type=int)
 hist_bins_retrieved = q_settings.value("histogram_resolution", hist_bins, type=int)
 density_cutoff_retrieved = q_settings.value("density_cutoff", density_cutoff, type=int)
-
-peak_detection_channel_retrieved = str(q_settings.value("peak_detection_channel", peak_detection_channel))  # there can only be one peak detection channel
-width_channel_retrieved = str(q_settings.value("width_channel", width_channels[0]))  # there can be more than one width channel, but currently only allowing one
-height_channel_retrieved = str(q_settings.value("height_channel", height_channels))  # there can be more than one height channel, but currently only allowing one
-use_dummy_instrument_retrieved = q_settings.value("use_dummy_instrument", use_dummy_instrument, type=bool)
 
 spectral_positive_gate_percent_retrieved = q_settings.value("spectral_positive_gate_percent", spectral_positive_gate_percent, type=int)
 spectral_negative_gate_percent_retrieved = q_settings.value("spectral_negative_gate_percent", spectral_negative_gate_percent, type=int)
@@ -288,45 +293,47 @@ report_include_raw_retrieved = q_settings.value("report_include_raw", report_inc
 report_include_unmixed_retrieved = q_settings.value("report_include_unmixed", report_include_unmixed, type=bool)
 report_include_process_retrieved = q_settings.value("report_include_process", report_include_process, type=bool)
 
-pressure_set_point_retrieved = q_settings.value('pressure_set_point', pressure_set_point, type=int)
-temperature_set_point_retrieved = q_settings.value('temperature_set_point', temperature_set_point, type=int)
-sample_pump_steps_per_microlitre_retrieved = q_settings.value('sample_pump_steps_per_microlitre', sample_pump_steps_per_microlitre, type=int)
-sample_flow_rate_retrieved = q_settings.value('sample_flow_rate', sample_flow_rate, type=int)
+use_dummy_instrument_retrieved = instrument_settings.value("use_dummy_instrument", use_dummy_instrument, type=bool)
 
-sample_pump_priming_speed_retrieved = q_settings.value('sample_pump_priming_speed', sample_pump_priming_speed, type=int)
-sample_pump_priming_time_retrieved = q_settings.value('sample_pump_priming_time', sample_pump_priming_time, type=float)
-sample_pump_unpriming_speed_retrieved = q_settings.value('sample_pump_unpriming_speed', sample_pump_unpriming_speed, type=int)
-sample_pump_unpriming_time_retrieved = q_settings.value('sample_pump_unpriming_time', sample_pump_unpriming_time, type=float)
-sample_pump_settle_time_retrieved = q_settings.value('sample_pump_settle_time', sample_pump_settle_time, type=float)
-sample_pump_flush_speed_retrieved = q_settings.value('sample_pump_flush_speed', sample_pump_flush_speed, type=int)
-sample_pump_flush_time_retrieved = q_settings.value('sample_pump_flush_time', sample_pump_flush_time, type=float)
-sample_pump_backflush_speed_retrieved = q_settings.value('sample_pump_backflush_speed', sample_pump_backflush_speed, type=int)
-sample_pump_backflush_time_retrieved = q_settings.value('sample_pump_backflush_time', sample_pump_backflush_time, type=float)
-sample_pump_acquisition_rate_retrieved = q_settings.value('sample_pump_acquisition_speed', sample_pump_acquisition_rate, type=float)
+pressure_set_point_retrieved = instrument_settings.value('pressure_set_point', pressure_set_point, type=int)
+temperature_set_point_retrieved = instrument_settings.value('temperature_set_point', temperature_set_point, type=int)
+sample_pump_steps_per_microlitre_retrieved = instrument_settings.value('sample_pump_steps_per_microlitre', sample_pump_steps_per_microlitre, type=int)
+sample_flow_rate_retrieved = instrument_settings.value('sample_flow_rate', sample_flow_rate, type=int)
 
-q_settings.beginGroup("dac_channels")
+sample_pump_priming_speed_retrieved = instrument_settings.value('sample_pump_priming_speed', sample_pump_priming_speed, type=int)
+sample_pump_priming_time_retrieved = instrument_settings.value('sample_pump_priming_time', sample_pump_priming_time, type=float)
+sample_pump_unpriming_speed_retrieved = instrument_settings.value('sample_pump_unpriming_speed', sample_pump_unpriming_speed, type=int)
+sample_pump_unpriming_time_retrieved = instrument_settings.value('sample_pump_unpriming_time', sample_pump_unpriming_time, type=float)
+sample_pump_settle_time_retrieved = instrument_settings.value('sample_pump_settle_time', sample_pump_settle_time, type=float)
+sample_pump_flush_speed_retrieved = instrument_settings.value('sample_pump_flush_speed', sample_pump_flush_speed, type=int)
+sample_pump_flush_time_retrieved = instrument_settings.value('sample_pump_flush_time', sample_pump_flush_time, type=float)
+sample_pump_backflush_speed_retrieved = instrument_settings.value('sample_pump_backflush_speed', sample_pump_backflush_speed, type=int)
+sample_pump_backflush_time_retrieved = instrument_settings.value('sample_pump_backflush_time', sample_pump_backflush_time, type=float)
+sample_pump_acquisition_rate_retrieved = instrument_settings.value('sample_pump_acquisition_speed', sample_pump_acquisition_rate, type=float)
+
+instrument_settings.beginGroup("dac_channels")
 dac_bias_retrieved = {}
 dac_ref_retrieved = {}
 for row, name in enumerate(adc_channels):
-    q_settings.beginGroup(name)
-    dac_bias_retrieved[name] = q_settings.value("bias", dac_bias_default if name not in ['FSC', 'SSC'] else 0, type=int)
-    dac_ref_retrieved[name] = q_settings.value("ref", dac_ref_default, type=int)
-    q_settings.endGroup()
-q_settings.endGroup()
+    instrument_settings.beginGroup(name)
+    dac_bias_retrieved[name] = instrument_settings.value("bias", dac_bias_default if name not in ['FSC', 'SSC'] else 0, type=int)
+    dac_ref_retrieved[name] = instrument_settings.value("ref", dac_ref_default, type=int)
+    instrument_settings.endGroup()
+instrument_settings.endGroup()
 
-q_settings.beginGroup("adc_channels")
+instrument_settings.beginGroup("adc_channels")
 adc_enabled_retrieved = {}
 adc_inverted_retrieved = {}
 adc_offset_retrieved = {}
 for row, name in enumerate(adc_channels):
-    q_settings.beginGroup(name)
-    adc_enabled_retrieved[name] = q_settings.value("enabled", True, type=bool)
-    adc_inverted_retrieved[name] = q_settings.value("inverted", False if name=='SSC' else True, type=bool)
-    adc_offset_retrieved[name] = q_settings.value("offset", 0, type=int)
-    q_settings.endGroup()
-q_settings.endGroup()
+    instrument_settings.beginGroup(name)
+    adc_enabled_retrieved[name] = instrument_settings.value("enabled", True, type=bool)
+    adc_inverted_retrieved[name] = instrument_settings.value("inverted", False if name=='SSC' else True, type=bool)
+    adc_offset_retrieved[name] = instrument_settings.value("offset", 0, type=int)
+    instrument_settings.endGroup()
+instrument_settings.endGroup()
 
-q_settings.beginGroup("trigger_channels")
+instrument_settings.beginGroup("trigger_channels")
 trigger_enabled_retrieved = {}
 trigger_mask_retrieved = {}
 trigger_edge_retrieved = {}
@@ -336,29 +343,29 @@ trigger_delay_retrieved = {}
 trigger_h_off_retrieved = {}
 trigger_skew_retrieved = {}
 for row, name in enumerate(adc_channels):
-    q_settings.beginGroup(name)
-    trigger_enabled_retrieved[name] = q_settings.value("enabled", True if name=='FSC' else False, type=bool)
-    trigger_mask_retrieved[name] = q_settings.value("mask", True if name=='FSC' else False, type=bool)
-    trigger_edge_retrieved[name] = q_settings.value("edge", True if name=='FSC' else False, type=bool)
-    trigger_level_retrieved[name] = q_settings.value("level", threshold, type=int)
-    trigger_hyst_retrieved[name] = q_settings.value("hyst", trigger_default_hysteresis, type=int)
-    trigger_delay_retrieved[name] = q_settings.value("delay", 0, type=int)
-    trigger_h_off_retrieved[name] = q_settings.value("h_off", 0, type=int)
-    trigger_skew_retrieved[name] = q_settings.value("skew", 0, type=int)
-    q_settings.endGroup()
-q_settings.endGroup()
+    instrument_settings.beginGroup(name)
+    trigger_enabled_retrieved[name] = instrument_settings.value("enabled", True if name=='FSC' else False, type=bool)
+    trigger_mask_retrieved[name] = instrument_settings.value("mask", True if name=='FSC' else False, type=bool)
+    trigger_edge_retrieved[name] = instrument_settings.value("edge", True if name=='FSC' else False, type=bool)
+    trigger_level_retrieved[name] = instrument_settings.value("level", threshold, type=int)
+    trigger_hyst_retrieved[name] = instrument_settings.value("hyst", trigger_default_hysteresis, type=int)
+    trigger_delay_retrieved[name] = instrument_settings.value("delay", 0, type=int)
+    trigger_h_off_retrieved[name] = instrument_settings.value("h_off", 0, type=int)
+    trigger_skew_retrieved[name] = instrument_settings.value("skew", 0, type=int)
+    instrument_settings.endGroup()
+instrument_settings.endGroup()
 
 
-q_settings.beginGroup("capture_channels")
+instrument_settings.beginGroup("capture_channels")
 capture_enabled_retrieved = {}
 capture_pre_trigger_retrieved = {}
 capture_post_trigger_retrieved = {}
 for row, name in enumerate(adc_channels):
-    q_settings.beginGroup(name)
-    capture_enabled_retrieved[name] = q_settings.value("enabled", capture_enabled_default, type=bool)
-    capture_pre_trigger_retrieved[name] = q_settings.value("pre_trigger", capture_pre_trigger_default, type=int)
-    capture_post_trigger_retrieved[name] = q_settings.value("post_trigger", capture_post_trigger_default, type=int)
-    q_settings.endGroup()
-q_settings.endGroup()
+    instrument_settings.beginGroup(name)
+    capture_enabled_retrieved[name] = instrument_settings.value("enabled", capture_enabled_default, type=bool)
+    capture_pre_trigger_retrieved[name] = instrument_settings.value("pre_trigger", capture_pre_trigger_default, type=int)
+    capture_post_trigger_retrieved[name] = instrument_settings.value("post_trigger", capture_post_trigger_default, type=int)
+    instrument_settings.endGroup()
+instrument_settings.endGroup()
 
-threshold_retrieved = q_settings.value("threshold", threshold, type=int)
+threshold_retrieved = instrument_settings.value("threshold", threshold, type=int)

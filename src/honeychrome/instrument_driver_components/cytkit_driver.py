@@ -347,7 +347,7 @@ class CytkitDevice:
 
         # set initial settings
         self.laser.set_interlock_effects(force=False, stop_fan=False, stop_sheath=False, stop_sample=False, stop_laser=True)
-        self.laser.set_interlock_inversion(1) # 1 is normally closed, i.e. break circuit to trigger interlock stop laser
+        self.laser.set_interlock_inversion(0) # 1 is normally open, i.e. make circuit to trigger interlock stop laser
         self.laser.set_interlock_mask(1) # currently should be 1, i.e. only one interlock circuit
         self.get_state(['zero_pressure']) # calibrate assuming pressure zero before start
         self.sample_pump.stop()
@@ -368,7 +368,7 @@ class CytkitDevice:
         self.sample_pump_flow_rate_getter.start()
         self.laser_getter = LaserGetter(self.laser)
         self.laser_getter.start()
-        self.display = Display(event_rate_object=self.event_rate_counter, sample_pump_object=self.sample_pump_flow_rate_getter, pressure_object=self.pressure_control_worker, temperature_object=self.temperature_control_worker, laser_object=self.laser_getter)
+        self.display = Display(comms=self.ft4222, event_rate_object=self.event_rate_counter, sample_pump_object=self.sample_pump_flow_rate_getter, pressure_object=self.pressure_control_worker, temperature_object=self.temperature_control_worker, laser_object=self.laser_getter)
         self.display.start()
 
         # dac state
@@ -777,6 +777,7 @@ class CytkitDevice:
 
         if 'capture' in list_of_parameters:
             self.fifo_level = self.capture.aggr_get_fifo_level()
+            self.fifo_flooded = self.capture.aggr_get_flooded()
             message['capture'] = {'fifo_level':self.fifo_level, 'fifo_status':'🔴 Flooded!' if self.fifo_flooded else '🟢 OK', 'decode_errors':self.decoder.error_count, 'auto_resets':self.auto_resets}
 
         if 'test_capture_and_read_memory' in list_of_parameters:

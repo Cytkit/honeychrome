@@ -80,26 +80,24 @@ def _dirty_rects(new: bytes, old: bytes):
 class CommsThroughMainBoard:
     def __init__(self, ft4222communicator):
         self.ft4222 = ft4222communicator
-        self.ft4222.register_write('DISP_TXFR_SIZE', 32)
 
     def spi_write_4bytes(self, data):
-        while not self.ft4222.register_bit_get('DISP_CTRL', 4):
-            time.sleep(0.0001)
         self.ft4222.register_2reg_write('DISP_DATA_L', 'DISP_DATA_H', data)
-
-    def dc_write(self, is_data):
-        if is_data:
-            self.ft4222.register_bit_set('DISP_CTRL', 0)
-        else:
-            self.ft4222.register_bit_clear('DISP_CTRL', 0)
+        self.ft4222.register_bit_set('DISP_CTRL', 0)
+        while not self.ft4222.register_bit_get('DISP_CTRL', 4):
+            time.sleep(0.00001)
 
     def set_dc(self, is_data):
-        pass #todo
+        if is_data:
+            self.ft4222.register_bit_set('DISP_CTRL', 12)
+        else:
+            self.ft4222.register_bit_clear('DISP_CTRL', 12)
 
     def command(self, *cmds):
+        self.ft4222.register_write('DISP_TXFR_SIZE', 8)
         self.set_dc(False)
         for cmd in cmds:
-            self.spi_write_4bytes(bytes([cmd]))
+            self.spi_write_4bytes(cmd)
 
     def write_data(self, data_bytes):
         self.set_dc(True)
@@ -107,6 +105,8 @@ class CommsThroughMainBoard:
         data_bytes = bytes(data_bytes)
         for i in range(0, len(data_bytes), 4): # transmit in 4-byte chunks
             chunk = data_bytes[i:i + 4]
+            self.ft4222.register_write('DISP_TXFR_SIZE', 8*len(chunk))
+            chunk = int.from_bytes(chunk, byteorder='big')
             self.spi_write_4bytes(chunk)
 
     def close(self):
@@ -177,9 +177,9 @@ class CommsThroughEvalBoard:
 
 
 class SSD1309:
-    def __init__(self):
-        self.comms = CommsThroughEvalBoard()
-        # self.comms = CommsThroughMainBoard()
+    def __init__(self, ft4222):
+        # self.comms = CommsThroughEvalBoard()
+        self.comms = CommsThroughMainBoard(ft4222)
 
         time.sleep(0.1)  # Wait for internal power-on reset to complete
 
@@ -292,12 +292,13 @@ class SimProxy:
 
 
 class Display(Thread):
-    def __init__(self, event_rate_object=None, sample_pump_object=None, pressure_object=None, temperature_object=None, laser_object=None):
+    def __init__(self, comms=None, event_rate_object=None, sample_pump_object=None, pressure_object=None, temperature_object=None, laser_object=None):
         super().__init__(daemon=True)
-        try:
-            self.oled = SSD1309()
-        except:
-            self.oled = SimProxy()
+        self.oled = SSD1309(comms)
+        # try:
+        #     self.oled = SSD1309(comms)
+        # except:
+        #     self.oled = SimProxy()
         # self.oled = SSD1309()
         # self.oled = SimProxy()
 
@@ -372,6 +373,8 @@ class Display(Thread):
         self._stop_event.set()
 
     def close(self):
+        self.stop()
+        self.join(timeout=1.0)
         self.transmission_animation = False
         self.frame, self.draw = load_and_convert_frame("connection front panel template.png")
         draw_text_lr(self.draw, 3, 0, "Connect", font6x13, 1)
@@ -379,11 +382,9 @@ class Display(Thread):
         draw_text_lr(self.draw, 3, 36, "Cytkit is powered on.", font4x6, 1)
         draw_text_lr(self.draw, 3, 44, "Connect to host PC", font4x6, 1)
         draw_text_lr(self.draw, 3, 52, "then run Honeychrome.", font4x6, 1)
-        self.oled.display(self.frame)
-        self.join(timeout=1.0)
+        self.oled.display(self.frame, force_full=True)
         self.oled.close()
         self._closed = True
-        self.stop()
 
     def action_message(self, message):
         self.frame = deepcopy(frame_flying)
