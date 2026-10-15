@@ -533,9 +533,14 @@ def _glm_fit_one_feature(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
     dispersion from the Cameron & Trivedi auxiliary-OLS estimate.
     ``offset`` is the log of the per-sample denominator (a library-size
     term), so the fit compares rates, not raw totals, across samples.
-    Returns the fitted GLM result, or None if even the Poisson fit fails."""
+    Returns the fitted GLM result, or None when the feature cannot be
+    tested: no events in any sample (there is nothing to fit, and the
+    Poisson starting values are 0/0), or the Poisson fit fails."""
     import statsmodels.api as sm
 
+    if not np.any(y):
+        log.debug("GLM skipped: feature has no events in any sample")
+        return None
     try:
         poisson_fit = sm.GLM(y, design, family=sm.families.Poisson(), offset=offset).fit()
     except Exception as e:
@@ -553,6 +558,24 @@ def _glm_fit_one_feature(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
         return poisson_fit
 
 
+def _glm_fit_observed(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
+    """Fit one feature on the samples where it was measured (finite count
+    and offset). Design columns that are all zero over those samples (a
+    group with no measured sample) are left out. Returns (fit, columns of
+    *design* the fit's parameters belong to), or (None, None) when the
+    feature cannot be tested: too few measured samples for the remaining
+    columns, or a rank-deficient design."""
+    observed = np.isfinite(y) & np.isfinite(offset)
+    columns = np.flatnonzero(np.any(design[observed] != 0.0, axis=0))
+    if observed.sum() <= columns.size:
+        return None, None
+    sub_design = design[np.ix_(observed, columns)]
+    if np.linalg.matrix_rank(sub_design) < columns.size:
+        return None, None
+    fit = _glm_fit_one_feature(y[observed], sub_design, offset[observed])
+    return (fit, columns) if fit is not None else (None, None)
+
+
 def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
                           contrasts: list[tuple[str, str]],
                           pairing_vec: list[str] | None,
@@ -564,6 +587,9 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
     counts_df) unless ``offset_df`` gives a per-feature denominator. The
     coefficient is a rate difference between groups, reported on the log2
     scale with Wald standard errors (df.total = inf).
+    NaN counts or offsets mark samples where a feature was not measured:
+    each feature is fitted on the samples that have it, and is untestable
+    (NaN result) when a compared group has none.
     """
     base = contrasts[0][0]
     design_mat, _names, group_cols = build_design(group_vec, base, pairing_vec, covariates)
@@ -579,7 +605,7 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
 
     LN2 = np.log(2.0)
     Z95 = 1.959963984540054
-    fits = [_glm_fit_one_feature(counts_df[f].values.astype(float), design_mat, offsets[f])
+    fits = [_glm_fit_observed(counts_df[f].values.astype(float), design_mat, offsets[f])
             for f in features]
 
     frames = []
@@ -588,12 +614,16 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
         logfc = np.full(len(features), np.nan)
         se = np.full(len(features), np.nan)
         tvals = np.full(len(features), np.nan)
-        for i, fit in enumerate(fits):
+        for i, (fit, columns) in enumerate(fits):
             if fit is None:
                 continue
-            logfc[i] = fit.params[j] / LN2
-            se[i] = fit.bse[j] / LN2
-            tvals[i] = fit.tvalues[j]
+            position = np.flatnonzero(columns == j)
+            if position.size == 0:
+                continue
+            k = int(position[0])
+            logfc[i] = fit.params[k] / LN2
+            se[i] = fit.bse[k] / LN2
+            tvals[i] = fit.tvalues[k]
         p = ms.treat_pvalues(logfc, se, np.inf, 0.0)
         frames.append(pd.DataFrame({
             'feature':   features,
