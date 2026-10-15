@@ -46,7 +46,6 @@ import csv
 import math
 import re
 from collections import Counter
-from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -539,13 +538,16 @@ def _load_unstained_gated_transformed(
 
         unmixed = drc_pipeline.apply_unmixing_af_aware(controller, raw, af_state=af_state)
 
-        cdd = deepcopy(controller.data_for_cytometry_plots_unmixed)
-        cdd['event_data'] = unmixed
-        gate_names = [g[0] for g in cdd['gating'].get_gate_ids()]
+        # This sample's own gates: its per-sample overrides and Time range.
+        from honeychrome.controller_components.per_sample_gating_functions import SampleGating
+        sample_gating = SampleGating.from_controller(controller)
+        gate_names = sample_gating.gate_names()
 
         gated = None
         if 'Singlets' in gate_names:
-            singlets = drc_pipeline.apply_gate_by_lookup_table(deepcopy(cdd), 'Singlets')
+            pnn = list(controller.data_for_cytometry_plots_unmixed['pnn'])
+            membership = sample_gating.memberships(str(rel_path), unmixed, pnn)
+            singlets = unmixed[membership['Singlets']] if 'Singlets' in membership else unmixed[:0]
             if len(singlets) >= min_singlets_events:
                 gated = singlets
             else:

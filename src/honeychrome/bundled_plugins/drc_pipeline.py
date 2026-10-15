@@ -44,7 +44,6 @@ import numpy as np
 from honeychrome.controller_components.functions import (
     sample_from_fcs,
     apply_transfer_matrix,
-    apply_gates_in_place,
 )
 from honeychrome.settings import af_index_channel
 from honeychrome.controller_components.autospectral_functions import (
@@ -71,49 +70,6 @@ log = get_logger(__name__)
 # *name selection*, never by deleting them from the index map. AF Index is a
 # library position, not an intensity, so it is a label rather than a feature.
 META_CHANNELS = ("event_id", "Time", "ribbon", af_index_channel)
-
-
-# ---------------------------------------------------------------------------
-# Gating
-# ---------------------------------------------------------------------------
-
-def apply_gate_by_lookup_table(cytometry_data_dictionary: dict, gate_name: str) -> np.ndarray:
-    """
-    Return the subset of ``event_data`` belonging to *gate_name* using the
-    Honeychrome lookup-table gating approach.  Operates on the supplied dict
-    (caller is responsible for passing a copy).
-    """
-    event_data = cytometry_data_dictionary['event_data']
-    gate_membership = {'root': np.ones(len(event_data), dtype=np.bool_)}
-    cytometry_data_dictionary.update({'gate_membership': gate_membership})
-    gates_to_calculate = [
-        g[0] for g in cytometry_data_dictionary['gating'].get_gate_ids()
-    ]
-    apply_gates_in_place(cytometry_data_dictionary, gates_to_calculate=gates_to_calculate)
-    mask = cytometry_data_dictionary['gate_membership'][gate_name]
-    return event_data[mask]
-
-
-def apply_gates_union_by_lookup_table(cytometry_data_dictionary: dict,
-                                      gate_names: list[str]) -> np.ndarray:
-    """
-    Return the UNION of events belonging to ANY gate in *gate_names*, using
-    the same lookup-table approach as apply_gate_by_lookup_table().  Backs
-    the multi-select gate tree (§0.3): a run can be built from gates picked
-    across different branches, not just one.  ``gates_to_calculate`` already
-    computes every gate's mask regardless of which is used, so the union is
-    just a logical OR reduce — no extra FlowKit calls.
-    """
-    event_data = cytometry_data_dictionary['event_data']
-    gate_membership = {'root': np.ones(len(event_data), dtype=np.bool_)}
-    cytometry_data_dictionary.update({'gate_membership': gate_membership})
-    gates_to_calculate = [
-        g[0] for g in cytometry_data_dictionary['gating'].get_gate_ids()
-    ]
-    apply_gates_in_place(cytometry_data_dictionary, gates_to_calculate=gates_to_calculate)
-    masks = [cytometry_data_dictionary['gate_membership'][g] for g in gate_names]
-    union_mask = np.logical_or.reduce(masks)
-    return event_data[union_mask]
 
 
 # ---------------------------------------------------------------------------
@@ -407,17 +363,22 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray
     selected gate(s).  Returns the UNTRANSFORMED unmixed gated matrix with
     all unmixed columns (shape ``(n_gated, n_unmixed_full)``).
 
+    The gates are this sample's own: its per-sample gate overrides and its
+    own range on per-sample (Time) axes, not those of the sample shown in
+    the main window (see ``per_sample_gating_functions.SampleGating``).
+
     Cached on state.gated_data_cache, keyed by (file, gates, unmixing
-    matrix identity).  This is the single most expensive step in the
-    Workspace Marker-colour path — without caching it re-reads and
-    re-unmixes the FCS file from disk on every PlotCard refresh.
+    matrix identity, the sample's gating).  This is the single most
+    expensive step in the Workspace Marker-colour path — without caching
+    it re-reads and re-unmixes the FCS file from disk on every PlotCard
+    refresh.
 
     af_state: optional unmixing snapshot — see apply_unmixing_af_aware()
         docstring. Pass this from any background worker thread; leave as
         None only for main-thread callers. Each sample is unmixed with its
         own AF profile assignment.
     """
-    from copy import deepcopy
+    from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 
     sample_key = sample_key_for_path(controller.experiment_dir, abs_path)
 
@@ -425,6 +386,7 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray
         str(abs_path),
         tuple(sorted(state.selected_gates)),
         _af_cache_token(controller, af_state, sample_key),
+        SampleGating.from_controller(controller, copy=False).signature([sample_key]),
     )
     cached = state.gated_data_cache.get(cache_key)
     if cached is not None:
@@ -456,9 +418,9 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray
         "  unmixed → %d events × %d channels (gates=%r)",
         unmixed.shape[0], unmixed.shape[1], state.selected_gates,
     )
-    cdd = deepcopy(controller.data_for_cytometry_plots_unmixed)
-    cdd['event_data'] = unmixed
-    gated = apply_gates_union_by_lookup_table(cdd, state.selected_gates)
+    pnn = list(controller.data_for_cytometry_plots_unmixed['pnn'])
+    sample_gating = SampleGating.from_controller(controller)
+    gated = unmixed[sample_gating.population_mask(sample_key, unmixed, pnn, list(state.selected_gates))]
     log.debug("  gated → %d events retained (%d removed)",
               gated.shape[0], unmixed.shape[0] - gated.shape[0])
     state.gated_data_cache[cache_key] = gated

@@ -197,12 +197,15 @@ from honeychrome.controller_components.functions import (
     apply_gates_in_place,
 )
 from honeychrome.controller_components.sample_loader import sample_key_for_path
+from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.transform import Transform
 from honeychrome.view_components.clear_layout import clear_layout
 from honeychrome.view_components.ordered_multi_sample_picker import OrderedMultiSamplePicker
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 from honeychrome.view_components.icon_loader import icon
+from honeychrome.view_components import suggest_groupings_dialog as sgd
+from honeychrome.controller_components.differential_stats import suggest_groupings_from_names
 from honeychrome.view_components.differential_plots import (
     make_heatmap_figure,
     make_marker_summary_figure,
@@ -340,9 +343,10 @@ def apply_gate_by_lookup_table(cytometry_data_dictionary, gate_name):
 def apply_gates_union_by_lookup_table(cytometry_data_dictionary, gate_names: list[str]):
     """
     Return the UNION of event_data belonging to ANY gate in *gate_names*.
-    Same lookup-table approach as apply_gate_by_lookup_table() above; see
-    drc_pipeline.apply_gates_union_by_lookup_table() for the identical
-    sibling used by the data-pipeline module.
+    Same lookup-table approach as apply_gate_by_lookup_table() above. The
+    controller's lookup tables belong to the sample on display, so this is
+    only for that sample's events; other samples are gated with
+    ``per_sample_gating_functions.SampleGating``.
 
     Returns
     -------
@@ -3943,28 +3947,30 @@ class TransformTab(QWidget):
 
         whitelisted_pnn = self.controller.experiment.settings['raw'].get('whitelisted_pnn')
 
+        # Each sample is gated with its own gates (per-sample overrides and
+        # its own Time range), not those of the sample shown in the main window.
+        sample_gating = None
+        if selected_gates and selected_gates != ['root']:
+            sample_gating = SampleGating.from_controller(self.controller)
+            gating_pnn = list(self.controller.data_for_cytometry_plots_unmixed['pnn'])
+
         for path in full_paths:
             try:
                 sample = sample_from_fcs(path)
                 raw = sample.get_events(source='raw', col_order=whitelisted_pnn)
+                sample_key = sample_key_for_path(self.controller.experiment_dir, path)
 
                 # Replicate controller.load_sample unmixing (AF-corrected if
                 # an AF profile is active — see drc_pipeline.apply_unmixing_af_aware).
                 unmixed = drc_pipeline.apply_unmixing_af_aware(
-                    self.controller, raw,
-                    sample_key=sample_key_for_path(self.controller.experiment_dir, path),
+                    self.controller, raw, sample_key=sample_key,
                 )
 
                 # Apply gate(s) if selected
-                if selected_gates and selected_gates != ['root']:
+                if sample_gating is not None:
                     try:
-                        cytometry_dict = dict(
-                            self.controller.data_for_cytometry_plots_unmixed
-                        )
-                        cytometry_dict['event_data'] = unmixed.copy()
-                        unmixed = apply_gates_union_by_lookup_table(
-                            cytometry_dict, selected_gates
-                        )
+                        unmixed = unmixed[sample_gating.population_mask(
+                            sample_key, unmixed, gating_pnn, list(selected_gates))]
                     except Exception as e:
                         print(f"[DR TransformTab] Gating failed for {path.name}: {e}")
 
@@ -4111,6 +4117,10 @@ class GroupsStatsTab(QWidget):
         # a fresh Figure/DataFrame for any open result without duplicating
         # the maker logic -- see get_report_items().
         self._results_registry: dict[str, dict] = {}
+        # Automatic Suggest Groupings: the sample list it last ran for (it
+        # runs once per list) and the state to restore on Undo.
+        self._auto_groupings_key = None
+        self._auto_groupings_undo = None
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -4252,6 +4262,19 @@ class GroupsStatsTab(QWidget):
         self._group_count_label.setStyleSheet("color: grey; font-style: italic;")
         csv_row.addWidget(self._group_count_label)
         table_box_layout.addLayout(csv_row)
+
+        auto_row = QHBoxLayout()
+        self._auto_groupings_label = QLabel()
+        self._auto_groupings_label.setWordWrap(True)
+        self._auto_groupings_label.setStyleSheet("color: grey; font-style: italic;")
+        self._auto_groupings_undo_btn = QPushButton("Undo")
+        self._auto_groupings_undo_btn.setToolTip("Remove the groups and pairing applied from the sample names.")
+        self._auto_groupings_undo_btn.clicked.connect(self._undo_auto_groupings)
+        auto_row.addWidget(self._auto_groupings_label, stretch=1)
+        auto_row.addWidget(self._auto_groupings_undo_btn)
+        self._auto_groupings_label.setVisible(False)
+        self._auto_groupings_undo_btn.setVisible(False)
+        table_box_layout.addLayout(auto_row)
 
         # Table: Sample | Group | [covariate columns...] -- column count is
         # dynamic (one per state.covariates column, added via '+ Add
@@ -5364,6 +5387,7 @@ class GroupsStatsTab(QWidget):
 
         matched = self._scoped_sample_groups()
         self._populate_table(matched)
+        self._maybe_auto_suggest_groupings()
         self._populate_run_combo()
         self._sync_composition_to_run()
         self._populate_trex_dr_combo()
@@ -5594,14 +5618,11 @@ class GroupsStatsTab(QWidget):
 
     def _suggest_groupings(self):
         """
-        Scan on-screen sample names (and, when the experiment's Sample
-        name source setting differs from plain filenames, the
-        FCS-keyword-derived display name already computed at import time
-        -- see experiment_model.py) for repeated, delimiter-separated
-        tokens, and offer to populate the Group column and/or add
-        covariate/pairing columns from what's found. Pure string
-        processing over already-loaded sample paths -- no disk I/O, runs
-        synchronously on the main thread.
+        Scan the on-screen sample names (and, when the experiment's Sample
+        name source is not the filename, the display names computed at
+        import) for repeated, delimiter-separated tokens, and let the user
+        choose which to apply as the Group column or as covariate/pairing
+        columns.
         """
         sample_paths = self._table_sample_paths()
         if len(sample_paths) < 2:
@@ -5611,139 +5632,82 @@ class GroupsStatsTab(QWidget):
             )
             return
         display_names = self.controller.experiment.samples.get('all_samples', {})
-        result = drc_stats.suggest_covariates_from_names(sample_paths, display_names)
+        result = suggest_groupings_from_names(sample_paths, display_names)
         if not result['suggestions']:
-            msg = "No repeated naming patterns were found across these sample names."
-            if result['irregular_samples']:
-                msg += (f"\n\n{len(result['irregular_samples'])} sample name(s) have an "
-                        "unusual structure and couldn't be compared.")
-            QMessageBox.information(self, "Suggest Groupings", msg)
+            QMessageBox.information(self, "Suggest Groupings", sgd.no_suggestion_message(result))
             return
-        self._show_suggestion_dialog(result, sample_paths)
+        chosen = sgd.choose_groupings(self, result)
+        if chosen:
+            self._apply_groupings(chosen, sample_paths)
+            self._show_auto_groupings_note(None)
 
-    def _show_suggestion_dialog(self, result: dict, sample_paths: list[str]):
+    def _maybe_auto_suggest_groupings(self):
         """
-        Lets the user review, rename, and select which detected naming
-        patterns to apply as the Group column and/or new covariate
-        columns. Built fresh each call -- no persistent state here beyond
-        what gets written into self.state on Apply.
+        Apply groupings suggested from the sample names when none of the
+        on-screen samples has a group yet: the detected group, and the
+        detected pairing variable (selected for a paired design). Runs once
+        per sample list and never overwrites existing assignments; the note
+        above the table says what was applied and offers Undo.
         """
-        from PySide6.QtWidgets import QDialog, QDialogButtonBox
-
-        suggestions = result['suggestions']
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Suggest Groupings")
-        dlg.setMinimumWidth(720)
-        layout = QVBoxLayout(dlg)
-
-        hint = QLabel(
-            "Detected repeated naming patterns across the samples in the table "
-            "below. Tick the ones to apply, adjust role/column name if needed, "
-            "then Apply."
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        if result['irregular_samples']:
-            warn = QLabel(
-                f"{len(result['irregular_samples'])} sample(s) have a different "
-                "naming structure and are excluded from every suggestion below."
-            )
-            warn.setWordWrap(True)
-            warn.setStyleSheet("color: grey; font-style: italic;")
-            layout.addWidget(warn)
-
-        table = QTableWidget(len(suggestions), 5)
-        table.setHorizontalHeaderLabels(
-            ['Use', 'Detected field', 'Role', 'Column / group name', 'Example values']
-        )
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        table.verticalHeader().setVisible(False)
-
-        role_labels = {'group': 'Group', 'pairing': 'Pairing/covariate', 'covariate': 'Covariate'}
-        for row, sug in enumerate(suggestions):
-            chk = QTableWidgetItem()
-            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            chk.setCheckState(Qt.Checked if sug['role_guess'] in ('group', 'pairing') else Qt.Unchecked)
-            table.setItem(row, 0, chk)
-
-            field_item = QTableWidgetItem(sug['field_name'])
-            field_item.setFlags(Qt.ItemIsEnabled)
-            table.setItem(row, 1, field_item)
-
-            role_combo = QComboBox()
-            role_combo.addItems(['Group', 'Pairing/covariate', 'Covariate'])
-            role_combo.setCurrentText(role_labels[sug['role_guess']])
-            table.setCellWidget(row, 2, role_combo)
-
-            default_name = ('Group' if sug['role_guess'] == 'group'
-                            else f"field_{sug['position'] + 1}")
-            table.setItem(row, 3, QTableWidgetItem(default_name))
-
-            examples_item = QTableWidgetItem(', '.join(sug['examples']))
-            examples_item.setFlags(Qt.ItemIsEnabled)
-            table.setItem(row, 4, examples_item)
-
-        layout.addWidget(table)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Cancel)
-        buttons.rejected.connect(dlg.reject)
-        apply_btn = buttons.button(QDialogButtonBox.Apply)
-        apply_btn.clicked.connect(
-            lambda: self._apply_suggestions(dlg, table, suggestions, sample_paths)
-        )
-        layout.addWidget(buttons)
-
-        dlg.exec()
-
-    def _apply_suggestions(self, dlg, table, suggestions: list[dict], sample_paths: list[str]):
-        """
-        Writes the checked rows from the Suggest Groupings dialog into
-        state: at most one 'Group' role overwrites state.group_names /
-        state.sample_groups for the on-screen samples only (with
-        confirmation, same precedent as Auto-assign by pattern); any
-        number of 'Pairing/covariate' or 'Covariate' rows are written
-        into state.covariates, one column each.
-        """
-        role_map = {'Group': 'group', 'Pairing/covariate': 'pairing', 'Covariate': 'covariate'}
-
-        chosen = []
-        for row, sug in enumerate(suggestions):
-            if table.item(row, 0).checkState() != Qt.Checked:
-                continue
-            role = role_map[table.cellWidget(row, 2).currentText()]
-            name = table.item(row, 3).text().strip()
-            if not name:
-                QMessageBox.warning(self, "Suggest Groupings", "Column/group name cannot be blank.")
-                return
-            chosen.append((role, name, sug))
-
+        sample_paths = self._table_sample_paths()
+        if len(sample_paths) < 2:
+            return
+        if any(self.state.sample_groups.get(sp) in self.state.group_names for sp in sample_paths):
+            return
+        key = tuple(sample_paths)
+        if key == self._auto_groupings_key:
+            return
+        self._auto_groupings_key = key
+        display_names = self.controller.experiment.samples.get('all_samples', {})
+        chosen = sgd.automatic_groupings(suggest_groupings_from_names(sample_paths, display_names))
         if not chosen:
-            dlg.accept()
             return
+        st = self.state
+        self._auto_groupings_undo = (
+            list(st.group_names), dict(st.sample_groups),
+            None if st.covariates is None else st.covariates.copy(),
+            st.pairing_variable, st.paired,
+        )
+        self._apply_groupings(chosen, sample_paths, select_pairing=True)
+        self._show_auto_groupings_note(sgd.describe_groupings(chosen))
 
-        group_rows = [c for c in chosen if c[0] == 'group']
-        if len(group_rows) > 1:
-            QMessageBox.warning(
-                self, "Suggest Groupings",
-                "Only one detected field can be applied as the Group column at a time."
-            )
+    def _show_auto_groupings_note(self, text: str | None):
+        """Show (text) or hide (None) the automatic-groupings note and Undo."""
+        if text is None:
+            self._auto_groupings_undo = None
+        self._auto_groupings_label.setText(text or '')
+        self._auto_groupings_label.setVisible(text is not None)
+        self._auto_groupings_undo_btn.setVisible(text is not None and self._auto_groupings_undo is not None)
+
+    def _undo_auto_groupings(self):
+        """Restore the groups, covariates and pairing from before the
+        automatic groupings were applied."""
+        if self._auto_groupings_undo is None:
             return
+        groups, sample_groups, covariates, pairing_variable, paired = self._auto_groupings_undo
+        st = self.state
+        st.group_names = groups
+        st.sample_groups = sample_groups
+        st.covariates = covariates
+        st.pairing_variable = pairing_variable
+        st.paired = paired
+        self.chk_paired.blockSignals(True)
+        self.chk_paired.setChecked(paired)
+        self.chk_paired.blockSignals(False)
+        self.pairing_variable_combo.setEnabled(paired)
+        self._show_auto_groupings_note(None)
+        self._refresh_after_groupings()
 
-        if group_rows:
-            reply = QMessageBox.question(
-                self, "Suggest Groupings",
-                "Applying a detected field as the Group column will overwrite every "
-                "on-screen sample's current group, including manual selections. Continue?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
-
+    def _apply_groupings(self, chosen: list[dict], sample_paths: list[str],
+                         select_pairing: bool = False):
+        """
+        Write chosen groupings into state: a 'group' choice replaces
+        state.group_names and the on-screen samples' groups; every other
+        choice becomes a covariate column (state.covariates is keyed by
+        path relative to the raw samples folder). A 'pairing' choice is
+        made the pairing variable; with ``select_pairing`` the paired
+        design is also switched on.
+        """
         if self.state.covariates is None:
             self.state.covariates = pd.DataFrame(index=pd.Index([], dtype=str))
 
@@ -5757,26 +5721,36 @@ class GroupsStatsTab(QWidget):
                     pass
             return sp
 
-        for role, name, sug in chosen:
+        for choice in chosen:
+            role, name = choice['role'], choice['name']
             if role == 'group':
-                distinct_vals = sorted(set(sug['values'].values()))
+                distinct_vals = sorted(set(choice['values'].values()))
                 self.state.group_names = distinct_vals
                 for sp in sample_paths:
-                    self.state.sample_groups[sp] = sug['values'].get(sp, 'Unassigned')
+                    self.state.sample_groups[sp] = choice['values'].get(sp, 'Unassigned')
                 for val in distinct_vals:
                     self._group_colour(val)  # seed default colours
             else:
                 if name in self.state.covariates.columns:
                     name = f"{name}_2"
                 self.state.covariates[name] = ''
-                for sp, val in sug['values'].items():
+                for sp, val in choice['values'].items():
                     rel = _to_rel(sp)
                     if rel not in self.state.covariates.index:
                         self.state.covariates.loc[rel] = ''
                     self.state.covariates.loc[rel, name] = val
                 if role == 'pairing':
                     self.state.pairing_variable = name
+                    if select_pairing:
+                        self.state.paired = True
+                        self.chk_paired.blockSignals(True)
+                        self.chk_paired.setChecked(True)
+                        self.chk_paired.blockSignals(False)
+                        self.pairing_variable_combo.setEnabled(True)
+        self._refresh_after_groupings()
 
+    def _refresh_after_groupings(self):
+        self._last_stats_data_key = None
         self._populate_groups_table()
         self._refresh_group_combos()
         self._refresh_compare_combos()
@@ -5786,7 +5760,6 @@ class GroupsStatsTab(QWidget):
         self.state.invalidate_trex()
         self._update_group_count_label()
         self._update_run_button()
-        dlg.accept()
 
     def _on_covariate_edited(self, rel: str, col_name: str, value: str):
         """Write one sample's value for one covariate column directly."""
