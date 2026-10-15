@@ -1534,6 +1534,14 @@ class RunManagementTable(CopyableTableWidget):
     _HEADERS = ['Label', 'Kind', 'Algorithm', 'Gate(s)', 'Samples',
                 'Events', 'Channels', 'Timestamp']
 
+    # Text colour of a run whose events no longer match the current gating
+    # and unmixing (see drc_run_archive.sync_status).
+    _OUT_OF_SYNC_COLOUR = QColor('#ff9800')
+
+    # Item-data role holding a label's own tooltip, so the sync note can be
+    # appended to it (and replaced) without losing it.
+    _BASE_TOOLTIP_ROLE = Qt.UserRole + 1
+
     def __init__(self, controller, state, parent=None):
         QTableWidget.__init__(self, 0, len(self._HEADERS), parent)
         self.controller = controller
@@ -1559,8 +1567,10 @@ class RunManagementTable(CopyableTableWidget):
         self.setSortingEnabled(False)  # avoid resort-during-populate churn
         entries = list(self.state.dr_runs) + list(self.state.clustering_runs)
         self.setRowCount(len(entries))
+        fingerprints: dict = {}
         for row, entry in enumerate(entries):
             self._populate_row(row, entry)
+            self._apply_sync_style(row, entry, fingerprints)
         self.setSortingEnabled(True)
         self.resizeColumnsToContents()
         self.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -1573,10 +1583,10 @@ class RunManagementTable(CopyableTableWidget):
         label_item.setData(Qt.UserRole, run_id)
         if not drc_run_archive.run_payload_exists(self.controller, run_id):
             label_item.setText(f"⚠ {label_text}")
-            label_item.setToolTip(
-                "Payload file missing from disk — this run's data can no "
-                "longer be loaded."
-            )
+            missing_note = ("Payload file missing from disk — this run's data can no "
+                            "longer be loaded.")
+            label_item.setToolTip(missing_note)
+            label_item.setData(self._BASE_TOOLTIP_ROLE, missing_note)
         self.setItem(row, 0, label_item)
 
         self.setItem(row, 1, QTableWidgetItem(
@@ -1612,6 +1622,61 @@ class RunManagementTable(CopyableTableWidget):
         ts_item = _SortableItem(ts_raw.replace('T', '  '))
         ts_item.set_sort_key(ts_raw)  # ISO 8601 — lexicographic == chronological
         self.setItem(row, 7, ts_item)
+
+    # ------------------------------------------------------------------
+    # Sync with the current gating / unmixing
+    # ------------------------------------------------------------------
+
+    def _current_fingerprint(self, entry: dict, cache: dict):
+        """drc_pipeline.sync_fingerprint() for the run's own gates and samples,
+        computed once per distinct (gates, samples) pair per pass."""
+        key = (tuple(entry.get('gates', [])), tuple(entry.get('training_sample_ids', [])))
+        if key not in cache:
+            cache[key] = drc_pipeline.sync_fingerprint(self.controller, *key)
+        return cache[key]
+
+    def _apply_sync_style(self, row: int, entry: dict, cache: dict):
+        """Colour the row's text orange when the run is out of sync with the
+        current gating and unmixing, and say why in the label's tooltip."""
+        status = drc_run_archive.sync_status(entry, self._current_fingerprint(entry, cache))
+        out_of_sync = status == drc_run_archive.SYNC_OUT_OF_SYNC
+        label_item = self.item(row, 0)
+        for col in range(self.columnCount()):
+            item = self.item(row, col)
+            if item is not None:
+                item.setData(Qt.ForegroundRole,
+                             self._OUT_OF_SYNC_COLOUR if out_of_sync else None)
+        if label_item is None:
+            return
+        base = label_item.data(self._BASE_TOOLTIP_ROLE) or ''
+        if out_of_sync:
+            note = ("Out of sync: the unmixing, AF profile assignment or gating has "
+                    "changed since this run was made, so cells may have moved in or "
+                    "out of its gates. Its saved events no longer match what the "
+                    "current gating selects.")
+        elif status == drc_run_archive.SYNC_UNKNOWN:
+            note = ("Sync cannot be verified: this run was made before sync tracking "
+                    "was added, or the current state could not be fingerprinted.")
+        else:
+            note = ''
+        label_item.setToolTip('\n\n'.join(t for t in (base, note) if t))
+
+    def refresh_sync_status(self):
+        """Re-evaluate every row's sync colouring without rebuilding the table
+        (keeps the selection). Called when the table is shown, since the
+        unmixing or gating may have been edited elsewhere in the app."""
+        fingerprints: dict = {}
+        for row in range(self.rowCount()):
+            label_item = self.item(row, 0)
+            if label_item is None:
+                continue
+            entry = self._find_entry(label_item.data(Qt.UserRole))
+            if entry is not None:
+                self._apply_sync_style(row, entry, fingerprints)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_sync_status()
 
     # ------------------------------------------------------------------
     # Row lookup
@@ -5012,10 +5077,17 @@ class GroupsStatsTab(QWidget):
             return
         self.state.group_names.append(name)
         self._group_colour(name)   # seed a default colour immediately
+        # A new group is ticked in 'Groups to Test' straight away. An empty
+        # selection already means "every group", so only extend a real one.
+        if self.state.testing_group_selection:
+            self.state.testing_group_selection.append(name)
         self._populate_groups_table()
         self._refresh_group_combos()
         self._refresh_compare_combos()
+        self._populate_test_groups_list()
+        self._last_stats_data_key = None
         self._update_group_count_label()
+        self._update_run_button()
 
     def _remove_selected_group(self):
         row = self.groups_table.currentRow()
@@ -5041,10 +5113,18 @@ class GroupsStatsTab(QWidget):
             self.state.compare_group_a = ''
         if self.state.compare_group_b == name:
             self.state.compare_group_b = ''
+        self.state.testing_group_selection = [
+            g for g in self.state.testing_group_selection if g != name
+        ]
+        if self.state.reference_group == name:
+            self.state.reference_group = ''
         self.state.invalidate_trex()
         self._populate_groups_table()
         self._populate_table()
         self._refresh_compare_combos()
+        self._populate_test_groups_list()
+        self._last_stats_data_key = None
+        self._update_group_count_label()
         self._update_run_button()
 
     def _refresh_group_combos(self):
@@ -11270,6 +11350,7 @@ class ClusterAnnotationTab(QWidget):
         snapshot_dict = cl_run.get('marker_values', {}) or {}
         training_samples = cl_run.get('training_sample_ids', [])
         pooled: dict[str, dict[int, list]] = {ch: {} for ch in channels}
+        self._violin_skipped_samples = []
 
         for rel in training_samples:
             labels = labels_dict.get(rel)
@@ -11287,6 +11368,7 @@ class ClusterAnnotationTab(QWidget):
                         "length mismatch, skipping sample.",
                         rel, len(values), len(labels),
                     )
+                    self._violin_skipped_samples.append(rel)
                     continue
             else:
                 # af_state, when given, is a main-thread unmixing
@@ -11302,13 +11384,13 @@ class ClusterAnnotationTab(QWidget):
                 if len(values) != len(labels):
                     _log.warning(
                         "_pool_violin_data: %s -- values (%d) vs labels (%d) length "
-                        "mismatch, truncating to %d. This run predates the "
-                        "marker-value snapshot fix -- re-run clustering for "
-                        "guaranteed alignment.",
-                        rel, len(values), len(labels), min(len(values), len(labels)),
+                        "mismatch, skipping sample. The run has no stored marker "
+                        "values and the current gating and unmixing give a "
+                        "different number of events.",
+                        rel, len(values), len(labels),
                     )
-                m = min(len(values), len(labels))
-                values, labels = values[:m], labels[:m]
+                    self._violin_skipped_samples.append(rel)
+                    continue
 
             # Boolean mask per cluster computed once per sample and reused
             # across every channel -- previously `labels == cl_id` was
@@ -11350,6 +11432,7 @@ class ClusterAnnotationTab(QWidget):
             pooled = self._pool_violin_data(cl_run, channels)
         finally:
             QApplication.restoreOverrideCursor()
+        self._warn_violin_samples_skipped(run_id, cl_run)
         self._violin_cache[run_id] = {
             'pooled': pooled,
             'channels': list(channels),
@@ -11358,6 +11441,26 @@ class ClusterAnnotationTab(QWidget):
         }
         self._populate_violin_channel_combo(channels)
         self._draw_current_violin()
+
+    def _warn_violin_samples_skipped(self, run_id, cl_run: dict):
+        """Tell the user, once per run, when samples were left out of the
+        violins because their marker values do not line up with the run's
+        cluster labels."""
+        skipped = list(getattr(self, '_violin_skipped_samples', []))
+        warned = getattr(self, '_violin_warned_runs', None)
+        if warned is None:
+            warned = self._violin_warned_runs = set()
+        if not skipped or run_id in warned:
+            return
+        warned.add(run_id)
+        QMessageBox.warning(
+            self, "Samples Left Out of the Violins",
+            f"{len(skipped)} of {len(cl_run.get('training_sample_ids', []))} sample(s) "
+            "were left out: this run has no stored marker values for them, and "
+            "the current gating and unmixing give a different number of events "
+            f"than were clustered (for example {skipped[0]}).\n\n"
+            "Re-run the clustering on the current gating and unmixing to bring "
+            "them back in sync.")
 
     def _populate_violin_channel_combo(self, channels: list[str]):
         prev = self.violin_channel_combo.currentData()
@@ -14743,6 +14846,9 @@ class PluginWidget(QWidget):
                 channels=channels,
                 params=dict(params),
                 n_events=n_events,
+                sync_fingerprint=drc_pipeline.sync_fingerprint(
+                    self.controller, self.state.selected_gates,
+                    self.state.training_sample_ids),
             )
         except Exception as e:
             # Archiving must never take down _on_dr_finished — a failure
@@ -14821,9 +14927,70 @@ class PluginWidget(QWidget):
                     f"{len(self.state.training_sample_ids)} are missing.\n\n"
                     "Run (or re-run) the DR first, or cluster in marker space.")
                 return
+            problems = self._dr_embedding_sync_problems(dr_algo)
+            if problems:
+                bullet_list = '\n'.join(f"  \u2022 {p}" for p in problems)
+                reply = QMessageBox.question(
+                    self, "DR Embedding Out of Sync",
+                    f"The {dr_algo} embedding may not match the current data:\n\n"
+                    f"{bullet_list}\n\n"
+                    "Clustering will label the embedding's own cells correctly, but "
+                    "the marker values behind the violins, heatmaps and Cluster ID "
+                    "come from the current gating and unmixing, and cannot be "
+                    "matched row for row to the embedding. Samples whose event "
+                    "counts differ will have no marker values stored, and where the "
+                    "counts happen to agree the rows can still be shifted.\n\n"
+                    "Re-running the DR brings it back in sync.\n\n"
+                    "Cluster on this embedding anyway?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
 
         self._confirm_large_run(
             'cl', algo, params, lambda: self._start_clustering(algo, params))
+
+    def _source_dr_run_entry(self, dr_algo: str) -> dict | None:
+        """
+        The archived DR run behind state.embeddings[dr_algo]: the run trained
+        in this session if there is one, otherwise the newest archived run of
+        that algorithm. None when no archived run of it exists.
+        """
+        candidates = [e for e in self.state.dr_runs if e.get('algorithm') == dr_algo]
+        active_id = self._active_dr_run_id.get(dr_algo)
+        for entry in candidates:
+            if active_id and entry.get('run_id') == active_id:
+                return entry
+        return max(candidates, key=lambda e: e.get('timestamp', ''), default=None)
+
+    def _dr_embedding_sync_problems(self, dr_algo: str) -> list[str]:
+        """
+        Reasons the live *dr_algo* embedding may not line up with the current
+        gating and unmixing; empty when it does (or no archived run exists to
+        compare against).
+        """
+        entry = self._source_dr_run_entry(dr_algo)
+        if entry is None:
+            return []
+        problems = []
+        run_gates = list(entry.get('gates', []))
+        if sorted(run_gates) != sorted(self.state.selected_gates):
+            problems.append(
+                f"The DR run used gate(s) {', '.join(run_gates) or 'none'}; the "
+                f"Configuration tab now selects "
+                f"{', '.join(self.state.selected_gates) or 'none'}.")
+        status = drc_run_archive.sync_status(
+            entry, drc_pipeline.sync_fingerprint(
+                self.controller, run_gates, entry.get('training_sample_ids', [])))
+        if status == drc_run_archive.SYNC_OUT_OF_SYNC:
+            problems.append(
+                "The unmixing, AF profile assignment or gating has changed since "
+                f"\"{entry.get('label', '')}\" was made.")
+        elif status == drc_run_archive.SYNC_UNKNOWN:
+            problems.append(
+                f"\"{entry.get('label', '')}\" was made before sync tracking was "
+                "added, so it cannot be checked against the current data.")
+        return problems
 
     def _start_clustering(self, algo: str, params: dict):
         """Start the background clustering worker (inputs already validated)."""
@@ -14841,6 +15008,18 @@ class PluginWidget(QWidget):
         # Snapshot AF/transfer-matrix state on the main thread before the
         # worker starts — see drc_pipeline.apply_unmixing_af_aware() docstring.
         af_state = drc_pipeline.snapshot_af_state(self.controller)
+
+        # Which cells the labels will belong to: the embedding's own for a
+        # DR-space run (so it inherits the DR run's fingerprint), the
+        # current gating's otherwise.
+        if params.get('_space') == 'dr':
+            source_dr = self._source_dr_run_entry(params.get('_dr_algo') or '')
+            run_fingerprint = source_dr.get('sync_fingerprint') if source_dr else None
+        else:
+            run_fingerprint = drc_pipeline.sync_fingerprint(
+                self.controller, self.state.selected_gates,
+                self.state.training_sample_ids)
+        unaligned_samples: list[str] = []
 
         def _checked_progress(msg):
             # Raises in the worker thread once the run is cancelled
@@ -14897,15 +15076,30 @@ class PluginWidget(QWidget):
                         marker_values=dict(self.state.cluster_marker_values),
                         dr_positions=dict(self.state.cluster_dr_positions),
                         tree_data=tree_data,
+                        sync_fingerprint=run_fingerprint,
                     )
                     self.progress_message(
                         f"Run archived as \"{entry['label']}\""
                     )
+                    unaligned_samples.extend(
+                        rel for rel in self.state.cluster_labels
+                        if rel not in self.state.cluster_marker_values)
             self._release_clustering_ui()
             if hasattr(self, 'config_tab'):
                 self.config_tab.run_table.refresh()
             self._on_runs_changed()
             self._cl_worker = None
+            if unaligned_samples:
+                QMessageBox.warning(
+                    self, "Marker Values Not Stored",
+                    f"For {len(unaligned_samples)} of {len(self.state.cluster_labels)} "
+                    "sample(s), the events under the current gating and unmixing do "
+                    "not line up with the events that were clustered (for example "
+                    f"{unaligned_samples[0]}). The cluster labels are saved, but no "
+                    "marker values could be stored for those samples, so violin "
+                    "plots, heatmaps and Cluster ID will leave them out.\n\n"
+                    "Re-run the DR (and then the clustering) on the current "
+                    "gating and unmixing to bring them back in sync.")
 
         worker = _ClusterWorker(_do_cluster)
         worker.finished.connect(_on_cl_done)

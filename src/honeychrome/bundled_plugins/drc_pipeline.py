@@ -38,6 +38,7 @@ unit-tested without a live ``PluginWidget``.
 from __future__ import annotations
 
 import hashlib
+import json
 
 import numpy as np
 
@@ -286,8 +287,9 @@ def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray, af_state=Non
       library, used for unstained samples that borrow a stand-in library
       (see drc_cluster_id.resolve_unstained_af_states).
     * ``None`` — main-thread callers only. The sample's assignment is
-      resolved from the live controller when *sample_key* is given;
-      otherwise the currently loaded sample's AF matrices are used.
+      resolved from the live controller, so *sample_key* is required: the
+      AF matrices of the sample shown in the main window are never used
+      for another sample.
 
     Background workers must pass a snapshot: the main thread reassigns the
     controller's transfer and AF matrices whenever a sample is (re)loaded.
@@ -299,12 +301,10 @@ def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray, af_state=Non
         snap = snapshot_unmix_state(controller, [sample_key], include_qc=False)
         return unmix_events(raw_event_data, snap, snap.af_for(sample_key))['unmixed']
 
-    if af_state is not None:
-        transfer_matrix, af_precomputed, af_spectra = af_state
-    else:
-        transfer_matrix = controller.transfer_matrix
-        af_precomputed = controller.af_precomputed
-        af_spectra = controller.af_spectra
+    if af_state is None:
+        raise ValueError('apply_unmixing_af_aware: pass sample_key or af_state; the AF matrices '
+                         'of the displayed sample are not used for other samples.')
+    transfer_matrix, af_precomputed, af_spectra = af_state
 
     if af_precomputed is not None and af_spectra is not None:
         raw_settings = controller.experiment.settings['raw']
@@ -495,6 +495,56 @@ def array_digest(data: np.ndarray) -> str:
     h.update(repr((arr.shape, arr.dtype.str)).encode())
     h.update(arr.reshape(-1).view(np.uint8))
     return h.hexdigest()
+
+
+def sync_fingerprint(controller, gates, sample_ids) -> str | None:
+    """
+    Digest of everything that decides which events *gates* select in
+    *sample_ids* and what their unmixed values are: the transfer matrix and
+    spillover, each sample's AF profile assignment and the spectra of the
+    profiles it uses, and the gating (template gates, those samples'
+    per-sample overrides, axis transforms).
+
+    A DR or clustering run stores the digest taken when it was made. Run
+    again later, a different digest means cells may have moved in or out of
+    the gates since, so the run's per-event rows no longer correspond to the
+    events the current gating yields. Main thread only, because it reads the
+    controller's live matrices and gating.
+
+    Returns None when the digest cannot be computed (callers treat that as
+    "cannot verify").
+    """
+    try:
+        from honeychrome.controller_components.per_sample_gating_functions import SampleGating
+
+        keys = sorted(
+            sample_key_for_path(controller.experiment_dir, sample_abs_path(controller, rel))
+            for rel in sample_ids
+        )
+        process = controller.experiment.process
+        af_profiles = process.get('af_profiles', {}) or {}
+        assignment = {k: [str(n) for n in af_profile_names(controller, k)] for k in keys}
+        used_profiles = sorted({n for names in assignment.values() for n in names})
+        spillover = process.get('spillover')
+        transfer_matrix = controller.transfer_matrix
+        parts = {
+            'gates': sorted(str(g) for g in gates),
+            'transfer_matrix': (array_digest(np.asarray(transfer_matrix, dtype=np.float64))
+                                if transfer_matrix is not None else ''),
+            'spillover': (array_digest(np.asarray(spillover, dtype=np.float64))
+                          if spillover is not None else ''),
+            'af_assignment': assignment,
+            'af_spectra': {
+                n: array_digest(np.asarray(af_profiles[n]['spectra'], dtype=np.float64))
+                for n in used_profiles if n in af_profiles
+            },
+            'gating': SampleGating.from_controller(controller, copy=False).signature(keys),
+        }
+        payload = json.dumps(parts, sort_keys=True, default=str).encode('utf-8')
+        return hashlib.blake2b(payload, digest_size=16).hexdigest()
+    except Exception as exc:
+        log.warning("sync_fingerprint: could not compute (%s)", exc)
+        return None
 
 
 def _downsample(data: np.ndarray, n: int, rng) -> np.ndarray:
