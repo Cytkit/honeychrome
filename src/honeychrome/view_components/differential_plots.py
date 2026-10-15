@@ -76,10 +76,53 @@ def text_width_inches(text: str, fontsize: float) -> float:
     return widest / 72.0
 
 
+def _is_default_black(colour) -> bool:
+    """True when *colour* is matplotlib's default opaque black."""
+    from matplotlib.colors import to_rgba
+    try:
+        return tuple(to_rgba(colour)) == (0.0, 0.0, 0.0, 1.0)
+    except ValueError:
+        return False
+
+
+def _recolour_default_text(fig, axes, fg: str, bg: str):
+    """
+    Make text readable on a dark background. Axis labels, ticks and titles
+    are coloured explicitly by style_figure_theme; this covers the other
+    text artists, which matplotlib leaves black unless told otherwise: text
+    and annotations placed on an axis, figure-level text and suptitles, and
+    legends. Only text still at the default black is changed, and text with
+    its own background box is left alone, so colours chosen on purpose
+    survive.
+    """
+    texts = list(fig.texts)
+    suptitle = getattr(fig, '_suptitle', None)
+    if suptitle is not None:
+        texts.append(suptitle)
+    legends = list(fig.legends)
+    for ax in axes:
+        texts.extend(ax.texts)
+        legend = ax.get_legend()
+        if legend is not None:
+            legends.append(legend)
+    for text in texts:
+        if text.get_bbox_patch() is None and _is_default_black(text.get_color()):
+            text.set_color(fg)
+    for legend in legends:
+        if legend.get_frame_on():
+            frame = legend.get_frame()
+            frame.set_facecolor(bg)
+            frame.set_edgecolor('#888888')
+        for text in list(legend.get_texts()) + [legend.get_title()]:
+            if _is_default_black(text.get_color()):
+                text.set_color(fg)
+
+
 def style_figure_theme(fig, is_dark: bool, axes=None) -> str:
     """
     Apply dark or light background styling to every axis of *fig* (or to
-    *axes*). Returns the foreground colour so callers can reuse it.
+    *axes*), including figure-level text, annotations and legends in dark
+    mode. Returns the foreground colour so callers can reuse it.
     """
     if axes is None:
         axes = fig.axes
@@ -97,6 +140,8 @@ def style_figure_theme(fig, is_dark: bool, axes=None) -> str:
         ax.title.set_color(fg)
         for spine in ax.spines.values():
             spine.set_edgecolor(fg)
+    if is_dark:
+        _recolour_default_text(fig, axes, fg, bg)
     return fg
 
 
