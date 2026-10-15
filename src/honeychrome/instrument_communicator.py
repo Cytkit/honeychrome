@@ -28,7 +28,6 @@ from multiprocessing import shared_memory, Lock
 import threading
 import numpy as np
 import time
-import warnings
 
 from honeychrome.settings import devices_boot_order, traces_cache_size, traces_cache_dtype, max_events_in_traces_cache, trace_n_points, transfer_target_repeat_time, verbosity_divider
 
@@ -88,9 +87,9 @@ class Instrument(mp.Process):
         )
 
         # Attach to existing shared memory
-        shm = shared_memory.SharedMemory(name=self.traces_cache_name)
+        self.shm = shared_memory.SharedMemory(name=self.traces_cache_name)
         with self.traces_cache_lock:
-            self.traces_cache = np.ndarray((self.max_events_in_traces_cache * self.trace_n_points), dtype=traces_cache_dtype, buffer=shm.buf)
+            self.traces_cache = np.ndarray((self.max_events_in_traces_cache * self.trace_n_points), dtype=traces_cache_dtype, buffer=self.shm.buf)
 
         # main loop waiting for commands from experiment control
         while True:
@@ -132,13 +131,17 @@ class Instrument(mp.Process):
 
             self.pipe_connection.send(response_to_experiment_control)
 
-        while self.thread.is_alive():
-            self.logger.info('[Instrument driver] Waiting until transfer thread ends')
-            time.sleep(0.25)
+        if self.thread:
+            if self.thread.is_alive():
+                self.stop_transfer.set()
+                self.thread.join(0.1)
+                while self.thread.is_alive():
+                    self.logger.info('[Instrument driver] Waiting until transfer thread ends')
+                    time.sleep(0.25)
 
         time.sleep(1)
         self.disconnect_instrument()
-        shm.close()
+        self.shm.close()
         self.logger.info('[Instrument driver] Quit')
 
 
@@ -290,8 +293,8 @@ class Instrument(mp.Process):
                 if queue_end_index >= queue_begin_index:
                     try:
                         self.traces_cache[slice_begin:slice_end] = blob_np #todo fix: this crashes in long acquisition
-                    except ValueError as e:
-                        warnings.warn(str(e))
+                    except Exception as e:
+                        self.logger.exception(str(e))
                 else:
                     # note number of events that didn't fit is queue_end_index
                     switch_index = (self.max_events_in_traces_cache - queue_begin_index) * self.trace_n_points

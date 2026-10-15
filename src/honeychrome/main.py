@@ -317,14 +317,16 @@ def main():
 
     # end processes, free memory
     logger.info('***** Quitting Honeychrome *****')
-    controller.quit_instrument_quit_analyser()
-    trace_analyser.join()
-    instrument.join()
-    traces_cache_shm.close()
-    events_cache_shm.close()
-    traces_cache_shm.unlink()
-    events_cache_shm.unlink()
-    listener.stop()
+    try:
+        controller.quit_instrument_quit_analyser()
+        trace_analyser.join()
+        instrument.join()
+    finally:
+        traces_cache_shm.close()
+        events_cache_shm.close()
+        traces_cache_shm.unlink()
+        events_cache_shm.unlink()
+        listener.stop()
 
     sys.exit(exit_code)
 
