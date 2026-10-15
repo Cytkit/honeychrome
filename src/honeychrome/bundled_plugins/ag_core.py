@@ -61,6 +61,7 @@ Model application modes
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 import math
@@ -486,22 +487,37 @@ def ordered_gate_defs(gate_defs: list[dict]) -> list[dict]:
             num = 10 ** 6
         return (num, str(g.get('gate_name', '')))
 
-    remaining = sorted(gate_defs, key=sort_key)
+    ranked = sorted(gate_defs, key=sort_key)
+    waiting: dict[str, list[int]] = {}
+    unmet: list[set[str]] = []
+    ready: list[int] = []
+    for rank, g in enumerate(ranked):
+        deps = gate_dependencies(g) & set(by_name)
+        unmet.append(deps)
+        if not deps:
+            ready.append(rank)
+        for dep in deps:
+            waiting.setdefault(dep, []).append(rank)
+    heapq.heapify(ready)
     placed: set[str] = set()
+    done = [False] * len(ranked)
     out: list[dict] = []
-    while remaining:
-        progressed = False
-        for g in list(remaining):
-            deps = gate_dependencies(g) & set(by_name)
-            if deps <= placed:
-                out.append(g)
-                placed.add(g['gate_name'])
-                remaining.remove(g)
-                progressed = True
-                break
-        if not progressed:
-            names = [g.get('gate_name') for g in remaining]
-            raise ValueError(f"Gate hierarchy has a cycle among: {names}")
+    while ready:
+        rank = heapq.heappop(ready)
+        g = ranked[rank]
+        done[rank] = True
+        out.append(g)
+        name = g['gate_name']
+        if name in placed:
+            continue
+        placed.add(name)
+        for dependent in waiting.get(name, ()):
+            unmet[dependent].discard(name)
+            if not unmet[dependent]:
+                heapq.heappush(ready, dependent)
+    if len(out) < len(ranked):
+        names = [g.get('gate_name') for rank, g in enumerate(ranked) if not done[rank]]
+        raise ValueError(f"Gate hierarchy has a cycle among: {names}")
     return out
 
 

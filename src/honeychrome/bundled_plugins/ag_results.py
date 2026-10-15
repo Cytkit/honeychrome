@@ -41,15 +41,19 @@ CONFIDENT_ALIGNMENTS = frozenset({ALIGN_EXACT, ALIGN_ANTIGEN})
 
 FEATURE_SEP = ' | '
 DEFAULT_MIN_MARKER_EVENTS = 20
+# A population is tested only when it can be measured (its parent has
+# events) in at least this many samples.
+MIN_MEASURED_SAMPLES = 3
 
 __all__ = [
     'ALIGN_EXACT', 'ALIGN_ANTIGEN', 'ALIGN_CHANNEL', 'ALIGN_FUZZY', 'ALIGN_AMBIGUOUS',
-    'CONFIDENT_ALIGNMENTS', 'FEATURE_SEP', 'DEFAULT_MIN_MARKER_EVENTS',
+    'CONFIDENT_ALIGNMENTS', 'FEATURE_SEP', 'DEFAULT_MIN_MARKER_EVENTS', 'MIN_MEASURED_SAMPLES',
     'align_channels', 'alignment_problems', 'apply_alignment',
     'summarise_sample', 'population_tables', 'marker_table', 'marker_feature',
     'sample_flags', 'population_export', 'marker_export',
     'MIN_SAMPLES_PER_GROUP', 'qualifying_groups', 'run_statistics', 'reapply_thresholds',
     'read_sample_table', 'sample_table_frame', 'sample_pca', 'predictive_matrix',
+    'stats_to_jsonable', 'stats_from_jsonable',
 ]
 
 
@@ -213,14 +217,26 @@ def summarise_sample(gate_defs: list[dict], result: ag_core.GatingResult, data_t
 # Feature tables for statistics
 # ---------------------------------------------------------------------------
 
+def _name_list(names: list[str], limit: int = 8) -> str:
+    """The first *limit* of *names*, comma-separated, with a count of the rest."""
+    shown = ", ".join(names[:limit])
+    return shown if len(names) <= limit else f"{shown} and {len(names) - limit} more"
+
+
 def population_tables(summaries: dict, samples: list[str],
                       use_stats_parent: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """Population counts and their denominators, samples × populations.
 
     The denominator is the parent population's count, or the population's
     ``stats_parent`` count when one is defined and *use_stats_parent* is
-    set. Populations missing from any sample, or with a zero denominator in
-    any sample, are dropped.
+    set.
+
+    A population with no events in a sample whose parent has events is a
+    true zero and is kept as 0. Where the population cannot be measured
+    (it is absent from the sample's record, or its parent has no events)
+    both tables hold NaN, so the population is tested on the samples that
+    do have it rather than being left out. Populations measurable in fewer
+    than ``MIN_MEASURED_SAMPLES`` samples are dropped.
 
     Returns (counts, denominators, dropped population keys).
     """
@@ -238,10 +254,13 @@ def population_tables(summaries: dict, samples: list[str],
                                                  else row['n_parent'])
     counts_df = pd.DataFrame({k: counts[k] for k in order}, index=list(samples), dtype=float)
     denom_df = pd.DataFrame({k: denoms[k] for k in order}, index=list(samples), dtype=float)
-    bad = [k for k in order
-           if counts_df[k].isna().any() or denom_df[k].isna().any() or (denom_df[k] <= 0).any()]
-    keep = [k for k in order if k not in bad]
-    return counts_df[keep], denom_df[keep], bad
+    unmeasurable = counts_df.isna() | denom_df.isna() | (denom_df <= 0)
+    counts_df = counts_df.mask(unmeasurable)
+    denom_df = denom_df.mask(unmeasurable)
+    measured = (~unmeasurable).sum(axis=0)
+    dropped = [k for k in order if measured[k] < MIN_MEASURED_SAMPLES]
+    keep = [k for k in order if k not in dropped]
+    return counts_df[keep], denom_df[keep], dropped
 
 
 def marker_feature(pop_key: str, channel: str) -> str:
@@ -257,8 +276,11 @@ def marker_table(summaries: dict, samples: list[str], gate_defs: list[dict],
     exclude_gating_markers : leave out, for each population, the channels
         used by its own gate and every ancestor gate (its 'type' markers,
         which define the population and so differ by construction).
-    min_events             : a (population, channel) feature is kept only
-        when the population has at least this many events in every sample.
+    min_events             : a population's medians are taken only from
+        samples where it has at least this many events; in the others the
+        value is NaN (not measured), and the feature is tested on the
+        samples that have it. Populations measured in fewer than
+        ``MIN_MEASURED_SAMPLES`` samples are dropped.
 
     Returns (values, feature metadata with 'feature', 'cluster' (display
     label), 'cluster_id' (population key) and 'channel' columns, dropped
@@ -279,21 +301,24 @@ def marker_table(summaries: dict, samples: list[str], gate_defs: list[dict],
     pop_keys = [k for k in n_events if k in with_markers]
     for pop_key in pop_keys:
         per_sample = n_events.get(pop_key, {})
-        present = all(pop_key in ((summaries.get(s) or {}).get('markers') or {}) for s in samples)
-        if not present or any(per_sample.get(s, 0) < min_events for s in samples):
+        measured = [s for s in samples
+                    if pop_key in ((summaries.get(s) or {}).get('markers') or {})
+                    and per_sample.get(s, 0) >= min_events]
+        if len(measured) < MIN_MEASURED_SAMPLES:
             dropped.append(pop_key)
             continue
         gate_name, _pop = ag_core.split_population_key(pop_key)
         skip = type_markers.get(gate_name, set()) if exclude_gating_markers else set()
         channels = None
-        for s in samples:
+        for s in measured:
             chans = set(((summaries[s].get('markers') or {}).get(pop_key) or {}).keys())
             channels = chans if channels is None else channels & chans
         for ch in sorted(channels or [], key=str):
             if ch in skip:
                 continue
             feature = marker_feature(pop_key, ch)
-            values[feature] = {s: float(summaries[s]['markers'][pop_key][ch][0]) for s in samples}
+            values[feature] = {s: float(summaries[s]['markers'][pop_key][ch][0])
+                               for s in measured}
             meta.append({'feature': feature, 'cluster': labels.get(pop_key, pop_key),
                          'cluster_id': pop_key, 'channel': ch})
     df = pd.DataFrame(values, index=list(samples), dtype=float)
@@ -422,8 +447,16 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
     if run_freq or run_counts:
         counts, denom, dropped = population_tables(summaries, used, use_stats_parent)
         if dropped:
-            out['notes'].append("Populations missing or empty in some samples were left out: "
-                                + ", ".join(dropped))
+            out['notes'].append(
+                f"Populations measurable in fewer than {MIN_MEASURED_SAMPLES} samples (their "
+                "parent population had no events in the others) were left out: "
+                + _name_list(dropped))
+        partial = [k for k in counts.columns if counts[k].isna().any()]
+        if partial:
+            out['notes'].append(
+                f"{len(partial)} population(s) could not be measured in some samples (their "
+                "parent population had no events) and were tested on the samples that could: "
+                + _name_list(partial))
         if run_freq:
             data = ds.logit_proportions(counts, denom)
             out['freq'] = ds.run_moderated(data, group_vec, contrasts, contrast_mode,
@@ -434,6 +467,11 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                                               pval_threshold, fc_threshold,
                                               offset_df=denom, **common)
             out['counts_values'] = counts
+            empty = [k for k in counts.columns if not (counts[k].fillna(0) > 0).any()]
+            if empty:
+                out['notes'].append(
+                    f"{len(empty)} population(s) have no events in any sample and could not be "
+                    "tested for counts: " + ", ".join(empty))
 
     if run_markers:
         values, meta, dropped = marker_table(
@@ -443,12 +481,68 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                                for s in used for r in summaries[s].get('populations', [])})
         if dropped:
             out['notes'].append(
-                f"Populations with fewer than {min_marker_events} events in some samples "
-                "were left out of the marker tests: " + ", ".join(dropped))
+                f"Populations with at least {min_marker_events} events in fewer than "
+                f"{MIN_MEASURED_SAMPLES} samples were left out of the marker tests: "
+                + _name_list(dropped))
+        partial = sorted({m['cluster_id'] for _i, m in meta.iterrows()
+                          if values[m['feature']].isna().any()})
+        if partial:
+            out['notes'].append(
+                f"{len(partial)} population(s) have fewer than {min_marker_events} events in "
+                "some samples; their marker medians were tested on the samples that have "
+                "enough: " + _name_list(partial))
         out['markers'] = ds.run_moderated(values, group_vec, contrasts, contrast_mode,
                                           pval_threshold, marker_threshold,
                                           feature_meta=meta, hierarchical=True, **common)
         out['marker_values'] = values
+    return out
+
+
+_STATS_FRAMES = ('freq', 'freq_values', 'counts', 'counts_values', 'markers', 'marker_values')
+
+
+def _frame_to_jsonable(df: pd.DataFrame) -> dict:
+    split = df.to_dict(orient='split')
+    return ag_core.to_jsonable({'index': split['index'], 'columns': split['columns'],
+                                'data': split['data']})
+
+
+def _frame_from_jsonable(obj: dict) -> pd.DataFrame:
+    df = pd.DataFrame(obj['data'], index=obj['index'], columns=obj['columns'])
+    for col in df.columns:
+        values = df[col].tolist()
+        if all(isinstance(v, bool) for v in values):
+            continue
+        if all(v is None or (isinstance(v, (int, float)) and not isinstance(v, bool))
+               for v in values):
+            df[col] = pd.to_numeric(df[col])
+    return df
+
+
+def stats_to_jsonable(stats: dict) -> dict:
+    """*stats* (a ``run_statistics`` result) as JSON-safe values, for saving.
+    Non-finite numbers become null."""
+    out = {k: v for k, v in stats.items() if k not in _STATS_FRAMES}
+    out['comparisons'] = [list(c) for c in stats.get('comparisons') or []]
+    out = ag_core.to_jsonable(out)
+    for key in _STATS_FRAMES:
+        frame = stats.get(key)
+        out[key] = _frame_to_jsonable(frame) if frame is not None else None
+    return out
+
+
+def stats_from_jsonable(payload: dict) -> dict:
+    """The ``run_statistics`` result that ``stats_to_jsonable`` saved. The
+    degrees of freedom of the count tests (infinite for a Wald test) are
+    restored where they were saved as null."""
+    out = {k: v for k, v in payload.items() if k not in _STATS_FRAMES}
+    out['comparisons'] = [tuple(c) for c in payload.get('comparisons') or []]
+    for key in _STATS_FRAMES:
+        obj = payload.get(key)
+        out[key] = _frame_from_jsonable(obj) if obj else None
+    counts = out.get('counts')
+    if counts is not None and 'df.total' in counts.columns:
+        counts['df.total'] = counts['df.total'].fillna(np.inf)
     return out
 
 

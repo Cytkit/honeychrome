@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QTreeWidget, QTreeWidgetItem,
     QAbstractItemView, QListWidget, QListWidgetItem,
-    QProgressBar, QGridLayout,
+    QProgressBar, QGridLayout, QDialog,
 )
 
 import honeychrome
@@ -111,7 +111,7 @@ NoPanViewBox = None
 TransparentGraphicsLayoutWidget = None
 CopyableTableWidget = None
 HelpToggleWidget = None
-ExportablePlotWidget = None
+ScalableFigureWidget = None
 
 _qt_imports_done = False
 
@@ -119,7 +119,7 @@ _qt_imports_done = False
 def _ensure_qt_imports():
     """Import pyqtgraph and Honeychrome view components (main thread only)."""
     global pg, ZoomAxis, NoPanViewBox, TransparentGraphicsLayoutWidget
-    global CopyableTableWidget, HelpToggleWidget, ExportablePlotWidget, _qt_imports_done
+    global CopyableTableWidget, HelpToggleWidget, ScalableFigureWidget, _qt_imports_done
     if _qt_imports_done:
         return
     import pyqtgraph as _pg
@@ -139,10 +139,10 @@ def _ensure_qt_imports():
         HelpToggleWidget as _HTW,
     )
     HelpToggleWidget = _HTW
-    from honeychrome.view_components.exportable_plot_widget import (
-        ExportablePlotWidget as _EPW,
+    from honeychrome.view_components.scalable_figure_widget import (
+        ScalableFigureWidget as _SFW,
     )
-    ExportablePlotWidget = _EPW
+    ScalableFigureWidget = _SFW
     _qt_imports_done = True
 
 
@@ -154,6 +154,7 @@ plugin_name = 'Automated Gating'
 DEFAULT_DISPLAY_EVENTS = 20_000
 DISPLAY_SEED = 42
 RESULTS_FILE = Path('cache') / 'automated_gating' / 'results.json'
+STATS_FILE = Path('cache') / 'automated_gating' / 'stats.json'
 
 MODE_LABELS = {ag_core.MODE_FIXED: 'Fixed', ag_core.MODE_RECALCULATE: 'Recalculate'}
 DRIFT_ACTIONS = {'flag': 'Flag only', 'reference': 'Use the stored boundary'}
@@ -334,7 +335,7 @@ class GatingRunState:
     display        : {sample key: display subsample and masks} — this
                      session only.
     covariates     : {covariate name: {sample key: value}}.
-    stats          : results of the last statistics run — this session only.
+    stats          : results of the last statistics run (kept in STATS_FILE).
     pca, predictive: the last sample PCA and predictive analysis (from the
                      statistics run's per-sample values) — this session only.
     pending_samples: samples of a paused (or interrupted) run still to be
@@ -1616,7 +1617,7 @@ def build_result_figures(stats: dict, base: str, other: str, pval_threshold: flo
     def _add(key, tab_title, maker, results=None, **kwargs):
         try:
             out[key] = {'fig': maker(**kwargs), 'title': tab_title, 'error': None,
-                        'results': results}
+                        'results': results, 'make': lambda: maker(**kwargs)}
         except Exception as exc:
             log.exception("figure %s failed", key)
             out[key] = {'fig': None, 'title': tab_title, 'error': str(exc), 'results': None}
@@ -1644,7 +1645,7 @@ def build_result_figures(stats: dict, base: str, other: str, pval_threshold: flo
         _add(f'{key}_volcano', f"{name} volcano", dp.make_volcano_figure, results=view,
              results_df=view, title=f"{name} volcano: {label}", pval_threshold=pval_threshold,
              fc_threshold=thr, is_dark=is_dark, fdr_scope=fdr_scope, feature_labels=labels,
-             x_label=x_label, run_label=run_label)
+             x_label=x_label, run_label=run_label, group_a=base, group_b=other)
 
     mview = _comparison_view(stats.get('markers'), label)
     if mview is not None:
@@ -1658,7 +1659,8 @@ def build_result_figures(stats: dict, base: str, other: str, pval_threshold: flo
         _add('marker_volcano', "Marker volcano", dp.make_volcano_figure, results=mview,
              results_df=mview, title=f"Marker volcano: {label}", pval_threshold=pval_threshold,
              fc_threshold=marker_threshold, is_dark=is_dark, fdr_scope=fdr_scope,
-             feature_labels=mlabels, x_label='Δ median (transformed units)', run_label=run_label)
+             feature_labels=mlabels, x_label='Δ median (transformed units)', run_label=run_label,
+             group_a=base, group_b=other)
     return out
 
 
@@ -1677,6 +1679,8 @@ def _is_dark_palette() -> bool:
 class ResultsTab(QWidget):
     """Groups and covariates, statistics, figures, population browser, export."""
 
+    stats_finished = Signal()
+
     def __init__(self, state: GatingRunState, bus, controller, parent=None):
         super().__init__(parent)
         self.state = state
@@ -1688,6 +1692,7 @@ class ResultsTab(QWidget):
         self._predictive_worker: _CallWorker | None = None
         self._filling = False
         self._volcano_tables: dict = {}
+        self._figures_for = None
         # Automatic Suggest Groupings: the sample list it last ran for (it
         # runs once per list) and the state to restore on Undo.
         self._auto_groupings_key = None
@@ -2345,18 +2350,24 @@ class ResultsTab(QWidget):
         self.state.pca = {}
         self.state.predictive = {}
         self._load_explore_controls()
+        self.lbl_stats.setText(self._stats_summary(result))
+        _status(self.bus, "Statistics complete.")
+        self._populate_comparisons()
+        self._show_results_tables()
+        self._draw_figures()
+        self._populate_report_items()
+        self.stats_finished.emit()
+
+    @staticmethod
+    def _stats_summary(result: dict) -> str:
+        """One-line summary of a statistics run, with its notes."""
         n_sig = sum(int(result[k]['significant'].sum()) for k in ('freq', 'counts', 'markers')
                     if result.get(k) is not None)
         text = (f"{len(result['samples'])} samples, {len(result['comparisons'])} comparison(s), "
                 f"{n_sig} significant result(s).")
         if result.get('notes'):
             text += "<br>" + "<br>".join(result['notes'])
-        self.lbl_stats.setText(text)
-        _status(self.bus, "Statistics complete.")
-        self._populate_comparisons()
-        self._show_results_tables()
-        self._draw_figures()
-        self._populate_report_items()
+        return text
 
     def _populate_comparisons(self):
         comps = (self.state.stats or {}).get('comparisons') or []
@@ -2422,6 +2433,7 @@ class ResultsTab(QWidget):
         if not self.state.stats or comp is None:
             self.figures_tabs.clear()
             return
+        self._figures_for = self.state.stats
         if self._figure_worker is not None:
             self._figure_pending = True
             return
@@ -2456,10 +2468,12 @@ class ResultsTab(QWidget):
                 lbl.setStyleSheet("color: #b00020;")
                 self.figures_tabs.addTab(lbl, item['title'])
                 continue
-            widget = ExportablePlotWidget(figure=item['fig'], title=item['title'].replace(' ', '_'),
-                                          experiment_dir=exp_dir, parent=self)
-            widget.delete_button.setVisible(False)
             fig = item['fig']
+            widget = ScalableFigureWidget(
+                fig, title=item['title'], experiment_dir=exp_dir,
+                pop_out=lambda make=item['make'], title=item['title'], results=item.get('results'):
+                    self._pop_out_figure(make, title, results),
+                parent=self)
             handler = getattr(fig, '_hover_handler', None)
             if handler is not None:
                 widget.canvas.mpl_connect('motion_notify_event', handler)
@@ -2468,10 +2482,40 @@ class ResultsTab(QWidget):
                 widget.canvas.mpl_connect('button_press_event', self._on_volcano_click)
                 widget.canvas.setToolTip("Click a point to open that population in "
                                          "the Populations browser.")
-            scroll = QScrollArea()
-            scroll.setWidget(widget)
-            self.figures_tabs.addTab(scroll, item['title'])
+            self.figures_tabs.addTab(widget, item['title'])
         self._add_extra_figures()
+
+    def _pop_out_figure(self, make, title: str, results=None):
+        """Show a fresh copy of a figure in its own resizable window, with
+        the matplotlib toolbar, hover labels and (for a volcano) the same
+        click-through to the Populations browser."""
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+        try:
+            fig = make()
+        except Exception as exc:
+            log.exception("could not pop out %s", title)
+            QMessageBox.warning(self, "Pop out failed", str(exc))
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        canvas = FigureCanvasQTAgg(fig)
+        handler = getattr(fig, '_hover_handler', None)
+        if handler is not None:
+            canvas.mpl_connect('motion_notify_event', handler)
+        if results is not None:
+            self._volcano_tables[id(canvas)] = results
+            canvas.mpl_connect('button_press_event', self._on_volcano_click)
+            dialog.finished.connect(lambda _code, key=id(canvas): self._volcano_tables.pop(key, None))
+        toolbar = NavigationToolbar2QT(canvas, dialog)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas, stretch=1)
+        dpi = fig.get_dpi()
+        dialog.resize(min(int(fig.get_figwidth() * dpi * 1.5), 1400) + 24,
+                      min(int(fig.get_figheight() * dpi * 1.5), 1000) + 80)
+        dialog.show()
 
     def _on_volcano_click(self, event):
         """Open the clicked volcano point's population in the browser."""
@@ -2716,22 +2760,29 @@ class ResultsTab(QWidget):
         self.pred_table_holder.addWidget(table)
 
     def _extra_figures(self) -> list:
-        """(title, figure) of the sample PCA and predictive analysis."""
+        """(title, figure, function that builds a fresh copy) of the sample
+        PCA and predictive analysis."""
         st = self.state
         is_dark = _is_dark_palette()
         out = []
         try:
+            makers = []
             if st.pca:
-                out.append(("Sample PCA", ag_report.make_pca_figure(st.pca, is_dark)))
+                pca = st.pca
+                makers.append(("Sample PCA", lambda: ag_report.make_pca_figure(pca, is_dark)))
             res = st.predictive
             if res:
                 summary = res['summary']
-                out.append(("Predictive: ROC", ag_report.make_roc_figure(
-                    res['performance'], res['roc'], summary, is_dark)))
-                out.append(("Predictive: features", ag_report.make_importance_figure(
-                    res['importance'], summary, is_dark)))
-                out.append(("Predictive: panel size", ag_report.make_panel_figure(
-                    res['panel'], summary, is_dark)))
+                makers += [
+                    ("Predictive: ROC", lambda: ag_report.make_roc_figure(
+                        res['performance'], res['roc'], summary, is_dark)),
+                    ("Predictive: features", lambda: ag_report.make_importance_figure(
+                        res['importance'], summary, is_dark)),
+                    ("Predictive: panel size", lambda: ag_report.make_panel_figure(
+                        res['panel'], summary, is_dark)),
+                ]
+            for title, make in makers:
+                out.append((title, make(), make))
         except Exception as exc:
             log.exception("sample PCA / predictive figure failed")
             _status(self.bus, f"Figure failed: {exc}")
@@ -2745,16 +2796,15 @@ class ResultsTab(QWidget):
             if self.figures_tabs.tabText(i) in titles:
                 self.figures_tabs.removeTab(i)
         exp_dir = getattr(self.controller, 'experiment_dir', '')
-        for title, fig in self._extra_figures():
-            widget = ExportablePlotWidget(figure=fig, title=title.replace(' ', '_').replace(':', ''),
-                                          experiment_dir=exp_dir, parent=self)
-            widget.delete_button.setVisible(False)
+        for title, fig, make in self._extra_figures():
+            widget = ScalableFigureWidget(
+                fig, title=title, experiment_dir=exp_dir,
+                pop_out=lambda make=make, title=title: self._pop_out_figure(make, title),
+                parent=self)
             handler = getattr(fig, '_hover_handler', None)
             if handler is not None:
                 widget.canvas.mpl_connect('motion_notify_event', handler)
-            scroll = QScrollArea()
-            scroll.setWidget(widget)
-            self.figures_tabs.addTab(scroll, title)
+            self.figures_tabs.addTab(widget, title)
 
     def _build_browser_page(self):
         layout = QHBoxLayout(self.browser_page)
@@ -3062,6 +3112,10 @@ class ResultsTab(QWidget):
         if not self.state.stats:
             self.figures_tabs.clear()
             self.lbl_stats.setText("")
+            self._figures_for = None
+        elif self._figures_for is not self.state.stats:
+            self.lbl_stats.setText(self._stats_summary(self.state.stats))
+            self._draw_figures()
         self._populate_population_list()
         self._populate_report_items()
 
@@ -3080,7 +3134,9 @@ class PluginWidget(QWidget):
     QSettings per experiment as one JSON string. Gated results (counts,
     medians and per-gate status, not the display events) are kept in
     RESULTS_FILE in the experiment folder, so they survive a restart,
-    together with the samples a paused run has still to gate.
+    together with the samples a paused run has still to gate. The last
+    statistics run is kept in STATS_FILE, written when the run completes,
+    and is restored while it still matches the gated results.
     """
 
     def __init__(self, bus=None, controller=None, parent=None):
@@ -3096,7 +3152,7 @@ class PluginWidget(QWidget):
         self._loaded_experiment_key = None
         self._loaded_experiment_dir = None
 
-        self.label_disabled = QLabel(f"{plugin_name}: set up the spectral model first.")
+        self.label_disabled = QLabel(f"{plugin_name}: Loading...Set up the spectral model if you have not already done so.")
         self.label_disabled.setWordWrap(True)
         self.label_disabled.setStyleSheet(
             "QLabel { color: #856404; background: #fff3cd; "
@@ -3127,6 +3183,7 @@ class PluginWidget(QWidget):
 
         self.setup_tab.model_ready.connect(self._on_model_ready)
         self.run_tab.gating_finished.connect(self._on_gating_finished)
+        self.results_tab.stats_finished.connect(self._on_stats_finished)
 
         self.content_widget.setVisible(False)
         self.bus.modeChangeRequested.connect(self._on_mode_change)
@@ -3155,16 +3212,19 @@ class PluginWidget(QWidget):
         if self.controller.experiment.process.get('unmixing_matrix') is not None:
             self.label_disabled.setVisible(False)
             self.content_widget.setVisible(True)
-            self._ensure_state_loaded()
-            self._refresh_active_tab()
+            setup_refreshed = self._ensure_state_loaded()
+            if not (setup_refreshed and self.inner_tabs.currentIndex() == 0):
+                self._refresh_active_tab()
         else:
             self.label_disabled.setVisible(True)
             self.content_widget.setVisible(False)
 
-    def _ensure_state_loaded(self):
+    def _ensure_state_loaded(self) -> bool:
+        """Load the persisted state when the experiment has changed. Returns
+        True when it did, in which case the Setup tab has been refreshed."""
         current_key = self._settings_key()
         if current_key == self._loaded_experiment_key:
-            return
+            return False
         # A run's results belong to the experiment it started in.
         self.run_tab.abandon_run()
         if self._loaded_experiment_key is not None:
@@ -3177,6 +3237,7 @@ class PluginWidget(QWidget):
         self._loaded_experiment_dir = Path(self.controller.experiment_dir)
         self.load_state()
         self.setup_tab.refresh()
+        return True
 
     def _on_inner_tab_changed(self, index: int):
         self.save_state()
@@ -3196,6 +3257,13 @@ class PluginWidget(QWidget):
 
     def _on_gating_finished(self):
         self._write_results()
+        self._write_stats()
+        self.save_state()
+
+    def _on_stats_finished(self):
+        """Keep the statistics, and the settings they were run with, as soon
+        as a run completes."""
+        self._write_stats()
         self.save_state()
 
     def progress_message(self, msg: str):
@@ -3265,6 +3333,7 @@ class PluginWidget(QWidget):
                 self.state.alignment_confirmed = False
                 self.progress_message(f"The model file {path} is no longer available.")
         self._load_results()
+        self._load_stats()
 
     def _results_path(self) -> Path | None:
         if self._loaded_experiment_dir is None:
@@ -3295,6 +3364,55 @@ class PluginWidget(QWidget):
             _os.replace(tmp, path)
         except Exception:
             log.exception("could not write gating results to %s", path)
+
+    def _stats_path(self) -> Path | None:
+        if self._loaded_experiment_dir is None:
+            return None
+        return self._loaded_experiment_dir / STATS_FILE
+
+    def _write_stats(self):
+        """Write the last statistics run to STATS_FILE, or remove the file
+        when there is none (a new gating run clears the statistics)."""
+        if not self._controller_shows_loaded_experiment():
+            return
+        path = self._stats_path()
+        st = self.state
+        try:
+            if not st.stats:
+                path.unlink(missing_ok=True)
+                return
+            payload = {
+                'format_version': 1,
+                'run_fingerprint': st.run_fingerprint,
+                'stats': ag_results.stats_to_jsonable(st.stats),
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + '.tmp')
+            tmp.write_text(json.dumps(payload), encoding='utf-8')
+            _os.replace(tmp, path)
+        except Exception:
+            log.exception("could not write statistics to %s", path)
+
+    def _load_stats(self):
+        """Restore the saved statistics when they still match the gated
+        results they were computed from."""
+        path = self._stats_path()
+        if path is None or not path.exists():
+            return
+        st = self.state
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            if payload.get('run_fingerprint') != st.run_fingerprint:
+                return
+            stats = ag_results.stats_from_jsonable(payload['stats'])
+            if not stats.get('samples') or any(k not in st.summaries for k in stats['samples']):
+                return
+            st.stats = ag_results.reapply_thresholds(
+                stats, st.pval_threshold, st.fc_threshold, st.marker_threshold,
+                st.fdr_scope, st.use_treat)
+        except Exception:
+            log.exception("could not read statistics %s", path)
+            st.stats = {}
 
     def _load_results(self):
         path = self._results_path()
