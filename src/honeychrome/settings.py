@@ -15,6 +15,7 @@ devices_boot_order = [
   'dummy_device'
 ]
 transfer_target_repeat_time = 0.01 #s
+verbosity_divider = 5
 n_channels_trace = 16
 adc_rate = 2.5  # [MHz]
 max_event_time = 120  # [us]
@@ -347,7 +348,7 @@ for row, name in enumerate(adc_channels):
     trigger_enabled_retrieved[name] = instrument_settings.value("enabled", True if name=='FSC' else False, type=bool)
     trigger_mask_retrieved[name] = instrument_settings.value("mask", True if name=='FSC' else False, type=bool)
     trigger_edge_retrieved[name] = instrument_settings.value("edge", True if name=='FSC' else False, type=bool)
-    trigger_level_retrieved[name] = instrument_settings.value("level", threshold, type=int)
+    trigger_level_retrieved[name] = instrument_settings.value("level", threshold * 1000 / adc_scale_uv, type=int)
     trigger_hyst_retrieved[name] = instrument_settings.value("hyst", trigger_default_hysteresis, type=int)
     trigger_delay_retrieved[name] = instrument_settings.value("delay", 0, type=int)
     trigger_h_off_retrieved[name] = instrument_settings.value("h_off", 0, type=int)

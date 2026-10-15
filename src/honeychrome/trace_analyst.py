@@ -12,12 +12,11 @@ from multiprocessing import shared_memory, Lock
 import threading
 import numpy as np
 import time
-import warnings
 
 from honeychrome.settings import traces_cache_size, max_events_in_traces_cache, trace_n_points, n_channels_trace, adc_rate, threshold_retrieved, n_time_points_in_event, window_extension_length_pre, baseline_decay_rate, window_extension_length_post, timeout_length, deltaT, adc_scale_uv
 from honeychrome.settings import max_events_in_cache, n_channels_per_event, event_channels_pnn, analyser_target_repeat_time
 from honeychrome.settings import adc_channels, peak_detection_channel_retrieved, area_channels, height_channels, width_channels, scatter_channels, fluorescence_channels
-
+from honeychrome.settings import verbosity_divider
 
 baseline_length = int(1/baseline_decay_rate)
 gap = 10 # gap between start of end of baseline and start of peak
@@ -139,13 +138,8 @@ class TraceAnalyser(mp.Process):
         with self.events_cache_lock:
             self.events_cache = np.ndarray((self.max_events_in_cache, self.n_channels_per_event), dtype=np.int64, buffer=shm_events.buf)
 
-        # create analysis thread
-        thread = threading.Thread(
-            target=self.analyse,
-            daemon=True
-        )
-
         # main loop waiting for commands from experiment control
+        thread = None
         while True:
             try:
                 incoming_from_experiment_control = self.pipe_connection.recv()
@@ -162,9 +156,11 @@ class TraceAnalyser(mp.Process):
                 with self.index_tail_events_cache.get_lock():
                     self.index_tail_events_cache.value = 0
                 self.logger.info('[Trace Analyser] Events cache flushed!')
-                while thread.is_alive():
-                    self.logger.info('[Trace Analyser] Waiting until previous analysis thread ends')
-                    time.sleep(0.25)
+                if thread:
+                    self.stop_analyser.set()
+                    while thread.is_alive():
+                        self.logger.info('[Trace Analyser] Waiting until previous analysis thread ends')
+                        time.sleep(0.25)
                 # create analysis thread
                 thread = threading.Thread(
                     target=self.analyse,
@@ -176,9 +172,12 @@ class TraceAnalyser(mp.Process):
 
             elif incoming_from_experiment_control['command'] == 'stop':
                 self.stop_analyser.set()
-                while self.stop_analyser.is_set():
-                    self.logger.info('[Trace Analyser] Waiting until analysis thread ends')
-                    time.sleep(0.25)
+                if thread:
+                    if thread.is_alive():
+                        thread.join(0.1)
+                        while thread.is_alive():
+                            self.logger.info('[Trace Analyser] Waiting until analysis thread ends')
+                            time.sleep(0.25)
                 response_to_experiment_control = {'status':'OK', 'message':'[Trace Analyser] stopped'}
 
             elif incoming_from_experiment_control['command'] == 'configure':
@@ -217,10 +216,12 @@ class TraceAnalyser(mp.Process):
 
     def analyse(self):
         start_time  = time.perf_counter()
+        cycle_n = 0
 
         # stop if stop analyser event is set
         while not self.stop_analyser.is_set():
             cycle_start_time = time.perf_counter()
+            cycle_n += 1
 
             '''
             input cached traces
@@ -309,11 +310,13 @@ class TraceAnalyser(mp.Process):
                         #self.logger.info(self.events_cache[events_tail:events_tail + n_new_events])
 
                 else:
-                    self.logger.info(f'[Trace Analyser] {len(keep_mask)} traces returned but none above threshold')
+                    if not cycle_n % verbosity_divider:
+                        self.logger.info(f'[Trace Analyser] {len(keep_mask)} traces returned but none above threshold')
 
                 # update head of traces cache and tail of events cache
                 events_tail += n_new_events
-                self.logger.info(f'[Trace Analyser] analysed {n_new_events} events (traces cache old head:{traces_head}, new head and tail:{traces_tail}), (events cache head:{events_head}, tail:{events_tail})')
+                if not cycle_n % verbosity_divider:
+                    self.logger.info(f'[Trace Analyser] analysed {n_new_events} events (traces cache old head:{traces_head}, new head and tail:{traces_tail}), (events cache head:{events_head}, tail:{events_tail})')
                 traces_head = traces_tail
 
                 with self.index_head_traces_cache.get_lock():
@@ -323,7 +326,8 @@ class TraceAnalyser(mp.Process):
 
 
             else:
-                self.logger.info(f'[Trace Analyser] awaiting traces (traces cache head:{traces_head}, tail:{traces_tail})')
+                if not cycle_n % verbosity_divider:
+                    self.logger.info(f'[Trace Analyser] awaiting traces (traces cache head:{traces_head}, tail:{traces_tail})')
 
             # stop if events cache full
             if events_tail + n_new_events > self.max_events_in_cache:

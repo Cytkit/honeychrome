@@ -30,7 +30,7 @@ import numpy as np
 import time
 import warnings
 
-from honeychrome.settings import devices_boot_order, traces_cache_size, traces_cache_dtype, max_events_in_traces_cache, trace_n_points, transfer_target_repeat_time
+from honeychrome.settings import devices_boot_order, traces_cache_size, traces_cache_dtype, max_events_in_traces_cache, trace_n_points, transfer_target_repeat_time, verbosity_divider
 
 debug = True
 
@@ -245,7 +245,9 @@ class Instrument(mp.Process):
         return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
     def transfer(self):
+        cycle_n = 0
         while True:
+            cycle_n += 1
             start_time = time.perf_counter()
 
             blob_of_traces_as_array = self.device.read_out_traces()
@@ -260,6 +262,15 @@ class Instrument(mp.Process):
             elapsed = time.perf_counter() - start_time
             sleep_time = max(0., transfer_target_repeat_time - elapsed)
             time.sleep(sleep_time)
+
+            if debug == True:
+                with self.index_tail_traces_cache.get_lock():
+                    tail = self.index_tail_traces_cache.value
+                with self.index_head_traces_cache.get_lock():
+                    head = self.index_head_traces_cache.value
+
+                if not cycle_n % verbosity_divider:
+                    self.logger.info(f'[Instrument driver] pushed data to traces cache (head:{head}, tail:{tail})')
 
     def push_to_traces_cache(self, blob_np):
         n_traces_from_memory = len(blob_np) // self.trace_n_points
@@ -290,12 +301,8 @@ class Instrument(mp.Process):
             with self.index_tail_traces_cache.get_lock():
                 self.index_tail_traces_cache.value = cache_new_tail
 
-            if debug == True:
-                self.logger.info(f'[Instrument driver] pushed data to traces cache (head:{head}, tail:{cache_new_tail})')
         else:
-            warnings.warn("[Instrument driver] Traces cache is full, data dropped")
-            pass
-
+            self.logger.warning("[Instrument driver] Traces cache is full, data dropped")
 
 
 if __name__ == '__main__':

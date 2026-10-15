@@ -22,11 +22,11 @@ from honeychrome.instrument_driver_components.cytkit_components.sheath_pump impo
 from honeychrome.instrument_driver_components.cytkit_components.trigger import Trigger
 from honeychrome.instrument_driver_components.cytkit_components.vi_monitor import VIMonitor
 from honeychrome import settings
+from honeychrome.settings import verbosity_divider
 
 import logging
 logger = logging.getLogger(__name__)
 
-verbosity_divider = 5
 
 class PID:
     '''
