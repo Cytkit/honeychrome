@@ -6,7 +6,8 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QObject, Signal, QTimer
 
-from honeychrome.controller_components.functions import timer, apply_gates_in_place, apply_transfer_matrix, calc_stats, sample_from_fcs, calc_hist1d
+from honeychrome.controller_components.functions import timer, apply_transfer_matrix, calc_stats, sample_from_fcs, calc_hist1d
+from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.view_components.busy_cursor import with_busy_cursor
 
 import logging
@@ -21,6 +22,10 @@ class StatisticsCalculator(QObject):
         # connect
         self.controller = controller
         self.bus = bus
+        # Taken here, on the main thread: each sample is gated with its own
+        # gates (its per-sample overrides and its own Time range), not with
+        # the lookup tables of the sample on display.
+        self.sample_gating = SampleGating.from_controller(controller)
 
     @with_busy_cursor
     def run(self):
@@ -31,6 +36,8 @@ class StatisticsCalculator(QObject):
         samples_by_set = {sample_set:[sample for sample in samples_to_calculate if sample.startswith(sample_set)] for sample_set in sample_sets}
 
         if self.controller.experiment.process['unmixing_matrix'] is not None:
+            # Channel transforms for intensities and histograms are shared by
+            # every sample, so values stay comparable across samples.
             data_for_statistics_comparison = self.controller.data_for_cytometry_plots_unmixed.copy()
             # set up data first by sample
             data_by_sample = {}
@@ -77,11 +84,9 @@ class StatisticsCalculator(QObject):
                     unmixed_event_data = apply_transfer_matrix(self.controller.transfer_matrix, raw_event_data)
                     data_for_statistics_comparison.update({'event_data': unmixed_event_data})
 
-                    gate_membership = {'root': np.ones(len(data_for_statistics_comparison['event_data']), dtype=np.bool_)}
+                    gate_membership = self.sample_gating.memberships(samples_to_calculate[n], unmixed_event_data,
+                                                                     data_for_statistics_comparison['pnn'])
                     data_for_statistics_comparison.update({'gate_membership': gate_membership})
-                    gates_to_calculate = [g[0] for g in data_for_statistics_comparison['gating'].get_gate_ids()]
-                    # gates_to_calculate = list(set([statistics_comparison['gate'] for statistics_comparison in experiment_statistics]))
-                    apply_gates_in_place(data_for_statistics_comparison, gates_to_calculate=gates_to_calculate)
                     sample_statistics = calc_stats(data_for_statistics_comparison)
                     for statistics_comparison in experiment_statistics:
                         gate_name = statistics_comparison['gate']
