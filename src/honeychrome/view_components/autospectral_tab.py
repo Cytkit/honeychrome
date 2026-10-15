@@ -9,7 +9,8 @@ Sections
 --------
 1  Extract AF profile from an unstained sample (SOM, KMeans fallback).
 2  Manage stored AF profiles (spectral plot, CSV load/save/delete).
-3  Assign AF profiles to samples (grid: rows=non-SSC samples, columns=profiles).
+3  Assign AF profiles to samples (grid: rows=samples, columns=profiles; unstained
+   and single-stained controls optionally included).
 4  Side-by-side OLS vs AF-corrected biplot comparison, using the same
    density-heatmap rendering, logicle transforms, and axis-drag zoom as the
    Unmixed Data tab.
@@ -34,11 +35,11 @@ import warnings
 from honeychrome.controller_components.functions import (
     sample_from_fcs,
     apply_transfer_matrix,
+    apply_gates_in_place,
     build_display_label_map,
 )
 from honeychrome.controller_components.autospectral_functions import (
     get_af_spectra,
-    precompute_af_matrices,
     apply_af_transfer,
     save_af_profile_csv,
     load_af_profile_csv,
@@ -53,6 +54,7 @@ from honeychrome.controller_components.spread_model import (
     compute_spread_entry,
 )
 from honeychrome.controller_components.transform import Transform
+from honeychrome.controller_components.sample_loader import resolve_af_for_profiles
 from honeychrome.view_components.cytometry_plot_components import (
     InteractiveLabel,
     NoPanViewBox,
@@ -600,12 +602,13 @@ class AfComparisonPlotWidget(QWidget):
     def _compute_gate_mask(self, event_data: np.ndarray) -> np.ndarray | None:
         """
         Compute a per-event boolean mask for self._source_gate applied to
-        event_data, using the controller's unmixed_lookup_tables,
-        unmixed_transformations, and unmixed_gating.
+        event_data, with the controller's unmixed_lookup_tables,
+        unmixed_transformations and unmixed_gating: the gating the main
+        window applies to the displayed sample, whose events these are.
 
-        This replicates the logic of apply_gates_in_place() from functions.py,
-        walking the full gate ancestry so that child gates correctly inherit
-        their parent's membership.
+        The gate and its ancestors are evaluated with apply_gates_in_place,
+        so child gates inherit their parent's membership and quadrants are
+        resolved through their quadrant gate.
 
         Returns None if 'root' is selected or if gating is unavailable.
         Returns a boolean ndarray of length len(event_data) otherwise.
@@ -621,88 +624,33 @@ class AfComparisonPlotWidget(QWidget):
         if gating is None or not lookup_tables or not transforms or not pnn:
             return None
 
-        # Build the full ancestry path to the target gate, root-first
         try:
             paths = gating.find_matching_gate_paths(self._source_gate)
         except Exception:
             return None
         if not paths:
             return None
+        gate_sequence = [g for g in paths[0] if g != 'root'] + [self._source_gate]
 
-        # Ancestry: all gates in the path from root to target (exclusive of
-        # 'root' itself since every event is in root), then the target gate.
-        ancestry_path = list(paths[0])   # e.g. ('root', 'Cells')
-        gate_sequence = [g for g in ancestry_path if g != 'root'] + [self._source_gate]
-        # Deduplicate while preserving order (target may already be last)
-        seen = set()
-        gate_sequence_dedup = []
-        for g in gate_sequence:
-            if g not in seen:
-                seen.add(g)
-                gate_sequence_dedup.append(g)
-
-        n_events = len(event_data)
-        # Start with all-True (every event is in 'root')
-        cumulative_mask = np.ones(n_events, dtype=bool)
-
-        for gate_name in gate_sequence_dedup:
-            if gate_name not in lookup_tables:
-                # Gate not found in lookup tables — skip
-                logger.warning(
-                    f'AfComparisonPlotWidget._compute_gate_mask: '
-                    f'"{gate_name}" not in unmixed_lookup_tables'
-                )
-                return None
-
-            try:
-                gate = gating.get_gate(gate_name)
-                channels = gate.get_dimension_ids()
-
-                if len(channels) == 1:
-                    xchan = channels[0]
-                    if xchan not in pnn:
-                        return None
-                    ix = pnn.index(xchan)
-                    x = event_data[:, ix]
-                    scale_x = transforms[xchan].scale
-                    idx = np.searchsorted(scale_x, x) - 2
-                    lt = lookup_tables[gate_name]
-                    idx = np.clip(idx, 0, len(lt) - 1)
-                    gate_mask = lt[idx]
-
-                else:  # 2-channel gate
-                    if gate.gate_type == 'QuadrantGate':
-                        xchan = gate.dimensions[0].dimension_ref
-                        ychan = gate.dimensions[1].dimension_ref
-                    else:
-                        xchan = channels[0]
-                        ychan = channels[1]
-                    if xchan not in pnn or ychan not in pnn:
-                        return None
-                    ix = pnn.index(xchan)
-                    iy = pnn.index(ychan)
-                    x = event_data[:, ix]
-                    y = event_data[:, iy]
-                    scale_x = transforms[xchan].scale
-                    scale_y = transforms[ychan].scale
-                    idx_x = np.searchsorted(scale_x, x) - 2
-                    idx_y = np.searchsorted(scale_y, y) - 2
-                    bins_x = transforms[xchan].scale_bins + 1
-                    flat_idx = idx_x * bins_x + idx_y
-                    lt = lookup_tables[gate_name]
-                    flat_idx = np.clip(flat_idx, 0, len(lt) - 1)
-                    gate_mask = lt[flat_idx]
-
-                cumulative_mask = cumulative_mask & gate_mask.astype(bool)
-
-            except Exception as e:
-                logger.error(
-                    f'AfComparisonPlotWidget._compute_gate_mask: '
-                    f'error computing mask for "{gate_name}": {e}'
-                )
-                return None
-
-        return cumulative_mask
+        data = {'event_data': event_data, 'pnn': list(pnn), 'transformations': transforms,
+                'lookup_tables': lookup_tables, 'gating': gating,
+                'gate_membership': {'root': np.ones(len(event_data), dtype=bool)}}
+        try:
+            apply_gates_in_place(data, gates_to_calculate=gate_sequence)
+        except Exception as e:
+            logger.error(
+                f'AfComparisonPlotWidget._compute_gate_mask: '
+                f'error computing mask for "{self._source_gate}": {e}'
+            )
+            return None
+        mask = data['gate_membership'].get(self._source_gate)
+        if mask is None:
+            logger.warning(
+                f'AfComparisonPlotWidget._compute_gate_mask: '
+                f'"{self._source_gate}" could not be evaluated on these events'
+            )
+            return None
+        return np.asarray(mask, dtype=bool)
 
     # ------------------------------------------------------------------
     # Internal: zoom (mirrors CytometryPlotWidget.apply_zoom)
@@ -928,7 +876,7 @@ class AutoSpectralTab(QWidget):
 
         self._som_dim_spin = QSpinBox()
         self._som_dim_spin.setRange(2, 30)
-        self._som_dim_spin.setValue(10)
+        self._som_dim_spin.setValue(15)
         self._som_dim_spin.setToolTip(
             'Side length of the square SOM grid (som.dim in R AutoSpectral); '
             'the grid has som.dim² nodes. KMeans with the same number of '
@@ -1002,10 +950,31 @@ class AutoSpectralTab(QWidget):
             'Tick the AF profile(s) for each sample. '
             'Multiple profiles are concatenated before unmixing. '
             'Unticked samples use standard OLS unmixing. '
-            'Single Stain Controls are excluded.'
+            'Unstained controls are listed first and are assigned the AF '
+            'profile extracted from their own data by default.'
         )
         info.setWordWrap(True)
         layout.addWidget(info)
+
+        filter_row = QHBoxLayout()
+        self._include_unstained_cb = QCheckBox('Include unstained controls')
+        self._include_unstained_cb.setChecked(True)
+        self._include_unstained_cb.setToolTip(
+            'Show unstained controls (listed at the top of the grid).'
+        )
+        filter_row.addWidget(self._include_unstained_cb)
+
+        self._include_ssc_cb = QCheckBox('Include single-stained controls')
+        self._include_ssc_cb.setChecked(False)
+        self._include_ssc_cb.setToolTip(
+            'Show single-stained controls (listed after the samples). '
+            'Also includes unstained controls.'
+        )
+        filter_row.addWidget(self._include_ssc_cb)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
+        self._include_unstained_cb.toggled.connect(self._on_assignment_filter_changed)
+        self._include_ssc_cb.toggled.connect(self._on_assignment_filter_changed)
 
         # Frozen header row (profile names) — does not scroll vertically.
         # Its own horizontal scrollbar is hidden and driven by the body's.
@@ -1022,7 +991,7 @@ class AutoSpectralTab(QWidget):
         self._assign_header_scroll.setWidget(self._assign_header_widget)
         layout.addWidget(self._assign_header_scroll)
 
-        # Scrollable grid: rows = non-SSC samples, columns = AF profiles
+        # Scrollable grid: rows = samples, columns = AF profiles
         # Min/max here are just the pre-populate defaults; _rebuild_assignment_grid()
         # re-sizes this to fit the actual sample count each time it's called.
         self._assign_scroll = QScrollArea()
@@ -1053,7 +1022,7 @@ class AutoSpectralTab(QWidget):
         assign_all_btn = QPushButton('Assign Selected Profile to All Samples')
         assign_all_btn.setToolTip(
             'Assign the profile currently selected in the Stored AF Profiles list '
-            'to all non-SSC samples. Already-assigned profiles are not duplicated.'
+            'to every sample shown in the grid. Already-assigned profiles are not duplicated.'
         )
         assign_all_btn.clicked.connect(self._assign_selected_profile_to_all)
         btn_row.addWidget(assign_all_btn)
@@ -1163,6 +1132,7 @@ class AutoSpectralTab(QWidget):
 
         self._populate_sample_combo()
         self._refresh_profile_list()
+        self._assign_unstained_own_profiles()
         self._rebuild_assignment_grid()
         self._refresh_comparison_controls()
 
@@ -1337,6 +1307,8 @@ class AutoSpectralTab(QWidget):
         else:
             self.controller.cache_af_profile(profile_name)
         self.controller.on_af_profiles_changed()
+
+        self._assign_profile_to_sample(str(source_fcs_path), profile_name)
 
         if csv_save_error:
             self._extract_status.setText(
@@ -1555,13 +1527,115 @@ class AutoSpectralTab(QWidget):
             self.bus.statusMessage.emit(f'AutoSpectral: deleted profile "{name}".')
 
     # ======================================================================
-    # Section 3 — assignment grid (non-SSC samples only)
+    # Section 3 — assignment grid
     # ======================================================================
+
+    def _is_unstained_sample(self, sample_path: str, display_name: str = '') -> bool:
+        """True if the sample is tagged as unstained or its name says so."""
+        samples = self.controller.experiment.samples
+        if sample_path in samples.get('unstained_samples', []):
+            return True
+        name = display_name or samples.get('all_samples', {}).get(sample_path, '')
+        return bool(
+            re.search(r'unstained', name, re.IGNORECASE)
+            or re.search(r'unstained', str(sample_path), re.IGNORECASE)
+        )
+
+    def _assignment_samples(self) -> dict:
+        """
+        Samples shown in the assignment grid, as {path: display name}.
+        Order: unstained controls, then ordinary samples, then single-stained
+        controls. Unstained controls are shown when either control checkbox is
+        ticked; single-stained controls only when their own checkbox is ticked.
+        """
+        samples = self.controller.experiment.samples
+        all_samples = samples.get('all_samples', {})
+        ssc = set(samples.get('single_stain_controls', []))
+        include_ssc = self._include_ssc_cb.isChecked()
+        include_unstained = include_ssc or self._include_unstained_cb.isChecked()
+
+        unstained_rows = {}
+        sample_rows = {}
+        ssc_rows = {}
+        for path, name in all_samples.items():
+            if self._is_unstained_sample(path, name):
+                if include_unstained:
+                    unstained_rows[path] = name
+            elif path in ssc:
+                if include_ssc:
+                    ssc_rows[path] = name
+            else:
+                sample_rows[path] = name
+        return {**unstained_rows, **sample_rows, **ssc_rows}
+
+    def _on_assignment_filter_changed(self, _checked=False):
+        """Ticking single-stained controls forces unstained controls on."""
+        include_ssc = self._include_ssc_cb.isChecked()
+        if include_ssc:
+            self._include_unstained_cb.blockSignals(True)
+            self._include_unstained_cb.setChecked(True)
+            self._include_unstained_cb.blockSignals(False)
+        self._include_unstained_cb.setEnabled(not include_ssc)
+        self._rebuild_assignment_grid()
+
+    def _profiles_from_sample(self, sample_path: str) -> list:
+        """Names of stored AF profiles that were extracted from sample_path."""
+        af_profiles = self.controller.experiment.process.get('af_profiles', {})
+        return [
+            name for name, entry in af_profiles.items()
+            if str(entry.get('source_fcs', '')) == str(sample_path)
+        ]
+
+    def _reapply_unmixing_if_current(self, sample_paths):
+        """Refresh AF matrices and unmixing when the loaded sample is in sample_paths."""
+        if self.controller.current_sample_path not in sample_paths:
+            return
+        self.controller.initialise_af_matrices()
+        if self.controller.raw_event_data is not None:
+            self.controller.unmixed_event_data = self.controller._apply_unmixing(
+                self.controller.raw_event_data
+            )
+            self.controller.clear_data_for_cytometry_plots()
+            self.controller.initialise_data_for_cytometry_plots()
+
+    def _assign_profile_to_sample(self, sample_path: str, profile_name: str):
+        """Add profile_name to the sample's assignment if not already present."""
+        sample_af = self.controller.experiment.samples.get('sample_af_profiles', {})
+        assigned = list(sample_af.get(sample_path, []))
+        if profile_name not in assigned:
+            assigned.append(profile_name)
+        sample_af[sample_path] = assigned
+        self.controller.experiment.samples['sample_af_profiles'] = sample_af
+        self.bus.autoSaveRequested.emit()
+        self._reapply_unmixing_if_current([sample_path])
+
+    def _assign_unstained_own_profiles(self):
+        """
+        Give each unstained control the AF profile(s) extracted from its own
+        data. Only samples with no assignment record are touched, so an
+        assignment the user has edited or cleared is never overwritten.
+        """
+        samples = self.controller.experiment.samples
+        sample_af = samples.get('sample_af_profiles', {})
+        changed = []
+        for path, name in samples.get('all_samples', {}).items():
+            if path in sample_af or not self._is_unstained_sample(path, name):
+                continue
+            own = self._profiles_from_sample(path)
+            if own:
+                sample_af[path] = own
+                changed.append(path)
+        if not changed:
+            return
+        samples['sample_af_profiles'] = sample_af
+        self.bus.autoSaveRequested.emit()
+        self._reapply_unmixing_if_current(changed)
 
     def _rebuild_assignment_grid(self):
         """
         Rebuild the samples × profiles checkbox grid.
-        Only non-Single-Stain-Control samples are shown.
+        Rows are chosen by _assignment_samples(): unstained controls first,
+        then samples, then single-stained controls if requested.
         The profile-name header lives in a separate frozen widget/layout
         (self._assign_header_layout) above the scrollable body grid, kept
         column-aligned with it. Body row 0 = first sample (no header row
@@ -1581,15 +1655,12 @@ class AutoSpectralTab(QWidget):
 
         af_profiles = self.controller.experiment.process.get('af_profiles', {})
         profile_names = list(af_profiles.keys())
-        all_samples = self.controller.experiment.samples.get('all_samples', {})
-        ssc = set(self.controller.experiment.samples.get('single_stain_controls', []))
-        # Exclude SSC from the assignment grid
-        non_ssc = {p: n for p, n in all_samples.items() if p not in ssc}
+        shown_samples = self._assignment_samples()
         sample_af = self.controller.experiment.samples.get('sample_af_profiles', {})
 
-        if not profile_names or not non_ssc:
+        if not profile_names or not shown_samples:
             self._assign_grid_layout.addWidget(
-                QLabel('No profiles or non-SSC samples available yet.'), 0, 0
+                QLabel('No profiles or samples available yet.'), 0, 0
             )
             self._assign_header_scroll.setFixedHeight(1)
             self._assign_scroll.setMinimumHeight(60)
@@ -1614,7 +1685,7 @@ class AutoSpectralTab(QWidget):
             self._assign_header_layout.addWidget(lbl, 0, col, Qt.AlignCenter)
 
         # Sample rows (scrolling body — row 0 is now the first sample)
-        for row, (sample_path, display_name) in enumerate(non_ssc.items()):
+        for row, (sample_path, display_name) in enumerate(shown_samples.items()):
             name_lbl = QLabel(display_name)
             name_lbl.setToolTip(sample_path)
             if sample_path == self.controller.current_sample_path:
@@ -1660,7 +1731,7 @@ class AutoSpectralTab(QWidget):
         # counts — the tab's outer QScrollArea handles page-level scrolling
         # instead. Beyond the cap, the inner scrollbar takes back over.
         self._assign_grid_layout.activate()
-        n_rows = len(non_ssc)
+        n_rows = len(shown_samples)
         row_heights = [
             self._assign_grid_layout.itemAtPosition(r, 0).widget().sizeHint().height()
             for r in range(n_rows)
@@ -1753,7 +1824,7 @@ class AutoSpectralTab(QWidget):
             )
 
     def _assign_selected_profile_to_all(self):
-        """Assign the profile selected in the profile list to every non-SSC sample."""
+        """Assign the profile selected in the profile list to every sample shown in the grid."""
         item = self._profile_list.currentItem()
         if item is None:
             self._assign_status.setText(
@@ -1762,16 +1833,14 @@ class AutoSpectralTab(QWidget):
             return
 
         profile_name = item.text()
-        all_samples = self.controller.experiment.samples.get('all_samples', {})
-        ssc = set(self.controller.experiment.samples.get('single_stain_controls', []))
-        non_ssc = [p for p in all_samples if p not in ssc]
+        target_samples = list(self._assignment_samples())
 
-        if not non_ssc:
-            self._assign_status.setText('No non-SSC samples available.')
+        if not target_samples:
+            self._assign_status.setText('No samples available.')
             return
 
         sample_af = self.controller.experiment.samples.get('sample_af_profiles', {})
-        for sample_path in non_ssc:
+        for sample_path in target_samples:
             assigned = list(sample_af.get(sample_path, []))
             if profile_name not in assigned:
                 assigned.append(profile_name)
@@ -1782,7 +1851,7 @@ class AutoSpectralTab(QWidget):
 
         # If the current sample was affected, reinitialise its AF matrices and
         # re-apply unmixing so the Unmixed Data tab updates immediately.
-        if self.controller.current_sample_path in non_ssc:
+        if self.controller.current_sample_path in target_samples:
             self.controller.initialise_af_matrices()
             if self.controller.raw_event_data is not None:
                 self.controller.unmixed_event_data = self.controller._apply_unmixing(
@@ -1793,15 +1862,16 @@ class AutoSpectralTab(QWidget):
 
         self._rebuild_assignment_grid()
         self._assign_status.setText(
-            f'"{profile_name}" assigned to {len(non_ssc)} sample(s).'
+            f'"{profile_name}" assigned to {len(target_samples)} sample(s).'
         )
         if self.bus:
             self.bus.statusMessage.emit(
-                f'AutoSpectral: "{profile_name}" assigned to all {len(non_ssc)} non-SSC sample(s).'
+                f'AutoSpectral: "{profile_name}" assigned to {len(target_samples)} sample(s).'
             )
 
     def _clear_all_af(self):
-        self.controller.experiment.samples['sample_af_profiles'] = {}
+        all_samples = self.controller.experiment.samples.get('all_samples', {})
+        self.controller.experiment.samples['sample_af_profiles'] = {p: [] for p in all_samples}
         self.controller.experiment.save()
 
         self.controller.initialise_af_matrices()
@@ -1889,22 +1959,25 @@ class AutoSpectralTab(QWidget):
             self._cmp_status.setText('Fluorophore profiles unavailable.')
             return
 
-        # Use cached precomputed matrices where possible.
-        # For the "assigned" case, controller.af_precomputed is already the
-        # correctly combined result — no recomputation needed.
-        # For a single named profile, use its cached entry if available.
-        if profile_key == '__assigned__' and self.controller.af_precomputed is not None:
-            af_precomputed = self.controller.af_precomputed
-        elif profile_key != '__assigned__' and profile_key in self.controller.af_precomputed_cache:
-            af_precomputed = self.controller.af_precomputed_cache[profile_key]
+        # The AF matrices the main window unmixes with, negative envelope
+        # included: the sample's combined assignment, or the chosen profile
+        # (computed and cached now if it is not cached yet).
+        if profile_key == '__assigned__':
+            assigned = (self.controller.experiment.samples
+                        .get('sample_af_profiles', {})
+                        .get(self.controller.current_sample_path, []))
+            af = resolve_af_for_profiles(self.controller, assigned)
+            af_precomputed = None if af is None else af.precomputed
+            if af is not None:
+                af_spectra, af_index_map = af.spectra, af.index_map
         else:
-            # Fallback: compute now (e.g. profile was just loaded from CSV and
-            # cache hasn't been populated yet, or fluor_spectra changed).
-            try:
-                af_precomputed = precompute_af_matrices(fluor_spectra, af_spectra)
-            except Exception as e:
-                self._cmp_status.setText(f'Precompute error: {e}')
-                return
+            af_precomputed = self.controller.precomputed_for_profile(profile_key)
+        if af_precomputed is None:
+            self._cmp_status.setText(
+                'AF matrices are not available yet for this profile. '
+                'Wait for the spectral process to finish, then run the comparison again.'
+            )
+            return
 
         self._plot_ols.set_status('Computing...')
         self._plot_af.set_status('Computing...')

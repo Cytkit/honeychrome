@@ -7,7 +7,9 @@ from PySide6.QtCore import Qt, QModelIndex, QTimer, QThread, Slot, QObject, QEve
 from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QStyledItemDelegate, QComboBox, QLineEdit, QMessageBox, QHeaderView, QLabel, QWidget, QCheckBox, QMenu, QInputDialog)
 
 from honeychrome.controller_components.functions import raw_gates_list, resolve_base_gate
-from honeychrome.controller_components.spectral_controller import SpectralAutoGenerator, ProfileUpdater, SpectralCleaner
+from honeychrome.controller_components.spectral_controller import (
+    SpectralAutoGenerator, ProfileUpdater, SpectralCleaner, LowEventLog, control_gating,
+)
 from honeychrome.controller_components.spectral_reference_library import (
     cosine_similarity_to_reference, SpectralReferenceLibrary, compute_config_key, describe_profile,
     profile_id_from_description,
@@ -1375,7 +1377,8 @@ class SpectralControlsEditor(QFrame):
             gate_label_for_load = base_gate_label if base_gate_label != 'root' else None
             fl_events = get_raw_events(sample, fluor_ids,
                                     gate_label=gate_label_for_load,
-                                    gating_strategy=raw_gating)
+                                    gating_strategy=control_gating(self.controller),
+                                    sample_key=sample_rel_path)
             ch_values = fl_events[:, fl_col]
 
             pos_pct = settings.spectral_positive_gate_percent_retrieved
@@ -1575,14 +1578,21 @@ class SpectralControlsEditor(QFrame):
     def _on_force_recalc(self):
         self.setEnabled(False)
         self.profile_updater.flush()  # remove profiles that are not in the model
+        # Warnings from the profiles and the spectral process refresh are shown
+        # together once the recalculation is done.
+        own_collector = self.controller.warning_collector is None
+        if own_collector:
+            self.controller.warning_collector = []
+        self.profile_updater.low_events = LowEventLog(self.controller, self.bus, collect=True)
 
         for index, control in enumerate(self.model._data):
             label = control.get('label', '')
 
-            # Skip this control if its profile is already present and the gate
-            # it references still exists in raw gating (i.e. nothing has changed
-            # that would invalidate it).  This avoids unnecessary re-extraction
-            # when only one or two controls have changed.
+            # Skip this control if its profile is already present, the gate it
+            # references still exists in raw gating, and none of the gates its
+            # profile was computed from has moved (template or per-sample
+            # override). This avoids unnecessary re-extraction when only one or
+            # two controls have changed.
             if label and label in self.profile_updater.profiles:
                 # Library controls depend on spectral_library_search_results which is
                 # only populated after refresh_comboboxes runs — always regenerate them
@@ -1593,8 +1603,10 @@ class SpectralControlsEditor(QFrame):
                     not gate_label
                     or bool(self.raw_gating.find_matching_gate_paths(gate_label))
                 )
-                if gate_still_valid and not is_library:
-                    logger.info(f'SpectralModelEditor: skipping recalc for "{label}" — profile present and gate valid')
+                gating_unchanged = (self.profile_updater.profile_gating.get(label)
+                                    == self.profile_updater.gating_signature(control))
+                if gate_still_valid and gating_unchanged and not is_library:
+                    logger.info(f'SpectralModelEditor: skipping recalc for "{label}" — profile present and gates unchanged')
                     continue
 
             control_valid = self.profile_updater.generate(control, self.spectral_library_search_results)
@@ -1603,8 +1615,20 @@ class SpectralControlsEditor(QFrame):
                 # Do not break — attempt remaining controls so the user sees all
                 # failures at once rather than stopping at the first one.
 
-        self.bus.spectralModelUpdated.emit()
-        self.refresh_table_and_enable()
+        low_event_text = self.profile_updater.low_events.text()
+        self.profile_updater.low_events = LowEventLog(self.controller, self.bus, collect=False)
+        if low_event_text:
+            self.controller.warning_collector.append(low_event_text)
+
+        try:
+            self.bus.spectralModelUpdated.emit()
+            self.refresh_table_and_enable()
+        finally:
+            if own_collector:
+                messages = self.controller.warning_collector or []
+                self.controller.warning_collector = None
+                if messages and self.bus:
+                    self.bus.warningMessage.emit('\n\n'.join(messages))
         logger.info(f'SpectralModelEditor: forced recalculation complete')
 
     def _on_unmixing_method_changed(self, method_key: str):
@@ -1659,8 +1683,9 @@ class SpectralControlsEditor(QFrame):
         # Rebuild comboboxes now so that spectral_library_search_results is populated before the recalc worker runs
         self.refresh_comboboxes()
 
-        # Negative-profile warnings from the recalculation are reported with the rest
+        # Negative-profile and low-event warnings from the recalculation are reported with the rest
         self.profile_updater.negative_profile_warnings = []
+        self.profile_updater.low_events = LowEventLog(self.controller, self.bus, collect=True)
 
         # Run profile regeneration in a background thread so the main thread
         # stays responsive. _on_force_recalc is not thread-safe (it touches Qt
@@ -1692,6 +1717,10 @@ class SpectralControlsEditor(QFrame):
                 f'Negative profile: the negative gate has higher mean fluorescence than the '
                 f'positive for {labels}. Check the negative assigned to these controls.'
             )
+        low_event_text = self.profile_updater.low_events.text()
+        self.profile_updater.low_events = LowEventLog(self.controller, self.bus, collect=False)
+        if low_event_text:
+            messages.append(low_event_text)
         messages += self.controller.warning_collector or []
         self.controller.warning_collector = None
         low_cosine_text = self._low_cosine_warning_text()

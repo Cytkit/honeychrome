@@ -205,7 +205,9 @@ def _statistics(controller, monkeypatch):
     from honeychrome.controller_components import statistical_controller as sc
 
     monkeypatch.setattr(sc, 'sample_from_fcs', lambda path: _FakeSample(SAMPLES[f'Raw/{Path(path).name}']))
-    monkeypatch.setattr(sc, 'apply_transfer_matrix', lambda _matrix, raw: raw)
+    controller.experiment.settings['raw'].update({'event_channels_pnn': list(PNN), 'whitelisted_pnn': None})
+    controller.filtered_raw_fluorescence_channel_ids = [0]
+    controller.transfer_matrix = np.eye(len(PNN))
     controller.experiment_dir = Path('experiment')
     controller.experiment.samples['all_samples'] = {key: Path(key).stem for key in SAMPLES}
     controller.experiment.process['unmixing_matrix'] = [[1.0]]

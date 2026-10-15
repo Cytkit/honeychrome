@@ -187,6 +187,19 @@ class SampleGating:
     def gate_names(self) -> list:
         return [gid for gid, _path in self.gating.get_gate_ids()]
 
+    def _with_ancestors(self, gate_names) -> list:
+        """*gate_names* and every gate above them, in hierarchy order. Names
+        not in the hierarchy are dropped."""
+        wanted = set()
+        for name in gate_names:
+            if name == 'root':
+                continue
+            paths = self.gating.find_matching_gate_paths(name)
+            if paths:
+                wanted.update(g for g in paths[0] if g != 'root')
+                wanted.add(name)
+        return [gid for gid in self.gate_names() if gid in wanted]
+
     def signature(self, sample_keys=None) -> str:
         """Identifies the gating of *sample_keys* (every sample when None):
         the template gates, those samples' overrides and the axis transforms.
@@ -211,10 +224,12 @@ class SampleGating:
                     out[ch] = sample_tr
         return out
 
-    def _lookup_tables(self, sample_key: str, transforms: dict) -> dict:
+    def _lookup_tables(self, sample_key: str, transforms: dict, names=None) -> dict:
         own = self.overrides.get(str(sample_key), {})
         tables = {}
         for name, gate in self._nodes(self.gating):
+            if names is not None and name not in names:
+                continue
             channels = _gate_channels(gate)
             if any(ch not in transforms for ch in channels):
                 continue
@@ -229,15 +244,17 @@ class SampleGating:
                 tables.update(self._template_tables[name])
         return tables
 
-    def memberships(self, sample_key: str, events: np.ndarray, pnn: list) -> dict:
+    def memberships(self, sample_key: str, events: np.ndarray, pnn: list, gate_names=None) -> dict:
         """{gate name: bool mask} for every gate that can be evaluated on
-        *events* (columns named by *pnn*), plus 'root'."""
+        *events* (columns named by *pnn*), plus 'root'. With *gate_names*,
+        only those gates and their ancestors are evaluated."""
         pnn = list(pnn)
+        names = self.gate_names() if gate_names is None else self._with_ancestors(gate_names)
         transforms = self._sample_transforms(events, pnn)
         data = {'event_data': events, 'pnn': pnn, 'transformations': transforms,
-                'lookup_tables': self._lookup_tables(sample_key, transforms), 'gating': self.gating,
+                'lookup_tables': self._lookup_tables(sample_key, transforms, set(names)), 'gating': self.gating,
                 'gate_membership': {'root': np.ones(len(events), dtype=bool)}}
-        apply_gates_in_place(data, gates_to_calculate=self.gate_names())
+        apply_gates_in_place(data, gates_to_calculate=names)
         return data['gate_membership']
 
     def population_mask(self, sample_key: str, events: np.ndarray, pnn: list, gate_names: list) -> np.ndarray:
@@ -247,7 +264,7 @@ class SampleGating:
         ancestor's channels is not in *pnn*)."""
         if not gate_names:
             return np.ones(len(events), dtype=bool)
-        membership = self.memberships(sample_key, events, pnn)
+        membership = self.memberships(sample_key, events, pnn, gate_names)
         masks = []
         for name in gate_names:
             if name not in membership:
@@ -255,3 +272,26 @@ class SampleGating:
                                  f'channels (or an ancestor gate\'s) is not in the data.')
             masks.append(np.asarray(membership[name], dtype=bool))
         return np.logical_or.reduce(masks)
+
+    def chain_signature(self, sample_key: str, gate_names) -> str:
+        """Identifies how *sample_key* is gated by *gate_names* and their
+        ancestors: each gate's effective boundary for that sample (its
+        override, else the template) and the transforms of their channels.
+        Unlike ``signature`` it ignores every other gate, so a result built
+        from these gates stays current when unrelated gates are edited. The
+        range of per-sample (Time) axes is left out: each sample is gated on
+        its own range, whichever sample is displayed."""
+        own = self.overrides.get(str(sample_key), {})
+        gates_used, channels = [], set()
+        for name in self._with_ancestors(gate_names):
+            if self.gating._get_gate_node(name, self.gating.find_matching_gate_paths(name)[0]).gate_type == 'Quadrant':
+                continue
+            gate = own[name] if name in own else self.gating.get_gate(name)
+            gates_used.append([name, _gml(gate)])
+            channels.update(_gate_channels(gate))
+        return _digest({
+            'gates': gates_used,
+            'transforms': {ch: (_transform_params(self.transforms[ch])
+                                if getattr(self.transforms[ch], 'id', None) != 'default' else 'default')
+                           for ch in sorted(channels) if ch in self.transforms},
+        })

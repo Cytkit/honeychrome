@@ -6,8 +6,9 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QObject, Signal, QTimer
 
-from honeychrome.controller_components.functions import timer, apply_transfer_matrix, calc_stats, sample_from_fcs, calc_hist1d
+from honeychrome.controller_components.functions import timer, calc_stats, sample_from_fcs, calc_hist1d
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
+from honeychrome.controller_components.sample_loader import snapshot_unmix_state, unmix_events
 from honeychrome.view_components.busy_cursor import with_busy_cursor
 
 import logging
@@ -26,6 +27,10 @@ class StatisticsCalculator(QObject):
         # gates (its per-sample overrides and its own Time range), not with
         # the lookup tables of the sample on display.
         self.sample_gating = SampleGating.from_controller(controller)
+        # Likewise each sample is unmixed with its own AutoSpectral AF
+        # profile assignment, as the main window unmixes it when displayed.
+        self.unmix_snapshot = (snapshot_unmix_state(controller, include_qc=False)
+                               if controller.transfer_matrix is not None else None)
 
     @with_busy_cursor
     def run(self):
@@ -35,7 +40,7 @@ class StatisticsCalculator(QObject):
         samples_to_calculate = [sample for sample in all_samples if any([Path(sample).is_relative_to(folder) for folder in sample_sets])]
         samples_by_set = {sample_set:[sample for sample in samples_to_calculate if sample.startswith(sample_set)] for sample_set in sample_sets}
 
-        if self.controller.experiment.process['unmixing_matrix'] is not None:
+        if self.controller.experiment.process['unmixing_matrix'] is not None and self.unmix_snapshot is not None:
             # Channel transforms for intensities and histograms are shared by
             # every sample, so values stay comparable across samples.
             data_for_statistics_comparison = self.controller.data_for_cytometry_plots_unmixed.copy()
@@ -81,7 +86,10 @@ class StatisticsCalculator(QObject):
 
                 data_by_sample[samples_to_calculate[n]] = {'Sample': sample_name, 'Group': group_name, 'Category': category_name, 'Statistics': {}}
                 if n_events > 0:
-                    unmixed_event_data = apply_transfer_matrix(self.controller.transfer_matrix, raw_event_data)
+                    if np.isnan(raw_event_data).any():
+                        raw_event_data = np.where(np.isnan(raw_event_data), 0.0, raw_event_data)
+                    unmixed_event_data = unmix_events(raw_event_data, self.unmix_snapshot,
+                                                      self.unmix_snapshot.af_for(samples_to_calculate[n]))['unmixed']
                     data_for_statistics_comparison.update({'event_data': unmixed_event_data})
 
                     gate_membership = self.sample_gating.memberships(samples_to_calculate[n], unmixed_event_data,

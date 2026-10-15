@@ -114,6 +114,7 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
     labels_dict = cl_run.get('labels', {}) or {}
     training_samples = cl_run.get('training_sample_ids', [])
     pooled: dict[str, dict[int, list]] = {ch: {} for ch in channels}
+    misaligned: list[str] = []
 
     log.info(
         "pool_cluster_marker_values: pooling %d channel(s) across %d training "
@@ -135,14 +136,17 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
                 progress_callback(i + 1)
             continue
         labels = np.asarray(labels)
-        m = min(len(values), len(labels))
-        if m != len(values) or m != len(labels):
+        if len(values) != len(labels):
             log.warning(
                 "pool_cluster_marker_values: %s -- values (%d) vs labels (%d) "
-                "length mismatch, truncating to %d.",
-                rel, len(values), len(labels), m,
+                "length mismatch; the run's events no longer line up with the "
+                "current gating and unmixing.",
+                rel, len(values), len(labels),
             )
-        values, labels = values[:m], labels[:m]
+            misaligned.append(rel)
+            if progress_callback is not None:
+                progress_callback(i + 1)
+            continue
         for ch in channels:
             if ch not in names:
                 continue
@@ -153,6 +157,16 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
                 pooled[ch].setdefault(int(cl_id), []).append(col[labels == cl_id])
         if progress_callback is not None:
             progress_callback(i + 1)
+
+    if misaligned:
+        raise RuntimeError(
+            f"{len(misaligned)} of {len(training_samples)} sample(s) have a different "
+            "number of events under the current gating and unmixing than when this "
+            "run was made (first: "
+            f"{misaligned[0]}), so their events cannot be matched to the run's "
+            "cluster labels. Re-run the clustering, or restore the gating and "
+            "unmixing the run was made with."
+        )
 
     rng = np.random.default_rng(seed)
     result: dict[str, dict[int, np.ndarray]] = {}
@@ -387,11 +401,14 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
     controller.experiment.process['af_profiles'], both of which the main
     thread can reassign while a background worker is reading them.
 
-    The unstained sample(s) used by calculate_unstained_channel_thresholds
-    are never assigned an AF profile themselves in the AutoSpectral AF tab
-    -- there's no per-cell classification to run AF discovery against on
-    an unstained control -- so each one needs a stand-in AF assignment to
-    be unmixed consistently with the STAINED training samples it's meant
+    Each unstained sample used by calculate_unstained_channel_thresholds
+    is unmixed with, in order of preference:
+
+      0. Its own AF profile assignment in the AutoSpectral AF tab, when it
+         has one (e.g. from "assign to all"), as the main window unmixes it.
+
+    An unstained sample without an assignment needs a stand-in, so that it
+    is unmixed consistently with the STAINED training samples it's meant
     to set a threshold for:
 
       1. An AF profile whose name matches the unstained sample's OWN
@@ -458,7 +475,14 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
     af_state_cache: dict[tuple, tuple | None] = {}
     for rel in unstained_paths:
         display_name = all_samples_names.get(rel)
-        if display_name and display_name in af_profiles:
+        own = tuple(n for n in sample_af_profiles.get(rel, []) or [] if n in af_profiles)
+        if own:
+            profile_names = own
+            log.info(
+                "resolve_unstained_af_states: %s -- using its own AF profile "
+                "assignment %s", rel, own,
+            )
+        elif display_name and display_name in af_profiles:
             profile_names: tuple = (display_name,)
             log.info(
                 "resolve_unstained_af_states: %s -- AF profile matching its "
@@ -509,8 +533,10 @@ def _load_unstained_gated_transformed(
     which this intentionally bypasses, and this is only called once per
     unstained sample per Cluster ID run, not a hot path.
 
-    af_state: optional AF snapshot -- see apply_unmixing_af_aware()'s
-    docstring. Pass this when calling from a background worker thread.
+    af_state: the sample's unmixing state, ``(transfer_matrix,
+    af_precomputed, af_spectra)`` from resolve_unstained_af_states (see
+    apply_unmixing_af_aware()'s docstring). None unmixes without per-cell
+    AF correction.
 
     Returns (values, channel_names) or None on error.
     """
@@ -536,6 +562,8 @@ def _load_unstained_gated_transformed(
         else:
             raw = sample.get_events(source='raw')
 
+        if af_state is None:
+            af_state = (controller.transfer_matrix, None, None)
         unmixed = drc_pipeline.apply_unmixing_af_aware(controller, raw, af_state=af_state)
 
         # This sample's own gates: its per-sample overrides and Time range.
@@ -596,13 +624,12 @@ def calculate_unstained_channel_thresholds(
     training samples look like.
 
     unstained_af_states: {rel_path: af_state_or_None}, as returned by
-    resolve_unstained_af_states -- the unstained sample never has an AF
-    profile of its own, so it must be unmixed with a STAND-IN AF state
-    resolved per sample, never the training samples' own af_state (they
-    have no bearing on an unstained control -- see
-    resolve_unstained_af_states for how the stand-in is chosen). A rel_path
+    resolve_unstained_af_states -- each unstained sample is unmixed with
+    its own AF assignment, or a STAND-IN AF state when it has none, never
+    the training samples' own af_state snapshot (see
+    resolve_unstained_af_states for how the state is chosen). A rel_path
     missing from this dict (or a None value) is unmixed WITHOUT per-cell
-    AF correction, same as any other AF-unaware call.
+    AF correction.
 
     If more than one unstained cell sample is found, the per-channel
     threshold is the MEDIAN across samples (each sample's own

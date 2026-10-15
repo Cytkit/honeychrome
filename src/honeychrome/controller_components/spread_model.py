@@ -229,15 +229,17 @@ def spread_snapshot(controller, fluor_names: list, fluor_spectra: np.ndarray, un
     Everything compute_spread_entry needs, read on the main thread. The
     positives are the controls' events in the base gate; the negative is the
     control's universal negative ("Neg Unstained" gate) when it has one, else
-    the unstained sample the AF profile is extracted from.
+    the unstained sample the AF profile is extracted from. Each sample is
+    gated with its own gates (its per-sample overrides and Time range).
     """
     from honeychrome.controller_components.functions import resolve_base_gate
+    from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 
-    gating = controller.raw_gating
-    base_gate, _ = resolve_base_gate(gating, controller.experiment.process.get('base_gate_priority_order', []))
+    base_gate, _ = resolve_base_gate(controller.raw_gating, controller.experiment.process.get('base_gate_priority_order', []))
     layout = raw_layout(controller)
     return {
-        'experiment_dir': str(controller.experiment_dir), 'gating': gating, 'layout': layout,
+        'experiment_dir': str(controller.experiment_dir),
+        'gating': SampleGating.from_controller(controller, scope='raw'), 'layout': layout,
         'fluor_names': list(fluor_names), 'spectra': np.asarray(fluor_spectra, dtype=np.float64),
         'controls': control_records(controller, list(fluor_names), layout['detectors']),
         'unstained_path': unstained_path, 'base_gate': base_gate,
@@ -245,13 +247,15 @@ def spread_snapshot(controller, fluor_names: list, fluor_spectra: np.ndarray, un
 
 
 def load_events(experiment_dir, rel_path: str, gate_label: str | None, layout: dict, gating) -> tuple:
-    """(fluorescence, scatter) raw events of one sample inside gate_label (all events when None)."""
+    """(fluorescence, scatter) raw events of one sample inside gate_label (all events when None).
+    rel_path is the sample's experiment key; gating a SampleGating or GatingStrategy."""
     from honeychrome.controller_components.functions import sample_from_fcs
     from honeychrome.controller_components.spectral_functions import get_raw_events
 
     sample = sample_from_fcs(str(Path(experiment_dir) / rel_path))
     fl, sc = get_raw_events(sample, layout['fl_ids'], gate_label=gate_label, gating_strategy=gating,
-                            extra_channel_ids=layout['sc_ids'], col_order=layout['col_order'])
+                            extra_channel_ids=layout['sc_ids'], col_order=layout['col_order'],
+                            sample_key=rel_path)
     return np.asarray(fl, dtype=np.float64), np.asarray(sc, dtype=np.float64)
 
 
