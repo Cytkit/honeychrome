@@ -30,6 +30,8 @@ Sends and receives signals to GUI
 
 import warnings
 from datetime import datetime
+from queue import Empty
+
 import numpy as np
 from pathlib import Path
 from PySide6.QtCore import QObject, Slot, QTimer
@@ -40,7 +42,7 @@ from multiprocessing import shared_memory
 import time
 
 from honeychrome.experiment_model import ExperimentModel, check_fcs_matches_experiment
-from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map
+from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, empty_queue_until_stable
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml
 from honeychrome.settings import traces_cache_size, traces_cache_dtype, adc_rate
 import honeychrome.settings as settings
@@ -1152,7 +1154,7 @@ class Controller(QObject):
                 self.bus.statusMessage.emit(f'No data acquired')
 
         # empty oscilloscope traces queue
-        removed = empty_queue_nowait(self.oscilloscope_traces_queue)
+        removed = empty_queue_until_stable(self.oscilloscope_traces_queue)
         logger.info(f"Controller: emptied oscilloscope traces queue ({removed} traces)")
 
         # update experiment file samples list

@@ -32,7 +32,7 @@ def peak_start_stop_baseline(tr, threshold):
 
     for n in range(window_extension_length_pre, len(tr)):
         # if not in peak, update baselines and detect if there is a peak
-        condition = tr[n] - baseline > threshold * 1000
+        condition = tr[n] - baseline > threshold
         if not in_peak:
             if condition:
                 in_peak = True
@@ -161,6 +161,7 @@ class TraceAnalyser(mp.Process):
                     while thread.is_alive():
                         self.logger.info('[Trace Analyser] Waiting until previous analysis thread ends')
                         time.sleep(0.25)
+                self.stop_analyser.clear()
                 # create analysis thread
                 thread = threading.Thread(
                     target=self.analyse,

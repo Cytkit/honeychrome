@@ -4,7 +4,7 @@ from flowio.exceptions import FCSParsingError
 from flowkit import Sample, QuadrantDivider, Dimension, gates
 from PySide6.QtCore import QSettings
 from queue import Empty
-from time import perf_counter
+from time import perf_counter, sleep
 from functools import wraps
 from pathlib import Path
 from honeychrome.controller_components.transform import Transform
@@ -156,6 +156,23 @@ def empty_queue_nowait(q):
         except Empty:
             break
     return items_removed
+
+def empty_queue_until_stable(q, quiet_rounds=3, settle=0.05, max_rounds=100, log=None):
+    total = 0
+    quiet = 0
+    rounds = 0
+    while quiet < quiet_rounds and rounds < max_rounds:
+        rounds += 1
+        n = empty_queue_nowait(q)
+        total += n
+        if log:
+            log.debug(f"drain round {rounds}: removed {n}, quiet={quiet}")
+        if n == 0:
+            quiet += 1
+            sleep(settle)
+        else:
+            quiet = 0
+    return total
 
 def add_recent_file(path):
     path = str(path)
