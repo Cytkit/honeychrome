@@ -356,6 +356,23 @@ def test_exporter_writes_unmixed_af_and_extra_channels(tmp_path):
     assert _text_value(text, 'FLOWCODEUNMIX') == '0.1.0'
 
 
+def test_exporter_writes_per_sample_keywords_over_the_shared_ones(tmp_path):
+    controller = syn.make_experiment(tmp_path, n_events=500)
+    controller.experiment.samples['sample_af_profiles'][syn.PLAIN_SAMPLE] = ['AF profile']
+    layout = jue.build_export_layout(controller)
+    exporter = jue.JointUnmixExporter(
+        [syn.AF_SAMPLE, syn.PLAIN_SAMPLE], layout, _ols_unmix_fn(layout),
+        output_root=tmp_path / 'Out', name_suffix=' FlowCode',
+        extra_keywords={'FLOWCODEUNMIX': '0.1.0', 'FLOWCODESOURCE': 'shared'},
+        sample_keywords=lambda path: {'FLOWCODESOURCE': path},
+    )
+    assert not _run_exporter(exporter)
+    for key in (syn.AF_SAMPLE, syn.PLAIN_SAMPLE):
+        _pnn, _events, text = syn.read_fcs(tmp_path / 'Out' / f'{Path(key).stem} FlowCode (Unmixed).fcs')
+        assert _text_value(text, 'FLOWCODESOURCE') == key
+        assert _text_value(text, 'FLOWCODEUNMIX') == '0.1.0'
+
+
 @pytest.mark.numpy_only
 def test_exporter_chunking_does_not_change_the_output(tmp_path):
     controller = syn.make_experiment(tmp_path, n_events=2500)

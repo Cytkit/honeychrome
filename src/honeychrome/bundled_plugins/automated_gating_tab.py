@@ -62,6 +62,7 @@ from PySide6.QtWidgets import (
 import honeychrome
 from honeychrome.settings import af_abundance_channel
 from honeychrome.controller_components import differential_stats as ds
+from honeychrome.view_components import suggest_groupings_dialog as sgd
 from honeychrome.controller_components.functions import (
     build_antigen_map,
     build_display_label_map,
@@ -334,6 +335,13 @@ class GatingRunState:
                      session only.
     covariates     : {covariate name: {sample key: value}}.
     stats          : results of the last statistics run — this session only.
+    pca, predictive: the last sample PCA and predictive analysis (from the
+                     statistics run's per-sample values) — this session only.
+    pending_samples: samples of a paused (or interrupted) run still to be
+                     gated; empty when the last run finished.
+    run_fingerprint: what the gated results depend on (model file, channel
+                     alignment, gate modes, drift settings, marker channels),
+                     so a paused run is only resumed with the same settings.
     """
     model_path: str = ''
     model: dict = field(default_factory=dict)
@@ -355,6 +363,8 @@ class GatingRunState:
     marker_channels: list = field(default_factory=list)
     results_model_sha: str = ''
     display: dict = field(default_factory=dict)
+    pending_samples: list = field(default_factory=list)
+    run_fingerprint: str = ''
 
     group_names: list = field(default_factory=list)
     group_patterns: dict = field(default_factory=dict)
@@ -377,6 +387,17 @@ class GatingRunState:
     min_marker_events: int = ag_results.DEFAULT_MIN_MARKER_EVENTS
     exclude_flagged: bool = False
     stats: dict = field(default_factory=dict)
+    pca_use_freq: bool = True
+    pca_use_counts: bool = False
+    pca_use_markers: bool = False
+    pca_n_loadings: int = 10
+    pred_use_freq: bool = True
+    pred_use_markers: bool = False
+    pred_lasso: bool = True
+    pred_forest: bool = True
+    pred_repeats: int = 5
+    pca: dict = field(default_factory=dict)
+    predictive: dict = field(default_factory=dict)
 
     def gate_defs(self) -> list[dict]:
         return list((self.applied_model or {}).get('gate_definitions') or [])
@@ -400,8 +421,18 @@ _PERSISTED_FIELDS = (
     'pairing', 'adjust_covariates', 'contrast_mode', 'reference_group', 'pval_threshold',
     'fc_threshold', 'marker_threshold', 'use_treat', 'fdr_scope', 'run_freq', 'run_counts',
     'run_markers', 'use_stats_parent', 'exclude_gating_markers', 'min_marker_events',
-    'exclude_flagged',
+    'exclude_flagged', 'pca_use_freq', 'pca_use_counts', 'pca_use_markers', 'pca_n_loadings',
+    'pred_use_freq', 'pred_use_markers', 'pred_lasso', 'pred_forest', 'pred_repeats',
 )
+
+
+def run_fingerprint(state: 'GatingRunState', model_sha: str) -> str:
+    """Hash of everything the gated results of a run depend on."""
+    payload = {'model': model_sha, 'alignment': state.alignment, 'modes': state.modes,
+               'drift_limit': state.drift_limit, 'drift_action': state.drift_action,
+               'markers': state.marker_channels}
+    return hashlib.sha256(json.dumps(ag_core.to_jsonable(payload), sort_keys=True)
+                          .encode('utf-8')).hexdigest()
 
 
 def prepare_applied_model(model: dict, alignment: dict, live_params: dict) -> tuple[dict, list[str]]:
@@ -939,11 +970,16 @@ class _GatingWorker(QThread):
     transform, run the gate hierarchy, and emit sample_done(key, payload)
     with the compact summary, load counts and a display subsample. The full
     event array is released before the next sample.
+
+    pause() and abort() stop the run before the next gate; the sample being
+    gated is dropped, so only complete samples are ever reported.
+    finished(outcome, message) gives 'done', 'paused', 'cancelled' or
+    'failed'.
     """
 
     progress = Signal(str)
     sample_done = Signal(str, object)
-    finished = Signal(bool, str)
+    finished = Signal(str, str)
 
     def __init__(self, experiment_dir, keys, snapshot, gate_defs, reference, modes,
                  drift_limit, drift_action, channels, transforms, marker_channels,
@@ -961,22 +997,26 @@ class _GatingWorker(QThread):
         self._transforms = transforms
         self._markers = marker_channels
         self._display = int(display_events)
-        self._abort = False
+        self._stop = None
 
     def abort(self):
-        self._abort = True
+        self._stop = 'cancelled'
+
+    def pause(self):
+        if self._stop is None:
+            self._stop = 'paused'
+
+    def _stopping(self) -> bool:
+        return self._stop is not None
 
     def run(self):
         try:
             n_done = self._execute()
         except Exception as exc:
             log.exception("automated gating failed")
-            self.finished.emit(False, str(exc))
+            self.finished.emit('failed', str(exc))
             return
-        if self._abort:
-            self.finished.emit(False, f"Cancelled after {n_done} sample(s).")
-        else:
-            self.finished.emit(True, "")
+        self.finished.emit(self._stop or 'done', f"{n_done} sample(s) gated in this run.")
 
     def _execute(self) -> int:
         index = {ch: i for i, ch in enumerate(self._channels)}
@@ -985,7 +1025,7 @@ class _GatingWorker(QThread):
         limits = _axis_limits(self._transforms)
         n_done = 0
         for i, key in enumerate(self._keys, 1):
-            if self._abort:
+            if self._stopping():
                 break
             self.progress.emit(f"Gating {_sample_label(key)} ({i}/{len(self._keys)}) …")
             try:
@@ -995,12 +1035,18 @@ class _GatingWorker(QThread):
                 self.progress.emit(f"Could not load {_sample_label(key)}: {exc}")
                 continue
             unmixed = out['unmixed']
+            if self._stopping():
+                break
             data_t = ag_core.transform_columns(unmixed, self._channels, self._transforms)
-            result = ag_core.run_gating(
-                self._gate_defs, data_t, index, reference=self._reference,
-                modes=self._modes, drift_limit=self._drift_limit,
-                drift_action=self._drift_action, axis_limits=limits,
-            )
+            try:
+                result = ag_core.run_gating(
+                    self._gate_defs, data_t, index, reference=self._reference,
+                    modes=self._modes, drift_limit=self._drift_limit,
+                    drift_action=self._drift_action, axis_limits=limits,
+                    stop_check=self._stopping,
+                )
+            except ag_core.GatingStopped:
+                break
             summary = ag_results.summarise_sample(self._gate_defs, result, data_t, index,
                                                   self._markers, len(data_t))
             rows = seeded_subsample_indices(len(unmixed), self._display, key, DISPLAY_SEED)
@@ -1044,6 +1090,7 @@ class RunTab(QWidget):
         self.controller = controller
         self._worker: _GatingWorker | None = None
         self._run_keys: list[str] = []
+        self._before_run: dict | None = None
         self._filling = False
         self._build_ui()
 
@@ -1113,14 +1160,21 @@ class RunTab(QWidget):
         run_row = QHBoxLayout()
         self.btn_run = QPushButton("Run Gating")
         self.btn_run.clicked.connect(self._on_run_clicked)
+        self.btn_pause = QPushButton("Pause")
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setToolTip("Stop after the sample being gated is dropped, keeping every "
+                                  "sample gated so far; Run Gating offers to resume.")
+        self.btn_pause.clicked.connect(self._on_pause_clicked)
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setToolTip("Stop and discard this run, keeping the results from before it.")
         self.btn_cancel.clicked.connect(self._on_cancel_clicked)
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.lbl_status = QLabel("")
         self.lbl_status.setWordWrap(True)
         run_row.addWidget(self.btn_run)
+        run_row.addWidget(self.btn_pause)
         run_row.addWidget(self.btn_cancel)
         run_row.addWidget(self.progress_bar)
         run_row.addWidget(self.lbl_status, stretch=1)
@@ -1239,6 +1293,30 @@ class RunTab(QWidget):
 
     # ------------------------------------------------------------------
 
+    def _ask_resume(self, n_done: int, n_left: int, compatible: bool) -> str | None:
+        """'resume', 'restart' or None (do nothing) for an unfinished run."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Unfinished gating run")
+        if compatible:
+            box.setText(f"The last run stopped with {n_done} sample(s) gated and {n_left} still "
+                        "to go.\n\nResume gates only the ticked samples without results; "
+                        "Restart discards the results so far and gates every ticked sample.")
+            resume = box.addButton("Resume", QMessageBox.AcceptRole)
+        else:
+            box.setText(f"The last run stopped with {n_done} sample(s) gated, but the model or "
+                        "its settings have changed since, so it cannot be resumed.\n\n"
+                        "Restart discards the results so far and gates every ticked sample.")
+            resume = None
+        restart = box.addButton("Restart", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if resume is not None and clicked is resume:
+            return 'resume'
+        if clicked is restart:
+            return 'restart'
+        return None
+
     def _on_run_clicked(self):
         st = self.state
         keys = self._checked(self.COL_RUN)
@@ -1251,68 +1329,150 @@ class RunTab(QWidget):
             QMessageBox.warning(self, "Channels missing",
                                 "Gated channels not in this experiment: " + ", ".join(missing))
             return
+        markers = _marker_channels(self.controller)
+        model_sha = _file_sha256(st.model_path)
+        saved_markers = st.marker_channels
+        st.marker_channels = markers
+        fingerprint = run_fingerprint(st, model_sha)
+        st.marker_channels = saved_markers
+        to_gate = list(keys)
+        resume = False
+        if st.pending_samples and st.summaries:
+            choice = self._ask_resume(len(st.summaries), len(st.pending_samples),
+                                      fingerprint == st.run_fingerprint)
+            if choice is None:
+                return
+            resume = choice == 'resume'
+            if resume:
+                to_gate = [k for k in keys if k not in st.summaries]
+                if not to_gate:
+                    st.pending_samples = []
+                    self.lbl_status.setText("Every ticked sample is already gated.")
+                    self.gating_finished.emit()
+                    return
         try:
-            snap = snapshot_unmix_state(self.controller, keys)
+            snap = snapshot_unmix_state(self.controller, to_gate)
         except Exception as exc:
             QMessageBox.warning(self, "Cannot gate", str(exc))
             return
+        self._before_run = {name: deepcopy(getattr(st, name)) for name in (
+            'run_samples', 'summaries', 'load_info', 'display', 'stats', 'marker_channels',
+            'results_model_sha', 'pending_samples', 'run_fingerprint')}
         st.run_samples = keys
-        st.summaries = {}
-        st.load_info = {}
-        st.display = {}
+        if resume:
+            keep = set(keys)
+            st.summaries = {k: v for k, v in st.summaries.items() if k in keep}
+            st.load_info = {k: v for k, v in st.load_info.items() if k in keep}
+            st.display = {k: v for k, v in st.display.items() if k in keep}
+        else:
+            st.summaries = {}
+            st.load_info = {}
+            st.display = {}
         st.stats = {}
-        st.marker_channels = _marker_channels(self.controller)
-        st.results_model_sha = _file_sha256(st.model_path)
-        self._run_keys = keys
+        st.marker_channels = markers
+        st.results_model_sha = model_sha
+        st.run_fingerprint = fingerprint
+        st.pending_samples = list(to_gate)
+        self._run_keys = to_gate
 
-        self._worker = _GatingWorker(
-            self.controller.experiment_dir, keys, snap,
+        worker = _GatingWorker(
+            self.controller.experiment_dir, to_gate, snap,
             deepcopy(st.gate_defs()), deepcopy(st.reference_boundaries()), dict(st.modes),
             st.drift_limit, st.drift_action, channels,
             deepcopy(self.controller.unmixed_transformations or {}),
             list(st.marker_channels), st.display_events, parent=self,
         )
-        self._worker.progress.connect(self._on_progress)
-        self._worker.sample_done.connect(self._on_sample_done)
-        self._worker.finished.connect(self._on_finished)
-        self.btn_run.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
+        # Slots ignore a worker that has been abandoned (see abandon_run).
+        worker.progress.connect(lambda msg, w=worker: w is self._worker and self._on_progress(msg))
+        worker.sample_done.connect(
+            lambda key, payload, w=worker: w is self._worker and self._on_sample_done(key, payload))
+        worker.finished.connect(
+            lambda outcome, msg, w=worker: w is self._worker and self._on_finished(outcome, msg))
+        self._worker = worker
+        self._set_running(True)
         self.progress_bar.setRange(0, len(keys))
-        self.progress_bar.setValue(0)
+        self.progress_bar.setValue(len(keys) - len(to_gate))
         self.progress_bar.setVisible(True)
-        self._worker.start()
+        worker.start()
+
+    def _set_running(self, running: bool):
+        self.btn_run.setEnabled(not running)
+        self.btn_pause.setEnabled(running)
+        self.btn_cancel.setEnabled(running)
+
+    def is_running(self) -> bool:
+        return self._worker is not None
+
+    def _on_pause_clicked(self):
+        if self._worker is not None:
+            self._worker.pause()
+            self.btn_pause.setEnabled(False)
+            self.lbl_status.setText("Pausing …")
 
     def _on_cancel_clicked(self):
         if self._worker is not None:
             self._worker.abort()
+            self.btn_pause.setEnabled(False)
+            self.btn_cancel.setEnabled(False)
+            self.lbl_status.setText("Cancelling …")
+
+    def abandon_run(self):
+        """Stop a run whose results no longer belong to the state (the
+        experiment is changing); its late signals are ignored."""
+        if self._worker is None:
+            return
+        self._worker.abort()
+        self._worker = None
+        self._before_run = None
+        self._set_running(False)
+        self.progress_bar.setVisible(False)
 
     def _on_progress(self, msg: str):
         self.lbl_status.setText(msg)
         _status(self.bus, msg)
 
     def _on_sample_done(self, key: str, payload: object):
-        self.state.summaries[key] = payload['summary']
-        self.state.load_info[key] = payload['load_info']
-        self.state.display[key] = payload['display']
+        st = self.state
+        st.summaries[key] = payload['summary']
+        st.load_info[key] = payload['load_info']
+        st.display[key] = payload['display']
+        if key in st.pending_samples:
+            st.pending_samples.remove(key)
         self.progress_bar.setValue(self.progress_bar.value() + 1)
 
-    def _on_finished(self, ok: bool, message: str):
+    def _on_finished(self, outcome: str, message: str):
+        """Finish a run: keep it ('done'), keep what was gated and remember
+        what is left ('paused' and 'failed'), or put the results from before
+        the run back ('cancelled')."""
         self._worker = None
-        self.btn_run.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
+        self._set_running(False)
         self.progress_bar.setVisible(False)
-        n = len(self.state.summaries)
-        flagged = sum(1 for k in self.state.summaries if self.state.flags(k))
-        if ok:
-            text = f"Gated {n} sample(s)" + (f"; {flagged} flagged." if flagged else ".")
+        st = self.state
+        if outcome == 'cancelled' and self._before_run is not None:
+            for name, value in self._before_run.items():
+                setattr(st, name, value)
+            text = "Cancelled; the results from before this run are kept."
         else:
-            text = f"{message} {n} sample(s) gated."
+            n = len(st.summaries)
+            flagged = sum(1 for k in st.summaries if st.flags(k))
+            flag_text = f"; {flagged} flagged" if flagged else ''
+            if outcome == 'done':
+                st.pending_samples = []
+                text = f"Gated {n} sample(s){flag_text}."
+            elif outcome == 'paused':
+                text = (f"Paused with {n} sample(s) gated{flag_text} and "
+                        f"{len(st.pending_samples)} to go. Run Gating to resume or restart.")
+            else:
+                text = (f"Gating stopped: {message} {n} sample(s) gated, "
+                        f"{len(st.pending_samples)} to go. Run Gating to resume or restart.")
+        self._before_run = None
         self.lbl_status.setText(text)
         _status(self.bus, text)
         self._populate_views()
         self._draw_summary_table()
-        if n:
+        if st.summaries and outcome != 'cancelled':
             self.toolbox.setCurrentIndex(self._page_views)
+        if outcome != 'cancelled':
             self.gating_finished.emit()
 
     # ------------------------------------------------------------------
@@ -1525,8 +1685,13 @@ class ResultsTab(QWidget):
         self._stats_worker: _CallWorker | None = None
         self._figure_worker: _CallWorker | None = None
         self._figure_pending = False
+        self._predictive_worker: _CallWorker | None = None
         self._filling = False
         self._volcano_tables: dict = {}
+        # Automatic Suggest Groupings: the sample list it last ran for (it
+        # runs once per list) and the state to restore on Undo.
+        self._auto_groupings_key = None
+        self._auto_groupings_undo = None
         self._build_ui()
 
     def _build_ui(self):
@@ -1550,6 +1715,9 @@ class ResultsTab(QWidget):
         self.stats_page = QWidget()
         self._build_stats_page()
         add_concertina_page(self.toolbox, self.stats_page, "Statistics")
+        self.explore_page = QWidget()
+        self._build_explore_page()
+        add_concertina_page(self.toolbox, self.explore_page, "Sample PCA and prediction")
         self.figures_tabs = QTabWidget()
         self.figures_tabs.setMinimumHeight(400)
         add_concertina_page(self.toolbox, self.figures_tabs, "Figures")
@@ -1578,7 +1746,8 @@ class ResultsTab(QWidget):
         gl.addWidget(self.groups_table)
         row = QHBoxLayout()
         for text, slot in (("Add group", self._on_add_group), ("Remove group", self._on_remove_group),
-                           ("Assign by pattern", self._on_assign_by_pattern)):
+                           ("Assign by pattern", self._on_assign_by_pattern),
+                           ("Suggest groupings…", self._on_suggest_groupings)):
             b = QPushButton(text)
             b.clicked.connect(slot)
             row.addWidget(b)
@@ -1600,9 +1769,35 @@ class ResultsTab(QWidget):
         crow.addWidget(b_add)
         crow.addWidget(b_rm)
         cl.addLayout(crow)
+        trow = QHBoxLayout()
+        b_import = QPushButton("Import table…")
+        b_import.setToolTip(
+            "Read groups and covariates from a CSV or tab-separated file with one row per "
+            "sample: a 'sample' column (file name, with or without extension), an optional "
+            "'group' column, and one column per covariate (e.g. donor, age, sex).")
+        b_import.clicked.connect(self._on_import_table)
+        b_export = QPushButton("Export table…")
+        b_export.setToolTip("Save the samples' groups and covariates in the same format.")
+        b_export.clicked.connect(self._on_export_table)
+        trow.addWidget(b_import)
+        trow.addWidget(b_export)
+        cl.addLayout(trow)
         cl.addStretch()
         top.addWidget(cbox, stretch=1)
         layout.addLayout(top)
+
+        auto_row = QHBoxLayout()
+        self.lbl_auto_groupings = QLabel()
+        self.lbl_auto_groupings.setWordWrap(True)
+        self.lbl_auto_groupings.setStyleSheet("color: grey; font-style: italic;")
+        self.btn_undo_groupings = QPushButton("Undo")
+        self.btn_undo_groupings.setToolTip("Remove the groups and pairing applied from the sample names.")
+        self.btn_undo_groupings.clicked.connect(self._undo_auto_groupings)
+        auto_row.addWidget(self.lbl_auto_groupings, stretch=1)
+        auto_row.addWidget(self.btn_undo_groupings)
+        self.lbl_auto_groupings.setVisible(False)
+        self.btn_undo_groupings.setVisible(False)
+        layout.addLayout(auto_row)
 
         self.samples_table = QTableWidget(0, 3)
         self.samples_table.verticalHeader().setVisible(False)
@@ -1734,6 +1929,89 @@ class ResultsTab(QWidget):
             msg += " Invalid pattern for: " + ", ".join(sorted(set(bad)))
         _status(self.bus, msg)
 
+    def _groupings_result(self, keys: list[str]) -> dict:
+        display = self.controller.experiment.samples.get('all_samples', {}) if self.controller else {}
+        return ds.suggest_groupings_from_names(keys, display)
+
+    def _on_suggest_groupings(self):
+        """Offer groupings found in the gated samples' names (see
+        ``differential_stats.suggest_groupings_from_names``)."""
+        keys = self.state.gated_samples()
+        if len(keys) < 2:
+            QMessageBox.information(self, "Suggest Groupings",
+                                    "Need at least two gated samples to detect a pattern.")
+            return
+        result = self._groupings_result(keys)
+        if not result['suggestions']:
+            QMessageBox.information(self, "Suggest Groupings", sgd.no_suggestion_message(result))
+            return
+        chosen = sgd.choose_groupings(self, result)
+        if chosen:
+            self._apply_groupings(chosen, keys)
+            self._show_auto_groupings_note(None)
+
+    def _maybe_auto_suggest_groupings(self):
+        """Apply groupings found in the sample names when none of the gated
+        samples has a group yet: the detected group and pairing variable.
+        Runs once per sample list and never overwrites assignments; the note
+        above the sample table says what was applied and offers Undo."""
+        st = self.state
+        keys = st.gated_samples()
+        if len(keys) < 2 or any(st.sample_groups.get(k) in st.group_names for k in keys):
+            return
+        if tuple(keys) == self._auto_groupings_key:
+            return
+        self._auto_groupings_key = tuple(keys)
+        chosen = sgd.automatic_groupings(self._groupings_result(keys))
+        if not chosen:
+            return
+        self._auto_groupings_undo = (list(st.group_names), dict(st.group_patterns), dict(st.sample_groups),
+                                     deepcopy(st.covariates), st.pairing)
+        self._apply_groupings(chosen, keys)
+        self._show_auto_groupings_note(sgd.describe_groupings(chosen))
+
+    def _show_auto_groupings_note(self, text: str | None):
+        if text is None:
+            self._auto_groupings_undo = None
+        self.lbl_auto_groupings.setText(text or '')
+        self.lbl_auto_groupings.setVisible(text is not None)
+        self.btn_undo_groupings.setVisible(text is not None and self._auto_groupings_undo is not None)
+
+    def _undo_auto_groupings(self):
+        if self._auto_groupings_undo is None:
+            return
+        st = self.state
+        st.group_names, st.group_patterns, st.sample_groups, st.covariates, st.pairing = \
+            self._auto_groupings_undo
+        self._show_auto_groupings_note(None)
+        self._populate_groups()
+        self._load_stats_controls()
+
+    def _apply_groupings(self, chosen: list[dict], keys: list[str]):
+        """Write chosen groupings: a 'group' choice replaces the groups and
+        the listed samples' assignments; other choices become covariates,
+        and a 'pairing' choice is selected under Pair samples by."""
+        st = self.state
+        for choice in chosen:
+            if choice['role'] == 'group':
+                names = sorted(set(choice['values'].values()))
+                st.group_names = names
+                st.group_patterns = {n: st.group_patterns.get(n, '') for n in names}
+                for k in keys:
+                    if k in choice['values']:
+                        st.sample_groups[k] = choice['values'][k]
+                    else:
+                        st.sample_groups.pop(k, None)
+            else:
+                name = choice['name']
+                if name in st.covariates:
+                    name = f"{name}_2"
+                st.covariates[name] = dict(choice['values'])
+                if choice['role'] == 'pairing':
+                    st.pairing = name
+        self._populate_groups()
+        self._load_stats_controls()
+
     def _on_add_covariate(self):
         name, ok = QInputDialog.getText(self, "Add covariate", "Covariate name:")
         name = (name or '').strip()
@@ -1759,6 +2037,52 @@ class ResultsTab(QWidget):
         self.state.adjust_covariates = [c for c in self.state.adjust_covariates if c != name]
         self._populate_samples_table()
         self._populate_stats_choices()
+
+    def _on_import_table(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import sample table", str(getattr(self.controller, 'experiment_dir', '')),
+            "Tables (*.csv *.tsv *.txt);;All files (*)")
+        if not path:
+            return
+        try:
+            df = pd.read_csv(path, sep=None, engine='python', dtype=str)
+            table = ag_results.read_sample_table(df, self.state.gated_samples())
+        except Exception as exc:
+            QMessageBox.warning(self, "Import table", f"Could not read the table: {exc}")
+            return
+        st = self.state
+        for group in table['groups'].values():
+            if group not in st.group_names:
+                st.group_names.append(group)
+        st.sample_groups.update(table['groups'])
+        for name, values in table['covariates'].items():
+            st.covariates.setdefault(name, {}).update(values)
+        self._populate_groups()
+        self._populate_stats_choices()
+        msg = (f"Imported {len(table['groups'])} group assignment(s) and "
+               f"{len(table['columns'])} covariate(s) from {Path(path).name}.")
+        if table['unmatched']:
+            msg += (f" {len(table['unmatched'])} row(s) matched no gated sample: "
+                    + ", ".join(table['unmatched'][:6]) + (" …" if len(table['unmatched']) > 6 else ''))
+        _status(self.bus, msg)
+        QMessageBox.information(self, "Import table", msg)
+
+    def _on_export_table(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export sample table", str(getattr(self.controller, 'experiment_dir', '')),
+            "CSV (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith('.csv'):
+            path += '.csv'
+        st = self.state
+        try:
+            ag_results.sample_table_frame(st.gated_samples(), st.sample_groups,
+                                          st.covariates).to_csv(path, index=False)
+        except Exception as exc:
+            QMessageBox.warning(self, "Export table", str(exc))
+            return
+        _status(self.bus, f"Sample table written to {path}")
 
     def _on_sample_cell_changed(self, item: QTableWidgetItem):
         if self._filling or item.column() < 3:
@@ -2017,6 +2341,10 @@ class ResultsTab(QWidget):
             self.lbl_stats.setText(f"<span style='color:#b00020'>{error}</span>")
             return
         self.state.stats = result
+        # PCA and predictive results describe the previous statistics run.
+        self.state.pca = {}
+        self.state.predictive = {}
+        self._load_explore_controls()
         n_sig = sum(int(result[k]['significant'].sum()) for k in ('freq', 'counts', 'markers')
                     if result.get(k) is not None)
         text = (f"{len(result['samples'])} samples, {len(result['comparisons'])} comparison(s), "
@@ -2143,6 +2471,7 @@ class ResultsTab(QWidget):
             scroll = QScrollArea()
             scroll.setWidget(widget)
             self.figures_tabs.addTab(scroll, item['title'])
+        self._add_extra_figures()
 
     def _on_volcano_click(self, event):
         """Open the clicked volcano point's population in the browser."""
@@ -2171,6 +2500,261 @@ class ResultsTab(QWidget):
     # ------------------------------------------------------------------
     # Population browser
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Sample PCA and predictive analysis
+    # ------------------------------------------------------------------
+
+    def _build_explore_page(self):
+        layout = QVBoxLayout(self.explore_page)
+        note = QLabel("Both use the per-sample values of the last statistics run (population "
+                      "% of parent, counts and marker medians), so run Statistics first with "
+                      "the matching tests ticked. Figures open on the Figures page.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        pbox = QGroupBox("Sample PCA")
+        pl = QHBoxLayout(pbox)
+        self.chk_pca_freq = QCheckBox("Frequencies")
+        self.chk_pca_counts = QCheckBox("Counts")
+        self.chk_pca_markers = QCheckBox("Marker medians")
+        self.sb_pca_loadings = QSpinBox()
+        self.sb_pca_loadings.setRange(1, 50)
+        self.sb_pca_loadings.setToolTip("Number of loadings (arrows) shown: the longest.")
+        self.btn_pca = QPushButton("Show Sample PCA")
+        self.btn_pca.clicked.connect(self._on_show_pca)
+        for w in (self.chk_pca_freq, self.chk_pca_counts, self.chk_pca_markers):
+            pl.addWidget(w)
+        pl.addWidget(QLabel("Loadings:"))
+        pl.addWidget(self.sb_pca_loadings)
+        pl.addWidget(self.btn_pca)
+        pl.addStretch()
+        layout.addWidget(pbox)
+
+        dbox = QGroupBox("Predictive analysis")
+        dl = QVBoxLayout(dbox)
+        dnote = QLabel("Which features best separate two groups, and how well: lasso logistic "
+                       "regression and a random forest in repeated, nested cross-validation, "
+                       "with the cross-validated ROC curve and AUC, the most informative "
+                       "features and the AUC by number of features. Needs at least 10 samples "
+                       "per group; 30 or more is recommended.")
+        dnote.setWordWrap(True)
+        dl.addWidget(dnote)
+        drow = QHBoxLayout()
+        drow.addWidget(QLabel("Comparison:"))
+        self.cb_pred_comparison = QComboBox()
+        drow.addWidget(self.cb_pred_comparison, stretch=1)
+        dl.addLayout(drow)
+        orow = QHBoxLayout()
+        self.chk_pred_freq = QCheckBox("Frequencies")
+        self.chk_pred_markers = QCheckBox("Marker medians")
+        self.chk_pred_lasso = QCheckBox("Lasso")
+        self.chk_pred_forest = QCheckBox("Random forest")
+        self.sb_pred_repeats = QSpinBox()
+        self.sb_pred_repeats.setRange(1, 50)
+        self.sb_pred_repeats.setToolTip("Repeats of the outer cross-validation.")
+        for w in (self.chk_pred_freq, self.chk_pred_markers, self.chk_pred_lasso,
+                  self.chk_pred_forest):
+            orow.addWidget(w)
+        orow.addWidget(QLabel("Repeats:"))
+        orow.addWidget(self.sb_pred_repeats)
+        self.btn_pred = QPushButton("Run Predictive Analysis")
+        self.btn_pred.clicked.connect(self._on_run_predictive)
+        orow.addWidget(self.btn_pred)
+        orow.addStretch()
+        dl.addLayout(orow)
+        self.lbl_pred = QLabel("")
+        self.lbl_pred.setWordWrap(True)
+        dl.addWidget(self.lbl_pred)
+        self.pred_table_holder = QVBoxLayout()
+        dl.addLayout(self.pred_table_holder)
+        layout.addWidget(dbox)
+        layout.addStretch()
+
+        for w, name in ((self.chk_pca_freq, 'pca_use_freq'), (self.chk_pca_counts, 'pca_use_counts'),
+                        (self.chk_pca_markers, 'pca_use_markers'),
+                        (self.chk_pred_freq, 'pred_use_freq'),
+                        (self.chk_pred_markers, 'pred_use_markers'),
+                        (self.chk_pred_lasso, 'pred_lasso'), (self.chk_pred_forest, 'pred_forest')):
+            w.toggled.connect(lambda v, n=name: self._filling or setattr(self.state, n, bool(v)))
+        self.sb_pca_loadings.valueChanged.connect(
+            lambda v: self._filling or setattr(self.state, 'pca_n_loadings', int(v)))
+        self.sb_pred_repeats.valueChanged.connect(
+            lambda v: self._filling or setattr(self.state, 'pred_repeats', int(v)))
+
+    def _load_explore_controls(self):
+        st = self.state
+        self._filling = True
+        try:
+            for w, v in ((self.chk_pca_freq, st.pca_use_freq), (self.chk_pca_counts, st.pca_use_counts),
+                         (self.chk_pca_markers, st.pca_use_markers),
+                         (self.chk_pred_freq, st.pred_use_freq),
+                         (self.chk_pred_markers, st.pred_use_markers),
+                         (self.chk_pred_lasso, st.pred_lasso), (self.chk_pred_forest, st.pred_forest)):
+                w.setChecked(bool(v))
+            self.sb_pca_loadings.setValue(int(st.pca_n_loadings))
+            self.sb_pred_repeats.setValue(int(st.pred_repeats))
+            self.cb_pred_comparison.clear()
+            for base, other in (st.stats or {}).get('comparisons') or []:
+                self.cb_pred_comparison.addItem(_comparison_label(base, other),
+                                                json.dumps([base, other]))
+        finally:
+            self._filling = False
+        stats = st.stats or {}
+        self.chk_pca_freq.setEnabled(stats.get('freq_values') is not None)
+        self.chk_pca_counts.setEnabled(stats.get('counts_values') is not None)
+        self.chk_pca_markers.setEnabled(stats.get('marker_values') is not None)
+        self.chk_pred_freq.setEnabled(stats.get('freq_values') is not None)
+        self.chk_pred_markers.setEnabled(stats.get('marker_values') is not None)
+        self.btn_pca.setEnabled(bool(stats))
+        self.btn_pred.setEnabled(bool(stats) and self._predictive_worker is None)
+        self._show_predictive_table()
+
+    def _feature_labels(self) -> dict:
+        """Display names for population keys and channels in feature names."""
+        labels = dict(_population_labels(self.state.gate_defs()))
+        labels.update(_antigen_map(self.controller))
+        return labels
+
+    def _on_show_pca(self):
+        st = self.state
+        if not st.stats:
+            QMessageBox.information(self, "Sample PCA", "Run Statistics first.")
+            return
+        use = (self.chk_pca_freq.isChecked() and self.chk_pca_freq.isEnabled(),
+               self.chk_pca_counts.isChecked() and self.chk_pca_counts.isEnabled(),
+               self.chk_pca_markers.isChecked() and self.chk_pca_markers.isEnabled())
+        if not any(use):
+            QMessageBox.information(self, "Sample PCA",
+                                    "Tick at least one table that the last statistics run made.")
+            return
+        try:
+            pca = ag_results.sample_pca(st.stats, *use, n_loadings=st.pca_n_loadings,
+                                        labels=self._feature_labels())
+        except Exception as exc:
+            QMessageBox.warning(self, "Sample PCA", str(exc))
+            return
+        if pca is None:
+            QMessageBox.information(self, "Sample PCA",
+                                    "At least 2 samples and 2 features that vary are needed.")
+            return
+        st.pca = pca
+        self._add_extra_figures()
+        self._populate_report_items()
+        _status(self.bus, f"Sample PCA of {len(pca['scores'])} samples.")
+
+    def _on_run_predictive(self):
+        import drc_predictive
+        st = self.state
+        if self._predictive_worker is not None or not st.stats:
+            return
+        data = self.cb_pred_comparison.currentData()
+        if not data:
+            return
+        base, other = json.loads(data)
+        models = [m for m, on in (('l1_logistic', self.chk_pred_lasso.isChecked()),
+                                  ('random_forest', self.chk_pred_forest.isChecked())) if on]
+        use_freq = self.chk_pred_freq.isChecked() and self.chk_pred_freq.isEnabled()
+        use_markers = self.chk_pred_markers.isChecked() and self.chk_pred_markers.isEnabled()
+        if not models or not (use_freq or use_markers):
+            QMessageBox.information(self, "Predictive analysis",
+                                    "Tick at least one model and one kind of feature.")
+            return
+        groups = list(st.stats['group_vec'])
+        n_per_group = {other: groups.count(other), base: groups.count(base)}
+        status, message = drc_predictive.sample_size_status(n_per_group)
+        if status == 'block':
+            QMessageBox.warning(self, "Predictive analysis", message)
+            return
+        X = ag_results.predictive_matrix(st.stats, use_freq, use_markers, self._feature_labels())
+        repeats = int(st.pred_repeats)
+
+        def _run():
+            return drc_predictive.run_predictive(X, groups, other, base, models=tuple(models),
+                                                 repeats=repeats)
+
+        self.btn_pred.setEnabled(False)
+        self.lbl_pred.setText(f"Running on {X.shape[1]} features, "
+                              f"{sum(n_per_group.values())} samples …")
+        worker = _CallWorker(_run, parent=self)
+        worker.finished.connect(
+            lambda ok, err, res, s=status, m=message: self._on_predictive_finished(ok, err, res, s, m))
+        self._predictive_worker = worker
+        worker.start()
+
+    def _on_predictive_finished(self, ok: bool, error: str, result: object, status: str,
+                                message: str):
+        self._predictive_worker = None
+        self.btn_pred.setEnabled(bool(self.state.stats))
+        if not ok:
+            self.lbl_pred.setText(f"<span style='color:#b00020'>{error}</span>")
+            return
+        self.state.predictive = result
+        summary = result['summary']
+        text = (f"Minimal panel: {summary['minimal_panel']} feature(s) (best panel AUC "
+                f"{summary['best_panel_auc']:.2f}).")
+        if status == 'warn':
+            text += f" {message}"
+        self.lbl_pred.setText(text)
+        self._show_predictive_table()
+        self._add_extra_figures()
+        self._populate_report_items()
+        _status(self.bus, "Predictive analysis complete.")
+
+    def _show_predictive_table(self):
+        _clear_layout(self.pred_table_holder)
+        res = self.state.predictive
+        if not res:
+            return
+        rows = [{'Model': r['model'],
+                 'AUC': f"{r['auc_mean']:.3f} ± {r['auc_sd']:.3f}",
+                 'Balanced accuracy': f"{r['balanced_accuracy_mean']:.3f} ± "
+                                      f"{r['balanced_accuracy_sd']:.3f}"}
+                for _i, r in res['performance'].iterrows()]
+        table = CopyableTableWidget(rows, ['Model', 'AUC', 'Balanced accuracy'])
+        table.setMaximumHeight(110)
+        self.pred_table_holder.addWidget(table)
+
+    def _extra_figures(self) -> list:
+        """(title, figure) of the sample PCA and predictive analysis."""
+        st = self.state
+        is_dark = _is_dark_palette()
+        out = []
+        try:
+            if st.pca:
+                out.append(("Sample PCA", ag_report.make_pca_figure(st.pca, is_dark)))
+            res = st.predictive
+            if res:
+                summary = res['summary']
+                out.append(("Predictive: ROC", ag_report.make_roc_figure(
+                    res['performance'], res['roc'], summary, is_dark)))
+                out.append(("Predictive: features", ag_report.make_importance_figure(
+                    res['importance'], summary, is_dark)))
+                out.append(("Predictive: panel size", ag_report.make_panel_figure(
+                    res['panel'], summary, is_dark)))
+        except Exception as exc:
+            log.exception("sample PCA / predictive figure failed")
+            _status(self.bus, f"Figure failed: {exc}")
+        return out
+
+    def _add_extra_figures(self):
+        """Show the PCA and predictive figures on the Figures page, replacing
+        earlier ones."""
+        titles = {"Sample PCA", "Predictive: ROC", "Predictive: features", "Predictive: panel size"}
+        for i in reversed(range(self.figures_tabs.count())):
+            if self.figures_tabs.tabText(i) in titles:
+                self.figures_tabs.removeTab(i)
+        exp_dir = getattr(self.controller, 'experiment_dir', '')
+        for title, fig in self._extra_figures():
+            widget = ExportablePlotWidget(figure=fig, title=title.replace(' ', '_').replace(':', ''),
+                                          experiment_dir=exp_dir, parent=self)
+            widget.delete_button.setVisible(False)
+            handler = getattr(fig, '_hover_handler', None)
+            if handler is not None:
+                widget.canvas.mpl_connect('motion_notify_event', handler)
+            scroll = QScrollArea()
+            scroll.setWidget(widget)
+            self.figures_tabs.addTab(scroll, title)
 
     def _build_browser_page(self):
         layout = QHBoxLayout(self.browser_page)
@@ -2316,7 +2900,8 @@ class ResultsTab(QWidget):
                 self.controller.experiment.process.get('spectral_model') or []),
             stats=st.stats, pval_threshold=st.pval_threshold, fc_threshold=st.fc_threshold,
             marker_threshold=st.marker_threshold, fdr_scope=st.fdr_scope,
-            build_figures=build_result_figures,
+            build_figures=build_result_figures, pca=st.pca or None,
+            predictive=st.predictive or None,
         )
 
     def _populate_report_items(self):
@@ -2361,13 +2946,13 @@ class ResultsTab(QWidget):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         report_dir = Path(self.controller.experiment_dir) / 'Automated_Gating_Reports' / f"{stem}_{timestamp}"
 
-        progress = QProgressDialog("Generating report…", None, 0, len(items) + 1, self)
+        progress = QProgressDialog("Generating report…", "Cancel", 0, len(items) + 1, self)
         progress.setWindowTitle("Generate Report")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
-        progress.setCancelButton(None)
         progress.setValue(0)
         QApplication.setOverrideCursor(Qt.WaitCursor)
+        cancelled = False
         try:
             report_dir.mkdir(parents=True, exist_ok=True)
             ag_results.population_export(st.summaries, samples, st.sample_groups).to_csv(
@@ -2386,20 +2971,25 @@ class ResultsTab(QWidget):
                 done = 0
                 for section in ag_report.SECTIONS:
                     section_items = [it for it in items if it.tab == section]
-                    if not section_items:
+                    if not section_items or cancelled:
                         continue
                     drc_report.add_section_divider(pdf, section)
                     subfolder = report_dir / drc_report.sanitize_filename(section)
                     subfolder.mkdir(parents=True, exist_ok=True)
                     for it in section_items:
+                        QApplication.processEvents()
+                        if progress.wasCanceled():
+                            cancelled = True
+                            break
                         progress.setLabelText(f"Adding {it.label} …")
                         drc_report.export_report_item(it, subfolder, pdf)
                         done += 1
                         progress.setValue(done)
-                        QApplication.processEvents()
-            progress.setLabelText("Writing settings document …")
-            (report_dir / 'settings.txt').write_text(self._settings_text(samples), encoding='utf-8')
-            progress.setValue(len(items) + 1)
+            if not cancelled:
+                progress.setLabelText("Writing settings document …")
+                (report_dir / 'settings.txt').write_text(self._settings_text(samples),
+                                                         encoding='utf-8')
+                progress.setValue(len(items) + 1)
         except Exception as exc:
             log.exception("report generation failed")
             QMessageBox.critical(self, "Report failed", str(exc))
@@ -2407,6 +2997,13 @@ class ResultsTab(QWidget):
         finally:
             QApplication.restoreOverrideCursor()
             progress.close()
+        if cancelled:
+            # The folder was made by this report: leave nothing half written.
+            import shutil
+            shutil.rmtree(report_dir, ignore_errors=True)
+            self.lbl_export.setText("Report cancelled; nothing was written.")
+            _status(self.bus, "Report cancelled.")
+            return
         self.lbl_export.setText(f"Report written to {report_dir}")
         _status(self.bus, f"Report written to {report_dir}")
 
@@ -2457,7 +3054,9 @@ class ResultsTab(QWidget):
 
     def refresh(self):
         self._populate_groups()
+        self._maybe_auto_suggest_groupings()
         self._load_stats_controls()
+        self._load_explore_controls()
         self._populate_comparisons()
         self._show_results_tables()
         if not self.state.stats:
@@ -2480,7 +3079,8 @@ class PluginWidget(QWidget):
     selection, groups, covariates and statistics options) are kept in
     QSettings per experiment as one JSON string. Gated results (counts,
     medians and per-gate status, not the display events) are kept in
-    RESULTS_FILE in the experiment folder, so they survive a restart.
+    RESULTS_FILE in the experiment folder, so they survive a restart,
+    together with the samples a paused run has still to gate.
     """
 
     def __init__(self, bus=None, controller=None, parent=None):
@@ -2565,6 +3165,8 @@ class PluginWidget(QWidget):
         current_key = self._settings_key()
         if current_key == self._loaded_experiment_key:
             return
+        # A run's results belong to the experiment it started in.
+        self.run_tab.abandon_run()
         if self._loaded_experiment_key is not None:
             self.save_state()
         # The inner tabs share self.state by reference, so reset it in place.
@@ -2683,6 +3285,8 @@ class PluginWidget(QWidget):
             'run_samples': st.run_samples,
             'summaries': st.summaries,
             'load_info': st.load_info,
+            'pending_samples': st.pending_samples,
+            'run_fingerprint': st.run_fingerprint,
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -2708,6 +3312,9 @@ class PluginWidget(QWidget):
         st.results_model_sha = str(payload.get('model_sha256') or '')
         if payload.get('run_samples'):
             st.run_samples = list(payload['run_samples'])
+        st.pending_samples = [k for k in (payload.get('pending_samples') or [])
+                              if k not in st.summaries]
+        st.run_fingerprint = str(payload.get('run_fingerprint') or '')
         if st.summaries and st.results_model_sha and st.model_path \
                 and _file_sha256(st.model_path) != st.results_model_sha:
             self.progress_message("The saved gating results were made with a different version "

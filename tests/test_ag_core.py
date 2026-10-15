@@ -491,3 +491,159 @@ def test_rename_channels_for_alignment():
     out = ag.rename_channels(gates, {'BV421-A': 'V1-A'})
     assert out[0]['gate_marker_x'] == 'V1-A' and out[0]['gate_marker_y'] == 'PE-A'
     assert gates[0]['gate_marker_x'] == 'BV421-A'
+
+
+# ---------------------------------------------------------------------------
+# Off-scale events, replicated thresholds, cell gates, retired ellipses
+# ---------------------------------------------------------------------------
+
+@pytest.mark.numpy_only
+def test_shapes_include_off_scale_events_on_the_axis_edge():
+    box = [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.5], [0.0, 0.0]]
+    g = _gate('G', 'free', 'A', 'B')
+    boundary = {'in': {'boundary': box, 'region': 'inside'}}
+    data = np.array([[-0.2, 0.2], [0.2, -0.3], [0.2, 0.2], [0.7, 0.2]])
+    idx = {'A': 0, 'B': 1}
+    plain = ag.population_masks(g, boundary, data, idx)['in']
+    edge = ag.population_masks(g, boundary, data, idx,
+                               axis_limits={'A': (0.0, 1.0), 'B': (0.0, 1.0)})['in']
+    assert plain.tolist() == [False, False, True, False]
+    assert edge.tolist() == [True, True, True, False]
+    shapes = {'in': {'boundary': box, 'shape_channels': ['A', 'B'], 'region': 'inside'}}
+    assert ag.population_masks(g, shapes, data, idx,
+                               axis_limits={'A': (0.0, 1.0), 'B': (0.0, 1.0)})['in'].tolist() \
+        == [True, True, True, False]
+
+
+@pytest.mark.numpy_only
+def test_replicate_copies_threshold_from_gate_on_same_channel():
+    data, idx = _three_channel_data()
+    src = _gate('src', '1dsep', 'A', number=1)
+    rep = _gate('rep', '1dsep', 'A', parent='src', parent_pop='pos', number=2,
+                algorithm='replicate')
+    rep['gate_param'] = {'replicate_x': {'gate': 'src'}}
+    res = ag.train_boundaries([src, rep], data, idx)
+    assert res.boundaries['rep']['pos']['threshold_x'] == res.boundaries['src']['pos']['threshold_x']
+    assert ag.gate_dependencies(rep) == {'src'}
+
+
+@pytest.mark.numpy_only
+def test_replicate_from_reference_population_needs_no_events_of_its_own():
+    data, idx = _three_channel_data()
+    ref = _gate('ref', '1dsep', 'A', number=1)
+    ref['populations']['neg']['reference'] = True
+    rare = _gate('rare', '1dsep', 'C', parent='ref', parent_pop='pos', number=2,
+                 algorithm='replicate')
+    rare['gate_param'] = {'replicate_x': {'population': 'ref/neg', 'algorithm': 'tail'}}
+    res = ag.train_boundaries([ref, rare], data, idx)
+    neg = res.masks['ref']['neg']
+    expected = ag.compute_threshold(ag.trim_quantiles(data[neg, 2], 0.001), 'tail')
+    assert res.boundaries['rare']['pos']['threshold_x'] == pytest.approx(expected, abs=0.02)
+    assert ag.reference_populations([ref, rare]) == ['ref/neg']
+    # Missing source: the gate fails rather than falling back to another algorithm.
+    rare['gate_param'] = {'replicate_x': None}
+    res = ag.train_boundaries([ref, rare], data, idx)
+    assert 'rare' not in res.boundaries and res.status['rare']['flag'] == 'failed'
+
+
+@pytest.mark.numpy_only
+def test_2dsep_replicates_one_axis_and_calculates_the_other():
+    data, idx = _three_channel_data()
+    src = _gate('src', '1dsep', 'A', number=1)
+    q = _gate('q', '2dsep', 'A', 'B', number=2, algorithm='mixture')
+    q['gate_param'] = {'algorithm_x': 'replicate', 'replicate_x': {'gate': 'src'},
+                       'algorithm_y': 'mixture'}
+    res = ag.train_boundaries([src, q], data, idx)
+    first = next(iter(res.boundaries['q'].values()))
+    assert first['threshold_x'] == res.boundaries['src']['pos']['threshold_x']
+    assert 0.3 < first['threshold_y'] < 0.6
+
+
+@pytest.mark.numpy_only
+def test_cells_gate_cuts_debris_and_stays_open_above():
+    rng = np.random.default_rng(4)
+    debris = np.column_stack([rng.normal(0.1, 0.03, 3000), rng.normal(0.1, 0.05, 3000)])
+    cells = np.column_stack([rng.normal(0.5, 0.06, 7000), rng.normal(0.4, 0.1, 7000)])
+    data = np.vstack([debris, cells])
+    g = _gate('Cells', 'free', 'FSC', 'SSC', algorithm='cells')
+    res = ag.train_boundaries([g], data, {'FSC': 0, 'SSC': 1},
+                              axis_limits={'FSC': (0, 1), 'SSC': (0, 1)})
+    box = np.asarray(res.boundaries['Cells']['in']['boundary'])
+    assert 0.15 < box[:, 0].min() < 0.35 and box[:, 0].max() > 1.0 and box[:, 1].min() < 0.0
+    frac = res.boundaries['Cells']['in']['fraction']
+    assert 0.65 < frac < 0.72
+
+
+@pytest.mark.numpy_only
+def test_saturated_pile_is_cut():
+    rng = np.random.default_rng(5)
+    v = np.concatenate([rng.normal(0.4, 0.1, 9900), np.full(100, 1.0)])
+    cut = ag.saturation_cut(v)
+    assert cut is not None and cut < 1.0 and (v > cut).sum() == 100
+    assert ag.saturation_cut(rng.normal(0.4, 0.1, 10000)) is None
+
+
+@pytest.mark.numpy_only
+def test_ellipse_algorithm_is_retired_on_load():
+    t = np.linspace(0, 2 * np.pi, 64, endpoint=False)
+    ellipse = [[0.5 + 0.2 * np.cos(a), 0.5 + 0.1 * np.sin(a)] for a in t] + [[0.7, 0.5]]
+    g = _gate('Cells', 'free', 'FSC', 'SSC', algorithm='ellipse')
+    model = ag.new_model([g], {'Cells': {'in': {'boundary': ellipse, 'region': 'inside'}}},
+                         channel_map={}, transforms={}, training_summary={}, metadata={})
+    out, warnings = ag.normalize_model(model)
+    assert out['gate_definitions'][0]['algorithm'] == 'cells'
+    poly = np.asarray(out['trained_boundaries']['Cells']['in']['boundary'])
+    assert len(poly) == ag.ELLIPSE_VERTICES + 1
+    area = 0.5 * abs(np.dot(poly[:-1, 0], poly[1:, 1]) - np.dot(poly[1:, 0], poly[:-1, 1]))
+    assert area == pytest.approx(np.pi * 0.2 * 0.1, rel=0.03)
+    assert any('ellipse' in w for w in warnings)
+    assert 'ellipse' not in ag.ALGORITHMS_BY_GATE_TYPE['free']
+
+
+@pytest.mark.numpy_only
+def test_singlet_band_spans_the_axis():
+    rng = np.random.default_rng(6)
+    x = rng.uniform(0.3, 0.6, 5000)
+    data = np.column_stack([x, x + rng.normal(0, 0.01, 5000)])
+    g = _gate('S', 'singlets', 'A', 'H')
+    res = ag.train_boundaries([g], data, {'A': 0, 'H': 1}, axis_limits={'A': (0, 1), 'H': (0, 1)})
+    poly = np.asarray(res.boundaries['S']['in']['boundary'])
+    assert poly[:, 0].min() <= 0.0 and poly[:, 0].max() >= 1.0
+
+
+@pytest.mark.numpy_only
+def test_run_gating_stops_when_asked():
+    data, idx = _three_channel_data()
+    gates = [_gate('a', '1dsep', 'A', number=1), _gate('b', '1dsep', 'B', number=2)]
+    calls = []
+
+    def stop():
+        calls.append(1)
+        return len(calls) > 1
+
+    with pytest.raises(ag.GatingStopped):
+        ag.run_gating(gates, data, idx, stop_check=stop)
+
+
+@pytest.mark.numpy_only
+def test_channel_remap_touches_only_gates_on_that_channel():
+    gates = [_gate('a', '1dsep', 'A', number=1), _gate('b', '1dsep', 'B', number=2)]
+    tb = {'a': {'pos': {'threshold_x': 0.5, 'boundary': [[0.5, 0], [1, 0], [1, 1], [0.5, 1]]}},
+          'b': {'pos': {'threshold_x': 0.5, 'boundary': [[0.5, 0], [1, 0], [1, 1], [0.5, 1]]}}}
+    b_before = tb['b']
+
+    class Lin:
+        def __init__(self, k):
+            self.k = k
+
+        def apply(self, v):
+            return np.asarray(v, dtype=float) * self.k
+
+        def inverse(self, v):
+            return np.asarray(v, dtype=float) / self.k
+
+    changed = ag.remap_channel_transform(gates, tb, 'A', {'id': 0, 'scale_t': 1.0},
+                                         {'id': 0, 'scale_t': 2.0},
+                                         transform_factory=lambda p: Lin(p['scale_t']))
+    assert changed and tb['a']['pos']['threshold_x'] == pytest.approx(1.0)
+    assert tb['b'] is b_before and ag.gates_on_channel(gates, tb, 'A') == {'a'}

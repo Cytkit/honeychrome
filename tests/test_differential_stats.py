@@ -120,3 +120,37 @@ def test_figures_build_without_canvas():
 
     empty = dp.make_heatmap_figure(res.assign(significant=False), data, 'Frequencies', {})
     assert empty.axes[0].texts
+
+
+def test_comparison_heatmap_colours_only_significant_cells():
+    pytest.importorskip('matplotlib')
+    from honeychrome.view_components import differential_plots as dp
+
+    rng = np.random.default_rng(5)
+    groups = ['Ref'] * 4 + ['B'] * 4 + ['C'] * 4
+    data = pd.DataFrame(rng.normal(scale=0.3, size=(12, 9)), index=[f's{i}' for i in range(12)],
+                        columns=[f'g{j}' for j in range(9)])
+    data.iloc[4:8, 0] += 3.0
+    data.iloc[8:12, 1] -= 2.5
+    contrasts = ds.build_contrasts(['Ref', 'B', 'C'], 'reference', 'Ref')
+    res = ds.run_moderated(data, groups, contrasts, 'reference', 0.05, 1.0, use_treat=False)
+
+    fig = dp.make_comparison_heatmap_figure(res, 'All comparisons', n_rows=2)
+    panels = [ax for ax in fig.axes if ax.images]
+    assert len(panels) == 2
+    shown = np.hstack([np.asarray(ax.images[0].get_array()) for ax in panels])
+    names = [t.get_text() for ax in panels for t in ax.get_xticklabels()]
+    rows = [t.get_text() for t in panels[0].get_yticklabels()]
+    assert rows == ['B vs Ref', 'C vs Ref'] and sorted(names) == sorted(data.columns)
+    expected = res.assign(v=np.where(res['significant'], res['logFC'], 0.0)).pivot(
+        index='comparison', columns='feature', values='v').reindex(index=rows, columns=names)
+    np.testing.assert_allclose(shown, expected.values)
+    assert shown[0, names.index('g0')] > 2 and shown[1, names.index('g1')] < -2
+    # effect order: most negative mean first
+    assert names[0] == 'g1' and names[-1] == 'g0'
+
+    alpha = dp.make_comparison_heatmap_figure(res, 'All', order='alphabetical')
+    assert [t.get_text() for t in alpha.axes[0].get_xticklabels()] == sorted(data.columns)
+
+    none = dp.make_comparison_heatmap_figure(res.assign(significant=False), 'All')
+    assert none.axes[0].texts

@@ -16,8 +16,8 @@ parents show partially-checked when only some descendants are checked).
 ``checked_names()`` only reports the TOPMOST fully-checked node in each
 checked branch: a child gate's membership is always a subset of its
 parent's in a FlowKit gating hierarchy, so including descendants of an
-already-checked node would be redundant for
-``apply_gates_union_by_lookup_table()``'s union-of-masks computation.
+already-checked node would be redundant for the union of the checked
+gates' masks.
 """
 
 from __future__ import annotations

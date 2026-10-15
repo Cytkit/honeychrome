@@ -27,25 +27,34 @@ and records the trainable gate it converts to:
 <ul>
 <li>the forward-scatter area against height (or width) gate becomes a
 <i>singlets</i> gate and moves to the top of the hierarchy; gates drawn above
-it are placed directly below it;</li>
-<li>ellipses become 10-vertex polygons of the same area;</li>
+it are placed directly below it; a side-scatter area against height gate is a
+<i>singlets</i> gate too, left where it is;</li>
+<li>ellipses become 10-vertex polygons of the same area; no gate is ever an
+ellipse;</li>
 <li>sibling gates drawn on the same pair of parameters become one gate with a
 population each: <i>2dsep</i>, or <i>1dsep</i> on the fluorescence parameter
 when the other is scatter (proposed algorithm <i>mixture</i>);</li>
-<li>a histogram gate becomes a <i>1dsep</i> gate with a histogram view
-(<i>tail</i>);</li>
+<li>a histogram gate becomes a <i>1dsep</i> gate with a histogram view:
+<i>tail</i>, or <i>mixture</i> when its positive population holds more than
+25% of the parent (from the counts in the workspace, or on the Review tab from
+the review samples when the workspace has none);</li>
 <li>a single gate on a pair becomes a <i>1dsep</i> gate on its fluorescence
 parameter when the other is scatter, or a <i>2dsep</i> gate when both are
 fluorescence (<i>mixture</i>);</li>
-<li>shapes drawn only on scatter parameters stay <i>free</i>.</li>
+<li>shapes drawn only on scatter parameters (e.g. FSC-A against SSC-A)
+become <i>free</i> gates with the <i>cells</i> algorithm.</li>
 </ul>
+Gates that share a name in the import (e.g. <i>TIGIT+</i> drawn on many T cell
+subsets) are named after the population they are drawn on, <i>TIGIT+ (Tem)</i>,
+with the populations above it added only when needed, <i>TIGIT+ (CD4+ › Tem)</i>.
+They keep their shared name as a link: converting one converts the others
+still as drawn the same way (see the Review tab).
 Which side of a fluorescence parameter a population is on comes from the drawn
 coordinates: entirely above the channel's zero is the positive side, reaching
 zero or below is the negative side. Compare each gate as drawn with its
 trainable form on the Review tab, then use <b>Convert to trainable</b> (or
 <b>Convert all to trainable</b>) so Train calculates it from the training
-samples. A free polygon cannot be learned, so <i>Convert all</i> leaves it as
-drawn; converting one by hand fits an ellipse instead. <b>Split…</b> replaces
+samples. <b>Split…</b> replaces
 a 2dsep gate with sequential 1dsep gates; you choose the order, algorithms and
 view parameters. <b>Keep imported boundary</b> in the right-click menu
 reverses a conversion.</li>
@@ -75,11 +84,22 @@ carries the separation parameter of gates you add or split; each gate's Edit
 dialog can change it.</li>
 <li><b>2dsep</b> — a threshold on each of two channels (four quadrants).</li>
 <li><b>singlets</b> — a band around the area-against-height diagonal.</li>
-<li><b>free</b> — a polygon around the parent population (convex hull or
-ellipse).</li>
-<li><b>replicate</b> — reuses another gate's boundary on a different
-parent.</li>
+<li><b>free</b> — a shape on two scatter channels. <b>cells</b> cuts the
+debris: the density valley left of the main forward-scatter peak (or where
+the density there falls below 5% of the peak), keeping everything above it;
+the other sides stay open except just below a pile of saturated events.
+<b>all</b> is the convex hull of the parent population.</li>
+<li><b>replicate</b> (gate type) — reuses another gate's boundary on a
+different parent.</li>
 </ul>
+<p>The <b>replicate</b> algorithm of a threshold gate axis takes its threshold
+from elsewhere, chosen on the Review tab: another gate separating on the same
+channel (its threshold is copied), or a <b>reference population</b>. A
+reference population is one whose biology is known and whose events are
+plentiful: the threshold is calculated there, by default with <i>tail</i>, and
+transferred to a population that is rare, noisy or has no clear boundary. For
+example, CD3+ T cells, which do not express CD19, set the CD19 threshold, and
+Foxp3− CD4 T cells set the CD25 threshold applied to Tregs.</p>
 <p>Threshold algorithms: <b>tail</b> (the upper tail of a symmetric negative
 population; negative populations are symmetric on a logicle or biexponential
 axis [6]), <b>kde_min</b> and <b>bimodal</b> (the density minimum between
@@ -89,7 +109,9 @@ each threshold gate is given a suggested algorithm: <i>mixture</i> when its
 channel looks bimodal (a two-component Gaussian mixture fits clearly better
 than one), otherwise <i>tail</i>.</p>
 <p>Threshold populations are open-ended: every event beyond the threshold
-belongs to the population, however far outside the plotted range.</p>
+belongs to the population, however far outside the plotted range. Shapes are
+tested where the plots draw the events: an event beyond an axis sits on that
+axis edge, so a shape drawn up to the edge includes the events past it.</p>
 <p>Thresholds are calculated once, on the pooled training samples, rather than
 recalculated for each sample as OpenCyto [4] and flowDensity [5] do; the Setup
 tab offers per-sample recalculation as an option.</p>
@@ -133,10 +155,13 @@ then calculated in hierarchy order on the pooled, transformed events.</li>
 </ol>
 
 <h4>Checking and adjusting</h4>
-<p>Each gate appears as a tile showing its parent population and boundary.
-Click a tile to open it full size, move the threshold (1D gates) or the
-threshold lines (2D gates), and accept to keep the adjustment. Adjusted
-gates are marked in the model.</p>
+<p>Each gate appears as a tile showing its parent population and boundary,
+beside the gating hierarchy. Tiles are shown for the gates drawn on the
+populations open in the tree: the first three levels to begin with. Expand a
+population to show the gates drawn on it, or select it to jump to them.
+Click a tile's <b>Detail…</b> to open it full size, move the threshold (1D
+gates) or the threshold lines (2D gates), and accept to keep the adjustment.
+Adjusted gates are marked in the model.</p>
 <p>A gate whose parent population has too few events to calculate a
 boundary is reported in the status line, and its children are skipped.</p>
 <p>Training results are kept with the experiment and restored when you come
@@ -203,6 +228,13 @@ data.</li>
 autofluorescence profiles, restricted to its time-QC keep-mask when present,
 transformed, and gated through the whole hierarchy using every event.</li>
 </ol>
+<p><b>Pause</b> stops at the next gate, keeps every sample gated so far and
+saves them with the experiment; the sample being gated is dropped. <b>Run
+Gating</b> then asks whether to <b>Resume</b> (gate only the ticked samples
+without results) or <b>Restart</b> (discard the results so far). A paused run
+can only be restarted once the model, the channel alignment or the gate
+settings have changed. <b>Cancel</b> stops the same way but discards the run,
+keeping the results from before it.</p>
 
 <h4>Inspecting the result</h4>
 <p><b>View</b> shows every gate either for all gated samples pooled (with the
@@ -225,6 +257,10 @@ sample name, and click <b>Assign by pattern</b>, or choose each sample's group
 by hand. Covariates hold per-sample values: use one to <b>pair</b> samples
 (e.g. donor) or to <b>adjust</b> for (e.g. age, sex, batch). Every group
 compared needs at least 3 samples.</p>
+<p><b>Import table…</b> reads groups and covariates from a CSV or tab-separated
+file with a <i>sample</i> column (the file name, with or without its
+extension), an optional <i>group</i> column and one column per covariate.
+New groups are added. <b>Export table…</b> writes the same format.</p>
 
 <h4>Statistics</h4>
 <p>The same framework has been applied in systems-immunology studies of flow
@@ -247,6 +283,18 @@ threshold; with it off, they test for any difference and the threshold only
 filters. FDR is pooled over all comparisons or taken within each. Changing a
 threshold updates significance without refitting.</p>
 
+<h4>Sample PCA and prediction</h4>
+<p>Both use the per-sample values of the last statistics run. <b>Sample
+PCA</b> places every sample on the first two principal components of the
+chosen tables (each column scaled to unit variance), coloured by group, with
+the features that load most strongly as arrows. The <b>predictive
+analysis</b> asks which features best separate two groups, and how well:
+lasso logistic regression and a random forest, assessed by repeated nested
+cross-validation, give the cross-validated ROC curve with its AUC (mean ± SD
+over repeats) and balanced accuracy, the most informative features, and the
+AUC reached with the top 1, 2, 3 … features [6, 7]. It needs at least 10
+samples per group; 30 or more is recommended.</p>
+
 <h4>Figures and populations</h4>
 <p>Heatmaps, volcano plots and a population × marker summary are drawn for
 the comparison chosen at the top. Click a volcano point to open its
@@ -259,7 +307,9 @@ gated in this session, with the boundary the sample was gated with.</p>
 marker tables as CSV, a settings document, a PNG or CSV per ticked item
 (sample tables, one plot per gate, and each comparison's figures and results)
 and one PDF with all of them. Gate plots need the display events, so they are
-offered only for samples gated in this session.</p>
+offered only for samples gated in this session. The sample PCA and
+predictive figures are included once they have been run. <b>Cancel</b> on the
+progress window stops the report and removes its half-written folder.</p>
 
 <h4>Further Reading and Background</h4>
 <p>References:<br/>
@@ -281,30 +331,50 @@ FlowJo coordinates are raw instrument units converted with this experiment's
 transforms, and unmixing here can differ from the unmixing the gates were
 drawn on, so look at them before training.</p>
 <ol>
-<li>Choose a <b>population</b> in the gating hierarchy on the left (expand
-and collapse its branches) or in the population list above it; the two stay
-in step. A population with no gates below it shows the plot it is gated
-on.</li>
-<li>Each row shows one plot of the population's daughter gates. On the
-<b>left</b>, the gates <b>as drawn</b>; on the <b>right</b>, each gate's
-<b>trainable form</b>: calculated on the review sample's parent population with
-the algorithm chosen above it, or its trained boundary once trained. Change
-the algorithm to see the result update.</li>
-<li><b>Convert to trainable</b> makes Train calculate the gate with the chosen
-algorithm; <b>Use shapes as drawn</b> reverses it. <b>Split…</b> replaces a
-2dsep gate with sequential 1dsep gates.</li>
-<li>Choose the <b>review sample</b>. When the imported counts came from a
-sample in this experiment it is selected for you, and each population label
-shows its fraction of parent next to the fraction recorded at import. A label
-turns red when they differ by 2 percentage points or by 5% of the imported
+<li>Choose a <b>population</b> in the gating hierarchy on the left or in the
+population list above it; the two stay in step. A population with no gates
+below it shows the plot it is gated on.</li>
+<li>Choose the <b>review samples</b>. Tick several to pool them, each giving the
+same number of events. When the imported counts came from a sample in this
+experiment it is chosen for you, and with that one sample each population
+label shows its fraction of parent next to the fraction recorded at import,
+in red when they differ by 2 percentage points or by 5% of the imported
 fraction.</li>
-<li>Tick <b>Edit gates</b> to drag the corners, edges and limits of the shapes
-as drawn (long polygons are thinned to 32 corners when edited). <b>Reset to
-import</b> restores the shapes shown to their imported state.</li>
+<li>Each plot's gates <b>as drawn</b> are on the left; on the right, level
+with it, each gate's <b>trainable form</b>: calculated on the review samples'
+parent population with the algorithm chosen above it, or its trained boundary
+once trained. A 2dsep gate has an algorithm per axis. Choosing
+<b>replicate</b> shows a source: another gate on the same channel, whose
+threshold is copied, or a reference population, on which the threshold is
+calculated. <b>Update</b> calculates the shown gates again.</li>
+<li><b>Convert to trainable</b> makes Train calculate the gate with the chosen
+algorithm; <b>Use shapes as drawn</b> reverses it. <b>Convert all to
+trainable</b> converts every gate still as drawn to its proposed algorithm.
+<b>Split…</b> replaces a 2dsep gate with sequential 1dsep gates. The red
+<b>−</b> deletes a gate and the gates below it, after asking.</li>
+<li>Gates that share an imported name (e.g. every <i>CD80+</i>) are kept on
+one algorithm: converting one, or changing a converted one's algorithm,
+converts the others still as drawn (or set this way before) to the same
+algorithm and parameters. Once two of them have been set differently by
+hand, the others are left alone and a message at the bottom says so; when
+you set them alike again, the others follow.</li>
+<li>Tick <b>Edit gates</b> to drag the shapes as drawn of gates that still
+apply them (left; long polygons are thinned to 32 corners), and the
+boundaries of converted gates (right). A boundary moved on the right is kept
+as an adjustment until the gate is trained again. <b>Reset to import</b>
+restores the shapes shown to their imported state.</li>
 <li>Drag an axis to rescale it, as on the main plots: the lower half of a
 biexponential axis changes its width basis, the upper half zooms. The gates
 move with the axis, so they stay on the same events.</li>
 </ol>
+<h4>Hierarchy menu</h4>
+<p>Right-click the hierarchy (Ctrl- or Shift-click selects several
+populations) to <b>Copy gate</b> or <b>Copy gating branch</b> (the gate and
+every gate below it) and <b>Paste</b> them onto other populations; copies are
+named after the population they are pasted on and follow their same-named
+gates. <b>Delete gate…</b> and <b>Delete population…</b> remove the selection
+with what is below it. <b>Use as reference population</b> marks a population
+as a source for replicated thresholds.</p>
 <p>Changing a gate clears the training of that gate and of the gates below
 it; train again to apply the change.</p>
 '''

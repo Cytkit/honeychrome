@@ -29,6 +29,14 @@ Data conventions
   view channel it is drawn against (None: a histogram of the separation
   channel). ``sep_axis`` ('x' or 'y') is the plot axis the separation
   channel is drawn on (see ``plot_channels``).
+* A threshold gate axis whose algorithm is ``replicate`` takes its
+  threshold from elsewhere (``gate_param['replicate_x']`` /
+  ``['replicate_y']``): ``{'gate': name}`` copies the threshold another gate
+  has on the same channel; ``{'population': 'gate/pop', 'algorithm': a}``
+  calculates it with algorithm *a* on the events of that population, which
+  is usually marked as a reference population (``populations[pop]
+  ['reference']``): one whose biology is known and whose events are
+  plentiful, so its positive/negative boundary can be transferred.
 * An imported gate's ``template`` may hold its shapes as drawn: entries
   with ``shape_channels`` (the channels of the plot it was drawn on) and a
   closed ``boundary`` polygon, or a ``range`` for a 1-D shape. While the
@@ -38,7 +46,10 @@ Data conventions
 
 Threshold gates are open-ended: a population is every event on its side of
 the thresholds, however far outside the display range. Polygon gates
-(``singlets``, ``free``) contain the events inside their polygon.
+(``singlets``, ``free``) and shapes as drawn contain the events inside their
+polygon or range; when display limits are given, events beyond them are
+tested where the plots show them, on the axis edge, so a shape drawn up to
+an axis includes the off-scale events past it.
 
 Model application modes
 -----------------------
@@ -100,13 +111,20 @@ POLYGON_TYPES = frozenset({'singlets', 'free'})
 # (e.g. a gate imported from a FlowJo workspace) instead of calculating one.
 ALGORITHM_IMPORTED = 'imported'
 
+# 'replicate' takes a threshold from another gate or a reference population.
+ALGORITHM_REPLICATE = 'replicate'
+
 ALGORITHMS_BY_GATE_TYPE: dict[str, list[str]] = {
     'singlets':  ['singlets', ALGORITHM_IMPORTED],
-    '1dsep':     ['tail', 'kde_min', 'mixture', 'otsu', 'bimodal', ALGORITHM_IMPORTED],
-    '2dsep':     ['tail', 'kde_min', 'mixture', 'otsu', 'bimodal', ALGORITHM_IMPORTED],
-    'free':      ['all', 'ellipse', ALGORITHM_IMPORTED],
+    '1dsep':     ['tail', 'kde_min', 'mixture', 'otsu', 'bimodal', ALGORITHM_REPLICATE,
+                  ALGORITHM_IMPORTED],
+    '2dsep':     ['tail', 'kde_min', 'mixture', 'otsu', 'bimodal', ALGORITHM_REPLICATE,
+                  ALGORITHM_IMPORTED],
+    'free':      ['cells', 'all', ALGORITHM_IMPORTED],
     'replicate': ['replicate'],
 }
+# Algorithms that calculate a threshold from data (replicate sources use one).
+THRESHOLD_ALGORITHMS = ('tail', 'kde_min', 'mixture', 'otsu', 'bimodal')
 
 MODEL_FORMAT_VERSION = 2
 MODE_FIXED = 'fixed'
@@ -140,6 +158,65 @@ def default_populations_for_type(gate_type: str) -> dict:
     if gate_type in POLYGON_TYPES:
         return {'in': {'label': 'in', 'label_pos': 1, 'region': REGION_INSIDE}}
     return {}
+
+
+def axis_algorithm(gate_def: dict, axis: str) -> str:
+    """Algorithm of one axis ('x' or 'y') of a threshold gate: the per-axis
+    ``algorithm_x``/``algorithm_y`` of a 2dsep gate, else the gate's."""
+    default = gate_def.get('algorithm') or 'tail'
+    if gate_def.get('gate_type') != '2dsep':
+        return default
+    return (gate_def.get('gate_param') or {}).get(f'algorithm_{axis}') or default
+
+
+def threshold_axes(gate_def: dict) -> tuple:
+    """The data axes a threshold gate separates on: ('x',) or ('x', 'y')."""
+    return ('x', 'y') if gate_def.get('gate_type') == '2dsep' else ('x',)
+
+
+def axis_channel(gate_def: dict, axis: str):
+    return gate_def.get('gate_marker_x' if axis == 'x' else 'gate_marker_y')
+
+
+def replicate_sources(gate_def: dict) -> dict:
+    """{axis: source} for the axes of a threshold gate that replicate a
+    threshold (see the module notes); a missing source is None."""
+    if gate_def.get('gate_type') not in THRESHOLD_TYPES \
+            or gate_def.get('algorithm') == ALGORITHM_IMPORTED:
+        return {}
+    gp = gate_def.get('gate_param') or {}
+    out = {}
+    for axis in threshold_axes(gate_def):
+        if axis_algorithm(gate_def, axis) == ALGORITHM_REPLICATE:
+            src = gp.get(f'replicate_{axis}')
+            out[axis] = src if isinstance(src, dict) and (src.get('gate') or src.get('population')) \
+                else None
+    return out
+
+
+def gate_dependencies(gate_def: dict) -> set:
+    """Names of the gates that must be calculated before *gate_def*: its
+    parent, a replicate gate's origin, and the gates or reference
+    populations its replicated thresholds come from."""
+    deps = {d for d in (gate_def.get('parent_gate'), gate_def.get('origin_gate')) if d}
+    for src in replicate_sources(gate_def).values():
+        if not src:
+            continue
+        if src.get('gate'):
+            deps.add(src['gate'])
+        elif src.get('population'):
+            deps.add(split_population_key(src['population'])[0])
+    return deps
+
+
+def reference_populations(gate_defs: list[dict]) -> list[str]:
+    """'gate/pop' keys of every population marked as a reference."""
+    out = []
+    for g in gate_defs:
+        for pop, meta in (g.get('populations') or {}).items():
+            if (meta or {}).get('reference'):
+                out.append(population_key(g['gate_name'], pop))
+    return out
 
 
 def default_algorithm_for_type(gate_type: str) -> str:
@@ -394,7 +471,8 @@ def gates_by_name(gate_defs: list[dict]) -> dict[str, dict]:
 
 
 def ordered_gate_defs(gate_defs: list[dict]) -> list[dict]:
-    """Gate definitions ordered so every gate follows its parent and origin.
+    """Gate definitions ordered so every gate follows the gates it depends
+    on (see gate_dependencies).
 
     Ties are broken by ``gate_number`` then name. Raises ValueError on a
     cycle.
@@ -414,8 +492,7 @@ def ordered_gate_defs(gate_defs: list[dict]) -> list[dict]:
     while remaining:
         progressed = False
         for g in list(remaining):
-            deps = {d for d in (g.get('parent_gate'), g.get('origin_gate')) if d}
-            deps &= set(by_name)
+            deps = gate_dependencies(g) & set(by_name)
             if deps <= placed:
                 out.append(g)
                 placed.add(g['gate_name'])
@@ -674,7 +751,10 @@ class GateCalculator:
         slope, intercept = np.polyfit(x[keep], y[keep], 1)
         sigma = float((y[keep] - (slope * x[keep] + intercept)).std()) or 1.0
         offset = width_sd * sigma
-        x_lo, x_hi = float(x.min()), float(x.max())
+        # The band runs the full width of the axis, so the gate is open along
+        # the diagonal rather than ending at the extremes of the training data.
+        lim_lo, lim_hi = self._limits(gate_def['gate_marker_x'], x)
+        x_lo, x_hi = min(float(x.min()), lim_lo), max(float(x.max()), lim_hi)
         poly = [
             [x_lo, slope * x_lo + intercept - offset],
             [x_hi, slope * x_hi + intercept - offset],
@@ -691,6 +771,12 @@ class GateCalculator:
         q = float(gp.get('quantile_trim', 0.001))
         ch = gate_def['gate_marker_x']
         full = data[:, channel_index[ch]]
+        fixed = gp.get('fixed_threshold_x')
+        if fixed is not None:
+            # A replicated threshold needs no events of this population.
+            return self.threshold_boundaries(gate_def, float(fixed), None, full, None)
+        if gate_def.get('algorithm') == ALGORITHM_REPLICATE:
+            return {}
         col = trim_quantiles(full, q)
         if len(col) < MIN_EVENTS:
             return {}
@@ -706,7 +792,8 @@ class GateCalculator:
         ix = channel_index[gate_def['gate_marker_x']]
         iy = channel_index[gate_def['gate_marker_y']]
         xy = trim_quantiles(data[:, [ix, iy]], q)
-        if len(xy) < 20:
+        both_fixed = all(gp.get(f'fixed_threshold_{a}') is not None for a in ('x', 'y'))
+        if len(xy) < 20 and not both_fixed:
             return {}
         default_algo = gate_def.get('algorithm', 'tail')
 
@@ -719,12 +806,18 @@ class GateCalculator:
 
         thresholds = []
         for k, axis in enumerate(('x', 'y')):
+            fixed = gp.get(f'fixed_threshold_{axis}')
+            if fixed is not None:
+                thresholds.append(float(fixed))
+                continue
             col = xy[:, k]
             calc = crop_to_region(col, float(gp.get(f'axis_lo_{axis}', 0.01)),
                                   float(gp.get(f'axis_hi_{axis}', 0.99)))
             if len(calc) < MIN_EVENTS:
                 calc = col
             algo = gp.get(f'algorithm_{axis}') or default_algo
+            if algo == ALGORITHM_REPLICATE:
+                return {}
             thresholds.append(compute_threshold(calc, algo, axis_params(axis)))
         return self.threshold_boundaries(gate_def, thresholds[0], thresholds[1],
                                          data[:, ix], data[:, iy])
@@ -760,6 +853,8 @@ class GateCalculator:
         ix = channel_index[gate_def['gate_marker_x']]
         pop = next(iter(gate_def.get('populations') or {'in': {}}))
         y_ch = gate_def.get('gate_marker_y')
+        if gate_def.get('algorithm') == 'cells' and y_ch:
+            return self._calc_cells(data, gate_def, channel_index, pop)
         if not y_ch:
             col = trim_quantiles(data[:, ix], q)
             if len(col) < MIN_EVENTS:
@@ -771,13 +866,86 @@ class GateCalculator:
         if len(cols) < 4:
             return {}
         if gate_def.get('algorithm') == 'ellipse':
-            poly = _ellipse_polygon(cols)
+            poly = _ellipse_polygon(cols, n_points=ELLIPSE_VERTICES)
         else:
             poly = _convex_hull_polygon(cols)
         if poly is None:
             return {}
         return {pop: {'boundary': poly, 'threshold_x': None, 'threshold_y': None,
                       'region': REGION_INSIDE}}
+
+    def _open_limit(self, channel: str, values: np.ndarray, side: str) -> float:
+        """A coordinate one display span beyond the axis limit on *side*
+        ('lo' or 'hi'), so a polygon edge there leaves the gate open."""
+        lo, hi = self._limits(channel, values)
+        span = (hi - lo) or 1.0
+        return lo - span if side == 'lo' else hi + span
+
+    def _calc_cells(self, data, gate_def, channel_index, pop) -> dict:
+        """Cell gate on a pair of scatter channels: a rectangle that cuts the
+        debris on the forward-scatter axis and keeps everything above it.
+
+        The debris cut is the density valley left of the highest peak of the
+        forward-scatter axis (``gate_param['debris_axis']``, 'x' or 'y'),
+        or, when no peak lies left of it, the point where the density left of
+        the peak first falls below ``debris_density`` (default 0.05) of the
+        peak height. The other sides are open, except that a pile of events
+        at the top of either axis (saturation, more than
+        ``saturation_fraction`` of the events, default 0.0005) is cut just
+        below the pile.
+        """
+        gp = gate_def.get('gate_param', {}) or {}
+        q = float(gp.get('quantile_trim', 0.001))
+        chans = [gate_def['gate_marker_x'], gate_def['gate_marker_y']]
+        xy = data[:, [channel_index[c] for c in chans]]
+        if len(xy) < 50:
+            return {}
+        d = 1 if gp.get('debris_axis') == 'y' else 0
+        col = trim_quantiles(xy[:, d], q)
+        cut = debris_cut(col, float(gp.get('debris_density', 0.05)))
+        bounds = []
+        for k, ch in enumerate(chans):
+            values = xy[:, k]
+            lo = cut if k == d else self._open_limit(ch, values, 'lo')
+            hi = saturation_cut(values, float(gp.get('saturation_fraction', 0.0005)))
+            if hi is None:
+                hi = self._open_limit(ch, values, 'hi')
+            bounds.append((lo, hi))
+        (x0, x1), (y0, y1) = bounds
+        return {pop: {'boundary': _rect(x0, x1, y0, y1), 'threshold_x': None,
+                      'threshold_y': None, 'region': REGION_INSIDE}}
+
+
+def debris_cut(x: np.ndarray, rel_density: float = 0.05) -> float:
+    """Forward-scatter value separating debris from cells (see
+    GateCalculator._calc_cells)."""
+    from scipy.signal import find_peaks
+    x = np.asarray(x, dtype=float)
+    if len(x) < 20 or float(x.max()) == float(x.min()):
+        return float(x.min()) if len(x) else 0.0
+    grid, density = _kde_grid(x)
+    top = int(np.argmax(density))
+    peaks, _ = find_peaks(density, prominence=0.05 * float(density[top]))
+    left = [int(p) for p in peaks if p < top]
+    if left:
+        start = max(left)
+        return float(grid[start + int(np.argmin(density[start:top + 1]))])
+    below = np.flatnonzero(density[:top] < rel_density * float(density[top]))
+    return float(grid[below[-1]]) if len(below) else float(grid[0])
+
+
+def saturation_cut(values: np.ndarray, min_fraction: float = 0.0005) -> float | None:
+    """Just below a pile of events at the maximum of *values* (a saturated
+    detector), or None when there is no such pile."""
+    values = np.asarray(values, dtype=float)
+    if not len(values):
+        return None
+    v_max, v_min = float(values.max()), float(values.min())
+    span = (v_max - v_min) or 1.0
+    edge = v_max - 1e-3 * span
+    if float(np.mean(values >= edge)) <= min_fraction:
+        return None
+    return edge - 1e-3 * span
 
 
 def _convex_hull_polygon(xy: np.ndarray) -> list | None:
@@ -791,14 +959,26 @@ def _convex_hull_polygon(xy: np.ndarray) -> list | None:
     return verts
 
 
-def _ellipse_polygon(xy: np.ndarray, n_points: int = 64, n_sd: float = 3.0) -> list | None:
+ELLIPSE_VERTICES = 10
+
+
+def ellipse_area_scale(n_points: int) -> float:
+    """Radius factor giving an n-vertex polygon the area of its ellipse."""
+    return math.sqrt(2.0 * math.pi / (n_points * math.sin(2.0 * math.pi / n_points)))
+
+
+def _ellipse_polygon(xy: np.ndarray, n_points: int = ELLIPSE_VERTICES,
+                     n_sd: float = 3.0) -> list | None:
+    """The 3 SD ellipse of *xy* as an n-vertex polygon of the same area
+    (models saved with the retired 'ellipse' algorithm)."""
     try:
         cx, cy = xy[:, 0].mean(), xy[:, 1].mean()
         vals, vecs = np.linalg.eigh(np.cov(xy.T))
     except Exception:
         return None
-    a = n_sd * math.sqrt(abs(vals[0]))
-    b = n_sd * math.sqrt(abs(vals[1]))
+    k = ellipse_area_scale(n_points)
+    a = k * n_sd * math.sqrt(abs(vals[0]))
+    b = k * n_sd * math.sqrt(abs(vals[1]))
     angle = math.atan2(vecs[1, 0], vecs[0, 0])
     t = np.linspace(0, 2 * np.pi, n_points, endpoint=False)
     xr = a * np.cos(t) * math.cos(angle) - b * np.sin(t) * math.sin(angle) + cx
@@ -808,15 +988,132 @@ def _ellipse_polygon(xy: np.ndarray, n_points: int = 64, n_sd: float = 3.0) -> l
     return poly
 
 
+def ellipse_as_polygon(coords, n_points: int = ELLIPSE_VERTICES) -> list:
+    """The ellipse traced by the closed polygon *coords* as an n-vertex
+    polygon of the same area, vertices spaced evenly in the ellipse's own
+    angle: used to turn stored ellipses into 10-vertex polygons.
+
+    The ellipse is recovered from the polygon's area moments (centroid and
+    second moments), which a densely traced ellipse matches exactly.
+    """
+    pts = np.asarray(coords, dtype=float)
+    if len(pts) > 1 and np.allclose(pts[0], pts[-1]):
+        pts = pts[:-1]
+    if len(pts) < 3:
+        return [list(map(float, p)) for p in coords]
+    x, y = pts[:, 0], pts[:, 1]
+    xn, yn = np.roll(x, -1), np.roll(y, -1)
+    cross = x * yn - xn * y
+    area = cross.sum() / 2.0
+    if abs(area) < 1e-15:
+        return [list(map(float, p)) for p in coords]
+    cx = ((x + xn) * cross).sum() / (6.0 * area)
+    cy = ((y + yn) * cross).sum() / (6.0 * area)
+    sxx = ((x * x + x * xn + xn * xn) * cross).sum() / (12.0 * area) - cx * cx
+    syy = ((y * y + y * yn + yn * yn) * cross).sum() / (12.0 * area) - cy * cy
+    sxy = ((x * yn + 2 * x * y + 2 * xn * yn + xn * y) * cross).sum() / (24.0 * area) - cx * cy
+    vals, vecs = np.linalg.eigh(np.array([[sxx, sxy], [sxy, syy]]))
+    # A uniform ellipse with semi-axes a, b has second moments a²/4 and b²/4.
+    axes = 2.0 * np.sqrt(np.clip(vals, 0.0, None)) * ellipse_area_scale(n_points)
+    t = np.linspace(0, 2 * np.pi, n_points, endpoint=False)
+    out = [[float(cx + axes[0] * math.cos(a) * vecs[0, 0] + axes[1] * math.sin(a) * vecs[0, 1]),
+            float(cy + axes[0] * math.cos(a) * vecs[1, 0] + axes[1] * math.sin(a) * vecs[1, 1])]
+           for a in t]
+    out.append(list(out[0]))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Replicated thresholds
+# ---------------------------------------------------------------------------
+
+def _threshold_on_channel(gate_def: dict, entries: dict, channel: str):
+    """The threshold a calculated threshold gate has on *channel*, or None."""
+    if not entries or is_shape_boundary(entries) \
+            or gate_def.get('gate_type') not in THRESHOLD_TYPES:
+        return None
+    first = next(iter(entries.values()))
+    if gate_def.get('gate_marker_x') == channel and first.get('threshold_x') is not None:
+        return float(first['threshold_x'])
+    if gate_def.get('gate_type') == '2dsep' and gate_def.get('gate_marker_y') == channel \
+            and first.get('threshold_y') is not None:
+        return float(first['threshold_y'])
+    return None
+
+
+def resolve_replicates(gate_def: dict, data: np.ndarray, channel_index: dict,
+                       result: 'GatingResult', by_name: dict) -> tuple[dict, str]:
+    """Copy of *gate_def* (an effective definition) with the thresholds of
+    its replicated axes fixed in ``gate_param['fixed_threshold_x/y']``.
+
+    *result* holds the gates applied so far to *data* (boundaries and
+    population masks over its rows). Returns (definition, '') or
+    (None, reason) when a source is missing or cannot be calculated.
+    """
+    sources = replicate_sources(gate_def)
+    if not sources:
+        return gate_def, ''
+    out = deepcopy(gate_def)
+    gp = out.setdefault('gate_param', {})
+    for axis, src in sources.items():
+        channel = axis_channel(gate_def, axis)
+        if not src:
+            return None, f"no replicate source chosen for {channel}"
+        if src.get('gate'):
+            origin = by_name.get(src['gate'])
+            if origin is None:
+                return None, f"replicate source gate '{src['gate']}' does not exist"
+            eff = effective_gate_def(origin, by_name)
+            t = _threshold_on_channel(eff, result.boundaries.get(src['gate']), channel)
+            if t is None:
+                return None, (f"gate '{src['gate']}' has no threshold on {channel} "
+                              "to replicate")
+        else:
+            key = src['population']
+            mask = result.population_mask(*split_population_key(key))
+            if mask is None or channel not in channel_index:
+                return None, f"reference population {key} is not available"
+            values = trim_quantiles(np.asarray(data)[mask, channel_index[channel]],
+                                    float(gp.get('quantile_trim', 0.001)))
+            if len(values) < MIN_EVENTS:
+                return None, f"reference population {key} has too few events"
+            suffix = f'_{axis}' if gate_def.get('gate_type') == '2dsep' else ''
+            calc = crop_to_region(values, float(gp.get(f'axis_lo{suffix}', 0.01)),
+                                  float(gp.get(f'axis_hi{suffix}', 0.99)))
+            if len(calc) < MIN_EVENTS:
+                calc = values
+            params = {'tail_fraction': gp.get(f'tail_fraction{suffix}', gp.get('tail_fraction', 0.01)),
+                      'mixture_components': gp.get(f'mixture_components{suffix}',
+                                                   gp.get('mixture_components', 2))}
+            algo = src.get('algorithm') if src.get('algorithm') in THRESHOLD_ALGORITHMS else 'tail'
+            t = compute_threshold(calc, algo, params)
+        gp[f'fixed_threshold_{axis}'] = float(t)
+    return out, ''
+
+
 # ---------------------------------------------------------------------------
 # Gate application
 # ---------------------------------------------------------------------------
 
+def _edge_clamped(values: np.ndarray, limits) -> np.ndarray:
+    """*values* with off-scale events moved just inside the display limits,
+    where the plots draw them."""
+    if limits is None or len(limits) < 2:
+        return values
+    lo, hi = float(limits[0]), float(limits[1])
+    if not hi > lo:
+        return values
+    eps = 1e-6 * (hi - lo)
+    return np.clip(values, lo + eps, hi - eps)
+
 def population_masks(gate_def: dict, boundary: dict, data: np.ndarray,
-                     channel_index: dict) -> dict[str, np.ndarray]:
+                     channel_index: dict, axis_limits: dict | None = None) -> dict[str, np.ndarray]:
     """Boolean masks over *data* rows for each population of one gate.
 
     *gate_def* must be the effective definition (see effective_gate_def).
+    axis_limits : {channel: (lo, hi)} display limits; polygons and ranges
+                  test off-scale events on the axis edge (see the module
+                  notes). Thresholds are open-ended and ignore them.
     Returns {} when a channel is missing or the boundary is empty.
     """
     if not boundary:
@@ -824,8 +1121,9 @@ def population_masks(gate_def: dict, boundary: dict, data: np.ndarray,
     chans = gate_channels(gate_def)
     if any(ch not in channel_index for ch in chans):
         return {}
+    limits = axis_limits or {}
     if is_shape_boundary(boundary):
-        return _shape_masks(boundary, data, channel_index)
+        return _shape_masks(boundary, data, channel_index, limits)
     gate_type = gate_def.get('gate_type')
     n = len(data)
     x = data[:, channel_index[chans[0]]] if chans else np.zeros(n)
@@ -855,31 +1153,36 @@ def population_masks(gate_def: dict, boundary: dict, data: np.ndarray,
         return masks
 
     from matplotlib.path import Path as MplPath
+    x = _edge_clamped(x, limits.get(chans[0])) if chans else x
+    y = (_edge_clamped(data[:, channel_index[chans[1]]], limits.get(chans[1]))
+         if len(chans) > 1 else None)
     for pop, entry in boundary.items():
         rng = entry.get('range')
         if rng is not None and len(chans) == 1:
             masks[pop] = (x >= float(rng[0])) & (x <= float(rng[1]))
             continue
         coords = np.asarray(entry.get('boundary') or [], dtype=float)
-        if coords.ndim != 2 or coords.shape[0] < 3 or len(chans) < 2:
+        if coords.ndim != 2 or coords.shape[0] < 3 or y is None:
             masks[pop] = np.zeros(n, dtype=bool)
             continue
-        pts = np.column_stack([x, data[:, channel_index[chans[1]]]])
-        masks[pop] = MplPath(coords).contains_points(pts)
+        masks[pop] = MplPath(coords).contains_points(np.column_stack([x, y]))
     return masks
 
 
-def _shape_masks(boundary: dict, data: np.ndarray, channel_index: dict) -> dict[str, np.ndarray]:
+def _shape_masks(boundary: dict, data: np.ndarray, channel_index: dict,
+                 axis_limits: dict | None = None) -> dict[str, np.ndarray]:
     """Masks of shapes as drawn: inside each polygon, or within each range,
-    on the entry's own ``shape_channels``. {} when a channel is missing."""
+    on the entry's own ``shape_channels``, with off-scale events on the
+    axis edge (see population_masks). {} when a channel is missing."""
     from matplotlib.path import Path as MplPath
+    limits = axis_limits or {}
     n = len(data)
     masks: dict[str, np.ndarray] = {}
     for pop, entry in boundary.items():
         chans = [c for c in entry['shape_channels'] if c]
         if any(c not in channel_index for c in chans):
             return {}
-        x = data[:, channel_index[chans[0]]]
+        x = _edge_clamped(data[:, channel_index[chans[0]]], limits.get(chans[0]))
         if len(chans) == 1:
             rng = entry.get('range')
             masks[pop] = ((x >= float(rng[0])) & (x <= float(rng[1]))
@@ -889,8 +1192,8 @@ def _shape_masks(boundary: dict, data: np.ndarray, channel_index: dict) -> dict[
         if coords.ndim != 2 or coords.shape[0] < 3:
             masks[pop] = np.zeros(n, dtype=bool)
             continue
-        pts = np.column_stack([x, data[:, channel_index[chans[1]]]])
-        masks[pop] = MplPath(coords).contains_points(pts)
+        y = _edge_clamped(data[:, channel_index[chans[1]]], limits.get(chans[1]))
+        masks[pop] = MplPath(coords).contains_points(np.column_stack([x, y]))
     return masks
 
 
@@ -921,6 +1224,10 @@ def boundary_drift(gate_def: dict, boundary: dict, reference: dict) -> float | N
     return max(shifts) if shifts else None
 
 
+class GatingStopped(Exception):
+    """Raised by run_gating when its stop_check asks it to stop."""
+
+
 @dataclass
 class GatingResult:
     """Outcome of running a gate hierarchy on one event array.
@@ -946,7 +1253,8 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
                default_mode: str = MODE_FIXED,
                drift_limit: float = DEFAULT_DRIFT_LIMIT,
                drift_action: str = 'flag',
-               axis_limits: dict | None = None) -> GatingResult:
+               axis_limits: dict | None = None,
+               stop_check=None) -> GatingResult:
     """Run a gate hierarchy on one transformed event array.
 
     Without *reference* every gate is calculated from the data (training).
@@ -957,6 +1265,8 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
     ``drift_action='reference'`` a flagged gate uses the reference instead.
 
     Each gate is applied to its parent population only, in hierarchy order.
+    *stop_check*, when given, is called before each gate; when it returns
+    True the run stops by raising GatingStopped.
     """
     data = np.asarray(data)
     n = len(data)
@@ -967,6 +1277,8 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
     root = np.ones(n, dtype=bool)
 
     for gate_def in ordered_gate_defs(gate_defs):
+        if stop_check is not None and stop_check():
+            raise GatingStopped()
         name = gate_def['gate_name']
         eff = effective_gate_def(gate_def, by_name)
         parent_gate = gate_def.get('parent_gate')
@@ -995,8 +1307,13 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
                 status['message'] = 'no stored boundary'
         else:
             try:
-                boundary = calc.calculate(parent_data, eff, channel_index,
-                                          trained=result.boundaries, by_name=by_name)
+                resolved, reason = resolve_replicates(eff, data, channel_index, result, by_name)
+                if resolved is None:
+                    status['message'] = reason
+                    boundary = {}
+                else:
+                    boundary = calc.calculate(parent_data, resolved, channel_index,
+                                              trained=result.boundaries, by_name=by_name)
             except Exception as exc:
                 log.warning("gate %s: calculation failed: %s", name, exc)
                 status['message'] = str(exc)
@@ -1024,7 +1341,8 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
         result.status[name] = status
         if not boundary:
             continue
-        masks_parent = population_masks(eff, boundary, parent_data, channel_index)
+        masks_parent = population_masks(eff, boundary, parent_data, channel_index,
+                                        axis_limits=calc.axis_limits)
         if not masks_parent:
             status['flag'] = status['flag'] or 'failed'
             status['message'] = status['message'] or 'gate channels not in the data'
@@ -1354,6 +1672,18 @@ def remap_model(model: dict, dst_params: dict,
     return out, messages
 
 
+def gates_on_channel(gate_defs: list[dict], boundaries: dict, channel: str) -> set:
+    """Names of the gates whose definition, imported shapes or stored
+    boundary use *channel*."""
+    by_name = gates_by_name(gate_defs)
+    out = {g['gate_name'] for g in gate_defs
+           if channel in referenced_channels(effective_gate_def(g, by_name))}
+    for name, entries in (boundaries or {}).items():
+        if any(channel in ((e or {}).get('shape_channels') or []) for e in (entries or {}).values()):
+            out.add(name)
+    return out
+
+
 def remap_channel_transform(gate_defs: list[dict], trained_boundaries: dict, channel: str,
                             old_params: dict, new_params: dict,
                             transform_factory=make_transform,
@@ -1371,13 +1701,15 @@ def remap_channel_transform(gate_defs: list[dict], trained_boundaries: dict, cha
     if not old_params or not new_params or same_transform(old_params, new_params):
         return False
     src, dst = {channel: old_params}, {channel: new_params}
-    converted, _ = remap_boundaries(gate_defs, trained_boundaries, src, dst,
-                                    transform_factory=transform_factory,
+    names = gates_on_channel(gate_defs, trained_boundaries, channel)
+    converted, _ = remap_boundaries(gate_defs,
+                                    {n: trained_boundaries[n] for n in names if n in trained_boundaries},
+                                    src, dst, transform_factory=transform_factory,
                                     points_per_edge=points_per_edge)
-    trained_boundaries.clear()
     trained_boundaries.update(converted)
     for key in ('template', 'template_original'):
-        templates = {g['gate_name']: g[key] for g in gate_defs if g.get(key)}
+        templates = {g['gate_name']: g[key] for g in gate_defs
+                     if g.get(key) and g['gate_name'] in names}
         if not templates:
             continue
         converted, _ = remap_boundaries(gate_defs, templates, src, dst,
@@ -1528,11 +1860,39 @@ def normalize_model(model: dict) -> tuple[dict, list[str]]:
     for g in gate_defs:
         if modes.get(g['gate_name']) not in APPLICATION_MODES:
             modes[g['gate_name']] = app['default_mode']
+    retired = migrate_retired_algorithms(gate_defs, m['trained_boundaries'])
+    if retired:
+        warnings.append(
+            "The 'ellipse' algorithm is no longer offered; these gates now use 'cells' "
+            "and their stored ellipses were converted to 10-vertex polygons (train again "
+            "to calculate them with 'cells'): " + ", ".join(retired))
     untrained = [g['gate_name'] for g in gate_defs
                  if g['gate_name'] not in m['trained_boundaries']]
     if untrained:
         warnings.append("Untrained gate(s): " + ", ".join(untrained))
     return m, warnings
+
+
+def migrate_retired_algorithms(gate_defs: list[dict], boundaries: dict) -> list[str]:
+    """Replace the retired 'ellipse' algorithm with 'cells', in place, and
+    turn the stored ellipses of those gates into 10-vertex polygons of the
+    same area. Returns the names of the gates changed."""
+    changed = []
+    for g in gate_defs:
+        hit = False
+        if g.get('algorithm') == 'ellipse':
+            g['algorithm'] = 'cells'
+            hit = True
+            for entry in (boundaries.get(g['gate_name']) or {}).values():
+                coords = entry.get('boundary')
+                if coords and len(coords) > ELLIPSE_VERTICES + 1:
+                    entry['boundary'] = ellipse_as_polygon(coords)
+        if g.get('proposed_algorithm') == 'ellipse':
+            g['proposed_algorithm'] = 'cells'
+            hit = True
+        if hit:
+            changed.append(g['gate_name'])
+    return changed
 
 
 def read_model(path) -> tuple[dict, list[str]]:

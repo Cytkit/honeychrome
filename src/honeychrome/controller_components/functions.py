@@ -3,7 +3,7 @@ import numpy as np
 import struct
 from copy import deepcopy
 from flowio.exceptions import FCSParsingError
-from flowkit import Sample, QuadrantDivider, Dimension, gates
+from flowkit import GatingStrategy, Sample, QuadrantDivider, Dimension, gates
 from PySide6.QtCore import QSettings
 from queue import Empty
 from time import perf_counter
@@ -1159,6 +1159,69 @@ def define_ellipse_gate(pos, size, angle, channel_x, channel_y, transformations)
     # print(transformations[channel_y].limits)
 
     return dim_x, dim_y, coordinates, covariance_matrix, distance_square
+
+
+def gate_lookup_tables(gate, gate_name: str, transformations: dict) -> dict:
+    """
+    Rasterise one gate's boundary onto the bin grid of its channels'
+    transforms: ``{name: bool array}``, one entry for an ordinary gate and
+    one per quadrant for a quadrant gate. Each array is the gate membership
+    of the bin centres of ``transform.scale`` (row-major over x then y for
+    two channels), which ``apply_gates_in_place`` indexes with each event's
+    bin. The table depends only on the gate geometry and the transforms, not
+    on any events, so it can be applied to any data in the same channels.
+
+    ``gate`` is the effective gate to rasterise (a sample's custom gate or
+    the template); ``transformations`` maps channel names to Honeychrome
+    ``Transform`` objects.
+    """
+    import honeychrome.settings as hc_settings
+
+    channels = gate.get_dimension_ids()
+    temp_gating_strategy = GatingStrategy()
+
+    if gate.gate_type == 'QuadrantGate':
+        xchan = gate.dimensions[0].dimension_ref
+        ychan = gate.dimensions[1].dimension_ref
+        channels = [xchan, ychan]
+        transform_x = transformations[xchan]
+        transform_y = transformations[ychan]
+        unit_2d = np.ones((hc_settings.hist_bins_retrieved + 1, hc_settings.hist_bins_retrieved + 1), dtype=np.bool_)
+        mask_ones_2d = np.nonzero(unit_2d)
+        mask_coords = np.column_stack((transform_x.scale[mask_ones_2d[0] + 1], transform_y.scale[mask_ones_2d[1] + 1]))
+        temp_gating_strategy.add_gate(gate, gate_path=('root',))
+        temp_gating_strategy.transformations[xchan] = transform_x.xform
+        temp_gating_strategy.transformations[ychan] = transform_y.xform
+        for divider in gate.dimensions:
+            # stale transformation_ref values point at the divider's own channel transform
+            if divider.transformation_ref and divider.transformation_ref not in (xchan, ychan):
+                temp_gating_strategy.transformations[divider.transformation_ref] = \
+                    transformations[divider.dimension_ref].xform
+    else:
+        if len(channels) == 1:
+            transform_x = transformations[channels[0]]
+            unit_1d = np.ones(transform_x.scale_bins + 1, dtype=np.bool_)
+            mask_coords = transform_x.scale[np.nonzero(unit_1d)[0] + 1]
+        else:
+            transform_x = transformations[channels[0]]
+            transform_y = transformations[channels[1]]
+            unit_2d = np.ones((transform_x.scale_bins + 1, transform_y.scale_bins + 1), dtype=np.bool_)
+            mask_ones_2d = np.nonzero(unit_2d)
+            mask_coords = np.column_stack((transform_x.scale[mask_ones_2d[0] + 1],
+                                           transform_y.scale[mask_ones_2d[1] + 1]))
+        temp_gating_strategy.add_gate(gate, gate_path=('root',))
+        for channel in gate.dimensions:
+            xform = transformations[channel.id].xform
+            temp_gating_strategy.transformations[channel.id] = xform
+            # stale transformation_ref values point at the channel's own transform
+            if channel.transformation_ref and channel.transformation_ref != channel.id:
+                temp_gating_strategy.transformations[channel.transformation_ref] = xform
+
+    mask_as_fksample = Sample(mask_coords, channel_labels=channels, sample_id='mask_as_fksample')
+    results = temp_gating_strategy.gate_sample(mask_as_fksample, verbose=True)
+    if gate.gate_type == 'QuadrantGate':
+        return {name: results.get_gate_membership(name) for name in gate.quadrants.keys()}
+    return {gate_name: results.get_gate_membership(gate_name)}
 
 
 def apply_gates_in_place(data_for_cytometry_plots, gates_to_calculate=None):

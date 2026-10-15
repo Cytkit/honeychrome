@@ -15,7 +15,9 @@ Sections:
                  boundary and pooled fractions.
   • Statistics — for each comparison of the last statistics run: heatmaps,
                  volcano plots (with their results tables) and the marker
-                 summary.
+                 summary; the sample PCA and the predictive analysis (ROC
+                 with AUC, most informative features, panel size) when
+                 they have been run.
 
 The file name does not end in ``_tab.py``, so the plugin loader does not
 treat it as a tab.
@@ -33,7 +35,11 @@ from drc_report import ReportItem
 SECTIONS = ('Samples', 'Gates', 'Statistics')
 
 __all__ = ['SECTIONS', 'pooled_display', 'boundary_fractions', 'label_position',
-           'make_gate_figure', 'population_frequency_table', 'sample_table', 'build_report_items']
+           'make_gate_figure', 'population_frequency_table', 'sample_table', 'build_report_items',
+           'make_pca_figure', 'make_roc_figure', 'make_importance_figure', 'make_panel_figure',
+           'predictive_subtitle']
+
+_GROUP_COLOURS = ('#4477AA', '#EE6677', '#228833', '#CCBB44', '#66CCEE', '#AA3377', '#BBBBBB')
 
 
 def pooled_display(display: dict, samples: list[str], gate_name: str):
@@ -78,8 +84,11 @@ def boundary_fractions(gate_def: dict, boundary: dict, events: np.ndarray | None
         return {}
     data = np.column_stack([_apply(transforms.get(ch), events[mask, channels.index(ch)])
                             for ch in gate_chans])
+    limits = {ch: tuple(transforms[ch].limits) for ch in gate_chans
+              if getattr(transforms.get(ch), 'limits', None) is not None}
     masks = ag_core.population_masks(gate_def, boundary, data,
-                                     {ch: i for i, ch in enumerate(gate_chans)})
+                                     {ch: i for i, ch in enumerate(gate_chans)},
+                                     axis_limits=limits)
     return {pop: float(m.mean()) for pop, m in masks.items()}
 
 
@@ -229,7 +238,10 @@ def population_frequency_table(summaries: dict, samples: list[str], labels: dict
     """Samples × populations, % of each population's parent."""
     rows = {}
     for s in samples:
-        rows[s] = {labels.get(r['key'], r['key']): 100.0 * r['fraction_of_parent']
+        # An empty parent's fraction is stored as None (JSON has no NaN).
+        rows[s] = {labels.get(r['key'], r['key']):
+                   100.0 * r['fraction_of_parent'] if r.get('fraction_of_parent') is not None
+                   else float('nan')
                    for r in (summaries.get(s) or {}).get('populations', [])}
     df = pd.DataFrame.from_dict(rows, orient='index')
     df.index.name = 'sample'
@@ -257,8 +269,12 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
                        groups: dict, flags: dict, antigens: dict, transforms: dict,
                        axis_labels: dict, stats: dict | None, pval_threshold: float,
                        fc_threshold: float, marker_threshold: float, fdr_scope: str,
-                       build_figures) -> list[ReportItem]:
+                       build_figures, pca: dict | None = None,
+                       predictive: dict | None = None) -> list[ReportItem]:
     """Every available report item, in section order.
+
+    pca        : ag_results.sample_pca() result, or None.
+    predictive : drc_predictive.run_predictive() result, or None.
 
     build_figures : callable(stats, base, other, pval, fc, marker, fdr_scope,
                     is_dark, antigens, pop_labels) -> {key: {'fig', 'title',
@@ -348,4 +364,182 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
                 items.append(ReportItem(key=f'{key}:{label}', tab='Statistics',
                                         label=f"{title}: {label}", get_figure=_fig,
                                         get_tables=get_tables))
+    if pca:
+        items.append(ReportItem(
+            key='sample_pca', tab='Statistics', label='Sample PCA',
+            get_figure=lambda: make_pca_figure(pca, False),
+            get_tables=lambda: {'scores': pca['scores'].assign(group=pca['groups']),
+                                'loadings': pca['loadings']}))
+    if predictive:
+        summary = predictive['summary']
+        what = f"{summary['positive']} vs {summary['negative']}"
+        items.append(ReportItem(
+            key='pred_roc', tab='Statistics', label=f"Predictive ROC: {what}",
+            get_figure=lambda: make_roc_figure(predictive['performance'], predictive['roc'],
+                                               summary, False),
+            get_tables=lambda: {'performance': predictive['performance']}))
+        items.append(ReportItem(
+            key='pred_features', tab='Statistics', label=f"Predictive features: {what}",
+            get_figure=lambda: make_importance_figure(predictive['importance'], summary, False),
+            get_tables=lambda: {'importance': predictive['importance']}))
+        items.append(ReportItem(
+            key='pred_panel', tab='Statistics', label=f"Predictive panel size: {what}",
+            get_figure=lambda: make_panel_figure(predictive['panel'], summary, False),
+            get_tables=lambda: {'panel': predictive['panel']}))
     return items
+
+
+# ---------------------------------------------------------------------------
+# Sample PCA and predictive analysis figures
+# ---------------------------------------------------------------------------
+
+def _group_colours(groups: list[str]) -> dict:
+    order = list(dict.fromkeys(groups))
+    return {g: _GROUP_COLOURS[i % len(_GROUP_COLOURS)] for i, g in enumerate(order)}
+
+
+def make_pca_figure(pca: dict, is_dark: bool, sample_labels: dict | None = None,
+                    show_loadings: bool = True, label_points: bool = False):
+    """Samples on PC1 × PC2 coloured by group, with the top loadings as
+    arrows; hovering names a sample or loading (fig._hover_handler)."""
+    from matplotlib.figure import Figure
+    from honeychrome.view_components import differential_plots as dp
+
+    fig = Figure(figsize=(6, 6), constrained_layout=True)
+    ax = fig.add_subplot(111)
+    fg = 'white' if is_dark else 'black'
+    scores, loadings, groups = pca['scores'], pca['loadings'], pca['groups']
+    colours = _group_colours(groups)
+    names = [(sample_labels or {}).get(s, str(s).replace('\\', '/').rsplit('/', 1)[-1])
+             for s in scores.index]
+    for grp, colour in colours.items():
+        mask = np.array([g == grp for g in groups])
+        ax.scatter(scores['PC1'].values[mask], scores['PC2'].values[mask], s=60, color=colour,
+                   edgecolors=fg, linewidths=0.4, label=grp or 'no group', zorder=3)
+    hover_xy = list(zip(scores['PC1'].values, scores['PC2'].values))
+    hover_labels = list(names)
+    if label_points:
+        for x, y, name in zip(scores['PC1'].values, scores['PC2'].values, names):
+            ax.annotate(name, xy=(x, y), xytext=(4, 4), textcoords='offset points',
+                        fontsize=6, color=fg, zorder=5)
+    if show_loadings and len(loadings):
+        score_max = max(float(scores[['PC1', 'PC2']].abs().values.max()), 1e-6)
+        load_max = max(float(loadings[['PC1', 'PC2']].abs().values.max()), 1e-12)
+        ends = loadings[['PC1', 'PC2']].values * (0.8 * score_max / load_max)
+        for feat, (x, y) in zip(loadings.index, ends):
+            ax.annotate('', xy=(x, y), xytext=(0, 0),
+                        arrowprops=dict(arrowstyle='-|>', color='#7fa7c9', lw=1.1), zorder=4)
+            ax.annotate(str(feat), xy=(x, y), xytext=(3, 3), textcoords='offset points',
+                        fontsize=6, color=fg, zorder=5)
+            for t in np.linspace(0.2, 1.0, 6):
+                hover_xy.append((x * t, y * t))
+                hover_labels.append(str(feat))
+        all_x = np.concatenate([scores['PC1'].values, ends[:, 0], [0.0]])
+        all_y = np.concatenate([scores['PC2'].values, ends[:, 1], [0.0]])
+        pad_x = max(float(np.ptp(all_x)), 1e-6) * 0.15
+        pad_y = max(float(np.ptp(all_y)), 1e-6) * 0.15
+        ax.set_xlim(all_x.min() - pad_x, all_x.max() + pad_x)
+        ax.set_ylim(all_y.min() - pad_y, all_y.max() + pad_y)
+    hover = np.asarray(hover_xy, dtype=float)
+    overlay = ax.scatter(hover[:, 0], hover[:, 1], s=120, alpha=0, zorder=6)
+    fig._hover_handler = dp.make_scatter_hover_handler(fig, ax, overlay, hover_labels, is_dark)
+    ax.axhline(0, color='grey', linestyle='--', linewidth=0.6, zorder=1)
+    ax.axvline(0, color='grey', linestyle='--', linewidth=0.6, zorder=1)
+    ev = pca['explained_variance_ratio']
+    ax.set_xlabel(f"PC1 ({ev[0] * 100:.1f}% variance)")
+    ax.set_ylabel(f"PC2 ({ev[1] * 100:.1f}% variance)")
+    ax.set_title(f"Sample PCA ({' + '.join(pca['sources'])})", fontsize=10)
+    ax.legend(fontsize=7, loc='best')
+    dp.style_figure_theme(fig, is_dark)
+    return fig
+
+
+def predictive_subtitle(summary: dict) -> str:
+    import drc_predictive
+    n = ", ".join(f"{g} n={k}" for g, k in summary['n_per_group'].items())
+    text = (f"{summary['positive']} vs {summary['negative']} ({n}); "
+            f"{summary['repeats']}× repeated {summary['outer_folds']}-fold CV")
+    if summary.get('status') == 'warn':
+        text += (f"\nfewer than {drc_predictive.RECOMMENDED_PER_GROUP} per group: "
+                 "estimates are noisy")
+    return text
+
+
+def make_roc_figure(performance: pd.DataFrame, roc: pd.DataFrame, summary: dict, is_dark: bool):
+    """Mean cross-validated ROC curve per model; AUC ± SD and balanced
+    accuracy over the repeats in the legend."""
+    from matplotlib.figure import Figure
+    from honeychrome.view_components import differential_plots as dp
+
+    fig = Figure(figsize=(5.5, 5), constrained_layout=True)
+    ax = fig.add_subplot(111)
+    ax.plot([0, 1], [0, 1], color='grey', linestyle='--', linewidth=0.8)
+    for _i, row in performance.iterrows():
+        curve = roc[roc['model'] == row['model']]
+        ax.plot(curve['fpr'], curve['tpr'], linewidth=1.6,
+                label=(f"{row['model']}: AUC {row['auc_mean']:.2f} ± {row['auc_sd']:.2f}, "
+                       f"bal. acc. {row['balanced_accuracy_mean']:.2f}"))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1.02)
+    ax.set_xlabel("False positive rate")
+    ax.set_ylabel("True positive rate")
+    ax.legend(loc='lower right', fontsize=7)
+    ax.set_title(f"Cross-validated ROC\n{predictive_subtitle(summary)}", fontsize=9)
+    dp.style_figure_theme(fig, is_dark)
+    return fig
+
+
+def make_importance_figure(importance: pd.DataFrame, summary: dict, is_dark: bool,
+                           top_n: int = 20):
+    """The most informative features: lasso selection frequency and/or
+    forest importance, coloured by the group with the higher value."""
+    from matplotlib.figure import Figure
+    import matplotlib.patches as mpatches
+    from honeychrome.view_components import differential_plots as dp
+
+    metrics = [(c, lbl) for c, lbl in (
+        ('lasso_selection', 'Lasso: fraction of fits selecting'),
+        ('forest_importance', 'Random forest: mean importance'),
+    ) if c in importance.columns]
+    top = importance.head(top_n).iloc[::-1]
+    colours = ['#EE6677' if d > 0 else '#4477AA' for d in top['direction']]
+    fig = Figure(figsize=(4.5 * max(1, len(metrics)) + 2.5, max(3.5, 0.28 * len(top) + 1.8)),
+                 constrained_layout=True)
+    for i, (col, label) in enumerate(metrics):
+        ax = fig.add_subplot(1, len(metrics), i + 1)
+        xerr = top['forest_importance_sd'] if col == 'forest_importance' else None
+        ax.barh(range(len(top)), top[col], color=colours, xerr=xerr, error_kw={'elinewidth': 0.6})
+        ax.set_yticks(range(len(top)))
+        ax.set_yticklabels(top['feature'] if i == 0 else [''] * len(top), fontsize=7)
+        ax.set_xlabel(label, fontsize=8)
+    fig.legend(handles=[
+        mpatches.Patch(color='#EE6677', label=f"higher in {summary['positive']}"),
+        mpatches.Patch(color='#4477AA', label=f"higher in {summary['negative']}"),
+    ], loc='outside lower center', ncol=2, fontsize=7)
+    fig.suptitle(f"Most informative features\n{predictive_subtitle(summary)}", fontsize=9)
+    dp.style_figure_theme(fig, is_dark)
+    return fig
+
+
+def make_panel_figure(panel: pd.DataFrame, summary: dict, is_dark: bool):
+    """Cross-validated AUC against the number of top-ranked features."""
+    from matplotlib.figure import Figure
+    from honeychrome.view_components import differential_plots as dp
+
+    fig = Figure(figsize=(5.5, 4.5), constrained_layout=True)
+    ax = fig.add_subplot(111)
+    x, m, sd = panel['n_features'].values, panel['auc_mean'].values, panel['auc_sd'].values
+    ax.fill_between(x, m - sd, m + sd, alpha=0.25)
+    ax.plot(x, m, marker='o', markersize=3, linewidth=1.4)
+    ax.axhline(0.5, color='grey', linestyle='--', linewidth=0.8)
+    ax.axvline(summary['minimal_panel'], color='grey', linestyle=':', linewidth=1.0)
+    ax.annotate(f"minimal panel: {summary['minimal_panel']}", xy=(summary['minimal_panel'], 0.5),
+                xytext=(4, 4), textcoords='offset points', fontsize=7)
+    if len(x) > 1:
+        ax.set_xscale('log')
+    ax.set_xlabel("Number of top-ranked features (log scale)")
+    ax.set_ylabel("Cross-validated AUC (mean ± SD)")
+    ax.set_ylim(0, 1.02)
+    ax.set_title(f"How many features are needed?\n{predictive_subtitle(summary)}", fontsize=9)
+    dp.style_figure_theme(fig, is_dark)
+    return fig

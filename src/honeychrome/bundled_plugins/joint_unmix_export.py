@@ -292,6 +292,9 @@ class JointUnmixExporter(QObject):
     channel) and its AF library before the first chunk, for estimates that
     need the whole sample.
 
+    ``sample_keywords(sample_path)``, when given, returns FCS keywords for
+    that sample's file only; they are written over ``extra_keywords``.
+
     Each file is read, unmixed and written ``chunk_size`` events at a time
     (FcsEventReader, export_unmixed_sample_stream), so memory use does not
     grow with file size, except while ``prepare_fn`` holds a whole sample.
@@ -304,7 +307,7 @@ class JointUnmixExporter(QObject):
                  extra_channels=(), output_root=None, name_suffix: str = '',
                  unmixing_method: str = 'AutoSpectral Optimization',
                  extra_keywords: dict | None = None, chunk_size: int = UNMIX_CHUNK_SIZE,
-                 sample_done=None, prepare_fn=None):
+                 sample_done=None, prepare_fn=None, sample_keywords=None):
         super().__init__()
         self.sample_paths = list(sample_paths)
         self.layout = layout
@@ -318,6 +321,7 @@ class JointUnmixExporter(QObject):
         self.chunk_size = int(chunk_size)
         self.sample_done = sample_done
         self.prepare_fn = prepare_fn
+        self.sample_keywords = sample_keywords
 
     def _export_pnn(self) -> list:
         export_pnn = list(self.layout.pnn_unmixed)
@@ -410,6 +414,9 @@ class JointUnmixExporter(QObject):
                     output_folder = self._output_folder(sample_path)
                     output_folder.mkdir(parents=True, exist_ok=True)
                     sample_name = layout.all_samples.get(sample_path, Path(sample_path).stem)
+                    keywords = dict(self.extra_keywords or {})
+                    if self.sample_keywords is not None:
+                        keywords.update(self.sample_keywords(sample_path) or {})
 
                     export_unmixed_sample_stream(
                         sample_name=f'{sample_name}{self.name_suffix}',
@@ -430,7 +437,7 @@ class JointUnmixExporter(QObject):
                         unmixing_weights=None,
                         af_index_map=af.index_map,
                         n_af_index=layout.n_af_index,
-                        extra_keywords=self.extra_keywords,
+                        extra_keywords=keywords or None,
                     )
                 finally:
                     reader.close()
