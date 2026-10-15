@@ -170,6 +170,9 @@ class ReportGenerator(QObject):
                     f"Sample: {str(current_sample_path)}\n"
                     f"Event count: {current_sample.event_count}\n"
                     f'Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}\n')
+            if self.controller.raw_event_data is not None and len(self.controller.raw_event_data) < current_sample.event_count:
+                # Subset note after Joan Escrivà Font's pull request #16
+                desc += f'Displayed events: {len(self.controller.raw_event_data):,} (random subset); plotted gates and statistics use this subset.\n'
             try:
                 desc += f"Sample acquired: {current_sample.get_metadata()['date']}; begin time: {current_sample.get_metadata()['btim']}; end time: {current_sample.get_metadata()['etim']}"
             except:
