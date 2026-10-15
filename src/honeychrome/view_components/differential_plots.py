@@ -13,6 +13,8 @@ can be built on a worker thread and embedded later (e.g. in
   bars and a hover tooltip on significant points.
 * ``make_marker_summary_figure`` — population (or cluster) × marker grid of
   intensity differences, significant markers marked with a dot.
+* ``make_comparison_heatmap_figure`` — comparison × feature grid of effect
+  sizes, coloured only where significant: every comparison of a run at once.
 
 Hover tooltips need a canvas: a figure builder stores its handler as
 ``fig._hover_handler``; connect it with
@@ -31,7 +33,7 @@ import pandas as pd
 __all__ = [
     'style_figure_theme', 'make_scatter_hover_handler', 'stamp_run_label',
     'message_figure', 'make_heatmap_figure', 'make_volcano_figure',
-    'make_marker_summary_figure', 'significance_column',
+    'make_marker_summary_figure', 'make_comparison_heatmap_figure', 'significance_column',
     'wrap_label', 'text_width_inches',
 ]
 
@@ -522,6 +524,93 @@ def make_marker_summary_figure(results_df: pd.DataFrame, title: str, channel_nam
     cb.set_label(value_label, fontsize=7)
     cb.ax.tick_params(labelsize=7)
     ax.set_title(title, fontsize=10)
+    style_figure_theme(fig, is_dark)
+    stamp_run_label(fig, run_label)
+    return fig
+
+
+def make_comparison_heatmap_figure(results_df: pd.DataFrame, title: str, is_dark: bool = False,
+                                   run_label: str = '', order: str = 'effect', n_rows: int = 1,
+                                   value_label: str = 'log2 fold change',
+                                   feature_labels: dict | None = None,
+                                   comparison_order: list[str] | None = None,
+                                   show_all: bool = False):
+    """
+    Comparison × feature heatmap of effect sizes across every comparison
+    of a results table. A cell is coloured by ``logFC`` where the feature
+    is significant in that comparison and left white (0) otherwise, so the
+    grid shows the same hits as the volcano plots. Diverging colours
+    centred on 0, limits ± the largest |logFC| shown.
+
+    results_df       : stacked results with 'feature', 'comparison', 'logFC'
+                       and 'significant' (``apply_significance`` output).
+    order            : 'effect' — features ordered by mean coloured logFC
+                       across comparisons, most negative first;
+                       'alphabetical' — by display label.
+    n_rows           : split the features over this many stacked panels
+                       (1–3), for long feature lists.
+    feature_labels   : optional {feature: display label}.
+    comparison_order : optional row order; default first appearance.
+    show_all         : colour every cell by its logFC, significant or not.
+    """
+    import matplotlib
+    from matplotlib.colors import TwoSlopeNorm
+    from matplotlib.figure import Figure
+
+    needed = {'feature', 'comparison', 'logFC', 'significant'}
+    if results_df is None or results_df.empty or not needed.issubset(results_df.columns):
+        return message_figure('Run statistics to see the comparison heatmap', title, is_dark, run_label)
+
+    df = results_df.copy()
+    keep = df['significant'].astype(bool) | bool(show_all)
+    df['value'] = np.where(keep & np.isfinite(df['logFC'].astype(float)), df['logFC'].astype(float), 0.0)
+    grid = df.pivot_table(index='comparison', columns='feature', values='value', aggfunc='first')
+    comparisons = list(comparison_order or dict.fromkeys(df['comparison'].tolist()))
+    comparisons = [c for c in comparisons if c in grid.index]
+    labels = feature_labels or {}
+    features = list(dict.fromkeys(df['feature'].tolist()))
+    if order == 'alphabetical':
+        features.sort(key=lambda f: str(labels.get(f, f)).lower())
+    else:
+        mean_effect = grid.mean(axis=0)
+        features.sort(key=lambda f: (float(mean_effect.get(f, 0.0)), str(labels.get(f, f)).lower()))
+    grid = grid.reindex(index=comparisons, columns=features).fillna(0.0)
+
+    if not (grid.values != 0).any():
+        return message_figure('No significant features at current thresholds', title, is_dark, run_label)
+
+    vmax = float(np.nanmax(np.abs(grid.values)))
+    vmax = vmax if vmax > 0 else 1.0
+    n_rows = int(min(max(1, n_rows), 3, len(features)))
+    per_row = int(np.ceil(len(features) / n_rows))
+    chunks = [features[i * per_row:(i + 1) * per_row] for i in range(n_rows)]
+
+    row_label_w = max(text_width_inches(c, 7) for c in comparisons) + 0.3
+    fig_w = min(max(5.0, per_row * 0.28 + row_label_w + 1.2), 28.0)
+    longest = max(len(str(labels.get(f, f))) for f in features)
+    panel_h = len(comparisons) * 0.32 + min(longest, 30) * 0.055 + 0.3
+    fig = Figure(figsize=(fig_w, max(2.5, panel_h * n_rows + 0.8)), constrained_layout=True)
+    axes = fig.subplots(n_rows, 1, squeeze=False)[:, 0]
+    cmap = matplotlib.colormaps['RdBu_r']
+    norm = TwoSlopeNorm(vcenter=0.0, vmin=-vmax, vmax=vmax)
+    image = None
+    for ax, chunk in zip(axes, chunks):
+        values = grid[chunk].values
+        image = ax.imshow(values, aspect='auto', cmap=cmap, norm=norm, interpolation='nearest')
+        ax.set_xticks(range(len(chunk)))
+        ax.set_xticklabels([str(labels.get(f, f)) for f in chunk], rotation=90, fontsize=7)
+        ax.set_yticks(range(len(comparisons)))
+        ax.set_yticklabels(comparisons, fontsize=7)
+        ax.set_xticks(np.arange(-0.5, len(chunk), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(comparisons), 1), minor=True)
+        ax.grid(which='minor', color='#898989', linestyle='-', linewidth=0.4)
+        ax.tick_params(which='minor', bottom=False, left=False)
+        if len(chunk) < per_row:
+            ax.set_xlim(-0.5, per_row - 0.5)
+    cb = fig.colorbar(image, ax=list(axes), shrink=0.8)
+    cb.set_label(value_label if show_all else f'{value_label} (significant only)', fontsize=7)
+    cb.ax.tick_params(labelsize=7)
+    axes[0].set_title(title, fontsize=10)
     style_figure_theme(fig, is_dark)
     stamp_run_label(fig, run_label)
     return fig
