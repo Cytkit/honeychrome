@@ -34,11 +34,11 @@ import warnings
 from honeychrome.controller_components.functions import (
     sample_from_fcs,
     apply_transfer_matrix,
+    apply_gates_in_place,
     build_display_label_map,
 )
 from honeychrome.controller_components.autospectral_functions import (
     get_af_spectra,
-    precompute_af_matrices,
     apply_af_transfer,
     save_af_profile_csv,
     load_af_profile_csv,
@@ -53,6 +53,7 @@ from honeychrome.controller_components.spread_model import (
     compute_spread_entry,
 )
 from honeychrome.controller_components.transform import Transform
+from honeychrome.controller_components.sample_loader import resolve_af_for_profiles
 from honeychrome.view_components.cytometry_plot_components import (
     InteractiveLabel,
     NoPanViewBox,
@@ -600,12 +601,13 @@ class AfComparisonPlotWidget(QWidget):
     def _compute_gate_mask(self, event_data: np.ndarray) -> np.ndarray | None:
         """
         Compute a per-event boolean mask for self._source_gate applied to
-        event_data, using the controller's unmixed_lookup_tables,
-        unmixed_transformations, and unmixed_gating.
+        event_data, with the controller's unmixed_lookup_tables,
+        unmixed_transformations and unmixed_gating: the gating the main
+        window applies to the displayed sample, whose events these are.
 
-        This replicates the logic of apply_gates_in_place() from functions.py,
-        walking the full gate ancestry so that child gates correctly inherit
-        their parent's membership.
+        The gate and its ancestors are evaluated with apply_gates_in_place,
+        so child gates inherit their parent's membership and quadrants are
+        resolved through their quadrant gate.
 
         Returns None if 'root' is selected or if gating is unavailable.
         Returns a boolean ndarray of length len(event_data) otherwise.
@@ -621,88 +623,33 @@ class AfComparisonPlotWidget(QWidget):
         if gating is None or not lookup_tables or not transforms or not pnn:
             return None
 
-        # Build the full ancestry path to the target gate, root-first
         try:
             paths = gating.find_matching_gate_paths(self._source_gate)
         except Exception:
             return None
         if not paths:
             return None
+        gate_sequence = [g for g in paths[0] if g != 'root'] + [self._source_gate]
 
-        # Ancestry: all gates in the path from root to target (exclusive of
-        # 'root' itself since every event is in root), then the target gate.
-        ancestry_path = list(paths[0])   # e.g. ('root', 'Cells')
-        gate_sequence = [g for g in ancestry_path if g != 'root'] + [self._source_gate]
-        # Deduplicate while preserving order (target may already be last)
-        seen = set()
-        gate_sequence_dedup = []
-        for g in gate_sequence:
-            if g not in seen:
-                seen.add(g)
-                gate_sequence_dedup.append(g)
-
-        n_events = len(event_data)
-        # Start with all-True (every event is in 'root')
-        cumulative_mask = np.ones(n_events, dtype=bool)
-
-        for gate_name in gate_sequence_dedup:
-            if gate_name not in lookup_tables:
-                # Gate not found in lookup tables — skip
-                logger.warning(
-                    f'AfComparisonPlotWidget._compute_gate_mask: '
-                    f'"{gate_name}" not in unmixed_lookup_tables'
-                )
-                return None
-
-            try:
-                gate = gating.get_gate(gate_name)
-                channels = gate.get_dimension_ids()
-
-                if len(channels) == 1:
-                    xchan = channels[0]
-                    if xchan not in pnn:
-                        return None
-                    ix = pnn.index(xchan)
-                    x = event_data[:, ix]
-                    scale_x = transforms[xchan].scale
-                    idx = np.searchsorted(scale_x, x) - 2
-                    lt = lookup_tables[gate_name]
-                    idx = np.clip(idx, 0, len(lt) - 1)
-                    gate_mask = lt[idx]
-
-                else:  # 2-channel gate
-                    if gate.gate_type == 'QuadrantGate':
-                        xchan = gate.dimensions[0].dimension_ref
-                        ychan = gate.dimensions[1].dimension_ref
-                    else:
-                        xchan = channels[0]
-                        ychan = channels[1]
-                    if xchan not in pnn or ychan not in pnn:
-                        return None
-                    ix = pnn.index(xchan)
-                    iy = pnn.index(ychan)
-                    x = event_data[:, ix]
-                    y = event_data[:, iy]
-                    scale_x = transforms[xchan].scale
-                    scale_y = transforms[ychan].scale
-                    idx_x = np.searchsorted(scale_x, x) - 2
-                    idx_y = np.searchsorted(scale_y, y) - 2
-                    bins_x = transforms[xchan].scale_bins + 1
-                    flat_idx = idx_x * bins_x + idx_y
-                    lt = lookup_tables[gate_name]
-                    flat_idx = np.clip(flat_idx, 0, len(lt) - 1)
-                    gate_mask = lt[flat_idx]
-
-                cumulative_mask = cumulative_mask & gate_mask.astype(bool)
-
-            except Exception as e:
-                logger.error(
-                    f'AfComparisonPlotWidget._compute_gate_mask: '
-                    f'error computing mask for "{gate_name}": {e}'
-                )
-                return None
-
-        return cumulative_mask
+        data = {'event_data': event_data, 'pnn': list(pnn), 'transformations': transforms,
+                'lookup_tables': lookup_tables, 'gating': gating,
+                'gate_membership': {'root': np.ones(len(event_data), dtype=bool)}}
+        try:
+            apply_gates_in_place(data, gates_to_calculate=gate_sequence)
+        except Exception as e:
+            logger.error(
+                f'AfComparisonPlotWidget._compute_gate_mask: '
+                f'error computing mask for "{self._source_gate}": {e}'
+            )
+            return None
+        mask = data['gate_membership'].get(self._source_gate)
+        if mask is None:
+            logger.warning(
+                f'AfComparisonPlotWidget._compute_gate_mask: '
+                f'"{self._source_gate}" could not be evaluated on these events'
+            )
+            return None
+        return np.asarray(mask, dtype=bool)
 
     # ------------------------------------------------------------------
     # Internal: zoom (mirrors CytometryPlotWidget.apply_zoom)
@@ -1889,22 +1836,25 @@ class AutoSpectralTab(QWidget):
             self._cmp_status.setText('Fluorophore profiles unavailable.')
             return
 
-        # Use cached precomputed matrices where possible.
-        # For the "assigned" case, controller.af_precomputed is already the
-        # correctly combined result — no recomputation needed.
-        # For a single named profile, use its cached entry if available.
-        if profile_key == '__assigned__' and self.controller.af_precomputed is not None:
-            af_precomputed = self.controller.af_precomputed
-        elif profile_key != '__assigned__' and profile_key in self.controller.af_precomputed_cache:
-            af_precomputed = self.controller.af_precomputed_cache[profile_key]
+        # The AF matrices the main window unmixes with, negative envelope
+        # included: the sample's combined assignment, or the chosen profile
+        # (computed and cached now if it is not cached yet).
+        if profile_key == '__assigned__':
+            assigned = (self.controller.experiment.samples
+                        .get('sample_af_profiles', {})
+                        .get(self.controller.current_sample_path, []))
+            af = resolve_af_for_profiles(self.controller, assigned)
+            af_precomputed = None if af is None else af.precomputed
+            if af is not None:
+                af_spectra, af_index_map = af.spectra, af.index_map
         else:
-            # Fallback: compute now (e.g. profile was just loaded from CSV and
-            # cache hasn't been populated yet, or fluor_spectra changed).
-            try:
-                af_precomputed = precompute_af_matrices(fluor_spectra, af_spectra)
-            except Exception as e:
-                self._cmp_status.setText(f'Precompute error: {e}')
-                return
+            af_precomputed = self.controller.precomputed_for_profile(profile_key)
+        if af_precomputed is None:
+            self._cmp_status.setText(
+                'AF matrices are not available yet for this profile. '
+                'Wait for the spectral process to finish, then run the comparison again.'
+            )
+            return
 
         self._plot_ols.set_status('Computing...')
         self._plot_af.set_status('Computing...')

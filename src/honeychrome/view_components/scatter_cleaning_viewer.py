@@ -370,6 +370,8 @@ class ScatterCleaningViewer(QFrame):
 
     def _draw(self, label: str):
         from honeychrome.controller_components.functions import sample_from_fcs
+        from honeychrome.controller_components.spectral_functions import gate_event_mask
+        from honeychrome.controller_components.spectral_controller import control_gating
 
         self._neg_plot.clear_vb()
         self._pos_plot.clear_vb()
@@ -445,8 +447,9 @@ class ScatterCleaningViewer(QFrame):
                 pos_scatter_all = all_ev[:, [abs_x, abs_y]].astype(float)
                 gate_label = control.get('gate_label')
                 if gate_label and raw_gating.find_matching_gate_paths(gate_label):
-                    mask = raw_gating.gate_sample(
-                        pos_sample).get_gate_membership(gate_label)
+                    # the control sample's own gate (per-sample override included)
+                    mask = gate_event_mask(all_ev, list(pos_sample.pnn_labels), gate_label,
+                                           control_gating(self.controller), pos_rel)
                     pos_scatter_gated = all_ev[mask][:, [abs_x, abs_y]].astype(float)
             except Exception as exc:
                 logger.warning(f'ScatterCleaningViewer: pos load failed for "{label}": {exc}')
