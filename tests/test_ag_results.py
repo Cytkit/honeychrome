@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 _PLUGIN_DIR = Path(__file__).resolve().parents[1] / 'src' / 'honeychrome' / 'bundled_plugins'
@@ -319,3 +320,57 @@ def test_run_statistics_counts_glm_uses_parent_offset():
                             run_freq=False, run_markers=False, run_counts=True, fc_threshold=0.0)
     hi = out['counts'][out['counts']['comparison'] == 'high vs ctrl']
     assert 'T/pos' in set(hi.loc[hi['significant'], 'feature'])
+
+
+# ---------------------------------------------------------------------------
+# Sample tables, sample PCA and predictive features
+# ---------------------------------------------------------------------------
+
+def test_sample_table_matches_names_and_reads_covariates():
+    keys = ['Raw/Plate 1/S1.fcs', 'Raw/Plate 1/S2.fcs', 'Raw/S3.fcs']
+    df = pd.DataFrame({'Sample': ['S1', 's2.FCS', 'Raw/S3.fcs', 'missing'],
+                       'Group': ['A', 'B', '', 'A'], 'donor': ['d1', 'd2', 'd3', 'd4'],
+                       'age': ['30', None, '41', '50']})
+    out = ar.read_sample_table(df, keys)
+    assert out['groups'] == {keys[0]: 'A', keys[1]: 'B'}
+    assert out['covariates']['donor'] == {keys[0]: 'd1', keys[1]: 'd2', keys[2]: 'd3'}
+    assert out['covariates']['age'] == {keys[0]: '30', keys[2]: '41'}
+    assert out['unmatched'] == ['missing']
+    back = ar.read_sample_table(ar.sample_table_frame(keys, out['groups'], out['covariates']), keys)
+    assert back['groups'] == out['groups'] and back['covariates']['donor'] == out['covariates']['donor']
+    with pytest.raises(ValueError):
+        ar.read_sample_table(pd.DataFrame({'x': [1]}), keys)
+
+
+def _stats_for_pca(n=24, seed=0):
+    rng = np.random.default_rng(seed)
+    samples = [f'S{i}' for i in range(n)]
+    groups = ['A'] * (n // 2) + ['B'] * (n - n // 2)
+    freq = pd.DataFrame(rng.normal(10, 1, (n, 5)), index=samples,
+                        columns=[f'g{i}/p' for i in range(5)])
+    freq.iloc[n // 2:, :3] += 6       # three populations move together between groups
+    med = pd.DataFrame(rng.normal(0.5, 0.05, (n, 3)), index=samples,
+                       columns=[ar.marker_feature('g0/p', c) for c in ('PE', 'APC', 'FITC')])
+    return {'samples': samples, 'group_vec': groups, 'freq_values': freq,
+            'counts_values': None, 'marker_values': med}
+
+
+def test_sample_pca_separates_groups_on_the_varying_feature():
+    pytest.importorskip('sklearn')
+    stats = _stats_for_pca()
+    pca = ar.sample_pca(stats, use_freq=True, use_markers=True, n_loadings=2,
+                        labels={'g0/p': 'CD4 T', 'PE': 'CD25'})
+    assert pca['sources'] == ['Freq', 'Median']
+    assert 'Freq: CD4 T' in list(pca['loadings'].index)
+    pc1 = pca['scores']['PC1'].values
+    assert abs(pc1[:12].mean() - pc1[12:].mean()) > 2
+    assert pca['groups'] == stats['group_vec']
+    assert ar.sample_pca(stats, use_freq=False, use_counts=True) is None
+
+
+def test_predictive_matrix_names_features_for_display():
+    stats = _stats_for_pca()
+    X = ar.predictive_matrix(stats, use_freq=True, use_markers=True, labels={'g0/p': 'CD4 T'})
+    assert X.shape == (24, 8)
+    assert 'Freq: CD4 T' in X.columns and 'Median: CD4 T PE' in X.columns
+    assert np.allclose(X['Freq: CD4 T'], np.log2(stats['freq_values']['g0/p'] + 0.01))
