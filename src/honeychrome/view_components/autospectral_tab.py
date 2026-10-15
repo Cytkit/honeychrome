@@ -875,7 +875,7 @@ class AutoSpectralTab(QWidget):
 
         self._som_dim_spin = QSpinBox()
         self._som_dim_spin.setRange(2, 30)
-        self._som_dim_spin.setValue(10)
+        self._som_dim_spin.setValue(15)
         self._som_dim_spin.setToolTip(
             'Side length of the square SOM grid (som.dim in R AutoSpectral); '
             'the grid has som.dim² nodes. KMeans with the same number of '
