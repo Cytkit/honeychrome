@@ -17,9 +17,10 @@ import numpy as np
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QComboBox
 from PySide6.QtCore import Qt
-from honeychrome.controller_components.functions import sample_from_fcs, apply_transfer_matrix
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
-from honeychrome.controller_components.sample_loader import sample_key_for_path
+from honeychrome.controller_components.sample_loader import (
+    sample_key_for_path, snapshot_unmix_state, read_raw_events, unmix_events,
+)
 from honeychrome.view_components.busy_cursor import with_busy_cursor
 from honeychrome.view_components.clear_layout import clear_layout
 from honeychrome.view_components.exportable_plot_widget import ExportablePlotWidget
@@ -222,19 +223,22 @@ class PluginWidget(QWidget):
         # take a copy of the unmixed gating (gates, axis transforms and per-sample gate overrides),
         # so that each sample is gated with its own gates
         sample_gating = SampleGating.from_controller(self.controller)
+        # and of the unmixing state: the transfer matrix and each sample's own AutoSpectral AF
+        # profile assignment, so that each sample is unmixed as the main window unmixes it
+        unmix_snapshot = snapshot_unmix_state(self.controller, include_qc=False)
         pnn = self.controller.data_for_cytometry_plots_unmixed['pnn']
         gated_sample_data_all = []
         for sample_name in source_samples:
             full_sample_path = str(self.controller.experiment_dir / self.controller.experiment.settings['raw']['raw_samples_subdirectory'] / sample_name)
-            # use sample_from_fcs function which is a wrapper around flowkit.Sample to get data regardless of a couple of FCS errors that are present in common instruments
-            sample = sample_from_fcs(full_sample_path)
-            raw_event_data = sample.get_events(source='raw')
-            n_events = sample.event_count
+            sample_key = sample_key_for_path(self.controller.experiment_dir, full_sample_path)
+            # read_raw_events reads the experiment's raw channels in order (with the channel whitelist when set)
+            raw_event_data = read_raw_events(full_sample_path, unmix_snapshot)
+            n_events = len(raw_event_data)
 
             if n_events > 0:
-                # apply unmixing via transfer matrix
-                unmixed_event_data = apply_transfer_matrix(self.controller.transfer_matrix, raw_event_data)
-                sample_key = sample_key_for_path(self.controller.experiment_dir, full_sample_path)
+                # apply unmixing: transfer matrix, with per-cell AF correction when the sample has an AF profile
+                unmixed_event_data = unmix_events(raw_event_data, unmix_snapshot,
+                                                  unmix_snapshot.af_for(sample_key))['unmixed']
                 gated_sample_data = apply_gate(sample_gating, sample_key, unmixed_event_data, pnn, gate_name)
                 gated_sample_data_all.append(gated_sample_data)
                 self.progress_message(f'{datetime.now():%H:%M:%S} Loaded {sample_name}: {len(gated_sample_data)}/{n_events} events within {gate_name}')
@@ -310,13 +314,14 @@ class PluginWidget(QWidget):
                 pnn = self.controller.data_for_cytometry_plots_unmixed['pnn']
 
                 full_sample_path = str(self.controller.experiment_dir / sample_path)
-                sample = sample_from_fcs(full_sample_path)
-                raw_event_data = sample.get_events(source='raw')
-                n_events = sample.event_count
+                sample_key = sample_key_for_path(self.controller.experiment_dir, full_sample_path)
+                unmix_snapshot = snapshot_unmix_state(self.controller, [sample_key], include_qc=False)
+                raw_event_data = read_raw_events(full_sample_path, unmix_snapshot)
+                n_events = len(raw_event_data)
 
                 if n_events > 0:
-                    unmixed_event_data = apply_transfer_matrix(self.controller.transfer_matrix, raw_event_data)
-                    sample_key = sample_key_for_path(self.controller.experiment_dir, full_sample_path)
+                    unmixed_event_data = unmix_events(raw_event_data, unmix_snapshot,
+                                                      unmix_snapshot.af_for(sample_key))['unmixed']
                     gated_sample_data = apply_gate(sample_gating, sample_key, unmixed_event_data, pnn, gate_name)
 
                     self.progress_message(f'{datetime.now():%H:%M:%S} Loaded {sample_path}: {len(gated_sample_data)}/{n_events} events within {gate_name}')
