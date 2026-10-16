@@ -78,7 +78,7 @@ class PlotTracesWidget(QWidget):
                 self.legendLayout1.addWidget(entry)
                 solid_pen = pg.mkPen(color=color, width=1, style=Qt.SolidLine)
 
-                for n in range(len(traces)):
+                for n in range(min(len(traces), 5)):
                     self.plot_widget1.plot(self.x, traces[n,i,:], pen=solid_pen)
 
 class DacChannelTable(QWidget):
