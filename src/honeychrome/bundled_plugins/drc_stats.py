@@ -145,11 +145,13 @@ def missing_covariate_values(state, all_rel: list[str], names: list[str]) -> dic
 
 def covariate_frame(state, all_rel: list[str], names: list[str]) -> pd.DataFrame | None:
     """
-    Adjustment covariates for ``all_rel`` (rows in that order), as strings.
+    Adjustment covariates for ``all_rel`` (rows in that order): the columns
+    in ``state.numeric_covariates`` as floats, the others as strings.
     Returns None when ``names`` is empty. Raises RuntimeError if any sample
-    lacks a value.
+    lacks a value or a numeric covariate has a value that is not a number.
     """
-    return _ds.covariate_frame(state.covariates, all_rel, names)
+    return _ds.covariate_frame(state.covariates, all_rel, names,
+                               numeric=list(state.numeric_covariates))
 
 
 def n_clusters_from_labels(state, all_rel, cluster_labels_override=None) -> int:

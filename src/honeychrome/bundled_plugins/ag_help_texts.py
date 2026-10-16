@@ -293,7 +293,10 @@ AG_RESULTS = '''
 <p>Add groups, give each an optional regular expression matched against the
 sample name, and click <b>Assign by pattern</b>, or choose each sample's group
 by hand. Covariates hold per-sample values: use one to <b>pair</b> samples
-(e.g. donor) or to <b>adjust</b> for (e.g. age, sex, batch). Every group
+(e.g. donor) or to <b>adjust</b> for (e.g. age, sex, batch). Tick
+<b>Numeric</b> under a covariate's title to enter it as a continuous number
+(e.g. age, CRP) with a value for every sample; unticked covariates enter as
+categories, so leave numeric codes such as batch 1, 2, 3 unticked. Every group
 compared needs at least 3 samples.</p>
 <p><b>Import table…</b> reads groups and covariates from a CSV or tab-separated
 file with a <i>sample</i> column (the file name, with or without its

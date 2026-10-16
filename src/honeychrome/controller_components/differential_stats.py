@@ -18,8 +18,8 @@ intensities. Used by the DR/Clustering and Automated Gating plugins.
 
 Every test builds one design matrix: an intercept, one indicator per
 non-baseline group, optional pairing (blocking) levels, and optional
-adjustment covariates — numeric columns enter as centred continuous terms,
-anything else as treatment-coded factors.
+adjustment covariates — columns the caller marks numeric (age, CRP) enter
+as centred continuous terms, all others as treatment-coded factors.
 
 Frequency scales:
 
@@ -36,6 +36,7 @@ threshold change re-derives p-values and significance without refitting.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -240,7 +241,8 @@ def _is_numeric_column(values) -> bool:
 
 
 def covariate_kind(values) -> str:
-    """'numeric' when every filled value is a number, else 'categorical'."""
+    """'numeric' when every filled value is a number (so the column can be
+    used as a continuous covariate), else 'categorical'."""
     return 'numeric' if _is_numeric_column(values) else 'categorical'
 
 
@@ -265,11 +267,18 @@ def missing_covariate_values(covariates: pd.DataFrame | None, sample_ids: list[s
 
 
 def covariate_frame(covariates: pd.DataFrame | None, sample_ids: list[str],
-                    names: list[str]) -> pd.DataFrame | None:
+                    names: list[str],
+                    numeric: Iterable[str] | None = None) -> pd.DataFrame | None:
     """
-    Adjustment covariates for ``sample_ids`` (rows in that order), as
-    strings. Returns None when ``names`` is empty. Raises RuntimeError if
-    any sample lacks a value.
+    Adjustment covariates for ``sample_ids`` (rows in that order). Columns
+    named in ``numeric`` are returned as floats and enter the design as
+    continuous terms; every other column is returned as strings and enters
+    as a factor. With ``numeric=None`` a column is numeric when all of its
+    values are numbers.
+
+    Returns None when ``names`` is empty. Raises RuntimeError if any sample
+    lacks a value, or a column named in ``numeric`` holds a value that is
+    not a number.
     """
     names = [n for n in names if n]
     if not names:
@@ -282,11 +291,22 @@ def covariate_frame(covariates: pd.DataFrame | None, sample_ids: list[str],
             for name, rels in missing.items()
         )
         raise RuntimeError(f"Adjustment covariates have missing values — {detail}")
-    return pd.DataFrame(
-        {name: [str(covariates.loc[sid, name]).strip() for sid in sample_ids]
-         for name in names},
-        index=list(sample_ids),
-    )
+    columns = {name: [str(covariates.loc[sid, name]).strip() for sid in sample_ids]
+               for name in names}
+    if numeric is None:
+        as_numeric = {n for n in names if covariate_kind(columns[n]) == 'numeric'}
+    else:
+        as_numeric = set(names) & set(numeric)
+    for name in sorted(as_numeric):
+        bad = [sid for sid, v in zip(sample_ids, columns[name]) if not _is_numeric_column([v])]
+        if bad:
+            raise RuntimeError(
+                f"Covariate '{name}' is set to numeric but has values that are not "
+                "numbers for: " + ", ".join(Path(r).stem for r in bad[:5])
+                + (" …" if len(bad) > 5 else "")
+                + ". Untick 'Numeric' for this covariate or correct the values.")
+        columns[name] = [float(v) for v in columns[name]]
+    return pd.DataFrame(columns, index=list(sample_ids))
 
 
 def build_design(group_vec: list[str], baseline: str,
@@ -299,8 +319,9 @@ def build_design(group_vec: list[str], baseline: str,
     order of first appearance); one indicator per pairing level except the
     first in sorted order; then each covariate — numeric columns centred,
     categorical columns as indicators for every level except the first in
-    sorted order. Covariates that are constant over these samples are
-    dropped.
+    sorted order. A column is numeric when it has a numeric dtype (see
+    covariate_frame()); string columns are always categorical. Covariates
+    that are constant over these samples are dropped.
 
     Returns (X, column_names, group_columns) where group_columns maps each
     non-baseline group to its column index. Raises RuntimeError naming the
@@ -340,7 +361,7 @@ def build_design(group_vec: list[str], baseline: str,
                 log.info("covariate %r is constant over these samples — dropped", name)
                 continue
             added = []
-            if covariate_kind(values) == 'numeric':
+            if pd.api.types.is_numeric_dtype(covariates[name]):
                 x = np.array([float(v) for v in values])
                 added.append((x - x.mean(), f"{name}"))
             else:

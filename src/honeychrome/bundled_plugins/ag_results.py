@@ -417,6 +417,7 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                    group_order: list[str] | None = None, contrast_mode: str = 'reference',
                    reference: str = '', pairing: dict | None = None,
                    covariates: pd.DataFrame | None = None,
+                   numeric_covariates: list[str] | None = None,
                    pval_threshold: float = 0.05, fc_threshold: float = 0.5,
                    marker_threshold: float = 0.03, use_treat: bool = True,
                    fdr_scope: str = 'global', run_freq: bool = True, run_counts: bool = False,
@@ -434,6 +435,8 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
     groups     : {sample: group name}; samples without a group are left out.
     pairing    : {sample: pairing level} (e.g. donor), or None.
     covariates : adjustment covariates, indexed by sample, or None.
+    numeric_covariates : the covariates entered as continuous terms (age,
+                 CRP); every other covariate is treated as categories.
 
     Returns {'samples', 'group_vec', 'comparisons', 'freq', 'freq_values'
     (% of denominator), 'counts', 'counts_values', 'markers',
@@ -455,7 +458,8 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
     pairing_vec = [str((pairing or {}).get(s, '')) for s in used] if pairing else None
     cov = None
     if covariates is not None and len(covariates.columns):
-        cov = ds.covariate_frame(covariates, used, list(covariates.columns))
+        cov = ds.covariate_frame(covariates, used, list(covariates.columns),
+                                 numeric=list(numeric_covariates or []))
 
     out = {'samples': used, 'group_vec': group_vec, 'comparisons': contrasts,
            'freq': None, 'freq_values': None, 'counts': None, 'counts_values': None,
