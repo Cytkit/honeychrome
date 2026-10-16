@@ -163,6 +163,9 @@ MODE_RECALCULATE = 'recalculate'
 APPLICATION_MODES = (MODE_FIXED, MODE_RECALCULATE)
 DEFAULT_DRIFT_LIMIT = 0.05
 MIN_EVENTS = 10
+# Above this many events, kernel densities are computed from finely binned
+# events (see _kde_grid) instead of summing one kernel per event.
+KDE_EXACT_MAX_EVENTS = 20_000
 
 REGION_BELOW = 'below'
 REGION_ABOVE = 'above'
@@ -320,10 +323,55 @@ def crop_to_region(col: np.ndarray, lo_frac: float, hi_frac: float) -> np.ndarra
 
 
 def _kde_grid(x: np.ndarray, n_grid: int = 512):
+    """Gaussian kernel density of *x* (Scott's bandwidth, as scipy's
+    gaussian_kde) at *n_grid* points spanning its range.
+
+    Up to KDE_EXACT_MAX_EVENTS events it is scipy's gaussian_kde. Beyond
+    that the events are linearly binned on a grid at least eight times
+    finer than the output (and fine enough for four points per
+    bandwidth), and the bin weights convolved with the kernel, out to
+    where it underflows as scipy's does. The density then agrees with
+    gaussian_kde to about 1e-5 of its peak at a cost linear in the number
+    of events rather than proportional to events × grid points (about
+    10 ms instead of 8 s for a million events).
+    """
+    x = np.asarray(x, dtype=float)
+    grid = np.linspace(float(x.min()), float(x.max()), n_grid)
+    if len(x) > KDE_EXACT_MAX_EVENTS and np.isfinite(x).all():
+        density = _binned_kde(x, grid)
+        if density is not None:
+            return grid, density
     from scipy.stats import gaussian_kde
     kde = gaussian_kde(x, bw_method='scott')
-    grid = np.linspace(float(x.min()), float(x.max()), n_grid)
     return grid, kde(grid)
+
+
+def _binned_kde(x: np.ndarray, grid: np.ndarray, max_refine: int = 2048):
+    """Binned Gaussian kernel density of *x* at the evenly spaced *grid*
+    (see _kde_grid); None when the bandwidth is too small for the range."""
+    n = len(x)
+    lo, hi = float(grid[0]), float(grid[-1])
+    bandwidth = float(np.std(x, ddof=1)) * n ** -0.2
+    if not bandwidth > 0 or hi <= lo:
+        return None
+    n_grid = len(grid)
+    refine = max(8, int(np.ceil(4.0 * (hi - lo) / ((n_grid - 1) * bandwidth))))
+    if refine > max_refine:
+        return None
+    m = (n_grid - 1) * refine + 1
+    step = (hi - lo) / (m - 1)
+    pos = (x - lo) / step
+    left = np.clip(np.floor(pos).astype(np.int64), 0, m - 2)
+    frac = pos - left
+    weights = (np.bincount(left, weights=1.0 - frac, minlength=m)
+               + np.bincount(left + 1, weights=frac, minlength=m))
+    # Kernel out to 37.5 bandwidths, where exp() underflows to 0, or across
+    # the whole grid if that is shorter
+    half = min(int(np.ceil(37.5 * bandwidth / step)), m - 1)
+    offsets = np.arange(-half, half + 1) * step
+    kernel = np.exp(-0.5 * (offsets / bandwidth) ** 2) / (bandwidth * np.sqrt(2 * np.pi) * n)
+    density = np.convolve(weights, kernel)[half:half + m]
+    return density[::refine]
 
 
 def kde_mode(x: np.ndarray) -> float:
