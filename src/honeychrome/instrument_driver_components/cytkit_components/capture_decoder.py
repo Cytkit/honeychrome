@@ -20,6 +20,8 @@ MAX_SAMPLES = 10000
 HEADER_LEN = 16  # sync0, sync1, ts0..ts3, channel, count
 N_CHANNELS = 16
 time_threshold_single_event_ns = 40
+trace_length = settings.n_time_points_in_event
+trace_mid = trace_length//2
 
 class CapturePacket(NamedTuple):
     timestamp: int
@@ -29,6 +31,8 @@ class CapturePacket(NamedTuple):
 class CaptureDecoder:
     def __init__(self) -> None:
         self.error_count: int = 0
+        self.pre = [settings.capture_pre_trigger_retrieved[channel] for channel in settings.adc_channels]
+        self.post = [settings.capture_post_trigger_retrieved[channel] for channel in settings.adc_channels]
 
     def reset(self) -> None:
         self.error_count = 0
@@ -53,17 +57,20 @@ class CaptureDecoder:
             # print(channel_sequence, start_packets, index_packets, timestamps, start_timestamps, time_good)
 
             N = len(index_start_packets) # number of events
-            traces = np.zeros((N, settings.n_channels_trace, settings.n_time_points_in_event), dtype=np.uint16)
+            traces = np.empty((N, settings.n_channels_trace, trace_length), dtype=np.uint16)
+            traces.fill(65535) # this is the sentinel value for empty
 
-            for n, start_packet_index in enumerate(index_start_packets):
+            for n in index_start_packets:
                 packet_indices = np.flatnonzero(start_packets == n)
 
                 if len(np.unique(packet_indices)) == len(packet_indices):
                     for index in packet_indices:
                         packet = packets[index]
-                        length = min(packet.samples.size, settings.n_time_points_in_event)
+                        length = min(packet.samples.size, trace_length)
+                        trace_start = max(trace_mid - self.pre[packet.channel], 0)
+                        trace_end = trace_start + length
                         if length > 0:
-                            traces[n, packet.channel, :length] = packet.samples[:length]
+                            traces[n, packet.channel, trace_start:trace_end] = packet.samples[:length]
                 else:
                     self.error_count += 1 # incomplete event
 

@@ -254,7 +254,9 @@ class TraceAnalyser(mp.Process):
                         blob_np = np.concatenate((blob_np_back, blob_np_front))
 
                 # scale to uV and convert to float
-                traces_batch_scaled = blob_np.reshape(-1, self.n_channels_trace, self.n_time_points_in_event).astype(np.float32) * adc_scale_uv # scale in uV, float32
+                traces_batch_scaled = blob_np.reshape(-1, self.n_channels_trace, self.n_time_points_in_event).astype(np.float32)
+                traces_batch_scaled[traces_batch_scaled==65535] = np.nan
+                traces_batch_scaled = traces_batch_scaled * adc_scale_uv  # scale in uV, float32
 
                 # calculate area, height, width as defined in channel_dict and write to events_cache
 

@@ -57,7 +57,9 @@ class OscilloscopeWidget(QWidget):
             self.layout.addWidget(self.plot_widget2)
             self.layout.addWidget(self.legendContainer2)
 
-            self.x = np.arange(n_time_points_in_event) / adc_rate
+            trace_length = n_time_points_in_event
+            trace_mid = trace_length // 2
+            self.x = (np.arange(n_time_points_in_event) - trace_mid) / adc_rate
 
             self.scatter_channel_indices = [i for i,channel in enumerate(adc_channels) if channel in scatter_channels]
             self.fluorescence_channel_indices = [i for i,channel in enumerate(adc_channels) if channel in fluorescence_channels]
