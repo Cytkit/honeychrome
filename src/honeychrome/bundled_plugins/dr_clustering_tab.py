@@ -170,7 +170,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 import csv
-import math
 import re
 import time
 import traceback
@@ -178,7 +177,7 @@ import traceback
 import numpy as np
 import pandas as pd
 
-from PySide6.QtCore import Qt, QTimer, QSettings, QEvent, QRectF, QThread, Signal, QSize
+from PySide6.QtCore import Qt, QTimer, QSettings, QEvent, QThread, Signal, QSize
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
@@ -189,7 +188,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QFileDialog, QMessageBox, QSizePolicy,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QColorDialog, QProgressBar, QSlider,
-    QDialog, QTextEdit, QApplication, QStackedWidget, QToolBox,
+    QDialog, QTextEdit, QApplication, QToolBox,
 )
 
 from honeychrome.controller_components.functions import (
@@ -203,7 +202,7 @@ from honeychrome.view_components.clear_layout import clear_layout
 from honeychrome.view_components.ordered_multi_sample_picker import OrderedMultiSamplePicker
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
-from honeychrome.view_components.icon_loader import icon
+from honeychrome.view_components.side_tab_widget import SideTabWidget
 from honeychrome.view_components import suggest_groupings_dialog as sgd
 from honeychrome.controller_components.differential_stats import suggest_groupings_from_names
 from honeychrome.view_components.differential_plots import (
@@ -242,6 +241,7 @@ import drc_report
 import drc_help_texts
 import drc_predictive
 import drc_time_estimate
+from transforms_panel import TransformInspector
 
 _log = drc_logging.get_logger(__name__)
 
@@ -778,85 +778,7 @@ class _FrozenScrollArea(QScrollArea):
         event.ignore()
 
 
-class _SideTabWidget(QWidget):
-    """
-    Vertical navigation list beside a page stack.
-
-    Replaces a QTabWidget so the plugin's own sections read as distinct
-    from the main window's top-level tab bar: labels stay horizontal and
-    each entry carries an icon. Exposes the subset of the QTabWidget API
-    the plugin uses (addTab, currentIndex, setCurrentIndex, currentWidget,
-    widget, count, currentChanged).
-    """
-
-    currentChanged = Signal(int)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._nav = QListWidget()
-        self._nav.setIconSize(QSize(20, 20))
-        self._nav.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._nav.setFrameShape(QFrame.NoFrame)
-        self._nav.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        self._nav.setStyleSheet(
-            "QListWidget::item { padding: 8px 14px 8px 8px; }"
-        )
-
-        self._stack = QStackedWidget()
-
-        divider = QFrame()
-        divider.setFrameShape(QFrame.VLine)
-        divider.setFrameShadow(QFrame.Sunken)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        layout.addWidget(self._nav)
-        layout.addWidget(divider)
-        layout.addWidget(self._stack, stretch=1)
-
-        self._nav.currentRowChanged.connect(self._on_row_changed)
-
-    def addTab(self, widget: QWidget, label: str, icon_name: str | None = None) -> int:
-        index = self._stack.addWidget(widget)
-        item = QListWidgetItem(label)
-        if icon_name:
-            item.setIcon(icon(icon_name))
-        self._nav.addItem(item)
-        if self._nav.currentRow() < 0:
-            self._nav.setCurrentRow(0)
-        # Polish first so the item padding from the style sheet is measured.
-        self._nav.ensurePolished()
-        self._nav.setFixedWidth(
-            self._nav.sizeHintForColumn(0) + 2 * self._nav.frameWidth() + 12
-        )
-        return index
-
-    def currentIndex(self) -> int:
-        return self._stack.currentIndex()
-
-    def setCurrentIndex(self, index: int):
-        self._nav.setCurrentRow(index)
-
-    def currentWidget(self) -> QWidget | None:
-        return self._stack.currentWidget()
-
-    def widget(self, index: int) -> QWidget | None:
-        return self._stack.widget(index)
-
-    def count(self) -> int:
-        return self._stack.count()
-
-    def _on_row_changed(self, row: int):
-        # Clearing the list's current row (e.g. ctrl-click) must not blank the page.
-        if row < 0:
-            self._nav.setCurrentRow(self._stack.currentIndex())
-            return
-        if row == self._stack.currentIndex():
-            return
-        self._stack.setCurrentIndex(row)
-        self.currentChanged.emit(row)
+_SideTabWidget = SideTabWidget
 
 
 # Events kept per (marker, cluster) cell in the Marker Heatmap / Ridgelines
@@ -2779,191 +2701,6 @@ class ConfigTab(QWidget):
         self.run_table.refresh()
 
 
-class BiplotTile(QWidget):
-    """
-    A single square biplot tile — heatmap of x_channel vs y_channel.
-    x_channel is always the TransformTab's active channel (set externally).
-    y_channel is chosen by clicking the y-axis InteractiveLabel (same
-    mechanism as CytometryPlotWidget) or via the combo at the top.
-    Drag the axes to adjust W / zoom, exactly as in CytometryPlotWidget.
-    """
-
-    # InteractiveLabel.mousePressEvent calls parent_plot.select_plot_on_parent_grid()
-    # BiplotTile is the parent_plot — provide a no-op stub so the call doesn't crash.
-    def select_plot_on_parent_grid(self):
-        pass
-
-    def __init__(self, rgba_lut, parent_tab, y_channel: str = '', parent=None):
-        super().__init__(parent)
-        self._parent_tab = parent_tab
-        self._y_channel  = y_channel
-        self._rgba_lut   = rgba_lut
-
-        size = hc_settings.cytometry_plot_width_target_retrieved
-        self.setMinimumSize(size, size)
-        self.setMaximumSize(size, size)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(2)
-
-        # y-channel selector combo -- not shown; kept purely as the
-        # internal selection store, driven by the InteractiveLabel click
-        # menu below (the visible combo was redundant with that menu).
-        self._y_combo = QComboBox()
-        self._y_combo.setMaximumHeight(22)
-        self._y_combo.setVisible(False)
-        self._y_combo.currentTextChanged.connect(self._on_y_changed)
-        outer.addWidget(self._y_combo)
-
-        # pyqtgraph graphics layout
-        self._gw = TransparentGraphicsLayoutWidget()
-        self._gw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        gl = self._gw.ci.layout
-        gl.setHorizontalSpacing(0)
-        gl.setVerticalSpacing(0)
-
-        # Y-axis InteractiveLabel — click to change y-channel, same as Honeychrome
-        self._label_y = InteractiveLabel('', parent_plot=self, angle=-90, size='9pt')
-        self._label_y.leftClickMenuFunction = self._set_y_from_label
-        self._gw.addItem(self._label_y, row=0, col=0)
-
-        self._vb = NoPanViewBox()
-        self._gw.addItem(self._vb, row=0, col=2)
-
-        self._axis_x = ZoomAxis('bottom', self._vb)
-        self._axis_y = ZoomAxis('left',   self._vb)
-        self._gw.addItem(self._axis_x, row=1, col=2)
-        self._gw.addItem(self._axis_y, row=0, col=1)
-        self._axis_x.linkToView(self._vb)
-        self._axis_y.linkToView(self._vb)
-
-        # X-axis InteractiveLabel — click to change the shared active/x
-        # channel, same mechanism as the y-axis above. Routes
-        # through parent_tab since x is shared across every tile, not
-        # local to this one.
-        self._label_x = InteractiveLabel('', parent_plot=self, size='9pt')
-        self._label_x.leftClickMenuFunction = self._set_x_from_label
-        self._gw.addItem(self._label_x, row=2, col=2)
-
-        self._vb.setMouseEnabled(x=False, y=False)
-        self._vb.raiseContextMenu = lambda ev: None
-
-        self._img = pg.ImageItem()
-        self._img.setLookupTable(rgba_lut)
-        self._vb.addItem(self._img)
-
-        self._axis_x.zoom_timer.timeout.connect(
-            lambda: self._parent_tab._apply_tile_zoom(self, 'x')
-        )
-        self._axis_y.zoom_timer.timeout.connect(
-            lambda: self._parent_tab._apply_tile_zoom(self, 'y')
-        )
-
-        outer.addWidget(self._gw)
-
-    # ------------------------------------------------------------------
-
-    def _set_y_from_label(self, item_index, _parent):
-        """Called by InteractiveLabel when user picks a channel from the menu."""
-        channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
-        if 0 <= item_index < len(channels):
-            self._label_y.leftItemSelected = item_index
-            self._y_combo.setCurrentText(channels[item_index])
-
-    def _set_x_from_label(self, item_index, _parent):
-        """Called by InteractiveLabel when the user picks a channel from
-        the x-axis menu. x is the TransformTab's shared active
-        channel, not local to this tile -- route through parent_tab so
-        every tile's x-axis and the 1-D histogram update together."""
-        channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
-        if 0 <= item_index < len(channels):
-            self._parent_tab._set_active_channel_from_tile(channels[item_index])
-
-    def set_channels(self, available: list[str], y_channel: str = ''):
-        self._y_combo.blockSignals(True)
-        current = y_channel or self._y_combo.currentText()
-        self._y_combo.clear()
-        self._y_combo.addItems(available)
-        if current in available:
-            self._y_combo.setCurrentText(current)
-        self._y_combo.blockSignals(False)
-        self._y_channel = self._y_combo.currentText()
-
-        # Sync InteractiveLabel menu items -- antigen-labeled for display;
-        # selection is index-based (see InteractiveLabel.selectable_menu_
-        # activates_function), so display text doesn't need to match
-        # `available`'s raw channel names.
-        labels = _antigen_dash_labels(self._parent_tab.controller)
-        self._label_y.leftClickMenuItems = [labels.get(ch, ch) for ch in available]
-        ch = self._y_combo.currentText()
-        self._label_y.leftItemSelected = available.index(ch) if ch in available else 0
-
-        # x-axis menu shares the same available list; selection
-        # tracks the tab's active channel, not anything local to this tile.
-        self._label_x.leftClickMenuItems = [labels.get(ch, ch) for ch in available]
-        x_ch = self._parent_tab._active_channel
-        self._label_x.leftItemSelected = available.index(x_ch) if x_ch in available else 0
-
-    def y_channel(self) -> str:
-        return self._y_combo.currentText()
-
-    def set_x_selected(self, x_ch: str):
-        """Sync the x-axis InteractiveLabel's highlighted menu item to
-        the tab's current active channel -- called whenever the
-        shared x channel changes, mirroring _on_y_changed's own
-        leftItemSelected sync for the y-axis."""
-        channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
-        if x_ch in channels:
-            self._label_x.leftItemSelected = channels.index(x_ch)
-
-    def _on_y_changed(self, ch: str):
-        self._y_channel = ch
-        labels = _antigen_dash_labels(self._parent_tab.controller)
-        self._label_y.setText(labels.get(ch, ch))
-        # Keep leftItemSelected in sync
-        channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
-        if ch in channels:
-            self._label_y.leftItemSelected = channels.index(ch)
-        self._parent_tab._configure_tile_axes(self)
-        self._parent_tab._draw_tile(self)
-
-    def configure_axes(self, tr_x: 'Transform', tr_y: 'Transform',
-                       x_label: str = '', y_label: str = ''):
-        """Apply transform ticks/limits and axis labels.
-        Calls setTicks() BEFORE setXRange/setYRange so real-value labels appear immediately."""
-        if x_label:
-            self._label_x.setText(x_label)
-        if y_label:
-            self._label_y.setText(y_label)
-            self._y_channel = y_label
-
-        if tr_x.ticks:
-            self._axis_x.setTicks(tr_x.ticks())
-        self._axis_x.zoomZero = tr_x.zero
-        self._axis_x.fullRange = (0, 1.1)
-        self._axis_x.limits = tuple(tr_x.limits)
-        self._vb.setXRange(tr_x.limits[0], tr_x.limits[1], padding=0)
-
-        if tr_y.ticks:
-            self._axis_y.setTicks(tr_y.ticks())
-        self._axis_y.zoomZero = tr_y.zero
-        self._axis_y.fullRange = (0, 1.1)
-        self._axis_y.limits = tuple(tr_y.limits)
-        self._vb.setYRange(tr_y.limits[0], tr_y.limits[1], padding=0)
-
-    def draw(self, heatmap, tr_x: 'Transform', tr_y: 'Transform'):
-        self._img.setImage(heatmap)
-        self._img.setRect(QRectF(
-            tr_x.limits[0], tr_y.limits[0],
-            tr_x.limits[1] - tr_x.limits[0],
-            tr_y.limits[1] - tr_y.limits[0],
-        ))
-
-    def clear(self):
-        self._img.clear()
-
-
 class _SquareWidget(QWidget):
     """A widget that always maintains a square geometry."""
     def resizeEvent(self, event):
@@ -2972,7 +2709,7 @@ class _SquareWidget(QWidget):
         super().resizeEvent(event)
 
 
-class TransformTab(QWidget):
+class TransformTab(TransformInspector):
     """
     Tab 1 — Transform Inspector (Read-Only Preview)
     ------------------------------------------------
@@ -2980,79 +2717,33 @@ class TransformTab(QWidget):
     Lets the user preview local W-adjustments (and auto-transform suggestions)
     without writing back to the experiment.
 
-    Visual style matches CytometryPlotWidget exactly:
-      • 1-D histogram: pg.PlotDataItem stepMode='center', colorcet fill, ZoomAxis
-        with the Honeychrome axis-drag W-adjustment (lower half = W, upper = zoom)
-      • Biplot: pg.ImageItem heatmap with the same colourmap and ZoomAxis on both
-        axes; dragging either axis adjusts W for that channel the same way
-        CytometryPlotWidget does.
-      • Axes tick labels show real (raw) values — 10², 10³ etc. — via
-        Transform.ticks(), not logicle floating-point numbers.
-      • Biplot is square (resizeEvent enforces width == height).
+    The histogram, biplots, axis drags and CSV import/export are those of
+    ``transforms_panel.TransformInspector`` (shared with the gating
+    plugins); this tab adds the gate tree whose events are previewed, the
+    training samples used by Auto-transform, and the persisted W values.
     """
 
-    _XFORM_LABELS = {0: 'Linear', 1: 'Logicle', 2: 'Log', 'default': 'Default'}
-
     def __init__(self, state: PipelineState, bus, controller, parent=None):
-        super().__init__(parent)
-        self.state      = state
-        self.bus        = bus
-        self.controller = controller
-
-        self._active_channel: str | None = None
-        # {channel: Transform}  — local copies, never written back
-        self._transforms: dict[str, Transform] = {}
-        # {channel: np.ndarray}  — raw unmixed event data for current sample
-        self._raw_data: dict[str, np.ndarray] = {}
-        # channel-name list in pnn order
-        self._pnn: list[str] = []
-
-        # Debounce timer — redraws plots 200 ms after last change
-        self._redraw_timer = QTimer(self)
-        self._redraw_timer.setSingleShot(True)
-        self._redraw_timer.setInterval(200)
-        self._redraw_timer.timeout.connect(self._redraw_plots)
-
-        # Build LUT from Honeychrome colourmap settings (same as CytometryPlotWidget)
-        try:
-            colors = cc.palette[hc_settings.colourmap_name_retrieved]
-        except Exception:
-            colors = cc.palette['bjy']
-        cmap = pg.ColorMap(
-            pos=0.9 * np.linspace(0, 1, len(colors)) ** 2
-                + 0.1 * np.linspace(0, 1, len(colors)),
-            color=colors,
+        super().__init__(controller, help_text=drc_help_texts.transforms_tab_help_text,
+                         parent=parent)
+        self.state = state
+        self.bus = bus
+        self.auto_btn.setText("✦ Auto-transform preview (all channels)")
+        self.auto_btn.setToolTip(
+            "Compute suggested Logicle W/A for every fluorescence channel "
+            "(Parks, Roederer & Moore 2006).  Preview only — not saved."
         )
-        rgba_lut = cmap.getLookupTable(alpha=True)
-        rgba_lut[0, 3] = 0   # fully transparent for zero bins
-        self._rgba_lut = rgba_lut
-
-        self._build_ui()
+        self.save_csv_btn.setToolTip(
+            "Export current (local preview) transform parameters to a CSV file.\n"
+            "Columns: channel, id, T, W, M, A"
+        )
 
     # ------------------------------------------------------------------
-    # UI construction
+    # Inspector hooks
     # ------------------------------------------------------------------
 
-    def _build_ui(self):
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 6, 6, 6)
-        outer.setSpacing(6)
-
-        self.help_widget = HelpToggleWidget(
-            text=drc_help_texts.transforms_tab_help_text
-        )
-        outer.addWidget(self.help_widget)
-
-        # Body: gates, controls and plots flow down the left; the channel
-        # list sits at full height on the right.
-        body = QHBoxLayout()
-        body.setSpacing(8)
-        outer.addLayout(body, stretch=1)
-        main_col = QVBoxLayout()
-        main_col.setSpacing(6)
-        body.addLayout(main_col, stretch=1)
-
-        # --- Gate selection — primary tree ---
+    def _build_selection(self, layout):
+        """Gate selection — primary tree."""
         gate_box = QGroupBox("Gate(s)")
         gate_box_layout = QVBoxLayout(gate_box)
         self.gate_tree = drc_gate_tree.GateTreeWidget()
@@ -3065,11 +2756,9 @@ class TransformTab(QWidget):
         self.gate_tree.setMaximumHeight(220)
         self.gate_tree.selectionChanged.connect(self._on_gate_tree_changed)
         gate_box_layout.addWidget(self.gate_tree)
-        main_col.addWidget(gate_box)
+        layout.addWidget(gate_box)
 
-        # --- Top toolbar ---
-        toolbar = QHBoxLayout()
-
+    def _extend_toolbar(self, toolbar):
         self.reload_btn = QPushButton("↺ Reload from experiment")
         self.reload_btn.setToolTip(
             "Re-read transform parameters from the experiment model, "
@@ -3078,146 +2767,17 @@ class TransformTab(QWidget):
         self.reload_btn.clicked.connect(self.refresh)
         toolbar.addWidget(self.reload_btn)
 
-        self.auto_btn = QPushButton("✦ Auto-transform preview (all channels)")
-        self.auto_btn.setToolTip(
-            "Compute suggested Logicle W/A for every fluorescence channel "
-            "(Parks, Roederer & Moore 2006).  Preview only — not saved."
-        )
-        self.auto_btn.clicked.connect(self._auto_transform_all)
-        toolbar.addWidget(self.auto_btn)
+    def channel_labels(self) -> dict:
+        return _antigen_dash_labels(self.controller)
 
-        self.save_csv_btn = QPushButton("⬇ Save CSV")
-        self.save_csv_btn.setToolTip(
-            "Export current (local preview) transform parameters to a CSV file.\n"
-            "Columns: channel, id, T, W, M, A"
-        )
-        self.save_csv_btn.clicked.connect(self._save_transforms_csv)
-        toolbar.addWidget(self.save_csv_btn)
+    def _on_transform_edited(self, channel: str, tr, before: dict):
+        self._sync_transform_to_state(channel, tr)
 
-        self.load_csv_btn = QPushButton("⬆ Load CSV")
-        self.load_csv_btn.setToolTip(
-            "Import transform parameters from a CSV file.\n"
-            "Channel names are validated against the current experiment.\n"
-            "Unrecognised channels are skipped; missing channels keep their\n"
-            "current parameters."
-        )
-        self.load_csv_btn.clicked.connect(self._load_transforms_csv)
-        toolbar.addWidget(self.load_csv_btn)
-
-        toolbar.addStretch()
-        main_col.addLayout(toolbar)
-
-        # Plots: scrollable area holding histogram + biplots
-        plots_scroll = QScrollArea()
-        plots_scroll.setWidgetResizable(True)
-        plots_scroll.setFrameShape(QFrame.NoFrame)
-        plots_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.plots_widget = QWidget()
-        self.plots_layout = QVBoxLayout(self.plots_widget)
-        self.plots_layout.setContentsMargins(0, 0, 0, 0)
-        self.plots_layout.setSpacing(8)
-        plots_scroll.setWidget(self.plots_widget)
-        main_col.addWidget(plots_scroll, stretch=1)
-
-        # Channel list + transform type label, full height on the right
-        channels_col = QVBoxLayout()
-        channels_col.setContentsMargins(0, 0, 0, 0)
-        channels_col.addWidget(QLabel("Channels"))
-        self.channel_list = QListWidget()
-        self.channel_list.setFixedWidth(180)
-        self.channel_list.currentItemChanged.connect(self._on_channel_item_changed)
-        channels_col.addWidget(self.channel_list, stretch=1)
-        self.xform_type_label = QLabel("—")
-        self.xform_type_label.setStyleSheet("font-style: italic; color: grey; padding: 4px;")
-        channels_col.addWidget(self.xform_type_label)
-        body.addLayout(channels_col)
-
-        # ------------------------------------------------------------------
-        # 1-D Histogram — built once, updated in-place each redraw
-        # ------------------------------------------------------------------
-        self.plots_layout.addWidget(QLabel("1-D Histogram  (drag axis to adjust transform)"))
-
-        self._hist_gw = TransparentGraphicsLayoutWidget()
-        self._hist_gw.setMinimumHeight(180)
-        self._hist_gw.setMaximumHeight(280)
-        self._hist_gw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        gl = self._hist_gw.ci.layout
-        gl.setHorizontalSpacing(0)
-        gl.setVerticalSpacing(0)
-
-        self._hist_vb = NoPanViewBox()
-        self._hist_vb.enableAutoRange(axis=self._hist_vb.YAxis, enable=True)
-        self._hist_gw.addItem(self._hist_vb, row=0, col=1)
-
-        self._hist_axis_x = ZoomAxis('bottom', self._hist_vb)
-        self._hist_axis_y = ZoomAxis('left',   self._hist_vb)
-        self._hist_gw.addItem(self._hist_axis_x, row=1, col=1)
-        self._hist_gw.addItem(self._hist_axis_y, row=0, col=0)
-        self._hist_axis_x.linkToView(self._hist_vb)
-        self._hist_axis_y.linkToView(self._hist_vb)
-
-        # Disable panning in the viewbox; zoom done via axis drag
-        self._hist_vb.setMouseEnabled(x=False, y=False)
-        self._hist_vb.raiseContextMenu = lambda ev: None
-
-        # Filled step-curve — same as CytometryPlotWidget.hist
-        self._hist_curve = pg.PlotDataItem(
-            stepMode='center',
-            fillLevel=0,
-            brush=(100, 100, 250, 150),
-        )
-        self._hist_vb.addItem(self._hist_curve)
-
-        self._hist_axis_x.zoom_timer.timeout.connect(self._apply_hist_zoom)
-        self._hist_axis_y.zoom_timer.timeout.connect(lambda: None)  # y auto-ranges
-
-        self.plots_layout.addWidget(self._hist_gw)
-
-        # ------------------------------------------------------------------
-        # Biplot grid — multiple square tiles, Add/Remove buttons
-        # x-axis of every tile = active channel; y-axis chosen per tile
-        # ------------------------------------------------------------------
-        biplot_header = QHBoxLayout()
-        biplot_header.addWidget(QLabel("Biplots  (drag axes to adjust transforms)"))
-        biplot_header.addStretch()
-        add_btn = QPushButton("＋ Add biplot")
-        add_btn.setFixedHeight(24)
-        add_btn.clicked.connect(self._add_biplot)
-        biplot_header.addWidget(add_btn)
-        remove_btn = QPushButton("－ Remove last")
-        remove_btn.setFixedHeight(24)
-        remove_btn.clicked.connect(self._remove_biplot)
-        biplot_header.addWidget(remove_btn)
-        self.plots_layout.addLayout(biplot_header)
-
-        # Scrollable area for biplot tiles — tiles wrap based on available width
-        self._biplot_scroll = QScrollArea()
-        self._biplot_scroll.setWidgetResizable(True)
-        self._biplot_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._biplot_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._biplot_scroll.setMinimumHeight(
-            hc_settings.cytometry_plot_width_target_retrieved + 40
-        )
-        self._biplot_scroll.setMaximumHeight(
-            2 * hc_settings.cytometry_plot_width_target_retrieved + 50
-        )
-
-        self._biplot_container = QWidget()
-        self._biplot_grid = QGridLayout(self._biplot_container)
-        self._biplot_grid.setContentsMargins(0, 0, 0, 0)
-        self._biplot_grid.setSpacing(4)
-        self._biplot_scroll.setWidget(self._biplot_container)
-        self.plots_layout.addWidget(self._biplot_scroll)
-
-        # Debounce timer for tile reflow on resize (mirrors CytometryGridWidget)
-        self._tile_relayout_timer = QTimer(self)
-        self._tile_relayout_timer.setSingleShot(True)
-        self._tile_relayout_timer.setInterval(150)
-        self._tile_relayout_timer.timeout.connect(self._relayout_tiles)
-        self._biplot_scroll.viewport().installEventFilter(self)
-
-        self._biplot_tiles: list[BiplotTile] = []
-        self.plots_layout.addStretch()
+    def _available_channels(self) -> list[str]:
+        skip = {'ribbon', 'Time', 'event_id'}
+        all_ch = [ch for ch in self._transforms if ch not in skip]
+        sel = self.state.selected_channels
+        return [ch for ch in all_ch if ch in sel] if sel else all_ch
 
     # ------------------------------------------------------------------
     # Refresh — called on tab activation
@@ -3226,7 +2786,7 @@ class TransformTab(QWidget):
     def refresh(self):
         """
         Reload Transform objects from controller.unmixed_transformations,
-        repopulate the channel list and biplot x-combo, then load event data.
+        repopulate the channel list and biplot channels, then load event data.
         """
         if self.controller.experiment.process.get('unmixing_matrix') is None:
             return
@@ -3247,7 +2807,6 @@ class TransformTab(QWidget):
             self.controller
         )
 
-        # pnn list
         self._pnn = self.controller.experiment.settings.get(
             'unmixed', {}
         ).get('event_channels_pnn', [])
@@ -3257,53 +2816,13 @@ class TransformTab(QWidget):
 
         # Restore any previously computed auto-transform W values
         self._load_computed_transforms()
-        skip = {'ribbon', 'Time', 'event_id'}
-        # Order by the cytometer's own PNN order (self._pnn, set
-        # just above) -- the same order the Spectral Process tab uses --
-        # rather than self._transforms' dict order, which reflects
-        # however the experiment file happened to store the transforms
-        # and can drift out of PNN order. Anything in self._transforms
-        # but not in self._pnn (shouldn't normally happen) is appended at
-        # the end rather than silently dropped.
-        pnn_order = [ch for ch in self._pnn if ch in self._transforms and ch not in skip]
-        remaining = [ch for ch in self._transforms if ch not in skip and ch not in pnn_order]
-        all_channels = pnn_order + remaining
-        # Transforms tab always shows every channel — channel selection
-        # for DR/clustering happens later, in Configuration.
-        channels = all_channels
 
-        # Repopulate channel list
-        self.channel_list.blockSignals(True)
-        prev = self.channel_list.currentItem()
-        prev_channel = prev.data(Qt.UserRole) if prev else None
-        self.channel_list.clear()
-        labels = _antigen_dash_labels(self.controller)
-        for ch in channels:
-            item = QListWidgetItem(labels.get(ch, ch))
-            item.setData(Qt.UserRole, ch)
-            self.channel_list.addItem(item)
-        self.channel_list.blockSignals(False)
-
-        # Update all biplot tiles with the new channel list
-        # Add a default first tile if none exist yet
-        if not self._biplot_tiles:
-            self._add_biplot()
-        for tile in self._biplot_tiles:
-            tile.set_channels(channels)
+        # The Transforms tab always shows every channel (in PNN order);
+        # channel selection for DR/clustering happens in Configuration.
+        self.show_channels()
 
         # Load data (deferred so load_sample has finished)
         self._load_preview_data()
-
-        # Restore / default channel selection
-        restored = False
-        if prev_channel and prev_channel in channels:
-            for i in range(self.channel_list.count()):
-                if self.channel_list.item(i).data(Qt.UserRole) == prev_channel:
-                    self.channel_list.setCurrentRow(i)
-                    restored = True
-                    break
-        if not restored and channels:
-            self.channel_list.setCurrentRow(0)
 
         QTimer.singleShot(50, self._redraw_plots)
 
@@ -3335,7 +2854,6 @@ class TransformTab(QWidget):
 
             selected_gates = self.state.selected_gates
             if selected_gates and selected_gates != ['root']:
-                _n_in = len(event_data)
                 try:
                     cytometry_dict = dict(self.controller.data_for_cytometry_plots_unmixed)
                     cytometry_dict['event_data'] = event_data.copy()
@@ -3361,592 +2879,40 @@ class TransformTab(QWidget):
         self.state.selected_gates = list(gates)
         self._load_preview_data()
 
-    # ------------------------------------------------------------------
-    # Channel selection
-    # ------------------------------------------------------------------
-
-    def _on_channel_item_changed(self, current, previous):
-        """Bridge from the QListWidgetItem (display label) to the raw
-        channel name stored in its UserRole data."""
-        channel = current.data(Qt.UserRole) if current else None
-        self._on_channel_selected(channel)
-
-    def _on_channel_selected(self, channel: str):
-        if not channel or channel not in self._transforms:
-            return
-        self._active_channel = channel
-        tr = self._transforms[channel]
-        self.xform_type_label.setText(self._XFORM_LABELS.get(tr.id, str(tr.id)))
-
-        self._configure_hist_axes()
-        self._configure_tile_axes_all()
-        self._schedule_redraw()
-
-    def _set_active_channel_from_tile(self, channel: str):
-        """
-        A BiplotTile's x-axis InteractiveLabel was clicked.  x is
-        the tab's shared active channel, so route through the left-hand
-        channel_list selection (same path a manual list click takes) --
-        that already fires _on_channel_selected, which updates the 1-D
-        histogram axis and every tile's axes together.
-        """
-        for i in range(self.channel_list.count()):
-            if self.channel_list.item(i).data(Qt.UserRole) == channel:
-                self.channel_list.setCurrentRow(i)
-                return
-
-    # ------------------------------------------------------------------
-    # M parameter — cytometer-specific, derived from $PnR
-    # ------------------------------------------------------------------
-
-    def _compute_M(self) -> float:
-        """
-        Compute M (logicle decades) from the cytometer's ADC range.
-        M = log10(magnitude_ceiling) − 1.
-
-        Per the Gating-ML spec the top-of-scale decade is excluded from M
-        (e.g. a 1 × 10⁶ instrument → M = 5, not 6).  magnitude_ceiling is
-        the max $PnR value across fluorescence channels stored at import time.
-        """
-        try:
-            ceiling = self.controller.experiment.settings['raw']['magnitude_ceiling']
-            if ceiling and ceiling > 0:
-                return math.log10(float(ceiling)) - 1.0
-        except (KeyError, TypeError, ValueError):
-            pass
-        return 4.5   # fall back to Honeychrome default
-
-    # ------------------------------------------------------------------
-    # Biplot tile management
-    # ------------------------------------------------------------------
-
-    def _available_channels(self) -> list[str]:
-        skip = {'ribbon', 'Time', 'event_id'}
-        all_ch = [ch for ch in self._transforms if ch not in skip]
-        sel = self.state.selected_channels
-        return [ch for ch in all_ch if ch in sel] if sel else all_ch
-
-    def eventFilter(self, obj, event):
-        """Debounce tile reflow when the biplot scroll viewport is resized."""
-        if obj is self._biplot_scroll.viewport() and event.type() == QEvent.Resize:
-            if event.oldSize().width() != event.size().width():
-                self._tile_relayout_timer.start()
-        return super().eventFilter(obj, event)
-
-    def _relayout_tiles(self):
-        """Place biplot tiles into the grid, wrapping based on available width."""
-        # Remove all from grid without deleting
-        for i in range(self._biplot_grid.count()):
-            item = self._biplot_grid.itemAt(i)
-            if item and item.widget():
-                self._biplot_grid.removeWidget(item.widget())
-
-        tile_size = hc_settings.cytometry_plot_width_target_retrieved
-        available_w = self._biplot_scroll.viewport().width() or (tile_size + 4)
-        cols = max(1, available_w // (tile_size + 4))
-
-        for n, tile in enumerate(self._biplot_tiles):
-            row, col = divmod(n, cols)
-            self._biplot_grid.addWidget(tile, row, col)
-
-        # Update scroll area height to fit all rows
-        n_rows = max(1, (len(self._biplot_tiles) + cols - 1) // cols) if self._biplot_tiles else 1
-        self._biplot_scroll.setMinimumHeight(
-            min(n_rows, 2) * (tile_size + 30) + 10
-        )
-
-    def _add_biplot(self):
-        """Add a new BiplotTile to the grid."""
-        channels = self._available_channels()
-        used_y = {t.y_channel() for t in self._biplot_tiles}
-        x_ch = self._active_channel or (channels[0] if channels else '')
-        candidates = [ch for ch in channels if ch != x_ch and ch not in used_y]
-        default_y = candidates[0] if candidates else (
-            channels[1] if len(channels) > 1 else (channels[0] if channels else '')
-        )
-
-        tile = BiplotTile(self._rgba_lut, parent_tab=self)
-        tile.set_channels(channels, y_channel=default_y)
-        self._biplot_tiles.append(tile)
-        self._relayout_tiles()
-        self._configure_tile_axes(tile)
-        self._draw_tile(tile)
-
-    def _remove_biplot(self):
-        """Remove the last BiplotTile."""
-        if not self._biplot_tiles:
-            return
-        tile = self._biplot_tiles.pop()
-        self._biplot_grid.removeWidget(tile)
-        tile.deleteLater()
-        self._relayout_tiles()
-
-    def _configure_tile_axes(self, tile: 'BiplotTile'):
-        """Configure axes and labels on a single tile."""
-        x_ch = self._active_channel
-        y_ch = tile.y_channel()
-        if not x_ch or not y_ch:
-            return
-        if x_ch not in self._transforms or y_ch not in self._transforms:
-            return
-        labels = _antigen_dash_labels(self.controller)
-        tile.configure_axes(self._transforms[x_ch], self._transforms[y_ch],
-                            x_label=labels.get(x_ch, x_ch), y_label=labels.get(y_ch, y_ch))
-        tile.set_x_selected(x_ch)   # keep menu highlight in sync
-
-    def _configure_tile_axes_all(self):
-        for tile in self._biplot_tiles:
-            self._configure_tile_axes(tile)
-
-    def _configure_hist_axes(self):
-        """Set ZoomAxis ticks/limits for the 1-D histogram x-axis.
-        Must call setTicks() before setXRange() so real-value labels
-        are shown immediately, not pyqtgraph auto-generated floats."""
-        ch = self._active_channel
-        if not ch or ch not in self._transforms:
-            return
-        tr = self._transforms[ch]
-        if tr.ticks is None:
-            return
-        ticks = tr.ticks()
-        if ticks:
-            self._hist_axis_x.setTicks(ticks)
-        self._hist_axis_x.zoomZero = tr.zero
-        self._hist_axis_x.fullRange = (0, 1.1)
-        self._hist_axis_x.limits = tuple(tr.limits)
-        self._hist_vb.setXRange(tr.limits[0], tr.limits[1], padding=0)
-
-    def _draw_tile(self, tile: 'BiplotTile'):
-        """Compute and render heatmap for a single tile."""
-        x_ch = self._active_channel
-        y_ch = tile.y_channel()
-        if (not x_ch or not y_ch or x_ch == y_ch
-                or x_ch not in self._transforms or y_ch not in self._transforms
-                or x_ch not in self._raw_data or y_ch not in self._raw_data):
-            tile.clear()
-            return
-        tr_x = self._transforms[x_ch]
-        tr_y = self._transforms[y_ch]
-        raw_x = self._raw_data[x_ch]
-        raw_y = self._raw_data[y_ch]
-        try:
-            heatmap, _, _ = np.histogram2d(raw_x, raw_y,
-                                            bins=[tr_x.scale, tr_y.scale])
-        except Exception as e:
-            print(f"[DR Plugin] biplot histogram2d error ({x_ch} vs {y_ch}): {e}")
-            tile.clear()
-            return
-        try:
-            cutoff = hc_settings.density_cutoff_retrieved
-        except Exception:
-            cutoff = 1
-        heatmap[heatmap < cutoff] = 0
-        tile.draw(heatmap, tr_x, tr_y)
-
-    def _apply_tile_zoom(self, tile: 'BiplotTile', axis_name: str):
-        """Axis-drag zoom for a tile — mirrors CytometryPlotWidget.apply_zoom."""
-        if axis_name == 'x':
-            axis   = tile._axis_x
-            channel = self._active_channel
-            vb_set  = tile._vb.setXRange
-            vb_range_idx = 0
-            factor_flip  = False
-        else:
-            axis   = tile._axis_y
-            channel = tile.y_channel()
-            vb_set  = tile._vb.setYRange
-            vb_range_idx = 1
-            factor_flip  = True
-
-        if not channel or channel not in self._transforms:
-            return
-        if axis._pending_delta == 0:
-            return
-        step = axis._pending_delta
-        axis._pending_delta = 0
-        if abs(step) < 1:
-            return
-
-        zoom_rate = 1.04
-        factor = (1 / zoom_rate) if step > 0 else zoom_rate
-        if factor_flip:
-            factor = 1 / factor
-
-        tr = self._transforms[channel]
-        vmin, vmax = tile._vb.viewRange()[vb_range_idx]
-        map_pos = (tile._vb.mapToView(axis.initial_pos).x()
-                   if axis_name == 'x' and axis.initial_pos else
-                   tile._vb.mapToView(axis.initial_pos).y()
-                   if axis.initial_pos else 0.5)
-
-        if tr.id == 1:   # logicle: lower half → W, upper half → zoom
-            if map_pos < 0.5 * vmax:
-                tr.logicle_w = max(0.01, tr.logicle_w / factor)
-                tr.set_transform()
-            else:
-                new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
-                new_min = (vmin - axis.zoomZero) * factor + axis.zoomZero
-                if new_max < axis.fullRange[1] * 1.01:
-                    vb_set(new_min, new_max, padding=0)
-                axis.limits = (new_min, new_max)
-                tr.set_transform(limits=list(axis.limits))
-        else:
-            new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
-            new_min = (vmin - axis.zoomZero) * factor + axis.zoomZero
-            if new_max < axis.fullRange[1] * 1.01:
-                vb_set(new_min, new_max, padding=0)
-            axis.limits = (new_min, new_max)
-            tr.set_transform(limits=list(axis.limits))
-
-        axis.zoomZero = tr.zero
-        if tr.ticks:
-            axis.setTicks(tr.ticks())
-        # Keep all tiles that share this channel consistent
-        for other in self._biplot_tiles:
-            if other is not tile:
-                if axis_name == 'x' and self._active_channel == channel:
-                    if other._transforms if hasattr(other, '_transforms') else True:
-                        self._configure_tile_axes(other)
-        # Also sync hist x-axis if the active channel was changed
-        if channel == self._active_channel:
-            self._configure_hist_axes()
-        self._sync_transform_to_state(channel, tr)
-        self._schedule_redraw()
-
-    def _apply_hist_zoom(self):
-        """Called by hist x-axis ZoomAxis timer — adjusts W (lower half) or limits (upper)."""
-        ch = self._active_channel
-        if not ch or ch not in self._transforms:
-            return
-        axis = self._hist_axis_x
-        if axis._pending_delta == 0:
-            return
-        step = axis._pending_delta
-        axis._pending_delta = 0
-        if abs(step) < 1:
-            return
-
-        zoom_rate = 1.04
-        factor = (1 / zoom_rate) if step > 0 else zoom_rate
-
-        tr = self._transforms[ch]
-        vmin, vmax = self._hist_vb.viewRange()[0]
-        map_pos = self._hist_vb.mapToView(axis.initial_pos).x() if axis.initial_pos else 0.5
-
-        if tr.id == 1:
-            if map_pos < 0.5 * vmax:
-                tr.logicle_w = max(0.01, tr.logicle_w / factor)
-                tr.set_transform()
-            else:
-                new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
-                new_min = (vmin - axis.zoomZero) * factor + axis.zoomZero
-                if new_max < axis.fullRange[1] * 1.01:
-                    self._hist_vb.setXRange(new_min, new_max, padding=0)
-                axis.limits = (new_min, new_max)
-                tr.set_transform(limits=list(axis.limits))
-        else:
-            new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
-            new_min = (vmin - axis.zoomZero) * factor + axis.zoomZero
-            if new_max < axis.fullRange[1] * 1.01:
-                self._hist_vb.setXRange(new_min, new_max, padding=0)
-            axis.limits = (new_min, new_max)
-            tr.set_transform(limits=list(axis.limits))
-
-        axis.zoomZero = tr.zero
-        if tr.ticks:
-            axis.setTicks(tr.ticks())
-        self._sync_transform_to_state(ch, tr)
-        # Keep all biplot tiles that use this channel on x-axis in sync
-        self._configure_tile_axes_all()
-        self._schedule_redraw()
-
     def _sync_transform_to_state(self, channel: str, tr: 'Transform'):
         """Push updated W back into state.channel_transform_params."""
         if channel in self.state.channel_transform_params:
             self.state.channel_transform_params[channel]['W'] = tr.logicle_w
 
-    def _schedule_redraw(self):
-        self._redraw_timer.start()
-
-    def _redraw_plots(self):
-        self._draw_histogram()
-        for tile in self._biplot_tiles:
-            self._draw_tile(tile)
-
-    def _draw_histogram(self):
-        """Update 1-D histogram in-place using Transform.step_scale."""
-        ch = self._active_channel
-        if not ch or ch not in self._transforms or ch not in self._raw_data:
-            self._hist_curve.setData([], [])
-            return
-
-        tr = self._transforms[ch]
-        raw = self._raw_data[ch]
-
-        # Bin raw events into the transform's scale bins (same as CytometryPlotWidget)
-        try:
-            count, _ = np.histogram(raw, bins=tr.scale)
-        except Exception:
-            self._hist_curve.setData([], [])
-            return
-
-        # step_scale has len = scale_bins + 2; count has len = scale_bins + 1
-        # PlotDataItem with stepMode='center' needs x and y the same length
-        self._hist_curve.setData(tr.step_scale, count)
-        self._configure_hist_axes()
-
-    # ------------------------------------------------------------------
-    # CSV import / export
-    # ------------------------------------------------------------------
-
-    def _save_transforms_csv(self):
-        """
-        Export current local transform parameters to a CSV file.
-        Columns: channel, id, T, W, M, A
-        id codes: 0=linear, 1=logicle, 2=log
-        """
-        if not self._transforms:
-            QMessageBox.information(self, "Save Transforms",
-                                    "No transforms loaded yet.")
-            return
-
-        default_dir = str(getattr(self.controller, 'experiment_dir', ''))
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Transforms CSV", default_dir,
-            "CSV files (*.csv);;All files (*)"
-        )
-        if not path:
-            return
-        path = _with_extension(path, '.csv')
-
-        skip = {'ribbon', 'Time', 'event_id'}
-        rows = []
-        for ch, tr in self._transforms.items():
-            if ch in skip:
-                continue
-            rows.append({
-                'channel': ch,
-                'id':      tr.id,
-                'T':       tr.scale_t,
-                'W':       round(tr.logicle_w, 6),
-                'M':       round(tr.logicle_m, 6),
-                'A':       round(tr.logicle_a, 6),
-            })
-
-        try:
-            with open(path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=['channel', 'id', 'T', 'W', 'M', 'A'])
-                writer.writeheader()
-                writer.writerows(rows)
-            QMessageBox.information(
-                self, "Save Transforms",
-                f"Saved {len(rows)} channels to:\n{path}"
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", str(e))
-
-    def _load_transforms_csv(self):
-        """
-        Import transform parameters from a CSV file.
-
-        Validation:
-          • Required columns: channel, W  (T, M, A, id are optional)
-          • Only channels present in the current experiment are updated;
-            unrecognised channel names are reported and skipped.
-          • W must satisfy 0 ≤ W ≤ M/2; values outside this range are clamped.
-          • T must be > 0 if provided.
-
-        After loading, the local Transform objects are updated and plots redrawn.
-        Nothing is written back to the experiment.
-        """
-        default_dir = str(getattr(self.controller, 'experiment_dir', ''))
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Transforms CSV", default_dir,
-            "CSV files (*.csv);;All files (*)"
-        )
-        if not path:
-            return
-
-        try:
-            with open(path, newline='', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-        except Exception as e:
-            QMessageBox.critical(self, "Load Error", f"Could not read CSV:\n{e}")
-            return
-
-        if not rows:
-            QMessageBox.warning(self, "Load Transforms", "CSV file is empty.")
-            return
-
-        required_cols = {'channel', 'W'}
-        if not required_cols.issubset(set(rows[0].keys())):
-            QMessageBox.critical(
-                self, "Load Transforms",
-                f"CSV must contain at least columns: {sorted(required_cols)}\n"
-                f"Found: {sorted(rows[0].keys())}"
-            )
-            return
-
-        known_channels = set(self._transforms.keys())
-        updated, skipped_unknown, skipped_invalid = [], [], []
-
-        for row in rows:
-            ch = (row.get('channel') or '').strip()
-            if not ch:
-                continue
-            if ch not in known_channels:
-                skipped_unknown.append(ch)
-                continue
-
-            tr = self._transforms[ch]
-            try:
-                W = float(row['W'])
-            except (ValueError, KeyError):
-                skipped_invalid.append(f"{ch} (W invalid)")
-                continue
-
-            # Apply optional columns
-            if 'T' in row and row['T'].strip():
-                try:
-                    T = float(row['T'])
-                    if T > 0:
-                        tr.scale_t = T
-                except ValueError:
-                    pass
-
-            if 'M' in row and row['M'].strip():
-                try:
-                    M = float(row['M'])
-                    if M > 0:
-                        tr.logicle_m = M
-                except ValueError:
-                    pass
-
-            if 'A' in row and row['A'].strip():
-                try:
-                    tr.logicle_a = float(row['A'])
-                except ValueError:
-                    pass
-
-            if 'id' in row and row['id'].strip():
-                try:
-                    tr.id = int(row['id'])
-                except ValueError:
-                    pass
-
-            # Clamp W to valid range: 0 ≤ W ≤ M/2
-            M_eff = tr.logicle_m
-            W = max(0.0, min(M_eff / 2.0, W))
-            tr.logicle_w = round(W, 6)
-
-            try:
-                tr.set_transform()
-            except Exception as e:
-                skipped_invalid.append(f"{ch} (set_transform failed: {e})")
-                continue
-
-            self._sync_transform_to_state(ch, tr)
-            updated.append(ch)
-
-        # Report
-        msg_parts = [f"Updated {len(updated)} channel(s)."]
-        if skipped_unknown:
-            msg_parts.append(
-                f"\nSkipped {len(skipped_unknown)} unrecognised channel(s):\n"
-                + ", ".join(skipped_unknown[:10])
-                + (" …" if len(skipped_unknown) > 10 else "")
-            )
-        if skipped_invalid:
-            msg_parts.append(
-                f"\nSkipped {len(skipped_invalid)} invalid row(s):\n"
-                + ", ".join(skipped_invalid[:10])
-            )
-        QMessageBox.information(self, "Load Transforms", "".join(msg_parts))
-
-        if updated:
-            self._configure_hist_axes()
-            self._configure_tile_axes_all()
-            self._schedule_redraw()
-
     # ------------------------------------------------------------------
     # Auto-transform (Parks & Moore) — over all training samples
     # ------------------------------------------------------------------
 
-    def _auto_transform_all(self):
+    def auto_transform_data(self):
         """
-        Compute optimal Logicle W for every Logicle channel using Parks & Moore,
-        pooling data across ALL selected training samples.
-
-        Formula: W = (M − log₁₀(T / |q|)) / 2
-        where q = 25th-percentile of the negative-event population across all
-        training samples combined.  This gives a more robust estimate than using
-        only the currently loaded sample, and ensures the transform is appropriate
-        for the whole dataset.
-
-        After computing W, the result is persisted to QSettings so it survives
-        experiment close/re-open.
+        Events for Auto-transform, pooled across ALL selected training
+        samples (a more robust estimate than the currently loaded sample
+        alone, and appropriate for the whole dataset); the currently loaded
+        sample when no training samples are selected.
         """
         training_paths = self._get_training_sample_full_paths()
         if not training_paths:
-            # Fall back to the currently loaded sample
             if self._raw_data:
-                training_data = {ch: [arr] for ch, arr in self._raw_data.items()}
-                source_note = "active sample only (no training samples selected)"
-            else:
-                QMessageBox.information(
-                    self, "Auto-Transform",
-                    "No training samples selected and no sample is currently loaded.\n"
-                    "Select training samples in the Configuration tab first."
-                )
-                return
-        else:
-            print(f"\n[DR TransformTab] Auto-transform: loading {len(training_paths)} training sample(s)…")
-            training_data = self._load_all_training_samples(training_paths)
-            source_note = f"{len(training_paths)} training sample(s)"
+                return ({ch: [arr] for ch, arr in self._raw_data.items()},
+                        "active sample only (no training samples selected)")
+            QMessageBox.information(
+                self, "Auto-Transform",
+                "No training samples selected and no sample is currently loaded.\n"
+                "Select training samples in the Configuration tab first."
+            )
+            return None, ''
+        print(f"\n[DR TransformTab] Auto-transform: loading {len(training_paths)} training sample(s)…")
+        return (self._load_all_training_samples(training_paths),
+                f"{len(training_paths)} training sample(s)")
 
-        M = self._compute_M()
-        print(f"[DR TransformTab] Auto-transform: M = {M:.4f},  source = {source_note}")
-        n_updated = 0
-
-        for ch, tr in self._transforms.items():
-            if tr.id != 1:
-                continue
-            arrays = training_data.get(ch, [])
-            if not arrays:
-                continue
-
-            # Pool all negative events across all training samples
-            negatives = np.concatenate([a[a < 0] for a in arrays if len(a[a < 0]) > 0]) \
-                if any(len(a[a < 0]) > 0 for a in arrays) else np.array([])
-
-            T = tr.scale_t
-
-            if len(negatives) == 0:
-                W = 0.5
-                print(f"  {ch}: no negatives in any training sample → W = {W}")
-            else:
-                q = np.percentile(negatives, 25)   # q < 0
-                try:
-                    W = (M - math.log10(T / abs(q))) / 2.0
-                except (ValueError, ZeroDivisionError):
-                    W = 0.5
-                W = max(0.0, min(M / 2.0, W))
-                print(f"  {ch}: n_neg={len(negatives):,}, q(25th)={q:.1f}, T={T} → W = {W:.4f}")
-
-            tr.logicle_w = round(W, 3)
-            tr.set_transform()
-            self._sync_transform_to_state(ch, tr)
-            n_updated += 1
-
-        # Persist the computed W values
+    def _after_auto_transform(self, n_updated: int, source_note: str):
+        """Persist the computed W values (restored on next open) and report."""
         self._save_computed_transforms()
-
-        if self._active_channel and self._active_channel in self._transforms:
-            self._configure_hist_axes()
-            self._configure_tile_axes_all()
-        self._schedule_redraw()
-
         QMessageBox.information(
             self, "Auto-Transform Preview",
             f"W computed for {n_updated} Logicle channel(s) from {source_note},\n"
@@ -4086,7 +3052,7 @@ class TransformTab(QWidget):
             if not computed_repr:
                 return
             computed: dict[str, float] = eval(computed_repr)  # noqa: S307
-            M = self._compute_M()
+            M = self.magnitude_decades()
             n_restored = 0
             for ch, W in computed.items():
                 if ch not in self._transforms:
