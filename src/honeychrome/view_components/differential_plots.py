@@ -314,6 +314,11 @@ def _fixed_margin_layout(gridspec, left: float, right: float, top: float, bottom
             lo_y = min(bottom / height, 0.3)
             hi_y = min(max(1.0 - top / height, lo_y + 0.1), 1.0)
             gridspec.update(left=lo_x, right=hi_x, bottom=lo_y, top=hi_y)
+            # GridSpec.update only moves the axes of pyplot-managed figures.
+            for ax in fig.axes:
+                spec = ax.get_subplotspec()
+                if spec is not None and spec.get_topmost_subplotspec().get_gridspec() is gridspec:
+                    ax._set_position(spec.get_position(fig))
 
     return _FixedMarginEngine()
 
