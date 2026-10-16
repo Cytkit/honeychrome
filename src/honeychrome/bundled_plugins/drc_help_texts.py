@@ -16,9 +16,11 @@ transforms_tab_help_text = '''
 (Logicle/biexponential) used to load event data for training and plotting
 elsewhere in this plugin. It reads the transforms currently configured in
 the main Honeychrome experiment, but any adjustments you make here are
-<b>local previews only</b> — they are saved to this plugin's own settings,
-not written back to the experiment. To change the transforms used
-elsewhere in Honeychrome, drag the same channel's axis on the main
+<b>local to this plugin</b> and are not written back to the experiment.
+The first time you open an experiment here it starts from the transforms
+defined in Unmixed Data; after that your adjustments are kept, and saved
+between sessions, until you click Reload from experiment. To change the
+transforms used elsewhere in Honeychrome, drag the same channel's axis on the main
 cytometry plots.</p>
 
 <h4>Before you start</h4>
@@ -26,8 +28,10 @@ cytometry plots.</p>
 <li>Select one or more <b>gates</b> from the gate tree. Their events are
 unioned to build the preview pool (and, later, the training pool used for
 DR and clustering).</li>
-<li>Click <b>Reload from experiment</b> if you've changed transforms in
-the main Honeychrome window and want this tab to pick them up.</li>
+<li>Click <b>Reload from experiment</b> to return every channel to the
+transform defined in Unmixed Data, discarding Auto-transform results and
+axis changes made in this tab. Changes made later in Unmixed Data are not
+picked up unless you do.</li>
 </ol>
 
 <h4>Working with the preview</h4>
@@ -37,7 +41,7 @@ and current transform type.</li>
 <li><b>Drag the histogram's x-axis</b> to adjust the transform, exactly
 as in the main Honeychrome cytometry plots (lower half of the axis
 adjusts Logicle W; upper half zooms the display range).</li>
-<li>Use <b>Auto-transform preview (all channels)</b> to run an automated
+<li>Use <b>Auto-transform (all channels)</b> to run an automated
 W estimate across every channel in one step, pooling all selected
 training samples for a more stable estimate than a single sample would
 give.</li>
@@ -415,10 +419,12 @@ were a separate analysis.</li>
 <h4>Adjusting for covariates</h4>
 <p>Ticking a column under <b>Adjust for</b> adds it to every test's model,
 so group differences are estimated with that variable held fixed — for
-example comparing disease vs control at the same age and sex. Columns
-whose values are all numbers enter as a continuous term (a straight-line
-effect); any other column enters as categories, compared against its
-first level. Every tested sample needs a value. A covariate that is
+example comparing disease vs control at the same age and sex. A column
+ticked <b>Numeric</b> under its title in the Sample Group Assignment table
+enters as a continuous term (a straight-line effect, for example age or
+CRP) and needs a number for every sample; any other column enters as
+categories, compared against its first level, so leave numeric codes such
+as batch 1, 2, 3 unticked. Every tested sample needs a value. A covariate that is
 completely confounded with group (e.g. all controls from one batch and all
 cases from another) cannot be separated from the group effect, and the
 run stops with a message naming it. Each covariate uses up degrees of
