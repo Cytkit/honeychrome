@@ -68,9 +68,11 @@ class CaptureDecoder:
                         packet = packets[index]
                         length = min(packet.samples.size, trace_length)
                         trace_start = max(trace_mid - self.pre[packet.channel], 0)
-                        trace_end = trace_start + length
+                        trace_start = min(trace_start, traces.shape[2])
+                        trace_end = min(trace_start + length, traces.shape[2])
+                        usable = trace_end - trace_start
                         if length > 0:
-                            traces[n, packet.channel, trace_start:trace_end] = packet.samples[:length]
+                            traces[n, packet.channel, trace_start:trace_end] = packet.samples[:usable]
                 else:
                     self.error_count += 1 # incomplete event
 
