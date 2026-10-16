@@ -20,7 +20,9 @@ The work is split in two:
 ``load_unmixed(experiment_dir, sample_key, snapshot)``
     Worker-safe. Reads one FCS file, applies an optional keep-mask and a
     seeded event cap, and unmixes it with that sample's own AF library.
-    Optionally returns the per-cell AF abundance and AF index.
+    Optionally returns the per-cell AF abundance and AF index. With a cap,
+    only the selected events are read from list-mode float files (see
+    ``read_raw_subsample``).
 
 Sample keys are the keys of ``experiment.samples['all_samples']``: paths
 relative to the experiment directory, e.g. ``'Raw/Spleen/S1.fcs'``.
@@ -53,7 +55,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     'AFState', 'UnmixSnapshot', 'sample_key_for_path', 'af_profile_names',
     'resolve_af_for_profiles', 'snapshot_unmix_state', 'read_raw_events',
-    'unmix_events', 'load_unmixed', 'seeded_subsample_indices',
+    'unmix_events', 'load_unmixed', 'seeded_subsample_indices', 'read_raw_subsample',
     'control_sample_keys', 'analysis_sample_keys',
 ]
 
@@ -355,6 +357,80 @@ def seeded_subsample_indices(n: int, max_events: int | None, sample_key: str,
     return np.sort(rng.choice(n, size=int(max_events), replace=False))
 
 
+def _kept_index(key: str, mask, n_file: int) -> np.ndarray:
+    """Row positions kept by the keep-mask *mask* (every row without one)."""
+    if mask is None:
+        return np.arange(n_file)
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != (n_file,):
+        raise ValueError(
+            f'keep-mask for {key} has {mask.shape[0]} entries but the file '
+            f'has {n_file} events'
+        )
+    return np.flatnonzero(mask)
+
+
+def _read_rows_streamed(abs_path, snap: UnmixSnapshot, rows: np.ndarray, metadata):
+    """Raw events at *rows* in the experiment's raw channel order, reading
+    only those rows; None when the file cannot be read that way."""
+    from honeychrome.controller_components.fcs_preview import read_fcs_rows
+
+    col_order = list(snap.pnn_raw) if snap.whitelisted else None
+    try:
+        return read_fcs_rows(abs_path, rows, col_order, metadata)
+    except Exception as exc:
+        logger.debug('read_raw_subsample: %s read whole (%s)', abs_path, exc)
+        return None
+
+
+def read_raw_subsample(abs_path, snap, sample_key: str, max_events: int | None,
+                       seed: int = 42, keep_mask: np.ndarray | None = None):
+    """Raw events of a seeded subsample of one FCS file.
+
+    The events are those ``read_raw_events`` followed by the keep-mask and
+    ``seeded_subsample_indices`` select, but when the cap leaves fewer
+    events than the file holds, list-mode float files are memory-mapped
+    and only the selected rows are read, so a large file is never loaded
+    whole. Other files, and files whose TEXT segment cannot be trusted for
+    this, are read whole as before.
+
+    snap       : an UnmixSnapshot, or any object with ``pnn_raw`` and
+                 ``whitelisted``.
+    max_events : the cap; None or 0 keeps every event.
+    keep_mask  : boolean mask over the file's events, applied before the cap.
+
+    Returns ``(raw, event_index, n_events_file, n_events_kept)``.
+
+    Raises ValueError if the keep-mask length does not match the file.
+    """
+    from honeychrome.controller_components.fcs_preview import read_preview_metadata
+
+    key = str(sample_key)
+    if max_events is not None and max_events > 0:
+        try:
+            metadata = read_preview_metadata(abs_path)
+            n_file = int(metadata.event_count)
+        except Exception as exc:
+            logger.debug('read_raw_subsample: no TEXT event count for %s (%s)', abs_path, exc)
+            metadata = None
+        if metadata is not None:
+            kept_index = _kept_index(key, keep_mask, n_file)
+            if len(kept_index) > max_events:
+                event_index = kept_index[
+                    seeded_subsample_indices(len(kept_index), max_events, key, seed)]
+                raw = _read_rows_streamed(abs_path, snap, event_index, metadata)
+                if raw is not None:
+                    return raw, event_index, n_file, int(len(kept_index))
+
+    raw = read_raw_events(abs_path, snap)
+    n_file = len(raw)
+    kept_index = _kept_index(key, keep_mask, n_file)
+    event_index = kept_index[seeded_subsample_indices(len(kept_index), max_events, key, seed)]
+    if len(event_index) < n_file:
+        raw = raw[event_index]
+    return raw, event_index, n_file, int(len(kept_index))
+
+
 def load_unmixed(experiment_dir, sample_key: str, snap: UnmixSnapshot,
                  keep_mask: np.ndarray | None = None,
                  max_events: int | None = None, seed: int = 42,
@@ -369,7 +445,9 @@ def load_unmixed(experiment_dir, sample_key: str, snap: UnmixSnapshot,
     keep_mask      : boolean mask over the file's events; events outside it
                      are dropped before capping. Defaults to the snapshot's
                      time-QC mask for this sample, if any.
-    max_events     : optional cap, applied as a seeded random subsample.
+    max_events     : optional cap, applied as a seeded random subsample;
+                     only the selected events are read where the file
+                     allows it (see ``read_raw_subsample``).
     return_af      : also return per-cell AF abundance and index.
 
     Returns
@@ -382,31 +460,16 @@ def load_unmixed(experiment_dir, sample_key: str, snap: UnmixSnapshot,
     Raises ValueError if the keep-mask length does not match the file.
     """
     key = str(sample_key)
-    raw = read_raw_events(Path(experiment_dir) / key, snap)
-    n_file = len(raw)
-
     mask = keep_mask if keep_mask is not None else snap.qc_by_sample.get(key)
-    if mask is not None:
-        mask = np.asarray(mask, dtype=bool)
-        if mask.shape != (n_file,):
-            raise ValueError(
-                f'keep-mask for {key} has {mask.shape[0]} entries but the file '
-                f'has {n_file} events'
-            )
-        kept_index = np.flatnonzero(mask)
-    else:
-        kept_index = np.arange(n_file)
-
-    sub = seeded_subsample_indices(len(kept_index), max_events, key, seed)
-    event_index = kept_index[sub]
-    raw = raw[event_index]
+    raw, event_index, n_file, n_kept = read_raw_subsample(
+        Path(experiment_dir) / key, snap, key, max_events, seed=seed, keep_mask=mask)
 
     af = snap.af_for(key)
     result = unmix_events(raw, snap, af, return_af=return_af)
     result.update({
         'event_index': event_index,
         'n_events_file': n_file,
-        'n_events_kept': int(len(kept_index)),
+        'n_events_kept': n_kept,
         'af_profiles': af.profile_names if af is not None else (),
     })
     return result
