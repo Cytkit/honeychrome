@@ -27,25 +27,34 @@ and records the trainable gate it converts to:
 <ul>
 <li>the forward-scatter area against height (or width) gate becomes a
 <i>singlets</i> gate and moves to the top of the hierarchy; gates drawn above
-it are placed directly below it;</li>
-<li>ellipses become 10-vertex polygons of the same area;</li>
+it are placed directly below it; a side-scatter area against height gate is a
+<i>singlets</i> gate too, left where it is;</li>
+<li>ellipses become 10-vertex polygons of the same area; no gate is ever an
+ellipse;</li>
 <li>sibling gates drawn on the same pair of parameters become one gate with a
 population each: <i>2dsep</i>, or <i>1dsep</i> on the fluorescence parameter
 when the other is scatter (proposed algorithm <i>mixture</i>);</li>
-<li>a histogram gate becomes a <i>1dsep</i> gate with a histogram view
-(<i>tail</i>);</li>
+<li>a histogram gate becomes a <i>1dsep</i> gate with a histogram view:
+<i>tail</i>, or <i>mixture</i> when its positive population holds more than
+25% of the parent (from the counts in the workspace, or on the Review tab from
+the review samples when the workspace has none);</li>
 <li>a single gate on a pair becomes a <i>1dsep</i> gate on its fluorescence
 parameter when the other is scatter, or a <i>2dsep</i> gate when both are
 fluorescence (<i>mixture</i>);</li>
-<li>shapes drawn only on scatter parameters stay <i>free</i>.</li>
+<li>shapes drawn only on scatter parameters (e.g. FSC-A against SSC-A)
+become <i>free</i> gates with the <i>cells</i> algorithm.</li>
 </ul>
+Gates that share a name in the import (e.g. <i>TIGIT+</i> drawn on many T cell
+subsets) are named after the population they are drawn on, <i>TIGIT+ (Tem)</i>,
+with the populations above it added only when needed, <i>TIGIT+ (CD4+ › Tem)</i>.
+They keep their shared name as a link: converting one converts the others
+still as drawn the same way (see the Review tab).
 Which side of a fluorescence parameter a population is on comes from the drawn
 coordinates: entirely above the channel's zero is the positive side, reaching
 zero or below is the negative side. Compare each gate as drawn with its
 trainable form on the Review tab, then use <b>Convert to trainable</b> (or
 <b>Convert all to trainable</b>) so Train calculates it from the training
-samples. A free polygon cannot be learned, so <i>Convert all</i> leaves it as
-drawn; converting one by hand fits an ellipse instead. <b>Split…</b> replaces
+samples. <b>Split…</b> replaces
 a 2dsep gate with sequential 1dsep gates; you choose the order, algorithms and
 view parameters. <b>Keep imported boundary</b> in the right-click menu
 reverses a conversion.</li>
@@ -56,7 +65,9 @@ main plots are marked stale rather than deleted.</li>
 A section expands under the buttons: choose the group or sample whose gating
 to import, check how each FlowJo parameter maps to an experiment channel
 (matched by fluorophore name where possible), and assign or drop any
-parameter that could not be matched. Populations that use a dropped
+parameter that could not be matched. The search box and <b>Flagged or
+unmatched</b> narrow the parameter list to the rows that need a decision.
+Populations that use a dropped
 parameter, and those below them, are not imported. <b>Import all — add</b>
 adds the gates to the model; <b>Import all — replace</b> replaces its gates.
 FlowJo gates are converted by the same rules as <b>Import from
@@ -65,6 +76,17 @@ experiment's own gating is never changed. Review the imported gates on the
 Review tab before training.</li>
 <li><b>Add gate manually</b> creates a gate that is not on the main plots.</li>
 </ul>
+
+<h4>Finding gates</h4>
+<p>The X and Y columns show each axis by its marker (the fluorophore when the
+channel has no marker). Type in the search box to keep the gates whose name,
+populations, markers, channels or algorithm match; the populations above a
+match stay visible. <b>Show</b> narrows the list to <i>Unconverted</i> gates
+(still applying their imported shapes), <i>Conflicting algorithms</i> (gates
+sharing a name whose algorithms were set differently by hand) or <i>Flagged
+conversions</i> (gates whose trainable form lands far from the imported shape;
+see the Review tab). Flagged gates are marked ⚠ with the reason in the
+tooltip.</p>
 
 <h4>Gate types and algorithms</h4>
 <ul>
@@ -75,11 +97,22 @@ carries the separation parameter of gates you add or split; each gate's Edit
 dialog can change it.</li>
 <li><b>2dsep</b> — a threshold on each of two channels (four quadrants).</li>
 <li><b>singlets</b> — a band around the area-against-height diagonal.</li>
-<li><b>free</b> — a polygon around the parent population (convex hull or
-ellipse).</li>
-<li><b>replicate</b> — reuses another gate's boundary on a different
-parent.</li>
+<li><b>free</b> — a shape on two scatter channels. <b>cells</b> cuts the
+debris: the density valley left of the main forward-scatter peak (or where
+the density there falls below 5% of the peak), keeping everything above it;
+the other sides stay open except just below a pile of saturated events.
+<b>all</b> is the convex hull of the parent population.</li>
+<li><b>replicate</b> (gate type) — reuses another gate's boundary on a
+different parent.</li>
 </ul>
+<p>The <b>replicate</b> algorithm of a threshold gate axis takes its threshold
+from elsewhere, chosen on the Review tab: another gate separating on the same
+channel (its threshold is copied), or a <b>reference population</b>. A
+reference population is one whose biology is known and whose events are
+plentiful: the threshold is calculated there, by default with <i>tail</i>, and
+transferred to a population that is rare, noisy or has no clear boundary. For
+example, CD3+ T cells, which do not express CD19, set the CD19 threshold, and
+Foxp3− CD4 T cells set the CD25 threshold applied to Tregs.</p>
 <p>Threshold algorithms: <b>tail</b> (the upper tail of a symmetric negative
 population; negative populations are symmetric on a logicle or biexponential
 axis [6]), <b>kde_min</b> and <b>bimodal</b> (the density minimum between
@@ -89,7 +122,9 @@ each threshold gate is given a suggested algorithm: <i>mixture</i> when its
 channel looks bimodal (a two-component Gaussian mixture fits clearly better
 than one), otherwise <i>tail</i>.</p>
 <p>Threshold populations are open-ended: every event beyond the threshold
-belongs to the population, however far outside the plotted range.</p>
+belongs to the population, however far outside the plotted range. Shapes are
+tested where the plots draw the events: an event beyond an axis sits on that
+axis edge, so a shape drawn up to the edge includes the events past it.</p>
 <p>Thresholds are calculated once, on the pooled training samples, rather than
 recalculated for each sample as OpenCyto [4] and flowDensity [5] do; the Setup
 tab offers per-sample recalculation as an option.</p>
@@ -133,27 +168,46 @@ then calculated in hierarchy order on the pooled, transformed events.</li>
 </ol>
 
 <h4>Checking and adjusting</h4>
-<p>Each gate appears as a tile showing its parent population and boundary.
-Click a tile to open it full size, move the threshold (1D gates) or the
-threshold lines (2D gates), and accept to keep the adjustment. Adjusted
-gates are marked in the model.</p>
+<p>Each gate appears as a tile showing its parent population and boundary,
+beside the gating hierarchy. Tiles are shown for the gates drawn on the
+populations open in the tree: the first three levels to begin with. Expand a
+population to show the gates drawn on it, or select it to jump to them.
+Click a tile's <b>Detail…</b> to open it full size, move the threshold (1D
+gates) or the threshold lines (2D gates), and accept to keep the adjustment.
+Adjusted gates are marked in the model.</p>
+<p>The hierarchy is coloured by training status: green trained, blue
+adjusted by hand, amber not yet trained and red failed; the line below it
+counts each. Its search box and <b>Show</b> filter work as on the Hierarchy
+tab. Threshold lines on the tiles take the colour of their algorithm.</p>
 <p>A gate whose parent population has too few events to calculate a
 boundary is reported in the status line, and its children are skipped.</p>
-<p>Training results are kept with the experiment and restored when you come
-back to it. Boundaries are stored in transformed units together with each
-channel's transform, so they are converted if a transform has changed.</p>
+
+<h4>Pause and Abort</h4>
+<p><b>Pause</b> stops after the gate being calculated and keeps every gate
+trained so far. <b>Calculate Gates</b> then asks whether to <b>Resume</b>,
+keeping those gates and training the rest on the same pooled events, or to
+<b>Overwrite</b>, training every gate again. A paused run can be resumed only
+while the training samples, events per sample, gates and transforms are as
+they were; otherwise it is trained again from the start. <b>Abort</b> stops
+and keeps nothing from the run: the boundaries from before stay.</p>
+<p>Training results, and a paused run's progress, are kept with the
+experiment and restored when you come back to it. Boundaries are stored in
+transformed units together with the builder's transforms (see the Transforms
+tab).</p>
 '''
 
 BUILDER_EXPORT = '''
 <h3>Export — save or load a gating model</h3>
 <p><b>Save Model…</b> writes a <b>.agmodel</b> file: the gate hierarchy,
-the trained boundaries, the transform of every gated channel, the training
-samples with their event counts and autofluorescence assignments, and
-time-QC details. The Automated Gating plugin applies it to new samples.</p>
+the trained boundaries, the builder's transform of every channel (those on
+the Transforms tab), the training samples with their event counts and
+autofluorescence assignments, and time-QC details. The Automated Gating
+plugin applies it to new samples and shows them in its transforms by
+default.</p>
 <p><b>Load Model…</b> opens an existing model to inspect it or to continue
-training. When the model's transforms differ from this experiment's, its
-boundaries are converted to the current transforms; channels without stored
-transforms (older model files) are loaded unchanged and reported.</p>
+training. Its transforms become the builder's, so its boundaries are shown
+where they were trained; channels without a stored transform (older model
+files) take this experiment's.</p>
 '''
 
 AG_SETUP = '''
@@ -169,10 +223,12 @@ matched by antigen. Amber rows need checking: the same detector carries a
 different antigen, the match is only by similar name, or the antigen is on
 more than one detector. Red rows have no match; choose a channel. Then click
 <b>Accept Alignment</b>.</li>
-<li>On accepting, the model's boundaries are converted to this experiment's
-axis transforms where they differ; the message area lists the channels
-converted.</li>
+<li>On accepting, the model's boundaries are converted to the transforms on
+the Transforms page (the model's own unless you changed them) where they
+differ; the message area lists the channels converted.</li>
 </ol>
+<p>Long lists can be searched, and the alignment table can show only the
+rows to check.</p>
 
 <h4>How each gate is applied</h4>
 <ul>
@@ -188,6 +244,8 @@ either keeps its recalculated boundary or uses the stored one, as chosen.
 If the calculation fails (too few events), the stored boundary is used and
 the sample is flagged.</li>
 </ul>
+<p>Double-click a gate to switch it between fixed and recalculated, or
+right-click to set every selected gate.</p>
 '''
 
 AG_RUN = '''
@@ -198,23 +256,35 @@ and unstained samples are hidden unless <b>Show controls</b> is ticked. A
 warning lists samples whose autofluorescence profile assignment none of the
 training samples had, since their unmixing differs from the training
 data.</li>
-<li>Tick <b>Validate</b> for samples you want to inspect one at a time.</li>
+<li>Tick <b>Validate</b> for samples whose gates you want to see one by one.
+Validation samples are gated too, whether or not <b>Gate</b> is ticked.</li>
 <li>Click <b>Run Gating</b>. Each sample is unmixed with its own
 autofluorescence profiles, restricted to its time-QC keep-mask when present,
-transformed, and gated through the whole hierarchy using every event.</li>
+transformed with the Transforms page's transforms, and gated through the
+whole hierarchy using every event.</li>
 </ol>
+<p><b>Pause</b> stops at the next gate, keeps every sample gated so far and
+saves them with the experiment; the sample being gated is dropped. <b>Run
+Gating</b> then asks whether to <b>Resume</b> (gate only the ticked samples
+without results) or <b>Restart</b> (discard the results so far). A paused run
+can only be restarted once the model, the channel alignment, the gate
+settings or the transforms have changed. <b>Cancel</b> stops the same way but
+discards the run, keeping the results from before it.</p>
 
 <h4>Inspecting the result</h4>
-<p><b>View</b> shows every gate either for all gated samples pooled (with the
-stored boundaries) or for one validation sample (with the boundary that
-sample was gated with). Plots use a random subsample of each sample
+<p><b>Gated views</b> show the gates drawn on the population picked in the
+hierarchy on the left (search it by name): a row for all gated samples pooled,
+with the stored boundaries, and a row for each validation sample, with the
+boundaries it was gated with. Plots use a random subsample of each sample
 (<b>Display events per sample</b>); counts and statistics always use every
 event.</p>
 <p>The table lists each sample's event counts, autofluorescence profiles and
 flags: gates that could not be calculated, recalculated gates that drifted,
 and events removed by time QC.</p>
-<p>Gated results are saved with the experiment. The display events are not,
-so plots need gating to be run again after a restart.</p>
+<p>Gated results and their plot events are saved with the experiment and
+restored when you open it again. Each run's population counts and marker
+medians are also written as CSV files to <i>Automated_Gating_Results</i> in
+the experiment folder, named after the model with a timestamp.</p>
 '''
 
 AG_RESULTS = '''
@@ -223,8 +293,15 @@ AG_RESULTS = '''
 <p>Add groups, give each an optional regular expression matched against the
 sample name, and click <b>Assign by pattern</b>, or choose each sample's group
 by hand. Covariates hold per-sample values: use one to <b>pair</b> samples
-(e.g. donor) or to <b>adjust</b> for (e.g. age, sex, batch). Every group
+(e.g. donor) or to <b>adjust</b> for (e.g. age, sex, batch). Tick
+<b>Numeric</b> under a covariate's title to enter it as a continuous number
+(e.g. age, CRP) with a value for every sample; unticked covariates enter as
+categories, so leave numeric codes such as batch 1, 2, 3 unticked. Every group
 compared needs at least 3 samples.</p>
+<p><b>Import table…</b> reads groups and covariates from a CSV or tab-separated
+file with a <i>sample</i> column (the file name, with or without its
+extension), an optional <i>group</i> column and one column per covariate.
+New groups are added. <b>Export table…</b> writes the same format.</p>
 
 <h4>Statistics</h4>
 <p>The same framework has been applied in systems-immunology studies of flow
@@ -247,19 +324,51 @@ threshold; with it off, they test for any difference and the threshold only
 filters. FDR is pooled over all comparisons or taken within each. Changing a
 threshold updates significance without refitting.</p>
 
-<h4>Figures and populations</h4>
+<h4>Sample PCA and prediction</h4>
+<p>Both use the per-sample values of the last statistics run. <b>Sample
+PCA</b> places every sample on the first two principal components of the
+chosen tables (each column scaled to unit variance), coloured by group, with
+the features that load most strongly as arrows. The <b>predictive
+analysis</b> asks which features best separate two groups, and how well:
+lasso logistic regression and a random forest, assessed by repeated nested
+cross-validation, give the cross-validated ROC curve with its AUC (mean ± SD
+over repeats) and balanced accuracy, the most informative features, and the
+AUC reached with the top 1, 2, 3 … features [6, 7]. It needs at least 10
+samples per group; 30 or more is recommended.</p>
+
+<h4>Figures</h4>
 <p>Heatmaps, volcano plots and a population × marker summary are drawn for
-the comparison chosen at the top. Click a volcano point to open its
-population in <b>Populations</b>, which shows that gate for every sample
-gated in this session, with the boundary the sample was gated with.</p>
+the comparison chosen at the top. Large heatmaps open at half size (or
+smaller); the size slider enlarges them. <b>Pop Out</b> opens a figure in its
+own window, which can stay open while you work. In either place,
+double-click a heatmap row or a volcano point to show that population on the
+<b>Populations</b> page and tick it for the report; right-click it to show
+it, open its comparison in a window, or include it in the report.</p>
+
+<h4>Populations</h4>
+<p>Lists the significant populations of the chosen comparison (marked ★), or
+all of them, and can be searched by name. For the population picked: each
+group's events pooled over its samples (up to 100,000 events per group) on
+the population's gate, with the stored boundary and the pooled gated
+frequency, beside a dot and violin plot of every sample's frequency (% of
+parent) with the test's p-value and FDR. Tick <b>Include in report</b> to
+add the comparison to the report.</p>
 
 <h4>Export</h4>
 <p><b>Generate Report</b> writes a folder under
 <i>Automated_Gating_Reports</i> in the experiment folder: the population and
 marker tables as CSV, a settings document, a PNG or CSV per ticked item
-(sample tables, one plot per gate, and each comparison's figures and results)
-and one PDF with all of them. Gate plots need the display events, so they are
-offered only for samples gated in this session.</p>
+(sample tables, one plot per gate, each comparison's figures and results, and
+the populations ticked for the report) and one PDF with all of them. The
+sample PCA and predictive figures are included once they have been run.
+<b>Cancel</b> on the progress window stops the report and removes its
+half-written folder.</p>
+<p>Every statistics run is written automatically to
+<i>Automated_Gating_Results</i> as CSV files (each test's results, and the
+per-sample values tested), named after the model with a timestamp; the
+statistics are also kept with the experiment and restored when you open it
+again. <b>Export Gating Results…</b> and <b>Export Statistics…</b> write the
+same files to a folder of your choice.</p>
 
 <h4>Further Reading and Background</h4>
 <p>References:<br/>
@@ -281,30 +390,126 @@ FlowJo coordinates are raw instrument units converted with this experiment's
 transforms, and unmixing here can differ from the unmixing the gates were
 drawn on, so look at them before training.</p>
 <ol>
-<li>Choose a <b>population</b> in the gating hierarchy on the left (expand
-and collapse its branches) or in the population list above it; the two stay
-in step. A population with no gates below it shows the plot it is gated
-on.</li>
-<li>Each row shows one plot of the population's daughter gates. On the
-<b>left</b>, the gates <b>as drawn</b>; on the <b>right</b>, each gate's
-<b>trainable form</b>: calculated on the review sample's parent population with
-the algorithm chosen above it, or its trained boundary once trained. Change
-the algorithm to see the result update.</li>
-<li><b>Convert to trainable</b> makes Train calculate the gate with the chosen
-algorithm; <b>Use shapes as drawn</b> reverses it. <b>Split…</b> replaces a
-2dsep gate with sequential 1dsep gates.</li>
-<li>Choose the <b>review sample</b>. When the imported counts came from a
-sample in this experiment it is selected for you, and each population label
-shows its fraction of parent next to the fraction recorded at import. A label
-turns red when they differ by 2 percentage points or by 5% of the imported
+<li>Choose a <b>population</b> in the gating hierarchy on the left or in the
+population list above it; the two stay in step. A population with no gates
+below it shows the plot it is gated on.</li>
+<li>Choose the <b>review samples</b>. Tick several to pool them, each giving the
+same number of events. When the imported counts came from a sample in this
+experiment it is chosen for you, and with that one sample each population
+label shows its fraction of parent next to the fraction recorded at import,
+in red when they differ by 2 percentage points or by 5% of the imported
 fraction.</li>
-<li>Tick <b>Edit gates</b> to drag the corners, edges and limits of the shapes
-as drawn (long polygons are thinned to 32 corners when edited). <b>Reset to
-import</b> restores the shapes shown to their imported state.</li>
+<li>Each plot's gates <b>as drawn</b> are on the left; on the right, level
+with it, each gate's <b>trainable form</b>: calculated on the review samples'
+parent population with the algorithm chosen above it, or its trained boundary
+once trained. A 2dsep gate has an algorithm per axis. Each algorithm has a
+colour, used for its name in the lists and for its threshold on the plots:
+<span style="color:#8e44ad">mixture</span>,
+<span style="color:#dc6e00">tail</span>,
+<span style="color:#1e64dc">replicate</span>,
+<span style="color:#008c8c">otsu</span>,
+<span style="color:#c82878">bimodal</span>,
+<span style="color:#8c5f28">kde_min</span> and
+<span style="color:#1ea032">imported</span>. Choosing
+<b>replicate</b> shows a source: another gate on the same channel, whose
+threshold is copied, or a reference population, on which the threshold is
+calculated; until a source gives a threshold, the imported boundary is shown
+in its place, captioned. With <b>tail</b> (also for a reference population),
+<b>Tail fraction</b> beside the algorithm sets the share of the mirrored
+negative population left above the threshold: smaller is stricter. The tail
+algorithm uses the whole axis; the others ignore the lowest 1% of it.
+<b>Update</b> calculates the shown gates again.</li>
+<li><b>Convert to trainable</b> makes Train calculate the gate with the chosen
+algorithm; <b>Use shapes as drawn</b> reverses it. <b>Convert all to
+trainable</b> converts every gate still as drawn to its proposed algorithm.
+<b>Split…</b> replaces a 2dsep gate with sequential 1dsep gates. The red
+<b>−</b> deletes a gate and the gates below it, after asking.</li>
+<li>Gates that share an imported name (e.g. every <i>CD80+</i>) are kept on
+one algorithm: converting one, or changing a converted one's algorithm,
+converts the others still as drawn (or set this way before) to the same
+algorithm and parameters. Once two of them have been set differently by
+hand, the others are left alone and a message at the bottom says so; when
+you set them alike again, the others follow. The <b>⇊</b> button beside a
+converted gate applies its algorithm and settings to every gate of the same
+name below the population it is drawn on, set by hand or not: set up
+<i>CD25+</i> on one T cell subset, for example, then pass it to the subsets
+below it.</li>
+<li>Tick <b>Edit gates</b> to drag the shapes as drawn of gates that still
+apply them (left; long polygons are thinned to 32 corners), and the
+boundaries of converted gates (right). A boundary moved on the right is kept
+as an adjustment until the gate is trained again. <b>Reset to import</b>
+restores the shapes shown to their imported state.</li>
 <li>Drag an axis to rescale it, as on the main plots: the lower half of a
 biexponential axis changes its width basis, the upper half zooms. The gates
 move with the axis, so they stay on the same events.</li>
 </ol>
+<h4>Finding and checking gates</h4>
+<p>The search box above the hierarchy keeps the populations whose gates match
+(by name, marker, channel or algorithm), and <b>Show</b> narrows it to
+unconverted gates, gates with conflicting algorithms or flagged conversions,
+as on the Hierarchy tab. <b>Flag conversions</b> compares, on the review
+samples, each gate's imported shape with its trainable form and flags it when
+a threshold moves more than the set distance (in axis units: the axis spans
+about 0 to 1) or a population's share of its parent changes by more than the
+set number of percentage points. Flagged gates are red in the hierarchy, with
+the reason in the tooltip.</p>
+<h4>Hierarchy menu</h4>
+<p>Right-click the hierarchy (Ctrl- or Shift-click selects several
+populations) to <b>Copy gate</b> or <b>Copy gating branch</b> (the gate and
+every gate below it) and <b>Paste</b> them onto other populations; copies are
+named after the population they are pasted on and follow their same-named
+gates. <b>Delete gate…</b> and <b>Delete population…</b> remove the selection
+with what is below it. <b>Use as reference population</b> marks a population
+as a source for replicated thresholds.</p>
 <p>Changing a gate clears the training of that gate and of the gates below
 it; train again to apply the change.</p>
+'''
+
+AG_TRANSFORMS = '''
+<h3>Transforms — the axis scales gating uses</h3>
+<p>Threshold gates are calculated on transformed (logicle) values, so where a
+gate falls depends on the transform. By default the transforms are the
+model's own, the ones it was trained in, so a recalculated gate behaves as it
+did in training; channels the model has none for use this experiment's.</p>
+<ul>
+<li>Pick a <b>population</b> of the experiment's gating hierarchy (the gates of
+the Unmixed Data tab; Singlets or Cells to start with). Its events are pooled
+from a few of the samples ticked on the Run page, each unmixed and gated as
+the main window does.</li>
+<li>Select a channel on the right to see its histogram and biplots. Drag an
+axis to adjust it as on the main plots: the lower half of a logicle axis
+changes its width basis W, the upper half the displayed range.</li>
+<li><b>Auto-transform</b> sets W for every logicle channel from the events
+shown (Parks, Roederer and Moore 2006).</li>
+<li><b>Revert to the model's transforms</b> undoes your changes.</li>
+</ul>
+<p>The model's boundaries move with a transform, so they stay on the same
+events. Gating results record the transforms they were made in; changing the
+transforms means a paused run is restarted rather than resumed.</p>
+'''
+
+BUILDER_TRANSFORMS = '''
+<h3>Transforms — the axis scales the model is trained in</h3>
+<p>Threshold algorithms work on transformed (logicle) values, so the transform
+of a channel changes where its gates are placed. The model is trained in
+these transforms and saves them; Automated Gating uses them by default.
+They start as this experiment's display transforms and are the builder's
+own: changing them here does not change the main window's plots.</p>
+<ul>
+<li>Pick a <b>population</b> of the experiment's gating hierarchy (the gates of
+the Unmixed Data tab; Singlets or Cells to start with). Its events are pooled
+from the training samples (or the sample on show), each unmixed and gated as
+the main window does.</li>
+<li>Select a channel on the right to see its histogram and biplots. Drag an
+axis to adjust it: the lower half of a logicle axis changes its width basis
+W, the upper half the displayed range. Axes dragged on the Hierarchy and
+Review plots change the same transforms.</li>
+<li><b>Auto-transform</b> sets W for every logicle channel from the events
+shown (Parks, Roederer and Moore 2006).</li>
+<li><b>Reset to the experiment's transforms</b> returns to the main window's
+transforms.</li>
+</ul>
+<p>Imported shapes and trained boundaries move with a transform, so they stay
+on the same events. Retrain after changing transforms to calculate the gates
+on the new scales.</p>
 '''

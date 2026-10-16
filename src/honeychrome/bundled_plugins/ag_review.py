@@ -12,10 +12,15 @@ Imported gates carry a ``template`` (their boundary in display units),
 ``template_original`` (the boundary as imported) and a ``source`` record
 (see ag_flowjo.build_gate_definitions). The file name does not end in
 ``_tab.py``, so the plugin loader does not treat it as a tab.
+
+Also here: keeping gates that share a name (``name_group``, e.g. every
+'CD80+') on one algorithm, the sources a replicated threshold can come
+from, and deleting, copying and pasting gates and branches.
 """
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 
 import numpy as np
@@ -29,6 +34,11 @@ __all__ = [
     'with_thresholds', 'with_polygon', 'with_range', 'reset_template',
     'polygon_vertices', 'convert_target', 'is_free_shape', 'drawn_channels',
     'trainable_algorithms', 'trainable_definition', 'has_drawn_shape', 'split_2dsep',
+    'histogram_proposal', 'name_group', 'sync_members', 'sync_fingerprint',
+    'apply_name_sync', 'sync_conflicts', 'conflicting_gate_names', 'gates_below_population',
+    'feed_forward', 'conversion_check', 'SYNC_USER', 'SYNC_AUTO', 'SYNC_DRAWN',
+    'replicate_choices', 'descendants', 'delete_gates', 'delete_population',
+    'copy_gates', 'paste_gates', 'rename_references',
 ]
 
 ROOT = ('', 'root')
@@ -129,7 +139,8 @@ def population_tree(gate_defs: list[dict]) -> list[dict]:
     ``n_gates`` counts the gates drawn on the population. ``view`` is the
     ``(gate, pop)`` whose daughter gates are shown to review the node: the
     node itself when gates are drawn on it, else its parent (the plot it is
-    gated on). Labels follow ``population_choices``.
+    gated on). Labels follow ``population_choices``; reference populations
+    are marked.
     """
     ordered = ag_core.ordered_gate_defs(gate_defs)
     by_name = ag_core.gates_by_name(gate_defs)
@@ -161,6 +172,8 @@ def population_tree(gate_defs: list[dict]) -> list[dict]:
                 continue
             n = counts.get(key, 0)
             label = pop if imported else f"{gate_def['gate_name']} / {pop}"
+            if ((gate_def.get('populations') or {}).get(pop) or {}).get('reference'):
+                label += '  [reference]'
             nodes.append({'gate': gate_def['gate_name'], 'pop': pop, 'label': label,
                           'parent': parent, 'n_gates': n, 'view': key if n else parent})
             known.add(key)
@@ -282,31 +295,44 @@ def is_free_shape(gate_def: dict) -> bool:
     return gate_def.get('gate_type') == 'free'
 
 
-def convert_target(gate_def: dict, recommendation: str | None = None):
+def histogram_proposal(gate_def: dict, positive_fraction) -> str | None:
+    """The algorithm the histogram rule proposes for an imported histogram
+    gate whose proposal was set by the rule (``proposal_rule``), given the
+    fraction of its parent on the positive side: 'mixture' above 25%, else
+    'tail'. None when the rule does not apply."""
+    if gate_def.get('proposal_rule') != 'histogram' or positive_fraction is None:
+        return None
+    import ag_flowjo
+    return ag_flowjo.histogram_algorithm(positive_fraction)
+
+
+def convert_target(gate_def: dict, recommendation: str | None = None,
+                   positive_fraction=None):
     """The learning algorithm an imported gate converts to.
 
     Returns ``(algorithm, note)``; *algorithm* is None when the gate is not
-    using its imported boundary. The algorithm proposed at import comes
-    first; otherwise threshold gates use the recommended algorithm when
-    there is one, else 'tail', and singlet gates use 'singlets'.
-    A free polygon can only become 'ellipse' (the 3 SD ellipse of its
-    parent population), which does not reproduce the drawn shape, so the
-    note says so.
+    using its imported boundary. A histogram gate still on the import's rule
+    (see histogram_proposal) uses *positive_fraction* when one is given;
+    otherwise the algorithm proposed at import comes first, then for
+    threshold gates the recommended algorithm when there is one, else
+    'tail'; singlet gates use 'singlets' and scatter shapes 'cells'.
     """
     if gate_def.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
         return None, ''
     gate_type = gate_def.get('gate_type')
     allowed = trainable_algorithms(gate_def)
+    by_rule = histogram_proposal(gate_def, positive_fraction)
+    if by_rule in allowed:
+        return by_rule, ''
     proposed = gate_def.get('proposed_algorithm')
-    if proposed in allowed and gate_type != 'free':
+    if proposed in allowed:
         return proposed, ''
     if gate_type in ag_core.THRESHOLD_TYPES:
         return (recommendation if recommendation in allowed else 'tail'), ''
     if gate_type == 'singlets':
         return 'singlets', ''
-    if gate_type == 'free' and 'ellipse' in allowed:
-        return 'ellipse', ("A drawn shape cannot be learned: 'ellipse' fits an ellipse to the "
-                           "parent population instead of keeping the drawn polygon.")
+    if gate_type == 'free' and 'cells' in allowed:
+        return 'cells', ''
     return (allowed[0] if allowed else None), ''
 
 
@@ -430,3 +456,491 @@ def split_2dsep(gate_defs: list[dict], gate_name: str, steps: list[dict]) -> tup
         d['gate_number'] = k
     out.sort(key=lambda d: d['gate_number'])
     return out, [d['gate_name'] for d in new]
+
+
+# ---------------------------------------------------------------------------
+# Gates that share a name
+# ---------------------------------------------------------------------------
+
+SYNC_USER = 'user'      # the algorithm was chosen for this gate by the user
+SYNC_AUTO = 'auto'      # the algorithm was copied from same-named gates
+SYNC_DRAWN = 'drawn'    # the user returned this gate to its shapes as drawn
+
+# gate_param keys that are part of a gate's trainable configuration.
+SYNC_PARAM_KEYS = (
+    'algorithm_x', 'algorithm_y', 'replicate_x', 'replicate_y',
+    'tail_fraction', 'tail_fraction_x', 'tail_fraction_y',
+    'mixture_components', 'mixture_components_x', 'mixture_components_y',
+    'axis_lo', 'axis_hi', 'axis_lo_x', 'axis_hi_x', 'axis_lo_y', 'axis_hi_y',
+    'quantile_trim', 'width_sd', 'debris_axis', 'debris_density', 'saturation_fraction',
+)
+
+
+def name_group(gate_def: dict) -> str:
+    """The name a gate shares with its replicates: the name it was imported
+    with (``name_group``), else its own name."""
+    return gate_def.get('name_group') or gate_def['gate_name']
+
+
+def _sync_key(gate_def: dict) -> tuple:
+    return (name_group(gate_def), gate_def.get('gate_type'),
+            gate_def.get('gate_marker_x'), gate_def.get('gate_marker_y'))
+
+
+def sync_members(gate_defs: list[dict], gate_name: str) -> list[dict]:
+    """The gates treated as replicates of *gate_name*: the same imported
+    name, type and channels. Empty when the gate has no such partners."""
+    by_name = ag_core.gates_by_name(gate_defs)
+    g = by_name.get(gate_name)
+    if g is None:
+        return []
+    key = _sync_key(g)
+    members = [o for o in gate_defs if _sync_key(o) == key]
+    return members if len(members) > 1 else []
+
+
+def sync_fingerprint(gate_def: dict) -> str:
+    """The gate's trainable configuration as a comparable string: its
+    algorithm and the gate_param keys in SYNC_PARAM_KEYS."""
+    gp = gate_def.get('gate_param') or {}
+    return json.dumps({'algorithm': gate_def.get('algorithm'),
+                       'params': {k: gp[k] for k in SYNC_PARAM_KEYS if k in gp}},
+                      sort_keys=True, default=str)
+
+
+def _user_set(gate_def: dict) -> bool:
+    """Converted to trainable by the user (gates converted before syncing
+    existed count as the user's choice)."""
+    return (gate_def.get('algorithm') != ag_core.ALGORITHM_IMPORTED
+            and gate_def.get('sync_origin') not in (SYNC_AUTO, SYNC_DRAWN))
+
+
+def _follows_sync(gate_def: dict) -> bool:
+    """Updated to match its replicates: still as drawn, or set automatically."""
+    if gate_def.get('sync_origin') == SYNC_DRAWN:
+        return False
+    return (gate_def.get('algorithm') == ag_core.ALGORITHM_IMPORTED
+            or gate_def.get('sync_origin') == SYNC_AUTO)
+
+
+def _group_label(members: list[dict]) -> str:
+    return name_group(members[0])
+
+
+def apply_name_sync(gate_defs: list[dict], gate_name: str) -> tuple[list[str], str | None]:
+    """Bring the replicates of *gate_name* in line with the configuration
+    the user chose for them.
+
+    The user-set members (see _user_set) decide. When they all agree, every
+    member that is still as drawn, or was set automatically, takes their
+    algorithm and parameters and is marked SYNC_AUTO; members the user set,
+    or returned to their shapes as drawn, are left alone. A member is also
+    left alone when the configuration would make it replicate a threshold
+    from itself or from a gate below it. When the user-set members disagree
+    nothing changes and the group's name is returned as a conflict.
+
+    Returns (names of the gates changed, conflicting group name or None).
+    """
+    members = sync_members(gate_defs, gate_name)
+    if not members:
+        return [], None
+    chosen = [m for m in members if _user_set(m)]
+    if not chosen:
+        return [], None
+    prints = {sync_fingerprint(m) for m in chosen}
+    if len(prints) > 1:
+        return [], _group_label(members)
+    template = chosen[0]
+    target = sync_fingerprint(template)
+    tgp = template.get('gate_param') or {}
+    sources = {src.get('gate') for src in (tgp.get('replicate_x'), tgp.get('replicate_y'))
+               if isinstance(src, dict) and src.get('gate')}
+    sources |= {ag_core.split_population_key(src['population'])[0]
+                for src in (tgp.get('replicate_x'), tgp.get('replicate_y'))
+                if isinstance(src, dict) and src.get('population')}
+    changed = []
+    for m in members:
+        if not _follows_sync(m):
+            continue
+        if m.get('algorithm') != ag_core.ALGORITHM_IMPORTED and sync_fingerprint(m) == target:
+            continue
+        below = {m['gate_name']} | descendants(gate_defs, m['gate_name'])
+        if sources & below:
+            continue
+        gp = {k: v for k, v in (m.get('gate_param') or {}).items() if k not in SYNC_PARAM_KEYS}
+        gp.update({k: deepcopy(tgp[k]) for k in SYNC_PARAM_KEYS if k in tgp})
+        m['gate_param'] = gp
+        m['algorithm'] = template.get('algorithm')
+        m['sync_origin'] = SYNC_AUTO
+        changed.append(m['gate_name'])
+    return changed, None
+
+
+def sync_conflicts(gate_defs: list[dict]) -> list[str]:
+    """Names of the groups of same-named gates whose user-set members use
+    different configurations, so the others are not updated."""
+    seen, out = set(), []
+    for g in gate_defs:
+        key = _sync_key(g)
+        if key in seen:
+            continue
+        seen.add(key)
+        members = sync_members(gate_defs, g['gate_name'])
+        prints = {sync_fingerprint(m) for m in members if _user_set(m)}
+        if len(prints) > 1:
+            out.append(_group_label(members))
+    return out
+
+
+def conflicting_gate_names(gate_defs: list[dict]) -> set:
+    """Names of every gate in a same-named group whose user-set members use
+    different configurations (see sync_conflicts)."""
+    seen, out = set(), set()
+    for g in gate_defs:
+        key = _sync_key(g)
+        if key in seen:
+            continue
+        seen.add(key)
+        members = sync_members(gate_defs, g['gate_name'])
+        if len({sync_fingerprint(m) for m in members if _user_set(m)}) > 1:
+            out |= {m['gate_name'] for m in members}
+    return out
+
+
+def gates_below_population(gate_defs: list[dict], parent_gate, parent_pop: str) -> set:
+    """Names of every gate drawn on population (parent_gate, parent_pop) or
+    on any population below it; parent_gate None is the root."""
+    parent_gate = parent_gate or None
+    on_it = {g['gate_name'] for g in gate_defs
+             if (g.get('parent_gate') or None) == parent_gate
+             and (parent_gate is None or (g.get('parent_popul') or 'root') == parent_pop)}
+    out = set(on_it)
+    for name in on_it:
+        out |= descendants(gate_defs, name)
+    return out
+
+
+def feed_forward(gate_defs: list[dict], gate_name: str) -> tuple[list[str], list[str]]:
+    """Give the gates that share *gate_name*'s name, type and channels and
+    lie below the population it is drawn on the same trainable
+    configuration (algorithm and the SYNC_PARAM_KEYS parameters), in place.
+
+    The copies count as the user's choice (SYNC_USER). A gate is left
+    alone when the configuration would make it replicate a threshold from
+    itself or from a gate below it.
+
+    Returns (names changed, names skipped).
+    """
+    by_name = ag_core.gates_by_name(gate_defs)
+    source = by_name.get(gate_name)
+    if source is None or source.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+        return [], []
+    key = _sync_key(source)
+    below = gates_below_population(gate_defs, source.get('parent_gate'),
+                                   source.get('parent_popul') or 'root') - {gate_name}
+    tgp = source.get('gate_param') or {}
+    sources = {src.get('gate') for src in (tgp.get('replicate_x'), tgp.get('replicate_y'))
+               if isinstance(src, dict) and src.get('gate')}
+    sources |= {ag_core.split_population_key(src['population'])[0]
+                for src in (tgp.get('replicate_x'), tgp.get('replicate_y'))
+                if isinstance(src, dict) and src.get('population')}
+    changed, skipped = [], []
+    for g in ag_core.ordered_gate_defs(gate_defs):
+        name = g['gate_name']
+        if name not in below or _sync_key(g) != key:
+            continue
+        if sources & ({name} | descendants(gate_defs, name)):
+            skipped.append(name)
+            continue
+        target = by_name[name]
+        gp = {k: v for k, v in (target.get('gate_param') or {}).items() if k not in SYNC_PARAM_KEYS}
+        gp.update({k: deepcopy(tgp[k]) for k in SYNC_PARAM_KEYS if k in tgp})
+        if (target.get('algorithm') == source.get('algorithm')
+                and sync_fingerprint(dict(target, gate_param=gp)) == sync_fingerprint(target)):
+            continue
+        target['gate_param'] = gp
+        target['algorithm'] = source.get('algorithm')
+        target['sync_origin'] = SYNC_USER
+        changed.append(name)
+    return changed, skipped
+
+
+def conversion_check(gate_def: dict, drawn: dict, proposed: dict, drawn_fractions: dict,
+                     proposed_fractions: dict, shift_limit: float = 0.1,
+                     fraction_limit: float = 0.1) -> dict | None:
+    """Compare a gate's imported boundary (*drawn*) with its trainable form
+    (*proposed*) on the same events.
+
+    shift    : the largest move of a threshold, in transformed axis units
+               (thresholds of both; None when either is a shape).
+    fraction : the largest change of a population's fraction of the parent.
+
+    Returns {'shift', 'fraction', 'message'} when either exceeds its limit,
+    else None.
+    """
+    shift = None
+    first_d = next(iter(drawn.values()), {}) if drawn else {}
+    first_p = next(iter(proposed.values()), {}) if proposed else {}
+    if not ag_core.is_shape_boundary(drawn) and first_d and first_p:
+        moves = [abs(float(first_p[k]) - float(first_d[k])) for k in ('threshold_x', 'threshold_y')
+                 if first_d.get(k) is not None and first_p.get(k) is not None]
+        shift = max(moves) if moves else None
+    pops = set(drawn_fractions) & set(proposed_fractions)
+    fraction = max((abs(float(proposed_fractions[p]) - float(drawn_fractions[p])) for p in pops),
+                   default=None)
+    over_shift = shift is not None and shift > shift_limit
+    over_fraction = fraction is not None and fraction > fraction_limit
+    if not (over_shift or over_fraction):
+        return None
+    parts = []
+    if shift is not None:
+        parts.append(f"threshold moves {shift:.3f} axis units")
+    if fraction is not None:
+        parts.append(f"a population changes by {100 * fraction:.1f} percentage points")
+    return {'shift': shift, 'fraction': fraction,
+            'message': "Trainable form far from the imported boundary: " + "; ".join(parts) + "."}
+
+
+# ---------------------------------------------------------------------------
+# Replicated thresholds
+# ---------------------------------------------------------------------------
+
+def descendants(gate_defs: list[dict], gate_name: str) -> set:
+    """Names of every gate below *gate_name*."""
+    out, frontier = set(), {gate_name}
+    while frontier:
+        frontier = {g['gate_name'] for g in gate_defs if g.get('parent_gate') in frontier} - out
+        out |= frontier
+    return out
+
+
+def replicate_choices(gate_defs: list[dict], gate_name: str, axis: str) -> list[tuple]:
+    """Sources a replicated threshold of *gate_name* on *axis* can come from,
+    as (label, source) pairs: other threshold gates separating on the same
+    channel (their threshold is copied), then the reference populations
+    (the threshold is calculated on their events). The gate itself and the
+    gates below it are left out, since they are calculated after it."""
+    by_name = ag_core.gates_by_name(gate_defs)
+    g = by_name.get(gate_name)
+    if g is None:
+        return []
+    channel = ag_core.axis_channel(g, axis)
+    excluded = {gate_name} | descendants(gate_defs, gate_name)
+    out = []
+    for o in ag_core.ordered_gate_defs(gate_defs):
+        if o['gate_name'] in excluded:
+            continue
+        eff = ag_core.effective_gate_def(o, by_name)
+        if eff.get('gate_type') not in ag_core.THRESHOLD_TYPES:
+            continue
+        chans = [eff.get('gate_marker_x')]
+        if eff.get('gate_type') == '2dsep':
+            chans.append(eff.get('gate_marker_y'))
+        if channel in chans:
+            out.append((f"Copy from gate: {o['gate_name']}", {'gate': o['gate_name']}))
+    for key in ag_core.reference_populations(gate_defs):
+        gate, pop = ag_core.split_population_key(key)
+        if gate in excluded:
+            continue
+        out.append((f"Reference population: {pop} ({gate})", {'population': key, 'algorithm': 'tail'}))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Deleting, copying and pasting
+# ---------------------------------------------------------------------------
+
+def _clear_sources(gate_defs: list[dict], removed: set) -> list[str]:
+    """Clear replicate sources that point at removed gates or their
+    populations. Returns the names of the gates affected."""
+    hit = []
+    for g in gate_defs:
+        gp = g.get('gate_param') or {}
+        for axis in ('x', 'y'):
+            src = gp.get(f'replicate_{axis}')
+            if not isinstance(src, dict):
+                continue
+            gate = src.get('gate') or ag_core.split_population_key(src.get('population') or '')[0]
+            if gate in removed:
+                gp[f'replicate_{axis}'] = None
+                if g['gate_name'] not in hit:
+                    hit.append(g['gate_name'])
+    return hit
+
+
+def delete_gates(gate_defs: list[dict], names) -> tuple[list[dict], list[str], list[str]]:
+    """Remove gates with everything below them, and old-style replicate
+    gates copying them.
+
+    Returns (remaining definitions, removed names, names of remaining gates
+    whose replicate source was removed and must be chosen again).
+    """
+    removed = set()
+    frontier = set(names)
+    while frontier:
+        removed |= frontier
+        nxt = set()
+        for g in gate_defs:
+            if g['gate_name'] in removed:
+                continue
+            if g.get('parent_gate') in removed or (
+                    g.get('gate_type') == 'replicate' and g.get('origin_gate') in removed):
+                nxt.add(g['gate_name'])
+        frontier = nxt
+    out = [deepcopy(g) for g in gate_defs if g['gate_name'] not in removed]
+    orphaned = _clear_sources(out, removed)
+    return out, [g['gate_name'] for g in gate_defs if g['gate_name'] in removed], orphaned
+
+
+def delete_population(gate_defs: list[dict], gate_name: str, pop: str
+                      ) -> tuple[list[dict], list[str], list[str]]:
+    """Remove one population of a gate with the gates below it; a gate left
+    with no population is removed. Returns as delete_gates."""
+    by_name = ag_core.gates_by_name(gate_defs)
+    g = by_name.get(gate_name)
+    if g is None or pop not in (g.get('populations') or {}):
+        return [deepcopy(x) for x in gate_defs], [], []
+    if len(g['populations']) == 1:
+        return delete_gates(gate_defs, [gate_name])
+    below = [o['gate_name'] for o in gate_defs
+             if o.get('parent_gate') == gate_name and o.get('parent_popul') == pop]
+    out, removed, orphaned = delete_gates(gate_defs, below) if below else (
+        [deepcopy(x) for x in gate_defs], [], [])
+    target = ag_core.gates_by_name(out)[gate_name]
+    target['populations'].pop(pop, None)
+    for key in ('template', 'template_original'):
+        if target.get(key):
+            target[key].pop(pop, None)
+    src = target.get('source') or {}
+    for key in ('populations', 'counts'):
+        if isinstance(src.get(key), dict):
+            src[key].pop(pop, None)
+    for o in out:
+        sp = o.get('stats_parent')
+        if isinstance(sp, dict):
+            for k, v in list(sp.items()):
+                if v == ag_core.population_key(gate_name, pop):
+                    sp.pop(k)
+    gone_key = ag_core.population_key(gate_name, pop)
+    for o in out:
+        gp = o.get('gate_param') or {}
+        for axis in ('x', 'y'):
+            src_ = gp.get(f'replicate_{axis}')
+            if isinstance(src_, dict) and src_.get('population') == gone_key:
+                gp[f'replicate_{axis}'] = None
+                if o['gate_name'] not in orphaned:
+                    orphaned.append(o['gate_name'])
+    return out, removed, orphaned
+
+
+def copy_gates(gate_defs: list[dict], names, branch: bool = False) -> list[dict]:
+    """Copies of the named gates (and, with *branch*, every gate below
+    them), parents before children, for pasting elsewhere."""
+    wanted = set(names)
+    if branch:
+        for n in list(wanted):
+            wanted |= descendants(gate_defs, n)
+    return [deepcopy(g) for g in ag_core.ordered_gate_defs(gate_defs) if g['gate_name'] in wanted]
+
+
+def _paste_name(base: str, place: str, taken: set) -> str:
+    cand = f"{base} ({place})"
+    stem, k = cand, 2
+    while cand in taken:
+        cand = f"{stem} {k}"
+        k += 1
+    return cand
+
+
+def paste_gates(gate_defs: list[dict], clipboard: list[dict], target_gate, target_pop: str
+                ) -> tuple[list[dict], list[str]]:
+    """Add copies of *clipboard* (see copy_gates) below the population
+    (target_gate, target_pop); target_gate None or '' is the root.
+
+    Copied gates whose parent was not copied are drawn on the target;
+    the others keep their place in the copied branch. Each copy is named
+    after its name group and the population it now sits in, keeps the name
+    group (so it follows its same-named gates), and is untrained.
+    Replicate sources pointing inside the copied branch follow the copies.
+
+    Returns (new definition list, names of the new gates).
+    """
+    target_gate = target_gate or None
+    taken = {g['gate_name'] for g in gate_defs}
+    copied = {g['gate_name'] for g in clipboard}
+    renamed: dict[str, str] = {}
+    new = []
+    inner = set()
+    number = max((int(g.get('gate_number', 0) or 0) for g in gate_defs), default=0)
+    for g in clipboard:
+        c = deepcopy(g)
+        if c.get('parent_gate') in copied:
+            place = c.get('parent_popul') or 'root'
+            inner.add(id(c))
+        else:
+            place = target_pop if target_gate else 'All events'
+            c['parent_gate'], c['parent_popul'] = target_gate, (target_pop if target_gate else 'root')
+        base = name_group(g)
+        name = _paste_name(base, place, taken)
+        taken.add(name)
+        renamed[g['gate_name']] = name
+        c['name_group'] = base
+        c['gate_name'] = name
+        c.pop('sync_origin', None)
+        number += 1
+        c['gate_number'] = number
+        new.append(c)
+    for c in new:
+        if id(c) in inner:
+            c['parent_gate'] = renamed[c['parent_gate']]
+        if c.get('origin_gate') in renamed:
+            c['origin_gate'] = renamed[c['origin_gate']]
+        gp = c.get('gate_param') or {}
+        for axis in ('x', 'y'):
+            src = gp.get(f'replicate_{axis}')
+            if not isinstance(src, dict):
+                continue
+            if src.get('gate') in renamed:
+                src['gate'] = renamed[src['gate']]
+            elif src.get('population'):
+                gate, pop = ag_core.split_population_key(src['population'])
+                if gate in renamed:
+                    src['population'] = ag_core.population_key(renamed[gate], pop)
+        sp = c.get('stats_parent')
+        if isinstance(sp, dict):
+            for k, v in list(sp.items()):
+                gate, pop = ag_core.split_population_key(str(v))
+                if gate in renamed:
+                    sp[k] = ag_core.population_key(renamed[gate], pop)
+    out = [deepcopy(g) for g in gate_defs] + new
+    ag_core.ordered_gate_defs(out)
+    return out, [c['gate_name'] for c in new]
+
+
+def rename_references(gate_defs: list[dict], old: str, new: str) -> None:
+    """Point every reference to gate *old* at *new*, in place: parents,
+    replicate origins and sources, and statistics parents."""
+    for g in gate_defs:
+        if g.get('parent_gate') == old:
+            g['parent_gate'] = new
+        if g.get('origin_gate') == old:
+            g['origin_gate'] = new
+        gp = g.get('gate_param') or {}
+        for axis in ('x', 'y'):
+            src = gp.get(f'replicate_{axis}')
+            if not isinstance(src, dict):
+                continue
+            if src.get('gate') == old:
+                src['gate'] = new
+            elif src.get('population'):
+                gate, pop = ag_core.split_population_key(src['population'])
+                if gate == old:
+                    src['population'] = ag_core.population_key(new, pop)
+        sp = g.get('stats_parent')
+        if isinstance(sp, dict):
+            for k, v in list(sp.items()):
+                gate, pop = ag_core.split_population_key(str(v))
+                if pop and gate == old:
+                    sp[k] = ag_core.population_key(new, pop)
+                elif v == old:
+                    sp[k] = new

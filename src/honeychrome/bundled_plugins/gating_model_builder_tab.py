@@ -4,12 +4,18 @@ gating_model_builder_tab.py — Gating Model Builder plugin for Honeychrome
 Authors automated gating models (``.agmodel`` files) for the Automated
 Gating plugin:
 
-  • Hierarchy — import the gate hierarchy from the unmixed gating strategy,
-                choose each gate's type, algorithm and parameters.
+  • Transforms — the axis transforms the model is trained in (the builder's
+                own; they start as the experiment's and are saved with the
+                model).
+  • Hierarchy — import the gate hierarchy from the unmixed gating strategy
+                or a FlowJo workspace, choose each gate's type, algorithm
+                and parameters.
+  • Review    — compare imported gates with their trainable form on review
+                samples, convert, edit and flag them.
   • Train     — pick training samples; each gate's boundary is calculated
                 from its parent population in a pooled, equal-sized sample
-                of every training file (background worker), then inspected
-                and adjusted gate by gate.
+                of every training file (background worker, which can be
+                paused and resumed), then inspected and adjusted gate by gate.
   • Export    — review the model and save or load ``.agmodel`` files.
 
 Samples are unmixed with their own autofluorescence profile assignments,
@@ -42,8 +48,8 @@ from PySide6.QtWidgets import (
     QCheckBox, QSpinBox, QDoubleSpinBox, QSizePolicy,
     QSplitter, QLineEdit, QFileDialog, QMessageBox, QFormLayout,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QTabWidget, QTreeWidget, QTreeWidgetItem,
-    QAbstractItemView, QMenu,
+    QTreeWidget, QTreeWidgetItem,
+    QAbstractItemView, QMenu, QToolButton,
     QDialog, QDialogButtonBox, QGridLayout, QTextEdit, QGroupBox,
     QRadioButton, QButtonGroup,
 )
@@ -79,13 +85,20 @@ from ag_core import (  # noqa: E402
     default_populations_for_type as _default_populations_for_type,
 )
 import ag_help_texts  # noqa: E402
+import transforms_panel as tp  # noqa: E402
 from ag_widgets import (  # noqa: E402
+    FilterBar,
     PopulationTree,
     SquareHolder,
     add_concertina_page,
+    algorithm_combo,
+    block_wheel,
+    colour_algorithm_items,
     make_concertina,
+    text_matches,
     zoom_axis_transform,
 )
+from honeychrome.view_components.side_tab_widget import SideTabWidget  # noqa: E402
 
 log = ag_core.get_logger(__name__)
 
@@ -151,9 +164,6 @@ def _ensure_qt_imports():
 # Plugin identity
 # ---------------------------------------------------------------------------
 plugin_name = 'Gating Model Builder'
-
-# Main-window tabs whose plots show the unmixed data (see Controller.set_mode).
-_UNMIXED_DATA_TABS = {'Unmixed Data', 'Statistics'}
 
 DEFAULT_EVENTS_PER_SAMPLE = 50_000
 TRAINING_SEED = 42
@@ -245,14 +255,20 @@ def _axis_limits(transforms: dict) -> dict:
     return out
 
 
-def _axis_cells(g: dict) -> tuple[str, str]:
-    """Text of a gate's X and Y axis columns. A 1dsep gate's channels are
-    marked as the separation (sep) and view parameters, on the plot axes
-    they are drawn on; a view of None is a histogram."""
+def _axis_cells(g: dict, antigens: dict | None = None) -> tuple[str, str]:
+    """Text of a gate's X and Y axis columns: each channel's marker (its
+    antigen), or the channel name when it has none. A 1dsep gate's channels
+    are marked as the separation (sep) and view parameters, on the plot
+    axes they are drawn on; a view of None is a histogram."""
+    antigens = antigens or {}
+
+    def name(ch):
+        return (antigens.get(ch) or ch) if ch else ''
+
     if g.get('gate_type') != '1dsep':
-        return str(g.get('gate_marker_x') or ''), str(g.get('gate_marker_y') or '')
-    sep = f"{g.get('gate_marker_x') or ''} (sep)"
-    view = f"{g['gate_marker_y']} (view)" if g.get('gate_marker_y') else "Histogram (view)"
+        return name(g.get('gate_marker_x')), name(g.get('gate_marker_y'))
+    sep = f"{name(g.get('gate_marker_x'))} (sep)"
+    view = f"{name(g['gate_marker_y'])} (view)" if g.get('gate_marker_y') else "Histogram (view)"
     return (view, sep) if ag_core.separation_axis(g) == 'y' else (sep, view)
 
 
@@ -274,6 +290,29 @@ def _preview_axes(g: dict) -> tuple[str, str]:
 def _sample_label(key: str) -> str:
     """Short display name for a sample key."""
     return Path(str(key)).stem
+
+
+# Filters of the gate lists (Hierarchy table, Review tree).
+GATE_FILTERS = (('all', 'All gates'), ('unconverted', 'Unconverted'),
+                ('conflicting', 'Conflicting algorithms'), ('flagged', 'Flagged conversions'))
+
+
+def filtered_gate_names(state, mode: str) -> set | None:
+    """Names of the gates a filter keeps (None: every gate)."""
+    defs = state.gate_definitions
+    if mode == 'unconverted':
+        return {g['gate_name'] for g in defs if g.get('algorithm') == ag_core.ALGORITHM_IMPORTED}
+    if mode == 'conflicting':
+        return ag_review.conflicting_gate_names(defs)
+    if mode == 'flagged':
+        names = {g['gate_name'] for g in defs}
+        return {n for n in state.conversion_flags if n in names}
+    return None
+
+
+def filter_counts(state) -> dict:
+    """{filter key: number of gates it keeps}."""
+    return {key: len(filtered_gate_names(state, key) or ()) for key, _l in GATE_FILTERS[1:]}
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +350,16 @@ class GatingModelState:
     default_sep_axis
         Plot axis ('x' or 'y') given to the separation channel of 1dsep
         gates that are added or split here.
+    conversion_flags
+        {gate_name: {'shift', 'fraction', 'message'}} for imported gates
+        whose trainable form lands far from the imported boundary on the
+        review samples (see ReviewTab's Flag conversions).
+    training_progress
+        Set while a training run is paused: {'fingerprint', 'done'} with
+        the gates trained so far (their boundaries are kept).
+    transform_population
+        Population of the experiment's gating hierarchy shown on the
+        Transforms tab.
     """
 
     gate_definitions: list = field(default_factory=list)
@@ -322,6 +371,9 @@ class GatingModelState:
     model_metadata: dict = field(default_factory=dict)
     algorithm_recommendations: dict = field(default_factory=dict)
     default_sep_axis: str = 'x'
+    conversion_flags: dict = field(default_factory=dict)
+    training_progress: dict = field(default_factory=dict)
+    transform_population: str = ''
 
     def is_trained(self, gate_name: str) -> bool:
         """Return True if a non-empty boundary exists for *gate_name*."""
@@ -434,11 +486,13 @@ class GateParamDialog(QDialog):
         self.sb_axis_lo.setRange(0.0, 1.0)
         self.sb_axis_lo.setDecimals(3)
         self.sb_axis_lo.setSingleStep(0.01)
-        self.sb_axis_lo.setValue(float(params.get('axis_lo', 0.01)))
+        algo = self.gate_def.get('algorithm')
+        self.sb_axis_lo.setValue(float(params.get('axis_lo', ag_core.default_axis_lo(algo))))
         self.sb_axis_lo.setToolTip(
             "Crops the data fed into the threshold calculation to this "
             "fraction of the axis's own min-max range (not a percentile). "
-            "Matches R's region.min. Default 0.01."
+            "Matches R's region.min. Default 0 for 'tail' (it measures the "
+            "low side of the negative population), else 0.01."
         )
         form.addRow("Axis lo (calc crop)", self.sb_axis_lo)
 
@@ -503,12 +557,18 @@ class GateParamDialog(QDialog):
         grid.addWidget(QLabel("Algorithm"), 1, 0)
         self.cb_algo_x = QComboBox()
         self.cb_algo_y = QComboBox()
+        axis_algos = [a for a in ag_core.ALGORITHMS_BY_GATE_TYPE['2dsep']
+                      if a != ag_core.ALGORITHM_IMPORTED]
         for cb, key in ((self.cb_algo_x, 'algorithm_x'),
                         (self.cb_algo_y, 'algorithm_y')):
-            cb.addItems(ALGORITHMS_BY_GATE_TYPE['2dsep'])
+            cb.addItems(axis_algos)
+            cb.setToolTip("'replicate' takes this axis's threshold from another gate or a "
+                          "reference population; choose the source on the Review tab.")
             val = params.get(key, '') or default_algo
-            if val in ALGORITHMS_BY_GATE_TYPE['2dsep']:
+            if val in axis_algos:
                 cb.setCurrentText(val)
+            block_wheel(cb)
+            colour_algorithm_items(cb, ag_core.algorithm_colour)
         grid.addWidget(self.cb_algo_x, 1, 1)
         grid.addWidget(self.cb_algo_y, 1, 2)
 
@@ -550,15 +610,17 @@ class GateParamDialog(QDialog):
         grid.addWidget(QLabel("Axis lo (calc crop)"), 5, 0)
         self.sb_axis_lo_x = QDoubleSpinBox()
         self.sb_axis_lo_y = QDoubleSpinBox()
-        for sb, key in ((self.sb_axis_lo_x, 'axis_lo_x'),
-                        (self.sb_axis_lo_y, 'axis_lo_y')):
+        for sb, key, axis in ((self.sb_axis_lo_x, 'axis_lo_x', 'x'),
+                              (self.sb_axis_lo_y, 'axis_lo_y', 'y')):
             sb.setRange(0.0, 1.0)
             sb.setDecimals(3)
             sb.setSingleStep(0.01)
-            sb.setValue(float(params.get(key, 0.01)))
+            axis_algo = params.get(f'algorithm_{axis}') or default_algo
+            sb.setValue(float(params.get(key, ag_core.default_axis_lo(axis_algo))))
             sb.setToolTip(
                 "Crops the data fed into the threshold calculation to "
-                "this fraction of the axis's own min-max range. Default 0.01."
+                "this fraction of the axis's own min-max range. Default 0 for "
+                "'tail', else 0.01."
             )
         grid.addWidget(self.sb_axis_lo_x, 5, 1)
         grid.addWidget(self.sb_axis_lo_y, 5, 2)
@@ -914,6 +976,7 @@ class GateEditDialog(QDialog):
                     self.cb_algorithm.setCurrentText(default)
         finally:
             self.cb_algorithm.blockSignals(False)
+        colour_algorithm_items(self.cb_algorithm, ag_core.algorithm_colour)
 
     def _on_type_changed(self, new_type: str):
         """Adjust dependent fields when the gate type changes.
@@ -1167,7 +1230,7 @@ class SplitGateDialog(QDialog):
         self.resize(720, 280)
         x, y = gate_def.get('gate_marker_x'), gate_def.get('gate_marker_y')
         params = gate_def.get('gate_param') or {}
-        algos = [a for a in ALGORITHMS_BY_GATE_TYPE['1dsep'] if a != ag_core.ALGORITHM_IMPORTED]
+        algos = list(ag_core.THRESHOLD_ALGORITHMS)
         self._algorithms = algos
         self._order = [x, y]
         self._choices = {}
@@ -1233,9 +1296,7 @@ class SplitGateDialog(QDialog):
             other = self._order[1 - r]
             self.tbl.setItem(r, 0, QTableWidgetItem(str(r + 1)))
             self.tbl.setItem(r, 1, QTableWidgetItem(f"{self._label(ch)} (sep)"))
-            algo = QComboBox()
-            algo.addItems(self._algorithms)
-            algo.setCurrentText(choice['algorithm'])
+            algo = algorithm_combo(self._algorithms, choice['algorithm'], ag_core.algorithm_colour)
             view = QComboBox()
             view.addItem(f"{self._label(other)} (view)", other)
             view.addItem("Histogram", None)
@@ -1300,8 +1361,10 @@ class _RecommendWorker(QThread):
             self.finished.emit(False, str(exc), {})
 
 
-def _flowjo_experiment_channels(controller) -> 'ag_flowjo.ExperimentChannels':
-    """The experiment's unmixed channels in the form ag_flowjo aligns against."""
+def _flowjo_experiment_channels(controller, transforms: dict | None = None) -> 'ag_flowjo.ExperimentChannels':
+    """The experiment's unmixed channels in the form ag_flowjo aligns against;
+    gate coordinates are converted to *transforms* ({channel: Transform},
+    the experiment's display transforms when None)."""
     import honeychrome.settings as hc_settings
     channels = _experiment_channels(controller)
     fluorescence = _fluorescence_channels(controller)
@@ -1312,10 +1375,11 @@ def _flowjo_experiment_channels(controller) -> 'ag_flowjo.ExperimentChannels':
         cytometer = controller.experiment.settings.get('raw', {}).get('cytometer', '')
     except Exception:
         pass
-    transforms = {}
-    for ch, tr in (controller.unmixed_transformations or {}).items():
+    params = {}
+    source = transforms if transforms is not None else (controller.unmixed_transformations or {})
+    for ch, tr in source.items():
         try:
-            transforms[ch] = ag_core.transform_params(tr)
+            params[ch] = ag_core.transform_params(tr)
         except Exception:
             continue
     return ag_flowjo.ExperimentChannels(
@@ -1323,7 +1387,7 @@ def _flowjo_experiment_channels(controller) -> 'ag_flowjo.ExperimentChannels':
         fluorescence=fluorescence,
         scatter=scatter,
         antigens=_antigen_map(controller),
-        transforms=transforms,
+        transforms=params,
         singlet_pair=singlet_channels(cytometer),
     )
 
@@ -1354,7 +1418,9 @@ class FlowJoImportPanel(QWidget):
     imported. The model changes only when an import button is pressed,
     which emits ``importRequested(gate_defs, report, replace, name)``.
     ``titleChanged(text)`` gives the heading for the page, and
-    ``closeRequested`` asks the host to leave the page.
+    ``closeRequested`` asks the host to leave the page. The parameter table
+    and the messages can be searched, and the table narrowed to the rows
+    that need a decision (amber and red).
     """
 
     importRequested = Signal(object, object, bool, str)
@@ -1370,10 +1436,12 @@ class FlowJoImportPanel(QWidget):
     _RED = QColor(250, 218, 218)
     _GREY = QColor(236, 236, 236)
 
-    def __init__(self, controller, existing_names, parent=None):
+    def __init__(self, controller, existing_names, transforms=None, parent=None):
         super().__init__(parent)
         self.controller = controller
         self._existing_names = existing_names
+        self._transforms = transforms
+        self._notes: list = []
         self.workspace = None
         self.exp = None
         self._fluor_match = self._marker_match = None
@@ -1391,9 +1459,14 @@ class FlowJoImportPanel(QWidget):
         body.addWidget(self.lbl_status)
 
         form = QFormLayout()
-        self.combo_source = QComboBox()
+        self.combo_source = block_wheel(QComboBox())
         form.addRow("Gating source:", self.combo_source)
         body.addLayout(form)
+
+        self.filter_bar = FilterBar([('all', 'All parameters'), ('check', 'Flagged or unmatched')],
+                                    placeholder="Search parameters, labels, channels and messages…")
+        self.filter_bar.changed.connect(lambda _t, _m: self._apply_filter())
+        body.addWidget(self.filter_bar)
 
         self.tbl = QTableWidget(0, len(self._COLUMNS))
         self.tbl.setHorizontalHeaderLabels(self._COLUMNS)
@@ -1469,7 +1542,8 @@ class FlowJoImportPanel(QWidget):
             self._fail("The workspace contains no gated populations.")
             return
         self.workspace = workspace
-        self.exp = _flowjo_experiment_channels(self.controller)
+        self.exp = _flowjo_experiment_channels(
+            self.controller, self._transforms() if self._transforms is not None else None)
         self._fluor_match, self._marker_match = _flowjo_matchers()
         self.combo_source.blockSignals(True)
         for s in workspace.sources:
@@ -1517,7 +1591,7 @@ class FlowJoImportPanel(QWidget):
             self._matches[param] = hit.get('method') if channel else None
             self.tbl.setItem(row, 0, QTableWidgetItem(param))
             self.tbl.setItem(row, 1, QTableWidgetItem(hit.get('label') or source.labels.get(param, '') or ''))
-            combo = QComboBox()
+            combo = block_wheel(QComboBox())
             if not channel:
                 combo.addItem("— choose a channel or drop —", self._UNSET)
             combo.addItem(self._DROP, self._DROPPED)
@@ -1533,6 +1607,34 @@ class FlowJoImportPanel(QWidget):
         for param in self._params:
             self._colour_row(param)
         self._refresh()
+        self._apply_filter()
+
+    def _needs_check(self, param: str) -> bool:
+        """Amber or red: unresolved, or matched without confidence."""
+        value = self._combos[param].currentData()
+        if value == self._UNSET:
+            return True
+        if value == self._DROPPED:
+            return False
+        return self._matches.get(param) not in ag_flowjo.CONFIDENT_MATCHES
+
+    def _apply_filter(self):
+        """Show the rows and messages matching the search and the "show"
+        choice."""
+        text, mode = self.filter_bar.text(), self.filter_bar.mode()
+        n_check = 0
+        for row, param in enumerate(self._params):
+            check = self._needs_check(param)
+            n_check += int(check)
+            cells = [self.tbl.item(row, c).text() for c in (0, 1, 3, 4) if self.tbl.item(row, c)]
+            combo = self._combos.get(param)
+            shown = text_matches(text, param, combo.currentText() if combo else '', *cells)
+            if mode == 'check':
+                shown = shown and check
+            self.tbl.setRowHidden(row, not shown)
+        self.filter_bar.set_mode_label('check', f"Flagged or unmatched ({n_check})")
+        lines = [m for m in self._notes if text_matches(text, m)] if text else list(self._notes)
+        self.txt_notes.setPlainText("\n".join(lines))
 
     def _on_edited(self, param: str):
         row = self._params.index(param)
@@ -1542,6 +1644,7 @@ class FlowJoImportPanel(QWidget):
             self.tbl.item(row, 3).setText(ag_flowjo.MATCH_MANUAL)
         self._colour_row(param)
         self._refresh()
+        self._apply_filter()
 
     def _colour_row(self, param: str):
         row = self._params.index(param)
@@ -1603,6 +1706,7 @@ class FlowJoImportPanel(QWidget):
                     messages += [f"{gate}: {note}" for note in notes]
             except Exception as exc:
                 messages.append(f"Conversion failed: {exc}")
+        self._notes = messages
         self.txt_notes.setPlainText("\n".join(messages))
         ready = bool(plan.keep) and not unresolved and not problems
         self.btn_add.setEnabled(ready)
@@ -1669,11 +1773,12 @@ class HierarchyTab(QWidget):
     # Emitted when an axis drag changed a channel's transform: (channel, parameters before).
     transformChanged = Signal(str, object)
 
-    def __init__(self, state: GatingModelState, bus, controller, parent=None):
+    def __init__(self, state: GatingModelState, bus, controller, tf=None, parent=None):
         super().__init__(parent)
         self.state = state
         self.bus = bus
         self.controller = controller
+        self.tf = tf
 
         self._recommend_worker: _RecommendWorker | None = None
 
@@ -1738,9 +1843,9 @@ class HierarchyTab(QWidget):
         self.btn_flowjo   = QPushButton("Import FlowJo…")
         self.btn_convert_all = QPushButton("Convert all to trainable")
         self.btn_convert_all.setToolTip(
-            "Switch every gate that uses its imported boundary to a learning "
-            "algorithm, so Train calculates it from the training samples. "
-            "Free polygons keep their drawn boundary: no algorithm reproduces a drawn shape."
+            "Switch every gate that uses its imported boundary to its proposed learning "
+            "algorithm, so Train calculates it from the training samples. Gates sharing "
+            "a name with a gate you converted yourself follow your choice."
         )
         self.btn_refresh  = QPushButton("Refresh from Hierarchy")
         self.btn_add      = QPushButton("Add gate manually")
@@ -1779,8 +1884,18 @@ class HierarchyTab(QWidget):
         self.flowjo_panel = FlowJoImportPanel(
             self.controller,
             lambda: {g.get('gate_name') for g in self.state.gate_definitions},
+            transforms=lambda: self.tf.objects,
             parent=self)
         self.flowjo_panel.importRequested.connect(self._on_flowjo_import_requested)
+
+        # Search and filter.
+        self.filter_bar = FilterBar(GATE_FILTERS, placeholder="Search gates, markers or algorithms…")
+        self.filter_bar.setToolTip(
+            "Unconverted: gates still applying their imported boundary. Conflicting: gates "
+            "sharing a name whose algorithms were set differently by hand. Flagged: gates whose "
+            "trainable form lands far from the imported boundary (Review → Flag conversions).")
+        self.filter_bar.changed.connect(lambda _t, _m: self._apply_filter())
+        page_layout.addWidget(self.filter_bar)
 
         # Tree widget.
         self.tree = QTreeWidget()
@@ -1957,8 +2072,8 @@ class HierarchyTab(QWidget):
             self._suppress_item_changed = False
 
         self.btn_convert_all.setEnabled(any(
-            g.get('algorithm') == ag_core.ALGORITHM_IMPORTED and not ag_review.is_free_shape(g)
-            for g in self.state.gate_definitions))
+            g.get('algorithm') == ag_core.ALGORITHM_IMPORTED for g in self.state.gate_definitions))
+        self._apply_filter()
         n = self.state.n_gates()
         if n == 0:
             self.lbl_summary.setText("No gates loaded — click 'Import from Hierarchy'.")
@@ -1971,6 +2086,20 @@ class HierarchyTab(QWidget):
             )
 
         self._update_preview()
+
+    def _apply_filter(self):
+        """Hide the rows outside the search and the "show" choice."""
+        text, mode = self.filter_bar.text(), self.filter_bar.mode()
+        wanted = filtered_gate_names(self.state, mode)
+        counts = filter_counts(self.state)
+        for key, label in GATE_FILTERS[1:]:
+            self.filter_bar.set_mode_label(key, f"{label} ({counts.get(key, 0)})")
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            name = item.data(0, Qt.UserRole)
+            shown = (wanted is None or name in wanted) and text_matches(
+                text, *(item.text(c) for c in range(self.tree.columnCount())))
+            item.setHidden(not shown)
 
     def _conversion_buttons(self, g: dict):
         """'Convert to trainable' for a gate using its imported shapes and
@@ -2020,7 +2149,7 @@ class HierarchyTab(QWidget):
         if rec and rec != algo_display:
             algo_display = f"{algo_display} [rec: {rec}]" if algo_display else f"[rec: {rec}]"
 
-        x_text, y_text = _axis_cells(g)
+        x_text, y_text = _axis_cells(g, _antigen_map(self.controller))
         item = QTreeWidgetItem([
             str(g.get('gate_number', '')),
             str(gate_name_for_item),
@@ -2048,6 +2177,9 @@ class HierarchyTab(QWidget):
         )
         status_text, status_brush, row_tint = self._status_for(g, is_stale)
         item.setText(self.COL_STATUS, status_text)
+        flag = self.state.conversion_flags.get(gate_name_for_item)
+        if flag:
+            item.setToolTip(self.COL_STATUS, flag.get('message', ''))
         item.setForeground(self.COL_STATUS, status_brush)
         if row_tint is not None:
             for col in range(self.tree.columnCount()):
@@ -2065,6 +2197,9 @@ class HierarchyTab(QWidget):
         """Return (text, foreground brush, optional background tint) for status column."""
         if is_stale:
             return ("Stale", QBrush(QColor('#a00000')), QColor(255, 235, 235))
+        flag = self.state.conversion_flags.get(g.get('gate_name', ''))
+        if flag and g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+            return ("⚠ Flagged", QBrush(QColor('#c0392b')), None)
         if self.state.is_trained(g.get('gate_name', '')):
             return ("Trained", QBrush(QColor('#0a7a23')), None)
         return ("Untrained", QBrush(QColor('#946100')), None)
@@ -2158,20 +2293,17 @@ class HierarchyTab(QWidget):
 
     def _cell_value_for(self, g: dict, column: int) -> str:
         if column == self.COL_TYPE:        return str(g.get('gate_type', ''))
-        if column == self.COL_X:           return _axis_cells(g)[0]
-        if column == self.COL_Y:           return _axis_cells(g)[1]
+        if column == self.COL_X:           return _axis_cells(g, _antigen_map(self.controller))[0]
+        if column == self.COL_Y:           return _axis_cells(g, _antigen_map(self.controller))[1]
         if column == self.COL_PARENT:      return str(g.get('parent_gate') or 'root')
         if column == self.COL_PARENT_POP:  return str(g.get('parent_popul', '') or '')
         if column == self.COL_ALGORITHM:   return str(g.get('algorithm', '') or '')
         return ""
 
     def _rename_gate_references(self, old: str, new: str):
-        """Update parent_gate / origin_gate / trained_boundaries on rename."""
-        for other in self.state.gate_definitions:
-            if other.get('parent_gate') == old:
-                other['parent_gate'] = new
-            if other.get('origin_gate') == old:
-                other['origin_gate'] = new
+        """Update every reference to a renamed gate, its trained boundaries
+        and its recommendation."""
+        ag_review.rename_references(self.state.gate_definitions, old, new)
         if old in self.state.trained_boundaries:
             self.state.trained_boundaries[new] = self.state.trained_boundaries.pop(old)
         if old in self.state.algorithm_recommendations:
@@ -2325,8 +2457,22 @@ class HierarchyTab(QWidget):
         for name in {gate_def['gate_name']} | self._descendant_names(gate_def['gate_name']):
             self.state.trained_boundaries.pop(name, None)
 
+    def _sync(self, gate_name: str) -> list[str]:
+        """Bring the gates sharing *gate_name*'s imported name in line (see
+        ag_review.apply_name_sync); returns the names changed."""
+        changed, conflict = ag_review.apply_name_sync(self.state.gate_definitions, gate_name)
+        for name in changed:
+            for n in {name} | self._descendant_names(name):
+                self.state.trained_boundaries.pop(n, None)
+        if conflict:
+            self.bus.statusMessage.emit(
+                "[Gating Model Builder] Conflicting algorithms chosen — identically named gates "
+                f"will not be auto-updated ('{conflict}').")
+        return changed
+
     def _convert_gate(self, gate_name: str):
-        """Switch one imported gate to a learning algorithm."""
+        """Switch one imported gate to a learning algorithm; same-named gates
+        still as drawn follow it."""
         gate_def = self.state.gate_by_name(gate_name)
         if gate_def is None:
             return
@@ -2334,29 +2480,39 @@ class HierarchyTab(QWidget):
             gate_def, self.state.algorithm_recommendations.get(gate_name))
         if algorithm is None:
             return
+        if gate_def.get('gate_type') == '2dsep':
+            gate_def.setdefault('gate_param', {}).setdefault('algorithm_x', algorithm)
         self._set_algorithm(gate_def, algorithm)
+        gate_def['sync_origin'] = ag_review.SYNC_USER
+        changed = self._sync(gate_name)
         self._repopulate_tree()
+        tail = f" {len(changed)} gate(s) with the same name follow it." if changed else ''
         self.bus.statusMessage.emit(
-            f"[Gating Model Builder] '{gate_name}' now uses '{algorithm}'; train to calculate it. {note}".strip())
+            f"[Gating Model Builder] '{gate_name}' now uses '{algorithm}'; train to calculate "
+            f"it.{tail} {note}".strip())
 
     def _convert_all_gates(self):
-        """Switch every imported gate that a learning algorithm can reproduce
-        to one; free polygons stay as drawn."""
-        converted, kept = 0, 0
+        """Switch every imported gate to its proposed learning algorithm.
+        Same-named gates you converted yourself bring theirs in line."""
+        converted = 0
         for gate_def in self.state.gate_definitions:
             if gate_def.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
-                continue
-            if ag_review.is_free_shape(gate_def):
-                kept += 1
                 continue
             algorithm, _note = ag_review.convert_target(
                 gate_def, self.state.algorithm_recommendations.get(gate_def['gate_name']))
             if algorithm is not None:
+                if gate_def.get('gate_type') == '2dsep':
+                    gate_def.setdefault('gate_param', {}).setdefault('algorithm_x', algorithm)
                 self._set_algorithm(gate_def, algorithm)
+                gate_def['sync_origin'] = ag_review.SYNC_AUTO
                 converted += 1
+        followed = 0
+        for gate_def in self.state.gate_definitions:
+            if gate_def.get('sync_origin') not in (ag_review.SYNC_AUTO, ag_review.SYNC_DRAWN) \
+                    and gate_def.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
+                followed += len(self._sync(gate_def['gate_name']))
         self._repopulate_tree()
-        tail = (f" {kept} free polygon(s) keep their drawn boundary; convert them one by one "
-                "if you want an ellipse fitted instead.") if kept else ''
+        tail = f" {followed} follow a same-named gate you set." if followed else ''
         self.bus.statusMessage.emit(
             f"[Gating Model Builder] Converted {converted} gate(s) to learning algorithms; "
             f"train to calculate them.{tail}")
@@ -2367,6 +2523,7 @@ class HierarchyTab(QWidget):
         if gate_def is None or not gate_def.get('template'):
             return
         self._set_algorithm(gate_def, ag_core.ALGORITHM_IMPORTED)
+        gate_def['sync_origin'] = ag_review.SYNC_DRAWN
         self._repopulate_tree()
 
     def _on_refresh_clicked(self):
@@ -2485,9 +2642,14 @@ class HierarchyTab(QWidget):
         )
         if ans != QMessageBox.Yes:
             return
-        self.state.gate_definitions.remove(g)
+        defs, _removed, orphaned = ag_review.delete_gates(self.state.gate_definitions, [gate_name])
+        self.state.gate_definitions = defs
         self.state.trained_boundaries.pop(gate_name, None)
         self.state.algorithm_recommendations.pop(gate_name, None)
+        if orphaned:
+            self.bus.statusMessage.emit(
+                "[Gating Model Builder] These gates replicated the deleted gate and need a new "
+                "source: " + ", ".join(f"'{n}'" for n in orphaned) + ".")
         self._repopulate_tree()
 
     def _add_child_gate(self, parent_gate_name: str):
@@ -2610,6 +2772,13 @@ class HierarchyTab(QWidget):
                        for p in ag_flowjo.gated_parameters(source)}
             gate_defs, report = ag_flowjo.build_gate_definitions(
                 source, mapping, exp, native_display=True, origin='Experiment hierarchy')
+            # The hierarchy's gates are drawn in the experiment's transforms.
+            live = _live_transform_params(self.controller)
+            own = self.tf.params()
+            for ch, params in own.items():
+                if ch in live and not ag_core.same_transform(live[ch], params):
+                    ag_core.remap_channel_transform(gate_defs, {}, ch, live[ch], params,
+                                                    points_per_edge=16)
         except Exception as exc:
             self.bus.statusMessage.emit(
                 f"[Gating Model Builder] Could not read unmixed_gating: {exc}"
@@ -2705,7 +2874,7 @@ class HierarchyTab(QWidget):
             self.controller.experiment_dir, key, snap,
             deepcopy(self.state.gate_definitions),
             _experiment_channels(self.controller),
-            deepcopy(self.controller.unmixed_transformations or {}),
+            deepcopy(self.tf.objects),
             parent=self,
         )
         worker.finished.connect(self._on_recommendations_ready)
@@ -2776,7 +2945,7 @@ class HierarchyTab(QWidget):
                       f"type={g.get('gate_type', '')}",
                       f"algo={g.get('algorithm', '')}"]
 
-        transforms = self.controller.unmixed_transformations or {}
+        transforms = self.tf.objects
         tr_x = transforms.get(ch_x)
         tr_y = transforms.get(ch_y) if ch_y else None
 
@@ -2868,7 +3037,7 @@ class HierarchyTab(QWidget):
         """
         channel = self._preview_channels[0 if axis_name == 'x' else 1]
         axis = self._preview_axis_x if axis_name == 'x' else self._preview_axis_y
-        tr = (self.controller.unmixed_transformations or {}).get(channel) if channel else None
+        tr = self.tf.objects.get(channel) if channel else None
         if tr is None:
             axis._pending_delta = 0
             return
@@ -2950,7 +3119,7 @@ class HierarchyTab(QWidget):
             else:
                 modes[name] = ag_core.MODE_RECALCULATE
         pnn = _experiment_channels(self.controller)
-        transforms = self.controller.unmixed_transformations or {}
+        transforms = self.tf.objects
         transformed = ag_core.transform_columns(data, pnn, transforms)
         result = ag_core.run_gating(
             chain, transformed, {ch: i for i, ch in enumerate(pnn)},
@@ -3124,6 +3293,11 @@ class GateDetailWidget(QDialog):
             self._ctrl_row.addWidget(self._sb_threshold)
             self._ctrl_row.addStretch()
 
+    def _builder_transforms(self) -> dict:
+        """The builder's transforms (from the TrainTab that opened this)."""
+        tf = getattr(self.parent(), 'tf', None)
+        return tf.objects if tf is not None else {}
+
     def _current_boundary_entry(self):
         """Return the first population entry for this gate, or None."""
         gate_name = self.gate_def.get('gate_name', '')
@@ -3148,12 +3322,7 @@ class GateDetailWidget(QDialog):
         ch_x, ch_y = _boundary_axes(self.gate_def, self.state.trained_boundaries.get(gate_name))
         sep_y = ag_core.separation_axis(self.gate_def) == 'y'
 
-        transforms = getattr(self, '_transforms', {})
-        # Try to get live transforms from parent TrainTab
-        try:
-            transforms = self.parent().controller.unmixed_transformations or {}
-        except Exception:
-            pass
+        transforms = self._builder_transforms()
         tr_x = transforms.get(ch_x)
         tr_y = transforms.get(ch_y) if ch_y else None
 
@@ -3254,11 +3423,7 @@ class GateDetailWidget(QDialog):
         gate_name = self.gate_def.get('gate_name', '')
         gt = self.gate_def.get('gate_type', '')
         tb = self.state.trained_boundaries.get(gate_name, {})
-        try:
-            transforms = self.parent().controller.unmixed_transformations or {}
-        except Exception:
-            transforms = {}
-        calc = ag_core.GateCalculator(_axis_limits(transforms))
+        calc = ag_core.GateCalculator(_axis_limits(self._builder_transforms()))
 
         new_entries = None
         if self._shapes:
@@ -3288,6 +3453,11 @@ class _TrainingWorker(QThread):
     Emits finished(ok, error, payload); payload holds the boundaries, the
     per-gate status, per-sample event counts, and a display subsample of
     the pooled (untransformed) events with each gate's parent mask.
+
+    pause() stops before the next gate and reports the gates trained so far
+    (payload['stopped'] True, payload['done'] their names); abort() stops
+    and reports nothing. *done* ({gate: boundary}) resumes a paused run:
+    those gates are applied as they are and only the others calculated.
     """
 
     progress = Signal(str)
@@ -3295,8 +3465,10 @@ class _TrainingWorker(QThread):
 
     def __init__(self, experiment_dir, sample_keys, snapshot, gate_defs, channels,
                  transforms, events_per_sample: int, display_cap: int, seed: int,
-                 parent=None):
+                 done: dict | None = None, parent=None):
         super().__init__(parent)
+        self._done = dict(done or {})
+        self._pause = False
         self._experiment_dir = experiment_dir
         self._keys = list(sample_keys)
         self._snap = snapshot
@@ -3310,6 +3482,12 @@ class _TrainingWorker(QThread):
 
     def abort(self):
         self._abort = True
+
+    def pause(self):
+        self._pause = True
+
+    def _stopping(self) -> bool:
+        return self._abort or self._pause
 
     def run(self):
         try:
@@ -3327,7 +3505,7 @@ class _TrainingWorker(QThread):
         chunks = []
         per_sample = {}
         for i, key in enumerate(self._keys, 1):
-            if self._abort:
+            if self._stopping():
                 return None
             self.progress.emit(f"Loading {_sample_label(key)} ({i}/{len(self._keys)}) …")
             try:
@@ -3346,17 +3524,21 @@ class _TrainingWorker(QThread):
             }
         if not chunks:
             raise RuntimeError("No training samples could be loaded.")
-        if self._abort:
+        if self._stopping():
             return None
 
         pooled = np.concatenate(chunks, axis=0)
         del chunks
-        self.progress.emit(f"Calculating gates on {len(pooled):,} pooled events …")
+        n_left = len(self._gate_defs) - len(self._done)
+        self.progress.emit(f"Calculating {n_left} gate(s) on {len(pooled):,} pooled events …")
         data = ag_core.transform_columns(pooled, self._channels, self._transforms)
         index = {ch: i for i, ch in enumerate(self._channels)}
         result = ag_core.train_boundaries(self._gate_defs, data, index,
-                                          axis_limits=_axis_limits(self._transforms))
+                                          axis_limits=_axis_limits(self._transforms),
+                                          done=self._done, stop_check=self._stopping)
         del data
+        if result.stopped and self._abort:
+            return None
 
         n = len(pooled)
         if self._display_cap and n > self._display_cap:
@@ -3371,31 +3553,50 @@ class _TrainingWorker(QThread):
             'n_pooled': int(n),
             'display_events': pooled[rows],
             'display_parent_masks': {g: m[rows] for g, m in result.parent_masks.items()},
+            'stopped': bool(result.stopped),
+            'done': list(result.status),
         }
 
 
 class TrainTab(QWidget):
-    """Tab 1 — Train.
+    """Tab — Train.
 
-    Top: training-sample picker, events per sample, and Calculate/Abort.
-    Bottom: one tile per gate showing the trained boundary over a display
-    subsample of the pooled training events (parent population only).
-    "Detail…" on a tile opens GateDetailWidget to adjust thresholds.
+    The gating hierarchy runs down the left beside two sections: the
+    training samples, events per sample and Calculate / Pause / Abort, and
+    the gate boundaries — one tile per gate showing the trained boundary
+    over a display subsample of the pooled training events (parent
+    population only). Hierarchy nodes are coloured by training status.
+    Tiles are made only for the gates drawn on populations open in the
+    tree: the first three levels to start with, and more as nodes are
+    expanded, so large hierarchies open quickly. "Detail…" on a tile opens
+    GateDetailWidget to adjust thresholds.
+
+    Pause keeps every gate trained so far; Calculate Gates then offers to
+    resume (train only the remaining gates on the same pooled events) or to
+    overwrite (train every gate again).
     """
 
-    trained = Signal()              # training finished successfully
+    _EXPAND_DEPTH = 3
+    _STATUS_COLOURS = {'trained': (10, 122, 35), 'adjusted': (30, 100, 220),
+                       'failed': (192, 57, 43), 'untrained': (148, 97, 0)}
+
+    trained = Signal()              # training finished successfully (or paused)
     boundaries_changed = Signal()   # a boundary was adjusted by hand
 
-    def __init__(self, state: GatingModelState, bus, controller, parent=None):
+    def __init__(self, state: GatingModelState, bus, controller, tf=None, parent=None):
         super().__init__(parent)
         self.state = state
         self.bus = bus
         self.controller = controller
+        self.tf = tf
 
         self._worker: _TrainingWorker | None = None
         self._tile_widgets: dict[str, QWidget] = {}
+        self._layout_pending = False
         self._last_event_data: np.ndarray | None = None      # untransformed display events
         self._last_gate_masks: dict[str, np.ndarray] = {}    # gate -> parent mask over display rows
+        self._run_fingerprint = ''
+        self._previous_boundaries: dict = {}
 
         self._build_ui()
 
@@ -3408,9 +3609,40 @@ class TrainTab(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(HelpToggleWidget(text=ag_help_texts.BUILDER_TRAIN))
 
+        # Hierarchy (always shown) beside the training and boundary sections.
+        tree_panel = QWidget()
+        tree_layout = QVBoxLayout(tree_panel)
+        tree_layout.setContentsMargins(0, 0, 0, 0)
+        tree_header = QHBoxLayout()
+        tree_header.addWidget(QLabel("<b>Gating hierarchy</b>"))
+        tree_header.addStretch()
+        self.btn_expand = QPushButton("Expand")
+        self.btn_collapse = QPushButton("Collapse")
+        self.btn_expand.setToolTip("Expand every node: shows a tile for every gate, which can "
+                                   "be slow for large hierarchies.")
+        self.btn_collapse.setToolTip("Collapse the hierarchy to the root.")
+        tree_header.addWidget(self.btn_expand)
+        tree_header.addWidget(self.btn_collapse)
+        tree_layout.addLayout(tree_header)
+        self.tree_filter = FilterBar(placeholder="Search populations…")
+        self.tree_filter.changed.connect(lambda _t, _m: self._filter_tree())
+        tree_layout.addWidget(self.tree_filter)
+        self.pop_tree = PopulationTree()
+        self.pop_tree.setToolTip("Select a population to show the gates drawn on it. Colours: "
+                                 "green trained, blue adjusted by hand, amber untrained, red "
+                                 "failed to train.")
+        tree_layout.addWidget(self.pop_tree, stretch=1)
+        self.lbl_tree_status = QLabel("")
+        self.lbl_tree_status.setWordWrap(True)
+        self.lbl_tree_status.setStyleSheet("color: #555; font-style: italic;")
+        tree_layout.addWidget(self.lbl_tree_status)
+        self.btn_expand.clicked.connect(self.pop_tree.expandAll)
+        self.btn_collapse.clicked.connect(self.pop_tree.collapseAll)
+        self.pop_tree.expansionChanged.connect(self._schedule_layout)
+        self.pop_tree.populationSelected.connect(self._on_tree_selected)
+
         # One section open at a time; each page scrolls on its own.
         self.toolbox = make_concertina()
-        outer.addWidget(self.toolbox, stretch=1)
 
         top = QWidget()
         top_layout = QVBoxLayout(top)
@@ -3422,7 +3654,7 @@ class TrainTab(QWidget):
 
         opts_row = QHBoxLayout()
         opts_row.addWidget(QLabel("Events per sample:"))
-        self.sb_events = QSpinBox()
+        self.sb_events = block_wheel(QSpinBox())
         self.sb_events.setRange(0, 10_000_000)
         self.sb_events.setSingleStep(10_000)
         self.sb_events.setSpecialValueText("All")
@@ -3445,14 +3677,21 @@ class TrainTab(QWidget):
         run_row = QHBoxLayout()
         self.btn_run = QPushButton("Calculate Gates")
         self.btn_run.setToolTip("Calculate every gate's boundary from the selected training samples.")
+        self.btn_pause = QPushButton("Pause")
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setToolTip("Stop before the next gate, keeping every gate trained so far; "
+                                  "Calculate Gates then offers to resume or overwrite.")
         self.btn_abort = QPushButton("Abort")
         self.btn_abort.setEnabled(False)
+        self.btn_abort.setToolTip("Stop and discard this run, keeping the boundaries from before it.")
         self.btn_run.clicked.connect(self._on_run_clicked)
+        self.btn_pause.clicked.connect(self._on_pause_clicked)
         self.btn_abort.clicked.connect(self._on_abort_clicked)
         self.lbl_status = QLabel("")
         self.lbl_status.setStyleSheet("color: #555;")
         self.lbl_status.setWordWrap(True)
         run_row.addWidget(self.btn_run)
+        run_row.addWidget(self.btn_pause)
         run_row.addWidget(self.btn_abort)
         run_row.addWidget(self.lbl_status, stretch=1)
         top_layout.addLayout(run_row)
@@ -3461,23 +3700,37 @@ class TrainTab(QWidget):
         self.grid_scroll = QScrollArea()
         self.grid_scroll.setWidgetResizable(True)
         self.grid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
         self.grid_container = QWidget()
         self.grid_layout = QGridLayout(self.grid_container)
         self.grid_layout.setSpacing(4)
         self.grid_layout.setContentsMargins(4, 4, 4, 4)
-
         self.grid_scroll.setWidget(self.grid_container)
 
+        tiles_page = QWidget()
+        tiles_layout = QVBoxLayout(tiles_page)
+        tiles_layout.setContentsMargins(0, 0, 0, 0)
+        self.lbl_tiles = QLabel("")
+        self.lbl_tiles.setStyleSheet("color: #555; font-style: italic;")
+        tiles_layout.addWidget(self.lbl_tiles)
+        tiles_layout.addWidget(self.grid_scroll, stretch=1)
+
         add_concertina_page(self.toolbox, top, "Training")
-        self._page_tiles = self.toolbox.addItem(self.grid_scroll, "Gate boundaries")
+        self._page_tiles = self.toolbox.addItem(tiles_page, "Gate boundaries")
+
+        split = QSplitter(Qt.Horizontal)
+        split.addWidget(tree_panel)
+        split.addWidget(self.toolbox)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 4)
+        split.setSizes([260, 760])
+        outer.addWidget(split, stretch=1)
 
     # ------------------------------------------------------------------
     # Public refresh hook
     # ------------------------------------------------------------------
 
     def refresh(self):
-        """Repopulate the sample picker from the current experiment."""
+        """Repopulate the sample picker and the hierarchy from the state."""
         self.sb_events.blockSignals(True)
         self.sb_events.setValue(int(self.state.events_per_sample))
         self.sb_events.blockSignals(False)
@@ -3486,6 +3739,10 @@ class TrainTab(QWidget):
         self.chk_controls.blockSignals(False)
         self._populate_picker()
         self._rebuild_grid()
+        if self.state.training_progress and self._worker is None:
+            done = len(self.state.training_progress.get('done') or [])
+            self.lbl_status.setText(f"Paused: {done} of {self.state.n_gates()} gate(s) trained. "
+                                    "Calculate Gates to resume or overwrite.")
 
     def _populate_picker(self):
         try:
@@ -3501,23 +3758,123 @@ class TrainTab(QWidget):
         self._populate_picker()
 
     # ------------------------------------------------------------------
+    # Hierarchy status
+    # ------------------------------------------------------------------
+
+    def _gate_status(self, gate_name: str) -> str:
+        """'trained', 'adjusted', 'failed' or 'untrained'."""
+        entries = self.state.trained_boundaries.get(gate_name)
+        if self.state.is_trained(gate_name):
+            if any((e or {}).get('adjusted') for e in (entries or {}).values()):
+                return 'adjusted'
+            return 'trained'
+        status = (self.state.training_summary.get('gate_status') or {}).get(gate_name) or {}
+        return 'failed' if status.get('flag') in ('failed', 'skipped') else 'untrained'
+
+    def _mark_tree(self):
+        """Colour each population by the training status of its gate."""
+        marks, counts = {}, {}
+        for g in self.state.gate_definitions:
+            status = self._gate_status(g['gate_name'])
+            counts[status] = counts.get(status, 0) + 1
+            for pop in (g.get('populations') or {}):
+                marks[(g['gate_name'], pop)] = (self._STATUS_COLOURS[status], status)
+        self.pop_tree.mark(marks)
+        parts = [f"{counts[k]} {k}" for k in ('trained', 'adjusted', 'untrained', 'failed')
+                 if counts.get(k)]
+        self.lbl_tree_status.setText(", ".join(parts))
+
+    def _filter_tree(self):
+        text = self.tree_filter.text()
+        if not text:
+            self.pop_tree.set_filter(None)
+            return
+        hits = set()
+        for g in self.state.gate_definitions:
+            for pop, info in (g.get('populations') or {}).items():
+                if text_matches(text, g['gate_name'], (info or {}).get('label', pop), pop):
+                    hits.add((g['gate_name'], pop))
+        self.pop_tree.set_filter(hits)
+
+    # ------------------------------------------------------------------
     # Tile grid
     # ------------------------------------------------------------------
 
     def _rebuild_grid(self):
-        """Redraw all tiles from state.trained_boundaries."""
+        """Refill the hierarchy tree and redraw the tiles of the gates in
+        view from state.trained_boundaries."""
         while self.grid_layout.count():
-            item = self.grid_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            self.grid_layout.takeAt(0)
+        for tile in self._tile_widgets.values():
+            tile.setParent(None)
+            tile.deleteLater()
         self._tile_widgets.clear()
+        self.pop_tree.set_nodes(ag_review.population_tree(self.state.gate_definitions),
+                                expand_depth=self._EXPAND_DEPTH)
+        self._mark_tree()
+        self._filter_tree()
+        self._layout_tiles()
 
+    def _schedule_layout(self):
+        """Lay the tiles out once the tree has finished expanding or
+        collapsing (Expand all sends one signal per node)."""
+        if self._layout_pending:
+            return
+        self._layout_pending = True
+        QTimer.singleShot(0, self._layout_tiles)
+
+    def _shown_gates(self) -> list[dict]:
+        """Gates drawn on populations open in the tree, in hierarchy order."""
+        out = []
+        for g in ag_core.ordered_gate_defs(self.state.gate_definitions):
+            parent = (g.get('parent_gate') or '',
+                      (g.get('parent_popul') or 'root') if g.get('parent_gate') else 'root')
+            if self.pop_tree.is_open(parent):
+                out.append(g)
+        return out
+
+    def _layout_tiles(self):
+        """Show a tile for each gate in view, making tiles only when first
+        needed; tiles of gates out of view are hidden and kept."""
+        self._layout_pending = False
+        while self.grid_layout.count():
+            self.grid_layout.takeAt(0)
+        shown = self._shown_gates()
+        names = {g.get('gate_name', '') for g in shown}
+        for name, tile in self._tile_widgets.items():
+            if name not in names:
+                tile.hide()
         cols = 4
-        for i, g in enumerate(ag_core.ordered_gate_defs(self.state.gate_definitions)):
-            tile = self._make_tile(g)
+        for i, g in enumerate(shown):
+            name = g.get('gate_name', '')
+            tile = self._tile_widgets.get(name)
+            if tile is None:
+                tile = self._make_tile(g)
+                self._tile_widgets[name] = tile
             row, col = divmod(i, cols)
             self.grid_layout.addWidget(tile, row, col)
-            self._tile_widgets[g.get('gate_name', '')] = tile
+            tile.show()
+        total = len(self.state.gate_definitions)
+        if total and len(shown) < total:
+            self.lbl_tiles.setText(f"Showing {len(shown)} of {total} gates. Expand populations "
+                                   "in the hierarchy to show the gates drawn on them.")
+        else:
+            self.lbl_tiles.setText(f"Showing all {total} gates." if total else "")
+
+    def _on_tree_selected(self, gate: str, pop: str):
+        """Open the selected population and scroll to the first of its gates."""
+        key = (gate or '', pop)
+        if self.toolbox.currentIndex() != self._page_tiles:
+            self.toolbox.setCurrentIndex(self._page_tiles)
+        if not self.pop_tree.is_open(key):
+            self.pop_tree.expand_population(gate, pop)
+            self._layout_tiles()
+        for g in self._shown_gates():
+            parent = (g.get('parent_gate') or '',
+                      (g.get('parent_popul') or 'root') if g.get('parent_gate') else 'root')
+            if parent == key and g.get('gate_name') in self._tile_widgets:
+                self.grid_scroll.ensureWidgetVisible(self._tile_widgets[g['gate_name']])
+                break
 
     def _make_tile(self, gate_def: dict) -> QWidget:
         """Create one plot tile for a gate."""
@@ -3541,9 +3898,10 @@ class TrainTab(QWidget):
         pnn_labels = build_display_label_map(pnn, spectral_model)
         x_label = pnn_labels.get(ch_x, ch_x)
         y_label = pnn_labels.get(ch_y, ch_y) if ch_y else 'Count'
-        transforms = self.controller.unmixed_transformations or {}
+        transforms = self.tf.objects
         tr_x = transforms.get(ch_x)
         tr_y = transforms.get(ch_y) if ch_y else None
+        line_colour = ag_core.algorithm_colour(gate_def.get('algorithm'))
 
         # Tile size from settings
         tile_size = hc_settings.cytometry_plot_width_target_retrieved
@@ -3660,7 +4018,7 @@ class TrainTab(QWidget):
                 tx = entry.get('threshold_x') or 0.0
                 line = pg.InfiniteLine(
                     pos=float(tx), angle=0 if sep_y else 90,
-                    pen=pg.mkPen(color=(30, 160, 50), width=1.5)
+                    pen=pg.mkPen(color=line_colour, width=1.5)
                 )
                 vb.addItem(line)
                 view_tr = tr_x if sep_y else tr_y
@@ -3676,7 +4034,7 @@ class TrainTab(QWidget):
                         pop_label = pop_data.get('label', pop_name)
                         pct_txt = pg.TextItem(
                             f"{pop_label}\n{frac * 100:.1f}%",
-                            color=(30, 160, 50), anchor=(0.5, 0.5),
+                            color=line_colour, anchor=(0.5, 0.5),
                         )
                         if sep_y:
                             pct_txt.setPos(across, at)
@@ -3698,7 +4056,7 @@ class TrainTab(QWidget):
                         ys_b.append(ys_b[0])
                     line_item = pg.PlotDataItem(
                         xs_b, ys_b,
-                        pen=pg.mkPen(color=(30, 160, 50), width=1.5)
+                        pen=pg.mkPen(color=line_colour, width=1.5)
                     )
                     vb.addItem(line_item)
                     frac = pop_data.get('fraction')
@@ -3708,7 +4066,7 @@ class TrainTab(QWidget):
                         pop_label = pop_data.get('label', pop_name)
                         pct_txt = pg.TextItem(
                             f"{pop_label}\n{frac * 100:.1f}%",
-                            color=(30, 160, 50), anchor=(0.5, 0.5),
+                            color=line_colour, anchor=(0.5, 0.5),
                         )
                         pct_txt.setPos(cx, cy)
                         vb.addItem(pct_txt)
@@ -3739,12 +4097,13 @@ class TrainTab(QWidget):
         if self._last_event_data is None or not self.state.trained_boundaries:
             return
         channels = _experiment_channels(self.controller)
-        transforms = self.controller.unmixed_transformations or {}
+        transforms = self.tf.objects
         data = ag_core.transform_columns(self._last_event_data, channels, transforms)
         index = {ch: i for i, ch in enumerate(channels)}
         result = ag_core.run_gating(self.state.gate_definitions, data, index,
                                     reference=self.state.trained_boundaries,
-                                    default_mode=ag_core.MODE_FIXED)
+                                    default_mode=ag_core.MODE_FIXED,
+                                    axis_limits=_axis_limits(transforms))
         for gate_name, entries in result.boundaries.items():
             stored = self.state.trained_boundaries.get(gate_name, {})
             for pop, entry in entries.items():
@@ -3755,6 +4114,42 @@ class TrainTab(QWidget):
     # ------------------------------------------------------------------
     # Run / abort handlers
     # ------------------------------------------------------------------
+
+    def _fingerprint(self, selected: list[str]) -> str:
+        """What a training run's result depends on: samples, events per
+        sample, seed, the gate definitions and the transforms."""
+        import hashlib
+        payload = {'samples': list(selected), 'events': int(self.state.events_per_sample),
+                   'seed': TRAINING_SEED, 'gates': self.state.gate_definitions,
+                   'transforms': {ch: {k: v for k, v in p.items() if k != 'limits'}
+                                  for ch, p in self.tf.params().items()}}
+        return hashlib.sha256(json.dumps(ag_core.to_jsonable(payload), sort_keys=True,
+                                         default=str).encode('utf-8')).hexdigest()
+
+    def _ask_resume(self, n_done: int, compatible: bool) -> str | None:
+        """'resume', 'overwrite' or None for a paused training run."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Paused training")
+        total = self.state.n_gates()
+        if compatible:
+            box.setText(f"Training was paused with {n_done} of {total} gate(s) trained.\n\n"
+                        "Resume keeps them and trains the remaining gates; Overwrite trains "
+                        "every gate again.")
+            resume = box.addButton("Resume", QMessageBox.AcceptRole)
+        else:
+            box.setText(f"Training was paused with {n_done} of {total} gate(s) trained, but the "
+                        "training samples, events per sample, gates or transforms have changed "
+                        "since, so it cannot be resumed.\n\nOverwrite trains every gate again.")
+            resume = None
+        overwrite = box.addButton("Overwrite", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if resume is not None and clicked is resume:
+            return 'resume'
+        if clicked is overwrite:
+            return 'overwrite'
+        return None
 
     def _on_run_clicked(self):
         selected = self.picker.get_ordered_list()
@@ -3771,30 +4166,52 @@ class TrainTab(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Cannot train", str(exc))
             return
+        fingerprint = self._fingerprint(selected)
+        done = {}
+        progress = self.state.training_progress
+        if progress:
+            names = [n for n in progress.get('done') or [] if self.state.is_trained(n)]
+            choice = self._ask_resume(len(names), progress.get('fingerprint') == fingerprint)
+            if choice is None:
+                return
+            if choice == 'resume':
+                done = {n: deepcopy(self.state.trained_boundaries[n]) for n in names}
         self.state.training_samples = list(selected)
+        self._run_fingerprint = fingerprint
+        self._previous_boundaries = dict(self.state.trained_boundaries)
 
         import honeychrome.settings as hc_settings
         display_cap = int(getattr(hc_settings, 'max_display_events', 500_000) or 500_000)
 
         self.btn_run.setEnabled(False)
+        self.btn_pause.setEnabled(True)
         self.btn_abort.setEnabled(True)
-        self.lbl_status.setText("Running …")
+        self.lbl_status.setText("Resuming …" if done else "Running …")
 
         self._worker = _TrainingWorker(
             self.controller.experiment_dir, selected, snap,
             deepcopy(self.state.gate_definitions),
             _experiment_channels(self.controller),
-            deepcopy(self.controller.unmixed_transformations or {}),
+            deepcopy(self.tf.objects),
             events_per_sample=self.state.events_per_sample,
-            display_cap=display_cap, seed=TRAINING_SEED, parent=self,
+            display_cap=display_cap, seed=TRAINING_SEED, done=done, parent=self,
         )
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
 
+    def _on_pause_clicked(self):
+        if self._worker is not None:
+            self._worker.pause()
+            self.btn_pause.setEnabled(False)
+            self.lbl_status.setText("Pausing …")
+
     def _on_abort_clicked(self):
         if self._worker is not None:
             self._worker.abort()
+            self.btn_pause.setEnabled(False)
+            self.btn_abort.setEnabled(False)
+            self.lbl_status.setText("Aborting …")
 
     def _on_worker_progress(self, msg: str):
         self.lbl_status.setText(msg)
@@ -3803,14 +4220,18 @@ class TrainTab(QWidget):
 
     def _on_worker_finished(self, success: bool, error: str, payload: object):
         self.btn_run.setEnabled(True)
+        self.btn_pause.setEnabled(False)
         self.btn_abort.setEnabled(False)
         self._worker = None
         if not success:
-            self.lbl_status.setText(f"Error: {error}")
+            text = ("Stopped before any gate was trained; the boundaries from before are kept."
+                    if error == "Cancelled." else f"Error: {error}")
+            self.lbl_status.setText(text)
             ts = datetime.now().strftime('%H:%M:%S')
-            self.bus.statusMessage.emit(f"[GatingModelBuilder {ts}] Training error: {error}")
+            self.bus.statusMessage.emit(f"[GatingModelBuilder {ts}] Training: {text}")
             return
 
+        stopped = bool(payload.get('stopped'))
         self.state.trained_boundaries = payload['boundaries']
         self.state.training_summary = {
             'training_sample_names': list(payload['per_sample'].keys()),
@@ -3820,19 +4241,28 @@ class TrainTab(QWidget):
             'n_events_pooled': payload['n_pooled'],
             'per_sample': payload['per_sample'],
             'gate_status': payload['status'],
+            'complete': not stopped,
         }
+        self.state.training_progress = ({'fingerprint': self._run_fingerprint,
+                                         'done': list(payload.get('done') or [])}
+                                        if stopped else {})
         self._last_event_data = payload['display_events']
         self._last_gate_masks = payload['display_parent_masks']
         self._rebuild_grid()
         self.toolbox.setCurrentIndex(self._page_tiles)
 
         n_trained = len(payload['boundaries'])
+        self.trained.emit()
+        if stopped:
+            left = self.state.n_gates() - n_trained
+            self.lbl_status.setText(f"Paused — {n_trained} gate(s) trained, {left} to go. "
+                                    "Calculate Gates to resume or overwrite.")
+            return
         problems = [
             f"{name}: {st.get('message') or st.get('flag')}"
             for name, st in payload['status'].items() if st.get('flag')
         ]
         self.lbl_status.setText(f"Done — {n_trained} gate(s) trained.")
-        self.trained.emit()
         text = (f"{n_trained} gate(s) trained on {payload['n_pooled']:,} events from "
                 f"{len(payload['per_sample'])} sample(s).")
         if problems:
@@ -3841,22 +4271,26 @@ class TrainTab(QWidget):
 
 
 class _ReviewWorker(QThread):
-    """Load and unmix one sample for the Review tab."""
+    """Load and unmix the review samples for the Review tab, each capped at
+    the same number of events, and pool them."""
 
     finished = Signal(bool, str, object)   # ok, message, unmixed events
 
-    def __init__(self, experiment_dir, sample_key, snapshot, max_events, parent=None):
+    def __init__(self, experiment_dir, sample_keys, snapshot, max_events, parent=None):
         super().__init__(parent)
         self._experiment_dir = experiment_dir
-        self._key = sample_key
+        self._keys = list(sample_keys)
         self._snap = snapshot
         self._max_events = max_events
 
     def run(self):
         try:
-            out = load_unmixed(self._experiment_dir, self._key, self._snap,
-                               max_events=self._max_events, seed=TRAINING_SEED)
-            self.finished.emit(True, '', np.asarray(out['unmixed'], dtype=np.float32))
+            chunks = []
+            for key in self._keys:
+                out = load_unmixed(self._experiment_dir, key, self._snap,
+                                   max_events=self._max_events, seed=TRAINING_SEED)
+                chunks.append(np.asarray(out['unmixed'], dtype=np.float32))
+            self.finished.emit(True, '', np.concatenate(chunks, axis=0))
         except Exception as exc:
             log.exception("review sample load failed")
             self.finished.emit(False, str(exc), None)
@@ -3864,6 +4298,19 @@ class _ReviewWorker(QThread):
 
 _REVIEW_COLOURS = [(30, 160, 50), (210, 100, 20), (40, 100, 210), (170, 50, 170), (0, 150, 150)]
 _REVIEW_ALERT = (200, 30, 30)
+_TITLE_NAMES_CHARS = 70
+
+
+def _pop_key_text(gate, pop) -> str:
+    """A population as combo-box data (PySide6 returns stored tuples as lists)."""
+    return f"{gate or ''}\x1f{pop}"
+
+
+def _pop_key_tuple(text):
+    if text is None:
+        return None, 'root'
+    gate, _, pop = str(text).partition('\x1f')
+    return (gate or None), (pop or 'root')
 
 
 class _ReviewPlot(QWidget):
@@ -3878,7 +4325,8 @@ class _ReviewPlot(QWidget):
     # (channel, transform parameters before the drag, or None when only the range moved)
     axisZoomed = Signal(str, object)
 
-    def __init__(self, channels, gates, controller, tile_size, parent=None, caption: str = ''):
+    def __init__(self, channels, gates, controller, tile_size, parent=None, caption: str = '',
+                 transforms: dict | None = None):
         super().__init__(parent)
         self.channels = tuple(channels)
         self.gates = list(gates)
@@ -3887,7 +4335,8 @@ class _ReviewPlot(QWidget):
         self._overlay: list = []
         self._lines: dict = {}
         self._rois: dict = {}
-        self._transforms = controller.unmixed_transformations or {}
+        self._transforms = transforms if transforms is not None else (
+            controller.unmixed_transformations or {})
         self._pnn = _experiment_channels(controller)
         labels = build_display_label_map(
             self._pnn, controller.experiment.process.get('spectral_model') or [])
@@ -3897,7 +4346,8 @@ class _ReviewPlot(QWidget):
         layout.setContentsMargins(2, 2, 2, 2)
         self.lbl_title = QLabel()
         self.lbl_title.setAlignment(Qt.AlignCenter)
-        self.lbl_title.setWordWrap(True)
+        # Two lines, always: plots side by side stay level.
+        self.lbl_title.setFixedHeight(2 * self.lbl_title.fontMetrics().lineSpacing() + 6)
         layout.addWidget(self.lbl_title)
 
         self.gw = TransparentGraphicsLayoutWidget()
@@ -3999,20 +4449,26 @@ class _ReviewPlot(QWidget):
         self._overlay.append(item)
         return item
 
-    def draw_overlays(self, boundaries: dict, texts: dict, editable: set):
+    def draw_overlays(self, boundaries: dict, texts: dict, editable: set,
+                      colours: dict | None = None):
         """Draw every daughter gate.
 
         boundaries : {gate: {pop: entry}} to draw.
         texts      : {(gate, pop): (text, alert)} label for each population.
         editable   : names of the gates whose boundaries can be moved.
+        colours    : optional {gate: RGB, or {'x': RGB, 'y': RGB} for a
+                     threshold gate's two lines}; default one colour per
+                     gate in turn.
         """
         self.clear_overlays()
         names = ", ".join(g['gate_name'] for g in self.gates)
+        short = names if len(names) <= _TITLE_NAMES_CHARS else names[:_TITLE_NAMES_CHARS - 1] + '…'
         axes = f"{self._labels[0]} vs {self._labels[1]}" if len(self._labels) > 1 else self._labels[0]
         head = f"{self.caption} — {axes}" if self.caption else axes
-        self.lbl_title.setText(f"<b>{head}</b><br><small>{names}</small>")
+        self.lbl_title.setText(f"<b>{head}</b><br><small>{short}</small>")
+        self.lbl_title.setToolTip(names)
         for k, gate in enumerate(self.gates):
-            colour = _REVIEW_COLOURS[k % len(_REVIEW_COLOURS)]
+            colour = (colours or {}).get(gate['gate_name']) or _REVIEW_COLOURS[k % len(_REVIEW_COLOURS)]
             entries = boundaries.get(gate['gate_name']) or {}
             if not entries:
                 continue
@@ -4034,7 +4490,8 @@ class _ReviewPlot(QWidget):
                 pos = self._label_position(entry)
                 if pos is None:
                     continue
-                label = pg.TextItem(text[0], color=_REVIEW_ALERT if text[1] else colour,
+                text_colour = colour.get('x') if isinstance(colour, dict) else colour
+                label = pg.TextItem(text[0], color=_REVIEW_ALERT if text[1] else text_colour,
                                     anchor=(0.5, 0.5))
                 label.setPos(*pos)
                 self._add(label)
@@ -4058,16 +4515,19 @@ class _ReviewPlot(QWidget):
     def _draw_thresholds(self, gate, entries, colour, movable):
         first = next(iter(entries.values()))
         tx, ty = first.get('threshold_x'), first.get('threshold_y')
+        cx = colour.get('x') if isinstance(colour, dict) else colour
+        cy = colour.get('y', cx) if isinstance(colour, dict) else colour
         lines = {}
         if tx is not None:
             lines['x'] = self._add(pg.InfiniteLine(pos=float(tx), angle=90, movable=movable,
-                                                   pen=self._pen(colour)))
+                                                   pen=self._pen(cx, 3 if movable else 2)))
         if ty is not None and len(self.channels) > 1:
             lines['y'] = self._add(pg.InfiniteLine(pos=float(ty), angle=0, movable=movable,
-                                                   pen=self._pen(colour)))
+                                                   pen=self._pen(cy, 3 if movable else 2)))
         self._lines[gate['gate_name']] = lines
         if movable:
             for line in lines.values():
+                line.setHoverPen(self._pen(_REVIEW_ALERT, 3))
                 line.sigPositionChangeFinished.connect(
                     lambda _l=None, g=gate: self._on_thresholds_moved(g))
 
@@ -4085,18 +4545,22 @@ class _ReviewPlot(QWidget):
             log.exception("threshold edit failed")
 
     def _draw_range(self, gate, pop, entry, colour, movable):
+        colour = colour.get('x') if isinstance(colour, dict) else colour
         lo, hi = entry['range']
         pair = [self._add(pg.InfiniteLine(pos=float(v), angle=90, movable=movable,
-                                          pen=self._pen(colour))) for v in (lo, hi)]
+                                          pen=self._pen(colour, 3 if movable else 2)))
+                for v in (lo, hi)]
         self._lines[(gate['gate_name'], pop)] = pair
         if movable:
             for line in pair:
+                line.setHoverPen(self._pen(_REVIEW_ALERT, 3))
                 line.sigPositionChangeFinished.connect(
                     lambda _l=None, g=gate, p=pop, pr=pair: self.gateEdited.emit(
                         g['gate_name'],
                         ag_review.with_range(g, p, pr[0].value(), pr[1].value())))
 
     def _draw_polygon(self, gate, pop, entry, colour, movable):
+        colour = colour.get('x') if isinstance(colour, dict) else colour
         coords = np.asarray(entry.get('boundary') or [], dtype=float)
         if coords.ndim != 2 or coords.shape[1] != 2 or len(coords) < 3:
             return
@@ -4105,7 +4569,7 @@ class _ReviewPlot(QWidget):
             self._add(pg.PlotDataItem(closed[:, 0], closed[:, 1], pen=self._pen(colour)))
             return
         roi = pg.PolyLineROI(ag_review.polygon_vertices(coords), closed=True,
-                             pen=self._pen(colour), movable=True)
+                             pen=self._pen(colour, 3), movable=True)
         self._add(roi)
         self._rois[(gate['gate_name'], pop)] = roi
         roi.sigRegionChangeFinished.connect(
@@ -4122,21 +4586,150 @@ class _ReviewPlot(QWidget):
             log.exception("polygon edit failed")
 
 
-class ReviewTab(QWidget):
-    """Review imported gates against a sample and convert them to trainable.
+class _FlagWorker(QThread):
+    """Compare every imported gate's boundary with its trainable form on the
+    review events (see ag_review.conversion_check); finished(ok, message,
+    {gate: flag}). progress(done, total) reports as it goes."""
 
-    Pick a population from the gating hierarchy; for each distinct plot
-    among the population's daughter gates the tab shows one row: on the
-    left the gates as drawn (the imported shapes), on the right each gate's
-    trainable form, calculated on this sample's parent population with the
-    algorithm chosen above it (or the trained boundary once the gate is
-    trained). Each population is labelled with its fraction of parent, next
-    to the fraction recorded at import when the review sample is the sample
-    the counts came from; a difference is shown in red. The algorithm combo
-    sets the algorithm a gate converts to, Convert to trainable switches the
-    gate to it, and Split… replaces a 2dsep gate with sequential 1dsep
-    gates. With Edit gates on, the shapes as drawn can be moved; Reset
-    restores them as imported.
+    progress = Signal(int, int)
+    finished = Signal(bool, str, object)
+
+    MAX_EVENTS = 10_000
+
+    def __init__(self, gate_defs, trained, data, pnn, limits, recommendations,
+                 shift_limit: float, fraction_limit: float, parent=None):
+        super().__init__(parent)
+        self._defs = gate_defs
+        self._trained = trained
+        self._data = data
+        self._pnn = list(pnn)
+        self._limits = limits
+        self._recs = recommendations
+        self._shift = float(shift_limit)
+        self._fraction = float(fraction_limit)
+        self._abort = False
+
+    def abort(self):
+        self._abort = True
+
+    def run(self):
+        try:
+            flags = self._execute()
+        except Exception as exc:
+            log.exception("conversion check failed")
+            self.finished.emit(False, str(exc), {})
+            return
+        if flags is None:
+            self.finished.emit(False, "Cancelled.", {})
+        else:
+            self.finished.emit(True, '', flags)
+
+    def _execute(self):
+        defs = self._defs
+        index = {c: i for i, c in enumerate(self._pnn)}
+        by_name = ag_core.gates_by_name(defs)
+        reference = ag_review.reference_boundaries(defs, self._trained)
+        modes = {}
+        for g in defs:
+            name = g['gate_name']
+            if name in self._trained or g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+                continue
+            if not g.get('template'):
+                reference.pop(name, None)
+            modes[name] = ag_core.MODE_RECALCULATE
+        result = ag_core.run_gating(defs, self._data, index, reference=reference, modes=modes,
+                                    default_mode=ag_core.MODE_FIXED, axis_limits=self._limits,
+                                    stop_check=lambda: self._abort, keep_partial=True)
+        if self._abort:
+            return None
+        candidates = [g for g in ag_core.ordered_gate_defs(defs)
+                      if g.get('template') and g['gate_name'] not in self._trained]
+        calc = ag_core.GateCalculator(self._limits)
+        rng = np.random.default_rng(TRAINING_SEED)
+        flags = {}
+        for k, g in enumerate(candidates, 1):
+            if self._abort:
+                return None
+            if k % 25 == 0:
+                self.progress.emit(k, len(candidates))
+            name = g['gate_name']
+            parent = result.parent_masks.get(name)
+            if parent is None or not parent.any():
+                continue
+            events = self._data[parent]
+            if len(events) > self.MAX_EVENTS:
+                events = events[np.sort(rng.choice(len(events), self.MAX_EVENTS, replace=False))]
+            algo = (ag_review.convert_target(g, self._recs.get(name))[0]
+                    if g.get('algorithm') == ag_core.ALGORITHM_IMPORTED else g.get('algorithm'))
+            if not algo:
+                continue
+            eff = ag_core.effective_gate_def(ag_review.trainable_definition(g, algo), by_name)
+            try:
+                resolved, _reason = ag_core.resolve_replicates(eff, self._data, index, result, by_name)
+                if resolved is None:
+                    continue
+                proposed = calc.calculate(events, resolved, index, trained=result.boundaries,
+                                          by_name=by_name)
+                if not proposed:
+                    continue
+                drawn = g['template']
+                drawn_masks = ag_core.population_masks(g, drawn, events, index,
+                                                       axis_limits=self._limits)
+                proposed_masks = ag_core.population_masks(eff, proposed, events, index,
+                                                          axis_limits=self._limits)
+            except Exception as exc:
+                log.info("conversion check of %s skipped: %s", name, exc)
+                continue
+            flag = ag_review.conversion_check(
+                g, drawn, proposed, {p: float(m.mean()) for p, m in drawn_masks.items()},
+                {p: float(m.mean()) for p, m in proposed_masks.items()},
+                shift_limit=self._shift, fraction_limit=self._fraction)
+            if flag is not None:
+                flag['algorithm'] = algo
+                flags[name] = flag
+        self.progress.emit(len(candidates), len(candidates))
+        return flags
+
+
+class ReviewTab(QWidget):
+    """Review imported gates against one or more samples, convert them to
+    trainable and edit them.
+
+    Pick a population in the gating hierarchy; for each distinct plot among
+    the population's daughter gates the tab shows the gates as drawn (left)
+    and, beside them, each gate's trainable form (right), calculated on the
+    review samples' parent population with the algorithm chosen above it
+    (or the trained boundary once the gate is trained). Each population is
+    labelled with its fraction of parent, next to the fraction recorded at
+    import when one review sample is the sample the counts came from; a
+    difference is shown in red.
+
+    Per gate: the algorithm of each separating axis (a 2dsep gate has two),
+    with a source to copy from when an axis replicates a threshold, Convert
+    to trainable (or Use shapes as drawn), Split… for 2dsep gates and a red
+    − to delete the gate and the gates below it. Converting a gate brings
+    the gates that share its imported name into line (see
+    ag_review.apply_name_sync). Convert all converts every gate still as
+    drawn; Update calculates the shown gates again on the review samples.
+    With Edit gates on, the shapes as drawn of gates that apply them, and
+    the boundaries of converted gates, can be moved; Reset restores the
+    shapes as imported.
+
+    The hierarchy tree takes several selected populations (Ctrl/Shift-click)
+    for its right-click menu: copy gates or whole branches and paste them on
+    other populations, delete gates or populations, and mark a population
+    as a reference for replicated thresholds.
+
+    Only the gates the shown plots depend on are gated, so a large
+    hierarchy stays responsive.
+
+    The hierarchy can be searched and narrowed to unconverted gates, gates
+    whose same-named partners were set to different algorithms, or flagged
+    gates. Flag conversions compares, for every gate with an imported
+    boundary, that boundary with its trainable form on the review samples
+    and flags the gates where a threshold moves, or a population changes,
+    by more than the limits set beside it. Each gate's arrow button gives
+    the gates of the same name below its population its configuration.
     """
 
     templatesChanged = Signal()
@@ -4147,28 +4740,41 @@ class ReviewTab(QWidget):
     # Emitted when an axis drag changed a channel's transform: (channel, parameters before).
     transformChanged = Signal(str, object)
     _MAX_EVENTS = 150_000
+    _MIN_EVENTS_PER_SAMPLE = 20_000
     _PROPOSAL_EVENTS = 50_000
+    _REGATE_DELAY_MS = 400
 
-    def __init__(self, state: GatingModelState, bus, controller, parent=None):
+    def __init__(self, state: GatingModelState, bus, controller, tf=None, parent=None):
         super().__init__(parent)
         self.state = state
         self.bus = bus
         self.controller = controller
+        self.tf = tf
+        self._flag_worker = None
+        self._fallbacks: set = set()
         self._raw = None
         self._data_t = None
-        self._loaded_key = None
+        self._loaded_keys = None
         self._loaded_dir = None
-        self._wanted_key = None
+        self._wanted_keys = None
+        self._sample_keys: list = []
         self._result = None
+        self._gated: set = set()
         self._worker = None
         self._plots: list = []
+        self._trainable: list = []
         self._building = False
         self._mask = None
         self._data_signature = None
         self._tree_views: dict = {}
         self._tree_labels: dict = {}
         self._proposals: dict = {}
-        self._trainable: list = []
+        self._clipboard: list = []
+        self._clipboard_branch = False
+        self._regate_timer = QTimer(self)
+        self._regate_timer.setSingleShot(True)
+        self._regate_timer.setInterval(self._REGATE_DELAY_MS)
+        self._regate_timer.timeout.connect(self._on_regate_timer)
         self._build_ui()
 
     def _build_ui(self):
@@ -4177,21 +4783,67 @@ class ReviewTab(QWidget):
         row = QHBoxLayout()
         self.combo_pop = QComboBox()
         self.combo_pop.setMinimumWidth(220)
-        self.combo_sample = QComboBox()
-        self.combo_sample.setMinimumWidth(220)
+        self.btn_samples = QToolButton()
+        self.btn_samples.setPopupMode(QToolButton.InstantPopup)
+        self.btn_samples.setMinimumWidth(200)
+        self.btn_samples.setToolTip("Samples the gates are reviewed on. Tick several to pool "
+                                    "them, each contributing the same number of events.")
+        self.menu_samples = QMenu(self.btn_samples)
+        self.btn_samples.setMenu(self.menu_samples)
         self.chk_edit = QCheckBox("Edit gates")
-        self.chk_edit.setToolTip("Move the shapes as drawn (left-hand plots) of gates "
-                                 "that still apply them.")
+        self.chk_edit.setToolTip(
+            "Drag the boundaries: on the left, the shapes as drawn of gates that still "
+            "apply them; on the right, the boundaries of converted gates (kept as a "
+            "manual adjustment until the gate is trained again).")
         self.btn_reset = QPushButton("Reset to import")
         self.btn_reset.setToolTip("Restore the shapes shown to their shapes as imported.")
+        self.btn_update = QPushButton("Update")
+        self.btn_update.setToolTip("Calculate the shown gates again on the review samples "
+                                   "with their current algorithms.")
+        self.btn_convert_all = QPushButton("Convert all to trainable")
+        self.btn_convert_all.setToolTip(
+            "Convert every gate that still applies its shapes as drawn to its proposed "
+            "algorithm. Gates sharing a name with a gate you converted yourself follow "
+            "your choice.")
         row.addWidget(QLabel("Population:"))
         row.addWidget(self.combo_pop)
-        row.addWidget(QLabel("Review sample:"))
-        row.addWidget(self.combo_sample)
+        row.addWidget(QLabel("Review samples:"))
+        row.addWidget(self.btn_samples)
         row.addWidget(self.chk_edit)
         row.addWidget(self.btn_reset)
+        row.addWidget(self.btn_update)
+        row.addWidget(self.btn_convert_all)
         row.addStretch()
         layout.addLayout(row)
+
+        flag_row = QHBoxLayout()
+        self.btn_flag = QPushButton("Flag conversions")
+        self.btn_flag.setToolTip(
+            "Compare every gate's imported boundary with its trainable form on the review "
+            "samples, and flag the gates whose trainable form lands far from it. Flagged "
+            "gates are red in the hierarchy and listed by Show: Flagged conversions.")
+        self.btn_flag.clicked.connect(self._on_flag_clicked)
+        flag_row.addWidget(self.btn_flag)
+        flag_row.addWidget(QLabel("when a threshold moves more than"))
+        self.sb_flag_shift = block_wheel(QDoubleSpinBox())
+        self.sb_flag_shift.setRange(0.01, 1.0)
+        self.sb_flag_shift.setDecimals(2)
+        self.sb_flag_shift.setSingleStep(0.01)
+        self.sb_flag_shift.setValue(0.10)
+        self.sb_flag_shift.setToolTip("In transformed axis units (the display axis spans about 0 to 1).")
+        flag_row.addWidget(self.sb_flag_shift)
+        flag_row.addWidget(QLabel("or a population changes by more than"))
+        self.sb_flag_fraction = block_wheel(QDoubleSpinBox())
+        self.sb_flag_fraction.setRange(1.0, 100.0)
+        self.sb_flag_fraction.setDecimals(0)
+        self.sb_flag_fraction.setSuffix(" pp")
+        self.sb_flag_fraction.setValue(10.0)
+        self.sb_flag_fraction.setToolTip("Percentage points of its parent.")
+        flag_row.addWidget(self.sb_flag_fraction)
+        self.lbl_flag = QLabel("")
+        self.lbl_flag.setStyleSheet("color: #555; font-style: italic;")
+        flag_row.addWidget(self.lbl_flag, stretch=1)
+        layout.addLayout(flag_row)
         self.lbl_status = QLabel("Import a gating strategy to review it here.")
         self.lbl_status.setWordWrap(True)
         self.lbl_status.setStyleSheet("color: #555; font-style: italic;")
@@ -4200,9 +4852,9 @@ class ReviewTab(QWidget):
         self._host = QWidget()
         self._grid = QGridLayout(self._host)
         self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self._host)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setWidget(self._host)
 
         # Gating hierarchy on the left, inspection plots on the right.
         tree_panel = QWidget()
@@ -4218,32 +4870,47 @@ class ReviewTab(QWidget):
         tree_header.addWidget(self.btn_expand)
         tree_header.addWidget(self.btn_collapse)
         tree_layout.addLayout(tree_header)
-        self.pop_tree = PopulationTree()
+        self.tree_filter = FilterBar(GATE_FILTERS, placeholder="Search populations and gates…",
+                                     vertical=True)
+        self.tree_filter.changed.connect(lambda _t, _m: self._apply_tree_filter())
+        tree_layout.addWidget(self.tree_filter)
+        self.pop_tree = PopulationTree(multi_select=True)
         self.pop_tree.setToolTip(
-            "Select a population to inspect the gates drawn on it. Populations "
-            "with no gates below them show the plot they are gated on.")
+            "Select a population to inspect the gates drawn on it. Populations with no "
+            "gates below them show the plot they are gated on. Right-click to copy, "
+            "paste or delete gates, or to mark a reference population; Ctrl/Shift-click "
+            "selects several.")
+        self.pop_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.pop_tree.customContextMenuRequested.connect(self._on_tree_menu)
         tree_layout.addWidget(self.pop_tree, stretch=1)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(tree_panel)
-        splitter.addWidget(scroll)
+        splitter.addWidget(self._scroll)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 4)
         splitter.setSizes([240, 760])
         layout.addWidget(splitter, stretch=1)
 
+        self.lbl_sync = QLabel()
+        self.lbl_sync.setWordWrap(True)
+        self.lbl_sync.setStyleSheet("color: #b06000; font-weight: bold;")
+        self.lbl_sync.setVisible(False)
+        layout.addWidget(self.lbl_sync)
+
         self.pop_tree.populationSelected.connect(self._on_tree_selected)
         self.btn_expand.clicked.connect(self.pop_tree.expandAll)
         self.btn_collapse.clicked.connect(self.pop_tree.collapseAll)
         self.combo_pop.currentIndexChanged.connect(self._on_population_changed)
-        self.combo_sample.currentIndexChanged.connect(self._on_sample_changed)
-        self.chk_edit.toggled.connect(lambda _on: self._redraw_overlays())
+        self.chk_edit.toggled.connect(self._on_edit_toggled)
         self.btn_reset.clicked.connect(self._on_reset)
+        self.btn_update.clicked.connect(self._on_update)
+        self.btn_convert_all.clicked.connect(self._on_convert_all)
 
     # -- population and sample pickers --------------------------------------
 
     def refresh(self):
-        """Rebuild the pickers from the model; reload the sample if needed."""
+        """Rebuild the pickers from the model; reload the samples if needed."""
         self._building = True
         try:
             previous = self.combo_pop.currentData()
@@ -4251,7 +4918,7 @@ class ReviewTab(QWidget):
             for choice in ag_review.population_choices(self.state.gate_definitions):
                 self.combo_pop.addItem(f"{choice['label']}  ({choice['n_gates']} gate"
                                        f"{'s' if choice['n_gates'] != 1 else ''})",
-                                       (choice['gate'], choice['pop']))
+                                       _pop_key_text(choice['gate'], choice['pop']))
             if previous is not None:
                 i = self.combo_pop.findData(previous)
                 if i >= 0:
@@ -4260,6 +4927,9 @@ class ReviewTab(QWidget):
             self._fill_samples()
         finally:
             self._building = False
+        self._update_sync_banner()
+        self.btn_convert_all.setEnabled(any(
+            g.get('algorithm') == ag_core.ALGORITHM_IMPORTED for g in self.state.gate_definitions))
         if self.combo_pop.count() == 0:
             self._clear_plots()
             self.lbl_status.setText("The model has no gates to review.")
@@ -4272,7 +4942,46 @@ class ReviewTab(QWidget):
         self._tree_views = {(n['gate'], n['pop']): n['view'] for n in nodes}
         self._tree_labels = {(n['gate'], n['pop']): n['label'] for n in nodes}
         self.pop_tree.set_nodes(nodes)
+        self._mark_flags()
+        self._apply_tree_filter()
         self._select_in_tree()
+
+    def _mark_flags(self):
+        """Flagged gates' populations in red, with the flag as tooltip."""
+        marks = {}
+        for name, flag in self.state.conversion_flags.items():
+            g = self.state.gate_by_name(name)
+            if g is None:
+                continue
+            for pop in (g.get('populations') or {}):
+                marks[(name, pop)] = (_REVIEW_ALERT, flag.get('message', ''))
+        self.pop_tree.mark(marks)
+
+    def _apply_tree_filter(self):
+        """Show the populations whose gates match the search and the
+        "show" choice (with the populations above them)."""
+        text, mode = self.tree_filter.text(), self.tree_filter.mode()
+        counts = filter_counts(self.state)
+        for key, label in GATE_FILTERS[1:]:
+            self.tree_filter.set_mode_label(key, f"{label} ({counts.get(key, 0)})")
+        wanted = filtered_gate_names(self.state, mode)
+        if wanted is None and not text:
+            self.pop_tree.set_filter(None)
+            return
+        shown = set()
+        for g in self.state.gate_definitions:
+            name = g['gate_name']
+            if wanted is not None and name not in wanted:
+                continue
+            pops = g.get('populations') or {}
+            labels = [(pops.get(p) or {}).get('label', p) for p in pops]
+            if not text_matches(text, name, *labels):
+                continue
+            parent = (g.get('parent_gate') or '',
+                      (g.get('parent_popul') or 'root') if g.get('parent_gate') else 'root')
+            shown.add(parent)
+            shown |= {(name, p) for p in pops}
+        self.pop_tree.set_filter(shown)
 
     def _select_in_tree(self):
         gate, pop = self._selected()
@@ -4283,7 +4992,7 @@ class ReviewTab(QWidget):
         view = self._tree_views.get((gate, pop))
         if view is None:
             return
-        i = self.combo_pop.findData((view[0] or None, view[1]))
+        i = self.combo_pop.findData(_pop_key_text(view[0], view[1]))
         if i < 0:
             return
         self._building = True
@@ -4303,73 +5012,112 @@ class ReviewTab(QWidget):
         return None
 
     def _fill_samples(self):
-        keys = analysis_sample_keys(self.controller)
-        wanted = self.combo_sample.currentData() or self._import_sample_key()
-        if wanted is None:
-            current = getattr(self.controller, 'current_sample_path', None)
-            for key in keys:
-                if current and str(current).endswith(str(key)):
-                    wanted = key
-        self.combo_sample.clear()
-        all_keys = list(keys)
-        if wanted and wanted not in all_keys:
-            all_keys.insert(0, wanted)
-        for key in all_keys:
-            self.combo_sample.addItem(_sample_label(key), key)
-        i = self.combo_sample.findData(wanted) if wanted else 0
-        self.combo_sample.setCurrentIndex(max(i, 0))
+        """Offer every analysis sample; keep the chosen ones, else start with
+        the sample the import's counts came from, or the one on show."""
+        keys = list(analysis_sample_keys(self.controller))
+        chosen = [k for k in self._sample_keys if k in keys]
+        if not chosen:
+            wanted = self._import_sample_key()
+            if wanted is None:
+                current = getattr(self.controller, 'current_sample_path', None)
+                wanted = next((k for k in keys if current and str(current).endswith(str(k))), None)
+            if wanted is None and keys:
+                wanted = keys[0]
+            if wanted is not None and wanted not in keys:
+                keys.insert(0, wanted)
+            chosen = [wanted] if wanted is not None else []
+        self._sample_keys = chosen
+        self.menu_samples.clear()
+        for key in keys:
+            action = QAction(_sample_label(key), self.menu_samples)
+            action.setCheckable(True)
+            action.setChecked(key in chosen)
+            action.toggled.connect(lambda on, k=key: self._on_sample_toggled(k, on))
+            self.menu_samples.addAction(action)
+        self._update_samples_button()
+
+    def _update_samples_button(self):
+        keys = self._sample_keys
+        if not keys:
+            self.btn_samples.setText("(no samples)")
+        elif len(keys) == 1:
+            self.btn_samples.setText(_sample_label(keys[0]))
+        else:
+            self.btn_samples.setText(f"{len(keys)} samples pooled")
+
+    def _on_sample_toggled(self, key, on: bool):
+        if on and key not in self._sample_keys:
+            self._sample_keys.append(key)
+        elif not on and key in self._sample_keys:
+            if len(self._sample_keys) == 1:
+                # At least one sample stays chosen.
+                QTimer.singleShot(0, self._fill_samples)
+                return
+            self._sample_keys.remove(key)
+        self._update_samples_button()
+        if not self._building:
+            self._ensure_sample()
 
     def _on_population_changed(self, _index=None):
         if not self._building:
             self._select_in_tree()
             self._rebuild_plots()
 
-    def _on_sample_changed(self, _index=None):
-        if not self._building:
-            self._ensure_sample()
+    def _samples_text(self) -> str:
+        keys = self._loaded_keys or ()
+        if len(keys) == 1:
+            return _sample_label(keys[0])
+        return f"{len(keys)} pooled samples"
+
+    def _single_review_key(self):
+        """The review sample when exactly one is loaded, else None."""
+        keys = self._loaded_keys or ()
+        return keys[0] if len(keys) == 1 else None
 
     # -- loading and gating -------------------------------------------------
 
     def _ensure_sample(self):
-        key = self.combo_sample.currentData()
-        if key is None:
+        keys = tuple(self._sample_keys)
+        if not keys:
             self.lbl_status.setText("No sample available for review.")
             return
         experiment_dir = getattr(self.controller, 'experiment_dir', None)
         if experiment_dir != self._loaded_dir:
-            self._raw = self._data_t = self._result = self._loaded_key = None
+            self._raw = self._data_t = self._result = self._loaded_keys = None
+            self._gated = set()
             self._loaded_dir = experiment_dir
-        if key == self._loaded_key and self._raw is not None:
+        if keys == self._loaded_keys and self._raw is not None:
             if self._data_signature != self._transform_signature():
                 self._transform_events()
             self._regate()
             self._rebuild_plots()
             return
         if self._worker is not None:
-            self._wanted_key = key
+            self._wanted_keys = keys
             return
         try:
-            snap = snapshot_unmix_state(self.controller, [key])
+            snap = snapshot_unmix_state(self.controller, list(keys))
         except Exception as exc:
-            self.lbl_status.setText(f"Cannot load {_sample_label(key)}: {exc}")
+            self.lbl_status.setText(f"Cannot load the review samples: {exc}")
             return
-        self.lbl_status.setText(f"Loading {_sample_label(key)} …")
-        self._wanted_key = key
-        worker = _ReviewWorker(self.controller.experiment_dir, key, snap,
-                               self._MAX_EVENTS, parent=self)
-        worker.finished.connect(lambda ok, msg, data, k=key: self._on_loaded(ok, msg, data, k))
+        label = _sample_label(keys[0]) if len(keys) == 1 else f"{len(keys)} samples"
+        self.lbl_status.setText(f"Loading {label} …")
+        self._wanted_keys = keys
+        per_sample = max(self._MAX_EVENTS // len(keys), self._MIN_EVENTS_PER_SAMPLE)
+        worker = _ReviewWorker(self.controller.experiment_dir, keys, snap, per_sample, parent=self)
+        worker.finished.connect(lambda ok, msg, data, k=keys: self._on_loaded(ok, msg, data, k))
         self._worker = worker
         worker.start()
 
-    def _on_loaded(self, ok, message, data, key):
+    def _on_loaded(self, ok, message, data, keys):
         self._worker = None
         if not ok:
-            self.lbl_status.setText(f"Could not load {_sample_label(key)}: {message}")
+            self.lbl_status.setText(f"Could not load the review samples: {message}")
             return
         self._raw = data
-        self._loaded_key = key
+        self._loaded_keys = tuple(keys)
         self._transform_events()
-        if self._wanted_key not in (None, key):
+        if self._wanted_keys not in (None, tuple(keys)):
             self._ensure_sample()
             return
         self._regate()
@@ -4377,7 +5125,7 @@ class ReviewTab(QWidget):
 
     def _transform_signature(self):
         """The transforms the events are shown in, as comparable values."""
-        live = self.controller.unmixed_transformations or {}
+        live = self.tf.objects
         return tuple(sorted(
             (ch, tuple(sorted((k, str(v)) for k, v in ag_core.transform_params(tr).items()
                               if k != 'limits')))
@@ -4386,14 +5134,13 @@ class ReviewTab(QWidget):
     def _transform_events(self):
         """Transform every column of the loaded events with the live transforms."""
         pnn = _experiment_channels(self.controller)
-        self._data_t = ag_core.transform_columns(
-            self._raw, pnn, self.controller.unmixed_transformations or {})
+        self._data_t = ag_core.transform_columns(self._raw, pnn, self.tf.objects)
         self._data_signature = self._transform_signature()
 
     def _retransform_channel(self, channel: str):
         """Transform one column again after its transform changed."""
         pnn = _experiment_channels(self.controller)
-        tr = (self.controller.unmixed_transformations or {}).get(channel)
+        tr = self.tf.objects.get(channel)
         xform = getattr(tr, 'xform', None)
         if self._raw is None or self._data_t is None or xform is None or channel not in pnn:
             return
@@ -4402,27 +5149,70 @@ class ReviewTab(QWidget):
             xform.apply(self._raw[:, col].astype(np.float64)), dtype=np.float32)
         self._data_signature = self._transform_signature()
 
-    def _regate(self):
-        """Gate the review sample: trained gates and gates applying their
-        shapes as drawn use those boundaries; gates converted to a learning
-        algorithm but not yet trained are calculated on this sample."""
+    def _axis_limits(self) -> dict:
+        return _axis_limits(self.tf.objects)
+
+    def _needed_gates(self) -> set:
+        """The gates the shown population's plots depend on: its ancestors,
+        its daughter gates and everything their calculation needs (replicate
+        sources and reference populations, with their own ancestors)."""
+        by_name = ag_core.gates_by_name(self.state.gate_definitions)
+        gate, pop = self._selected()
+        start = {g['gate_name'] for g in self.state.gate_definitions
+                 if (g.get('parent_gate') or None) == (gate or None)
+                 and (gate is None or (g.get('parent_popul') or 'root') == pop)}
+        if gate:
+            start.add(gate)
+        needed, stack = set(), list(start)
+        while stack:
+            name = stack.pop()
+            if name in needed or name not in by_name:
+                continue
+            needed.add(name)
+            g = by_name[name]
+            deps = ag_core.gate_dependencies(g)
+            if g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+                deps |= ag_core.gate_dependencies(ag_review.trainable_definition(g))
+            stack.extend(d for d in deps if d not in needed)
+        return needed
+
+    def _regate(self, names: set | None = None):
+        """Gate the review events for the gates in *names* (default: those
+        the shown plots need): trained gates and gates applying their shapes
+        as drawn use those boundaries; gates converted to a learning
+        algorithm but not yet trained are calculated on these events."""
         self._proposals = {}
         if self._data_t is None:
             return
+        names = self._needed_gates() if names is None else set(names)
+        subset = [g for g in self.state.gate_definitions if g['gate_name'] in names]
         pnn = _experiment_channels(self.controller)
-        reference = ag_review.reference_boundaries(self.state.gate_definitions,
-                                                   self.state.trained_boundaries)
+        reference = ag_review.reference_boundaries(subset, self.state.trained_boundaries)
         modes = {}
-        for g in self.state.gate_definitions:
+        for g in subset:
             name = g['gate_name']
             if self.state.is_trained(name) or g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
                 continue
-            reference.pop(name, None)
+            # The imported boundary stands in while the gate cannot be
+            # calculated (e.g. a replicate source not yet chosen), so the
+            # gates below it keep their events.
+            if not g.get('template'):
+                reference.pop(name, None)
             modes[name] = ag_core.MODE_RECALCULATE
         self._result = ag_core.run_gating(
-            self.state.gate_definitions, self._data_t, {c: i for i, c in enumerate(pnn)},
+            subset, self._data_t, {c: i for i, c in enumerate(pnn)},
             reference=reference, modes=modes, default_mode=ag_core.MODE_FIXED,
-            axis_limits=_axis_limits(self.controller.unmixed_transformations or {}))
+            axis_limits=self._axis_limits())
+        self._gated = names
+
+    def _ensure_gated(self):
+        if self._data_t is not None and not self._needed_gates() <= self._gated:
+            self._regate()
+
+    def _on_regate_timer(self):
+        """Gate again once an axis drag has stopped."""
+        self._regate()
+        self._redraw_overlays()
 
     # -- plots --------------------------------------------------------------
 
@@ -4434,13 +5224,28 @@ class ReviewTab(QWidget):
         self._trainable = []
 
     def _selected(self):
-        data = self.combo_pop.currentData()
-        return data if data is not None else (None, 'root')
+        return _pop_key_tuple(self.combo_pop.currentData())
 
     def _rebuild_plots(self):
+        """Lay out the shown population's plots: per parameter set, the gates
+        as drawn on the left and each gate's controls above its trainable
+        form on the right, so the two plots of a gate sit level. The scroll
+        position is kept."""
         import honeychrome.settings as hc_settings
+        from PySide6.QtWidgets import QApplication
+        bar = self._scroll.verticalScrollBar()
+        scroll_to = bar.value()
+        # Hiding the focused widget (the button just clicked) passes focus to
+        # the next one, and the scroll area scrolls to show it: clear the
+        # focus first so the view stays where it is.
+        focused = QApplication.focusWidget()
+        if focused is not None and self._host.isAncestorOf(focused):
+            focused.clearFocus()
         self._clear_plots()
-        if self._raw is None or self._result is None:
+        if self._raw is None:
+            return
+        self._ensure_gated()
+        if self._result is None:
             return
         gate, pop = self._selected()
         groups = ag_review.daughter_groups(self.state.gate_definitions, gate, pop)
@@ -4450,70 +5255,123 @@ class ReviewTab(QWidget):
             mask = self._result.population_mask(gate, pop)
         if mask is None:
             self.lbl_status.setText(
-                f"The parent population {gate}/{pop} could not be gated on this sample "
+                f"The parent population {gate}/{pop} could not be gated on these samples "
                 "(its gate has no boundary or its channels are missing).")
             return
         self._mask = mask
         tile = hc_settings.cytometry_plot_width_target_retrieved
         self._trainable = []
-        for n, group in enumerate(groups):
+        r = 0
+        for group in groups:
             drawn = any(ag_review.has_drawn_shape(g) for g in group['gates'])
-            plot = _ReviewPlot(group['channels'], group['gates'], self.controller, tile, self,
-                               caption="As drawn" if drawn else "Current")
-            plot.gateEdited.connect(self._on_gate_edited)
-            plot.axisZoomed.connect(self._on_axis_zoomed)
-            plot.set_events(self._raw, mask)
-            self._grid.addWidget(plot, n, 0, Qt.AlignTop)
-            self._plots.append(plot)
-            column = QWidget()
-            col_layout = QVBoxLayout(column)
-            col_layout.setContentsMargins(0, 0, 0, 0)
-            for g in group['gates']:
-                col_layout.addWidget(self._trainable_panel(g, tile))
-            col_layout.addStretch()
-            self._grid.addWidget(column, n, 1, Qt.AlignTop)
-            self._plots.append(column)
+            left = _ReviewPlot(group['channels'], group['gates'], self.controller, tile, self,
+                               caption="As drawn" if drawn else "Current",
+                               transforms=self.tf.objects)
+            left.gateEdited.connect(self._on_gate_edited)
+            left.axisZoomed.connect(self._on_axis_zoomed)
+            left.set_events(self._raw, mask)
+            for k, g in enumerate(group['gates']):
+                controls = self._controls(g)
+                self._grid.addWidget(controls, r, 1, Qt.AlignLeft | Qt.AlignBottom)
+                self._plots.append(controls)
+                plot = self._trainable_plot(g, tile)
+                self._grid.addWidget(plot, r + 1, 1, Qt.AlignTop)
+                self._plots.append(plot)
+                minus = self._delete_button(g)
+                self._grid.addWidget(minus, r + 1, 2, Qt.AlignTop)
+                self._plots.append(minus)
+                forward = self._feed_forward_button(g)
+                self._grid.addWidget(forward, r + 1, 3, Qt.AlignTop)
+                self._plots.append(forward)
+                if k == 0:
+                    self._grid.addWidget(left, r + 1, 0, Qt.AlignTop)
+                    self._plots.append(left)
+                r += 2
         self._redraw_overlays()
         label = 'All events' if gate is None else f"{pop}"
         text = (f"{label}: {int(mask.sum()):,} of {len(self._raw):,} events on "
-                f"{_sample_label(self._loaded_key)}; {len(groups)} parameter set"
+                f"{self._samples_text()}; {len(groups)} parameter set"
                 f"{'s' if len(groups) != 1 else ''}. Left: gates as drawn; right: their "
                 "trainable form.")
         node = self.pop_tree.current_population()
         if node is not None and self._tree_views.get(node) not in (None, node):
             text = f"{self._tree_labels.get(node, node[1])} is gated on this plot. " + text
+        if self.chk_edit.isChecked():
+            text += " " + self._edit_hint(groups)
         self.lbl_status.setText(text)
+        QTimer.singleShot(0, lambda v=scroll_to: bar.setValue(v))
+
+    def _edit_hint(self, groups) -> str:
+        left = sum(1 for grp in groups for g in grp['gates']
+                   if g.get('template') and g.get('algorithm') == ag_core.ALGORITHM_IMPORTED)
+        right = sum(1 for grp in groups for g in grp['gates']
+                    if g.get('algorithm') != ag_core.ALGORITHM_IMPORTED)
+        return (f"Editing: {left} gate(s) movable as drawn (left), {right} converted gate(s) "
+                "movable on the right.")
 
     def _trainable_algorithm(self, g: dict) -> str | None:
         """The learning algorithm a gate uses, or converts to while imported."""
         if g.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
             return g.get('algorithm')
         return ag_review.convert_target(
-            g, self.state.algorithm_recommendations.get(g['gate_name']))[0]
+            g, self.state.algorithm_recommendations.get(g['gate_name']),
+            positive_fraction=self._positive_fraction(g))[0]
 
-    def _trainable_panel(self, g: dict, tile: int) -> QWidget:
-        """Controls and plot of one gate's trainable form."""
+    def _positive_fraction(self, g: dict):
+        """Fraction of the parent on the positive side of a histogram gate's
+        shapes as drawn on the review events (for the histogram rule)."""
+        if g.get('proposal_rule') != 'histogram' or self._result is None or self._data_t is None:
+            return None
+        if g['gate_name'] not in self._result.parent_masks:
+            return None
+        boundary = self._drawn_boundary(g)
+        regions = ag_core.population_regions(g, boundary)
+        above = [e.get('fraction') for p, e in boundary.items() if regions.get(p) == ag_core.REGION_ABOVE]
+        below = [e.get('fraction') for p, e in boundary.items() if regions.get(p) != ag_core.REGION_ABOVE]
+        if above and None not in above:
+            return float(sum(above))
+        if below and None not in below:
+            return 1.0 - float(sum(below))
+        return None
+
+    def _axis_label(self, channel) -> str:
+        return _channel_to_antigen(self.controller, channel) if channel else ''
+
+    def _controls(self, g: dict) -> QWidget:
+        """The controls above one gate's trainable form."""
         name = g['gate_name']
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        row = QHBoxLayout()
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(QLabel(f"<b>{name}</b> → {g.get('gate_type', '')}"))
-        combo = QComboBox()
-        algos = ag_review.trainable_algorithms(g)
-        combo.addItems(algos)
-        current = self._trainable_algorithm(g)
-        if current in algos:
-            combo.setCurrentText(current)
-        combo.setToolTip("Algorithm that calculates this gate from the training samples. "
-                         "The plot below shows it calculated on the review sample.")
-        combo.currentTextChanged.connect(lambda algo, n=name: self._on_algorithm_chosen(n, algo))
-        row.addWidget(combo)
         imported = g.get('algorithm') == ag_core.ALGORITHM_IMPORTED
+        algos = ag_review.trainable_algorithms(g)
+        trainable = self._trainable_algorithm(g)
+        axes = ag_core.threshold_axes(g) if g.get('gate_type') in ag_core.THRESHOLD_TYPES else ('x',)
+        gp = g.get('gate_param') or {}
+        for axis in axes:
+            if len(axes) > 1:
+                row.addWidget(QLabel(f"{self._axis_label(ag_core.axis_channel(g, axis))}:"))
+            current = trainable
+            if g.get('gate_type') == '2dsep':
+                current = gp.get(f'algorithm_{axis}') or trainable
+            combo = algorithm_combo(algos, current, ag_core.algorithm_colour)
+            combo.setToolTip("Algorithm that calculates this axis from the training samples; "
+                             "'replicate' takes the threshold from another gate or a reference "
+                             "population. The plot below shows it on the review samples, its "
+                             "threshold drawn in the algorithm's colour.")
+            combo.currentTextChanged.connect(
+                lambda algo, n=name, a=axis: self._on_axis_algorithm(n, a, algo))
+            row.addWidget(combo)
+            if current == 'tail':
+                self._add_tail_fraction(row, g, axis)
+            if current == ag_core.ALGORITHM_REPLICATE:
+                self._add_source_controls(row, g, axis)
         if imported:
             btn = QPushButton("Convert to trainable")
-            btn.setToolTip("Train this gate with the chosen algorithm instead of applying "
-                           "the shapes as drawn.")
+            btn.setToolTip("Train this gate with the chosen algorithm instead of applying the "
+                           "shapes as drawn. Gates with the same imported name that are still "
+                           "as drawn are converted the same way.")
             btn.clicked.connect(lambda _c=False, n=name: self._convert(n))
             row.addWidget(btn)
         elif ag_review.has_drawn_shape(g):
@@ -4526,31 +5384,168 @@ class ReviewTab(QWidget):
             btn.setToolTip("Replace this gate with sequential 1dsep gates.")
             btn.clicked.connect(lambda _c=False, n=name: self.splitRequested.emit(n))
             row.addWidget(btn)
+        members = ag_review.sync_members(self.state.gate_definitions, name)
+        if members:
+            tag = QLabel(f"<small>{len(members)} gates named "
+                         f"'{ag_review.name_group(g)}'</small>")
+            tag.setToolTip("Gates sharing this imported name follow the algorithm you choose "
+                           "for any of them, unless you set them differently.")
+            row.addWidget(tag)
         row.addStretch()
-        layout.addLayout(row)
+        return holder
+
+    def _add_source_controls(self, row, g: dict, axis: str):
+        """Source combo (and, for a reference population, its algorithm) of a
+        replicated axis."""
+        name = g['gate_name']
+        gp = g.get('gate_param') or {}
+        current = gp.get(f'replicate_{axis}') if isinstance(gp.get(f'replicate_{axis}'), dict) else None
+        choices = ag_review.replicate_choices(self.state.gate_definitions, name, axis)
+        source = block_wheel(QComboBox())
+        source.setMinimumWidth(200)
+        if not choices:
+            source.addItem("(no gate on this channel or reference population)", None)
+        else:
+            source.addItem("— choose a source —", None)
+        selected = 0
+        for k, (label, src) in enumerate(choices, start=1):
+            source.addItem(label, json.dumps(src, sort_keys=True))
+            if current and (src.get('gate') == current.get('gate')
+                            and src.get('population') == current.get('population')):
+                selected = k
+        source.setCurrentIndex(selected)
+        source.setToolTip("Copy the threshold another gate has on this channel, or calculate "
+                          "it on a reference population (mark one in the tree's right-click "
+                          "menu).")
+        source.currentIndexChanged.connect(
+            lambda _i, n=name, a=axis, c=source: self._on_source(n, a, c.currentData()))
+        row.addWidget(source)
+        if current and current.get('population'):
+            algo = algorithm_combo(list(ag_core.THRESHOLD_ALGORITHMS),
+                                   current.get('algorithm') or 'tail', ag_core.algorithm_colour)
+            algo.setToolTip("Algorithm that calculates the threshold on the reference population.")
+            algo.currentTextChanged.connect(
+                lambda a, n=name, ax=axis: self._on_source_algorithm(n, ax, a))
+            row.addWidget(algo)
+            if (current.get('algorithm') or 'tail') == 'tail':
+                self._add_tail_fraction(row, g, axis)
+
+    def _add_tail_fraction(self, row, g: dict, axis: str):
+        """Tail fraction of a 'tail' axis: the share of the mirrored negative
+        population left above the threshold (smaller is stricter)."""
+        gp = g.get('gate_param') or {}
+        key = f'tail_fraction_{axis}' if g.get('gate_type') == '2dsep' else 'tail_fraction'
+        spin = block_wheel(QDoubleSpinBox())
+        spin.setRange(0.0001, 0.5)
+        spin.setDecimals(4)
+        spin.setSingleStep(0.001)
+        spin.setKeyboardTracking(False)
+        spin.setValue(float(gp.get(key, gp.get('tail_fraction', 0.01))))
+        spin.setToolTip("Tail fraction: the negative population's events below the mode are "
+                        "mirrored about it, and the threshold is placed where this fraction of "
+                        "that symmetric population lies above it (0.01 = 1%). Smaller is "
+                        "stricter.")
+        spin.valueChanged.connect(lambda v, n=g['gate_name'], k=key: self._on_tail_fraction(n, k, v))
+        row.addWidget(QLabel("Tail fraction:"))
+        row.addWidget(spin)
+
+    def _on_tail_fraction(self, gate_name: str, key: str, value: float):
+        g = self.state.gate_by_name(gate_name)
+        if g is None:
+            return
+        g.setdefault('gate_param', {})[key] = float(value)
+        self._after_config_change(g)
+
+    def _feed_forward_button(self, g: dict) -> QWidget:
+        """Give the same-named gates below this gate's population its
+        configuration (see ag_review.feed_forward)."""
+        btn = QPushButton("⇊")
+        btn.setFixedWidth(28)
+        btn.setStyleSheet("QPushButton { font-weight: bold; font-size: 14pt; }")
+        btn.setFocusPolicy(Qt.NoFocus)
+        converted = g.get('algorithm') != ag_core.ALGORITHM_IMPORTED
+        btn.setEnabled(converted)
+        btn.setToolTip(
+            f"Apply '{g['gate_name']}''s algorithm and settings to every gate of the same name "
+            "below the population it is drawn on." if converted else
+            "Convert this gate to trainable first; its settings can then be applied to the gates "
+            "of the same name below its population.")
+        btn.clicked.connect(lambda _c=False, n=g['gate_name']: self._feed_forward(n))
+        return btn
+
+    def _feed_forward(self, gate_name: str):
+        g = self.state.gate_by_name(gate_name)
+        if g is None:
+            return
+        below = ag_review.gates_below_population(
+            self.state.gate_definitions, g.get('parent_gate'), g.get('parent_popul') or 'root')
+        key = (ag_review.name_group(g), g.get('gate_type'), g.get('gate_marker_x'),
+               g.get('gate_marker_y'))
+        targets = [o['gate_name'] for o in self.state.gate_definitions
+                   if o['gate_name'] in below and o['gate_name'] != gate_name
+                   and (ag_review.name_group(o), o.get('gate_type'), o.get('gate_marker_x'),
+                        o.get('gate_marker_y')) == key]
+        if not targets:
+            QMessageBox.information(self, "Apply downstream",
+                                    f"No gate named '{ag_review.name_group(g)}' lies below "
+                                    f"'{g.get('parent_popul') or 'root'}'.")
+            return
+        if not self._confirm("Apply downstream",
+                             f"Give {len(targets)} gate(s) named '{ag_review.name_group(g)}' below "
+                             f"'{g.get('parent_popul') or 'root'}' the algorithm and settings of "
+                             f"'{gate_name}'? Their training is cleared."):
+            return
+        changed, skipped = ag_review.feed_forward(self.state.gate_definitions, gate_name)
+        self._untrain(changed)
+        msg = f"[Gating Model Builder] Applied '{gate_name}''s settings to {len(changed)} gate(s) below it."
+        if skipped:
+            msg += (f" {len(skipped)} were left alone because they would replicate from "
+                    "themselves or a gate below them.")
+        self.bus.statusMessage.emit(msg)
+        self._update_sync_banner()
+        self._after_change()
+
+    def _delete_button(self, g: dict) -> QWidget:
+        btn = QPushButton("−")
+        btn.setFixedWidth(28)
+        btn.setStyleSheet("QPushButton { color: #c00000; font-weight: bold; font-size: 16pt; }")
+        btn.setToolTip(f"Delete '{g['gate_name']}' and the gates below it.")
+        btn.setFocusPolicy(Qt.NoFocus)
+        btn.clicked.connect(lambda _c=False, n=g['gate_name']: self._delete_gates([n]))
+        return btn
+
+    def _trainable_plot(self, g: dict, tile: int) -> QWidget:
+        """Plot of one gate's trainable form."""
+        name = g['gate_name']
+        imported = g.get('algorithm') == ag_core.ALGORITHM_IMPORTED
         chans = [c for c in ag_core.plot_channels(g) if c]
         trained = (not imported) and self.state.is_trained(name)
-        caption = "Trained" if trained else "Calculated on this sample"
-        plot = _ReviewPlot(chans, [g], self.controller, tile, panel, caption=caption)
+        adjusted = trained and any((e or {}).get('adjusted') for e in
+                                   (self.state.trained_boundaries.get(name) or {}).values())
+        caption = ("Adjusted" if adjusted else "Trained") if trained else (
+            f"Calculated on {self._samples_text()}")
+        plot = _ReviewPlot(chans, [g], self.controller, tile, self, caption=caption,
+                           transforms=self.tf.objects)
+        plot._base_caption = caption
         plot.axisZoomed.connect(self._on_axis_zoomed)
+        plot.gateEdited.connect(self._on_trainable_edited)
         plot.set_events(self._raw, self._mask)
-        layout.addWidget(plot)
         self._trainable.append((name, plot))
-        return panel
+        return plot
 
     def _proposal(self, g: dict) -> dict:
-        """The gate's trainable boundary on the review sample's parent
+        """The gate's trainable boundary on the review events' parent
         population: the trained boundary once trained, else calculated with
         its algorithm (cached until the events are gated again)."""
         name = g['gate_name']
         algo = self._trainable_algorithm(g)
         if g.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
-            # Trained, or calculated on this sample when the events were gated.
+            # Trained, or calculated on these events when they were gated.
             boundary = deepcopy(self.state.trained_boundaries.get(name)
                                 or self._result.boundaries.get(name)) or None
             key = (name, 'applied')
         else:
-            key = (name, algo)
+            key = (name, algo, ag_review.sync_fingerprint(dict(g, algorithm=algo)))
             boundary = None
         if key in self._proposals:
             return self._proposals[key]
@@ -4559,45 +5554,152 @@ class ReviewTab(QWidget):
         by_name = ag_core.gates_by_name(self.state.gate_definitions)
         eff = ag_core.effective_gate_def(ag_review.trainable_definition(g, algo), by_name)
         parent = self._data_t[self._mask] if self._mask is not None else self._data_t
+        limits = self._axis_limits()
         if boundary is None:
             sample = parent
             if len(sample) > self._PROPOSAL_EVENTS:
                 rng = np.random.default_rng(TRAINING_SEED)
                 sample = sample[np.sort(rng.choice(len(sample), self._PROPOSAL_EVENTS, replace=False))]
-            calc = ag_core.GateCalculator(_axis_limits(self.controller.unmixed_transformations or {}))
+            calc = ag_core.GateCalculator(limits)
             try:
-                boundary = calc.calculate(sample, eff, index, trained=self._result.boundaries,
-                                          by_name=by_name)
+                resolved, reason = ag_core.resolve_replicates(eff, self._data_t, index,
+                                                              self._result, by_name)
+                if resolved is None:
+                    log.info("review: %s not calculated: %s", name, reason)
+                    boundary = {}
+                else:
+                    boundary = calc.calculate(sample, resolved, index,
+                                              trained=self._result.boundaries, by_name=by_name)
             except Exception as exc:
                 log.warning("review: %s could not be calculated with %s: %s", name, algo, exc)
                 boundary = {}
+        self._fallbacks.discard(name)
+        status = (self._result.status.get(name) or {}) if self._result is not None else {}
+        if (not boundary or status.get('source') == 'reference') and g.get('template'):
+            # Not calculable yet (e.g. no replicate source): show the imported boundary.
+            boundary = deepcopy(g['template'])
+            eff = g
+            self._fallbacks.add(name)
         if boundary and len(parent):
-            masks = ag_core.population_masks(eff, boundary, parent, index)
+            masks = ag_core.population_masks(eff, boundary, parent, index, axis_limits=limits)
             for pop, m in masks.items():
                 if pop in boundary:
                     boundary[pop]['fraction'] = float(m.mean())
         self._proposals[key] = boundary
         return boundary
 
-    def _on_algorithm_chosen(self, gate_name: str, algorithm: str):
-        g = self.state.gate_by_name(gate_name)
-        if g is None or not algorithm:
-            return
-        if g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
-            g['proposed_algorithm'] = algorithm
-        else:
-            self._set_algorithm(g, algorithm)
-        # The combo that sent this is rebuilt, so wait until it has returned.
-        QTimer.singleShot(0, self._rebuild_plots)
-        self.gatesChanged.emit()
-        self.templatesChanged.emit()
+    # -- changing gates ---------------------------------------------------------
+
+    def _descendants(self, gate_name: str) -> set:
+        return ag_review.descendants(self.state.gate_definitions, gate_name)
+
+    def _untrain(self, names):
+        """Training of the named gates, and of the gates below them, no
+        longer applies."""
+        for name in list(names):
+            for n in {name} | self._descendants(name):
+                self.state.trained_boundaries.pop(n, None)
 
     def _set_algorithm(self, g: dict, algorithm: str):
         """Change a gate's algorithm; its training and that of the gates
         below it no longer applies."""
         g['algorithm'] = algorithm
-        for name in {g['gate_name']} | self._descendants(g['gate_name']):
-            self.state.trained_boundaries.pop(name, None)
+        self._untrain([g['gate_name']])
+
+    def _sync(self, gate_name: str, quiet: bool = False) -> list[str]:
+        """Bring the gates sharing *gate_name*'s imported name in line (see
+        ag_review.apply_name_sync); returns the names changed."""
+        changed, conflict = ag_review.apply_name_sync(self.state.gate_definitions, gate_name)
+        self._untrain(changed)
+        if changed and not quiet:
+            self.bus.statusMessage.emit(
+                f"[Gating Model Builder] {len(changed)} gate(s) named "
+                f"'{ag_review.name_group(self.state.gate_by_name(gate_name))}' now use the same "
+                "algorithm.")
+        if conflict:
+            self.bus.statusMessage.emit(
+                "[Gating Model Builder] Conflicting algorithms chosen — identically named gates "
+                f"will not be auto-updated ('{conflict}').")
+        self._update_sync_banner()
+        return changed
+
+    def _update_sync_banner(self):
+        conflicts = ag_review.sync_conflicts(self.state.gate_definitions)
+        if conflicts:
+            shown = ", ".join(f"'{c}'" for c in conflicts[:8])
+            more = f" and {len(conflicts) - 8} more" if len(conflicts) > 8 else ''
+            self.lbl_sync.setText("Conflicting algorithms chosen — identically named gates will "
+                                  f"not be auto-updated: {shown}{more}.")
+        self.lbl_sync.setVisible(bool(conflicts))
+
+    def _on_axis_algorithm(self, gate_name: str, axis: str, algorithm: str):
+        """An axis algorithm was chosen in a gate's controls."""
+        g = self.state.gate_by_name(gate_name)
+        if g is None or not algorithm:
+            return
+        gp = g.setdefault('gate_param', {})
+        imported = g.get('algorithm') == ag_core.ALGORITHM_IMPORTED
+        two_d = g.get('gate_type') == '2dsep'
+        if two_d:
+            # Each axis keeps its own algorithm when the other one changes.
+            current = self._trainable_algorithm(g)
+            for a in ('x', 'y'):
+                gp.setdefault(f'algorithm_{a}', current)
+        if axis == 'x':
+            if imported:
+                g['proposed_algorithm'] = algorithm
+                g.pop('proposal_rule', None)
+            else:
+                g['algorithm'] = algorithm
+            if two_d:
+                gp['algorithm_x'] = algorithm
+        else:
+            gp['algorithm_y'] = algorithm
+        if algorithm == ag_core.ALGORITHM_REPLICATE and not isinstance(gp.get(f'replicate_{axis}'), dict):
+            gp[f'replicate_{axis}'] = None
+        self._after_config_change(g)
+
+    def _on_source(self, gate_name: str, axis: str, data):
+        g = self.state.gate_by_name(gate_name)
+        if g is None:
+            return
+        src = json.loads(data) if data else None
+        gp = g.setdefault('gate_param', {})
+        old = gp.get(f'replicate_{axis}')
+        if isinstance(old, dict) and src and src.get('population') and old.get('population') == src.get('population'):
+            src['algorithm'] = old.get('algorithm', 'tail')
+        gp[f'replicate_{axis}'] = src
+        try:
+            ag_core.ordered_gate_defs(self.state.gate_definitions)
+        except ValueError:
+            gp[f'replicate_{axis}'] = old
+            QMessageBox.warning(self, "Replicate source",
+                                "That source depends on this gate, so it cannot be used.")
+            QTimer.singleShot(0, self._rebuild_plots)
+            return
+        self._after_config_change(g)
+
+    def _on_source_algorithm(self, gate_name: str, axis: str, algorithm: str):
+        g = self.state.gate_by_name(gate_name)
+        src = ((g or {}).get('gate_param') or {}).get(f'replicate_{axis}')
+        if g is None or not isinstance(src, dict):
+            return
+        src['algorithm'] = algorithm
+        self._after_config_change(g)
+
+    def _after_config_change(self, g: dict):
+        """A gate's trainable configuration changed. A converted gate becomes
+        the user's choice, is calculated again and brings its same-named
+        gates along; an imported gate only shows the new proposal."""
+        if g.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
+            g['sync_origin'] = ag_review.SYNC_USER
+            self._untrain([g['gate_name']])
+            self._sync(g['gate_name'])
+            self._regate()
+        # The combo that sent this is rebuilt, so wait until it has returned.
+        QTimer.singleShot(0, self._rebuild_plots)
+        self.gatesChanged.emit()
+        self.templatesChanged.emit()
 
     def _convert(self, gate_name: str):
         g = self.state.gate_by_name(gate_name)
@@ -4606,9 +5708,51 @@ class ReviewTab(QWidget):
         algorithm = self._trainable_algorithm(g)
         if not algorithm:
             return
+        if g.get('gate_type') == '2dsep':
+            g.setdefault('gate_param', {}).setdefault('algorithm_x', algorithm)
         self._set_algorithm(g, algorithm)
+        g['sync_origin'] = ag_review.SYNC_USER
+        changed = self._sync(gate_name, quiet=True)
+        tail = f" {len(changed)} gate(s) with the same name follow it." if changed else ''
         self.bus.statusMessage.emit(
-            f"[Gating Model Builder] '{gate_name}' now uses '{algorithm}'; train to calculate it.")
+            f"[Gating Model Builder] '{gate_name}' now uses '{algorithm}'; train to calculate "
+            f"it.{tail}")
+        self._after_change()
+
+    def _on_convert_all(self):
+        """Convert every gate still as drawn to its proposed algorithm. Bulk
+        conversions are not the user's choice for a gate, so same-named gates
+        the user did set bring them in line."""
+        pending = [g for g in self.state.gate_definitions
+                   if g.get('algorithm') == ag_core.ALGORITHM_IMPORTED]
+        if not pending:
+            return
+        ans = QMessageBox.question(
+            self, "Convert all to trainable",
+            f"Convert {len(pending)} gate(s) that still apply their shapes as drawn to their "
+            "proposed algorithms?")
+        if ans != QMessageBox.Yes:
+            return
+        converted = 0
+        for g in pending:
+            algorithm = self._trainable_algorithm(g)
+            if not algorithm:
+                continue
+            if g.get('gate_type') == '2dsep':
+                g.setdefault('gate_param', {}).setdefault('algorithm_x', algorithm)
+            self._set_algorithm(g, algorithm)
+            g['sync_origin'] = ag_review.SYNC_AUTO
+            converted += 1
+        followed = 0
+        for g in self.state.gate_definitions:
+            if g.get('sync_origin') not in (ag_review.SYNC_AUTO, ag_review.SYNC_DRAWN) \
+                    and g.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
+                followed += len(self._sync(g['gate_name'], quiet=True))
+        tail = f" {followed} follow a same-named gate you set." if followed else ''
+        self.bus.statusMessage.emit(
+            f"[Gating Model Builder] Converted {converted} gate(s) to their proposed "
+            f"algorithms; train to calculate them.{tail}")
+        self.btn_convert_all.setEnabled(False)
         self._after_change()
 
     def _use_drawn(self, gate_name: str):
@@ -4618,6 +5762,8 @@ class ReviewTab(QWidget):
         if g.get('algorithm') in ag_review.trainable_algorithms(g):
             g['proposed_algorithm'] = g['algorithm']
         self._set_algorithm(g, ag_core.ALGORITHM_IMPORTED)
+        g['sync_origin'] = ag_review.SYNC_DRAWN
+        self._update_sync_banner()
         self._after_change()
 
     def _after_change(self):
@@ -4627,28 +5773,61 @@ class ReviewTab(QWidget):
         self.gatesChanged.emit()
         self.templatesChanged.emit()
 
+    def _on_update(self):
+        """Calculate the shown gates again on the review samples."""
+        if self._data_t is None:
+            self._ensure_sample()
+            return
+        if self._data_signature != self._transform_signature():
+            self._transform_events()
+        self._regate()
+        self._rebuild_plots()
+
     def _on_axis_zoomed(self, channel: str, before):
         """An axis of a review plot was dragged.
 
         A change of the transform itself (*before* holds its earlier
-        parameters) converts the model's boundaries, then the events are
-        transformed and gated again; either way the plots using the channel
-        are drawn again.
+        parameters) converts the model's boundaries (through
+        ``transformChanged``) and the boundaries on show, transforms that
+        channel's events again and gates again once the drag has stopped.
+        The plots using the channel are redrawn at once.
         """
         if before is not None:
+            tr = self.tf.objects.get(channel)
+            after = ag_core.transform_params(tr) if tr is not None else None
             self.transformChanged.emit(channel, before)
+            self._remap_shown(channel, before, after)
             self._retransform_channel(channel)
-            self._regate()
+            self._regate_timer.start()
         for plot in self._plots + [p for _n, p in self._trainable]:
             if isinstance(plot, _ReviewPlot) and channel in plot.channels:
                 plot.set_events(self._raw, self._mask)
-        self._redraw_overlays()
+        self._redraw_overlays(channel)
+
+    def _remap_shown(self, channel: str, before: dict, after: dict | None):
+        """Convert the applied and proposed boundaries on *channel* to its new
+        transform, so they are drawn in place until the events are gated again."""
+        if not after or self._result is None:
+            return
+        defs = self.state.gate_definitions
+        names = ag_core.gates_on_channel(defs, self._result.boundaries, channel)
+        src, dst = {channel: before}, {channel: after}
+        applied = {n: self._result.boundaries[n] for n in names if n in self._result.boundaries}
+        if applied:
+            converted, _ = ag_core.remap_boundaries(defs, applied, src, dst, points_per_edge=1)
+            self._result.boundaries.update(converted)
+        for key, boundary in list(self._proposals.items()):
+            if key[0] in names and boundary:
+                converted, _ = ag_core.remap_boundaries(defs, {key[0]: boundary}, src, dst,
+                                                        points_per_edge=1)
+                self._proposals[key] = converted[key[0]]
 
     def _label_texts(self, gate_def: dict, boundary: dict) -> dict:
         """{(gate, pop): (text, alert)} for the populations worth labelling."""
         src = gate_def.get('source') or {}
         shown = set((src.get('populations') or {}).keys()) or set(boundary)
-        compare = ag_review.matches_import_sample(gate_def, self._loaded_key)
+        single = self._single_review_key()
+        compare = single is not None and ag_review.matches_import_sample(gate_def, single)
         out = {}
         for pop, entry in boundary.items():
             if pop not in shown:
@@ -4668,7 +5847,7 @@ class ReviewTab(QWidget):
 
     def _drawn_boundary(self, g: dict) -> dict:
         """A gate's boundary for the left-hand plot: its shapes as drawn, with
-        their fractions of the parent on this sample, else its boundary as
+        their fractions of the parent on these events, else its boundary as
         applied."""
         name = g['gate_name']
         applied = self._result.boundaries.get(name) or {}
@@ -4679,20 +5858,28 @@ class ReviewTab(QWidget):
             return applied
         out = deepcopy(template)
         pnn = _experiment_channels(self.controller)
-        parent = self._data_t[self._mask] if self._mask is not None else self._data_t
+        mask = self._result.parent_masks.get(name)
+        if mask is None:
+            mask = self._mask
+        parent = self._data_t[mask] if mask is not None else self._data_t
         if len(parent):
-            masks = ag_core.population_masks(g, out, parent, {c: i for i, c in enumerate(pnn)})
+            masks = ag_core.population_masks(g, out, parent, {c: i for i, c in enumerate(pnn)},
+                                             axis_limits=self._axis_limits())
             for pop, m in masks.items():
                 out[pop]['fraction'] = float(m.mean())
         return out
 
-    def _redraw_overlays(self):
+    def _redraw_overlays(self, channel: str | None = None):
+        """Draw the boundaries on the plots (only those using *channel* when
+        one is given)."""
         if self._result is None:
             return
         editing = self.chk_edit.isChecked()
-        by_plot = {id(plot): plot for _name, plot in self._trainable}
+        by_plot = {id(plot) for _name, plot in self._trainable}
         for plot in self._plots:
             if not isinstance(plot, _ReviewPlot) or id(plot) in by_plot:
+                continue
+            if channel is not None and channel not in plot.channels:
                 continue
             boundaries, texts, editable = {}, {}, set()
             for g in plot.gates:
@@ -4704,35 +5891,111 @@ class ReviewTab(QWidget):
                     editable.add(name)
             plot.draw_overlays(boundaries, texts, editable)
         for name, plot in self._trainable:
+            if channel is not None and channel not in plot.channels:
+                continue
             g = self.state.gate_by_name(name)
             if g is None:
                 continue
             boundary = self._proposal(g)
-            plot.draw_overlays({name: boundary}, self._label_texts(g, boundary), set())
+            # The plot edits a copy whose shapes are the boundary shown.
+            plot.gates = [dict(g, template=deepcopy(boundary or {}))]
+            fallback = name in self._fallbacks
+            editable = {name} if editing and boundary and not fallback and \
+                g.get('algorithm') != ag_core.ALGORITHM_IMPORTED else set()
+            plot.caption = ("Not calculated (choose a replicate source): imported boundary"
+                            if fallback else getattr(plot, '_base_caption', plot.caption))
+            colour = _REVIEW_ALERT if fallback else self._algorithm_colours(g)
+            plot.draw_overlays({name: boundary}, self._label_texts(g, boundary), editable,
+                               colours={name: colour})
+
+    def _algorithm_colours(self, g: dict):
+        """Colour of a gate's trainable boundary: its algorithm's, per axis
+        for a 2dsep gate."""
+        algo = self._trainable_algorithm(g)
+        if g.get('gate_type') == '2dsep':
+            gp = g.get('gate_param') or {}
+            return {'x': ag_core.algorithm_colour(gp.get('algorithm_x') or algo),
+                    'y': ag_core.algorithm_colour(gp.get('algorithm_y') or algo)}
+        return ag_core.algorithm_colour(algo)
+
+    # -- conversion flags ----------------------------------------------------
+
+    def _on_flag_clicked(self):
+        if self._flag_worker is not None:
+            self._flag_worker.abort()
+            return
+        if self._data_t is None:
+            self.lbl_flag.setText("Load the review samples first.")
+            return
+        worker = _FlagWorker(deepcopy(self.state.gate_definitions),
+                             deepcopy(self.state.trained_boundaries), np.array(self._data_t),
+                             _experiment_channels(self.controller), self._axis_limits(),
+                             dict(self.state.algorithm_recommendations),
+                             self.sb_flag_shift.value(), self.sb_flag_fraction.value() / 100.0,
+                             parent=self)
+        worker.progress.connect(lambda done, total: self.lbl_flag.setText(
+            f"Checking {done} of {total} gate(s) … (click again to stop)"))
+        worker.finished.connect(self._on_flags_ready)
+        self._flag_worker = worker
+        self.btn_flag.setText("Stop checking")
+        self.lbl_flag.setText("Checking …")
+        worker.start()
+
+    def _on_flags_ready(self, ok: bool, message: str, flags: object):
+        self._flag_worker = None
+        self.btn_flag.setText("Flag conversions")
+        if not ok:
+            self.lbl_flag.setText(message)
+            return
+        self.state.conversion_flags = dict(flags or {})
+        n = len(self.state.conversion_flags)
+        self.lbl_flag.setText(f"{n} gate(s) flagged on {self._samples_text()}."
+                              + (" Show: Flagged conversions lists them." if n else ''))
+        self._mark_flags()
+        self._apply_tree_filter()
+        self.gatesChanged.emit()
+        self.templatesChanged.emit()
+
+    def _on_edit_toggled(self, on: bool):
+        self._redraw_overlays()
+        if on and self._result is not None:
+            gate, pop = self._selected()
+            groups = ag_review.daughter_groups(self.state.gate_definitions, gate, pop)
+            self.bus.statusMessage.emit(f"[Gating Model Builder] {self._edit_hint(groups)}")
 
     # -- editing ------------------------------------------------------------
-
-    def _descendants(self, gate_name: str) -> set:
-        out, frontier = set(), {gate_name}
-        while frontier:
-            frontier = {g['gate_name'] for g in self.state.gate_definitions
-                        if g.get('parent_gate') in frontier} - out
-            out |= frontier
-        return out
 
     def _apply_template(self, gate_name: str, entries: dict):
         gate = self.state.gate_by_name(gate_name)
         if gate is None:
             return
         gate['template'] = entries
-        for name in {gate_name} | self._descendants(gate_name):
-            self.state.trained_boundaries.pop(name, None)
+        self._untrain([gate_name])
 
     def _on_gate_edited(self, gate_name: str, entries: dict):
         self._apply_template(gate_name, entries)
         QTimer.singleShot(0, self._after_edit)
         self.bus.statusMessage.emit(
             f"[Gating Model Builder] Adjusted '{gate_name}'. Train again to apply it to the training samples.")
+
+    def _on_trainable_edited(self, gate_name: str, entries: dict):
+        """A converted gate's boundary was moved: keep it as the gate's
+        boundary, marked as adjusted, until the gate is trained again."""
+        g = self.state.gate_by_name(gate_name)
+        if g is None or not entries:
+            return
+        clean = {}
+        for pop, entry in entries.items():
+            e = {k: v for k, v in entry.items() if k not in ('fraction', 'n_events')}
+            e['adjusted'] = True
+            clean[pop] = e
+        for name in self._descendants(gate_name):
+            self.state.trained_boundaries.pop(name, None)
+        self.state.trained_boundaries[gate_name] = clean
+        QTimer.singleShot(0, self._after_edit)
+        self.bus.statusMessage.emit(
+            f"[Gating Model Builder] Adjusted '{gate_name}' by hand; training it again "
+            "replaces the adjustment.")
 
     def _after_edit(self):
         self._regate()
@@ -4751,20 +6014,173 @@ class ReviewTab(QWidget):
         if changed:
             self._after_edit()
 
+    # -- hierarchy tree menu ---------------------------------------------------
+
+    def _node_gates(self, nodes) -> list[str]:
+        """The gates that make the given populations (the root has none)."""
+        out = []
+        for gate, _pop in nodes:
+            if gate and gate not in out and self.state.gate_by_name(gate) is not None:
+                out.append(gate)
+        return out
+
+    def _on_tree_menu(self, pos):
+        clicked = self.pop_tree.population_at(pos)
+        nodes = self.pop_tree.selected_populations()
+        if clicked is not None and clicked not in nodes:
+            self.pop_tree.select_population(*clicked)
+            nodes = [clicked]
+        gates = self._node_gates(nodes)
+        menu = QMenu(self.pop_tree)
+        act_copy = menu.addAction("Copy gate")
+        act_branch = menu.addAction("Copy gating branch")
+        act_paste = menu.addAction(
+            f"Paste ({len(self._clipboard)} gate{'s' if len(self._clipboard) != 1 else ''})"
+            if self._clipboard else "Paste")
+        menu.addSeparator()
+        act_del_gate = menu.addAction("Delete gate…")
+        act_del_pop = menu.addAction("Delete population…")
+        menu.addSeparator()
+        act_ref = menu.addAction("Use as reference population")
+        act_ref.setCheckable(True)
+        for a in (act_copy, act_branch, act_del_gate):
+            a.setEnabled(bool(gates))
+        act_paste.setEnabled(bool(self._clipboard) and bool(nodes))
+        single = nodes[0] if len(nodes) == 1 and nodes[0][0] else None
+        act_del_pop.setEnabled(bool(nodes) and all(n[0] for n in nodes))
+        act_ref.setEnabled(single is not None)
+        if single is not None:
+            meta = ((self.state.gate_by_name(single[0]) or {}).get('populations') or {}).get(single[1]) or {}
+            act_ref.setChecked(bool(meta.get('reference')))
+        act_copy.triggered.connect(lambda: self._copy(gates, branch=False))
+        act_branch.triggered.connect(lambda: self._copy(gates, branch=True))
+        act_paste.triggered.connect(lambda: self._paste(nodes))
+        act_del_gate.triggered.connect(lambda: self._delete_gates(gates))
+        act_del_pop.triggered.connect(lambda: self._delete_populations(nodes))
+        if single is not None:
+            act_ref.triggered.connect(lambda on: self._set_reference(single, on))
+        menu.exec(self.pop_tree.viewport().mapToGlobal(pos))
+
+    def _copy(self, gates: list[str], branch: bool):
+        self._clipboard = ag_review.copy_gates(self.state.gate_definitions, gates, branch=branch)
+        self._clipboard_branch = branch
+        what = "branch(es)" if branch else "gate(s)"
+        self.bus.statusMessage.emit(
+            f"[Gating Model Builder] Copied {len(gates)} {what} ({len(self._clipboard)} gates). "
+            "Right-click a population and Paste to add them there.")
+
+    def _paste(self, nodes):
+        if not self._clipboard:
+            return
+        defs = self.state.gate_definitions
+        added = []
+        try:
+            for gate, pop in nodes:
+                defs, names = ag_review.paste_gates(defs, self._clipboard, gate or None, pop)
+                added += names
+        except ValueError as exc:
+            QMessageBox.warning(self, "Paste", f"The gates could not be pasted: {exc}")
+            return
+        self.state.gate_definitions = defs
+        for name in added:
+            g = self.state.gate_by_name(name)
+            if g is not None and g.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
+                g['sync_origin'] = ag_review.SYNC_AUTO
+            self._sync(name, quiet=True)
+        self.bus.statusMessage.emit(
+            f"[Gating Model Builder] Pasted {len(added)} gate(s) onto {len(nodes)} "
+            "population(s); train to calculate them.")
+        self._structure_changed()
+
+    def _confirm(self, title: str, text: str) -> bool:
+        return QMessageBox.question(self, title, text) == QMessageBox.Yes
+
+    def _delete_gates(self, gates: list[str]):
+        if not gates:
+            return
+        below = set()
+        for name in gates:
+            below |= self._descendants(name)
+        below -= set(gates)
+        names = ", ".join(f"'{n}'" for n in gates[:5]) + (" …" if len(gates) > 5 else '')
+        extra = f" and the {len(below)} gate(s) below" if below else ''
+        if not self._confirm("Delete gate", f"Delete {names}{extra}? This cannot be undone."):
+            return
+        defs, removed, orphaned = ag_review.delete_gates(self.state.gate_definitions, gates)
+        self._finish_delete(defs, removed, orphaned)
+
+    def _delete_populations(self, nodes):
+        nodes = [n for n in nodes if n[0]]
+        if not nodes:
+            return
+        labels = ", ".join(f"'{p}' of '{g}'" for g, p in nodes[:4]) + (" …" if len(nodes) > 4 else '')
+        if not self._confirm("Delete population",
+                             f"Delete {labels} and the gates drawn on "
+                             f"{'it' if len(nodes) == 1 else 'them'}? This cannot be undone."):
+            return
+        defs, removed, orphaned = self.state.gate_definitions, [], []
+        for gate, pop in nodes:
+            defs, gone, lost = ag_review.delete_population(defs, gate, pop)
+            removed += gone
+            orphaned += [n for n in lost if n not in orphaned]
+        self._finish_delete(defs, removed, orphaned)
+
+    def _finish_delete(self, defs, removed, orphaned):
+        self.state.gate_definitions = defs
+        for name in removed:
+            self.state.trained_boundaries.pop(name, None)
+            self.state.algorithm_recommendations.pop(name, None)
+        msg = f"[Gating Model Builder] Deleted {len(removed)} gate(s)."
+        if orphaned:
+            msg += (" These replicated a deleted gate and need a new source: "
+                    + ", ".join(f"'{n}'" for n in orphaned[:6]) + ".")
+        self.bus.statusMessage.emit(msg)
+        self._structure_changed()
+
+    def _set_reference(self, node, on: bool):
+        g = self.state.gate_by_name(node[0])
+        if g is None or node[1] not in (g.get('populations') or {}):
+            return
+        meta = g['populations'][node[1]]
+        if on:
+            meta['reference'] = True
+        else:
+            meta.pop('reference', None)
+        self.bus.statusMessage.emit(
+            f"[Gating Model Builder] '{node[1]}' is {'now' if on else 'no longer'} a reference "
+            "population for replicated thresholds.")
+        self._structure_changed()
+
+    def _structure_changed(self):
+        """The hierarchy changed: renumber, refresh the pickers and plots."""
+        for k, d in enumerate(ag_core.ordered_gate_defs(self.state.gate_definitions), start=1):
+            d['gate_number'] = k
+        self._gated = set()
+        self.refresh()
+        self.gatesChanged.emit()
+        self.templatesChanged.emit()
+
 
 class ExportTab(QWidget):
-    """Tab 2 — Export.
+    """Export tab.
 
     Gate summary, model metadata, and Save/Load of ``.agmodel`` files
-    (format 2: gates, trained boundaries, the gated channels' transforms,
+    (format 2: gates, trained boundaries, the builder's transforms,
     training samples with their AF assignments and QC state).
+
+    Loading a model adopts its transforms as the builder's (``tf``), so its
+    boundaries are shown where they were trained; modelLoaded is emitted
+    afterwards.
     """
 
-    def __init__(self, state: GatingModelState, bus, controller, parent=None):
+    modelLoaded = Signal()
+
+    def __init__(self, state: GatingModelState, bus, controller, tf=None, parent=None):
         super().__init__(parent)
         self.state = state
         self.bus = bus
         self.controller = controller
+        self.tf = tf if tf is not None else tp.TransformSet()
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -4908,7 +6324,8 @@ class ExportTab(QWidget):
         if not path.endswith('.agmodel'):
             path += '.agmodel'
         try:
-            ag_core.write_model(path, build_model_from_state(self.state, self.controller))
+            ag_core.write_model(path, build_model_from_state(self.state, self.controller,
+                                                             self.tf.params()))
         except Exception as exc:
             QMessageBox.critical(self, "Save failed", str(exc))
             return
@@ -4930,41 +6347,39 @@ class ExportTab(QWidget):
             return
         try:
             model, warnings_list = ag_core.read_model(path)
-            model, remap_messages = ag_core.remap_model(
-                model, _live_transform_params(self.controller))
         except Exception as exc:
             QMessageBox.critical(self, "Load failed", f"Could not read model:\n{exc}")
             return
-        warnings_list = list(warnings_list) + list(remap_messages)
         apply_model_to_state(model, self.state)
+        self.tf.load(model.get('transforms'), self.controller.unmixed_transformations or {})
         self.state.model_metadata['last_model_path'] = path
         if warnings_list:
             QMessageBox.information(self, "Model loaded", "\n\n".join(warnings_list))
         self.refresh()
+        self.modelLoaded.emit()
         ts = datetime.now().strftime('%H:%M:%S')
         self.bus.statusMessage.emit(
             f"[GatingModelBuilder {ts}] Model loaded: {path} ({self.state.n_gates()} gates)"
         )
 
 
-def build_model_from_state(state: GatingModelState, controller) -> dict:
+def build_model_from_state(state: GatingModelState, controller,
+                           transform_params: dict | None = None) -> dict:
     """Assemble a format-2 .agmodel dict from the builder state.
 
-    Main thread: reads the experiment's channel names, the live display
-    transforms of every gated channel, and the training samples' AF
-    assignments.
+    *transform_params* ({channel: parameter dict}) are the transforms the
+    boundaries are in: the builder's own, stored for every channel so that
+    Automated Gating shows the data as it was trained. Channels without
+    one take the experiment's display transform.
+
+    Main thread: reads the experiment's channel names, its display
+    transforms and the training samples' AF assignments.
     """
     antigens = _antigen_map(controller)
     channel_map = {ch: (antigen or ch) for ch, antigen in antigens.items()}
 
-    by_name = ag_core.gates_by_name(state.gate_definitions)
-    gated = []
-    for g in state.gate_definitions:
-        for ch in ag_core.referenced_channels(ag_core.effective_gate_def(g, by_name)):
-            if ch not in gated:
-                gated.append(ch)
-    live = controller.unmixed_transformations or {}
-    transforms = {ch: ag_core.transform_params(live[ch]) for ch in gated if ch in live}
+    transforms = _live_transform_params(controller)
+    transforms.update({ch: dict(p) for ch, p in (transform_params or {}).items() if p})
 
     samples = controller.experiment.samples
     af_assign = samples.get('sample_af_profiles', {}) or {}
@@ -5003,6 +6418,7 @@ def apply_model_to_state(model: dict, state: GatingModelState):
     """Load a normalised model's gates, boundaries and training record."""
     state.gate_definitions = list(model.get('gate_definitions', []))
     state.trained_boundaries = dict(model.get('trained_boundaries', {}))
+    ag_flowjo.upgrade_gate_definitions(state.gate_definitions)
     summary = dict(model.get('training_summary', {}))
     state.training_summary = summary
     state.training_samples = list(summary.get('training_sample_names', []))
@@ -5013,14 +6429,14 @@ def apply_model_to_state(model: dict, state: GatingModelState):
 
 
 # ---------------------------------------------------------------------------
-# 5.  PluginWidget — outer container, fulfils the plugin contract
+# PluginWidget — outer container, fulfils the plugin contract
 #
 # Inserted as a tab in the Honeychrome main window by plugin_loaders.py.
-# Owns the GatingModelState and all three inner tabs.
+# Owns the GatingModelState, the builder's transforms and the inner pages.
 #
 # The outer layer follows the standard Honeychrome plugin pattern:
 #   • a disabled-label shown when an unmixing matrix is not yet available;
-#   • a scrollable content widget shown when it is.
+#   • the content (section list and pages) shown when it is.
 #
 # Both visibilities are toggled by `_on_mode_change()` in response to the
 # bus's `modeChangeRequested` signal.  No other widget in the application
@@ -5030,6 +6446,11 @@ def apply_model_to_state(model: dict, state: GatingModelState):
 
 class PluginWidget(QWidget):
     """Top-level widget for the Gating Model Builder plugin.
+
+    The builder keeps its own axis transforms (``tf``), shared by every
+    page and edited on the Transforms page or by dragging an axis on a
+    plot; they start as the experiment's and are saved with the model, and
+    changing them leaves the main window's plots as they are.
 
     Parameters
     ----------
@@ -5055,8 +6476,9 @@ class PluginWidget(QWidget):
         _ensure_qt_imports()
         _suppress_third_party_warnings()
 
-        # Shared state — passed by reference to all inner tabs.
+        # Shared state and transforms — passed by reference to all inner tabs.
         self.state = GatingModelState()
+        self.tf = tp.TransformSet()
 
         # QSettings — keyed per experiment in save_state/load_state.
         # Two-part key per Qt convention: ('honeychrome', 'plugin_<name>').
@@ -5076,12 +6498,8 @@ class PluginWidget(QWidget):
         self._loaded_experiment_key = None
         self._loaded_experiment_dir = None
 
-        # Channels whose axis transform was changed here and that the main
-        # window's plots have not been told about yet.
-        self._dirty_axes: set = set()
-
         # ------------------------------------------------------------------
-        # Outer layout: disabled label + scrollable content area.
+        # Outer layout: disabled label + content area.
         # The disabled label is shown until the experiment has an
         # unmixing matrix; the content widget is hidden in that state.
         # ------------------------------------------------------------------
@@ -5099,32 +6517,30 @@ class PluginWidget(QWidget):
         content_layout = QVBoxLayout(self.content_widget)
         content_layout.setContentsMargins(0, 0, 0, 0)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(self.content_widget)
-
         overall_layout = QVBoxLayout(self)
         overall_layout.setContentsMargins(6, 6, 6, 6)
         overall_layout.addWidget(self.label_disabled)
-        overall_layout.addWidget(scroll)
+        overall_layout.addWidget(self.content_widget, stretch=1)
 
         # ------------------------------------------------------------------
-        # Inner tab widget — three tabs per CONTEXT §4.1.
+        # Pages, listed down the left-hand side.
         # ------------------------------------------------------------------
-        self.inner_tabs = QTabWidget()
-        self.inner_tabs.setDocumentMode(True)
+        self.inner_tabs = SideTabWidget()
 
-        self.hierarchy_tab = HierarchyTab(self.state, bus, controller)
-        self.review_tab    = ReviewTab(self.state, bus, controller)
-        self.train_tab     = TrainTab(self.state, bus, controller)
-        self.export_tab    = ExportTab(self.state, bus, controller)
+        self.transforms_tab = tp.PopulationTransformsPanel(
+            controller, self.tf, self._transform_samples,
+            help_text=ag_help_texts.BUILDER_TRANSFORMS,
+            reset_label="Reset to the experiment's transforms", reset=self._reset_transforms)
+        self.hierarchy_tab = HierarchyTab(self.state, bus, controller, tf=self.tf)
+        self.review_tab    = ReviewTab(self.state, bus, controller, tf=self.tf)
+        self.train_tab     = TrainTab(self.state, bus, controller, tf=self.tf)
+        self.export_tab    = ExportTab(self.state, bus, controller, tf=self.tf)
 
-        self.inner_tabs.addTab(self.hierarchy_tab, "Hierarchy")
-        self.inner_tabs.addTab(self.review_tab,    "Review")
-        self.inner_tabs.addTab(self.train_tab,     "Train")
-        self.inner_tabs.addTab(self.export_tab,    "Export")
+        self.inner_tabs.addTab(self.transforms_tab, "Transforms", 'wave-sine')
+        self.inner_tabs.addTab(self.hierarchy_tab, "Hierarchy", 'binary-tree')
+        self.inner_tabs.addTab(self.review_tab,    "Review", 'adjustments')
+        self.inner_tabs.addTab(self.train_tab,     "Train", 'player-play')
+        self.inner_tabs.addTab(self.export_tab,    "Export", 'file-export')
 
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
         self.hierarchy_tab.gatesImported.connect(
@@ -5135,9 +6551,13 @@ class PluginWidget(QWidget):
         self.hierarchy_tab.gatesSplit.connect(self._refresh_active_tab)
         self.hierarchy_tab.transformChanged.connect(self._on_axis_transformed)
         self.review_tab.transformChanged.connect(self._on_axis_transformed)
+        self.transforms_tab.transformsChanged.connect(self._on_axis_transformed)
+        self.transforms_tab.populationChanged.connect(
+            lambda name: setattr(self.state, 'transform_population', name))
         self.train_tab.trained.connect(self._write_session)
         self.train_tab.boundaries_changed.connect(self._write_session)
-        content_layout.addWidget(self.inner_tabs)
+        self.export_tab.modelLoaded.connect(self._on_model_loaded)
+        content_layout.addWidget(self.inner_tabs, stretch=1)
 
         # Start with the content area hidden until the bus tells us
         # unmixing is available.
@@ -5177,8 +6597,6 @@ class PluginWidget(QWidget):
         only when the experiment has changed, so returning to the tab
         keeps whatever was trained or edited in the meantime.
         """
-        if mode in _UNMIXED_DATA_TABS and self._dirty_axes:
-            QTimer.singleShot(0, self._flush_axis_transforms)
         if mode != plugin_name:
             if self._plugin_was_active:
                 self.save_state()
@@ -5196,27 +6614,41 @@ class PluginWidget(QWidget):
             self.content_widget.setVisible(False)
 
     def _on_axis_transformed(self, channel: str, before: dict):
-        """A tab changed a channel's transform: keep the model's boundaries
-        in the same place in the data and note the change for the main plots."""
-        live = _live_transform_params(self.controller)
-        after = live.get(channel)
-        if after is None:
+        """A page changed one of the builder's transforms: keep the model's
+        boundaries in the same place in the data."""
+        tr = self.tf.objects.get(channel)
+        if tr is None:
             return
         ag_core.remap_channel_transform(
             self.state.gate_definitions, self.state.trained_boundaries,
-            channel, before, after)
-        self._dirty_axes.add(channel)
+            channel, before, ag_core.transform_params(tr))
 
-    def _flush_axis_transforms(self):
-        """Tell the main window's plots about transforms changed here.
+    # ----------------------------------------------------------------------
+    # Transforms
+    # ----------------------------------------------------------------------
 
-        Emitted only once an unmixed data tab is showing: the controller
-        recalculates the plots of the active data tab, and recalculating
-        before the tab switch has completed would use the wrong data.
-        """
-        channels, self._dirty_axes = sorted(self._dirty_axes), set()
-        for channel in channels:
-            self.bus.axisTransformed.emit(channel)
+    def _transform_samples(self) -> list[str]:
+        """Samples pooled on the Transforms page: the training samples."""
+        return self.train_tab.picker.get_ordered_list() or list(self.state.training_samples)
+
+    def _reset_transforms(self):
+        """Back to the experiment's display transforms, converting the
+        model's boundaries so they stay in place in the data."""
+        old = self.tf.params()
+        self.tf.load(None, self.controller.unmixed_transformations or {})
+        for ch, params in self.tf.params().items():
+            if ch in old:
+                ag_core.remap_channel_transform(
+                    self.state.gate_definitions, self.state.trained_boundaries,
+                    ch, old[ch], params, points_per_edge=16)
+        self.transforms_tab.set_transforms()
+        self._write_session()
+        self.progress_message("Transforms reset to the experiment's.")
+
+    def _on_model_loaded(self):
+        """A model was loaded on the Export page with its own transforms."""
+        self.transforms_tab.set_transforms()
+        self._write_session()
 
     def _ensure_state_loaded(self):
         """Load persisted state when the controller's experiment is not the
@@ -5287,12 +6719,13 @@ class PluginWidget(QWidget):
         self._refresh_tab_at(self.inner_tabs.currentIndex())
 
     def _refresh_tab_at(self, index: int):
-        """Call refresh() on the tab at *index* if it exposes one."""
-        tabs = [self.hierarchy_tab, self.review_tab, self.train_tab, self.export_tab]
-        if 0 <= index < len(tabs):
-            tab = tabs[index]
-            if hasattr(tab, 'refresh'):
-                tab.refresh()
+        """Call refresh() on the page at *index*."""
+        if index == 0:
+            self.transforms_tab.refresh(self.state.transform_population or None)
+            return
+        tabs = [None, self.hierarchy_tab, self.review_tab, self.train_tab, self.export_tab]
+        if 0 < index < len(tabs):
+            tabs[index].refresh()
 
     # ----------------------------------------------------------------------
     # Convenience: progress / status messages routed through the bus.
@@ -5309,13 +6742,14 @@ class PluginWidget(QWidget):
     # State persistence
     #
     # QSettings, keyed by experiment directory, holds the training-sample
-    # selection, events per sample, the controls toggle, the last model path
-    # and the gate hierarchy, all as JSON strings (the Linux INI backend
-    # does not round-trip lists). The trained boundaries are kept in a
-    # session model in the experiment's cache folder (SESSION_FILE), in the
-    # same .agmodel format as an export, together with the transforms they
-    # were calculated in, so training survives a restart and is converted if
-    # a transform changes in the meantime.
+    # selection, events per sample, the controls toggle, the last model path,
+    # the gate hierarchy, the conversion flags, a paused run's progress and
+    # the population shown on the Transforms page, as JSON strings or
+    # scalars (the Linux INI backend does not round-trip lists). The trained
+    # boundaries are kept in a session model in the experiment's cache
+    # folder (SESSION_FILE), in the same .agmodel format as an export,
+    # together with the builder's transforms they are in, so training and
+    # the transforms survive a restart.
     # ----------------------------------------------------------------------
 
     def _settings_key(self) -> str:
@@ -5351,7 +6785,8 @@ class PluginWidget(QWidget):
             return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            ag_core.write_model(path, build_model_from_state(self.state, self.controller))
+            ag_core.write_model(path, build_model_from_state(self.state, self.controller,
+                                                             self.tf.params()))
         except Exception:
             log.exception("could not write the session model %s", path)
 
@@ -5375,6 +6810,11 @@ class PluginWidget(QWidget):
                        str(self.state.model_metadata.get('last_model_path', '') or ''))
             s.setValue('gate_definitions_json',
                        json.dumps(ag_core.to_jsonable(self.state.gate_definitions)))
+            s.setValue('conversion_flags_json',
+                       json.dumps(ag_core.to_jsonable(self.state.conversion_flags)))
+            s.setValue('training_progress_json',
+                       json.dumps(ag_core.to_jsonable(self.state.training_progress)))
+            s.setValue('transform_population', str(self.state.transform_population or ''))
             s.remove('training_samples')
         finally:
             s.endGroup()
@@ -5416,14 +6856,31 @@ class PluginWidget(QWidget):
             gate_defs = _settings_json(s.value('gate_definitions_json', ''), None)
             if isinstance(gate_defs, list):
                 self.state.gate_definitions = gate_defs
+
+            flags = _settings_json(s.value('conversion_flags_json', ''), None)
+            if isinstance(flags, dict):
+                self.state.conversion_flags = flags
+            progress = _settings_json(s.value('training_progress_json', ''), None)
+            if isinstance(progress, dict):
+                self.state.training_progress = progress
+            self.state.transform_population = str(s.value('transform_population', '') or '')
         finally:
             s.endGroup()
         self._load_session(have_gates=isinstance(gate_defs, list))
+        ag_flowjo.upgrade_gate_definitions(self.state.gate_definitions)
+        ag_core.migrate_retired_algorithms(self.state.gate_definitions,
+                                           self.state.trained_boundaries)
 
     def _load_session(self, have_gates: bool):
-        """Restore trained boundaries (and, when QSettings has none, the
-        gate hierarchy) from the session file, converted to the current
-        transforms."""
+        """Restore the builder's transforms, the trained boundaries (and,
+        when QSettings has none, the gate hierarchy) from the session file.
+
+        The boundaries are kept in the transforms they were saved in, which
+        become the builder's; channels the session has no transform for
+        take the experiment's.
+        """
+        live = self.controller.unmixed_transformations or {}
+        self.tf.load(None, live)
         if self._loaded_experiment_dir is None:
             return
         path = self._loaded_experiment_dir / SESSION_FILE
@@ -5431,10 +6888,10 @@ class PluginWidget(QWidget):
             return
         try:
             model, _ = ag_core.read_model(path)
-            model, messages = ag_core.remap_model(model, _live_transform_params(self.controller))
         except Exception:
             log.exception("could not read the session model %s", path)
             return
+        self.tf.load(model.get('transforms'), live)
         if not have_gates:
             self.state.gate_definitions = list(model.get('gate_definitions', []))
         names = {g['gate_name'] for g in self.state.gate_definitions}
@@ -5442,8 +6899,6 @@ class PluginWidget(QWidget):
             k: v for k, v in (model.get('trained_boundaries') or {}).items() if k in names
         }
         self.state.training_summary = dict(model.get('training_summary') or {})
-        for msg in messages:
-            self.progress_message(msg)
 
 
 # ---------------------------------------------------------------------------

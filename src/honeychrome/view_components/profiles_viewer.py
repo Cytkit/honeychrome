@@ -352,6 +352,7 @@ class ProfilesViewer(QFrame):
         
         from honeychrome.controller_components.spectral_functions import get_raw_events
         from honeychrome.controller_components.functions import sample_from_fcs
+        from honeychrome.controller_components.spectral_controller import control_gating
 
         self._hist_vb.clear()
 
@@ -454,11 +455,12 @@ class ProfilesViewer(QFrame):
                     if rel_path and raw_gating:
                         try:
                             sample = sample_from_fcs(str(experiment_dir / rel_path))
-                            all_ev = get_raw_events(sample, fluor_ch_ids)
                             neg_gate_lbl = control.get('neg_gate_label') or f'Neg {label}'
                             if raw_gating.find_matching_gate_paths(neg_gate_lbl):
-                                neg_mask = raw_gating.gate_sample(sample).get_gate_membership(neg_gate_lbl)
-                                neg_ev = all_ev[neg_mask]
+                                # the control sample's own gate (per-sample override included)
+                                neg_ev = get_raw_events(sample, fluor_ch_ids, gate_label=neg_gate_lbl,
+                                                        gating_strategy=control_gating(self.controller),
+                                                        sample_key=rel_path)
                                 neg_peak_raw = neg_ev[:, peak_local_idx] if len(neg_ev) > 0 else None
                                 logger.info(
                                     f'_plot_peak_histograms: "{label}" internal neg — '

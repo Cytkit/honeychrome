@@ -55,7 +55,8 @@ __all__ = [
     'MATCH_NAME', 'MATCH_FLUOROPHORE', 'MATCH_FLUOROPHORE_LABEL_DIFFERS',
     'MATCH_ANTIGEN', 'MATCH_FUZZY', 'MATCH_MANUAL', 'CONFIDENT_MATCHES',
     'ImportPlan', 'plan_import', 'build_gate_definitions',
-    'ALGORITHM_IMPORTED', 'source_from_gating',
+    'ALGORITHM_IMPORTED', 'source_from_gating', 'upgrade_gate_definitions',
+    'histogram_algorithm', 'HISTOGRAM_MIXTURE_FREQUENCY',
 ]
 
 ALGORITHM_IMPORTED = ag_core.ALGORITHM_IMPORTED
@@ -72,12 +73,15 @@ _POPULATION_NODES = ('Population', 'AndNode', 'OrNode', 'NotNode')
 _AREA_SUFFIX = re.compile(r'-A$')
 _HEIGHT_WIDTH_SUFFIX = re.compile(r'-[HW]$')
 _DEFAULT_PREFIXES = ('Comp-', 'Unmixed-', 'Spectral-')
-ELLIPSE_VERTICES = 10                     # ellipses import as polygons
+ELLIPSE_VERTICES = ag_core.ELLIPSE_VERTICES   # ellipses import as polygons
+# A histogram gate whose population holds more than this fraction of its
+# parent is proposed 'mixture' instead of 'tail'.
+HISTOGRAM_MIXTURE_FREQUENCY = 0.25
 
 
 def _ellipse_scale(n_points: int) -> float:
     """Radius factor giving an n-vertex polygon the area of its ellipse."""
-    return math.sqrt(2.0 * math.pi / (n_points * math.sin(2.0 * math.pi / n_points)))
+    return ag_core.ellipse_area_scale(n_points)
 
 
 def _local(name: str) -> str:
@@ -892,13 +896,30 @@ class _Piece:
 
 
 def _is_singlet_pair(chans: list, exp: ExperimentChannels) -> bool:
-    """True for the forward-scatter area against height or width pair."""
-    if not exp.singlet_pair or len(chans) != 2:
+    """True for a scatter area channel against the height or width of the
+    same scatter detector (forward or side scatter singlet gates)."""
+    if len(chans) != 2:
         return False
-    area, other = exp.singlet_pair
-    stem = area.rsplit('-', 1)[0]
-    alternatives = {other, f'{stem}-H', f'{stem}-W'} - {area}
-    return area in chans and bool(set(chans) & alternatives)
+    if exp.singlet_pair:
+        area, other = exp.singlet_pair
+        stem = area.rsplit('-', 1)[0]
+        alternatives = {other, f'{stem}-H', f'{stem}-W'} - {area}
+        if area in chans and set(chans) & alternatives:
+            return True
+    scatter = set(exp.scatter)
+    if not all(c in scatter for c in chans):
+        return False
+    stems = [c.rsplit('-', 1) for c in chans]
+    if any(len(st) != 2 for st in stems) or stems[0][0] != stems[1][0]:
+        return False
+    return {stems[0][1], stems[1][1]} in ({'A', 'H'}, {'A', 'W'})
+
+
+def _forward_scatter_axis(chans: list, exp: ExperimentChannels) -> str:
+    """'y' when the forward-scatter area channel is a plot's y channel,
+    else 'x' (the debris cut of a cell gate is made on forward scatter)."""
+    area = exp.singlet_pair[0] if exp.singlet_pair else None
+    return 'y' if area is not None and len(chans) == 2 and chans[1] == area else 'x'
 
 
 def _piece(pop: FJPopulation, source: FJSource, mapping: dict,
@@ -962,7 +983,7 @@ def _plan_gate(grp: list[_Piece]) -> dict:
     fluor = [k for k, s in enumerate(first.signs) if s is not None]
     if not fluor:
         return {'gate_type': 'free', 'sep': None,
-                'regions': [ag_core.REGION_INSIDE] * len(grp), 'algorithm': None}
+                'regions': [ag_core.REGION_INSIDE] * len(grp), 'algorithm': 'cells'}
     if len(fluor) == 1:
         k = fluor[0]
         return {'gate_type': '1dsep', 'sep': k,
@@ -1010,7 +1031,33 @@ def _describe(gdef: dict, plan: dict, exp_labels) -> str:
                 f"{exp_labels(gdef['gate_marker_y'])}: {pops}{tail}.")
     if gtype == 'singlets':
         return f"Singlet gate{tail}."
-    return "Kept as drawn (scatter shape): no trainable conversion reproduces it."
+    axis = (gdef.get('gate_param') or {}).get('debris_axis', 'x')
+    debris = gdef.get('gate_marker_y') if axis == 'y' else gdef.get('gate_marker_x')
+    return (f"Scatter gate on {exp_labels(gdef['gate_marker_x'])} × "
+            f"{exp_labels(gdef['gate_marker_y'])}: cell gate cutting debris on "
+            f"{exp_labels(debris)}{tail}.")
+
+
+def _histogram_positive_fraction(grp: list, gplan: dict, parent_count) -> float | None:
+    """Fraction of the parent on the positive side of a histogram gate, from
+    the counts recorded at import, or None when they were not recorded."""
+    if not parent_count:
+        return None
+    above = [p for p, r in zip(grp, gplan['regions']) if r == ag_core.REGION_ABOVE]
+    below = [p for p, r in zip(grp, gplan['regions']) if r != ag_core.REGION_ABOVE]
+    if above and all(p.pop.count is not None for p in above):
+        return sum(p.pop.count for p in above) / float(parent_count)
+    if below and all(p.pop.count is not None for p in below):
+        return 1.0 - sum(p.pop.count for p in below) / float(parent_count)
+    return None
+
+
+def histogram_algorithm(positive_fraction) -> str:
+    """'mixture' for a histogram gate whose positive population holds more
+    than HISTOGRAM_MIXTURE_FREQUENCY of its parent, else 'tail'."""
+    if positive_fraction is not None and positive_fraction > HISTOGRAM_MIXTURE_FREQUENCY:
+        return 'mixture'
+    return 'tail'
 
 
 def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChannels,
@@ -1037,11 +1084,24 @@ def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChann
         one fluorescence parameter, become one gate with one population
         each (2dsep, or 1dsep on the fluorescence parameter when the other
         is scatter); proposed algorithm 'mixture';
-      * a histogram (1-D) gate → 1dsep with a histogram view; 'tail';
+      * a histogram (1-D) gate → 1dsep with a histogram view; 'tail', or
+        'mixture' when its positive population held more than 25% of the
+        parent in the recorded counts (``proposal_rule`` 'histogram' lets
+        the Review tab apply the rule to the review sample when no counts
+        were recorded);
       * a single gate on a pair → 1dsep separating on the fluorescence
         parameter when the other is scatter, 2dsep when both are
         fluorescence; 'mixture';
-      * shapes drawn only on scatter parameters stay 'free'.
+      * an area against height or width gate of the same scatter detector →
+        'singlets' (only the first moves to the top);
+      * shapes drawn only on scatter parameters stay 'free'; proposed
+        'cells', a debris cut on forward scatter.
+
+    Gate names are unique. Gates sharing a name (e.g. 'TIGIT+' drawn on
+    many populations) are told apart by the population they are drawn on,
+    'TIGIT+ (Tem)', adding the populations above it only when that is not
+    enough, 'TIGIT+ (CD4+ › Tem)'; the shared name is kept in
+    ``name_group`` so the Review tab can treat them as replicates.
 
     The side of a fluorescence parameter comes from the drawn coordinates:
     entirely above the channel's raw zero selects the positive side,
@@ -1067,13 +1127,19 @@ def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChann
         antigen = (exp.antigens.get(ch) or '').strip()
         return f"{ch} ({antigen})" if antigen and antigen != ch else str(ch)
 
-    def unique(name: str) -> str:
+    temp_names: set = set()
+    bases: dict[str, str] = {}
+    parent_paths: dict[str, tuple] = {}
+
+    def unique(name: str, parent_path: tuple) -> str:
         base = _safe_name(name)
         cand, k = base, 2
-        while cand in used:
-            cand = f"{base} ({k})"
+        while cand in temp_names:
+            cand = f"{base}\x00{k}"
             k += 1
-        used.add(cand)
+        temp_names.add(cand)
+        bases[cand] = base
+        parent_paths[cand] = parent_path
         return cand
 
     def emit(parent: FJPopulation | None, children: list[FJPopulation]):
@@ -1085,17 +1151,26 @@ def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChann
         pieces = [_piece(c, source, mapping, exp, native_display) for c in kids]
         for grp in _group_siblings(pieces, merge_siblings):
             names = [p.pop.name for p in grp]
-            gname = unique(names[0] if len(grp) == 1 else ' & '.join(names))
+            gname = unique(names[0] if len(grp) == 1 else ' & '.join(names),
+                           tuple(parent.path) if parent is not None else ())
             gplan = _plan_gate(grp)
             gdef, pops = _gate_def(grp, gplan, gname, parent_gate, parent_pop)
             gdef['gate_number'] = len(gate_defs) + 1
             gdef['template_original'] = deepcopy(gdef['template'])
+            parent_count = parent.count if parent is not None else source.count
+            if gdef['gate_type'] == '1dsep' and len(grp[0].channels) == 1:
+                gdef['proposal_rule'] = 'histogram'
+                gdef['proposed_algorithm'] = histogram_algorithm(
+                    _histogram_positive_fraction(grp, gplan, parent_count))
+                gplan = dict(gplan, algorithm=gdef['proposed_algorithm'])
+            elif gdef['gate_type'] == 'free':
+                gdef['gate_param']['debris_axis'] = _forward_scatter_axis(grp[0].channels, exp)
             gdef['source'] = {
                 'origin': origin,
                 'workspace': workspace_name,
                 'gating_source': source.title,
                 'sample': source.name if source.kind == 'sample' else source.sample_name,
-                'parent_count': parent.count if parent is not None else source.count,
+                'parent_count': parent_count,
                 'populations': {pname: p.pop.key for pname, p in pops.items()},
                 'counts': {pname: p.pop.count for pname, p in pops.items()},
                 'parameters': {ch: fj for p in grp for fj, ch in zip(p.pop.gate.channels, p.channels)},
@@ -1108,7 +1183,15 @@ def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChann
             emit(c, c.children)
 
     emit(None, source.roots)
-    moved, below = _singlets_first(gate_defs)
+    renamed = _final_names(bases, parent_paths, used)
+    for g in gate_defs:
+        g['name_group'] = bases[g['gate_name']]
+        g['gate_name'] = renamed[g['gate_name']]
+        if g.get('parent_gate') in renamed:
+            g['parent_gate'] = renamed[g['parent_gate']]
+    notes = {renamed.get(k, k): v for k, v in notes.items()}
+    pop_map = {k: (renamed.get(v[0], v[0]), v[1]) for k, v in pop_map.items()}
+    moved, below = _singlets_first(gate_defs, exp.singlet_pair[0] if exp.singlet_pair else None)
     if moved:
         singlets = moved[0]
         # FlowJo's singlet population is now the last moved gate's
@@ -1133,8 +1216,51 @@ def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChann
     return gate_defs, report
 
 
-def _singlets_first(gate_defs: list[dict]) -> tuple[list[str], tuple | None]:
-    """Make the first singlet gate the top of the hierarchy.
+def _final_names(bases: dict, parent_paths: dict, taken: set) -> dict:
+    """{temporary name: unique gate name}. A name used by one gate only, and
+    not taken, is kept. Gates sharing a name are qualified by the names of
+    the populations they are drawn on, the closest first and as few as make
+    them distinct: 'TIGIT+ (Tem)', 'TIGIT+ (CD4+ › Tem)'. Numbers are the
+    last resort."""
+    groups: dict[str, list[str]] = {}
+    for temp, base in bases.items():
+        groups.setdefault(base, []).append(temp)
+    out: dict[str, str] = {}
+    used = set(taken)
+    for base, members in groups.items():
+        if len(members) == 1 and base not in used:
+            out[members[0]] = base
+            used.add(base)
+    for base, members in groups.items():
+        if members[0] in out:
+            continue
+        paths = [tuple(parent_paths[m]) or ('All events',) for m in members]
+        depth = max(len(p) for p in paths)
+        chosen = None
+        for k in range(1, depth + 1):
+            cands = [f"{base} ({' › '.join(_safe_name(n) for n in p[-k:])})" for p in paths]
+            if len(set(cands)) == len(cands) and not set(cands) & used:
+                chosen = cands
+                break
+        if chosen is None:
+            chosen = []
+            for p in paths:
+                cand = f"{base} ({' › '.join(_safe_name(n) for n in p)})"
+                stem, k = cand, 2
+                while cand in used or cand in chosen:
+                    cand = f"{stem} {k}"
+                    k += 1
+                chosen.append(cand)
+        for m, cand in zip(members, chosen):
+            out[m] = cand
+            used.add(cand)
+    return out
+
+
+def _singlets_first(gate_defs: list[dict], forward_area: str | None = None
+                    ) -> tuple[list[str], tuple | None]:
+    """Make the first forward-scatter singlet gate (on *forward_area*; any
+    singlet gate when none is) the top of the hierarchy.
 
     The gates on the path from the root to it are placed directly below it,
     in their original order, and the singlet gate's own daughters move to
@@ -1144,7 +1270,10 @@ def _singlets_first(gate_defs: list[dict]) -> tuple[list[str], tuple | None]:
     or ([], None) when nothing moved.
     """
     by_name = ag_core.gates_by_name(gate_defs)
-    single = next((g for g in gate_defs if g.get('gate_type') == 'singlets'), None)
+    singlets = [g for g in gate_defs if g.get('gate_type') == 'singlets']
+    single = next((g for g in singlets
+                   if forward_area in (g.get('gate_marker_x'), g.get('gate_marker_y'))),
+                  singlets[0] if singlets and forward_area is None else None)
     if single is None or not single.get('parent_gate'):
         return [], None
     chain = []
@@ -1216,3 +1345,44 @@ def _gate_def(grp: list[_Piece], gplan: dict, gname: str, parent_gate,
         'template': template,
     }
     return gdef, pops_by_name
+
+
+_NUMBERED = re.compile(r'^(.*\S) \((\d+)\)$')
+
+
+def upgrade_gate_definitions(gate_defs: list[dict]) -> int:
+    """Bring gates imported before the current rules up to date, in place,
+    without renaming them: the shared imported name (``name_group``, the
+    name without a ' (2)' style suffix), the histogram rule on gates still
+    as drawn, and 'cells' as the proposal for scatter shapes. Returns the
+    number of gates changed."""
+    changed = 0
+    for g in gate_defs:
+        before = (g.get('name_group'), g.get('proposal_rule'), g.get('proposed_algorithm'),
+                  (g.get('gate_param') or {}).get('debris_axis'))
+        if g.get('source') and not g.get('name_group'):
+            m = _NUMBERED.match(g['gate_name'])
+            g['name_group'] = m.group(1) if m else g['gate_name']
+        imported = g.get('algorithm') == ALGORITHM_IMPORTED and g.get('source')
+        if imported and g.get('gate_type') == '1dsep' and not g.get('gate_marker_y') \
+                and not g.get('proposal_rule') and g.get('proposed_algorithm') in (None, 'tail'):
+            g['proposal_rule'] = 'histogram'
+            src = g.get('source') or {}
+            parent = src.get('parent_count')
+            counts = src.get('counts') or {}
+            regions = ag_core.population_regions(g)
+            above = [counts.get(p) for p, r in regions.items() if r == ag_core.REGION_ABOVE]
+            below = [counts.get(p) for p, r in regions.items() if r != ag_core.REGION_ABOVE]
+            frac = None
+            if parent and above and None not in above:
+                frac = sum(above) / float(parent)
+            elif parent and below and None not in below:
+                frac = 1.0 - sum(below) / float(parent)
+            g['proposed_algorithm'] = histogram_algorithm(frac)
+        if g.get('gate_type') == 'free' and g.get('proposed_algorithm') in (None, 'ellipse'):
+            g['proposed_algorithm'] = 'cells'
+            g.setdefault('gate_param', {}).setdefault('debris_axis', 'x')
+        after = (g.get('name_group'), g.get('proposal_rule'), g.get('proposed_algorithm'),
+                 (g.get('gate_param') or {}).get('debris_axis'))
+        changed += before != after
+    return changed

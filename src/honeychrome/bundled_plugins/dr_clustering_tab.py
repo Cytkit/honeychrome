@@ -170,7 +170,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 import csv
-import math
 import re
 import time
 import traceback
@@ -178,7 +177,7 @@ import traceback
 import numpy as np
 import pandas as pd
 
-from PySide6.QtCore import Qt, QTimer, QSettings, QEvent, QRectF, QThread, Signal, QSize
+from PySide6.QtCore import Qt, QTimer, QSettings, QEvent, QThread, Signal, QSize
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
@@ -189,7 +188,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QFileDialog, QMessageBox, QSizePolicy,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QColorDialog, QProgressBar, QSlider,
-    QDialog, QTextEdit, QApplication, QStackedWidget, QToolBox,
+    QDialog, QTextEdit, QApplication, QToolBox,
 )
 
 from honeychrome.controller_components.functions import (
@@ -197,12 +196,16 @@ from honeychrome.controller_components.functions import (
     apply_gates_in_place,
 )
 from honeychrome.controller_components.sample_loader import sample_key_for_path
+from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.transform import Transform
 from honeychrome.view_components.clear_layout import clear_layout
 from honeychrome.view_components.ordered_multi_sample_picker import OrderedMultiSamplePicker
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
-from honeychrome.view_components.icon_loader import icon
+from honeychrome.view_components.side_tab_widget import SideTabWidget
+from honeychrome.view_components import suggest_groupings_dialog as sgd
+from honeychrome.view_components.checkable_header import CheckableHeaderView
+from honeychrome.controller_components.differential_stats import suggest_groupings_from_names
 from honeychrome.view_components.differential_plots import (
     make_heatmap_figure,
     make_marker_summary_figure,
@@ -239,6 +242,9 @@ import drc_report
 import drc_help_texts
 import drc_predictive
 import drc_time_estimate
+from transforms_panel import (
+    TransformInspector, transform_from_params, transform_params as _transform_params,
+)
 
 _log = drc_logging.get_logger(__name__)
 
@@ -340,9 +346,10 @@ def apply_gate_by_lookup_table(cytometry_data_dictionary, gate_name):
 def apply_gates_union_by_lookup_table(cytometry_data_dictionary, gate_names: list[str]):
     """
     Return the UNION of event_data belonging to ANY gate in *gate_names*.
-    Same lookup-table approach as apply_gate_by_lookup_table() above; see
-    drc_pipeline.apply_gates_union_by_lookup_table() for the identical
-    sibling used by the data-pipeline module.
+    Same lookup-table approach as apply_gate_by_lookup_table() above. The
+    controller's lookup tables belong to the sample on display, so this is
+    only for that sample's events; other samples are gated with
+    ``per_sample_gating_functions.SampleGating``.
 
     Returns
     -------
@@ -397,19 +404,40 @@ def _read_transforms_from_experiment(controller):
         or controller.experiment.cytometry.get('raw_transforms')
         or {}
     )
+    return _channel_transform_params_from(transforms)
+
+
+def _channel_transform_params_from(transforms: dict) -> dict:
+    """
+    Convert {channel: transform parameter dict} (the experiment's own keys:
+    scale_t, logicle_w, logicle_m, logicle_a, id, limits) into the
+    {channel: {'T', 'W', 'M', 'A', 'id', 'limits'}} form held in
+    PipelineState.channel_transform_params.
+    """
     result = {}
     for channel, params in transforms.items():
         if not isinstance(params, dict):
             continue
         result[channel] = {
-            'T': float(params.get('scale_t',   262144.0)),
-            'W': float(params.get('logicle_w', 0.5)),
-            'M': float(params.get('logicle_m', 4.5)),
-            'A': float(params.get('logicle_a', 0.0)),
+            'T': float(params.get('scale_t') or 262144.0),
+            'W': float(params.get('logicle_w') if params.get('logicle_w') is not None else 0.5),
+            'M': float(params.get('logicle_m') or 4.5),
+            'A': float(params.get('logicle_a') or 0.0),
             'id': params.get('id', 1),   # 0=linear, 1=logicle, 2=log
-            'limits': list(params.get('limits', [0, 1])),
+            'limits': list(params.get('limits') or [0, 1]),
         }
     return result
+
+
+def _working_channel_transform_params(controller, saved: dict) -> dict:
+    """
+    channel_transform_params for the open experiment: the saved transforms
+    where there are any, the experiment's own for the remaining channels.
+    """
+    params = _read_transforms_from_experiment(controller)
+    params.update({ch: v for ch, v in _channel_transform_params_from(saved).items()
+                   if ch in params})
+    return params
 
 def _qs_list(settings, key: str) -> list[str]:
     """
@@ -774,85 +802,7 @@ class _FrozenScrollArea(QScrollArea):
         event.ignore()
 
 
-class _SideTabWidget(QWidget):
-    """
-    Vertical navigation list beside a page stack.
-
-    Replaces a QTabWidget so the plugin's own sections read as distinct
-    from the main window's top-level tab bar: labels stay horizontal and
-    each entry carries an icon. Exposes the subset of the QTabWidget API
-    the plugin uses (addTab, currentIndex, setCurrentIndex, currentWidget,
-    widget, count, currentChanged).
-    """
-
-    currentChanged = Signal(int)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._nav = QListWidget()
-        self._nav.setIconSize(QSize(20, 20))
-        self._nav.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._nav.setFrameShape(QFrame.NoFrame)
-        self._nav.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        self._nav.setStyleSheet(
-            "QListWidget::item { padding: 8px 14px 8px 8px; }"
-        )
-
-        self._stack = QStackedWidget()
-
-        divider = QFrame()
-        divider.setFrameShape(QFrame.VLine)
-        divider.setFrameShadow(QFrame.Sunken)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        layout.addWidget(self._nav)
-        layout.addWidget(divider)
-        layout.addWidget(self._stack, stretch=1)
-
-        self._nav.currentRowChanged.connect(self._on_row_changed)
-
-    def addTab(self, widget: QWidget, label: str, icon_name: str | None = None) -> int:
-        index = self._stack.addWidget(widget)
-        item = QListWidgetItem(label)
-        if icon_name:
-            item.setIcon(icon(icon_name))
-        self._nav.addItem(item)
-        if self._nav.currentRow() < 0:
-            self._nav.setCurrentRow(0)
-        # Polish first so the item padding from the style sheet is measured.
-        self._nav.ensurePolished()
-        self._nav.setFixedWidth(
-            self._nav.sizeHintForColumn(0) + 2 * self._nav.frameWidth() + 12
-        )
-        return index
-
-    def currentIndex(self) -> int:
-        return self._stack.currentIndex()
-
-    def setCurrentIndex(self, index: int):
-        self._nav.setCurrentRow(index)
-
-    def currentWidget(self) -> QWidget | None:
-        return self._stack.currentWidget()
-
-    def widget(self, index: int) -> QWidget | None:
-        return self._stack.widget(index)
-
-    def count(self) -> int:
-        return self._stack.count()
-
-    def _on_row_changed(self, row: int):
-        # Clearing the list's current row (e.g. ctrl-click) must not blank the page.
-        if row < 0:
-            self._nav.setCurrentRow(self._stack.currentIndex())
-            return
-        if row == self._stack.currentIndex():
-            return
-        self._stack.setCurrentIndex(row)
-        self.currentChanged.emit(row)
+_SideTabWidget = SideTabWidget
 
 
 # Events kept per (marker, cluster) cell in the Marker Heatmap / Ridgelines
@@ -861,6 +811,11 @@ class _SideTabWidget(QWidget):
 # 200-bin histogram of 100,000 events agree with the full cell to well
 # within the resolution of the plots. None keeps every event.
 MARKER_SUMMARY_MAX_EVENTS_PER_CELL = 100_000
+# Sample Group Assignment table column sizes (pixels): the sample name is
+# capped so a long name cannot push the other columns out of view;
+# covariates get room to type.
+SAMPLE_COLUMN_MAX_WIDTH = 280
+COVARIATE_COLUMN_MIN_WIDTH = 110
 
 
 def _channel_xform(state, ch: str):
@@ -972,10 +927,13 @@ class PipelineState:
 
     Transforms
     ----------
-    channel_transform_params is populated from the experiment model at
-    initialisation and when the tab is activated.  It is NEVER written back
-    to the experiment.  Any local modifications (e.g. from the auto-transform
-    preview in the Transform tab) stay here only.
+    saved_transforms holds this plugin's transform of every channel
+    (Transforms tab).  An experiment opened here for the first time starts
+    from the transforms defined in Unmixed Data; after that the saved ones
+    are kept, with every adjustment made in the Transforms tab, until the
+    user reloads from the experiment.  channel_transform_params is the
+    form the other tabs read.  Neither is ever written back to the
+    experiment.
     """
 
     # --- Configuration ---
@@ -988,7 +946,10 @@ class PipelineState:
 
     # --- Transforms (read from experiment; never written back) ---
     channel_transform_params: dict = field(default_factory=dict)
-    # {channel_name: {'W': float, 'A': float, 'T': float, 'M': float}}
+    # {channel_name: {'W': float, 'A': float, 'T': float, 'M': float,
+    #                 'id': int, 'limits': [float, float]}}
+    saved_transforms: dict = field(default_factory=dict)
+    # {channel_name: transforms_panel.transform_params() dict}
 
     # --- Dimensionality reduction ---
     trained_reducers: dict[str, Any] = field(default_factory=dict)
@@ -1115,7 +1076,11 @@ class PipelineState:
     #   correction instead, without pooling across comparisons.
     stats_adjust_covariates: list[str] = field(default_factory=list)
     # state.covariates columns added to every test's design as adjustment
-    # terms (numeric -> continuous, otherwise categorical).
+    # terms: continuous when listed in numeric_covariates, otherwise
+    # categorical.
+    numeric_covariates: list[str] = field(default_factory=list)
+    # state.covariates columns entered as continuous numbers (age, CRP);
+    # ticked under the column title in the Sample Group Assignment table.
     stats_use_treat: bool = True
     # True: p-values test |effect| > threshold (TREAT). False: test
     #   effect != 0 and use the threshold only as a filter.
@@ -1530,6 +1495,14 @@ class RunManagementTable(CopyableTableWidget):
     _HEADERS = ['Label', 'Kind', 'Algorithm', 'Gate(s)', 'Samples',
                 'Events', 'Channels', 'Timestamp']
 
+    # Text colour of a run whose events no longer match the current gating
+    # and unmixing (see drc_run_archive.sync_status).
+    _OUT_OF_SYNC_COLOUR = QColor('#ff9800')
+
+    # Item-data role holding a label's own tooltip, so the sync note can be
+    # appended to it (and replaced) without losing it.
+    _BASE_TOOLTIP_ROLE = Qt.UserRole + 1
+
     def __init__(self, controller, state, parent=None):
         QTableWidget.__init__(self, 0, len(self._HEADERS), parent)
         self.controller = controller
@@ -1555,8 +1528,10 @@ class RunManagementTable(CopyableTableWidget):
         self.setSortingEnabled(False)  # avoid resort-during-populate churn
         entries = list(self.state.dr_runs) + list(self.state.clustering_runs)
         self.setRowCount(len(entries))
+        fingerprints: dict = {}
         for row, entry in enumerate(entries):
             self._populate_row(row, entry)
+            self._apply_sync_style(row, entry, fingerprints)
         self.setSortingEnabled(True)
         self.resizeColumnsToContents()
         self.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -1569,10 +1544,10 @@ class RunManagementTable(CopyableTableWidget):
         label_item.setData(Qt.UserRole, run_id)
         if not drc_run_archive.run_payload_exists(self.controller, run_id):
             label_item.setText(f"⚠ {label_text}")
-            label_item.setToolTip(
-                "Payload file missing from disk — this run's data can no "
-                "longer be loaded."
-            )
+            missing_note = ("Payload file missing from disk — this run's data can no "
+                            "longer be loaded.")
+            label_item.setToolTip(missing_note)
+            label_item.setData(self._BASE_TOOLTIP_ROLE, missing_note)
         self.setItem(row, 0, label_item)
 
         self.setItem(row, 1, QTableWidgetItem(
@@ -1608,6 +1583,61 @@ class RunManagementTable(CopyableTableWidget):
         ts_item = _SortableItem(ts_raw.replace('T', '  '))
         ts_item.set_sort_key(ts_raw)  # ISO 8601 — lexicographic == chronological
         self.setItem(row, 7, ts_item)
+
+    # ------------------------------------------------------------------
+    # Sync with the current gating / unmixing
+    # ------------------------------------------------------------------
+
+    def _current_fingerprint(self, entry: dict, cache: dict):
+        """drc_pipeline.sync_fingerprint() for the run's own gates and samples,
+        computed once per distinct (gates, samples) pair per pass."""
+        key = (tuple(entry.get('gates', [])), tuple(entry.get('training_sample_ids', [])))
+        if key not in cache:
+            cache[key] = drc_pipeline.sync_fingerprint(self.controller, *key)
+        return cache[key]
+
+    def _apply_sync_style(self, row: int, entry: dict, cache: dict):
+        """Colour the row's text orange when the run is out of sync with the
+        current gating and unmixing, and say why in the label's tooltip."""
+        status = drc_run_archive.sync_status(entry, self._current_fingerprint(entry, cache))
+        out_of_sync = status == drc_run_archive.SYNC_OUT_OF_SYNC
+        label_item = self.item(row, 0)
+        for col in range(self.columnCount()):
+            item = self.item(row, col)
+            if item is not None:
+                item.setData(Qt.ForegroundRole,
+                             self._OUT_OF_SYNC_COLOUR if out_of_sync else None)
+        if label_item is None:
+            return
+        base = label_item.data(self._BASE_TOOLTIP_ROLE) or ''
+        if out_of_sync:
+            note = ("Out of sync: the unmixing, AF profile assignment or gating has "
+                    "changed since this run was made, so cells may have moved in or "
+                    "out of its gates. Its saved events no longer match what the "
+                    "current gating selects.")
+        elif status == drc_run_archive.SYNC_UNKNOWN:
+            note = ("Sync cannot be verified: this run was made before sync tracking "
+                    "was added, or the current state could not be fingerprinted.")
+        else:
+            note = ''
+        label_item.setToolTip('\n\n'.join(t for t in (base, note) if t))
+
+    def refresh_sync_status(self):
+        """Re-evaluate every row's sync colouring without rebuilding the table
+        (keeps the selection). Called when the table is shown, since the
+        unmixing or gating may have been edited elsewhere in the app."""
+        fingerprints: dict = {}
+        for row in range(self.rowCount()):
+            label_item = self.item(row, 0)
+            if label_item is None:
+                continue
+            entry = self._find_entry(label_item.data(Qt.UserRole))
+            if entry is not None:
+                self._apply_sync_style(row, entry, fingerprints)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_sync_status()
 
     # ------------------------------------------------------------------
     # Row lookup
@@ -2710,191 +2740,6 @@ class ConfigTab(QWidget):
         self.run_table.refresh()
 
 
-class BiplotTile(QWidget):
-    """
-    A single square biplot tile — heatmap of x_channel vs y_channel.
-    x_channel is always the TransformTab's active channel (set externally).
-    y_channel is chosen by clicking the y-axis InteractiveLabel (same
-    mechanism as CytometryPlotWidget) or via the combo at the top.
-    Drag the axes to adjust W / zoom, exactly as in CytometryPlotWidget.
-    """
-
-    # InteractiveLabel.mousePressEvent calls parent_plot.select_plot_on_parent_grid()
-    # BiplotTile is the parent_plot — provide a no-op stub so the call doesn't crash.
-    def select_plot_on_parent_grid(self):
-        pass
-
-    def __init__(self, rgba_lut, parent_tab, y_channel: str = '', parent=None):
-        super().__init__(parent)
-        self._parent_tab = parent_tab
-        self._y_channel  = y_channel
-        self._rgba_lut   = rgba_lut
-
-        size = hc_settings.cytometry_plot_width_target_retrieved
-        self.setMinimumSize(size, size)
-        self.setMaximumSize(size, size)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(2)
-
-        # y-channel selector combo -- not shown; kept purely as the
-        # internal selection store, driven by the InteractiveLabel click
-        # menu below (the visible combo was redundant with that menu).
-        self._y_combo = QComboBox()
-        self._y_combo.setMaximumHeight(22)
-        self._y_combo.setVisible(False)
-        self._y_combo.currentTextChanged.connect(self._on_y_changed)
-        outer.addWidget(self._y_combo)
-
-        # pyqtgraph graphics layout
-        self._gw = TransparentGraphicsLayoutWidget()
-        self._gw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        gl = self._gw.ci.layout
-        gl.setHorizontalSpacing(0)
-        gl.setVerticalSpacing(0)
-
-        # Y-axis InteractiveLabel — click to change y-channel, same as Honeychrome
-        self._label_y = InteractiveLabel('', parent_plot=self, angle=-90, size='9pt')
-        self._label_y.leftClickMenuFunction = self._set_y_from_label
-        self._gw.addItem(self._label_y, row=0, col=0)
-
-        self._vb = NoPanViewBox()
-        self._gw.addItem(self._vb, row=0, col=2)
-
-        self._axis_x = ZoomAxis('bottom', self._vb)
-        self._axis_y = ZoomAxis('left',   self._vb)
-        self._gw.addItem(self._axis_x, row=1, col=2)
-        self._gw.addItem(self._axis_y, row=0, col=1)
-        self._axis_x.linkToView(self._vb)
-        self._axis_y.linkToView(self._vb)
-
-        # X-axis InteractiveLabel — click to change the shared active/x
-        # channel, same mechanism as the y-axis above. Routes
-        # through parent_tab since x is shared across every tile, not
-        # local to this one.
-        self._label_x = InteractiveLabel('', parent_plot=self, size='9pt')
-        self._label_x.leftClickMenuFunction = self._set_x_from_label
-        self._gw.addItem(self._label_x, row=2, col=2)
-
-        self._vb.setMouseEnabled(x=False, y=False)
-        self._vb.raiseContextMenu = lambda ev: None
-
-        self._img = pg.ImageItem()
-        self._img.setLookupTable(rgba_lut)
-        self._vb.addItem(self._img)
-
-        self._axis_x.zoom_timer.timeout.connect(
-            lambda: self._parent_tab._apply_tile_zoom(self, 'x')
-        )
-        self._axis_y.zoom_timer.timeout.connect(
-            lambda: self._parent_tab._apply_tile_zoom(self, 'y')
-        )
-
-        outer.addWidget(self._gw)
-
-    # ------------------------------------------------------------------
-
-    def _set_y_from_label(self, item_index, _parent):
-        """Called by InteractiveLabel when user picks a channel from the menu."""
-        channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
-        if 0 <= item_index < len(channels):
-            self._label_y.leftItemSelected = item_index
-            self._y_combo.setCurrentText(channels[item_index])
-
-    def _set_x_from_label(self, item_index, _parent):
-        """Called by InteractiveLabel when the user picks a channel from
-        the x-axis menu. x is the TransformTab's shared active
-        channel, not local to this tile -- route through parent_tab so
-        every tile's x-axis and the 1-D histogram update together."""
-        channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
-        if 0 <= item_index < len(channels):
-            self._parent_tab._set_active_channel_from_tile(channels[item_index])
-
-    def set_channels(self, available: list[str], y_channel: str = ''):
-        self._y_combo.blockSignals(True)
-        current = y_channel or self._y_combo.currentText()
-        self._y_combo.clear()
-        self._y_combo.addItems(available)
-        if current in available:
-            self._y_combo.setCurrentText(current)
-        self._y_combo.blockSignals(False)
-        self._y_channel = self._y_combo.currentText()
-
-        # Sync InteractiveLabel menu items -- antigen-labeled for display;
-        # selection is index-based (see InteractiveLabel.selectable_menu_
-        # activates_function), so display text doesn't need to match
-        # `available`'s raw channel names.
-        labels = _antigen_dash_labels(self._parent_tab.controller)
-        self._label_y.leftClickMenuItems = [labels.get(ch, ch) for ch in available]
-        ch = self._y_combo.currentText()
-        self._label_y.leftItemSelected = available.index(ch) if ch in available else 0
-
-        # x-axis menu shares the same available list; selection
-        # tracks the tab's active channel, not anything local to this tile.
-        self._label_x.leftClickMenuItems = [labels.get(ch, ch) for ch in available]
-        x_ch = self._parent_tab._active_channel
-        self._label_x.leftItemSelected = available.index(x_ch) if x_ch in available else 0
-
-    def y_channel(self) -> str:
-        return self._y_combo.currentText()
-
-    def set_x_selected(self, x_ch: str):
-        """Sync the x-axis InteractiveLabel's highlighted menu item to
-        the tab's current active channel -- called whenever the
-        shared x channel changes, mirroring _on_y_changed's own
-        leftItemSelected sync for the y-axis."""
-        channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
-        if x_ch in channels:
-            self._label_x.leftItemSelected = channels.index(x_ch)
-
-    def _on_y_changed(self, ch: str):
-        self._y_channel = ch
-        labels = _antigen_dash_labels(self._parent_tab.controller)
-        self._label_y.setText(labels.get(ch, ch))
-        # Keep leftItemSelected in sync
-        channels = [self._y_combo.itemText(i) for i in range(self._y_combo.count())]
-        if ch in channels:
-            self._label_y.leftItemSelected = channels.index(ch)
-        self._parent_tab._configure_tile_axes(self)
-        self._parent_tab._draw_tile(self)
-
-    def configure_axes(self, tr_x: 'Transform', tr_y: 'Transform',
-                       x_label: str = '', y_label: str = ''):
-        """Apply transform ticks/limits and axis labels.
-        Calls setTicks() BEFORE setXRange/setYRange so real-value labels appear immediately."""
-        if x_label:
-            self._label_x.setText(x_label)
-        if y_label:
-            self._label_y.setText(y_label)
-            self._y_channel = y_label
-
-        if tr_x.ticks:
-            self._axis_x.setTicks(tr_x.ticks())
-        self._axis_x.zoomZero = tr_x.zero
-        self._axis_x.fullRange = (0, 1.1)
-        self._axis_x.limits = tuple(tr_x.limits)
-        self._vb.setXRange(tr_x.limits[0], tr_x.limits[1], padding=0)
-
-        if tr_y.ticks:
-            self._axis_y.setTicks(tr_y.ticks())
-        self._axis_y.zoomZero = tr_y.zero
-        self._axis_y.fullRange = (0, 1.1)
-        self._axis_y.limits = tuple(tr_y.limits)
-        self._vb.setYRange(tr_y.limits[0], tr_y.limits[1], padding=0)
-
-    def draw(self, heatmap, tr_x: 'Transform', tr_y: 'Transform'):
-        self._img.setImage(heatmap)
-        self._img.setRect(QRectF(
-            tr_x.limits[0], tr_y.limits[0],
-            tr_x.limits[1] - tr_x.limits[0],
-            tr_y.limits[1] - tr_y.limits[0],
-        ))
-
-    def clear(self):
-        self._img.clear()
-
-
 class _SquareWidget(QWidget):
     """A widget that always maintains a square geometry."""
     def resizeEvent(self, event):
@@ -2903,7 +2748,7 @@ class _SquareWidget(QWidget):
         super().resizeEvent(event)
 
 
-class TransformTab(QWidget):
+class TransformTab(TransformInspector):
     """
     Tab 1 — Transform Inspector (Read-Only Preview)
     ------------------------------------------------
@@ -2911,79 +2756,40 @@ class TransformTab(QWidget):
     Lets the user preview local W-adjustments (and auto-transform suggestions)
     without writing back to the experiment.
 
-    Visual style matches CytometryPlotWidget exactly:
-      • 1-D histogram: pg.PlotDataItem stepMode='center', colorcet fill, ZoomAxis
-        with the Honeychrome axis-drag W-adjustment (lower half = W, upper = zoom)
-      • Biplot: pg.ImageItem heatmap with the same colourmap and ZoomAxis on both
-        axes; dragging either axis adjusts W for that channel the same way
-        CytometryPlotWidget does.
-      • Axes tick labels show real (raw) values — 10², 10³ etc. — via
-        Transform.ticks(), not logicle floating-point numbers.
-      • Biplot is square (resizeEvent enforces width == height).
+    The histogram, biplots, axis drags and CSV import/export are those of
+    ``transforms_panel.TransformInspector`` (shared with the gating
+    plugins); this tab adds the gate tree whose events are previewed, the
+    training samples used by Auto-transform, and the reload of the
+    transforms defined in Unmixed Data.  The transforms as adjusted are
+    kept in ``state.saved_transforms``, which the plugin saves with the
+    experiment's other settings.
     """
 
-    _XFORM_LABELS = {0: 'Linear', 1: 'Logicle', 2: 'Log', 'default': 'Default'}
+    transformsPersistRequested = Signal()
 
     def __init__(self, state: PipelineState, bus, controller, parent=None):
-        super().__init__(parent)
-        self.state      = state
-        self.bus        = bus
-        self.controller = controller
-
-        self._active_channel: str | None = None
-        # {channel: Transform}  — local copies, never written back
-        self._transforms: dict[str, Transform] = {}
-        # {channel: np.ndarray}  — raw unmixed event data for current sample
-        self._raw_data: dict[str, np.ndarray] = {}
-        # channel-name list in pnn order
-        self._pnn: list[str] = []
-
-        # Debounce timer — redraws plots 200 ms after last change
-        self._redraw_timer = QTimer(self)
-        self._redraw_timer.setSingleShot(True)
-        self._redraw_timer.setInterval(200)
-        self._redraw_timer.timeout.connect(self._redraw_plots)
-
-        # Build LUT from Honeychrome colourmap settings (same as CytometryPlotWidget)
-        try:
-            colors = cc.palette[hc_settings.colourmap_name_retrieved]
-        except Exception:
-            colors = cc.palette['bjy']
-        cmap = pg.ColorMap(
-            pos=0.9 * np.linspace(0, 1, len(colors)) ** 2
-                + 0.1 * np.linspace(0, 1, len(colors)),
-            color=colors,
+        super().__init__(controller, help_text=drc_help_texts.transforms_tab_help_text,
+                         parent=parent)
+        self.state = state
+        self.bus = bus
+        self._transforms_source = None
+        self.auto_btn.setToolTip(
+            "Set the Logicle W of every Logicle channel from the training "
+            "samples (Parks, Roederer & Moore 2006).  The result is kept "
+            "with this analysis and is not written to the experiment.  Use "
+            "Reload from experiment to undo."
         )
-        rgba_lut = cmap.getLookupTable(alpha=True)
-        rgba_lut[0, 3] = 0   # fully transparent for zero bins
-        self._rgba_lut = rgba_lut
-
-        self._build_ui()
+        self.save_csv_btn.setToolTip(
+            "Export current (local preview) transform parameters to a CSV file.\n"
+            "Columns: channel, id, T, W, M, A"
+        )
 
     # ------------------------------------------------------------------
-    # UI construction
+    # Inspector hooks
     # ------------------------------------------------------------------
 
-    def _build_ui(self):
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 6, 6, 6)
-        outer.setSpacing(6)
-
-        self.help_widget = HelpToggleWidget(
-            text=drc_help_texts.transforms_tab_help_text
-        )
-        outer.addWidget(self.help_widget)
-
-        # Body: gates, controls and plots flow down the left; the channel
-        # list sits at full height on the right.
-        body = QHBoxLayout()
-        body.setSpacing(8)
-        outer.addLayout(body, stretch=1)
-        main_col = QVBoxLayout()
-        main_col.setSpacing(6)
-        body.addLayout(main_col, stretch=1)
-
-        # --- Gate selection — primary tree ---
+    def _build_selection(self, layout):
+        """Gate selection — primary tree."""
         gate_box = QGroupBox("Gate(s)")
         gate_box_layout = QVBoxLayout(gate_box)
         self.gate_tree = drc_gate_tree.GateTreeWidget()
@@ -2996,159 +2802,37 @@ class TransformTab(QWidget):
         self.gate_tree.setMaximumHeight(220)
         self.gate_tree.selectionChanged.connect(self._on_gate_tree_changed)
         gate_box_layout.addWidget(self.gate_tree)
-        main_col.addWidget(gate_box)
+        layout.addWidget(gate_box)
 
-        # --- Top toolbar ---
-        toolbar = QHBoxLayout()
-
+    def _extend_toolbar(self, toolbar):
         self.reload_btn = QPushButton("↺ Reload from experiment")
         self.reload_btn.setToolTip(
-            "Re-read transform parameters from the experiment model, "
-            "discarding any local preview edits."
+            "Restore every transform to the one defined in Unmixed Data, "
+            "discarding Auto-transform results and axis changes made here."
         )
-        self.reload_btn.clicked.connect(self.refresh)
+        self.reload_btn.clicked.connect(self.reload_from_experiment)
         toolbar.addWidget(self.reload_btn)
 
-        self.auto_btn = QPushButton("✦ Auto-transform preview (all channels)")
-        self.auto_btn.setToolTip(
-            "Compute suggested Logicle W/A for every fluorescence channel "
-            "(Parks, Roederer & Moore 2006).  Preview only — not saved."
-        )
-        self.auto_btn.clicked.connect(self._auto_transform_all)
-        toolbar.addWidget(self.auto_btn)
+    def _default_channels(self) -> list[str]:
+        """Fluorescence channels in the cytometer's channel order."""
+        settings = self.controller.experiment.settings.get('unmixed', {})
+        pnn = settings.get('event_channels_pnn') or []
+        ids = sorted(set(settings.get('fluorescence_channel_ids') or []))
+        named = [pnn[i] for i in ids if 0 <= i < len(pnn)]
+        return named or list(settings.get('fluorescence_channels') or [])
 
-        self.save_csv_btn = QPushButton("⬇ Save CSV")
-        self.save_csv_btn.setToolTip(
-            "Export current (local preview) transform parameters to a CSV file.\n"
-            "Columns: channel, id, T, W, M, A"
-        )
-        self.save_csv_btn.clicked.connect(self._save_transforms_csv)
-        toolbar.addWidget(self.save_csv_btn)
+    def channel_labels(self) -> dict:
+        return _antigen_dash_labels(self.controller)
 
-        self.load_csv_btn = QPushButton("⬆ Load CSV")
-        self.load_csv_btn.setToolTip(
-            "Import transform parameters from a CSV file.\n"
-            "Channel names are validated against the current experiment.\n"
-            "Unrecognised channels are skipped; missing channels keep their\n"
-            "current parameters."
-        )
-        self.load_csv_btn.clicked.connect(self._load_transforms_csv)
-        toolbar.addWidget(self.load_csv_btn)
+    def _on_transform_edited(self, channel: str, tr, before: dict):
+        self._store_transform(channel, tr)
+        self.transformsPersistRequested.emit()
 
-        toolbar.addStretch()
-        main_col.addLayout(toolbar)
-
-        # Plots: scrollable area holding histogram + biplots
-        plots_scroll = QScrollArea()
-        plots_scroll.setWidgetResizable(True)
-        plots_scroll.setFrameShape(QFrame.NoFrame)
-        plots_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.plots_widget = QWidget()
-        self.plots_layout = QVBoxLayout(self.plots_widget)
-        self.plots_layout.setContentsMargins(0, 0, 0, 0)
-        self.plots_layout.setSpacing(8)
-        plots_scroll.setWidget(self.plots_widget)
-        main_col.addWidget(plots_scroll, stretch=1)
-
-        # Channel list + transform type label, full height on the right
-        channels_col = QVBoxLayout()
-        channels_col.setContentsMargins(0, 0, 0, 0)
-        channels_col.addWidget(QLabel("Channels"))
-        self.channel_list = QListWidget()
-        self.channel_list.setFixedWidth(180)
-        self.channel_list.currentItemChanged.connect(self._on_channel_item_changed)
-        channels_col.addWidget(self.channel_list, stretch=1)
-        self.xform_type_label = QLabel("—")
-        self.xform_type_label.setStyleSheet("font-style: italic; color: grey; padding: 4px;")
-        channels_col.addWidget(self.xform_type_label)
-        body.addLayout(channels_col)
-
-        # ------------------------------------------------------------------
-        # 1-D Histogram — built once, updated in-place each redraw
-        # ------------------------------------------------------------------
-        self.plots_layout.addWidget(QLabel("1-D Histogram  (drag axis to adjust transform)"))
-
-        self._hist_gw = TransparentGraphicsLayoutWidget()
-        self._hist_gw.setMinimumHeight(180)
-        self._hist_gw.setMaximumHeight(280)
-        self._hist_gw.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        gl = self._hist_gw.ci.layout
-        gl.setHorizontalSpacing(0)
-        gl.setVerticalSpacing(0)
-
-        self._hist_vb = NoPanViewBox()
-        self._hist_vb.enableAutoRange(axis=self._hist_vb.YAxis, enable=True)
-        self._hist_gw.addItem(self._hist_vb, row=0, col=1)
-
-        self._hist_axis_x = ZoomAxis('bottom', self._hist_vb)
-        self._hist_axis_y = ZoomAxis('left',   self._hist_vb)
-        self._hist_gw.addItem(self._hist_axis_x, row=1, col=1)
-        self._hist_gw.addItem(self._hist_axis_y, row=0, col=0)
-        self._hist_axis_x.linkToView(self._hist_vb)
-        self._hist_axis_y.linkToView(self._hist_vb)
-
-        # Disable panning in the viewbox; zoom done via axis drag
-        self._hist_vb.setMouseEnabled(x=False, y=False)
-        self._hist_vb.raiseContextMenu = lambda ev: None
-
-        # Filled step-curve — same as CytometryPlotWidget.hist
-        self._hist_curve = pg.PlotDataItem(
-            stepMode='center',
-            fillLevel=0,
-            brush=(100, 100, 250, 150),
-        )
-        self._hist_vb.addItem(self._hist_curve)
-
-        self._hist_axis_x.zoom_timer.timeout.connect(self._apply_hist_zoom)
-        self._hist_axis_y.zoom_timer.timeout.connect(lambda: None)  # y auto-ranges
-
-        self.plots_layout.addWidget(self._hist_gw)
-
-        # ------------------------------------------------------------------
-        # Biplot grid — multiple square tiles, Add/Remove buttons
-        # x-axis of every tile = active channel; y-axis chosen per tile
-        # ------------------------------------------------------------------
-        biplot_header = QHBoxLayout()
-        biplot_header.addWidget(QLabel("Biplots  (drag axes to adjust transforms)"))
-        biplot_header.addStretch()
-        add_btn = QPushButton("＋ Add biplot")
-        add_btn.setFixedHeight(24)
-        add_btn.clicked.connect(self._add_biplot)
-        biplot_header.addWidget(add_btn)
-        remove_btn = QPushButton("－ Remove last")
-        remove_btn.setFixedHeight(24)
-        remove_btn.clicked.connect(self._remove_biplot)
-        biplot_header.addWidget(remove_btn)
-        self.plots_layout.addLayout(biplot_header)
-
-        # Scrollable area for biplot tiles — tiles wrap based on available width
-        self._biplot_scroll = QScrollArea()
-        self._biplot_scroll.setWidgetResizable(True)
-        self._biplot_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._biplot_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._biplot_scroll.setMinimumHeight(
-            hc_settings.cytometry_plot_width_target_retrieved + 40
-        )
-        self._biplot_scroll.setMaximumHeight(
-            2 * hc_settings.cytometry_plot_width_target_retrieved + 50
-        )
-
-        self._biplot_container = QWidget()
-        self._biplot_grid = QGridLayout(self._biplot_container)
-        self._biplot_grid.setContentsMargins(0, 0, 0, 0)
-        self._biplot_grid.setSpacing(4)
-        self._biplot_scroll.setWidget(self._biplot_container)
-        self.plots_layout.addWidget(self._biplot_scroll)
-
-        # Debounce timer for tile reflow on resize (mirrors CytometryGridWidget)
-        self._tile_relayout_timer = QTimer(self)
-        self._tile_relayout_timer.setSingleShot(True)
-        self._tile_relayout_timer.setInterval(150)
-        self._tile_relayout_timer.timeout.connect(self._relayout_tiles)
-        self._biplot_scroll.viewport().installEventFilter(self)
-
-        self._biplot_tiles: list[BiplotTile] = []
-        self.plots_layout.addStretch()
+    def _available_channels(self) -> list[str]:
+        skip = {'ribbon', 'Time', 'event_id'}
+        all_ch = [ch for ch in self._transforms if ch not in skip]
+        sel = self.state.selected_channels
+        return [ch for ch in all_ch if ch in sel] if sel else all_ch
 
     # ------------------------------------------------------------------
     # Refresh — called on tab activation
@@ -3156,9 +2840,22 @@ class TransformTab(QWidget):
 
     def refresh(self):
         """
-        Reload Transform objects from controller.unmixed_transformations,
-        repopulate the channel list and biplot x-combo, then load event data.
+        Bring the tab up to date: rebuild the gate tree, repopulate the
+        channel list and biplot channels, and load the preview events.
+
+        The transforms shown are the saved ones (state.saved_transforms),
+        which start as the transforms defined in Unmixed Data and keep every
+        adjustment made here (axis drags, Auto-transform, CSV);
+        reload_from_experiment() discards those adjustments.
         """
+        self._refresh(force_reload=False)
+
+    def reload_from_experiment(self):
+        """Replace every transform with the one defined in Unmixed Data,
+        discarding Auto-transform results and axis changes made here."""
+        self._refresh(force_reload=True)
+
+    def _refresh(self, force_reload: bool):
         if self.controller.experiment.process.get('unmixing_matrix') is None:
             return
 
@@ -3169,16 +2866,17 @@ class TransformTab(QWidget):
         self.gate_tree.set_hierarchy(hierarchy)
         self.gate_tree.set_checked_names(self.state.selected_gates)
 
-        # Deep-copy Transform objects from controller so we can tweak locally
+        # Local copies of the controller's Transform objects, set to the saved
+        # parameters.  Rebuilt on request or for a different experiment only,
+        # so that adjustments survive tab switches.
         src = self.controller.unmixed_transformations or {}
-        self._transforms = {ch: deepcopy(tr) for ch, tr in src.items()}
+        source_key = (str(getattr(self.controller, 'experiment_dir', '')), tuple(src))
+        if force_reload or not self._transforms or source_key != self._transforms_source:
+            saved = {} if force_reload else self.state.saved_transforms
+            self._transforms = self._build_transforms(src, saved)
+            self._transforms_source = source_key
+            self._snapshot_transforms()
 
-        # Also sync state.channel_transform_params for downstream use
-        self.state.channel_transform_params = _read_transforms_from_experiment(
-            self.controller
-        )
-
-        # pnn list
         self._pnn = self.controller.experiment.settings.get(
             'unmixed', {}
         ).get('event_channels_pnn', [])
@@ -3186,55 +2884,13 @@ class TransformTab(QWidget):
         if not self._transforms:
             return
 
-        # Restore any previously computed auto-transform W values
-        self._load_computed_transforms()
-        skip = {'ribbon', 'Time', 'event_id'}
-        # Order by the cytometer's own PNN order (self._pnn, set
-        # just above) -- the same order the Spectral Process tab uses --
-        # rather than self._transforms' dict order, which reflects
-        # however the experiment file happened to store the transforms
-        # and can drift out of PNN order. Anything in self._transforms
-        # but not in self._pnn (shouldn't normally happen) is appended at
-        # the end rather than silently dropped.
-        pnn_order = [ch for ch in self._pnn if ch in self._transforms and ch not in skip]
-        remaining = [ch for ch in self._transforms if ch not in skip and ch not in pnn_order]
-        all_channels = pnn_order + remaining
-        # Transforms tab always shows every channel — channel selection
-        # for DR/clustering happens later, in Configuration.
-        channels = all_channels
-
-        # Repopulate channel list
-        self.channel_list.blockSignals(True)
-        prev = self.channel_list.currentItem()
-        prev_channel = prev.data(Qt.UserRole) if prev else None
-        self.channel_list.clear()
-        labels = _antigen_dash_labels(self.controller)
-        for ch in channels:
-            item = QListWidgetItem(labels.get(ch, ch))
-            item.setData(Qt.UserRole, ch)
-            self.channel_list.addItem(item)
-        self.channel_list.blockSignals(False)
-
-        # Update all biplot tiles with the new channel list
-        # Add a default first tile if none exist yet
-        if not self._biplot_tiles:
-            self._add_biplot()
-        for tile in self._biplot_tiles:
-            tile.set_channels(channels)
+        # The Transforms tab always shows every channel (in PNN order);
+        # channel selection for DR/clustering happens in Configuration.
+        self.show_channels()
+        self.redraw_all()
 
         # Load data (deferred so load_sample has finished)
         self._load_preview_data()
-
-        # Restore / default channel selection
-        restored = False
-        if prev_channel and prev_channel in channels:
-            for i in range(self.channel_list.count()):
-                if self.channel_list.item(i).data(Qt.UserRole) == prev_channel:
-                    self.channel_list.setCurrentRow(i)
-                    restored = True
-                    break
-        if not restored and channels:
-            self.channel_list.setCurrentRow(0)
 
         QTimer.singleShot(50, self._redraw_plots)
 
@@ -3266,7 +2922,6 @@ class TransformTab(QWidget):
 
             selected_gates = self.state.selected_gates
             if selected_gates and selected_gates != ['root']:
-                _n_in = len(event_data)
                 try:
                     cytometry_dict = dict(self.controller.data_for_cytometry_plots_unmixed)
                     cytometry_dict['event_data'] = event_data.copy()
@@ -3292,599 +2947,75 @@ class TransformTab(QWidget):
         self.state.selected_gates = list(gates)
         self._load_preview_data()
 
-    # ------------------------------------------------------------------
-    # Channel selection
-    # ------------------------------------------------------------------
-
-    def _on_channel_item_changed(self, current, previous):
-        """Bridge from the QListWidgetItem (display label) to the raw
-        channel name stored in its UserRole data."""
-        channel = current.data(Qt.UserRole) if current else None
-        self._on_channel_selected(channel)
-
-    def _on_channel_selected(self, channel: str):
-        if not channel or channel not in self._transforms:
-            return
-        self._active_channel = channel
-        tr = self._transforms[channel]
-        self.xform_type_label.setText(self._XFORM_LABELS.get(tr.id, str(tr.id)))
-
-        self._configure_hist_axes()
-        self._configure_tile_axes_all()
-        self._schedule_redraw()
-
-    def _set_active_channel_from_tile(self, channel: str):
-        """
-        A BiplotTile's x-axis InteractiveLabel was clicked.  x is
-        the tab's shared active channel, so route through the left-hand
-        channel_list selection (same path a manual list click takes) --
-        that already fires _on_channel_selected, which updates the 1-D
-        histogram axis and every tile's axes together.
-        """
-        for i in range(self.channel_list.count()):
-            if self.channel_list.item(i).data(Qt.UserRole) == channel:
-                self.channel_list.setCurrentRow(i)
-                return
-
-    # ------------------------------------------------------------------
-    # M parameter — cytometer-specific, derived from $PnR
-    # ------------------------------------------------------------------
-
-    def _compute_M(self) -> float:
-        """
-        Compute M (logicle decades) from the cytometer's ADC range.
-        M = log10(magnitude_ceiling) − 1.
-
-        Per the Gating-ML spec the top-of-scale decade is excluded from M
-        (e.g. a 1 × 10⁶ instrument → M = 5, not 6).  magnitude_ceiling is
-        the max $PnR value across fluorescence channels stored at import time.
-        """
-        try:
-            ceiling = self.controller.experiment.settings['raw']['magnitude_ceiling']
-            if ceiling and ceiling > 0:
-                return math.log10(float(ceiling)) - 1.0
-        except (KeyError, TypeError, ValueError):
-            pass
-        return 4.5   # fall back to Honeychrome default
-
-    # ------------------------------------------------------------------
-    # Biplot tile management
-    # ------------------------------------------------------------------
-
-    def _available_channels(self) -> list[str]:
-        skip = {'ribbon', 'Time', 'event_id'}
-        all_ch = [ch for ch in self._transforms if ch not in skip]
-        sel = self.state.selected_channels
-        return [ch for ch in all_ch if ch in sel] if sel else all_ch
-
-    def eventFilter(self, obj, event):
-        """Debounce tile reflow when the biplot scroll viewport is resized."""
-        if obj is self._biplot_scroll.viewport() and event.type() == QEvent.Resize:
-            if event.oldSize().width() != event.size().width():
-                self._tile_relayout_timer.start()
-        return super().eventFilter(obj, event)
-
-    def _relayout_tiles(self):
-        """Place biplot tiles into the grid, wrapping based on available width."""
-        # Remove all from grid without deleting
-        for i in range(self._biplot_grid.count()):
-            item = self._biplot_grid.itemAt(i)
-            if item and item.widget():
-                self._biplot_grid.removeWidget(item.widget())
-
-        tile_size = hc_settings.cytometry_plot_width_target_retrieved
-        available_w = self._biplot_scroll.viewport().width() or (tile_size + 4)
-        cols = max(1, available_w // (tile_size + 4))
-
-        for n, tile in enumerate(self._biplot_tiles):
-            row, col = divmod(n, cols)
-            self._biplot_grid.addWidget(tile, row, col)
-
-        # Update scroll area height to fit all rows
-        n_rows = max(1, (len(self._biplot_tiles) + cols - 1) // cols) if self._biplot_tiles else 1
-        self._biplot_scroll.setMinimumHeight(
-            min(n_rows, 2) * (tile_size + 30) + 10
-        )
-
-    def _add_biplot(self):
-        """Add a new BiplotTile to the grid."""
-        channels = self._available_channels()
-        used_y = {t.y_channel() for t in self._biplot_tiles}
-        x_ch = self._active_channel or (channels[0] if channels else '')
-        candidates = [ch for ch in channels if ch != x_ch and ch not in used_y]
-        default_y = candidates[0] if candidates else (
-            channels[1] if len(channels) > 1 else (channels[0] if channels else '')
-        )
-
-        tile = BiplotTile(self._rgba_lut, parent_tab=self)
-        tile.set_channels(channels, y_channel=default_y)
-        self._biplot_tiles.append(tile)
-        self._relayout_tiles()
-        self._configure_tile_axes(tile)
-        self._draw_tile(tile)
-
-    def _remove_biplot(self):
-        """Remove the last BiplotTile."""
-        if not self._biplot_tiles:
-            return
-        tile = self._biplot_tiles.pop()
-        self._biplot_grid.removeWidget(tile)
-        tile.deleteLater()
-        self._relayout_tiles()
-
-    def _configure_tile_axes(self, tile: 'BiplotTile'):
-        """Configure axes and labels on a single tile."""
-        x_ch = self._active_channel
-        y_ch = tile.y_channel()
-        if not x_ch or not y_ch:
-            return
-        if x_ch not in self._transforms or y_ch not in self._transforms:
-            return
-        labels = _antigen_dash_labels(self.controller)
-        tile.configure_axes(self._transforms[x_ch], self._transforms[y_ch],
-                            x_label=labels.get(x_ch, x_ch), y_label=labels.get(y_ch, y_ch))
-        tile.set_x_selected(x_ch)   # keep menu highlight in sync
-
-    def _configure_tile_axes_all(self):
-        for tile in self._biplot_tiles:
-            self._configure_tile_axes(tile)
-
-    def _configure_hist_axes(self):
-        """Set ZoomAxis ticks/limits for the 1-D histogram x-axis.
-        Must call setTicks() before setXRange() so real-value labels
-        are shown immediately, not pyqtgraph auto-generated floats."""
-        ch = self._active_channel
-        if not ch or ch not in self._transforms:
-            return
-        tr = self._transforms[ch]
-        if tr.ticks is None:
-            return
-        ticks = tr.ticks()
-        if ticks:
-            self._hist_axis_x.setTicks(ticks)
-        self._hist_axis_x.zoomZero = tr.zero
-        self._hist_axis_x.fullRange = (0, 1.1)
-        self._hist_axis_x.limits = tuple(tr.limits)
-        self._hist_vb.setXRange(tr.limits[0], tr.limits[1], padding=0)
-
-    def _draw_tile(self, tile: 'BiplotTile'):
-        """Compute and render heatmap for a single tile."""
-        x_ch = self._active_channel
-        y_ch = tile.y_channel()
-        if (not x_ch or not y_ch or x_ch == y_ch
-                or x_ch not in self._transforms or y_ch not in self._transforms
-                or x_ch not in self._raw_data or y_ch not in self._raw_data):
-            tile.clear()
-            return
-        tr_x = self._transforms[x_ch]
-        tr_y = self._transforms[y_ch]
-        raw_x = self._raw_data[x_ch]
-        raw_y = self._raw_data[y_ch]
-        try:
-            heatmap, _, _ = np.histogram2d(raw_x, raw_y,
-                                            bins=[tr_x.scale, tr_y.scale])
-        except Exception as e:
-            print(f"[DR Plugin] biplot histogram2d error ({x_ch} vs {y_ch}): {e}")
-            tile.clear()
-            return
-        try:
-            cutoff = hc_settings.density_cutoff_retrieved
-        except Exception:
-            cutoff = 1
-        heatmap[heatmap < cutoff] = 0
-        tile.draw(heatmap, tr_x, tr_y)
-
-    def _apply_tile_zoom(self, tile: 'BiplotTile', axis_name: str):
-        """Axis-drag zoom for a tile — mirrors CytometryPlotWidget.apply_zoom."""
-        if axis_name == 'x':
-            axis   = tile._axis_x
-            channel = self._active_channel
-            vb_set  = tile._vb.setXRange
-            vb_range_idx = 0
-            factor_flip  = False
-        else:
-            axis   = tile._axis_y
-            channel = tile.y_channel()
-            vb_set  = tile._vb.setYRange
-            vb_range_idx = 1
-            factor_flip  = True
-
-        if not channel or channel not in self._transforms:
-            return
-        if axis._pending_delta == 0:
-            return
-        step = axis._pending_delta
-        axis._pending_delta = 0
-        if abs(step) < 1:
-            return
-
-        zoom_rate = 1.04
-        factor = (1 / zoom_rate) if step > 0 else zoom_rate
-        if factor_flip:
-            factor = 1 / factor
-
-        tr = self._transforms[channel]
-        vmin, vmax = tile._vb.viewRange()[vb_range_idx]
-        map_pos = (tile._vb.mapToView(axis.initial_pos).x()
-                   if axis_name == 'x' and axis.initial_pos else
-                   tile._vb.mapToView(axis.initial_pos).y()
-                   if axis.initial_pos else 0.5)
-
-        if tr.id == 1:   # logicle: lower half → W, upper half → zoom
-            if map_pos < 0.5 * vmax:
-                tr.logicle_w = max(0.01, tr.logicle_w / factor)
-                tr.set_transform()
-            else:
-                new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
-                new_min = (vmin - axis.zoomZero) * factor + axis.zoomZero
-                if new_max < axis.fullRange[1] * 1.01:
-                    vb_set(new_min, new_max, padding=0)
-                axis.limits = (new_min, new_max)
-                tr.set_transform(limits=list(axis.limits))
-        else:
-            new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
-            new_min = (vmin - axis.zoomZero) * factor + axis.zoomZero
-            if new_max < axis.fullRange[1] * 1.01:
-                vb_set(new_min, new_max, padding=0)
-            axis.limits = (new_min, new_max)
-            tr.set_transform(limits=list(axis.limits))
-
-        axis.zoomZero = tr.zero
-        if tr.ticks:
-            axis.setTicks(tr.ticks())
-        # Keep all tiles that share this channel consistent
-        for other in self._biplot_tiles:
-            if other is not tile:
-                if axis_name == 'x' and self._active_channel == channel:
-                    if other._transforms if hasattr(other, '_transforms') else True:
-                        self._configure_tile_axes(other)
-        # Also sync hist x-axis if the active channel was changed
-        if channel == self._active_channel:
-            self._configure_hist_axes()
-        self._sync_transform_to_state(channel, tr)
-        self._schedule_redraw()
-
-    def _apply_hist_zoom(self):
-        """Called by hist x-axis ZoomAxis timer — adjusts W (lower half) or limits (upper)."""
-        ch = self._active_channel
-        if not ch or ch not in self._transforms:
-            return
-        axis = self._hist_axis_x
-        if axis._pending_delta == 0:
-            return
-        step = axis._pending_delta
-        axis._pending_delta = 0
-        if abs(step) < 1:
-            return
-
-        zoom_rate = 1.04
-        factor = (1 / zoom_rate) if step > 0 else zoom_rate
-
-        tr = self._transforms[ch]
-        vmin, vmax = self._hist_vb.viewRange()[0]
-        map_pos = self._hist_vb.mapToView(axis.initial_pos).x() if axis.initial_pos else 0.5
-
-        if tr.id == 1:
-            if map_pos < 0.5 * vmax:
-                tr.logicle_w = max(0.01, tr.logicle_w / factor)
-                tr.set_transform()
-            else:
-                new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
-                new_min = (vmin - axis.zoomZero) * factor + axis.zoomZero
-                if new_max < axis.fullRange[1] * 1.01:
-                    self._hist_vb.setXRange(new_min, new_max, padding=0)
-                axis.limits = (new_min, new_max)
-                tr.set_transform(limits=list(axis.limits))
-        else:
-            new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
-            new_min = (vmin - axis.zoomZero) * factor + axis.zoomZero
-            if new_max < axis.fullRange[1] * 1.01:
-                self._hist_vb.setXRange(new_min, new_max, padding=0)
-            axis.limits = (new_min, new_max)
-            tr.set_transform(limits=list(axis.limits))
-
-        axis.zoomZero = tr.zero
-        if tr.ticks:
-            axis.setTicks(tr.ticks())
-        self._sync_transform_to_state(ch, tr)
-        # Keep all biplot tiles that use this channel on x-axis in sync
-        self._configure_tile_axes_all()
-        self._schedule_redraw()
-
-    def _sync_transform_to_state(self, channel: str, tr: 'Transform'):
-        """Push updated W back into state.channel_transform_params."""
-        if channel in self.state.channel_transform_params:
-            self.state.channel_transform_params[channel]['W'] = tr.logicle_w
-
-    def _schedule_redraw(self):
-        self._redraw_timer.start()
-
-    def _redraw_plots(self):
-        self._draw_histogram()
-        for tile in self._biplot_tiles:
-            self._draw_tile(tile)
-
-    def _draw_histogram(self):
-        """Update 1-D histogram in-place using Transform.step_scale."""
-        ch = self._active_channel
-        if not ch or ch not in self._transforms or ch not in self._raw_data:
-            self._hist_curve.setData([], [])
-            return
-
-        tr = self._transforms[ch]
-        raw = self._raw_data[ch]
-
-        # Bin raw events into the transform's scale bins (same as CytometryPlotWidget)
-        try:
-            count, _ = np.histogram(raw, bins=tr.scale)
-        except Exception:
-            self._hist_curve.setData([], [])
-            return
-
-        # step_scale has len = scale_bins + 2; count has len = scale_bins + 1
-        # PlotDataItem with stepMode='center' needs x and y the same length
-        self._hist_curve.setData(tr.step_scale, count)
-        self._configure_hist_axes()
-
-    # ------------------------------------------------------------------
-    # CSV import / export
-    # ------------------------------------------------------------------
-
-    def _save_transforms_csv(self):
-        """
-        Export current local transform parameters to a CSV file.
-        Columns: channel, id, T, W, M, A
-        id codes: 0=linear, 1=logicle, 2=log
-        """
-        if not self._transforms:
-            QMessageBox.information(self, "Save Transforms",
-                                    "No transforms loaded yet.")
-            return
-
-        default_dir = str(getattr(self.controller, 'experiment_dir', ''))
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Transforms CSV", default_dir,
-            "CSV files (*.csv);;All files (*)"
-        )
-        if not path:
-            return
-        path = _with_extension(path, '.csv')
-
-        skip = {'ribbon', 'Time', 'event_id'}
-        rows = []
-        for ch, tr in self._transforms.items():
-            if ch in skip:
-                continue
-            rows.append({
-                'channel': ch,
-                'id':      tr.id,
-                'T':       tr.scale_t,
-                'W':       round(tr.logicle_w, 6),
-                'M':       round(tr.logicle_m, 6),
-                'A':       round(tr.logicle_a, 6),
-            })
-
-        try:
-            with open(path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=['channel', 'id', 'T', 'W', 'M', 'A'])
-                writer.writeheader()
-                writer.writerows(rows)
-            QMessageBox.information(
-                self, "Save Transforms",
-                f"Saved {len(rows)} channels to:\n{path}"
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", str(e))
-
-    def _load_transforms_csv(self):
-        """
-        Import transform parameters from a CSV file.
-
-        Validation:
-          • Required columns: channel, W  (T, M, A, id are optional)
-          • Only channels present in the current experiment are updated;
-            unrecognised channel names are reported and skipped.
-          • W must satisfy 0 ≤ W ≤ M/2; values outside this range are clamped.
-          • T must be > 0 if provided.
-
-        After loading, the local Transform objects are updated and plots redrawn.
-        Nothing is written back to the experiment.
-        """
-        default_dir = str(getattr(self.controller, 'experiment_dir', ''))
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Transforms CSV", default_dir,
-            "CSV files (*.csv);;All files (*)"
-        )
-        if not path:
-            return
-
-        try:
-            with open(path, newline='', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-        except Exception as e:
-            QMessageBox.critical(self, "Load Error", f"Could not read CSV:\n{e}")
-            return
-
-        if not rows:
-            QMessageBox.warning(self, "Load Transforms", "CSV file is empty.")
-            return
-
-        required_cols = {'channel', 'W'}
-        if not required_cols.issubset(set(rows[0].keys())):
-            QMessageBox.critical(
-                self, "Load Transforms",
-                f"CSV must contain at least columns: {sorted(required_cols)}\n"
-                f"Found: {sorted(rows[0].keys())}"
-            )
-            return
-
-        known_channels = set(self._transforms.keys())
-        updated, skipped_unknown, skipped_invalid = [], [], []
-
-        for row in rows:
-            ch = (row.get('channel') or '').strip()
-            if not ch:
-                continue
-            if ch not in known_channels:
-                skipped_unknown.append(ch)
-                continue
-
-            tr = self._transforms[ch]
+    @staticmethod
+    def _build_transforms(src: dict, saved: dict) -> dict:
+        """Copies of the Transform objects in *src*, set to the parameters in
+        *saved* where there are any."""
+        out = {}
+        for ch, tr in src.items():
             try:
-                W = float(row['W'])
-            except (ValueError, KeyError):
-                skipped_invalid.append(f"{ch} (W invalid)")
-                continue
+                out[ch] = (transform_from_params(saved[ch], template=tr)
+                           if saved.get(ch) else deepcopy(tr))
+            except Exception:
+                out[ch] = deepcopy(tr)
+        return out
 
-            # Apply optional columns
-            if 'T' in row and row['T'].strip():
-                try:
-                    T = float(row['T'])
-                    if T > 0:
-                        tr.scale_t = T
-                except ValueError:
-                    pass
+    def _store_transform(self, channel: str, tr: 'Transform'):
+        """Record one channel's transform in the shared state, where the
+        other tabs read it and from where it is saved."""
+        params = _transform_params(tr)
+        self.state.saved_transforms[channel] = params
+        self.state.channel_transform_params.update(
+            _channel_transform_params_from({channel: params}))
 
-            if 'M' in row and row['M'].strip():
-                try:
-                    M = float(row['M'])
-                    if M > 0:
-                        tr.logicle_m = M
-                except ValueError:
-                    pass
-
-            if 'A' in row and row['A'].strip():
-                try:
-                    tr.logicle_a = float(row['A'])
-                except ValueError:
-                    pass
-
-            if 'id' in row and row['id'].strip():
-                try:
-                    tr.id = int(row['id'])
-                except ValueError:
-                    pass
-
-            # Clamp W to valid range: 0 ≤ W ≤ M/2
-            M_eff = tr.logicle_m
-            W = max(0.0, min(M_eff / 2.0, W))
-            tr.logicle_w = round(W, 6)
-
-            try:
-                tr.set_transform()
-            except Exception as e:
-                skipped_invalid.append(f"{ch} (set_transform failed: {e})")
-                continue
-
-            self._sync_transform_to_state(ch, tr)
-            updated.append(ch)
-
-        # Report
-        msg_parts = [f"Updated {len(updated)} channel(s)."]
-        if skipped_unknown:
-            msg_parts.append(
-                f"\nSkipped {len(skipped_unknown)} unrecognised channel(s):\n"
-                + ", ".join(skipped_unknown[:10])
-                + (" …" if len(skipped_unknown) > 10 else "")
-            )
-        if skipped_invalid:
-            msg_parts.append(
-                f"\nSkipped {len(skipped_invalid)} invalid row(s):\n"
-                + ", ".join(skipped_invalid[:10])
-            )
-        QMessageBox.information(self, "Load Transforms", "".join(msg_parts))
-
-        if updated:
-            self._configure_hist_axes()
-            self._configure_tile_axes_all()
-            self._schedule_redraw()
+    def _snapshot_transforms(self):
+        """Record every channel's transform in the shared state."""
+        self.state.saved_transforms = {
+            ch: _transform_params(tr) for ch, tr in self._transforms.items()}
+        self.state.channel_transform_params = _working_channel_transform_params(
+            self.controller, self.state.saved_transforms)
+        self.transformsPersistRequested.emit()
 
     # ------------------------------------------------------------------
     # Auto-transform (Parks & Moore) — over all training samples
     # ------------------------------------------------------------------
 
-    def _auto_transform_all(self):
+    def auto_transform_data(self):
         """
-        Compute optimal Logicle W for every Logicle channel using Parks & Moore,
-        pooling data across ALL selected training samples.
-
-        Formula: W = (M − log₁₀(T / |q|)) / 2
-        where q = 25th-percentile of the negative-event population across all
-        training samples combined.  This gives a more robust estimate than using
-        only the currently loaded sample, and ensures the transform is appropriate
-        for the whole dataset.
-
-        After computing W, the result is persisted to QSettings so it survives
-        experiment close/re-open.
+        Events for Auto-transform, pooled across ALL selected training
+        samples (a more robust estimate than the currently loaded sample
+        alone, and appropriate for the whole dataset); the currently loaded
+        sample when no training samples are selected.
         """
         training_paths = self._get_training_sample_full_paths()
         if not training_paths:
-            # Fall back to the currently loaded sample
             if self._raw_data:
-                training_data = {ch: [arr] for ch, arr in self._raw_data.items()}
-                source_note = "active sample only (no training samples selected)"
-            else:
-                QMessageBox.information(
-                    self, "Auto-Transform",
-                    "No training samples selected and no sample is currently loaded.\n"
-                    "Select training samples in the Configuration tab first."
-                )
-                return
-        else:
-            print(f"\n[DR TransformTab] Auto-transform: loading {len(training_paths)} training sample(s)…")
-            training_data = self._load_all_training_samples(training_paths)
-            source_note = f"{len(training_paths)} training sample(s)"
+                return ({ch: [arr] for ch, arr in self._raw_data.items()},
+                        "active sample only (no training samples selected)")
+            QMessageBox.information(
+                self, "Auto-Transform",
+                "No training samples selected and no sample is currently loaded.\n"
+                "Select training samples in the Configuration tab first."
+            )
+            return None, ''
+        print(f"\n[DR TransformTab] Auto-transform: loading {len(training_paths)} training sample(s)…")
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        QApplication.processEvents()
+        try:
+            pooled = self._load_all_training_samples(training_paths)
+        finally:
+            QApplication.restoreOverrideCursor()
+        return pooled, f"{len(training_paths)} training sample(s)"
 
-        M = self._compute_M()
-        print(f"[DR TransformTab] Auto-transform: M = {M:.4f},  source = {source_note}")
-        n_updated = 0
-
-        for ch, tr in self._transforms.items():
-            if tr.id != 1:
-                continue
-            arrays = training_data.get(ch, [])
-            if not arrays:
-                continue
-
-            # Pool all negative events across all training samples
-            negatives = np.concatenate([a[a < 0] for a in arrays if len(a[a < 0]) > 0]) \
-                if any(len(a[a < 0]) > 0 for a in arrays) else np.array([])
-
-            T = tr.scale_t
-
-            if len(negatives) == 0:
-                W = 0.5
-                print(f"  {ch}: no negatives in any training sample → W = {W}")
-            else:
-                q = np.percentile(negatives, 25)   # q < 0
-                try:
-                    W = (M - math.log10(T / abs(q))) / 2.0
-                except (ValueError, ZeroDivisionError):
-                    W = 0.5
-                W = max(0.0, min(M / 2.0, W))
-                print(f"  {ch}: n_neg={len(negatives):,}, q(25th)={q:.1f}, T={T} → W = {W:.4f}")
-
-            tr.logicle_w = round(W, 3)
-            tr.set_transform()
-            self._sync_transform_to_state(ch, tr)
-            n_updated += 1
-
-        # Persist the computed W values
-        self._save_computed_transforms()
-
-        if self._active_channel and self._active_channel in self._transforms:
-            self._configure_hist_axes()
-            self._configure_tile_axes_all()
-        self._schedule_redraw()
-
+    def _after_auto_transform(self, n_updated: int, source_note: str):
+        """Report the computed W values."""
         QMessageBox.information(
-            self, "Auto-Transform Preview",
+            self, "Auto-Transform",
             f"W computed for {n_updated} Logicle channel(s) from {source_note},\n"
             f"using the Parks & Moore method (lower-quarter quantile of negatives).\n\n"
-            f"Parameters saved and will be restored on next open.\n"
-            f"These are local previews only -- to change what the main "
-            f"Honeychrome plots use, drag the same axis there."
+            f"These transforms are kept with this analysis and are not written "
+            f"to the experiment.  Reload from experiment restores the "
+            f"transforms defined in Unmixed Data."
         )
 
     def _get_training_sample_full_paths(self) -> list[Path]:
@@ -3943,28 +3074,30 @@ class TransformTab(QWidget):
 
         whitelisted_pnn = self.controller.experiment.settings['raw'].get('whitelisted_pnn')
 
+        # Each sample is gated with its own gates (per-sample overrides and
+        # its own Time range), not those of the sample shown in the main window.
+        sample_gating = None
+        if selected_gates and selected_gates != ['root']:
+            sample_gating = SampleGating.from_controller(self.controller)
+            gating_pnn = list(self.controller.data_for_cytometry_plots_unmixed['pnn'])
+
         for path in full_paths:
             try:
                 sample = sample_from_fcs(path)
                 raw = sample.get_events(source='raw', col_order=whitelisted_pnn)
+                sample_key = sample_key_for_path(self.controller.experiment_dir, path)
 
                 # Replicate controller.load_sample unmixing (AF-corrected if
                 # an AF profile is active — see drc_pipeline.apply_unmixing_af_aware).
                 unmixed = drc_pipeline.apply_unmixing_af_aware(
-                    self.controller, raw,
-                    sample_key=sample_key_for_path(self.controller.experiment_dir, path),
+                    self.controller, raw, sample_key=sample_key,
                 )
 
                 # Apply gate(s) if selected
-                if selected_gates and selected_gates != ['root']:
+                if sample_gating is not None:
                     try:
-                        cytometry_dict = dict(
-                            self.controller.data_for_cytometry_plots_unmixed
-                        )
-                        cytometry_dict['event_data'] = unmixed.copy()
-                        unmixed = apply_gates_union_by_lookup_table(
-                            cytometry_dict, selected_gates
-                        )
+                        unmixed = unmixed[sample_gating.population_mask(
+                            sample_key, unmixed, gating_pnn, list(selected_gates))]
                     except Exception as e:
                         print(f"[DR TransformTab] Gating failed for {path.name}: {e}")
 
@@ -3977,61 +3110,6 @@ class TransformTab(QWidget):
                 print(f"[DR TransformTab] Failed to load {path}: {e}")
 
         return result
-
-    def _save_computed_transforms(self):
-        """
-        Persist the currently computed local Transform W values to QSettings,
-        keyed by experiment directory.  Called after auto-transform completes.
-        """
-        try:
-            exp_dir = str(self.controller.experiment_dir)
-            safe_key = exp_dir.replace('\\', '/').replace(':', '_').replace(' ', '_')
-            s = QSettings('honeychrome', _SETTINGS_APP_KEY)
-            s.beginGroup(safe_key)
-            computed = {
-                ch: round(tr.logicle_w, 6)
-                for ch, tr in self._transforms.items()
-                if tr.id == 1
-            }
-            s.setValue('computed_transform_W', repr(computed))
-            s.endGroup()
-            print(f"[DR TransformTab] Saved computed W for {len(computed)} channels")
-        except Exception as e:
-            print(f"[DR TransformTab] Could not save computed transforms: {e}")
-
-    def _load_computed_transforms(self):
-        """
-        Restore previously computed W values from QSettings and apply them
-        to the local Transform objects.  Called from refresh() after transforms
-        are loaded from the experiment.
-        """
-        try:
-            exp_dir = str(self.controller.experiment_dir)
-            safe_key = exp_dir.replace('\\', '/').replace(':', '_').replace(' ', '_')
-            s = QSettings('honeychrome', _SETTINGS_APP_KEY)
-            s.beginGroup(safe_key)
-            computed_repr = s.value('computed_transform_W', '')
-            s.endGroup()
-            if not computed_repr:
-                return
-            computed: dict[str, float] = eval(computed_repr)  # noqa: S307
-            M = self._compute_M()
-            n_restored = 0
-            for ch, W in computed.items():
-                if ch not in self._transforms:
-                    continue
-                tr = self._transforms[ch]
-                if tr.id != 1:
-                    continue
-                W = max(0.0, min(M / 2.0, float(W)))
-                tr.logicle_w = W
-                tr.set_transform()
-                self._sync_transform_to_state(ch, tr)
-                n_restored += 1
-            if n_restored:
-                print(f"[DR TransformTab] Restored computed W for {n_restored} channels")
-        except Exception as e:
-            print(f"[DR TransformTab] Could not restore computed transforms: {e}")
 
 
 class _ResultsDrawWorker(QThread):
@@ -4111,6 +3189,10 @@ class GroupsStatsTab(QWidget):
         # a fresh Figure/DataFrame for any open result without duplicating
         # the maker logic -- see get_report_items().
         self._results_registry: dict[str, dict] = {}
+        # Automatic Suggest Groupings: the sample list it last ran for (it
+        # runs once per list) and the state to restore on Undo.
+        self._auto_groupings_key = None
+        self._auto_groupings_undo = None
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -4253,14 +3335,34 @@ class GroupsStatsTab(QWidget):
         csv_row.addWidget(self._group_count_label)
         table_box_layout.addLayout(csv_row)
 
+        auto_row = QHBoxLayout()
+        self._auto_groupings_label = QLabel()
+        self._auto_groupings_label.setWordWrap(True)
+        self._auto_groupings_label.setStyleSheet("color: grey; font-style: italic;")
+        self._auto_groupings_undo_btn = QPushButton("Undo")
+        self._auto_groupings_undo_btn.setToolTip("Remove the groups and pairing applied from the sample names.")
+        self._auto_groupings_undo_btn.clicked.connect(self._undo_auto_groupings)
+        auto_row.addWidget(self._auto_groupings_label, stretch=1)
+        auto_row.addWidget(self._auto_groupings_undo_btn)
+        self._auto_groupings_label.setVisible(False)
+        self._auto_groupings_undo_btn.setVisible(False)
+        table_box_layout.addLayout(auto_row)
+
         # Table: Sample | Group | [covariate columns...] -- column count is
         # dynamic (one per state.covariates column, added via '+ Add
         # Column' or CSV import). Never includes single-stain/unstained
         # controls (see _non_control_sample_paths).
         self.table = QTableWidget(0, 2)
+        self._table_header = CheckableHeaderView(
+            self.table, check_label="Numeric",
+            tooltip="Enter this covariate as a continuous number (e.g. age, CRP) instead of "
+                    "as categories. Every value must be a number.")
+        self.table.setHorizontalHeader(self._table_header)
+        self._table_header.check_toggled.connect(self._on_covariate_numeric_toggled)
         self.table.setHorizontalHeaderLabels(['Sample', 'Group'])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.setTextElideMode(Qt.ElideMiddle)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -4366,9 +3468,9 @@ class GroupsStatsTab(QWidget):
         self.adjust_covariates_list.setSelectionMode(QAbstractItemView.NoSelection)
         self.adjust_covariates_list.setToolTip(
             "Covariate columns from the table above to include in every "
-            "test's model (e.g. age, sex, batch). Columns whose values are "
-            "all numbers are fitted as continuous terms; anything else as "
-            "categories. Every tested sample needs a value. The pairing "
+            "test's model (e.g. age, sex, batch). Columns ticked Numeric "
+            "in the table above are fitted as continuous terms; anything "
+            "else as categories. Every tested sample needs a value. The pairing "
             "variable is already in the model when 'Paired design' is on."
         )
         self.adjust_covariates_list.itemChanged.connect(self._on_adjust_covariate_changed)
@@ -4989,10 +4091,17 @@ class GroupsStatsTab(QWidget):
             return
         self.state.group_names.append(name)
         self._group_colour(name)   # seed a default colour immediately
+        # A new group is ticked in 'Groups to Test' straight away. An empty
+        # selection already means "every group", so only extend a real one.
+        if self.state.testing_group_selection:
+            self.state.testing_group_selection.append(name)
         self._populate_groups_table()
         self._refresh_group_combos()
         self._refresh_compare_combos()
+        self._populate_test_groups_list()
+        self._last_stats_data_key = None
         self._update_group_count_label()
+        self._update_run_button()
 
     def _remove_selected_group(self):
         row = self.groups_table.currentRow()
@@ -5018,10 +4127,18 @@ class GroupsStatsTab(QWidget):
             self.state.compare_group_a = ''
         if self.state.compare_group_b == name:
             self.state.compare_group_b = ''
+        self.state.testing_group_selection = [
+            g for g in self.state.testing_group_selection if g != name
+        ]
+        if self.state.reference_group == name:
+            self.state.reference_group = ''
         self.state.invalidate_trex()
         self._populate_groups_table()
         self._populate_table()
         self._refresh_compare_combos()
+        self._populate_test_groups_list()
+        self._last_stats_data_key = None
+        self._update_group_count_label()
         self._update_run_button()
 
     def _refresh_group_combos(self):
@@ -5165,8 +4282,7 @@ class GroupsStatsTab(QWidget):
         self.adjust_covariates_list.blockSignals(True)
         self.adjust_covariates_list.clear()
         for col in cols:
-            values = self.state.covariates[col].tolist()
-            kind = drc_stats.covariate_kind(values)
+            kind = 'numeric' if col in self.state.numeric_covariates else 'categorical'
             item = QListWidgetItem(f"{col}  ({kind})")
             item.setData(Qt.UserRole, col)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -5364,6 +4480,7 @@ class GroupsStatsTab(QWidget):
 
         matched = self._scoped_sample_groups()
         self._populate_table(matched)
+        self._maybe_auto_suggest_groupings()
         self._populate_run_combo()
         self._sync_composition_to_run()
         self._populate_trex_dr_combo()
@@ -5487,21 +4604,23 @@ class GroupsStatsTab(QWidget):
         )
         self.table.setColumnCount(2 + len(covariate_cols))
         self.table.setHorizontalHeaderLabels(['Sample', 'Group'] + covariate_cols)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        # ResizeToContents both locks the column against manual drag and
-        # sizes off each QComboBox's sizeHint(), which is only measured
-        # once on first show -- so it can end up narrower than the longest
-        # group name, and shrinks further on every rebuild (e.g. after
-        # auto-assign). Size it explicitly from font metrics instead, then
-        # leave it Interactive so it stops auto-shrinking and the user can
-        # still drag it themselves.
+        # Every column is Interactive so it can be dragged to any width, and
+        # the table scrolls sideways when the columns are wider than the
+        # view. Initial widths come from font metrics rather than from the
+        # cell widgets' size hints, which are only measured on first show.
         opts = self._group_options()
         fm = self.table.fontMetrics()
         longest_opt_width = max((fm.horizontalAdvance(o) for o in opts), default=0)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        longest_name_width = max(
+            (fm.horizontalAdvance(Path(sp).name) for sp in sample_groups), default=0)
+        self.table.setColumnWidth(0, min(longest_name_width + 24, SAMPLE_COLUMN_MAX_WIDTH))
         self.table.setColumnWidth(1, longest_opt_width + 40)  # padding for combo chrome/arrow
-        for c in range(2, 2 + len(covariate_cols)):
-            self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        for c, col_name in enumerate(covariate_cols, start=2):
+            self.table.setColumnWidth(
+                c, max(COVARIATE_COLUMN_MIN_WIDTH, fm.horizontalAdvance(col_name) + 32))
+        self._table_header.set_checks(
+            {c: col_name in self.state.numeric_covariates
+             for c, col_name in enumerate(covariate_cols, start=2)})
 
         self.table.setRowCount(0)
         for sample_path, group in sorted(
@@ -5543,6 +4662,26 @@ class GroupsStatsTab(QWidget):
         self.table.setMinimumHeight(28 * n_rows + 40)
         self._update_group_count_label()
 
+    def _on_covariate_numeric_toggled(self, section: int, checked: bool):
+        """Enter the covariate under *section* as a continuous number (or as
+        categories). A column holding text cannot be numeric."""
+        name = self.table.horizontalHeaderItem(section).text()
+        if checked and self.state.covariates is not None and name in self.state.covariates.columns:
+            filled = [v for v in self.state.covariates[name].astype(str).str.strip() if v]
+            if filled and drc_stats.covariate_kind(filled) != 'numeric':
+                QMessageBox.warning(
+                    self, "Numeric covariate",
+                    f"'{name}' has values that are not numbers, so it cannot be numeric.")
+                self._table_header.set_checks(
+                    {c: self.table.horizontalHeaderItem(c).text() in self.state.numeric_covariates
+                     for c in self._table_header.checks()})
+                return
+        self.state.numeric_covariates = [c for c in self.state.numeric_covariates if c != name]
+        if checked:
+            self.state.numeric_covariates.append(name)
+        self._populate_adjust_covariates_list()
+        self._last_stats_data_key = None
+
     def _add_covariate_column(self):
         """Add a new covariate/pairing column directly in-app -- fill it
         in per sample below, then select it as 'Pairing variable'."""
@@ -5583,6 +4722,7 @@ class GroupsStatsTab(QWidget):
         if reply != QMessageBox.Yes:
             return
         self.state.covariates = self.state.covariates.drop(columns=[name])
+        self.state.numeric_covariates = [c for c in self.state.numeric_covariates if c != name]
         if self.state.pairing_variable == name:
             self.state.pairing_variable = ''
             if self.state.paired:
@@ -5594,14 +4734,11 @@ class GroupsStatsTab(QWidget):
 
     def _suggest_groupings(self):
         """
-        Scan on-screen sample names (and, when the experiment's Sample
-        name source setting differs from plain filenames, the
-        FCS-keyword-derived display name already computed at import time
-        -- see experiment_model.py) for repeated, delimiter-separated
-        tokens, and offer to populate the Group column and/or add
-        covariate/pairing columns from what's found. Pure string
-        processing over already-loaded sample paths -- no disk I/O, runs
-        synchronously on the main thread.
+        Scan the on-screen sample names (and, when the experiment's Sample
+        name source is not the filename, the display names computed at
+        import) for repeated, delimiter-separated tokens, and let the user
+        choose which to apply as the Group column or as covariate/pairing
+        columns.
         """
         sample_paths = self._table_sample_paths()
         if len(sample_paths) < 2:
@@ -5611,139 +4748,82 @@ class GroupsStatsTab(QWidget):
             )
             return
         display_names = self.controller.experiment.samples.get('all_samples', {})
-        result = drc_stats.suggest_covariates_from_names(sample_paths, display_names)
+        result = suggest_groupings_from_names(sample_paths, display_names)
         if not result['suggestions']:
-            msg = "No repeated naming patterns were found across these sample names."
-            if result['irregular_samples']:
-                msg += (f"\n\n{len(result['irregular_samples'])} sample name(s) have an "
-                        "unusual structure and couldn't be compared.")
-            QMessageBox.information(self, "Suggest Groupings", msg)
+            QMessageBox.information(self, "Suggest Groupings", sgd.no_suggestion_message(result))
             return
-        self._show_suggestion_dialog(result, sample_paths)
+        chosen = sgd.choose_groupings(self, result)
+        if chosen:
+            self._apply_groupings(chosen, sample_paths)
+            self._show_auto_groupings_note(None)
 
-    def _show_suggestion_dialog(self, result: dict, sample_paths: list[str]):
+    def _maybe_auto_suggest_groupings(self):
         """
-        Lets the user review, rename, and select which detected naming
-        patterns to apply as the Group column and/or new covariate
-        columns. Built fresh each call -- no persistent state here beyond
-        what gets written into self.state on Apply.
+        Apply groupings suggested from the sample names when none of the
+        on-screen samples has a group yet: the detected group, and the
+        detected pairing variable (selected for a paired design). Runs once
+        per sample list and never overwrites existing assignments; the note
+        above the table says what was applied and offers Undo.
         """
-        from PySide6.QtWidgets import QDialog, QDialogButtonBox
-
-        suggestions = result['suggestions']
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Suggest Groupings")
-        dlg.setMinimumWidth(720)
-        layout = QVBoxLayout(dlg)
-
-        hint = QLabel(
-            "Detected repeated naming patterns across the samples in the table "
-            "below. Tick the ones to apply, adjust role/column name if needed, "
-            "then Apply."
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        if result['irregular_samples']:
-            warn = QLabel(
-                f"{len(result['irregular_samples'])} sample(s) have a different "
-                "naming structure and are excluded from every suggestion below."
-            )
-            warn.setWordWrap(True)
-            warn.setStyleSheet("color: grey; font-style: italic;")
-            layout.addWidget(warn)
-
-        table = QTableWidget(len(suggestions), 5)
-        table.setHorizontalHeaderLabels(
-            ['Use', 'Detected field', 'Role', 'Column / group name', 'Example values']
-        )
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        table.verticalHeader().setVisible(False)
-
-        role_labels = {'group': 'Group', 'pairing': 'Pairing/covariate', 'covariate': 'Covariate'}
-        for row, sug in enumerate(suggestions):
-            chk = QTableWidgetItem()
-            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            chk.setCheckState(Qt.Checked if sug['role_guess'] in ('group', 'pairing') else Qt.Unchecked)
-            table.setItem(row, 0, chk)
-
-            field_item = QTableWidgetItem(sug['field_name'])
-            field_item.setFlags(Qt.ItemIsEnabled)
-            table.setItem(row, 1, field_item)
-
-            role_combo = QComboBox()
-            role_combo.addItems(['Group', 'Pairing/covariate', 'Covariate'])
-            role_combo.setCurrentText(role_labels[sug['role_guess']])
-            table.setCellWidget(row, 2, role_combo)
-
-            default_name = ('Group' if sug['role_guess'] == 'group'
-                            else f"field_{sug['position'] + 1}")
-            table.setItem(row, 3, QTableWidgetItem(default_name))
-
-            examples_item = QTableWidgetItem(', '.join(sug['examples']))
-            examples_item.setFlags(Qt.ItemIsEnabled)
-            table.setItem(row, 4, examples_item)
-
-        layout.addWidget(table)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Cancel)
-        buttons.rejected.connect(dlg.reject)
-        apply_btn = buttons.button(QDialogButtonBox.Apply)
-        apply_btn.clicked.connect(
-            lambda: self._apply_suggestions(dlg, table, suggestions, sample_paths)
-        )
-        layout.addWidget(buttons)
-
-        dlg.exec()
-
-    def _apply_suggestions(self, dlg, table, suggestions: list[dict], sample_paths: list[str]):
-        """
-        Writes the checked rows from the Suggest Groupings dialog into
-        state: at most one 'Group' role overwrites state.group_names /
-        state.sample_groups for the on-screen samples only (with
-        confirmation, same precedent as Auto-assign by pattern); any
-        number of 'Pairing/covariate' or 'Covariate' rows are written
-        into state.covariates, one column each.
-        """
-        role_map = {'Group': 'group', 'Pairing/covariate': 'pairing', 'Covariate': 'covariate'}
-
-        chosen = []
-        for row, sug in enumerate(suggestions):
-            if table.item(row, 0).checkState() != Qt.Checked:
-                continue
-            role = role_map[table.cellWidget(row, 2).currentText()]
-            name = table.item(row, 3).text().strip()
-            if not name:
-                QMessageBox.warning(self, "Suggest Groupings", "Column/group name cannot be blank.")
-                return
-            chosen.append((role, name, sug))
-
+        sample_paths = self._table_sample_paths()
+        if len(sample_paths) < 2:
+            return
+        if any(self.state.sample_groups.get(sp) in self.state.group_names for sp in sample_paths):
+            return
+        key = tuple(sample_paths)
+        if key == self._auto_groupings_key:
+            return
+        self._auto_groupings_key = key
+        display_names = self.controller.experiment.samples.get('all_samples', {})
+        chosen = sgd.automatic_groupings(suggest_groupings_from_names(sample_paths, display_names))
         if not chosen:
-            dlg.accept()
             return
+        st = self.state
+        self._auto_groupings_undo = (
+            list(st.group_names), dict(st.sample_groups),
+            None if st.covariates is None else st.covariates.copy(),
+            st.pairing_variable, st.paired,
+        )
+        self._apply_groupings(chosen, sample_paths, select_pairing=True)
+        self._show_auto_groupings_note(sgd.describe_groupings(chosen))
 
-        group_rows = [c for c in chosen if c[0] == 'group']
-        if len(group_rows) > 1:
-            QMessageBox.warning(
-                self, "Suggest Groupings",
-                "Only one detected field can be applied as the Group column at a time."
-            )
+    def _show_auto_groupings_note(self, text: str | None):
+        """Show (text) or hide (None) the automatic-groupings note and Undo."""
+        if text is None:
+            self._auto_groupings_undo = None
+        self._auto_groupings_label.setText(text or '')
+        self._auto_groupings_label.setVisible(text is not None)
+        self._auto_groupings_undo_btn.setVisible(text is not None and self._auto_groupings_undo is not None)
+
+    def _undo_auto_groupings(self):
+        """Restore the groups, covariates and pairing from before the
+        automatic groupings were applied."""
+        if self._auto_groupings_undo is None:
             return
+        groups, sample_groups, covariates, pairing_variable, paired = self._auto_groupings_undo
+        st = self.state
+        st.group_names = groups
+        st.sample_groups = sample_groups
+        st.covariates = covariates
+        st.pairing_variable = pairing_variable
+        st.paired = paired
+        self.chk_paired.blockSignals(True)
+        self.chk_paired.setChecked(paired)
+        self.chk_paired.blockSignals(False)
+        self.pairing_variable_combo.setEnabled(paired)
+        self._show_auto_groupings_note(None)
+        self._refresh_after_groupings()
 
-        if group_rows:
-            reply = QMessageBox.question(
-                self, "Suggest Groupings",
-                "Applying a detected field as the Group column will overwrite every "
-                "on-screen sample's current group, including manual selections. Continue?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
-
+    def _apply_groupings(self, chosen: list[dict], sample_paths: list[str],
+                         select_pairing: bool = False):
+        """
+        Write chosen groupings into state: a 'group' choice replaces
+        state.group_names and the on-screen samples' groups; every other
+        choice becomes a covariate column (state.covariates is keyed by
+        path relative to the raw samples folder). A 'pairing' choice is
+        made the pairing variable; with ``select_pairing`` the paired
+        design is also switched on.
+        """
         if self.state.covariates is None:
             self.state.covariates = pd.DataFrame(index=pd.Index([], dtype=str))
 
@@ -5757,26 +4837,36 @@ class GroupsStatsTab(QWidget):
                     pass
             return sp
 
-        for role, name, sug in chosen:
+        for choice in chosen:
+            role, name = choice['role'], choice['name']
             if role == 'group':
-                distinct_vals = sorted(set(sug['values'].values()))
+                distinct_vals = sorted(set(choice['values'].values()))
                 self.state.group_names = distinct_vals
                 for sp in sample_paths:
-                    self.state.sample_groups[sp] = sug['values'].get(sp, 'Unassigned')
+                    self.state.sample_groups[sp] = choice['values'].get(sp, 'Unassigned')
                 for val in distinct_vals:
                     self._group_colour(val)  # seed default colours
             else:
                 if name in self.state.covariates.columns:
                     name = f"{name}_2"
                 self.state.covariates[name] = ''
-                for sp, val in sug['values'].items():
+                for sp, val in choice['values'].items():
                     rel = _to_rel(sp)
                     if rel not in self.state.covariates.index:
                         self.state.covariates.loc[rel] = ''
                     self.state.covariates.loc[rel, name] = val
                 if role == 'pairing':
                     self.state.pairing_variable = name
+                    if select_pairing:
+                        self.state.paired = True
+                        self.chk_paired.blockSignals(True)
+                        self.chk_paired.setChecked(True)
+                        self.chk_paired.blockSignals(False)
+                        self.pairing_variable_combo.setEnabled(True)
+        self._refresh_after_groupings()
 
+    def _refresh_after_groupings(self):
+        self._last_stats_data_key = None
         self._populate_groups_table()
         self._refresh_group_combos()
         self._refresh_compare_combos()
@@ -5786,7 +4876,6 @@ class GroupsStatsTab(QWidget):
         self.state.invalidate_trex()
         self._update_group_count_label()
         self._update_run_button()
-        dlg.accept()
 
     def _on_covariate_edited(self, rel: str, col_name: str, value: str):
         """Write one sample's value for one covariate column directly."""
@@ -6532,7 +5621,7 @@ class GroupsStatsTab(QWidget):
         snap = _shallow_copy(self.state)
         for attr in ('sample_groups', 'group_names', 'group_patterns',
                      'testing_group_selection', 'stats_adjust_covariates',
-                     'marker_roles', 'channel_transform_params', 'selected_channels',
+                     'numeric_covariates', 'marker_roles', 'channel_transform_params', 'selected_channels',
                      'cluster_names'):
             setattr(snap, attr, deepcopy(getattr(self.state, attr)))
         if self.state.covariates is not None:
@@ -6615,6 +5704,7 @@ class GroupsStatsTab(QWidget):
             tuple(self.state.testing_group_selection), self.state.contrast_mode,
             self.state.reference_group, self.state.paired, self.state.pairing_variable,
             tuple(adjust_covariates), covariate_values,
+            tuple(c for c in adjust_covariates if c in self.state.numeric_covariates),
         )
         roles_fingerprint = tuple(sorted(self.state.marker_roles.items()))
         transform_fingerprint = ()
@@ -7872,7 +6962,7 @@ class GroupsStatsTab(QWidget):
                 results_df=freq_results_view,
                 title=f"Cluster Frequency Volcano: {name_b} vs {name_a}",
                 pval_threshold=pval_threshold, fc_threshold=fc_threshold,
-                run_label=run_label,
+                run_label=run_label, group_a=name_a, group_b=name_b,
             ))
 
         if counts_results_view is not None:
@@ -7885,7 +6975,7 @@ class GroupsStatsTab(QWidget):
                 results_df=counts_results_view,
                 title=f"Cluster Counts Volcano: {name_b} vs {name_a}",
                 pval_threshold=pval_threshold, fc_threshold=fc_threshold,
-                run_label=run_label,
+                run_label=run_label, group_a=name_a, group_b=name_b,
             ))
 
         if mfi_sample_df_view is not None:
@@ -7899,7 +6989,7 @@ class GroupsStatsTab(QWidget):
                 results_df=mfi_results_view,
                 title=f"Cluster MFI Volcano: {name_b} vs {name_a}",
                 pval_threshold=pval_threshold, fc_threshold=mfi_fc,
-                run_label=run_label,
+                run_label=run_label, group_a=name_a, group_b=name_b,
             ))
             _build('mfi_clusters', "MFI Clusters", self._make_mfi_cluster_summary_figure, dict(
                 results_df=mfi_results_view,
@@ -8108,15 +7198,20 @@ class GroupsStatsTab(QWidget):
             results_df, sample_df, title, group_by_sample,
             group_a=group_a, group_b=group_b,
             is_dark=_resolve_is_dark(self.state), run_label=run_label,
+            group_colours={name: _resolve_group_colour(self.state, name)
+                           for name in (group_a, group_b) if name},
         )
 
     def _make_volcano_figure(self, results_df, title: str,
                               pval_threshold: float, fc_threshold: float,
-                              run_label: str = ''):
+                              run_label: str = '', group_a: str = '',
+                              group_b: str = ''):
         """Volcano plot of one comparison's results (see
         differential_plots.make_volcano_figure). MFI features are
         "{cluster_label}_{channel}"; their channel suffix is shown as the
-        Antigen (falling back to Label)."""
+        Antigen (falling back to Label). group_a/group_b are the
+        comparison's baseline and other group, named on the plot in their
+        group colours."""
         features = results_df['feature'].tolist()
         if 'MFI' in title:
             disp_map = _antigen_or_label_map(self.controller)
@@ -8135,6 +7230,9 @@ class GroupsStatsTab(QWidget):
             is_dark=_resolve_is_dark(self.state),
             fdr_scope=self.state.stats_fdr_scope,
             feature_labels=features, run_label=run_label,
+            group_a=group_a, group_b=group_b,
+            group_colours={name: _resolve_group_colour(self.state, name)
+                           for name in (group_a, group_b) if name},
         )
 
     def _make_mfi_cluster_summary_figure(self, results_df, title: str,
@@ -11297,6 +10395,7 @@ class ClusterAnnotationTab(QWidget):
         snapshot_dict = cl_run.get('marker_values', {}) or {}
         training_samples = cl_run.get('training_sample_ids', [])
         pooled: dict[str, dict[int, list]] = {ch: {} for ch in channels}
+        self._violin_skipped_samples = []
 
         for rel in training_samples:
             labels = labels_dict.get(rel)
@@ -11314,6 +10413,7 @@ class ClusterAnnotationTab(QWidget):
                         "length mismatch, skipping sample.",
                         rel, len(values), len(labels),
                     )
+                    self._violin_skipped_samples.append(rel)
                     continue
             else:
                 # af_state, when given, is a main-thread unmixing
@@ -11329,13 +10429,13 @@ class ClusterAnnotationTab(QWidget):
                 if len(values) != len(labels):
                     _log.warning(
                         "_pool_violin_data: %s -- values (%d) vs labels (%d) length "
-                        "mismatch, truncating to %d. This run predates the "
-                        "marker-value snapshot fix -- re-run clustering for "
-                        "guaranteed alignment.",
-                        rel, len(values), len(labels), min(len(values), len(labels)),
+                        "mismatch, skipping sample. The run has no stored marker "
+                        "values and the current gating and unmixing give a "
+                        "different number of events.",
+                        rel, len(values), len(labels),
                     )
-                m = min(len(values), len(labels))
-                values, labels = values[:m], labels[:m]
+                    self._violin_skipped_samples.append(rel)
+                    continue
 
             # Boolean mask per cluster computed once per sample and reused
             # across every channel -- previously `labels == cl_id` was
@@ -11377,6 +10477,7 @@ class ClusterAnnotationTab(QWidget):
             pooled = self._pool_violin_data(cl_run, channels)
         finally:
             QApplication.restoreOverrideCursor()
+        self._warn_violin_samples_skipped(run_id, cl_run)
         self._violin_cache[run_id] = {
             'pooled': pooled,
             'channels': list(channels),
@@ -11385,6 +10486,26 @@ class ClusterAnnotationTab(QWidget):
         }
         self._populate_violin_channel_combo(channels)
         self._draw_current_violin()
+
+    def _warn_violin_samples_skipped(self, run_id, cl_run: dict):
+        """Tell the user, once per run, when samples were left out of the
+        violins because their marker values do not line up with the run's
+        cluster labels."""
+        skipped = list(getattr(self, '_violin_skipped_samples', []))
+        warned = getattr(self, '_violin_warned_runs', None)
+        if warned is None:
+            warned = self._violin_warned_runs = set()
+        if not skipped or run_id in warned:
+            return
+        warned.add(run_id)
+        QMessageBox.warning(
+            self, "Samples Left Out of the Violins",
+            f"{len(skipped)} of {len(cl_run.get('training_sample_ids', []))} sample(s) "
+            "were left out: this run has no stored marker values for them, and "
+            "the current gating and unmixing give a different number of events "
+            f"than were clustered (for example {skipped[0]}).\n\n"
+            "Re-run the clustering on the current gating and unmixing to bring "
+            "them back in sync.")
 
     def _populate_violin_channel_combo(self, channels: list[str]):
         prev = self.violin_channel_combo.currentData()
@@ -12806,7 +11927,7 @@ class PluginWidget(QWidget):
         # ------------------------------------------------------------------
         self.label_disabled = QLabel(
             f"{plugin_name}: loading...  "
-            "Set up the spectral model first if you have not done so."
+            "Loading...Set up the spectral model first if you have not done so."
         )
         self.label_disabled.setWordWrap(True)
         self.label_disabled.setStyleSheet(
@@ -12885,6 +12006,15 @@ class PluginWidget(QWidget):
         # lost if the plugin tab (or the app) closes before that happens.
         self.workspace_tab.plots_changed.connect(self._save_plot_configs_only)
 
+        # Same for the transforms: written shortly after the last change, so
+        # a drag does not write on every mouse move.
+        self._transform_save_timer = QTimer(self)
+        self._transform_save_timer.setSingleShot(True)
+        self._transform_save_timer.setInterval(500)
+        self._transform_save_timer.timeout.connect(self._save_transforms_only)
+        self.transform_tab.transformsPersistRequested.connect(
+            lambda: self._transform_save_timer.start())
+
         # ------------------------------------------------------------------
         # Connect bus signals
         # ------------------------------------------------------------------
@@ -12942,9 +12072,6 @@ class PluginWidget(QWidget):
             try:
                 all_samples = _non_control_sample_paths(self.controller)
                 self.state.initialise_sample_groups(all_samples)
-                self.state.channel_transform_params = _read_transforms_from_experiment(
-                    self.controller
-                )
 
                 current_key = self._settings_key()
                 if current_key != self._loaded_experiment_key:
@@ -12976,6 +12103,7 @@ class PluginWidget(QWidget):
                             gst.chk_include_type_markers.setChecked(
                                 bool(getattr(self, '_pending_include_type_markers', False))
                             )
+                self._sync_transform_state()
             finally:
                 self._loading = False
 
@@ -13017,6 +12145,39 @@ class PluginWidget(QWidget):
             s.setValue('plot_configs', json.dumps(self.state.plot_configs))
         finally:
             s.endGroup()
+
+    def _save_transforms_only(self):
+        """
+        Persist just the saved transforms, to the experiment the state was
+        loaded for (see save_state).
+        """
+        if self._loading or self._loaded_experiment_key is None:
+            return
+        if not self.state.saved_transforms:
+            return
+        import json
+        s = self._qsettings
+        s.beginGroup(self._loaded_experiment_key)
+        try:
+            s.setValue('saved_transforms', json.dumps(self.state.saved_transforms))
+        finally:
+            s.endGroup()
+
+    def _sync_transform_state(self):
+        """
+        Make the saved transforms and channel_transform_params consistent
+        for the open experiment.  An experiment with no saved transforms
+        starts from the ones defined in Unmixed Data and keeps its own from
+        then on.
+        """
+        if not self.state.saved_transforms:
+            src = self.controller.unmixed_transformations or {}
+            self.state.saved_transforms = {
+                ch: _transform_params(tr) for ch, tr in src.items()}
+            if self.state.saved_transforms:
+                self._transform_save_timer.start()
+        self.state.channel_transform_params = _working_channel_transform_params(
+            self.controller, self.state.saved_transforms)
 
     def save_state(self):
         """
@@ -13105,6 +12266,7 @@ class PluginWidget(QWidget):
             s.setValue('paired',            self.state.paired)
             s.setValue('pairing_variable',  self.state.pairing_variable)
             s.setValue('stats_adjust_covariates', list(self.state.stats_adjust_covariates))
+            s.setValue('numeric_covariates', list(self.state.numeric_covariates))
             s.setValue('stats_use_treat',   self.state.stats_use_treat)
             s.setValue('stats_mfi_threshold', self.state.stats_mfi_threshold)
             s.setValue('stats_mfi_hierarchical', self.state.stats_mfi_hierarchical)
@@ -13181,6 +12343,9 @@ class PluginWidget(QWidget):
                 tile_y = [t.y_channel() for t in self.transform_tab._biplot_tiles]
                 s.setValue('transform_biplot_y_channels', tile_y)
                 s.setValue('transform_n_tiles', len(tile_y))
+            if self.state.saved_transforms:
+                import json
+                s.setValue('saved_transforms', json.dumps(self.state.saved_transforms))
             # Config tab: DR algorithm and hyperparameters
             ct = self.config_tab
             if hasattr(ct, '_dr_algo_group'):
@@ -13351,6 +12516,7 @@ class PluginWidget(QWidget):
             self.state.paired = paired_val in (True, 'true', 'True', 1, '1')
             self.state.pairing_variable = s.value('pairing_variable', '')
             self.state.stats_adjust_covariates = _qs_list(s, 'stats_adjust_covariates')
+            self.state.numeric_covariates = _qs_list(s, 'numeric_covariates')
             use_treat = s.value('stats_use_treat', None)
             if use_treat is not None:
                 self.state.stats_use_treat = use_treat in (True, 'true', 'True', 1, '1')
@@ -13540,6 +12706,15 @@ class PluginWidget(QWidget):
             self._pending_tile_y_channels = _qs_list(
                 s, 'transform_biplot_y_channels')
             self._pending_n_tiles = _qs_int(s, 'transform_n_tiles', 0) or 0
+            # Transform tab: the transforms as last adjusted (empty for an
+            # experiment not seen before, which then starts from Unmixed Data)
+            try:
+                import json
+                loaded_transforms = json.loads(s.value('saved_transforms', '') or '{}')
+            except Exception:
+                loaded_transforms = {}
+            self.state.saved_transforms = (
+                loaded_transforms if isinstance(loaded_transforms, dict) else {})
             # DR algorithm and hyperparameters
             self._pending_dr_algo          = s.value('dr_algo', '')
             self._pending_umap_n_neighbors = s.value('umap_n_neighbors', None)
@@ -14770,6 +13945,9 @@ class PluginWidget(QWidget):
                 channels=channels,
                 params=dict(params),
                 n_events=n_events,
+                sync_fingerprint=drc_pipeline.sync_fingerprint(
+                    self.controller, self.state.selected_gates,
+                    self.state.training_sample_ids),
             )
         except Exception as e:
             # Archiving must never take down _on_dr_finished — a failure
@@ -14848,9 +14026,70 @@ class PluginWidget(QWidget):
                     f"{len(self.state.training_sample_ids)} are missing.\n\n"
                     "Run (or re-run) the DR first, or cluster in marker space.")
                 return
+            problems = self._dr_embedding_sync_problems(dr_algo)
+            if problems:
+                bullet_list = '\n'.join(f"  \u2022 {p}" for p in problems)
+                reply = QMessageBox.question(
+                    self, "DR Embedding Out of Sync",
+                    f"The {dr_algo} embedding may not match the current data:\n\n"
+                    f"{bullet_list}\n\n"
+                    "Clustering will label the embedding's own cells correctly, but "
+                    "the marker values behind the violins, heatmaps and Cluster ID "
+                    "come from the current gating and unmixing, and cannot be "
+                    "matched row for row to the embedding. Samples whose event "
+                    "counts differ will have no marker values stored, and where the "
+                    "counts happen to agree the rows can still be shifted.\n\n"
+                    "Re-running the DR brings it back in sync.\n\n"
+                    "Cluster on this embedding anyway?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
 
         self._confirm_large_run(
             'cl', algo, params, lambda: self._start_clustering(algo, params))
+
+    def _source_dr_run_entry(self, dr_algo: str) -> dict | None:
+        """
+        The archived DR run behind state.embeddings[dr_algo]: the run trained
+        in this session if there is one, otherwise the newest archived run of
+        that algorithm. None when no archived run of it exists.
+        """
+        candidates = [e for e in self.state.dr_runs if e.get('algorithm') == dr_algo]
+        active_id = self._active_dr_run_id.get(dr_algo)
+        for entry in candidates:
+            if active_id and entry.get('run_id') == active_id:
+                return entry
+        return max(candidates, key=lambda e: e.get('timestamp', ''), default=None)
+
+    def _dr_embedding_sync_problems(self, dr_algo: str) -> list[str]:
+        """
+        Reasons the live *dr_algo* embedding may not line up with the current
+        gating and unmixing; empty when it does (or no archived run exists to
+        compare against).
+        """
+        entry = self._source_dr_run_entry(dr_algo)
+        if entry is None:
+            return []
+        problems = []
+        run_gates = list(entry.get('gates', []))
+        if sorted(run_gates) != sorted(self.state.selected_gates):
+            problems.append(
+                f"The DR run used gate(s) {', '.join(run_gates) or 'none'}; the "
+                f"Configuration tab now selects "
+                f"{', '.join(self.state.selected_gates) or 'none'}.")
+        status = drc_run_archive.sync_status(
+            entry, drc_pipeline.sync_fingerprint(
+                self.controller, run_gates, entry.get('training_sample_ids', [])))
+        if status == drc_run_archive.SYNC_OUT_OF_SYNC:
+            problems.append(
+                "The unmixing, AF profile assignment or gating has changed since "
+                f"\"{entry.get('label', '')}\" was made.")
+        elif status == drc_run_archive.SYNC_UNKNOWN:
+            problems.append(
+                f"\"{entry.get('label', '')}\" was made before sync tracking was "
+                "added, so it cannot be checked against the current data.")
+        return problems
 
     def _start_clustering(self, algo: str, params: dict):
         """Start the background clustering worker (inputs already validated)."""
@@ -14868,6 +14107,18 @@ class PluginWidget(QWidget):
         # Snapshot AF/transfer-matrix state on the main thread before the
         # worker starts — see drc_pipeline.apply_unmixing_af_aware() docstring.
         af_state = drc_pipeline.snapshot_af_state(self.controller)
+
+        # Which cells the labels will belong to: the embedding's own for a
+        # DR-space run (so it inherits the DR run's fingerprint), the
+        # current gating's otherwise.
+        if params.get('_space') == 'dr':
+            source_dr = self._source_dr_run_entry(params.get('_dr_algo') or '')
+            run_fingerprint = source_dr.get('sync_fingerprint') if source_dr else None
+        else:
+            run_fingerprint = drc_pipeline.sync_fingerprint(
+                self.controller, self.state.selected_gates,
+                self.state.training_sample_ids)
+        unaligned_samples: list[str] = []
 
         def _checked_progress(msg):
             # Raises in the worker thread once the run is cancelled
@@ -14924,15 +14175,30 @@ class PluginWidget(QWidget):
                         marker_values=dict(self.state.cluster_marker_values),
                         dr_positions=dict(self.state.cluster_dr_positions),
                         tree_data=tree_data,
+                        sync_fingerprint=run_fingerprint,
                     )
                     self.progress_message(
                         f"Run archived as \"{entry['label']}\""
                     )
+                    unaligned_samples.extend(
+                        rel for rel in self.state.cluster_labels
+                        if rel not in self.state.cluster_marker_values)
             self._release_clustering_ui()
             if hasattr(self, 'config_tab'):
                 self.config_tab.run_table.refresh()
             self._on_runs_changed()
             self._cl_worker = None
+            if unaligned_samples:
+                QMessageBox.warning(
+                    self, "Marker Values Not Stored",
+                    f"For {len(unaligned_samples)} of {len(self.state.cluster_labels)} "
+                    "sample(s), the events under the current gating and unmixing do "
+                    "not line up with the events that were clustered (for example "
+                    f"{unaligned_samples[0]}). The cluster labels are saved, but no "
+                    "marker values could be stored for those samples, so violin "
+                    "plots, heatmaps and Cluster ID will leave them out.\n\n"
+                    "Re-run the DR (and then the clustering) on the current "
+                    "gating and unmixing to bring them back in sync.")
 
         worker = _ClusterWorker(_do_cluster)
         worker.finished.connect(_on_cl_done)

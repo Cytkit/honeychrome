@@ -168,6 +168,14 @@ class FakeController:
     def _build_fluor_spectra(self):
         return fluor_spectra()
 
+    def precomputed_for_profile(self, profile_name):
+        """Precomputed AF matrices for a stored profile (joint L2 scoring, no envelope)."""
+        from honeychrome.controller_components.autospectral_functions import build_af_precomputed
+        entry = self.experiment.process['af_profiles'].get(profile_name)
+        if entry is None:
+            return None
+        return build_af_precomputed(fluor_spectra(), np.array(entry['spectra']))
+
     def get_af_index_map_for_sample(self, sample_path):
         from honeychrome.controller_components.autospectral_functions import af_index_lookup
         names = self.experiment.samples['sample_af_profiles'].get(sample_path, [])

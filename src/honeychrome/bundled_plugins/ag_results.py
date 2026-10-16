@@ -12,6 +12,19 @@ Pure computation for the Automated Gating plugin (no Qt, no controller):
   the differential tests in ``controller_components.differential_stats``.
 * ``sample_flags`` / ``population_export`` / ``marker_export`` — QC flags
   and long-format export tables.
+* ``read_sample_table`` / ``sample_table_frame`` — import and export of
+  group assignments and covariates as a table with one row per sample.
+* ``sample_pca`` / ``predictive_matrix`` — sample-level PCA and the feature
+  matrix for the predictive analysis (``drc_predictive``), both from the
+  per-sample values of the last statistics run.
+* ``pack_display`` / ``display_population_mask`` / ``display_parent_mask`` /
+  ``save_display`` / ``load_display`` — the display subsample kept per
+  gated sample for plotting: its events and every population's membership
+  as packed bits, small enough to keep for every sample and to save.
+* ``statistics_tables`` — the statistics run as tables for CSV export.
+* ``group_population_values`` / ``population_result`` — one population's
+  per-sample values by group and its test result, for the population
+  comparison plots.
 
 The file name does not end in ``_tab.py``, so the plugin loader does not
 treat it as a tab.
@@ -36,14 +49,27 @@ CONFIDENT_ALIGNMENTS = frozenset({ALIGN_EXACT, ALIGN_ANTIGEN})
 
 FEATURE_SEP = ' | '
 DEFAULT_MIN_MARKER_EVENTS = 20
+# A population is tested only when it can be measured (its parent has
+# events) in at least this many samples.
+MIN_MEASURED_SAMPLES = 3
+# A population is also tested only when it has events in at least this many
+# samples; below that the comparison reflects the parent counts, not the
+# population.
+MIN_NONZERO_SAMPLES = 3
 
 __all__ = [
     'ALIGN_EXACT', 'ALIGN_ANTIGEN', 'ALIGN_CHANNEL', 'ALIGN_FUZZY', 'ALIGN_AMBIGUOUS',
-    'CONFIDENT_ALIGNMENTS', 'FEATURE_SEP', 'DEFAULT_MIN_MARKER_EVENTS',
+    'CONFIDENT_ALIGNMENTS', 'FEATURE_SEP', 'DEFAULT_MIN_MARKER_EVENTS', 'MIN_MEASURED_SAMPLES',
+    'MIN_NONZERO_SAMPLES',
     'align_channels', 'alignment_problems', 'apply_alignment',
     'summarise_sample', 'population_tables', 'marker_table', 'marker_feature',
     'sample_flags', 'population_export', 'marker_export',
     'MIN_SAMPLES_PER_GROUP', 'qualifying_groups', 'run_statistics', 'reapply_thresholds',
+    'read_sample_table', 'sample_table_frame', 'sample_pca', 'predictive_matrix',
+    'stats_to_jsonable', 'stats_from_jsonable',
+    'pack_display', 'display_population_mask', 'display_parent_mask', 'save_display',
+    'load_display', 'display_file_name', 'statistics_tables', 'group_population_values',
+    'population_result',
 ]
 
 
@@ -207,14 +233,27 @@ def summarise_sample(gate_defs: list[dict], result: ag_core.GatingResult, data_t
 # Feature tables for statistics
 # ---------------------------------------------------------------------------
 
+def _name_list(names: list[str], limit: int = 8) -> str:
+    """The first *limit* of *names*, comma-separated, with a count of the rest."""
+    shown = ", ".join(names[:limit])
+    return shown if len(names) <= limit else f"{shown} and {len(names) - limit} more"
+
+
 def population_tables(summaries: dict, samples: list[str],
                       use_stats_parent: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """Population counts and their denominators, samples × populations.
 
     The denominator is the parent population's count, or the population's
     ``stats_parent`` count when one is defined and *use_stats_parent* is
-    set. Populations missing from any sample, or with a zero denominator in
-    any sample, are dropped.
+    set.
+
+    A population with no events in a sample whose parent has events is a
+    true zero and is kept as 0. Where the population cannot be measured
+    (it is absent from the sample's record, or its parent has no events)
+    both tables hold NaN, so the population is tested on the samples that
+    do have it rather than being left out. Populations measurable in fewer
+    than ``MIN_MEASURED_SAMPLES`` samples, or with events in fewer than
+    ``MIN_NONZERO_SAMPLES`` samples, are dropped.
 
     Returns (counts, denominators, dropped population keys).
     """
@@ -232,10 +271,15 @@ def population_tables(summaries: dict, samples: list[str],
                                                  else row['n_parent'])
     counts_df = pd.DataFrame({k: counts[k] for k in order}, index=list(samples), dtype=float)
     denom_df = pd.DataFrame({k: denoms[k] for k in order}, index=list(samples), dtype=float)
-    bad = [k for k in order
-           if counts_df[k].isna().any() or denom_df[k].isna().any() or (denom_df[k] <= 0).any()]
-    keep = [k for k in order if k not in bad]
-    return counts_df[keep], denom_df[keep], bad
+    unmeasurable = counts_df.isna() | denom_df.isna() | (denom_df <= 0)
+    counts_df = counts_df.mask(unmeasurable)
+    denom_df = denom_df.mask(unmeasurable)
+    from honeychrome.controller_components import differential_stats as ds
+    measured = (~unmeasurable).sum(axis=0)
+    sparse = set(ds.sparse_features(counts_df, MIN_NONZERO_SAMPLES))
+    dropped = [k for k in order if measured[k] < MIN_MEASURED_SAMPLES or k in sparse]
+    keep = [k for k in order if k not in dropped]
+    return counts_df[keep], denom_df[keep], dropped
 
 
 def marker_feature(pop_key: str, channel: str) -> str:
@@ -251,8 +295,11 @@ def marker_table(summaries: dict, samples: list[str], gate_defs: list[dict],
     exclude_gating_markers : leave out, for each population, the channels
         used by its own gate and every ancestor gate (its 'type' markers,
         which define the population and so differ by construction).
-    min_events             : a (population, channel) feature is kept only
-        when the population has at least this many events in every sample.
+    min_events             : a population's medians are taken only from
+        samples where it has at least this many events; in the others the
+        value is NaN (not measured), and the feature is tested on the
+        samples that have it. Populations measured in fewer than
+        ``MIN_MEASURED_SAMPLES`` samples are dropped.
 
     Returns (values, feature metadata with 'feature', 'cluster' (display
     label), 'cluster_id' (population key) and 'channel' columns, dropped
@@ -273,21 +320,24 @@ def marker_table(summaries: dict, samples: list[str], gate_defs: list[dict],
     pop_keys = [k for k in n_events if k in with_markers]
     for pop_key in pop_keys:
         per_sample = n_events.get(pop_key, {})
-        present = all(pop_key in ((summaries.get(s) or {}).get('markers') or {}) for s in samples)
-        if not present or any(per_sample.get(s, 0) < min_events for s in samples):
+        measured = [s for s in samples
+                    if pop_key in ((summaries.get(s) or {}).get('markers') or {})
+                    and per_sample.get(s, 0) >= min_events]
+        if len(measured) < MIN_MEASURED_SAMPLES:
             dropped.append(pop_key)
             continue
         gate_name, _pop = ag_core.split_population_key(pop_key)
         skip = type_markers.get(gate_name, set()) if exclude_gating_markers else set()
         channels = None
-        for s in samples:
+        for s in measured:
             chans = set(((summaries[s].get('markers') or {}).get(pop_key) or {}).keys())
             channels = chans if channels is None else channels & chans
         for ch in sorted(channels or [], key=str):
             if ch in skip:
                 continue
             feature = marker_feature(pop_key, ch)
-            values[feature] = {s: float(summaries[s]['markers'][pop_key][ch][0]) for s in samples}
+            values[feature] = {s: float(summaries[s]['markers'][pop_key][ch][0])
+                               for s in measured}
             meta.append({'feature': feature, 'cluster': labels.get(pop_key, pop_key),
                          'cluster_id': pop_key, 'channel': ch})
     df = pd.DataFrame(values, index=list(samples), dtype=float)
@@ -367,6 +417,7 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                    group_order: list[str] | None = None, contrast_mode: str = 'reference',
                    reference: str = '', pairing: dict | None = None,
                    covariates: pd.DataFrame | None = None,
+                   numeric_covariates: list[str] | None = None,
                    pval_threshold: float = 0.05, fc_threshold: float = 0.5,
                    marker_threshold: float = 0.03, use_treat: bool = True,
                    fdr_scope: str = 'global', run_freq: bool = True, run_counts: bool = False,
@@ -384,6 +435,8 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
     groups     : {sample: group name}; samples without a group are left out.
     pairing    : {sample: pairing level} (e.g. donor), or None.
     covariates : adjustment covariates, indexed by sample, or None.
+    numeric_covariates : the covariates entered as continuous terms (age,
+                 CRP); every other covariate is treated as categories.
 
     Returns {'samples', 'group_vec', 'comparisons', 'freq', 'freq_values'
     (% of denominator), 'counts', 'counts_values', 'markers',
@@ -405,7 +458,8 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
     pairing_vec = [str((pairing or {}).get(s, '')) for s in used] if pairing else None
     cov = None
     if covariates is not None and len(covariates.columns):
-        cov = ds.covariate_frame(covariates, used, list(covariates.columns))
+        cov = ds.covariate_frame(covariates, used, list(covariates.columns),
+                                 numeric=list(numeric_covariates or []))
 
     out = {'samples': used, 'group_vec': group_vec, 'comparisons': contrasts,
            'freq': None, 'freq_values': None, 'counts': None, 'counts_values': None,
@@ -416,8 +470,17 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
     if run_freq or run_counts:
         counts, denom, dropped = population_tables(summaries, used, use_stats_parent)
         if dropped:
-            out['notes'].append("Populations missing or empty in some samples were left out: "
-                                + ", ".join(dropped))
+            out['notes'].append(
+                f"Populations measurable in fewer than {MIN_MEASURED_SAMPLES} samples (their "
+                f"parent population had no events in the others), or with events in fewer than "
+                f"{MIN_NONZERO_SAMPLES} samples, were left out: "
+                + _name_list(dropped))
+        partial = [k for k in counts.columns if counts[k].isna().any()]
+        if partial:
+            out['notes'].append(
+                f"{len(partial)} population(s) could not be measured in some samples (their "
+                "parent population had no events) and were tested on the samples that could: "
+                + _name_list(partial))
         if run_freq:
             data = ds.logit_proportions(counts, denom)
             out['freq'] = ds.run_moderated(data, group_vec, contrasts, contrast_mode,
@@ -428,6 +491,11 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                                               pval_threshold, fc_threshold,
                                               offset_df=denom, **common)
             out['counts_values'] = counts
+            empty = [k for k in counts.columns if not (counts[k].fillna(0) > 0).any()]
+            if empty:
+                out['notes'].append(
+                    f"{len(empty)} population(s) have no events in any sample and could not be "
+                    "tested for counts: " + ", ".join(empty))
 
     if run_markers:
         values, meta, dropped = marker_table(
@@ -437,12 +505,82 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                                for s in used for r in summaries[s].get('populations', [])})
         if dropped:
             out['notes'].append(
-                f"Populations with fewer than {min_marker_events} events in some samples "
-                "were left out of the marker tests: " + ", ".join(dropped))
+                f"Populations with at least {min_marker_events} events in fewer than "
+                f"{MIN_MEASURED_SAMPLES} samples were left out of the marker tests: "
+                + _name_list(dropped))
+        partial = sorted({m['cluster_id'] for _i, m in meta.iterrows()
+                          if values[m['feature']].isna().any()})
+        if partial:
+            out['notes'].append(
+                f"{len(partial)} population(s) have fewer than {min_marker_events} events in "
+                "some samples; their marker medians were tested on the samples that have "
+                "enough: " + _name_list(partial))
         out['markers'] = ds.run_moderated(values, group_vec, contrasts, contrast_mode,
                                           pval_threshold, marker_threshold,
                                           feature_meta=meta, hierarchical=True, **common)
         out['marker_values'] = values
+    return out
+
+
+_STATS_FRAMES = ('freq', 'freq_values', 'counts', 'counts_values', 'markers', 'marker_values')
+
+
+def _frame_to_jsonable(df: pd.DataFrame) -> dict:
+    split = df.to_dict(orient='split')
+    return ag_core.to_jsonable({'index': split['index'], 'columns': split['columns'],
+                                'data': split['data']})
+
+
+def _column_from_jsonable(values: list):
+    """One saved column: booleans and text as they are; numbers as int64
+    or, with missing values (None) or fractions, float64 with NaN."""
+    if values and all(isinstance(v, bool) for v in values):
+        return values
+    numeric = all(v is None or (isinstance(v, (int, float)) and not isinstance(v, bool))
+                  for v in values)
+    if not numeric:
+        return values
+    if values and all(isinstance(v, int) for v in values):
+        return np.asarray(values, dtype=np.int64)
+    return np.asarray(values, dtype=float)
+
+
+def _frame_from_jsonable(obj: dict) -> pd.DataFrame:
+    """The DataFrame _frame_to_jsonable saved, built column by column in one
+    step (wide tables, e.g. thousands of marker features, stay fast)."""
+    columns = list(obj['columns'])
+    rows = obj['data']
+    by_column = list(zip(*rows)) if rows else [() for _c in columns]
+    data = {i: _column_from_jsonable(list(values)) for i, values in enumerate(by_column)}
+    df = pd.DataFrame(data, index=obj['index'])
+    df.columns = columns
+    return df
+
+
+def stats_to_jsonable(stats: dict) -> dict:
+    """*stats* (a ``run_statistics`` result) as JSON-safe values, for saving.
+    Non-finite numbers become null."""
+    out = {k: v for k, v in stats.items() if k not in _STATS_FRAMES}
+    out['comparisons'] = [list(c) for c in stats.get('comparisons') or []]
+    out = ag_core.to_jsonable(out)
+    for key in _STATS_FRAMES:
+        frame = stats.get(key)
+        out[key] = _frame_to_jsonable(frame) if frame is not None else None
+    return out
+
+
+def stats_from_jsonable(payload: dict) -> dict:
+    """The ``run_statistics`` result that ``stats_to_jsonable`` saved. The
+    degrees of freedom of the count tests (infinite for a Wald test) are
+    restored where they were saved as null."""
+    out = {k: v for k, v in payload.items() if k not in _STATS_FRAMES}
+    out['comparisons'] = [tuple(c) for c in payload.get('comparisons') or []]
+    for key in _STATS_FRAMES:
+        obj = payload.get(key)
+        out[key] = _frame_from_jsonable(obj) if obj else None
+    counts = out.get('counts')
+    if counts is not None and 'df.total' in counts.columns:
+        counts['df.total'] = counts['df.total'].fillna(np.inf)
     return out
 
 
@@ -459,3 +597,359 @@ def reapply_thresholds(stats: dict, pval_threshold: float, fc_threshold: float,
             out[key] = ds.apply_significance(out[key], pval_threshold, thr, fdr_scope=fdr_scope,
                                              use_treat=use_treat, hierarchical=hier)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Sample tables (groups and covariates)
+# ---------------------------------------------------------------------------
+
+_SAMPLE_COLUMNS = ('sample', 'file', 'filename', 'name')
+_GROUP_COLUMNS = ('group', 'condition')
+
+
+def _sample_names(key: str) -> list[str]:
+    """Ways a table may name a sample: its key, file name and stem (lower case)."""
+    path = str(key).replace('\\', '/')
+    name = path.rsplit('/', 1)[-1]
+    stem = name.rsplit('.', 1)[0] if '.' in name else name
+    return [path.lower(), name.lower(), stem.lower()]
+
+
+def read_sample_table(df: pd.DataFrame, sample_keys: list[str]) -> dict:
+    """Group assignments and covariates from a table with one row per sample.
+
+    The sample column is the first of 'sample', 'file', 'filename' or
+    'name' (any case); it may hold the sample key, the file name or the
+    file name without extension. A 'group' (or 'condition') column assigns
+    groups; every other column is a covariate. Empty cells are skipped.
+
+    Returns {'groups': {key: group}, 'covariates': {name: {key: value}},
+    'unmatched': [table rows' sample names with no sample], 'columns':
+    covariate names}. Raises ValueError without a sample column.
+    """
+    lower = {str(c).strip().lower(): c for c in df.columns}
+    sample_col = next((lower[c] for c in _SAMPLE_COLUMNS if c in lower), None)
+    if sample_col is None:
+        raise ValueError("The table needs a 'sample' column naming each sample.")
+    group_col = next((lower[c] for c in _GROUP_COLUMNS if c in lower), None)
+    cov_cols = [c for c in df.columns if c not in (sample_col, group_col)
+                and str(c).strip().lower() != 'full_path']
+    lookup: dict[str, str] = {}
+    for key in sample_keys:
+        for n in _sample_names(key):
+            lookup.setdefault(n, key)
+    groups: dict[str, str] = {}
+    covs: dict[str, dict[str, str]] = {str(c): {} for c in cov_cols}
+    unmatched = []
+    for _i, row in df.iterrows():
+        raw = row[sample_col]
+        if pd.isna(raw) or not str(raw).strip():
+            continue
+        name = str(raw).strip()
+        key = next((lookup[n] for n in _sample_names(name) if n in lookup), None)
+        if key is None:
+            unmatched.append(name)
+            continue
+        if group_col is not None and pd.notna(row[group_col]) and str(row[group_col]).strip():
+            groups[key] = str(row[group_col]).strip()
+        for c in cov_cols:
+            v = row[c]
+            if pd.notna(v) and str(v).strip():
+                covs[str(c)][key] = str(v).strip()
+    return {'groups': groups, 'covariates': covs, 'unmatched': unmatched,
+            'columns': [str(c) for c in cov_cols]}
+
+
+def sample_table_frame(samples: list[str], groups: dict, covariates: dict) -> pd.DataFrame:
+    """One row per sample: 'sample' (key), 'group' and each covariate; the
+    format read_sample_table reads back."""
+    rows = []
+    for key in samples:
+        row = {'sample': key, 'group': groups.get(key, '')}
+        for name, values in (covariates or {}).items():
+            row[name] = (values or {}).get(key, '')
+        rows.append(row)
+    return pd.DataFrame(rows, columns=['sample', 'group'] + list(covariates or {}))
+
+
+# ---------------------------------------------------------------------------
+# Sample PCA and predictive features
+# ---------------------------------------------------------------------------
+
+def _source_frames(stats: dict, use_freq: bool, use_counts: bool, use_markers: bool,
+                   labels: dict | None) -> tuple[list, list]:
+    labels = labels or {}
+
+    def named(df, prefix, label_of):
+        return df.rename(columns={c: f"{prefix}: {label_of(c)}" for c in df.columns})
+
+    def marker_label(feature):
+        pop, _sep, ch = str(feature).partition(FEATURE_SEP)
+        return f"{labels.get(pop, pop)} {labels.get(ch, ch)}"
+
+    sources, frames = [], []
+    for use, key, prefix, label_of in (
+            (use_freq, 'freq_values', 'Freq', lambda c: labels.get(c, c)),
+            (use_counts, 'counts_values', 'Counts', lambda c: labels.get(c, c)),
+            (use_markers, 'marker_values', 'Median', marker_label)):
+        df = stats.get(key) if use else None
+        if df is not None and not df.empty:
+            sources.append(prefix)
+            frames.append(named(df.astype(float), prefix, label_of))
+    return sources, frames
+
+
+def sample_pca(stats: dict, use_freq: bool = True, use_counts: bool = False,
+               use_markers: bool = False, n_loadings: int = 10,
+               labels: dict | None = None) -> dict | None:
+    """Two-component PCA of every sample of the last statistics run.
+
+    The chosen per-sample tables (population % of parent, counts, marker
+    medians) are z-scored column by column, so no table dominates on scale,
+    and joined. Loadings are scaled by the square root of each component's
+    variance (a correlation biplot) and reduced to the *n_loadings* longest.
+    *labels* maps population keys and channels to display names.
+
+    Returns None with fewer than 2 samples or 2 varying features, else
+    {'scores' (samples × PC1, PC2), 'loadings' (features × PC1, PC2),
+    'explained_variance_ratio' (PC1, PC2), 'groups' (per score row),
+    'sources'}.
+    """
+    from sklearn.decomposition import PCA
+
+    sources, frames = _source_frames(stats, use_freq, use_counts, use_markers, labels)
+    if not frames:
+        return None
+    combined = pd.concat(frames, axis=1, join='inner')
+    if combined.shape[0] < 2:
+        return None
+    std = combined.std(axis=0, ddof=0)
+    combined = combined.loc[:, std > 1e-12]
+    if combined.shape[1] < 2:
+        return None
+    z = ((combined - combined.mean(axis=0)) / combined.std(axis=0, ddof=0)).fillna(0.0)
+    n_comp = min(2, z.shape[0], z.shape[1])
+    pca = PCA(n_components=n_comp)
+    pcs = pca.fit_transform(z.values)
+    explained = list(pca.explained_variance_ratio_[:n_comp]) + [0.0] * (2 - n_comp)
+    if n_comp < 2:
+        pcs = np.hstack([pcs, np.zeros((pcs.shape[0], 2 - n_comp))])
+    scores = pd.DataFrame(pcs[:, :2], index=combined.index, columns=['PC1', 'PC2'])
+    load = np.zeros((z.shape[1], 2))
+    for c in range(n_comp):
+        load[:, c] = pca.components_[c] * np.sqrt(max(pca.explained_variance_[c], 0.0))
+    loadings = pd.DataFrame(load, index=combined.columns, columns=['PC1', 'PC2'])
+    length = np.hypot(loadings['PC1'], loadings['PC2'])
+    loadings = loadings.loc[length.sort_values(ascending=False).head(max(1, int(n_loadings))).index]
+    group_of = dict(zip(stats.get('samples') or [], stats.get('group_vec') or []))
+    return {'scores': scores, 'loadings': loadings,
+            'explained_variance_ratio': (float(explained[0]), float(explained[1])),
+            'groups': [group_of.get(s, '') for s in scores.index], 'sources': sources}
+
+
+def predictive_matrix(stats: dict, use_freq: bool = True, use_markers: bool = False,
+                      labels: dict | None = None) -> pd.DataFrame:
+    """Samples × features for the predictive analysis: log2(% of parent +
+    0.01) and/or marker medians, from the last statistics run, named for
+    display; missing or constant features are dropped (see
+    drc_predictive.build_feature_matrix)."""
+    import drc_predictive
+
+    _sources, frames = _source_frames(stats, use_freq, False, False, labels)
+    freq = frames[0] if frames else None
+    if freq is not None:
+        freq = freq.rename(columns=lambda c: c.split(': ', 1)[1])
+    _sources, mframes = _source_frames(stats, False, False, use_markers, labels)
+    med = mframes[0] if mframes else None
+    if med is not None:
+        med = med.rename(columns=lambda c: c.split(': ', 1)[1])
+    X = drc_predictive.build_feature_matrix(freq, med, list(stats.get('samples') or []))
+    return X.rename(columns=lambda c: c.replace('MFI: ', 'Median: '))
+
+
+# ---------------------------------------------------------------------------
+# Display subsamples
+# ---------------------------------------------------------------------------
+
+DISPLAY_FORMAT = 1
+
+
+def pack_display(gate_defs: list[dict], result: ag_core.GatingResult, rows: np.ndarray,
+                 events: np.ndarray, channels: list[str]) -> dict:
+    """The display record of one gated sample.
+
+    rows     : indices of the display events among the gated events.
+    events   : the display events (untransformed), columns named by *channels*.
+
+    Returns {'channels', 'events', 'populations' (population keys, hierarchy
+    order), 'bits' (one packed membership row per population), 'n'}.
+    """
+    rows = np.asarray(rows)
+    n = int(len(rows))
+    keys, masks = [], []
+    for g in ag_core.ordered_gate_defs(gate_defs):
+        for pop, m in (result.masks.get(g['gate_name']) or {}).items():
+            keys.append(ag_core.population_key(g['gate_name'], pop))
+            masks.append(np.asarray(m)[rows])
+    if masks:
+        bits = np.packbits(np.vstack(masks).astype(bool), axis=1)
+    else:
+        bits = np.zeros((0, (n + 7) // 8), dtype=np.uint8)
+    return {'channels': list(channels), 'events': np.asarray(events, dtype=np.float32),
+            'populations': keys, 'bits': bits, 'n': n}
+
+
+def _population_row(disp: dict, pop_key: str):
+    index = disp.get('_index')
+    if index is None:
+        index = {k: i for i, k in enumerate(disp.get('populations') or [])}
+        disp['_index'] = index
+    return index.get(pop_key)
+
+
+def display_population_mask(disp: dict, pop_key: str) -> np.ndarray | None:
+    """Membership of a population ('gate/pop', or 'root') over the record's
+    display events, or None when the population was not gated."""
+    n = int(disp.get('n', len(disp.get('events') if disp.get('events') is not None else [])))
+    if pop_key in ('root', ''):
+        return np.ones(n, dtype=bool)
+    if 'pop_masks' in disp:
+        gate, pop = ag_core.split_population_key(pop_key)
+        return (disp['pop_masks'].get(gate) or {}).get(pop)
+    i = _population_row(disp, pop_key)
+    if i is None:
+        return None
+    return np.unpackbits(disp['bits'][i], count=n).astype(bool)
+
+
+def display_parent_mask(disp: dict, gate_name: str, gate_def: dict | None = None):
+    """The events a gate was applied to (its parent population) over the
+    record's display events, or None when unknown."""
+    if 'parent_masks' in disp:
+        return disp['parent_masks'].get(gate_name)
+    if gate_def is None:
+        return None
+    if not gate_def.get('parent_gate'):
+        return display_population_mask(disp, 'root')
+    return display_population_mask(
+        disp, ag_core.population_key(gate_def['parent_gate'], gate_def.get('parent_popul') or ''))
+
+
+def display_file_name(sample_key: str) -> str:
+    """File name of a sample's saved display record."""
+    import hashlib
+    return hashlib.sha1(str(sample_key).encode('utf-8')).hexdigest()[:20] + '.npz'
+
+
+def save_display(path, disp: dict, sample_key: str, fingerprint: str):
+    """Write a display record (compressed) next to its sample key and the
+    run fingerprint it belongs to; replaced atomically."""
+    import json
+    import os
+    from pathlib import Path
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.tmp.npz')
+    meta = json.dumps({'format': DISPLAY_FORMAT, 'sample': str(sample_key),
+                       'fingerprint': fingerprint, 'channels': list(disp['channels']),
+                       'populations': list(disp['populations']), 'n': int(disp['n'])})
+    np.savez_compressed(tmp, events=disp['events'], bits=disp['bits'], meta=np.array(meta))
+    os.replace(tmp, path)
+
+
+def load_display(path) -> tuple[dict, dict] | None:
+    """(display record, {'sample', 'fingerprint'}) from save_display, or None."""
+    import json
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            meta = json.loads(str(z['meta']))
+            if meta.get('format') != DISPLAY_FORMAT:
+                return None
+            disp = {'channels': meta['channels'], 'events': z['events'],
+                    'populations': meta['populations'], 'bits': z['bits'], 'n': int(meta['n'])}
+    except Exception:
+        return None
+    return disp, {'sample': meta.get('sample'), 'fingerprint': meta.get('fingerprint')}
+
+
+# ---------------------------------------------------------------------------
+# Statistics export and population comparison
+# ---------------------------------------------------------------------------
+
+def statistics_tables(stats: dict, labels: dict | None = None,
+                      antigens: dict | None = None) -> dict:
+    """The statistics run as tables: {'frequencies', 'counts', 'markers'}
+    for the tests that were run (every comparison, with a population label
+    and, for markers, the antigen), plus 'values_frequencies' (samples ×
+    populations, % of the denominator) and 'values_markers'."""
+    labels = labels or {}
+    antigens = antigens or {}
+    out = {}
+    for key, name in (('freq', 'frequencies'), ('counts', 'counts'), ('markers', 'markers')):
+        df = stats.get(key)
+        if df is None:
+            continue
+        df = df.copy()
+        pop_col = 'cluster_id' if key == 'markers' and 'cluster_id' in df.columns else 'feature'
+        df.insert(0, 'population', [labels.get(k, k) for k in df[pop_col]])
+        if key == 'markers' and 'channel' in df.columns:
+            df.insert(1, 'antigen', [antigens.get(c, c) for c in df['channel']])
+        out[name] = df
+    values = stats.get('freq_values')
+    if values is not None:
+        vf = values.rename(columns=lambda c: labels.get(c, c)).copy()
+        vf.insert(0, 'group', list(stats.get('group_vec') or [''] * len(vf)))
+        vf.index.name = 'sample'
+        out['values_frequencies'] = vf
+    mvalues = stats.get('marker_values')
+    if mvalues is not None:
+        def _label(feature):
+            pop, _sep, ch = str(feature).partition(FEATURE_SEP)
+            return f"{labels.get(pop, pop)} | {antigens.get(ch, ch)}"
+        vm = mvalues.rename(columns=_label).copy()
+        vm.insert(0, 'group', list(stats.get('group_vec') or [''] * len(vm)))
+        vm.index.name = 'sample'
+        out['values_markers'] = vm
+    return out
+
+
+def group_population_values(summaries: dict, samples: list[str], groups: dict, pop_key: str,
+                            use_stats_parent: bool = True) -> dict:
+    """{group: [(sample, % of parent)]} for one population, from the gated
+    summaries; samples where the population cannot be measured are left out."""
+    out: dict[str, list] = {}
+    for s in samples:
+        g = groups.get(s)
+        if not g:
+            continue
+        row = next((r for r in (summaries.get(s) or {}).get('populations', [])
+                    if r['key'] == pop_key), None)
+        if row is None:
+            continue
+        use_sp = use_stats_parent and row.get('n_stats_parent') is not None
+        denom = row['n_stats_parent'] if use_sp else row['n_parent']
+        if not denom:
+            continue
+        out.setdefault(g, []).append((s, 100.0 * float(row['n_events']) / float(denom)))
+    return out
+
+
+def population_result(stats: dict, pop_key: str, comparison: str,
+                      fdr_scope: str = 'global') -> dict | None:
+    """The frequency test of one population in one comparison: {'logFC',
+    'P', 'FDR', 'significant'}, or None when it was not tested."""
+    df = (stats or {}).get('freq')
+    if df is None or df.empty:
+        return None
+    sel = df[df['feature'] == pop_key]
+    if 'comparison' in sel.columns:
+        sel = sel[sel['comparison'] == comparison]
+    if sel.empty:
+        return None
+    r = sel.iloc[0]
+    fdr_col = 'adj.P.Val.global' if fdr_scope == 'global' and 'adj.P.Val.global' in sel.columns \
+        else 'adj.P.Val'
+    return {'logFC': float(r['logFC']), 'P': float(r['P.Value']),
+            'FDR': float(r[fdr_col]) if fdr_col in sel.columns and pd.notna(r[fdr_col]) else None,
+            'significant': bool(r.get('significant', False))}
+

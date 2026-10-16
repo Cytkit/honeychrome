@@ -42,7 +42,8 @@ import time
 
 from honeychrome.controller_components.per_sample_gating_functions import install_custom_gate, copy_gate_geometry, serialize_custom_sample_gates
 from honeychrome.experiment_model import ExperimentModel, check_fcs_matches_experiment
-from honeychrome.controller_components.functions import apply_gates_in_place, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels, sync_af_index_transform, resolve_base_gate, gate_channels, prune_gating_to_channels, prune_plots_to_channels
+from honeychrome.controller_components.functions import apply_gates_in_place, gate_lookup_tables, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels, sync_af_index_transform, resolve_base_gate, gate_channels, prune_gating_to_channels, prune_plots_to_channels
+from honeychrome.controller_components.fcs_preview import read_preview_metadata, load_fcs_preview
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml, gate_to_gml, gate_from_gml
 from honeychrome.settings import traces_cache_size, traces_cache_dtype, adc_rate
 import honeychrome.settings as settings
@@ -539,94 +540,7 @@ class Controller(QObject):
                             # use the current sample's effective gate: FlowKit returns the
                             # custom sample gate if one exists, otherwise the template gate.
                             gate = gating.get_gate(gate_id[0], sample_id=self.current_sample_path)
-                            # gate = gating.get_gate(gate_id[0], gate_id[1]) # include gate path? no
-                            channels = gate.get_dimension_ids()
-
-                            if len(channels) == 1:
-                                xchan = channels[0]
-                                transform_x = transformations[xchan]
-
-                                unit_1d = np.ones(transform_x.scale_bins+1, dtype=np.bool_)
-                                mask_ones_1d = np.nonzero(unit_1d)
-
-                                ### Use flowkit to make lookup table, gate by lookup table
-                                scale_x = transform_x.scale
-                                mask_coords = scale_x[mask_ones_1d[0] + 1]
-                                mask_as_fksample = Sample(mask_coords, channel_labels=channels, sample_id='mask_as_fksample')
-
-                                # get events in gate - generate temporary gating strategy for mask only - faster
-                                temp_gating_strategy = GatingStrategy()
-                                temp_gating_strategy.add_gate(gate, gate_path=('root',))
-                                for channel in gate.dimensions:
-                                    xform = transformations[channel.id].xform
-                                    temp_gating_strategy.transformations[channel.id] = xform
-                                    if channel.transformation_ref and channel.transformation_ref != channel.id: # fix for stale transformation_ref references
-                                        temp_gating_strategy.transformations[channel.transformation_ref] = xform
-                                results_for_lookup_table = temp_gating_strategy.gate_sample(mask_as_fksample, verbose=True)
-                                lookup_table = {gate_id[0]: results_for_lookup_table.get_gate_membership(gate_id[0])}
-
-
-                            elif len(channels) == 2 and gate.gate_type != 'QuadrantGate': #2 channels
-                                #todo this crashes if xchan and y chan are the same... fix
-                                xchan = channels[0]
-                                ychan = channels[1]
-                                transform_x = transformations[xchan]
-                                transform_y = transformations[ychan] #on loading/creating new experiment, sometimes crashes on this line, e.g. saying no transformations['FSC-W']
-
-                                unit_2d = np.ones((transform_x.scale_bins + 1, transform_y.scale_bins + 1), dtype=np.bool_)
-                                # unit_2d = np.ones((settings.hist_bins_retrieved+1, settings.hist_bins_retrieved+1), dtype=np.bool_)
-                                mask_ones_2d = np.nonzero(unit_2d)
-
-                                ### Use flowkit to make lookup table, gate by lookup table
-                                scale_x = transform_x.scale
-                                scale_y = transform_y.scale
-                                mask_coords = np.column_stack((scale_x[mask_ones_2d[0]+1], scale_y[mask_ones_2d[1]+1]))
-                                mask_as_fksample = Sample(mask_coords, channel_labels=channels, sample_id='mask_as_fksample')
-
-                                # get events in gate - generate temporary gating strategy for mask only - faster
-                                temp_gating_strategy = GatingStrategy()
-                                temp_gating_strategy.add_gate(gate, gate_path=('root',))
-                                for channel in gate.dimensions:
-                                    xform = transformations[channel.id].xform
-                                    temp_gating_strategy.transformations[channel.id] = transformations[channel.id].xform
-                                    if channel.transformation_ref and channel.transformation_ref != channel.id: # fix for stale transformation_ref references
-                                        temp_gating_strategy.transformations[channel.transformation_ref] = xform
-
-                                results_for_lookup_table = temp_gating_strategy.gate_sample(mask_as_fksample, verbose=True)
-                                lookup_table = {gate_id[0]: results_for_lookup_table.get_gate_membership(gate_id[0])}
-
-
-                            else: #quad gate
-                                xchan = gate.dimensions[0].dimension_ref
-                                ychan = gate.dimensions[1].dimension_ref
-                                channels = [xchan, ychan]
-                                transform_x = transformations[xchan]
-                                transform_y = transformations[ychan]
-
-                                unit_2d = np.ones((settings.hist_bins_retrieved+1, settings.hist_bins_retrieved+1), dtype=np.bool_)
-                                mask_ones_2d = np.nonzero(unit_2d)
-
-                                ### Use flowkit to make lookup table, gate by lookup table
-                                scale_x = transform_x.scale
-                                scale_y = transform_y.scale
-                                mask_coords = np.column_stack((scale_x[mask_ones_2d[0]+1], scale_y[mask_ones_2d[1]+1]))
-                                mask_as_fksample = Sample(mask_coords, channel_labels=channels, sample_id='mask_as_fksample')
-
-                                # get events in gate - generate temporary gating strategy for mask only - faster
-                                temp_gating_strategy = GatingStrategy()
-                                temp_gating_strategy.add_gate(gate, gate_path=('root',))
-                                temp_gating_strategy.transformations[xchan] = transformations[xchan].xform
-                                temp_gating_strategy.transformations[ychan] = transformations[ychan].xform
-
-                                for divider in gate.dimensions:
-                                    if divider.transformation_ref and divider.transformation_ref not in (xchan, ychan): # fix for stale transformation_ref references
-                                        temp_gating_strategy.transformations[divider.transformation_ref] = transformations[divider.dimension_ref].xform
-
-                                results_for_lookup_table = temp_gating_strategy.gate_sample(mask_as_fksample, verbose=True)
-                                quadrant_names = gate.quadrants.keys()
-                                lookup_table = {name:results_for_lookup_table.get_gate_membership(name) for name in quadrant_names}
-
-                            lookup_tables.update(lookup_table)
+                            lookup_tables.update(gate_lookup_tables(gate, gate_id[0], transformations))
 
         if self.bus is None:
             warnings.warn('No events bus connected')
@@ -1394,6 +1308,23 @@ class Controller(QObject):
                     (self.experiment_dir / sample_dir).mkdir(parents=True, exist_ok=True)
                     self.new_sample(sample[2], sample_dir)
 
+    def _load_capped_preview(self, sample_full_path, whitelisted_pnn):
+        """Stream a capped random subset of a large FCS file; None means use the full loader.
+
+        Streaming preview based on Joan Escrivà Font's pull request #16.
+        """
+        cap = settings.max_display_events
+        if not cap:
+            return None
+        try:
+            metadata = read_preview_metadata(sample_full_path)
+            if metadata.event_count <= cap:
+                return None
+            return load_fcs_preview(sample_full_path, cap, whitelisted_pnn or None, metadata)
+        except Exception as e:
+            logger.info('load_sample: streaming preview unavailable (%s); reading full file', e)
+            return None
+
     @with_busy_cursor
     def load_sample(self, sample_path):
         logger.info(f'Controller: loading sample {sample_path}')
@@ -1401,11 +1332,19 @@ class Controller(QObject):
         check_pnn = whitelisted_pnn or self.experiment.settings['raw']['event_channels_pnn']
         if check_fcs_matches_experiment(self.experiment_dir / sample_path, check_pnn, self.experiment.settings['raw']['magnitude_ceiling']):
             self.current_sample_path = sample_path
-            self.current_sample = sample_from_fcs(self.experiment_dir / self.current_sample_path, self.bus)
+            preview = None
+            if self.current_sample_path != self.live_sample_path:
+                preview = self._load_capped_preview(self.experiment_dir / sample_path, whitelisted_pnn)
+            if preview is not None:
+                self.current_sample, self.raw_event_data = preview
+                n_events = self.current_sample.event_count
+                logger.info('load_sample: streamed display events %d of %d', len(self.raw_event_data), n_events)
+            else:
+                self.current_sample = sample_from_fcs(self.experiment_dir / self.current_sample_path, self.bus)
 
             if self.current_sample_path == self.live_sample_path:
                 self.raw_event_data, n_events = self.copy_live_data(extent='update')
-            else:
+            elif preview is None:
                 try:
                     self.raw_event_data = self.current_sample.get_events(
                         source='raw', col_order=whitelisted_pnn

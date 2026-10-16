@@ -164,8 +164,31 @@ def make_run_label(kind: str, algorithm: str, gates: list[str],
     return f"{algo_part}_{gate_part}_{ts}"
 
 
+# Result of sync_status(): whether a run's events still correspond to what the
+# current unmixing and gating select.
+SYNC_IN_SYNC = 'in_sync'
+SYNC_OUT_OF_SYNC = 'out_of_sync'
+SYNC_UNKNOWN = 'unknown'
+
+
+def sync_status(entry: dict, current_fingerprint: str | None) -> str:
+    """
+    Compare a run's recorded drc_pipeline.sync_fingerprint() with the
+    fingerprint of the same gates and samples computed now.
+
+    SYNC_UNKNOWN when either is missing (a run archived before fingerprints
+    were recorded, or a fingerprint that could not be computed); otherwise
+    SYNC_IN_SYNC when they match and SYNC_OUT_OF_SYNC when they differ.
+    """
+    recorded = entry.get('sync_fingerprint')
+    if not recorded or not current_fingerprint:
+        return SYNC_UNKNOWN
+    return SYNC_IN_SYNC if recorded == current_fingerprint else SYNC_OUT_OF_SYNC
+
+
 def _manifest_entry(run_id, kind, label, algorithm, gates, training_sample_ids,
-                     n_events, channels, params, timestamp, n_clusters=None) -> dict:
+                     n_events, channels, params, timestamp, n_clusters=None,
+                     sync_fingerprint=None) -> dict:
     return {
         'run_id': run_id,
         'kind': kind,
@@ -179,6 +202,7 @@ def _manifest_entry(run_id, kind, label, algorithm, gates, training_sample_ids,
         'params': dict(params),
         'timestamp': timestamp,
         'n_clusters': n_clusters,
+        'sync_fingerprint': sync_fingerprint,
         'storage': STORAGE_FORMAT,
     }
 
@@ -240,7 +264,8 @@ def delete_run_payload(controller, run_id: str) -> None:
 
 def archive_dr_run(controller, state, *, algorithm, embeddings,
                     gates, training_sample_ids, channels, params,
-                    n_events, label=None, embedding_features=None) -> dict:
+                    n_events, label=None, embedding_features=None,
+                    sync_fingerprint=None) -> dict:
     """
     Archive a completed DR training run: write the embeddings to
     ``cache/dr_clustering/runs/<run_id>/``, append a lightweight entry to
@@ -256,6 +281,8 @@ def archive_dr_run(controller, state, *, algorithm, embeddings,
         compute true marker-space neighbours with guaranteed row-for-row
         alignment to what's plotted, without re-deriving anything from live
         (re-gate-able) data. Optional for callers that don't have it.
+    sync_fingerprint: drc_pipeline.sync_fingerprint() of the gates and
+        training samples at the time the embedding was made; see sync_status().
     """
     log_stage(log, "ARCHIVE DR RUN")
     run_id = _new_run_id()
@@ -270,6 +297,7 @@ def archive_dr_run(controller, state, *, algorithm, embeddings,
     entry = _manifest_entry(
         run_id, 'dr', run_label, algorithm, gates, training_sample_ids,
         n_events, channels, params, timestamp,
+        sync_fingerprint=sync_fingerprint,
     )
     manifest = read_manifest(controller)
     manifest.append(entry)
@@ -349,7 +377,7 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
                             training_sample_ids, channels, params,
                             n_events, label=None,
                             marker_values=None, dr_positions=None,
-                            tree_data=None) -> dict:
+                            tree_data=None, sync_fingerprint=None) -> dict:
     """
     Archive a completed clustering run.  Same file/manifest layout as
     archive_dr_run(), with 'labels' (per-sample label arrays), 'colors' and
@@ -374,6 +402,10 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
         Cluster Tree plot type render the MST without needing the live
         (possibly since-overwritten) state.trained_reducers[algorithm]
         entry.
+    sync_fingerprint: fingerprint of the cells the labels belong to (see
+        drc_pipeline.sync_fingerprint and sync_status). For a run clustered
+        in DR-embedding space that is the DR run's own fingerprint, since
+        the labels follow the embedding's rows, not the current gating.
     """
     log_stage(log, "ARCHIVE CLUSTERING RUN")
     run_id = _new_run_id()
@@ -395,6 +427,7 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
     entry = _manifest_entry(
         run_id, 'clustering', run_label, algorithm, gates, training_sample_ids,
         n_events, channels, params, timestamp, n_clusters=n_clusters,
+        sync_fingerprint=sync_fingerprint,
     )
     manifest = read_manifest(controller)
     manifest.append(entry)

@@ -1111,7 +1111,7 @@ def _cosine_similarity_matrix(a: np.ndarray) -> np.ndarray:
 
 def _deduplicate_spectra(
     spectra: np.ndarray,
-    cosine_threshold: float = 0.997,
+    cosine_threshold: float = 0.999,
 ) -> np.ndarray:
     """
     Greedy cosine-similarity deduplication.
@@ -1217,11 +1217,11 @@ def _filter_contaminant_events(
 def get_af_spectra(
     unstained_raw: np.ndarray,
     fluor_spectra: np.ndarray,
-    som_dim: int = 10,
+    som_dim: int = 15,
     min_cells: int = 100,
     random_state: int = 42,
     deduplicate: bool = True,
-    duplication_threshold: float = 0.995,
+    duplication_threshold: float = 0.999,
     refine: bool = True,
     problem_quantile: float = 0.99,
     k_neighbors: int = 15,

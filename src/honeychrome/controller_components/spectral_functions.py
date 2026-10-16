@@ -83,9 +83,15 @@ def _gate_events_via_lookup(
     ancestors, without calling gate_sample() on the full event array.
 
     Uses the lookup-table pattern from apply_gates_in_place() / controller.py:
-    gate a small coordinate grid (transform bin edges), then map events via
-    np.searchsorted.  Handles RectangleGate, PolygonGate, and EllipsoidGate
-    uniformly — no per-gate-type special-casing required.
+    gate a small coordinate grid, then map events via np.searchsorted.
+    Handles RectangleGate, PolygonGate, and EllipsoidGate uniformly — no
+    per-gate-type special-casing required.
+
+    Template gates only: per-sample overrides are not applied. A
+    GatingStrategy holds FlowKit transforms, which have no display bins, so
+    the grid is linear across the data's range (512 points in 1-D, 256 x 256
+    in 2-D). Use gate_event_mask with a SampleGating to gate a sample as the
+    main window does.
 
     Parameters
     ----------
@@ -175,6 +181,34 @@ def _gate_events_via_lookup(
 
     return mask
 
+def gate_event_mask(all_events: np.ndarray, pnn: list, gate_label: str, gating,
+                    sample_key: str | None = None) -> np.ndarray:
+    """
+    Boolean mask (n_events,) of the events inside gate_label and its ancestors.
+
+    gating is either
+      * a SampleGating (``SampleGating.from_controller(controller, scope='raw')``):
+        the events are gated as the main window gates *sample_key* when it is
+        displayed, with that sample's per-sample gate overrides, its own Time
+        range and the display bins; or
+      * a FlowKit GatingStrategy: template gates only, rasterised on a grid
+        spanning the data (_gate_events_via_lookup).
+
+    Build the SampleGating where the gates are used: it reads the live
+    gating, so gates added or moved before the call are included.
+    """
+    from honeychrome.controller_components.per_sample_gating_functions import SampleGating
+
+    if isinstance(gating, SampleGating):
+        return gating.population_mask(sample_key, all_events, list(pnn), [gate_label])
+    return _gate_events_via_lookup(all_events, pnn, gate_label, gating)
+
+
+def _gating_strategy(gating):
+    """The FlowKit GatingStrategy behind *gating* (a SampleGating or a GatingStrategy)."""
+    return getattr(gating, 'gating', gating)
+
+
 def get_profile(
     sample,
     gate_label: str,
@@ -183,10 +217,16 @@ def get_profile(
     preloaded_events: np.ndarray | None = None,
     preloaded_pnn: list | None = None,
     event_channels_pnn: list | None = None,
+    sample_key: str | None = None,
+    return_n_events: bool = False,
 ):
     """
     Return mean fluorescence profile for events within gate_label.
 
+    raw_gating          : SampleGating or GatingStrategy (see gate_event_mask).
+    sample_key          : the sample's experiment key, used with a SampleGating.
+    return_n_events     : also return the number of events in the gate, as
+                          ``(profile, n_events)``.
     preloaded_events    : (n_events, n_channels) float64, already loaded by the
                           caller.  If None, loaded here from sample.
     preloaded_pnn       : channel name list matching preloaded_events column
@@ -207,11 +247,12 @@ def get_profile(
         pnn = sample.pnn_labels
 
     if gate_label != 'root':
-        event_mask = _gate_events_via_lookup(all_events, pnn, gate_label, raw_gating)
+        event_mask = gate_event_mask(all_events, pnn, gate_label, raw_gating, sample_key)
     else:
         event_mask = np.ones(len(all_events), dtype=np.bool_)
+    n_events = int(event_mask.sum())
 
-    if event_mask.sum() > 0:
+    if n_events > 0:
         profile = all_events[event_mask].mean(axis=0)
         if preloaded_pnn is not None and event_channels_pnn is not None:
             # fluorescence_channel_ids index into event_channels_pnn (full list).
@@ -229,6 +270,8 @@ def get_profile(
         profile = np.zeros(len(fluorescence_channel_ids))
         warnings.warn('No events in gate')
 
+    if return_n_events:
+        return profile, n_events
     return profile
 
 def compute_sample_means_for_wls(
@@ -511,6 +554,7 @@ def get_raw_events(
     gating_strategy=None,
     extra_channel_ids: list | None = None,
     col_order: list | None = None,
+    sample_key: str | None = None,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Return a (n_events, n_channels) float64 array of raw fluorescence values.
@@ -525,6 +569,9 @@ def get_raw_events(
 
     col_order: if supplied, passed to get_events() to select/reorder columns by
     PnN name (used for FACSDiscover files with inconsistent derived-parameter sets).
+
+    gating_strategy may be a SampleGating, with sample_key the sample's
+    experiment key, to gate the sample with its own gates (see gate_event_mask).
     """
     try:
         all_events = sample.get_events('raw', col_order=col_order)
@@ -538,13 +585,13 @@ def get_raw_events(
         all_events = np.where(np.isnan(all_events), 0.0, all_events)
 
     if gate_label and gating_strategy:
-        gate_paths = gating_strategy.find_matching_gate_paths(gate_label)
+        gate_paths = _gating_strategy(gating_strategy).find_matching_gate_paths(gate_label)
         if gate_paths:
             # col_order is the whitelisted_pnn list when set, otherwise None.
             # all_events was loaded with col_order, so its columns match
             # col_order (or sample.pnn_labels when col_order is None).
             pnn = col_order if col_order is not None else sample.pnn_labels
-            event_mask = _gate_events_via_lookup(all_events, pnn, gate_label, gating_strategy)
+            event_mask = gate_event_mask(all_events, pnn, gate_label, gating_strategy, sample_key)
         else:
             warnings.warn(f'get_raw_events: gate "{gate_label}" not found — returning all events.')
             event_mask = np.ones(len(all_events), dtype=np.bool_)

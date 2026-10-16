@@ -51,6 +51,7 @@ from honeychrome.controller_components.autospectral_functions import (
 )
 from honeychrome.controller_components.functions import sample_from_fcs
 from honeychrome.controller_components.spectral_functions import get_raw_events
+from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.autospectral_functions import (
     combine_envelopes,
     fluorophores_identifiable,
@@ -692,7 +693,8 @@ def discover_all_variants(
 
     all_samples = controller.experiment.samples.get('all_samples', {})
     all_samples_rev = {v: k for k, v in all_samples.items()}
-    raw_gating = controller.raw_gating
+    # each control is gated with its own gates (per-sample overrides, Time range)
+    raw_gating = SampleGating.from_controller(controller, scope='raw', copy=False)
     experiment_dir = controller.experiment_dir
 
     def _load_gated(sample_name, gate_label):
@@ -703,7 +705,7 @@ def discover_all_variants(
         sample = sample_from_fcs(full_path)
         fluor, scatter = get_raw_events(
             sample, fl_ids, gate_label=gate_label, gating_strategy=raw_gating,
-            extra_channel_ids=sc_ids, col_order=col_order,
+            extra_channel_ids=sc_ids, col_order=col_order, sample_key=rel_path,
         )
         return fluor, scatter
 
