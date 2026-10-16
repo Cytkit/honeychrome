@@ -797,7 +797,7 @@ class CytkitDevice:
             if not already_acquiring:
                 self.capture.aggr_set_enable(False)
 
-            print(blob_of_traces_as_array)
+            # print(blob_of_traces_as_array)
             self.fifo_level = self.capture.aggr_get_fifo_level()
 
             message['capture'] = {'fifo_level':self.fifo_level, 'fifo_status':'🔴 Flooded!' if self.fifo_flooded else '🟢 OK', 'decode_errors':self.decoder.error_count, 'auto_resets':self.auto_resets}

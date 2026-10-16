@@ -64,7 +64,7 @@ dac_ref_default = 1023
 capture_enabled_default = True
 capture_pre_trigger_default = n_time_points_in_event//2
 capture_post_trigger_default = n_time_points_in_event - capture_pre_trigger_default
-trigger_default_hysteresis = 16
+trigger_default_hysteresis = 125
 
 ### define traces cache
 max_events_in_traces_cache = 100_000

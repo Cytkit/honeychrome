@@ -506,7 +506,7 @@ class TriggerChannelTable(QWidget):
         # ---- table ----
         self.table = QTableWidget(len(adc_channels), 9)
         self.table.setHorizontalHeaderLabels(
-            ["Enable", "Merge Mask", "Edge Descending", "Level", "Hysteresis", "Delay", "Hold-off", "Skew", "Events"]
+            ["Enable", "Merge Mask", "Descending", "Level", "Hysteresis", "Delay", "Hold-off", "Skew", "Events"]
         )
         self.table.verticalHeader().setVisible(True)
         self.table.setVerticalHeaderLabels(adc_channels)
@@ -1859,7 +1859,7 @@ class PluginWidget(QWidget):
         if self.controller:
             initialised = self.controller.is_instrument_initialised()
             self.initialised.setChecked(initialised)
-            print(f'Initialisation status: {initialised}')
+            logger.info(f'Initialisation status: {initialised}')
 
 
 if __name__ == "__main__":
