@@ -4,7 +4,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 from queue import Empty
 import pyqtgraph as pg
 
-from honeychrome.settings import n_time_points_in_event, adc_rate
+from honeychrome.settings import n_time_points_in_event, adc_rate, peak_detection_channel_retrieved, instrument_settings, peak_detection_channel, threshold
 from honeychrome.settings import analyser_target_repeat_time, line_colors, adc_channels, scatter_channels, fluorescence_channels
 from honeychrome.view_components.profiles_viewer import FlowLayout, LegendEntry
 
@@ -34,12 +34,12 @@ class OscilloscopeWidget(QWidget):
             self.label = QLabel('')
 
             self.plot_widget1 = pg.PlotWidget()
-            self.plot_widget1.setLabel('left', 'Intensity', units='uV')
+            self.plot_widget1.setLabel('left', 'Intensity [uv]')
             self.plot_widget1.setLabel('bottom', 'Time', units='us')
             self.plot_widget1.showGrid(x=True, y=True, alpha=0.3)
 
             self.plot_widget2 = pg.PlotWidget()
-            self.plot_widget2.setLabel('left', 'Intensity', units='uV')
+            self.plot_widget2.setLabel('left', 'Intensity [uv]')
             self.plot_widget2.setLabel('bottom', 'Time', units='us')
             self.plot_widget2.showGrid(x=True, y=True, alpha=0.3)
 
@@ -70,6 +70,9 @@ class OscilloscopeWidget(QWidget):
                 color = line_colors[i % len(line_colors)]
                 entry = LegendEntry(color, fluorescence_channels[i])
                 self.legendLayout2.addWidget(entry)
+
+            self.peak_detection_channel_index = adc_channels.index(str(instrument_settings.value("peak_detection_channel", peak_detection_channel)))
+            self.threshold = instrument_settings.value("threshold", threshold, type=int) * 1000
 
             # Use a timer to check the queue periodically
             self.trace = None
@@ -112,6 +115,10 @@ class OscilloscopeWidget(QWidget):
                 self.plot_widget1.plot(peak_start, np.array([0, self.trace['traces'][i][start:end].max()]), pen=solid_pen)
                 self.plot_widget1.plot(peak_end, np.array([0, self.trace['traces'][i][start:end].max()]), pen=solid_pen)
 
+                if i==self.peak_detection_channel_index:
+                    pen = pg.mkPen(color=color, width=5, style=Qt.DotLine)
+                    self.plot_widget1.plot(peak_span, self.threshold * np.ones(2), pen=pen)
+
             self.plot_widget2.clear()
             for i in self.fluorescence_channel_indices:
                 color = line_colors[i % len(line_colors)]
@@ -127,7 +134,15 @@ class OscilloscopeWidget(QWidget):
                 self.plot_widget2.plot(peak_start, np.array([0, self.trace['traces'][i][start:end].max()]), pen=solid_pen)
                 self.plot_widget2.plot(peak_end, np.array([0, self.trace['traces'][i][start:end].max()]), pen=solid_pen)
 
+                if i==self.peak_detection_channel_index:
+                    pen = pg.mkPen(color=color, width=5, style=Qt.DotLine)
+                    self.plot_widget2.plot(peak_span, self.threshold * np.ones(2), pen=pen)
+
             self.label.setText(f"event_id={self.trace['event_id']} time={self.trace['time']}")
+
+
+
+
 
         except Exception as e:
             logger.info(f"Error updating plot: {e}")

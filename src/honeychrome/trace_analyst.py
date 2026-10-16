@@ -14,11 +14,10 @@ import numpy as np
 import time
 
 from honeychrome.settings import traces_cache_size, max_events_in_traces_cache, trace_n_points, n_channels_trace, adc_rate, threshold_retrieved, n_time_points_in_event, window_extension_length_pre, baseline_decay_rate, window_extension_length_post, timeout_length, deltaT, adc_scale_uv
-from honeychrome.settings import max_events_in_cache, n_channels_per_event, event_channels_pnn, analyser_target_repeat_time
+from honeychrome.settings import max_events_in_cache, n_channels_per_event, event_channels_pnn, analyser_target_repeat_time, baseline_length
 from honeychrome.settings import adc_channels, peak_detection_channel_retrieved, area_channels, height_channels, width_channels, scatter_channels, fluorescence_channels
 
 verbosity_divider = int(1/analyser_target_repeat_time)
-baseline_length = int(1/baseline_decay_rate)
 gap = 10 # gap between start of end of baseline and start of peak
 
 default_baselines = np.zeros(n_channels_trace)
@@ -57,7 +56,8 @@ def peak_start_stop_baseline(tr, threshold):
     return n_start, n_end, baseline
 
 def peak_measurements(tr, n_start, n_end, deltaT, area_indices, height_indices):
-    baselines = np.concatenate((tr[:,gap:n_start-gap], tr[:,n_end-gap:]), axis=1).mean(axis=1)
+    # baselines = np.concatenate((tr[:,gap:n_start-gap], tr[:,n_end-gap:]), axis=1).mean(axis=1)
+    baselines = tr[:,gap:n_start-gap].mean(axis=1)
     traces_truncated_baseline_subtracted = tr[:,n_start:n_end] - baselines.reshape(-1,1)
     heights = np.max(traces_truncated_baseline_subtracted[height_indices,:], axis=1)
     areas = np.sum(traces_truncated_baseline_subtracted[area_indices,:], axis=1)
@@ -271,8 +271,10 @@ class TraceAnalyser(mp.Process):
                 last_event_index = 0
                 for n, traces in enumerate(traces_batch_scaled):
                     n_start, n_end, tr_baseline = peak_start_stop_baseline(traces[self.indices_peak_detection_channel_in_traces], self.threshold)
+                    print(n_start, n_end, tr_baseline)
                     if n_start > 0:
                         peak, baselines = peak_measurements(traces, n_start, n_end, deltaT, self.indices_area_channels_in_traces, self.indices_height_channels_in_traces)
+                        print(peak, baselines)
                         areas[n], heights[n], widths[n], centre = peak
                         keep_mask[n] = True
                         last_event_index = n

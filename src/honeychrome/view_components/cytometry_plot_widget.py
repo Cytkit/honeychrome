@@ -530,7 +530,7 @@ class CytometryPlotWidget(QFrame):
     def fit_axes_to_data(self):
         if self.plot['type'] == 'ribbon':
             channels = ['ribbon']
-            channel_max = np.percentile(self.data_for_cytometry_plots['event_data'][:,self.fluoro_indices], 99)
+            channel_max = np.abs(np.percentile(self.data_for_cytometry_plots['event_data'][:,self.fluoro_indices], 99))
             self.transformations[channels[0]].scale_t = 2 * channel_max
             self.transformations[channels[0]].set_transform(limits=[0, 1])
 
