@@ -647,3 +647,58 @@ def test_channel_remap_touches_only_gates_on_that_channel():
                                          transform_factory=lambda p: Lin(p['scale_t']))
     assert changed and tb['a']['pos']['threshold_x'] == pytest.approx(1.0)
     assert tb['b'] is b_before and ag.gates_on_channel(gates, tb, 'A') == {'a'}
+
+
+# ---------------------------------------------------------------------------
+# Algorithm order and colours, default axis range, paused training
+# ---------------------------------------------------------------------------
+
+@pytest.mark.numpy_only
+def test_threshold_algorithms_are_listed_in_display_order():
+    for gtype in ('1dsep', '2dsep'):
+        algos = ag.ALGORITHMS_BY_GATE_TYPE[gtype]
+        assert algos[:6] == ['mixture', 'tail', ag.ALGORITHM_REPLICATE, 'otsu', 'bimodal', 'kde_min']
+
+
+@pytest.mark.numpy_only
+def test_every_algorithm_has_its_own_colour():
+    names = list(ag.THRESHOLD_ALGORITHMS) + [ag.ALGORITHM_REPLICATE, ag.ALGORITHM_IMPORTED]
+    colours = [tuple(ag.algorithm_colour(a)) for a in names]
+    assert len(set(colours)) == len(names)
+    assert tuple(ag.algorithm_colour('no such algorithm')) == tuple(ag.DEFAULT_ALGORITHM_COLOUR)
+
+
+@pytest.mark.numpy_only
+def test_tail_uses_the_whole_axis_by_default():
+    assert ag.default_axis_lo('tail') == 0.0
+    assert ag.default_axis_lo('mixture') == 0.01
+
+
+@pytest.mark.numpy_only
+def test_rekey_prefers_the_renamed_entry():
+    out = ag.rekey({'X': 'model X', 'Y': 'model Y', 'Z': 'model Z'}, {'X': 'Y'})
+    assert out == {'Y': 'model X', 'Z': 'model Z'}
+
+
+@pytest.mark.numpy_only
+def test_paused_training_keeps_partial_results_and_resumes():
+    data, idx = _three_channel_data()
+    gates = [_gate('a', '1dsep', 'A', number=1),
+             _gate('b', '1dsep', 'B', number=2),
+             _gate('c', '1dsep', 'C', parent='a', parent_pop='pos', number=3)]
+    calls = []
+
+    def stop_after_first():
+        calls.append(1)
+        return len(calls) > 1
+
+    partial = ag.train_boundaries(gates, data, idx, stop_check=stop_after_first)
+    assert partial.stopped and list(partial.boundaries) == ['a']
+    full = ag.train_boundaries(gates, data, idx)
+    resumed = ag.train_boundaries(gates, data, idx, done=dict(partial.boundaries))
+    assert not resumed.stopped and set(resumed.boundaries) == {'a', 'b', 'c'}
+    assert resumed.boundaries['a'] == partial.boundaries['a']
+    for name in ('b', 'c'):
+        assert resumed.boundaries[name]['pos']['threshold_x'] == pytest.approx(
+            full.boundaries[name]['pos']['threshold_x'])
+    assert {s.get('source') for s in resumed.status.values()} <= {'trained', None}
