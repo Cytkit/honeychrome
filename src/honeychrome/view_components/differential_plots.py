@@ -497,6 +497,10 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
             value_label = '% frequency'
     cb.set_label(value_label, fontsize=7)
 
+    # Row identities, for clicking through to a feature.
+    fig._row_axes = ax_hm
+    fig._row_keys = [cols_present[i] for i in row_order]
+
     style_figure_theme(fig, is_dark)
     stamp_run_label(fig, run_label)
     return fig
@@ -712,6 +716,13 @@ def make_marker_summary_figure(results_df: pd.DataFrame, title: str, channel_nam
     cb.set_label(value_label, fontsize=7)
     cb.ax.tick_params(labelsize=7)
     ax.set_title(title, fontsize=10)
+    # Row identities, for clicking through to a family.
+    fig._row_axes = ax
+    if 'cluster_id' in fam_df.columns:
+        ids = fam_df.drop_duplicates('cluster').set_index('cluster')['cluster_id']
+        fig._row_keys = [ids.get(f, f) for f in fam_order]
+    else:
+        fig._row_keys = list(fam_order)
     style_figure_theme(fig, is_dark)
     stamp_run_label(fig, run_label)
     return fig
