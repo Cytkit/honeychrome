@@ -24,17 +24,40 @@ logger = logging.getLogger(__name__)
 
 plugin_name = 'Cytkit Hardware'
 
+class ScaledAxis(pg.AxisItem):
+    """A right-side axis that displays tick values as value * scale_factor,
+    but shares its range with the linked (left) axis."""
+
+    def __init__(self, scale_factor=1.0, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scale_factor = scale_factor
+
+    def tickStrings(self, values, scale, spacing):
+        # values are in the *left axis* units; convert for display only.
+        return [f"{v * self.scale_factor:g}" for v in values]
+
 class PlotTracesWidget(QWidget):
     def __init__(self):
         super().__init__()
 
+        self.setWindowTitle('Transfer Raw Traces')
         # self.setGeometry(10, 10, 800, 700)
         self.layout = QVBoxLayout(self)
 
-        self.plot_widget1 = pg.PlotWidget()
-        self.plot_widget1.setLabel('left', 'ADC value', units='')
+        self.plot_widget1 = pg.PlotWidget(axisItems={'right': ScaledAxis(orientation='right', scale_factor=settings.adc_scale_uv/1000, )})
+        self.plot_widget1.setLabel('left', 'ADC value')
         self.plot_widget1.setLabel('bottom', 'Time', units='us')
+        self.plot_widget1.setLabel('right', 'mV')
         self.plot_widget1.showGrid(x=True, y=True, alpha=0.3)
+
+        # Show the right axis (it exists but is hidden by default)
+        plot_item = self.plot_widget1.getPlotItem()
+        plot_item.showAxis('right')
+
+        # Style it so it's visually distinct
+        right_axis = plot_item.getAxis('right')
+        right_axis.setPen(pg.mkPen('#d62728'))
+        right_axis.setTextPen(pg.mkPen('#d62728'))
 
         # ---- Flowing Legend ----
         self.legendContainer1 = QWidget()
@@ -980,7 +1003,7 @@ class CaptureChannelTable(QWidget):
     # ---------- reset ----------
     def reset(self, rows=None) -> None:
         self._loading = True
-        if rows is None:
+        if not rows:
             rows = range(len(adc_channels))
         try:
             for row in rows:
@@ -1428,14 +1451,17 @@ class PluginWidget(QWidget):
         self.clear_fifo_btn = QPushButton('Clear FIFO')
         self.clear_fifo_btn.clicked.connect(lambda: self.set_instrument_state({'capture': 'clear_fifo'}))
         layout.addWidget(self.clear_fifo_btn)
-        self.read_memory_btn = QPushButton('Capture and read memory once')
+        read_memory_layout = QHBoxLayout()
+        self.read_memory_btn = QPushButton('Transfer raw traces')
         self.read_memory_btn.clicked.connect(lambda: self.get_instrument_state({'test_capture_and_read_memory'}))
+        self.read_memory_cb = QCheckBox('Loop')
+
         self.read_memory_output = QLabel('')
-        self.plot_traces_widget = PlotTracesWidget()
-        self.plot_traces_widget.setVisible(False)
-        layout.addWidget(self.read_memory_btn)
+        read_memory_layout.addWidget(self.read_memory_btn)
+        read_memory_layout.addWidget(self.read_memory_cb)
+        self.plot_traces_widget = None
+        layout.addLayout(read_memory_layout)
         layout.addWidget(self.read_memory_output)
-        layout.addWidget(self.plot_traces_widget)
         self.traces_blob_np = None
 
         layout.addStretch()
@@ -1594,6 +1620,9 @@ class PluginWidget(QWidget):
         self.update_tab(tab_name)
 
     def update_tab(self, name):
+        if self.read_memory_cb.isChecked() and self.plot_traces_widget is not None:
+            self.get_instrument_state(['test_capture_and_read_memory'])
+
         match name:
             case "Connection":
                 self.update_connection_status()
@@ -1768,12 +1797,22 @@ class PluginWidget(QWidget):
             if traces_blob_np is not None:
                 self.traces_blob_np = traces_blob_np.reshape(-1, len(adc_channels), settings.n_time_points_in_event)
                 self.read_memory_output.setText(f'Traces captured: {len(self.traces_blob_np)}, non-zero channels: {np.flatnonzero(self.traces_blob_np.sum(axis=2).sum(axis=0))}')
+
+                if self.plot_traces_widget is None:
+                    self.plot_traces_widget = PlotTracesWidget()
+                    self.plot_traces_widget.setAttribute(Qt.WA_DeleteOnClose)
+                    self.plot_traces_widget.destroyed.connect(lambda: setattr(self, "plot_traces_widget", None))
+                    self.plot_traces_widget.show()
+                else:
+                    if not self.plot_traces_widget.isVisible():
+                        self.plot_traces_widget.show()
+                    else:
+                        self.plot_traces_widget.raise_()
+                        self.plot_traces_widget.activateWindow()
                 self.plot_traces_widget.set_traces(self.traces_blob_np)
-                self.plot_traces_widget.setVisible(True)
             else:
                 self.traces_blob_np = None
                 self.read_memory_output.setText(f'No traces captured.')
-                self.plot_traces_widget.setVisible(False)
 
 
         if 'register_getter' in response['message']:

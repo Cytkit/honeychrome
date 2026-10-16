@@ -20,7 +20,7 @@ adc_rate = 2.5  # [MHz]
 max_event_time = 120  # [us]
 n_time_points_in_event = int(adc_rate * max_event_time)
 deltaT = 1/adc_rate # [us]
-adc_scale_uv = 183.11 # microvolts per unit adc scale(default for Cytkit)
+adc_scale_uv = 183.11 # microvolts per unit adc scale (default for Cytkit)
 
 # instrument automation settings
 standby_time = 600_000 # ms to automatically put instrument to standby (switch off laser and pumps)
