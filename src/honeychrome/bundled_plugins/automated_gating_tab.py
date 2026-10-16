@@ -73,6 +73,7 @@ import honeychrome
 from honeychrome.settings import af_abundance_channel
 from honeychrome.controller_components import differential_stats as ds
 from honeychrome.view_components import suggest_groupings_dialog as sgd
+from honeychrome.view_components.checkable_header import CheckableHeaderView
 from honeychrome.controller_components.functions import (
     build_antigen_map,
     build_display_label_map,
@@ -176,6 +177,10 @@ EXPORT_DIR = Path('Automated_Gating_Results')
 GROUP_PLOT_EVENTS = 100_000
 # Heatmaps and marker summaries open at this size (percent of natural size).
 HEATMAP_SCALE_PCT = 50
+# Samples-table column sizes (pixels): the sample name is capped so a long
+# name cannot push the other columns out of view; covariates get room to type.
+SAMPLE_COLUMN_MAX_WIDTH = 280
+COVARIATE_COLUMN_MIN_WIDTH = 110
 POP_FILTERS = (('significant', 'Significant populations'), ('all', 'All populations'))
 
 MODE_LABELS = {ag_core.MODE_FIXED: 'Fixed', ag_core.MODE_RECALCULATE: 'Recalculate'}
@@ -379,6 +384,8 @@ class GatingRunState:
     display        : {sample key: display subsample and masks} — this
                      session only.
     covariates     : {covariate name: {sample key: value}}.
+    numeric_covariates: covariate names entered into the statistics as
+                     continuous numbers (e.g. age); the rest are categories.
     stats          : results of the last statistics run (kept in STATS_FILE).
     pca, predictive: the last sample PCA and predictive analysis (from the
                      statistics run's per-sample values) — this session only.
@@ -428,6 +435,7 @@ class GatingRunState:
     group_patterns: dict = field(default_factory=dict)
     sample_groups: dict = field(default_factory=dict)
     covariates: dict = field(default_factory=dict)
+    numeric_covariates: list = field(default_factory=list)
     pairing: str = ''
     adjust_covariates: list = field(default_factory=list)
     contrast_mode: str = 'reference'
@@ -476,7 +484,7 @@ _PERSISTED_FIELDS = (
     'model_path', 'alignment', 'alignment_methods', 'alignment_confirmed', 'modes',
     'drift_limit', 'drift_action', 'run_samples', 'validation_samples', 'include_controls',
     'display_events', 'group_names', 'group_patterns', 'sample_groups', 'covariates',
-    'pairing', 'adjust_covariates', 'contrast_mode', 'reference_group', 'pval_threshold',
+    'numeric_covariates', 'pairing', 'adjust_covariates', 'contrast_mode', 'reference_group', 'pval_threshold',
     'fc_threshold', 'marker_threshold', 'use_treat', 'fdr_scope', 'run_freq', 'run_counts',
     'run_markers', 'use_stats_parent', 'exclude_gating_markers', 'min_marker_events',
     'exclude_flagged', 'pca_use_freq', 'pca_use_counts', 'pca_use_markers', 'pca_n_loadings',
@@ -2114,7 +2122,10 @@ class ResultsTab(QWidget):
         gl = QVBoxLayout(gbox)
         self.groups_table = QTableWidget(0, 2)
         self.groups_table.setHorizontalHeaderLabels(["Group", "Sample-name pattern (regex)"])
-        self.groups_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        groups_header = self.groups_table.horizontalHeader()
+        groups_header.setSectionResizeMode(QHeaderView.Interactive)
+        groups_header.setStretchLastSection(True)
+        self.groups_table.setColumnWidth(0, 180)
         self.groups_table.verticalHeader().setVisible(False)
         self.groups_table.itemChanged.connect(self._on_group_item_changed)
         gl.addWidget(self.groups_table)
@@ -2131,8 +2142,8 @@ class ResultsTab(QWidget):
         cbox = QGroupBox("Covariates")
         cl = QVBoxLayout(cbox)
         note = QLabel("Per-sample values, e.g. donor (for pairing) or age and sex (for "
-                      "adjustment). Numbers are treated as continuous, anything else as "
-                      "categories.")
+                      "adjustment). Tick Numeric under a column's title to enter it as a "
+                      "continuous number (age, CRP); unticked columns are categories.")
         note.setWordWrap(True)
         cl.addWidget(note)
         crow = QHBoxLayout()
@@ -2174,6 +2185,13 @@ class ResultsTab(QWidget):
         layout.addLayout(auto_row)
 
         self.samples_table = QTableWidget(0, 3)
+        self._samples_header = CheckableHeaderView(
+            self.samples_table, check_label="Numeric",
+            tooltip="Enter this covariate as a continuous number (e.g. age, CRP) instead of "
+                    "as categories. Every value must be a number.")
+        self.samples_table.setHorizontalHeader(self._samples_header)
+        self._samples_header.check_toggled.connect(self._on_covariate_numeric_toggled)
+        self.samples_table.setTextElideMode(Qt.ElideMiddle)
         self.samples_table.verticalHeader().setVisible(False)
         self.samples_table.itemChanged.connect(self._on_sample_cell_changed)
         layout.addWidget(self.samples_table, stretch=1)
@@ -2222,11 +2240,41 @@ class ResultsTab(QWidget):
                     self.samples_table.setItem(r, j, QTableWidgetItem(
                         str((st.covariates.get(cov) or {}).get(key, ''))))
             hh = self.samples_table.horizontalHeader()
-            hh.setSectionResizeMode(QHeaderView.ResizeToContents)
-            hh.setSectionResizeMode(0, QHeaderView.Stretch)
+            hh.setSectionResizeMode(QHeaderView.Interactive)
+            hh.setStretchLastSection(False)
+            self.samples_table.resizeColumnsToContents()
+            self.samples_table.setColumnWidth(
+                0, min(self.samples_table.columnWidth(0), SAMPLE_COLUMN_MAX_WIDTH))
+            fm = self.samples_table.fontMetrics()
+            group_w = max([fm.horizontalAdvance(g) for g in st.group_names] + [0]) + 48
+            self.samples_table.setColumnWidth(1, max(group_w, 110))
+            for j in range(3, len(headers)):
+                self.samples_table.setColumnWidth(
+                    j, max(self.samples_table.columnWidth(j), COVARIATE_COLUMN_MIN_WIDTH))
+            self._samples_header.set_checks(
+                {j: cov in st.numeric_covariates for j, cov in enumerate(covs, start=3)})
         finally:
             self._filling = False
 
+    def _on_covariate_numeric_toggled(self, section: int, checked: bool):
+        """Enter the covariate under *section* as a continuous number (or as
+        categories). A column holding text cannot be numeric."""
+        st = self.state
+        name = self.samples_table.horizontalHeaderItem(section).text()
+        if checked:
+            filled = [str(v).strip() for v in (st.covariates.get(name) or {}).values()
+                      if str(v).strip()]
+            if filled and ds.covariate_kind(filled) != 'numeric':
+                QMessageBox.warning(
+                    self, "Numeric covariate",
+                    f"'{name}' has values that are not numbers, so it cannot be numeric.")
+                self._samples_header.set_checks(
+                    {j: self.samples_table.horizontalHeaderItem(j).text() in st.numeric_covariates
+                     for j in self._samples_header.checks()})
+                return
+        st.numeric_covariates = [c for c in st.numeric_covariates if c != name]
+        if checked:
+            st.numeric_covariates.append(name)
     def _set_sample_group(self, key: str, group: str):
         if group:
             self.state.sample_groups[key] = group
@@ -2409,6 +2457,7 @@ class ResultsTab(QWidget):
         if self.state.pairing == name:
             self.state.pairing = ''
         self.state.adjust_covariates = [c for c in self.state.adjust_covariates if c != name]
+        self.state.numeric_covariates = [c for c in self.state.numeric_covariates if c != name]
         self._populate_samples_table()
         self._populate_stats_choices()
 
@@ -2690,6 +2739,7 @@ class ResultsTab(QWidget):
         kwargs = dict(
             group_order=list(st.group_names), contrast_mode=st.contrast_mode,
             reference=st.reference_group, pairing=pairing, covariates=covariates,
+            numeric_covariates=[c for c in st.numeric_covariates if c in adjust],
             pval_threshold=st.pval_threshold, fc_threshold=st.fc_threshold,
             marker_threshold=st.marker_threshold, use_treat=st.use_treat,
             fdr_scope=st.fdr_scope, run_freq=st.run_freq, run_counts=st.run_counts,
@@ -3266,6 +3316,12 @@ class ResultsTab(QWidget):
         self.btn_pop_window.clicked.connect(
             lambda: self._shown_population and self._population_window(self._shown_population))
         head.addWidget(self.btn_pop_window)
+        self.btn_pop_save = QPushButton("Save image…")
+        self.btn_pop_save.setToolTip("Save this population's group biplots and dot and violin "
+                                     "plot as one image (PNG, PDF or SVG).")
+        self.btn_pop_save.clicked.connect(
+            lambda: self._shown_population and self._save_population_image(self._shown_population))
+        head.addWidget(self.btn_pop_save)
         rl.addLayout(head)
         self.pop_scroll = QScrollArea()
         self.pop_scroll.setWidgetResizable(True)
@@ -3427,6 +3483,7 @@ class ResultsTab(QWidget):
         self.chk_pop_report.setEnabled(self._shown_population is not None)
         self.chk_pop_report.blockSignals(False)
         self.btn_pop_window.setEnabled(self._shown_population is not None)
+        self.btn_pop_save.setEnabled(self._shown_population is not None)
         if self._shown_population is None:
             self.lbl_pop_title.setText("")
             return
@@ -3498,7 +3555,13 @@ class ResultsTab(QWidget):
         chk = QCheckBox("Include in report")
         chk.setChecked(pop_key in self.state.report_populations)
         chk.toggled.connect(lambda on, k=pop_key: self._set_report_population(k, bool(on)))
-        layout.addWidget(chk)
+        footer = QHBoxLayout()
+        footer.addWidget(chk)
+        footer.addStretch()
+        save = QPushButton("Save image…")
+        save.clicked.connect(lambda _c=False, k=pop_key: self._save_population_image(k))
+        footer.addWidget(save)
+        layout.addLayout(footer)
         self._fill_population_view(row, pop_key, title)
         dialog.show()
 
@@ -3514,6 +3577,39 @@ class ResultsTab(QWidget):
             data['gate_def'], data['pop'], data['panels'] if self.state.display else [],
             self._result_transforms(), labels, data['values'], data['groups'], data['title'],
             ag_report.p_value_text(data['result']))
+
+    def _save_population_image(self, pop_key: str):
+        """Save one population's group biplots and dot and violin plot as a
+        single PNG, PDF or SVG image."""
+        import re
+        import honeychrome.settings as hc_settings
+        fig = self._population_report_figure(pop_key)
+        if fig is None:
+            QMessageBox.warning(self, "Save image", "This population has no figure to save.")
+            return
+        fmt = str(getattr(hc_settings, 'graphics_export_format_retrieved', 'png') or 'png').lower()
+        if fmt not in ('png', 'pdf', 'svg'):
+            fmt = 'png'
+        comp = self._current_comparison()
+        name = _population_labels(self.state.gate_defs()).get(pop_key, pop_key)
+        if comp:
+            name += f" {_comparison_label(*comp)}"
+        stem = re.sub(r'[^\w.\-]+', '_', name).strip('_')
+        start = str(Path(getattr(self.controller, 'experiment_dir', '') or '.') / f"{stem or 'population'}.{fmt}")
+        filters = "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)"
+        path, selected = QFileDialog.getSaveFileName(
+            self, "Save population image", start, filters,
+            {'png': "PNG (*.png)", 'pdf': "PDF (*.pdf)", 'svg': "SVG (*.svg)"}[fmt])
+        if not path:
+            return
+        if Path(path).suffix.lower() not in ('.png', '.pdf', '.svg'):
+            path += '.' + selected.split('*.')[-1].rstrip(')')
+        try:
+            fig.savefig(path, dpi=300, facecolor='white', bbox_inches='tight')
+        except Exception as exc:
+            QMessageBox.warning(self, "Save image", f"Could not save the image: {exc}")
+            return
+        _status(self.bus, f"Population image written to {path}")
 
     # ------------------------------------------------------------------
     # Export
@@ -3768,7 +3864,9 @@ class ResultsTab(QWidget):
                 "Statistics:",
                 "  Comparisons: " + ", ".join(_comparison_label(b, o) for b, o in st.stats['comparisons']),
                 f"  Contrast mode: {st.contrast_mode}; reference: {st.reference_group}",
-                f"  Pairing: {st.pairing or 'none'}; adjusted for: {', '.join(st.adjust_covariates) or 'none'}",
+                f"  Pairing: {st.pairing or 'none'}; adjusted for: "
+                + (', '.join(f"{c} (numeric)" if c in st.numeric_covariates else c
+                             for c in st.adjust_covariates) or 'none'),
                 f"  FDR <= {st.pval_threshold} ({st.fdr_scope}); TREAT: {st.use_treat}",
                 f"  Frequency/count threshold: {st.fc_threshold}; marker threshold: {st.marker_threshold}",
                 f"  Frequencies relative to stats parent where defined: {st.use_stats_parent}",
