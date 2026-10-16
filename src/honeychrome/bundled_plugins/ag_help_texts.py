@@ -475,7 +475,8 @@ did in training; channels the model has none for use this experiment's.</p>
 <li>Pick a <b>population</b> of the experiment's gating hierarchy (the gates of
 the Unmixed Data tab; Singlets or Cells to start with). Its events are pooled
 from a few of the samples ticked on the Run page, each unmixed and gated as
-the main window does.</li>
+the main window does: about 30,000 events of the population in all, an equal
+share from each sample, read without loading the whole file.</li>
 <li>Select a channel on the right to see its histogram and biplots. Drag an
 axis to adjust it as on the main plots: the lower half of a logicle axis
 changes its width basis W, the upper half the displayed range.</li>
@@ -499,7 +500,8 @@ own: changing them here does not change the main window's plots.</p>
 <li>Pick a <b>population</b> of the experiment's gating hierarchy (the gates of
 the Unmixed Data tab; Singlets or Cells to start with). Its events are pooled
 from the training samples (or the sample on show), each unmixed and gated as
-the main window does.</li>
+the main window does: about 30,000 events of the population in all, an equal
+share from each sample, read without loading the whole file.</li>
 <li>Select a channel on the right to see its histogram and biplots. Drag an
 axis to adjust it: the lower half of a logicle axis changes its width basis
 W, the upper half the displayed range. Axes dragged on the Hierarchy and
