@@ -60,6 +60,23 @@ def load_fcs_preview(path, max_events, col_order=None, metadata=None, seed=PREVI
     """
     if max_events <= 0:
         raise ValueError('A positive preview event limit is required.')
+    meta = metadata if metadata is not None else read_preview_metadata(path)
+    labels = meta.pnn_labels if col_order is None else list(col_order)
+    indices = preview_indices(meta.event_count, max_events, seed)
+    events = read_fcs_rows(path, indices, labels, meta)
+    return PreviewSample(path, meta, events, labels), events
+
+
+def read_fcs_rows(path, rows, col_order=None, metadata=None):
+    """Raw events at the sorted row positions *rows*, as a float64 array.
+
+    Reads only the pages of the DATA segment holding those rows. Values
+    carry the same gain, log and time scaling as FlowIO's as_array(), with
+    NaN replaced by 0. Only list-mode float32/float64 files are supported;
+    anything else raises ValueError so the caller can fall back to a full
+    load. A channel of *col_order* missing from the file also raises
+    ValueError.
+    """
     path = Path(path)
     meta = metadata if metadata is not None else read_preview_metadata(path)
     text = meta.text
@@ -81,7 +98,9 @@ def load_fcs_preview(path, max_events, col_order=None, metadata=None, seed=PREVI
 
     labels = meta.pnn_labels if col_order is None else list(col_order)
     columns = [meta.pnn_labels.index(name) for name in labels]
-    indices = preview_indices(meta.event_count, max_events, seed)
+    indices = np.asarray(rows, dtype=np.int64)
+    if len(indices) and (indices[0] < 0 or indices[-1] >= meta.event_count):
+        raise ValueError('Row positions outside the FCS DATA segment.')
     events = np.empty((len(indices), len(columns)), dtype=np.float64)
 
     # Gather rows block by block; the OS pages in only what is touched
@@ -89,8 +108,8 @@ def load_fcs_preview(path, max_events, col_order=None, metadata=None, seed=PREVI
                      shape=(meta.event_count, meta.channel_count))
     try:
         for start in range(0, len(indices), _BLOCK_ROWS):
-            rows = indices[start:start + _BLOCK_ROWS]
-            events[start:start + len(rows)] = data[rows][:, columns]
+            block = indices[start:start + _BLOCK_ROWS]
+            events[start:start + len(block)] = data[block][:, columns]
     finally:
         del data
 
@@ -106,4 +125,4 @@ def load_fcs_preview(path, max_events, col_order=None, metadata=None, seed=PREVI
         if gain not in (0, 1):
             values /= gain
     np.nan_to_num(events, copy=False, nan=0.0, posinf=np.inf, neginf=-np.inf)
-    return PreviewSample(path, meta, events, labels), events
+    return events
