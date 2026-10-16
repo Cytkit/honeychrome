@@ -48,7 +48,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     'build_contrasts', 'covariate_kind', 'missing_covariate_values',
     'covariate_frame', 'build_design', 'log2_frequencies',
-    'logit_proportions', 'run_moderated', 'run_glm_counts',
+    'logit_proportions', 'sparse_features', 'run_moderated', 'run_glm_counts',
     'apply_significance', 'suggest_groupings_from_names',
 ]
 
@@ -392,6 +392,11 @@ def logit_proportions(counts_df: pd.DataFrame, denominators_df: pd.DataFrame) ->
     ``counts_df`` (e.g. each population's parent count per sample). Adding
     half an event to both the population and its complement keeps 0% and
     100% finite. Differences on this scale are log2 odds ratios.
+
+    A zero count maps to -log2(2 · denominator + 1), a function of the
+    denominator alone. Where the groups' denominators differ, features that
+    are empty in (nearly) every sample therefore show a spurious group
+    difference; exclude them with sparse_features() before testing.
     """
     counts = counts_df.values.astype(float)
     denom = denominators_df.reindex(index=counts_df.index,
@@ -400,6 +405,21 @@ def logit_proportions(counts_df: pd.DataFrame, denominators_df: pd.DataFrame) ->
         raise ValueError("A population count exceeds its denominator.")
     vals = np.log2((counts + 0.5) / (denom - counts + 0.5))
     return pd.DataFrame(vals, index=counts_df.index, columns=counts_df.columns)
+
+
+def sparse_features(counts_df: pd.DataFrame, min_samples: int) -> list[str]:
+    """
+    Features whose count is above zero in fewer than ``min_samples`` samples,
+    in column order. NaN counts (samples where the feature was not measured)
+    are not above zero.
+
+    With so few observations the fitted difference between groups reflects
+    the pseudo-count and the denominators rather than the biology, and the
+    features distort the variance prior shared by the rest. Drop them
+    before run_moderated() or run_glm_counts().
+    """
+    nonzero = (counts_df.fillna(0.0) > 0).sum(axis=0)
+    return [f for f in counts_df.columns if nonzero[f] < min_samples]
 
 
 # ---------------------------------------------------------------------------
