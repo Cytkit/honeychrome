@@ -18,8 +18,8 @@ intensities. Used by the DR/Clustering and Automated Gating plugins.
 
 Every test builds one design matrix: an intercept, one indicator per
 non-baseline group, optional pairing (blocking) levels, and optional
-adjustment covariates — numeric columns enter as centred continuous terms,
-anything else as treatment-coded factors.
+adjustment covariates — columns the caller marks numeric (age, CRP) enter
+as centred continuous terms, all others as treatment-coded factors.
 
 Frequency scales:
 
@@ -36,6 +36,7 @@ threshold change re-derives p-values and significance without refitting.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -48,7 +49,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     'build_contrasts', 'covariate_kind', 'missing_covariate_values',
     'covariate_frame', 'build_design', 'log2_frequencies',
-    'logit_proportions', 'run_moderated', 'run_glm_counts',
+    'logit_proportions', 'sparse_features', 'run_moderated', 'run_glm_counts',
     'apply_significance', 'suggest_groupings_from_names',
 ]
 
@@ -240,7 +241,8 @@ def _is_numeric_column(values) -> bool:
 
 
 def covariate_kind(values) -> str:
-    """'numeric' when every filled value is a number, else 'categorical'."""
+    """'numeric' when every filled value is a number (so the column can be
+    used as a continuous covariate), else 'categorical'."""
     return 'numeric' if _is_numeric_column(values) else 'categorical'
 
 
@@ -265,11 +267,18 @@ def missing_covariate_values(covariates: pd.DataFrame | None, sample_ids: list[s
 
 
 def covariate_frame(covariates: pd.DataFrame | None, sample_ids: list[str],
-                    names: list[str]) -> pd.DataFrame | None:
+                    names: list[str],
+                    numeric: Iterable[str] | None = None) -> pd.DataFrame | None:
     """
-    Adjustment covariates for ``sample_ids`` (rows in that order), as
-    strings. Returns None when ``names`` is empty. Raises RuntimeError if
-    any sample lacks a value.
+    Adjustment covariates for ``sample_ids`` (rows in that order). Columns
+    named in ``numeric`` are returned as floats and enter the design as
+    continuous terms; every other column is returned as strings and enters
+    as a factor. With ``numeric=None`` a column is numeric when all of its
+    values are numbers.
+
+    Returns None when ``names`` is empty. Raises RuntimeError if any sample
+    lacks a value, or a column named in ``numeric`` holds a value that is
+    not a number.
     """
     names = [n for n in names if n]
     if not names:
@@ -282,11 +291,22 @@ def covariate_frame(covariates: pd.DataFrame | None, sample_ids: list[str],
             for name, rels in missing.items()
         )
         raise RuntimeError(f"Adjustment covariates have missing values — {detail}")
-    return pd.DataFrame(
-        {name: [str(covariates.loc[sid, name]).strip() for sid in sample_ids]
-         for name in names},
-        index=list(sample_ids),
-    )
+    columns = {name: [str(covariates.loc[sid, name]).strip() for sid in sample_ids]
+               for name in names}
+    if numeric is None:
+        as_numeric = {n for n in names if covariate_kind(columns[n]) == 'numeric'}
+    else:
+        as_numeric = set(names) & set(numeric)
+    for name in sorted(as_numeric):
+        bad = [sid for sid, v in zip(sample_ids, columns[name]) if not _is_numeric_column([v])]
+        if bad:
+            raise RuntimeError(
+                f"Covariate '{name}' is set to numeric but has values that are not "
+                "numbers for: " + ", ".join(Path(r).stem for r in bad[:5])
+                + (" …" if len(bad) > 5 else "")
+                + ". Untick 'Numeric' for this covariate or correct the values.")
+        columns[name] = [float(v) for v in columns[name]]
+    return pd.DataFrame(columns, index=list(sample_ids))
 
 
 def build_design(group_vec: list[str], baseline: str,
@@ -299,8 +319,9 @@ def build_design(group_vec: list[str], baseline: str,
     order of first appearance); one indicator per pairing level except the
     first in sorted order; then each covariate — numeric columns centred,
     categorical columns as indicators for every level except the first in
-    sorted order. Covariates that are constant over these samples are
-    dropped.
+    sorted order. A column is numeric when it has a numeric dtype (see
+    covariate_frame()); string columns are always categorical. Covariates
+    that are constant over these samples are dropped.
 
     Returns (X, column_names, group_columns) where group_columns maps each
     non-baseline group to its column index. Raises RuntimeError naming the
@@ -340,7 +361,7 @@ def build_design(group_vec: list[str], baseline: str,
                 log.info("covariate %r is constant over these samples — dropped", name)
                 continue
             added = []
-            if covariate_kind(values) == 'numeric':
+            if pd.api.types.is_numeric_dtype(covariates[name]):
                 x = np.array([float(v) for v in values])
                 added.append((x - x.mean(), f"{name}"))
             else:
@@ -392,6 +413,11 @@ def logit_proportions(counts_df: pd.DataFrame, denominators_df: pd.DataFrame) ->
     ``counts_df`` (e.g. each population's parent count per sample). Adding
     half an event to both the population and its complement keeps 0% and
     100% finite. Differences on this scale are log2 odds ratios.
+
+    A zero count maps to -log2(2 · denominator + 1), a function of the
+    denominator alone. Where the groups' denominators differ, features that
+    are empty in (nearly) every sample therefore show a spurious group
+    difference; exclude them with sparse_features() before testing.
     """
     counts = counts_df.values.astype(float)
     denom = denominators_df.reindex(index=counts_df.index,
@@ -400,6 +426,21 @@ def logit_proportions(counts_df: pd.DataFrame, denominators_df: pd.DataFrame) ->
         raise ValueError("A population count exceeds its denominator.")
     vals = np.log2((counts + 0.5) / (denom - counts + 0.5))
     return pd.DataFrame(vals, index=counts_df.index, columns=counts_df.columns)
+
+
+def sparse_features(counts_df: pd.DataFrame, min_samples: int) -> list[str]:
+    """
+    Features whose count is above zero in fewer than ``min_samples`` samples,
+    in column order. NaN counts (samples where the feature was not measured)
+    are not above zero.
+
+    With so few observations the fitted difference between groups reflects
+    the pseudo-count and the denominators rather than the biology, and the
+    features distort the variance prior shared by the rest. Drop them
+    before run_moderated() or run_glm_counts().
+    """
+    nonzero = (counts_df.fillna(0.0) > 0).sum(axis=0)
+    return [f for f in counts_df.columns if nonzero[f] < min_samples]
 
 
 # ---------------------------------------------------------------------------
@@ -533,9 +574,14 @@ def _glm_fit_one_feature(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
     dispersion from the Cameron & Trivedi auxiliary-OLS estimate.
     ``offset`` is the log of the per-sample denominator (a library-size
     term), so the fit compares rates, not raw totals, across samples.
-    Returns the fitted GLM result, or None if even the Poisson fit fails."""
+    Returns the fitted GLM result, or None when the feature cannot be
+    tested: no events in any sample (there is nothing to fit, and the
+    Poisson starting values are 0/0), or the Poisson fit fails."""
     import statsmodels.api as sm
 
+    if not np.any(y):
+        log.debug("GLM skipped: feature has no events in any sample")
+        return None
     try:
         poisson_fit = sm.GLM(y, design, family=sm.families.Poisson(), offset=offset).fit()
     except Exception as e:
@@ -553,6 +599,24 @@ def _glm_fit_one_feature(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
         return poisson_fit
 
 
+def _glm_fit_observed(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
+    """Fit one feature on the samples where it was measured (finite count
+    and offset). Design columns that are all zero over those samples (a
+    group with no measured sample) are left out. Returns (fit, columns of
+    *design* the fit's parameters belong to), or (None, None) when the
+    feature cannot be tested: too few measured samples for the remaining
+    columns, or a rank-deficient design."""
+    observed = np.isfinite(y) & np.isfinite(offset)
+    columns = np.flatnonzero(np.any(design[observed] != 0.0, axis=0))
+    if observed.sum() <= columns.size:
+        return None, None
+    sub_design = design[np.ix_(observed, columns)]
+    if np.linalg.matrix_rank(sub_design) < columns.size:
+        return None, None
+    fit = _glm_fit_one_feature(y[observed], sub_design, offset[observed])
+    return (fit, columns) if fit is not None else (None, None)
+
+
 def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
                           contrasts: list[tuple[str, str]],
                           pairing_vec: list[str] | None,
@@ -564,6 +628,9 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
     counts_df) unless ``offset_df`` gives a per-feature denominator. The
     coefficient is a rate difference between groups, reported on the log2
     scale with Wald standard errors (df.total = inf).
+    NaN counts or offsets mark samples where a feature was not measured:
+    each feature is fitted on the samples that have it, and is untestable
+    (NaN result) when a compared group has none.
     """
     base = contrasts[0][0]
     design_mat, _names, group_cols = build_design(group_vec, base, pairing_vec, covariates)
@@ -579,7 +646,7 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
 
     LN2 = np.log(2.0)
     Z95 = 1.959963984540054
-    fits = [_glm_fit_one_feature(counts_df[f].values.astype(float), design_mat, offsets[f])
+    fits = [_glm_fit_observed(counts_df[f].values.astype(float), design_mat, offsets[f])
             for f in features]
 
     frames = []
@@ -588,12 +655,16 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
         logfc = np.full(len(features), np.nan)
         se = np.full(len(features), np.nan)
         tvals = np.full(len(features), np.nan)
-        for i, fit in enumerate(fits):
+        for i, (fit, columns) in enumerate(fits):
             if fit is None:
                 continue
-            logfc[i] = fit.params[j] / LN2
-            se[i] = fit.bse[j] / LN2
-            tvals[i] = fit.tvalues[j]
+            position = np.flatnonzero(columns == j)
+            if position.size == 0:
+                continue
+            k = int(position[0])
+            logfc[i] = fit.params[k] / LN2
+            se[i] = fit.bse[k] / LN2
+            tvals[i] = fit.tvalues[k]
         p = ms.treat_pvalues(logfc, se, np.inf, 0.0)
         frames.append(pd.DataFrame({
             'feature':   features,

@@ -431,3 +431,70 @@ def test_rename_references_follows_sources_and_stats_parents(cd80):
     assert by['CD80+ (B)']['parent_gate'] == 'Live'
     assert by['CD80+ (B)']['gate_param']['replicate_x'] == {'population': 'Live/Cells'}
     assert by['CD80+ (B)']['stats_parent'] == {'CD80+': 'Live/Cells'}
+
+
+# ---------------------------------------------------------------------------
+# Filters, feeding a gate's settings forward and conversion flags
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def cd25_tree():
+    root = _poly_gate('Cells', 1, 'FSC-A', 'SSC-A')
+    tconv = _poly_gate('Tconv', 2, 'CD3', 'CD4', 'Cells', 'Cells')
+    tem = _poly_gate('Tem', 3, 'CCR7', 'CD45RA', 'Tconv', 'Tconv')
+    b = _poly_gate('B', 4, 'CD3', 'CD19', 'Cells', 'Cells')
+    on_tconv = _hist_gate('CD80+ (Tconv)', 5, 'Tconv', 'Tconv', 'CD80+')
+    on_tem = _hist_gate('CD80+ (Tem)', 6, 'Tem', 'Tem', 'CD80+')
+    on_b = _hist_gate('CD80+ (B)', 7, 'B', 'B', 'CD80+')
+    return [root, tconv, tem, b, on_tconv, on_tem, on_b]
+
+
+def test_feed_forward_reaches_same_named_gates_below_only(cd25_tree):
+    by = ag_core.gates_by_name(cd25_tree)
+    by['CD80+ (Tconv)'].update(algorithm='mixture', sync_origin=ag_review.SYNC_USER)
+    by['CD80+ (Tconv)']['gate_param']['tail_fraction'] = 0.03
+    # Tem is below Tconv, so the gate drawn on Tem is "below" the Tconv gate's population.
+    changed, skipped = ag_review.feed_forward(cd25_tree, 'CD80+ (Tconv)')
+    assert changed == ['CD80+ (Tem)'] and skipped == []
+    assert by['CD80+ (Tem)']['algorithm'] == 'mixture'
+    assert by['CD80+ (Tem)']['gate_param']['tail_fraction'] == 0.03
+    assert by['CD80+ (Tem)']['sync_origin'] == ag_review.SYNC_USER
+    assert by['CD80+ (B)']['algorithm'] == 'imported'
+
+
+def test_feed_forward_ignores_a_gate_still_as_drawn(cd25_tree):
+    assert ag_review.feed_forward(cd25_tree, 'CD80+ (Tconv)') == ([], [])
+
+
+def test_feed_forward_never_makes_a_gate_replicate_itself(cd25_tree):
+    by = ag_core.gates_by_name(cd25_tree)
+    by['CD80+ (Tconv)'].update(algorithm='replicate', sync_origin=ag_review.SYNC_USER)
+    by['CD80+ (Tconv)']['gate_param']['replicate_x'] = {'gate': 'CD80+ (Tem)'}
+    changed, skipped = ag_review.feed_forward(cd25_tree, 'CD80+ (Tconv)')
+    assert changed == [] and skipped == ['CD80+ (Tem)']
+
+
+def test_conflicting_gate_names_lists_the_whole_group(cd80):
+    by = ag_core.gates_by_name(cd80)
+    assert ag_review.conflicting_gate_names(cd80) == set()
+    by['CD80+ (Mono)'].update(algorithm='mixture', sync_origin=ag_review.SYNC_USER)
+    by['CD80+ (B)'].update(algorithm='tail', sync_origin=ag_review.SYNC_USER)
+    assert ag_review.conflicting_gate_names(cd80) == {'CD80+ (Mono)', 'CD80+ (B)', 'CD80+ (DC)'}
+
+
+def test_gates_below_population_follows_the_branch(cd25_tree):
+    assert ag_review.gates_below_population(cd25_tree, 'Tconv', 'Tconv') == {
+        'Tem', 'CD80+ (Tconv)', 'CD80+ (Tem)'}
+    assert len(ag_review.gates_below_population(cd25_tree, None, 'root')) == len(cd25_tree)
+
+
+def test_conversion_check_flags_large_moves_only():
+    g = _hist_gate('CD80+', 1, None, 'root')
+    drawn = {'CD80+': {'threshold_x': 0.40, 'threshold_y': None}}
+    near = {'CD80+': {'threshold_x': 0.43, 'threshold_y': None}}
+    far = {'CD80+': {'threshold_x': 0.60, 'threshold_y': None}}
+    assert ag_review.conversion_check(g, drawn, near, {'CD80+': 0.20}, {'CD80+': 0.22}) is None
+    flag = ag_review.conversion_check(g, drawn, far, {'CD80+': 0.20}, {'CD80+': 0.22})
+    assert flag['shift'] == pytest.approx(0.2) and 'threshold' in flag['message']
+    flag = ag_review.conversion_check(g, drawn, near, {'CD80+': 0.20}, {'CD80+': 0.45})
+    assert flag['fraction'] == pytest.approx(0.25)

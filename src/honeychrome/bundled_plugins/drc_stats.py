@@ -68,9 +68,15 @@ from honeychrome.controller_components.differential_stats import (
     log2_frequencies,
     run_glm_counts,
     run_moderated,
+    sparse_features,
 )
 
 log = get_logger(__name__)
+
+# A cluster is tested for differential abundance only when it has events in
+# at least this many samples; below that the comparison reflects the
+# samples' event totals, not the cluster.
+MIN_NONZERO_SAMPLES = 3
 
 
 # ---------------------------------------------------------------------------
@@ -139,11 +145,13 @@ def missing_covariate_values(state, all_rel: list[str], names: list[str]) -> dic
 
 def covariate_frame(state, all_rel: list[str], names: list[str]) -> pd.DataFrame | None:
     """
-    Adjustment covariates for ``all_rel`` (rows in that order), as strings.
+    Adjustment covariates for ``all_rel`` (rows in that order): the columns
+    in ``state.numeric_covariates`` as floats, the others as strings.
     Returns None when ``names`` is empty. Raises RuntimeError if any sample
-    lacks a value.
+    lacks a value or a numeric covariate has a value that is not a number.
     """
-    return _ds.covariate_frame(state.covariates, all_rel, names)
+    return _ds.covariate_frame(state.covariates, all_rel, names,
+                               numeric=list(state.numeric_covariates))
 
 
 def n_clusters_from_labels(state, all_rel, cluster_labels_override=None) -> int:
@@ -651,6 +659,11 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
             cluster_labels_override=cluster_labels_override,
             names_override=names_override,
         )
+        sparse = set(sparse_features(counts_df, MIN_NONZERO_SAMPLES))
+        if sparse:
+            log.info("abundance tests skip %d cluster(s) with events in fewer than %d samples: %s",
+                     len(sparse), MIN_NONZERO_SAMPLES, ", ".join(sorted(sparse)))
+        tested = [c for c in counts_df.columns if c not in sparse]
 
     if run_freq:
         freq_df = compute_frequencies(
@@ -660,7 +673,7 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
         )
         totals = sample_event_totals(state, all_rel, cluster_labels_override)
         freq_results = run_moderated(
-            log2_frequencies(counts_df, totals), group_vec, contrasts, state.contrast_mode,
+            log2_frequencies(counts_df[tested], totals), group_vec, contrasts, state.contrast_mode,
             pval_threshold, fc_threshold, pairing_vec=pairing_vec, fdr_scope=fdr_scope,
             covariates=covariates, use_treat=use_treat,
             too_few_hint=_TOO_FEW_CLUSTERS_HINT,
@@ -669,10 +682,15 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
         state.freq_df = freq_df          # % per cluster (display)
 
     if run_counts:
-        counts_results = run_glm_counts(counts_df, group_vec, contrasts, state.contrast_mode,
-                                        pval_threshold, fc_threshold, pairing_vec=pairing_vec,
-                                        fdr_scope=fdr_scope, covariates=covariates,
-                                        use_treat=use_treat)
+        # The library-size offset is each sample's total over all clusters,
+        # including those left out of the test.
+        row_totals = counts_df.sum(axis=1)
+        offset_df = pd.DataFrame({c: row_totals for c in tested}, index=counts_df.index)
+        counts_results = run_glm_counts(counts_df[tested], group_vec, contrasts,
+                                        state.contrast_mode, pval_threshold, fc_threshold,
+                                        pairing_vec=pairing_vec, fdr_scope=fdr_scope,
+                                        covariates=covariates, use_treat=use_treat,
+                                        offset_df=offset_df)
         state.counts_results = counts_results
         state.counts_df = counts_df      # raw (samples × clusters) counts
 

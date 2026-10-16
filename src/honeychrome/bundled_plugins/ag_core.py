@@ -61,6 +61,7 @@ Model application modes
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 import math
@@ -114,17 +115,47 @@ ALGORITHM_IMPORTED = 'imported'
 # 'replicate' takes a threshold from another gate or a reference population.
 ALGORITHM_REPLICATE = 'replicate'
 
+# Offered in order of preference.
 ALGORITHMS_BY_GATE_TYPE: dict[str, list[str]] = {
     'singlets':  ['singlets', ALGORITHM_IMPORTED],
-    '1dsep':     ['tail', 'kde_min', 'mixture', 'otsu', 'bimodal', ALGORITHM_REPLICATE,
+    '1dsep':     ['mixture', 'tail', ALGORITHM_REPLICATE, 'otsu', 'bimodal', 'kde_min',
                   ALGORITHM_IMPORTED],
-    '2dsep':     ['tail', 'kde_min', 'mixture', 'otsu', 'bimodal', ALGORITHM_REPLICATE,
+    '2dsep':     ['mixture', 'tail', ALGORITHM_REPLICATE, 'otsu', 'bimodal', 'kde_min',
                   ALGORITHM_IMPORTED],
     'free':      ['cells', 'all', ALGORITHM_IMPORTED],
     'replicate': ['replicate'],
 }
-# Algorithms that calculate a threshold from data (replicate sources use one).
-THRESHOLD_ALGORITHMS = ('tail', 'kde_min', 'mixture', 'otsu', 'bimodal')
+# Algorithms that calculate a threshold from data (replicate sources use one),
+# in order of preference.
+THRESHOLD_ALGORITHMS = ('mixture', 'tail', 'otsu', 'bimodal', 'kde_min')
+
+# Colour (RGB) of each algorithm: its name in algorithm pickers and its
+# threshold or boundary on review plots.
+ALGORITHM_COLOURS: dict[str, tuple] = {
+    'mixture':           (142, 68, 173),
+    'tail':              (220, 110, 0),
+    ALGORITHM_REPLICATE: (30, 100, 220),
+    'otsu':              (0, 140, 140),
+    'bimodal':           (200, 40, 120),
+    'kde_min':           (140, 95, 40),
+    ALGORITHM_IMPORTED:  (30, 160, 50),
+}
+DEFAULT_ALGORITHM_COLOUR = (30, 160, 50)
+
+
+def algorithm_colour(algorithm: str | None) -> tuple:
+    """RGB colour of an algorithm (see ALGORITHM_COLOURS)."""
+    return ALGORITHM_COLOURS.get(algorithm or '', DEFAULT_ALGORITHM_COLOUR)
+
+
+def default_axis_lo(algorithm: str | None) -> float:
+    """Default lower crop (``axis_lo``) of a threshold calculation.
+
+    ``tail`` mirrors the events below the negative population's mode, so
+    cropping the bottom of the axis would trim the very events it measures;
+    it starts uncropped. Other algorithms crop the lowest 1% of the range.
+    """
+    return 0.0 if algorithm == 'tail' else 0.01
 
 MODEL_FORMAT_VERSION = 2
 MODE_FIXED = 'fixed'
@@ -486,22 +517,37 @@ def ordered_gate_defs(gate_defs: list[dict]) -> list[dict]:
             num = 10 ** 6
         return (num, str(g.get('gate_name', '')))
 
-    remaining = sorted(gate_defs, key=sort_key)
+    ranked = sorted(gate_defs, key=sort_key)
+    waiting: dict[str, list[int]] = {}
+    unmet: list[set[str]] = []
+    ready: list[int] = []
+    for rank, g in enumerate(ranked):
+        deps = gate_dependencies(g) & set(by_name)
+        unmet.append(deps)
+        if not deps:
+            ready.append(rank)
+        for dep in deps:
+            waiting.setdefault(dep, []).append(rank)
+    heapq.heapify(ready)
     placed: set[str] = set()
+    done = [False] * len(ranked)
     out: list[dict] = []
-    while remaining:
-        progressed = False
-        for g in list(remaining):
-            deps = gate_dependencies(g) & set(by_name)
-            if deps <= placed:
-                out.append(g)
-                placed.add(g['gate_name'])
-                remaining.remove(g)
-                progressed = True
-                break
-        if not progressed:
-            names = [g.get('gate_name') for g in remaining]
-            raise ValueError(f"Gate hierarchy has a cycle among: {names}")
+    while ready:
+        rank = heapq.heappop(ready)
+        g = ranked[rank]
+        done[rank] = True
+        out.append(g)
+        name = g['gate_name']
+        if name in placed:
+            continue
+        placed.add(name)
+        for dependent in waiting.get(name, ()):
+            unmet[dependent].discard(name)
+            if not unmet[dependent]:
+                heapq.heappush(ready, dependent)
+    if len(out) < len(ranked):
+        names = [g.get('gate_name') for rank, g in enumerate(ranked) if not done[rank]]
+        raise ValueError(f"Gate hierarchy has a cycle among: {names}")
     return out
 
 
@@ -780,10 +826,12 @@ class GateCalculator:
         col = trim_quantiles(full, q)
         if len(col) < MIN_EVENTS:
             return {}
-        calc = crop_to_region(col, float(gp.get('axis_lo', 0.01)), float(gp.get('axis_hi', 0.99)))
+        algo = gate_def.get('algorithm', 'tail')
+        calc = crop_to_region(col, float(gp.get('axis_lo', default_axis_lo(algo))),
+                              float(gp.get('axis_hi', 0.99)))
         if len(calc) < MIN_EVENTS:
             calc = col
-        t = compute_threshold(calc, gate_def.get('algorithm', 'tail'), gp)
+        t = compute_threshold(calc, algo, gp)
         return self.threshold_boundaries(gate_def, t, None, full, None)
 
     def _calc_2dsep(self, data, gate_def, channel_index) -> dict:
@@ -811,13 +859,13 @@ class GateCalculator:
                 thresholds.append(float(fixed))
                 continue
             col = xy[:, k]
-            calc = crop_to_region(col, float(gp.get(f'axis_lo_{axis}', 0.01)),
-                                  float(gp.get(f'axis_hi_{axis}', 0.99)))
-            if len(calc) < MIN_EVENTS:
-                calc = col
             algo = gp.get(f'algorithm_{axis}') or default_algo
             if algo == ALGORITHM_REPLICATE:
                 return {}
+            calc = crop_to_region(col, float(gp.get(f'axis_lo_{axis}', default_axis_lo(algo))),
+                                  float(gp.get(f'axis_hi_{axis}', 0.99)))
+            if len(calc) < MIN_EVENTS:
+                calc = col
             thresholds.append(compute_threshold(calc, algo, axis_params(axis)))
         return self.threshold_boundaries(gate_def, thresholds[0], thresholds[1],
                                          data[:, ix], data[:, iy])
@@ -1078,14 +1126,14 @@ def resolve_replicates(gate_def: dict, data: np.ndarray, channel_index: dict,
             if len(values) < MIN_EVENTS:
                 return None, f"reference population {key} has too few events"
             suffix = f'_{axis}' if gate_def.get('gate_type') == '2dsep' else ''
-            calc = crop_to_region(values, float(gp.get(f'axis_lo{suffix}', 0.01)),
+            algo = src.get('algorithm') if src.get('algorithm') in THRESHOLD_ALGORITHMS else 'tail'
+            calc = crop_to_region(values, float(gp.get(f'axis_lo{suffix}', default_axis_lo(algo))),
                                   float(gp.get(f'axis_hi{suffix}', 0.99)))
             if len(calc) < MIN_EVENTS:
                 calc = values
             params = {'tail_fraction': gp.get(f'tail_fraction{suffix}', gp.get('tail_fraction', 0.01)),
                       'mixture_components': gp.get(f'mixture_components{suffix}',
                                                    gp.get('mixture_components', 2))}
-            algo = src.get('algorithm') if src.get('algorithm') in THRESHOLD_ALGORITHMS else 'tail'
             t = compute_threshold(calc, algo, params)
         gp[f'fixed_threshold_{axis}'] = float(t)
     return out, ''
@@ -1238,11 +1286,14 @@ class GatingResult:
     status       : {gate: {'source', 'drift', 'flag', 'message'}}; source is
                    'trained', 'fixed', 'recalculated' or 'reference';
                    flag is None, 'drift', 'failed' or 'skipped'.
+    stopped      : True when the run was stopped before every gate was
+                   applied (see run_gating's keep_partial).
     """
     boundaries: dict = field(default_factory=dict)
     masks: dict = field(default_factory=dict)
     parent_masks: dict = field(default_factory=dict)
     status: dict = field(default_factory=dict)
+    stopped: bool = False
 
     def population_mask(self, gate_name: str, pop_name: str) -> np.ndarray | None:
         return (self.masks.get(gate_name) or {}).get(pop_name)
@@ -1254,7 +1305,7 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
                drift_limit: float = DEFAULT_DRIFT_LIMIT,
                drift_action: str = 'flag',
                axis_limits: dict | None = None,
-               stop_check=None) -> GatingResult:
+               stop_check=None, keep_partial: bool = False) -> GatingResult:
     """Run a gate hierarchy on one transformed event array.
 
     Without *reference* every gate is calculated from the data (training).
@@ -1266,7 +1317,8 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
 
     Each gate is applied to its parent population only, in hierarchy order.
     *stop_check*, when given, is called before each gate; when it returns
-    True the run stops by raising GatingStopped.
+    True the run stops by raising GatingStopped, or, with *keep_partial*,
+    returns the gates applied so far with ``stopped`` set.
     """
     data = np.asarray(data)
     n = len(data)
@@ -1278,6 +1330,9 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
 
     for gate_def in ordered_gate_defs(gate_defs):
         if stop_check is not None and stop_check():
+            if keep_partial:
+                result.stopped = True
+                return result
             raise GatingStopped()
         name = gate_def['gate_name']
         eff = effective_gate_def(gate_def, by_name)
@@ -1365,9 +1420,28 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
 
 
 def train_boundaries(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
-                     axis_limits: dict | None = None) -> GatingResult:
-    """Calculate every gate from pooled training data (see run_gating)."""
-    return run_gating(gate_defs, data, channel_index, reference=None, axis_limits=axis_limits)
+                     axis_limits: dict | None = None, done: dict | None = None,
+                     stop_check=None) -> GatingResult:
+    """Calculate every gate from pooled training data (see run_gating).
+
+    done       : {gate: boundary} already trained (a paused training run);
+                 these are applied as they are and only the other gates are
+                 calculated.
+    stop_check : called before each gate; when it returns True training
+                 stops and the gates trained so far are returned with
+                 ``stopped`` set.
+    """
+    if not done:
+        return run_gating(gate_defs, data, channel_index, reference=None,
+                          axis_limits=axis_limits, stop_check=stop_check, keep_partial=True)
+    modes = {g['gate_name']: (MODE_FIXED if g['gate_name'] in done else MODE_RECALCULATE)
+             for g in gate_defs}
+    result = run_gating(gate_defs, data, channel_index, reference=dict(done), modes=modes,
+                        axis_limits=axis_limits, stop_check=stop_check, keep_partial=True)
+    for status in result.status.values():
+        if status.get('source') in ('recalculated', 'fixed'):
+            status['source'] = 'trained'
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1747,8 +1821,14 @@ def rename_boundary_channels(boundaries: dict, alignment: dict) -> dict:
 
 
 def rekey(mapping: dict | None, alignment: dict) -> dict:
-    """Copy of a per-channel dict with keys renamed via {old: new}."""
-    return {alignment.get(k, k): v for k, v in (mapping or {}).items()}
+    """Copy of a per-channel dict with keys renamed via {old: new}.
+
+    A renamed entry takes precedence over an unrenamed one that already has
+    the new name."""
+    mapping = mapping or {}
+    out = {k: v for k, v in mapping.items() if k not in alignment}
+    out.update({alignment[k]: v for k, v in mapping.items() if k in alignment})
+    return out
 
 
 # ---------------------------------------------------------------------------

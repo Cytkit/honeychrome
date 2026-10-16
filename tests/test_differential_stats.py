@@ -70,8 +70,34 @@ def test_covariate_frame_reports_missing_values():
     assert ds.missing_covariate_values(cov, ['a', 'b', 'c'], ['age']) == {'age': ['b']}
     with pytest.raises(RuntimeError, match='missing values'):
         ds.covariate_frame(cov, ['a', 'b', 'c'], ['age'])
-    frame = ds.covariate_frame(cov, ['a', 'c'], ['age'])
+    frame = ds.covariate_frame(cov, ['a', 'c'], ['age'], numeric=[])
     assert list(frame['age']) == ['30', '40']
+
+
+@pytest.mark.numpy_only
+def test_numeric_covariate_is_continuous_only_when_requested():
+    cov = pd.DataFrame({'batch': ['1', '2', '3', '1', '2', '3']},
+                       index=[f's{i}' for i in range(6)])
+    ids = list(cov.index)
+    groups = ['A', 'A', 'A', 'B', 'B', 'B']
+
+    as_numeric = ds.covariate_frame(cov, ids, ['batch'], numeric=['batch'])
+    as_factor = ds.covariate_frame(cov, ids, ['batch'], numeric=[])
+    assert pd.api.types.is_numeric_dtype(as_numeric['batch'])
+    assert not pd.api.types.is_numeric_dtype(as_factor['batch'])
+
+    x_num, names_num, _ = ds.build_design(groups, 'A', covariates=as_numeric)
+    _x_fac, names_fac, _ = ds.build_design(groups, 'A', covariates=as_factor)
+    assert names_num == ['(Intercept)', 'group[B]', 'batch']
+    assert names_fac == ['(Intercept)', 'group[B]', 'batch[2]', 'batch[3]']
+    assert abs(x_num[:, 2].mean()) < 1e-12
+
+
+@pytest.mark.numpy_only
+def test_numeric_covariate_rejects_text_values():
+    cov = pd.DataFrame({'crp': ['1.5', 'high', '2.0']}, index=['a', 'b', 'c'])
+    with pytest.raises(RuntimeError, match="'crp' is set to numeric"):
+        ds.covariate_frame(cov, ['a', 'b', 'c'], ['crp'], numeric=['crp'])
 
 
 def test_glm_offset_uses_per_feature_denominator():
@@ -154,3 +180,13 @@ def test_comparison_heatmap_colours_only_significant_cells():
 
     none = dp.make_comparison_heatmap_figure(res.assign(significant=False), 'All')
     assert none.axes[0].texts
+
+
+@pytest.mark.numpy_only
+def test_sparse_features_counts_samples_above_zero():
+    counts = pd.DataFrame({'none': [0.0, 0.0, 0.0, 0.0],
+                           'two': [0.0, 3.0, 0.0, 1.0],
+                           'three': [1.0, 2.0, 0.0, 5.0],
+                           'unmeasured': [np.nan, np.nan, 4.0, 2.0]})
+    assert ds.sparse_features(counts, 3) == ['none', 'two', 'unmeasured']
+    assert ds.sparse_features(counts, 1) == ['none']

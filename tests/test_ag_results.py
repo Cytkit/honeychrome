@@ -159,17 +159,144 @@ def test_population_tables_parent_and_stats_parent_denominators():
 
 
 @pytest.mark.numpy_only
-def test_population_tables_drop_missing_and_zero_denominators():
-    summaries = {
-        's1': {'populations': [{'key': 'G/pos', 'n_events': 5, 'n_parent': 10},
-                               {'key': 'H/pos', 'n_events': 0, 'n_parent': 0}]},
-        's2': {'populations': [{'key': 'G/pos', 'n_events': 6, 'n_parent': 12},
-                               {'key': 'H/pos', 'n_events': 1, 'n_parent': 3},
-                               {'key': 'K/pos', 'n_events': 1, 'n_parent': 3}]},
-    }
-    counts, denom, dropped = ar.population_tables(summaries, ['s1', 's2'])
-    assert list(counts.columns) == ['G/pos']
-    assert set(dropped) == {'H/pos', 'K/pos'}
+def test_population_tables_keep_populations_measured_in_some_samples():
+    summaries = {}
+    for i in range(5):
+        pops = [{'key': 'G/pos', 'n_events': 5 + i, 'n_parent': 10},
+                {'key': 'H/pos', 'n_events': 0 if i == 1 else 2, 'n_parent': 0 if i == 0 else 8}]
+        if i < 2:
+            pops.append({'key': 'K/pos', 'n_events': 1, 'n_parent': 3})
+        summaries[f's{i}'] = {'populations': pops}
+    counts, denom, dropped = ar.population_tables(summaries, list(summaries))
+    assert dropped == ['K/pos']
+    assert list(counts.columns) == ['G/pos', 'H/pos']
+    # Parent empty: not measurable, so NaN rather than zero.
+    assert np.isnan(counts.loc['s0', 'H/pos']) and np.isnan(denom.loc['s0', 'H/pos'])
+    # No events in a sample whose parent has events: a true zero.
+    assert counts.loc['s1', 'H/pos'] == 0 and denom.loc['s1', 'H/pos'] == 8
+    assert counts['G/pos'].notna().all()
+
+
+def _summaries_with_unmeasured_population():
+    rng = np.random.default_rng(1)
+    summaries, groups = {}, {}
+    for i in range(12):
+        grp = 'ctrl' if i < 6 else 'treated'
+        pops = []
+        for key, base in (('A/pos', 0.2), ('B/pos', 0.3), ('C/pos', 0.1), ('D/pos', 0.4)):
+            if key == 'D/pos' and i in (0, 7):
+                pops.append({'key': key, 'n_events': 0, 'n_parent': 0})
+                continue
+            frac = base * 3 if (key == 'A/pos' and grp == 'treated') else base
+            pops.append({'key': key, 'n_events': int(rng.binomial(1000, frac)), 'n_parent': 1000})
+        summaries[f's{i}'] = {'populations': pops}
+        groups[f's{i}'] = grp
+    return summaries, groups
+
+
+@pytest.mark.numpy_only
+def test_run_statistics_tests_populations_unmeasured_in_some_samples():
+    summaries, groups = _summaries_with_unmeasured_population()
+    out = ar.run_statistics(summaries, list(summaries), groups, [], run_freq=True,
+                            run_counts=True, run_markers=False, fc_threshold=0.0)
+    assert 'D/pos' in set(out['freq']['feature'])
+    assert out['freq_values']['D/pos'].isna().sum() == 2
+    assert any('D/pos' in note for note in out['notes'])
+    d_counts = out['counts'][out['counts']['feature'] == 'D/pos'].iloc[0]
+    assert np.isfinite(d_counts['logFC']) and np.isfinite(d_counts['P.Value'])
+    assert 'A/pos' in set(out['freq'].loc[out['freq']['significant'], 'feature'])
+
+
+@pytest.mark.numpy_only
+def test_counts_untestable_when_a_group_has_no_measured_sample():
+    summaries, groups = _summaries_with_unmeasured_population()
+    for key, grp in groups.items():
+        if grp == 'treated':
+            for row in summaries[key]['populations']:
+                if row['key'] == 'D/pos':
+                    row.update(n_events=0, n_parent=0)
+    out = ar.run_statistics(summaries, list(summaries), groups, [], run_freq=True,
+                            run_counts=True, run_markers=False, fc_threshold=0.0)
+    d_counts = out['counts'][out['counts']['feature'] == 'D/pos'].iloc[0]
+    assert np.isnan(d_counts['logFC'])
+    assert not bool(d_counts['significant'])
+
+
+def _summaries_with_empty_populations():
+    """Twelve samples; the groups' parent counts differ about fifty-fold.
+    'Z/pos' has no events anywhere, 'Y/pos' has events in two samples only."""
+    rng = np.random.default_rng(2)
+    summaries, groups = {}, {}
+    for i in range(12):
+        grp = 'ctrl' if i < 6 else 'treated'
+        n_parent = 5000 if grp == 'ctrl' else 100
+        pops = [{'key': 'A/pos', 'n_events': int(rng.binomial(n_parent, 0.3)),
+                 'n_parent': n_parent},
+                {'key': 'B/pos', 'n_events': int(rng.binomial(n_parent, 0.2)),
+                 'n_parent': n_parent},
+                {'key': 'C/pos', 'n_events': int(rng.binomial(n_parent, 0.1)),
+                 'n_parent': n_parent},
+                {'key': 'Y/pos', 'n_events': 1 if i in (3, 9) else 0, 'n_parent': n_parent},
+                {'key': 'Z/pos', 'n_events': 0, 'n_parent': n_parent}]
+        summaries[f's{i}'] = {'populations': pops}
+        groups[f's{i}'] = grp
+    return summaries, groups
+
+
+@pytest.mark.numpy_only
+def test_population_tables_drop_populations_with_events_in_too_few_samples():
+    summaries, _groups = _summaries_with_empty_populations()
+    counts, denom, dropped = ar.population_tables(summaries, list(summaries))
+    assert dropped == ['Y/pos', 'Z/pos']
+    assert list(counts.columns) == ['A/pos', 'B/pos', 'C/pos']
+    assert list(denom.columns) == ['A/pos', 'B/pos', 'C/pos']
+
+
+@pytest.mark.numpy_only
+def test_empty_populations_are_not_tested_despite_different_parent_counts():
+    from honeychrome.controller_components import differential_stats as ds
+    summaries, groups = _summaries_with_empty_populations()
+    samples = list(summaries)
+    # Untreated by the filter, an empty population looks different between
+    # the groups only because its parent counts differ.
+    counts = pd.DataFrame({'Z/pos': [0.0] * 12, 'A/pos': [r['n_events'] for s in samples
+                                                          for r in summaries[s]['populations']
+                                                          if r['key'] == 'A/pos'],
+                           'B/pos': [r['n_events'] for s in samples
+                                     for r in summaries[s]['populations'] if r['key'] == 'B/pos'],
+                           'C/pos': [r['n_events'] for s in samples
+                                     for r in summaries[s]['populations'] if r['key'] == 'C/pos']},
+                          index=samples, dtype=float)
+    denom = pd.DataFrame({c: [summaries[s]['populations'][0]['n_parent'] for s in samples]
+                          for c in counts.columns}, index=samples, dtype=float)
+    group_vec = [groups[s] for s in samples]
+    contrasts = ds.build_contrasts(['ctrl', 'treated'], 'reference', 'ctrl')
+    raw = ds.run_moderated(ds.logit_proportions(counts, denom), group_vec, contrasts,
+                           'reference', 0.05, 0.0)
+    assert bool(raw.loc[raw['feature'] == 'Z/pos', 'significant'].iloc[0])
+
+    out = ar.run_statistics(summaries, samples, groups, [], run_freq=True, run_counts=True,
+                            run_markers=False, fc_threshold=0.0)
+    for table in ('freq', 'counts'):
+        assert not {'Y/pos', 'Z/pos'} & set(out[table]['feature'])
+    assert list(out['freq_values'].columns) == ['A/pos', 'B/pos', 'C/pos']
+    assert any('Y/pos' in note and 'Z/pos' in note for note in out['notes'])
+
+
+@pytest.mark.numpy_only
+def test_stats_round_trip_through_json():
+    import json
+    summaries, groups = _summaries_with_unmeasured_population()
+    out = ar.run_statistics(summaries, list(summaries), groups, [], run_freq=True,
+                            run_counts=True, run_markers=False, fc_threshold=0.0)
+    back = ar.stats_from_jsonable(json.loads(json.dumps(ar.stats_to_jsonable(out))))
+    assert back['comparisons'] == out['comparisons']
+    assert back['samples'] == out['samples'] and back['notes'] == out['notes']
+    assert back['markers'] is None
+    for key in ('freq', 'counts', 'freq_values', 'counts_values'):
+        pd.testing.assert_frame_equal(back[key], out[key], check_dtype=False)
+    again = ar.reapply_thresholds(back, 0.05, 0.0, 0.03, 'global', True)
+    assert list(again['counts']['significant']) == list(out['counts']['significant'])
 
 
 @pytest.mark.numpy_only
@@ -285,7 +412,7 @@ def test_run_statistics_pairwise_pairing_and_covariates():
     cov = pd.DataFrame({'age': [str(a) for a in ages]}, index=samples)
     out = ar.run_statistics(summaries, samples, groups, gates, group_order=['ctrl', 'low', 'high'],
                             contrast_mode='pairwise', pairing=pairing, covariates=cov,
-                            run_markers=False, fc_threshold=0.0)
+                            numeric_covariates=['age'], run_markers=False, fc_threshold=0.0)
     assert out['comparisons'] == [('ctrl', 'low'), ('ctrl', 'high'), ('low', 'high')]
     assert set(out['freq']['comparison']) == {'low vs ctrl', 'high vs ctrl', 'high vs low'}
     assert out['markers'] is None
@@ -374,3 +501,62 @@ def test_predictive_matrix_names_features_for_display():
     assert X.shape == (24, 8)
     assert 'Freq: CD4 T' in X.columns and 'Median: CD4 T PE' in X.columns
     assert np.allclose(X['Freq: CD4 T'], np.log2(stats['freq_values']['g0/p'] + 0.01))
+
+
+# ---------------------------------------------------------------------------
+# Saved tables, display records and the population comparison
+# ---------------------------------------------------------------------------
+
+def test_frame_from_jsonable_keeps_column_types():
+    df = pd.DataFrame({'feature': ['a', 'b', 'c'], 'n': [1, 2, 3], 'x': [0.5, None, 1.5],
+                       'significant': [True, False, True]}, index=['r1', 'r2', 'r3'])
+    back = ar._frame_from_jsonable(ar._frame_to_jsonable(df))
+    assert list(back.columns) == list(df.columns) and list(back.index) == list(df.index)
+    assert back['n'].dtype == np.int64 and back['significant'].dtype == bool
+    assert np.isnan(back['x'].iloc[1]) and back['x'].iloc[2] == 1.5
+
+
+@pytest.mark.numpy_only
+def test_display_record_packs_population_membership(tmp_path):
+    gates = _hierarchy()
+    data = _sample(3)
+    idx = {'A': 0, 'B': 1, 'C': 2}
+    res = ag.run_gating(gates, data, idx, reference=_reference(gates))
+    rows = np.arange(0, len(data), 3)
+    disp = ar.pack_display(gates, res, rows, data[rows], ['A', 'B', 'C'])
+    t_pos = ar.display_population_mask(disp, 'T/pos')
+    assert np.array_equal(t_pos, res.population_mask('T', 'pos')[rows])
+    assert ar.display_population_mask(disp, 'root').all()
+    assert ar.display_population_mask(disp, 'nothing/here') is None
+    parent = ar.display_parent_mask(disp, 'T', gates[1])
+    assert np.array_equal(parent, res.population_mask('Lymph', 'pos')[rows])
+    path = tmp_path / ar.display_file_name('S1.fcs')
+    ar.save_display(path, disp, 'S1.fcs', 'abc')
+    loaded, meta = ar.load_display(path)
+    assert meta == {'sample': 'S1.fcs', 'fingerprint': 'abc'}
+    assert np.array_equal(ar.display_population_mask(loaded, 'T/pos'), t_pos)
+    assert np.allclose(loaded['events'], data[rows])
+
+
+@pytest.mark.numpy_only
+def test_group_values_and_population_result_match_the_statistics():
+    gates, summaries, groups = _grouped_summaries()
+    samples = list(summaries)
+    out = ar.run_statistics(summaries, samples, groups, gates,
+                            group_order=['ctrl', 'low', 'high'], reference='ctrl',
+                            fc_threshold=0.0, marker_threshold=0.0)
+    values = ar.group_population_values(summaries, samples, groups, 'T/pos')
+    assert set(values) == {'ctrl', 'low', 'high'}
+    assert all(len(v) == 4 for v in values.values())
+    hi = np.mean([v for _s, v in values['high']])
+    ctrl = np.mean([v for _s, v in values['ctrl']])
+    assert hi > ctrl
+    res = ar.population_result(out, 'T/pos', 'high vs ctrl')
+    assert res['significant'] and res['P'] < 0.05 and res['logFC'] > 0
+    assert ar.population_result(out, 'T/pos', 'no such comparison') is None
+    tables = ar.statistics_tables(out, labels={'T/pos': 'T cells'}, antigens={'C': 'CD25'})
+    assert 'T cells' in set(tables['frequencies']['population'])
+    mk = tables['markers']
+    assert set(mk.loc[mk['channel'] == 'C', 'antigen']) == {'CD25'}
+    assert set(mk.loc[mk['channel'] == 'B', 'antigen']) == {'B'}
+    assert list(tables['values_frequencies']['group']) == out['group_vec']

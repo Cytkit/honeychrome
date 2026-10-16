@@ -35,7 +35,8 @@ __all__ = [
     'polygon_vertices', 'convert_target', 'is_free_shape', 'drawn_channels',
     'trainable_algorithms', 'trainable_definition', 'has_drawn_shape', 'split_2dsep',
     'histogram_proposal', 'name_group', 'sync_members', 'sync_fingerprint',
-    'apply_name_sync', 'sync_conflicts', 'SYNC_USER', 'SYNC_AUTO', 'SYNC_DRAWN',
+    'apply_name_sync', 'sync_conflicts', 'conflicting_gate_names', 'gates_below_population',
+    'feed_forward', 'conversion_check', 'SYNC_USER', 'SYNC_AUTO', 'SYNC_DRAWN',
     'replicate_choices', 'descendants', 'delete_gates', 'delete_population',
     'copy_gates', 'paste_gates', 'rename_references',
 ]
@@ -589,6 +590,115 @@ def sync_conflicts(gate_defs: list[dict]) -> list[str]:
         if len(prints) > 1:
             out.append(_group_label(members))
     return out
+
+
+def conflicting_gate_names(gate_defs: list[dict]) -> set:
+    """Names of every gate in a same-named group whose user-set members use
+    different configurations (see sync_conflicts)."""
+    seen, out = set(), set()
+    for g in gate_defs:
+        key = _sync_key(g)
+        if key in seen:
+            continue
+        seen.add(key)
+        members = sync_members(gate_defs, g['gate_name'])
+        if len({sync_fingerprint(m) for m in members if _user_set(m)}) > 1:
+            out |= {m['gate_name'] for m in members}
+    return out
+
+
+def gates_below_population(gate_defs: list[dict], parent_gate, parent_pop: str) -> set:
+    """Names of every gate drawn on population (parent_gate, parent_pop) or
+    on any population below it; parent_gate None is the root."""
+    parent_gate = parent_gate or None
+    on_it = {g['gate_name'] for g in gate_defs
+             if (g.get('parent_gate') or None) == parent_gate
+             and (parent_gate is None or (g.get('parent_popul') or 'root') == parent_pop)}
+    out = set(on_it)
+    for name in on_it:
+        out |= descendants(gate_defs, name)
+    return out
+
+
+def feed_forward(gate_defs: list[dict], gate_name: str) -> tuple[list[str], list[str]]:
+    """Give the gates that share *gate_name*'s name, type and channels and
+    lie below the population it is drawn on the same trainable
+    configuration (algorithm and the SYNC_PARAM_KEYS parameters), in place.
+
+    The copies count as the user's choice (SYNC_USER). A gate is left
+    alone when the configuration would make it replicate a threshold from
+    itself or from a gate below it.
+
+    Returns (names changed, names skipped).
+    """
+    by_name = ag_core.gates_by_name(gate_defs)
+    source = by_name.get(gate_name)
+    if source is None or source.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+        return [], []
+    key = _sync_key(source)
+    below = gates_below_population(gate_defs, source.get('parent_gate'),
+                                   source.get('parent_popul') or 'root') - {gate_name}
+    tgp = source.get('gate_param') or {}
+    sources = {src.get('gate') for src in (tgp.get('replicate_x'), tgp.get('replicate_y'))
+               if isinstance(src, dict) and src.get('gate')}
+    sources |= {ag_core.split_population_key(src['population'])[0]
+                for src in (tgp.get('replicate_x'), tgp.get('replicate_y'))
+                if isinstance(src, dict) and src.get('population')}
+    changed, skipped = [], []
+    for g in ag_core.ordered_gate_defs(gate_defs):
+        name = g['gate_name']
+        if name not in below or _sync_key(g) != key:
+            continue
+        if sources & ({name} | descendants(gate_defs, name)):
+            skipped.append(name)
+            continue
+        target = by_name[name]
+        gp = {k: v for k, v in (target.get('gate_param') or {}).items() if k not in SYNC_PARAM_KEYS}
+        gp.update({k: deepcopy(tgp[k]) for k in SYNC_PARAM_KEYS if k in tgp})
+        if (target.get('algorithm') == source.get('algorithm')
+                and sync_fingerprint(dict(target, gate_param=gp)) == sync_fingerprint(target)):
+            continue
+        target['gate_param'] = gp
+        target['algorithm'] = source.get('algorithm')
+        target['sync_origin'] = SYNC_USER
+        changed.append(name)
+    return changed, skipped
+
+
+def conversion_check(gate_def: dict, drawn: dict, proposed: dict, drawn_fractions: dict,
+                     proposed_fractions: dict, shift_limit: float = 0.1,
+                     fraction_limit: float = 0.1) -> dict | None:
+    """Compare a gate's imported boundary (*drawn*) with its trainable form
+    (*proposed*) on the same events.
+
+    shift    : the largest move of a threshold, in transformed axis units
+               (thresholds of both; None when either is a shape).
+    fraction : the largest change of a population's fraction of the parent.
+
+    Returns {'shift', 'fraction', 'message'} when either exceeds its limit,
+    else None.
+    """
+    shift = None
+    first_d = next(iter(drawn.values()), {}) if drawn else {}
+    first_p = next(iter(proposed.values()), {}) if proposed else {}
+    if not ag_core.is_shape_boundary(drawn) and first_d and first_p:
+        moves = [abs(float(first_p[k]) - float(first_d[k])) for k in ('threshold_x', 'threshold_y')
+                 if first_d.get(k) is not None and first_p.get(k) is not None]
+        shift = max(moves) if moves else None
+    pops = set(drawn_fractions) & set(proposed_fractions)
+    fraction = max((abs(float(proposed_fractions[p]) - float(drawn_fractions[p])) for p in pops),
+                   default=None)
+    over_shift = shift is not None and shift > shift_limit
+    over_fraction = fraction is not None and fraction > fraction_limit
+    if not (over_shift or over_fraction):
+        return None
+    parts = []
+    if shift is not None:
+        parts.append(f"threshold moves {shift:.3f} axis units")
+    if fraction is not None:
+        parts.append(f"a population changes by {100 * fraction:.1f} percentage points")
+    return {'shift': shift, 'fraction': fraction,
+            'message': "Trainable form far from the imported boundary: " + "; ".join(parts) + "."}
 
 
 # ---------------------------------------------------------------------------
