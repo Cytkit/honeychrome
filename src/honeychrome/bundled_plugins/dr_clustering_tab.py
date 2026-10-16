@@ -204,6 +204,7 @@ from honeychrome.view_components.copyable_table_widget import CopyableTableWidge
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 from honeychrome.view_components.side_tab_widget import SideTabWidget
 from honeychrome.view_components import suggest_groupings_dialog as sgd
+from honeychrome.view_components.checkable_header import CheckableHeaderView
 from honeychrome.controller_components.differential_stats import suggest_groupings_from_names
 from honeychrome.view_components.differential_plots import (
     make_heatmap_figure,
@@ -241,7 +242,9 @@ import drc_report
 import drc_help_texts
 import drc_predictive
 import drc_time_estimate
-from transforms_panel import TransformInspector
+from transforms_panel import (
+    TransformInspector, transform_from_params, transform_params as _transform_params,
+)
 
 _log = drc_logging.get_logger(__name__)
 
@@ -401,19 +404,40 @@ def _read_transforms_from_experiment(controller):
         or controller.experiment.cytometry.get('raw_transforms')
         or {}
     )
+    return _channel_transform_params_from(transforms)
+
+
+def _channel_transform_params_from(transforms: dict) -> dict:
+    """
+    Convert {channel: transform parameter dict} (the experiment's own keys:
+    scale_t, logicle_w, logicle_m, logicle_a, id, limits) into the
+    {channel: {'T', 'W', 'M', 'A', 'id', 'limits'}} form held in
+    PipelineState.channel_transform_params.
+    """
     result = {}
     for channel, params in transforms.items():
         if not isinstance(params, dict):
             continue
         result[channel] = {
-            'T': float(params.get('scale_t',   262144.0)),
-            'W': float(params.get('logicle_w', 0.5)),
-            'M': float(params.get('logicle_m', 4.5)),
-            'A': float(params.get('logicle_a', 0.0)),
+            'T': float(params.get('scale_t') or 262144.0),
+            'W': float(params.get('logicle_w') if params.get('logicle_w') is not None else 0.5),
+            'M': float(params.get('logicle_m') or 4.5),
+            'A': float(params.get('logicle_a') or 0.0),
             'id': params.get('id', 1),   # 0=linear, 1=logicle, 2=log
-            'limits': list(params.get('limits', [0, 1])),
+            'limits': list(params.get('limits') or [0, 1]),
         }
     return result
+
+
+def _working_channel_transform_params(controller, saved: dict) -> dict:
+    """
+    channel_transform_params for the open experiment: the saved transforms
+    where there are any, the experiment's own for the remaining channels.
+    """
+    params = _read_transforms_from_experiment(controller)
+    params.update({ch: v for ch, v in _channel_transform_params_from(saved).items()
+                   if ch in params})
+    return params
 
 def _qs_list(settings, key: str) -> list[str]:
     """
@@ -787,6 +811,11 @@ _SideTabWidget = SideTabWidget
 # 200-bin histogram of 100,000 events agree with the full cell to well
 # within the resolution of the plots. None keeps every event.
 MARKER_SUMMARY_MAX_EVENTS_PER_CELL = 100_000
+# Sample Group Assignment table column sizes (pixels): the sample name is
+# capped so a long name cannot push the other columns out of view;
+# covariates get room to type.
+SAMPLE_COLUMN_MAX_WIDTH = 280
+COVARIATE_COLUMN_MIN_WIDTH = 110
 
 
 def _channel_xform(state, ch: str):
@@ -898,10 +927,13 @@ class PipelineState:
 
     Transforms
     ----------
-    channel_transform_params is populated from the experiment model at
-    initialisation and when the tab is activated.  It is NEVER written back
-    to the experiment.  Any local modifications (e.g. from the auto-transform
-    preview in the Transform tab) stay here only.
+    saved_transforms holds this plugin's transform of every channel
+    (Transforms tab).  An experiment opened here for the first time starts
+    from the transforms defined in Unmixed Data; after that the saved ones
+    are kept, with every adjustment made in the Transforms tab, until the
+    user reloads from the experiment.  channel_transform_params is the
+    form the other tabs read.  Neither is ever written back to the
+    experiment.
     """
 
     # --- Configuration ---
@@ -914,7 +946,10 @@ class PipelineState:
 
     # --- Transforms (read from experiment; never written back) ---
     channel_transform_params: dict = field(default_factory=dict)
-    # {channel_name: {'W': float, 'A': float, 'T': float, 'M': float}}
+    # {channel_name: {'W': float, 'A': float, 'T': float, 'M': float,
+    #                 'id': int, 'limits': [float, float]}}
+    saved_transforms: dict = field(default_factory=dict)
+    # {channel_name: transforms_panel.transform_params() dict}
 
     # --- Dimensionality reduction ---
     trained_reducers: dict[str, Any] = field(default_factory=dict)
@@ -1041,7 +1076,11 @@ class PipelineState:
     #   correction instead, without pooling across comparisons.
     stats_adjust_covariates: list[str] = field(default_factory=list)
     # state.covariates columns added to every test's design as adjustment
-    # terms (numeric -> continuous, otherwise categorical).
+    # terms: continuous when listed in numeric_covariates, otherwise
+    # categorical.
+    numeric_covariates: list[str] = field(default_factory=list)
+    # state.covariates columns entered as continuous numbers (age, CRP);
+    # ticked under the column title in the Sample Group Assignment table.
     stats_use_treat: bool = True
     # True: p-values test |effect| > threshold (TREAT). False: test
     #   effect != 0 and use the threshold only as a filter.
@@ -2720,18 +2759,25 @@ class TransformTab(TransformInspector):
     The histogram, biplots, axis drags and CSV import/export are those of
     ``transforms_panel.TransformInspector`` (shared with the gating
     plugins); this tab adds the gate tree whose events are previewed, the
-    training samples used by Auto-transform, and the persisted W values.
+    training samples used by Auto-transform, and the reload of the
+    transforms defined in Unmixed Data.  The transforms as adjusted are
+    kept in ``state.saved_transforms``, which the plugin saves with the
+    experiment's other settings.
     """
+
+    transformsPersistRequested = Signal()
 
     def __init__(self, state: PipelineState, bus, controller, parent=None):
         super().__init__(controller, help_text=drc_help_texts.transforms_tab_help_text,
                          parent=parent)
         self.state = state
         self.bus = bus
-        self.auto_btn.setText("✦ Auto-transform preview (all channels)")
+        self._transforms_source = None
         self.auto_btn.setToolTip(
-            "Compute suggested Logicle W/A for every fluorescence channel "
-            "(Parks, Roederer & Moore 2006).  Preview only — not saved."
+            "Set the Logicle W of every Logicle channel from the training "
+            "samples (Parks, Roederer & Moore 2006).  The result is kept "
+            "with this analysis and is not written to the experiment.  Use "
+            "Reload from experiment to undo."
         )
         self.save_csv_btn.setToolTip(
             "Export current (local preview) transform parameters to a CSV file.\n"
@@ -2761,17 +2807,26 @@ class TransformTab(TransformInspector):
     def _extend_toolbar(self, toolbar):
         self.reload_btn = QPushButton("↺ Reload from experiment")
         self.reload_btn.setToolTip(
-            "Re-read transform parameters from the experiment model, "
-            "discarding any local preview edits."
+            "Restore every transform to the one defined in Unmixed Data, "
+            "discarding Auto-transform results and axis changes made here."
         )
-        self.reload_btn.clicked.connect(self.refresh)
+        self.reload_btn.clicked.connect(self.reload_from_experiment)
         toolbar.addWidget(self.reload_btn)
+
+    def _default_channels(self) -> list[str]:
+        """Fluorescence channels in the cytometer's channel order."""
+        settings = self.controller.experiment.settings.get('unmixed', {})
+        pnn = settings.get('event_channels_pnn') or []
+        ids = sorted(set(settings.get('fluorescence_channel_ids') or []))
+        named = [pnn[i] for i in ids if 0 <= i < len(pnn)]
+        return named or list(settings.get('fluorescence_channels') or [])
 
     def channel_labels(self) -> dict:
         return _antigen_dash_labels(self.controller)
 
     def _on_transform_edited(self, channel: str, tr, before: dict):
-        self._sync_transform_to_state(channel, tr)
+        self._store_transform(channel, tr)
+        self.transformsPersistRequested.emit()
 
     def _available_channels(self) -> list[str]:
         skip = {'ribbon', 'Time', 'event_id'}
@@ -2785,9 +2840,22 @@ class TransformTab(TransformInspector):
 
     def refresh(self):
         """
-        Reload Transform objects from controller.unmixed_transformations,
-        repopulate the channel list and biplot channels, then load event data.
+        Bring the tab up to date: rebuild the gate tree, repopulate the
+        channel list and biplot channels, and load the preview events.
+
+        The transforms shown are the saved ones (state.saved_transforms),
+        which start as the transforms defined in Unmixed Data and keep every
+        adjustment made here (axis drags, Auto-transform, CSV);
+        reload_from_experiment() discards those adjustments.
         """
+        self._refresh(force_reload=False)
+
+    def reload_from_experiment(self):
+        """Replace every transform with the one defined in Unmixed Data,
+        discarding Auto-transform results and axis changes made here."""
+        self._refresh(force_reload=True)
+
+    def _refresh(self, force_reload: bool):
         if self.controller.experiment.process.get('unmixing_matrix') is None:
             return
 
@@ -2798,14 +2866,16 @@ class TransformTab(TransformInspector):
         self.gate_tree.set_hierarchy(hierarchy)
         self.gate_tree.set_checked_names(self.state.selected_gates)
 
-        # Deep-copy Transform objects from controller so we can tweak locally
+        # Local copies of the controller's Transform objects, set to the saved
+        # parameters.  Rebuilt on request or for a different experiment only,
+        # so that adjustments survive tab switches.
         src = self.controller.unmixed_transformations or {}
-        self._transforms = {ch: deepcopy(tr) for ch, tr in src.items()}
-
-        # Also sync state.channel_transform_params for downstream use
-        self.state.channel_transform_params = _read_transforms_from_experiment(
-            self.controller
-        )
+        source_key = (str(getattr(self.controller, 'experiment_dir', '')), tuple(src))
+        if force_reload or not self._transforms or source_key != self._transforms_source:
+            saved = {} if force_reload else self.state.saved_transforms
+            self._transforms = self._build_transforms(src, saved)
+            self._transforms_source = source_key
+            self._snapshot_transforms()
 
         self._pnn = self.controller.experiment.settings.get(
             'unmixed', {}
@@ -2814,12 +2884,10 @@ class TransformTab(TransformInspector):
         if not self._transforms:
             return
 
-        # Restore any previously computed auto-transform W values
-        self._load_computed_transforms()
-
         # The Transforms tab always shows every channel (in PNN order);
         # channel selection for DR/clustering happens in Configuration.
         self.show_channels()
+        self.redraw_all()
 
         # Load data (deferred so load_sample has finished)
         self._load_preview_data()
@@ -2879,10 +2947,34 @@ class TransformTab(TransformInspector):
         self.state.selected_gates = list(gates)
         self._load_preview_data()
 
-    def _sync_transform_to_state(self, channel: str, tr: 'Transform'):
-        """Push updated W back into state.channel_transform_params."""
-        if channel in self.state.channel_transform_params:
-            self.state.channel_transform_params[channel]['W'] = tr.logicle_w
+    @staticmethod
+    def _build_transforms(src: dict, saved: dict) -> dict:
+        """Copies of the Transform objects in *src*, set to the parameters in
+        *saved* where there are any."""
+        out = {}
+        for ch, tr in src.items():
+            try:
+                out[ch] = (transform_from_params(saved[ch], template=tr)
+                           if saved.get(ch) else deepcopy(tr))
+            except Exception:
+                out[ch] = deepcopy(tr)
+        return out
+
+    def _store_transform(self, channel: str, tr: 'Transform'):
+        """Record one channel's transform in the shared state, where the
+        other tabs read it and from where it is saved."""
+        params = _transform_params(tr)
+        self.state.saved_transforms[channel] = params
+        self.state.channel_transform_params.update(
+            _channel_transform_params_from({channel: params}))
+
+    def _snapshot_transforms(self):
+        """Record every channel's transform in the shared state."""
+        self.state.saved_transforms = {
+            ch: _transform_params(tr) for ch, tr in self._transforms.items()}
+        self.state.channel_transform_params = _working_channel_transform_params(
+            self.controller, self.state.saved_transforms)
+        self.transformsPersistRequested.emit()
 
     # ------------------------------------------------------------------
     # Auto-transform (Parks & Moore) — over all training samples
@@ -2907,19 +2999,23 @@ class TransformTab(TransformInspector):
             )
             return None, ''
         print(f"\n[DR TransformTab] Auto-transform: loading {len(training_paths)} training sample(s)…")
-        return (self._load_all_training_samples(training_paths),
-                f"{len(training_paths)} training sample(s)")
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        QApplication.processEvents()
+        try:
+            pooled = self._load_all_training_samples(training_paths)
+        finally:
+            QApplication.restoreOverrideCursor()
+        return pooled, f"{len(training_paths)} training sample(s)"
 
     def _after_auto_transform(self, n_updated: int, source_note: str):
-        """Persist the computed W values (restored on next open) and report."""
-        self._save_computed_transforms()
+        """Report the computed W values."""
         QMessageBox.information(
-            self, "Auto-Transform Preview",
+            self, "Auto-Transform",
             f"W computed for {n_updated} Logicle channel(s) from {source_note},\n"
             f"using the Parks & Moore method (lower-quarter quantile of negatives).\n\n"
-            f"Parameters saved and will be restored on next open.\n"
-            f"These are local previews only -- to change what the main "
-            f"Honeychrome plots use, drag the same axis there."
+            f"These transforms are kept with this analysis and are not written "
+            f"to the experiment.  Reload from experiment restores the "
+            f"transforms defined in Unmixed Data."
         )
 
     def _get_training_sample_full_paths(self) -> list[Path]:
@@ -3014,61 +3110,6 @@ class TransformTab(TransformInspector):
                 print(f"[DR TransformTab] Failed to load {path}: {e}")
 
         return result
-
-    def _save_computed_transforms(self):
-        """
-        Persist the currently computed local Transform W values to QSettings,
-        keyed by experiment directory.  Called after auto-transform completes.
-        """
-        try:
-            exp_dir = str(self.controller.experiment_dir)
-            safe_key = exp_dir.replace('\\', '/').replace(':', '_').replace(' ', '_')
-            s = QSettings('honeychrome', _SETTINGS_APP_KEY)
-            s.beginGroup(safe_key)
-            computed = {
-                ch: round(tr.logicle_w, 6)
-                for ch, tr in self._transforms.items()
-                if tr.id == 1
-            }
-            s.setValue('computed_transform_W', repr(computed))
-            s.endGroup()
-            print(f"[DR TransformTab] Saved computed W for {len(computed)} channels")
-        except Exception as e:
-            print(f"[DR TransformTab] Could not save computed transforms: {e}")
-
-    def _load_computed_transforms(self):
-        """
-        Restore previously computed W values from QSettings and apply them
-        to the local Transform objects.  Called from refresh() after transforms
-        are loaded from the experiment.
-        """
-        try:
-            exp_dir = str(self.controller.experiment_dir)
-            safe_key = exp_dir.replace('\\', '/').replace(':', '_').replace(' ', '_')
-            s = QSettings('honeychrome', _SETTINGS_APP_KEY)
-            s.beginGroup(safe_key)
-            computed_repr = s.value('computed_transform_W', '')
-            s.endGroup()
-            if not computed_repr:
-                return
-            computed: dict[str, float] = eval(computed_repr)  # noqa: S307
-            M = self.magnitude_decades()
-            n_restored = 0
-            for ch, W in computed.items():
-                if ch not in self._transforms:
-                    continue
-                tr = self._transforms[ch]
-                if tr.id != 1:
-                    continue
-                W = max(0.0, min(M / 2.0, float(W)))
-                tr.logicle_w = W
-                tr.set_transform()
-                self._sync_transform_to_state(ch, tr)
-                n_restored += 1
-            if n_restored:
-                print(f"[DR TransformTab] Restored computed W for {n_restored} channels")
-        except Exception as e:
-            print(f"[DR TransformTab] Could not restore computed transforms: {e}")
 
 
 class _ResultsDrawWorker(QThread):
@@ -3312,9 +3353,16 @@ class GroupsStatsTab(QWidget):
         # Column' or CSV import). Never includes single-stain/unstained
         # controls (see _non_control_sample_paths).
         self.table = QTableWidget(0, 2)
+        self._table_header = CheckableHeaderView(
+            self.table, check_label="Numeric",
+            tooltip="Enter this covariate as a continuous number (e.g. age, CRP) instead of "
+                    "as categories. Every value must be a number.")
+        self.table.setHorizontalHeader(self._table_header)
+        self._table_header.check_toggled.connect(self._on_covariate_numeric_toggled)
         self.table.setHorizontalHeaderLabels(['Sample', 'Group'])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.setTextElideMode(Qt.ElideMiddle)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -3420,9 +3468,9 @@ class GroupsStatsTab(QWidget):
         self.adjust_covariates_list.setSelectionMode(QAbstractItemView.NoSelection)
         self.adjust_covariates_list.setToolTip(
             "Covariate columns from the table above to include in every "
-            "test's model (e.g. age, sex, batch). Columns whose values are "
-            "all numbers are fitted as continuous terms; anything else as "
-            "categories. Every tested sample needs a value. The pairing "
+            "test's model (e.g. age, sex, batch). Columns ticked Numeric "
+            "in the table above are fitted as continuous terms; anything "
+            "else as categories. Every tested sample needs a value. The pairing "
             "variable is already in the model when 'Paired design' is on."
         )
         self.adjust_covariates_list.itemChanged.connect(self._on_adjust_covariate_changed)
@@ -4234,8 +4282,7 @@ class GroupsStatsTab(QWidget):
         self.adjust_covariates_list.blockSignals(True)
         self.adjust_covariates_list.clear()
         for col in cols:
-            values = self.state.covariates[col].tolist()
-            kind = drc_stats.covariate_kind(values)
+            kind = 'numeric' if col in self.state.numeric_covariates else 'categorical'
             item = QListWidgetItem(f"{col}  ({kind})")
             item.setData(Qt.UserRole, col)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -4557,21 +4604,23 @@ class GroupsStatsTab(QWidget):
         )
         self.table.setColumnCount(2 + len(covariate_cols))
         self.table.setHorizontalHeaderLabels(['Sample', 'Group'] + covariate_cols)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        # ResizeToContents both locks the column against manual drag and
-        # sizes off each QComboBox's sizeHint(), which is only measured
-        # once on first show -- so it can end up narrower than the longest
-        # group name, and shrinks further on every rebuild (e.g. after
-        # auto-assign). Size it explicitly from font metrics instead, then
-        # leave it Interactive so it stops auto-shrinking and the user can
-        # still drag it themselves.
+        # Every column is Interactive so it can be dragged to any width, and
+        # the table scrolls sideways when the columns are wider than the
+        # view. Initial widths come from font metrics rather than from the
+        # cell widgets' size hints, which are only measured on first show.
         opts = self._group_options()
         fm = self.table.fontMetrics()
         longest_opt_width = max((fm.horizontalAdvance(o) for o in opts), default=0)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        longest_name_width = max(
+            (fm.horizontalAdvance(Path(sp).name) for sp in sample_groups), default=0)
+        self.table.setColumnWidth(0, min(longest_name_width + 24, SAMPLE_COLUMN_MAX_WIDTH))
         self.table.setColumnWidth(1, longest_opt_width + 40)  # padding for combo chrome/arrow
-        for c in range(2, 2 + len(covariate_cols)):
-            self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        for c, col_name in enumerate(covariate_cols, start=2):
+            self.table.setColumnWidth(
+                c, max(COVARIATE_COLUMN_MIN_WIDTH, fm.horizontalAdvance(col_name) + 32))
+        self._table_header.set_checks(
+            {c: col_name in self.state.numeric_covariates
+             for c, col_name in enumerate(covariate_cols, start=2)})
 
         self.table.setRowCount(0)
         for sample_path, group in sorted(
@@ -4613,6 +4662,26 @@ class GroupsStatsTab(QWidget):
         self.table.setMinimumHeight(28 * n_rows + 40)
         self._update_group_count_label()
 
+    def _on_covariate_numeric_toggled(self, section: int, checked: bool):
+        """Enter the covariate under *section* as a continuous number (or as
+        categories). A column holding text cannot be numeric."""
+        name = self.table.horizontalHeaderItem(section).text()
+        if checked and self.state.covariates is not None and name in self.state.covariates.columns:
+            filled = [v for v in self.state.covariates[name].astype(str).str.strip() if v]
+            if filled and drc_stats.covariate_kind(filled) != 'numeric':
+                QMessageBox.warning(
+                    self, "Numeric covariate",
+                    f"'{name}' has values that are not numbers, so it cannot be numeric.")
+                self._table_header.set_checks(
+                    {c: self.table.horizontalHeaderItem(c).text() in self.state.numeric_covariates
+                     for c in self._table_header.checks()})
+                return
+        self.state.numeric_covariates = [c for c in self.state.numeric_covariates if c != name]
+        if checked:
+            self.state.numeric_covariates.append(name)
+        self._populate_adjust_covariates_list()
+        self._last_stats_data_key = None
+
     def _add_covariate_column(self):
         """Add a new covariate/pairing column directly in-app -- fill it
         in per sample below, then select it as 'Pairing variable'."""
@@ -4653,6 +4722,7 @@ class GroupsStatsTab(QWidget):
         if reply != QMessageBox.Yes:
             return
         self.state.covariates = self.state.covariates.drop(columns=[name])
+        self.state.numeric_covariates = [c for c in self.state.numeric_covariates if c != name]
         if self.state.pairing_variable == name:
             self.state.pairing_variable = ''
             if self.state.paired:
@@ -5551,7 +5621,7 @@ class GroupsStatsTab(QWidget):
         snap = _shallow_copy(self.state)
         for attr in ('sample_groups', 'group_names', 'group_patterns',
                      'testing_group_selection', 'stats_adjust_covariates',
-                     'marker_roles', 'channel_transform_params', 'selected_channels',
+                     'numeric_covariates', 'marker_roles', 'channel_transform_params', 'selected_channels',
                      'cluster_names'):
             setattr(snap, attr, deepcopy(getattr(self.state, attr)))
         if self.state.covariates is not None:
@@ -5634,6 +5704,7 @@ class GroupsStatsTab(QWidget):
             tuple(self.state.testing_group_selection), self.state.contrast_mode,
             self.state.reference_group, self.state.paired, self.state.pairing_variable,
             tuple(adjust_covariates), covariate_values,
+            tuple(c for c in adjust_covariates if c in self.state.numeric_covariates),
         )
         roles_fingerprint = tuple(sorted(self.state.marker_roles.items()))
         transform_fingerprint = ()
@@ -11935,6 +12006,15 @@ class PluginWidget(QWidget):
         # lost if the plugin tab (or the app) closes before that happens.
         self.workspace_tab.plots_changed.connect(self._save_plot_configs_only)
 
+        # Same for the transforms: written shortly after the last change, so
+        # a drag does not write on every mouse move.
+        self._transform_save_timer = QTimer(self)
+        self._transform_save_timer.setSingleShot(True)
+        self._transform_save_timer.setInterval(500)
+        self._transform_save_timer.timeout.connect(self._save_transforms_only)
+        self.transform_tab.transformsPersistRequested.connect(
+            lambda: self._transform_save_timer.start())
+
         # ------------------------------------------------------------------
         # Connect bus signals
         # ------------------------------------------------------------------
@@ -11992,9 +12072,6 @@ class PluginWidget(QWidget):
             try:
                 all_samples = _non_control_sample_paths(self.controller)
                 self.state.initialise_sample_groups(all_samples)
-                self.state.channel_transform_params = _read_transforms_from_experiment(
-                    self.controller
-                )
 
                 current_key = self._settings_key()
                 if current_key != self._loaded_experiment_key:
@@ -12026,6 +12103,7 @@ class PluginWidget(QWidget):
                             gst.chk_include_type_markers.setChecked(
                                 bool(getattr(self, '_pending_include_type_markers', False))
                             )
+                self._sync_transform_state()
             finally:
                 self._loading = False
 
@@ -12067,6 +12145,39 @@ class PluginWidget(QWidget):
             s.setValue('plot_configs', json.dumps(self.state.plot_configs))
         finally:
             s.endGroup()
+
+    def _save_transforms_only(self):
+        """
+        Persist just the saved transforms, to the experiment the state was
+        loaded for (see save_state).
+        """
+        if self._loading or self._loaded_experiment_key is None:
+            return
+        if not self.state.saved_transforms:
+            return
+        import json
+        s = self._qsettings
+        s.beginGroup(self._loaded_experiment_key)
+        try:
+            s.setValue('saved_transforms', json.dumps(self.state.saved_transforms))
+        finally:
+            s.endGroup()
+
+    def _sync_transform_state(self):
+        """
+        Make the saved transforms and channel_transform_params consistent
+        for the open experiment.  An experiment with no saved transforms
+        starts from the ones defined in Unmixed Data and keeps its own from
+        then on.
+        """
+        if not self.state.saved_transforms:
+            src = self.controller.unmixed_transformations or {}
+            self.state.saved_transforms = {
+                ch: _transform_params(tr) for ch, tr in src.items()}
+            if self.state.saved_transforms:
+                self._transform_save_timer.start()
+        self.state.channel_transform_params = _working_channel_transform_params(
+            self.controller, self.state.saved_transforms)
 
     def save_state(self):
         """
@@ -12155,6 +12266,7 @@ class PluginWidget(QWidget):
             s.setValue('paired',            self.state.paired)
             s.setValue('pairing_variable',  self.state.pairing_variable)
             s.setValue('stats_adjust_covariates', list(self.state.stats_adjust_covariates))
+            s.setValue('numeric_covariates', list(self.state.numeric_covariates))
             s.setValue('stats_use_treat',   self.state.stats_use_treat)
             s.setValue('stats_mfi_threshold', self.state.stats_mfi_threshold)
             s.setValue('stats_mfi_hierarchical', self.state.stats_mfi_hierarchical)
@@ -12231,6 +12343,9 @@ class PluginWidget(QWidget):
                 tile_y = [t.y_channel() for t in self.transform_tab._biplot_tiles]
                 s.setValue('transform_biplot_y_channels', tile_y)
                 s.setValue('transform_n_tiles', len(tile_y))
+            if self.state.saved_transforms:
+                import json
+                s.setValue('saved_transforms', json.dumps(self.state.saved_transforms))
             # Config tab: DR algorithm and hyperparameters
             ct = self.config_tab
             if hasattr(ct, '_dr_algo_group'):
@@ -12401,6 +12516,7 @@ class PluginWidget(QWidget):
             self.state.paired = paired_val in (True, 'true', 'True', 1, '1')
             self.state.pairing_variable = s.value('pairing_variable', '')
             self.state.stats_adjust_covariates = _qs_list(s, 'stats_adjust_covariates')
+            self.state.numeric_covariates = _qs_list(s, 'numeric_covariates')
             use_treat = s.value('stats_use_treat', None)
             if use_treat is not None:
                 self.state.stats_use_treat = use_treat in (True, 'true', 'True', 1, '1')
@@ -12590,6 +12706,15 @@ class PluginWidget(QWidget):
             self._pending_tile_y_channels = _qs_list(
                 s, 'transform_biplot_y_channels')
             self._pending_n_tiles = _qs_int(s, 'transform_n_tiles', 0) or 0
+            # Transform tab: the transforms as last adjusted (empty for an
+            # experiment not seen before, which then starts from Unmixed Data)
+            try:
+                import json
+                loaded_transforms = json.loads(s.value('saved_transforms', '') or '{}')
+            except Exception:
+                loaded_transforms = {}
+            self.state.saved_transforms = (
+                loaded_transforms if isinstance(loaded_transforms, dict) else {})
             # DR algorithm and hyperparameters
             self._pending_dr_algo          = s.value('dr_algo', '')
             self._pending_umap_n_neighbors = s.value('umap_n_neighbors', None)

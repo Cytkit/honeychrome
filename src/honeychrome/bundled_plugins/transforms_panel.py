@@ -37,9 +37,9 @@ import numpy as np
 
 from PySide6.QtCore import QEvent, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout,
-    QWidget,
+    QApplication, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
+    QVBoxLayout, QWidget,
 )
 
 import honeychrome.settings as hc_settings
@@ -472,6 +472,12 @@ class TransformInspector(QWidget):
     def _available_channels(self) -> list[str]:
         return [ch for ch in self._transforms if ch not in SKIP_CHANNELS]
 
+    def _default_channels(self) -> list[str]:
+        """Channels to show first, in order: the first is selected in the
+        channel list and the first biplot plots the first two. Empty keeps the
+        channel list's own order."""
+        return []
+
     # -- UI ---------------------------------------------------------------
 
     def _build_ui(self):
@@ -637,7 +643,8 @@ class TransformInspector(QWidget):
                     restored = True
                     break
         if not restored and channels:
-            self.channel_list.setCurrentRow(0)
+            first = next((ch for ch in self._default_channels() if ch in channels), channels[0])
+            self.channel_list.setCurrentRow(channels.index(first))
 
     def _on_channel_item_changed(self, current, previous):
         channel = current.data(Qt.UserRole) if current else None
@@ -684,14 +691,16 @@ class TransformInspector(QWidget):
         self._biplot_scroll.setMinimumHeight(min(n_rows, 2) * (tile_size + 30) + 10)
 
     def _add_biplot(self):
-        channels = self._available_channels()
+        available = self._available_channels()
+        preferred = [ch for ch in self._default_channels() if ch in available]
+        channels = preferred + [ch for ch in available if ch not in preferred]
         used_y = {t.y_channel() for t in self._biplot_tiles}
         x_ch = self._active_channel or (channels[0] if channels else '')
         candidates = [ch for ch in channels if ch != x_ch and ch not in used_y]
         default_y = candidates[0] if candidates else (
             channels[1] if len(channels) > 1 else (channels[0] if channels else ''))
         tile = BiplotTile(self._rgba_lut, parent_tab=self)
-        tile.set_channels(channels, y_channel=default_y)
+        tile.set_channels(available, y_channel=default_y)
         self._biplot_tiles.append(tile)
         self._relayout_tiles()
         self._configure_tile_axes(tile)
@@ -977,18 +986,23 @@ class TransformInspector(QWidget):
             return
         decades = self.magnitude_decades()
         n_updated = 0
-        for ch, tr in self._transforms.items():
-            if tr.id != 1:
-                continue
-            arrays = data.get(ch) or []
-            if not arrays:
-                continue
-            before = transform_params(tr)
-            tr.logicle_w = round(parks_moore_w(arrays, tr.scale_t, decades), 3)
-            tr.set_transform()
-            self._on_transform_edited(ch, tr, before)
-            n_updated += 1
-        self.redraw_all()
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        QApplication.processEvents()
+        try:
+            for ch, tr in self._transforms.items():
+                if tr.id != 1:
+                    continue
+                arrays = data.get(ch) or []
+                if not arrays:
+                    continue
+                before = transform_params(tr)
+                tr.logicle_w = round(parks_moore_w(arrays, tr.scale_t, decades), 3)
+                tr.set_transform()
+                self._on_transform_edited(ch, tr, before)
+                n_updated += 1
+            self.redraw_all()
+        finally:
+            QApplication.restoreOverrideCursor()
         self._after_auto_transform(n_updated, source_note)
 
 
