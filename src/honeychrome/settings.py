@@ -14,7 +14,7 @@ devices_boot_order = [
   'pico5000',
   'dummy_device'
 ]
-transfer_target_repeat_time = 0.01 #s
+transfer_target_repeat_time = 0.005 #s
 n_channels_trace = 16
 adc_rate = 2.5  # [MHz]
 max_event_time = 120  # [us]
@@ -62,8 +62,8 @@ dac_bias_default = 155
 dac_ref_default = 1023
 
 capture_enabled_default = True
-capture_pre_trigger_default = n_time_points_in_event//2
-capture_post_trigger_default = n_time_points_in_event - capture_pre_trigger_default
+capture_pre_trigger_default = n_time_points_in_event//4
+capture_post_trigger_default = n_time_points_in_event//4
 trigger_default_hysteresis = 125
 
 ### define traces cache

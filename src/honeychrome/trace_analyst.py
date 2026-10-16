@@ -42,7 +42,7 @@ def peak_start_stop_baseline(tr, threshold):
         if in_peak:
             # start countdown if signal dips below threshold
             if (not condition) and (countdown == 0) and (n > n_start + window_extension_length_pre):
-                countdown = window_extension_length_pre + window_extension_length_post
+                countdown = window_extension_length_post
 
             if countdown > 0:
                 countdown -= 1
@@ -271,10 +271,8 @@ class TraceAnalyser(mp.Process):
                 last_event_index = 0
                 for n, traces in enumerate(traces_batch_scaled):
                     n_start, n_end, tr_baseline = peak_start_stop_baseline(traces[self.indices_peak_detection_channel_in_traces], self.threshold)
-                    print(n_start, n_end, tr_baseline)
                     if n_start > 0:
                         peak, baselines = peak_measurements(traces, n_start, n_end, deltaT, self.indices_area_channels_in_traces, self.indices_height_channels_in_traces)
-                        print(peak, baselines)
                         areas[n], heights[n], widths[n], centre = peak
                         keep_mask[n] = True
                         last_event_index = n

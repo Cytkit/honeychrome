@@ -76,6 +76,10 @@ class Instrument(mp.Process):
 
 
     def run(self):
+        import faulthandler
+        f = open(f'/tmp/faulthandler_{self.pid}.log', 'w')
+        faulthandler.enable(file=f, all_threads=True)
+
         self.find_and_connect_to_instrument()
 
         # initialise the things that can't be pickled
