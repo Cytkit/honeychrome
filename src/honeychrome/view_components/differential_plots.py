@@ -25,6 +25,7 @@ the figure is on a canvas.
 
 from __future__ import annotations
 
+import functools
 import textwrap
 from pathlib import Path
 
@@ -36,7 +37,7 @@ __all__ = [
     'message_figure', 'make_heatmap_figure', 'make_volcano_figure',
     'group_pair_colours', 'draw_direction_ramp',
     'make_marker_summary_figure', 'make_comparison_heatmap_figure', 'significance_column',
-    'wrap_label', 'text_width_inches',
+    'wrap_label', 'text_width_inches', 'cell_grid_lines',
 ]
 
 GROUP_COLOUR_A = '#4477AA'
@@ -64,18 +65,37 @@ def wrap_label(text: str, width: int, max_lines: int | None = None) -> str:
 def text_width_inches(text: str, fontsize: float) -> float:
     """
     Rendered width in inches of the widest line of *text* at *fontsize*
-    points, measured with matplotlib's default font. Needs no canvas, so
-    it is safe on a worker thread.
+    points, from matplotlib's default font's advance widths. Needs no
+    canvas, so it is safe on a worker thread.
     """
-    from matplotlib.textpath import TextPath
-
     widest = 0.0
     for line in str(text).split('\n'):
-        if not line:
-            continue
-        extent = TextPath((0, 0), line, size=fontsize).get_extents()
-        widest = max(widest, float(extent.width))
+        if line:
+            widest = max(widest, _line_width_points(line, float(fontsize)))
     return widest / 72.0
+
+
+@functools.lru_cache(maxsize=8192)
+def _line_width_points(line: str, fontsize: float) -> float:
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.textpath import text_to_path
+    width, _height, _descent = text_to_path.get_text_width_height_descent(
+        line, FontProperties(size=fontsize), ismath=False)
+    return float(width)
+
+
+def cell_grid_lines(ax, n_cols: int, n_rows: int, color: str, linewidth: float):
+    """Lines between the cells of an image drawn with imshow on *ax*
+    (cell centres at integer positions), as two line collections rather
+    than one minor tick per boundary, which is far quicker to build and
+    draw for large grids. The axis limits are left as they were."""
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    x_edges = np.arange(-0.5, n_cols, 1)
+    y_edges = np.arange(-0.5, n_rows, 1)
+    ax.vlines(x_edges, -0.5, n_rows - 0.5, colors=color, linewidth=linewidth)
+    ax.hlines(y_edges, -0.5, n_cols - 0.5, colors=color, linewidth=linewidth)
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
 
 
 def _is_default_text_colour(colour) -> bool:
@@ -475,8 +495,12 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
     import matplotlib
     cmap = matplotlib.colormaps['viridis'].copy()
     cmap.set_bad('#bdbdbd')
-    im = ax_hm.imshow(np.ma.masked_invalid(mat_ord), aspect='auto', cmap=cmap,
-                      vmin=vmin, vmax=vmax, interpolation='nearest')
+    # One quad per cell: unlike an image, draw time does not grow with the
+    # canvas size, which matters for heatmaps of several hundred rows.
+    im = ax_hm.pcolormesh(np.arange(-0.5, n_samples, 1), np.arange(-0.5, n_features, 1),
+                          np.ma.masked_invalid(mat_ord), cmap=cmap, vmin=vmin, vmax=vmax)
+    ax_hm.set_xlim(-0.5, n_samples - 0.5)
+    ax_hm.set_ylim(n_features - 0.5, -0.5)
     ax_hm.set_xticks(range(n_samples))
     ax_hm.set_xticklabels([Path(str(s)).stem for s in samp_labels],
                           rotation=45, ha='right', fontsize=7)
@@ -485,10 +509,7 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
     ax_hm.yaxis.set_label_position('right')
     ax_hm.yaxis.tick_right()
     ax_hm.grid(False)
-    ax_hm.set_xticks(np.arange(-0.5, n_samples, 1), minor=True)
-    ax_hm.set_yticks(np.arange(-0.5, n_features, 1), minor=True)
-    ax_hm.grid(which='minor', color='white', linestyle='-', linewidth=0.6)
-    ax_hm.tick_params(which='minor', bottom=False, left=False, right=False)
+    cell_grid_lines(ax_hm, n_samples, n_features, 'white', 0.6)
 
     ax_cb = fig.add_subplot(gs[2, 3])
     cb = fig.colorbar(im, cax=ax_cb)
@@ -713,10 +734,7 @@ def make_marker_summary_figure(results_df: pd.DataFrame, title: str, channel_nam
     ax.set_yticks(range(n_rows))
     ax.set_yticklabels(row_labels, fontsize=7)
     ax.grid(False)
-    ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
-    ax.grid(which='minor', color='white', linestyle='-', linewidth=0.6)
-    ax.tick_params(which='minor', bottom=False, left=False)
+    cell_grid_lines(ax, n_cols, n_rows, 'white', 0.6)
     cb = fig.colorbar(im, ax=ax, shrink=0.8)
     cb.set_label(value_label, fontsize=7)
     cb.ax.tick_params(labelsize=7)
@@ -805,10 +823,7 @@ def make_comparison_heatmap_figure(results_df: pd.DataFrame, title: str, is_dark
         ax.set_xticklabels([str(labels.get(f, f)) for f in chunk], rotation=90, fontsize=7)
         ax.set_yticks(range(len(comparisons)))
         ax.set_yticklabels(comparisons, fontsize=7)
-        ax.set_xticks(np.arange(-0.5, len(chunk), 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, len(comparisons), 1), minor=True)
-        ax.grid(which='minor', color='#898989', linestyle='-', linewidth=0.4)
-        ax.tick_params(which='minor', bottom=False, left=False)
+        cell_grid_lines(ax, len(chunk), len(comparisons), '#898989', 0.4)
         if len(chunk) < per_row:
             ax.set_xlim(-0.5, per_row - 0.5)
     cb = fig.colorbar(image, ax=list(axes), shrink=0.8)
