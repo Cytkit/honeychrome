@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (
 import honeychrome.settings as settings
 from honeychrome.view_components.exportable_plot_widget import apply_plot_theme
 
-__all__ = ['ScalableFigureWidget', 'MIN_SCALE_PCT', 'MAX_SCALE_PCT', 'DEFAULT_SCALE_PCT']
+__all__ = ['ScalableFigureWidget', 'MIN_SCALE_PCT', 'MAX_SCALE_PCT', 'DEFAULT_SCALE_PCT',
+           'initial_scale_for']
 
 MIN_SCALE_PCT = 25
 MAX_SCALE_PCT = 400
@@ -30,6 +31,16 @@ DEFAULT_SCALE_PCT = 100
 RESIZE_DELAY_MS = 120
 
 _canvas_class = None
+
+
+def initial_scale_for(figure, preferred: int = DEFAULT_SCALE_PCT, max_height_px: int = 8000) -> int:
+    """A starting size (percent) for *figure*: *preferred*, reduced so the
+    canvas is at most *max_height_px* tall, and never below MIN_SCALE_PCT."""
+    height = figure.get_figheight() * figure.get_dpi()
+    pct = preferred
+    if height * pct / 100 > max_height_px:
+        pct = int(100 * max_height_px / max(height, 1))
+    return max(MIN_SCALE_PCT, min(MAX_SCALE_PCT, pct))
 
 
 def scrollable_canvas_class():
@@ -58,10 +69,12 @@ class ScalableFigureWidget(QWidget):
     experiment_dir : folder the exported graphic is written to.
     pop_out        : optional callable with no arguments that opens the
                      figure in its own window.
+    initial_scale  : starting size in percent of the natural size (large
+                     heatmaps start smaller so they draw quickly).
     """
 
     def __init__(self, figure, title: str = 'figure', experiment_dir='',
-                 pop_out=None, parent=None):
+                 pop_out=None, parent=None, initial_scale: int = DEFAULT_SCALE_PCT):
         super().__init__(parent)
         self.figure = figure
         self.export_stem = title.replace(' ', '_').replace(':', '')
@@ -97,7 +110,8 @@ class ScalableFigureWidget(QWidget):
         self.size_slider.setRange(MIN_SCALE_PCT, MAX_SCALE_PCT)
         self.size_slider.setSingleStep(5)
         self.size_slider.setPageStep(25)
-        self.size_slider.setValue(DEFAULT_SCALE_PCT)
+        initial_scale = int(min(MAX_SCALE_PCT, max(MIN_SCALE_PCT, initial_scale)))
+        self.size_slider.setValue(initial_scale)
         self.size_slider.setFixedWidth(200)
         self.size_slider.setToolTip(
             f"Show this plot at {MIN_SCALE_PCT}% to {MAX_SCALE_PCT}% of its natural size. "
@@ -123,7 +137,7 @@ class ScalableFigureWidget(QWidget):
         self._resize_timer.timeout.connect(self._apply_scale)
         self.size_slider.valueChanged.connect(self._on_slider_changed)
 
-        self._pct_label.setText(f"{DEFAULT_SCALE_PCT}%")
+        self._pct_label.setText(f"{initial_scale}%")
         self._apply_scale()
 
     def scale_percent(self) -> int:
