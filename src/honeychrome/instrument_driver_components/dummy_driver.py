@@ -18,7 +18,7 @@ fcs_file = Path(__file__).parent / 'data' / 'example_for_dummy_acquisition.fcs'
 dummy_event_rate = 1000
 trace_indices = np.arange(n_time_points_in_event)  # x positions
 
-def gaussian_rows_areas(x_grid, areas, mu, sigma):
+def gaussian_rows_areas(x_grid, areas, mu, sigma, baseline_noise=10000, baseline_shift=10):
     """
     Create 2D array where each row is a Gaussian with specified area.
 
@@ -34,8 +34,9 @@ def gaussian_rows_areas(x_grid, areas, mu, sigma):
     N, M = areas.shape
     array_of_traces = np.empty((N*M, len(x_grid)))
     for n in range(N):
+        baseline = baseline_shift + np.random.poisson(lam=10, size=len(x_grid))
         gaussian = np.exp(-0.5 * ((x_grid - mu[n]) / sigma[n]) ** 2) / (sigma[n] * np.sqrt(2 * np.pi))
-        array_of_traces[n*M:(n+1)*M,:] = areas[n,:][:,None] * gaussian
+        array_of_traces[n*M:(n+1)*M,:] = areas[n,:][:,None] * gaussian + baseline
 
     return array_of_traces
 

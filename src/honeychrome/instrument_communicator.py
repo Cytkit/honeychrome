@@ -29,8 +29,8 @@ import threading
 import numpy as np
 import time
 
-from honeychrome.settings import devices_boot_order, traces_cache_size, traces_cache_dtype, max_events_in_traces_cache, trace_n_points, transfer_target_repeat_time, verbosity_divider
-
+from honeychrome.settings import devices_boot_order, traces_cache_size, traces_cache_dtype, max_events_in_traces_cache, trace_n_points, transfer_target_repeat_time
+verbosity_divider = int(1/transfer_target_repeat_time)
 debug = True
 
 class Instrument(mp.Process):

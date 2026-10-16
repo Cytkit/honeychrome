@@ -16,8 +16,8 @@ import time
 from honeychrome.settings import traces_cache_size, max_events_in_traces_cache, trace_n_points, n_channels_trace, adc_rate, threshold_retrieved, n_time_points_in_event, window_extension_length_pre, baseline_decay_rate, window_extension_length_post, timeout_length, deltaT, adc_scale_uv
 from honeychrome.settings import max_events_in_cache, n_channels_per_event, event_channels_pnn, analyser_target_repeat_time
 from honeychrome.settings import adc_channels, peak_detection_channel_retrieved, area_channels, height_channels, width_channels, scatter_channels, fluorescence_channels
-from honeychrome.settings import verbosity_divider
 
+verbosity_divider = int(1/analyser_target_repeat_time)
 baseline_length = int(1/baseline_decay_rate)
 gap = 10 # gap between start of end of baseline and start of peak
 

@@ -15,7 +15,6 @@ devices_boot_order = [
   'dummy_device'
 ]
 transfer_target_repeat_time = 0.01 #s
-verbosity_divider = 5
 n_channels_trace = 16
 adc_rate = 2.5  # [MHz]
 max_event_time = 120  # [us]
