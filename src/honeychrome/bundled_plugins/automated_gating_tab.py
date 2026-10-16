@@ -5,22 +5,32 @@ Applies a gating model (``.agmodel``, made with the Gating Model Builder
 plugin) to experiment samples and compares the gated populations between
 sample groups:
 
+  • Transforms — the axis transforms gating uses: the model's own by
+              default (those its gates were trained in), adjustable by
+              axis drag or Auto-transform, with a return to the model's.
   • Setup   — load a model, align its channels to this experiment antigen by
-              antigen, convert its boundaries to this experiment's axis
-              transforms, and choose for each gate whether its stored
-              boundary is applied as it is (fixed) or recalculated on each
-              sample (recalculate, with a drift check against the stored
-              boundary).
+              antigen, convert its boundaries to the transforms, and choose
+              for each gate whether its stored boundary is applied as it is
+              (fixed) or recalculated on each sample (recalculate, with a
+              drift check against the stored boundary).
   • Run     — pick samples and gate them in a background worker. Each sample
               is unmixed with its own autofluorescence profile assignment
               and restricted to its time-QC keep-mask when present. Only
               counts, parent counts, per-population marker medians and a
-              small display subsample are kept per sample.
+              display subsample (events and population memberships) are
+              kept per sample; the gated views show one population's gates
+              pooled over every sample and for each validation sample.
   • Results — sample groups and covariates, moderated tests of population
               frequencies (log-odds within the parent population), optional
               negative-binomial tests of counts, population-first tests of
-              marker medians, heatmaps and volcano plots, a per-sample
-              population browser, and CSV export.
+              marker medians, heatmaps and volcano plots, a population
+              comparison (each group's pooled biplot and the per-sample
+              values with the test's p-value), and CSV export.
+
+Gated results, display subsamples and statistics are saved in the
+experiment's cache folder and restored when the experiment is opened again;
+each gating and statistics run is also written as CSV files to
+``Automated_Gating_Results`` (named after the model, with a timestamp).
 
 Gate application lives in ``ag_core.py`` (shared with the builder),
 alignment and feature tables in ``ag_results.py``, and the statistics in
@@ -87,7 +97,12 @@ import ag_core  # noqa: E402
 import ag_help_texts  # noqa: E402
 import ag_report  # noqa: E402
 import ag_results  # noqa: E402
-from ag_widgets import add_concertina_page, make_concertina  # noqa: E402
+import transforms_panel as tp  # noqa: E402
+from ag_widgets import (  # noqa: E402
+    FilterBar, PopulationTree, add_concertina_page, block_wheel, make_concertina,
+    text_matches,
+)
+from honeychrome.view_components.side_tab_widget import SideTabWidget  # noqa: E402
 
 log = ag_core.get_logger(__name__)
 
@@ -155,6 +170,13 @@ DEFAULT_DISPLAY_EVENTS = 20_000
 DISPLAY_SEED = 42
 RESULTS_FILE = Path('cache') / 'automated_gating' / 'results.json'
 STATS_FILE = Path('cache') / 'automated_gating' / 'stats.json'
+DISPLAY_DIR = Path('cache') / 'automated_gating' / 'display'
+EXPORT_DIR = Path('Automated_Gating_Results')
+# Events per group in the population comparison's pooled biplots.
+GROUP_PLOT_EVENTS = 100_000
+# Heatmaps and marker summaries open at this size (percent of natural size).
+HEATMAP_SCALE_PCT = 50
+POP_FILTERS = (('significant', 'Significant populations'), ('all', 'All populations'))
 
 MODE_LABELS = {ag_core.MODE_FIXED: 'Fixed', ag_core.MODE_RECALCULATE: 'Recalculate'}
 DRIFT_ACTIONS = {'flag': 'Flag only', 'reference': 'Use the stored boundary'}
@@ -239,9 +261,31 @@ def _axis_limits(transforms: dict) -> dict:
 
 
 def _live_transform_params(controller) -> dict:
-    """{channel: transform parameter dict} of the current display transforms."""
+    """{channel: transform parameter dict} of the experiment's display transforms."""
     live = getattr(controller, 'unmixed_transformations', None) or {}
     return {ch: ag_core.transform_params(tr) for ch, tr in live.items()}
+
+
+def model_transform_params(model: dict, alignment: dict, live_params: dict) -> dict:
+    """The transforms gating uses by default: the model's own (those its
+    boundaries were trained in), renamed to this experiment's channels; the
+    experiment's display transforms for channels the model has none for."""
+    out = {ch: dict(p) for ch, p in (live_params or {}).items()}
+    alignment = alignment or {}
+    stored = (model or {}).get('transforms') or {}
+    # Aligned channels last, so they win over an unaligned one of the same name.
+    order = sorted(stored, key=lambda mc: bool(alignment.get(mc)))
+    for model_ch in order:
+        params = stored[model_ch]
+        ch = alignment.get(model_ch) or model_ch
+        if ch in out and params:
+            out[ch] = dict(params)
+    return out
+
+
+def _export_stem(model_path: str) -> str:
+    import drc_report
+    return drc_report.sanitize_filename(Path(model_path).stem or 'automated_gating')
 
 
 def _sample_label(key: str) -> str:
@@ -341,8 +385,14 @@ class GatingRunState:
     pending_samples: samples of a paused (or interrupted) run still to be
                      gated; empty when the last run finished.
     run_fingerprint: what the gated results depend on (model file, channel
-                     alignment, gate modes, drift settings, marker channels),
-                     so a paused run is only resumed with the same settings.
+                     alignment, gate modes, drift settings, marker channels,
+                     transforms), so a paused run is only resumed with the
+                     same settings.
+    transform_params: {channel: transform parameters} gating uses (the
+                     model's by default).
+    run_transforms : the transforms the gated results were made in (their
+                     boundaries and display plots are in these units).
+    report_populations: population keys ticked for the report.
     """
     model_path: str = ''
     model: dict = field(default_factory=dict)
@@ -366,6 +416,13 @@ class GatingRunState:
     display: dict = field(default_factory=dict)
     pending_samples: list = field(default_factory=list)
     run_fingerprint: str = ''
+    transform_params: dict = field(default_factory=dict)
+    transform_population: str = ''
+    transform_model: str = ''
+    transform_custom: bool = False
+    run_transforms: dict = field(default_factory=dict)
+    report_populations: list = field(default_factory=list)
+    pop_filter: str = 'significant'
 
     group_names: list = field(default_factory=list)
     group_patterns: dict = field(default_factory=dict)
@@ -424,6 +481,8 @@ _PERSISTED_FIELDS = (
     'run_markers', 'use_stats_parent', 'exclude_gating_markers', 'min_marker_events',
     'exclude_flagged', 'pca_use_freq', 'pca_use_counts', 'pca_use_markers', 'pca_n_loadings',
     'pred_use_freq', 'pred_use_markers', 'pred_lasso', 'pred_forest', 'pred_repeats',
+    'transform_params', 'transform_population', 'transform_model', 'transform_custom',
+    'report_populations', 'pop_filter',
 )
 
 
@@ -431,7 +490,9 @@ def run_fingerprint(state: 'GatingRunState', model_sha: str) -> str:
     """Hash of everything the gated results of a run depend on."""
     payload = {'model': model_sha, 'alignment': state.alignment, 'modes': state.modes,
                'drift_limit': state.drift_limit, 'drift_action': state.drift_action,
-               'markers': state.marker_channels}
+               'markers': state.marker_channels,
+               'transforms': {ch: {k: v for k, v in (p or {}).items() if k != 'limits'}
+                              for ch, p in (state.transform_params or {}).items()}}
     return hashlib.sha256(json.dumps(ag_core.to_jsonable(payload), sort_keys=True)
                           .encode('utf-8')).hexdigest()
 
@@ -448,17 +509,25 @@ def prepare_applied_model(model: dict, alignment: dict, live_params: dict) -> tu
 # ---------------------------------------------------------------------------
 
 class SetupTab(QWidget):
-    """Load a model, align its channels, and set how each gate is applied."""
+    """Load a model, align its channels, and set how each gate is applied.
+
+    transforms_for : callable(model, alignment) -> {channel: transform
+                     parameters} the model is converted to when its
+                     alignment is accepted (the plugin's transforms).
+    """
 
     model_ready = Signal()
+    model_loaded = Signal()
 
-    def __init__(self, state: GatingRunState, bus, controller, parent=None):
+    def __init__(self, state: GatingRunState, bus, controller, transforms_for=None, parent=None):
         super().__init__(parent)
         self.state = state
         self.bus = bus
         self.controller = controller
+        self._transforms_for = transforms_for
         self._align_rows: list[str] = []
         self._read_warnings: list[str] = []
+        self._gate_items: dict = {}
         self._build_ui()
 
     def _build_ui(self):
@@ -500,6 +569,10 @@ class SetupTab(QWidget):
                       "matched by antigen; amber rows need checking; red rows need a channel.")
         note.setWordWrap(True)
         al.addWidget(note)
+        self.align_filter = FilterBar([('all', 'All channels'), ('check', 'Rows to check')],
+                                      placeholder="Search channels or antigens…")
+        self.align_filter.changed.connect(lambda _t, _m: self._filter_alignment())
+        al.addWidget(self.align_filter)
         self.align_table = QTableWidget(0, 4)
         self.align_table.setHorizontalHeaderLabels(
             ["Model channel", "Model antigen", "Experiment channel", "Match"])
@@ -523,7 +596,7 @@ class SetupTab(QWidget):
         gl = QVBoxLayout(gates_page)
         opts = QHBoxLayout()
         opts.addWidget(QLabel("Drift limit:"))
-        self.sb_drift = QDoubleSpinBox()
+        self.sb_drift = block_wheel(QDoubleSpinBox())
         self.sb_drift.setRange(0.001, 1.0)
         self.sb_drift.setDecimals(3)
         self.sb_drift.setSingleStep(0.01)
@@ -534,7 +607,7 @@ class SetupTab(QWidget):
         self.sb_drift.valueChanged.connect(lambda v: setattr(self.state, 'drift_limit', float(v)))
         opts.addWidget(self.sb_drift)
         opts.addWidget(QLabel("  When exceeded:"))
-        self.cb_drift_action = QComboBox()
+        self.cb_drift_action = block_wheel(QComboBox())
         for key, text in DRIFT_ACTIONS.items():
             self.cb_drift_action.addItem(text, key)
         self.cb_drift_action.currentIndexChanged.connect(
@@ -547,10 +620,24 @@ class SetupTab(QWidget):
             opts.addWidget(b)
         opts.addStretch()
         gl.addLayout(opts)
+        self.gate_filter = FilterBar(
+            [('all', 'All gates'), (ag_core.MODE_RECALCULATE, 'Recalculated gates'),
+             (ag_core.MODE_FIXED, 'Fixed gates')],
+            placeholder="Search gates, channels or algorithms…")
+        self.gate_filter.changed.connect(lambda _t, _m: self._filter_gates())
+        gl.addWidget(self.gate_filter)
         self.gate_tree = QTreeWidget()
         self.gate_tree.setColumnCount(6)
         self.gate_tree.setHeaderLabels(["Gate", "Type", "X axis", "Y axis", "Algorithm", "Application"])
-        self.gate_tree.header().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.gate_tree.header().setSectionResizeMode(QHeaderView.Interactive)
+        self.gate_tree.setColumnWidth(0, 220)
+        self.gate_tree.setUniformRowHeights(True)
+        self.gate_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.gate_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.gate_tree.customContextMenuRequested.connect(self._on_gate_menu)
+        self.gate_tree.itemDoubleClicked.connect(self._on_gate_double_clicked)
+        self.gate_tree.setToolTip("Double-click a gate to switch between fixed and recalculated; "
+                                  "right-click to set the selected gates.")
         self.gate_tree.setMinimumHeight(160)
         gl.addWidget(self.gate_tree, stretch=1)
 
@@ -575,6 +662,7 @@ class SetupTab(QWidget):
             self.lbl_summary.setText("")
             self.align_table.setRowCount(0)
             self.gate_tree.clear()
+            self._gate_items = {}
             self.lbl_messages.setText("")
             self.btn_accept.setEnabled(False)
             self.lbl_align_state.setText("")
@@ -600,11 +688,27 @@ class SetupTab(QWidget):
     def load_model(self, path: str, alignment: dict | None = None,
                    confirmed: bool = False) -> bool:
         """Read *path*; propose an alignment unless one is given."""
+        from PySide6.QtWidgets import QApplication
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             model, warnings_list = ag_core.read_model(path)
         except Exception as exc:
+            QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Load failed", f"Could not read model:\n{exc}")
             return False
+        try:
+            self.apply_loaded_model(path, model, warnings_list, alignment=alignment,
+                                    confirmed=confirmed)
+        finally:
+            QApplication.restoreOverrideCursor()
+        return True
+
+    def apply_loaded_model(self, path: str, model: dict, warnings_list: list,
+                           alignment: dict | None = None, confirmed: bool = False,
+                           applied: dict | None = None, messages: list | None = None):
+        """Show a model read from *path*. With *applied* (the model already
+        converted for *alignment*, e.g. by a background loader) the
+        alignment is taken as accepted."""
         st = self.state
         st.model_path = str(path)
         st.model = model
@@ -619,18 +723,22 @@ class SetupTab(QWidget):
             st.alignment = dict(alignment)
         else:
             self._propose_alignment()
+        self.model_loaded.emit()
         self.lbl_path.setText(st.model_path)
         self._populate_summary()
         self._populate_alignment(keep_current=True)
         self._populate_gate_tree()
-        if confirmed and not ag_results.alignment_problems(self._gated_alignment()):
+        if applied is not None:
+            st.applied_model = applied
+            st.alignment_confirmed = True
+            st.model_messages = list(self._read_warnings) + list(messages or [])
+        elif confirmed and not ag_results.alignment_problems(self._gated_alignment()):
             self._apply_alignment(quiet=True)
         self._show_messages()
         self._update_align_state()
         self.toolbox.setCurrentIndex(self._page_gates if st.alignment_confirmed
                                      else self._page_align)
         _status(self.bus, f"Model loaded: {Path(path).name}")
-        return True
 
     def _model_gated_channels(self) -> list[str]:
         return _gated_channels(self.state.model.get('gate_definitions') or [])
@@ -689,7 +797,7 @@ class SetupTab(QWidget):
                 else _ALIGN_COLOURS[ag_results.ALIGN_EXACT]
             self.align_table.setItem(r, 0, _coloured_item(mc, colour))
             self.align_table.setItem(r, 1, _coloured_item(channel_map.get(mc, ''), colour))
-            combo = QComboBox()
+            combo = block_wheel(QComboBox())
             combo.addItem("— choose —", None)
             for ch in exp_pnn:
                 if ch in ag_core.ALWAYS_EXCLUDED_CHANNELS:
@@ -703,6 +811,26 @@ class SetupTab(QWidget):
                 lambda _i, row=r, name=mc: self._on_align_changed(row, name))
             self.align_table.setCellWidget(r, 2, combo)
             self.align_table.setItem(r, 3, _coloured_item(_ALIGN_TEXT.get(method, ''), colour))
+        self._filter_alignment()
+
+    def _row_needs_check(self, mc: str) -> bool:
+        return (not self.state.alignment.get(mc)
+                or self.state.alignment_methods.get(mc) not in
+                (ag_results.ALIGN_EXACT, ag_results.ALIGN_ANTIGEN, 'manual'))
+
+    def _filter_alignment(self):
+        """Hide the alignment rows outside the search and the "show" choice."""
+        text, mode = self.align_filter.text(), self.align_filter.mode()
+        channel_map = (self.state.model or {}).get('channel_map') or {}
+        n_check = 0
+        for r, mc in enumerate(self._align_rows):
+            check = self._row_needs_check(mc)
+            n_check += int(check)
+            shown = text_matches(text, mc, channel_map.get(mc, ''), self.state.alignment.get(mc) or '')
+            if mode == 'check':
+                shown = shown and check
+            self.align_table.setRowHidden(r, not shown)
+        self.align_filter.set_mode_label('check', f"Rows to check ({n_check})")
 
     def _on_align_changed(self, row: int, model_ch: str):
         combo = self.align_table.cellWidget(row, 2)
@@ -721,6 +849,8 @@ class SetupTab(QWidget):
             self.state.applied_model = {}
             self._show_messages()
         self._update_align_state()
+        self.align_filter.set_mode_label(
+            'check', f"Rows to check ({sum(self._row_needs_check(m) for m in self._align_rows)})")
 
     def _update_align_state(self):
         problems = ag_results.alignment_problems(self._gated_alignment())
@@ -745,9 +875,11 @@ class SetupTab(QWidget):
 
     def _apply_alignment(self, quiet: bool):
         st = self.state
+        alignment = self._gated_alignment()
+        params = (self._transforms_for(st.model, alignment) if self._transforms_for is not None
+                  else _live_transform_params(self.controller))
         try:
-            applied, messages = prepare_applied_model(st.model, self._gated_alignment(),
-                                                      _live_transform_params(self.controller))
+            applied, messages = prepare_applied_model(st.model, alignment, params)
         except Exception as exc:
             if not quiet:
                 QMessageBox.critical(self, "Cannot apply model", str(exc))
@@ -771,39 +903,99 @@ class SetupTab(QWidget):
                         "not available in this installation; samples are gated unfiltered.")
         self.lbl_messages.setText("<br>".join(msgs))
 
+    # -- gates ------------------------------------------------------------
+
     def _populate_gate_tree(self):
+        """One row per gate, nested as in the hierarchy. The Application
+        column shows each gate's mode; double-click or the context menu
+        changes it."""
         self.gate_tree.clear()
+        self._gate_items = {}
         gates = self.state.model.get('gate_definitions') or []
-        items: dict[str, QTreeWidgetItem] = {}
+        antigens = _antigen_map(self.controller)
+
+        def axis_text(model_ch):
+            ch = self.state.alignment.get(model_ch) or model_ch or ''
+            return antigens.get(ch, ch) if ch else ''
+
         for g in ag_core.ordered_gate_defs(gates):
             name = g['gate_name']
-            x = self.state.alignment.get(g.get('gate_marker_x')) or g.get('gate_marker_x') or ''
-            y_model = g.get('gate_marker_y')
-            y = (self.state.alignment.get(y_model) or y_model or '') if y_model else ''
-            item = QTreeWidgetItem([name, g.get('gate_type', ''), x, y, g.get('algorithm', ''), ''])
-            parent = items.get(g.get('parent_gate') or '')
+            item = QTreeWidgetItem([name, g.get('gate_type', ''), axis_text(g.get('gate_marker_x')),
+                                    axis_text(g.get('gate_marker_y')), g.get('algorithm', ''), ''])
+            item.setData(0, Qt.UserRole, name)
+            if g.get('gate_type') == 'replicate':
+                item.setToolTip(5, "A replicate gate copies its origin gate's boundary, "
+                                   "whichever mode the origin uses.")
+            parent = self._gate_items.get(g.get('parent_gate') or '')
             if parent is not None:
                 parent.addChild(item)
             else:
                 self.gate_tree.addTopLevelItem(item)
-            items[name] = item
-            combo = QComboBox()
-            for mode, text in MODE_LABELS.items():
-                combo.addItem(text, mode)
-            if g.get('gate_type') == 'replicate':
-                combo.setToolTip("A replicate gate copies its origin gate's boundary, "
-                                 "whichever mode the origin uses.")
-            mode = self.state.modes.get(name, ag_core.MODE_FIXED)
-            combo.setCurrentIndex(max(combo.findData(mode), 0))
-            combo.currentIndexChanged.connect(
-                lambda _i, n=name, c=combo: self.state.modes.__setitem__(n, c.currentData()))
-            self.gate_tree.setItemWidget(item, 5, combo)
+            self._gate_items[name] = item
+            self._show_mode(name)
         self.gate_tree.expandAll()
+        self._filter_gates()
+
+    def _show_mode(self, name: str):
+        item = self._gate_items.get(name)
+        if item is None:
+            return
+        mode = self.state.modes.get(name, ag_core.MODE_FIXED)
+        item.setText(5, MODE_LABELS.get(mode, mode))
+        item.setForeground(5, QColor('#a05a00') if mode == ag_core.MODE_RECALCULATE
+                           else QColor('#1e7d32'))
+
+    def _set_modes(self, names, mode: str):
+        for name in names:
+            self.state.modes[name] = mode
+            self._show_mode(name)
+        self._filter_gates()
+
+    def _on_gate_double_clicked(self, item, _column):
+        name = item.data(0, Qt.UserRole)
+        current = self.state.modes.get(name, ag_core.MODE_FIXED)
+        self._set_modes([name], ag_core.MODE_FIXED if current == ag_core.MODE_RECALCULATE
+                        else ag_core.MODE_RECALCULATE)
+
+    def _on_gate_menu(self, pos):
+        from PySide6.QtWidgets import QMenu
+        names = [it.data(0, Qt.UserRole) for it in self.gate_tree.selectedItems()]
+        if not names:
+            item = self.gate_tree.itemAt(pos)
+            names = [item.data(0, Qt.UserRole)] if item is not None else []
+        if not names:
+            return
+        menu = QMenu(self.gate_tree)
+        for mode in (ag_core.MODE_FIXED, ag_core.MODE_RECALCULATE):
+            act = menu.addAction(f"{MODE_LABELS[mode]} ({len(names)} gate"
+                                 f"{'s' if len(names) != 1 else ''})")
+            act.triggered.connect(lambda _c=False, m=mode, n=list(names): self._set_modes(n, m))
+        menu.exec(self.gate_tree.viewport().mapToGlobal(pos))
 
     def _set_all_modes(self, mode: str):
-        for g in self.state.model.get('gate_definitions') or []:
-            self.state.modes[g['gate_name']] = mode
-        self._populate_gate_tree()
+        self._set_modes([g['gate_name'] for g in self.state.model.get('gate_definitions') or []],
+                        mode)
+
+    def _filter_gates(self):
+        """Show the gates matching the search and the "show" choice, with
+        the gates above them."""
+        text, mode = self.gate_filter.text(), self.gate_filter.mode()
+        if not text and mode in ('', 'all'):
+            for item in self._gate_items.values():
+                item.setHidden(False)
+            return
+        visible = set()
+        for name, item in self._gate_items.items():
+            hit = text_matches(text, *(item.text(c) for c in range(6)))
+            if mode not in ('', 'all'):
+                hit = hit and self.state.modes.get(name, ag_core.MODE_FIXED) == mode
+            if hit:
+                node = item
+                while node is not None and id(node) not in visible:
+                    visible.add(id(node))
+                    node = node.parent()
+        for item in self._gate_items.values():
+            item.setHidden(id(item) not in visible)
 
 
 # ---------------------------------------------------------------------------
@@ -969,8 +1161,10 @@ class _GatingWorker(QThread):
     Receives only values snapshotted on the main thread. For each sample:
     load and unmix it with its own AF assignment (and time-QC keep-mask),
     transform, run the gate hierarchy, and emit sample_done(key, payload)
-    with the compact summary, load counts and a display subsample. The full
-    event array is released before the next sample.
+    with the compact summary, load counts and a display record (see
+    ag_results.pack_display), which is also saved in *display_dir* with the
+    run fingerprint. The full event array is released before the next
+    sample.
 
     pause() and abort() stop the run before the next gate; the sample being
     gated is dropped, so only complete samples are ever reported.
@@ -984,8 +1178,10 @@ class _GatingWorker(QThread):
 
     def __init__(self, experiment_dir, keys, snapshot, gate_defs, reference, modes,
                  drift_limit, drift_action, channels, transforms, marker_channels,
-                 display_events, parent=None):
+                 display_events, display_dir=None, fingerprint: str = '', parent=None):
         super().__init__(parent)
+        self._display_dir = display_dir
+        self._fingerprint = fingerprint
         self._experiment_dir = experiment_dir
         self._keys = list(keys)
         self._snap = snapshot
@@ -1051,13 +1247,15 @@ class _GatingWorker(QThread):
             summary = ag_results.summarise_sample(self._gate_defs, result, data_t, index,
                                                   self._markers, len(data_t))
             rows = seeded_subsample_indices(len(unmixed), self._display, key, DISPLAY_SEED)
-            display = {
-                'channels': display_cols,
-                'events': np.asarray(unmixed[np.ix_(rows, display_idx)], dtype=np.float32),
-                'parent_masks': {g: m[rows] for g, m in result.parent_masks.items()},
-                'pop_masks': {g: {p: m[rows] for p, m in pops.items()}
-                              for g, pops in result.masks.items()},
-            }
+            display = ag_results.pack_display(
+                self._gate_defs, result, rows,
+                np.asarray(unmixed[np.ix_(rows, display_idx)], dtype=np.float32), display_cols)
+            if self._display_dir is not None:
+                try:
+                    ag_results.save_display(Path(self._display_dir) / ag_results.display_file_name(key),
+                                            display, key, self._fingerprint)
+                except Exception:
+                    log.exception("could not save the display events of %s", key)
             load_info = {
                 'n_events_file': int(out['n_events_file']),
                 'n_events_kept': int(out['n_events_kept']),
@@ -1074,25 +1272,52 @@ class _GatingWorker(QThread):
 # Run tab
 # ---------------------------------------------------------------------------
 
-POOLED_VIEW = '__pooled__'
+def _gates_on(gate_defs: list[dict], node) -> list[dict]:
+    """Gates drawn on population *node* ((gate, pop); the root is ('', 'root'))."""
+    gate, pop = node
+    out = []
+    for g in ag_core.ordered_gate_defs(gate_defs):
+        if (g.get('parent_gate') or '') != (gate or ''):
+            continue
+        if gate and (g.get('parent_popul') or 'root') != pop:
+            continue
+        out.append(g)
+    return out
 
 
 class RunTab(QWidget):
-    """Pick samples, gate them, and inspect the result gate by gate."""
+    """Pick samples, gate them, and inspect the result population by population.
 
-    gating_finished = Signal()
+    The gated views show the gates drawn on the population picked in the
+    hierarchy: pooled over every gated sample (the stored boundaries) and,
+    in a row each, for every validation sample (its own boundaries).
+
+    gating_transforms : callable -> {channel: Transform} gating uses.
+    result_transforms : callable -> {channel: Transform} the gated results
+                        are in (for drawing them).
+    display_dir       : callable -> folder the display records are saved in.
+    """
+
+    gating_finished = Signal(str)
 
     COL_RUN, COL_VALIDATE, COL_SAMPLE, COL_AF = range(4)
 
-    def __init__(self, state: GatingRunState, bus, controller, parent=None):
+    def __init__(self, state: GatingRunState, bus, controller, gating_transforms=None,
+                 result_transforms=None, display_dir=None, parent=None):
         super().__init__(parent)
         self.state = state
         self.bus = bus
         self.controller = controller
+        self._gating_transforms = gating_transforms or (
+            lambda: self.controller.unmixed_transformations or {})
+        self._result_transforms = result_transforms or self._gating_transforms
+        self._display_dir = display_dir or (lambda: None)
         self._worker: _GatingWorker | None = None
         self._run_keys: list[str] = []
         self._before_run: dict | None = None
         self._filling = False
+        self._pool_cache = None
+        self._tree_for = None
         self._build_ui()
 
     def _build_ui(self):
@@ -1133,7 +1358,7 @@ class RunTab(QWidget):
         sel_row.addWidget(self.chk_controls)
         sel_row.addStretch()
         sel_row.addWidget(QLabel("Display events per sample:"))
-        self.sb_display = QSpinBox()
+        self.sb_display = block_wheel(QSpinBox())
         self.sb_display.setRange(1_000, 1_000_000)
         self.sb_display.setSingleStep(5_000)
         self.sb_display.setToolTip(
@@ -1148,8 +1373,9 @@ class RunTab(QWidget):
         hh.setSectionResizeMode(QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(self.COL_SAMPLE, QHeaderView.Stretch)
         self.sample_table.verticalHeader().setVisible(False)
-        self.sample_table.setToolTip("Tick samples to gate. Validation samples can be viewed "
-                                     "one at a time below after gating.")
+        self.sample_table.setToolTip(
+            "Tick samples to gate. Validation samples are gated too, and their gates are "
+            "plotted under Gated views beside the pooled view.")
         self.sample_table.itemChanged.connect(self._on_sample_item_changed)
         tl.addWidget(self.sample_table)
 
@@ -1180,16 +1406,37 @@ class RunTab(QWidget):
         run_row.addWidget(self.progress_bar)
         run_row.addWidget(self.lbl_status, stretch=1)
         tl.addLayout(run_row)
+        tl.addWidget(QLabel("<b>Samples gated</b>"))
+        self.summary_holder = QVBoxLayout()
+        tl.addLayout(self.summary_holder)
+        tl.addStretch()
 
         bottom = QWidget()
         bl = QVBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 0, 0)
         view_row = QHBoxLayout()
-        view_row.addWidget(QLabel("<b>View:</b>"))
-        self.cb_view = QComboBox()
-        self.cb_view.currentIndexChanged.connect(lambda _i: self._draw_tiles())
-        view_row.addWidget(self.cb_view, stretch=1)
+        self.chk_pooled = QCheckBox("Pooled over all gated samples")
+        self.chk_pooled.setChecked(True)
+        self.chk_pooled.setToolTip("A row of the population's gates with the stored boundaries "
+                                   "over every gated sample's display events.")
+        self.chk_pooled.toggled.connect(lambda _on: self._draw_tiles())
+        view_row.addWidget(self.chk_pooled)
+        self.lbl_views = QLabel("")
+        self.lbl_views.setStyleSheet("color: #555; font-style: italic;")
+        view_row.addWidget(self.lbl_views, stretch=1)
         bl.addLayout(view_row)
+
+        tree_panel = QWidget()
+        tree_layout = QVBoxLayout(tree_panel)
+        tree_layout.setContentsMargins(0, 0, 0, 0)
+        self.tree_filter = FilterBar(placeholder="Search populations…")
+        tree_layout.addWidget(self.tree_filter)
+        self.pop_tree = PopulationTree()
+        self.pop_tree.setToolTip("Pick a population to see the gates drawn on it.")
+        self.pop_tree.populationSelected.connect(lambda _g, _p: self._draw_tiles())
+        tree_layout.addWidget(self.pop_tree, stretch=1)
+        self.tree_filter.changed.connect(self._filter_tree)
+
         self.tile_scroll = QScrollArea()
         self.tile_scroll.setWidgetResizable(True)
         self.tile_scroll.setMinimumHeight(260)
@@ -1198,13 +1445,17 @@ class RunTab(QWidget):
         self.tile_grid.setSpacing(4)
         self.tile_grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.tile_scroll.setWidget(self.tile_canvas)
-        bl.addWidget(self.tile_scroll, stretch=3)
-        bl.addWidget(QLabel("<b>Samples gated</b>"))
-        self.summary_holder = QVBoxLayout()
-        bl.addLayout(self.summary_holder, stretch=1)
+
+        split = QSplitter(Qt.Horizontal)
+        split.addWidget(tree_panel)
+        split.addWidget(self.tile_scroll)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 4)
+        split.setSizes([240, 760])
+        bl.addWidget(split, stretch=1)
 
         self._page_samples = add_concertina_page(self.toolbox, top, "Samples and gating")
-        self._page_views = add_concertina_page(self.toolbox, bottom, "Gated views")
+        self._page_views = self.toolbox.addItem(bottom, "Gated views")
 
     # ------------------------------------------------------------------
 
@@ -1263,6 +1514,8 @@ class RunTab(QWidget):
         self.state.run_samples = self._checked(self.COL_RUN)
         self.state.validation_samples = self._checked(self.COL_VALIDATE)
         self._update_warnings()
+        if item.column() == self.COL_VALIDATE:
+            self._draw_tiles()
 
     def _set_all(self, col: int, on: bool):
         self._filling = True
@@ -1282,7 +1535,7 @@ class RunTab(QWidget):
             self.lbl_warnings.setText("")
             return
         seen = {tuple(v or []) for v in training.values()}
-        odd = [k for k in self.state.run_samples
+        odd = [k for k in self._to_gate()
                if tuple(af_profile_names(self.controller, k)) not in seen]
         if odd:
             self.lbl_warnings.setText(
@@ -1291,6 +1544,15 @@ class RunTab(QWidget):
                 + ", ".join(_sample_label(k) for k in odd[:10]) + (" …" if len(odd) > 10 else ""))
         else:
             self.lbl_warnings.setText("")
+
+    def _to_gate(self) -> list[str]:
+        """Ticked samples, gating or validation, in table order."""
+        if self.sample_table.rowCount() == 0:
+            run = list(self.state.run_samples)
+            return run + [k for k in self.state.validation_samples if k not in run]
+        wanted = set(self._checked(self.COL_RUN)) | set(self._checked(self.COL_VALIDATE))
+        return [self._row_key(r) for r in range(self.sample_table.rowCount())
+                if self._row_key(r) in wanted]
 
     # ------------------------------------------------------------------
 
@@ -1320,7 +1582,7 @@ class RunTab(QWidget):
 
     def _on_run_clicked(self):
         st = self.state
-        keys = self._checked(self.COL_RUN)
+        keys = self._to_gate()
         if not keys:
             QMessageBox.information(self, "No samples", "Tick at least one sample to gate.")
             return
@@ -1349,16 +1611,17 @@ class RunTab(QWidget):
                 if not to_gate:
                     st.pending_samples = []
                     self.lbl_status.setText("Every ticked sample is already gated.")
-                    self.gating_finished.emit()
+                    self.gating_finished.emit('done')
                     return
         try:
             snap = snapshot_unmix_state(self.controller, to_gate)
         except Exception as exc:
             QMessageBox.warning(self, "Cannot gate", str(exc))
             return
-        self._before_run = {name: deepcopy(getattr(st, name)) for name in (
+        self._before_run = {name: (dict(getattr(st, name)) if isinstance(getattr(st, name), dict)
+                                   else deepcopy(getattr(st, name))) for name in (
             'run_samples', 'summaries', 'load_info', 'display', 'stats', 'marker_channels',
-            'results_model_sha', 'pending_samples', 'run_fingerprint')}
+            'results_model_sha', 'pending_samples', 'run_fingerprint', 'run_transforms')}
         st.run_samples = keys
         if resume:
             keep = set(keys)
@@ -1373,15 +1636,18 @@ class RunTab(QWidget):
         st.marker_channels = markers
         st.results_model_sha = model_sha
         st.run_fingerprint = fingerprint
+        st.run_transforms = deepcopy(st.transform_params)
         st.pending_samples = list(to_gate)
         self._run_keys = to_gate
+        self._pool_cache = None
 
+        transforms = self._gating_transforms()
         worker = _GatingWorker(
             self.controller.experiment_dir, to_gate, snap,
             deepcopy(st.gate_defs()), deepcopy(st.reference_boundaries()), dict(st.modes),
-            st.drift_limit, st.drift_action, channels,
-            deepcopy(self.controller.unmixed_transformations or {}),
-            list(st.marker_channels), st.display_events, parent=self,
+            st.drift_limit, st.drift_action, channels, deepcopy(transforms),
+            list(st.marker_channels), st.display_events,
+            display_dir=self._display_dir(), fingerprint=fingerprint, parent=self,
         )
         # Slots ignore a worker that has been abandoned (see abandon_run).
         worker.progress.connect(lambda msg, w=worker: w is self._worker and self._on_progress(msg))
@@ -1467,6 +1733,7 @@ class RunTab(QWidget):
                 text = (f"Gating stopped: {message} {n} sample(s) gated, "
                         f"{len(st.pending_samples)} to go. Run Gating to resume or restart.")
         self._before_run = None
+        self._pool_cache = None
         self.lbl_status.setText(text)
         _status(self.bus, text)
         self._populate_views()
@@ -1474,74 +1741,131 @@ class RunTab(QWidget):
         if st.summaries and outcome != 'cancelled':
             self.toolbox.setCurrentIndex(self._page_views)
         if outcome != 'cancelled':
-            self.gating_finished.emit()
+            self.gating_finished.emit(outcome)
 
+    # ------------------------------------------------------------------
+    # Gated views
     # ------------------------------------------------------------------
 
     def _populate_views(self):
-        current = self.cb_view.currentData()
-        self.cb_view.blockSignals(True)
-        self.cb_view.clear()
-        if self.state.display:
-            self.cb_view.addItem("All gated samples (pooled display events)", POOLED_VIEW)
-            for key in self.state.gated_samples():
-                if key in self.state.validation_samples and key in self.state.display:
-                    self.cb_view.addItem(f"Validation: {_sample_label(key)}", key)
-        i = self.cb_view.findData(current)
-        self.cb_view.setCurrentIndex(max(i, 0))
-        self.cb_view.blockSignals(False)
+        """Fill the population tree (when the model changed) and draw the
+        selected population's gates."""
+        gates = self.state.gate_defs()
+        key = (id(self.state.applied_model), len(gates))
+        if key != self._tree_for:
+            import ag_review
+            self._tree_for = key
+            self.pop_tree.set_nodes(ag_review.population_tree(gates) if gates else [],
+                                    expand_depth=2)
+            if self.pop_tree.current_population() is None and gates:
+                self.pop_tree.select_population('', 'root')
+            self._filter_tree(self.tree_filter.text(), '')
         self._draw_tiles()
+
+    def _filter_tree(self, text: str, _mode: str):
+        if not text:
+            self.pop_tree.set_filter(None)
+            return
+        labels = {}
+        for g in self.state.gate_defs():
+            for pop, info in (g.get('populations') or {}).items():
+                labels[(g['gate_name'], pop)] = f"{g['gate_name']} {(info or {}).get('label', pop)}"
+        self.pop_tree.set_filter({k for k, lbl in labels.items() if text_matches(text, lbl)})
+
+    def _validation_shown(self) -> list[str]:
+        st = self.state
+        return [k for k in st.validation_samples if k in st.display and k in st.summaries]
+
+    def _pooled(self, samples: list[str], gate_def: dict):
+        """Pooled display events of *samples* (concatenated once) with
+        *gate_def*'s parent mask."""
+        st = self.state
+        have = tuple(k for k in samples if k in st.display)
+        if not have:
+            return None, None, []
+        if self._pool_cache is None or self._pool_cache[0] != have:
+            self._pool_cache = (have, np.concatenate([st.display[k]['events'] for k in have]),
+                                st.display[have[0]]['channels'])
+        _keys, events, channels = self._pool_cache
+        parents = []
+        for k in have:
+            m = ag_results.display_parent_mask(st.display[k], gate_def['gate_name'], gate_def)
+            parents.append(m if m is not None else np.zeros(len(st.display[k]['events']), dtype=bool))
+        return events, np.concatenate(parents), channels
 
     def _draw_tiles(self):
         _clear_layout(self.tile_grid)
         st = self.state
-        view = self.cb_view.currentData()
-        gates = ag_core.ordered_gate_defs(st.gate_defs())
-        if not gates or not st.display or view is None:
+        gates = st.gate_defs()
+        node = self.pop_tree.current_population() or ('', 'root')
+        if not gates or not st.display:
             note = QLabel("Gate some samples to see their gates here."
                           if not st.summaries else
-                          "Plots are available for samples gated in this session; "
-                          "run gating again to see them.")
+                          "The plots of these results are not available; run gating again "
+                          "to see them.")
             note.setWordWrap(True)
             self.tile_grid.addWidget(note, 0, 0)
+            self.lbl_views.setText("")
             return
         by_name = ag_core.gates_by_name(gates)
-        transforms = self.controller.unmixed_transformations or {}
+        shown = _gates_on(gates, node)
+        highlight = None
+        if not shown and node[0] in by_name:
+            # A population without gates of its own: show the gate that makes it.
+            shown = [by_name[node[0]]]
+            highlight = node[1]
+        transforms = self._result_transforms()
         labels = build_display_label_map(
             _experiment_channels(self.controller),
             self.controller.experiment.process.get('spectral_model') or [])
-        cols = 4
-        for i, g in enumerate(gates):
-            name = g['gate_name']
-            eff = ag_core.effective_gate_def(g, by_name)
-            if view == POOLED_VIEW:
-                events, parent, channels = ag_report.pooled_display(
-                    st.display, st.gated_samples(), name)
-                boundary = st.reference_boundaries().get(name, {})
-                fractions = ag_report.boundary_fractions(eff, boundary, events, channels,
-                                                         parent, transforms)
-                mode = st.modes.get(name, ag_core.MODE_FIXED)
-                n_flag = sum(1 for k in st.summaries
-                             if ((st.summaries[k].get('status') or {}).get(name) or {}).get('flag'))
-                title = (f"<b>{name}</b> <small>[{MODE_LABELS[mode]}; stored boundary, "
-                         f"% of pooled display events]</small>")
-                footer = f"{n_flag} sample(s) flagged at this gate" if n_flag else ''
-            else:
-                disp = st.display.get(view) or {}
-                channels = disp.get('channels') or []
-                events = disp.get('events')
-                parent = (disp.get('parent_masks') or {}).get(name)
-                summ = st.summaries.get(view) or {}
-                boundary = (summ.get('boundaries') or {}).get(name, {})
-                fractions = {r['population']: r['fraction_of_parent']
-                             for r in summ.get('populations', []) if r['gate'] == name}
-                status = (summ.get('status') or {}).get(name) or {}
-                title = f"<b>{name}</b> <small>[{status.get('source') or '—'}]</small>"
-                footer = status.get('message') if status.get('flag') else ''
-            tile = _make_gate_tile(eff, boundary, events, channels, parent, transforms, labels,
-                                   title, fractions=fractions, footer=footer)
-            r, c = divmod(i, cols)
-            self.tile_grid.addWidget(tile, r, c)
+        validation = self._validation_shown()
+        missing = [k for k in st.validation_samples if k not in validation]
+        self.lbl_views.setText(
+            f"{len(st.display)} sample(s) with plots; {len(validation)} validation sample(s) shown"
+            + (f" ({len(missing)} ticked but not gated)" if missing else ''))
+        rows = ([('pooled', None)] if self.chk_pooled.isChecked() else []) + \
+            [('sample', k) for k in validation]
+        r = 0
+        for kind, key in rows:
+            head = QLabel("<b>All gated samples</b> <small>(stored boundaries, % of pooled "
+                          "display events)</small>" if kind == 'pooled' else
+                          f"<b>{_sample_label(key)}</b> <small>[validation"
+                          + (f"; {st.sample_groups[key]}" if st.sample_groups.get(key) else '')
+                          + "]</small>")
+            self.tile_grid.addWidget(head, r, 0, 1, max(1, len(shown)))
+            r += 1
+            for c, g in enumerate(shown):
+                name = g['gate_name']
+                eff = ag_core.effective_gate_def(g, by_name)
+                if kind == 'pooled':
+                    events, parent, channels = self._pooled(st.gated_samples(), eff)
+                    boundary = st.reference_boundaries().get(name, {})
+                    fractions = ag_report.boundary_fractions(eff, boundary, events, channels,
+                                                             parent, transforms)
+                    mode = st.modes.get(name, ag_core.MODE_FIXED)
+                    n_flag = sum(1 for k in st.summaries
+                                 if ((st.summaries[k].get('status') or {}).get(name) or {}).get('flag'))
+                    title = f"<b>{name}</b> <small>[{MODE_LABELS[mode]}]</small>"
+                    footer = f"{n_flag} sample(s) flagged at this gate" if n_flag else ''
+                else:
+                    disp = st.display.get(key) or {}
+                    channels = disp.get('channels') or []
+                    events = disp.get('events')
+                    parent = ag_results.display_parent_mask(disp, name, eff)
+                    summ = st.summaries.get(key) or {}
+                    boundary = (summ.get('boundaries') or {}).get(name, {})
+                    fractions = {row['population']: row['fraction_of_parent']
+                                 for row in summ.get('populations', []) if row['gate'] == name}
+                    status = (summ.get('status') or {}).get(name) or {}
+                    title = f"<b>{name}</b> <small>[{status.get('source') or '—'}]</small>"
+                    footer = status.get('message') if status.get('flag') else ''
+                tile = _make_gate_tile(eff, boundary, events, channels, parent, transforms, labels,
+                                       title, fractions=fractions, highlight=highlight,
+                                       footer=footer)
+                self.tile_grid.addWidget(tile, r, c)
+            r += 1
+        if not rows:
+            self.tile_grid.addWidget(QLabel("Tick 'Pooled' or some validation samples."), 0, 0)
 
     def _draw_summary_table(self):
         _clear_layout(self.summary_holder)
@@ -1673,6 +1997,44 @@ def _is_dark_palette() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# CSV export
+# ---------------------------------------------------------------------------
+
+def write_results_csv(folder: Path, stem: str, timestamp: str, summaries: dict,
+                      samples: list[str], groups: dict, labels: dict,
+                      antigens: dict) -> list[Path]:
+    """Write the gated samples' population counts and marker medians as
+    ``<stem>_<timestamp>_populations.csv`` and ``…_marker_medians.csv``;
+    returns the paths. Worker-safe (plain data only)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    pops = ag_results.population_export(summaries, samples, groups)
+    if not pops.empty:
+        pops.insert(2, 'population_label', [labels.get(k, k) for k in pops['key']])
+    markers = ag_results.marker_export(summaries, samples, antigens, groups)
+    if not markers.empty:
+        markers.insert(3, 'population_label', [labels.get(k, k) for k in markers['population']])
+    out = []
+    for frame, suffix in ((pops, 'populations'), (markers, 'marker_medians')):
+        path = folder / f"{stem}_{timestamp}_{suffix}.csv"
+        frame.to_csv(path, index=False)
+        out.append(path)
+    return out
+
+
+def write_statistics_csv(folder: Path, stem: str, timestamp: str, stats: dict, labels: dict,
+                         antigens: dict) -> list[Path]:
+    """Write the statistics run's tables as ``<stem>_<timestamp>_statistics_
+    <table>.csv``; returns the paths. Worker-safe (plain data only)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    out = []
+    for name, frame in ag_results.statistics_tables(stats, labels, antigens).items():
+        path = folder / f"{stem}_{timestamp}_statistics_{name}.csv"
+        frame.to_csv(path, index=name.startswith('values'))
+        out.append(path)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Results tab
 # ---------------------------------------------------------------------------
 
@@ -1680,19 +2042,26 @@ class ResultsTab(QWidget):
     """Groups and covariates, statistics, figures, population browser, export."""
 
     stats_finished = Signal()
+    report_populations_changed = Signal()
 
-    def __init__(self, state: GatingRunState, bus, controller, parent=None):
+    def __init__(self, state: GatingRunState, bus, controller, result_transforms=None,
+                 parent=None):
         super().__init__(parent)
         self.state = state
         self.bus = bus
         self.controller = controller
+        self._result_transforms = result_transforms or (
+            lambda: self.controller.unmixed_transformations or {})
         self._stats_worker: _CallWorker | None = None
         self._figure_worker: _CallWorker | None = None
         self._figure_pending = False
         self._predictive_worker: _CallWorker | None = None
+        self._popout_workers: list = []
         self._filling = False
         self._volcano_tables: dict = {}
+        self._row_figures: dict = {}
         self._figures_for = None
+        self._shown_population = None
         # Automatic Suggest Groupings: the sample list it last ran for (it
         # runs once per list) and the state to restore on Undo.
         self._auto_groupings_key = None
@@ -2285,6 +2654,7 @@ class ResultsTab(QWidget):
                 return
             self._show_results_tables()
             self._draw_figures()
+            self._populate_population_list()
 
     def _stats_samples(self) -> list[str]:
         st = self.state
@@ -2355,6 +2725,7 @@ class ResultsTab(QWidget):
         self._populate_comparisons()
         self._show_results_tables()
         self._draw_figures()
+        self._populate_population_list()
         self._populate_report_items()
         self.stats_finished.emit()
 
@@ -2386,6 +2757,7 @@ class ResultsTab(QWidget):
     def _on_comparison_changed(self, _i):
         self._show_results_tables()
         self._draw_figures()
+        self._populate_population_list()
 
     def _show_results_tables(self):
         self.results_tabs.clear()
@@ -2458,10 +2830,12 @@ class ResultsTab(QWidget):
             return
         self.figures_tabs.clear()
         self._volcano_tables = {}
+        self._row_figures = {}
         if not ok:
             self.figures_tabs.addTab(QLabel(f"Figures failed: {error}"), "Error")
             return
         exp_dir = getattr(self.controller, 'experiment_dir', '')
+        from honeychrome.view_components.scalable_figure_widget import initial_scale_for
         for key, item in payload.items():
             if item['fig'] is None:
                 lbl = QLabel(f"{item['title']}: {item['error']}")
@@ -2469,77 +2843,127 @@ class ResultsTab(QWidget):
                 self.figures_tabs.addTab(lbl, item['title'])
                 continue
             fig = item['fig']
+            large = key.endswith('heatmap') or key == 'marker_summary'
             widget = ScalableFigureWidget(
                 fig, title=item['title'], experiment_dir=exp_dir,
-                pop_out=lambda make=item['make'], title=item['title'], results=item.get('results'):
-                    self._pop_out_figure(make, title, results),
+                pop_out=lambda make=item['make'], title=item['title'], results=item.get('results'),
+                large=large: self._pop_out_figure(make, title, results, large),
+                initial_scale=initial_scale_for(fig, HEATMAP_SCALE_PCT) if large else 100,
                 parent=self)
-            handler = getattr(fig, '_hover_handler', None)
-            if handler is not None:
-                widget.canvas.mpl_connect('motion_notify_event', handler)
-            if item.get('results') is not None:
-                self._volcano_tables[id(widget.canvas)] = item['results']
-                widget.canvas.mpl_connect('button_press_event', self._on_volcano_click)
-                widget.canvas.setToolTip("Click a point to open that population in "
-                                         "the Populations browser.")
+            self._connect_figure(widget.canvas, fig, item.get('results'))
             self.figures_tabs.addTab(widget, item['title'])
         self._add_extra_figures()
 
-    def _pop_out_figure(self, make, title: str, results=None):
-        """Show a fresh copy of a figure in its own resizable window, with
-        the matplotlib toolbar, hover labels and (for a volcano) the same
-        click-through to the Populations browser."""
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
-        try:
-            fig = make()
-        except Exception as exc:
-            log.exception("could not pop out %s", title)
-            QMessageBox.warning(self, "Pop out failed", str(exc))
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle(title)
-        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        canvas = FigureCanvasQTAgg(fig)
+    def _connect_figure(self, canvas, fig, results=None):
+        """Hover labels, and click-through to the Populations page: a
+        double-click on a volcano point or a heatmap row shows that
+        population (and ticks it for the report); a right-click offers the
+        same and more."""
         handler = getattr(fig, '_hover_handler', None)
         if handler is not None:
             canvas.mpl_connect('motion_notify_event', handler)
         if results is not None:
             self._volcano_tables[id(canvas)] = results
-            canvas.mpl_connect('button_press_event', self._on_volcano_click)
-            dialog.finished.connect(lambda _code, key=id(canvas): self._volcano_tables.pop(key, None))
-        toolbar = NavigationToolbar2QT(canvas, dialog)
+        if getattr(fig, '_row_keys', None):
+            self._row_figures[id(canvas)] = fig
+        if results is not None or getattr(fig, '_row_keys', None):
+            canvas.mpl_connect('button_press_event', self._on_figure_click)
+            canvas.setToolTip("Double-click a point or row to show that population on the "
+                              "Populations page; right-click for more.")
+
+    def _pop_out_figure(self, make, title: str, results=None, large: bool = False):
+        """Build a fresh copy of a figure in the background and show it in
+        its own window (size slider, matplotlib toolbar, hover labels and
+        the same click-through to the Populations page). The window stays
+        open while the Populations page is used."""
+        worker = _CallWorker(make, parent=self)
+        worker.finished.connect(
+            lambda ok, err, fig, w=worker: self._show_pop_out(w, ok, err, fig, title, results, large))
+        self._popout_workers.append(worker)
+        _status(self.bus, f"Opening {title} …")
+        worker.start()
+
+    def _show_pop_out(self, worker, ok: bool, error: str, fig, title: str, results, large: bool):
+        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+        from honeychrome.view_components.scalable_figure_widget import initial_scale_for
+        if worker in self._popout_workers:
+            self._popout_workers.remove(worker)
+        if not ok or fig is None:
+            QMessageBox.warning(self, "Pop out failed", error or "The figure could not be made.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        widget = ScalableFigureWidget(
+            fig, title=title, experiment_dir=getattr(self.controller, 'experiment_dir', ''),
+            initial_scale=initial_scale_for(fig, HEATMAP_SCALE_PCT) if large else 100,
+            parent=dialog)
+        self._connect_figure(widget.canvas, fig, results)
+        canvas_key = id(widget.canvas)
+        dialog.finished.connect(lambda _code, k=canvas_key: (self._volcano_tables.pop(k, None),
+                                                            self._row_figures.pop(k, None)))
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(4, 4, 4, 4)
-        layout.addWidget(toolbar)
-        layout.addWidget(canvas, stretch=1)
+        layout.addWidget(NavigationToolbar2QT(widget.canvas, dialog))
+        layout.addWidget(widget, stretch=1)
         dpi = fig.get_dpi()
-        dialog.resize(min(int(fig.get_figwidth() * dpi * 1.5), 1400) + 24,
-                      min(int(fig.get_figheight() * dpi * 1.5), 1000) + 80)
+        scale = widget.scale_percent() / 100.0
+        dialog.resize(min(int(fig.get_figwidth() * dpi * scale), 1400) + 40,
+                      min(int(fig.get_figheight() * dpi * scale), 1000) + 110)
         dialog.show()
 
-    def _on_volcano_click(self, event):
-        """Open the clicked volcano point's population in the browser."""
+    def _figure_population(self, event) -> str | None:
+        """Population key under a mouse event on a volcano or heatmap."""
         from honeychrome.view_components.differential_plots import significance_column
         ax = event.inaxes
         if ax is None or event.x is None:
-            return
+            return None
+        fig = self._row_figures.get(id(event.canvas))
+        if fig is not None and ax is getattr(fig, '_row_axes', None) and event.ydata is not None:
+            row = int(round(event.ydata))
+            keys = fig._row_keys
+            return str(keys[row]) if 0 <= row < len(keys) else None
         table = self._volcano_tables.get(id(event.canvas))
         if table is None or table.empty:
-            return
+            return None
         col, _lbl = significance_column(table, self.state.fdr_scope)
         xy = np.column_stack([table['logFC'].values.astype(float),
                               -np.log10(np.maximum(table[col].values.astype(float), 1e-300))])
         ok = np.isfinite(xy).all(axis=1)
         if not ok.any():
-            return
+            return None
         px = ax.transData.transform(xy[ok])
         d = np.hypot(px[:, 0] - event.x, px[:, 1] - event.y)
         i = int(np.argmin(d))
         if d[i] > 12:
-            return
+            return None
         row = table[ok].iloc[i]
-        pop_key = row.get('cluster_id') if 'cluster_id' in table.columns else row['feature']
-        self.show_population(str(pop_key))
+        return str(row.get('cluster_id') if 'cluster_id' in table.columns else row['feature'])
+
+    def _on_figure_click(self, event):
+        pop_key = self._figure_population(event)
+        if pop_key is None:
+            return
+        if event.dblclick and event.button == 1:
+            self.show_population(pop_key, include=True)
+        elif event.button == 3:
+            self._figure_menu(pop_key)
+
+    def _figure_menu(self, pop_key: str):
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QMenu
+        label = _population_labels(self.state.gate_defs()).get(pop_key, pop_key)
+        menu = QMenu(self)
+        menu.addSection(label)
+        act_show = menu.addAction("Show on the Populations page")
+        act_window = menu.addAction("Open the comparison in a window")
+        act_report = menu.addAction("Include in the report")
+        act_report.setCheckable(True)
+        act_report.setChecked(pop_key in self.state.report_populations)
+        act_show.triggered.connect(lambda: self.show_population(pop_key))
+        act_window.triggered.connect(lambda: self._population_window(pop_key))
+        act_report.triggered.connect(lambda on: self._set_report_population(pop_key, on))
+        menu.exec(QCursor.pos())
 
     # ------------------------------------------------------------------
     # Population browser
@@ -2809,93 +3233,287 @@ class ResultsTab(QWidget):
     def _build_browser_page(self):
         layout = QHBoxLayout(self.browser_page)
         left = QWidget()
-        left.setFixedWidth(220)
+        left.setFixedWidth(280)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.addWidget(QLabel("<b>Populations</b>"))
+        self.pop_filter = FilterBar(POP_FILTERS, placeholder="Search populations…", vertical=True)
+        self.pop_filter.setToolTip("Significant: populations whose frequency differs between the "
+                                   "comparison's groups at the FDR threshold.")
+        self.pop_filter.changed.connect(self._on_pop_filter_changed)
+        ll.addWidget(self.pop_filter)
         self.pop_list = QListWidget()
         self.pop_list.currentItemChanged.connect(lambda cur, _prev: self._draw_population(cur))
         ll.addWidget(self.pop_list)
+        self.lbl_pop_count = QLabel("")
+        self.lbl_pop_count.setStyleSheet("color: #555; font-style: italic;")
+        ll.addWidget(self.lbl_pop_count)
         layout.addWidget(left)
-        self.browser_scroll = QScrollArea()
-        self.browser_scroll.setWidgetResizable(True)
-        self.browser_canvas = QWidget()
-        self.browser_grid = QGridLayout(self.browser_canvas)
-        self.browser_grid.setSpacing(4)
-        self.browser_grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.browser_scroll.setWidget(self.browser_canvas)
-        layout.addWidget(self.browser_scroll, stretch=1)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        head = QHBoxLayout()
+        self.lbl_pop_title = QLabel("")
+        self.lbl_pop_title.setWordWrap(True)
+        head.addWidget(self.lbl_pop_title, stretch=1)
+        self.chk_pop_report = QCheckBox("Include in report")
+        self.chk_pop_report.setToolTip("Add this population's group comparison (biplots and the "
+                                       "dot and violin plot) to the report.")
+        self.chk_pop_report.toggled.connect(self._on_pop_report_toggled)
+        head.addWidget(self.chk_pop_report)
+        self.btn_pop_window = QPushButton("⤢ Open in window")
+        self.btn_pop_window.clicked.connect(
+            lambda: self._shown_population and self._population_window(self._shown_population))
+        head.addWidget(self.btn_pop_window)
+        rl.addLayout(head)
+        self.pop_scroll = QScrollArea()
+        self.pop_scroll.setWidgetResizable(True)
+        self.pop_host = QWidget()
+        self.pop_view = QHBoxLayout(self.pop_host)
+        self.pop_view.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.pop_scroll.setWidget(self.pop_host)
+        rl.addWidget(self.pop_scroll, stretch=1)
+        layout.addWidget(right, stretch=1)
+
+    def _significant_populations(self) -> set | None:
+        """Population keys significant in the current comparison's frequency
+        test, or None without one."""
+        comp = self._current_comparison()
+        df = (self.state.stats or {}).get('freq')
+        if comp is None or df is None:
+            return None
+        view = _comparison_view(df, _comparison_label(*comp))
+        if view is None or 'significant' not in view.columns:
+            return None
+        return set(view.loc[view['significant'].astype(bool), 'feature'])
 
     def _populate_population_list(self):
         current = self.pop_list.currentItem().data(Qt.UserRole) if self.pop_list.currentItem() else None
+        if self.pop_filter.mode() != self.state.pop_filter:
+            self.pop_filter.blockSignals(True)
+            self.pop_filter.set_mode(self.state.pop_filter)
+            self.pop_filter.blockSignals(False)
+        significant = self._significant_populations()
+        only_sig = self.pop_filter.mode() == 'significant' and significant is not None
+        text = self.pop_filter.text()
         self.pop_list.blockSignals(True)
         self.pop_list.clear()
         labels = _population_labels(self.state.gate_defs())
+        n_all = 0
         for g in ag_core.ordered_gate_defs(self.state.gate_defs()):
             for pop in (g.get('populations') or {}):
                 key = ag_core.population_key(g['gate_name'], pop)
-                it = QListWidgetItem(labels.get(key, key))
+                n_all += 1
+                if only_sig and key not in significant:
+                    continue
+                label = labels.get(key, key)
+                if not text_matches(text, label):
+                    continue
+                it = QListWidgetItem(("★ " if significant and key in significant else '') + label)
                 it.setData(Qt.UserRole, key)
+                if key in self.state.report_populations:
+                    it.setToolTip("Included in the report")
+                    font = it.font()
+                    font.setBold(True)
+                    it.setFont(font)
                 self.pop_list.addItem(it)
                 if key == current:
                     self.pop_list.setCurrentItem(it)
         self.pop_list.blockSignals(False)
+        if significant is None:
+            note = "Run statistics to see which populations differ; all are listed."
+        else:
+            note = f"{self.pop_list.count()} of {n_all} populations ({len(significant)} significant)."
+        self.lbl_pop_count.setText(note)
         self._draw_population(self.pop_list.currentItem())
 
-    def show_population(self, pop_key: str):
+    def _on_pop_filter_changed(self, _text: str, mode: str):
+        self.state.pop_filter = mode or 'significant'
+        self._populate_population_list()
+
+    def show_population(self, pop_key: str, include: bool = False):
+        """Show a population on the Populations page (clearing the filter
+        when it hides it); with *include*, tick it for the report."""
+        if include:
+            self._set_report_population(pop_key, True)
+        found = self._select_population(pop_key)
+        if not found:
+            self.pop_filter.clear()
+            self._select_population(pop_key)
+        self.toolbox.setCurrentIndex(self._page_browser)
+        win = self.window()
+        if win is not None:
+            win.raise_()
+            win.activateWindow()
+
+    def _select_population(self, pop_key: str) -> bool:
         for i in range(self.pop_list.count()):
             if self.pop_list.item(i).data(Qt.UserRole) == pop_key:
                 self.pop_list.setCurrentRow(i)
-                break
-        self.toolbox.setCurrentIndex(self._page_browser)
+                return True
+        return False
 
-    def _draw_population(self, item):
-        _clear_layout(self.browser_grid)
-        st = self.state
-        if item is None:
+    def _set_report_population(self, pop_key: str, on: bool):
+        pops = list(self.state.report_populations)
+        if on and pop_key not in pops:
+            pops.append(pop_key)
+        elif not on and pop_key in pops:
+            pops.remove(pop_key)
+        else:
             return
-        pop_key = item.data(Qt.UserRole)
+        self.state.report_populations = pops
+        if self._shown_population == pop_key:
+            self.chk_pop_report.blockSignals(True)
+            self.chk_pop_report.setChecked(on)
+            self.chk_pop_report.blockSignals(False)
+        for i in range(self.pop_list.count()):
+            it = self.pop_list.item(i)
+            if it.data(Qt.UserRole) == pop_key:
+                font = it.font()
+                font.setBold(on)
+                it.setFont(font)
+        self._populate_report_items()
+        self.report_populations_changed.emit()
+
+    def _on_pop_report_toggled(self, on: bool):
+        if self._shown_population:
+            self._set_report_population(self._shown_population, bool(on))
+
+    def _comparison_groups(self) -> list[str]:
+        """Groups compared on the Populations page: the current comparison's,
+        else every group with gated samples."""
+        comp = self._current_comparison()
+        if comp is not None:
+            return [comp[0], comp[1]]
+        st = self.state
+        have = {st.sample_groups.get(k) for k in st.gated_samples()}
+        return [g for g in st.group_names if g in have]
+
+    def _population_data(self, pop_key: str) -> dict | None:
+        """Everything the comparison of one population shows."""
+        st = self.state
         gate_name, pop = ag_core.split_population_key(pop_key)
         by_name = ag_core.gates_by_name(st.gate_defs())
         gdef = by_name.get(gate_name)
         if gdef is None:
-            return
-        if not st.display:
-            note = QLabel("Plots are available for samples gated in this session; "
-                          "run gating again to see them.")
-            note.setWordWrap(True)
-            self.browser_grid.addWidget(note, 0, 0)
-            return
+            return None
         eff = ag_core.effective_gate_def(gdef, by_name)
-        transforms = self.controller.unmixed_transformations or {}
+        groups = self._comparison_groups()
+        panels = []
+        for g in groups:
+            samples = [k for k in st.gated_samples() if st.sample_groups.get(k) == g]
+            events, parent, member, channels = ag_report.pooled_population(
+                st.display, samples, eff, pop, max_events=GROUP_PLOT_EVENTS, seed=DISPLAY_SEED)
+            panels.append({'group': g, 'events': events, 'parent': parent, 'member': member,
+                           'channels': channels, 'n_samples': sum(1 for k in samples if k in st.display),
+                           'boundary': st.reference_boundaries().get(gate_name, {})})
+        values = ag_results.group_population_values(st.summaries, st.gated_samples(),
+                                                    st.sample_groups, pop_key, st.use_stats_parent)
+        values = {g: values.get(g, []) for g in groups}
+        comp = self._current_comparison()
+        result = ag_results.population_result(st.stats, pop_key, _comparison_label(*comp),
+                                               st.fdr_scope) if comp else None
+        label = _population_labels(st.gate_defs()).get(pop_key, pop_key)
+        return {'gate_def': eff, 'pop': pop, 'panels': panels, 'values': values, 'groups': groups,
+                'result': result, 'label': label,
+                'title': f"{label}" + (f" — {_comparison_label(*comp)}" if comp else '')}
+
+    def _draw_population(self, item):
+        _clear_layout(self.pop_view)
+        self._shown_population = item.data(Qt.UserRole) if item is not None else None
+        self.chk_pop_report.blockSignals(True)
+        self.chk_pop_report.setChecked(self._shown_population in self.state.report_populations)
+        self.chk_pop_report.setEnabled(self._shown_population is not None)
+        self.chk_pop_report.blockSignals(False)
+        self.btn_pop_window.setEnabled(self._shown_population is not None)
+        if self._shown_population is None:
+            self.lbl_pop_title.setText("")
+            return
+        self._fill_population_view(self.pop_view, self._shown_population, self.lbl_pop_title)
+
+    def _fill_population_view(self, layout, pop_key: str, title_label: QLabel):
+        """Each compared group's pooled biplot, then the dot and violin plot."""
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        data = self._population_data(pop_key)
+        if data is None:
+            title_label.setText("")
+            return
+        title_label.setText(f"<b>{data['title']}</b><br>{ag_report.p_value_text(data['result'])}")
+        st = self.state
+        if not data['groups']:
+            note = QLabel("Assign samples to groups on the Groups page to compare them.")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            return
+        transforms = self._result_transforms()
         labels = build_display_label_map(
             _experiment_channels(self.controller),
             self.controller.experiment.process.get('spectral_model') or [])
-        order = {g: i for i, g in enumerate(st.group_names)}
-        keys = sorted([k for k in st.gated_samples() if k in st.display],
-                      key=lambda k: (order.get(st.sample_groups.get(k, ''), len(order)),
-                                     _sample_label(k)))
-        cols = 4
-        for i, key in enumerate(keys):
-            disp = st.display[key]
-            summ = st.summaries.get(key) or {}
-            row = next((r for r in summ.get('populations', []) if r['key'] == pop_key), None)
-            fractions = {r['population']: r['fraction_of_parent']
-                         for r in summ.get('populations', []) if r['gate'] == gate_name}
-            group = st.sample_groups.get(key, '')
-            title = f"<b>{_sample_label(key)}</b>" + (f" <small>[{group}]</small>" if group else '')
-            status = (summ.get('status') or {}).get(gate_name) or {}
-            footer = ''
-            if row is not None:
-                footer = f"n = {row['n_events']:,} of {row['n_parent']:,}"
-            if status.get('flag'):
-                footer += f" — {status.get('message') or status['flag']}"
-            tile = _make_gate_tile(
-                eff, (summ.get('boundaries') or {}).get(gate_name, {}), disp['events'],
-                disp['channels'], disp['parent_masks'].get(gate_name), transforms, labels,
-                title, fractions=fractions, highlight=pop, footer=footer)
-            r, c = divmod(i, cols)
-            self.browser_grid.addWidget(tile, r, c)
+        if not st.display:
+            note = QLabel("The plots of these results are not available; run gating again to "
+                          "see the groups' biplots.")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+        else:
+            for panel in data['panels']:
+                member = panel['member']
+                frac = float(member.mean()) if member is not None and len(member) else None
+                vals = [v for _s, v in data['values'].get(panel['group'], [])]
+                footer = (f"{len(panel['events']) if panel['events'] is not None else 0:,} events "
+                          f"pooled from {panel['n_samples']} sample(s)")
+                if vals:
+                    footer += f"; mean {np.mean(vals):.2f}% of parent"
+                tile = _make_gate_tile(
+                    data['gate_def'], panel['boundary'], panel['events'], panel['channels'],
+                    panel['parent'], transforms, labels, f"<b>{panel['group']}</b>",
+                    fractions={data['pop']: frac} if frac is not None else None,
+                    highlight=data['pop'], footer=footer)
+                layout.addWidget(tile)
+        fig = ag_report.make_group_values_figure(
+            data['values'], data['groups'], f"{data['label']}: % of parent",
+            ag_report.p_value_text(data['result']), is_dark=_is_dark_palette())
+        import honeychrome.settings as hc_settings
+        canvas = FigureCanvasQTAgg(fig)
+        size = int(getattr(hc_settings, 'cytometry_plot_width_target_retrieved', 220) or 220)
+        canvas.setFixedSize(int(size * 1.3), size + 60)
+        handler = getattr(fig, '_hover_handler', None)
+        if handler is not None:
+            canvas.mpl_connect('motion_notify_event', handler)
+        layout.addWidget(canvas)
+
+    def _population_window(self, pop_key: str):
+        """The comparison of one population in its own window."""
+        dialog = QDialog(self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.setWindowTitle(_population_labels(self.state.gate_defs()).get(pop_key, pop_key))
+        layout = QVBoxLayout(dialog)
+        title = QLabel("")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+        host = QWidget()
+        row = QHBoxLayout(host)
+        row.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        layout.addWidget(host, stretch=1)
+        chk = QCheckBox("Include in report")
+        chk.setChecked(pop_key in self.state.report_populations)
+        chk.toggled.connect(lambda on, k=pop_key: self._set_report_population(k, bool(on)))
+        layout.addWidget(chk)
+        self._fill_population_view(row, pop_key, title)
+        dialog.show()
+
+    def _population_report_figure(self, pop_key: str):
+        """The report figure of one population's group comparison."""
+        data = self._population_data(pop_key)
+        if data is None:
+            return None
+        labels = build_display_label_map(
+            _experiment_channels(self.controller),
+            self.controller.experiment.process.get('spectral_model') or [])
+        return ag_report.make_population_comparison_figure(
+            data['gate_def'], data['pop'], data['panels'] if self.state.display else [],
+            self._result_transforms(), labels, data['values'], data['groups'], data['title'],
+            ag_report.p_value_text(data['result']))
 
     # ------------------------------------------------------------------
     # Export
@@ -2911,9 +3529,32 @@ class ResultsTab(QWidget):
             "sample, population and marker: median and quartiles in transformed units) and "
             "<i>settings.txt</i> (model file and its SHA-256, gate application, AF "
             "assignments and statistics settings), plus a PNG and/or CSV for each ticked "
-            "item below and one PDF containing all of them.")
+            "item below and one PDF containing all of them. Populations ticked for the "
+            "report on the Populations page are listed under Populations.")
         blurb.setWordWrap(True)
         layout.addWidget(blurb)
+        csv_box = QGroupBox("CSV files")
+        cb = QVBoxLayout(csv_box)
+        csv_note = QLabel(
+            "Each gating run and each statistics run is also written automatically to the "
+            "experiment's <i>Automated_Gating_Results</i> folder, named after the model with a "
+            "timestamp: the population counts and marker medians of every gated sample, and "
+            "the statistics tables (results of every test, and the per-sample values tested).")
+        csv_note.setWordWrap(True)
+        cb.addWidget(csv_note)
+        csv_row = QHBoxLayout()
+        self.btn_export_results = QPushButton("Export Gating Results…")
+        self.btn_export_results.setToolTip("Write the population counts and marker medians of "
+                                           "every gated sample to CSV files.")
+        self.btn_export_results.clicked.connect(lambda: self._export_csv('results'))
+        self.btn_export_stats = QPushButton("Export Statistics…")
+        self.btn_export_stats.setToolTip("Write the last statistics run's tables to CSV files.")
+        self.btn_export_stats.clicked.connect(lambda: self._export_csv('stats'))
+        csv_row.addWidget(self.btn_export_results)
+        csv_row.addWidget(self.btn_export_stats)
+        csv_row.addStretch()
+        cb.addLayout(csv_row)
+        layout.addWidget(csv_box)
         row = QHBoxLayout()
         for text, on in (("All", True), ("None", False)):
             b = QPushButton(text)
@@ -2944,7 +3585,7 @@ class ResultsTab(QWidget):
             modes=st.modes, summaries=st.summaries, samples=samples, load_info=st.load_info,
             display=st.display, groups=st.sample_groups,
             flags={k: st.flags(k) for k in samples}, antigens=_antigen_map(self.controller),
-            transforms=self.controller.unmixed_transformations or {},
+            transforms=self._result_transforms(),
             axis_labels=build_display_label_map(
                 _experiment_channels(self.controller),
                 self.controller.experiment.process.get('spectral_model') or []),
@@ -2952,7 +3593,45 @@ class ResultsTab(QWidget):
             marker_threshold=st.marker_threshold, fdr_scope=st.fdr_scope,
             build_figures=build_result_figures, pca=st.pca or None,
             predictive=st.predictive or None,
+            populations=[(k, _population_labels(st.gate_defs()).get(k, k))
+                         for k in st.report_populations],
+            population_figure=self._population_report_figure,
         )
+
+    def _export_csv(self, what: str):
+        """Ask for a folder and write the gating results or the statistics
+        tables there as CSV files."""
+        st = self.state
+        if what == 'stats' and not st.stats:
+            QMessageBox.information(self, "Export Statistics", "Run statistics first.")
+            return
+        if what == 'results' and not st.summaries:
+            QMessageBox.information(self, "Export Gating Results", "Gate some samples first.")
+            return
+        start = str(Path(getattr(self.controller, 'experiment_dir', '')) / EXPORT_DIR)
+        folder = QFileDialog.getExistingDirectory(self, "Export to folder", start)
+        if not folder:
+            return
+        from PySide6.QtWidgets import QApplication
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        labels = _population_labels(st.gate_defs())
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            if what == 'stats':
+                written = write_statistics_csv(Path(folder), _export_stem(st.model_path), stamp,
+                                               st.stats, labels, _antigen_map(self.controller))
+            else:
+                written = write_results_csv(Path(folder), _export_stem(st.model_path), stamp,
+                                            st.summaries, st.gated_samples(), st.sample_groups,
+                                            labels, _antigen_map(self.controller))
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            log.exception("CSV export failed")
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        QApplication.restoreOverrideCursor()
+        self.lbl_export.setText("Written: " + ", ".join(p.name for p in written))
+        _status(self.bus, f"CSV files written to {folder}")
 
     def _populate_report_items(self):
         unchecked = {self.report_list.item(i).data(Qt.UserRole)
@@ -3124,19 +3803,131 @@ class ResultsTab(QWidget):
 # PluginWidget
 # ---------------------------------------------------------------------------
 
+class _StateLoader(QThread):
+    """Read an experiment's saved model, gated results, display records and
+    statistics off the main thread; finished(dict) carries what was read."""
+
+    finished = Signal(object)
+
+    def __init__(self, job: dict, parent=None):
+        super().__init__(parent)
+        self._job = job
+
+    def run(self):
+        job = self._job
+        out = {'key': job['key'], 'errors': []}
+        try:
+            self._read_model(job, out)
+        except Exception as exc:
+            log.exception("could not read the model %s", job.get('model_path'))
+            out['errors'].append(f"Could not read the model: {exc}")
+        try:
+            self._read_results(job, out)
+        except Exception as exc:
+            log.exception("could not read the saved results")
+            out['errors'].append(f"Could not read the saved results: {exc}")
+        self.finished.emit(out)
+
+    @staticmethod
+    def _read_model(job: dict, out: dict):
+        path = job.get('model_path')
+        if not path:
+            return
+        if not Path(path).exists():
+            out['model_missing'] = path
+            return
+        model, warnings_list = ag_core.read_model(path)
+        out['model'], out['model_warnings'] = model, warnings_list
+        alignment = dict(job.get('alignment') or {})
+        gated = {mc: alignment.get(mc) for mc in _gated_channels(model.get('gate_definitions') or [])}
+        if not job.get('confirmed') or ag_results.alignment_problems(gated):
+            return
+        params = job.get('transform_params')
+        if not params or job.get('transform_model') != path:
+            params = model_transform_params(model, gated, job['live_params'])
+            out['transform_params'] = params
+        out['applied'], out['messages'] = prepare_applied_model(model, gated, params)
+
+    @staticmethod
+    def _read_results(job: dict, out: dict):
+        path = job.get('results_path')
+        if path is None or not Path(path).exists():
+            return
+        payload = json.loads(Path(path).read_text(encoding='utf-8'))
+        out['results'] = payload
+        fingerprint = str(payload.get('run_fingerprint') or '')
+        display = {}
+        folder = job.get('display_dir')
+        if folder is not None:
+            for key in (payload.get('summaries') or {}):
+                loaded = ag_results.load_display(Path(folder) / ag_results.display_file_name(key))
+                if loaded is None:
+                    continue
+                disp, meta = loaded
+                if meta.get('sample') == key and meta.get('fingerprint') == fingerprint:
+                    display[key] = disp
+        out['display'] = display
+        stats_path = job.get('stats_path')
+        if stats_path is None or not Path(stats_path).exists():
+            return
+        sp = json.loads(Path(stats_path).read_text(encoding='utf-8'))
+        if sp.get('run_fingerprint') != fingerprint:
+            return
+        stats = ag_results.stats_from_jsonable(sp['stats'])
+        summaries = payload.get('summaries') or {}
+        if not stats.get('samples') or any(k not in summaries for k in stats['samples']):
+            return
+        t = job['thresholds']
+        out['stats'] = ag_results.reapply_thresholds(stats, t['pval'], t['fc'], t['marker'],
+                                                     t['fdr_scope'], t['treat'])
+
+
+class _FileWriter(QThread):
+    """Run one file-writing job (a callable) off the main thread."""
+
+    done = Signal(bool, str, object)
+
+    def __init__(self, job, label: str, parent=None):
+        super().__init__(parent)
+        self._job = job
+        self.label = label
+
+    def run(self):
+        try:
+            result = self._job()
+        except Exception as exc:
+            log.exception("%s failed", self.label)
+            self.done.emit(False, str(exc), None)
+            return
+        self.done.emit(True, '', result)
+
+
+def _write_json_atomic(path: Path, payload, jsonable: bool = False):
+    """Write *payload* as JSON beside *path*, then move it into place."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.tmp')
+    data = ag_core.to_jsonable(payload) if jsonable else payload
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(data, fh, separators=(',', ':'))
+    _os.replace(tmp, path)
+
+
 class PluginWidget(QWidget):
     """Top-level widget for the Automated Gating plugin.
 
-    Owns GatingRunState and the Setup, Run and Results tabs.
+    Owns GatingRunState, the plugin's transforms and the Transforms, Setup,
+    Run and Results pages, listed down the left-hand side.
 
-    Persistence: settings (model file, alignment, gate modes, sample
-    selection, groups, covariates and statistics options) are kept in
+    Persistence: settings (model file, alignment, gate modes, transforms,
+    sample selection, groups, covariates and statistics options) are kept in
     QSettings per experiment as one JSON string. Gated results (counts,
-    medians and per-gate status, not the display events) are kept in
-    RESULTS_FILE in the experiment folder, so they survive a restart,
-    together with the samples a paused run has still to gate. The last
-    statistics run is kept in STATS_FILE, written when the run completes,
-    and is restored while it still matches the gated results.
+    medians and per-gate status) are kept in RESULTS_FILE in the experiment
+    folder, with the samples a paused run has still to gate, and each
+    sample's display record in DISPLAY_DIR; the last statistics run is kept
+    in STATS_FILE and restored while it still matches the gated results.
+    These are read in the background when the experiment is opened and
+    written in the background after each run, when the gating results and
+    statistics are also written as CSV files to EXPORT_DIR.
     """
 
     def __init__(self, bus=None, controller=None, parent=None):
@@ -3147,43 +3938,61 @@ class PluginWidget(QWidget):
         _suppress_third_party_warnings()
 
         self.state = GatingRunState()
+        self.tf = tp.TransformSet()
+        self._result_tf = (None, None)
         self._qsettings = QSettings('honeychrome', 'plugin_automated_gating')
         self._plugin_was_active = False
         self._loaded_experiment_key = None
         self._loaded_experiment_dir = None
+        self._loader = None
+        self._loading = False
+        self._writers: list = []
 
         self.label_disabled = QLabel(f"{plugin_name}: Loading...Set up the spectral model if you have not already done so.")
         self.label_disabled.setWordWrap(True)
         self.label_disabled.setStyleSheet(
             "QLabel { color: #856404; background: #fff3cd; "
             "border: 1px solid #ffc107; border-radius: 4px; padding: 8px; }")
+        self.label_loading = QLabel("Loading the saved model and results …")
+        self.label_loading.setStyleSheet("color: #555; font-style: italic;")
+        self.label_loading.setVisible(False)
 
         self.content_widget = QWidget()
         content_layout = QVBoxLayout(self.content_widget)
         content_layout.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(self.content_widget)
+        content_layout.addWidget(self.label_loading)
         overall = QVBoxLayout(self)
         overall.setContentsMargins(6, 6, 6, 6)
         overall.addWidget(self.label_disabled)
-        overall.addWidget(scroll)
+        overall.addWidget(self.content_widget, stretch=1)
 
-        self.inner_tabs = QTabWidget()
-        self.inner_tabs.setDocumentMode(True)
-        self.setup_tab = SetupTab(self.state, bus, controller)
-        self.run_tab = RunTab(self.state, bus, controller)
-        self.results_tab = ResultsTab(self.state, bus, controller)
-        self.inner_tabs.addTab(self.setup_tab, "Setup")
-        self.inner_tabs.addTab(self.run_tab, "Run")
-        self.inner_tabs.addTab(self.results_tab, "Results")
+        self.inner_tabs = SideTabWidget()
+        self.transforms_tab = tp.PopulationTransformsPanel(
+            controller, self.tf, self._transform_samples, help_text=ag_help_texts.AG_TRANSFORMS,
+            reset_label="Revert to the model's transforms", reset=self._revert_transforms)
+        self.setup_tab = SetupTab(self.state, bus, controller,
+                                  transforms_for=self._transforms_for_model)
+        self.run_tab = RunTab(self.state, bus, controller,
+                              gating_transforms=lambda: self.tf.objects,
+                              result_transforms=self._result_transforms,
+                              display_dir=self._display_dir)
+        self.results_tab = ResultsTab(self.state, bus, controller,
+                                      result_transforms=self._result_transforms)
+        self.inner_tabs.addTab(self.transforms_tab, "Transforms", 'wave-sine')
+        self.inner_tabs.addTab(self.setup_tab, "Setup", 'settings')
+        self.inner_tabs.addTab(self.run_tab, "Run", 'player-play')
+        self.inner_tabs.addTab(self.results_tab, "Results", 'table')
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
-        content_layout.addWidget(self.inner_tabs)
+        content_layout.addWidget(self.inner_tabs, stretch=1)
 
         self.setup_tab.model_ready.connect(self._on_model_ready)
+        self.setup_tab.model_loaded.connect(self._on_model_loaded)
         self.run_tab.gating_finished.connect(self._on_gating_finished)
         self.results_tab.stats_finished.connect(self._on_stats_finished)
+        self.results_tab.report_populations_changed.connect(self.save_state)
+        self.transforms_tab.transformsChanged.connect(self._on_transform_changed)
+        self.transforms_tab.populationChanged.connect(
+            lambda name: setattr(self.state, 'transform_population', name))
 
         self.content_widget.setVisible(False)
         self.bus.modeChangeRequested.connect(self._on_mode_change)
@@ -3212,16 +4021,15 @@ class PluginWidget(QWidget):
         if self.controller.experiment.process.get('unmixing_matrix') is not None:
             self.label_disabled.setVisible(False)
             self.content_widget.setVisible(True)
-            setup_refreshed = self._ensure_state_loaded()
-            if not (setup_refreshed and self.inner_tabs.currentIndex() == 0):
+            if not self._ensure_state_loaded() and not self._loading:
                 self._refresh_active_tab()
         else:
             self.label_disabled.setVisible(True)
             self.content_widget.setVisible(False)
 
     def _ensure_state_loaded(self) -> bool:
-        """Load the persisted state when the experiment has changed. Returns
-        True when it did, in which case the Setup tab has been refreshed."""
+        """Load the persisted state when the experiment has changed (in the
+        background). Returns True when loading started."""
         current_key = self._settings_key()
         if current_key == self._loaded_experiment_key:
             return False
@@ -3235,39 +4043,137 @@ class PluginWidget(QWidget):
             setattr(self.state, f.name, getattr(fresh, f.name))
         self._loaded_experiment_key = current_key
         self._loaded_experiment_dir = Path(self.controller.experiment_dir)
+        self._result_tf = (None, None)
         self.load_state()
-        self.setup_tab.refresh()
         return True
 
     def _on_inner_tab_changed(self, index: int):
         self.save_state()
-        self._refresh_tab_at(index)
+        if not self._loading:
+            self._refresh_tab_at(index)
 
     def _refresh_active_tab(self):
         self._refresh_tab_at(self.inner_tabs.currentIndex())
 
     def _refresh_tab_at(self, index: int):
-        tabs = [self.setup_tab, self.run_tab, self.results_tab]
-        if 0 <= index < len(tabs):
+        if index == 0:
+            self.transforms_tab.refresh(self.state.transform_population or None)
+            return
+        tabs = [None, self.setup_tab, self.run_tab, self.results_tab]
+        if 0 < index < len(tabs):
             tabs[index].refresh()
 
     def _on_model_ready(self):
         self.save_state()
         self.inner_tabs.setCurrentWidget(self.run_tab)
 
-    def _on_gating_finished(self):
+    def _on_gating_finished(self, outcome: str = 'done'):
+        self._result_tf = (None, None)
         self._write_results()
         self._write_stats()
         self.save_state()
+        if self.state.summaries and outcome in ('done', 'paused', 'failed'):
+            self._export_results_csv()
 
     def _on_stats_finished(self):
         """Keep the statistics, and the settings they were run with, as soon
-        as a run completes."""
+        as a run completes, and write them as CSV files."""
         self._write_stats()
         self.save_state()
+        self._export_statistics_csv()
 
     def progress_message(self, msg: str):
         _status(self.bus, msg)
+
+    # ------------------------------------------------------------------
+    # Transforms
+    # ------------------------------------------------------------------
+
+    def _transform_samples(self) -> list[str]:
+        st = self.state
+        keys = list(st.run_samples) or st.gated_samples()
+        return keys
+
+    def _model_defaults(self, alignment: dict | None = None) -> dict:
+        st = self.state
+        if not st.model:
+            return _live_transform_params(self.controller)
+        if alignment is None:
+            alignment = {mc: st.alignment.get(mc)
+                         for mc in _gated_channels(st.model.get('gate_definitions') or [])}
+        return model_transform_params(st.model, alignment, _live_transform_params(self.controller))
+
+    def _set_transforms(self, params: dict):
+        self.state.transform_params = params
+        self.tf.load(params, self.controller.unmixed_transformations or {})
+        self.transforms_tab.set_transforms()
+
+    def _transforms_for_model(self, model: dict, alignment: dict) -> dict:
+        """The transforms a model's boundaries are converted to when its
+        alignment is accepted: the user's, when they adjusted them for this
+        model, else the model's own."""
+        st = self.state
+        if st.transform_model != st.model_path or not st.transform_custom or not st.transform_params:
+            self._set_transforms(self._model_defaults(alignment))
+            st.transform_model = st.model_path
+            st.transform_custom = False
+        return st.transform_params
+
+    def _on_model_loaded(self):
+        """A model was read: show its transforms unless the user's
+        adjustments for it are kept."""
+        st = self.state
+        if st.transform_model != st.model_path:
+            self._set_transforms(self._model_defaults())
+            st.transform_model = st.model_path
+            st.transform_custom = False
+
+    def _on_transform_changed(self, channel: str, before: dict):
+        """The user adjusted a transform: keep the applied model's boundaries
+        in place in the data."""
+        st = self.state
+        after = ag_core.transform_params(self.tf.objects[channel])
+        st.transform_params[channel] = after
+        st.transform_custom = True
+        if st.applied_model:
+            ag_core.remap_channel_transform(
+                st.applied_model.get('gate_definitions') or [],
+                st.applied_model.setdefault('trained_boundaries', {}),
+                channel, before, after)
+            st.applied_model.setdefault('transforms', {})[channel] = after
+
+    def _revert_transforms(self):
+        """Back to the model's transforms (the experiment's without a model)."""
+        st = self.state
+        new = self._model_defaults()
+        old = dict(st.transform_params)
+        self._set_transforms(new)
+        st.transform_custom = False
+        st.transform_model = st.model_path
+        if st.applied_model:
+            for ch, params in new.items():
+                if ch in old and not ag_core.same_transform(old[ch], params):
+                    ag_core.remap_channel_transform(
+                        st.applied_model.get('gate_definitions') or [],
+                        st.applied_model.setdefault('trained_boundaries', {}),
+                        ch, old[ch], params)
+                    st.applied_model.setdefault('transforms', {})[ch] = params
+        self.save_state()
+        _status(self.bus, "Transforms reverted to the model's." if st.model
+                else "Transforms reset to the experiment's.")
+
+    def _result_transforms(self) -> dict:
+        """Transforms the gated results are in (those of the run), as
+        Transform objects."""
+        st = self.state
+        if not st.run_transforms:
+            return self.tf.objects
+        key = json.dumps(st.run_transforms, sort_keys=True, default=str)
+        if self._result_tf[0] != key:
+            built = tp.TransformSet()
+            built.load(st.run_transforms, self.controller.unmixed_transformations or {})
+            self._result_tf = (key, built.objects)
+        return self._result_tf[1]
 
     # ------------------------------------------------------------------
     # Persistence
@@ -3288,9 +4194,14 @@ class PluginWidget(QWidget):
         except Exception:
             return False
 
+    def _display_dir(self):
+        if self._loaded_experiment_dir is None:
+            return None
+        return self._loaded_experiment_dir / DISPLAY_DIR
+
     def save_state(self):
         """Persist settings for the experiment the state was loaded from."""
-        if self._loaded_experiment_key is None:
+        if self._loaded_experiment_key is None or self._loading:
             return
         payload = {name: getattr(self.state, name) for name in _PERSISTED_FIELDS}
         s = self._qsettings
@@ -3301,8 +4212,8 @@ class PluginWidget(QWidget):
             s.endGroup()
 
     def load_state(self):
-        """Restore settings, the model and cached results for the loaded
-        experiment."""
+        """Restore settings from QSettings, then read the model, gated
+        results, display records and statistics in the background."""
         s = self._qsettings
         s.beginGroup(self._loaded_experiment_key or self._settings_key())
         try:
@@ -3323,25 +4234,104 @@ class PluginWidget(QWidget):
                 value = float(value)
             if isinstance(value, expected):
                 setattr(self.state, name, value)
-        path = self.state.model_path
-        if path:
-            if Path(path).exists():
-                self.setup_tab.load_model(path, alignment=dict(self.state.alignment),
-                                          confirmed=bool(payload.get('alignment_confirmed')))
-            else:
-                self.state.model_path = ''
-                self.state.alignment_confirmed = False
-                self.progress_message(f"The model file {path} is no longer available.")
-        self._load_results()
-        self._load_stats()
+        st = self.state
+        self.tf.load(st.transform_params, self.controller.unmixed_transformations or {})
+        exp = self._loaded_experiment_dir
+        job = {
+            'key': self._loaded_experiment_key,
+            'model_path': st.model_path,
+            'alignment': dict(st.alignment),
+            'confirmed': bool(payload.get('alignment_confirmed')),
+            'transform_params': deepcopy(st.transform_params),
+            'transform_model': st.transform_model,
+            'live_params': _live_transform_params(self.controller),
+            'results_path': exp / RESULTS_FILE,
+            'stats_path': exp / STATS_FILE,
+            'display_dir': exp / DISPLAY_DIR,
+            'thresholds': {'pval': st.pval_threshold, 'fc': st.fc_threshold,
+                           'marker': st.marker_threshold, 'fdr_scope': st.fdr_scope,
+                           'treat': st.use_treat},
+        }
+        self._loading = True
+        self.label_loading.setVisible(True)
+        self.inner_tabs.setEnabled(False)
+        loader = _StateLoader(job, parent=self)
+        loader.finished.connect(self._on_state_loaded)
+        self._loader = loader
+        loader.start()
+
+    def _on_state_loaded(self, out: dict):
+        self._loader = None
+        self._loading = False
+        self.label_loading.setVisible(False)
+        self.inner_tabs.setEnabled(True)
+        if out.get('key') != self._loaded_experiment_key:
+            return
+        st = self.state
+        if out.get('transform_params'):
+            st.transform_params = out['transform_params']
+            st.transform_model = st.model_path
+            st.transform_custom = False
+            self.tf.load(st.transform_params, self.controller.unmixed_transformations or {})
+        if out.get('model') is not None:
+            self.setup_tab.apply_loaded_model(st.model_path, out['model'],
+                                              out.get('model_warnings') or [],
+                                              alignment=dict(st.alignment),
+                                              applied=out.get('applied'),
+                                              messages=out.get('messages'))
+        elif out.get('model_missing'):
+            st.model_path = ''
+            st.alignment_confirmed = False
+            self.progress_message(f"The model file {out['model_missing']} is no longer available.")
+        payload = out.get('results')
+        if payload:
+            st.summaries = dict(payload.get('summaries') or {})
+            st.load_info = dict(payload.get('load_info') or {})
+            st.marker_channels = list(payload.get('marker_channels') or [])
+            st.results_model_sha = str(payload.get('model_sha256') or '')
+            st.run_transforms = dict(payload.get('run_transforms') or {})
+            if payload.get('run_samples'):
+                st.run_samples = list(payload['run_samples'])
+            st.pending_samples = [k for k in (payload.get('pending_samples') or [])
+                                  if k not in st.summaries]
+            st.run_fingerprint = str(payload.get('run_fingerprint') or '')
+            st.display = dict(out.get('display') or {})
+            if st.summaries and st.results_model_sha and st.model_path \
+                    and _file_sha256(st.model_path) != st.results_model_sha:
+                self.progress_message("The saved gating results were made with a different "
+                                      "version of the model file; run gating again to update them.")
+        if out.get('stats'):
+            st.stats = out['stats']
+        for msg in out.get('errors') or []:
+            self.progress_message(msg)
+        self.setup_tab.refresh()
+        self._refresh_active_tab()
 
     def _results_path(self) -> Path | None:
         if self._loaded_experiment_dir is None:
             return None
         return self._loaded_experiment_dir / RESULTS_FILE
 
+    def _stats_path(self) -> Path | None:
+        if self._loaded_experiment_dir is None:
+            return None
+        return self._loaded_experiment_dir / STATS_FILE
+
+    def _start_writer(self, job, label: str):
+        writer = _FileWriter(job, label, parent=self)
+        writer.done.connect(lambda ok, err, _res, w=writer: self._on_writer_done(w, ok, err))
+        self._writers.append(writer)
+        writer.start()
+
+    def _on_writer_done(self, writer, ok: bool, error: str):
+        if writer in self._writers:
+            self._writers.remove(writer)
+        if not ok:
+            self.progress_message(f"{writer.label} failed: {error}")
+
     def _write_results(self):
-        """Write the gated results (not the display events) to RESULTS_FILE."""
+        """Write the gated results (summaries, not the display events, which
+        the worker saved) to RESULTS_FILE, in the background."""
         if not self._controller_shows_loaded_experiment():
             return
         path = self._results_path()
@@ -3350,90 +4340,59 @@ class PluginWidget(QWidget):
             'format_version': 1,
             'model_path': st.model_path,
             'model_sha256': st.results_model_sha,
-            'marker_channels': st.marker_channels,
-            'run_samples': st.run_samples,
-            'summaries': st.summaries,
-            'load_info': st.load_info,
-            'pending_samples': st.pending_samples,
+            'marker_channels': list(st.marker_channels),
+            'run_samples': list(st.run_samples),
+            'summaries': dict(st.summaries),
+            'load_info': dict(st.load_info),
+            'pending_samples': list(st.pending_samples),
             'run_fingerprint': st.run_fingerprint,
+            'run_transforms': deepcopy(st.run_transforms),
         }
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(path.name + '.tmp')
-            tmp.write_text(json.dumps(ag_core.to_jsonable(payload)), encoding='utf-8')
-            _os.replace(tmp, path)
-        except Exception:
-            log.exception("could not write gating results to %s", path)
-
-    def _stats_path(self) -> Path | None:
-        if self._loaded_experiment_dir is None:
-            return None
-        return self._loaded_experiment_dir / STATS_FILE
+        self._start_writer(lambda: _write_json_atomic(path, payload), "Saving the gating results")
 
     def _write_stats(self):
-        """Write the last statistics run to STATS_FILE, or remove the file
-        when there is none (a new gating run clears the statistics)."""
+        """Write the last statistics run to STATS_FILE (in the background),
+        or remove the file when there is none (a new gating run clears the
+        statistics)."""
         if not self._controller_shows_loaded_experiment():
             return
         path = self._stats_path()
         st = self.state
-        try:
-            if not st.stats:
+        if not st.stats:
+            try:
                 path.unlink(missing_ok=True)
-                return
-            payload = {
-                'format_version': 1,
-                'run_fingerprint': st.run_fingerprint,
-                'stats': ag_results.stats_to_jsonable(st.stats),
-            }
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(path.name + '.tmp')
-            tmp.write_text(json.dumps(payload), encoding='utf-8')
-            _os.replace(tmp, path)
-        except Exception:
-            log.exception("could not write statistics to %s", path)
+            except OSError:
+                log.exception("could not remove %s", path)
+            return
+        stats, fingerprint = dict(st.stats), st.run_fingerprint
 
-    def _load_stats(self):
-        """Restore the saved statistics when they still match the gated
-        results they were computed from."""
-        path = self._stats_path()
-        if path is None or not path.exists():
+        def _job():
+            _write_json_atomic(path, {'format_version': 1, 'run_fingerprint': fingerprint,
+                                      'stats': ag_results.stats_to_jsonable(stats)})
+
+        self._start_writer(_job, "Saving the statistics")
+
+    def _export_results_csv(self):
+        """Write the gating results as CSV files to EXPORT_DIR (background)."""
+        if not self._controller_shows_loaded_experiment():
             return
         st = self.state
-        try:
-            payload = json.loads(path.read_text(encoding='utf-8'))
-            if payload.get('run_fingerprint') != st.run_fingerprint:
-                return
-            stats = ag_results.stats_from_jsonable(payload['stats'])
-            if not stats.get('samples') or any(k not in st.summaries for k in stats['samples']):
-                return
-            st.stats = ag_results.reapply_thresholds(
-                stats, st.pval_threshold, st.fc_threshold, st.marker_threshold,
-                st.fdr_scope, st.use_treat)
-        except Exception:
-            log.exception("could not read statistics %s", path)
-            st.stats = {}
+        folder = self._loaded_experiment_dir / EXPORT_DIR
+        stem, stamp = _export_stem(st.model_path), datetime.now().strftime('%Y%m%d_%H%M%S')
+        args = (dict(st.summaries), st.gated_samples(), dict(st.sample_groups),
+                _population_labels(st.gate_defs()), _antigen_map(self.controller))
+        self._start_writer(lambda: write_results_csv(folder, stem, stamp, *args),
+                           "Writing the gating results CSV")
+        _status(self.bus, f"Gating results written to {folder}")
 
-    def _load_results(self):
-        path = self._results_path()
-        if path is None or not path.exists():
-            return
-        try:
-            payload = json.loads(path.read_text(encoding='utf-8'))
-        except Exception:
-            log.exception("could not read gating results %s", path)
+    def _export_statistics_csv(self):
+        """Write the statistics tables as CSV files to EXPORT_DIR (background)."""
+        if not self._controller_shows_loaded_experiment() or not self.state.stats:
             return
         st = self.state
-        st.summaries = dict(payload.get('summaries') or {})
-        st.load_info = dict(payload.get('load_info') or {})
-        st.marker_channels = list(payload.get('marker_channels') or [])
-        st.results_model_sha = str(payload.get('model_sha256') or '')
-        if payload.get('run_samples'):
-            st.run_samples = list(payload['run_samples'])
-        st.pending_samples = [k for k in (payload.get('pending_samples') or [])
-                              if k not in st.summaries]
-        st.run_fingerprint = str(payload.get('run_fingerprint') or '')
-        if st.summaries and st.results_model_sha and st.model_path \
-                and _file_sha256(st.model_path) != st.results_model_sha:
-            self.progress_message("The saved gating results were made with a different version "
-                                  "of the model file; run gating again to update them.")
+        folder = self._loaded_experiment_dir / EXPORT_DIR
+        stem, stamp = _export_stem(st.model_path), datetime.now().strftime('%Y%m%d_%H%M%S')
+        args = (dict(st.stats), _population_labels(st.gate_defs()), _antigen_map(self.controller))
+        self._start_writer(lambda: write_statistics_csv(folder, stem, stamp, *args),
+                           "Writing the statistics CSV")
+        _status(self.bus, f"Statistics written to {folder}")
