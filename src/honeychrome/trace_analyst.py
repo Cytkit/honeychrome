@@ -18,7 +18,7 @@ from honeychrome.settings import max_events_in_cache, n_channels_per_event, even
 from honeychrome.settings import adc_channels, peak_detection_channel_retrieved, area_channels, height_channels, width_channels, scatter_channels, fluorescence_channels
 
 verbosity_divider = int(1/analyser_target_repeat_time)
-gap = 10 # gap between start of end of baseline and start of peak
+gap = 4 # gap between start of end of baseline and start of peak
 left_gap = 0 # gap before trace starts
 
 default_baselines = np.zeros(n_channels_trace)

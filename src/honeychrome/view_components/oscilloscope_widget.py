@@ -106,16 +106,17 @@ class OscilloscopeWidget(QWidget):
             for i in self.scatter_channel_indices:
                 color = line_colors[i % len(line_colors)]
                 y = self.trace['traces'][i]
+                bound_height = self.trace['traces'][i][start:end].max() - self.trace['baselines'][i]
 
-                dotted_pen = pg.mkPen(color=color, width=2, style=Qt.DotLine)
-                dashed_pen = pg.mkPen(color=color, width=2, style=Qt.DashLine)
+                dotted_pen = pg.mkPen(color=color, width=5, style=Qt.DotLine)
+                # dashed_pen = pg.mkPen(color=color, width=2, style=Qt.DashLine)
                 solid_pen = pg.mkPen(color=color, width=2, style=Qt.SolidLine)
 
-                self.plot_widget1.plot(self.x, y, pen=dashed_pen)
+                # self.plot_widget1.plot(self.x, y, pen=dashed_pen)
                 self.plot_widget1.plot(self.x, y-self.trace['baselines'][i], pen=solid_pen)
-                self.plot_widget1.plot(peak_span, self.trace['baselines'][i] * np.ones(2), pen=dotted_pen)
-                self.plot_widget1.plot(peak_start, np.array([0, self.trace['traces'][i][start:end].max()]), pen=solid_pen)
-                self.plot_widget1.plot(peak_end, np.array([0, self.trace['traces'][i][start:end].max()]), pen=solid_pen)
+                # self.plot_widget1.plot(peak_span, self.trace['baselines'][i] * np.ones(2), pen=dotted_pen)
+                self.plot_widget1.plot(peak_start, np.array([0, bound_height]), pen=dotted_pen)
+                self.plot_widget1.plot(peak_end, np.array([0, bound_height]), pen=dotted_pen)
 
                 if i==self.peak_detection_channel_index:
                     pen = pg.mkPen(color=color, width=5, style=Qt.DotLine)
@@ -125,16 +126,17 @@ class OscilloscopeWidget(QWidget):
             for i in self.fluorescence_channel_indices:
                 color = line_colors[i % len(line_colors)]
                 y = self.trace['traces'][i]
+                bound_height = self.trace['traces'][i][start:end].max() - self.trace['baselines'][i]
 
-                dotted_pen = pg.mkPen(color=color, width=2, style=Qt.DotLine)
-                dashed_pen = pg.mkPen(color=color, width=2, style=Qt.DashLine)
+                dotted_pen = pg.mkPen(color=color, width=5, style=Qt.DotLine)
+                # dashed_pen = pg.mkPen(color=color, width=2, style=Qt.DashLine)
                 solid_pen = pg.mkPen(color=color, width=2, style=Qt.SolidLine)
 
-                self.plot_widget2.plot(self.x, y, pen=dashed_pen)
+                # self.plot_widget2.plot(self.x, y, pen=dashed_pen)
                 self.plot_widget2.plot(self.x, y-self.trace['baselines'][i], pen=solid_pen)
-                self.plot_widget2.plot(peak_span, self.trace['baselines'][i] * np.ones(2), pen=dotted_pen)
-                self.plot_widget2.plot(peak_start, np.array([0, self.trace['traces'][i][start:end].max()]), pen=solid_pen)
-                self.plot_widget2.plot(peak_end, np.array([0, self.trace['traces'][i][start:end].max()]), pen=solid_pen)
+                # self.plot_widget2.plot(peak_span, self.trace['baselines'][i] * np.ones(2), pen=dotted_pen)
+                self.plot_widget2.plot(peak_start, np.array([0, bound_height]), pen=dotted_pen)
+                self.plot_widget2.plot(peak_end, np.array([0, bound_height]), pen=dotted_pen)
 
                 if i==self.peak_detection_channel_index:
                     pen = pg.mkPen(color=color, width=5, style=Qt.DotLine)
