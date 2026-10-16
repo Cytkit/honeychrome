@@ -9,9 +9,14 @@ Gating plugins
   • zoom_axis_transform — applies a ZoomAxis drag to a Honeychrome Transform,
                           as the main window's plots do.
   • PopulationTree      — collapsible tree of the populations of a gating
-                          hierarchy, with single or extended selection.
+                          hierarchy, with single or extended selection, text
+                          search and filtering.
   • block_wheel         — stops a combo or spin box taking mouse-wheel
                           scrolling meant for the list or page around it.
+  • algorithm_combo     — algorithm picker whose entries are coloured as the
+                          algorithms' thresholds are drawn on the plots.
+  • FilterBar           — text search with a "show" filter, for long tables
+                          and trees.
 
 The file name does not end in ``_tab.py``, so the plugin loader does not
 treat it as a tab.
@@ -19,14 +24,18 @@ treat it as a tab.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFrame, QScrollArea, QSizePolicy, QToolBox,
+    QAbstractItemView, QAbstractScrollArea, QApplication, QComboBox, QFrame,
+    QHBoxLayout, QLabel, QLineEdit, QScrollArea, QSizePolicy, QToolBox,
     QTreeWidget, QTreeWidgetItem, QWidget,
 )
 
 __all__ = ['make_concertina', 'add_concertina_page', 'SquareHolder',
-           'zoom_axis_transform', 'PopulationTree', 'block_wheel']
+           'zoom_axis_transform', 'PopulationTree', 'block_wheel',
+           'algorithm_combo', 'colour_algorithm_items', 'set_combo_colour', 'FilterBar',
+           'text_matches']
 
 
 # ---------------------------------------------------------------------------
@@ -139,12 +148,165 @@ def zoom_axis_transform(axis, vb, axis_name: str, tr):
 # Mouse wheel
 # ---------------------------------------------------------------------------
 
+class _WheelBlocker(QObject):
+    """Event filter that keeps wheel events from the widgets it watches and
+    hands them to the nearest scroll area above, so the page or table
+    scrolls while the value under the pointer stays as it is."""
+
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.Type.Wheel:
+            return False
+        target = obj.parentWidget() if isinstance(obj, QWidget) else None
+        while target is not None and not isinstance(target, QAbstractScrollArea):
+            target = target.parentWidget()
+        if target is not None:
+            QApplication.sendEvent(target.viewport(), event)
+        return True
+
+
+_wheel_blocker = None
+
+
 def block_wheel(widget):
     """Make *widget* ignore the mouse wheel, so scrolling over it scrolls
-    the table or page it sits in instead of changing its value."""
+    the table or page it sits in instead of changing its value. Main
+    thread only."""
+    global _wheel_blocker
+    if _wheel_blocker is None:
+        _wheel_blocker = _WheelBlocker()
     widget.setFocusPolicy(Qt.StrongFocus)
-    widget.wheelEvent = lambda event: event.ignore()
+    widget.installEventFilter(_wheel_blocker)
     return widget
+
+
+# ---------------------------------------------------------------------------
+# Algorithm pickers
+# ---------------------------------------------------------------------------
+
+def _hex(rgb) -> str:
+    return '#{:02x}{:02x}{:02x}'.format(*[int(v) for v in rgb[:3]])
+
+
+def set_combo_colour(combo: QComboBox, rgb):
+    """Show the combo's current text in *rgb* (None: the default colour)."""
+    combo.setStyleSheet(f"QComboBox {{ color: {_hex(rgb)}; font-weight: bold; }}"
+                        if rgb is not None else "")
+
+
+def colour_algorithm_items(combo: QComboBox, colour_of):
+    """Draw each entry of an algorithm combo (entries named by algorithm) in
+    its colour, and the current entry's text likewise as it changes. Safe
+    to call again after the entries are replaced."""
+    for i in range(combo.count()):
+        name = combo.itemData(i) or combo.itemText(i)
+        combo.setItemData(i, QBrush(QColor(*colour_of(name)[:3])), Qt.ForegroundRole)
+
+    def _recolour(_index=None):
+        name = combo.currentData() or combo.currentText()
+        set_combo_colour(combo, colour_of(name) if name else None)
+
+    if not getattr(combo, '_algorithm_colours', False):
+        combo.currentIndexChanged.connect(_recolour)
+        combo._algorithm_colours = True
+    _recolour()
+
+
+def algorithm_combo(algorithms, current: str | None = None, colour_of=None) -> QComboBox:
+    """Combo box of *algorithms*, each entry drawn in its colour.
+
+    colour_of : callable, algorithm -> RGB tuple (e.g.
+                ag_core.algorithm_colour). The current entry's colour
+                follows the selection. The mouse wheel is blocked (see
+                block_wheel).
+    """
+    combo = block_wheel(QComboBox())
+    for name in algorithms:
+        combo.addItem(name, name)
+    if current in algorithms:
+        combo.setCurrentIndex(list(algorithms).index(current))
+    if colour_of is not None:
+        colour_algorithm_items(combo, colour_of)
+    return combo
+
+
+# ---------------------------------------------------------------------------
+# Search and filter bar
+# ---------------------------------------------------------------------------
+
+def text_matches(query: str, *texts) -> bool:
+    """True when every word of *query* occurs (case-insensitively) in one of
+    *texts*; an empty query matches everything."""
+    words = [w for w in str(query or '').lower().split() if w]
+    if not words:
+        return True
+    hay = ' '.join(str(t or '') for t in texts).lower()
+    return all(w in hay for w in words)
+
+
+class FilterBar(QWidget):
+    """A search box and a "Show" filter for a list, table or tree.
+
+    modes   : [(key, label)]; the first is the unfiltered view.
+    changed : emitted with (search text, mode key) whenever either changes.
+    """
+
+    changed = Signal(str, str)
+
+    def __init__(self, modes=None, placeholder: str = "Search…", vertical: bool = False,
+                 parent=None):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QVBoxLayout
+        outer = QVBoxLayout(self) if vertical else QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText(placeholder)
+        self.search.setClearButtonEnabled(True)
+        outer.addWidget(self.search, stretch=1)
+        self.combo = None
+        if modes:
+            row = QHBoxLayout()
+            row.addWidget(QLabel("Show:"))
+            self.combo = block_wheel(QComboBox())
+            for key, label in modes:
+                self.combo.addItem(label, key)
+            row.addWidget(self.combo, stretch=1)
+            outer.addLayout(row)
+            self.combo.currentIndexChanged.connect(lambda _i: self._emit())
+        self.search.textChanged.connect(lambda _t: self._emit())
+
+    def text(self) -> str:
+        return self.search.text().strip()
+
+    def clear(self):
+        """Empty the search and show everything."""
+        self.blockSignals(True)
+        self.search.clear()
+        if self.combo is not None:
+            self.combo.setCurrentIndex(0)
+        self.blockSignals(False)
+        self._emit()
+
+    def mode(self) -> str:
+        return self.combo.currentData() if self.combo is not None else ''
+
+    def set_mode(self, key: str):
+        if self.combo is not None:
+            i = self.combo.findData(key)
+            if i >= 0:
+                self.combo.setCurrentIndex(i)
+
+    def set_mode_label(self, key: str, label: str):
+        """Change the text of one filter choice (e.g. to show a count)."""
+        if self.combo is not None:
+            i = self.combo.findData(key)
+            if i >= 0:
+                self.combo.setItemText(i, label)
+
+    def is_active(self) -> bool:
+        return bool(self.text()) or (self.combo is not None and self.combo.currentIndex() > 0)
+
+    def _emit(self):
+        self.changed.emit(self.text(), self.mode())
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +434,46 @@ class PopulationTree(QTreeWidget):
 
     def depth(self, key) -> int:
         return self._depth.get((key[0] or '', key[1]), 0)
+
+    def keys(self) -> list:
+        """(gate, pop) of every node, parents before children."""
+        return list(self._items)
+
+    def parent_of(self, key):
+        return self._parents.get((key[0] or '', key[1]))
+
+    def set_filter(self, shown: set | None):
+        """Show only the nodes in *shown* and the nodes above them (None
+        shows every node). Nodes shown by the filter are expanded so they
+        are in view."""
+        self.blockSignals(True)
+        try:
+            if shown is None:
+                for item in self._items.values():
+                    item.setHidden(False)
+                return
+            visible = set()
+            for key in shown:
+                key = (key[0] or '', key[1])
+                while key is not None and key not in visible:
+                    visible.add(key)
+                    key = self._parents.get(key)
+            for key, item in self._items.items():
+                item.setHidden(key not in visible)
+            for key in visible:
+                parent = self._parents.get(key)
+                if parent is not None and parent in self._items:
+                    self._items[parent].setExpanded(True)
+        finally:
+            self.blockSignals(False)
+        self.expansionChanged.emit()
+
+    def mark(self, marks: dict):
+        """Colour nodes: {key: (RGB or None, tooltip suffix or '')}; nodes not
+        in *marks* return to the default colour."""
+        for key, item in self._items.items():
+            rgb, _tip = marks.get(key, (None, ''))
+            item.setForeground(0, QBrush(QColor(*rgb[:3])) if rgb is not None else QBrush())
 
     def is_open(self, key) -> bool:
         """True when the node and every node above it are expanded, so the
