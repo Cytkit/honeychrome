@@ -19,19 +19,25 @@ from honeychrome.settings import adc_channels, peak_detection_channel_retrieved,
 
 verbosity_divider = int(1/analyser_target_repeat_time)
 gap = 10 # gap between start of end of baseline and start of peak
+left_gap = 0 # gap before trace starts
 
 default_baselines = np.zeros(n_channels_trace)
 
 def peak_start_stop_baseline(tr, threshold):
     # initialise peak detector
-    baseline = tr[gap:baseline_length].mean()
+    baseline_start = np.isnan(tr).argmin() + left_gap
+    baseline = tr[baseline_start:baseline_start+baseline_length].mean()
     countdown = 0
     n_start = 0
     in_peak = False
-
-    for n in range(window_extension_length_pre, len(tr)):
+    n = 0
+    for n in range(baseline_start + window_extension_length_pre, len(tr)):
         # if not in peak, update baselines and detect if there is a peak
         condition = tr[n] - baseline > threshold
+
+        if np.isnan(tr[n]):
+            break
+
         if not in_peak:
             if condition:
                 in_peak = True
@@ -57,7 +63,13 @@ def peak_start_stop_baseline(tr, threshold):
 
 def peak_measurements(tr, n_start, n_end, deltaT, area_indices, height_indices):
     # baselines = np.concatenate((tr[:,gap:n_start-gap], tr[:,n_end-gap:]), axis=1).mean(axis=1)
-    baselines = tr[:,gap:n_start-gap].mean(axis=1)
+    # baselines = tr[:,gap:n_start-gap].mean(axis=1)
+
+    baselines = np.zeros(len(tr))
+    for ch in range(len(tr)):
+        baseline_start = np.isnan(tr[ch]).argmin() + left_gap
+        baselines[ch] = tr[ch,baseline_start:n_start-gap].mean()
+
     traces_truncated_baseline_subtracted = tr[:,n_start:n_end] - baselines.reshape(-1,1)
     heights = np.max(traces_truncated_baseline_subtracted[height_indices,:], axis=1)
     areas = np.sum(traces_truncated_baseline_subtracted[area_indices,:], axis=1)
@@ -272,9 +284,15 @@ class TraceAnalyser(mp.Process):
                 widths = np.zeros(n_new_events)
                 last_event_index = 0
                 for n, traces in enumerate(traces_batch_scaled):
-                    n_start, n_end, tr_baseline = peak_start_stop_baseline(traces[self.indices_peak_detection_channel_in_traces], self.threshold)
+                    tr_peak_detection = traces[self.indices_peak_detection_channel_in_traces]
+                    if not (tr_peak_detection == tr_peak_detection).any():
+                        # print('all nan') # debug: why would an all nan trigger trace come through?
+                        continue
+                    n_start, n_end, tr_baseline = peak_start_stop_baseline(tr_peak_detection, self.threshold)
+                    # print(n_start, n_end, tr_baseline) # debug
                     if n_start > 0:
                         peak, baselines = peak_measurements(traces, n_start, n_end, deltaT, self.indices_area_channels_in_traces, self.indices_height_channels_in_traces)
+                        # print(peak, baselines) # debug
                         areas[n], heights[n], widths[n], centre = peak
                         keep_mask[n] = True
                         last_event_index = n

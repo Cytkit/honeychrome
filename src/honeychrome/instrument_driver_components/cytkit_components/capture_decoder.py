@@ -58,9 +58,9 @@ class CaptureDecoder:
 
             N = len(index_start_packets) # number of events
             traces = np.empty((N, settings.n_channels_trace, trace_length), dtype=np.uint16)
-            traces.fill(65535) # this is the sentinel value for empty
+            traces.fill(65535) # this is the sentinel value for empty, gets replaced with np.nan in trace analyst
 
-            for n in index_start_packets:
+            for n, event_index in enumerate(index_start_packets):
                 packet_indices = np.flatnonzero(start_packets == n)
 
                 if len(np.unique(packet_indices)) == len(packet_indices):

@@ -63,14 +63,14 @@ class OscilloscopeWidget(QWidget):
 
             self.scatter_channel_indices = [i for i,channel in enumerate(adc_channels) if channel in scatter_channels]
             self.fluorescence_channel_indices = [i for i,channel in enumerate(adc_channels) if channel in fluorescence_channels]
-            for i in range(len(scatter_channels)):
+            for i in self.scatter_channel_indices:
                 color = line_colors[i % len(line_colors)]
-                entry = LegendEntry(color, scatter_channels[i])
+                entry = LegendEntry(color, adc_channels[i])
                 self.legendLayout1.addWidget(entry)
 
-            for i in range(len(fluorescence_channels)):
+            for i in self.fluorescence_channel_indices:
                 color = line_colors[i % len(line_colors)]
-                entry = LegendEntry(color, fluorescence_channels[i])
+                entry = LegendEntry(color, adc_channels[i])
                 self.legendLayout2.addWidget(entry)
 
             self.peak_detection_channel_index = adc_channels.index(str(instrument_settings.value("peak_detection_channel", peak_detection_channel)))
