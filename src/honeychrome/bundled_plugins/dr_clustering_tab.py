@@ -192,10 +192,11 @@ from PySide6.QtWidgets import (
 )
 
 from honeychrome.controller_components.functions import (
-    sample_from_fcs,
     apply_gates_in_place,
 )
-from honeychrome.controller_components.sample_loader import sample_key_for_path
+from honeychrome.controller_components.sample_loader import (
+    sample_key_for_path, snapshot_unmix_state,
+)
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.transform import Transform
 from honeychrome.view_components.clear_layout import clear_layout
@@ -243,7 +244,8 @@ import drc_help_texts
 import drc_predictive
 import drc_time_estimate
 from transforms_panel import (
-    TransformInspector, transform_from_params, transform_params as _transform_params,
+    TransformInspector, pool_population_events, transform_from_params,
+    transform_params as _transform_params,
 )
 
 _log = drc_logging.get_logger(__name__)
@@ -805,12 +807,13 @@ class _FrozenScrollArea(QScrollArea):
 _SideTabWidget = SideTabWidget
 
 
-# Events kept per (marker, cluster) cell in the Marker Heatmap / Ridgelines
-# summary. Cells larger than this are thinned by even systematic sampling
-# (deterministic) before the transform is applied. The median and the
-# 200-bin histogram of 100,000 events agree with the full cell to well
-# within the resolution of the plots. None keeps every event.
-MARKER_SUMMARY_MAX_EVENTS_PER_CELL = 100_000
+# Events kept per cluster for the Cluster Annotation plots (violins, Marker
+# Heatmap, Ridgelines). Larger clusters are thinned by even systematic
+# sampling across the run's samples (deterministic, the same events in
+# every channel) before the transform is applied. The median, the violin
+# density and the 200-bin histogram of 20,000 events agree with the full
+# cluster to well within the resolution of the plots. None keeps every event.
+CLUSTER_PLOT_MAX_EVENTS = 20_000
 # Sample Group Assignment table column sizes (pixels): the sample name is
 # capped so a long name cannot push the other columns out of view;
 # covariates get room to type.
@@ -2984,8 +2987,10 @@ class TransformTab(TransformInspector):
         """
         Events for Auto-transform, pooled across ALL selected training
         samples (a more robust estimate than the currently loaded sample
-        alone, and appropriate for the whole dataset); the currently loaded
-        sample when no training samples are selected.
+        alone, and appropriate for the whole dataset): about
+        TRANSFORM_TARGET_EVENTS gated events in all, an equal share from
+        each sample. The currently loaded sample when no training samples
+        are selected.
         """
         training_paths = self._get_training_sample_full_paths()
         if not training_paths:
@@ -3049,15 +3054,16 @@ class TransformTab(TransformInspector):
         self, full_paths: list[Path]
     ) -> dict[str, list[np.ndarray]]:
         """
-        Load and unmix each training sample FCS file, returning a dict of
-        {channel: [array_per_sample, …]}.
+        Gated, unmixed events pooled from the training samples, as
+        {channel: [pooled array]}.
 
-        Does NOT call controller.load_sample (which has side effects).
-        Instead replicates its unmixing step using
-        drc_pipeline.apply_unmixing_af_aware() — AF-corrected if an AF
-        profile is active, otherwise plain apply_transfer_matrix() — the
-        same side-effect-free helper load_unmixed_gated() uses, matching
-        what controller.load_sample / controller._apply_unmixing do.
+        Each sample contributes an equal share of about
+        TRANSFORM_TARGET_EVENTS gated events (see
+        transforms_panel.pool_population_events): only that many events
+        are read from each file, unmixed with the sample's own AF profile
+        assignment and gated with the sample's own gates (per-sample
+        overrides and its own Time range). Does NOT call
+        controller.load_sample (which has side effects).
         """
         channel_names = self.controller.experiment.settings.get(
             'unmixed', {}
@@ -3070,45 +3076,24 @@ class TransformTab(TransformInspector):
                   "cannot unmix training samples.")
             return result
 
-        selected_gates = self.state.selected_gates
-
-        whitelisted_pnn = self.controller.experiment.settings['raw'].get('whitelisted_pnn')
-
-        # Each sample is gated with its own gates (per-sample overrides and
-        # its own Time range), not those of the sample shown in the main window.
-        sample_gating = None
-        if selected_gates and selected_gates != ['root']:
-            sample_gating = SampleGating.from_controller(self.controller)
+        selected_gates = [g for g in (self.state.selected_gates or []) if g != 'root']
+        keys = [sample_key_for_path(self.controller.experiment_dir, path) for path in full_paths]
+        try:
+            snap = snapshot_unmix_state(self.controller, keys, include_qc=False)
+            sample_gating = SampleGating.from_controller(self.controller) if selected_gates else None
             gating_pnn = list(self.controller.data_for_cytometry_plots_unmixed['pnn'])
+            pooled, counts = pool_population_events(
+                self.controller.experiment_dir, keys, snap, sample_gating, gating_pnn,
+                selected_gates)
+        except Exception as e:
+            print(f"[DR TransformTab] Could not load the training samples: {e}")
+            return result
 
-        for path in full_paths:
-            try:
-                sample = sample_from_fcs(path)
-                raw = sample.get_events(source='raw', col_order=whitelisted_pnn)
-                sample_key = sample_key_for_path(self.controller.experiment_dir, path)
-
-                # Replicate controller.load_sample unmixing (AF-corrected if
-                # an AF profile is active — see drc_pipeline.apply_unmixing_af_aware).
-                unmixed = drc_pipeline.apply_unmixing_af_aware(
-                    self.controller, raw, sample_key=sample_key,
-                )
-
-                # Apply gate(s) if selected
-                if sample_gating is not None:
-                    try:
-                        unmixed = unmixed[sample_gating.population_mask(
-                            sample_key, unmixed, gating_pnn, list(selected_gates))]
-                    except Exception as e:
-                        print(f"[DR TransformTab] Gating failed for {path.name}: {e}")
-
-                for i, ch in enumerate(channel_names):
-                    if i < unmixed.shape[1]:
-                        result[ch].append(unmixed[:, i])
-
-                print(f"  Loaded {path.name}: {len(unmixed):,} events")
-            except Exception as e:
-                print(f"[DR TransformTab] Failed to load {path}: {e}")
-
+        for i, ch in enumerate(channel_names):
+            if i < pooled.shape[1]:
+                result[ch].append(pooled[:, i])
+        print(f"[DR TransformTab] Auto-transform: {len(pooled):,} gated events from "
+              f"{len(counts)} training sample(s)")
         return result
 
 
@@ -10377,7 +10362,9 @@ class ClusterAnnotationTab(QWidget):
         self._violin_recompute_timer.start()
 
     def _pool_violin_data(self, cl_run: dict, channels: list[str],
-                          af_state=None) -> dict[str, dict[int, list]]:
+                          af_state=None,
+                          max_events_per_cluster: int | None = CLUSTER_PLOT_MAX_EVENTS,
+                          ) -> dict[str, dict[int, list]]:
         """
         Pool per-cluster raw values for each channel from the run's own
         per-sample label arrays. Prefers the run's own 'marker_values'
@@ -10387,9 +10374,13 @@ class ClusterAnnotationTab(QWidget):
         made since). Falls back to live-reloading + truncating for runs
         archived before that snapshot existed.
 
-        Extracted from the old single-shot _plot_violins so results can
-        be cached per run_id instead of recomputed every time
-        the viewed channel changes.
+        A cluster with more than *max_events_per_cluster* events (over all
+        samples, in sample order) is thinned by even systematic sampling to
+        that many, the same events in every channel, so later steps (the
+        transform, violin densities, medians, histograms) only see a fixed
+        number of events per cluster. None keeps every event.
+
+        Returns {channel: {cluster_id: [per-sample arrays]}}.
         """
         labels_dict = cl_run.get('labels', {}) or {}
         snapshot_dict = cl_run.get('marker_values', {}) or {}
@@ -10397,6 +10388,7 @@ class ClusterAnnotationTab(QWidget):
         pooled: dict[str, dict[int, list]] = {ch: {} for ch in channels}
         self._violin_skipped_samples = []
 
+        loaded = []
         for rel in training_samples:
             labels = labels_dict.get(rel)
             if labels is None:
@@ -10436,22 +10428,43 @@ class ClusterAnnotationTab(QWidget):
                     )
                     self._violin_skipped_samples.append(rel)
                     continue
+            loaded.append((labels, values, list(names)))
 
-            # Boolean mask per cluster computed once per sample and reused
-            # across every channel -- previously `labels == cl_id` was
-            # recomputed inside the channel loop, redoing the same
-            # full-length comparison once per channel for no reason (cost
-            # scaled with n_channels x n_clusters x n_events instead of
-            # n_clusters x n_events).
-            cluster_masks = {int(cl_id): (labels == cl_id)
-                             for cl_id in np.unique(labels) if cl_id >= 0}
+        # Events of each cluster per sample, and each cluster's total.
+        rows_by_sample = []
+        totals: dict[int, int] = {}
+        for labels, _values, _names in loaded:
+            order = np.argsort(labels, kind='stable')
+            ids, starts, counts = np.unique(labels[order], return_index=True, return_counts=True)
+            rows = {int(cl_id): order[start:start + n]
+                    for cl_id, start, n in zip(ids, starts, counts) if cl_id >= 0}
+            rows_by_sample.append(rows)
+            for cl_id, r in rows.items():
+                totals[cl_id] = totals.get(cl_id, 0) + len(r)
 
-            for ch in channels:
-                if ch not in names:
+        # Positions kept in each cluster's sample-ordered event sequence.
+        kept = {}
+        for cl_id, total in totals.items():
+            if max_events_per_cluster is not None and total > max_events_per_cluster:
+                kept[cl_id] = (np.arange(max_events_per_cluster, dtype=np.int64)
+                               * total) // max_events_per_cluster
+            else:
+                kept[cl_id] = None
+
+        offsets = {cl_id: 0 for cl_id in totals}
+        for (labels, values, names), rows in zip(loaded, rows_by_sample):
+            columns = [(ch, names.index(ch)) for ch in channels if ch in names]
+            for cl_id, r in rows.items():
+                keep = kept[cl_id]
+                if keep is not None:
+                    lo, hi = np.searchsorted(keep, [offsets[cl_id], offsets[cl_id] + len(r)])
+                    r = r[keep[lo:hi] - offsets[cl_id]]
+                offsets[cl_id] += len(rows[cl_id])
+                if not len(r):
                     continue
-                col = values[:, names.index(ch)]
-                for cl_id, mask in cluster_masks.items():
-                    pooled[ch].setdefault(cl_id, []).append(col[mask])
+                block = values[r]
+                for ch, col in columns:
+                    pooled[ch].setdefault(cl_id, []).append(block[:, col])
 
         return pooled
 
@@ -11473,9 +11486,9 @@ class ClusterAnnotationTab(QWidget):
         values exactly ONCE, shared between the heatmap matrix (median per
         cell) and the ridgeline histogram grid. The channel's transform is
         built once and applied to every cluster; cells larger than
-        MARKER_SUMMARY_MAX_EVENTS_PER_CELL are thinned first.
+        CLUSTER_PLOT_MAX_EVENTS are thinned first.
         """
-        cap = MARKER_SUMMARY_MAX_EVENTS_PER_CELL
+        cap = CLUSTER_PLOT_MAX_EVENTS
         out: dict[str, dict[int, np.ndarray]] = {}
         for ch in channels:
             xform = _channel_xform(self.state, ch)
@@ -11652,11 +11665,58 @@ class ClusterAnnotationTab(QWidget):
         transformed: precomputed {channel: {cluster_id: transformed_array}}
         from _transform_and_pool_matrix_values -- shared with the heatmap
         matrix so the transform + concatenation only happens once.
+
+        Each panel's ridges are one polygon collection and one line
+        collection, and the ticks without labels (minor intensity ticks,
+        cluster rows beyond the first column) are drawn as one marker line
+        and one grid-line collection per panel rather than one Tick object
+        each, so the grid stays quick to build and draw with many markers
+        and clusters.
         """
+        import matplotlib as mpl
+        from matplotlib import markers as mmarkers
+        from matplotlib.collections import LineCollection, PolyCollection
         from matplotlib.figure import Figure
 
         is_dark = _resolve_is_dark(self.state)
+        fg = 'white' if is_dark else 'black'
         labels = _antigen_dash_labels(self.controller)
+        rc = mpl.rcParams
+
+        def _unlabelled_ticks(ax, positions, axis: str, which: str, length=None):
+            """Tick marks, and grid lines where the style draws them, at
+            *positions* on the 'x' or 'y' axis, styled as the axis' own
+            *which* ('major'/'minor') ticks."""
+            positions = np.asarray(positions, dtype=float)
+            if not len(positions):
+                return
+            key = f'{axis}tick.{which}'
+            size = rc[f'{key}.size'] if length is None else length
+            inward = rc[f'{axis}tick.direction'] == 'in'
+            if axis == 'x':
+                transform = ax.get_xaxis_transform()
+                xy = (positions, np.zeros(len(positions)))
+                marker = mmarkers.TICKUP if inward else mmarkers.TICKDOWN
+                segments = [[(p, 0.0), (p, 1.0)] for p in positions]
+            else:
+                transform = ax.get_yaxis_transform()
+                xy = (np.zeros(len(positions)), positions)
+                marker = mmarkers.TICKRIGHT if inward else mmarkers.TICKLEFT
+                segments = [[(0.0, p), (1.0, p)] for p in positions]
+            shown = rc['xtick.bottom'] if axis == 'x' else rc['ytick.left']
+            if shown and size > 0:
+                line, = ax.plot(*xy, transform=transform, linestyle='none', marker=marker,
+                                markersize=size, markeredgewidth=rc[f'{key}.width'],
+                                color=fg, clip_on=False)
+                line.set_in_layout(False)
+            if (rc['axes.grid'] and rc['axes.grid.axis'] in ('both', axis)
+                    and rc['axes.grid.which'] in ('both', which)):
+                below = rc['axes.axisbelow']
+                zorder = 0.5 if below is True else (1.5 if below == 'line' else 2.5)
+                ax.add_collection(LineCollection(
+                    segments, transform=transform, colors=rc['grid.color'],
+                    linewidths=rc['grid.linewidth'], linestyles=rc['grid.linestyle'],
+                    alpha=rc['grid.alpha'], zorder=zorder), autolim=False)
 
         n = len(channels)
         n_cols = min(4, max(1, n))
@@ -11668,11 +11728,8 @@ class ClusterAnnotationTab(QWidget):
 
         N_BINS = 200
 
-        ax0 = None
         for i, ch in enumerate(channels):
-            ax = fig.add_subplot(n_rows, n_cols, i + 1, sharey=ax0)
-            if ax0 is None:
-                ax0 = ax
+            ax = fig.add_subplot(n_rows, n_cols, i + 1)
 
             by_cluster = transformed.get(ch, {})
 
@@ -11696,7 +11753,14 @@ class ClusterAnnotationTab(QWidget):
                 bin_hi = bin_lo + 1.0
             bin_edges = np.linspace(bin_lo, bin_hi, N_BINS + 1)
             bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+            # Step outline through the bin centres, as drawstyle 'steps-mid'
+            step_x = np.concatenate((
+                [bin_centers[0]],
+                np.repeat(0.5 * (bin_centers[:-1] + bin_centers[1:]), 2),
+                [bin_centers[-1]],
+            ))
 
+            polygons, outlines, colours = [], [], []
             for row_idx, cl_id in enumerate(cluster_order):
                 arr = by_cluster.get(cl_id)
                 if arr is None:
@@ -11712,11 +11776,16 @@ class ClusterAnnotationTab(QWidget):
                 # First cluster in cluster_order at the TOP -- baseline
                 # counts down from n_clusters-1, not up from 0.
                 baseline = n_clusters - 1 - row_idx
-                color = colors_map.get(cl_id, '#888888')
-                ax.fill_between(bin_centers, baseline, baseline + density, color=color,
-                                alpha=0.75, linewidth=0, step='mid')
-                ax.plot(bin_centers, baseline + density, color=color, linewidth=0.8,
-                        drawstyle='steps-mid')
+                step_y = baseline + np.repeat(density, 2)
+                top = np.column_stack((step_x, step_y))
+                polygons.append(np.vstack((
+                    top, [[step_x[-1], baseline], [step_x[0], baseline]])))
+                outlines.append(top)
+                colours.append(colors_map.get(cl_id, '#888888'))
+            if polygons:
+                ax.add_collection(PolyCollection(polygons, facecolors=colours, alpha=0.75,
+                                                 linewidths=0))
+                ax.add_collection(LineCollection(outlines, colors=colours, linewidths=0.8))
 
             ax.set_title(labels.get(ch, ch), fontsize=9)
             ax.set_ylim(-0.3, n_clusters + 0.3)
@@ -11727,7 +11796,8 @@ class ClusterAnnotationTab(QWidget):
                     fontsize=7,
                 )
             else:
-                ax.tick_params(labelleft=False)
+                ax.set_yticks([])
+                _unlabelled_ticks(ax, np.arange(n_clusters), 'y', 'major')
             ax.tick_params(labelsize=6)
 
             # Data stays on the transformed scale (arr, above) -- only the
@@ -11738,8 +11808,10 @@ class ClusterAnnotationTab(QWidget):
                 major_ticks, minor_ticks, limits = tick_spec
                 ax.set_xticks([pos for pos, _label in major_ticks])
                 ax.set_xticklabels([label for _pos, label in major_ticks], fontsize=6)
-                ax.set_xticks([pos for pos, _label in minor_ticks], minor=True)
-                ax.tick_params(axis='x', which='minor', length=2, labelsize=0)
+                minor_x = np.array([pos for pos, _label in minor_ticks], dtype=float)
+                lo, hi = min(limits), max(limits)
+                _unlabelled_ticks(ax, minor_x[(minor_x >= lo) & (minor_x <= hi)], 'x', 'minor',
+                                  length=2)
                 ax.set_xlim(limits[0], limits[1])
                 ax.set_xlabel('Intensity', fontsize=6)
             else:

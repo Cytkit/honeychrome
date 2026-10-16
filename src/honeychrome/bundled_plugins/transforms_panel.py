@@ -46,12 +46,18 @@ import honeychrome.settings as hc_settings
 
 __all__ = ['TransformInspector', 'PopulationTransformsPanel', 'TransformSet', 'BiplotTile',
            'transform_params', 'transform_from_params', 'parks_moore_w', 'magnitude_decades',
-           'antigen_dash_labels', 'default_population', 'SKIP_CHANNELS']
+           'antigen_dash_labels', 'default_population', 'pool_population_events',
+           'SKIP_CHANNELS', 'TRANSFORM_TARGET_EVENTS']
 
 SKIP_CHANNELS = frozenset({'ribbon', 'Time', 'event_id'})
 TRANSFORM_KEYS = ('id', 'scale_t', 'linear_a', 'logicle_w', 'logicle_m', 'logicle_a',
                   'log_m', 'limits')
 _ZOOM_RATE = 1.04
+# Events of the chosen population pooled over the samples for display and
+# Auto-transform: ample for the 25th percentile of the negative events.
+TRANSFORM_TARGET_EVENTS = 30_000
+# Most events read from one sample while topping up a rare population.
+MAX_EVENTS_READ_PER_SAMPLE = 2_000_000
 
 # ---------------------------------------------------------------------------
 # Deferred Qt imports: pyqtgraph and the cytometry plot components create Qt
@@ -1010,13 +1016,68 @@ class TransformInspector(QWidget):
 # Population view for the gating plugins
 # ---------------------------------------------------------------------------
 
+def pool_population_events(experiment_dir, keys, snap, gating, pnn, gates,
+                           target: int = TRANSFORM_TARGET_EVENTS, seed: int = 42,
+                           max_read: int = MAX_EVENTS_READ_PER_SAMPLE):
+    """About *target* events of a population, pooled evenly over samples.
+
+    Each sample is read with an equal share of *target* as its event cap
+    (only those events are read from the file; see
+    ``sample_loader.load_unmixed``), unmixed and gated with its own gates.
+    A sample whose share of the population falls short is read again with
+    a cap raised from the fraction it showed (at most *max_read* events),
+    so a small population still reaches its share where the file holds
+    enough events. Worker-safe.
+
+    keys   : sample keys (paths relative to *experiment_dir*).
+    snap   : unmixing snapshot (``sample_loader.snapshot_unmix_state``).
+    gating : ``SampleGating``, or None to keep every event.
+    pnn    : unmixed channel names, in column order.
+    gates  : gate names whose union is kept; None, [] or ['root'] keeps all.
+
+    Returns (events, {key: n_events}) with the events as float32.
+    """
+    from honeychrome.controller_components.sample_loader import load_unmixed
+
+    keys = [str(k) for k in keys]
+    gates = [g for g in (gates or []) if g != 'root']
+    share = max(1, int(math.ceil(target / max(len(keys), 1))))
+
+    def _load(key, cap):
+        out = load_unmixed(experiment_dir, key, snap, max_events=cap, seed=seed)
+        events = np.asarray(out['unmixed'], dtype=np.float32)
+        n_read = len(events)
+        if gates and gating is not None:
+            events = events[gating.population_mask(key, events, list(pnn), list(gates))]
+        return events, n_read, int(out['n_events_kept'])
+
+    chunks, counts = {}, {}
+    for key in keys:
+        events, n_read, n_kept = _load(key, share)
+        if len(events) < share and n_read < n_kept:
+            fraction = len(events) / max(n_read, 1)
+            wanted = int(math.ceil(1.2 * share / fraction)) if fraction > 0 else max_read
+            cap = min(max(wanted, n_read + 1), max_read, n_kept)
+            if cap > n_read:
+                events, _n_read, _n_kept = _load(key, cap)
+                if len(events) > share:
+                    keep = (np.arange(share, dtype=np.int64) * len(events)) // share
+                    events = events[keep]
+        chunks[key] = events
+        counts[key] = int(len(events))
+    pooled = (np.concatenate(list(chunks.values()), axis=0) if chunks
+              else np.empty((0, len(pnn)), dtype=np.float32))
+    return pooled, counts
+
+
 class _PopulationLoader(QThread):
     """Load, unmix and gate a few samples; emits finished(ok, message,
-    (events, n_per_sample)) with the events of one population pooled."""
+    (events, n_per_sample)) with the events of one population pooled
+    (see pool_population_events)."""
 
     finished = Signal(bool, str, object)
 
-    def __init__(self, experiment_dir, keys, snapshot, gating, pnn, population, per_sample,
+    def __init__(self, experiment_dir, keys, snapshot, gating, pnn, population, target,
                  seed: int = 42, parent=None):
         super().__init__(parent)
         self._dir = experiment_dir
@@ -1025,25 +1086,15 @@ class _PopulationLoader(QThread):
         self._gating = gating
         self._pnn = list(pnn)
         self._population = population
-        self._per_sample = int(per_sample)
+        self._target = int(target)
         self._seed = int(seed)
 
     def run(self):
-        from honeychrome.controller_components.sample_loader import load_unmixed
         try:
-            chunks, counts = [], {}
-            for key in self._keys:
-                out = load_unmixed(self._dir, key, self._snap, max_events=self._per_sample,
-                                   seed=self._seed)
-                events = np.asarray(out['unmixed'], dtype=np.float32)
-                if self._population and self._population != 'root' and self._gating is not None:
-                    mask = self._gating.population_mask(key, events, self._pnn, [self._population])
-                    events = events[mask]
-                chunks.append(events)
-                counts[key] = int(len(events))
-            pooled = np.concatenate(chunks, axis=0) if chunks else np.empty((0, len(self._pnn)),
-                                                                            dtype=np.float32)
-            self.finished.emit(True, '', (pooled, counts))
+            gates = [self._population] if self._population else []
+            out = pool_population_events(self._dir, self._keys, self._snap, self._gating,
+                                         self._pnn, gates, target=self._target, seed=self._seed)
+            self.finished.emit(True, '', out)
         except Exception as exc:
             self.finished.emit(False, str(exc), None)
 
@@ -1069,8 +1120,7 @@ class PopulationTransformsPanel(TransformInspector):
     populationChanged = Signal(str)
 
     MAX_SAMPLES = 6
-    TARGET_EVENTS = 200_000
-    MIN_EVENTS_PER_SAMPLE = 20_000
+    TARGET_EVENTS = TRANSFORM_TARGET_EVENTS
 
     def __init__(self, controller, transform_set: TransformSet, sample_keys, help_text: str = '',
                  reset_label: str = '', reset=None, parent=None):
@@ -1197,10 +1247,9 @@ class PopulationTransformsPanel(TransformInspector):
             return
         pnn = list(self.controller.experiment.settings.get('unmixed', {})
                    .get('event_channels_pnn') or [])
-        per_sample = max(self.TARGET_EVENTS // len(keys), self.MIN_EVENTS_PER_SAMPLE)
         self.lbl_samples.setText(f"Loading {len(keys)} sample(s) …")
         loader = _PopulationLoader(self.controller.experiment_dir, keys, snap, gating, pnn,
-                                   self._population, per_sample, parent=self)
+                                   self._population, self.TARGET_EVENTS, parent=self)
         loader.finished.connect(lambda ok, msg, out, r=request: self._on_loaded(ok, msg, out, r))
         self._loader = loader
         loader.start()

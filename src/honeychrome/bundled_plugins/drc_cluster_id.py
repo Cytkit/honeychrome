@@ -63,6 +63,33 @@ log = get_logger(__name__)
 # (not just means) since MEM needs medians and IQRs, not just a mean.
 # ---------------------------------------------------------------------------
 
+def _stored_raw_values(cl_run: dict, channels: list[str]) -> dict | None:
+    """
+    {rel_path: (labels, raw values for *channels*)} from the run's own
+    'marker_values' (the untransformed values of the selected channels,
+    stored row-for-row with the labels when the run was classified -- see
+    drc_clustering._snapshot_marker_values), or None when any training
+    sample with labels lacks them or any of *channels*.
+    """
+    labels_dict = cl_run.get('labels', {}) or {}
+    stored = cl_run.get('marker_values', {}) or {}
+    out = {}
+    for rel in cl_run.get('training_sample_ids', []):
+        labels = labels_dict.get(rel)
+        if labels is None:
+            continue
+        entry = stored.get(rel)
+        if entry is None:
+            return None
+        values, names = entry
+        names = list(names)
+        if any(ch not in names for ch in channels) or len(values) != len(labels):
+            return None
+        values = np.asarray(values)
+        out[rel] = (np.asarray(labels), values[:, [names.index(ch) for ch in channels]])
+    return out
+
+
 def pool_cluster_marker_values(controller, state, cl_run: dict,
                                 channels: list[str],
                                 progress_callback=None,
@@ -77,11 +104,16 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
     globals, matching _plot_violins's per-run isolation. Noise (cluster id
     < 0) is excluded, same as the violin plots.
 
+    The values come from the run's own stored marker values when every
+    training sample has them (no file is read or unmixed); the
+    downsampling below is then done before the transform, so only the
+    kept events are transformed. Otherwise every training sample is
+    loaded, unmixed and gated again
+    (drc_pipeline.load_sample_transformed_values).
+
     progress_callback: optional callable(n_samples_done: int), invoked
-    after EACH training sample finishes loading (whether or not it
-    contributed data) -- lets the tab drive a progress bar without a
-    background thread, since loading + unmixing each sample from disk is
-    the dominant cost here, not the in-memory MEM math afterward.
+    after EACH training sample is pooled (whether or not it contributed
+    data) -- lets the tab drive a progress bar.
 
     af_state: optional unmixing snapshot -- see
     drc_pipeline.apply_unmixing_af_aware()'s docstring.
@@ -111,16 +143,40 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
     downsampled) np.ndarray}}. A channel/cluster combination with no
     data is simply absent from the inner dict (callers must use .get()).
     """
-    labels_dict = cl_run.get('labels', {}) or {}
     training_samples = cl_run.get('training_sample_ids', [])
-    pooled: dict[str, dict[int, list]] = {ch: {} for ch in channels}
-    misaligned: list[str] = []
-
+    stored = _stored_raw_values(cl_run, channels)
     log.info(
         "pool_cluster_marker_values: pooling %d channel(s) across %d training "
-        "sample(s), transformed scale",
+        "sample(s), transformed scale, from %s",
         len(channels), len(training_samples),
+        "the run's stored marker values" if stored is not None else "the sample files",
     )
+    if stored is not None:
+        pooled: dict[str, dict[int, list]] = {ch: {} for ch in channels}
+        for i, rel in enumerate(training_samples):
+            if rel not in stored:
+                log.warning("pool_cluster_marker_values: %s -- no cluster labels recorded for this sample, skipped", rel)
+            else:
+                labels, values = stored[rel]
+                _pool_sample(pooled, channels, values, channels, labels)
+            if progress_callback is not None:
+                progress_callback(i + 1)
+        result = _downsample_pooled(pooled, max_events_per_cluster, seed)
+        for ch in channels:
+            params = state.channel_transform_params.get(ch, {})
+            transform_id = int(params.get('id', 1)) if params else 1
+            xform = drc_pipeline._build_flowkit_transform(transform_id, params)
+            for cl, arr in result[ch].items():
+                arr = arr.astype(np.float64)
+                if xform is not None:
+                    arr = xform.apply(arr)
+                result[ch][cl] = arr.astype(np.float32)
+        _log_pooled(result)
+        return result
+
+    labels_dict = cl_run.get('labels', {}) or {}
+    pooled: dict[str, dict[int, list]] = {ch: {} for ch in channels}
+    misaligned: list[str] = []
     for i, rel in enumerate(training_samples):
         mv = drc_pipeline.load_sample_transformed_values(controller, state, rel, channels, af_state=af_state)
         if mv is None:
@@ -147,14 +203,7 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
             if progress_callback is not None:
                 progress_callback(i + 1)
             continue
-        for ch in channels:
-            if ch not in names:
-                continue
-            col = values[:, names.index(ch)]
-            for cl_id in np.unique(labels):
-                if cl_id < 0:
-                    continue
-                pooled[ch].setdefault(int(cl_id), []).append(col[labels == cl_id])
+        _pool_sample(pooled, channels, values, names, labels)
         if progress_callback is not None:
             progress_callback(i + 1)
 
@@ -168,6 +217,28 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
             "unmixing the run was made with."
         )
 
+    result = _downsample_pooled(pooled, max_events_per_cluster, seed)
+    _log_pooled(result)
+    return result
+
+
+def _pool_sample(pooled: dict, channels: list[str], values: np.ndarray, names: list[str],
+                 labels: np.ndarray):
+    """Append one sample's values of each channel, split by cluster."""
+    for ch in channels:
+        if ch not in names:
+            continue
+        col = values[:, names.index(ch)]
+        for cl_id in np.unique(labels):
+            if cl_id < 0:
+                continue
+            pooled[ch].setdefault(int(cl_id), []).append(col[labels == cl_id])
+
+
+def _downsample_pooled(pooled: dict, max_events_per_cluster: int | None,
+                       seed: int) -> dict[str, dict[int, np.ndarray]]:
+    """Concatenate each (channel, cluster) cell and cap it at
+    *max_events_per_cluster* events by seeded random downsampling."""
     rng = np.random.default_rng(seed)
     result: dict[str, dict[int, np.ndarray]] = {}
     n_capped = 0
@@ -184,7 +255,15 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
                 arr = arr[idx]
                 n_capped += 1
             result[ch][cl] = arr
+    log.info(
+        "pool_cluster_marker_values: capped %d/%d (channel, cluster) cell(s) "
+        "to <= %s events (seed=%d)",
+        n_capped, n_total, max_events_per_cluster, seed,
+    )
+    return result
 
+
+def _log_pooled(result: dict):
     for ch, by_cl in result.items():
         if not by_cl:
             log.warning(
@@ -197,12 +276,6 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
                 "  %-22s pooled %d cluster(s), n_events: %s",
                 ch, len(by_cl), {cl: len(v) for cl, v in by_cl.items()},
             )
-    log.info(
-        "pool_cluster_marker_values: capped %d/%d (channel, cluster) cell(s) "
-        "to <= %s events (seed=%d)",
-        n_capped, n_total, max_events_per_cluster, seed,
-    )
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -508,12 +581,20 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
     return result
 
 
+# Events read from an unstained sample for its positivity thresholds: a
+# seeded subsample, ample for a 98th percentile.
+UNSTAINED_MAX_EVENTS = 200_000
+
+
 def _load_unstained_gated_transformed(
     controller, state, rel_path, channels: list[str], af_state=None,
-    min_singlets_events: int = 500,
+    min_singlets_events: int = 500, max_events: int | None = UNSTAINED_MAX_EVENTS,
 ) -> tuple[np.ndarray, list[str]] | None:
     """
-    Load ONE unstained sample -> TRANSFORMED values for `channels`.
+    Load ONE unstained sample -> TRANSFORMED values for `channels`, from a
+    seeded subsample of at most *max_events* of its events (only those are
+    read from the file -- see sample_loader.read_raw_subsample); None
+    reads every event.
 
     Gated on 'Singlets', NOT state.selected_gates -- an unstained sample
     carries no staining, so it will not fall inside whatever stained gate
@@ -545,22 +626,20 @@ def _load_unstained_gated_transformed(
         # includes raw_samples_subdirectory) -- NOT training_sample_ids'
         # picker-relative convention, so sample_abs_path() must NOT be used
         # here (it would prepend raw_samples_subdirectory a second time).
+        from types import SimpleNamespace
+        from honeychrome.controller_components.sample_loader import read_raw_subsample
+
         abs_path = controller.experiment_dir / rel_path
         raw_settings = controller.experiment.settings['raw']
         whitelisted_pnn = raw_settings.get('whitelisted_pnn') or None
-
-        sample = drc_pipeline.sample_from_fcs(abs_path)
-        if whitelisted_pnn is not None:
-            try:
-                raw = sample.get_events(source='raw', col_order=whitelisted_pnn)
-            except (KeyError, ValueError) as e:
-                log.warning(
-                    "_load_unstained_gated_transformed: col_order get_events "
-                    "failed (%s) -- reading all channels", e,
-                )
-                raw = sample.get_events(source='raw')
-        else:
-            raw = sample.get_events(source='raw')
+        layout = SimpleNamespace(
+            pnn_raw=tuple(whitelisted_pnn or raw_settings['event_channels_pnn']),
+            whitelisted=whitelisted_pnn is not None,
+        )
+        raw, _rows, n_file, _n_kept = read_raw_subsample(abs_path, layout, str(rel_path),
+                                                          max_events)
+        log.debug("_load_unstained_gated_transformed: %s -- %d of %d event(s)",
+                  rel_path, len(raw), n_file)
 
         if af_state is None:
             af_state = (controller.transfer_matrix, None, None)

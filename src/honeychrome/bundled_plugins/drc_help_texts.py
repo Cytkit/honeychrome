@@ -44,7 +44,8 @@ adjusts Logicle W; upper half zooms the display range).</li>
 <li>Use <b>Auto-transform (all channels)</b> to run an automated
 W estimate across every channel in one step, pooling all selected
 training samples for a more stable estimate than a single sample would
-give.</li>
+give: about 30,000 events of the checked gates in all, an equal share from
+each sample, read without loading the whole file.</li>
 <li>Add or remove <b>biplots</b> below the 1-D histogram to inspect two
 channels together; drag either axis to adjust that channel's transform.</li>
 <li>Use <b>Save CSV</b> / <b>Load CSV</b> to export or re-import the
@@ -259,6 +260,10 @@ each marker, stacked for easy comparison.</li>
 </ul>
 <p>Click <b>Recompute Marker Summary</b> after changing the clustering
 run or channel selection.</p>
+<p>The violins, heatmap and ridgelines use up to 20,000 events per cluster,
+spread evenly over the run's samples, taken from the marker values stored
+with the run. Cluster ID suggestions use those stored values too, so neither
+reads the sample files again for runs that have them.</p>
 <p>The per-cluster marker distribution views and the editable cluster
 names are in the spirit of the marker-distribution and cluster
 relabelling tools of the MARMOT pipeline [4].</p>
