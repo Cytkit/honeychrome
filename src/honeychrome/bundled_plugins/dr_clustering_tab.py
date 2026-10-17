@@ -44,7 +44,7 @@ Clustering:
   FlowSOM: SOM grid, manual metacluster count (2-200).
   Leiden: hnswlib kNN graph of the clustering's own training events;
   graspologic-native community detection.
-  HDBSCAN: applied to UMAP embedding if available, else raw feature space.
+  HDBSCAN: on a DR embedding only (PaCMAP, then UMAP, then tSNE by default).
   All algorithms assign labels to every sample via nearest-centroid.
   Cluster colours from cc.glasbey; noise label −1 → grey.
 
@@ -2579,6 +2579,7 @@ class ConfigTab(QWidget):
             ),
         }
         self._cl_algo_note.setText(notes.get(algo, ''))
+        self._refresh_cl_space_combo()
         self._refresh_cl_status()
 
     def _refresh_cl_status(self):
@@ -2597,11 +2598,22 @@ class ConfigTab(QWidget):
             self.cl_status_label.setText("No clustering run.")
             self.cl_status_label.setStyleSheet("color: grey;")
 
+    # Default DR embedding for clustering: first usable one wins
+    _CL_DR_PREFERENCE = ('PaCMAP', 'UMAP', 'tSNE')
+
     def _refresh_cl_space_combo(self):
-        """Populate the DR embedding combo with any trained DR algorithms."""
+        """
+        Populate the DR embedding combo with the embeddings that can be
+        clustered on, in _CL_DR_PREFERENCE order. The current choice is kept
+        while it stays usable; otherwise the first (preferred) one is selected.
+        """
         if not hasattr(self, '_cl_dr_combo'):
             return
-        available = self.state.available_algorithms()
+        plugin = self._plugin_widget()
+        if plugin is None:
+            return
+        available = [a for a in self._CL_DR_PREFERENCE
+                     if plugin._dr_embedding_unusable(a) is None]
         current = self._cl_dr_combo.currentText()
         self._cl_dr_combo.blockSignals(True)
         self._cl_dr_combo.clear()
@@ -12126,9 +12138,9 @@ class PluginWidget(QWidget):
         # Shared state — passed by reference to all inner tabs
         self.state = PipelineState()
 
-        # {algorithm: run_id} — tracks which archived DR run 'Apply to All
-        # Samples' should extend, for the algorithm most recently trained
-        # in THIS session (see _archive_dr_run / _update_archived_dr_run).
+        # {algorithm: run_id} — the archived DR run behind each live embedding
+        # (state.embeddings); 'Apply to All Samples' extends this run. Saved
+        # in the current_state bundle.
         self._active_dr_run_id: dict[str, str] = {}
         # Training settings and pool size of each session-trained DR model, for
         # the run-time calibration of later 'Apply to All Samples' runs
@@ -12273,6 +12285,10 @@ class PluginWidget(QWidget):
         A run was renamed or deleted in ConfigTab's management table.
         Refresh every other place that lists runs so the change shows up immediately.
         """
+        self._drop_orphaned_dr_embeddings()
+        if hasattr(self, 'config_tab'):
+            self.config_tab._refresh_dr_status()
+            self.config_tab._refresh_cl_space_combo()
         if hasattr(self, 'groups_stats_tab'):
             self.groups_stats_tab._clear_stale_run_results()
             self.groups_stats_tab._populate_run_combo()
@@ -13032,6 +13048,7 @@ class PluginWidget(QWidget):
         )
         # Restore heavy state (models, embeddings, cluster labels) from sidecar
         self._load_model_sidecar()
+        self._drop_orphaned_dr_embeddings()
         print(f"[DR Plugin] State loaded for experiment: {key}")
 
         # Re-evaluate the Run Stats button now that cluster_labels are restored.
@@ -13110,6 +13127,7 @@ class PluginWidget(QWidget):
             ('trained_reducers',  tree_data),
             ('embeddings',        self.state.embeddings),
             ('embedding_rows',    self.state.embedding_rows),
+            ('active_dr_run_ids', dict(self._active_dr_run_id)),
             ('cluster_labels',    self.state.cluster_labels),
             ('cluster_rows',      self.state.cluster_rows),
             ('trex_scores',       self.state.trex_scores),
@@ -13194,6 +13212,9 @@ class PluginWidget(QWidget):
         except Exception as e:
             print(f"[DR Plugin] Could not load run archive: {e}")
 
+        # Source runs belong to the experiment being opened
+        self._active_dr_run_id = {}
+
         if path is None or not drc_persist.bundle_exists(path):
             return
         try:
@@ -13204,6 +13225,10 @@ class PluginWidget(QWidget):
                 self.state.embeddings = payload['embeddings']
             if isinstance(payload.get('embedding_rows'), dict):
                 self.state.embedding_rows = payload['embedding_rows']
+            if isinstance(payload.get('active_dr_run_ids'), dict):
+                self._active_dr_run_id = {
+                    str(a): r for a, r in payload['active_dr_run_ids'].items()
+                    if isinstance(r, str) and r}
             if isinstance(payload.get('cluster_labels'), dict):
                 self.state.cluster_labels = payload['cluster_labels']
             if isinstance(payload.get('cluster_rows'), dict):
@@ -14309,6 +14334,7 @@ class PluginWidget(QWidget):
                 self.state.dr_status[algo] = 'done' if task == 'apply' else 'idle'
         if hasattr(self, 'config_tab'):
             self.config_tab._refresh_dr_status()
+            self.config_tab._refresh_cl_space_combo()
         self._dr_worker = None
 
     def _archive_dr_run(self, algo: str, params: dict):
@@ -14411,19 +14437,25 @@ class PluginWidget(QWidget):
                                 "Select a gate in the Configuration tab.")
             return
 
-        # Clustering in a DR space needs that DR's embedding of every training
-        # sample; a partial embedding would silently cluster a subset.
+        # Clustering in a DR space needs a usable embedding of every training
+        # sample from a DR run that still exists.
         if params.get('_space') == 'dr':
             dr_algo = params.get('_dr_algo') or ''
-            embedded = self.state.embeddings.get(dr_algo) or {}
-            missing = [rel for rel in self.state.training_sample_ids if rel not in embedded]
-            if missing:
+            if not dr_algo:
                 QMessageBox.warning(
-                    self, "DR Embedding Incomplete",
-                    f"Clustering in {dr_algo or 'DR'} space needs a {dr_algo or 'DR'} "
-                    f"embedding of every training sample, but {len(missing)} of "
-                    f"{len(self.state.training_sample_ids)} are missing.\n\n"
-                    "Run (or re-run) the DR first, or cluster in marker space.")
+                    self, "No DR Embedding",
+                    f"{algo} in DR space needs a PaCMAP, UMAP or tSNE embedding of "
+                    "every training sample, and none is available.\n\n"
+                    "Train a DR first"
+                    + ("." if algo == 'HDBSCAN' else ", or cluster on the original features."))
+                return
+            problem = self._dr_embedding_unusable(dr_algo)
+            if problem:
+                QMessageBox.warning(
+                    self, "DR Embedding Not Usable",
+                    f"Cannot cluster on the {dr_algo} embedding:\n\n{problem}\n\n"
+                    f"Train {dr_algo} again or choose another embedding"
+                    + ("." if algo == 'HDBSCAN' else ", or cluster on the original features."))
                 return
             problems = self._dr_embedding_sync_problems(dr_algo)
             if problems:
@@ -14455,10 +14487,51 @@ class PluginWidget(QWidget):
         """
         candidates = [e for e in self.state.dr_runs if e.get('algorithm') == dr_algo]
         active_id = self._active_dr_run_id.get(dr_algo)
-        for entry in candidates:
-            if active_id and entry.get('run_id') == active_id:
-                return entry
+        if active_id:
+            # None once this session's run has been deleted
+            return next((e for e in candidates if e.get('run_id') == active_id), None)
         return max(candidates, key=lambda e: e.get('timestamp', ''), default=None)
+
+    def _dr_embedding_unusable(self, dr_algo: str) -> str | None:
+        """
+        Why the live *dr_algo* embedding cannot be clustered on, or None when
+        it can: it must be trained, cover every training sample, and come from
+        a DR run still in the archive (a deleted run's embedding cannot be
+        checked against the current gating and unmixing).
+        """
+        if self.state.dr_status.get(dr_algo) != 'done':
+            return f"No {dr_algo} embedding has been trained."
+        embedded = self.state.embeddings.get(dr_algo) or {}
+        missing = [rel for rel in self.state.training_sample_ids if rel not in embedded]
+        if missing:
+            return (f"{len(missing)} of {len(self.state.training_sample_ids)} training "
+                    f"samples have no {dr_algo} embedding.")
+        if self._source_dr_run_entry(dr_algo) is None:
+            return (f"The {dr_algo} run that made this embedding has been deleted, so "
+                    "its cells cannot be matched to the current gating and unmixing.")
+        return None
+
+    def _drop_orphaned_dr_embeddings(self):
+        """
+        Clear the live model, embedding and status of each DR algorithm whose
+        source run is no longer archived (deleted), so it is neither offered
+        for clustering nor shown as trained. Skipped while a DR run is active.
+        """
+        if self._dr_worker is not None:
+            return
+        for algo in ConfigTab._CL_DR_PREFERENCE:
+            live = (algo in self.state.embeddings or algo in self.state.trained_reducers
+                    or self.state.dr_status.get(algo) == 'done')
+            if not live or self._source_dr_run_entry(algo) is not None:
+                continue
+            for store in (self.state.embeddings, self.state.embedding_features,
+                          self.state.embedding_rows, self.state.trained_reducers,
+                          self.state.dr_timestamps, self._active_dr_run_id,
+                          self._dr_train_params, self._dr_pool_size):
+                store.pop(algo, None)
+            self.state.dr_status[algo] = 'idle'
+            _log.info("Dropped the live %s embedding: its DR run is no longer archived",
+                      algo)
 
     def _dr_embedding_sync_problems(self, dr_algo: str) -> list[str]:
         """
