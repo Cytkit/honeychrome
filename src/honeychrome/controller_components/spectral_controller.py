@@ -13,6 +13,9 @@ from honeychrome.controller_components.functions import timer, sample_from_fcs, 
 from honeychrome.controller_components.spectral_functions import get_profile, get_raw_events
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.label_matching import match_fluorophore, match_marker, get_fluorophore_db, get_marker_db
+from honeychrome.controller_components.particle_type import (
+    scatter_core_log_area, classify_particle_type, scatter_channel_pair, scatter_ceilings,
+)
 from honeychrome.controller_components.spectral_reference_library import profile_id_from_description
 from honeychrome.controller_components.spectral_cleaning import find_empirical_peak, cosine_filter, knn_scatter_match, exclude_saturated, CleanResult
 from honeychrome.controller_components.spectral_refinement import (
@@ -603,6 +606,13 @@ class SpectralAutoGenerator(QObject):
         self.insufficient_events_warnings = []         # tubenames; shown once at end of run()
         self.low_events = LowEventLog(controller, bus, collect=True)   # shown once at end of run()
 
+        # particle type from scatter, for controls not named cells or beads
+        raw_settings = self.controller.experiment.settings['raw']
+        self.scatter_pair = scatter_channel_pair(raw_settings, self.controller.experiment.cytometry.get('raw_plots'))
+        self.scatter_ceilings = scatter_ceilings(raw_settings, self.scatter_pair) if self.scatter_pair else None
+        self.scatter_anchor_log_area = None   # unstained cell control
+        self.scatter_typed = []               # (tubename, particle_type); shown once at end of run()
+
         self.progress_target = len(self.samples['single_stain_controls'])
         # self.progress_target = len(self.samples['single_stain_controls'][:5]) # quick test
 
@@ -663,6 +673,16 @@ class SpectralAutoGenerator(QObject):
             )
             self._report_warning(combined_insufficient)
 
+        scatter_beads = [name for name, particle_type in self.scatter_typed if particle_type == 'Beads']
+        if self.bus and scatter_beads:
+            names = ', '.join(f'"{name}"' for name in scatter_beads)
+            self._report_warning(
+                f'{len(self.scatter_typed)} control(s) do not say "cells" or "beads" in their name, '
+                f'so their particle type was set from scatter. Set to Beads: {names}. '
+                f'The rest were set to Cells.\n\n'
+                f'Check the Particle Type column and correct any that are wrong.'
+            )
+
         low_event_text = self.low_events.text()
         if self.bus and low_event_text:
             self._report_warning(low_event_text)
@@ -680,6 +700,17 @@ class SpectralAutoGenerator(QObject):
             collector.append(text)
         elif self.bus:
             self.bus.warningMessage.emit(text)
+
+    def _scatter_log_area(self, sample) -> float | None:
+        """Core area of the sample's ungated FSC/SSC (see particle_type)."""
+        if self.scatter_pair is None:
+            return None
+        try:
+            scatter = sample.get_events('raw', col_order=list(self.scatter_pair))
+        except (KeyError, ValueError) as e:
+            logger.warning(f'particle type: scatter channels {self.scatter_pair} not read: {e}')
+            return None
+        return scatter_core_log_area(scatter, self.scatter_ceilings)
 
     def get_unstained_negative(self, particle_type: str = 'Cells') -> bool:
         """
@@ -790,6 +821,8 @@ class SpectralAutoGenerator(QObject):
                     event_channels_pnn=_ecpnn, sample_key=sample_path,
                 )
                 self.unstained_negative_events = raw_events
+                if not _is_bead(sample_path, self.samples['all_samples'][sample_path]):
+                    self.scatter_anchor_log_area = self._scatter_log_area(sample)
 
             logger.info(
                 f'get_unstained_negative: {len(raw_events)} events '
@@ -826,15 +859,13 @@ class SpectralAutoGenerator(QObject):
                 logger.info(f'generate_spectral_control: skipping "{tubename}" (matches unstained/negative pattern or manually marked as unstained)')
                 return True
 
-            particle_type = 'Cells'
+            particle_type = None   # from scatter once the sample is loaded
             match = re.findall('([Cc]ells|[Bb]eads)', tubename)
             if match:
                 if 'cells' in match[0].lower():
                     particle_type = 'Cells'
                 else:
                     particle_type = 'Beads'
-            else:
-                warnings.warn(f'Unknown particle type from name, assigning as {particle_type}')
 
             match = re.findall(r'^(.*?)(?=\s*[\(\[]|\s+(?:cells?|beads?)\s*$)', tubename, re.IGNORECASE)
             raw_label = match[0].strip() if match else tubename
@@ -855,6 +886,19 @@ class SpectralAutoGenerator(QObject):
                 full_sample_path = str(self.experiment_dir / sample_path)
                 if check_fcs_matches_experiment(full_sample_path, self.controller.experiment.settings['raw']['event_channels_pnn'], self.controller.experiment.settings['raw']['magnitude_ceiling']):
                     sample = sample_from_fcs(full_sample_path)
+
+                    if particle_type is None:
+                        log_area = self._scatter_log_area(sample)
+                        particle_type = classify_particle_type(log_area, self.scatter_anchor_log_area)
+                        if particle_type is None:
+                            particle_type = 'Cells'
+                            warnings.warn(f'Unknown particle type from name or scatter, assigning as {particle_type}')
+                        else:
+                            self.scatter_typed.append((tubename, particle_type))
+                        logger.info(
+                            f'generate_spectral_control: "{tubename}" particle type {particle_type} from scatter '
+                            f'(core log10 area {log_area}, unstained cells {self.scatter_anchor_log_area})'
+                        )
 
                     match = re.findall('([Uu]nstained)', label)
                     if match:
