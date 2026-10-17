@@ -53,6 +53,7 @@ from honeychrome.controller_components.autospectral_functions import (
 from honeychrome.controller_components.sample_loader import (
     UnmixSnapshot,
     af_profile_names,
+    load_unmixed,
     resolve_af_for_profiles,
     sample_key_for_path,
     snapshot_unmix_state,
@@ -357,6 +358,25 @@ def _af_cache_token(controller, af_state, sample_key) -> tuple:
     return (id(controller.transfer_matrix), tuple(af_profile_names(controller, sample_key)))
 
 
+def _gated_cache_key(controller, state, abs_path, af_state, sample_key) -> tuple:
+    from honeychrome.controller_components.per_sample_gating_functions import SampleGating
+    return (
+        str(abs_path),
+        tuple(sorted(state.selected_gates)),
+        _af_cache_token(controller, af_state, sample_key),
+        SampleGating.from_controller(controller, copy=False).signature([sample_key]),
+    )
+
+
+def _rows_cache(state) -> dict:
+    """state.gated_rows_cache, created on states that lack one."""
+    cache = getattr(state, 'gated_rows_cache', None)
+    if cache is None:
+        cache = {}
+        state.gated_rows_cache = cache
+    return cache
+
+
 def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray:
     """
     Load one FCS file, unmix it with the transfer matrix, and apply the
@@ -368,10 +388,9 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray
     the main window (see ``per_sample_gating_functions.SampleGating``).
 
     Cached on state.gated_data_cache, keyed by (file, gates, unmixing
-    matrix identity, the sample's gating).  This is the single most
-    expensive step in the Workspace Marker-colour path — without caching
-    it re-reads and re-unmixes the FCS file from disk on every PlotCard
-    refresh.
+    matrix identity, the sample's gating).  The file row of every gated
+    event (its event key, see ``load_gated_rows``) is cached under the same
+    key in state.gated_rows_cache.
 
     af_state: optional unmixing snapshot — see apply_unmixing_af_aware()
         docstring. Pass this from any background worker thread; leave as
@@ -382,14 +401,9 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray
 
     sample_key = sample_key_for_path(controller.experiment_dir, abs_path)
 
-    cache_key = (
-        str(abs_path),
-        tuple(sorted(state.selected_gates)),
-        _af_cache_token(controller, af_state, sample_key),
-        SampleGating.from_controller(controller, copy=False).signature([sample_key]),
-    )
+    cache_key = _gated_cache_key(controller, state, abs_path, af_state, sample_key)
     cached = state.gated_data_cache.get(cache_key)
-    if cached is not None:
+    if cached is not None and cache_key in _rows_cache(state):
         log.debug("load_unmixed_gated: cache hit for %s",
                    getattr(abs_path, 'name', abs_path))
         return cached
@@ -420,11 +434,134 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray
     )
     pnn = list(controller.data_for_cytometry_plots_unmixed['pnn'])
     sample_gating = SampleGating.from_controller(controller)
-    gated = unmixed[sample_gating.population_mask(sample_key, unmixed, pnn, list(state.selected_gates))]
+    mask = np.asarray(sample_gating.population_mask(
+        sample_key, unmixed, pnn, list(state.selected_gates)), dtype=bool)
+    gated = unmixed[mask]
     log.debug("  gated → %d events retained (%d removed)",
               gated.shape[0], unmixed.shape[0] - gated.shape[0])
     state.gated_data_cache[cache_key] = gated
+    _rows_cache(state)[cache_key] = np.flatnonzero(mask).astype(np.int32)
     return gated
+
+
+def load_gated_rows(controller, state, abs_path, af_state=None) -> np.ndarray:
+    """
+    Event keys of the events load_unmixed_gated() returns for this file:
+    the row of each gated event in the FCS file (int32, ascending, one per
+    gated event, in the same order).  A file's rows never change, so these
+    identify the same cells whatever the gating or unmixing later becomes.
+    """
+    load_unmixed_gated(controller, state, abs_path, af_state=af_state)
+    sample_key = sample_key_for_path(controller.experiment_dir, abs_path)
+    return _rows_cache(state)[_gated_cache_key(controller, state, abs_path, af_state,
+                                               sample_key)]
+
+
+def load_sample_rows(controller, state, rel_path, af_state=None) -> np.ndarray | None:
+    """load_gated_rows() for a picker-relative sample path; None on error."""
+    try:
+        return load_gated_rows(controller, state, sample_abs_path(controller, rel_path),
+                               af_state=af_state)
+    except Exception as exc:
+        log.exception("could not load event rows for %s: %s", rel_path, exc)
+        return None
+
+
+def is_gated_cached(controller, state, rel_path, af_state=None) -> bool:
+    """True when load_unmixed_gated() would return this sample from the cache."""
+    abs_path = sample_abs_path(controller, rel_path)
+    sample_key = sample_key_for_path(controller.experiment_dir, abs_path)
+    key = _gated_cache_key(controller, state, abs_path, af_state, sample_key)
+    return key in state.gated_data_cache and key in _rows_cache(state)
+
+
+def sample_file_events(controller, rel_path) -> int:
+    """Events in a sample's FCS file, from the experiment (0 if unknown)."""
+    abs_path = sample_abs_path(controller, rel_path)
+    sample_key = sample_key_for_path(controller.experiment_dir, abs_path)
+    counts = controller.experiment.samples.get('all_sample_nevents', {}) or {}
+    return int(counts.get(sample_key, 0) or 0)
+
+
+def timed_preload(controller, state, rel_paths, af_state=None,
+                  should_stop=None) -> tuple[float, int]:
+    """Read, unmix and gate the samples not cached yet (they stay cached for
+    the run).  Returns (seconds taken, FCS-file events read), the 'io'
+    stage of drc_time_estimate."""
+    import time
+    seconds, events = 0.0, 0
+    for rel in rel_paths:
+        if should_stop is not None and should_stop():
+            break
+        if is_gated_cached(controller, state, rel, af_state=af_state):
+            continue
+        start = time.perf_counter()
+        if load_sample_rows(controller, state, rel, af_state=af_state) is None:
+            continue
+        seconds += time.perf_counter() - start
+        events += sample_file_events(controller, rel)
+    return seconds, events
+
+
+# Events read to estimate a sample's gated count without loading it whole
+COUNT_ESTIMATE_EVENTS = 10_000
+
+
+def _preview(controller, state, rel_path, af_state):
+    """(gated count, exact, gated unmixed preview) of one sample, cached on
+    state.count_preview_cache under the gated-data cache key."""
+    from honeychrome.controller_components.per_sample_gating_functions import SampleGating
+
+    abs_path = sample_abs_path(controller, rel_path)
+    sample_key = sample_key_for_path(controller.experiment_dir, abs_path)
+    key = _gated_cache_key(controller, state, abs_path, af_state, sample_key)
+    cached = state.gated_data_cache.get(key)
+    if cached is not None:
+        return len(cached), True, cached
+    previews = getattr(state, 'count_preview_cache', None)
+    if previews is None:
+        previews = {}
+        state.count_preview_cache = previews
+    if key in previews:
+        return previews[key]
+    res = load_unmixed(controller.experiment_dir, sample_key, af_state,
+                       max_events=COUNT_ESTIMATE_EVENTS)
+    unmixed = res['unmixed']
+    pnn = list(controller.data_for_cytometry_plots_unmixed['pnn'])
+    mask = np.asarray(SampleGating.from_controller(controller).population_mask(
+        sample_key, unmixed, pnn, list(state.selected_gates)), dtype=bool)
+    n_file = int(res['n_events_file'])
+    if len(unmixed) >= n_file:
+        result = (int(mask.sum()), True, unmixed[mask])
+    else:
+        result = ((int(round(mask.mean() * n_file)) if len(mask) else 0), False, unmixed[mask])
+    previews[key] = result
+    return result
+
+
+def estimate_gated_count(controller, state, rel_path, af_state) -> tuple[int, bool]:
+    """
+    (gated event count, exact) for one sample under the current gates.
+
+    Exact from the gated-data cache when the sample is already loaded, or
+    when the file holds no more than COUNT_ESTIMATE_EVENTS events.
+    Otherwise the file's event count times the gated fraction of a seeded
+    subsample of COUNT_ESTIMATE_EVENTS events, of which only the selected
+    rows are read (relative standard error about 3% for a gate holding 10%
+    of the events).  af_state must be an UnmixSnapshot.
+    """
+    count, exact, _gated = _preview(controller, state, rel_path, af_state)
+    return count, exact
+
+
+def preview_features(controller, state, rel_path, af_state) -> np.ndarray:
+    """Transformed selected-channel values of the gated events in the
+    sample's count preview (all gated events when the sample is loaded)."""
+    _count, _exact, gated = _preview(controller, state, rel_path, af_state)
+    if len(gated) > COUNT_ESTIMATE_EVENTS:
+        rng = np.random.default_rng(0)
+        gated = gated[np.sort(rng.choice(len(gated), COUNT_ESTIMATE_EVENTS, replace=False))]
+    return transform_selected_channels(controller, state, gated)
 
 
 def sample_abs_path(controller, rel_path) -> "object":
@@ -497,6 +634,46 @@ def array_digest(data: np.ndarray) -> str:
     return h.hexdigest()
 
 
+def _fingerprint_parts(controller, gates, sample_ids) -> dict:
+    """The two halves of a run's fingerprint: 'unmixing' (transfer matrix,
+    spillover, each sample's AF profile assignment and the spectra of the
+    profiles used) and 'gating' (gates, those samples' per-sample
+    overrides, axis transforms)."""
+    from honeychrome.controller_components.per_sample_gating_functions import SampleGating
+
+    keys = sorted(
+        sample_key_for_path(controller.experiment_dir, sample_abs_path(controller, rel))
+        for rel in sample_ids
+    )
+    process = controller.experiment.process
+    af_profiles = process.get('af_profiles', {}) or {}
+    assignment = {k: [str(n) for n in af_profile_names(controller, k)] for k in keys}
+    used_profiles = sorted({n for names in assignment.values() for n in names})
+    spillover = process.get('spillover')
+    transfer_matrix = controller.transfer_matrix
+    unmixing = {
+        'transfer_matrix': (array_digest(np.asarray(transfer_matrix, dtype=np.float64))
+                            if transfer_matrix is not None else ''),
+        'spillover': (array_digest(np.asarray(spillover, dtype=np.float64))
+                      if spillover is not None else ''),
+        'af_assignment': assignment,
+        'af_spectra': {
+            n: array_digest(np.asarray(af_profiles[n]['spectra'], dtype=np.float64))
+            for n in used_profiles if n in af_profiles
+        },
+    }
+    gating = {
+        'gates': sorted(str(g) for g in gates),
+        'gating': SampleGating.from_controller(controller, copy=False).signature(keys),
+    }
+    return {'unmixing': unmixing, 'gating': gating}
+
+
+def _digest(parts) -> str:
+    payload = json.dumps(parts, sort_keys=True, default=str).encode('utf-8')
+    return hashlib.blake2b(payload, digest_size=16).hexdigest()
+
+
 def sync_fingerprint(controller, gates, sample_ids) -> str | None:
     """
     Digest of everything that decides which events *gates* select in
@@ -507,44 +684,30 @@ def sync_fingerprint(controller, gates, sample_ids) -> str | None:
 
     A DR or clustering run stores the digest taken when it was made. Run
     again later, a different digest means cells may have moved in or out of
-    the gates since, so the run's per-event rows no longer correspond to the
-    events the current gating yields. Main thread only, because it reads the
-    controller's live matrices and gating.
+    the gates since, or their values changed. Main thread only, because it
+    reads the controller's live matrices and gating.
 
     Returns None when the digest cannot be computed (callers treat that as
     "cannot verify").
     """
     try:
-        from honeychrome.controller_components.per_sample_gating_functions import SampleGating
-
-        keys = sorted(
-            sample_key_for_path(controller.experiment_dir, sample_abs_path(controller, rel))
-            for rel in sample_ids
-        )
-        process = controller.experiment.process
-        af_profiles = process.get('af_profiles', {}) or {}
-        assignment = {k: [str(n) for n in af_profile_names(controller, k)] for k in keys}
-        used_profiles = sorted({n for names in assignment.values() for n in names})
-        spillover = process.get('spillover')
-        transfer_matrix = controller.transfer_matrix
-        parts = {
-            'gates': sorted(str(g) for g in gates),
-            'transfer_matrix': (array_digest(np.asarray(transfer_matrix, dtype=np.float64))
-                                if transfer_matrix is not None else ''),
-            'spillover': (array_digest(np.asarray(spillover, dtype=np.float64))
-                          if spillover is not None else ''),
-            'af_assignment': assignment,
-            'af_spectra': {
-                n: array_digest(np.asarray(af_profiles[n]['spectra'], dtype=np.float64))
-                for n in used_profiles if n in af_profiles
-            },
-            'gating': SampleGating.from_controller(controller, copy=False).signature(keys),
-        }
-        payload = json.dumps(parts, sort_keys=True, default=str).encode('utf-8')
-        return hashlib.blake2b(payload, digest_size=16).hexdigest()
+        parts = _fingerprint_parts(controller, gates, sample_ids)
+        return _digest({**parts['unmixing'], **parts['gating']})
     except Exception as exc:
         log.warning("sync_fingerprint: could not compute (%s)", exc)
         return None
+
+
+def split_fingerprints(controller, gates, sample_ids) -> dict:
+    """{'unmixing': digest, 'gating': digest} (None values when they cannot
+    be computed), so a run can tell whether its cells' values or their gate
+    membership changed.  Main thread only."""
+    try:
+        parts = _fingerprint_parts(controller, gates, sample_ids)
+        return {name: _digest(part) for name, part in parts.items()}
+    except Exception as exc:
+        log.warning("split_fingerprints: could not compute (%s)", exc)
+        return {'unmixing': None, 'gating': None}
 
 
 def _downsample(data: np.ndarray, n: int, rng) -> np.ndarray:
@@ -564,37 +727,56 @@ def load_training_pool(controller, state, seed: int = 42,
         docstring. Pass this from any background worker thread; leave as
         None only for main-thread callers.
     """
+    data, _selections = load_training_pool_with_rows(controller, state, seed=seed,
+                                                     af_state=af_state)
+    return data
+
+
+def load_training_pool_with_rows(controller, state, seed: int = 42, af_state=None):
+    """
+    load_training_pool(), plus which events each sample contributed:
+    ``(data, selections)`` with selections ``[(rel_path, idx), ...]`` in
+    pool order, where ``idx`` indexes the sample's gated events (the rows
+    of load_sample_features) and ``data`` holds those events in that order.
+    ``(None, [])`` when nothing could be loaded.
+    """
     log_stage(log, "LOAD TRAINING POOL")
     if not state.training_sample_ids:
         log.warning("no training samples selected")
-        return None
+        return None, []
     if not state.selected_channels:
         log.warning("no channels selected")
-        return None
+        return None, []
     if not state.selected_gates:
         log.warning("no gate selected")
-        return None
+        return None, []
 
     log_files(log, "training samples", state.training_sample_ids)
     log.info("per-sample event cap (n_training_events) = %d", state.n_training_events)
 
     rng = np.random.default_rng(seed)
     chunks = []
+    selections = []
     for rel_path in state.training_sample_ids:
         feats = load_sample_features(controller, state, rel_path, af_state=af_state)
         if feats is None or feats.shape[0] == 0:
             log.warning("  %s contributed no events", rel_path)
             continue
-        chunk = _downsample(feats, state.n_training_events, rng)
+        if len(feats) > state.n_training_events:
+            idx = rng.choice(len(feats), size=state.n_training_events, replace=False)
+        else:
+            idx = np.arange(len(feats))
+        chunk = feats[idx]
         log.info("  %s → %d events after downsample", rel_path, chunk.shape[0])
         chunks.append(chunk)
+        selections.append((rel_path, idx))
 
     if not chunks:
         log.error("no training data could be loaded")
-        return None
+        return None, []
 
     data = np.concatenate(chunks, axis=0).astype(np.float32)
     log_array(log, "training_pool",
               data,
               [c for c in state.selected_channels if c not in META_CHANNELS])
-    return data
+    return data, selections

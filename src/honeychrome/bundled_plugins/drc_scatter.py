@@ -160,25 +160,31 @@ def compatibility_warning(dr_run: dict | None, cl_run: dict | None) -> str | Non
         "results may not align."
     )
 
-def align_labels_to_embedding(labels: np.ndarray | None,
-                              n: int) -> tuple[np.ndarray, bool]:
+def align_labels_to_embedding(labels: np.ndarray | None, n: int,
+                              label_rows=None, emb_rows=None,
+                              mode: str = 'positional') -> tuple[np.ndarray, bool]:
     """
     Align one sample's cluster-label array to one of its DR embeddings.
 
-    UMAP/tSNE/PaCMAP embeddings and cluster labels both cover every gated
-    event of a sample in the same order, so they correspond row for row
-    exactly when their lengths match. A DR run and a clustering run can
-    share the same gate and sample set and still differ in length (e.g.
-    one was made before the gate was edited), which
-    compatibility_warning's gate/sample-set check does not catch.
+    mode is drc_run_align.runs_join_mode() of the two runs.  With event keys
+    (label_rows and emb_rows, the FCS-file row of each label and of each
+    embedding point) labels are matched event by event; embedding points
+    the clustering run did not label are greyed.  Without keys, labels and
+    points correspond row for row only when the runs were made under the
+    same gating and unmixing ('positional') and their lengths agree.
 
     labels: the sample's cluster-label array from a clustering run, or
         None if this sample has no labels under the selected run.
 
     Returns (aligned_labels, ok): aligned_labels always has length *n*
-    (-1 = unlabelled). ok is False when the sample had to be greyed out;
-    callers should surface a warning in that case.
+    (-1 = unlabelled, drawn grey). ok is False when some or all points
+    had to be greyed; callers should surface a warning in that case.
     """
-    if labels is None or len(labels) != n:
+    import drc_run_align
+    if labels is None:
         return np.full(n, -1, dtype=np.int32), False
-    return labels.astype(np.int32), True
+    aligned, matched = drc_run_align.pair_arrays(
+        np.asarray(labels, dtype=np.int32), n, mode, label_rows, emb_rows, fill=-1)
+    if aligned is None or len(aligned) != n:
+        return np.full(n, -1, dtype=np.int32), False
+    return aligned.astype(np.int32), bool(matched.all())

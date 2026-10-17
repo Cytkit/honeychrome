@@ -58,6 +58,7 @@ import pandas as pd
 from sklearn.decomposition import PCA
 
 import drc_pipeline
+import drc_run_align
 from drc_logging import get_logger, log_stage
 from honeychrome.controller_components import differential_stats as _ds
 from honeychrome.controller_components.differential_stats import (
@@ -197,7 +198,7 @@ def compute_frequencies(state, all_rel, n_clusters, cluster_labels_override=None
     freq_mat = np.zeros((len(all_rel), n_clusters), dtype=float)
     for i, rel in enumerate(all_rel):
         labels = np.asarray(cluster_labels[rel])
-        total = max(len(labels), 1)
+        total = max(int(np.sum(labels != drc_run_align.UNLABELLED)), 1)
         for cl in range(n_clusters):
             freq_mat[i, cl] = np.sum(labels == cl) / total * 100.0
     df = pd.DataFrame(freq_mat, index=all_rel,
@@ -230,10 +231,12 @@ def compute_counts(state, all_rel, n_clusters, cluster_labels_override=None,
 
 
 def sample_event_totals(state, all_rel, cluster_labels_override=None) -> np.ndarray:
-    """Events per sample, including noise (-1) labels — the frequency denominator."""
+    """Events per sample, including noise (-1) labels but not events the run
+    could not label (drc_run_align.UNLABELLED) — the frequency denominator."""
     cluster_labels = cluster_labels_override if cluster_labels_override is not None \
         else state.cluster_labels
-    return np.array([len(np.asarray(cluster_labels[rel])) for rel in all_rel], dtype=float)
+    return np.array([np.sum(np.asarray(cluster_labels[rel]) != drc_run_align.UNLABELLED)
+                     for rel in all_rel], dtype=float)
 
 
 def mfi_feature_table(state, n_clusters: int, channels: list[str],
@@ -269,7 +272,7 @@ def resolve_mfi_channels(state, include_type_markers: bool = False) -> list[str]
 def compute_mfis(controller, state, all_rel, n_clusters,
                  cluster_labels_override=None, channels=None,
                  names_override: dict | None = None,
-                 af_state=None) -> pd.DataFrame | None:
+                 af_state=None, values_override: dict | None = None) -> pd.DataFrame | None:
     """
     Per-sample mean intensity of each selected channel within each cluster.
 
@@ -289,6 +292,12 @@ def compute_mfis(controller, state, all_rel, n_clusters,
         before this (background-thread) call —
         see drc_pipeline.apply_unmixing_af_aware() docstring for why this
         must not be read live off ``controller`` from a worker thread.
+    values_override: {rel: (transformed values, names)} row for row with
+        the labels, used instead of the current events (a legacy run's own
+        stored values, see drc_run_align.statistics_inputs).
+
+    A sample whose values and labels differ in length cannot be paired
+    and is left out (NaN), never truncated.
     """
     log_stage(log, "MFI MATRIX")
     cluster_labels = cluster_labels_override if cluster_labels_override is not None \
@@ -298,9 +307,19 @@ def compute_mfis(controller, state, all_rel, n_clusters,
 
     sample_vals = {}
     for rel in all_rel:
-        mv = drc_pipeline.load_sample_transformed_values(controller, state, rel, channels, af_state=af_state)
-        if mv is not None:
-            sample_vals[rel] = mv          # (values (n,n_sel), names)
+        if values_override is not None:
+            mv = values_override.get(rel)
+        else:
+            mv = drc_pipeline.load_sample_transformed_values(controller, state, rel, channels,
+                                                             af_state=af_state)
+        if mv is None:
+            continue
+        if len(mv[0]) != len(np.asarray(cluster_labels[rel])):
+            log.warning("compute_mfis: %s -- %d values vs %d labels; the run's events do not "
+                        "match these values, sample left out", rel, len(mv[0]),
+                        len(np.asarray(cluster_labels[rel])))
+            continue
+        sample_vals[rel] = mv          # (values (n,n_sel), names)
 
     frames = []
     for ch in channels:
@@ -313,9 +332,7 @@ def compute_mfis(controller, state, all_rel, n_clusters,
             if ch not in names:
                 continue
             col = values[:, names.index(ch)]
-            labels = np.asarray(cluster_labels[rel])
-            m = min(len(col), len(labels))      # defensive; should be equal
-            col, lab = col[:m], labels[:m]
+            lab = np.asarray(cluster_labels[rel])
             for cl in range(n_clusters):
                 sel = lab == cl
                 if sel.any():
@@ -593,11 +610,20 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
                    covariate_names: list[str] | None = None,
                    use_treat: bool = True,
                    mfi_threshold: float | None = None,
-                   mfi_hierarchical: bool = True):
+                   mfi_hierarchical: bool = True,
+                   align_run: dict | None = None,
+                   align_mode: str | None = None):
     """
     Run the requested differential tests. Writes results onto ``state`` and
     returns ``(freq_results, mfi_results, counts_results)`` (any may be
     None).
+
+    align_run / align_mode: a hydrated archived clustering run that is not
+    in sync with the current gating and unmixing, and how it can be matched
+    to the current events (drc_run_align.live_join_mode).  Its labels are
+    then matched to the current gated events by event key before testing
+    (see drc_run_align.statistics_inputs); state.stats_alignment_note says
+    how well they matched.
 
     Resolves state.testing_group_selection (falling back to every defined
     group), builds the contrast list from state.contrast_mode/
@@ -619,6 +645,13 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
     log_stage(log, "DIFFERENTIAL STATISTICS")
     if mfi_threshold is None:
         mfi_threshold = fc_threshold
+
+    values_override = None
+    state.stats_alignment_note = ''
+    if align_run is not None and align_mode is not None:
+        cluster_labels_override, values_override, note = drc_run_align.statistics_inputs(
+            controller, state, align_run, align_mode, af_state=af_state)
+        state.stats_alignment_note = note
 
     group_rel = resolve_test_groups(controller, state, cluster_labels_override=cluster_labels_override)
     qualifying = [g for g in (state.testing_group_selection or state.group_names) if g in group_rel]
@@ -707,6 +740,7 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
             channels=mfi_channels,
             names_override=names_override,
             af_state=af_state,
+            values_override=values_override,
         )
         if mfi_df is not None:
             meta = mfi_feature_table(state, n_clusters, mfi_channels, names_override)
