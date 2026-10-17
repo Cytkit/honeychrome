@@ -1618,36 +1618,38 @@ class Controller(QObject):
         # calc all hists and stats if they do not already exist or force not set
         # force only necessary for reset axes transforms all and refresh spectral process
 
-        if self.data_for_cytometry_plots:
+        # one reference for the whole call (see calc_hists_and_stats)
+        data = self.data_for_cytometry_plots
+        if data:
             # make sure data for cytometry plots is pointing at correct data
             self.data_for_cytometry_plots_raw.update({'event_data': self.raw_event_data, 'sample_id': self.current_sample_path})
             self.data_for_cytometry_plots_process.update({'event_data': self.unmixed_event_data, 'sample_id': self.current_sample_path})
             self.data_for_cytometry_plots_unmixed.update({'event_data': self.unmixed_event_data, 'sample_id': self.current_sample_path})
 
             # recalculate everything if it isn't already present
-            if force_recalc_histograms or not self.data_for_cytometry_plots['statistics'] or not self.data_for_cytometry_plots['histograms']:
+            if force_recalc_histograms or not data['statistics'] or not data['histograms']:
                 if self.bus:
                     self.bus.statusMessage.emit(f'Initialising plots and gating statistics...')
 
                 # for default transformations, set limits to observed data
-                if self.data_for_cytometry_plots['event_data'] is not None and len(self.data_for_cytometry_plots['event_data']):
+                if data['event_data'] is not None and len(data['event_data']):
                     if self.current_sample_path != self.live_sample_path:
-                        for label in (self.data_for_cytometry_plots['transformations'] or {}):
-                            transformation = self.data_for_cytometry_plots['transformations'][label]
+                        for label in (data['transformations'] or {}):
+                            transformation = data['transformations'][label]
                             if transformation.id == 'default':
-                                index = self.data_for_cytometry_plots['pnn'].index(label)
-                                upper_limit = max(self.data_for_cytometry_plots['event_data'][:, index]) * 1.05
+                                index = data['pnn'].index(label)
+                                upper_limit = max(data['event_data'][:, index]) * 1.05
                                 transformation.set_transform(limits=[0, upper_limit])
 
                 # Refresh every gate whose geometry can vary by sample.
                 self.apply_custom_sample_gates()
 
-                self.data_for_cytometry_plots['statistics'] = initialise_stats(self.data_for_cytometry_plots['gating'])
-                self.data_for_cytometry_plots['histograms'] = initialise_hists(self.data_for_cytometry_plots['plots'], self.data_for_cytometry_plots)
+                data['statistics'] = initialise_stats(data['gating'])
+                data['histograms'] = initialise_hists(data['plots'], data)
 
                 # initialise plots
-                if self.bus and self.data_for_cytometry_plots['plots']:
-                    self.bus.statusMessage.emit(f'Calculating {len(self.data_for_cytometry_plots['plots'])} histograms...')
+                if self.bus and data['plots']:
+                    self.bus.statusMessage.emit(f'Calculating {len(data['plots'])} histograms...')
                 self.calc_hists_and_stats(status_message_signal=(self.bus.statusMessage if self.bus else None))
 
                 # refresh custom-gate highlighting on current tabs for this sample
@@ -1821,41 +1823,44 @@ class Controller(QObject):
 
     def calc_hists_and_stats(self, gates_to_calculate=None, indices_plots_to_calculate=None, status_message_signal=None):
         # guard first against this being reached by wrong path
-        if self.data_for_cytometry_plots is None:
+        # take one reference: a tab switch on the main thread (set_mode -> None for plugin tabs)
+        # can rebind self.data_for_cytometry_plots while this runs on a busy-cursor worker thread
+        data = self.data_for_cytometry_plots
+        if data is None:
             return
-        if self.data_for_cytometry_plots['event_data'] is not None:
+        if data['event_data'] is not None:
             # apply gates to event data
             # if gates_to_calculate is none, then initialise gates_membership dict, otherwise reference it from data_for_cytometry_plots
             if not gates_to_calculate:
-                gating = self.data_for_cytometry_plots['gating']
+                gating = data['gating']
                 if gating is None:
                     return
 
-                gate_membership = {'root': np.ones(len(self.data_for_cytometry_plots['event_data']), dtype=np.bool_)}
-                self.data_for_cytometry_plots.update({'gate_membership': gate_membership})
-                # self.data_for_cytometry_plots['gate_membership']['root'] = np.ones(len(self.data_for_cytometry_plots['event_data']), dtype=np.bool_)
-                gates_to_calculate = [g[0] for g in self.data_for_cytometry_plots['gating'].get_gate_ids()]
-            apply_gates_in_place(self.data_for_cytometry_plots, gates_to_calculate=gates_to_calculate)
-            statistics = calc_stats(self.data_for_cytometry_plots)
-            self.data_for_cytometry_plots['statistics'] = statistics
+                gate_membership = {'root': np.ones(len(data['event_data']), dtype=np.bool_)}
+                data.update({'gate_membership': gate_membership})
+                # data['gate_membership']['root'] = np.ones(len(data['event_data']), dtype=np.bool_)
+                gates_to_calculate = [g[0] for g in data['gating'].get_gate_ids()]
+            apply_gates_in_place(data, gates_to_calculate=gates_to_calculate)
+            statistics = calc_stats(data)
+            data['statistics'] = statistics
 
-            hists = calc_hists(self.data_for_cytometry_plots,
+            hists = calc_hists(data,
                                indices_plots_to_calculate=indices_plots_to_calculate,
                                status_message_signal=status_message_signal,
                                density_cutoff=settings.density_cutoff_retrieved,
                                dot_plot_by_gate=settings.hist2dtype_retrieved=='Dot plot coloured by gate')
             if indices_plots_to_calculate is None:
-                indices_plots_to_calculate = list(range(len(self.data_for_cytometry_plots['plots'])))
+                indices_plots_to_calculate = list(range(len(data['plots'])))
 
             # calc_hists skips plots whose source_gate is missing from
             # gate_membership, so hists may be shorter than indices_plots_to_calculate.
             # Zip stops at the shorter sequence, preventing an IndexError.
             # calc_hists returns None for plots whose source gate could not be evaluated
             for n, hist in zip(indices_plots_to_calculate, hists):
-                if hist is None or n >= len(self.data_for_cytometry_plots['histograms']):
+                if hist is None or n >= len(data['histograms']):
                     continue
-                if self.data_for_cytometry_plots['histograms'][n].shape == hist.shape:
-                    self.data_for_cytometry_plots['histograms'][n] += hist
+                if data['histograms'][n].shape == hist.shape:
+                    data['histograms'][n] += hist
                 else:
                     logger.warning(f'Controller: calc_hists_and_stats: histogram shape mismatch for plot {n} — discarding stale result')
 
