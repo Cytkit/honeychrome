@@ -19,7 +19,14 @@ Numba's 'omp' layer is safe when two threads run parallel numba code at
 once; its 'workqueue' fallback is not (concurrent use can deadlock or
 abort the process).  NUMBA_THREADING_LAYER is set to 'omp' when this module
 is imported, before numba is.  ``ensure_threading_layer`` checks that the
-OpenMP layer loads and falls back to 'workqueue' if it does not.
+OpenMP layer loads and falls back to 'workqueue' if it does not.  In
+practice the layer is 'workqueue' once UMAP is imported: pynndescent's
+``__init__`` replaces 'omp' with 'tbb', or 'workqueue' when TBB is missing
+(as it is with the plugin's requirements), and on macOS numba's OpenMP pool
+does not find a libomp anyway.  The two layers ran UMAP equally fast on the
+reference VM (fit of 50,000 events 6.1-6.3 s vs 6.2-6.4 s, embed of 40,000
+3.3-3.8 s vs 3.4-3.6 s), so the only cost of 'workqueue' is that a run
+started during the warm-up waits for it.
 
 ``numba_section`` serialises numba work (warm-up, fits, transforms) while
 the layer is 'workqueue', and is a no-op under 'omp'.  Every UMAP and
