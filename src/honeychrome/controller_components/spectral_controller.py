@@ -14,7 +14,7 @@ from honeychrome.controller_components.spectral_functions import get_profile, ge
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.label_matching import match_fluorophore, match_marker, get_fluorophore_db, get_marker_db
 from honeychrome.controller_components.particle_type import (
-    scatter_core_log_area, classify_particle_type, scatter_channel_pair, scatter_ceilings,
+    scatter_core_log_area, classify_particle_type, scatter_channel_pair, scatter_ceilings, is_bead_sample,
 )
 from honeychrome.controller_components.spectral_reference_library import profile_id_from_description
 from honeychrome.controller_components.spectral_cleaning import find_empirical_peak, cosine_filter, knn_scatter_match, exclude_saturated, CleanResult
@@ -89,9 +89,11 @@ class LowEventLog:
         return low_event_warning_text(self.entries or [])
 
 
-def _find_default_unstained_tube(all_samples: dict) -> str | None:
-    """Return tube name of the first sample whose path or name contains 'unstained'."""
-    for path, name in all_samples.items():
+def _find_default_unstained_tube(samples: dict) -> str | None:
+    """Return tube name of the first non-bead sample whose path or name contains 'unstained'."""
+    for path, name in samples['all_samples'].items():
+        if is_bead_sample(samples, path, name):
+            continue
         if re.search(r'unstained', path, re.IGNORECASE) or re.search(r'unstained', name, re.IGNORECASE):
             return name
     return None
@@ -179,12 +181,14 @@ class ProfileUpdater:
         #         self.bus.warningMessage.emit('Selected number of fluorophores has changed. Previous controls have been flushed.')
 
     def _unstained_sample_path(self) -> str | None:
-        """The sample the global unstained negative is taken from: the first
-        sample marked as unstained, else the first named unstained or negative."""
+        """The sample the global (cell) unstained negative is taken from: the first
+        non-bead sample marked as unstained, else the first named unstained or negative."""
         for path in self.samples.get('unstained_samples', []):
-            if path in self.samples['all_samples']:
+            if path in self.samples['all_samples'] and not is_bead_sample(self.samples, path):
                 return path
         for path in self.samples['all_samples']:
+            if is_bead_sample(self.samples, path):
+                continue
             if re.search(r'(unstained|negative)', path, re.IGNORECASE) or \
             re.search(r'(unstained|negative)', self.samples['all_samples'][path], re.IGNORECASE):
                 return path
@@ -323,7 +327,7 @@ class ProfileUpdater:
         # Fallback to global unstained if no per-control assignment
         if not tube_name:
             if self.controller.experiment.process.get('negative_type') == 'unstained':
-                tube_name = _find_default_unstained_tube(self.samples['all_samples']) or ''
+                tube_name = _find_default_unstained_tube(self.samples) or ''
             if not tube_name:
                 return None
 
@@ -717,8 +721,8 @@ class SpectralAutoGenerator(QObject):
         Locate the unstained sample for *particle_type*, create the 'Neg Unstained'
         gate if absent, then cache the profile and raw events.
 
-        particle_type='Cells': prefer a sample whose name does NOT contain 'Beads'.
-        particle_type='Beads': prefer a sample whose name contains 'Beads'.
+        particle_type='Cells': prefer a sample that is not a bead sample.
+        particle_type='Beads': prefer a bead sample (see particle_type.is_bead_sample).
 
         Stores results in:
             self.unstained_negative          (profile vector, Cells only)
@@ -737,8 +741,7 @@ class SpectralAutoGenerator(QObject):
                         or re.search(r'(unstained|negative)', name, re.IGNORECASE))
 
             def _is_bead(path: str, name: str) -> bool:
-                return bool(re.search(r'bead', name, re.IGNORECASE)
-                            or re.search(r'bead', path, re.IGNORECASE))
+                return is_bead_sample(self.samples, path, name)
 
             sample_path = None
             # Search: manually tagged first, then regex, filtered by particle type
@@ -861,7 +864,9 @@ class SpectralAutoGenerator(QObject):
 
             particle_type = None   # from scatter once the sample is loaded
             match = re.findall('([Cc]ells|[Bb]eads)', tubename)
-            if match:
+            if sample_path in self.samples.get('bead_samples', []):
+                particle_type = 'Beads'
+            elif match:
                 if 'cells' in match[0].lower():
                     particle_type = 'Cells'
                 else:
@@ -1009,14 +1014,14 @@ class SpectralAutoGenerator(QObject):
 
                     default_unstained = (
                         self.preferred_unstained
-                        or _find_default_unstained_tube(self.samples['all_samples'])
+                        or _find_default_unstained_tube(self.samples)
                     )
                     assigned_negative = default_unstained or ''  # default; overridden for Beads below
                     # For bead controls, only use an unstained negative if available
                     if particle_type == 'Beads':
                         # Mirror the combobox builder logic exactly: iterate all_samples,
                         # accept anything unstained (manually tagged OR regex), then
-                        # filter to those whose name contains "Beads".
+                        # keep bead samples.
                         manually_tagged = set(self.samples.get('unstained_samples', []))
                         default_unstained_bead = None
                         for path, name in self.samples['all_samples'].items():
@@ -1027,7 +1032,7 @@ class SpectralAutoGenerator(QObject):
                             )
                             if not is_unstained:
                                 continue
-                            if re.search(r'bead', name, re.IGNORECASE) or re.search(r'bead', path, re.IGNORECASE):
+                            if is_bead_sample(self.samples, path, name):
                                 default_unstained_bead = name
                                 break
                         # No bead-specific unstained available: explicitly opt out of the

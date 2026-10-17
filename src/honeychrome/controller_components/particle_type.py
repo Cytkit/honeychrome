@@ -34,9 +34,38 @@ scatter_channel_pair(raw_settings, raw_plots=None)
 
 scatter_ceilings(raw_settings, channels)
     Saturation ceiling of each scatter channel, as the raw transforms use.
+
+Bead samples
+------------
+samples['bead_samples'] lists the samples treated as beads everywhere a
+sample (rather than a spectral control) is judged bead or cell, e.g. which
+unstained sample is a bead or a cell negative. update_bead_samples() checks
+each sample once, listed in samples['bead_checked_samples']: a name
+containing "bead" marks it; an unstained sample is otherwise scored on
+scatter. After that check only the user's Mark/Unmark as Beads changes it.
+In the scatter check the anchor is the broadest unstained sample checked in
+the same call (v1: earlier calls' scores are not kept).
+
+is_bead_name(path, name)
+    Whether the path or name contains "bead".
+
+is_bead_sample(samples, path, name=None)
+    Whether a sample is a bead sample; by name in experiments not yet scanned.
+
+sample_scatter_log_area(abs_path, pair, ceilings)
+    Core area of a sample file, read from at most CORE_MAX_EVENTS events.
+
+update_bead_samples(samples, experiment_dir, raw_settings, raw_plots=None)
+    Check samples not yet checked; returns the paths newly marked as beads.
 """
 
+import logging
+import re
+from pathlib import Path
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 CORE_FRACTION = 0.25            # fraction of events in the core ellipse
 CORE_MAX_EVENTS = 20000         # events used per sample
@@ -118,3 +147,79 @@ def scatter_ceilings(raw_settings: dict, channels) -> list[float]:
         i = pnn.index(ch) if ch in pnn else -1
         out.append(float(pnr[i]) if 0 <= i < len(pnr) and pnr[i] else fallback)
     return out
+
+
+def is_bead_name(path: str, name: str | None) -> bool:
+    return bool(re.search(r'bead', str(path), re.IGNORECASE)
+                or re.search(r'bead', str(name or ''), re.IGNORECASE))
+
+
+def is_bead_sample(samples: dict, path: str, name: str | None = None) -> bool:
+    beads = samples.get('bead_samples')
+    if beads is not None:
+        return path in beads
+    if name is None:
+        name = samples.get('all_samples', {}).get(path, '')
+    return is_bead_name(path, name)
+
+
+def sample_scatter_log_area(abs_path, pair, ceilings) -> float | None:
+    from honeychrome.controller_components.fcs_preview import load_fcs_preview
+    try:
+        _, events = load_fcs_preview(abs_path, CORE_MAX_EVENTS, col_order=list(pair))
+    except ValueError:
+        # integer FCS data: full read
+        from honeychrome.controller_components.functions import sample_from_fcs
+        events = sample_from_fcs(str(abs_path)).get_events('raw', col_order=list(pair))
+    return scatter_core_log_area(events, ceilings)
+
+
+def update_bead_samples(samples: dict, experiment_dir, raw_settings: dict,
+                        raw_plots: list | None = None) -> list:
+    all_samples = samples.get('all_samples', {})
+    unstained = set(samples.get('unstained_samples', []))
+    beads = [p for p in samples.get('bead_samples', []) if p in all_samples]
+    checked = [p for p in samples.get('bead_checked_samples', []) if p in all_samples]
+    samples['bead_samples'] = beads
+    samples['bead_checked_samples'] = checked
+
+    newly = []
+    to_score = []
+    for path, name in all_samples.items():
+        if path in checked:
+            continue
+        if is_bead_name(path, name):
+            checked.append(path)
+            if path not in beads:
+                beads.append(path)
+                newly.append(path)
+        elif path in unstained:
+            to_score.append(path)
+
+    pair = scatter_channel_pair(raw_settings, raw_plots) if to_score else None
+    if pair is None:
+        return newly
+    ceilings = scatter_ceilings(raw_settings, pair)
+    scores = {}
+    for path in to_score:
+        try:
+            score = sample_scatter_log_area(Path(experiment_dir) / path, pair, ceilings)
+        except Exception as e:
+            logger.warning(f'update_bead_samples: scatter of {path} not read: {e}')
+            continue
+        if score is not None:
+            scores[path] = score
+
+    anchor = max(scores.values()) if scores else None
+    for path, score in scores.items():
+        checked.append(path)
+        particle_type = classify_particle_type(score, anchor)
+        logger.info(f'update_bead_samples: "{path}" {particle_type} from scatter '
+                    f'(core log10 area {score:.2f}, anchor {anchor:.2f})')
+        if particle_type == 'Beads' and path not in beads:
+            beads.append(path)
+            newly.append(path)
+
+    rank = {p: i for i, p in enumerate(all_samples)}
+    beads.sort(key=rank.__getitem__)
+    return newly

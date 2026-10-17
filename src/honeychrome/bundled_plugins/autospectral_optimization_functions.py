@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -50,6 +49,7 @@ from honeychrome.controller_components.autospectral_functions import (
     precompute_joint_cov_extras,
 )
 from honeychrome.controller_components.functions import sample_from_fcs
+from honeychrome.controller_components.particle_type import is_bead_sample
 from honeychrome.controller_components.spectral_functions import get_raw_events
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.autospectral_functions import (
@@ -520,11 +520,6 @@ def fluorescence_channel_names(controller) -> list:
     return [pnn_raw[i] for i in fl_ids]
 
 
-def _is_bead_sample(path: str, name: str) -> bool:
-    """Mirrors spectral_controller.py::get_unstained_negative's _is_bead()."""
-    return bool(re.search(r'bead', name, re.IGNORECASE) or re.search(r'bead', path, re.IGNORECASE))
-
-
 def _resolve_unstained_cell_sample_names(samples: dict) -> list:
     """
     Returns the names of every unstained cell sample (all matches, not just
@@ -544,7 +539,7 @@ def _resolve_unstained_cell_sample_names(samples: dict) -> list:
 
     names = []
     for path, name in all_samples.items():
-        if _is_unstained(path, name) and not _is_bead_sample(path, name):
+        if _is_unstained(path, name) and not is_bead_sample(samples, path, name):
             names.append(name)
     return names
 

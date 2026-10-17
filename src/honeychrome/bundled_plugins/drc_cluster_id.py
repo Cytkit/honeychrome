@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import csv
 import math
-import re
 from collections import Counter
 from pathlib import Path
 
@@ -442,11 +441,6 @@ def _otsu_threshold(values: np.ndarray, n_bins: int = 256) -> float:
     return float(bin_centers[int(np.argmax(between_class_var))])
 
 
-def _is_bead_sample(path: str, name: str) -> bool:
-    """Mirrors spectral_controller.py::get_unstained_negative's _is_bead()."""
-    return bool(re.search(r'bead', name, re.IGNORECASE) or re.search(r'bead', path, re.IGNORECASE))
-
-
 def _resolve_unstained_cell_sample_paths(controller) -> list[str]:
     """
     Returns the rel_path of every unstained CELL sample (manually tagged via
@@ -457,6 +451,8 @@ def _resolve_unstained_cell_sample_paths(controller) -> list[str]:
     _load_unstained_gated_transformed below expect) rather than display
     names.
     """
+    from honeychrome.controller_components.particle_type import is_bead_sample
+
     samples = getattr(controller.experiment, 'samples', {}) or {}
     all_samples = samples.get('all_samples', {})
     manually_unstained = set(samples.get('unstained_samples', []))
@@ -468,7 +464,7 @@ def _resolve_unstained_cell_sample_paths(controller) -> list[str]:
 
     return [
         path for path, name in all_samples.items()
-        if _is_unstained(path, name) and not _is_bead_sample(path, name)
+        if _is_unstained(path, name) and not is_bead_sample(samples, path, name)
     ]
 
 

@@ -46,6 +46,7 @@ from typing import Optional
 
 from honeychrome.controller_components.functions import generate_transformations, assign_default_transforms
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import to_gml
+from honeychrome.controller_components.particle_type import update_bead_samples
 from honeychrome.settings import settings_default, samples_default, process_default, cytometry_default, sample_name_source
 
 import logging
@@ -287,6 +288,10 @@ class ExperimentModel:
             p for p in self.samples['unstained_samples']
             if p in self.samples['all_samples']
         ]
+
+        # bead samples: named, or unstained and bead-like on scatter; checked once
+        update_bead_samples(self.samples, experiment_dir, self.settings['raw'],
+                            self.cytometry.get('raw_plots'))
 
 
 if __name__ == '__main__':

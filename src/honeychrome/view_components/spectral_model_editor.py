@@ -16,6 +16,7 @@ from honeychrome.controller_components.spectral_reference_library import (
 )
 from honeychrome.view_components.cosine_qc_viewer import COSINE_QC_WARNING_THRESHOLD
 from honeychrome.controller_components.spectral_functions import sanitise_control_in_place, _find_default_unstained
+from honeychrome.controller_components.particle_type import is_bead_sample
 from honeychrome.view_components.icon_loader import icon
 from honeychrome.settings import spectral_model_column_labels, heading_style, INTERNAL_NEGATIVE_SENTINEL
 from honeychrome.view_components.busy_cursor import with_busy_cursor
@@ -529,13 +530,13 @@ class SpectralControlsEditor(QFrame):
         if self.negatives_combo.currentText() == 'Using unstained negative':
             self.controller.experiment.process['negative_type'] = 'unstained'
             self.negatives_combo.setToolTip('Negative set to "Neg Unstained" gate on Unstained sample')
-            default_unstained = _find_default_unstained(self.samples['all_samples'])
+            default_unstained = _find_default_unstained(self.samples)
             if not default_unstained:
                 unstained_paths = self.samples.get('unstained_samples', [])
                 if unstained_paths:
                     default_unstained = self.samples['all_samples'].get(unstained_paths[0])
 
-            # Find a bead-specific unstained: must be manually tagged AND match bead regex.
+            # Find a bead-specific unstained: unstained AND a bead sample.
             manually_tagged = set(self.samples.get('unstained_samples', []))
             default_unstained_bead = None
             for path, name in self.samples['all_samples'].items():
@@ -546,7 +547,7 @@ class SpectralControlsEditor(QFrame):
                 )
                 if not is_unstained:
                     continue
-                if re.search(r'bead', name, re.IGNORECASE) or re.search(r'bead', path, re.IGNORECASE):
+                if is_bead_sample(self.samples, path, name):
                     default_unstained_bead = name
                     break
                 
@@ -675,7 +676,7 @@ class SpectralControlsEditor(QFrame):
             )
             if not is_unstained:
                 continue
-            is_bead = bool(re.search(r'[Bb]eads', tube_name))
+            is_bead = is_bead_sample(self.samples, p, tube_name)
             if particle_type == 'Beads' and not is_bead:
                 continue
             if particle_type == 'Cells' and is_bead:
@@ -718,7 +719,7 @@ class SpectralControlsEditor(QFrame):
             )
             if not is_unstained:
                 continue
-            if re.search(r'bead', name, re.IGNORECASE) or re.search(r'bead', path, re.IGNORECASE):
+            if is_bead_sample(self.samples, path, name):
                 continue
             return True
         return False
@@ -939,7 +940,7 @@ class SpectralControlsEditor(QFrame):
             )
             if not is_unstained:
                 continue
-            is_bead = bool(re.search(r'[Bb]eads', tube_name))
+            is_bead = is_bead_sample(self.samples, p, tube_name)
             if particle_type == 'Beads' and not is_bead:
                 continue
             if particle_type == 'Cells' and is_bead:

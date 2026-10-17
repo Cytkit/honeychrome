@@ -55,6 +55,7 @@ from honeychrome.controller_components.spread_model import (
 )
 from honeychrome.controller_components.transform import Transform
 from honeychrome.controller_components.sample_loader import resolve_af_for_profiles
+from honeychrome.controller_components.particle_type import is_bead_sample
 from honeychrome.view_components.cytometry_plot_components import (
     InteractiveLabel,
     NoPanViewBox,
@@ -1154,7 +1155,7 @@ class AutoSpectralTab(QWidget):
         # Search all samples for unstained negatives, excluding bead files.
         candidates = [
             p for p in all_samples
-            if not re.search(r'[Bb]eads', all_samples.get(p, ''), re.IGNORECASE)
+            if not is_bead_sample(samples, p)
             and (
                 p in manually_tagged
                 or re.search(r'unstained', all_samples.get(p, ''), re.IGNORECASE)

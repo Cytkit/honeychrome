@@ -227,6 +227,8 @@ samples_default = {
     'all_sample_nevents': {},
     'sample_af_profiles': {},
     'unstained_samples': [],
+    'bead_samples': [],
+    'bead_checked_samples': [],
 }
 
 process_default = {

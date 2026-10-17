@@ -11,6 +11,7 @@ from pathvalidate import sanitize_filename
 from honeychrome.controller import base_directory
 from honeychrome.controller_components.exporter import ReportGenerator
 from honeychrome.controller_components.functions import get_all_subfolders_recursive
+from honeychrome.controller_components.particle_type import is_bead_sample
 from honeychrome.controller_components.unmixed_exporter import UnmixedExporter
 from honeychrome.view_components.batch_export_samples_modal import BatchExportSamplesModal
 from honeychrome.view_components.icon_loader import icon as load_icon, icon
@@ -113,6 +114,16 @@ class DictTreeModel(QAbstractItemModel):
         return bool(re.search(r'unstained', tube_name, re.IGNORECASE)
                     or re.search(r'unstained', path, re.IGNORECASE))
 
+    def _sample_icon(self, path, nevents):
+        """Droplet: orange for bead samples, blue for unstained, plain otherwise."""
+        if not nevents > 0:
+            return load_icon('droplet-empty')
+        if is_bead_sample(self.full_data, path):
+            return load_icon('droplet', colour='#e08a2e')
+        if self._is_unstained(path):
+            return load_icon('droplet', colour='#4a90d9')
+        return load_icon('droplet')
+
     def setup_all_samples_from_dict(self, paths):
         title = 'All Samples'
         parent_item = TreeItem(None, title, "", self.root_item)
@@ -121,10 +132,7 @@ class DictTreeModel(QAbstractItemModel):
             if path not in self.full_data['single_stain_controls']:
                 title = self.full_data['all_samples'][path]
                 nevents = self.full_data['all_sample_nevents'][path]
-                if self._is_unstained(path):
-                    icon = load_icon('droplet', colour='#4a90d9') if nevents > 0 else load_icon('droplet-empty')
-                else:
-                    icon = load_icon('droplet') if nevents > 0 else load_icon('droplet-empty')
+                icon = self._sample_icon(path, nevents)
                 parts = path.replace("\\", "/").split("/")
                 node = parent_item
                 for part in parts[1:-1]:
@@ -139,10 +147,7 @@ class DictTreeModel(QAbstractItemModel):
         self.root_item.append_child(parent_item)
         for path in data:
             nevents = self.full_data['all_sample_nevents'][path]
-            if self._is_unstained(path):
-                icon = load_icon('droplet', colour='#4a90d9') if nevents > 0 else load_icon('droplet-empty')
-            else:
-                icon = load_icon('droplet') if nevents > 0 else load_icon('droplet-empty')
+            icon = self._sample_icon(path, nevents)
             item = TreeItem(icon, str(Path(path).stem), nevents, path, parent_item)
             parent_item.append_child(item)
 
@@ -163,10 +168,7 @@ class DictTreeModel(QAbstractItemModel):
         elif isinstance(data, list):
             for path in data:
                 nevents = self.full_data['all_sample_nevents'][path]
-                if self._is_unstained(path):
-                    icon = load_icon('droplet', colour='#4a90d9') if nevents > 0 else load_icon('droplet-empty')
-                else:
-                    icon = load_icon('droplet') if nevents > 0 else load_icon('droplet-empty')
+                icon = self._sample_icon(path, nevents)
                 item = TreeItem(icon, str(Path(path).stem), nevents, path, parent_item)
                 parent_item.append_child(item)
         else:
@@ -459,6 +461,14 @@ class SampleWidget(QWidget):
                     mark_action.triggered.connect(lambda checked, p=path: self.toggle_unstained(p))
                     menu.addAction(mark_action)
 
+                    # Beads toggle
+                    is_bead = is_bead_sample(self.controller.experiment.samples, path)
+                    bead_action = QAction("Unmark as Beads" if is_bead else "Mark as Beads", self)
+                    bead_action.setCheckable(True)
+                    bead_action.setChecked(is_bead)
+                    bead_action.triggered.connect(lambda checked, p=path: self.toggle_beads(p))
+                    menu.addAction(bead_action)
+
                     source_folder = str(self.controller.experiment_dir / self.controller.experiment.settings['raw']['raw_samples_subdirectory'])
                     folders = get_all_subfolders_recursive(source_folder, self.controller.experiment_dir)
                     move_actions = []
@@ -519,6 +529,22 @@ class SampleWidget(QWidget):
             unstained.remove(path)
         else:
             unstained.append(path)
+        self.bus.autoSaveRequested.emit()
+        self.model.refresh_tree()
+        self.tree_view.expandAll()
+        if self.bus:
+            self.bus.sampleTreeUpdated.emit()
+
+    def toggle_beads(self, path):
+        samples = self.controller.experiment.samples
+        beads = samples.setdefault('bead_samples', [])
+        checked = samples.setdefault('bead_checked_samples', [])
+        if path in beads:
+            beads.remove(path)
+        else:
+            beads.append(path)
+        if path not in checked:
+            checked.append(path)
         self.bus.autoSaveRequested.emit()
         self.model.refresh_tree()
         self.tree_view.expandAll()
