@@ -23,6 +23,7 @@ venv:
 	$(PYTHON) -m pip install --upgrade pip
 	$(PYTHON) install_annoy.py
 	$(PYTHON) -m pip install -r requirements.txt
+	$(PYTHON) install_opentsne.py
 	$(PYTHON) -m pip install pyinstaller
 
 build:

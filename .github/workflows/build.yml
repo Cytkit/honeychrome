@@ -53,6 +53,13 @@ jobs:
           python install_annoy.py
           pip install -r requirements.txt
 
+      # openTSNE's macOS wheels have no OpenMP; build it with OpenMP (checked)
+      - name: Build openTSNE with OpenMP (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          brew install libomp
+          python install_opentsne.py
+
       # --- Platform Specific Steps ---
 
       - name: Build Linux (Ubuntu)

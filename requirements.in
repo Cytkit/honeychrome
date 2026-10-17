@@ -14,6 +14,7 @@ lxml==6.0.2
 matplotlib==3.10.8
 networkx==3.6.1
 numpy==2.4.1
+# openTSNE's macOS wheels have no OpenMP: on macOS run `python install_opentsne.py` after installing
 openTSNE==1.0.4
 # pacmap needs Annoy built without -ffast-math: run `python install_annoy.py` before installing
 pacmap==0.8.0
