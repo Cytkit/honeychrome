@@ -14,7 +14,7 @@ from honeychrome.controller_components.spectral_reference_library import (
     cosine_similarity_to_reference, SpectralReferenceLibrary, compute_config_key, describe_profile,
     profile_id_from_description,
 )
-from honeychrome.view_components.cosine_qc_viewer import COSINE_QC_WARNING_THRESHOLD
+from honeychrome.view_components.cosine_qc_viewer import cosine_qc_warning_threshold, COSINE_QC_NOTE_BY_CYTOMETER
 from honeychrome.controller_components.spectral_functions import sanitise_control_in_place, _find_default_unstained
 from honeychrome.controller_components.particle_type import is_bead_sample
 from honeychrome.view_components.icon_loader import icon
@@ -1797,13 +1797,14 @@ class SpectralControlsEditor(QFrame):
 
     def _low_cosine_warning_text(self) -> str | None:
         """Text listing spectral-model controls with cosine similarity below
-        COSINE_QC_WARNING_THRESHOLD, or None.  Controls without a reference
-        entry are silently skipped."""
+        the threshold for their instrument (cosine_qc_warning_threshold), or None.
+        Controls without a reference entry are silently skipped."""
         cleaned = self.controller.cleaned_events
         pnn     = self.controller.experiment.settings['raw']['event_channels_pnn']
         model_labels = {control.get('label') for control in self.model._data}
 
-        low: list[tuple[str, float]] = []
+        low: list[tuple[str, float, float]] = []
+        low_cytometer_keys: set = set()
         for label, entry in cleaned.items():
             if label not in model_labels:
                 continue
@@ -1823,23 +1824,37 @@ class SpectralControlsEditor(QFrame):
             cs = cosine_similarity_to_reference(spectrum, fluor_pnn, label, cytometer_key)
             if cs is None:
                 continue  # no reference available — skip
-            if cs < COSINE_QC_WARNING_THRESHOLD:
-                low.append((label, cs))
+            threshold = cosine_qc_warning_threshold(cytometer_key)
+            if cs < threshold:
+                low.append((label, cs, threshold))
+                low_cytometer_keys.add(cytometer_key)
 
         if not low:
             return None
 
-        lines = '\n'.join(
-            f'  • {label}  (cosine = {cs:.4f})'
-            for label, cs in low
+        thresholds = sorted({threshold for _, _, threshold in low})
+        if len(thresholds) == 1:
+            threshold_text = f'{thresholds[0]}'
+            lines = '\n'.join(f'  • {label}  (cosine = {cs:.4f})' for label, cs, _ in low)
+        else:  # mixed instruments: state each control's own threshold
+            threshold_text = 'its instrument threshold'
+            lines = '\n'.join(
+                f'  • {label}  (cosine = {cs:.4f}, threshold {threshold})'
+                for label, cs, threshold in low
+            )
+        instrument_notes = ''.join(
+            f'\n\n{COSINE_QC_NOTE_BY_CYTOMETER[key]}'
+            for key in sorted(low_cytometer_keys, key=str)
+            if key in COSINE_QC_NOTE_BY_CYTOMETER
         )
         return (
             f'Cosine QC: the following {len(low)} control(s) have a cosine similarity to the '
-            f'reference library below {COSINE_QC_WARNING_THRESHOLD}:\n\n'
+            f'reference library below {threshold_text}:\n\n'
             f'{lines}\n\n'
             f'Check the Cosine QC plots for details. If the Major Channel is '
             f'incorrect, update it in the Spectral Model table and re-run '
             f'Clean Controls.'
+            + instrument_notes
         )
 
 

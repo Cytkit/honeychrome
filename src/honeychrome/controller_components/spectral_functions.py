@@ -10,6 +10,7 @@ import honeychrome.settings as settings
 logger = logging.getLogger(__name__)
 
 PROFILE_COSINE_WARNING_THRESHOLD = 0.95  # cross-profile cosine similarity QC threshold
+CONDITION_NUMBER_WARNING_MIN = 10  # never warn about the condition number below this, however few fluorophores
 
 # otb: get_best_channel can now be removed entirely
 def get_best_channel(sample, gating_strategy, base_gate_label, fluorescence_channel_ids):
@@ -393,7 +394,7 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
     conditioning_warnings = []
     n_profiles = unmixed_length
     cond_number = np.linalg.cond(M)
-    if cond_number > n_profiles:
+    if cond_number > max(n_profiles, CONDITION_NUMBER_WARNING_MIN):
         msg = (
             f'Spectral profile matrix is ill-conditioned: condition number '
             f'{cond_number:.1f} exceeds the number of fluorophores ({n_profiles}). '

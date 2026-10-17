@@ -36,6 +36,20 @@ logger = logging.getLogger(__name__)
 # Controls below this cosine similarity to the reference library trigger a popup warning.
 COSINE_QC_WARNING_THRESHOLD = 0.97
 
+# Instruments whose spectra match the reference library less well get a lower threshold.
+# Keys are cytometer_key / db_col values (see cytometer_whitelist).
+COSINE_QC_WARNING_THRESHOLD_BY_CYTOMETER = {'ID7000': 0.90}
+
+# Caveat appended to the Clean Controls cosine QC warning for these instruments only.
+COSINE_QC_NOTE_BY_CYTOMETER = {
+    'ID7000': ('Note: for the ID7000, a lower cosine similarity to the reference library is fairly '
+               'normal (spectra match less well across instruments) and does not necessarily '
+               'indicate a problem.'),
+}
+
+def cosine_qc_warning_threshold(cytometer_key) -> float:
+    return COSINE_QC_WARNING_THRESHOLD_BY_CYTOMETER.get(cytometer_key, COSINE_QC_WARNING_THRESHOLD)
+
 class CosineQCViewer(QFrame):
     """Spectral QC plot: calculated vs. reference spectrum with cosine score."""
 
