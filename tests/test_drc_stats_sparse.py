@@ -33,6 +33,7 @@ class _State:
     paired = False
     pairing_variable = None
     covariates = None
+    numeric_covariates = []
 
     def __init__(self):
         rng = np.random.default_rng(3)
