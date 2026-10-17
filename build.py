@@ -35,70 +35,160 @@ def get_project_files():
     label_data_destination = os.path.join('honeychrome', 'data')
     assets.append((label_data_path, label_data_destination))
 
-    # AutoSpectral Optimization kernel (bundled_plugins/) links OpenMP on
-    # macOS, but it is never hidden-imported (loaded dynamically by
-    # plugin_loaders.py), so PyInstaller's Analysis phase never
-    # sees it as a binary dependency and never applies its automatic
-    # @loader_path rewrite. Copying libomp.dylib alongside it is not sufficient
-    # on its own — the compiled extension's own load command still points at
-    # the absolute Homebrew path unless rewritten explicitly.
     if platform.system() == 'Darwin':
-        try:
-            libomp_prefix = subprocess.check_output(
-                ['brew', '--prefix', 'libomp'], stderr=subprocess.DEVNULL
-            ).decode().strip()
-            libomp_src = os.path.join(libomp_prefix, 'lib', 'libomp.dylib')
-            opt_kernel_dir = os.path.join(
-                project_root, 'src', 'honeychrome', 'bundled_plugins'
-            )
-            for fname in os.listdir(opt_kernel_dir):
-                if fname.startswith('_autospectral_opt_kernel') and fname.endswith('.dylib'):
-                    opt_kernel_path = os.path.join(opt_kernel_dir, fname)
-                    if os.path.exists(libomp_src):
-                        libomp_dest = os.path.join(opt_kernel_dir, 'libomp.dylib')
-                        shutil.copy2(libomp_src, libomp_dest)
-                        subprocess.run([
-                            'install_name_tool', '-change',
-                            libomp_src, '@loader_path/libomp.dylib',
-                            opt_kernel_path,
-                        ], check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            print('WARNING: could not rewrite libomp dependency for the '
-                  'AutoSpectral Optimization kernel — it may fail to load '
-                  'OpenMP on machines without Homebrew libomp installed.')
-
-    # SOM kernel (bundled_plugins/) -- same situation as
-    # _autospectral_opt_kernel just above: lives in the wholesale-copied
-    # bundled_plugins/ folder (so the file itself needs no extra collection
-    # step) but is loaded dynamically by som_kernel_wrapper.py rather than
-    # hidden-imported, so it also never goes through PyInstaller's
-    # automatic @loader_path rewrite and needs the same manual fix.
-    if platform.system() == 'Darwin':
-        try:
-            libomp_prefix = subprocess.check_output(
-                ['brew', '--prefix', 'libomp'], stderr=subprocess.DEVNULL
-            ).decode().strip()
-            libomp_src = os.path.join(libomp_prefix, 'lib', 'libomp.dylib')
-            som_kernel_dir = os.path.join(
-                project_root, 'src', 'honeychrome', 'bundled_plugins'
-            )
-            for fname in os.listdir(som_kernel_dir):
-                if fname.startswith('_som_kernel') and fname.endswith('.dylib'):
-                    som_kernel_path = os.path.join(som_kernel_dir, fname)
-                    if os.path.exists(libomp_src):
-                        libomp_dest = os.path.join(som_kernel_dir, 'libomp.dylib')
-                        shutil.copy2(libomp_src, libomp_dest)
-                        subprocess.run([
-                            'install_name_tool', '-change',
-                            libomp_src, '@loader_path/libomp.dylib',
-                            som_kernel_path,
-                        ], check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            print('WARNING: could not rewrite libomp dependency for the '
-                  'SOM kernel — it may fail to load OpenMP on machines '
-                  'without Homebrew libomp installed.')
+        link_kernels_to_bundled_libomp(os.path.join(project_root, 'src', 'honeychrome',
+                                                    'bundled_plugins'))
 
     return assets
+
+# --- One OpenMP runtime on macOS -------------------------------------------
+# The SOM and AutoSpectral optimisation kernels (bundled_plugins/) and openTSNE
+# (built by install_opentsne.py) all link Homebrew's libomp.dylib.  The app
+# must hold exactly one copy: two copies at different paths start two OpenMP
+# runtimes when both are used in one session, which can abort the app
+# ("OMP: Error #15").  openTSNE goes through PyInstaller's analysis, which
+# collects its libomp into Contents/Frameworks; the kernels are copied as data
+# and never analysed.  So libomp is added once at the top level, and the
+# kernels find it through @rpath (Contents/Frameworks in the app, Homebrew in
+# a source checkout).  check_single_libomp() verifies the built app.
+# scikit-learn ships its own, older libomp in sklearn/.dylibs; it cannot be
+# shared (it lacks entry points Apple clang now calls) and is left alone.
+
+KERNEL_PREFIXES = ('_som_kernel', '_autospectral_opt_kernel')
+APP_FRAMEWORKS_RPATH = '@executable_path/../Frameworks'
+LIBOMP_RPATH_REF = '@rpath/libomp.dylib'
+
+
+def homebrew_libomp():
+    """Path of Homebrew's libomp.dylib, or None."""
+    try:
+        prefix = subprocess.check_output(['brew', '--prefix', 'libomp'],
+                                         stderr=subprocess.DEVNULL).decode().strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    path = os.path.join(prefix, 'lib', 'libomp.dylib')
+    return path if os.path.exists(path) else None
+
+
+def macho_libomp_refs(binary):
+    """Load commands of a Mach-O file that name libomp.dylib."""
+    out = subprocess.check_output(['otool', '-L', binary]).decode().splitlines()[1:]
+    paths = [line.strip().split(' (')[0] for line in out]
+    return [p for p in paths if os.path.basename(p) == 'libomp.dylib']
+
+
+def macho_rpaths(binary):
+    """LC_RPATH entries of a Mach-O file."""
+    out = subprocess.check_output(['otool', '-l', binary]).decode().splitlines()
+    rpaths = []
+    for i, line in enumerate(out):
+        if line.strip() == 'cmd LC_RPATH':
+            for follow in out[i + 1:i + 4]:
+                follow = follow.strip()
+                if follow.startswith('path '):
+                    rpaths.append(follow[len('path '):].split(' (offset')[0])
+                    break
+    return rpaths
+
+
+def link_kernels_to_bundled_libomp(kernel_dir):
+    """Point the kernels' libomp load command at @rpath/libomp.dylib, with
+    rpaths to the app's Frameworks folder first and Homebrew second."""
+    libomp = homebrew_libomp()
+    if libomp is None:
+        print('WARNING: Homebrew libomp not found; the SOM and optimisation kernels '
+              'will not find OpenMP in the built app.')
+        return
+    stale = os.path.join(kernel_dir, 'libomp.dylib')
+    if os.path.exists(stale):
+        # Left by earlier versions of this script; a second copy in the app
+        os.remove(stale)
+        print(f'Removed {stale}')
+    for fname in sorted(os.listdir(kernel_dir)):
+        if not (fname.startswith(KERNEL_PREFIXES) and fname.endswith(('.so', '.dylib'))):
+            continue
+        kernel = os.path.join(kernel_dir, fname)
+        refs = macho_libomp_refs(kernel)
+        if not refs:
+            continue
+        changed = False
+        for ref in refs:
+            if ref != LIBOMP_RPATH_REF:
+                subprocess.run(['install_name_tool', '-change', ref, LIBOMP_RPATH_REF, kernel],
+                               check=True)
+                changed = True
+        rpaths = macho_rpaths(kernel)
+        for rpath in (APP_FRAMEWORKS_RPATH, os.path.dirname(libomp)):
+            if rpath not in rpaths:
+                subprocess.run(['install_name_tool', '-add_rpath', rpath, kernel], check=True)
+                changed = True
+        if changed:
+            subprocess.run(['codesign', '--force', '--sign', '-', kernel], check=True)
+        print(f'{fname}: libomp via {LIBOMP_RPATH_REF}, rpaths {macho_rpaths(kernel)}')
+
+
+def resolve_macho_ref(ref, binary, executable_dir):
+    """File a load command resolves to inside the app, or None."""
+    loader_dir = os.path.dirname(binary)
+
+    def expand(path):
+        return os.path.normpath(path.replace('@loader_path', loader_dir)
+                                .replace('@executable_path', executable_dir))
+    if ref.startswith('@rpath/'):
+        for rpath in macho_rpaths(binary):
+            candidate = expand(os.path.join(rpath, ref[len('@rpath/'):]))
+            if os.path.exists(candidate):
+                return candidate
+        return None
+    candidate = expand(ref)
+    return candidate if os.path.exists(candidate) else None
+
+
+def check_single_libomp(app):
+    """Fail the build unless the app holds one libomp (besides scikit-learn's
+    own) and every kernel and openTSNE extension that links libomp loads it."""
+    contents = os.path.join(app, 'Contents')
+    executable_dir = os.path.join(contents, 'MacOS')
+    copies = set()
+    binaries = []
+    for root, _dirs, files in os.walk(contents):
+        for fname in files:
+            path = os.path.join(root, fname)
+            if os.path.islink(path) or 'sklearn' in path.split(os.sep):
+                continue
+            if fname == 'libomp.dylib':
+                copies.add(os.path.realpath(path))
+            elif fname.endswith(('.so', '.dylib')):
+                binaries.append(path)
+    errors = []
+    if len(copies) != 1:
+        errors.append(f'{len(copies)} copies of libomp.dylib: {sorted(copies)}')
+    for binary in binaries:
+        refs = macho_libomp_refs(binary)
+        if not refs:
+            continue
+        ours = os.path.basename(binary).startswith(KERNEL_PREFIXES) or 'openTSNE' in binary
+        for ref in refs:
+            target = resolve_macho_ref(ref, binary, executable_dir)
+            if target is None:
+                message = f'{os.path.relpath(binary, app)}: {ref} does not resolve in the app'
+                if ours:
+                    errors.append(message)
+                else:
+                    print(f'WARNING: {message}')
+            elif os.path.realpath(target) not in copies:
+                errors.append(f'{os.path.relpath(binary, app)}: {ref} -> {target}, '
+                              f'not the bundled libomp')
+            else:
+                print(f'{os.path.relpath(binary, app)}: libomp -> '
+                      f'{os.path.relpath(os.path.realpath(target), app)}')
+    if errors:
+        print('libomp check FAILED:')
+        for error in errors:
+            print('   ', error)
+        sys.exit(1)
+    print(f'libomp check passed: one copy at {os.path.relpath(next(iter(copies)), app)}')
+
 
 def main():
     clean()
@@ -128,6 +218,12 @@ def main():
     sep = os.pathsep
     for source, dest in get_project_files():
         args.append(f'--add-data={source}{sep}{dest}')
+
+    # One libomp for the kernels and openTSNE, at the top level of the app
+    # (Contents/Frameworks); see link_kernels_to_bundled_libomp()
+    libomp = homebrew_libomp() if platform.system() == 'Darwin' else None
+    if libomp is not None:
+        args.append(f'--add-binary={libomp}{sep}.')
 
     # Add hooks directory
     args.append('--additional-hooks-dir=hooks')
@@ -159,6 +255,10 @@ def main():
         args.append(f'--exclude-module={pkg}')
 
     PyInstaller.__main__.run(args)
+
+    app = os.path.join('dist', 'honeychrome.app')
+    if libomp is not None and os.path.isdir(app):
+        check_single_libomp(app)
 
     # Show size
     exe_path = os.path.join('dist', 'honeychrome')
