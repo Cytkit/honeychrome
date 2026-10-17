@@ -42,7 +42,7 @@ Clustering:
   ConfigTab clustering section: FlowSOM / Leiden / HDBSCAN radio buttons
   with per-algorithm hyperparameter panels.
   FlowSOM: SOM grid, manual metacluster count (2-200).
-  Leiden: hnswlib kNN graph (UMAP's index when built on the same events);
+  Leiden: hnswlib kNN graph of the clustering's own training events;
   graspologic-native community detection.
   HDBSCAN: applied to UMAP embedding if available, else raw feature space.
   All algorithms assign labels to every sample via nearest-centroid.
@@ -76,53 +76,7 @@ Report tab:
 # ---------------------------------------------------------------------------
 import os as _os
 import sys
-import threading
 import warnings
-
-# Set Numba threading layer at module-import time, before any JIT compilation.
-# 'omp' ships with llvmlite (a hard Numba dep) and is always available.
-# Unlike the default 'workqueue' layer, 'omp' is safe when two Numba-compiled
-# functions (e.g. UMAP and FlowSOM) are running concurrently on separate
-# QThreads.  Must be set before the first numba import, which is why it lives
-# here at module scope.
-_NUMBA_LAYER_FROM_USER = 'NUMBA_THREADING_LAYER' in _os.environ
-if not _NUMBA_LAYER_FROM_USER:
-    _os.environ['NUMBA_THREADING_LAYER'] = 'omp'
-
-_numba_layer_lock = threading.Lock()
-_numba_layer_checked = False
-
-
-def _ensure_numba_threading_layer():
-    """
-    Make sure Numba's 'omp' threading layer can load before PaCMAP or UMAP
-    compile or load cached parallel code, and fall back to 'workqueue' if not.
-
-    Numba's OpenMP pool links against '@rpath/libomp.dylib' on macOS, which
-    wheel installs do not provide; it resolves only if a libomp of that name
-    is already loaded into the process (scikit-learn's bundled copy is
-    imported first to supply one).  Without a loadable layer Numba raises
-    'No threading layer could be loaded'.  A threading layer the user set
-    through NUMBA_THREADING_LAYER is left alone.  Safe to call repeatedly
-    from any thread.
-    """
-    global _numba_layer_checked
-    with _numba_layer_lock:
-        if _numba_layer_checked or _NUMBA_LAYER_FROM_USER:
-            _numba_layer_checked = True
-            return
-        _numba_layer_checked = True
-        try:
-            import sklearn.utils._openmp_helpers  # noqa: F401  (loads a libomp)
-        except Exception:
-            pass
-        try:
-            from numba.np.ufunc import omppool  # noqa: F401
-        except ImportError:
-            import numba
-            numba.config.THREADING_LAYER = 'workqueue'
-            _log.warning("Numba's OpenMP threading layer could not be loaded; "
-                         "using 'workqueue' (PaCMAP and UMAP may run slower).")
 
 
 def _suppress_third_party_warnings():
@@ -166,6 +120,7 @@ def _suppress_third_party_warnings():
 # ---------------------------------------------------------------------------
 from dataclasses import dataclass, field
 from copy import copy as _shallow_copy, deepcopy
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -230,6 +185,7 @@ _PLUGIN_DIR = _os.path.dirname(_os.path.abspath(__file__))
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
+import drc_jit  # first: sets NUMBA_THREADING_LAYER before numba is imported
 import drc_logging
 import drc_pipeline
 import drc_clustering
@@ -243,6 +199,8 @@ import drc_report
 import drc_help_texts
 import drc_predictive
 import drc_time_estimate
+import drc_run_align
+import drc_umap_index
 from transforms_panel import (
     TransformInspector, pool_population_events, transform_from_params,
     transform_params as _transform_params,
@@ -293,6 +251,10 @@ def _ensure_qt_imports():
 # 2.  Plugin identity
 # ---------------------------------------------------------------------------
 plugin_name = 'Honeycluster'
+
+# Version of the DR parameter defaults saved per experiment; settings from an
+# older version keep their values except the defaults that changed since.
+DR_DEFAULTS_VERSION = 2
 
 # QSettings 'application' identifier for this plugin's persisted
 # gates/channels/DR-clustering state -- deliberately frozen to the
@@ -972,11 +934,10 @@ class PipelineState:
     # from (same feature space the reducer was fit on). Cached alongside
     # embeddings precisely so T-REX (or anything else needing true
     # marker-space neighbours) never has to re-derive them from live data.
-    umap_knn_index: Any | None = None
-    # hnswlib index built during UMAP training; reused by Leiden and T-REX
-    umap_knn_fingerprint: tuple | None = None
-    # (shape, drc_pipeline.array_digest) of the array umap_knn_index was
-    # built on; Leiden reuses the index only for that exact array
+    embedding_rows: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    # {algorithm_name: {sample_path: np.ndarray int32}} -- event keys: the
+    # FCS-file row of every embedding row (drc_pipeline.load_gated_rows),
+    # so an embedding can be matched to any later gating by event.
     dr_runs: list[dict] = field(default_factory=list)
     # Ordered archive of completed DR training runs, parallel to
     # clustering_runs below.  Each entry (manifest fields + heavy payload):
@@ -1013,6 +974,9 @@ class PipelineState:
     # clustering_runs['dr_positions'] so the Cluster Annotation map can
     # still plot correct positions even if the live state.embeddings for
     # that algorithm have since been overwritten by a later DR run.
+    cluster_rows: dict[str, np.ndarray] = field(default_factory=dict)
+    # {sample_path: np.ndarray int32} -- event keys of cluster_labels' rows
+    # (the gated events, or the source embedding's rows for a DR-space run).
     n_clusters: int | None = None
     active_clustering_algorithm: str | None = None
     clustering_runs: list[dict] = field(default_factory=list)
@@ -1222,6 +1186,8 @@ class PipelineState:
 
     # --- Data pipeline cache ---
     gated_data_cache: dict[tuple, np.ndarray] = field(default_factory=dict)
+    gated_rows_cache: dict[tuple, np.ndarray] = field(default_factory=dict)
+    # Same keys as gated_data_cache: the FCS-file row of each gated event.
     # {(abs_path_str, sorted_gates_tuple, id(transfer_matrix)): gated array}
     # Populated by drc_pipeline.load_unmixed_gated(). Avoids re-reading and
     # re-unmixing an FCS file from disk on every PlotCard.refresh() — the
@@ -1592,18 +1558,22 @@ class RunManagementTable(CopyableTableWidget):
     # ------------------------------------------------------------------
 
     def _current_fingerprint(self, entry: dict, cache: dict):
-        """drc_pipeline.sync_fingerprint() for the run's own gates and samples,
-        computed once per distinct (gates, samples) pair per pass."""
+        """(drc_pipeline.sync_fingerprint(), drc_pipeline.split_fingerprints())
+        for the run's own gates and samples, computed once per distinct
+        (gates, samples) pair per pass."""
         key = (tuple(entry.get('gates', [])), tuple(entry.get('training_sample_ids', [])))
         if key not in cache:
-            cache[key] = drc_pipeline.sync_fingerprint(self.controller, *key)
+            cache[key] = (drc_pipeline.sync_fingerprint(self.controller, *key),
+                          drc_pipeline.split_fingerprints(self.controller, *key))
         return cache[key]
 
     def _apply_sync_style(self, row: int, entry: dict, cache: dict):
         """Colour the row's text orange when the run is out of sync with the
         current gating and unmixing, and say why in the label's tooltip."""
-        status = drc_run_archive.sync_status(entry, self._current_fingerprint(entry, cache))
+        current, split = self._current_fingerprint(entry, cache)
+        status = drc_run_archive.sync_status(entry, current)
         out_of_sync = status == drc_run_archive.SYNC_OUT_OF_SYNC
+        keyed = drc_run_align.has_event_keys(entry)
         label_item = self.item(row, 0)
         for col in range(self.columnCount()):
             item = self.item(row, col)
@@ -1613,14 +1583,29 @@ class RunManagementTable(CopyableTableWidget):
         if label_item is None:
             return
         base = label_item.data(self._BASE_TOOLTIP_ROLE) or ''
-        if out_of_sync:
-            note = ("Out of sync: the unmixing, AF profile assignment or gating has "
-                    "changed since this run was made, so cells may have moved in or "
-                    "out of its gates. Its saved events no longer match what the "
-                    "current gating selects.")
+        if out_of_sync and keyed:
+            detail = drc_run_archive.sync_detail(entry, split)
+            changed = [part for part in ('gating', 'unmixing')
+                       if detail[part] == drc_run_archive.SYNC_CHANGED]
+            note = (f"Changed since this run was made: {' and '.join(changed) or 'gating or unmixing'}. "
+                    "The run records which events it holds, so it is matched to the "
+                    "current gating event by event: cells that left its gates drop "
+                    "out, and new cells are labelled from its SOM codebook or "
+                    "cluster centroids where it has them (otherwise left unlabelled).")
+            if 'unmixing' in changed:
+                note += (" Its embedding or clusters were computed from the earlier "
+                         "unmixed values; re-run it to use the current ones.")
+        elif out_of_sync:
+            note = ("Out of sync, and made before event keys were recorded: the "
+                    "unmixing, AF profile assignment or gating has changed since, so "
+                    "its events can no longer be matched to the current data. It can "
+                    "still be viewed on its own; use \u2018Use These Settings\u2019 to "
+                    "re-run it.")
         elif status == drc_run_archive.SYNC_UNKNOWN:
             note = ("Sync cannot be verified: this run was made before sync tracking "
-                    "was added, or the current state could not be fingerprinted.")
+                    "was added, or the current state could not be fingerprinted. It "
+                    "is used on its own (its stored embedding, labels and marker values) "
+                    "and not matched to events loaded now.")
         else:
             note = ''
         label_item.setToolTip('\n\n'.join(t for t in (base, note) if t))
@@ -1921,11 +1906,12 @@ class ConfigTab(QWidget):
         umap_grid.addWidget(QLabel("n_epochs:"), 1, 2)
         self.umap_n_epochs = QSpinBox()
         self.umap_n_epochs.setRange(50, 2000)
-        self.umap_n_epochs.setValue(500)
+        self.umap_n_epochs.setValue(200)
         self.umap_n_epochs.setToolTip(
             "Number of optimisation epochs.\n"
-            "More epochs = finer embedding; also slower.\n"
-            "Default: 500"
+            "More epochs = finer embedding; also slower (layout time\n"
+            "grows in proportion).\n"
+            "Default: 200 (umap-learn's default above 10,000 events)"
         )
         umap_grid.addWidget(self.umap_n_epochs, 1, 3)
 
@@ -1938,11 +1924,9 @@ class ConfigTab(QWidget):
             "-1 = use all available cores.  Default: all cores.\n"
             "UMAP disables real multi-threading whenever a fixed random seed\n"
             "is set (needed for reproducible runs).\n"
-            "Setting this above 1 drops the fixed seed for THIS run, and the\n"
-            "hnswlib kNN graph it shares with Leiden clustering is built in\n"
-            "parallel too: neither the embedding nor Leiden's clusters will\n"
-            "be bit-for-bit reproducible run-to-run. Set to 1 if exact\n"
-            "reproducibility matters more than training speed."
+            "Setting this above 1 drops the fixed seed for THIS run, so the\n"
+            "embedding is not bit-for-bit reproducible run-to-run. Set to 1\n"
+            "if exact reproducibility matters more than training speed."
         )
         umap_grid.addWidget(self.umap_n_jobs, 2, 1)
 
@@ -1964,11 +1948,13 @@ class ConfigTab(QWidget):
         )
         tsne_grid.addWidget(self.tsne_perplexity, 0, 1)
 
-        tsne_grid.addWidget(QLabel('n_iter (max):'), 0, 2)
+        tsne_grid.addWidget(QLabel('n_iter:'), 0, 2)
         self.tsne_n_iter = QSpinBox()
         self.tsne_n_iter.setRange(250, 5000)
-        self.tsne_n_iter.setValue(1000)
-        self.tsne_n_iter.setToolTip('Maximum iterations.  Default: 1000')
+        self.tsne_n_iter.setValue(500)
+        self.tsne_n_iter.setToolTip(
+            'Optimisation iterations after the 250 early-exaggeration\n'
+            'iterations.  Default: 500 (openTSNE default)')
         tsne_grid.addWidget(self.tsne_n_iter, 0, 3)
 
         tsne_grid.addWidget(QLabel('n_jobs:'), 1, 0)
@@ -2158,10 +2144,7 @@ class ConfigTab(QWidget):
         self.leiden_n_neighbors.setRange(2, 500)
         self.leiden_n_neighbors.setValue(15)
         self.leiden_n_neighbors.setToolTip(
-            "Neighbours per event in the kNN graph. Default: 15\n"
-            "UMAP's hnswlib index is reused when it was built on exactly the\n"
-            "same training events (same samples, gate, channels and\n"
-            "downsampling); otherwise a new index is built."
+            "Neighbours per event in the kNN graph. Default: 15"
         )
         leiden_grid.addWidget(self.leiden_n_neighbors, 0, 3)
 
@@ -2323,6 +2306,13 @@ class ConfigTab(QWidget):
 
         runs_btn_row = QHBoxLayout()
         runs_btn_row.addStretch()
+        self.use_run_settings_btn = QPushButton("Use These Settings")
+        self.use_run_settings_btn.setEnabled(False)
+        self.use_run_settings_btn.setToolTip(
+            "Load the selected run's gates, training samples, channels, algorithm "
+            "and parameters into the Configuration pages, ready to run again.")
+        self.use_run_settings_btn.clicked.connect(self._on_use_run_settings_clicked)
+        runs_btn_row.addWidget(self.use_run_settings_btn)
         self.delete_run_btn = QPushButton("Delete Selected Run")
         self.delete_run_btn.setEnabled(False)
         self.delete_run_btn.setToolTip("Select a run above to delete it.")
@@ -2381,7 +2371,15 @@ class ConfigTab(QWidget):
         self.state.training_sample_ids = list(ordered_list)
 
     def _on_run_table_selection_changed(self):
-        self.delete_run_btn.setEnabled(self.run_table.selected_run_id() is not None)
+        selected = self.run_table.selected_run_id() is not None
+        self.delete_run_btn.setEnabled(selected)
+        self.use_run_settings_btn.setEnabled(selected)
+
+    def _on_use_run_settings_clicked(self):
+        plugin = self._plugin_widget()
+        entry = self.run_table._find_entry(self.run_table.selected_run_id())
+        if plugin is not None and entry is not None:
+            plugin.load_run_settings(entry)
 
     def _on_delete_run_clicked(self):
         self.run_table.delete_selected()
@@ -2541,25 +2539,35 @@ class ConfigTab(QWidget):
         # HDBSCAN doesn't behave well directly on the full
         # multichannel feature space (confirmed: hundreds of
         # near-meaningless clusters on a real run). Force DR space and
-        # disable the raw-feature-space option while it's selected;
-        # restore both for FlowSOM/Leiden, which are fine in either space.
+        # disable the raw-feature-space option while it's selected.
+        # FlowSOM trains its SOM on the channel values only, so the DR
+        # option is disabled for it.  Leiden is fine in either space.
         is_hdbscan = (algo == 'HDBSCAN')
+        is_flowsom = (algo == 'FlowSOM')
         self._rb_space_raw.setEnabled(not is_hdbscan)
+        self._rb_space_dr.setEnabled(not is_flowsom)
         if is_hdbscan and not self._rb_space_dr.isChecked():
             self._rb_space_dr.setChecked(True)
+        if is_flowsom and not self._rb_space_raw.isChecked():
+            self._rb_space_raw.setChecked(True)
         self._rb_space_raw.setToolTip(
             "Not available for HDBSCAN -- see the note below."
             if is_hdbscan else
             "Cluster directly on the logicle-transformed channel values."
         )
+        self._rb_space_dr.setToolTip(
+            "Not available for FlowSOM: its SOM trains on the channel values."
+            if is_flowsom else
+            "Cluster on a dimensionality-reduction embedding."
+        )
 
         notes = {
             'FlowSOM': (
-                "FlowSOM: self-organising map → metaclustering."
+                "FlowSOM: self-organising map → metaclustering, on the channel values."
             ),
             'Leiden': (
-                "Leiden: graph community detection (graspologic-native).\n"
-                "Reuses UMAP's kNN index when built on the same events.\n"
+                "Leiden: graph community detection (graspologic-native)\n"
+                "on its own kNN graph of the training events.\n"
                 "Higher resolution = more fine-grained clusters."
             ),
             'HDBSCAN': (
@@ -3722,7 +3730,8 @@ class GroupsStatsTab(QWidget):
 
         self.stats_status_label = QLabel("")
         self.stats_status_label.setStyleSheet("color: grey;")
-        run_row.addWidget(self.stats_status_label)
+        self.stats_status_label.setWordWrap(True)
+        run_row.addWidget(self.stats_status_label, 1)
         run_row.addStretch()
 
         self.export_results_btn = QPushButton("Export Results CSV")
@@ -5526,6 +5535,7 @@ class GroupsStatsTab(QWidget):
         # numpy arrays, and a reload mid-run could pair one sample's
         # transfer matrix with another sample's AF library.
         af_state = drc_pipeline.snapshot_af_state(self.controller)
+        align_run, align_mode = self._stats_alignment(run_id)
 
         class _StatsWorker(QThread):
             finished = Signal(bool, str)
@@ -5576,6 +5586,7 @@ class GroupsStatsTab(QWidget):
                     use_treat=self_._use_treat,
                     mfi_threshold=self_._mfi_threshold,
                     mfi_hierarchical=self_._mfi_hierarchical,
+                    align_run=align_run, align_mode=align_mode,
                 )
                 if freq is not None:
                     self_.progress.emit(f"Frequencies: {len(freq)} rows tested.")
@@ -5702,7 +5713,32 @@ class GroupsStatsTab(QWidget):
             )
         return (run_id, run_freq, run_counts, run_mfi, groups_fingerprint,
                 test_fingerprint, self.chk_include_type_markers.isChecked(),
-                roles_fingerprint, transform_fingerprint)
+                roles_fingerprint, transform_fingerprint, self._run_sync_key(run_id))
+
+    def _run_sync_key(self, run_id: str) -> str:
+        """Current fingerprint of a run's gates and samples: results computed
+        under other gating or unmixing are not current."""
+        for entry in self.state.clustering_runs:
+            if entry.get('run_id') == run_id:
+                return drc_pipeline.sync_fingerprint(
+                    self.controller, entry.get('gates', []),
+                    entry.get('training_sample_ids', [])) or ''
+        return ''
+
+    def _stats_alignment(self, run_id: str):
+        """(run, mode) when the selected archived run no longer matches the
+        current gating and unmixing and its labels have to be matched to
+        the current events first, else (None, None)."""
+        if not run_id:
+            return None, None
+        run = self._selected_run_entry()
+        if run is None or run.get('run_id') != run_id:
+            return None, None
+        current = drc_pipeline.sync_fingerprint(
+            self.controller, run.get('gates', []), run.get('training_sample_ids', []))
+        if drc_run_archive.sync_status(run, current) == drc_run_archive.SYNC_IN_SYNC:
+            return None, None
+        return run, drc_run_align.live_join_mode(run, current)
 
     def _update_stats_freshness(self):
         """
@@ -6258,7 +6294,9 @@ class GroupsStatsTab(QWidget):
         if data_key is not None:
             self._last_stats_data_key = data_key
             self.state.stats_data_key = data_key
-        self.stats_status_label.setText("✓ Statistics complete.")
+        note = getattr(worker.state, 'stats_alignment_note', '') if worker is not None else ''
+        self.stats_status_label.setText(
+            "✓ Statistics complete." + (f"\n{note}" if note else ''))
         self.stats_status_label.setStyleSheet("color: green;")
         self.export_results_btn.setEnabled(True)
         self._update_pca_source_availability()
@@ -7529,7 +7567,7 @@ class _MarkerValuesWorker(QThread):
     cache (see _marker_cache_key) skips even starting this worker once
     that's warm.
     """
-    finished = Signal(bool, str, dict)  # success, error, {rel_path: (values, names)}
+    finished = Signal(bool, str, dict)  # success, error, {rel_path: (values, names, rows)}
 
     def __init__(self, controller, state, samples: list[str], af_state, parent=None):
         super().__init__(parent)
@@ -7544,8 +7582,10 @@ class _MarkerValuesWorker(QThread):
             for rel in self._samples:
                 mv = drc_pipeline.load_sample_marker_values(
                     self._controller, self._state, rel, af_state=self._af_state)
-                if mv is not None:
-                    results[rel] = mv
+                rows = drc_pipeline.load_sample_rows(
+                    self._controller, self._state, rel, af_state=self._af_state)
+                if mv is not None and rows is not None:
+                    results[rel] = (mv[0], mv[1], rows)
             self.finished.emit(True, '', results)
         except Exception as exc:
             traceback.print_exc()
@@ -8117,7 +8157,14 @@ class PlotCard(QFrame):
 
         cl_run = self._selected_cluster_run()
         labels_dict = cl_run.get('labels', {}) if cl_run else {}
+        join_mode = drc_run_align.runs_join_mode(run, cl_run) if cl_run else None
         unaligned_samples: list[str] = []
+
+        def _labels_on(rel, n):
+            return drc_scatter.align_labels_to_embedding(
+                labels_dict.get(rel), n,
+                label_rows=drc_run_align.run_rows(cl_run, rel) if cl_run else None,
+                emb_rows=drc_run_align.run_rows(run, rel), mode=join_mode)
 
         # Gather data (plus the sample-of-origin per row, needed for Marker mode)
         sample_data_item = self.sample_combo.currentData()
@@ -8130,7 +8177,7 @@ class PlotCard(QFrame):
                 return
             xy = emb
             lbl_raw = labels_dict.get(rel_path)
-            lab, aligned_ok = drc_scatter.align_labels_to_embedding(lbl_raw, len(emb))
+            lab, aligned_ok = _labels_on(rel_path, len(emb))
             if lbl_raw is not None and not aligned_ok:
                 unaligned_samples.append(rel_path)
             origin = np.array([rel_path] * len(emb), dtype=object)
@@ -8147,12 +8194,12 @@ class PlotCard(QFrame):
                 xys.append(emb)
                 origins.append(np.array([rel] * n, dtype=object))
                 lbl_raw = labels_dict.get(rel)
-                lbl, aligned_ok = drc_scatter.align_labels_to_embedding(lbl_raw, n)
+                lbl, aligned_ok = _labels_on(rel, n)
                 if lbl_raw is None:
                     _log.debug("workspace: no cluster labels for %s — greyed", rel)
                 elif not aligned_ok:
-                    _log.warning("workspace: label/embedding length mismatch for %s "
-                                 "(%d labels vs %d points) — greyed",
+                    _log.warning("workspace: labels of %s do not cover every embedded "
+                                 "event (%d labels, %d points) — unmatched points greyed",
                                  rel, len(lbl_raw), n)
                     unaligned_samples.append(rel)
                 labs.append(lbl)
@@ -8429,7 +8476,7 @@ class PlotCard(QFrame):
     def _draw_marker_scatter(self, ax, xy, origin, disp_idx, sample_row_offsets,
                              run: dict, marker_values_by_sample: dict):
         """Colour by UNTRANSFORMED marker intensity on the full data scale.
-        marker_values_by_sample is {rel_path: (values, names)} for every
+        marker_values_by_sample is {rel_path: (values, names, rows)} for every
         sample in *origin*, already loaded by refresh() (synchronously from
         cache, or via _MarkerValuesWorker on a cold cache) -- this method
         does no disk I/O of its own."""
@@ -8439,60 +8486,50 @@ class PlotCard(QFrame):
             ax.set_title("Marker: no channel", fontsize=8)
             return
 
-        # Marker values are re-gated against the CURRENT gate selection, but
-        # the embedding itself was built under whatever gates were active
-        # when this run was archived (run['gates']). If those have since
-        # diverged, per-sample row counts won't line up with the embedding
-        # and points would be silently miscoloured rather than just greyed.
+        # Marker values come from the CURRENT gating and unmixing.  A run
+        # with event keys is matched to them event by event (points whose
+        # event is not gated now stay grey); a legacy run only row for row,
+        # and only when it is in sync and was made with the selected gates.
+        mode = drc_run_align.live_join_mode(run, drc_pipeline.sync_fingerprint(
+            self.controller, run.get('gates', []), run.get('training_sample_ids', [])))
         run_gates = run.get('gates')
-        if run_gates is not None and sorted(run_gates) != sorted(self.state.selected_gates):
+        if mode != drc_run_align.JOIN_KEYS and (
+                mode == drc_run_align.JOIN_NONE or run_gates is None
+                or sorted(run_gates) != sorted(self.state.selected_gates)):
             ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.3)
-            ax.set_title(f"{run.get('label', '')}: gate changed since training — retrain DR",
-                        fontsize=8)
-            _log.warning(
-                "marker scatter: gate selection changed since run %r was trained "
-                "(trained on %r, now %r) — embeddings are stale",
-                run.get('label'), run_gates, self.state.selected_gates,
-            )
+            ax.set_title(f"{run.get('label', '')}: made before event keys and no longer "
+                         "matches the current gating — retrain DR", fontsize=8)
+            _log.warning("marker scatter: run %r cannot be matched to the current events",
+                         run.get('label'))
             return
 
         values = np.full(len(xy), np.nan, dtype=np.float32)
+        n_unmatched = 0
         for rel in np.unique(origin):
             mv = marker_values_by_sample.get(str(rel))
             if mv is None:
                 continue
-            vals, names = mv
+            vals, names, cur_rows = mv
             if ch not in names:
                 continue
-            full_col = vals[:, names.index(ch)]  # all gated events for this sample
-
+            start, end = sample_row_offsets.get(rel, (0, int((origin == rel).sum())))
+            col, matched = drc_run_align.pair_arrays(
+                vals[:, names.index(ch)].astype(np.float32), end - start, mode,
+                src_rows=cur_rows, dst_rows=drc_run_align.run_rows(run, rel), fill=np.nan)
+            if col is None:
+                _log.warning("marker %s: %s embedding has %d points but current "
+                             "gating yields %d events — skipped", ch, rel, end - start,
+                             len(vals))
+                continue
+            n_unmatched += int((~matched).sum())
             mask = origin == rel   # which rows in the display array belong to this sample
-            if disp_idx is not None and rel in sample_row_offsets:
-                # Recover which rows within this sample survived global downsampling.
-                start, end = sample_row_offsets[rel]
-                # The embedding's row range for this sample must match its
-                # CURRENT re-gated event count exactly, or positional
-                # indexing below is meaningless (not just out-of-range —
-                # in-range-but-wrong is possible too, and silent). Check the
-                # count up front rather than only catching an overflow
-                # after the fact.
-                if (end - start) != len(full_col):
-                    _log.warning(
-                        "marker %s: %s embedding has %d points but current "
-                        "gating yields %d events — stale embedding for this "
-                        "sample, skipped (retrain DR to refresh)",
-                        ch, rel, end - start, len(full_col))
-                    continue
-                kept_global = disp_idx[mask]          # global indices of kept rows
-                within_sample = kept_global - start   # row indices inside full_col
-                values[mask] = full_col[within_sample]
+            if disp_idx is not None:
+                values[mask] = col[disp_idx[mask] - start]
             else:
-                # No downsampling or no offset info — direct assignment
-                if int(mask.sum()) == len(full_col):
-                    values[mask] = full_col
-                else:
-                    _log.warning("marker %s: %s has %d events but %d displayed points",
-                                 ch, rel, len(full_col), int(mask.sum()))
+                values[mask] = col
+        if n_unmatched:
+            _log.info("marker %s: %d embedded event(s) are not in the current gating "
+                      "and are not drawn", ch, n_unmatched)
 
         finite = np.isfinite(values)
         display_label = _antigen_dash_labels(self.controller).get(ch, ch)
@@ -8973,28 +9010,45 @@ def _array_summary(data) -> str:
             f"max={float(arr[finite].max()):.6g}")
 
 
+# Largest Annoy tree PaCMAP keeps in memory; above this it is rebuilt for
+# every transform (slower, no extra memory).
+PACMAP_TREE_MAX_BYTES = 5e9
+
+
+def _pacmap_tree_bytes(n_events: int, n_channels: int) -> float:
+    """Approximate size of PaCMAP's Annoy tree (20 trees, Euclidean): about
+    7.2 nodes per event of (16 + 4 x channels) bytes, measured at 480,000
+    events x 7 channels (153 MB)."""
+    return 7.2 * n_events * (16 + 4 * n_channels)
+
+
 class _PaCMAPWrapper:
     """
-    Thin wrapper around a fitted PaCMAP reducer that stores the training
-    data so out-of-sample transform() calls can pass it as `basis`.
+    Thin wrapper around a fitted PaCMAP reducer.
 
-    PaCMAP.transform(X_new, basis=X_train) is required when the Annoy
-    index is not saved to disk; without basis the call raises:
-      'If the index is not cached, the original dataset must be provided.'
+    With the Annoy tree kept (save_tree=True), transform() needs nothing
+    else.  A tree too large to keep (_pacmap_tree_bytes) is rebuilt from
+    the training data on every call, which PaCMAP takes as `basis`.
 
     transform() returns a plain ndarray — not a tuple.
     """
-    def __init__(self, reducer, training_data: np.ndarray):
+    def __init__(self, reducer, training_data: np.ndarray | None):
         self._reducer = reducer
         self._training_data = training_data
 
+    @property
+    def embedding_(self) -> np.ndarray:
+        """Embedding of the training data, in training-pool row order."""
+        return self._reducer.embedding_
+
     def transform(self, new_data: np.ndarray) -> np.ndarray:
         try:
-            return self._reducer.transform(new_data, basis=self._training_data)
+            with drc_jit.numba_section():
+                if self._training_data is None:
+                    return self._reducer.transform(new_data)
+                return self._reducer.transform(new_data, basis=self._training_data)
         except ValueError as exc:
-            _log.error(
-                "PaCMAP transform failed (%s): %s | training: %s",
-                exc, _array_summary(new_data), _array_summary(self._training_data))
+            _log.error("PaCMAP transform failed (%s): %s", exc, _array_summary(new_data))
             raise
 
 
@@ -9114,6 +9168,14 @@ class _DrWorker(QThread):
         # drc_pipeline.apply_unmixing_af_aware() docstring for why this
         # must not be read live off the controller from this thread.
         self._af_state = af_state
+        # Measured stage times and event counts, for drc_time_estimate's
+        # per-machine calibration: 'io' (read, unmix and gate files not yet
+        # cached; events = file events read), 'fit' (pool events), 'embed'
+        # (events transformed).  jit_included: the run compiled numba code.
+        self.stage_seconds = {'io': 0.0, 'fit': 0.0, 'index': 0.0, 'embed': 0.0}
+        self.stage_events = {'io': 0, 'fit': 0, 'index': 0, 'embed': 0}
+        self.embed_calls = 0
+        self.jit_included = False
 
     def cancel(self):
         self._cancelled = True
@@ -9143,6 +9205,8 @@ class _DrWorker(QThread):
             if self._task == 'train':
                 self._do_train()
             elif self._task == 'apply':
+                self.jit_included = self._algo == 'UMAP' and not (
+                    drc_jit.is_warm('UMAP', True) or drc_jit.is_warm('UMAP', False))
                 self._do_apply(training_only=self._training_only)
         except _RunCancelled:
             self.finished.emit(False, "Cancelled.")
@@ -9157,11 +9221,20 @@ class _DrWorker(QThread):
         """Emit a deterministic progress update (0,0 = indeterminate)."""
         self.progress_value.emit(current, total)
 
+    def _timed_load(self, rel_paths) -> None:
+        """Load (read, unmix, gate) the samples not yet cached, timing it as 'io'."""
+        seconds, events = drc_pipeline.timed_preload(
+            self._plugin.controller, self._plugin.state, rel_paths,
+            af_state=self._af_state, should_stop=lambda: self._cancelled)
+        self.stage_seconds['io'] += seconds
+        self.stage_events['io'] += events
+
     def _do_train(self):
         plugin = self._plugin
         algo = self._algo
 
-        training_data = plugin._load_training_data(af_state=self._af_state)
+        self._timed_load(plugin.state.training_sample_ids)
+        training_data, selections = plugin._load_training_data(af_state=self._af_state)
         if training_data is None:
             self.finished.emit(False, "No training data could be loaded.")
             return
@@ -9174,12 +9247,15 @@ class _DrWorker(QThread):
         # Signal indeterminate progress while setting up
         self._emit_progress(0, 0)
 
+        self.jit_included = (algo == 'UMAP' and not drc_jit.is_warm(
+            'UMAP', parallel=_umap_parallel(self._params)))
+        fit_start = time.perf_counter()
         if algo == 'UMAP':
             # UMAP supports a tqdm hook — gives us per-epoch progress.
             # total_override pins the bar's denominator to the actual
             # configured n_epochs, instead of whatever total UMAP's own
             # tqdm call happens to report.
-            n_epochs = self._params.get('n_epochs', 500)
+            n_epochs = self._params.get('n_epochs', 200)
             hook = _UMAPTqdmHook(callback=self._emit_progress, total_override=n_epochs,
                                  should_cancel=lambda: self._cancelled)
             reducer = plugin._run_umap(self._params, training_data,
@@ -9193,6 +9269,8 @@ class _DrWorker(QThread):
         else:
             self.finished.emit(False, f"Unknown algorithm: {algo}")
             return
+        self.stage_seconds['fit'] = time.perf_counter() - fit_start
+        self.stage_events['fit'] = len(training_data)
 
         if self._cancelled:
             self.finished.emit(False, "Cancelled.")
@@ -9207,11 +9285,22 @@ class _DrWorker(QThread):
         # larger) sample set inflate the "embeddings: N sample(s)" count.
         plugin.state.embeddings[algo] = {}
         plugin.state.embedding_features[algo] = {}
+        plugin.state.embedding_rows[algo] = {}
 
         self._emit(f"{algo} training complete.  Embedding training samples …")
-        self._do_apply(training_only=True)
+        self._do_apply(training_only=True,
+                       pool=(selections, _fit_embedding(reducer, len(training_data))))
 
-    def _do_apply(self, training_only: bool):
+    def _do_apply(self, training_only: bool, pool=None):
+        """
+        Embed samples with the trained model.
+
+        training_only: embed the training samples (after training), else
+        every sample not yet embedded by this model ('Apply to All Samples').
+        pool: (selections, fit_embedding) from training -- the events of the
+        training pool take their position from the fit itself, and only the
+        rest of each sample's events are transformed.
+        """
         plugin = self._plugin
         algo = self._algo
         reducer = plugin.state.trained_reducers.get(algo)
@@ -9220,32 +9309,34 @@ class _DrWorker(QThread):
             return
 
         raw_subdir = plugin.controller.experiment.settings['raw']['raw_samples_subdirectory']
+        all_sample_keys = []
+        for abs_key in plugin.controller.experiment.samples.get('all_samples', {}):
+            try:
+                rel = str(Path(abs_key).relative_to(raw_subdir))
+            except ValueError:
+                rel = abs_key
+            if training_only and rel not in plugin.state.training_sample_ids:
+                continue
+            all_sample_keys.append((abs_key, rel))
 
-        if training_only:
-            # Embed only the training samples
-            all_sample_keys = []
-            all_samples_dict = plugin.controller.experiment.samples.get('all_samples', {})
-            for abs_key in all_samples_dict:
-                try:
-                    rel = str(__import__('pathlib').Path(abs_key).relative_to(raw_subdir))
-                except ValueError:
-                    rel = abs_key
-                if rel in plugin.state.training_sample_ids:
-                    all_sample_keys.append((abs_key, rel))
-        else:
-            # Embed every sample in the experiment
-            all_sample_keys = []
-            for abs_key in plugin.controller.experiment.samples.get('all_samples', {}).keys():
-                try:
-                    rel = str(__import__('pathlib').Path(abs_key).relative_to(raw_subdir))
-                except ValueError:
-                    rel = abs_key
-                all_sample_keys.append((abs_key, rel))
+        for store in (plugin.state.embeddings, plugin.state.embedding_features,
+                      plugin.state.embedding_rows):
+            store.setdefault(algo, {})
+        embedded = plugin.state.embeddings[algo]
+        if not training_only:
+            # Samples this model has already embedded keep their positions
+            all_sample_keys = [(a, r) for a, r in all_sample_keys if r not in embedded]
 
-        if algo not in plugin.state.embeddings:
-            plugin.state.embeddings[algo] = {}
-        if algo not in plugin.state.embedding_features:
-            plugin.state.embedding_features[algo] = {}
+        from_fit = {}
+        if pool is not None:
+            selections, fit_embedding = pool
+            if fit_embedding is not None:
+                offset = 0
+                for rel, idx in selections:
+                    from_fit[rel] = (idx, fit_embedding[offset:offset + len(idx)])
+                    offset += len(idx)
+
+        self._timed_load([rel for _abs, rel in all_sample_keys])
 
         n_total = len(all_sample_keys)
         first_error = ''
@@ -9253,35 +9344,46 @@ class _DrWorker(QThread):
             if self._cancelled:
                 self.finished.emit(False, "Cancelled.")
                 return
-            self._emit(f"  Embedding {__import__('pathlib').Path(rel_path).name} …")
+            self._emit(f"  Embedding {Path(rel_path).name} …")
             self._emit_progress(i, n_total)
             sample_data = plugin._get_sample_data(rel_path, algo, af_state=self._af_state)
-            if sample_data is None:
+            rows = drc_pipeline.load_sample_rows(plugin.controller, plugin.state, rel_path,
+                                                 af_state=self._af_state)
+            if sample_data is None or rows is None:
                 continue
             try:
-                if algo == 'UMAP':
-                    emb = reducer.transform(sample_data)
-                elif algo == 'tSNE':
-                    emb = reducer.transform(sample_data)
-                elif algo == 'PaCMAP':
-                    # transform(new_data, basis=train_data) is required;
-                    # returns a plain ndarray (not a tuple).
-                    emb = reducer.transform(sample_data)
-                else:
-                    continue
+                emb = np.empty((len(sample_data), 2), dtype=np.float32)
+                todo = np.ones(len(sample_data), dtype=bool)
+                if rel_path in from_fit:
+                    idx, fit_rows = from_fit[rel_path]
+                    emb[idx] = fit_rows
+                    todo[idx] = False
+                if todo.any():
+                    if algo == 'UMAP' and drc_umap_index.needs_index(reducer):
+                        self._emit("  Building the hnswlib search index for embedding …")
+                        start = time.perf_counter()
+                        if drc_umap_index.attach_search_index(reducer, _umap_threads(reducer)):
+                            self.stage_seconds['index'] += time.perf_counter() - start
+                            self.stage_events['index'] += len(reducer._raw_data)
+                    start = time.perf_counter()
+                    emb[todo] = plugin._dr_transform(algo, reducer, sample_data[todo])
+                    self.stage_seconds['embed'] += time.perf_counter() - start
+                    self.stage_events['embed'] += int(todo.sum())
+                    self.embed_calls += 1
                 if self._cancelled:
                     self.finished.emit(False, "Cancelled.")
                     return
-                plugin.state.embeddings[algo][rel_path] = emb.astype(np.float32)
+                embedded[rel_path] = emb
                 # Same feature vectors that produced this embedding --
                 # cached so T-REX can align to them row-for-row later,
                 # with no live re-gating step in between.
                 plugin.state.embedding_features[algo][rel_path] = sample_data.astype(np.float32)
+                plugin.state.embedding_rows[algo][rel_path] = rows
             except Exception as e:
                 self._emit(f"    Could not embed {rel_path}: {e}")
                 first_error = first_error or f"{rel_path}: {e}"
 
-        n = len(plugin.state.embeddings[algo])
+        n = len(embedded)
         if n == 0 and n_total > 0:
             self.finished.emit(
                 False, f"No samples could be embedded with {algo}.  {first_error}".strip())
@@ -9291,13 +9393,52 @@ class _DrWorker(QThread):
         self.finished.emit(True, "")
 
 
+def _umap_parallel(params: dict) -> bool:
+    """True when UMAP runs without a fixed seed (multi-threaded numba path)."""
+    return params.get('n_jobs', 1) != 1
+
+
+def _umap_threads(reducer) -> int:
+    """Threads a fitted UMAP was set to use (1 keeps its search index
+    deterministic, as its fixed seed keeps the fit)."""
+    n_jobs = getattr(reducer, 'n_jobs', 1)
+    return (_os.cpu_count() or 1) if n_jobs in (-1, None) else max(int(n_jobs), 1)
+
+
+def _complete_rows(labels: dict, rows: dict) -> dict | None:
+    """Event keys of every labelled sample, or None (archived as a run without
+    keys) when any sample has none, e.g. clustering an embedding made before
+    event keys were recorded."""
+    out = {rel: rows.get(rel) for rel in labels}
+    if any(r is None for r in out.values()):
+        return None
+    return out
+
+
+def _fit_embedding(reducer, n_pool: int) -> np.ndarray | None:
+    """The fit's own 2-D layout of the training pool, in pool row order, or
+    None when the reducer does not expose one of the expected shape."""
+    emb = getattr(reducer, 'embedding_', None)
+    if emb is None and isinstance(reducer, np.ndarray):
+        emb = reducer          # openTSNE's TSNEEmbedding is the embedding
+    if emb is None:
+        return None
+    emb = np.asarray(emb, dtype=np.float32)
+    if emb.shape != (n_pool, 2):
+        _log.warning("fit embedding has shape %s, expected (%d, 2); transforming "
+                     "every event instead", emb.shape, n_pool)
+        return None
+    return emb
+
+
 class _RunEstimateWorker(QThread):
     """
-    Counts the events of a DR or clustering run and, above the event
-    threshold, times a probe of them (drc_time_estimate.estimate_run) so the
-    UI stays responsive.  Emits *estimated* with a RunTimeEstimate; if
-    counting itself fails, the estimate has no events and the run goes ahead
-    to report its own error.
+    Counts the events of a DR or clustering run and predicts its run time
+    (drc_time_estimate.estimate_run), timing a small probe only when this
+    machine has no calibration for the algorithm yet, so the UI stays
+    responsive.  Emits *estimated* with a RunTimeEstimate; if counting
+    itself fails, the estimate is empty and the run goes ahead to report
+    its own error.
     """
 
     estimated = Signal(object)   # RunTimeEstimate
@@ -9314,15 +9455,17 @@ class _RunEstimateWorker(QThread):
             pass
 
     def __init__(self, controller, state, kind: str, algo: str, params: dict,
-                 probe_fn, af_state=None, probe_repeats: int = 1, parent=None):
+                 calibration: dict, af_state=None, dr_probe_fn=None,
+                 jit_warm: bool = True, parent=None):
         super().__init__(parent)
-        self._probe_repeats = probe_repeats
         self._controller = controller
         self._state = state
         self._kind = kind
         self._algo = algo
         self._params = params
-        self._probe_fn = probe_fn
+        self._calibration = calibration
+        self._dr_probe_fn = dr_probe_fn
+        self._jit_warm = jit_warm
         # Snapshot captured on the main thread — see
         # drc_pipeline.apply_unmixing_af_aware() docstring.
         self._af_state = af_state
@@ -9331,8 +9474,8 @@ class _RunEstimateWorker(QThread):
         try:
             estimate = drc_time_estimate.estimate_run(
                 self._controller, self._state, self._kind, self._algo,
-                self._params, self._probe_fn, af_state=self._af_state,
-                probe_repeats=self._probe_repeats)
+                self._params, self._calibration, af_state=self._af_state,
+                dr_probe_fn=self._dr_probe_fn, jit_warm=self._jit_warm)
         except Exception:
             traceback.print_exc()
             estimate = drc_time_estimate.RunTimeEstimate(kind=self._kind, algo=self._algo)
@@ -9513,9 +9656,10 @@ class _MarkerSummaryWorker(QThread):
     finished = Signal(bool, str, dict)
 
     def __init__(self, plugin, cl_run: dict, channels: list[str],
-                cluster_order: list[int], af_state, pooled, parent=None):
+                cluster_order: list[int], af_state, pooled, live_mode=None, parent=None):
         super().__init__(parent)
         self._plugin = plugin
+        self._live_mode = live_mode
         self._cl_run = cl_run
         self._channels = channels
         self._cluster_order = cluster_order
@@ -9538,6 +9682,7 @@ class _MarkerSummaryWorker(QThread):
             if pooled is None:
                 pooled = plugin._pool_violin_data(
                     self._cl_run, self._channels, af_state=self._af_state,
+                    live_mode=self._live_mode,
                 )
                 t = _lap(t, "pool_violin_data")
             else:
@@ -10361,9 +10506,15 @@ class ClusterAnnotationTab(QWidget):
     def _on_violin_channel_checkbox_toggled(self, _checked: bool):
         self._violin_recompute_timer.start()
 
+    def _live_join_mode(self, cl_run: dict) -> str:
+        """drc_run_align.live_join_mode() of a run (main thread only)."""
+        return drc_run_align.live_join_mode(cl_run, drc_pipeline.sync_fingerprint(
+            self.controller, cl_run.get('gates', []), cl_run.get('training_sample_ids', [])))
+
     def _pool_violin_data(self, cl_run: dict, channels: list[str],
                           af_state=None,
                           max_events_per_cluster: int | None = CLUSTER_PLOT_MAX_EVENTS,
+                          live_mode: str | None = None,
                           ) -> dict[str, dict[int, list]]:
         """
         Pool per-cluster raw values for each channel from the run's own
@@ -10371,8 +10522,11 @@ class ClusterAnnotationTab(QWidget):
         snapshot (frozen at classification time -- see
         drc_clustering.py's _snapshot_marker_values -- guaranteed
         row-for-row aligned to 'labels' regardless of gate/channel edits
-        made since). Falls back to live-reloading + truncating for runs
-        archived before that snapshot existed.
+        made since). For a sample without it, values are loaded from the
+        current events and matched to the labels by event key, or row for row
+        for a legacy run still in sync (live_mode, see
+        drc_run_align.live_join_mode; computed here when not given, which
+        must then be on the main thread).
 
         A cluster with more than *max_events_per_cluster* events (over all
         samples, in sample order) is thinned by even systematic sampling to
@@ -10412,22 +10566,27 @@ class ClusterAnnotationTab(QWidget):
                 # snapshot so a background worker never reads the
                 # controller's matrices while the main window could be
                 # reassigning them (see apply_unmixing_af_aware()).
+                if live_mode is None:
+                    live_mode = self._live_join_mode(cl_run)
                 mv = drc_pipeline.load_sample_marker_values(
                     self.controller, self.state, rel, af_state=af_state,
                 )
-                if mv is None:
+                rows = drc_pipeline.load_sample_rows(self.controller, self.state, rel,
+                                                     af_state=af_state)
+                if mv is None or rows is None:
                     continue
                 values, names = mv
-                if len(values) != len(labels):
+                values, matched = drc_run_align.pair_arrays(
+                    np.asarray(values, dtype=np.float64), len(labels), live_mode,
+                    src_rows=rows, dst_rows=drc_run_align.run_rows(cl_run, rel), fill=np.nan)
+                if values is None:
                     _log.warning(
-                        "_pool_violin_data: %s -- values (%d) vs labels (%d) length "
-                        "mismatch, skipping sample. The run has no stored marker "
-                        "values and the current gating and unmixing give a "
-                        "different number of events.",
-                        rel, len(values), len(labels),
-                    )
+                        "_pool_violin_data: %s -- the run has no stored marker values "
+                        "and cannot be matched to the current events, skipping sample.",
+                        rel)
                     self._violin_skipped_samples.append(rel)
                     continue
+                labels, values = labels[matched], values[matched]
             loaded.append((labels, values, list(names)))
 
         # Events of each cluster per sample, and each cluster's total.
@@ -10666,11 +10825,15 @@ class ClusterAnnotationTab(QWidget):
         same_algo = bool(cl_params.get('_dr_algo')) and \
             cl_params.get('_dr_algo') == (dr_run.get('algorithm') or '')
         unaligned_samples: list[str] = []
+        join_mode = drc_run_align.runs_join_mode(dr_run, cl_run) if cl_run else None
         xys, labs = [], []
         for rel, emb in emb_dict.items():
             n = len(emb)
             lbl_raw = labels_dict.get(rel)
-            lbl, aligned_ok = drc_scatter.align_labels_to_embedding(lbl_raw, n)
+            lbl, aligned_ok = drc_scatter.align_labels_to_embedding(
+                lbl_raw, n,
+                label_rows=drc_run_align.run_rows(cl_run, rel) if cl_run else None,
+                emb_rows=drc_run_align.run_rows(dr_run, rel), mode=join_mode)
             if aligned_ok:
                 xys.append(emb)
                 labs.append(lbl)
@@ -10684,10 +10847,11 @@ class ClusterAnnotationTab(QWidget):
                 xys.append(own_positions[rel])
                 labs.append(lbl_raw)
             else:
+                # Keyed runs: labels where the events match, grey elsewhere
                 if lbl_raw is not None:
                     unaligned_samples.append(rel)
                 xys.append(emb)
-                labs.append(np.full(n, -1, dtype=np.int32))
+                labs.append(lbl)
         xy = np.concatenate(xys, axis=0)
         lab = np.concatenate(labs, axis=0)
 
@@ -11109,6 +11273,7 @@ class ClusterAnnotationTab(QWidget):
         # requirement as af_state above -- see
         # drc_cluster_id.resolve_unstained_af_states's docstring.
         unstained_af_states = drc_cluster_id.resolve_unstained_af_states(self.controller, cl_run)
+        live_mode = self._live_join_mode(cl_run)
 
         plugin_ref = self
 
@@ -11136,6 +11301,7 @@ class ClusterAnnotationTab(QWidget):
                         progress_callback=lambda n: self_.progress.emit(n),
                         af_state=self_._af_state,
                         unstained_af_states=self_._unstained_af_states,
+                        live_mode=live_mode,
                     )
                     self_.finished.emit(True, '', result)
                 except Exception as exc:
@@ -11286,7 +11452,8 @@ class ClusterAnnotationTab(QWidget):
         self.marker_summary_recompute_btn.setEnabled(False)
         self._set_marker_summary_busy(True)
         self._show_marker_summary_placeholder("⏳ Computing marker summary …")
-        worker = _MarkerSummaryWorker(self, cl_run, channels, cluster_order, af_state, pooled)
+        worker = _MarkerSummaryWorker(self, cl_run, channels, cluster_order, af_state, pooled,
+                                      live_mode=self._live_join_mode(cl_run))
         worker.finished.connect(
             lambda ok, err, payload, rid=run_id, w=worker:
                 self._on_marker_summary_finished(ok, err, payload, rid, w)
@@ -11963,6 +12130,10 @@ class PluginWidget(QWidget):
         # Samples' should extend, for the algorithm most recently trained
         # in THIS session (see _archive_dr_run / _update_archived_dr_run).
         self._active_dr_run_id: dict[str, str] = {}
+        # Training settings and pool size of each session-trained DR model, for
+        # the run-time calibration of later 'Apply to All Samples' runs
+        self._dr_train_params: dict[str, dict] = {}
+        self._dr_pool_size: dict[str, int] = {}
 
         # Cancelled workers (DR, clustering, run-time estimates) still
         # finishing an uninterruptible step; kept referenced until they end.
@@ -12181,9 +12352,19 @@ class PluginWidget(QWidget):
 
             # Refresh the active inner tab
             self._refresh_active_tab()
+            QTimer.singleShot(0, self._start_jit_warmup)
         else:
             self.label_disabled.setVisible(True)
             self.content_widget.setVisible(False)
+
+    def _start_jit_warmup(self):
+        """Compile UMAP's numba code in the background, once per session, on
+        the code path the current n_jobs setting will use."""
+        if not hasattr(self, 'config_tab'):
+            return
+        parallel = _umap_parallel({'n_jobs': self.config_tab.umap_n_jobs.value()})
+        if drc_jit.start_warmup('UMAP', parallel):
+            _log.info("started UMAP JIT warm-up (%s path)", 'parallel' if parallel else 'serial')
 
     # ------------------------------------------------------------------
     # State persistence (QSettings — keyed by experiment directory)
@@ -12424,6 +12605,7 @@ class PluginWidget(QWidget):
                 btn = ct._dr_algo_group.checkedButton()
                 if btn:
                     s.setValue('dr_algo', btn.text())
+            s.setValue('dr_defaults_version', DR_DEFAULTS_VERSION)
             if hasattr(ct, 'umap_n_neighbors'):
                 s.setValue('umap_n_neighbors', ct.umap_n_neighbors.value())
                 s.setValue('umap_min_dist',    ct.umap_min_dist.value())
@@ -12793,9 +12975,17 @@ class PluginWidget(QWidget):
             self._pending_umap_min_dist    = s.value('umap_min_dist', None)
             self._pending_umap_metric      = s.value('umap_metric', '')
             self._pending_umap_n_epochs    = s.value('umap_n_epochs', None)
+            # Settings saved before the defaults changed hold the old
+            # defaults (UMAP 500 epochs, tSNE 1000 iterations): use the new ones
+            old_defaults = _qs_int(s, 'dr_defaults_version', 1) < DR_DEFAULTS_VERSION
             self._pending_umap_n_jobs      = s.value('umap_n_jobs', None)
             self._pending_tsne_perplexity  = s.value('tsne_perplexity', None)
             self._pending_tsne_n_iter      = s.value('tsne_n_iter', None)
+            if old_defaults:
+                if str(self._pending_umap_n_epochs) == '500':
+                    self._pending_umap_n_epochs = None
+                if str(self._pending_tsne_n_iter) == '1000':
+                    self._pending_tsne_n_iter = None
             self._pending_tsne_n_jobs      = s.value('tsne_n_jobs', None)
             self._pending_pacmap_n_neighbors = s.value('pacmap_n_neighbors', None)
             self._pending_pacmap_mn_ratio  = s.value('pacmap_mn_ratio', None)
@@ -12919,7 +13109,9 @@ class PluginWidget(QWidget):
         payload = dict((
             ('trained_reducers',  tree_data),
             ('embeddings',        self.state.embeddings),
+            ('embedding_rows',    self.state.embedding_rows),
             ('cluster_labels',    self.state.cluster_labels),
+            ('cluster_rows',      self.state.cluster_rows),
             ('trex_scores',       self.state.trex_scores),
             ('freq_results',      self.state.freq_results),
             ('counts_results',    self.state.counts_results),
@@ -13010,8 +13202,12 @@ class PluginWidget(QWidget):
                 self.state.trained_reducers = payload['trained_reducers']
             if isinstance(payload.get('embeddings'), dict):
                 self.state.embeddings = payload['embeddings']
+            if isinstance(payload.get('embedding_rows'), dict):
+                self.state.embedding_rows = payload['embedding_rows']
             if isinstance(payload.get('cluster_labels'), dict):
                 self.state.cluster_labels = payload['cluster_labels']
+            if isinstance(payload.get('cluster_rows'), dict):
+                self.state.cluster_rows = payload['cluster_rows']
             if isinstance(payload.get('trex_scores'), dict):
                 self.state.trex_scores = payload['trex_scores']
             if isinstance(payload.get('freq_results'), pd.DataFrame):
@@ -13110,6 +13306,71 @@ class PluginWidget(QWidget):
             )
         except Exception as e:
             print(f"[DR Plugin] Could not load model sidecar: {e}")
+
+    # Run parameter -> pending-state attribute applied by
+    # _apply_pending_state_to_config_tab
+    _RUN_PARAM_PENDING = {
+        'UMAP': {'n_neighbors': '_pending_umap_n_neighbors', 'min_dist': '_pending_umap_min_dist',
+                 'metric': '_pending_umap_metric', 'n_epochs': '_pending_umap_n_epochs',
+                 'n_jobs': '_pending_umap_n_jobs'},
+        'tSNE': {'perplexity': '_pending_tsne_perplexity', 'n_iter': '_pending_tsne_n_iter',
+                 'n_jobs': '_pending_tsne_n_jobs'},
+        'PaCMAP': {'n_neighbors': '_pending_pacmap_n_neighbors',
+                   'MN_ratio': '_pending_pacmap_mn_ratio', 'FP_ratio': '_pending_pacmap_fp_ratio'},
+        'FlowSOM': {'xdim': '_pending_flowsom_xdim', 'ydim': '_pending_flowsom_ydim',
+                    'n_metaclusters': '_pending_flowsom_metaclusters',
+                    'n_iter': '_pending_flowsom_n_iter'},
+        'Leiden': {'resolution': '_pending_leiden_resolution',
+                   'n_neighbors': '_pending_leiden_n_neighbors'},
+        'HDBSCAN': {'min_cluster_size': '_pending_hdbscan_min_cluster_size',
+                    'min_samples': '_pending_hdbscan_min_samples',
+                    'cluster_selection_epsilon': '_pending_hdbscan_cluster_selection_epsilon'},
+    }
+
+    def load_run_settings(self, entry: dict):
+        """Put an archived run's gates, training samples, channels, algorithm
+        and parameters into the Configuration pages, so it can be run again
+        on the current data (the user starts the run)."""
+        if self.config_tab.is_run_in_progress():
+            QMessageBox.information(self, "Run In Progress",
+                                    "Wait for the current run to finish first.")
+            return
+        algo = entry.get('algorithm') or ''
+        params = dict(entry.get('params') or {})
+        self.state.selected_gates = list(entry.get('gates', []))
+        channels = set(entry.get('channels', []))
+        self._pending_channels_checked = repr(
+            {ch: ch in channels for ch in getattr(self.config_tab, 'channel_checkboxes', {})})
+        self._pending_training_samples = list(entry.get('training_sample_ids', []))
+        for name, attr in self._RUN_PARAM_PENDING.get(algo, {}).items():
+            if name in params:
+                setattr(self, attr, params[name])
+        if entry.get('kind') == 'dr':
+            self._pending_dr_algo = algo
+            if params.get('_n_training_events'):
+                self.state.n_training_events = int(params['_n_training_events'])
+        else:
+            self._pending_cl_algo = algo
+            self._pending_cl_assign_all_samples = bool(params.get('_assign_all_samples'))
+            self._pending_cl_downsample_training = params.get('_event_cap') is not None
+        self._loading = True
+        try:
+            self.config_tab.refresh()
+            self._apply_pending_state_to_config_tab()
+        finally:
+            self._loading = False
+        ct = self.config_tab
+        if entry.get('kind') == 'clustering' and hasattr(ct, '_rb_space_dr'):
+            if drc_clustering.clusters_in_dr_space(algo, params):
+                ct._rb_space_dr.setChecked(True)
+                idx = ct._cl_dr_combo.findText(params['_dr_algo'])
+                if idx >= 0:
+                    ct._cl_dr_combo.setCurrentIndex(idx)
+            elif ct._rb_space_raw.isEnabled():
+                ct._rb_space_raw.setChecked(True)
+        self.progress_message(
+            f"Settings of \"{entry.get('label', '')}\" loaded into Configuration; "
+            f"press {'Train' if entry.get('kind') == 'dr' else 'Run'} to re-run it.")
 
     def _apply_pending_state_to_config_tab(self):
         """Apply persisted config-tab state after ConfigTab.refresh() has run."""
@@ -13491,54 +13752,91 @@ class PluginWidget(QWidget):
     # _estimate_worker holds the active _RunEstimateWorker (or None).
     _estimate_worker = None
 
-    # DR algorithms that JIT-compile on first use; their probes are repeated
-    _JIT_DR_ALGOS = ('UMAP', 'PaCMAP')
-
-    # openTSNE uses FFT-accelerated gradients from this many events up
-    _TSNE_FFT_MIN_EVENTS = 10_000
-
     def _dr_probe_fn(self, algo: str, params: dict):
-        """Function timing a DR fit and then the embedding of an event array;
-        returns the seconds taken by each stage."""
-        def probe(data, run_events):
+        """Function timing a DR fit on one event array and the embedding of
+        another; returns {'fit': seconds, 'embed': seconds}, and for UMAP
+        'index' (its hnswlib search index).  UMAP's numba code is compiled
+        first, so no time includes compilation.
+        single_thread: time tSNE on one thread (calibrates its FFT fit)."""
+        def probe(fit_data, embed_data, single_thread=False):
+            if algo == 'UMAP':
+                drc_jit.ensure_warm('UMAP', _umap_parallel(params))
             start = time.perf_counter()
             if algo == 'UMAP':
-                reducer = self._run_umap(params, data, keep_index=False)
+                reducer = self._run_umap(params, fit_data)
             elif algo == 'tSNE':
-                # openTSNE's 'auto' picks the method from the event count, so
-                # the probe names the one the full run will use
-                method = 'fft' if run_events >= self._TSNE_FFT_MIN_EVENTS else 'bh'
-                reducer = self._run_opentsne(params, data, negative_gradient_method=method)
+                reducer = self._run_opentsne({**params, 'n_jobs': 1} if single_thread else params,
+                                             fit_data, negative_gradient_method='bh')
             elif algo == 'PaCMAP':
-                reducer = self._run_pacmap(params, data)
+                reducer = self._run_pacmap(params, fit_data)
             else:
                 raise ValueError(f"Unknown algorithm: {algo}")
             fitted = time.perf_counter()
-            reducer.transform(data)
-            return {'fit': fitted - start, 'embed': time.perf_counter() - fitted}
+            timings = {'fit': fitted - start}
+            if algo == 'UMAP' and drc_umap_index.attach_search_index(
+                    reducer, _umap_threads(reducer)):
+                timings['index'] = time.perf_counter() - fitted
+                fitted = time.perf_counter()
+            self._dr_transform(algo, reducer, embed_data)
+            timings['embed'] = time.perf_counter() - fitted
+            return timings
         return probe
+
+    # ------------------------------------------------------------------
+    # Per-machine run-time calibration (drc_time_estimate), kept in the
+    # plugin's QSettings outside any experiment group
+    # ------------------------------------------------------------------
+
+    _CALIBRATION_KEY = 'run_time_calibration'
+
+    def _calibration(self) -> dict:
+        raw = QSettings('honeychrome', _SETTINGS_APP_KEY).value(self._CALIBRATION_KEY, '')
+        try:
+            data = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            data = {}
+        return data if isinstance(data, dict) else {}
+
+    def _store_calibration(self, updates: dict):
+        if not updates:
+            return
+        data = self._calibration()
+        data.update(updates)
+        settings = QSettings('honeychrome', _SETTINGS_APP_KEY)
+        settings.setValue(self._CALIBRATION_KEY, json.dumps(data))
+        settings.sync()
+
+    def _learn_run_time(self, algo: str, params: dict, seconds: dict, events: dict,
+                        pool: int = 0, calls: int = 0, jit_included: bool = False):
+        """Update this machine's calibration from a completed run's stage times."""
+        try:
+            updates = drc_time_estimate.observe_run(
+                algo, params, self._calibration(), seconds, events,
+                pool=pool, calls=calls, jit_included=jit_included)
+            self._store_calibration(updates)
+        except Exception:
+            _log.exception("could not update the run-time calibration")
 
     def _confirm_large_run(self, kind: str, algo: str, params: dict, proceed):
         """
-        Call proceed() to start a 'dr' or 'cl' run.  A run on more than
-        drc_time_estimate.TIMING_EVENT_THRESHOLD events is first timed on a
-        small probe, and proceed() is called only if the user confirms the
-        estimated time.  Runs at or below the threshold start immediately.
+        Call proceed() to start a 'dr' or 'cl' run.  The run's time is
+        predicted first (drc_time_estimate); a run predicted to take
+        drc_time_estimate.CONFIRM_SECONDS or longer starts only if the user
+        confirms, shorter ones start immediately.
         """
         if self._estimate_worker is not None:
             QMessageBox.information(self, "Estimating Run Time",
                                     "A run time estimate is already in progress.")
             return
-        if kind == 'dr':
-            probe_fn = self._dr_probe_fn(algo, params)
-        else:
-            probe_fn = drc_time_estimate.clustering_probe_fn(algo, params)
         af_state = drc_pipeline.snapshot_af_state(self.controller)
         self._set_estimating(kind, True)
-        repeats = 2 if kind == 'dr' and algo in self._JIT_DR_ALGOS else 1
-        worker = _RunEstimateWorker(self.controller, self.state, kind, algo,
-                                    dict(params), probe_fn, af_state=af_state,
-                                    probe_repeats=repeats)
+        jit_warm = (algo != 'UMAP' or kind != 'dr'
+                    or drc_jit.is_warm('UMAP', _umap_parallel(params)))
+        worker = _RunEstimateWorker(
+            self.controller, self.state, kind, algo, dict(params), self._calibration(),
+            af_state=af_state,
+            dr_probe_fn=self._dr_probe_fn(algo, params) if kind == 'dr' else None,
+            jit_warm=jit_warm)
         worker.estimated.connect(
             lambda estimate: self._on_run_estimated(estimate, proceed, worker))
         worker.finished.connect(lambda: self._on_estimate_thread_finished(worker))
@@ -13566,13 +13864,16 @@ class PluginWidget(QWidget):
         """Main thread: start the run, or ask first when it was timed."""
         if worker is not None and worker is not self._estimate_worker:
             return
+        self._store_calibration(estimate.calibration_updates)
         if not estimate.needs_confirmation:
             proceed()
             return
         label = drc_time_estimate.KIND_NOUNS[estimate.kind]
         if estimate.error:
-            text = (f"The {label} time could not be estimated for "
-                    f"{estimate.total_events:,} events.\n\n"
+            text = (f"The {label} time could not be measured on this computer for "
+                    f"{estimate.total_events:,} events; assuming a slow computer it "
+                    f"could take about "
+                    f"{drc_time_estimate.format_duration(estimate.seconds)}.\n\n"
                     f"Start {label} anyway?")
         else:
             self.progress_message(
@@ -13627,12 +13928,12 @@ class PluginWidget(QWidget):
     # Dimensionality Reduction
     # ==================================================================
 
-    def _load_training_data(self, af_state=None) -> np.ndarray | None:
+    def _load_training_data(self, af_state=None):
         """
-        Pool transformed, gated, downsampled events from all training samples.
-        Delegates to drc_pipeline.load_training_pool (correct channel
-        alignment, correct FlowKit transform, no silent arcsinh fallback,
-        full logging).
+        Pool transformed, gated, downsampled events from all training samples:
+        ``(data, selections)`` from drc_pipeline.load_training_pool_with_rows
+        (correct channel alignment, correct FlowKit transform, no silent
+        arcsinh fallback, full logging).
 
         Must be callable from a background thread — contains no Qt GUI calls.
         Pre-flight validation (empty samples / channels / gate) is performed
@@ -13641,8 +13942,15 @@ class PluginWidget(QWidget):
         af_state: optional AF snapshot captured on the main thread before the
         worker started — see drc_pipeline.apply_unmixing_af_aware() docstring.
         """
-        return drc_pipeline.load_training_pool(
+        return drc_pipeline.load_training_pool_with_rows(
             self.controller, self.state, af_state=af_state)
+
+    def _dr_transform(self, algo: str, reducer, data: np.ndarray) -> np.ndarray:
+        """Embed *data* with a fitted reducer (numba work in a safe section)."""
+        if algo == 'UMAP':
+            with drc_jit.numba_section(self.progress_message):
+                return reducer.transform(data)
+        return reducer.transform(data)
 
     def _get_sample_data(self, rel_path: str, algo: str, af_state=None) -> np.ndarray | None:
         """
@@ -13659,18 +13967,14 @@ class PluginWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _run_umap(self, params: dict, training_data: np.ndarray,
-                  progress_hook=None, keep_index: bool = True,
-                  should_cancel=None):
-        """Train a UMAP reducer and store the kNN index in state.
+                  progress_hook=None, should_cancel=None):
+        """Train a UMAP reducer.
 
-        keep_index=False leaves the state untouched (used for timing probes).
-        should_cancel (callable() -> bool) is checked after the kNN index
-        build, the first point where the fit can stop; the epoch loop is
-        stopped through progress_hook.
+        should_cancel (callable() -> bool) is checked before the fit starts;
+        the epoch loop is stopped through progress_hook.
         """
-        _ensure_numba_threading_layer()
+        drc_jit.ensure_threading_layer()
         import umap as umap_lib
-        import hnswlib
         import os
 
         n_neighbors = params['n_neighbors']
@@ -13683,35 +13987,13 @@ class PluginWidget(QWidget):
             n_jobs = os.cpu_count() or 1
         random_state = 42 if n_jobs == 1 else None
 
-        self.progress_message(f"Building hnswlib kNN index (k={n_neighbors}) …")
-
-        # Build hnswlib index first — reuse for Leiden later.
-        # num_threads tied to the same n_jobs choice as UMAP itself: a
-        # parallel build is NOT deterministic even with random_seed fixed
-        # (concurrent insertion order is scheduler-dependent), so this
-        # index -- and every Leiden partition built on it -- silently
-        # varied run-to-run whenever it had to be rebuilt (e.g. after
-        # closing/reopening the experiment, since umap_knn_index isn't
-        # persisted to the sidecar). Single-threaded build when n_jobs==1
-        # keeps the graph itself reproducible, matching the UMAP seed
-        # behaviour above instead of disagreeing with it.
-        dim = training_data.shape[1]
-        index = hnswlib.Index(space='l2', dim=dim)
-        index.init_index(max_elements=len(training_data),
-                         ef_construction=200, M=16, random_seed=42)
-        index.add_items(training_data, num_threads=n_jobs)
-        index.set_ef(50)
         if should_cancel is not None and should_cancel():
             raise _RunCancelled()
-        if keep_index:
-            self.state.umap_knn_index = index
-            self.state.umap_knn_fingerprint = (
-                training_data.shape, drc_pipeline.array_digest(training_data))
 
         self.progress_message(
             f"Training UMAP  (n_neighbors={n_neighbors}, "
             f"min_dist={params['min_dist']}, metric={params['metric']}, "
-            f"n_jobs={n_jobs}) …"
+            f"n_epochs={params['n_epochs']}, n_jobs={n_jobs}) …"
         )
 
         # Wire the tqdm hook for per-epoch progress if one was supplied.
@@ -13729,7 +14011,8 @@ class PluginWidget(QWidget):
             verbose=False,
             tqdm_kwds=tqdm_kwds,
         )
-        reducer.fit(training_data)
+        with drc_jit.numba_section(self.progress_message):
+            reducer.fit(training_data)
 
         # Drop the tqdm hook now training is done. UMAP (sklearn
         # BaseEstimator) stores constructor kwargs as attributes, so
@@ -13775,6 +14058,11 @@ class PluginWidget(QWidget):
         cancel_kwds = ({'callbacks': _poll_cancel, 'callbacks_every_iters': 10}
                        if should_cancel is not None else {})
 
+        if negative_gradient_method == 'auto':
+            # Barnes-Hut up to 50,000 events where openTSNE has OpenMP,
+            # openTSNE's own 10,000 otherwise
+            negative_gradient_method = drc_time_estimate.tsne_gradient_method(len(training_data))
+            self.progress_message(f"tSNE gradient: {negative_gradient_method.upper()}")
         tsne = openTSNE.TSNE(
             n_components=2,
             perplexity=perplexity,
@@ -13787,6 +14075,13 @@ class PluginWidget(QWidget):
         )
         # fit() returns a TSNEEmbedding that supports .transform()
         embedding = tsne.fit(training_data)
+        # transform() inherits the fit's gradient method; 'auto' keeps
+        # openTSNE's choice by the size of each batch of new events
+        embedding.gradient_descent_params['negative_gradient_method'] = 'auto'
+        # transform() first centres the fitted map in place (on its bounding
+        # box); centre it now, so the pool's own fit coordinates (P2) and
+        # transformed events share one frame
+        embedding -= (np.max(embedding, axis=0) + np.min(embedding, axis=0)) / 2
         self.progress_message("tSNE training complete.")
         return embedding
 
@@ -13795,33 +14090,36 @@ class PluginWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _run_pacmap(self, params: dict, training_data: np.ndarray):
-        _ensure_numba_threading_layer()
+        drc_jit.ensure_threading_layer()
         _check_annoy_build()
         import pacmap
         self.progress_message(
             f"Training PaCMAP  (n_neighbors={params['n_neighbors']}, "
             f"MN_ratio={params['MN_ratio']}, FP_ratio={params['FP_ratio']}) …"
         )
+        # Keeping the Annoy tree lets transform() reuse it instead of
+        # rebuilding it from the whole training pool on every call.
+        tree_bytes = _pacmap_tree_bytes(*training_data.shape)
+        save_tree = tree_bytes <= PACMAP_TREE_MAX_BYTES
+        if not save_tree:
+            _log.warning("PaCMAP: the Annoy tree for %d events x %d channels would take "
+                         "about %.1f GB, so it is rebuilt for every transform instead",
+                         training_data.shape[0], training_data.shape[1], tree_bytes / 1e9)
         reducer = pacmap.PaCMAP(
             n_components=2,
             n_neighbors=params['n_neighbors'],
             MN_ratio=params['MN_ratio'],
             FP_ratio=params['FP_ratio'],
             random_state=42,
+            save_tree=save_tree,
         )
-        # fit_transform trains and returns the embedding of the training data.
-        # We don't use the training embedding directly here — it's reproduced
-        # per-sample in _do_apply via reducer.transform(new, basis=train_data).
         try:
-            reducer.fit_transform(training_data)
+            with drc_jit.numba_section(self.progress_message):
+                reducer.fit_transform(training_data)
         except ValueError as exc:
             _log.error("PaCMAP fit failed (%s): %s", exc, _array_summary(training_data))
             raise
-
-        # Wrap reducer + training_data together so the worker can pass 'basis'
-        # to transform().  PaCMAP requires the original data for out-of-sample
-        # projection when the Annoy index is not cached to disk.
-        return _PaCMAPWrapper(reducer, training_data)
+        return _PaCMAPWrapper(reducer, None if save_tree else training_data)
 
     # ------------------------------------------------------------------
     # Public DR entry points
@@ -13981,9 +14279,26 @@ class PluginWidget(QWidget):
                 # apply-only run: status was already 'done'
                 self.state.dr_status[algo] = 'done'
             if task == 'train':
+                self._dr_train_params[algo] = dict(params or {})
                 self._archive_dr_run(algo, params or {})
             else:
                 self._update_archived_dr_run(algo)
+            worker = self._dr_worker
+            if worker is not None:
+                seconds = dict(worker.stage_seconds)
+                if task == 'train':
+                    pool = worker.stage_events['fit']
+                    self._dr_pool_size[algo] = pool
+                else:
+                    pool = self._dr_pool_size.get(algo, 0)
+                    if not pool:
+                        # Model from an earlier session: its settings and
+                        # pool size are unknown, so only file reading is learnt
+                        seconds.pop('embed', None)
+                self._learn_run_time(
+                    algo, self._dr_train_params.get(algo, {}), seconds,
+                    worker.stage_events, pool=pool,
+                    calls=worker.embed_calls, jit_included=worker.jit_included)
         else:
             if error_msg and error_msg != 'Cancelled.':
                 self.state.dr_status[algo] = 'error'
@@ -14015,11 +14330,16 @@ class PluginWidget(QWidget):
                 gates=list(self.state.selected_gates),
                 training_sample_ids=list(self.state.training_sample_ids),
                 channels=channels,
-                params=dict(params),
+                params={**params, '_n_training_events': int(self.state.n_training_events)},
                 n_events=n_events,
                 sync_fingerprint=drc_pipeline.sync_fingerprint(
                     self.controller, self.state.selected_gates,
                     self.state.training_sample_ids),
+                event_rows=dict(self.state.embedding_rows.get(algo, {})),
+                split_fingerprints=drc_pipeline.split_fingerprints(
+                    self.controller, self.state.selected_gates,
+                    self.state.training_sample_ids),
+                transform_params=self._run_transform_params(channels),
             )
         except Exception as e:
             # Archiving must never take down _on_dr_finished — a failure
@@ -14034,6 +14354,12 @@ class PluginWidget(QWidget):
             self.config_tab.run_table.refresh()
         self._on_runs_changed()
 
+    def _run_transform_params(self, channels: list[str]) -> dict:
+        """The transforms a run is fitted in, recorded with it so events that
+        enter its gates later can be placed in the same feature space."""
+        return {ch: dict(self.state.channel_transform_params.get(ch, {}))
+                for ch in channels}
+
     def _update_archived_dr_run(self, algo: str):
         """
         Refresh an already-archived DR run's payload after 'Apply to All
@@ -14046,7 +14372,8 @@ class PluginWidget(QWidget):
         embeddings = dict(self.state.embeddings.get(algo, {}))
         embedding_features = dict(self.state.embedding_features.get(algo, {}))
         drc_run_archive.update_dr_run_embeddings(
-            self.controller, self.state, run_id, embeddings, embedding_features
+            self.controller, self.state, run_id, embeddings, embedding_features,
+            event_rows=dict(self.state.embedding_rows.get(algo, {})),
         )
         if hasattr(self, 'config_tab'):
             self.config_tab.run_table.refresh()
@@ -14107,10 +14434,9 @@ class PluginWidget(QWidget):
                     f"{bullet_list}\n\n"
                     "Clustering will label the embedding's own cells correctly, but "
                     "the marker values behind the violins, heatmaps and Cluster ID "
-                    "come from the current gating and unmixing, and cannot be "
-                    "matched row for row to the embedding. Samples whose event "
-                    "counts differ will have no marker values stored, and where the "
-                    "counts happen to agree the rows can still be shifted.\n\n"
+                    "come from the current gating and unmixing. Samples whose "
+                    "embedded cells are not exactly the cells gated now will have no "
+                    "marker values stored.\n\n"
                     "Re-running the DR brings it back in sync.\n\n"
                     "Cluster on this embedding anyway?",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
@@ -14181,15 +14507,23 @@ class PluginWidget(QWidget):
         af_state = drc_pipeline.snapshot_af_state(self.controller)
 
         # Which cells the labels will belong to: the embedding's own for a
-        # DR-space run (so it inherits the DR run's fingerprint), the
+        # DR-space run (so it inherits the DR run's fingerprints), the
         # current gating's otherwise.
-        if params.get('_space') == 'dr':
-            source_dr = self._source_dr_run_entry(params.get('_dr_algo') or '')
-            run_fingerprint = source_dr.get('sync_fingerprint') if source_dr else None
+        if drc_clustering.clusters_in_dr_space(algo, params):
+            source_dr = self._source_dr_run_entry(params.get('_dr_algo') or '') or {}
+            run_fingerprint = source_dr.get('sync_fingerprint')
+            run_split = {'unmixing': source_dr.get('unmixing_fingerprint'),
+                         'gating': source_dr.get('gating_fingerprint')}
         else:
             run_fingerprint = drc_pipeline.sync_fingerprint(
                 self.controller, self.state.selected_gates,
                 self.state.training_sample_ids)
+            run_split = drc_pipeline.split_fingerprints(
+                self.controller, self.state.selected_gates,
+                self.state.training_sample_ids)
+        channels_now = [c for c in self.state.selected_channels
+                        if c not in drc_pipeline.META_CHANNELS]
+        transform_params = self._run_transform_params(channels_now)
         unaligned_samples: list[str] = []
 
         def _checked_progress(msg):
@@ -14213,7 +14547,9 @@ class PluginWidget(QWidget):
                     self.progress_message(f"Clustering error: {err}")
                     QMessageBox.critical(self, "Clustering Error", err)
             else:
-                drc_clustering.commit_clustering_result(self.state, worker.result, algo)
+                staged = worker.result
+                drc_clustering.commit_clustering_result(self.state, staged, algo)
+                self._learn_run_time(algo, params, staged.stage_seconds, staged.stage_events)
                 # Archive this run so GroupsStatsTab can select it later.
                 if self.state.cluster_labels:
                     channels = [c for c in self.state.selected_channels
@@ -14248,6 +14584,10 @@ class PluginWidget(QWidget):
                         dr_positions=dict(self.state.cluster_dr_positions),
                         tree_data=tree_data,
                         sync_fingerprint=run_fingerprint,
+                        event_rows=_complete_rows(self.state.cluster_labels,
+                                                  self.state.cluster_rows),
+                        split_fingerprints=run_split,
+                        transform_params=transform_params,
                     )
                     self.progress_message(
                         f"Run archived as \"{entry['label']}\""

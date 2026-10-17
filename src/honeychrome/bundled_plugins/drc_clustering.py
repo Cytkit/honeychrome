@@ -41,6 +41,7 @@ question, controlled by two independent UI toggles collected into
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +51,30 @@ import flowsom_consensus
 from drc_logging import get_logger, log_stage, log_array
 
 log = get_logger(__name__)
+
+
+def clusters_in_dr_space(algo: str, params: dict) -> bool:
+    """True when the run clusters a DR embedding.  FlowSOM always trains its
+    SOM on the transformed marker values, whatever space is selected."""
+    return params.get('_space') == 'dr' and bool(params.get('_dr_algo')) \
+        and algo != 'FlowSOM'
+
+
+def _sample_rows(controller, state, rel_path, dr_space, af_state):
+    """Event keys of the rows a sample's labels follow: the gated events, or
+    the rows of the DR embedding the run clustered."""
+    if dr_space:
+        rows = (getattr(state, 'embedding_rows', {}) or {}).get(dr_space, {}).get(rel_path)
+        return None if rows is None else np.asarray(rows, dtype=np.int32)
+    return drc_pipeline.load_sample_rows(controller, state, rel_path, af_state=af_state)
+
+
+def _add_time(state, stage: str, seconds: float, events: int) -> None:
+    """Accumulate a measured stage on a StagedResult (no-op on the plain state)."""
+    times = getattr(state, 'stage_seconds', None)
+    if isinstance(times, dict):
+        times[stage] = times.get(stage, 0.0) + seconds
+        state.stage_events[stage] = state.stage_events.get(stage, 0) + int(events)
 
 
 def _noop(_msg: str) -> None:
@@ -106,6 +131,14 @@ def _snapshot_marker_values(controller, state, rel_path: str, labels: np.ndarray
             rel_path, len(values), len(labels),
         )
         return
+    label_rows = (getattr(state, 'cluster_rows', {}) or {}).get(rel_path)
+    if label_rows is not None:
+        current_rows = drc_pipeline.load_sample_rows(controller, state, rel_path,
+                                                     af_state=af_state)
+        if current_rows is None or not np.array_equal(label_rows, current_rows):
+            log.warning("_snapshot_marker_values: %s -- the labelled events are not the "
+                        "events gated now -- skipping snapshot.", rel_path)
+            return
     state.cluster_marker_values[rel_path] = (values, names)
 
 
@@ -206,6 +239,8 @@ def _assign_one_sample_approximate(controller, state, rel_path, predict_fn,
     try:
         labels = predict_fn(sample_data)
         state.cluster_labels[rel_path] = labels
+        state.cluster_rows[rel_path] = _sample_rows(controller, state, rel_path, dr_space,
+                                                    af_state)
         _snapshot_marker_values(controller, state, rel_path, labels, af_state=af_state)
         if dr_space:
             state.cluster_dr_positions[rel_path] = np.asarray(sample_data)
@@ -235,6 +270,7 @@ def _assign_by_slicing_or_predict(controller, state, pooled_data, boundaries, fi
     state.cluster_labels = {}
     state.cluster_marker_values = {}
     state.cluster_dr_positions = {}
+    state.cluster_rows = {}
 
     trained_rel_paths = set()
     for rel_path, start, end, was_downsampled in boundaries:
@@ -242,6 +278,8 @@ def _assign_by_slicing_or_predict(controller, state, pooled_data, boundaries, fi
         if not was_downsampled:
             labels = fit_labels[start:end].astype(np.int32)
             state.cluster_labels[rel_path] = labels
+            state.cluster_rows[rel_path] = _sample_rows(controller, state, rel_path,
+                                                        dr_space, af_state)
             _snapshot_marker_values(controller, state, rel_path, labels, af_state=af_state)
             if dr_space:
                 state.cluster_dr_positions[rel_path] = np.asarray(pooled_data[start:end])
@@ -344,7 +382,9 @@ def run_flowsom(controller, state, params: dict, progress=None, af_state=None):
 
     _progress(progress, f"Training SOM ({xdim}×{ydim} grid, rlen={n_iter}, "
                         f"{len(data):,} events) …")
+    start = time.perf_counter()
     node_weights = flowsom_consensus.train_som(data, xdim, ydim, n_iter, seed=42)
+    _add_time(state, 'som', time.perf_counter() - start, len(data))
 
     if n_meta == 0:
         _progress(progress, "Selecting metacluster count via consensus stability …")
@@ -395,6 +435,7 @@ def flowsom_assign_all(controller, state, node_weights, node_to_meta,
 
     state.cluster_labels = {}
     state.cluster_marker_values = {}
+    state.cluster_rows = {}
     node_counts = np.zeros(len(node_weights), dtype=np.int64)
     for sample_key in all_samples:
         try:
@@ -407,10 +448,14 @@ def flowsom_assign_all(controller, state, node_weights, node_to_meta,
         if sample_data is None:
             continue
         try:
+            start = time.perf_counter()
             node_ids = flowsom_consensus.assign_to_nodes(node_weights, sample_data)
+            _add_time(state, 'map', time.perf_counter() - start, len(sample_data))
             node_counts += np.bincount(node_ids, minlength=len(node_weights))
             labels = node_to_meta[node_ids].astype(np.int32)
             state.cluster_labels[rel_path] = labels
+            state.cluster_rows[rel_path] = drc_pipeline.load_sample_rows(
+                controller, state, rel_path, af_state=af_state)
             _snapshot_marker_values(controller, state, rel_path, labels, af_state=af_state)
             _progress(progress, f"  FlowSOM assigned {rel_path}: {len(labels):,} events "
                                 f"({len(np.unique(labels))} metaclusters)")
@@ -545,24 +590,6 @@ def get_training_embeddings(controller, state, algo: str | None, event_cap: int 
     return _pool_training_data_with_boundaries(controller, state, event_cap, af_state=af_state)
 
 
-def _umap_index_matches(state, data: np.ndarray) -> bool:
-    """
-    True when state.umap_knn_index was built on exactly `data`, row for
-    row. hnswlib returns neighbour ids as row numbers of the array the
-    index was built on, so the index is only usable for Leiden when its
-    training pool is this one. UMAP's pool caps every sample at
-    n_training_events; Leiden's pool, by default, is every gated event.
-    """
-    index = getattr(state, 'umap_knn_index', None)
-    fingerprint = getattr(state, 'umap_knn_fingerprint', None)
-    if index is None or fingerprint is None:
-        return False
-    shape, digest = fingerprint
-    if tuple(shape) != data.shape:
-        return False
-    return digest == drc_pipeline.array_digest(data)
-
-
 def run_leiden(controller, state, params: dict, progress=None, af_state=None) -> None:
     """Build a kNN graph and run Leiden community detection.
 
@@ -603,22 +630,22 @@ def run_leiden(controller, state, params: dict, progress=None, af_state=None) ->
     resolution = params['resolution']
     n_neighbors = params['n_neighbors']
 
-    if space != 'dr' and _umap_index_matches(state, data):
-        _progress(progress, "Reusing UMAP hnswlib kNN index for Leiden …")
-        index = state.umap_knn_index
-    else:
-        _progress(progress, f"Building hnswlib kNN index (k={n_neighbors}) for Leiden "
-                            f"({len(data):,} events) …")
-        index = hnswlib.Index(space='l2', dim=data.shape[1])
-        index.init_index(max_elements=len(data), ef_construction=200, M=16)
-        index.add_items(data)
-        index.set_ef(50)
+    _progress(progress, f"Building hnswlib kNN index (k={n_neighbors}) for Leiden "
+                        f"({len(data):,} events) …")
+    start = time.perf_counter()
+    index = hnswlib.Index(space='l2', dim=data.shape[1])
+    index.init_index(max_elements=len(data), ef_construction=200, M=16)
+    index.add_items(data)
+    index.set_ef(50)
 
     _progress(progress, "Querying kNN …")
     neigh, _ = index.knn_query(data, k=n_neighbors)
+    _add_time(state, 'knn', time.perf_counter() - start, len(data))
 
     _progress(progress, "Running Leiden …")
+    start = time.perf_counter()
     train_labels = leiden_labels(knn_adjacency(neigh), resolution)
+    _add_time(state, 'leiden', time.perf_counter() - start, len(data))
 
     def _predict(sample_data):
         neigh_ids, _dists = index.knn_query(sample_data, k=n_neighbors)
@@ -713,6 +740,7 @@ def run_hdbscan(controller, state, params: dict, progress=None, af_state=None) -
                         f"({len(data):,} events; min_cluster_size={min_cluster_size}, "
                         f"min_samples={min_samples}, "
                         f"cluster_selection_epsilon={cluster_selection_epsilon}) …")
+    start = time.perf_counter()
     clusterer = hdbscan_lib.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
@@ -720,6 +748,7 @@ def run_hdbscan(controller, state, params: dict, progress=None, af_state=None) -
         core_dist_n_jobs=-1,   # NOT 'n_jobs' -- different name than sklearn's HDBSCAN
         prediction_data=True,  # required for approximate_predict() below
     ).fit(data)
+    _add_time(state, 'fit', time.perf_counter() - start, len(data))
     train_labels = clusterer.labels_.astype(np.int32)
     n_noise = int(np.sum(train_labels == -1))
     n_cl = int(train_labels.max()) + 1
@@ -766,10 +795,14 @@ class StagedResult:
         self.cluster_labels = dict(state.cluster_labels)
         self.cluster_marker_values = dict(state.cluster_marker_values)
         self.cluster_dr_positions = dict(state.cluster_dr_positions)
+        self.cluster_rows = dict(getattr(state, 'cluster_rows', {}) or {})
         self.cluster_colors = dict(state.cluster_colors)
         self.n_clusters = state.n_clusters
         self.active_clustering_algorithm = state.active_clustering_algorithm
         self.trained_reducers = {}
+        # Measured stage times and event counts (drc_time_estimate)
+        self.stage_seconds = {}
+        self.stage_events = {}
 
     def __getattr__(self, name):
         return getattr(self._state, name)
@@ -788,6 +821,13 @@ def run_clustering_staged(controller, state, algo: str, params: dict,
         drc_pipeline.apply_unmixing_af_aware() docstring.
     """
     staged = StagedResult(state)
+    labelled = (sorted(_assignable_sample_paths(controller, state, True))
+                if params.get('_assign_all_samples') else list(state.training_sample_ids))
+    _progress(progress, "Loading samples …")
+    seconds, events = drc_pipeline.timed_preload(controller, state, labelled,
+                                                 af_state=af_state)
+    if events:
+        _add_time(staged, 'io', seconds, events)
     if algo == 'FlowSOM':
         run_flowsom(controller, staged, params, progress, af_state=af_state)
     elif algo == 'Leiden':
@@ -804,6 +844,7 @@ def commit_clustering_result(state, staged: StagedResult, algo: str) -> None:
     state.cluster_labels = staged.cluster_labels
     state.cluster_marker_values = staged.cluster_marker_values
     state.cluster_dr_positions = staged.cluster_dr_positions
+    state.cluster_rows = staged.cluster_rows
     state.cluster_colors = staged.cluster_colors
     state.n_clusters = staged.n_clusters
     state.active_clustering_algorithm = staged.active_clustering_algorithm

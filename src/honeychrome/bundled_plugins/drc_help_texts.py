@@ -107,15 +107,24 @@ metric. See the Further Reading links below for a practical comparison
 of how these algorithms behave on real flow cytometry data.</p>
 <p>Click <b>Train DR Model</b> to fit the selected algorithm on the
 training pool, then <b>Apply to All Samples</b> to project every sample
-(including ones not used for training) through the trained model.</p>
+(including ones not used for training) through the trained model.
+Events in the training pool keep the position the fit gave them; only
+the other events are projected. UMAP finds each projected event's
+neighbours in the training pool with an hnswlib index, built once per
+model before the first projection.</p>
+<p>Defaults: UMAP 200 epochs (umap-learn's own default above 10,000
+events) and tSNE 500 iterations after 250 of early exaggeration
+(openTSNE's defaults). UMAP's code is compiled in the background the
+first time this tab opens in a session, so the first UMAP run does not
+wait for it.</p>
 
 <h4>3. Clustering</h4>
 <ul>
 <li><b>FlowSOM</b> [6] — self-organising map followed by metaclustering; set
 the SOM grid size and number of metaclusters. Honeychrome uses a batched
 FlowSOM training for fast processing of even millions of events.</li>
-<li><b>Leiden</b> [7] — graph-based community detection; reuses UMAP's
-neighbour graph if one is available. Leiden was designed specifically to
+<li><b>Leiden</b> [7] — graph-based community detection on its own
+nearest-neighbour graph of the training events. Leiden was designed specifically to
 fix a defect in the Louvain-based algorithms behind classic
 Phenograph-style clustering [9], which can produce badly-connected or even
 disconnected "communities" and can be sensitive to how many cells and
@@ -127,7 +136,8 @@ sparse events as noise (label −1, shown in grey) rather than forcing
 every event into a cluster.</li>
 </ul>
 <p>Choose whether to <b>cluster on original features</b> or on a
-<b>trained DR embedding</b>; whether to downsample training data for
+<b>trained DR embedding</b> (FlowSOM always clusters on original features,
+HDBSCAN always on an embedding); whether to downsample training data for
 speed; and whether to assign the resulting cluster labels to every
 sample or just the training set. Click <b>Run Clustering</b> to fit.</p>
 
@@ -136,6 +146,21 @@ sample or just the training set. Click <b>Run Clustering</b> to fit.</p>
 to rename it, or any other cell to view its full configuration. Renaming
 or deleting a run here updates every run selector elsewhere in the
 plugin (Cluster Annotation, Stats, Workspace) immediately.</p>
+<p>Each run records which events of each file it holds, so it stays
+usable when the gating or unmixing changes afterwards: it is matched to
+the current gating event by event. Cells that have left its gates drop
+out; cells that have entered them are labelled from the run's SOM
+codebook or cluster centroids (clustering in marker space), or left
+unlabelled and reported otherwise. A run whose gating or unmixing has
+changed is shown in orange, with the details in its tooltip. Runs made
+before event keys were recorded can only be matched while nothing has
+changed; <b>Use These Settings</b> loads a run's gates, samples,
+channels and parameters so it can be run again on the current data.</p>
+<p><b>Run time.</b> Before a run starts, its time is estimated from
+measurements of each algorithm on this computer, which improve after
+every run. A run expected to take 30 seconds or more asks first; the
+first time an algorithm runs on a computer, a short timing test may be
+run to calibrate it.</p>
 
 <h4>5. Predictive Analysis (optional)</h4>
 <p>The differential tests ask, one feature at a time, "does this differ

@@ -15,7 +15,14 @@ Layout under the experiment folder:
       runs/<run_id>/     — one directory per archived run, holding only
                            that run's heavy payload (embeddings for a DR
                            run; per-sample label arrays, colours, names,
-                           marker snapshots for a clustering run).
+                           marker snapshots for a clustering run; for
+                           either, the event keys of every row).
+
+Runs archived since event keys exist have 'event_keys': True in the
+manifest and an 'event_rows' payload ({sample: FCS-file row of each of the
+run's rows}); see drc_run_align.  They also record the transforms they were
+fitted in ('transform_params') and the two halves of their fingerprint
+('unmixing_fingerprint', 'gating_fingerprint').
 
 current_state/ and each runs/<run_id>/ are drc_persist bundles (JSON +
 npz + CSV); nothing is pickled. Fitted UMAP/openTSNE/PaCMAP model
@@ -186,9 +193,30 @@ def sync_status(entry: dict, current_fingerprint: str | None) -> str:
     return SYNC_IN_SYNC if recorded == current_fingerprint else SYNC_OUT_OF_SYNC
 
 
+SYNC_SAME = 'same'
+SYNC_CHANGED = 'changed'
+
+
+def sync_detail(entry: dict, current: dict) -> dict:
+    """{'unmixing': ..., 'gating': ...} each SYNC_SAME, SYNC_CHANGED or
+    SYNC_UNKNOWN, comparing the run's recorded halves of its fingerprint
+    with drc_pipeline.split_fingerprints() computed now."""
+    out = {}
+    for part in ('unmixing', 'gating'):
+        recorded = entry.get(f'{part}_fingerprint')
+        now = (current or {}).get(part)
+        if not recorded or not now:
+            out[part] = SYNC_UNKNOWN
+        else:
+            out[part] = SYNC_SAME if recorded == now else SYNC_CHANGED
+    return out
+
+
 def _manifest_entry(run_id, kind, label, algorithm, gates, training_sample_ids,
                      n_events, channels, params, timestamp, n_clusters=None,
-                     sync_fingerprint=None) -> dict:
+                     sync_fingerprint=None, split_fingerprints=None,
+                     transform_params=None, event_keys=False) -> dict:
+    split_fingerprints = split_fingerprints or {}
     return {
         'run_id': run_id,
         'kind': kind,
@@ -203,6 +231,10 @@ def _manifest_entry(run_id, kind, label, algorithm, gates, training_sample_ids,
         'timestamp': timestamp,
         'n_clusters': n_clusters,
         'sync_fingerprint': sync_fingerprint,
+        'unmixing_fingerprint': split_fingerprints.get('unmixing'),
+        'gating_fingerprint': split_fingerprints.get('gating'),
+        'transform_params': dict(transform_params or {}),
+        'event_keys': bool(event_keys),
         'storage': STORAGE_FORMAT,
     }
 
@@ -220,7 +252,7 @@ def save_run_payload(controller, run_id: str, payload: dict) -> None:
 # keep this in sync with hydrate_run()'s 'clustering' branch below.
 _CLUSTERING_RUN_PAYLOAD_FIELDS = (
     'labels', 'colors', 'names', 'marker_values', 'dr_positions',
-    'mem_labels', 'cell_type_suggestions', 'tree_data',
+    'mem_labels', 'cell_type_suggestions', 'tree_data', 'event_rows',
 )
 
 
@@ -265,7 +297,8 @@ def delete_run_payload(controller, run_id: str) -> None:
 def archive_dr_run(controller, state, *, algorithm, embeddings,
                     gates, training_sample_ids, channels, params,
                     n_events, label=None, embedding_features=None,
-                    sync_fingerprint=None) -> dict:
+                    sync_fingerprint=None, event_rows=None,
+                    split_fingerprints=None, transform_params=None) -> dict:
     """
     Archive a completed DR training run: write the embeddings to
     ``cache/dr_clustering/runs/<run_id>/``, append a lightweight entry to
@@ -283,6 +316,9 @@ def archive_dr_run(controller, state, *, algorithm, embeddings,
         (re-gate-able) data. Optional for callers that don't have it.
     sync_fingerprint: drc_pipeline.sync_fingerprint() of the gates and
         training samples at the time the embedding was made; see sync_status().
+    event_rows: {sample_path: int32 FCS-file rows}, one per embedding row
+        (see drc_run_align).  Required for every new run.
+    split_fingerprints / transform_params: see the module docstring.
     """
     log_stage(log, "ARCHIVE DR RUN")
     run_id = _new_run_id()
@@ -292,12 +328,14 @@ def archive_dr_run(controller, state, *, algorithm, embeddings,
     save_run_payload(controller, run_id, {
         'embeddings': embeddings,
         'embedding_features': embedding_features or {},
+        'event_rows': event_rows or {},
     })
 
     entry = _manifest_entry(
         run_id, 'dr', run_label, algorithm, gates, training_sample_ids,
         n_events, channels, params, timestamp,
-        sync_fingerprint=sync_fingerprint,
+        sync_fingerprint=sync_fingerprint, split_fingerprints=split_fingerprints,
+        transform_params=transform_params, event_keys=event_rows is not None,
     )
     manifest = read_manifest(controller)
     manifest.append(entry)
@@ -306,6 +344,7 @@ def archive_dr_run(controller, state, *, algorithm, embeddings,
     full_entry = dict(entry)
     full_entry['embeddings'] = embeddings
     full_entry['embedding_features'] = embedding_features or {}
+    full_entry['event_rows'] = event_rows or {}
     state.dr_runs.append(full_entry)
     log.info("archived DR run %r (run_id=%s, %d embedded sample(s))",
              run_label, run_id, len(embeddings))
@@ -313,7 +352,8 @@ def archive_dr_run(controller, state, *, algorithm, embeddings,
 
 
 def update_dr_run_embeddings(controller, state, run_id: str, embeddings: dict,
-                              embedding_features: dict | None = None) -> None:
+                              embedding_features: dict | None = None,
+                              event_rows: dict | None = None) -> None:
     """
     Refresh the stored payload and in-memory entry for an already-archived
     DR run after 'Apply to All Samples' embeds additional samples under the
@@ -328,12 +368,16 @@ def update_dr_run_embeddings(controller, state, run_id: str, embeddings: dict,
     payload['embeddings'] = embeddings
     if embedding_features is not None:
         payload['embedding_features'] = embedding_features
+    if event_rows is not None:
+        payload['event_rows'] = event_rows
     save_run_payload(controller, run_id, payload)
     for entry in state.dr_runs:
         if entry.get('run_id') == run_id:
             entry['embeddings'] = embeddings
             if embedding_features is not None:
                 entry['embedding_features'] = embedding_features
+            if event_rows is not None:
+                entry['event_rows'] = event_rows
             break
 
 
@@ -377,7 +421,9 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
                             training_sample_ids, channels, params,
                             n_events, label=None,
                             marker_values=None, dr_positions=None,
-                            tree_data=None, sync_fingerprint=None) -> dict:
+                            tree_data=None, sync_fingerprint=None,
+                            event_rows=None, split_fingerprints=None,
+                            transform_params=None) -> dict:
     """
     Archive a completed clustering run.  Same file/manifest layout as
     archive_dr_run(), with 'labels' (per-sample label arrays), 'colors' and
@@ -406,6 +452,10 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
         drc_pipeline.sync_fingerprint and sync_status). For a run clustered
         in DR-embedding space that is the DR run's own fingerprint, since
         the labels follow the embedding's rows, not the current gating.
+    event_rows: {sample_path: int32 FCS-file rows}, one per label (the
+        source embedding's rows for a DR-space run).  Required for every
+        new run.
+    split_fingerprints / transform_params: see the module docstring.
     """
     log_stage(log, "ARCHIVE CLUSTERING RUN")
     run_id = _new_run_id()
@@ -422,12 +472,14 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
         'mem_labels': {},
         'cell_type_suggestions': None,
         'tree_data': tree_data,
+        'event_rows': event_rows or {},
     })
 
     entry = _manifest_entry(
         run_id, 'clustering', run_label, algorithm, gates, training_sample_ids,
         n_events, channels, params, timestamp, n_clusters=n_clusters,
-        sync_fingerprint=sync_fingerprint,
+        sync_fingerprint=sync_fingerprint, split_fingerprints=split_fingerprints,
+        transform_params=transform_params, event_keys=event_rows is not None,
     )
     manifest = read_manifest(controller)
     manifest.append(entry)
@@ -442,6 +494,7 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
     full_entry['mem_labels'] = {}
     full_entry['cell_type_suggestions'] = None
     full_entry['tree_data'] = tree_data
+    full_entry['event_rows'] = event_rows or {}
     state.clustering_runs.append(full_entry)
     log.info("archived clustering run %r (run_id=%s, %s cluster(s))",
              run_label, run_id, n_clusters)
@@ -528,6 +581,7 @@ def hydrate_run(controller, entry: dict) -> dict:
         payload = load_run_payload(controller, entry['run_id']) or {}
         entry['embeddings'] = payload.get('embeddings', {})
         entry['embedding_features'] = payload.get('embedding_features', {})
+        entry['event_rows'] = payload.get('event_rows', {})
     elif kind == 'clustering' and 'labels' not in entry:
         payload = load_run_payload(controller, entry['run_id']) or {}
         entry['labels'] = payload.get('labels', {})
@@ -538,4 +592,5 @@ def hydrate_run(controller, entry: dict) -> dict:
         entry['mem_labels'] = payload.get('mem_labels', {})
         entry['cell_type_suggestions'] = payload.get('cell_type_suggestions')
         entry['tree_data'] = payload.get('tree_data')
+        entry['event_rows'] = payload.get('event_rows', {})
     return entry

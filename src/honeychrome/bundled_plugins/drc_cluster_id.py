@@ -52,6 +52,7 @@ import numpy as np
 import pandas as pd
 
 import drc_pipeline
+import drc_run_align
 from drc_logging import get_logger, log_stage
 
 log = get_logger(__name__)
@@ -95,7 +96,9 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
                                 progress_callback=None,
                                 af_state=None,
                                 max_events_per_cluster: int | None = 1000,
-                                seed: int = 42) -> dict[str, dict[int, np.ndarray]]:
+                                seed: int = 42,
+                                live_mode: str = drc_run_align.JOIN_NONE,
+                                ) -> dict[str, dict[int, np.ndarray]]:
     """
     Pool TRANSFORMED marker values (state.channel_transform_params -- the
     SAME per-channel transform the Transforms tab and clustering itself
@@ -109,7 +112,10 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
     downsampling below is then done before the transform, so only the
     kept events are transformed. Otherwise every training sample is
     loaded, unmixed and gated again
-    (drc_pipeline.load_sample_transformed_values).
+    (drc_pipeline.load_sample_transformed_values) and its values are
+    matched to the labels as *live_mode* allows (drc_run_align: by event
+    key, or row for row for a legacy run in sync; computed by the caller on
+    the main thread).
 
     progress_callback: optional callable(n_samples_done: int), invoked
     after EACH training sample is pooled (whether or not it contributed
@@ -192,29 +198,31 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
                 progress_callback(i + 1)
             continue
         labels = np.asarray(labels)
-        if len(values) != len(labels):
+        rows = drc_pipeline.load_sample_rows(controller, state, rel, af_state=af_state)
+        aligned, matched = drc_run_align.pair_arrays(
+            np.asarray(values, dtype=np.float64), len(labels), live_mode,
+            src_rows=rows, dst_rows=drc_run_align.run_rows(cl_run, rel), fill=np.nan)
+        if aligned is None:
             log.warning(
-                "pool_cluster_marker_values: %s -- values (%d) vs labels (%d) "
-                "length mismatch; the run's events no longer line up with the "
-                "current gating and unmixing.",
+                "pool_cluster_marker_values: %s -- values (%d) vs labels (%d): the "
+                "run's events cannot be matched to the current gating and unmixing.",
                 rel, len(values), len(labels),
             )
             misaligned.append(rel)
             if progress_callback is not None:
                 progress_callback(i + 1)
             continue
-        _pool_sample(pooled, channels, values, names, labels)
+        _pool_sample(pooled, channels, aligned[matched], names, labels[matched])
         if progress_callback is not None:
             progress_callback(i + 1)
 
     if misaligned:
         raise RuntimeError(
-            f"{len(misaligned)} of {len(training_samples)} sample(s) have a different "
-            "number of events under the current gating and unmixing than when this "
-            "run was made (first: "
-            f"{misaligned[0]}), so their events cannot be matched to the run's "
-            "cluster labels. Re-run the clustering, or restore the gating and "
-            "unmixing the run was made with."
+            f"{len(misaligned)} of {len(training_samples)} sample(s) cannot be matched "
+            "to the run's cluster labels under the current gating and unmixing (first: "
+            f"{misaligned[0]}): the run was made before event keys were recorded and the "
+            "gating or unmixing has changed since. Re-run the clustering, or restore the "
+            "gating and unmixing the run was made with."
         )
 
     result = _downsample_pooled(pooled, max_events_per_cluster, seed)
@@ -1224,7 +1232,8 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
                                     af_state=None,
                                     unstained_af_states: dict | None = None,
                                     max_events_per_cluster: int | None = 1000,
-                                    downsample_seed: int = 42):
+                                    downsample_seed: int = 42,
+                                    live_mode: str = drc_run_align.JOIN_NONE):
     """
     One-call pipeline for the Cluster Annotation tab's controls.
 
@@ -1288,6 +1297,7 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
         af_state=af_state,
         max_events_per_cluster=max_events_per_cluster,
         seed=downsample_seed,
+        live_mode=live_mode,
     )
 
     mem_scores = calculate_mem_scores(pooled, iqr_floor=iqr_floor)
