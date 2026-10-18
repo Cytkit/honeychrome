@@ -11,7 +11,7 @@ from pathvalidate import sanitize_filename
 from honeychrome.controller import base_directory
 from honeychrome.controller_components.exporter import ReportGenerator
 from honeychrome.controller_components.functions import get_all_subfolders_recursive
-from honeychrome.controller_components.particle_type import is_bead_sample
+from honeychrome.controller_components.particle_type import is_bead_sample, set_bead_sample
 from honeychrome.controller_components.unmixed_exporter import UnmixedExporter
 from honeychrome.view_components.batch_export_samples_modal import BatchExportSamplesModal
 from honeychrome.view_components.icon_loader import icon as load_icon, icon
@@ -537,14 +537,8 @@ class SampleWidget(QWidget):
 
     def toggle_beads(self, path):
         samples = self.controller.experiment.samples
-        beads = samples.setdefault('bead_samples', [])
-        checked = samples.setdefault('bead_checked_samples', [])
-        if path in beads:
-            beads.remove(path)
-        else:
-            beads.append(path)
-        if path not in checked:
-            checked.append(path)
+        set_bead_sample(samples, path, not is_bead_sample(samples, path))
+        self.bus.beadSampleToggled.emit(path)
         self.bus.autoSaveRequested.emit()
         self.model.refresh_tree()
         self.tree_view.expandAll()

@@ -37,14 +37,21 @@ scatter_ceilings(raw_settings, channels)
 
 Bead samples
 ------------
-samples['bead_samples'] lists the samples treated as beads everywhere a
-sample (rather than a spectral control) is judged bead or cell, e.g. which
-unstained sample is a bead or a cell negative. update_bead_samples() checks
-each sample once, listed in samples['bead_checked_samples']: a name
-containing "bead" marks it; an unstained sample is otherwise scored on
-scatter. After that check only the user's Mark/Unmark as Beads changes it.
-In the scatter check the anchor is the broadest unstained sample checked in
-the same call (v1: earlier calls' scores are not kept).
+samples['bead_samples'] lists the samples treated as beads: by Auto generate
+for the particle type of single-stain controls, and wherever a sample is
+judged bead or cell, e.g. which unstained sample is a bead or a cell
+negative. update_bead_samples() checks each sample once, listed in
+samples['bead_checked_samples'], in this order:
+  1. a particle type already set for it in the Spectral Model (known_types);
+  2. a name or path containing "bead": beads;
+  3. a name containing "cells": cells (an unstained one is still scored, as
+     the anchor);
+  4. unstained samples and single-stain controls: scored on scatter.
+After that check only the user's changes move a sample in or out of the list:
+Mark/Unmark as Beads in the sample tree, or its Particle Type in the Spectral
+Model. Scores are kept in samples['bead_scatter_scores']; the anchor is the
+broadest scored unstained sample, so a control added later is judged against
+the same unstained sample.
 
 is_bead_name(path, name)
     Whether the path or name contains "bead".
@@ -52,10 +59,13 @@ is_bead_name(path, name)
 is_bead_sample(samples, path, name=None)
     Whether a sample is a bead sample; by name in experiments not yet scanned.
 
+set_bead_sample(samples, path, is_bead)
+    Mark or unmark a sample as beads (a user decision: also marks it checked).
+
 sample_scatter_log_area(abs_path, pair, ceilings)
     Core area of a sample file, read from at most CORE_MAX_EVENTS events.
 
-update_bead_samples(samples, experiment_dir, raw_settings, raw_plots=None)
+update_bead_samples(samples, experiment_dir, raw_settings, raw_plots=None, known_types=None)
     Check samples not yet checked; returns the paths newly marked as beads.
 """
 
@@ -174,51 +184,81 @@ def sample_scatter_log_area(abs_path, pair, ceilings) -> float | None:
     return scatter_core_log_area(events, ceilings)
 
 
+def set_bead_sample(samples: dict, path: str, is_bead: bool) -> bool:
+    """Returns whether the list changed."""
+    beads = samples.setdefault('bead_samples', [])
+    checked = samples.setdefault('bead_checked_samples', [])
+    if path not in checked:
+        checked.append(path)
+    if is_bead == (path in beads):
+        return False
+    if is_bead:
+        beads.append(path)
+        rank = {p: i for i, p in enumerate(samples.get('all_samples', {}))}
+        beads.sort(key=lambda p: rank.get(p, len(rank)))
+    else:
+        beads.remove(path)
+    return True
+
+
 def update_bead_samples(samples: dict, experiment_dir, raw_settings: dict,
-                        raw_plots: list | None = None) -> list:
+                        raw_plots: list | None = None, known_types: dict | None = None) -> list:
     all_samples = samples.get('all_samples', {})
     unstained = set(samples.get('unstained_samples', []))
+    controls = set(samples.get('single_stain_controls', []))
+    known_types = known_types or {}
     beads = [p for p in samples.get('bead_samples', []) if p in all_samples]
     checked = [p for p in samples.get('bead_checked_samples', []) if p in all_samples]
+    scores = {p: v for p, v in (samples.get('bead_scatter_scores') or {}).items() if p in all_samples}
     samples['bead_samples'] = beads
     samples['bead_checked_samples'] = checked
+    samples['bead_scatter_scores'] = scores
 
     newly = []
+
+    def decide(path, is_bead):
+        checked.append(path)
+        if is_bead and path not in beads:
+            beads.append(path)
+            newly.append(path)
+
     to_score = []
     for path, name in all_samples.items():
         if path in checked:
             continue
-        if is_bead_name(path, name):
-            checked.append(path)
-            if path not in beads:
-                beads.append(path)
-                newly.append(path)
-        elif path in unstained:
+        if known_types.get(path) in ('Beads', 'Cells'):
+            decide(path, known_types[path] == 'Beads')
+        elif is_bead_name(path, name):
+            decide(path, True)
+        elif re.search(r'cells', str(name), re.IGNORECASE):
+            decide(path, False)
+        elif path in unstained or path in controls:
             to_score.append(path)
 
-    pair = scatter_channel_pair(raw_settings, raw_plots) if to_score else None
-    if pair is None:
-        return newly
-    ceilings = scatter_ceilings(raw_settings, pair)
-    scores = {}
-    for path in to_score:
-        try:
-            score = sample_scatter_log_area(Path(experiment_dir) / path, pair, ceilings)
-        except Exception as e:
-            logger.warning(f'update_bead_samples: scatter of {path} not read: {e}')
-            continue
-        if score is not None:
-            scores[path] = score
+    # unstained cell samples are scored too, as the anchor
+    to_read = to_score + [p for p in all_samples
+                          if p in unstained and p not in scores and p not in beads and p not in to_score]
+    pair = scatter_channel_pair(raw_settings, raw_plots) if to_read else None
+    if pair is not None:
+        ceilings = scatter_ceilings(raw_settings, pair)
+        for path in to_read:
+            try:
+                score = sample_scatter_log_area(Path(experiment_dir) / path, pair, ceilings)
+            except Exception as e:
+                logger.warning(f'update_bead_samples: scatter of {path} not read: {e}')
+                continue
+            if score is not None:
+                scores[path] = round(score, 3)
 
-    anchor = max(scores.values()) if scores else None
-    for path, score in scores.items():
-        checked.append(path)
-        particle_type = classify_particle_type(score, anchor)
+    unstained_scores = [v for p, v in scores.items() if p in unstained]
+    anchor = max(unstained_scores) if unstained_scores else None
+    for path in to_score:
+        if path in checked or path not in scores:
+            continue
+        particle_type = classify_particle_type(scores[path], anchor)
         logger.info(f'update_bead_samples: "{path}" {particle_type} from scatter '
-                    f'(core log10 area {score:.2f}, anchor {anchor:.2f})')
-        if particle_type == 'Beads' and path not in beads:
-            beads.append(path)
-            newly.append(path)
+                    f'(core log10 area {scores[path]:.2f}, anchor {anchor})')
+        decide(path, particle_type == 'Beads')
 
     rank = {p: i for i, p in enumerate(all_samples)}
     beads.sort(key=rank.__getitem__)

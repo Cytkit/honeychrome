@@ -16,7 +16,7 @@ from honeychrome.controller_components.spectral_reference_library import (
 )
 from honeychrome.view_components.cosine_qc_viewer import cosine_qc_warning_threshold, COSINE_QC_NOTE_BY_CYTOMETER
 from honeychrome.controller_components.spectral_functions import sanitise_control_in_place, _find_default_unstained
-from honeychrome.controller_components.particle_type import is_bead_sample
+from honeychrome.controller_components.particle_type import is_bead_sample, set_bead_sample
 from honeychrome.view_components.icon_loader import icon
 from honeychrome.settings import spectral_model_column_labels, heading_style, INTERNAL_NEGATIVE_SENTINEL
 import honeychrome.settings as settings
@@ -282,6 +282,7 @@ class SpectralControlsEditor(QFrame):
         self.bus.spectralProcessRefreshed.connect(self._on_autogenerate_refreshed)
         self.bus.spectralControlAdded.connect(self.view.resizeToFit) #extends the table as autogeneration runs... looks interesting but a bit wonky
         self.bus.sampleTreeUpdated.connect(self.refresh_comboboxes) # check for changes to unstained samples
+        self.bus.beadSampleToggled.connect(self._on_bead_sample_toggled)
         self.bus.rawGateRenamed.connect(self._on_raw_gate_renamed)
         self.view.selectionModel().selectionChanged.connect(self._show_selected_profiles)
 
@@ -1138,6 +1139,10 @@ class SpectralControlsEditor(QFrame):
             if self.bus:
                 self.bus.statusMessage.emit('Automatic cleaning skipped: no unstained cell sample found.')
 
+        # particle types come from the bead list: check samples not yet checked
+        if self.controller.experiment.check_bead_samples():
+            self.bus.sampleTreeUpdated.emit()
+
         # if user gets through all above, run spectral auto generator
         self.setEnabled(False)
         self.thread = QThread()
@@ -1364,6 +1369,9 @@ class SpectralControlsEditor(QFrame):
             if control['gate_channel'] != current_gate_channel:
                 self._move_pos_neg_gates_to_channel(control)
 
+        if changed_col == 'particle_type' and control.get('control_type') == SSC_CONTROL_TYPE:
+            self._sync_particle_type(control)
+
         sanitise_control_in_place(control)
         if control['control_type'] == 'Single Stained Spectral Control from Library':
             self._select_default_library_profile(control)
@@ -1381,6 +1389,54 @@ class SpectralControlsEditor(QFrame):
                 self.bus.changedGatingHierarchy.emit('raw', pos_gate_label)
             self.bus.spectralModelUpdated.emit()
         logger.info(f'SpectralModelEditor: updated {"valid" if control_valid else "invalid"} control {control}')
+
+    def _sync_particle_type(self, control: dict) -> None:
+        """Particle Type edited: mark or unmark the control's sample as beads, and
+        replace an unstained negative of the other particle type."""
+        particle_type = control.get('particle_type')
+        if particle_type not in ('Beads', 'Cells'):
+            return
+        name_to_path = {name: path for path, name in self.samples['all_samples'].items()}
+        path = name_to_path.get(control.get('sample_name'))
+        if path and set_bead_sample(self.samples, path, particle_type == 'Beads'):
+            self.bus.sampleTreeUpdated.emit()
+
+        neg_name = control.get('universal_negative_name') or ''
+        if neg_name == INTERNAL_NEGATIVE_SENTINEL or (not neg_name and particle_type == 'Cells'):
+            return  # internal, or blank (the global cell unstained)
+        neg_path = name_to_path.get(neg_name)
+        if neg_path is not None and is_bead_sample(self.samples, neg_path, neg_name) == (particle_type == 'Beads'):
+            return
+        control['universal_negative_name'] = self._default_negative(particle_type)
+
+    def _default_negative(self, particle_type: str) -> str:
+        """First unstained bead sample for Beads, the default cell unstained for Cells,
+        else the internal negative."""
+        if particle_type == 'Cells':
+            return _find_default_unstained(self.samples) or INTERNAL_NEGATIVE_SENTINEL
+        manually_tagged = set(self.samples.get('unstained_samples', []))
+        for path, name in self.samples['all_samples'].items():
+            is_unstained = (
+                path in manually_tagged
+                or bool(re.search(r'unstained', name, re.IGNORECASE))
+                or bool(re.search(r'unstained', path, re.IGNORECASE))
+            )
+            if is_unstained and is_bead_sample(self.samples, path, name):
+                return name
+        return INTERNAL_NEGATIVE_SENTINEL
+
+    @Slot(str)
+    def _on_bead_sample_toggled(self, path: str) -> None:
+        """Mark/Unmark as Beads in the sample tree: set the Particle Type of the
+        single-stain controls made from that sample to match."""
+        particle_type = 'Beads' if is_bead_sample(self.samples, path) else 'Cells'
+        name = self.samples['all_samples'].get(path)
+        col = COLUMNS.index('particle_type')
+        for row, control in enumerate(self.model._data):
+            if (control.get('control_type') == SSC_CONTROL_TYPE
+                    and control.get('sample_name') == name
+                    and control.get('particle_type') != particle_type):
+                self.model.setData(self.model.index(row, col), particle_type)
 
     @with_busy_cursor
     def _move_pos_neg_gates_to_channel(self, control: dict) -> None:

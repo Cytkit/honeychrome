@@ -24,6 +24,7 @@ class EventBus(QObject):
     batchAddSamples = Signal()
     newSampleRequested = Signal(str, str)
     sampleTreeUpdated = Signal()
+    beadSampleToggled = Signal(str)
     selectSample = Signal(str)
     showExportModal = Signal()
     batchExportRequested = Signal(str, bool)

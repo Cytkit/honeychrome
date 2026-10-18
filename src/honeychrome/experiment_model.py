@@ -289,9 +289,21 @@ class ExperimentModel:
             if p in self.samples['all_samples']
         ]
 
-        # bead samples: named, or unstained and bead-like on scatter; checked once
-        update_bead_samples(self.samples, experiment_dir, self.settings['raw'],
-                            self.cytometry.get('raw_plots'))
+        self.check_bead_samples()
+
+    def check_bead_samples(self) -> list:
+        """Check samples not yet checked for beads (particle_type.update_bead_samples),
+        taking the particle types already set in the Spectral Model as given."""
+        name_to_path = {name: path for path, name in self.samples['all_samples'].items()}
+        known_types = {
+            name_to_path[c['sample_name']]: c.get('particle_type')
+            for c in self.process.get('spectral_model', [])
+            if c.get('control_type') == 'Single Stained Spectral Control'
+            and c.get('sample_name') in name_to_path
+        }
+        experiment_dir = Path(self.experiment_path).parent / Path(self.experiment_path).stem
+        return update_bead_samples(self.samples, experiment_dir, self.settings['raw'],
+                                   self.cytometry.get('raw_plots'), known_types=known_types)
 
 
 if __name__ == '__main__':
