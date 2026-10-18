@@ -1115,6 +1115,8 @@ class PopulationTransformsPanel(TransformInspector):
                         replaces the TransformSet's objects and calls
                         set_transforms).
     populationChanged(name) is emitted when the user picks a population.
+    The channels shown default to the first fluorescence channels; the
+    host saves view() and gives it back with set_view().
     """
 
     populationChanged = Signal(str)
@@ -1132,6 +1134,7 @@ class PopulationTransformsPanel(TransformInspector):
         self._loader = None
         self._wanted = None
         self._loaded = None
+        self._pending_view = None
         self.reset_btn.setText(f"↺ {reset_label}")
         self.reset_btn.setVisible(reset is not None)
 
@@ -1165,6 +1168,14 @@ class PopulationTransformsPanel(TransformInspector):
         if self._reset is not None:
             self._reset()
 
+    def _default_channels(self) -> list[str]:
+        """Fluorescence channels in the cytometer's channel order."""
+        settings = self.controller.experiment.settings.get('unmixed', {})
+        pnn = settings.get('event_channels_pnn') or []
+        ids = sorted(set(settings.get('fluorescence_channel_ids') or []))
+        named = [pnn[i] for i in ids if 0 <= i < len(pnn)]
+        return named or list(settings.get('fluorescence_channels') or [])
+
     # -- host API ---------------------------------------------------------
 
     def set_transforms(self):
@@ -1173,7 +1184,40 @@ class PopulationTransformsPanel(TransformInspector):
         self._pnn = list(self.controller.experiment.settings.get('unmixed', {})
                          .get('event_channels_pnn') or [])
         self.show_channels()
+        self._apply_view()
         self.redraw_all()
+
+    def view(self) -> dict | None:
+        """{'x': channel selected in the list, 'y': [each biplot's y
+        channel]}; None before anything has been shown."""
+        if self._pending_view is not None:
+            return dict(self._pending_view)
+        if not self._active_channel and not self._biplot_tiles:
+            return None
+        return {'x': self._active_channel or '',
+                'y': [t.y_channel() for t in self._biplot_tiles]}
+
+    def set_view(self, view: dict | None):
+        """Channels to show the next time the transforms are shown (see view())."""
+        self._pending_view = dict(view) if isinstance(view, dict) and view else None
+
+    def _apply_view(self):
+        """Select the channels given to set_view, where they still exist."""
+        view, self._pending_view = self._pending_view, None
+        if not view:
+            return
+        channels = self._channel_order()
+        if view.get('x') in channels:
+            self.channel_list.setCurrentRow(channels.index(view['x']))
+        available = self._available_channels()
+        ys = [y for y in (view.get('y') or []) if y in available]
+        if not ys:
+            return
+        while self._biplot_tiles:
+            self._remove_biplot()
+        for y in ys:
+            self._add_biplot()
+            self._biplot_tiles[-1].set_channels(available, y_channel=y)
 
     def population(self) -> str:
         return self._population
