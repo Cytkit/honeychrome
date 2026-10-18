@@ -15,16 +15,27 @@ Thresholds were set on 305 controls named cells or beads (117 bead, 188 cell)
 from 18 experiments on 10 cytometers (Aurora, Northern Lights, FACSDiscover A8,
 ID7000, CytoFLEX LX, CytoFLEX Mosaic, Attune NxT, Attune Xenith, Bigfoot,
 NovoCyte Opteon): log10 core area of bead controls -4.74 to -3.05, of cell
-controls -2.78 to -0.95.
+controls -2.78 to -0.95. Slingshot beads, built to scatter like cells, are the
+broadest beads seen: -3.25 and -3.15 (Aurora), against -2.65 and -2.57 for
+cell controls of the same experiment.
 
 A control is called beads when its core area is below BEAD_CORE_LOG_AREA and,
 when the experiment has an unstained cell control, also more than
-BEAD_ANCHOR_MARGIN decades below that control's core area.
+BEAD_ANCHOR_MARGIN decades below that control's core area. No named cell
+control is below BEAD_CORE_LOG_AREA, so the margin only guards tight cell
+preparations; 0.4 keeps Slingshot beads (0.58 and 0.60 below) as beads.
+
+Bead controls are matched to unstained bead samples by the centre of their
+core ellipse: the nearest unstained bead sample whose centre is within
+BEAD_MATCH_DECADES on both FSC and SSC. Within one bead type, centres agree
+to 0.024 decades (12 experiments); Slingshot and UltraComp centres differ by
+0.39-0.40 decades in FSC (0.05 in SSC), so both axes are compared.
 
 Public API
 ----------
-scatter_core_log_area(scatter, ceilings)
-    log10 area of the core ellipse of an (n_events, 2) FSC/SSC array, or None.
+scatter_core(scatter, ceilings)
+    (log10 area, centre) of the core ellipse of an (n_events, 2) FSC/SSC
+    array, or None. scatter_core_log_area() returns the area alone.
 
 classify_particle_type(log_area, anchor_log_area=None)
     'Beads', 'Cells', or None when log_area is None.
@@ -49,7 +60,9 @@ samples['bead_checked_samples'], in this order:
   4. unstained samples and single-stain controls: scored on scatter.
 After that check only the user's changes move a sample in or out of the list:
 Mark/Unmark as Beads in the sample tree, or its Particle Type in the Spectral
-Model. Scores are kept in samples['bead_scatter_scores']; the anchor is the
+Model. Scores are kept in samples['bead_scatter_scores'] and core centres in
+samples['bead_scatter_centres'] (also read for bead samples decided by name or
+Spectral Model, for matching); the anchor is the
 broadest scored unstained sample, so a control added later is judged against
 the same unstained sample.
 
@@ -62,8 +75,11 @@ is_bead_sample(samples, path, name=None)
 set_bead_sample(samples, path, is_bead)
     Mark or unmark a sample as beads (a user decision: also marks it checked).
 
-sample_scatter_log_area(abs_path, pair, ceilings)
-    Core area of a sample file, read from at most CORE_MAX_EVENTS events.
+sample_scatter_core(abs_path, pair, ceilings)
+    scatter_core() of a sample file, read from at most CORE_MAX_EVENTS events.
+
+match_bead_unstained(samples, path)
+    The unstained bead sample matching a bead sample's scatter, or None.
 
 update_bead_samples(samples, experiment_dir, raw_settings, raw_plots=None, known_types=None)
     Check samples not yet checked; returns the paths newly marked as beads.
@@ -82,16 +98,18 @@ CORE_MAX_EVENTS = 20000         # events used per sample
 CORE_MIN_EVENTS = 200           # fewer usable events: no call
 CORE_STEPS = 4                  # concentration steps
 BEAD_CORE_LOG_AREA = -2.9       # log10 core area; beads below
-BEAD_ANCHOR_MARGIN = 0.75       # decades below the unstained cell control
+BEAD_ANCHOR_MARGIN = 0.4        # decades below the unstained cell control
+BEAD_MATCH_DECADES = 0.15       # max core-centre difference, FSC and SSC, bead to unstained bead
 
 
-def scatter_core_log_area(scatter: np.ndarray, ceilings,
-                          fraction: float = CORE_FRACTION,
-                          max_events: int = CORE_MAX_EVENTS,
-                          seed: int = 0) -> float | None:
-    """log10 area of the tightest ellipse holding `fraction` of the events
-    in log10 scatter. Non-positive and saturated events are dropped;
-    `ceilings` is one value per column or a single value."""
+def scatter_core(scatter: np.ndarray, ceilings,
+                 fraction: float = CORE_FRACTION,
+                 max_events: int = CORE_MAX_EVENTS,
+                 seed: int = 0) -> tuple[float, list] | None:
+    """(log10 area, [log10 FSC, log10 SSC] centre) of the tightest ellipse
+    holding `fraction` of the events in log10 scatter. Non-positive and
+    saturated events are dropped; `ceilings` is one value per column or a
+    single value."""
     scatter = np.asarray(scatter, dtype=np.float64)
     if scatter.ndim != 2 or scatter.shape[1] != 2:
         return None
@@ -119,7 +137,12 @@ def scatter_core_log_area(scatter: np.ndarray, ceilings,
     det = np.linalg.det(cov)
     if not np.isfinite(det) or det <= 0:
         return None
-    return float(np.log10(np.pi * np.sqrt(det)))
+    return float(np.log10(np.pi * np.sqrt(det))), [float(v) for v in centre]
+
+
+def scatter_core_log_area(scatter: np.ndarray, ceilings, **kwargs) -> float | None:
+    core = scatter_core(scatter, ceilings, **kwargs)
+    return None if core is None else core[0]
 
 
 def classify_particle_type(log_area: float | None,
@@ -173,7 +196,7 @@ def is_bead_sample(samples: dict, path: str, name: str | None = None) -> bool:
     return is_bead_name(path, name)
 
 
-def sample_scatter_log_area(abs_path, pair, ceilings) -> float | None:
+def sample_scatter_core(abs_path, pair, ceilings) -> tuple[float, list] | None:
     from honeychrome.controller_components.fcs_preview import load_fcs_preview
     try:
         _, events = load_fcs_preview(abs_path, CORE_MAX_EVENTS, col_order=list(pair))
@@ -181,7 +204,24 @@ def sample_scatter_log_area(abs_path, pair, ceilings) -> float | None:
         # integer FCS data: full read
         from honeychrome.controller_components.functions import sample_from_fcs
         events = sample_from_fcs(str(abs_path)).get_events('raw', col_order=list(pair))
-    return scatter_core_log_area(events, ceilings)
+    return scatter_core(events, ceilings)
+
+
+def match_bead_unstained(samples: dict, path: str) -> str | None:
+    """Path of the unstained bead sample with the nearest core centre within
+    BEAD_MATCH_DECADES on both axes; None when there is none."""
+    centres = samples.get('bead_scatter_centres') or {}
+    centre = centres.get(path)
+    if centre is None:
+        return None
+    best = None
+    for other in samples.get('unstained_samples', []):
+        if other == path or not is_bead_sample(samples, other) or other not in centres:
+            continue
+        diff = max(abs(centre[0] - centres[other][0]), abs(centre[1] - centres[other][1]))
+        if diff <= BEAD_MATCH_DECADES and (best is None or diff < best[0]):
+            best = (diff, other)
+    return best[1] if best else None
 
 
 def set_bead_sample(samples: dict, path: str, is_bead: bool) -> bool:
@@ -210,9 +250,11 @@ def update_bead_samples(samples: dict, experiment_dir, raw_settings: dict,
     beads = [p for p in samples.get('bead_samples', []) if p in all_samples]
     checked = [p for p in samples.get('bead_checked_samples', []) if p in all_samples]
     scores = {p: v for p, v in (samples.get('bead_scatter_scores') or {}).items() if p in all_samples}
+    centres = {p: v for p, v in (samples.get('bead_scatter_centres') or {}).items() if p in all_samples}
     samples['bead_samples'] = beads
     samples['bead_checked_samples'] = checked
     samples['bead_scatter_scores'] = scores
+    samples['bead_scatter_centres'] = centres
 
     newly = []
 
@@ -235,20 +277,22 @@ def update_bead_samples(samples: dict, experiment_dir, raw_settings: dict,
         elif path in unstained or path in controls:
             to_score.append(path)
 
-    # unstained cell samples are scored too, as the anchor
-    to_read = to_score + [p for p in all_samples
-                          if p in unstained and p not in scores and p not in beads and p not in to_score]
+    # unstained cell samples are read too, as the anchor; bead samples for their centre
+    to_read = to_score + [p for p in all_samples if p not in to_score and (
+        (p in unstained and p not in scores and p not in beads)
+        or (p in beads and p not in centres))]
     pair = scatter_channel_pair(raw_settings, raw_plots) if to_read else None
     if pair is not None:
         ceilings = scatter_ceilings(raw_settings, pair)
         for path in to_read:
             try:
-                score = sample_scatter_log_area(Path(experiment_dir) / path, pair, ceilings)
+                core = sample_scatter_core(Path(experiment_dir) / path, pair, ceilings)
             except Exception as e:
                 logger.warning(f'update_bead_samples: scatter of {path} not read: {e}')
                 continue
-            if score is not None:
-                scores[path] = round(score, 3)
+            if core is not None:
+                scores[path] = round(core[0], 3)
+                centres[path] = [round(v, 4) for v in core[1]]
 
     unstained_scores = [v for p, v in scores.items() if p in unstained]
     anchor = max(unstained_scores) if unstained_scores else None

@@ -13,7 +13,7 @@ from honeychrome.controller_components.functions import timer, sample_from_fcs, 
 from honeychrome.controller_components.spectral_functions import get_profile, get_raw_events
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.label_matching import match_fluorophore, match_marker, get_fluorophore_db, get_marker_db
-from honeychrome.controller_components.particle_type import is_bead_sample
+from honeychrome.controller_components.particle_type import is_bead_sample, match_bead_unstained
 from honeychrome.controller_components.spectral_reference_library import profile_id_from_description
 from honeychrome.controller_components.spectral_cleaning import find_empirical_peak, cosine_filter, knn_scatter_match, exclude_saturated, CleanResult
 from honeychrome.controller_components.spectral_refinement import (
@@ -607,7 +607,7 @@ class SpectralAutoGenerator(QObject):
         self.profiles.clear()
         self.unstained_negative = None
         self.unstained_negative_events = None          # cells unstained raw events
-        self.unstained_negative_events_beads = None    # beads unstained raw events
+        self.bead_unstained_events = {}                # bead unstained raw events by path
         self.negative_profile_warnings = []            # labels; shown once at end of run()
         self.insufficient_events_warnings = []         # tubenames; shown once at end of run()
         self.low_events = LowEventLog(controller, bus, collect=True)   # shown once at end of run()
@@ -699,12 +699,13 @@ class SpectralAutoGenerator(QObject):
         gate if absent, then cache the profile and raw events.
 
         particle_type='Cells': prefer a sample that is not a bead sample.
-        particle_type='Beads': prefer a bead sample (see particle_type.is_bead_sample).
+        particle_type='Beads': every unstained bead sample (see particle_type.is_bead_sample);
+        each bead control uses the one matching its scatter (match_bead_unstained).
 
         Stores results in:
             self.unstained_negative          (profile vector, Cells only)
             self.unstained_negative_events   (raw array, Cells)
-            self.unstained_negative_events_beads (raw array, Beads)
+            self.bead_unstained_events       (raw arrays by path, Beads)
 
         Returns True if an unstained was found and loaded, False otherwise.
         Does NOT modify negative_type on failure.
@@ -726,9 +727,9 @@ class SpectralAutoGenerator(QObject):
                 path for path, name in self.samples['all_samples'].items()
                 if _is_unstained(path, name)
             ]
+            bead_candidates = [p for p in candidates if _is_bead(p, self.samples['all_samples'][p])]
             if particle_type == 'Beads':
-                bead_candidates = [p for p in candidates if _is_bead(p, self.samples['all_samples'][p])]
-                sample_path = (bead_candidates or candidates or [None])[0]
+                sample_path = (bead_candidates or [None])[0]
             else:
                 # Honour editor hint for Cells unstained when available.
                 if self.preferred_unstained:
@@ -784,7 +785,17 @@ class SpectralAutoGenerator(QObject):
             self.low_events.note(self.samples['all_samples'][sample_path], self.base_gate_label, len(raw_events))
 
             if particle_type == 'Beads':
-                self.unstained_negative_events_beads = raw_events
+                self.bead_unstained_events[sample_path] = raw_events
+                for path in bead_candidates[1:]:
+                    other = sample_from_fcs(str(self.experiment_dir / path))
+                    self.bead_unstained_events[path] = get_raw_events(
+                        other, self.fluorescence_channel_ids,
+                        gate_label=self.base_gate_label,
+                        gating_strategy=control_gating(self.controller),
+                        sample_key=path,
+                    )
+                    self.low_events.note(self.samples['all_samples'][path], self.base_gate_label,
+                                         len(self.bead_unstained_events[path]))
             else:
                 _col_order = self.controller.experiment.settings['raw'].get('whitelisted_pnn')
                 _ecpnn = self.controller.experiment.settings['raw']['event_channels_pnn']
@@ -846,6 +857,8 @@ class SpectralAutoGenerator(QObject):
             else:
                 particle_type = 'Cells'
                 warnings.warn(f'Particle type of "{tubename}" not known from the bead list or name, assigning as Cells')
+            # bead controls: the unstained bead sample matching their scatter, if any
+            bead_match = match_bead_unstained(self.samples, sample_path) if particle_type == 'Beads' else None
 
             match = re.findall(r'^(.*?)(?=\s*[\(\[]|\s+(?:cells?|beads?)\s*$)', tubename, re.IGNORECASE)
             raw_label = match[0].strip() if match else tubename
@@ -887,7 +900,7 @@ class SpectralAutoGenerator(QObject):
                         # use particle-type-matched unstained events if available,
                         # otherwise fall back to the bottom 25 % of this sample.
                         unstained_ref = (
-                            self.unstained_negative_events_beads
+                            self.bead_unstained_events.get(bead_match)
                             if particle_type == 'Beads'
                             else self.unstained_negative_events
                         )
@@ -981,28 +994,13 @@ class SpectralAutoGenerator(QObject):
                     assigned_negative = default_unstained or ''  # default; overridden for Beads below
                     # For bead controls, only use an unstained negative if available
                     if particle_type == 'Beads':
-                        # Mirror the combobox builder logic exactly: iterate all_samples,
-                        # accept anything unstained (manually tagged OR regex), then
-                        # keep bead samples.
-                        manually_tagged = set(self.samples.get('unstained_samples', []))
-                        default_unstained_bead = None
-                        for path, name in self.samples['all_samples'].items():
-                            is_unstained = (
-                                path in manually_tagged
-                                or bool(re.search(r'unstained', name, re.IGNORECASE))
-                                or bool(re.search(r'unstained', path, re.IGNORECASE))
-                            )
-                            if not is_unstained:
-                                continue
-                            if is_bead_sample(self.samples, path, name):
-                                default_unstained_bead = name
-                                break
-                        # No bead-specific unstained available: explicitly opt out of the
+                        # No matching bead unstained: explicitly opt out of the
                         # global-unstained fallback (which is cell-only in ProfileUpdater)
                         # rather than leaving this blank. A blank value reads to
                         # ProfileUpdater.generate() as "no per-control override, use the
                         # global default" — silently pulling in the cell AF vector.
-                        assigned_negative = default_unstained_bead or INTERNAL_NEGATIVE_SENTINEL
+                        assigned_negative = (self.samples['all_samples'][bead_match] if bead_match
+                                             else INTERNAL_NEGATIVE_SENTINEL)
                     control = {
                         'label': label,
                         'antigen': antigen,

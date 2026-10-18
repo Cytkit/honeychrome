@@ -16,7 +16,7 @@ from honeychrome.controller_components.spectral_reference_library import (
 )
 from honeychrome.view_components.cosine_qc_viewer import cosine_qc_warning_threshold, COSINE_QC_NOTE_BY_CYTOMETER
 from honeychrome.controller_components.spectral_functions import sanitise_control_in_place, _find_default_unstained
-from honeychrome.controller_components.particle_type import is_bead_sample, set_bead_sample
+from honeychrome.controller_components.particle_type import is_bead_sample, set_bead_sample, match_bead_unstained
 from honeychrome.view_components.icon_loader import icon
 from honeychrome.settings import spectral_model_column_labels, heading_style, INTERNAL_NEGATIVE_SENTINEL
 import honeychrome.settings as settings
@@ -568,28 +568,13 @@ class SpectralControlsEditor(QFrame):
                 if unstained_paths:
                     default_unstained = self.samples['all_samples'].get(unstained_paths[0])
 
-            # Find a bead-specific unstained: unstained AND a bead sample.
-            manually_tagged = set(self.samples.get('unstained_samples', []))
-            default_unstained_bead = None
-            for path, name in self.samples['all_samples'].items():
-                is_unstained = (
-                    path in manually_tagged
-                    or bool(re.search(r'unstained', name, re.IGNORECASE))
-                    or bool(re.search(r'unstained', path, re.IGNORECASE))
-                )
-                if not is_unstained:
-                    continue
-                if is_bead_sample(self.samples, path, name):
-                    default_unstained_bead = name
-                    break
-                
             for control in self.model._data:
                 if control.get('control_type') == 'Single Stained Spectral Control':
                     if not control.get('universal_negative_name'):
                         if control.get('particle_type') == 'Cells' and default_unstained:
                             control['universal_negative_name'] = default_unstained
-                        elif control.get('particle_type') == 'Beads' and default_unstained_bead:
-                            control['universal_negative_name'] = default_unstained_bead
+                        elif control.get('particle_type') == 'Beads':
+                            control['universal_negative_name'] = self._default_negative(control)
                         else:
                             control['universal_negative_name'] = INTERNAL_NEGATIVE_SENTINEL
         else:
@@ -1407,23 +1392,16 @@ class SpectralControlsEditor(QFrame):
         neg_path = name_to_path.get(neg_name)
         if neg_path is not None and is_bead_sample(self.samples, neg_path, neg_name) == (particle_type == 'Beads'):
             return
-        control['universal_negative_name'] = self._default_negative(particle_type)
+        control['universal_negative_name'] = self._default_negative(control)
 
-    def _default_negative(self, particle_type: str) -> str:
-        """First unstained bead sample for Beads, the default cell unstained for Cells,
-        else the internal negative."""
-        if particle_type == 'Cells':
+    def _default_negative(self, control: dict) -> str:
+        """Bead control: the unstained bead sample matching its scatter; cell control:
+        the default cell unstained; else the internal negative."""
+        if control.get('particle_type') == 'Cells':
             return _find_default_unstained(self.samples) or INTERNAL_NEGATIVE_SENTINEL
-        manually_tagged = set(self.samples.get('unstained_samples', []))
-        for path, name in self.samples['all_samples'].items():
-            is_unstained = (
-                path in manually_tagged
-                or bool(re.search(r'unstained', name, re.IGNORECASE))
-                or bool(re.search(r'unstained', path, re.IGNORECASE))
-            )
-            if is_unstained and is_bead_sample(self.samples, path, name):
-                return name
-        return INTERNAL_NEGATIVE_SENTINEL
+        name_to_path = {name: path for path, name in self.samples['all_samples'].items()}
+        match = match_bead_unstained(self.samples, name_to_path.get(control.get('sample_name')))
+        return self.samples['all_samples'][match] if match else INTERNAL_NEGATIVE_SENTINEL
 
     @Slot(str)
     def _on_bead_sample_toggled(self, path: str) -> None:
