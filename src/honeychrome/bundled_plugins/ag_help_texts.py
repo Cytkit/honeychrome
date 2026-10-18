@@ -10,7 +10,7 @@ HelpToggleWidget (honeychrome.view_components.help_toggle_widget).
 """
 
 BUILDER_HIERARCHY = '''
-<h3>Hierarchy — define the gates the model will learn</h3>
+<h3>Import/Setup — define the gates the model will learn</h3>
 <p>A gating model is a hierarchy of gates. Each gate is calculated from its
 parent population only, so a child gate adapts to whatever its parent
 selects. This is automation for targeted analysis of well-characterised
@@ -36,11 +36,18 @@ population each: <i>2dsep</i>, or <i>1dsep</i> on the fluorescence parameter
 when the other is scatter (proposed algorithm <i>mixture</i>);</li>
 <li>a histogram gate becomes a <i>1dsep</i> gate with a histogram view:
 <i>tail</i>, or <i>mixture</i> when its positive population holds more than
-25% of the parent (from the counts in the workspace, or on the Review tab from
-the review samples when the workspace has none);</li>
+25% of the parent (on the Hierarchy tab, in the shapes as drawn on the review
+samples; until review samples are loaded, from the counts in the workspace);</li>
+<li>the same 25% rule sets each axis of the other threshold gates on the
+Hierarchy tab, from the shapes as drawn on the review samples: <i>mixture</i>
+for an axis whose positive side holds more than 25% of the parent, <i>tail</i>
+otherwise (<i>mixture</i> until review samples are loaded). A template's counts
+are not used for this: they describe the group, not the samples. Once review
+samples are loaded, the Hierarchy tab refines these proposals (see its help);</li>
 <li>a single gate on a pair becomes a <i>1dsep</i> gate on its fluorescence
 parameter when the other is scatter, or a <i>2dsep</i> gate when both are
-fluorescence (<i>mixture</i>);</li>
+fluorescence (<i>mixture</i>); on the Hierarchy tab, a 2dsep gate whose shape
+does not cut one of its parameters converts to 1dsep on the other;</li>
 <li>shapes drawn only on scatter parameters (e.g. FSC-A against SSC-A)
 become <i>free</i> gates with the <i>cells</i> algorithm.</li>
 </ul>
@@ -48,11 +55,16 @@ Gates that share a name in the import (e.g. <i>TIGIT+</i> drawn on many T cell
 subsets) are named after the population they are drawn on, <i>TIGIT+ (Tem)</i>,
 with the populations above it added only when needed, <i>TIGIT+ (CD4+ › Tem)</i>.
 They keep their shared name as a link: converting one converts the others
-still as drawn the same way (see the Review tab).
+still as drawn the same way (see the Hierarchy tab).
 Which side of a fluorescence parameter a population is on comes from the drawn
 coordinates: entirely above the channel's zero is the positive side, reaching
-zero or below is the negative side. Compare each gate as drawn with its
-trainable form on the Review tab, then use <b>Convert to trainable</b> (or
+zero or below is the negative side. Sibling gates on two fluorescence parameters
+take the quadrants that best match their shapes instead: a gate spanning both
+sides of a threshold keeps both (e.g. <i>CD14-</i> drawn over the whole height
+of the plot is the whole CD14- side; <i>NK</i> drawn around <i>non-NK</i> is
+the L of the other three quadrants), and when one parameter separates none of
+the gates the gate becomes a <i>1dsep</i> gate on the other. Compare each gate as drawn with its
+trainable form on the Hierarchy tab, then use <b>Convert to trainable</b> (or
 <b>Convert all to trainable</b>) so Train calculates it from the training
 samples. <b>Split…</b> replaces
 a 2dsep gate with sequential 1dsep gates; you choose the order, algorithms and
@@ -73,7 +85,7 @@ adds the gates to the model; <b>Import all — replace</b> replaces its gates.
 FlowJo gates are converted by the same rules as <b>Import from
 Hierarchy</b>. The gate preview is hidden while this section is open. The
 experiment's own gating is never changed. Review the imported gates on the
-Review tab before training.</li>
+Hierarchy tab before training.</li>
 <li><b>Add gate manually</b> creates a gate that is not on the main plots.</li>
 </ul>
 
@@ -85,7 +97,8 @@ match stay visible. <b>Show</b> narrows the list to <i>Unconverted</i> gates
 (still applying their imported shapes), <i>Conflicting algorithms</i> (gates
 sharing a name whose algorithms were set differently by hand) or <i>Flagged
 conversions</i> (gates whose trainable form lands far from the imported shape;
-see the Review tab). Flagged gates are marked ⚠ with the reason in the
+see the Hierarchy tab) or <i>Overlapping gates</i> (populations defined twice;
+see the Hierarchy tab). Flagged gates are marked ⚠ with the reason in the
 tooltip.</p>
 
 <h4>Gate types and algorithms</h4>
@@ -95,18 +108,25 @@ tooltip.</p>
 histogram. <b>1dsep separation axis</b> above the buttons sets which plot axis
 carries the separation parameter of gates you add or split; each gate's Edit
 dialog can change it.</li>
-<li><b>2dsep</b> — a threshold on each of two channels (four quadrants).</li>
+<li><b>2dsep</b> — a threshold on each of two channels (four quadrants). A
+population is one quadrant or several joined: a whole side, two opposite
+corners, or an L of three quadrants around another population.</li>
 <li><b>singlets</b> — a band around the area-against-height diagonal.</li>
-<li><b>free</b> — a shape on two scatter channels. <b>cells</b> cuts the
-debris: the density valley left of the main forward-scatter peak (or where
-the density there falls below 5% of the peak), keeping everything above it;
-the other sides stay open except just below a pile of saturated events.
+<li><b>free</b> — a shape on two scatter channels. <b>cells</b> is a
+rectangle: its lower forward-scatter side cuts the debris (the density valley
+left of the main forward-scatter peak, or where the density there falls below
+5% of the peak); its other three sides are where the density of the events
+above the cut falls below its <b>fall-off</b> on each axis (0.002 of its peak,
+i.e. 0.2%, set per axis on the Hierarchy tab or in Advanced parameters), and
+just below a pile of saturated events when there is one. A shape drawn on the
+debris (below the cut) converts to a cells gate that keeps the debris side
+instead.
 <b>all</b> is the convex hull of the parent population.</li>
 <li><b>replicate</b> (gate type) — reuses another gate's boundary on a
 different parent.</li>
 </ul>
 <p>The <b>replicate</b> algorithm of a threshold gate axis takes its threshold
-from elsewhere, chosen on the Review tab: another gate separating on the same
+from elsewhere, chosen on the Hierarchy tab: another gate separating on the same
 channel (its threshold is copied), or a <b>reference population</b>. A
 reference population is one whose biology is known and whose events are
 plentiful: the threshold is calculated there, by default with <i>tail</i>, and
@@ -135,6 +155,13 @@ populations or algorithm. <b>Advanced…</b> exposes the algorithm
 parameters: tail fraction, number of mixture components, quantile trimming,
 the part of the axis used for the calculation and, for singlets gates, the
 band width in standard deviations.</p>
+<p>Changing a gate between <i>1dsep</i> and <i>2dsep</i> keeps its population
+names, so the gates below stay attached: going to 1dsep, each population takes
+its side of the separation parameter (a population on both sides, or two on
+the same side, cannot be kept: use <b>Split…</b>); going to 2dsep, each side
+becomes that half of the plot. Renaming a population in the dialog renames it
+for the gates below too. A change that would leave gates below without their
+parent population is refused, naming them.</p>
 
 <h4>Further Reading and Background</h4>
 <p>Documentation:</p>
@@ -177,7 +204,7 @@ gates) or the threshold lines (2D gates), and accept to keep the adjustment.
 Adjusted gates are marked in the model.</p>
 <p>The hierarchy is coloured by training status: green trained, blue
 adjusted by hand, amber not yet trained and red failed; the line below it
-counts each. Its search box and <b>Show</b> filter work as on the Hierarchy
+counts each. Its search box and <b>Show</b> filter work as on the Import/Setup
 tab. Threshold lines on the tiles take the colour of their algorithm.</p>
 <p>A gate whose parent population has too few events to calculate a
 boundary is reported in the status line, and its children are skipped.</p>
@@ -382,8 +409,90 @@ same files to a folder of your choice.</p>
 </p>
 '''
 
+AG_ENRICHMENT = '''
+<h3>Enrichment — immune states</h3>
+<p>Flow Set Enrichment Analysis asks whether the features of a curated
+<b>immune state</b> (for example CD8 T-cell exhaustion: PD-1, TIGIT, LAG3 and
+CD39 up and TCF1 and CD127 down in CD8 T cells) shift together between two
+groups, in the manner of gene set enrichment analysis [1]. It uses the samples,
+groups, pairing, covariates and comparisons of the Results page.</p>
+
+<h4>Samples</h4>
+<p>A comparison is tested only with at least <b>30 samples</b> in its two
+groups and <b>10 in each</b>. The p-values come from permuting the samples'
+group labels; with fewer samples there are too few distinct labellings, and
+the correlation between features cannot be estimated, so set-level results are
+not reliable.</p>
+
+<h4>Library</h4>
+<p>The bundled library (<i>ag_fsea_library.csv</i>) holds draft immune states,
+each a list of rows: a cell type with either its <b>abundance</b> (Abund) or a
+<b>marker</b> read out in it, and the direction (UP or DOWN) the feature moves
+when the state is gained. Competing phenotypes are separate states that may
+share markers (PD-1 is in exhaustion and in acute activation); the data decide
+which one moves. Each row carries a citation. The draft entries need review
+before results are published. <b>Choose library…</b> uses your own CSV with the
+same columns.</p>
+
+<h4>Features and cell types</h4>
+<ul>
+<li><b>Positivity</b> — the fraction of a population positive for a marker
+(gates such as PD1+ drawn on CD8 TEM), as log odds within the parent.</li>
+<li><b>Subsets</b> — each phenotype population within its parent, as log odds.</li>
+<li><b>Abundance</b> — each phenotype population within the <b>anchor</b>, so
+samples with different numbers of events, debris or dead cells compare on the
+same footing. The default is the model's anchor population: the one marked in
+the Gating Model Builder, else the viable cells (the deepest gate using a
+viability dye, recognised from the fluorophore database), else single cells,
+else <i>Cells</i>.</li>
+<li><b>Marker medians</b> — medians of phenotype populations only; medians
+inside positivity gates repeat their parent.</li>
+</ul>
+<p>Exact duplicates and the two halves of a two-way split are counted once.
+Panels that re-use one fluorochrome for markers of different lineages are
+handled by reading the marker from the positivity gates drawn on that channel
+nearest to the population; channels whose marker cannot be told apart are
+tested but match no library row.</p>
+<p><b>Check matching</b> shows how each population maps to a library cell type
+(by name, accepted only when its lineage agrees with the population's
+ancestors) and how each library row matched. Choose a cell type in the table
+to correct a mapping. A library cell type matches its own population only, not
+the populations below it. A state needs the minimum number of distinct matched
+features (5 by default) to be tested.</p>
+
+<h4>Statistics</h4>
+<p>Each feature is ranked by sign(logFC) × −log10 p from the same moderated
+linear model as the Results page [2] (no TREAT threshold). A state's enrichment
+score (ES) is the weighted running sum over that ranking, with the DOWN members
+negated: ES above zero means the state is <b>gained</b> in the second group,
+below zero <b>lost</b>. The group labels are permuted and every feature refitted
+to give the null distribution, which keeps the correlation between features;
+with pairing or covariates the residuals of the model without the group terms
+are permuted (within pairs) [3]. NES is the ES divided by the mean null ES of
+the same sign; p is never zero [4]; FDR is Benjamini–Hochberg over the states
+of a comparison and FWER the chance that the largest null NES of any state
+reaches the NES. The FDR threshold is the Results page's. Read FDR: the
+FWER estimate was liberal when calibrated on 15 samples (10% of null labellings
+had a state below 0.05, against 5% expected).</p>
+
+<h4>Results</h4>
+<p>The dot plot shows every tested state in every comparison (colour NES, size
+the share of members in the leading edge, ringed when FDR is below the
+threshold). Select a state in the table for its running sum and its members;
+the leading edge is the set of members that drive the score.</p>
+
+<h4>References</h4>
+<ol>
+<li>Subramanian A et al. (2005) Gene set enrichment analysis. PNAS 102:15545–15550.</li>
+<li>Smyth GK (2004) Stat Appl Genet Mol Biol 3: Article 3.</li>
+<li>Freedman D, Lane D (1983) J Bus Econ Stat 1:292–298.</li>
+<li>Phipson B, Smyth GK (2010) Permutation p-values should never be zero.
+Stat Appl Genet Mol Biol 9: Article 39.</li>
+</ol>
+'''
+
 BUILDER_REVIEW = '''
-<h3>Review — compare imported gates with their trainable form</h3>
+<h3>Hierarchy — compare imported gates with their trainable form</h3>
 <p>Imported gates (from the experiment's hierarchy or a FlowJo workspace)
 keep their shapes exactly as drawn until they are converted to trainable.
 FlowJo coordinates are raw instrument units converted with this experiment's
@@ -414,14 +523,63 @@ colour, used for its name in the lists and for its threshold on the plots:
 <b>replicate</b> shows a source: another gate on the same channel, whose
 threshold is copied, or a reference population, on which the threshold is
 calculated; until a source gives a threshold, the imported boundary is shown
-in its place, captioned. With <b>tail</b> (also for a reference population),
+in its place, captioned. Once a source is chosen, a plot below the pair shows
+the population the threshold is calculated on (the reference population, or
+the parent population of the gate copied) with the gate drawn on it and each
+population's share of it. With <b>tail</b> (also for a reference population),
 <b>Tail fraction</b> beside the algorithm sets the share of the mirrored
-negative population left above the threshold: smaller is stricter. The tail
+negative population left above the threshold: smaller is stricter. It starts at
+0.0001; the arrows step by factors of ten and any other value can be typed. The tail
 algorithm uses the whole axis; the others ignore the lowest 1% of it.
 <b>Update</b> calculates the shown gates again.</li>
+<li>With review samples loaded, an imported gate's proposal comes from its
+shapes as drawn on them (an algorithm you choose for an axis is kept; the
+algorithm's tooltip gives the reason):
+<ul>
+<li><b>1dsep</b>, from its parent population on the separation channel:
+<i>tail</i> when at least 40% of the parent lies below zero (centred on zero);
+when at least 5% does, whichever of <i>tail</i>, <i>mixture</i> and a
+three-component <i>mixture</i> cut between its lowest two or highest two
+components reproduces the shapes as drawn best; when less than 5% does and
+more than 40% of the parent is drawn positive, the parent's own events cannot
+place the threshold, so it is <i>replicate</i>d from the <b>anchor
+population</b> (with <i>mixture</i> when more than 25% of the anchor lies above
+the drawn threshold, else <i>tail</i>) and a red line asks you to choose a
+reference population (the source list offers the anchor and the marked
+reference populations; <b>Keep</b> accepts it); otherwise the 25% rule. Gates
+drawn on the anchor or above it are not replicated.</li>
+<li><b>2dsep</b>: the combination of these candidates on the two axes that
+reproduces the shapes as drawn best.</li>
+<li>The <b>anchor population</b> is the population marked with <b>Use as
+anchor population</b> in the tree's right-click menu; until one is marked it is
+the viable cells (the population on the negative side of the deepest gate
+using a viability dye, recognised from the fluorophore database), else single
+cells, else <i>Cells</i>. It is marked <i>[anchor]</i> in the tree. Automated
+Gating's enrichment analysis uses the same population as its default
+anchor.</li>
+<li>A <b>single shape</b> on two fluorescence parameters whose edges on one
+parameter leave out at most 1% of the parent's events within its band on the
+other converts to <b>1dsep</b> on the other parameter (e.g. a CD3 rectangle
+spanning the whole CD20 range).</li>
+<li>A 2dsep gate with one population on a whole side of one parameter and one
+population in each quadrant of the other side is <b>split</b> by Convert into
+sequential 1dsep gates: that parameter first (its other side named after the
+marker, e.g. <i>CD38+</i>), then the other parameter on that side. The new
+gates keep the shapes as drawn and are then converted by these rules.</li>
+<li>A scatter shape drawn on the debris (most of its events below the debris
+cut) converts to a <i>cells</i> gate that keeps the debris side. A
+<i>cells</i> gate shows its fall-off per axis beside the algorithm.</li>
+<li>A <i>mixture</i> axis shows its number of <b>components</b> and its
+<b>cut</b>: which two components, ordered by mean, cross at the threshold
+(lowest and highest, the lowest two, or the highest two; with three
+components, e.g. a negative, a dim and a bright population).</li>
+</ul>
+A 2dsep threshold that separates populations on one side only (a joined
+region) is drawn on that side only.</li>
 <li><b>Convert to trainable</b> makes Train calculate the gate with the chosen
 algorithm; <b>Use shapes as drawn</b> reverses it. <b>Convert all to
-trainable</b> converts every gate still as drawn to its proposed algorithm.
+trainable</b> converts every gate still as drawn to its proposed form, first
+checking every gate on the review samples (click it again to stop).
 <b>Split…</b> replaces a 2dsep gate with sequential 1dsep gates. The red
 <b>−</b> deletes a gate and the gates below it, after asking.</li>
 <li>Gates that share an imported name (e.g. every <i>CD80+</i>) are kept on
@@ -433,7 +591,8 @@ you set them alike again, the others follow. The <b>⇊</b> button beside a
 converted gate applies its algorithm and settings to every gate of the same
 name below the population it is drawn on, set by hand or not: set up
 <i>CD25+</i> on one T cell subset, for example, then pass it to the subsets
-below it.</li>
+below it. The <b>⇉</b> button beside it does the same for every gate of that
+name on the same channels anywhere in the model.</li>
 <li>Tick <b>Edit gates</b> to drag the shapes as drawn of gates that still
 apply them (left; long polygons are thinned to 32 corners), and the
 boundaries of converted gates (right). A boundary moved on the right is kept
@@ -442,20 +601,37 @@ restores the shapes shown to their imported state.</li>
 <li>Drag an axis to rescale it, as on the main plots: the lower half of a
 biexponential axis changes its width basis, the upper half zooms. The gates
 move with the axis, so they stay on the same events.</li>
+<li>Right-click a population on any plot to <b>open</b> it: the page moves to
+that population and shows the gates drawn on it.</li>
 </ol>
 <h4>Finding and checking gates</h4>
 <p>The search box above the hierarchy keeps the populations whose gates match
 (by name, marker, channel or algorithm), and <b>Show</b> narrows it to
 unconverted gates, gates with conflicting algorithms or flagged conversions,
-as on the Hierarchy tab. <b>Flag conversions</b> compares, on the review
+as on the Import/Setup tab. <b>Flag conversions</b> compares, on the review
 samples, each gate's imported shape with its trainable form and flags it when
 a threshold moves more than the set distance (in axis units: the axis spans
 about 0 to 1) or a population's share of its parent changes by more than the
-set number of percentage points. Flagged gates are red in the hierarchy, with
-the reason in the tooltip.</p>
+set number of percentage points. Flagged gates are marked ⚠ in the hierarchy,
+with the reason in the tooltip.</p>
+<p><b>Flag overlaps</b> looks for populations defined twice: two populations,
+neither below the other, that share at least the set share of their events on
+the review samples (events in both as a share of events in either). Only
+populations with gates drawn on them are compared, and a population that is
+nearly the same as one above it (90% shared) counts as that one, so a branch
+defined twice is reported once rather than for every marker gate below it.
+Flagged gates are marked ⚠ in the hierarchy and listed by <b>Show: Overlapping
+gates</b>; the Import/Setup table marks them ⚠ Overlap.</p>
+<p>The colour of a population in the hierarchy is the status of the gate that
+makes it, as in the Import/Setup table:
+<span style="color:#c0392b">red</span> unconverted (still applying its shapes
+as drawn), <span style="color:#946100">amber</span> converted but not trained,
+<span style="color:#0a7a23">green</span> trained.</p>
 <h4>Hierarchy menu</h4>
-<p>Right-click the hierarchy (Ctrl- or Shift-click selects several
-populations) to <b>Copy gate</b> or <b>Copy gating branch</b> (the gate and
+<p>Right-click a population for <b>Edit gate…</b> (the gate editor of the
+Import/Setup tab: name, type, channels, parent and populations) and
+<b>Advanced parameters…</b> of the gate that makes it. Right-click the
+hierarchy (Ctrl- or Shift-click selects several populations) to <b>Copy gate</b> or <b>Copy gating branch</b> (the gate and
 every gate below it) and <b>Paste</b> them onto other populations; copies are
 named after the population they are pasted on and follow their same-named
 gates. <b>Delete gate…</b> and <b>Delete population…</b> remove the selection
@@ -504,8 +680,8 @@ the main window does: about 30,000 events of the population in all, an equal
 share from each sample, read without loading the whole file.</li>
 <li>Select a channel on the right to see its histogram and biplots. Drag an
 axis to adjust it: the lower half of a logicle axis changes its width basis
-W, the upper half the displayed range. Axes dragged on the Hierarchy and
-Review plots change the same transforms.</li>
+W, the upper half the displayed range. Axes dragged on the Import/Setup and
+Hierarchy plots change the same transforms.</li>
 <li><b>Auto-transform</b> sets W for every logicle channel from the events
 shown (Parks, Roederer and Moore 2006).</li>
 <li><b>Reset to the experiment's transforms</b> returns to the main window's

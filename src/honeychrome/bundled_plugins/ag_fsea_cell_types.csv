@@ -1,0 +1,74 @@
+cell_type,lineage,synonyms
+Viable cells,,"Live cells;Viable;Live;FSC-A, viability subset;Viability"
+T cell,T,T cells;CD3;CD3+;CD3+ T cells
+ab T cell,T,abTC;ab T cells;alpha beta T cells
+gd T cell,T,gdTC;gd T cells;gamma delta T cells;TCRgd
+Vg9 gd T cell,T,gdTC Vg9;Vg9 gdTC;gdTC Vg9Vd2;Vg9Vd2 T cells
+MAIT,T,MAIT cells
+CD4 T cell,T,CD4;CD4 T cells;CD4+ T cells
+CD8 T cell,T,CD8;CD8 T cells;CD8+ T cells
+DN T cell,T,DN TC;DN T cells;double-negative T cells
+CD4 Tconv,T,CD4 Tconv;CD4 conventional T cells
+CD4 Treg,T,CD4 Treg;Treg;Tregs
+CD8 Tconv,T,CD8 Tconv;CD8 conventional T cells
+CD8 Treg,T,CD8 Treg
+Naïve CD4 Tconv,T,CD4 Naive;Naive CD4;CD4 naive T cells;Naive CD4 Tconv
+CD4 Tconv CM,T,CD4 TCM;CD4 central memory
+CD4 Tconv EM,T,CD4 TEM;CD4 effector memory
+CD4 Tconv TEMRA,T,CD4 TEMRA
+Naïve CD8 Tconv,T,CD8 Naive;Naive CD8;CD8 naive T cells;Naive CD8 Tconv
+CD8 Tconv CM,T,CD8 TCM;CD8 central memory
+CD8 Tconv EM,T,CD8 TEM;CD8 effector memory
+CD8 Tconv TEMRA,T,CD8 TEMRA
+CD8 SLEC,T,SLECs;SLEC;short-lived effector cells
+CD8 MPEC,T,MPECs;MPEC;memory precursor effector cells
+exhausted CD8,T,CD8 Exhausted
+exhausted CD4 Tconv,T,Tconv Exhausted;CD4 Exhausted
+Tfh,T,Tfh;cTfh;circulating Tfh
+Tfr,T,Tfr
+Th1,T,Th1
+Th1 T-bet+,T,Th1 (CXCR3 Tbet);Th1 (CXCR3 T-bet)
+Th2,T,Th2 (CCR4 GATA3);Th2
+Th17,T,Th17
+Th1/17,T,Th17-Th1;Th1/Th17;Th1Th17
+Treg Th1-like,T,Treg Th1
+Treg Th17-like,T,Treg Th17
+Treg Th1/17-like,T,Treg Th17-Th1
+Treg Th2-like,T,Treg Th2
+AIM+ CD4 Tconv,T,CD4 AIM
+AIM+ CD8 Tconv,T,CD8 AIM
+AIM+ CD4 Treg,T,Treg AIM
+AIM+ MAIT,T,MAIT AIM
+cytotoxic CD4 Tconv,T,CD4 Granzyme Perforin
+GzmB+ Perforin+ CD8 Tconv,T,CD8 Granzyme Perforin
+Ki67+ CD4 Tconv,T,CD4 Ki67
+B cell,B,B cells;CD19+ B cells
+non-transitional non-plasma B cell,B,non-Trans non-Plasma
+Transitional B cell,B,Transitional B cells;Transitional
+Plasmablast,B,Plasmablasts
+Plasma cell,B,Plasma cells
+Activated memory B cell,B,Activated
+Atypical B cell,B,Atypical;tissue-like memory B cells;DN2 B cells
+Resting naive B cell,B,Mature Naive
+Resting memory B cell,B,Memory
+DN B cell,B,B cell DN;double-negative B cells
+Naïve B cell,B,B cell Naive;Naive B cells
+Unswitched memory B cell,B,B cell Non-switched;Non-switched memory B cells
+Class switched Mem B cell,B,B cell switched memory;Switched memory B cells
+NK,NK,NK cells
+CD56bright NK,NK,CD56bright NK;CD56bright NK cells
+CD56dim NK,NK,CD56dim NK;CD56dim NK cells
+CD14 Monocyte,myeloid,CD14 Monocytes;Classical monocytes
+CD14+CD16+ Monocyte,myeloid,CD14+CD16+ Monocytes;Intermediate monocytes
+CD16 Monocyte,myeloid,CD16 Monocytes;Non-classical monocytes
+activated CD14 Monocyte,myeloid,CD14 Monocytes Act
+activated CD14+CD16+ Monocyte,myeloid,CD14+CD16+ Monocytes Act
+Basophil,myeloid,Basophils
+pDC,myeloid,pDCs
+cDC,myeloid,CD11c cDCs
+cDC1,myeloid,cDC1s
+cDC2,myeloid,cDC2s
+DN DC,myeloid,DN cDCs
+ILC,ILC,ILCs
+ILC1,ILC,ILC1
+ILC2,ILC,ILC2

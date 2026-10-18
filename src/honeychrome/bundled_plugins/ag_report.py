@@ -22,6 +22,10 @@ Sections:
                  groups' pooled biplots side by side with their gated
                  frequencies, and a dot and violin plot of the population's
                  frequency per sample with the test's p-value.
+  • Enrichment — the last Flow Set Enrichment Analysis run: the dot plot of
+                 immune states with the states table, and for each
+                 comparison the running-sum figure of every state below
+                 the FDR threshold, with its members.
 
 The file name does not end in ``_tab.py``, so the plugin loader does not
 treat it as a tab.
@@ -36,13 +40,13 @@ import ag_core
 import ag_results
 from drc_report import ReportItem
 
-SECTIONS = ('Samples', 'Gates', 'Statistics', 'Populations')
+SECTIONS = ('Samples', 'Gates', 'Statistics', 'Populations', 'Enrichment')
 
 __all__ = ['SECTIONS', 'pooled_display', 'pooled_population', 'boundary_fractions',
            'label_position', 'make_gate_figure', 'population_frequency_table', 'sample_table',
            'build_report_items', 'make_pca_figure', 'make_roc_figure', 'make_importance_figure',
            'make_panel_figure', 'predictive_subtitle', 'make_group_values_figure',
-           'make_population_comparison_figure', 'p_value_text']
+           'make_population_comparison_figure', 'p_value_text', 'enrichment_report_items']
 
 _GROUP_COLOURS = ('#4477AA', '#EE6677', '#228833', '#CCBB44', '#66CCEE', '#AA3377', '#BBBBBB')
 
@@ -145,13 +149,20 @@ def boundary_fractions(gate_def: dict, boundary: dict, events: np.ndarray | None
 def label_position(gate_type: str, region: str | None, entry: dict,
                    x_lim: tuple, y_lim: tuple) -> tuple[float, float, str, str]:
     """(x, y, horizontal alignment, vertical alignment) for a population
-    label: quadrant labels in their quadrant's outer corner (clear of the
-    events near the thresholds), 1D labels mid-height in their region,
-    polygon labels at the vertex mean."""
-    if gate_type == '2dsep' and region in ag_core.QUADRANT_REGIONS:
+    label: quadrant labels in their quadrant's outer corner, clear of the
+    events near the thresholds (a joined region: its last quadrant in
+    QUADRANT_REGIONS order; an L: the corner opposite the missing quadrant),
+    1D labels mid-height in their region, polygon labels at the vertex
+    mean."""
+    quads = ag_core.region_quadrants(region) if gate_type == '2dsep' else ()
+    if quads:
         dx = 0.03 * (x_lim[1] - x_lim[0])
         dy = 0.03 * (y_lim[1] - y_lim[0])
-        right, top = region.startswith('x+'), region.endswith('y+')
+        corner = quads[-1]
+        if len(quads) == 3:
+            missing = next(q for q in ag_core.QUADRANT_REGIONS if q not in quads)
+            corner = f"x{'+' if missing[1] == '-' else '-'}y{'+' if missing[3] == '-' else '-'}"
+        right, top = corner[1] == '+', corner[3] == '+'
         return ((x_lim[1] - dx) if right else (x_lim[0] + dx),
                 (y_lim[1] - dy) if top else (y_lim[0] + dy),
                 'right' if right else 'left', 'top' if top else 'bottom')
@@ -326,7 +337,8 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
                        build_figures, pca: dict | None = None,
                        predictive: dict | None = None, include_gates: bool = True,
                        populations: list | None = None,
-                       population_figure=None) -> list[ReportItem]:
+                       population_figure=None,
+                       enrichment: dict | None = None) -> list[ReportItem]:
     """Every available report item, in section order.
 
     pca               : ag_results.sample_pca() result, or None.
@@ -335,6 +347,7 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
     populations       : [(population key, label)] ticked for the report.
     population_figure : callable(population key) -> Figure of the
                         population's group comparison.
+    enrichment        : ag_fsea.run_enrichment() result, or None.
 
     build_figures : callable(stats, base, other, pval, fc, marker, fdr_scope,
                     is_dark, antigens, pop_labels) -> {key: {'fig', 'title',
@@ -451,6 +464,36 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
             items.append(ReportItem(
                 key=f'population:{pop_key}', tab='Populations', label=f"Population {label}",
                 get_figure=lambda _k=pop_key: population_figure(_k)))
+    if enrichment:
+        items.extend(enrichment_report_items(enrichment, pval_threshold))
+    return items
+
+
+def enrichment_report_items(result: dict, fdr_threshold: float) -> list[ReportItem]:
+    """Report items of an enrichment run: the dot plot with every table,
+    and the running-sum and member figures of each state below
+    *fdr_threshold* in each comparison."""
+    import ag_fsea
+    import ag_fsea_plots as fp
+
+    comps = [f"{o} vs {b}" for b, o in result.get('comparisons') or []]
+    items = [ReportItem(
+        key='enrichment', tab='Enrichment', label='Immune state enrichment',
+        get_figure=lambda: fp.make_dot_plot(result['states'], comps, fdr_threshold, False),
+        get_tables=lambda: ag_fsea.result_tables(result))]
+    states = result['states']
+    sig = states[states['FDR'] < fdr_threshold]
+    for _i, row in sig.iterrows():
+        comp, name = row['comparison'], row['immune_state']
+        members = result['members']
+        mb = members[(members['comparison'] == comp) & (members['immune_state'] == name)]
+
+        def _curve(_c=comp, _n=name, _r=row.to_dict()):
+            return fp.make_curve_figure(ag_fsea.state_curve(result, _c, _n), _n, _c, _r, False)
+
+        items.append(ReportItem(
+            key=f'enrichment:{comp}:{name}', tab='Enrichment', label=f"{name}: {comp}",
+            get_figure=_curve, get_tables=lambda _m=mb: {'members': _m}))
     return items
 
 

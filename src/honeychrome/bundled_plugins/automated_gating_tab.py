@@ -26,6 +26,9 @@ sample groups:
               marker medians, heatmaps and volcano plots, a population
               comparison (each group's pooled biplot and the per-sample
               values with the test's p-value), and CSV export.
+  • Enrichment — Flow Set Enrichment Analysis: curated immune states
+              tested for coordinated shifts between the groups of the
+              Results page (``ag_fsea``, page in ``ag_fsea_ui``).
 
 Gated results, display subsamples and statistics are saved in the
 experiment's cache folder and restored when the experiment is opened again;
@@ -95,6 +98,8 @@ if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
 import ag_core  # noqa: E402
+import ag_fsea  # noqa: E402
+import ag_fsea_ui  # noqa: E402
 import ag_help_texts  # noqa: E402
 import ag_report  # noqa: E402
 import ag_results  # noqa: E402
@@ -171,6 +176,7 @@ DEFAULT_DISPLAY_EVENTS = 20_000
 DISPLAY_SEED = 42
 RESULTS_FILE = Path('cache') / 'automated_gating' / 'results.json'
 STATS_FILE = Path('cache') / 'automated_gating' / 'stats.json'
+ENRICHMENT_FILE = Path('cache') / 'automated_gating' / 'enrichment.json'
 DISPLAY_DIR = Path('cache') / 'automated_gating' / 'display'
 EXPORT_DIR = Path('Automated_Gating_Results')
 # Events per group in the population comparison's pooled biplots.
@@ -400,6 +406,12 @@ class GatingRunState:
     run_transforms : the transforms the gated results were made in (their
                      boundaries and display plots are in these units).
     report_populations: population keys ticked for the report.
+    fsea_*         : Enrichment page settings (library file, '' for the
+                     bundled one; species; abundance anchor, '' for the
+                     default; feature types; marker readout; ranking
+                     statistic; permutations; seed; minimum set size;
+                     {population key: cell type} overrides).
+    fsea           : the last enrichment run (kept in ENRICHMENT_FILE).
     """
     model_path: str = ''
     model: dict = field(default_factory=dict)
@@ -425,6 +437,7 @@ class GatingRunState:
     run_fingerprint: str = ''
     transform_params: dict = field(default_factory=dict)
     transform_population: str = ''
+    transform_view: dict = field(default_factory=dict)
     transform_model: str = ''
     transform_custom: bool = False
     run_transforms: dict = field(default_factory=dict)
@@ -464,6 +477,17 @@ class GatingRunState:
     pred_repeats: int = 5
     pca: dict = field(default_factory=dict)
     predictive: dict = field(default_factory=dict)
+    fsea_library_path: str = ''
+    fsea_species: str = 'human'
+    fsea_anchor: str = ''
+    fsea_feature_types: list = field(default_factory=lambda: list(ag_fsea.FEATURE_TYPES))
+    fsea_marker_readout: str = 'positivity'
+    fsea_rank_metric: str = 'signed_log10p'
+    fsea_n_perm: int = ag_fsea.DEFAULT_N_PERM
+    fsea_seed: int = ag_fsea.DEFAULT_SEED
+    fsea_min_set_size: int = ag_fsea.MIN_SET_SIZE
+    fsea_overrides: dict = field(default_factory=dict)
+    fsea: dict = field(default_factory=dict)
 
     def gate_defs(self) -> list[dict]:
         return list((self.applied_model or {}).get('gate_definitions') or [])
@@ -489,8 +513,11 @@ _PERSISTED_FIELDS = (
     'run_markers', 'use_stats_parent', 'exclude_gating_markers', 'min_marker_events',
     'exclude_flagged', 'pca_use_freq', 'pca_use_counts', 'pca_use_markers', 'pca_n_loadings',
     'pred_use_freq', 'pred_use_markers', 'pred_lasso', 'pred_forest', 'pred_repeats',
-    'transform_params', 'transform_population', 'transform_model', 'transform_custom',
-    'report_populations', 'pop_filter',
+    'transform_params', 'transform_population', 'transform_view', 'transform_model',
+    'transform_custom', 'report_populations', 'pop_filter',
+    'fsea_library_path', 'fsea_species', 'fsea_anchor', 'fsea_feature_types',
+    'fsea_marker_readout', 'fsea_rank_metric', 'fsea_n_perm', 'fsea_seed', 'fsea_min_set_size',
+    'fsea_overrides',
 )
 
 
@@ -1628,7 +1655,7 @@ class RunTab(QWidget):
             return
         self._before_run = {name: (dict(getattr(st, name)) if isinstance(getattr(st, name), dict)
                                    else deepcopy(getattr(st, name))) for name in (
-            'run_samples', 'summaries', 'load_info', 'display', 'stats', 'marker_channels',
+            'run_samples', 'summaries', 'load_info', 'display', 'stats', 'fsea', 'marker_channels',
             'results_model_sha', 'pending_samples', 'run_fingerprint', 'run_transforms')}
         st.run_samples = keys
         if resume:
@@ -1641,6 +1668,7 @@ class RunTab(QWidget):
             st.load_info = {}
             st.display = {}
         st.stats = {}
+        st.fsea = {}
         st.marker_channels = markers
         st.results_model_sha = model_sha
         st.run_fingerprint = fingerprint
@@ -1921,6 +1949,31 @@ class _CallWorker(QThread):
 
 def _comparison_label(base: str, other: str) -> str:
     return f"{other} vs {base}"
+
+
+def statistics_design(state: 'GatingRunState', samples: list[str]) -> dict:
+    """The design the statistics (and the enrichment) use for *samples*:
+    {'groups': {sample: group}, 'pairing': {sample: level} or None,
+    'covariates': adjustment covariates (DataFrame) or None, 'numeric':
+    covariates entered as numbers, 'missing_pairing': labels of samples
+    without a pairing value (pairing is None when any is missing)}."""
+    st = state
+    groups = {k: st.sample_groups[k] for k in samples}
+    pairing, missing = None, []
+    if st.pairing:
+        vals = st.covariates.get(st.pairing) or {}
+        missing = [_sample_label(k) for k in samples if not str(vals.get(k, '')).strip()]
+        if not missing:
+            pairing = {k: vals[k] for k in samples}
+    covariates = None
+    adjust = [c for c in st.adjust_covariates if c in st.covariates and c != st.pairing]
+    if adjust:
+        covariates = pd.DataFrame(
+            {c: [str((st.covariates.get(c) or {}).get(k, '')) for k in samples] for c in adjust},
+            index=samples)
+    return {'groups': groups, 'pairing': pairing, 'covariates': covariates,
+            'numeric': [c for c in st.numeric_covariates if c in adjust],
+            'missing_pairing': missing}
 
 
 def _comparison_view(results: pd.DataFrame | None, label: str) -> pd.DataFrame | None:
@@ -2720,26 +2773,17 @@ class ResultsTab(QWidget):
             QMessageBox.information(self, "Nothing to test", "Tick at least one kind of test.")
             return
         samples = self._stats_samples()
-        groups = {k: st.sample_groups[k] for k in samples}
-        pairing = None
-        if st.pairing:
-            vals = st.covariates.get(st.pairing) or {}
-            missing = [_sample_label(k) for k in samples if not str(vals.get(k, '')).strip()]
-            if missing:
-                QMessageBox.warning(self, "Pairing incomplete",
-                                    f"No '{st.pairing}' value for: " + ", ".join(missing[:10]))
-                return
-            pairing = {k: vals[k] for k in samples}
-        covariates = None
-        adjust = [c for c in st.adjust_covariates if c in st.covariates and c != st.pairing]
-        if adjust:
-            covariates = pd.DataFrame(
-                {c: [str((st.covariates.get(c) or {}).get(k, '')) for k in samples] for c in adjust},
-                index=samples)
+        design = statistics_design(st, samples)
+        if design['missing_pairing']:
+            QMessageBox.warning(self, "Pairing incomplete",
+                                f"No '{st.pairing}' value for: "
+                                + ", ".join(design['missing_pairing'][:10]))
+            return
+        groups = design['groups']
         kwargs = dict(
             group_order=list(st.group_names), contrast_mode=st.contrast_mode,
-            reference=st.reference_group, pairing=pairing, covariates=covariates,
-            numeric_covariates=[c for c in st.numeric_covariates if c in adjust],
+            reference=st.reference_group, pairing=design['pairing'],
+            covariates=design['covariates'], numeric_covariates=design['numeric'],
             pval_threshold=st.pval_threshold, fc_threshold=st.fc_threshold,
             marker_threshold=st.marker_threshold, use_treat=st.use_treat,
             fdr_scope=st.fdr_scope, run_freq=st.run_freq, run_counts=st.run_counts,
@@ -3692,6 +3736,7 @@ class ResultsTab(QWidget):
             populations=[(k, _population_labels(st.gate_defs()).get(k, k))
                          for k in st.report_populations],
             population_figure=self._population_report_figure,
+            enrichment=st.fsea or None,
         )
 
     def _export_csv(self, what: str):
@@ -3924,7 +3969,24 @@ class _StateLoader(QThread):
         except Exception as exc:
             log.exception("could not read the saved results")
             out['errors'].append(f"Could not read the saved results: {exc}")
+        try:
+            self._read_enrichment(job, out)
+        except Exception as exc:
+            log.exception("could not read the saved enrichment")
+            out['errors'].append(f"Could not read the saved enrichment: {exc}")
         self.finished.emit(out)
+
+    @staticmethod
+    def _read_enrichment(job: dict, out: dict):
+        """The last enrichment run, while it matches the gated results."""
+        path = job.get('enrichment_path')
+        results = out.get('results')
+        if path is None or not results or not Path(path).exists():
+            return
+        payload = json.loads(Path(path).read_text(encoding='utf-8'))
+        if payload.get('run_fingerprint') != str(results.get('run_fingerprint') or ''):
+            return
+        out['fsea'] = ag_fsea.result_from_jsonable(payload['result'])
 
     @staticmethod
     def _read_model(job: dict, out: dict):
@@ -4014,7 +4076,7 @@ class PluginWidget(QWidget):
     """Top-level widget for the Automated Gating plugin.
 
     Owns GatingRunState, the plugin's transforms and the Transforms, Setup,
-    Run and Results pages, listed down the left-hand side.
+    Run, Results and Enrichment pages, listed down the left-hand side.
 
     Persistence: settings (model file, alignment, gate modes, transforms,
     sample selection, groups, covariates and statistics options) are kept in
@@ -4022,7 +4084,8 @@ class PluginWidget(QWidget):
     medians and per-gate status) are kept in RESULTS_FILE in the experiment
     folder, with the samples a paused run has still to gate, and each
     sample's display record in DISPLAY_DIR; the last statistics run is kept
-    in STATS_FILE and restored while it still matches the gated results.
+    in STATS_FILE and the last enrichment run in ENRICHMENT_FILE, both
+    restored while they still match the gated results.
     These are read in the background when the experiment is opened and
     written in the background after each run, when the gating results and
     statistics are also written as CSV files to EXPORT_DIR.
@@ -4076,10 +4139,16 @@ class PluginWidget(QWidget):
                               display_dir=self._display_dir)
         self.results_tab = ResultsTab(self.state, bus, controller,
                                       result_transforms=self._result_transforms)
+        self.enrichment_tab = ag_fsea_ui.EnrichmentTab(
+            self.state, bus, controller, samples_fn=self.results_tab._stats_samples,
+            design_fn=lambda samples: statistics_design(self.state, samples),
+            antigens_fn=lambda: _antigen_map(self.controller),
+            experiment_dir_fn=lambda: str(self._loaded_experiment_dir or ''))
         self.inner_tabs.addTab(self.transforms_tab, "Transforms", 'wave-sine')
         self.inner_tabs.addTab(self.setup_tab, "Setup", 'settings')
         self.inner_tabs.addTab(self.run_tab, "Run", 'player-play')
         self.inner_tabs.addTab(self.results_tab, "Results", 'table')
+        self.inner_tabs.addTab(self.enrichment_tab, "Enrichment", 'sparkles')
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
         content_layout.addWidget(self.inner_tabs, stretch=1)
 
@@ -4088,6 +4157,7 @@ class PluginWidget(QWidget):
         self.run_tab.gating_finished.connect(self._on_gating_finished)
         self.results_tab.stats_finished.connect(self._on_stats_finished)
         self.results_tab.report_populations_changed.connect(self.save_state)
+        self.enrichment_tab.enrichment_finished.connect(self._on_enrichment_finished)
         self.transforms_tab.transformsChanged.connect(self._on_transform_changed)
         self.transforms_tab.populationChanged.connect(
             lambda name: setattr(self.state, 'transform_population', name))
@@ -4157,7 +4227,7 @@ class PluginWidget(QWidget):
         if index == 0:
             self.transforms_tab.refresh(self.state.transform_population or None)
             return
-        tabs = [None, self.setup_tab, self.run_tab, self.results_tab]
+        tabs = [None, self.setup_tab, self.run_tab, self.results_tab, self.enrichment_tab]
         if 0 < index < len(tabs):
             tabs[index].refresh()
 
@@ -4169,6 +4239,7 @@ class PluginWidget(QWidget):
         self._result_tf = (None, None)
         self._write_results()
         self._write_stats()
+        self._write_enrichment()
         self.save_state()
         if self.state.summaries and outcome in ('done', 'paused', 'failed'):
             self._export_results_csv()
@@ -4179,6 +4250,14 @@ class PluginWidget(QWidget):
         self._write_stats()
         self.save_state()
         self._export_statistics_csv()
+
+    def _on_enrichment_finished(self):
+        """Keep the enrichment run, write it as CSV files and list it in
+        the report."""
+        self._write_enrichment()
+        self.save_state()
+        self._export_enrichment_csv()
+        self.results_tab._populate_report_items()
 
     def progress_message(self, msg: str):
         _status(self.bus, msg)
@@ -4301,6 +4380,9 @@ class PluginWidget(QWidget):
         """Persist settings for the experiment the state was loaded from."""
         if self._loaded_experiment_key is None or self._loading:
             return
+        view = self.transforms_tab.view()
+        if view is not None:
+            self.state.transform_view = view
         payload = {name: getattr(self.state, name) for name in _PERSISTED_FIELDS}
         s = self._qsettings
         s.beginGroup(self._loaded_experiment_key)
@@ -4334,6 +4416,7 @@ class PluginWidget(QWidget):
                 setattr(self.state, name, value)
         st = self.state
         self.tf.load(st.transform_params, self.controller.unmixed_transformations or {})
+        self.transforms_tab.set_view(st.transform_view)
         exp = self._loaded_experiment_dir
         job = {
             'key': self._loaded_experiment_key,
@@ -4345,6 +4428,7 @@ class PluginWidget(QWidget):
             'live_params': _live_transform_params(self.controller),
             'results_path': exp / RESULTS_FILE,
             'stats_path': exp / STATS_FILE,
+            'enrichment_path': exp / ENRICHMENT_FILE,
             'display_dir': exp / DISPLAY_DIR,
             'thresholds': {'pval': st.pval_threshold, 'fc': st.fc_threshold,
                            'marker': st.marker_threshold, 'fdr_scope': st.fdr_scope,
@@ -4400,6 +4484,8 @@ class PluginWidget(QWidget):
                                       "version of the model file; run gating again to update them.")
         if out.get('stats'):
             st.stats = out['stats']
+        if out.get('fsea'):
+            st.fsea = out['fsea']
         for msg in out.get('errors') or []:
             self.progress_message(msg)
         self.setup_tab.refresh()
@@ -4469,6 +4555,39 @@ class PluginWidget(QWidget):
                                       'stats': ag_results.stats_to_jsonable(stats)})
 
         self._start_writer(_job, "Saving the statistics")
+
+    def _write_enrichment(self):
+        """Write the last enrichment run to ENRICHMENT_FILE (in the
+        background), or remove the file when there is none."""
+        if not self._controller_shows_loaded_experiment():
+            return
+        path = self._loaded_experiment_dir / ENRICHMENT_FILE
+        st = self.state
+        if not st.fsea:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                log.exception("could not remove %s", path)
+            return
+        result, fingerprint = dict(st.fsea), st.run_fingerprint
+
+        def _job():
+            _write_json_atomic(path, {'format_version': 1, 'run_fingerprint': fingerprint,
+                                      'result': ag_fsea.result_to_jsonable(result)})
+
+        self._start_writer(_job, "Saving the enrichment")
+
+    def _export_enrichment_csv(self):
+        """Write the enrichment tables as CSV files to EXPORT_DIR (background)."""
+        if not self._controller_shows_loaded_experiment() or not self.state.fsea:
+            return
+        st = self.state
+        folder = self._loaded_experiment_dir / EXPORT_DIR
+        stem, stamp = _export_stem(st.model_path), datetime.now().strftime('%Y%m%d_%H%M%S')
+        result = dict(st.fsea)
+        self._start_writer(lambda: ag_fsea_ui.write_enrichment_csv(folder, stem, stamp, result),
+                           "Writing the enrichment CSV")
+        _status(self.bus, f"Enrichment written to {folder}")
 
     def _export_results_csv(self):
         """Write the gating results as CSV files to EXPORT_DIR (background)."""
