@@ -37,6 +37,10 @@ Data conventions
   is usually marked as a reference population (``populations[pop]
   ['reference']``): one whose biology is known and whose events are
   plentiful, so its positive/negative boundary can be transferred.
+  ``populations[pop]['anchor']`` marks the anchor population
+  (``anchor_population``): the default reference of replicated thresholds
+  in the Gating Model Builder and the default abundance anchor of
+  enrichment analysis.
 * An imported gate's ``template`` may hold its shapes as drawn: entries
   with ``shape_channels`` (the channels of the plot it was drawn on) and a
   closed ``boundary`` polygon, or a ``range`` for a 1-D shape. While the
@@ -158,6 +162,12 @@ def default_axis_lo(algorithm: str | None) -> float:
     return 0.0 if algorithm == 'tail' else 0.01
 
 MODEL_FORMAT_VERSION = 2
+DEFAULT_TAIL_FRACTION = 0.0001
+DEFAULT_EDGE_DENSITY = 0.002        # cells: density fall-off, fraction of the peak
+CELL_SIDE_CELLS = 'cells'           # cells: keep the events above the debris cut
+CELL_SIDE_DEBRIS = 'debris'         # cells: keep the events below it
+# Tail fraction of kde_min's fallback when the density has a single peak.
+KDE_MIN_FALLBACK_TAIL = 0.01
 MODE_FIXED = 'fixed'
 MODE_RECALCULATE = 'recalculate'
 APPLICATION_MODES = (MODE_FIXED, MODE_RECALCULATE)
@@ -171,6 +181,101 @@ REGION_BELOW = 'below'
 REGION_ABOVE = 'above'
 REGION_INSIDE = 'inside'
 QUADRANT_REGIONS = ('x-y-', 'x+y-', 'x-y+', 'x+y+')
+REGION_JOIN = '|'
+
+
+def region_quadrants(region: str | None) -> tuple:
+    """Quadrants of a 2dsep region, in QUADRANT_REGIONS order. A region is
+    one quadrant ('x+y-') or several joined with '|' ('x-y-|x-y+' is the
+    whole x- side; three quadrants make an L shape)."""
+    parts = set(str(region or '').split(REGION_JOIN))
+    return tuple(q for q in QUADRANT_REGIONS if q in parts)
+
+
+def join_quadrants(quadrants) -> str:
+    """Region string of a set of quadrants (see region_quadrants)."""
+    parts = set(quadrants)
+    return REGION_JOIN.join(q for q in QUADRANT_REGIONS if q in parts)
+
+
+def region_sign(region: str | None, axis: str) -> str | None:
+    """'+' or '-' when every quadrant of a 2dsep region lies on that side
+    of the *axis* ('x' or 'y') threshold, else None."""
+    k = 1 if axis == 'x' else 3
+    signs = {q[k] for q in region_quadrants(region)}
+    return signs.pop() if len(signs) == 1 else None
+
+
+def quadrant_mask(region: str | None, above_x: np.ndarray, above_y: np.ndarray) -> np.ndarray:
+    """Events of a 2dsep region given which events are at or above each
+    threshold."""
+    out = np.zeros(len(above_x), dtype=bool)
+    for q in region_quadrants(region):
+        mx = above_x if q[1] == '+' else ~above_x
+        my = above_y if q[3] == '+' else ~above_y
+        out |= mx & my
+    return out
+
+
+def threshold_sides(gate_def: dict, axis: str) -> set:
+    """Sides ('-', '+') of the other axis on which a 2dsep gate's threshold
+    on *axis* ('x' or 'y') separates two populations, or a population from
+    none (a joined region needs it on one side only)."""
+    owner = {}
+    for pop, region in population_regions(gate_def).items():
+        for q in region_quadrants(region):
+            owner[q] = pop
+    out = set()
+    for s in '-+':
+        pair = (f'x-y{s}', f'x+y{s}') if axis == 'x' else (f'x{s}y-', f'x{s}y+')
+        if owner.get(pair[0]) != owner.get(pair[1]):
+            out.add(s)
+    return out
+
+
+def region_polygon(region: str | None, tx: float, ty: float, x_lo: float, x_hi: float,
+                   y_lo: float, y_hi: float) -> list:
+    """Closed outline of a 2dsep region's quadrants within the limits: a
+    rectangle for one quadrant or a side, an L for three quadrants, two
+    rectangles meeting at the threshold crossing for opposite quadrants."""
+    quads = set(region_quadrants(region))
+    xs = {'-': (x_lo, tx), '+': (tx, x_hi)}
+    ys = {'-': (y_lo, ty), '+': (ty, y_hi)}
+    if len(quads) == 4:
+        return _rect(x_lo, x_hi, y_lo, y_hi)
+    if len(quads) == 1:
+        q = next(iter(quads))
+        return _rect(*xs[q[1]], *ys[q[3]])
+    if len(quads) == 2:
+        sx, sy = {q[1] for q in quads}, {q[3] for q in quads}
+        if len(sx) == 1:
+            return _rect(*xs[sx.pop()], y_lo, y_hi)
+        if len(sy) == 1:
+            return _rect(x_lo, x_hi, *ys[sy.pop()])
+        a, b = sorted(quads)
+        ra, rb = _rect(*xs[a[1]], *ys[a[3]]), _rect(*xs[b[1]], *ys[b[3]])
+        return _opposite_outline(ra, rb, tx, ty)
+    missing = (set(QUADRANT_REGIONS) - quads).pop() if len(quads) == 3 else None
+    if missing is None:
+        return []
+    cx = x_lo if missing[1] == '-' else x_hi
+    cy = y_lo if missing[3] == '-' else y_hi
+    ox = x_hi if missing[1] == '-' else x_lo
+    oy = y_hi if missing[3] == '-' else y_lo
+    pts = [[tx, cy], [ox, cy], [ox, oy], [cx, oy], [cx, ty], [tx, ty], [tx, cy]]
+    return [[float(a), float(b)] for a, b in pts]
+
+
+def _opposite_outline(ra: list, rb: list, tx: float, ty: float) -> list:
+    """Outline of two rectangles touching only at (tx, ty), traced through
+    that point."""
+    def from_corner(r):
+        pts = r[:-1]
+        k = min(range(len(pts)), key=lambda i: abs(pts[i][0] - tx) + abs(pts[i][1] - ty))
+        return pts[k:] + pts[:k]
+    a, b = from_corner(ra), from_corner(rb)
+    pts = a + [a[0]] + b[1:] + [b[0]]
+    return [[float(x), float(y)] for x, y in pts]
 
 ALWAYS_EXCLUDED_CHANNELS = frozenset({'Time', 'ribbon', 'event_id'})
 
@@ -251,6 +356,83 @@ def reference_populations(gate_defs: list[dict]) -> list[str]:
             if (meta or {}).get('reference'):
                 out.append(population_key(g['gate_name'], pop))
     return out
+
+
+ANCHOR_FLAG = 'anchor'
+
+
+def viability_channels(channels) -> set:
+    """Channels whose fluorophore is a viability dye (``is.viability`` in
+    Honeychrome's fluorophore database, matched by name and synonyms)."""
+    return set(_viability_lookup(tuple(sorted({str(c) for c in channels if c}))))
+
+
+_VIABILITY_CACHE: dict = {}
+
+
+def _viability_lookup(channels: tuple) -> tuple:
+    if channels in _VIABILITY_CACHE:
+        return _VIABILITY_CACHE[channels]
+    try:
+        from honeychrome.controller_components.label_matching import (
+            get_fluorophore_db, match_fluorophore)
+        db = get_fluorophore_db()
+    except Exception:
+        return ()
+    viable = {r.get('fluorophore') for r in db
+              if str(r.get('is.viability', '')).strip().upper() == 'TRUE'}
+    out = tuple(ch for ch in channels if match_fluorophore(ch, db) in viable)
+    _VIABILITY_CACHE[channels] = out
+    return out
+
+
+def anchor_population(gate_defs: list[dict]) -> str | None:
+    """'gate/pop' key of the anchor population: the one marked with
+    ANCHOR_FLAG; else the viable population of the deepest gate using a
+    viability dye channel (its population on the dye's negative side, or
+    its only population); else the deepest singlets population; else the
+    population labelled 'Cells'. None when there is none of these."""
+    for g in gate_defs:
+        for pop, meta in (g.get('populations') or {}).items():
+            if (meta or {}).get(ANCHOR_FLAG):
+                return population_key(g['gate_name'], pop)
+    ordered = ordered_gate_defs(gate_defs)
+    by_name = gates_by_name(gate_defs)
+    depth: dict = {}
+    for g in ordered:
+        parent = g.get('parent_gate')
+        depth[g['gate_name']] = depth.get(parent, -1) + 1 if parent in by_name else 0
+    used = set()
+    for g in gate_defs:
+        used |= set(referenced_channels(g))
+    viability = viability_channels(used)
+
+    def deepest(gates):
+        return max(gates, key=lambda g: depth.get(g['gate_name'], 0)) if gates else None
+
+    via = deepest([g for g in ordered if viability & set(referenced_channels(g))])
+    if via is not None:
+        pops = list(population_regions(via).items())
+        if len(pops) == 1:
+            return population_key(via['gate_name'], pops[0][0])
+        dye = next(c for c in referenced_channels(via) if c in viability)
+        for pop, region in pops:
+            if via.get('gate_type') == '1dsep' and via.get('gate_marker_x') == dye \
+                    and region == REGION_BELOW:
+                return population_key(via['gate_name'], pop)
+            if via.get('gate_type') == '2dsep':
+                axis = 'x' if via.get('gate_marker_x') == dye else 'y'
+                if region_sign(region, axis) == '-':
+                    return population_key(via['gate_name'], pop)
+        return population_key(via['gate_name'], pops[0][0])
+    singlets = deepest([g for g in ordered if g.get('gate_type') == 'singlets'])
+    if singlets is not None:
+        return population_key(singlets['gate_name'], next(iter(singlets.get('populations') or {'': 0})))
+    for g in ordered:
+        for pop, meta in (g.get('populations') or {}).items():
+            if str((meta or {}).get('label') or pop).strip().lower() == 'cells':
+                return population_key(g['gate_name'], pop)
+    return None
 
 
 def default_algorithm_for_type(gate_type: str) -> str:
@@ -383,7 +565,7 @@ def kde_mode(x: np.ndarray) -> float:
     return float(grid[int(np.argmax(density))])
 
 
-def threshold_tail(x: np.ndarray, tail_fraction: float = 0.01) -> float:
+def threshold_tail(x: np.ndarray, tail_fraction: float = DEFAULT_TAIL_FRACTION) -> float:
     """Upper tail of the negative population, assuming it is symmetric.
 
     The events below the density mode are mirrored about the mode to
@@ -405,7 +587,8 @@ def threshold_tail(x: np.ndarray, tail_fraction: float = 0.01) -> float:
 def threshold_kde_min(x: np.ndarray) -> float:
     """Density minimum between the two highest density peaks.
 
-    Falls back to ``threshold_tail`` when the density has a single peak.
+    Falls back to ``threshold_tail`` (KDE_MIN_FALLBACK_TAIL) when the
+    density has a single peak.
     """
     from scipy.signal import find_peaks
     x = np.asarray(x, dtype=float)
@@ -414,16 +597,22 @@ def threshold_kde_min(x: np.ndarray) -> float:
     grid, density = _kde_grid(x)
     peaks, _ = find_peaks(density)
     if len(peaks) < 2:
-        return threshold_tail(x)
+        return threshold_tail(x, tail_fraction=KDE_MIN_FALLBACK_TAIL)
     top_two = sorted(peaks[np.argsort(density[peaks])[::-1][:2]])
     p1, p2 = int(top_two[0]), int(top_two[1])
     valley = p1 + int(np.argmin(density[p1:p2 + 1]))
     return float(grid[valley])
 
 
-def threshold_mixture(x: np.ndarray, n_components: int = 2, seed: int = 0) -> float:
-    """Density crossover between the lowest- and highest-mean components
-    of a Gaussian mixture."""
+MIXTURE_CUTS = ('outer', 'lower', 'upper')
+
+
+def threshold_mixture(x: np.ndarray, n_components: int = 2, seed: int = 0,
+                      cut: str = 'outer') -> float:
+    """Density crossover between two components of a Gaussian mixture,
+    ordered by mean: the lowest and highest (*cut* 'outer'), the lowest
+    two ('lower') or the highest two ('upper'). With two components the
+    three are the same."""
     from scipy.optimize import brentq
     from scipy.stats import norm
     from sklearn.mixture import GaussianMixture
@@ -438,9 +627,10 @@ def threshold_mixture(x: np.ndarray, n_components: int = 2, seed: int = 0) -> fl
     weights = gm.weights_.ravel()
     stds = np.sqrt(gm.covariances_.ravel())
     order = np.argsort(means)
-    mu1, mu2 = means[order[0]], means[order[-1]]
-    w1, w2 = weights[order[0]], weights[order[-1]]
-    s1, s2 = stds[order[0]], stds[order[-1]]
+    lo, hi = {'lower': (0, 1), 'upper': (-2, -1)}.get(cut, (0, -1))
+    mu1, mu2 = means[order[lo]], means[order[hi]]
+    w1, w2 = weights[order[lo]], weights[order[hi]]
+    s1, s2 = stds[order[lo]], stds[order[hi]]
 
     def diff(v):
         return w1 * norm.pdf(v, mu1, s1) - w2 * norm.pdf(v, mu2, s2)
@@ -481,12 +671,12 @@ def threshold_bimodal(x: np.ndarray) -> float:
 def compute_threshold(x: np.ndarray, algorithm: str, params: dict | None = None) -> float:
     """Run the named threshold algorithm; unknown names use ``tail``."""
     params = params or {}
-    tf = float(params.get('tail_fraction', 0.01))
+    tf = float(params.get('tail_fraction', DEFAULT_TAIL_FRACTION))
     nc = int(params.get('mixture_components', 2))
     if algorithm == 'kde_min':
         return threshold_kde_min(x)
     if algorithm == 'mixture':
-        return threshold_mixture(x, n_components=nc)
+        return threshold_mixture(x, n_components=nc, cut=str(params.get('mixture_cut', 'outer')))
     if algorithm == 'otsu':
         return threshold_otsu(x)
     if algorithm == 'bimodal':
@@ -895,9 +1085,11 @@ class GateCalculator:
 
         def axis_params(axis: str) -> dict:
             p = dict(gp)
-            p['tail_fraction'] = float(gp.get(f'tail_fraction_{axis}', gp.get('tail_fraction', 0.01)))
+            p['tail_fraction'] = float(gp.get(f'tail_fraction_{axis}',
+                                              gp.get('tail_fraction', DEFAULT_TAIL_FRACTION)))
             p['mixture_components'] = int(gp.get(f'mixture_components_{axis}',
                                                  gp.get('mixture_components', 2)))
+            p['mixture_cut'] = gp.get(f'mixture_cut_{axis}', gp.get('mixture_cut', 'outer'))
             return p
 
         thresholds = []
@@ -937,9 +1129,7 @@ class GateCalculator:
         y_lo, y_hi = self._limits(y_ch, np.asarray(y_values if y_values is not None else []))
         y_lo, y_hi = min(y_lo, ty), max(y_hi, ty)
         for pop, region in regions.items():
-            xs = (x_lo, tx) if region.startswith('x-') else (tx, x_hi)
-            ys = (y_lo, ty) if region.endswith('y-') else (ty, y_hi)
-            out[pop] = {'boundary': _rect(xs[0], xs[1], ys[0], ys[1]),
+            out[pop] = {'boundary': region_polygon(region, tx, ty, x_lo, x_hi, y_lo, y_hi),
                         'threshold_x': float(tx), 'threshold_y': float(ty), 'region': region}
         return out
 
@@ -970,25 +1160,25 @@ class GateCalculator:
         return {pop: {'boundary': poly, 'threshold_x': None, 'threshold_y': None,
                       'region': REGION_INSIDE}}
 
-    def _open_limit(self, channel: str, values: np.ndarray, side: str) -> float:
-        """A coordinate one display span beyond the axis limit on *side*
-        ('lo' or 'hi'), so a polygon edge there leaves the gate open."""
-        lo, hi = self._limits(channel, values)
-        span = (hi - lo) or 1.0
-        return lo - span if side == 'lo' else hi + span
-
     def _calc_cells(self, data, gate_def, channel_index, pop) -> dict:
-        """Cell gate on a pair of scatter channels: a rectangle that cuts the
-        debris on the forward-scatter axis and keeps everything above it.
+        """Cell gate on a pair of scatter channels: a rectangle from the
+        debris cut on the forward-scatter axis to where the cells' density
+        ends on each side.
 
         The debris cut is the density valley left of the highest peak of the
         forward-scatter axis (``gate_param['debris_axis']``, 'x' or 'y'),
         or, when no peak lies left of it, the point where the density left of
         the peak first falls below ``debris_density`` (default 0.05) of the
-        peak height. The other sides are open, except that a pile of events
-        at the top of either axis (saturation, more than
-        ``saturation_fraction`` of the events, default 0.0005) is cut just
-        below the pile.
+        peak height. On the events above the cut, the other three sides are
+        the outermost points where each axis's density is still at least
+        its fall-off (``edge_density_x`` / ``edge_density_y``, else
+        ``edge_density``, default DEFAULT_EDGE_DENSITY) of its peak
+        (density_edges). ``cell_side`` CELL_SIDE_DEBRIS keeps the events
+        below the cut instead (a debris gate): the cut is then the upper
+        side on the forward-scatter axis and the other sides come from the
+        events below it. A pile of events at the top of either axis
+        (saturation, more than ``saturation_fraction`` of the events,
+        default 0.0005) is cut just below the pile.
         """
         gp = gate_def.get('gate_param', {}) or {}
         q = float(gp.get('quantile_trim', 0.001))
@@ -999,13 +1189,24 @@ class GateCalculator:
         d = 1 if gp.get('debris_axis') == 'y' else 0
         col = trim_quantiles(xy[:, d], q)
         cut = debris_cut(col, float(gp.get('debris_density', 0.05)))
+        debris = gp.get('cell_side') == CELL_SIDE_DEBRIS
+        kept = xy[xy[:, d] < cut] if debris else xy[xy[:, d] >= cut]
+        if len(kept) < 50:
+            kept = xy
         bounds = []
         for k, ch in enumerate(chans):
+            edge = float(gp.get(f'edge_density_{"xy"[k]}',
+                                gp.get('edge_density', DEFAULT_EDGE_DENSITY)))
             values = xy[:, k]
-            lo = cut if k == d else self._open_limit(ch, values, 'lo')
-            hi = saturation_cut(values, float(gp.get('saturation_fraction', 0.0005)))
-            if hi is None:
-                hi = self._open_limit(ch, values, 'hi')
+            lo, hi = density_edges(trim_quantiles(kept[:, k], q), edge)
+            if k == d:
+                if debris:
+                    hi = cut
+                else:
+                    lo = cut
+            pile = saturation_cut(values, float(gp.get('saturation_fraction', 0.0005)))
+            if pile is not None:
+                hi = min(hi, pile)
             bounds.append((lo, hi))
         (x0, x1), (y0, y1) = bounds
         return {pop: {'boundary': _rect(x0, x1, y0, y1), 'threshold_x': None,
@@ -1028,6 +1229,19 @@ def debris_cut(x: np.ndarray, rel_density: float = 0.05) -> float:
         return float(grid[start + int(np.argmin(density[start:top + 1]))])
     below = np.flatnonzero(density[:top] < rel_density * float(density[top]))
     return float(grid[below[-1]]) if len(below) else float(grid[0])
+
+
+def density_edges(x: np.ndarray, rel_density: float = DEFAULT_EDGE_DENSITY) -> tuple[float, float]:
+    """(lo, hi): the lowest and highest points where the density of *x* is
+    at least *rel_density* of its peak height (the extent of the events,
+    leaving out sparse tails; a second population above that height is
+    kept)."""
+    x = np.asarray(x, dtype=float)
+    if len(x) < 20 or float(x.max()) == float(x.min()):
+        return (float(x.min()), float(x.max())) if len(x) else (0.0, 0.0)
+    grid, density = _kde_grid(x)
+    keep = np.flatnonzero(density >= rel_density * float(density.max()))
+    return float(grid[keep[0]]), float(grid[keep[-1]])
 
 
 def saturation_cut(values: np.ndarray, min_fraction: float = 0.0005) -> float | None:
@@ -1179,9 +1393,11 @@ def resolve_replicates(gate_def: dict, data: np.ndarray, channel_index: dict,
                                   float(gp.get(f'axis_hi{suffix}', 0.99)))
             if len(calc) < MIN_EVENTS:
                 calc = values
-            params = {'tail_fraction': gp.get(f'tail_fraction{suffix}', gp.get('tail_fraction', 0.01)),
+            params = {'tail_fraction': gp.get(f'tail_fraction{suffix}',
+                                              gp.get('tail_fraction', DEFAULT_TAIL_FRACTION)),
                       'mixture_components': gp.get(f'mixture_components{suffix}',
-                                                   gp.get('mixture_components', 2))}
+                                                   gp.get('mixture_components', 2)),
+                      'mixture_cut': gp.get(f'mixture_cut{suffix}', gp.get('mixture_cut', 'outer'))}
             t = compute_threshold(calc, algo, params)
         gp[f'fixed_threshold_{axis}'] = float(t)
     return out, ''
@@ -1242,10 +1458,7 @@ def population_masks(gate_def: dict, boundary: dict, data: np.ndarray,
             return {}
         above_y = data[:, channel_index[chans[1]]] >= float(ty)
         for pop in boundary:
-            region = regions.get(pop, 'x+y+')
-            mx = above_x if region.startswith('x+') else ~above_x
-            my = above_y if region.endswith('y+') else ~above_y
-            masks[pop] = mx & my
+            masks[pop] = quadrant_mask(regions.get(pop, 'x+y+'), above_x, above_y)
         return masks
 
     from matplotlib.path import Path as MplPath
@@ -2057,8 +2270,9 @@ def model_to_gating_strategy(gate_defs: list[dict], boundaries: dict, transforma
 
     transformations : {channel: Transform} (only ``.xform`` is used).
 
-    Threshold gates become one open-ended rectangle gate per population;
-    polygon gates become polygon gates. Each population is a gate named
+    Threshold gates become one open-ended rectangle gate per population (a
+    region of three quadrants, or of two opposite ones, a polygon gate on
+    its outline); polygon gates become polygon gates. Each population is a gate named
     ``{prefix}{gate}/{pop}``, nested under its parent population.
     """
     import flowkit as fk
@@ -2102,8 +2316,20 @@ def model_to_gating_strategy(gate_defs: list[dict], boundaries: dict, transforma
                     dims = [dim(chans[0], lo, hi)]
                 else:
                     ty = entry.get('threshold_y')
-                    xr = (tx, None) if region.startswith('x+') else (None, tx)
-                    yr = (ty, None) if region.endswith('y+') else (None, ty)
+                    sx, sy = region_sign(region, 'x'), region_sign(region, 'y')
+                    n_quads = len(region_quadrants(region))
+                    if not ((n_quads == 1) or (n_quads == 2 and (sx or sy))):
+                        verts = [tuple(v) for v in (entry.get('boundary') or [])]
+                        if len(verts) < 3:
+                            continue
+                        if verts[0] == verts[-1]:
+                            verts = verts[:-1]
+                        gs.add_gate(fk_gates.PolygonGate(gname, [dim(chans[0]), dim(chans[1])],
+                                                         verts), gate_path=gate_path)
+                        paths[key] = gate_path
+                        continue
+                    xr = {'+': (tx, None), '-': (None, tx)}.get(sx, (None, None))
+                    yr = {'+': (ty, None), '-': (None, ty)}.get(sy, (None, None))
                     dims = [dim(chans[0], *xr), dim(chans[1], *yr)]
                 gate = fk_gates.RectangleGate(gname, dims)
             else:

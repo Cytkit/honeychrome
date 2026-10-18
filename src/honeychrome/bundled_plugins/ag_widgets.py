@@ -17,6 +17,8 @@ Gating plugins
                           algorithms' thresholds are drawn on the plots.
   • FilterBar           — text search with a "show" filter, for long tables
                           and trees.
+  • DecadeSpinBox       — spin box for small fractions that steps by factors
+                          of ten and accepts any typed value.
 
 The file name does not end in ``_tab.py``, so the plugin loader does not
 treat it as a tab.
@@ -27,15 +29,15 @@ from __future__ import annotations
 from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QAbstractScrollArea, QApplication, QComboBox, QFrame,
-    QHBoxLayout, QLabel, QLineEdit, QScrollArea, QSizePolicy, QToolBox,
+    QAbstractItemView, QAbstractScrollArea, QApplication, QComboBox, QDoubleSpinBox,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QScrollArea, QSizePolicy, QToolBox,
     QTreeWidget, QTreeWidgetItem, QWidget,
 )
 
 __all__ = ['make_concertina', 'add_concertina_page', 'SquareHolder',
            'zoom_axis_transform', 'PopulationTree', 'block_wheel',
            'algorithm_combo', 'colour_algorithm_items', 'set_combo_colour', 'FilterBar',
-           'text_matches']
+           'text_matches', 'DecadeSpinBox']
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +179,24 @@ def block_wheel(widget):
     widget.setFocusPolicy(Qt.StrongFocus)
     widget.installEventFilter(_wheel_blocker)
     return widget
+
+
+class DecadeSpinBox(QDoubleSpinBox):
+    """Spin box for a small positive fraction: the arrows multiply or divide
+    the value by ten (0.0001, 0.001, 0.01, …) and any value in range can be
+    typed. Shown without trailing zeros."""
+
+    def __init__(self, minimum: float = 1e-6, maximum: float = 0.5, parent=None):
+        super().__init__(parent)
+        self.setDecimals(6)
+        self.setRange(minimum, maximum)
+
+    def stepBy(self, steps: int):
+        value = float(self.value()) * (10.0 ** int(steps))
+        self.setValue(min(max(value, self.minimum()), self.maximum()))
+
+    def textFromValue(self, value: float) -> str:
+        return f"{float(value):.6f}".rstrip('0').rstrip('.')
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +377,8 @@ class PopulationTree(QTreeWidget):
         self._items: dict = {}
         self._depth: dict = {}
         self._parents: dict = {}
+        self._labels: dict = {}
+        self._tips: dict = {}
         self.itemSelectionChanged.connect(self._on_selection_changed)
         self.itemExpanded.connect(lambda _item: self.expansionChanged.emit())
         self.itemCollapsed.connect(lambda _item: self.expansionChanged.emit())
@@ -377,6 +399,7 @@ class PopulationTree(QTreeWidget):
         try:
             self.clear()
             self._items, self._depth, self._parents = {}, {}, {}
+            self._labels, self._tips = {}, {}
             for node in nodes:
                 key = (node['gate'] or '', node['pop'])
                 parent_key = node.get('parent')
@@ -396,6 +419,8 @@ class PopulationTree(QTreeWidget):
                 else:
                     parent_item.addChild(item)
                 self._items[key] = item
+                self._labels[key] = node['label']
+                self._tips[key] = item.toolTip(0)
             for key, item in self._items.items():
                 if key in known:
                     item.setExpanded(key in expanded)
@@ -469,11 +494,18 @@ class PopulationTree(QTreeWidget):
         self.expansionChanged.emit()
 
     def mark(self, marks: dict):
-        """Colour nodes: {key: (RGB or None, tooltip suffix or '')}; nodes not
-        in *marks* return to the default colour."""
+        """Colour nodes: {key: (RGB or None, tooltip suffix or '')}, or
+        {key: (RGB or None, flag text, True)} to flag a node: its label then
+        starts with ⚠ and its tooltip ends with the flag text. Nodes not in
+        *marks* return to the default colour and label."""
         for key, item in self._items.items():
-            rgb, _tip = marks.get(key, (None, ''))
+            rgb, tip, *rest = marks.get(key, (None, ''))
+            flagged = bool(rest and rest[0])
             item.setForeground(0, QBrush(QColor(*rgb[:3])) if rgb is not None else QBrush())
+            label = self._labels.get(key, item.text(0))
+            item.setText(0, f"⚠ {label}" if flagged else label)
+            base = self._tips.get(key, '')
+            item.setToolTip(0, f"{base}\n{tip}" if flagged and tip else base)
 
     def is_open(self, key) -> bool:
         """True when the node and every node above it are expanded, so the

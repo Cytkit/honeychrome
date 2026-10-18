@@ -38,16 +38,36 @@ __all__ = [
     'apply_name_sync', 'sync_conflicts', 'conflicting_gate_names', 'gates_below_population',
     'feed_forward', 'conversion_check', 'SYNC_USER', 'SYNC_AUTO', 'SYNC_DRAWN',
     'replicate_choices', 'descendants', 'delete_gates', 'delete_population',
-    'copy_gates', 'paste_gates', 'rename_references',
+    'copy_gates', 'paste_gates', 'rename_references', 'convert_threshold_regions',
+    'orphaned_by_populations', 'rename_populations', 'population_ancestors',
+    'overlapping_populations', 'overlap_flags', 'OVERLAP_LIMIT', 'OVERLAP_MIN_EVENTS',
+    'RULE_HISTOGRAM', 'RULE_FRACTION', 'positive_fractions', 'proposed_axis_algorithms',
+    'CENTRED_BELOW_ZERO', 'SPANS_ZERO_BELOW', 'REPLICATE_POSITIVE', 'SEPARATES_MIN',
+    'FIT_ALGORITHMS', 'FIT_CANDIDATES', 'FIT_LABELS', 'axis_cuts', 'separating_axis_dropped',
+    'without_axis',
+    'default_reference', 'split_steps', 'conversion_evidence', 'evidence_axes',
+    'reference_algorithm', 'proposed_definition', 'apply_conversion', 'default_source_axes',
 ]
 
 ROOT = ('', 'root')
+
+# proposal_rule of an imported threshold gate: its proposed algorithm follows
+# the share of the parent on each axis's positive side (see histogram_proposal).
+RULE_HISTOGRAM = 'histogram'    # histogram gates (from the import's counts)
+RULE_FRACTION = 'fraction'      # other threshold gates (review samples only)
 
 # A fraction of parent differs from the import's when it moves by this many
 # fractional units (0.02 = 2 percentage points) or by this relative amount.
 ABS_TOLERANCE = 0.02
 REL_TOLERANCE = 0.05
 _MIN_REFERENCE = 0.0005
+# Two populations overlap when they share at least this share of the events
+# in either (intersection over union) and neither lies below the other.
+OVERLAP_LIMIT = 0.5
+OVERLAP_MIN_EVENTS = 20
+# A population sharing this share of its events with a population above it
+# is treated as that population when looking for overlaps.
+OVERLAP_SAME_AS_ANCESTOR = 0.9
 
 
 def reference_boundaries(gate_defs: list[dict], trained: dict | None) -> dict:
@@ -86,15 +106,22 @@ def trainable_algorithms(gate_def: dict) -> list[str]:
             if a != ag_core.ALGORITHM_IMPORTED]
 
 
-def trainable_definition(gate_def: dict, algorithm: str | None = None) -> dict:
+def trainable_definition(gate_def: dict, algorithm: str | None = None,
+                         axis_algorithms: dict | None = None) -> dict:
     """Copy of *gate_def* using a learning algorithm: *algorithm*, else the
-    gate's own when it is not ``imported``, else its conversion target."""
+    gate's own when it is not ``imported``, else its conversion target.
+    *axis_algorithms* ({axis: algorithm}) fills the per-axis algorithms of
+    a 2dsep gate that has none set."""
     out = deepcopy(gate_def)
     if algorithm is None:
         algorithm = gate_def.get('algorithm')
         if algorithm == ag_core.ALGORITHM_IMPORTED:
             algorithm = convert_target(gate_def)[0]
     out['algorithm'] = algorithm
+    if axis_algorithms and out.get('gate_type') == '2dsep':
+        gp = out.setdefault('gate_param', {})
+        for axis, algo in axis_algorithms.items():
+            gp.setdefault(f'algorithm_{axis}', algo)
     return out
 
 
@@ -140,7 +167,7 @@ def population_tree(gate_defs: list[dict]) -> list[dict]:
     ``(gate, pop)`` whose daughter gates are shown to review the node: the
     node itself when gates are drawn on it, else its parent (the plot it is
     gated on). Labels follow ``population_choices``; reference populations
-    are marked.
+    and the anchor population (ag_core.anchor_population) are marked.
     """
     ordered = ag_core.ordered_gate_defs(gate_defs)
     by_name = ag_core.gates_by_name(gate_defs)
@@ -149,6 +176,9 @@ def population_tree(gate_defs: list[dict]) -> list[dict]:
 
     def key_of(gate, pop):
         return (gate or '', pop or 'root')
+
+    anchor = ag_core.anchor_population(gate_defs)
+    anchor_node = key_of(*ag_core.split_population_key(anchor)) if anchor else None
 
     counts: dict = {}
     for g in ordered:
@@ -174,6 +204,8 @@ def population_tree(gate_defs: list[dict]) -> list[dict]:
             label = pop if imported else f"{gate_def['gate_name']} / {pop}"
             if ((gate_def.get('populations') or {}).get(pop) or {}).get('reference'):
                 label += '  [reference]'
+            if key_of(gate_def['gate_name'], pop) == anchor_node:
+                label += '  [anchor]'
             nodes.append({'gate': gate_def['gate_name'], 'pop': pop, 'label': label,
                           'parent': parent, 'n_gates': n, 'view': key if n else parent})
             known.add(key)
@@ -295,24 +327,85 @@ def is_free_shape(gate_def: dict) -> bool:
     return gate_def.get('gate_type') == 'free'
 
 
-def histogram_proposal(gate_def: dict, positive_fraction) -> str | None:
-    """The algorithm the histogram rule proposes for an imported histogram
-    gate whose proposal was set by the rule (``proposal_rule``), given the
-    fraction of its parent on the positive side: 'mixture' above 25%, else
-    'tail'. None when the rule does not apply."""
-    if gate_def.get('proposal_rule') != 'histogram' or positive_fraction is None:
+def histogram_proposal(gate_def: dict, positive_fraction, axis: str = 'x') -> str | None:
+    """The algorithm the import's rule proposes for one axis of an imported
+    threshold gate whose proposal follows the rule (``proposal_rule``
+    RULE_HISTOGRAM or RULE_FRACTION), given the fraction of its parent on
+    the positive side: 'mixture' above 25%, else 'tail'. *positive_fraction*
+    is a number (the x axis) or {axis: fraction} (see positive_fractions).
+    None when the rule does not apply or the fraction is unknown."""
+    if gate_def.get('proposal_rule') not in (RULE_HISTOGRAM, RULE_FRACTION):
+        return None
+    if isinstance(positive_fraction, dict):
+        positive_fraction = positive_fraction.get(axis)
+    if positive_fraction is None:
         return None
     import ag_flowjo
     return ag_flowjo.histogram_algorithm(positive_fraction)
 
 
+def positive_fractions(gate_def: dict, fractions: dict) -> dict:
+    """{axis: fraction of the parent on the positive side} of a threshold
+    gate, from its populations' fractions of the parent (*fractions*, e.g.
+    the shapes as drawn on the review samples): the populations wholly on
+    the positive side, else one minus those wholly on the negative side.
+    Axes with neither are left out."""
+    if gate_def.get('gate_type') not in ag_core.THRESHOLD_TYPES:
+        return {}
+    regions = ag_core.population_regions(gate_def)
+    out = {}
+    for axis in ag_core.threshold_axes(gate_def):
+        def side(region):
+            if gate_def.get('gate_type') == '1dsep':
+                return '+' if region == ag_core.REGION_ABOVE else '-'
+            return ag_core.region_sign(region, axis)
+        plus = [fractions.get(p) for p, r in regions.items() if side(r) == '+']
+        minus = [fractions.get(p) for p, r in regions.items() if side(r) == '-']
+        if plus and None not in plus:
+            out[axis] = float(sum(plus))
+        elif minus and None not in minus:
+            out[axis] = 1.0 - float(sum(minus))
+    return out
+
+
+def proposed_axis_algorithms(gate_def: dict, recommendation: str | None = None,
+                             positive_fraction=None, evidence: dict | None = None) -> dict:
+    """{axis: algorithm} a threshold gate trains with: its own per-axis
+    algorithms once converted; while imported, the conversion target on x
+    (convert_target) and, on y of a 2dsep gate, the algorithm chosen for y,
+    else the rule's for y (evidence_axes when *evidence* from the review
+    events is given, else histogram_proposal), else x's. The axes are those
+    of evidence['definition'] when given (a gate converting to 1dsep has x
+    only). {} for other gates."""
+    definition = (evidence or {}).get('definition') or gate_def
+    if gate_def.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
+        if gate_def.get('gate_type') not in ag_core.THRESHOLD_TYPES:
+            return {}
+        return {a: ag_core.axis_algorithm(gate_def, a) for a in ag_core.threshold_axes(gate_def)}
+    if definition.get('gate_type') not in ag_core.THRESHOLD_TYPES:
+        return {}
+    axes = ag_core.threshold_axes(definition)
+    ruled = evidence_axes(evidence) if evidence and gate_def.get('proposal_rule') in (
+        RULE_HISTOGRAM, RULE_FRACTION) else {}
+    x = convert_target(gate_def, recommendation, positive_fraction, evidence)[0]
+    out = {'x': x}
+    if 'y' in axes:
+        gp = gate_def.get('gate_param') or {}
+        y = gp.get('algorithm_y') or (ruled['y'][0] if 'y' in ruled else
+                                      histogram_proposal(gate_def, positive_fraction, 'y'))
+        out['y'] = y if y in trainable_algorithms(definition) else x
+    return out
+
+
 def convert_target(gate_def: dict, recommendation: str | None = None,
-                   positive_fraction=None):
+                   positive_fraction=None, evidence: dict | None = None):
     """The learning algorithm an imported gate converts to.
 
     Returns ``(algorithm, note)``; *algorithm* is None when the gate is not
-    using its imported boundary. A histogram gate still on the import's rule
-    (see histogram_proposal) uses *positive_fraction* when one is given;
+    using its imported boundary. A gate still on the import's rule (see
+    histogram_proposal) uses the rules on the review events (evidence_axes)
+    when *evidence* is given, else *positive_fraction* (a number or {axis:
+    fraction}) when one is given;
     otherwise the algorithm proposed at import comes first, then for
     threshold gates the recommended algorithm when there is one, else
     'tail'; singlet gates use 'singlets' and scatter shapes 'cells'.
@@ -321,6 +414,10 @@ def convert_target(gate_def: dict, recommendation: str | None = None,
         return None, ''
     gate_type = gate_def.get('gate_type')
     allowed = trainable_algorithms(gate_def)
+    if evidence and gate_def.get('proposal_rule') in (RULE_HISTOGRAM, RULE_FRACTION):
+        ruled = evidence_axes(evidence).get('x')
+        if ruled and ruled[0] in allowed:
+            return ruled[0], ruled[1]
     by_rule = histogram_proposal(gate_def, positive_fraction)
     if by_rule in allowed:
         return by_rule, ''
@@ -336,22 +433,597 @@ def convert_target(gate_def: dict, recommendation: str | None = None,
     return (allowed[0] if allowed else None), ''
 
 
+def convert_threshold_regions(populations: dict, old_type: str, old_x, old_y,
+                              new_type: str, new_x, new_y) -> tuple[dict | None, str]:
+    """Populations of a threshold gate changed between 1dsep and 2dsep,
+    keeping their names (so the gates below them stay attached) and their
+    sides of the shared separation parameter.
+
+    2dsep → 1dsep separating on one of the two parameters: each population
+    takes its side of that parameter; populations that span both sides, or
+    share a side, cannot be kept (Split into 1D gates instead).
+    1dsep → 2dsep with the separation parameter on one axis: each side
+    becomes that half of the plot (two quadrants).
+
+    Returns (populations, '') or (None, reason). Other type changes return
+    (populations unchanged, '').
+    """
+    out = deepcopy(populations)
+    if (old_type, new_type) == ('2dsep', '1dsep'):
+        axis = 'x' if new_x == old_x else ('y' if new_x == old_y else None)
+        if axis is None:
+            return None, "The separation parameter must be one of the 2dsep gate's two parameters."
+        sides: dict = {}
+        for pop, meta in out.items():
+            sign = ag_core.region_sign(meta.get('region'), axis)
+            if sign is None:
+                return None, (f"'{pop}' lies on both sides of {new_x}; use Split into 1D gates "
+                              "instead.")
+            if sign in sides:
+                return None, (f"'{sides[sign]}' and '{pop}' are on the same side of {new_x}; "
+                              "use Split into 1D gates instead.")
+            sides[sign] = pop
+            meta['region'] = ag_core.REGION_ABOVE if sign == '+' else ag_core.REGION_BELOW
+            meta['label_pos'] = 2 if sign == '+' else 1
+        return out, ''
+    if (old_type, new_type) == ('1dsep', '2dsep'):
+        axis = 'x' if old_x == new_x else ('y' if old_x == new_y else None)
+        if axis is None:
+            return None, "One of the 2dsep gate's parameters must be the 1dsep separation parameter."
+        for pop, meta in out.items():
+            sign = '+' if meta.get('region') == ag_core.REGION_ABOVE else '-'
+            k = 1 if axis == 'x' else 3
+            meta['region'] = ag_core.join_quadrants(q for q in ag_core.QUADRANT_REGIONS
+                                                    if q[k] == sign)
+        return out, ''
+    return out, ''
+
+
+# ---------------------------------------------------------------------------
+# Conversion proposals from the review events
+# ---------------------------------------------------------------------------
+
+# 1dsep gates on their parent's separation channel, from the review events:
+CENTRED_BELOW_ZERO = 0.40     # this much of the parent below raw zero: tail
+SPANS_ZERO_BELOW = 0.05       # at least this much below zero: best fit of FIT_ALGORITHMS
+REPLICATE_POSITIVE = 0.40     # less below zero and more drawn positive: replicate
+# A single drawn shape's axis whose edges leave out at most this share of
+# the parent's events within the shape's band on the other axis separates
+# nothing: the gate converts to 1dsep on the other axis.
+SEPARATES_MIN = 0.01
+FIT_ALGORITHMS = ('tail', 'mixture')
+# Candidates the shapes as drawn are fitted with: label → (algorithm, parameters).
+FIT_CANDIDATES = {
+    'tail': ('tail', {}),
+    'mixture': ('mixture', {'mixture_components': 2, 'mixture_cut': 'outer'}),
+    'mixture3_lower': ('mixture', {'mixture_components': 3, 'mixture_cut': 'lower'}),
+    'mixture3_upper': ('mixture', {'mixture_components': 3, 'mixture_cut': 'upper'}),
+}
+FIT_LABELS = {'tail': 'tail', 'mixture': 'mixture',
+              'mixture3_lower': 'mixture (3 components, lower cut)',
+              'mixture3_upper': 'mixture (3 components, upper cut)'}
+FIT_MAX_EVENTS = 10_000
+EVIDENCE_MIN_EVENTS = 50
+
+
+def _agreement(drawn: dict, calculated: dict) -> float | None:
+    """Mean over the drawn populations of the events in both / events in
+    the larger of drawn and calculated."""
+    scores = []
+    for pop, d in drawn.items():
+        c = calculated.get(pop)
+        if c is None:
+            scores.append(0.0)
+            continue
+        nd, nc = int(d.sum()), int(c.sum())
+        scores.append(float((c & d).sum()) / max(nd, nc) if max(nd, nc) else 1.0)
+    return float(np.mean(scores)) if scores else None
+
+
+def _shape_extent(gate_def: dict, pop: str, channel: str):
+    """(lo, hi) of population *pop*'s drawn shape on *channel*, or None."""
+    entry = (gate_def.get('template') or {}).get(pop) or {}
+    chans = list(entry.get('shape_channels') or [])
+    if channel not in chans:
+        return None
+    k = chans.index(channel)
+    if entry.get('range') is not None and k == 0:
+        return float(entry['range'][0]), float(entry['range'][1])
+    coords = np.asarray(entry.get('boundary') or [], dtype=float)
+    if coords.ndim != 2 or coords.shape[1] <= k or not len(coords):
+        return None
+    return float(coords[:, k].min()), float(coords[:, k].max())
+
+
+def axis_cuts(gate_def: dict, parent: np.ndarray, index: dict) -> dict:
+    """{axis: share of the parent's events within the drawn shape's band on
+    the other axis that the shape's edges on this axis leave out}, for a
+    2dsep gate drawn as a single shape; {} otherwise."""
+    if gate_def.get('gate_type') != '2dsep' or len(gate_def.get('populations') or {}) != 1 \
+            or not has_drawn_shape(gate_def):
+        return {}
+    pop = next(iter(gate_def['populations']))
+    chans = {a: ag_core.axis_channel(gate_def, a) for a in ('x', 'y')}
+    ext = {a: _shape_extent(gate_def, pop, ch) for a, ch in chans.items()}
+    if any(e is None for e in ext.values()) or any(ch not in index for ch in chans.values()):
+        return {}
+    inside = {a: (parent[:, index[chans[a]]] >= ext[a][0]) & (parent[:, index[chans[a]]] <= ext[a][1])
+              for a in ('x', 'y')}
+    out = {}
+    for a, other in (('x', 'y'), ('y', 'x')):
+        band = inside[other]
+        if int(band.sum()) >= 20:
+            out[a] = 1.0 - float(inside[a][band].mean())
+    return out
+
+
+def separating_axis_dropped(gate_def: dict, parent: np.ndarray, index: dict) -> str | None:
+    """The axis of a single-shape 2dsep gate that separates nothing (see
+    axis_cuts and SEPARATES_MIN), or None. When both qualify, the one
+    leaving out fewer events."""
+    cuts = axis_cuts(gate_def, parent, index)
+    if len(cuts) != 2:
+        return None
+    axis = min(cuts, key=cuts.get)
+    return axis if cuts[axis] <= SEPARATES_MIN else None
+
+
+def without_axis(gate_def: dict, axis: str) -> dict:
+    """Copy of a 2dsep gate as a 1dsep gate separating on its other axis,
+    drawn against the dropped one on the same plot axes. Populations keep
+    their names and sides; per-axis parameters of the kept axis become the
+    1dsep's."""
+    keep = 'y' if axis == 'x' else 'x'
+    sep, view = ag_core.axis_channel(gate_def, keep), ag_core.axis_channel(gate_def, axis)
+    pops, reason = convert_threshold_regions(gate_def.get('populations') or {}, '2dsep',
+                                             gate_def.get('gate_marker_x'),
+                                             gate_def.get('gate_marker_y'), '1dsep', sep, view)
+    if pops is None:
+        raise ValueError(reason)
+    out = deepcopy(gate_def)
+    out.update(gate_type='1dsep', gate_marker_x=sep, gate_marker_y=view, sep_axis=keep,
+               populations=pops)
+    gp = out.get('gate_param') or {}
+    new_gp = {k: v for k, v in gp.items()
+              if not (k.endswith('_x') or k.endswith('_y')) and k != 'algorithm'}
+    for key in ('tail_fraction', 'mixture_components', 'axis_lo', 'axis_hi'):
+        if f'{key}_{keep}' in gp:
+            new_gp[key] = gp[f'{key}_{keep}']
+    if isinstance(gp.get(f'replicate_{keep}'), dict):
+        new_gp['replicate_x'] = deepcopy(gp[f'replicate_{keep}'])
+    out['gate_param'] = new_gp
+    if gp.get(f'algorithm_{keep}') and out.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
+        out['algorithm'] = gp[f'algorithm_{keep}']
+    return out
+
+
+_UNSET = object()
+
+
+def default_reference(gate_defs: list[dict], gate_def: dict, anchor=_UNSET) -> str | None:
+    """The anchor population (ag_core.anchor_population, or *anchor* when
+    the caller has it) when it lies above the population *gate_def* is
+    drawn on; None otherwise (a gate drawn on the anchor, above it or
+    beside it has no default reference)."""
+    if anchor is _UNSET:
+        anchor = ag_core.anchor_population(gate_defs)
+    if anchor is None:
+        return None
+    by_name = ag_core.gates_by_name(gate_defs)
+    g = by_name.get(gate_def.get('parent_gate'))
+    seen = set()
+    while g is not None and g['gate_name'] not in seen and g.get('parent_gate'):
+        seen.add(g['gate_name'])
+        if ag_core.population_key(g['parent_gate'], g.get('parent_popul') or 'root') == anchor:
+            return anchor
+        g = by_name.get(g['parent_gate'])
+    return None
+
+
+def _drawn_threshold(gate_def: dict) -> float | None:
+    """A 1dsep gate's drawn threshold on its separation channel: the lower
+    edge of the shapes on the positive side, else the upper edge of those
+    on the negative side."""
+    ch = gate_def.get('gate_marker_x')
+    regions = ag_core.population_regions(gate_def)
+    above = [_shape_extent(gate_def, p, ch) for p, r in regions.items() if r == ag_core.REGION_ABOVE]
+    below = [_shape_extent(gate_def, p, ch) for p, r in regions.items() if r == ag_core.REGION_BELOW]
+    if above and None not in above:
+        return min(e[0] for e in above)
+    if below and None not in below:
+        return max(e[1] for e in below)
+    return None
+
+
+def split_steps(gate_def: dict, names: dict | None = None) -> list[dict] | None:
+    """Steps for split_2dsep when a 2dsep gate has one population on a whole
+    side of one channel and one population in each quadrant on the other
+    side: that channel first, then the other on that side. Each step's
+    'algorithm' is 'tail' (the gates are proposed afresh after the split).
+    None for other layouts."""
+    if gate_def.get('gate_type') != '2dsep':
+        return None
+    regions = ag_core.population_regions(gate_def)
+    if len(regions) != 3:
+        return None
+    chans = {'x': gate_def.get('gate_marker_x'), 'y': gate_def.get('gate_marker_y')}
+    for a, b in (('x', 'y'), ('y', 'x')):
+        whole = [p for p, r in regions.items()
+                 if ag_core.region_sign(r, a) is not None and ag_core.region_sign(r, b) is None]
+        if len(whole) != 1:
+            continue
+        side = ag_core.region_sign(regions[whole[0]], a)
+        rest = [r for p, r in regions.items() if p != whole[0]]
+        if all(len(ag_core.region_quadrants(r)) == 1 and ag_core.region_sign(r, a) not in (None, side)
+               for r in rest) and len({ag_core.region_sign(r, b) for r in rest}) == 2:
+            return [{'channel': chans[a], 'algorithm': 'tail', 'view': chans[b], 'sep_axis': a},
+                    {'channel': chans[b], 'algorithm': 'tail', 'view': chans[a], 'sep_axis': b}]
+    return None
+
+
+def _apply_candidate(definition: dict, axis: str, label: str) -> None:
+    """Give one axis of a threshold gate the FIT_CANDIDATES entry *label*,
+    in place."""
+    algo, params = FIT_CANDIDATES[label]
+    gp = definition.setdefault('gate_param', {})
+    suffix = f'_{axis}' if definition.get('gate_type') == '2dsep' else ''
+    if suffix:
+        gp[f'algorithm_{axis}'] = algo
+    else:
+        definition['algorithm'] = algo
+    for key in ('mixture_components', 'mixture_cut'):
+        gp.pop(f'{key}{suffix}', None)
+    for key, value in params.items():
+        gp[f'{key}{suffix}'] = value
+
+
+def _fit_scores(gate_def: dict, parent: np.ndarray, index: dict, drawn: dict,
+                calc, candidates: dict) -> dict:
+    """{tuple of per-axis candidate labels: agreement with the drawn masks}
+    for every combination of *candidates* ({axis: [FIT_CANDIDATES labels]},
+    [None] for an axis kept as it is). Each candidate's thresholds are
+    calculated once; the combinations reuse them."""
+    import itertools
+    axes = list(candidates)
+    labels = sorted({lab for a in axes for lab in candidates[a] if lab})
+    thresholds = {}
+    for label in labels or [None]:
+        d = deepcopy(gate_def)
+        if d.get('gate_type') == '2dsep':
+            d['algorithm'] = 'tail'
+        for a in axes:
+            if label is not None and label in candidates[a]:
+                _apply_candidate(d, a, label)
+        try:
+            boundary = calc.calculate(parent, d, index)
+        except Exception:
+            boundary = {}
+        if boundary:
+            first = next(iter(boundary.values()))
+            thresholds[label] = {a: first.get(f'threshold_{a}') for a in axes}
+    if not thresholds:
+        return {}
+    any_t = next(iter(thresholds.values()))
+    out = {}
+    for combo in itertools.product(*(candidates[a] for a in axes)):
+        if any(lab is not None and lab not in thresholds for lab in combo):
+            continue
+        d = deepcopy(gate_def)
+        d['algorithm'] = 'tail'
+        gp = d.setdefault('gate_param', {})
+        for a, lab in zip(axes, combo):
+            t = (thresholds[lab] if lab is not None else any_t).get(a)
+            if t is None:
+                break
+            gp[f'fixed_threshold_{a}'] = float(t)
+        else:
+            try:
+                boundary = calc.calculate(parent, d, index)
+                masks = ag_core.population_masks(d, boundary, parent, index) if boundary else {}
+            except Exception:
+                masks = {}
+            score = _agreement(drawn, masks) if masks else None
+            if score is not None:
+                out[combo] = score
+    return out
+
+
+def conversion_evidence(gate_def: dict, gate_defs: list[dict], data: np.ndarray, index: dict,
+                        result, axis_limits: dict | None, zeros: dict, anchor=_UNSET) -> dict:
+    """What the review events say about converting an imported gate.
+
+    *result* gates *data* with the hierarchy as reviewed (parent masks and
+    population masks); *zeros* is {channel: raw zero in display units}.
+    Returns {} when the gate has no drawn shape or too few parent events,
+    else a dict with:
+
+    definition        the gate the proposal applies to: the gate itself,
+                      or as 1dsep when an axis of a single drawn shape
+                      separates nothing (drop_axis);
+    drop_axis         that axis, or None;
+    positive          {axis: fraction of the parent on the positive side}
+                      of the shapes as drawn (positive_fractions);
+    below_zero        {axis: fraction of the parent below raw zero};
+    fit               {per-axis algorithm tuple: agreement with the shapes
+                      as drawn} over FIT_ALGORITHMS (2dsep gates, and 1dsep
+                      gates spanning zero but not centred on it);
+    reference         default reference population (default_reference)
+                      of a 1dsep gate, with reference_positive (its share
+                      on the positive side of the drawn threshold);
+    split             split_steps of a 2dsep gate, or None;
+    cell_side         for a scatter shape: CELL_SIDE_DEBRIS when most drawn
+                      events lie below the debris cut, else CELL_SIDE_CELLS.
+    """
+    name = gate_def['gate_name']
+    parent_mask = result.parent_masks.get(name) if result is not None else None
+    template = gate_def.get('template') or {}
+    if parent_mask is None or not ag_core.is_shape_boundary(template) \
+            or int(parent_mask.sum()) < EVIDENCE_MIN_EVENTS:
+        return {}
+    parent = data[parent_mask]
+    if len(parent) > FIT_MAX_EVENTS:
+        rng = np.random.default_rng(42)
+        parent = parent[np.sort(rng.choice(len(parent), FIT_MAX_EVENTS, replace=False))]
+    if any(ch not in index for ch in ag_core.shape_channels(gate_def)):
+        return {}
+    drawn = ag_core.population_masks(gate_def, template, parent, index, axis_limits=axis_limits)
+    evidence = {'definition': gate_def, 'drop_axis': None, 'n': int(parent_mask.sum())}
+    gate_type = gate_def.get('gate_type')
+    if gate_type == 'free':
+        gp = gate_def.get('gate_param') or {}
+        d = 1 if gp.get('debris_axis') == 'y' else 0
+        chans = ag_core.shape_channels(gate_def)
+        if len(chans) == 2 and drawn:
+            col = parent[:, index[chans[d]]]
+            cut = ag_core.debris_cut(ag_core.trim_quantiles(col, float(gp.get('quantile_trim', 0.001))),
+                                     float(gp.get('debris_density', 0.05)))
+            inside = np.any(np.stack(list(drawn.values())), axis=0)
+            if inside.any():
+                below = float((col[inside] < cut).mean())
+                evidence['cell_side'] = (ag_core.CELL_SIDE_DEBRIS if below > 0.5
+                                         else ag_core.CELL_SIDE_CELLS)
+        return evidence
+    if gate_type not in ag_core.THRESHOLD_TYPES:
+        return evidence
+    definition = gate_def
+    drop = separating_axis_dropped(gate_def, parent, index)
+    if drop is not None:
+        try:
+            definition = without_axis(gate_def, drop)
+            evidence['drop_axis'] = drop
+        except ValueError:
+            definition = gate_def
+    evidence['definition'] = definition
+    fractions = {p: float(m.mean()) for p, m in drawn.items()}
+    evidence['positive'] = positive_fractions(definition, fractions)
+    below = {}
+    for axis in ag_core.threshold_axes(definition):
+        ch = ag_core.axis_channel(definition, axis)
+        if ch in index and ch in zeros:
+            below[axis] = float((parent[:, index[ch]] < float(zeros[ch])).mean())
+    evidence['below_zero'] = below
+    evidence['split'] = split_steps(definition)
+    calc = ag_core.GateCalculator(axis_limits)
+    gp = definition.get('gate_param') or {}
+    if definition.get('gate_type') == '2dsep':
+        candidates = {a: ([None] if gp.get(f'algorithm_{a}') else list(FIT_CANDIDATES))
+                      for a in ('x', 'y')}
+        if ag_core.ALGORITHM_REPLICATE not in (gp.get('algorithm_x'), gp.get('algorithm_y')):
+            evidence['fit'] = _fit_scores(definition, parent, index, drawn, calc, candidates)
+    else:
+        b0 = below.get('x')
+        if b0 is not None and SPANS_ZERO_BELOW <= b0 < CENTRED_BELOW_ZERO:
+            evidence['fit'] = _fit_scores(definition, parent, index, drawn, calc,
+                                          {'x': list(FIT_CANDIDATES)})
+        ref = default_reference(gate_defs, definition, anchor)
+        threshold = _drawn_threshold(definition)
+        ch = definition.get('gate_marker_x')
+        if ref is not None and threshold is not None and ch in index:
+            mask = result.population_mask(*ag_core.split_population_key(ref))
+            if mask is not None and int(mask.sum()) >= EVIDENCE_MIN_EVENTS:
+                evidence['reference'] = ref
+                evidence['reference_positive'] = float((data[mask, index[ch]] >= threshold).mean())
+    return evidence
+
+
+def evidence_axes(evidence: dict) -> dict:
+    """{axis: (algorithm, reason, parameters)} the rules propose for the
+    gate in evidence['definition'] (see conversion_evidence); {} when the
+    evidence does not cover it. *parameters* are gate_param entries for the
+    axis without suffix (e.g. mixture_components and mixture_cut of a
+    3-component mixture).
+
+    1dsep: tail when at least CENTRED_BELOW_ZERO of the parent lies below
+    zero; the better fit of FIT_ALGORITHMS to the shapes as drawn when at
+    least SPANS_ZERO_BELOW does; replicate (from the default reference
+    population) when less does and more than REPLICATE_POSITIVE of the
+    parent is drawn positive; otherwise the 25% rule (histogram_proposal).
+    2dsep: the best-fitting combination of FIT_ALGORITHMS, else the 25% rule
+    per axis.
+    """
+    d = evidence.get('definition')
+    if not d or d.get('gate_type') not in ag_core.THRESHOLD_TYPES:
+        return {}
+    pos = evidence.get('positive') or {}
+    fit = evidence.get('fit') or {}
+
+    def by_rule(axis):
+        f = pos.get(axis)
+        if f is None:
+            return None
+        import ag_flowjo
+        algo = ag_flowjo.histogram_algorithm(f)
+        return algo, f"{100 * f:.1f}% of the parent drawn positive", {}
+
+    def fitted(label, why):
+        algo, params = FIT_CANDIDATES[label]
+        return algo, f"{why}best fit to the shapes as drawn: {FIT_LABELS[label]}", dict(params)
+
+    if d.get('gate_type') == '2dsep':
+        if fit:
+            combo = max(fit, key=fit.get)
+            why = f"agreement {fit[combo]:.2f}; "
+            return {a: fitted(lab, why) for a, lab in zip(('x', 'y'), combo) if lab is not None}
+        return {a: r for a in ('x', 'y') if (r := by_rule(a)) is not None}
+    b0 = (evidence.get('below_zero') or {}).get('x')
+    if b0 is None:
+        r = by_rule('x')
+        return {'x': r} if r else {}
+    if b0 >= CENTRED_BELOW_ZERO:
+        return {'x': ('tail', f"{100 * b0:.0f}% of the parent below zero (centred on zero)", {})}
+    if b0 >= SPANS_ZERO_BELOW:
+        if fit:
+            combo = max(fit, key=fit.get)
+            return {'x': fitted(combo[0], f"{100 * b0:.0f}% of the parent below zero; agreement "
+                                          f"{fit[combo]:.2f}; ")}
+        r = by_rule('x')
+        return {'x': r} if r else {}
+    f = pos.get('x')
+    if f is not None and f > REPLICATE_POSITIVE and evidence.get('reference'):
+        return {'x': (ag_core.ALGORITHM_REPLICATE,
+                      f"{100 * f:.0f}% of the parent drawn positive and {100 * b0:.1f}% below "
+                      "zero: its own events cannot place the threshold", {})}
+    r = by_rule('x')
+    return {'x': r} if r else {}
+
+
+def reference_algorithm(evidence: dict) -> str:
+    """Algorithm the anchor population calculates a replicated threshold
+    with: the 25% rule on its share above the drawn threshold."""
+    import ag_flowjo
+    return ag_flowjo.histogram_algorithm(evidence.get('reference_positive'))
+
+
+def proposed_definition(gate_def: dict, recommendation: str | None = None,
+                        positive_fraction=None, evidence: dict | None = None) -> dict:
+    """The trainable gate an imported gate converts to: as 1dsep when the
+    evidence drops an axis, with the proposed algorithms (an axis chosen by
+    hand keeps its choice), a default reference population for a proposed
+    replicate axis without a source (marked 'default', to be confirmed),
+    and the debris side for a scatter shape drawn on the debris. A gate no
+    longer imported is returned as it is (a copy)."""
+    if gate_def.get('algorithm') != ag_core.ALGORITHM_IMPORTED:
+        return deepcopy(gate_def)
+    evidence = evidence or {}
+    base = gate_def
+    if evidence.get('drop_axis') and gate_def.get('gate_type') == '2dsep':
+        try:
+            base = without_axis(gate_def, evidence['drop_axis'])
+        except ValueError:
+            base = gate_def
+    axes = proposed_axis_algorithms(gate_def, recommendation, positive_fraction, evidence)
+    algorithm = axes.get('x') or convert_target(gate_def, recommendation, positive_fraction,
+                                                evidence)[0]
+    out = trainable_definition(dict(base, algorithm=ag_core.ALGORITHM_IMPORTED), algorithm, axes)
+    gp = out.setdefault('gate_param', {})
+    ruled = evidence_axes(evidence) if evidence and gate_def.get('proposal_rule') in (
+        RULE_HISTOGRAM, RULE_FRACTION) else {}
+    suffix_of = (lambda a: f'_{a}') if out.get('gate_type') == '2dsep' else (lambda a: '')
+    for axis, algo in axes.items():
+        rule = ruled.get(axis)
+        if rule and rule[0] == algo:
+            for k, v in rule[2].items():
+                gp.setdefault(f'{k}{suffix_of(axis)}', v)
+        key = f'replicate_{axis}'
+        if algo == ag_core.ALGORITHM_REPLICATE and not isinstance(gp.get(key), dict) \
+                and evidence.get('reference'):
+            gp[key] = {'population': evidence['reference'],
+                       'algorithm': reference_algorithm(evidence), 'default': True}
+    if evidence.get('cell_side') and out.get('gate_type') == 'free' and 'cell_side' not in gp:
+        gp['cell_side'] = evidence['cell_side']
+    return out
+
+
+def apply_conversion(gate_def: dict, proposed: dict) -> None:
+    """Make an imported gate the trainable gate *proposed*
+    (proposed_definition), in place: type, channels, separation axis,
+    populations, parameters and algorithm. The shapes as drawn stay."""
+    for key in ('gate_type', 'gate_marker_x', 'gate_marker_y', 'sep_axis', 'populations',
+                'gate_param', 'algorithm'):
+        if key in proposed:
+            gate_def[key] = deepcopy(proposed[key])
+
+
+def default_source_axes(gate_def: dict) -> list[str]:
+    """Axes whose replicate source is a default reference population not
+    yet confirmed by the user."""
+    gp = gate_def.get('gate_param') or {}
+    return [a for a in ('x', 'y') if isinstance(gp.get(f'replicate_{a}'), dict)
+            and gp[f'replicate_{a}'].get('default')]
+
+
+def orphaned_by_populations(gate_defs: list[dict], gate_name: str, removed) -> list[str]:
+    """Gates drawn on one of the *removed* populations of *gate_name*."""
+    removed = set(removed)
+    return [g['gate_name'] for g in gate_defs
+            if g.get('parent_gate') == gate_name and g.get('parent_popul') in removed]
+
+
+def rename_populations(gate_defs: list[dict], gate_name: str, renames: dict,
+                       trained: dict | None = None) -> None:
+    """Rename populations of *gate_name* ({old: new}) everywhere, in place:
+    the gate's shapes as drawn, import record and trained boundaries, and
+    the parents, replicate sources and statistics parents of other gates."""
+    renames = {o: n for o, n in renames.items() if o != n}
+    if not renames:
+        return
+
+    def key(value):
+        gate, pop = ag_core.split_population_key(str(value))
+        if gate == gate_name and pop in renames:
+            return ag_core.population_key(gate_name, renames[pop])
+        return value
+
+    for g in gate_defs:
+        if g.get('gate_name') == gate_name:
+            for field in ('template', 'template_original'):
+                entries = g.get(field)
+                if isinstance(entries, dict):
+                    g[field] = {renames.get(p, p): e for p, e in entries.items()}
+            src = g.get('source') or {}
+            for field in ('populations', 'counts'):
+                if isinstance(src.get(field), dict):
+                    src[field] = {renames.get(p, p): v for p, v in src[field].items()}
+        if g.get('parent_gate') == gate_name and g.get('parent_popul') in renames:
+            g['parent_popul'] = renames[g['parent_popul']]
+        gp = g.get('gate_param') or {}
+        for axis in ('x', 'y'):
+            src = gp.get(f'replicate_{axis}')
+            if isinstance(src, dict) and src.get('population'):
+                src['population'] = key(src['population'])
+        sp = g.get('stats_parent')
+        if isinstance(sp, dict):
+            for k, v in list(sp.items()):
+                sp[k] = key(v)
+    if trained and isinstance(trained.get(gate_name), dict):
+        trained[gate_name] = {renames.get(p, p): e for p, e in trained[gate_name].items()}
+
+
 def _split_name(text: str) -> str:
     return str(text).replace('/', '∕').strip()
 
 
-def split_2dsep(gate_defs: list[dict], gate_name: str, steps: list[dict]) -> tuple[list[dict], list[str]]:
+def split_2dsep(gate_defs: list[dict], gate_name: str, steps: list[dict],
+                names: dict | None = None, keep_drawn: bool = False
+                ) -> tuple[list[dict], list[str]]:
     """Replace a 2dsep gate with sequential 1dsep gates.
 
     *steps* gives the order: two dicts with 'channel' (one of the gate's
     two channels), 'algorithm', 'view' (view channel or None for a
     histogram) and 'sep_axis'. The first step's gate separates the parent
-    population on its channel into '<channel>-' and '<channel>+'. On each
+    population on its channel into '<channel>-' and '<channel>+' (the
+    channel as named in *names*, e.g. its antigen, when given). On each
     side holding any of the 2dsep gate's populations, a second gate
     separates on the other channel; it carries those populations under
     their own names, so gates drawn on them keep their parent population
     and move to it. Per-axis parameters of the 2dsep gate
     (``algorithm_x``, ``tail_fraction_y``, …) go to the matching gate.
+
+    *keep_drawn* (for a gate with shapes as drawn): the new gates stay
+    imported, each population keeping its drawn shape (a side population
+    of the first gate is drawn as the convex hull of the shapes on that
+    side), with each step's algorithm as the proposal and the gate's
+    proposal rule.
 
     Returns (new gate definition list, names of the new gates); raises
     ValueError when a new name is taken or the steps do not match the gate.
@@ -370,7 +1042,8 @@ def split_2dsep(gate_defs: list[dict], gate_name: str, steps: list[dict]) -> tup
     def param_for(axis: str) -> dict:
         p = {'quantile_trim': params.get('quantile_trim', 0.001),
              'tail_fraction': float(params.get(f'tail_fraction_{axis}',
-                                               params.get('tail_fraction', 0.01))),
+                                               params.get('tail_fraction',
+                                                          ag_core.DEFAULT_TAIL_FRACTION))),
              'mixture_components': int(params.get(f'mixture_components_{axis}',
                                                   params.get('mixture_components', 2)))}
         for key in ('axis_lo', 'axis_hi'):
@@ -379,13 +1052,21 @@ def split_2dsep(gate_defs: list[dict], gate_name: str, steps: list[dict]) -> tup
                 p[key] = float(value)
         return p
 
-    def sign(region: str, axis: str) -> str:
-        return region[1] if axis == 'x' else region[3]
+    sign = ag_core.region_sign
 
     regions = ag_core.population_regions(g)
+    spanning = [p for p, r in regions.items() if sign(r, a_axis) is None]
+    if spanning:
+        raise ValueError(
+            f"{', '.join(repr(p) for p in spanning)} lies on both sides of "
+            f"{first['channel']}; separate on {second['channel']} first.")
     src = g.get('source') or {}
-    a = _split_name(first['channel'])
-    b = _split_name(second['channel'])
+    names = names or {}
+    a = _split_name(names.get(first['channel']) or first['channel'])
+    b = _split_name(names.get(second['channel']) or second['channel'])
+    drawn = keep_drawn and has_drawn_shape(g)
+    template = g.get('template') or {}
+    side_members: dict[str, list] = {}
     name_a = f"{gate_name} · {a}"
     side_pop = {'-': f"{a}-", '+': f"{a}+"}
     gate_a = {
@@ -406,6 +1087,18 @@ def split_2dsep(gate_defs: list[dict], gate_name: str, steps: list[dict]) -> tup
         pops = {p: r for p, r in regions.items() if sign(r, a_axis) == side}
         if not pops:
             continue
+        side_members[side] = list(pops)
+        whole = [p for p, r in pops.items() if sign(r, b_axis) is None]
+        if whole:
+            if len(pops) > 1:
+                raise ValueError(f"'{whole[0]}' covers the whole {a}{side} side, which other "
+                                 "populations of the gate share.")
+            p = whole[0]
+            meta = dict((g.get('populations') or {}).get(p) or {})
+            side_meta = gate_a['populations'].pop(side_pop[side])
+            gate_a['populations'][p] = dict(side_meta, label=meta.get('label', p))
+            moved[p] = name_a
+            continue
         name_b = f"{gate_name} · {b} ({a}{side})"
         populations = {}
         for p, r in pops.items():
@@ -424,6 +1117,9 @@ def split_2dsep(gate_defs: list[dict], gate_name: str, steps: list[dict]) -> tup
             'algorithm': second['algorithm'], 'gate_param': param_for(b_axis),
             'stats_parent': {}, 'origin_gate': None,
         }
+        if drawn:
+            gate_b['template'] = {p: dict(deepcopy(template[p]), region=meta['region'])
+                                  for p, meta in populations.items() if p in template}
         if src.get('populations'):
             gate_b['source'] = {
                 'origin': src.get('origin'), 'workspace': src.get('workspace'),
@@ -433,6 +1129,35 @@ def split_2dsep(gate_defs: list[dict], gate_name: str, steps: list[dict]) -> tup
                 'counts': {p: v for p, v in (src.get('counts') or {}).items() if p in populations},
             }
         new.append(gate_b)
+
+    if drawn:
+        entries = {}
+        for side, members in side_members.items():
+            pop = next((p for p in gate_a['populations'] if p in members), None) \
+                or side_pop[side]
+            region = gate_a['populations'][pop]['region']
+            if pop in template:
+                entries[pop] = dict(deepcopy(template[pop]), region=region)
+                continue
+            shapes = [np.asarray(template[p].get('boundary') or [], dtype=float)
+                      for p in members if p in template]
+            shapes = [c for c in shapes if c.ndim == 2 and len(c) >= 3]
+            if not shapes:
+                continue
+            first_entry = template[members[0]]
+            hull = ag_core._convex_hull_polygon(np.vstack(shapes))
+            if hull is None:
+                continue
+            entries[pop] = {'shape_channels': list(first_entry.get('shape_channels') or []),
+                            'boundary': hull, 'region': region, 'label': pop}
+        gate_a['template'] = entries
+        for d in new:
+            step = first if d is gate_a else second
+            d['proposed_algorithm'] = step['algorithm']
+            d['algorithm'] = ag_core.ALGORITHM_IMPORTED
+            d['proposal_rule'] = g.get('proposal_rule') or RULE_FRACTION
+            d['template_original'] = deepcopy(d.get('template') or {})
+            d['name_group'] = d['gate_name']
 
     taken = {d['gate_name'] for d in gate_defs if d['gate_name'] != gate_name}
     clash = [d['gate_name'] for d in new if d['gate_name'] in taken]
@@ -472,7 +1197,9 @@ SYNC_PARAM_KEYS = (
     'tail_fraction', 'tail_fraction_x', 'tail_fraction_y',
     'mixture_components', 'mixture_components_x', 'mixture_components_y',
     'axis_lo', 'axis_hi', 'axis_lo_x', 'axis_hi_x', 'axis_lo_y', 'axis_hi_y',
-    'quantile_trim', 'width_sd', 'debris_axis', 'debris_density', 'saturation_fraction',
+    'quantile_trim', 'width_sd', 'debris_axis', 'debris_density', 'edge_density',
+    'edge_density_x', 'edge_density_y', 'cell_side', 'saturation_fraction',
+    'mixture_cut', 'mixture_cut_x', 'mixture_cut_y',
 )
 
 
@@ -501,11 +1228,48 @@ def sync_members(gate_defs: list[dict], gate_name: str) -> list[dict]:
 
 def sync_fingerprint(gate_def: dict) -> str:
     """The gate's trainable configuration as a comparable string: its
-    algorithm and the gate_param keys in SYNC_PARAM_KEYS."""
+    algorithm and the gate_param keys in SYNC_PARAM_KEYS (a default
+    reference population counts as 'default', whichever it is)."""
     gp = gate_def.get('gate_param') or {}
-    return json.dumps({'algorithm': gate_def.get('algorithm'),
-                       'params': {k: gp[k] for k in SYNC_PARAM_KEYS if k in gp}},
+    params = {}
+    for k in SYNC_PARAM_KEYS:
+        if k not in gp:
+            continue
+        v = gp[k]
+        if isinstance(v, dict) and v.get('default'):
+            v = {'default': True, 'algorithm': v.get('algorithm')}
+        params[k] = v
+    return json.dumps({'algorithm': gate_def.get('algorithm'), 'params': params},
                       sort_keys=True, default=str)
+
+
+def _synced_params(gate_defs: list[dict], target: dict, tgp: dict, anchor=_UNSET) -> dict:
+    """*target*'s gate_param with the SYNC_PARAM_KEYS of *tgp*; a default
+    reference population becomes the target's own (default_reference)."""
+    gp = {k: v for k, v in (target.get('gate_param') or {}).items() if k not in SYNC_PARAM_KEYS}
+    for k in SYNC_PARAM_KEYS:
+        if k not in tgp:
+            continue
+        v = deepcopy(tgp[k])
+        if isinstance(v, dict) and v.get('default'):
+            ref = default_reference(gate_defs, target, anchor)
+            v = dict(v, population=ref) if ref else None
+        gp[k] = v
+    return gp
+
+
+def _source_gates(tgp: dict) -> set:
+    """Gates a configuration's replicate sources come from, leaving out
+    default reference populations (each gate has its own)."""
+    out = set()
+    for src in (tgp.get('replicate_x'), tgp.get('replicate_y')):
+        if not isinstance(src, dict) or src.get('default'):
+            continue
+        if src.get('gate'):
+            out.add(src['gate'])
+        elif src.get('population'):
+            out.add(ag_core.split_population_key(src['population'])[0])
+    return out
 
 
 def _user_set(gate_def: dict) -> bool:
@@ -553,11 +1317,8 @@ def apply_name_sync(gate_defs: list[dict], gate_name: str) -> tuple[list[str], s
     template = chosen[0]
     target = sync_fingerprint(template)
     tgp = template.get('gate_param') or {}
-    sources = {src.get('gate') for src in (tgp.get('replicate_x'), tgp.get('replicate_y'))
-               if isinstance(src, dict) and src.get('gate')}
-    sources |= {ag_core.split_population_key(src['population'])[0]
-                for src in (tgp.get('replicate_x'), tgp.get('replicate_y'))
-                if isinstance(src, dict) and src.get('population')}
+    sources = _source_gates(tgp)
+    anchor = _UNSET
     changed = []
     for m in members:
         if not _follows_sync(m):
@@ -567,9 +1328,9 @@ def apply_name_sync(gate_defs: list[dict], gate_name: str) -> tuple[list[str], s
         below = {m['gate_name']} | descendants(gate_defs, m['gate_name'])
         if sources & below:
             continue
-        gp = {k: v for k, v in (m.get('gate_param') or {}).items() if k not in SYNC_PARAM_KEYS}
-        gp.update({k: deepcopy(tgp[k]) for k in SYNC_PARAM_KEYS if k in tgp})
-        m['gate_param'] = gp
+        if anchor is _UNSET:
+            anchor = ag_core.anchor_population(gate_defs)
+        m['gate_param'] = _synced_params(gate_defs, m, tgp, anchor)
         m['algorithm'] = template.get('algorithm')
         m['sync_origin'] = SYNC_AUTO
         changed.append(m['gate_name'])
@@ -620,10 +1381,12 @@ def gates_below_population(gate_defs: list[dict], parent_gate, parent_pop: str) 
     return out
 
 
-def feed_forward(gate_defs: list[dict], gate_name: str) -> tuple[list[str], list[str]]:
+def feed_forward(gate_defs: list[dict], gate_name: str,
+                 everywhere: bool = False) -> tuple[list[str], list[str]]:
     """Give the gates that share *gate_name*'s name, type and channels and
-    lie below the population it is drawn on the same trainable
-    configuration (algorithm and the SYNC_PARAM_KEYS parameters), in place.
+    lie below the population it is drawn on (anywhere in the model with
+    *everywhere*) the same trainable configuration (algorithm and the
+    SYNC_PARAM_KEYS parameters), in place.
 
     The copies count as the user's choice (SYNC_USER). A gate is left
     alone when the configuration would make it replicate a threshold from
@@ -636,25 +1399,26 @@ def feed_forward(gate_defs: list[dict], gate_name: str) -> tuple[list[str], list
     if source is None or source.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
         return [], []
     key = _sync_key(source)
-    below = gates_below_population(gate_defs, source.get('parent_gate'),
-                                   source.get('parent_popul') or 'root') - {gate_name}
+    if everywhere:
+        scope = {g['gate_name'] for g in gate_defs} - {gate_name}
+    else:
+        scope = gates_below_population(gate_defs, source.get('parent_gate'),
+                                       source.get('parent_popul') or 'root') - {gate_name}
     tgp = source.get('gate_param') or {}
-    sources = {src.get('gate') for src in (tgp.get('replicate_x'), tgp.get('replicate_y'))
-               if isinstance(src, dict) and src.get('gate')}
-    sources |= {ag_core.split_population_key(src['population'])[0]
-                for src in (tgp.get('replicate_x'), tgp.get('replicate_y'))
-                if isinstance(src, dict) and src.get('population')}
+    sources = _source_gates(tgp)
+    anchor = _UNSET
     changed, skipped = [], []
     for g in ag_core.ordered_gate_defs(gate_defs):
         name = g['gate_name']
-        if name not in below or _sync_key(g) != key:
+        if name not in scope or _sync_key(g) != key:
             continue
         if sources & ({name} | descendants(gate_defs, name)):
             skipped.append(name)
             continue
         target = by_name[name]
-        gp = {k: v for k, v in (target.get('gate_param') or {}).items() if k not in SYNC_PARAM_KEYS}
-        gp.update({k: deepcopy(tgp[k]) for k in SYNC_PARAM_KEYS if k in tgp})
+        if anchor is _UNSET:
+            anchor = ag_core.anchor_population(gate_defs)
+        gp = _synced_params(gate_defs, target, tgp, anchor)
         if (target.get('algorithm') == source.get('algorithm')
                 and sync_fingerprint(dict(target, gate_param=gp)) == sync_fingerprint(target)):
             continue
@@ -714,12 +1478,15 @@ def descendants(gate_defs: list[dict], gate_name: str) -> set:
     return out
 
 
-def replicate_choices(gate_defs: list[dict], gate_name: str, axis: str) -> list[tuple]:
+def replicate_choices(gate_defs: list[dict], gate_name: str, axis: str,
+                      anchor=_UNSET) -> list[tuple]:
     """Sources a replicated threshold of *gate_name* on *axis* can come from,
     as (label, source) pairs: other threshold gates separating on the same
     channel (their threshold is copied), then the reference populations
-    (the threshold is calculated on their events). The gate itself and the
-    gates below it are left out, since they are calculated after it."""
+    (the threshold is calculated on their events), the anchor population
+    when it lies above the gate (default_reference) and the population the
+    axis replicates from now. The gate itself and the gates below it are
+    left out, since they are calculated after it."""
     by_name = ag_core.gates_by_name(gate_defs)
     g = by_name.get(gate_name)
     if g is None:
@@ -743,6 +1510,19 @@ def replicate_choices(gate_defs: list[dict], gate_name: str, axis: str) -> list[
         if gate in excluded:
             continue
         out.append((f"Reference population: {pop} ({gate})", {'population': key, 'algorithm': 'tail'}))
+    listed = {src.get('population') for _label, src in out}
+    anchor = default_reference(gate_defs, g, anchor)
+    current = (g.get('gate_param') or {}).get(f'replicate_{axis}')
+    extra = [anchor] + ([current.get('population')] if isinstance(current, dict) else [])
+    for key in extra:
+        if not key or key in listed:
+            continue
+        gate, pop = ag_core.split_population_key(key)
+        if gate in excluded:
+            continue
+        listed.add(key)
+        kind = "Anchor population" if key == anchor else "Population"
+        out.append((f"{kind}: {pop} ({gate})", {'population': key, 'algorithm': 'tail'}))
     return out
 
 
@@ -887,6 +1667,9 @@ def paste_gates(gate_defs: list[dict], clipboard: list[dict], target_gate, targe
         c['name_group'] = base
         c['gate_name'] = name
         c.pop('sync_origin', None)
+        for meta in (c.get('populations') or {}).values():
+            if isinstance(meta, dict):
+                meta.pop(ag_core.ANCHOR_FLAG, None)
         number += 1
         c['gate_number'] = number
         new.append(c)
@@ -944,3 +1727,87 @@ def rename_references(gate_defs: list[dict], old: str, new: str) -> None:
                     sp[k] = ag_core.population_key(new, pop)
                 elif v == old:
                     sp[k] = new
+
+
+# ---------------------------------------------------------------------------
+# Overlapping populations
+# ---------------------------------------------------------------------------
+
+def population_ancestors(gate_defs: list[dict]) -> dict:
+    """{(gate, pop): set of (gate, pop) populations above it}."""
+    by_name = ag_core.gates_by_name(gate_defs)
+    out: dict = {}
+
+    def above(gate_name: str, seen: set) -> set:
+        g = by_name.get(gate_name)
+        parent = g.get('parent_gate') if g else None
+        if not parent or parent in seen or parent not in by_name:
+            return set()
+        key = (parent, g.get('parent_popul'))
+        return {key} | above(parent, seen | {gate_name})
+
+    for g in gate_defs:
+        chain = above(g['gate_name'], set())
+        for pop in (g.get('populations') or {}):
+            out[(g['gate_name'], pop)] = chain
+    return out
+
+
+def overlapping_populations(gate_defs: list[dict], masks: dict, limit: float = OVERLAP_LIMIT,
+                            min_events: int = OVERLAP_MIN_EVENTS) -> list[tuple]:
+    """Populations defined twice in the hierarchy: ``[(a, b, share)]`` with
+    *a* and *b* ``(gate, pop)`` keys holding largely the same events
+    (*share*, the intersection over the union, at least *limit*) although
+    neither lies below the other.
+
+    Only populations that gates are drawn on (branches of the hierarchy,
+    not end-point marker gates) and that are distinct from every population
+    above them are compared: a population sharing at least
+    OVERLAP_SAME_AS_ANCESTOR of its events with one of its ancestors is
+    represented by that ancestor, so each population defined twice is
+    reported once rather than for every gate below it. Populations of one
+    gate are not compared, nor populations with fewer than *min_events*
+    events.
+
+    masks : {(gate, pop): boolean event mask}, all over the same events.
+    """
+    ancestors = population_ancestors(gate_defs)
+    parents = {(g.get('parent_gate'), g.get('parent_popul')) for g in gate_defs
+               if g.get('parent_gate')}
+    keys = [k for k, m in masks.items() if m is not None and int(np.count_nonzero(m)) >= min_events]
+    if len(keys) < 2:
+        return []
+    index = {k: i for i, k in enumerate(keys)}
+    mat = np.vstack([np.asarray(masks[k], dtype=np.float32) for k in keys])
+    sizes = mat.sum(axis=1)
+    inter = mat @ mat.T
+    union = sizes[:, None] + sizes[None, :] - inter
+    share = np.divide(inter, union, out=np.zeros_like(inter), where=union > 0)
+    distinct = np.array([k in parents and not any(
+        index.get(a) is not None and share[index[k], index[a]] >= OVERLAP_SAME_AS_ANCESTOR
+        for a in ancestors.get(k, ())) for k in keys])
+    out = []
+    rows, cols = np.nonzero(np.triu((share >= limit) & distinct[:, None] & distinct[None, :], k=1))
+    for i, j in zip(rows.tolist(), cols.tolist()):
+        a, b = keys[i], keys[j]
+        if a[0] == b[0] or a in ancestors.get(b, ()) or b in ancestors.get(a, ()):
+            continue
+        out.append((a, b, float(share[i, j])))
+    out.sort(key=lambda t: -t[2])
+    return out
+
+
+def overlap_flags(pairs: list[tuple]) -> dict:
+    """{gate: {'pairs': [[pop, other gate, other pop, share]], 'message'}}
+    from overlapping_populations, each pair listed under both gates."""
+    flags: dict = {}
+    for (ga, pa), (gb, pb), share in pairs:
+        for (g, p), (og, op) in (((ga, pa), (gb, pb)), ((gb, pb), (ga, pa))):
+            flags.setdefault(g, {'pairs': []})['pairs'].append([p, og, op, round(share, 4)])
+    for g, flag in flags.items():
+        parts = [f"'{p}' shares {100 * sh:.0f}% of its events with '{op}' ({og})"
+                 for p, og, op, sh in flag['pairs'][:5]]
+        more = len(flag['pairs']) - 5
+        flag['message'] = ("Overlap: " + "; ".join(parts)
+                           + (f"; and {more} more" if more > 0 else '') + ".")
+    return flags

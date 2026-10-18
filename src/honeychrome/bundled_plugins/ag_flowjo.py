@@ -77,6 +77,21 @@ ELLIPSE_VERTICES = ag_core.ELLIPSE_VERTICES   # ellipses import as polygons
 # A histogram gate whose population holds more than this fraction of its
 # parent is proposed 'mixture' instead of 'tail'.
 HISTOGRAM_MIXTURE_FREQUENCY = 0.25
+# Quadrant layout of sibling shapes drawn on two fluorescence parameters
+# (see _quadrant_layout): grid cells per axis over the shapes' extent, the
+# share of a quadrant a shape must cover to claim it, and how much more
+# mismatch (as a share of the drawn area) a one-parameter layout may have
+# than the best two-parameter one and still be preferred.
+LAYOUT_GRID = 80
+LAYOUT_MIN_COVER = 0.25
+LAYOUT_1D_TOLERANCE = 0.05
+LAYOUT_EMPTY_COVER = 0.1
+LAYOUT_TIE = 0.01
+LAYOUT_1D_MAX_EXTRA = 0.09
+# Weight of a quadrant cell given to a shape that does not cover it, against
+# a drawn cell given to another shape or none (drawn shapes seldom fill the
+# quadrant they select).
+LAYOUT_UNDRAWN_WEIGHT = 0.25
 
 
 def _ellipse_scale(n_points: int) -> float:
@@ -988,8 +1003,176 @@ def _plan_gate(grp: list[_Piece]) -> dict:
         k = fluor[0]
         return {'gate_type': '1dsep', 'sep': k,
                 'regions': [_region_1d(p.signs[k]) for p in grp], 'algorithm': 'mixture'}
+    layout = _quadrant_layout(grp) if len(grp) > 1 else None
+    if layout is not None:
+        return dict(layout, algorithm='mixture')
     return {'gate_type': '2dsep', 'sep': None,
             'regions': [f"x{p.signs[0]}y{p.signs[1]}" for p in grp], 'algorithm': 'mixture'}
+
+
+def _quadrant_layout(grp: list[_Piece]) -> dict | None:
+    """Thresholds and regions that best reproduce sibling shapes drawn on
+    two fluorescence parameters, or None when no layout gives every shape
+    a region of its own.
+
+    Over a grid on the shapes' joint extent, each pair of thresholds splits
+    the plot into quadrants; a quadrant goes to the shape covering most of
+    it when that shape covers at least LAYOUT_MIN_COVER of it and most of
+    what is drawn in it. A shape's
+    region is the union of its quadrants, so a shape spanning both sides of
+    a threshold (the x- side, or an L around another shape) keeps all of
+    it. The layout with the fewest mismatched cells (drawn but given to
+    another shape or none, plus LAYOUT_UNDRAWN_WEIGHT times those given but
+    not drawn) wins. The gate
+    separates on one parameter only (1dsep) when one threshold alone does
+    nearly as well (within LAYOUT_1D_TOLERANCE of the drawn area) and the
+    other does not leave two shapes wholly on opposite sides, or when
+    the other threshold separates no two shapes in a layout within
+    LAYOUT_TIE of the best and the one-parameter layout is within
+    LAYOUT_1D_MAX_EXTRA of it: no two shapes lie wholly on
+    opposite sides of it, and each shape's quadrants, mirrored across it,
+    are its own or left undrawn (less than LAYOUT_EMPTY_COVER of the
+    quadrant drawn).
+    """
+    from matplotlib.path import Path as MplPath
+    polys = [np.asarray(p.shape.get('boundary') or [], dtype=float) for p in grp]
+    if any(pl.ndim != 2 or len(pl) < 3 for pl in polys):
+        return None
+    pts = np.vstack(polys)
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    if not np.all(hi > lo):
+        return None
+    n = LAYOUT_GRID
+    cx = lo[0] + (np.arange(n) + 0.5) * (hi[0] - lo[0]) / n
+    cy = lo[1] + (np.arange(n) + 0.5) * (hi[1] - lo[1]) / n
+    gx, gy = np.meshgrid(cx, cy)
+    centres = np.column_stack([gx.ravel(), gy.ravel()])
+    cover = np.stack([MplPath(pl).contains_points(centres).reshape(n, n) for pl in polys])
+    drawn = cover.any(axis=0)
+    if not drawn.any() or not all(c.any() for c in cover):
+        return None
+    total = float(drawn.sum())
+
+    def cum(a):
+        out = np.zeros((n + 1, n + 1))
+        out[1:, 1:] = np.cumsum(np.cumsum(a, axis=0), axis=1)
+        return out
+
+    sums = [cum(c.astype(float)) for c in cover]
+    sum_drawn = cum(drawn.astype(float))
+
+    def box(c, r0, r1, c0, c1):
+        return c[r1, c1] - c[r0, c1] - c[r1, c0] + c[r0, c0]
+
+    def assign(cells):
+        """cells: {label: (r0, r1, c0, c1)} → (cost, {label: piece index})"""
+        cost, owner = 0.0, {}
+        for lab, (r0, r1, c0, c1) in cells.items():
+            area = (r1 - r0) * (c1 - c0)
+            if area <= 0:
+                continue
+            got = [box(sm, r0, r1, c0, c1) for sm in sums]
+            k = int(np.argmax(got))
+            in_drawn = box(sum_drawn, r0, r1, c0, c1)
+            if got[k] >= LAYOUT_MIN_COVER * area and got[k] >= 0.5 * in_drawn:
+                owner[lab] = k
+                cost += (in_drawn - got[k]) + LAYOUT_UNDRAWN_WEIGHT * (area - got[k])
+            else:
+                cost += in_drawn
+        return cost, owner
+
+    def quadrants(i, j):
+        return {'x-y-': (0, j, 0, i), 'x+y-': (0, j, i, n),
+                'x-y+': (j, n, 0, i), 'x+y+': (j, n, i, n)}
+
+    # Every pair of thresholds at once (same rules as assign).
+    gi, gj = np.meshgrid(np.arange(1, n), np.arange(1, n), indexing='ij')
+    zero, full = np.zeros_like(gi), np.full_like(gi, n)
+    total_cost = np.zeros(gi.shape)
+    claimed = np.zeros((len(grp),) + gi.shape, dtype=bool)
+    for r0, r1, c0, c1 in quadrants(gi, gj).values():
+        r0 = zero if np.isscalar(r0) else r0
+        r1 = full if np.isscalar(r1) else r1
+        c0 = zero if np.isscalar(c0) else c0
+        c1 = full if np.isscalar(c1) else c1
+        area = (r1 - r0) * (c1 - c0)
+        got = np.stack([box(sm, r0, r1, c0, c1) for sm in sums])
+        k = np.argmax(got, axis=0)
+        best_got = np.take_along_axis(got, k[None], axis=0)[0]
+        in_drawn = box(sum_drawn, r0, r1, c0, c1)
+        owned = ((area > 0) & (best_got >= LAYOUT_MIN_COVER * area)
+                 & (best_got >= 0.5 * in_drawn))
+        total_cost += np.where(owned, (in_drawn - best_got)
+                               + LAYOUT_UNDRAWN_WEIGHT * (area - best_got), in_drawn)
+        for p in range(len(grp)):
+            claimed[p] |= owned & (k == p)
+    valid = claimed.all(axis=0)
+    layouts = []
+    if valid.any():
+        floor = float(total_cost[valid].min())
+        for i, j in zip(*np.nonzero(valid & (total_cost <= floor + LAYOUT_TIE * total))):
+            cells = quadrants(int(gi[i, j]), int(gj[i, j]))
+            cost, owner = assign(cells)
+            layouts.append((cost, owner, cells))
+    best2 = min(layouts, key=lambda lay: lay[0]) if layouts else None
+    best1 = {}
+    for k_axis in (0, 1):
+        for i in range(1, n):
+            cells = ({'-': (0, n, 0, i), '+': (0, n, i, n)} if k_axis == 0
+                     else {'-': (0, i, 0, n), '+': (i, n, 0, n)})
+            cost, owner = assign(cells)
+            if len(set(owner.values())) == len(grp) and (
+                    k_axis not in best1 or cost < best1[k_axis][0]):
+                best1[k_axis] = (cost, owner, k_axis)
+
+    def splits(layout, axis_pos: int) -> bool:
+        """True when two shapes lie wholly on opposite sides of the
+        threshold of quadrant character *axis_pos* (1: x, 3: y)."""
+        sides: dict = {}
+        for q, k in layout[1].items():
+            sides.setdefault(k, set()).add(q[axis_pos])
+        return {next(iter(v)) for v in sides.values() if len(v) == 1} == {'+', '-'}
+
+    def redundant(layout, axis_pos: int) -> bool:
+        """True when the threshold of quadrant character *axis_pos* (1: x,
+        3: y) separates no two shapes in a two-parameter layout."""
+        _c, owner, cells = layout
+        if splits(layout, axis_pos):
+            return False
+        for q, k in owner.items():
+            m = q[:axis_pos] + ('+' if q[axis_pos] == '-' else '-') + q[axis_pos + 1:]
+            if owner.get(m, k) != k:
+                return False
+            if m not in owner:
+                r0, r1, c0, c1 = cells[m]
+                area = (r1 - r0) * (c1 - c0)
+                if area and box(sum_drawn, r0, r1, c0, c1) >= LAYOUT_EMPTY_COVER * area:
+                    return False
+        return True
+
+    one_d = [best1[k] for k in (0, 1) if k in best1]
+    if best2 is not None:
+        near = layouts
+        allowed = [best1[k] for k, pos in ((0, 3), (1, 1))
+                   if k in best1 and best1[k][0] <= best2[0] + LAYOUT_1D_MAX_EXTRA * total
+                   and any(redundant(lay, pos) for lay in near)]
+        close = [best1[k] for k, pos in ((0, 3), (1, 1))
+                 if k in best1 and not splits(best2, pos)
+                 and best1[k][0] <= best2[0] + LAYOUT_1D_TOLERANCE * total]
+        one_d = allowed + close
+    if one_d:
+        _cost, owner, k_axis = min(one_d, key=lambda b: b[0])
+        regions = [None] * len(grp)
+        for side, k in owner.items():
+            regions[k] = _region_1d(side)
+        return {'gate_type': '1dsep', 'sep': k_axis, 'regions': regions}
+    if best2 is None:
+        return None
+    quads: list[list[str]] = [[] for _ in grp]
+    for q, k in best2[1].items():
+        quads[k].append(q)
+    return {'gate_type': '2dsep', 'sep': None,
+            'regions': [ag_core.join_quadrants(q) for q in quads]}
 
 
 def _group_siblings(pieces: list[_Piece], merge: bool) -> list[list[_Piece]]:
@@ -1087,11 +1270,17 @@ def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChann
       * a histogram (1-D) gate → 1dsep with a histogram view; 'tail', or
         'mixture' when its positive population held more than 25% of the
         parent in the recorded counts (``proposal_rule`` 'histogram' lets
-        the Review tab apply the rule to the review sample when no counts
+        the Hierarchy tab apply the rule to the review sample when no counts
         were recorded);
       * a single gate on a pair → 1dsep separating on the fluorescence
         parameter when the other is scatter, 2dsep when both are
         fluorescence; 'mixture';
+      * threshold gates other than histograms are proposed 'mixture' with
+        ``proposal_rule`` 'fraction': on the Hierarchy tab each axis takes
+        'mixture' when the shapes as drawn hold more than 25% of the parent
+        on its positive side in the review samples, else 'tail' (the
+        histogram rule on every axis; the workspace's counts are not used,
+        as a template's group counts do not describe the samples);
       * an area against height or width gate of the same scatter detector →
         'singlets' (only the first moves to the top);
       * shapes drawn only on scatter parameters stay 'free'; proposed
@@ -1101,11 +1290,15 @@ def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChann
     many populations) are told apart by the population they are drawn on,
     'TIGIT+ (Tem)', adding the populations above it only when that is not
     enough, 'TIGIT+ (CD4+ › Tem)'; the shared name is kept in
-    ``name_group`` so the Review tab can treat them as replicates.
+    ``name_group`` so the Hierarchy tab can treat them as replicates.
 
     The side of a fluorescence parameter comes from the drawn coordinates:
     entirely above the channel's raw zero selects the positive side,
-    reaching zero or below selects the negative side.
+    reaching zero or below selects the negative side. Sibling shapes on two
+    fluorescence parameters instead take the quadrant layout that best
+    reproduces them (_quadrant_layout): a shape may take several quadrants
+    (a whole side, or an L around another shape), and a parameter that
+    separates no two shapes is dropped (1dsep on the other).
 
     native_display : the source's coordinates are already Honeychrome display
               units (see source_from_gating), so no transform is applied.
@@ -1163,6 +1356,8 @@ def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChann
                 gdef['proposed_algorithm'] = histogram_algorithm(
                     _histogram_positive_fraction(grp, gplan, parent_count))
                 gplan = dict(gplan, algorithm=gdef['proposed_algorithm'])
+            elif gdef['gate_type'] in ag_core.THRESHOLD_TYPES:
+                gdef['proposal_rule'] = 'fraction'
             elif gdef['gate_type'] == 'free':
                 gdef['gate_param']['debris_axis'] = _forward_scatter_axis(grp[0].channels, exp)
             gdef['source'] = {
@@ -1353,9 +1548,10 @@ _NUMBERED = re.compile(r'^(.*\S) \((\d+)\)$')
 def upgrade_gate_definitions(gate_defs: list[dict]) -> int:
     """Bring gates imported before the current rules up to date, in place,
     without renaming them: the shared imported name (``name_group``, the
-    name without a ' (2)' style suffix), the histogram rule on gates still
-    as drawn, and 'cells' as the proposal for scatter shapes. Returns the
-    number of gates changed."""
+    name without a ' (2)' style suffix), the histogram rule on histogram
+    gates still as drawn and the fraction rule on other threshold gates
+    still as drawn with the import's proposal, and 'cells' as the proposal
+    for scatter shapes. Returns the number of gates changed."""
     changed = 0
     for g in gate_defs:
         before = (g.get('name_group'), g.get('proposal_rule'), g.get('proposed_algorithm'),
@@ -1379,6 +1575,9 @@ def upgrade_gate_definitions(gate_defs: list[dict]) -> int:
             elif parent and below and None not in below:
                 frac = 1.0 - sum(below) / float(parent)
             g['proposed_algorithm'] = histogram_algorithm(frac)
+        elif imported and g.get('gate_type') in ag_core.THRESHOLD_TYPES \
+                and not g.get('proposal_rule') and g.get('proposed_algorithm') in (None, 'mixture'):
+            g['proposal_rule'] = 'fraction'
         if g.get('gate_type') == 'free' and g.get('proposed_algorithm') in (None, 'ellipse'):
             g['proposed_algorithm'] = 'cells'
             g.setdefault('gate_param', {}).setdefault('debris_axis', 'x')
