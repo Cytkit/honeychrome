@@ -1187,8 +1187,8 @@ class Controller(QObject):
 
     @Slot(str, int)
     def on_gain_change(self, ch_name, value):
-        # store value in qsettings
-        s = settings.q_settings
+        # store value in instrument settings
+        s = settings.instrument_settings
         s.beginGroup('dac_channels')
         s.beginGroup(ch_name)
         s.setValue("bias", value)

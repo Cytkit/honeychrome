@@ -62,13 +62,14 @@ class GainsWidget(QWidget):
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(0, gain_range)
         slider.setValue(dac_bias_retrieved[ch_name])
-        slider.valueChanged.connect(lambda value: self.bus.gainChanged.emit(ch_name, value))
 
         # Spin box
         spinbox = QSpinBox()
         spinbox.setRange(0, gain_range)
         spinbox.setValue(dac_bias_retrieved[ch_name])
         spinbox.valueChanged.connect(slider.setValue)
+
+        slider.valueChanged.connect(lambda value: self.bus.gainChanged.emit(ch_name, value))
         slider.valueChanged.connect(spinbox.setValue)
 
         # Add widgets to layout

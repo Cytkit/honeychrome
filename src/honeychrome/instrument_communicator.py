@@ -41,12 +41,6 @@ class Instrument(mp.Process):
                  pipe_connection=None, logging_queue=None):
         super().__init__(daemon=True)
 
-        # Route standard logs through the queue
-        import logging.handlers
-        qh = logging.handlers.QueueHandler(logging_queue)
-        self.logger = logging.getLogger(__name__)
-        self.logger.addHandler(qh)
-
         ### example
         # self.logger = logging.getLogger(__name__)
         # self.logger.info("************Worker logging message back to main process")
@@ -74,9 +68,17 @@ class Instrument(mp.Process):
         self.trace_n_points = trace_n_points
         self.stop_transfer = None
         self.thread = None
+        self.logging_queue = logging_queue
+        self.logger = None
 
 
     def run(self):
+        # Route standard logs through the queue
+        import logging.handlers
+        qh = logging.handlers.QueueHandler(self.logging_queue)
+        self.logger = logging.getLogger(__name__)
+        self.logger.addHandler(qh)
+
         self.find_and_connect_to_instrument()
 
         # initialise the things that can't be pickled
@@ -138,10 +140,7 @@ class Instrument(mp.Process):
         if self.thread:
             if self.thread.is_alive():
                 self.stop_transfer.set()
-                self.thread.join(0.1)
-                while self.thread.is_alive():
-                    self.logger.info('[Instrument driver] Waiting until transfer thread ends')
-                    time.sleep(0.25)
+                self.thread.join(timeout=5)
 
         time.sleep(1)
         self.disconnect_instrument()

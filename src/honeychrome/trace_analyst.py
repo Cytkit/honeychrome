@@ -68,7 +68,7 @@ def peak_measurements(tr, n_start, n_end, deltaT, area_indices, height_indices):
     baselines = np.zeros(len(tr))
     for ch in range(len(tr)):
         baseline_start = np.isnan(tr[ch]).argmin() + left_gap
-        baselines[ch] = tr[ch,baseline_start:n_start-gap].mean()
+        baselines[ch] = tr[ch,baseline_start:n_start-gap].mean() # todo error here if empty slice, then areas and heights will be nan
 
     traces_truncated_baseline_subtracted = tr[:,n_start:n_end] - baselines.reshape(-1,1)
     heights = np.max(traces_truncated_baseline_subtracted[height_indices,:], axis=1)
@@ -95,10 +95,8 @@ class TraceAnalyser(mp.Process):
         super().__init__(daemon=True)
 
         # Route standard logs through the queue
-        import logging.handlers
-        qh = logging.handlers.QueueHandler(logging_queue)
-        self.logger = logging.getLogger(__name__)
-        self.logger.addHandler(qh)
+        self.logging_queue = logging_queue
+        self.logger = None
 
         # pipe connection
         self.pipe_connection = pipe_connection
@@ -139,6 +137,11 @@ class TraceAnalyser(mp.Process):
         self.stop_analyser = None
 
     def run(self):
+        import logging.handlers
+        qh = logging.handlers.QueueHandler(self.logging_queue)
+        self.logger = logging.getLogger(__name__)
+        self.logger.addHandler(qh)
+
         # initialise the things that can't be pickled
         self.stop_analyser = threading.Event()
 

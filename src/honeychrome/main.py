@@ -164,7 +164,7 @@ def main():
     listener = None
 
     try:
-        configure_multiprocessing()
+        # configure_multiprocessing()
 
         # create experiments directory and plugins directory
         experiment_path = Path.home() / experiments_folder

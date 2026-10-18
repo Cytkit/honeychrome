@@ -1660,15 +1660,18 @@ class PluginWidget(QWidget):
                     self.set_instrument_state({'trigger': 'force'})
                 self.get_instrument_state(['test_capture_and_read_memory'])
 
-            baselines = {}
-            triggers = {}
-            for row, name in enumerate(adc_channels):
-                if self.trigger_table.is_enabled(row):
-                    pre = settings.capture_pre_trigger_retrieved[name]
-                    baselines[row] = np.median(self.traces_blob_np[:, row, :pre//2].reshape(-1))
-                    triggers[row] = baselines[row] + threshold * 1000 / settings.adc_scale_uv # convert mV to adc units
-                    self.trigger_table.set_level(row, triggers[row])
-            self.set_trigger_over_baseline_text.setText(f'Baselines: {[(adc_channels[row], baselines[row]) for row in baselines]} (ADC scale) + threshold: {threshold} mV = {[(adc_channels[row], triggers[row]) for row in triggers]} (ADC scale)')
+            if self.traces_blob_np is not None:
+                baselines = {}
+                triggers = {}
+                for row, name in enumerate(adc_channels):
+                    if self.trigger_table.is_enabled(row):
+                        pre = settings.capture_pre_trigger_retrieved[name]
+                        baselines[row] = np.median(self.traces_blob_np[:, row, :pre//2].reshape(-1))
+                        triggers[row] = baselines[row] + threshold * 1000 / settings.adc_scale_uv # convert mV to adc units
+                        self.trigger_table.set_level(row, triggers[row])
+                self.set_trigger_over_baseline_text.setText(f'Baselines: {[(adc_channels[row], baselines[row]) for row in baselines]} (ADC scale) + threshold: {threshold} mV = {[(adc_channels[row], triggers[row]) for row in triggers]} (ADC scale)')
+            else:
+                self.set_trigger_over_baseline_text.setText(f'Failed to capture traces.')
 
         else:
             self.set_trigger_over_baseline_text.setText(f'No trigger channels selected.')
