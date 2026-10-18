@@ -1462,6 +1462,13 @@ class Controller(QObject):
                 self.unmixed_event_data = apply_transfer_matrix(self.transfer_matrix, self.raw_event_data)
                 self.data_for_cytometry_plots['event_data'] = self.unmixed_event_data
 
+            # for Time transformation, set limits to observed data
+            if self.data_for_cytometry_plots['event_data'] is not None and len(self.data_for_cytometry_plots['event_data']):
+                transformation = self.data_for_cytometry_plots['transformations']['Time']
+                index = self.data_for_cytometry_plots['pnn'].index('Time')
+                upper_limit = self.data_for_cytometry_plots['event_data'][-1, index] * 1.05
+                transformation.set_transform(limits=[0, upper_limit])
+
             self.calc_hists_and_stats()
 
             # Calculate elapsed time and sleep precisely
