@@ -1575,7 +1575,7 @@ class PluginWidget(QWidget):
         self.alignment_camera = AlignmentCameraWidget(parent=self)
         layout.addWidget(self.alignment_camera)
         layout.addStretch()
-        toolbox.addTab(tab, "Alignment Camera")
+        toolbox.addTab(tab, "Camera")
 
 
         # Style the toolbox
@@ -1731,7 +1731,7 @@ class PluginWidget(QWidget):
             if response['message']['vi_monitors']:
                 for channel in monitor_dictionary:
                     for col, monitor_type in enumerate(['V', 'I']):
-                        value = response['message']['vi_monitors']['V'][channel]
+                        value = response['message']['vi_monitors'][monitor_type][channel]
                         self.vi_table.cellWidget(channel, col).setText(f'{value:0.2f}')
 
         if 'fan_state' in response['message']:

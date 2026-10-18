@@ -92,7 +92,7 @@ class TraceAnalyser(mp.Process):
                  oscilloscope_traces_queue=None,
                  pipe_connection=None,
                  logging_queue=None):
-        super().__init__()
+        super().__init__(daemon=True)
 
         # Route standard logs through the queue
         import logging.handlers

@@ -120,12 +120,17 @@ def setup_logging(log_file):
 
 
 def configure_multiprocessing():
-    if getattr(sys, 'frozen', False):
-        # Running as PyInstaller executable
-        mp.freeze_support()  # Required for Windows
-        # On Unix systems, also need:
-        if os.name == 'posix':
-            mp.set_start_method('spawn', force=True)
+    # Running as PyInstaller executable
+    mp.freeze_support()  # Required for Windows
+    # On Unix systems, also need:
+    if os.name == 'posix':
+        mp.set_start_method('spawn', force=True)
+    # if getattr(sys, 'frozen', False):
+    #     # Running as PyInstaller executable
+    #     mp.freeze_support()  # Required for Windows
+    #     # On Unix systems, also need:
+    #     if os.name == 'posix':
+    #         mp.set_start_method('spawn', force=True)
 
 def init_sentry():
     try:
@@ -152,180 +157,205 @@ def init_sentry():
 
 
 def main():
-    configure_multiprocessing()
+    traces_cache_shm = None
+    events_cache_shm = None
+    instrument = None
+    trace_analyser = None
+    listener = None
 
-    # create experiments directory and plugins directory
-    experiment_path = Path.home() / experiments_folder
-    experiment_path.mkdir(parents=True, exist_ok=True)
-    plugins_path = experiment_path / 'plugins'
-    plugins_path.mkdir(parents=True, exist_ok=True)
+    try:
+        configure_multiprocessing()
 
-    # copy plugin templates if they do not already exist in experiments/plugins folder
-    meipass = getattr(sys, '_MEIPASS', None)
-    if not meipass:
-        template_plugins_path = current_file_path.parent / "plugin_templates"
-        for template in template_plugins_path.glob("*_tab.py"):
-            destination = plugins_path / template.name
-            if not destination.exists():
-                shutil.copy2(template, destination)
+        # create experiments directory and plugins directory
+        experiment_path = Path.home() / experiments_folder
+        experiment_path.mkdir(parents=True, exist_ok=True)
+        plugins_path = experiment_path / 'plugins'
+        plugins_path.mkdir(parents=True, exist_ok=True)
 
-    logger = setup_logging(Path.home() / experiments_folder / 'honeychrome.log')
+        # copy plugin templates if they do not already exist in experiments/plugins folder
+        meipass = getattr(sys, '_MEIPASS', None)
+        if not meipass:
+            template_plugins_path = current_file_path.parent / "plugin_templates"
+            for template in template_plugins_path.glob("*_tab.py"):
+                destination = plugins_path / template.name
+                if not destination.exists():
+                    shutil.copy2(template, destination)
 
-    # # Log messages at different levels
-    # logger.debug("Debug message")  # Only to file
-    # logger.info("Info message")  # To both console and file
-    # logger.warning("Warning message")
-    # logger.error("Error message")
+        logger = setup_logging(Path.home() / experiments_folder / 'honeychrome.log')
 
-    # send debug data if setting is on
-    if q_settings_app_config.value("send_debug_data", send_debug_data, type=bool):
-        threading.Thread(target=init_sentry, daemon=True).start()
+        # # Log messages at different levels
+        # logger.debug("Debug message")  # Only to file
+        # logger.info("Info message")  # To both console and file
+        # logger.warning("Warning message")
+        # logger.error("Error message")
 
-        # # Test sentry
-        # try:
-        #     division_by_zero = 1 / 0
-        # except Exception as e:
-        #     # Manually send the caught exception to Sentry
-        #     sentry_sdk.capture_exception(e)
+        # send debug data if setting is on
+        if q_settings_app_config.value("send_debug_data", send_debug_data, type=bool):
+            threading.Thread(target=init_sentry, daemon=True).start()
 
-    '''
-    define objects for communication between processes
-    '''
-    from honeychrome.settings import traces_cache_size, traces_cache_dtype
-    from honeychrome.settings import max_events_in_cache, n_channels_per_event
-    import honeychrome.settings as settings
+            # # Test sentry
+            # try:
+            #     division_by_zero = 1 / 0
+            # except Exception as e:
+            #     # Manually send the caught exception to Sentry
+            #     sentry_sdk.capture_exception(e)
 
-    # Allocate shared memory block, plus head and tail indices
-    traces_cache_shm = shared_memory.SharedMemory(create=True, size=np.zeros(traces_cache_size, dtype=traces_cache_dtype).nbytes)
-    traces_cache_lock = Lock()
-    index_head_traces_cache = mp.Value('i', 0)
-    index_tail_traces_cache = mp.Value('i', 0)
+        '''
+        define objects for communication between processes
+        '''
+        from honeychrome.settings import traces_cache_size, traces_cache_dtype
+        from honeychrome.settings import max_events_in_cache, n_channels_per_event
+        import honeychrome.settings as settings
 
-    events_cache_shm = shared_memory.SharedMemory(create=True,
-                                                  size=np.zeros((max_events_in_cache, n_channels_per_event),
-                                                                dtype=np.int_).nbytes)
-    events_cache_lock = Lock()
-    index_head_events_cache = mp.Value('i', 0)
-    index_tail_events_cache = mp.Value('i', 0)
+        # Allocate shared memory block, plus head and tail indices
+        traces_cache_shm = shared_memory.SharedMemory(create=True, size=np.zeros(traces_cache_size, dtype=traces_cache_dtype).nbytes)
+        traces_cache_lock = Lock()
+        index_head_traces_cache = mp.Value('i', 0)
+        index_tail_traces_cache = mp.Value('i', 0)
 
-    # oscilloscope traces
-    oscilloscope_traces_queue = mp.Queue()
-    # command pipes
-    pipe_experiment_instrument_e, pipe_experiment_instrument_i = mp.Pipe()
-    pipe_experiment_analyser_e, pipe_experiment_analyser_a = mp.Pipe()
-    # logging queue
-    logging_queue = mp.Queue()
-    # Set up listener in the main process
-    listener = logging.handlers.QueueListener(logging_queue, logging.StreamHandler(), respect_handler_level=True)
-    listener.start()
+        events_cache_shm = shared_memory.SharedMemory(create=True,
+                                                      size=np.zeros((max_events_in_cache, n_channels_per_event),
+                                                                    dtype=np.int_).nbytes)
+        events_cache_lock = Lock()
+        index_head_events_cache = mp.Value('i', 0)
+        index_tail_events_cache = mp.Value('i', 0)
 
-    '''
-    start instrument driver
-    '''
-    instrument = Instrument(
-        use_dummy_instrument=settings.use_dummy_instrument_retrieved,
-        traces_cache_name=traces_cache_shm.name,
-        traces_cache_lock=traces_cache_lock,
-        index_head_traces_cache=index_head_traces_cache,
-        index_tail_traces_cache=index_tail_traces_cache,
-        pipe_connection=pipe_experiment_instrument_i,
-        logging_queue=logging_queue
-    )
-    instrument.start()
+        # oscilloscope traces
+        oscilloscope_traces_queue = mp.Queue()
+        # command pipes
+        pipe_experiment_instrument_e, pipe_experiment_instrument_i = mp.Pipe()
+        pipe_experiment_analyser_e, pipe_experiment_analyser_a = mp.Pipe()
+        # logging queue
+        logging_queue = mp.Queue()
+        # Set up listener in the main process
+        listener = logging.handlers.QueueListener(logging_queue, logging.StreamHandler(), respect_handler_level=True)
+        listener.start()
 
-    '''
-    start trace analyser
-    '''
-    trace_analyser = TraceAnalyser(
-        traces_cache_name=traces_cache_shm.name,
-        traces_cache_lock=traces_cache_lock,
-        index_head_traces_cache=index_head_traces_cache,
-        index_tail_traces_cache=index_tail_traces_cache,
-        events_cache_name=events_cache_shm.name,
-        events_cache_lock=events_cache_lock,
-        index_head_events_cache=index_head_events_cache,
-        index_tail_events_cache=index_tail_events_cache,
-        oscilloscope_traces_queue=oscilloscope_traces_queue,
-        pipe_connection=pipe_experiment_analyser_a,
-        logging_queue=logging_queue
-    )
-    trace_analyser.start()
+        '''
+        start instrument driver
+        '''
+        instrument = Instrument(
+            use_dummy_instrument=settings.use_dummy_instrument_retrieved,
+            traces_cache_name=traces_cache_shm.name,
+            traces_cache_lock=traces_cache_lock,
+            index_head_traces_cache=index_head_traces_cache,
+            index_tail_traces_cache=index_tail_traces_cache,
+            pipe_connection=pipe_experiment_instrument_i,
+            logging_queue=logging_queue
+        )
+        instrument.start()
 
-    '''
-    start controller
-    '''
-    controller = Controller(
+        '''
+        start trace analyser
+        '''
+        trace_analyser = TraceAnalyser(
+            traces_cache_name=traces_cache_shm.name,
+            traces_cache_lock=traces_cache_lock,
+            index_head_traces_cache=index_head_traces_cache,
+            index_tail_traces_cache=index_tail_traces_cache,
             events_cache_name=events_cache_shm.name,
             events_cache_lock=events_cache_lock,
             index_head_events_cache=index_head_events_cache,
             index_tail_events_cache=index_tail_events_cache,
             oscilloscope_traces_queue=oscilloscope_traces_queue,
-            pipe_connection_instrument=pipe_experiment_instrument_e,
-            pipe_connection_analyser=pipe_experiment_analyser_e)
+            pipe_connection=pipe_experiment_analyser_a,
+            logging_queue=logging_queue
+        )
+        trace_analyser.start()
 
-    '''
-    start application and view
-    '''
-    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
-    app = QApplication(sys.argv)
+        '''
+        start controller
+        '''
+        controller = Controller(
+                events_cache_name=events_cache_shm.name,
+                events_cache_lock=events_cache_lock,
+                index_head_events_cache=index_head_events_cache,
+                index_tail_events_cache=index_tail_events_cache,
+                oscilloscope_traces_queue=oscilloscope_traces_queue,
+                pipe_connection_instrument=pipe_experiment_instrument_e,
+                pipe_connection_analyser=pipe_experiment_analyser_e)
 
-    if sys.platform == 'win32':
-        import ctypes
-        myappid = f'honeychrome.cytometry.v{__version__}'
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        '''
+        start application and view
+        '''
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+        app = QApplication(sys.argv)
 
-    # Use Fusion style (works consistently across platforms)
-    app.setStyle("Fusion")
-    # Ensure consistent rounding of fractional scaling factors
-    os.environ["QT_SCALE_FACTOR_ROUNDING_POLICY"] = "PassThrough"
+        if sys.platform == 'win32':
+            import ctypes
+            myappid = f'honeychrome.cytometry.v{__version__}'
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
-    # app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent / 'view_components' / 'assets' / 'cytkit_web_logo.ico')))
-    app.setWindowIcon(QIcon(logo_icon))
-    app.setDesktopFileName("honeychrome")
+        # Use Fusion style (works consistently across platforms)
+        app.setStyle("Fusion")
+        # Ensure consistent rounding of fractional scaling factors
+        os.environ["QT_SCALE_FACTOR_ROUNDING_POLICY"] = "PassThrough"
 
-    # # debug space usage by highlighting
-    # app.setStyleSheet("""
-    #     QMainWindow {
-    #         background-color: Maroon;
-    #     }
-    #     QWidget {
-    #             /* This background covers the Padding and Content area */
-    #             background-color: Indigo;
-    #     }
-    #     QWidget {
-    #         border: 1px solid green;
-    #     }
-    #     QFrame, QGroupBox {
-    #         background-color: Goldenrod;
-    #         border: 1px solid blue;
-    #     }
-    #     QScrollBar {
-    #         background: DarkOliveGreen; border: 1px solid red;
-    #     }
-    # """)
+        # app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent / 'view_components' / 'assets' / 'cytkit_web_logo.ico')))
+        app.setWindowIcon(QIcon(logo_icon))
+        app.setDesktopFileName("honeychrome")
 
-    view = View(
-        controller=controller
-    )
-    controller.bus = view.bus # connect signals coming from controller
+        # # debug space usage by highlighting
+        # app.setStyleSheet("""
+        #     QMainWindow {
+        #         background-color: Maroon;
+        #     }
+        #     QWidget {
+        #             /* This background covers the Padding and Content area */
+        #             background-color: Indigo;
+        #     }
+        #     QWidget {
+        #         border: 1px solid green;
+        #     }
+        #     QFrame, QGroupBox {
+        #         background-color: Goldenrod;
+        #         border: 1px solid blue;
+        #     }
+        #     QScrollBar {
+        #         background: DarkOliveGreen; border: 1px solid red;
+        #     }
+        # """)
 
-    '''
-    start QT application
-    '''
-    logger.info('***** Started Honeychrome *****')
-    exit_code = app.exec()
+        view = View(
+            controller=controller
+        )
+        controller.bus = view.bus # connect signals coming from controller
 
-    # end processes, free memory
-    logger.info('***** Quitting Honeychrome *****')
-    try:
+        '''
+        start QT application
+        '''
+        logger.info('***** Started Honeychrome *****')
+        exit_code = app.exec()
+
+        # end processes, free memory
+        logger.info('***** Quitting Honeychrome *****')
+
         controller.quit_instrument_quit_analyser()
         trace_analyser.join()
         instrument.join()
     finally:
-        traces_cache_shm.close()
-        events_cache_shm.close()
-        traces_cache_shm.unlink()
-        events_cache_shm.unlink()
+        if instrument is not None:
+            instrument.join(timeout=5)
+            if instrument.is_alive():
+                instrument.terminate();
+                instrument.join()
+        if trace_analyser is not None:
+            trace_analyser.join(timeout=5)
+            if trace_analyser.is_alive():
+                trace_analyser.terminate();
+                trace_analyser.join()
+        if traces_cache_shm is not None:
+            traces_cache_shm.close()
+            try:
+                traces_cache_shm.unlink()
+            except FileNotFoundError:
+                pass
+        if events_cache_shm is not None:
+            events_cache_shm.close()
+            try:
+                events_cache_shm.unlink()
+            except FileNotFoundError:
+                pass
         listener.stop()
 
     sys.exit(exit_code)

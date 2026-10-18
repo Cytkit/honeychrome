@@ -7,7 +7,7 @@ import numpy as np
 from honeychrome.instrument_driver_components.cytkit_components.adcs import ADCs
 from honeychrome.instrument_driver_components.cytkit_components.capture import Capture
 from honeychrome.instrument_driver_components.cytkit_components.capture_decoder import CaptureDecoder
-from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max, connection_direction
 from honeychrome.instrument_driver_components.cytkit_components.dacs import DACs
 from honeychrome.instrument_driver_components.cytkit_components.display import Display
 from honeychrome.instrument_driver_components.cytkit_components.ft4222communicator import Ft4222Communicator
@@ -214,7 +214,7 @@ class SamplePumpFlowRateGetter(Thread):
             reverse = -1 if self.sample_pump.get_reverse() else 1
             speed = self.sample_pump.get_speed()
             steps_per_microlitre = self.parent.sample_pump_steps_per_microlitre
-            self.flow_rate = enabled * reverse * speed / steps_per_microlitre *6 # factor 6 is for 60 seconds * 0.1 Hz
+            self.flow_rate = enabled * reverse * connection_direction * speed / steps_per_microlitre *6 # factor 6 is for 60 seconds * 0.1 Hz
             time.sleep(0.5)
 
 class LaserGetter(Thread):

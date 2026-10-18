@@ -39,7 +39,7 @@ class Instrument(mp.Process):
                  traces_cache_lock=None,
                  index_head_traces_cache=None, index_tail_traces_cache=None,
                  pipe_connection=None, logging_queue=None):
-        super().__init__()
+        super().__init__(daemon=True)
 
         # Route standard logs through the queue
         import logging.handlers
@@ -63,6 +63,7 @@ class Instrument(mp.Process):
         else:
             self.use_dummy_instrument = False
 
+        self.shm = None
         self.pipe_connection = pipe_connection
         self.index_head_traces_cache = index_head_traces_cache
         self.index_tail_traces_cache = index_tail_traces_cache
@@ -88,8 +89,11 @@ class Instrument(mp.Process):
 
         # Attach to existing shared memory
         self.shm = shared_memory.SharedMemory(name=self.traces_cache_name)
+
         with self.traces_cache_lock:
             self.traces_cache = np.ndarray((self.max_events_in_traces_cache * self.trace_n_points), dtype=traces_cache_dtype, buffer=self.shm.buf)
+
+        assert self.traces_cache.nbytes <= self.shm.size, f"cache {self.traces_cache.nbytes} > shm {self.shm.size}"
 
         # main loop waiting for commands from experiment control
         while True:
@@ -208,6 +212,9 @@ class Instrument(mp.Process):
             return {'source': '[Instrument driver]', 'status': 'Error', 'message': {'initialised': None}}
 
     def start_acquisition(self):
+        if self.thread is not None and self.thread.is_alive():
+            return {'source': '[Instrument driver]', 'status': 'Error', 'message': 'acquisition already running'}
+
         status, message = self.device.start_acquisition()
         """Start transfer in a separate thread"""
         self.thread = threading.Thread(

@@ -1,6 +1,6 @@
 import time
 
-from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import min_speed, max_speed
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import min_speed, max_speed, connection_direction
 
 
 class SamplePump:
@@ -37,7 +37,7 @@ class SamplePump:
 
     def get_reverse(self):
         mask = 0b0000_0000_0001_0000
-        return self.ft4222.register_read('SMPMP_CTRL') & mask == 1
+        return self.ft4222.register_read('SMPMP_CTRL') & mask == mask
 
     def set_ramp(self, ramp):
         # ramp is bit 12
@@ -79,6 +79,7 @@ class SamplePump:
         return self.ft4222.register_2reg_read('SMPMP_CPC_L', 'SMPMP_CPC_H')
 
     def ramp_to(self, speed):
+        speed *= connection_direction
         reverse = speed < 0
         # guard against speed 0
         if speed == 0:
@@ -124,3 +125,23 @@ class SamplePump:
         self.set_speed(min_speed)
         time.sleep(0.1)
 
+
+if __name__ == '__main__':
+    from honeychrome.instrument_driver_components.cytkit_components.ft4222communicator import Ft4222Communicator
+    import honeychrome.settings as settings
+
+    # test connection and id
+    ft4222 = Ft4222Communicator()
+    print(ft4222.find_and_connect())
+
+    print('test sample pump')
+    sample_pump = SamplePump(ft4222)
+    sample_pump.stop()
+    sample_pump.set_steps_per_cycle(settings.sample_pump_steps_per_cycle)
+    sample_pump.set_clocks_per_cycle(settings.sample_pump_clocks_per_cycle)
+
+    sample_pump.ramp_to(20000)
+    time.sleep(10)
+    sample_pump.ramp_to(-20000)
+    time.sleep(1)
+    sample_pump.set_enable(False)
