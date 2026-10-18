@@ -152,6 +152,7 @@ from honeychrome.controller_components.functions import (
 from honeychrome.controller_components.sample_loader import (
     sample_key_for_path, snapshot_unmix_state,
 )
+from honeychrome.controller_components.particle_type import is_bead_sample
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.transform import Transform
 from honeychrome.view_components.ordered_multi_sample_picker import OrderedMultiSamplePicker
@@ -1709,6 +1710,18 @@ class ConfigTab(QWidget):
         events_row.addStretch()
         shared_layout.addLayout(events_row)
 
+        # Sample types offered as training samples (off by default)
+        self.include_unstained_chk = QCheckBox("Include unstained samples")
+        self.include_single_stain_chk = QCheckBox("Include single-stained controls")
+        self.include_beads_chk = QCheckBox("Include bead samples")
+        include_row = QHBoxLayout()
+        for chk in (self.include_unstained_chk, self.include_single_stain_chk,
+                    self.include_beads_chk):
+            chk.toggled.connect(self._on_training_pool_filter_changed)
+            include_row.addWidget(chk)
+        include_row.addStretch()
+        shared_layout.addLayout(include_row)
+
         # Training sample picker
         shared_layout.addWidget(QLabel("Training samples:"))
         self.picker = OrderedMultiSamplePicker(title="Choose Training Samples")
@@ -2251,6 +2264,37 @@ class ConfigTab(QWidget):
         """Keep state.training_sample_ids in sync with the picker."""
         self.state.training_sample_ids = list(ordered_list)
 
+    def training_pool_paths(self) -> list[str]:
+        """Samples offered for training, relative to the raw samples subdirectory.
+        A sample of an excluded type is offered only if one of its types is ticked."""
+        experiment = self.controller.experiment
+        raw_subdir = experiment.settings['raw']['raw_samples_subdirectory']
+        samples = experiment.samples
+        unstained = set(samples.get('unstained_samples', []))
+        single_stain = set(samples.get('single_stain_controls', []))
+        pool = []
+        for s, name in samples.get('all_samples', {}).items():
+            type_checks = []
+            if s in unstained:
+                type_checks.append(self.include_unstained_chk)
+            if s in single_stain:
+                type_checks.append(self.include_single_stain_chk)
+            if is_bead_sample(samples, s, name):
+                type_checks.append(self.include_beads_chk)
+            if type_checks and not any(chk.isChecked() for chk in type_checks):
+                continue
+            try:
+                pool.append(str(Path(s).relative_to(raw_subdir)))
+            except ValueError:
+                pool.append(s)
+        return pool
+
+    def _on_training_pool_filter_changed(self, *_):
+        """Rebuild the picker pool, keeping selected samples that are still offered."""
+        pool = self.training_pool_paths()
+        selected = [p for p in self.picker.get_ordered_list() if p in pool]
+        self.picker.set_items(pool, selected=selected)
+
     def _on_run_table_selection_changed(self):
         selected = self.run_table.selected_run_id() is not None
         self.delete_run_btn.setEnabled(selected)
@@ -2616,23 +2660,7 @@ class ConfigTab(QWidget):
 
         # Training sample picker — only if empty
         if not self.picker.get_ordered_list():
-            raw_subdir = self.controller.experiment.settings['raw'][
-                'raw_samples_subdirectory'
-            ]
-            all_samples = self.controller.experiment.samples.get('all_samples', {})
-            # Single stain controls should not be used as training samples
-            single_stain_controls = set(
-                self.controller.experiment.samples.get('single_stain_controls', [])
-            )
-            rel_paths = []
-            for s in all_samples:
-                if s in single_stain_controls:
-                    continue
-                try:
-                    rel_paths.append(str(Path(s).relative_to(raw_subdir)))
-                except ValueError:
-                    rel_paths.append(s)
-            self.picker.set_items(rel_paths)
+            self.picker.set_items(self.training_pool_paths())
 
         # Refresh DR and clustering status labels
         self._refresh_dr_status()
@@ -12235,6 +12263,13 @@ class PluginWidget(QWidget):
                 checked = {ch: cb.isChecked()
                            for ch, cb in self.config_tab.channel_checkboxes.items()}
                 s.setValue('config_channels_checked', repr(checked))
+            if hasattr(self.config_tab, 'include_unstained_chk'):
+                s.setValue('config_training_include_unstained',
+                           self.config_tab.include_unstained_chk.isChecked())
+                s.setValue('config_training_include_single_stain',
+                           self.config_tab.include_single_stain_chk.isChecked())
+                s.setValue('config_training_include_beads',
+                           self.config_tab.include_beads_chk.isChecked())
             if hasattr(self.config_tab, 'picker') and self.config_tab.picker.get_ordered_list():
                 s.setValue('config_training_samples',
                            self.config_tab.picker.get_ordered_list())
@@ -12598,6 +12633,11 @@ class PluginWidget(QWidget):
             # (restored above) directly.
             self._pending_channels_checked = s.value('config_channels_checked', '')
             self._pending_training_samples = _qs_list(s, 'config_training_samples')
+            self._pending_training_include = {
+                'unstained': _qs_bool(s, 'config_training_include_unstained', False),
+                'single_stain': _qs_bool(s, 'config_training_include_single_stain', False),
+                'beads': _qs_bool(s, 'config_training_include_beads', False),
+            }
             # Transform tab: restore biplot tile count and y-channels
             self._pending_tile_y_channels = _qs_list(
                 s, 'transform_biplot_y_channels')
@@ -13032,27 +13072,23 @@ class PluginWidget(QWidget):
             except Exception:
                 pass
 
+        include_pending = getattr(self, '_pending_training_include', None) or {}
+        if hasattr(self.config_tab, 'include_unstained_chk'):
+            for chk, key in ((self.config_tab.include_unstained_chk, 'unstained'),
+                             (self.config_tab.include_single_stain_chk, 'single_stain'),
+                             (self.config_tab.include_beads_chk, 'beads')):
+                if key in include_pending:
+                    chk.blockSignals(True)
+                    chk.setChecked(bool(include_pending[key]))
+                    chk.blockSignals(False)
+
         training = list(getattr(self, '_pending_training_samples', []) or [])
-        if training and hasattr(self.config_tab, 'picker'):
-            # Re-populate the picker with the saved selection order.
-            # We need the full pool first; re-derive it the same way ConfigTab.refresh does.
+        if ((training or any(include_pending.values()))
+                and hasattr(self.config_tab, 'picker')):
+            # Re-populate the picker with the saved selection order
             try:
-                raw_subdir = self.controller.experiment.settings['raw'][
-                    'raw_samples_subdirectory'
-                ]
-                all_samples = self.controller.experiment.samples.get('all_samples', {})
-                single_stain = set(
-                    self.controller.experiment.samples.get('single_stain_controls', [])
-                )
-                rel_paths = []
-                for s in all_samples:
-                    if s in single_stain:
-                        continue
-                    try:
-                        rel_paths.append(str(Path(s).relative_to(raw_subdir)))
-                    except ValueError:
-                        rel_paths.append(s)
-                # Only restore samples that are still present in the experiment
+                rel_paths = self.config_tab.training_pool_paths()
+                # Only restore samples that are still offered
                 valid_selected = [p for p in training if p in rel_paths]
                 self.config_tab.picker.set_items(rel_paths, selected=valid_selected)
             except Exception as e:

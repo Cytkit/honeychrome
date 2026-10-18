@@ -78,8 +78,9 @@ to include. Scatter channels are pre-unchecked by default, and
 <tt>Time</tt>/<tt>event_id</tt> are always excluded.</li>
 <li><b>Training events per sample</b> and <b>Training samples:</b>
 choose how many events to pool per sample and which samples contribute
-to training. Single-stain controls are automatically excluded from the
-picker.</li>
+to training. Unstained samples, single-stained controls and bead samples
+are left out of the picker unless the matching <i>Include</i> box above it
+is ticked.</li>
 </ul>
 
 <h4>2. Dimensionality Reduction</h4>
