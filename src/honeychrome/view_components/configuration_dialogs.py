@@ -13,7 +13,7 @@ from honeychrome.settings import (colourmap_choice, graphics_export_formats, his
                       use_dummy_instrument, magnitude_ceilings, magnitude_ceiling, raw_settings, unmixed_settings, experiments_folder,
                       magnitude_ceilings_int, spectral_positive_gate_percent, spectral_negative_gate_percent, report_include_raw, report_include_unmixed, report_include_process, send_debug_data,
                       heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral,
-                      spectral_cleaning_refine)
+                      spectral_cleaning_refine, auto_clean_controls)
 import honeychrome.settings as settings
 
 
@@ -258,6 +258,13 @@ class AppConfigDialog(QDialog):
             'After cleaning, re-measure each spectrum on the whole gated population of its control and '
             'check the full panel for residual spillover (robust fit).')
 
+        self.auto_clean_controls_cb = QCheckBox()
+        form.addRow("Control cleaning: clean automatically after Auto generate (new experiments):", self.auto_clean_controls_cb)
+        self.auto_clean_controls_cb.setToolTip(
+            'Default for the "Automatically Clean" box in new experiments. When ticked, "Auto generate spectral '
+            'controls" continues straight into Clean Controls, provided "Show AutoSpectral Cleaning" is ticked. '
+            'Each experiment can override this in the Spectral Process tab.')
+
         self.report_include_raw_cb = QCheckBox("Raw Data")
         self.report_include_unmixed_cb = QCheckBox("Unmixed Data")
         self.report_include_process_cb = QCheckBox("Spectral Process")
@@ -365,6 +372,7 @@ class AppConfigDialog(QDialog):
         self.spectral_cleaning_n_candidates_spin.setValue(self.settings.value("spectral_cleaning_n_candidates", spectral_cleaning_n_candidates, type=int))
         self.spectral_cleaning_n_spectral_spin.setValue(self.settings.value("spectral_cleaning_n_spectral", spectral_cleaning_n_spectral, type=int))
         self.spectral_cleaning_refine_cb.setChecked(self.settings.value("spectral_cleaning_refine", spectral_cleaning_refine, type=bool))
+        self.auto_clean_controls_cb.setChecked(self.settings.value("auto_clean_controls", auto_clean_controls, type=bool))
 
         self.report_include_raw_cb.setChecked(self.settings.value("report_include_raw", report_include_raw, type=bool))
         self.report_include_unmixed_cb.setChecked(self.settings.value("report_include_unmixed", report_include_unmixed, type=bool))
@@ -395,6 +403,7 @@ class AppConfigDialog(QDialog):
         self.settings.setValue("spectral_cleaning_n_candidates", self.spectral_cleaning_n_candidates_spin.value())
         self.settings.setValue("spectral_cleaning_n_spectral", self.spectral_cleaning_n_spectral_spin.value())
         self.settings.setValue("spectral_cleaning_refine", self.spectral_cleaning_refine_cb.isChecked())
+        self.settings.setValue("auto_clean_controls", self.auto_clean_controls_cb.isChecked())
         self.settings.setValue("report_include_raw", self.report_include_raw_cb.isChecked())
         self.settings.setValue("report_include_unmixed", self.report_include_unmixed_cb.isChecked())
         self.settings.setValue("report_include_process", self.report_include_process_cb.isChecked())
@@ -437,6 +446,7 @@ class AppConfigDialog(QDialog):
         self.spectral_cleaning_n_candidates_spin.setValue(spectral_cleaning_n_candidates)
         self.spectral_cleaning_n_spectral_spin.setValue(spectral_cleaning_n_spectral)
         self.spectral_cleaning_refine_cb.setChecked(spectral_cleaning_refine)
+        self.auto_clean_controls_cb.setChecked(auto_clean_controls)
         self.report_include_raw_cb.setChecked(report_include_raw)
         self.report_include_unmixed_cb.setChecked(report_include_unmixed)
         self.report_include_process_cb.setChecked(report_include_process)

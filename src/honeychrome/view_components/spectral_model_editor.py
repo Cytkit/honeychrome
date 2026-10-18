@@ -19,6 +19,7 @@ from honeychrome.controller_components.spectral_functions import sanitise_contro
 from honeychrome.controller_components.particle_type import is_bead_sample
 from honeychrome.view_components.icon_loader import icon
 from honeychrome.settings import spectral_model_column_labels, heading_style, INTERNAL_NEGATIVE_SENTINEL
+import honeychrome.settings as settings
 from honeychrome.view_components.busy_cursor import with_busy_cursor
 from honeychrome.view_components.help_toggle_widget import WheelBlocker, HelpToggleWidget
 from honeychrome.view_components.help_texts import autospectral_cleaning_help_text
@@ -277,6 +278,7 @@ class SpectralControlsEditor(QFrame):
         self.bus.spectralModelUpdated.connect(self.view.resizeToFit)
         self.bus.spectralModelUpdated.connect(self._sort_model_by_gate_channel)
         self._autogenerate_state = None  # set while auto-generation is holding warnings for one dialog
+        self._autoclean_warnings = None  # auto-generation warnings carried into the Clean Controls dialog
         self.bus.spectralProcessRefreshed.connect(self._on_autogenerate_refreshed)
         self.bus.spectralControlAdded.connect(self.view.resizeToFit) #extends the table as autogeneration runs... looks interesting but a bit wonky
         self.bus.sampleTreeUpdated.connect(self.refresh_comboboxes) # check for changes to unstained samples
@@ -446,6 +448,24 @@ class SpectralControlsEditor(QFrame):
             'scatter-matching and noise exclusion diagnostic plots.'
         )
 
+        self.auto_clean_checkbox = QCheckBox("Automatically Clean")
+        self.auto_clean_checkbox.setStyleSheet("""
+            QCheckBox {
+                font-size: 13pt;
+                spacing: 8px;
+                padding: 6px 0px;
+            }
+        """)
+        self.auto_clean_checkbox.setToolTip(
+            'Continue "Auto generate spectral controls" straight into Clean Controls,\n'
+            'refreshing the spectral process once at the end.\n'
+            'Needs "Show AutoSpectral Cleaning" and an unstained cell sample.\n'
+            'Saved with this experiment; the default for new experiments is in App Settings.'
+        )
+        auto_clean = self.controller.experiment.settings.get('auto_clean_controls')
+        self.auto_clean_checkbox.setChecked(settings.auto_clean_controls_retrieved if auto_clean is None else bool(auto_clean))
+        self.auto_clean_checkbox.setEnabled(False)  # follows Show AutoSpectral Cleaning
+
         self.cleaning_help_widget = HelpToggleWidget(
             title="Show Cleaning Help",
             text=autospectral_cleaning_help_text,
@@ -457,6 +477,7 @@ class SpectralControlsEditor(QFrame):
 
         # ---- Wiring ----
         self.activate_cleaning_checkbox.toggled.connect(self._on_activate_cleaning_toggled)
+        self.auto_clean_checkbox.toggled.connect(self._on_auto_clean_toggled)
 
         # ---- Main layout ----
         layout = QVBoxLayout()
@@ -465,7 +486,11 @@ class SpectralControlsEditor(QFrame):
         layout.addWidget(title)
         title.setStyleSheet(heading_style)
         layout.addWidget(QLabel("Note: editing this table resets unmixed cytometry (plots, gates and fine-tuning (spillover) matrix)"))
-        layout.addWidget(self.activate_cleaning_checkbox)
+        cleaning_row = QHBoxLayout()
+        cleaning_row.addWidget(self.activate_cleaning_checkbox)
+        cleaning_row.addWidget(self.auto_clean_checkbox)
+        cleaning_row.addStretch()
+        layout.addLayout(cleaning_row)
         layout.addWidget(self.cleaning_help_widget)
         layout.addLayout(btn_top_layout)
         layout.addWidget(self._bulk_neg_widget)
@@ -506,9 +531,15 @@ class SpectralControlsEditor(QFrame):
             self.cleaning_help_widget.help_label.setVisible(True)
             self.cleaning_help_widget.help_button.setText("Hide Help")
         self._set_cleaning_columns_visible(checked)
+        self.auto_clean_checkbox.setEnabled(checked)
         QSettings("honeychrome", "app_configuration").setValue("show_autospectral_cleaning", checked)
         if self.bus:
             self.bus.cleaningActivated.emit(checked)
+
+    def _on_auto_clean_toggled(self, checked: bool):
+        self.controller.experiment.settings['auto_clean_controls'] = checked
+        if self.bus:
+            self.bus.autoSaveRequested.emit()
 
     def _save_cleaning_help_state(self):
         # Called after toggle_help has already flipped the label, so isVisible()
@@ -1100,6 +1131,13 @@ class SpectralControlsEditor(QFrame):
                                              'or assign channels (for conventional cytometry).')
                 return
 
+        # continue into Clean Controls, with one spectral process refresh at the end
+        auto_clean = self.activate_cleaning_checkbox.isChecked() and self.auto_clean_checkbox.isChecked()
+        if auto_clean and not self._has_unstained_cell_sample():
+            auto_clean = False
+            if self.bus:
+                self.bus.statusMessage.emit('Automatic cleaning skipped: no unstained cell sample found.')
+
         # if user gets through all above, run spectral auto generator
         self.setEnabled(False)
         self.thread = QThread()
@@ -1111,19 +1149,32 @@ class SpectralControlsEditor(QFrame):
             preferred = None
         self.spectral_auto_generator = SpectralAutoGenerator(self.bus, self.controller,
                                                              preferred_unstained=preferred,
-                                                             previous_controls=previous_controls)
+                                                             previous_controls=previous_controls,
+                                                             defer_model_update=auto_clean)
 
         # Profile QC warnings raised by the recalculation are held and shown in one
         # dialog once the run has finished and the plots have been rebuilt.
         self.controller.warning_collector = []
-        self._autogenerate_state = {'finished': False, 'refreshed': False}
+        self._autogenerate_state = None if auto_clean else {'finished': False, 'refreshed': False}
         self.spectral_auto_generator.moveToThread(self.thread)
         self.bus.spectralControlAdded.connect(self._on_spectral_control_added_by_autogenerator)
         self.thread.started.connect(self.spectral_auto_generator.run)
-        self.bus.spectralModelUpdated.connect(self.thread.quit)
-        self.thread.finished.connect(self.refresh_table_and_enable)
-        self.thread.finished.connect(self._on_autogenerate_finished)
+        if auto_clean:
+            self.spectral_auto_generator.generationFinished.connect(self.thread.quit)
+            self.thread.finished.connect(self._clean_after_autogenerate)
+        else:
+            self.bus.spectralModelUpdated.connect(self.thread.quit)
+            self.thread.finished.connect(self.refresh_table_and_enable)
+            self.thread.finished.connect(self._on_autogenerate_finished)
         self.thread.start()
+
+    @Slot()
+    def _clean_after_autogenerate(self):
+        """Auto generation has ended without refreshing the spectral process: clean
+        the new controls. The recalculation after cleaning emits spectralModelUpdated
+        and shows the warnings of both steps in one dialog."""
+        self._autoclean_warnings = list(self.controller.warning_collector or [])
+        self._on_clean_controls()
 
     @Slot()
     def _on_autogenerate_finished(self):
@@ -1708,8 +1759,10 @@ class SpectralControlsEditor(QFrame):
             self.bus.cleaningResultsReady.emit()
         logger.info('SpectralControlsEditor: Clean Controls run complete.')
 
-        # One dialog for everything raised during the run
-        messages = list(self.spectral_cleaner.warnings)
+        # One dialog for everything raised during the run, auto generation included
+        title = 'Clean Controls:' if self._autoclean_warnings is None else 'Auto generate and Clean Controls:'
+        messages = (self._autoclean_warnings or []) + list(self.spectral_cleaner.warnings)
+        self._autoclean_warnings = None
         negative_labels = self.profile_updater.negative_profile_warnings or []
         self.profile_updater.negative_profile_warnings = None
         if negative_labels:
@@ -1728,7 +1781,7 @@ class SpectralControlsEditor(QFrame):
         if low_cosine_text:
             messages.append(low_cosine_text)
         if messages and self.bus:
-            self.bus.warningMessage.emit('Clean Controls:\n\n' + '\n\n'.join(messages))
+            self.bus.warningMessage.emit(title + '\n\n' + '\n\n'.join(messages))
 
     def _show_row_context_menu(self, position):
         """Right-click menu on a control row: save its spectrum to the Reference

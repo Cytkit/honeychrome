@@ -42,6 +42,8 @@ Now in the Spectral Process tab, generate your spectral controls (e.g. with the 
 
 Click "Show AutoSpectral Cleaning", which brings up the AutoSpectral control cleaning box and a workflow help guide. 
 
+Beside it, "Automatically Clean" makes "Auto generate spectral controls" continue straight into Clean Controls, so the cleaning below runs without a second click and the spectral model is only recalculated once. It is ticked by default in new experiments (the default can be changed in App Settings) and is saved with each experiment. Untick it to generate and clean separately.
+
 Two new columns are shown in the spectral controls table: "Use cleaned" and "Exclude Noise". The cleaned profiles are applied when you run Clean Controls. The noise removal is not checked by default, as it is not necessary for controls with low autofluorescence: run it first and see the results. Then consider applying noise removal to controls with high autofluorescence and re-running.
 
 You may now click "Clean Controls". The AutoSpectal cleaning pipeline will automatically proceed. Each control will be processed for:

@@ -147,7 +147,7 @@ autospectral_cleaning_help_text = '''
 <h4>Workflow</h4>
 <ol>
 <li><b>Set up the basic scatter gates in the Raw Data tab:</b> for ease of use, set broad gates that capture all events of interest, including large and small cells but not doublets. The cleaning pipeline will automatically select the relevant events for each control based on the positive gate and particle type.</li>
-<li><b>Run "Auto generate spectral controls":</b> do this in the Spectral Model Editor to set up the single stained controls, if you haven't already. This will add positive and negative gates to the raw gating for each control.</li>
+<li><b>Run "Auto generate spectral controls":</b> do this in the Spectral Model Editor to set up the single stained controls, if you haven't already. This will add positive and negative gates to the raw gating for each control. With "Automatically Clean" ticked (beside "Show AutoSpectral Cleaning"), the controls are then cleaned straight away, as in the "Clean Controls" step below; use "Clean Controls" to re-run cleaning after changing gates, negatives or particle types.</li>
 <li><b>Ensure that "Particle type" is set correctly for each control:</b> this determines the scatter-matching process. If particle type is incorrect, the cleaning will not work well.</li>
 <li><b>For best results, use "Unstained Negative" profiles (instead of "Internal Negatives":</b> these provide a more accurate negative reference for the spectral profiles than the default internal negatives.</li>
 <li><b>Assign unstained negatives:</b> Ensure each cell control has an "Unstained Negative" assigned in the table. Right-click a sample in the Sample panel and select "Mark as Unstained" to make it available as a negative reference.</li>

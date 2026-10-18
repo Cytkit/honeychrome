@@ -177,9 +177,10 @@ class Controller(QObject):
             self.experiment.load(template_path)
             logger.info(f'Controller: template loaded {template_path}')
             self.experiment.experiment_path = str(experiment_path)
-            self.experiment.save()
         else:
             self.experiment.create(experiment_path) # initialises and saves experiment
+        self.experiment.settings['auto_clean_controls'] = settings.auto_clean_controls_retrieved  # app default for new experiments
+        self.experiment.save()
 
         add_recent_file(experiment_path)
         self.experiment_dir = self.experiment.generate_subdirs()

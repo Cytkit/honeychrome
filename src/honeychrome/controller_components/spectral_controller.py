@@ -578,8 +578,10 @@ class ProfileUpdater:
         self.profiles.pop(label)
 
 class SpectralAutoGenerator(QObject):
+    generationFinished = Signal()
+
     def __init__(self, bus, controller, preferred_unstained: str | None = None,
-                 previous_controls: list[dict] | None = None):
+                 previous_controls: list[dict] | None = None, defer_model_update: bool = False):
         super().__init__()
 
         # connect
@@ -600,6 +602,8 @@ class SpectralAutoGenerator(QObject):
         self.experiment_dir = self.controller.experiment_dir
         self.preferred_unstained = preferred_unstained  # tube name hint from editor
         self.previous_controls = previous_controls or []  # model being replaced, for label restore
+        # caller cleans the controls next and emits spectralModelUpdated itself
+        self.defer_model_update = defer_model_update
 
         self.spectral_model.clear()
         self.profiles.clear()
@@ -656,7 +660,8 @@ class SpectralAutoGenerator(QObject):
         logger.info('SpectralAutoGenerator: regenerated spectral model and raw gating hierarchy:')
         logger.info(self.raw_gating.get_gate_hierarchy(output='ascii'))
 
-        if self.bus and self.negative_profile_warnings:
+        # with deferred update, profiles and gate counts are rechecked after cleaning
+        if self.bus and self.negative_profile_warnings and not self.defer_model_update:
             labels = ', '.join(f'"{label}"' for label in self.negative_profile_warnings)
             combined_warning = (
                 f'The following control(s) have a negative profile — the negative gate '
@@ -688,13 +693,15 @@ class SpectralAutoGenerator(QObject):
             )
 
         low_event_text = self.low_events.text()
-        if self.bus and low_event_text:
+        if self.bus and low_event_text and not self.defer_model_update:
             self._report_warning(low_event_text)
 
         if self.bus:
             self.bus.progress.emit(self.progress_target, self.progress_target)
-            self.bus.spectralModelUpdated.emit()
-            self.bus.showSelectedProfiles.emit([])
+            if not self.defer_model_update:
+                self.bus.spectralModelUpdated.emit()
+                self.bus.showSelectedProfiles.emit([])
+        self.generationFinished.emit()
 
     def _report_warning(self, text: str):
         """Hold the warning in the controller's collector when one is active, so the

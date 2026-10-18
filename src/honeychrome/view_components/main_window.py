@@ -368,7 +368,7 @@ class MainWindow(QMainWindow):
         # Restore cleaning UI state
         from PySide6.QtCore import QSettings as _QSettings
         _qs = _QSettings("honeychrome", "app_configuration")
-        if _qs.value("show_autospectral_cleaning", False, type=bool):
+        if _qs.value("show_autospectral_cleaning", True, type=bool):
             _help_expanded = _qs.value("cleaning_help_expanded", True, type=bool)
             self.spectral_controls_editor.activate_cleaning_checkbox.setChecked(True)
             # Restore help expanded/collapsed state (setChecked auto-expands help;
