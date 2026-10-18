@@ -1454,10 +1454,11 @@ class Controller(QObject):
 
             # copy live data
             self.raw_event_data, n_new_events = self.copy_live_data(extent='update')
-            self.data_for_cytometry_plots['event_data'] = self.raw_event_data
+            if self.current_mode == 'raw':
+                self.data_for_cytometry_plots['event_data'] = self.raw_event_data
 
             # apply spectral unmixing and compensation if defined
-            if self.current_mode == 'raw' and self.experiment.process['unmixing_matrix'] is not None:
+            elif self.current_mode != 'raw' and self.experiment.process['unmixing_matrix'] is not None:
                 self.unmixed_event_data = apply_transfer_matrix(self.transfer_matrix, self.raw_event_data)
                 self.data_for_cytometry_plots['event_data'] = self.unmixed_event_data
 
