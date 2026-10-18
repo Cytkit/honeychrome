@@ -140,7 +140,7 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
     (use every pooled event -- the previous behaviour).
 
     seed: numpy default_rng seed for the downsampling above. Fixed at 42
-    (matching drc_pipeline.load_training_pool's own downsampling
+    (matching drc_pipeline.load_training_pool_with_rows's downsampling
     convention) so repeated runs against the same run/channels are
     reproducible.
 

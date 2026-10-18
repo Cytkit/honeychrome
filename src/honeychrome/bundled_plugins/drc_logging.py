@@ -110,7 +110,6 @@ def log_array(
         return
 
     arr = np.asarray(arr)
-    n_rows = arr.shape[0]
     n_cols = arr.shape[1] if arr.ndim > 1 else 1
     n_nonfinite = int(np.count_nonzero(~np.isfinite(arr))) if arr.size else 0
 

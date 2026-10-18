@@ -41,7 +41,6 @@ mandatory context.
 
 from __future__ import annotations
 
-import math
 import re
 import textwrap
 import traceback

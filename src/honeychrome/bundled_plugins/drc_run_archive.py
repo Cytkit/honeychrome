@@ -296,7 +296,7 @@ def delete_run_payload(controller, run_id: str) -> None:
 
 def archive_dr_run(controller, state, *, algorithm, embeddings,
                     gates, training_sample_ids, channels, params,
-                    n_events, label=None, embedding_features=None,
+                    n_events, label=None,
                     sync_fingerprint=None, event_rows=None,
                     split_fingerprints=None, transform_params=None) -> dict:
     """
@@ -308,12 +308,6 @@ def archive_dr_run(controller, state, *, algorithm, embeddings,
     The fitted reducer itself is not archived; the live model stays in
     state.trained_reducers for the rest of the session.
 
-    embedding_features: optional {sample_path: np.ndarray} of the ORIGINAL
-        high-dimensional feature vectors each embedding row came from (same
-        feature space the reducer was fit on). Lets consumers like T-REX
-        compute true marker-space neighbours with guaranteed row-for-row
-        alignment to what's plotted, without re-deriving anything from live
-        (re-gate-able) data. Optional for callers that don't have it.
     sync_fingerprint: drc_pipeline.sync_fingerprint() of the gates and
         training samples at the time the embedding was made; see sync_status().
     event_rows: {sample_path: int32 FCS-file rows}, one per embedding row
@@ -327,7 +321,6 @@ def archive_dr_run(controller, state, *, algorithm, embeddings,
 
     save_run_payload(controller, run_id, {
         'embeddings': embeddings,
-        'embedding_features': embedding_features or {},
         'event_rows': event_rows or {},
     })
 
@@ -343,7 +336,6 @@ def archive_dr_run(controller, state, *, algorithm, embeddings,
 
     full_entry = dict(entry)
     full_entry['embeddings'] = embeddings
-    full_entry['embedding_features'] = embedding_features or {}
     full_entry['event_rows'] = event_rows or {}
     state.dr_runs.append(full_entry)
     log.info("archived DR run %r (run_id=%s, %d embedded sample(s))",
@@ -352,30 +344,21 @@ def archive_dr_run(controller, state, *, algorithm, embeddings,
 
 
 def update_dr_run_embeddings(controller, state, run_id: str, embeddings: dict,
-                              embedding_features: dict | None = None,
                               event_rows: dict | None = None) -> None:
     """
     Refresh the stored payload and in-memory entry for an already-archived
     DR run after 'Apply to All Samples' embeds additional samples under the
     same trained model.  Does NOT create a new manifest entry or run_id —
     it is still the same run, just covering more samples.
-
-    embedding_features: see archive_dr_run(). Optional so a caller that
-    hasn't been updated to pass it doesn't wipe out an existing cache with
-    an empty one; only overwritten when actually supplied.
     """
     payload = load_run_payload(controller, run_id) or {}
     payload['embeddings'] = embeddings
-    if embedding_features is not None:
-        payload['embedding_features'] = embedding_features
     if event_rows is not None:
         payload['event_rows'] = event_rows
     save_run_payload(controller, run_id, payload)
     for entry in state.dr_runs:
         if entry.get('run_id') == run_id:
             entry['embeddings'] = embeddings
-            if embedding_features is not None:
-                entry['embedding_features'] = embedding_features
             if event_rows is not None:
                 entry['event_rows'] = event_rows
             break
@@ -580,7 +563,6 @@ def hydrate_run(controller, entry: dict) -> dict:
     if kind == 'dr' and 'embeddings' not in entry:
         payload = load_run_payload(controller, entry['run_id']) or {}
         entry['embeddings'] = payload.get('embeddings', {})
-        entry['embedding_features'] = payload.get('embedding_features', {})
         entry['event_rows'] = payload.get('event_rows', {})
     elif kind == 'clustering' and 'labels' not in entry:
         payload = load_run_payload(controller, entry['run_id']) or {}

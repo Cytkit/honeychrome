@@ -75,7 +75,6 @@ _numba_lock = threading.RLock()
 _warmup_lock = threading.Lock()
 _warmup_threads: dict[tuple, threading.Thread] = {}
 _warmed: set[tuple] = set()
-_warmup_seconds: dict[tuple, float] = {}
 
 
 def ensure_threading_layer() -> None:
@@ -170,11 +169,6 @@ def is_warm(algo: str, parallel: bool) -> bool:
     return _warmup_key(algo, parallel) in _warmed
 
 
-def warmup_seconds(algo: str, parallel: bool) -> float | None:
-    """Seconds the warm-up of *algo* took in this session (None if not run)."""
-    return _warmup_seconds.get(_warmup_key(algo, parallel))
-
-
 def _warmup_umap(parallel: bool) -> None:
     import umap as umap_lib
     rng = np.random.default_rng(0)
@@ -202,9 +196,8 @@ def _run_warmup(algo: str, parallel: bool) -> None:
             if algo == 'UMAP':
                 _warmup_umap(parallel)
         _warmed.add(key)
-        _warmup_seconds[key] = time.perf_counter() - start
         log.info("JIT warm-up for %s (%s) done in %.1fs", algo,
-                 'parallel' if parallel else 'serial', _warmup_seconds[key])
+                 'parallel' if parallel else 'serial', time.perf_counter() - start)
     except Exception:
         log.exception("JIT warm-up for %s failed; the run compiles on first use", algo)
     finally:

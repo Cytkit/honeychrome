@@ -593,7 +593,7 @@ in the plugin) to control the layout.</li>
   <li><b>Colour mode</b> — Clusters (needs a clustering run selected as
   the overlay), Marker (colour by a channel's intensity, pick the
   channel from the marker selector), or Group (colour by comparison
-  group, or by T-REX enrichment score when a T-REX run is selected).</li>
+  group).</li>
   </ul>
 </li>
 <li>Right-click a cluster or group's legend colour swatch to recolour

@@ -181,7 +181,7 @@ def _pool_training_data_with_boundaries(controller, state, event_cap: int | None
                                         seed: int = 42, af_state=None):
     """
     Clustering-specific training pool -- separate from
-    drc_pipeline.load_training_pool (still used by DR, which always
+    drc_pipeline.load_training_pool_with_rows (used by DR, which always
     applies state.n_training_events): event_cap=None (the new default)
     means every gated event from every training sample, no downsampling;
     an int caps each training sample's contribution the same way DR's
@@ -850,11 +850,3 @@ def commit_clustering_result(state, staged: StagedResult, algo: str) -> None:
     state.active_clustering_algorithm = staged.active_clustering_algorithm
     if algo in staged.trained_reducers:
         state.trained_reducers[algo] = staged.trained_reducers[algo]
-
-
-def run_clustering(controller, state, algo: str, params: dict,
-                   progress=None, af_state=None) -> None:
-    """Run the selected clustering algorithm and commit its results to *state*."""
-    staged = run_clustering_staged(controller, state, algo, params,
-                                   progress=progress, af_state=af_state)
-    commit_clustering_result(state, staged, algo)

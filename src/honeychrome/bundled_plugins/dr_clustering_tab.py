@@ -154,7 +154,6 @@ from honeychrome.controller_components.sample_loader import (
 )
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.transform import Transform
-from honeychrome.view_components.clear_layout import clear_layout
 from honeychrome.view_components.ordered_multi_sample_picker import OrderedMultiSamplePicker
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
@@ -275,43 +274,11 @@ _SETTINGS_APP_KEY = 'plugin_DR / Clustering / Statistics'
 # 3.  Module-level helper functions
 # ---------------------------------------------------------------------------
 
-def apply_gate_by_lookup_table(cytometry_data_dictionary, gate_name):
-    """
-    Return the subset of event_data belonging to *gate_name*.
-
-    Uses the fast lookup-table approach from the Honeychrome example plugin.
-    Always operate on a copy of the cytometry data dictionary to avoid
-    mutating the main application state.
-
-    Parameters
-    ----------
-    cytometry_data_dictionary : dict
-        Copy of controller.data_for_cytometry_plots_unmixed with
-        'event_data' replaced by the current sample's unmixed data.
-    gate_name : str
-        Name of the gate to apply (e.g. 'Singlets', 'root').
-
-    Returns
-    -------
-    np.ndarray  shape (n_gated_events, n_channels)
-    """
-    gate_membership = {
-        'root': np.ones(len(cytometry_data_dictionary['event_data']), dtype=np.bool_)
-    }
-    cytometry_data_dictionary.update({'gate_membership': gate_membership})
-    gates_to_calculate = [
-        g[0] for g in cytometry_data_dictionary['gating'].get_gate_ids()
-    ]
-    apply_gates_in_place(cytometry_data_dictionary, gates_to_calculate=gates_to_calculate)
-    mask = cytometry_data_dictionary['gate_membership'][gate_name]
-    return cytometry_data_dictionary['event_data'][mask]
-
-
 def apply_gates_union_by_lookup_table(cytometry_data_dictionary, gate_names: list[str]):
     """
-    Return the UNION of event_data belonging to ANY gate in *gate_names*.
-    Same lookup-table approach as apply_gate_by_lookup_table() above. The
-    controller's lookup tables belong to the sample on display, so this is
+    Return the UNION of event_data belonging to ANY gate in *gate_names*,
+    using the controller's gate lookup tables. Those belong to the sample
+    on display, so this is
     only for that sample's events; other samples are gated with
     ``per_sample_gating_functions.SampleGating``.
 
@@ -447,17 +414,6 @@ def _qs_int(settings, key: str, default=None):
         return default
 
 
-def _qs_float(settings, key: str, default=None):
-    """Read a QSettings float. INI backends return strings."""
-    raw = settings.value(key, None)
-    if raw is None or raw == '':
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
-
-
 def _with_extension(path: str, ext: str) -> str:
     """Append *ext* ('.csv') unless *path* already ends in it."""
     return path if path.lower().endswith(ext.lower()) else path + ext
@@ -501,25 +457,6 @@ class _HintLabel(QLabel):
         if event.type() == QEvent.PaletteChange:
             self._apply_hint_style()
         super().changeEvent(event)
-
-
-def _channel_antigens(controller) -> dict[str, str]:
-    """
-    channel -> raw antigen text from the spectral model (empty string if
-    none assigned). Used only to decide default channel selection in
-    TransformTab.refresh() -- see _is_viability_antigen() below. Mirrors
-    drc_cluster_id._channel_to_antigen_map(), kept as a separate copy here
-    for the same reason _antigen_dash_labels() is: this file must not
-    import from drc_cluster_id.py.
-    """
-    try:
-        unmixed_pnn = controller.experiment.settings.get('unmixed', {}).get(
-            'event_channels_pnn') or []
-        spectral_model = controller.experiment.process.get('spectral_model') or []
-    except (AttributeError, KeyError):
-        return {}
-    label_to_antigen = {c.get('label'): (c.get('antigen') or '') for c in spectral_model}
-    return {ch: label_to_antigen.get(ch, '') for ch in unmixed_pnn}
 
 
 def _is_viability_antigen(antigen: str) -> bool:
@@ -716,17 +653,10 @@ class _AspectCanvasHolder(QWidget):
     configurable aspect ratio (height / width), maximised within the
     holder's own size.
 
-    The shared `_SquareWidget` pattern used elsewhere in this file (a plain
-    QVBoxLayout plus a resizeEvent hack that calls setFixedHeight once it
-    notices height != width) depends on first receiving an oversized
-    resize so it has a mismatch to correct — reliable when the widget sits
-    directly in a QVBoxLayout with a stretch factor, but not once nested
-    differently or given an explicit QHBoxLayout alignment flag (both no
-    longer feed it that oversized resize). Managing the child's geometry
-    directly here removes that dependency entirely, and as a side effect
-    keeps the canvas's top flush with the legend's top: both start at y=0
-    within plot_row's row, since any leftover space appears to the right
-    or below the fitted rectangle, never above or split around it.
+    The child's geometry is managed directly, so the canvas's top stays
+    flush with the legend's top: both start at y=0 within plot_row's row,
+    and any leftover space appears to the right of or below the fitted
+    rectangle.
     """
     def __init__(self, child: QWidget, aspect_ratio: float = 1.0, parent=None):
         super().__init__(parent)
@@ -928,12 +858,6 @@ class PipelineState:
     # {algorithm_name: ISO timestamp string}
     embeddings: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
     # {algorithm_name: {sample_path: np.ndarray shape (n_events, 2)}} — current/most-recent only
-    embedding_features: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
-    # {algorithm_name: {sample_path: np.ndarray shape (n_events, n_channels)}} —
-    # the ORIGINAL high-dimensional feature vectors each embedding row came
-    # from (same feature space the reducer was fit on). Cached alongside
-    # embeddings precisely so T-REX (or anything else needing true
-    # marker-space neighbours) never has to re-derive them from live data.
     embedding_rows: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
     # {algorithm_name: {sample_path: np.ndarray int32}} -- event keys: the
     # FCS-file row of every embedding row (drc_pipeline.load_gated_rows),
@@ -947,7 +871,6 @@ class PipelineState:
     #   'n_samples': int, 'n_events': int, 'channels': list[str],
     #   'params': dict, 'timestamp': str, 'n_clusters': None,
     #   'storage': str, 'embeddings': dict[str, np.ndarray],
-    #   'embedding_features': dict[str, np.ndarray],
     # }
     # Archived automatically each time a DR algorithm finishes training
     # (see PluginWidget._archive_dr_run); 'Apply to All Samples' afterwards
@@ -1010,11 +933,6 @@ class PipelineState:
     # Ordered list of currently-defined group names. Display order in the UI == this order.
     group_patterns: dict[str, str] = field(default_factory=dict)
     # {group_name: filename regex} for "Auto-assign by pattern"
-    compare_group_a: str = ''
-    compare_group_b: str = ''
-    # T-REX's own two-group pair.
-    # Run Statistics/Composition-by-group
-    # use testing_group_selection below instead.
     covariates: pd.DataFrame | None = None
     # rows = samples (rel-path index), columns = covariate names, all
     # values str. now actually populated by CSV import
@@ -1167,18 +1085,6 @@ class PipelineState:
     # results — the authoritative match key for combo restore / change
     # detection, since labels are user-editable and not guaranteed unique.
 
-    # --- T-REX ---
-    trex_knn_index: Any | None = None
-    # hnswlib index over pooled Group A + B events
-    trex_knn_group_labels: np.ndarray | None = None
-    # group label ('A' or 'B') per row in trex_knn_index
-    trex_scores: dict[str, np.ndarray] = field(default_factory=dict)
-    # {sample_path: np.ndarray float32 in [-1, +1]}
-    trex_k: int = 30
-    trex_dr_run_id: str = ''
-    # Which archived DR run's embeddings trex_scores was computed against --
-    # T-REX can only ever be plotted against THIS run's events.
-
     # --- Workspace ---
     plot_configs: list[dict] = field(default_factory=list)
     # One dict per PlotCard on the workspace canvas
@@ -1206,20 +1112,6 @@ class PipelineState:
     # Convenience helpers
     # ------------------------------------------------------------------
 
-    def stats_runnable(self, sample_keys: set[str] | None = None) -> bool:
-        """
-        Return True if the two selected "Compare" groups are
-        distinct and each has >= 3 assigned samples. Pass sample_keys to
-        restrict the count to a specific run's samples (see n_per_group);
-        omitting it counts across the whole experiment.
-        """
-        if not self.compare_group_a or not self.compare_group_b or \
-                self.compare_group_a == self.compare_group_b:
-            return False
-        counts = self.n_per_group(sample_keys)
-        return (counts.get(self.compare_group_a, 0) >= 3 and
-                counts.get(self.compare_group_b, 0) >= 3)
-
     def n_per_group(self, sample_keys: set[str] | None = None) -> dict[str, int]:
         """Return {group_name: assigned_sample_count} for every defined
         group. Pass sample_keys (e.g. GroupsStatsTab._table_sample_paths())
@@ -1240,8 +1132,7 @@ class PipelineState:
         """
         True if at least 2 of the checked 'Groups to Test'
         each have >= 3 assigned samples. Governs Run Statistics/
-        Composition-by-group -- separate from stats_runnable(),
-        which still gates T-REX's fixed Compare pair. Pass sample_keys to
+        Composition-by-group. Pass sample_keys to
         restrict the count to a specific run's samples (see n_per_group);
         omitting it counts across the whole experiment.
         """
@@ -1249,16 +1140,6 @@ class PipelineState:
         counts = self.n_per_group(sample_keys)
         qualifying = sum(1 for name in selection if counts.get(name, 0) >= 3)
         return qualifying >= 2
-
-    def available_algorithms(self) -> list[str]:
-        """Return list of DR algorithms that have completed training."""
-        return [a for a, s in self.dr_status.items() if s == 'done']
-
-    def invalidate_trex(self):
-        """Call whenever group assignments change — clears cached T-REX data."""
-        self.trex_knn_index = None
-        self.trex_knn_group_labels = None
-        self.trex_scores = {}
 
     def cluster_label(self, cluster_id: int) -> str:
         """Return display name for a cluster id, falling back to 'Cluster N'."""
@@ -2708,7 +2589,7 @@ class ConfigTab(QWidget):
 
         if channels and not self.channel_checkboxes:
             labels = _antigen_dash_labels(self.controller)
-            antigens = _channel_antigens(self.controller)
+            antigens = drc_cluster_id._channel_to_antigen_map(self.controller)
             grid_idx = 0
             for ch in channels:
                 if ch in _always_exclude:
@@ -2761,14 +2642,6 @@ class ConfigTab(QWidget):
         # Run management table — cheap metadata-only rebuild, safe
         # to call every time this tab becomes active.
         self.run_table.refresh()
-
-
-class _SquareWidget(QWidget):
-    """A widget that always maintains a square geometry."""
-    def resizeEvent(self, event):
-        if self.height() != self.width():
-            self.setFixedHeight(self.width())
-        super().resizeEvent(event)
 
 
 class TransformTab(TransformInspector):
@@ -3169,10 +3042,8 @@ class GroupsStatsTab(QWidget):
         self.state = state
         self.bus = bus
         self.controller = controller
-        # group names/patterns/compare-selection all live directly
-        # on state now (state.group_names / state.group_patterns /
-        # state.compare_group_a / state.compare_group_b) — no local mirror
-        # to keep in sync.
+        # group names and patterns live on state (state.group_names /
+        # state.group_patterns) — no local mirror to keep in sync.
         self._stats_worker = None
         self._predictive_worker = None
         # Names of the long-running jobs that currently hold a busy cursor.
@@ -3484,58 +3355,6 @@ class GroupsStatsTab(QWidget):
 
         stats_layout.addWidget(test_groups_box)
 
-        # ---- T-REX Compare selector ----
-        # Walled off from the user for now
-        # containers below are hidden but left fully wired so this can be
-        # re-enabled later just by removing the setVisible(False) calls.
-        self.trex_compare_container = QWidget()
-        compare_container_layout = QVBoxLayout(self.trex_compare_container)
-        compare_container_layout.setContentsMargins(0, 0, 0, 0)
-        compare_row = QHBoxLayout()
-        compare_row.addWidget(QLabel("T-REX Compare:"))
-        self.compare_group_a_combo = QComboBox()
-        self.compare_group_a_combo.setMinimumWidth(140)
-        compare_row.addWidget(self.compare_group_a_combo)
-        compare_row.addWidget(QLabel("vs"))
-        self.compare_group_b_combo = QComboBox()
-        self.compare_group_b_combo.setMinimumWidth(140)
-        compare_row.addWidget(self.compare_group_b_combo)
-        compare_row.addStretch()
-        compare_container_layout.addLayout(compare_row)
-        self.compare_group_a_combo.currentTextChanged.connect(self._on_compare_group_changed)
-        self.compare_group_b_combo.currentTextChanged.connect(self._on_compare_group_changed)
-
-        compare_hint = _HintLabel(
-            "T-REX's neighbour-fraction score only works for exactly two "
-            "conditions, so it uses this dedicated pair regardless of how "
-            "many groups are checked above."
-        )
-        compare_hint.setWordWrap(True)
-        compare_container_layout.addWidget(compare_hint)
-        stats_layout.addWidget(self.trex_compare_container)
-        self.trex_compare_container.setVisible(False)
-
-        # ---- T-REX DR run selector ----
-        # T-REX can only ever be plotted against the events a specific DR
-        # run actually embedded -- it must be scored against exactly that
-        # run's event set, not freshly re-gated data that may have since
-        # drifted in size.
-        self.trex_dr_container = QWidget()
-        trex_dr_row = QHBoxLayout(self.trex_dr_container)
-        trex_dr_row.setContentsMargins(0, 0, 0, 0)
-        trex_dr_row.addWidget(QLabel("T-REX DR run:"))
-        self.trex_dr_run_combo = QComboBox()
-        self.trex_dr_run_combo.setMinimumWidth(160)
-        self.trex_dr_run_combo.setToolTip(
-            "The archived DR run T-REX will score against. Only events "
-            "that run actually embedded can be plotted with a T-REX score."
-        )
-        self.trex_dr_run_combo.currentIndexChanged.connect(self._on_trex_dr_run_changed)
-        trex_dr_row.addWidget(self.trex_dr_run_combo)
-        trex_dr_row.addStretch()
-        stats_layout.addWidget(self.trex_dr_container)
-        self.trex_dr_container.setVisible(False)
-
         # Config row: what to test
         config_row = QHBoxLayout()
         config_row.addWidget(QLabel("Test:"))
@@ -3706,16 +3525,6 @@ class GroupsStatsTab(QWidget):
         self.run_stats_btn.setToolTip("Requires ≥ 3 samples in each group and clustering complete.")
         self.run_stats_btn.clicked.connect(self._run_statistics)
         run_row.addWidget(self.run_stats_btn)
-
-        self.run_trex_btn = QPushButton("▶  Run T-REX")
-        self.run_trex_btn.setEnabled(False)
-        self.run_trex_btn.setToolTip(
-            "Build T-REX kNN index and score all samples.\n"
-            "Results appear in Workspace plots (Colour: T-REX)."
-        )
-        self.run_trex_btn.clicked.connect(self._run_trex)
-        run_row.addWidget(self.run_trex_btn)
-        self.run_trex_btn.setVisible(False)  # walled off
 
         self.composition_btn = QPushButton("Composition Barplot")
         self.composition_btn.setEnabled(False)
@@ -4059,10 +3868,6 @@ class GroupsStatsTab(QWidget):
                     self.state.group_patterns[new_name] = self.state.group_patterns.pop(old_name)
                 if old_name in self.state.group_colors:
                     self.state.group_colors[new_name] = self.state.group_colors.pop(old_name)
-                if self.state.compare_group_a == old_name:
-                    self.state.compare_group_a = new_name
-                if self.state.compare_group_b == old_name:
-                    self.state.compare_group_b = new_name
                 # 'Groups to Test' is a separate checked-name
                 # list (state.testing_group_selection)
                 if self.state.testing_group_selection and old_name in self.state.testing_group_selection:
@@ -4073,10 +3878,8 @@ class GroupsStatsTab(QWidget):
                 if self.state.reference_group == old_name:
                     self.state.reference_group = new_name
                 self.state.group_names[row] = new_name
-                self.state.invalidate_trex()
                 self._populate_table()
                 self._populate_test_groups_list()
-                self._refresh_compare_combos()
                 self._update_group_count_label()
         else:
             self.state.group_patterns[old_name] = item.text().strip()
@@ -4103,7 +3906,6 @@ class GroupsStatsTab(QWidget):
             self.state.testing_group_selection.append(name)
         self._populate_groups_table()
         self._refresh_group_combos()
-        self._refresh_compare_combos()
         self._populate_test_groups_list()
         self._last_stats_data_key = None
         self._update_group_count_label()
@@ -4129,19 +3931,13 @@ class GroupsStatsTab(QWidget):
         self.state.group_names.pop(row)
         self.state.group_patterns.pop(name, None)
         self.state.group_colors.pop(name, None)
-        if self.state.compare_group_a == name:
-            self.state.compare_group_a = ''
-        if self.state.compare_group_b == name:
-            self.state.compare_group_b = ''
         self.state.testing_group_selection = [
             g for g in self.state.testing_group_selection if g != name
         ]
         if self.state.reference_group == name:
             self.state.reference_group = ''
-        self.state.invalidate_trex()
         self._populate_groups_table()
         self._populate_table()
-        self._refresh_compare_combos()
         self._populate_test_groups_list()
         self._last_stats_data_key = None
         self._update_group_count_label()
@@ -4166,35 +3962,6 @@ class GroupsStatsTab(QWidget):
             idx = combo.findText(current)
             combo.setCurrentIndex(max(0, idx))
             combo.blockSignals(False)
-
-    def _refresh_compare_combos(self):
-        """Repopulate the Compare: selector from state.group_names, trying
-        to preserve the current selection; falls back to the first two
-        defined groups."""
-        names = list(self.state.group_names)
-        for combo in (self.compare_group_a_combo, self.compare_group_b_combo):
-            combo.blockSignals(True)
-        prev_a, prev_b = self.state.compare_group_a, self.state.compare_group_b
-        self.compare_group_a_combo.clear()
-        self.compare_group_a_combo.addItems(names)
-        self.compare_group_b_combo.clear()
-        self.compare_group_b_combo.addItems(names)
-        idx_a = self.compare_group_a_combo.findText(prev_a)
-        idx_b = self.compare_group_b_combo.findText(prev_b)
-        self.compare_group_a_combo.setCurrentIndex(idx_a if idx_a >= 0 else 0)
-        default_b = 1 if len(names) > 1 else 0
-        self.compare_group_b_combo.setCurrentIndex(idx_b if idx_b >= 0 else default_b)
-        for combo in (self.compare_group_a_combo, self.compare_group_b_combo):
-            combo.blockSignals(False)
-        self.state.compare_group_a = self.compare_group_a_combo.currentText()
-        self.state.compare_group_b = self.compare_group_b_combo.currentText()
-
-    def _on_compare_group_changed(self, _text: str):
-        self.state.compare_group_a = self.compare_group_a_combo.currentText()
-        self.state.compare_group_b = self.compare_group_b_combo.currentText()
-        self.state.invalidate_trex()
-        self._update_run_button()
-        self._update_group_count_label()
 
     # ------------------------------------------------------------------
     # Groups to Test / contrast mode / pairing
@@ -4376,7 +4143,6 @@ class GroupsStatsTab(QWidget):
             else:
                 _log.info("  no match: %r", fn)
 
-        self.state.invalidate_trex()
         self.refresh()                  # repopulate the SAME (training) view
         self._update_run_button()
         summary = ", ".join(f"{n} → {name}" for name, n in assigned_counts.items())
@@ -4463,7 +4229,6 @@ class GroupsStatsTab(QWidget):
         samples if that's empty too.
         """
         self._populate_groups_table()
-        self._refresh_compare_combos()
 
         self._populate_test_groups_list()
         self._populate_pairing_variable_combo()
@@ -4489,7 +4254,6 @@ class GroupsStatsTab(QWidget):
         self._maybe_auto_suggest_groupings()
         self._populate_run_combo()
         self._sync_composition_to_run()
-        self._populate_trex_dr_combo()
         self._populate_marker_roles_list()
         self._update_run_button()
         self._refresh_predictive_controls()
@@ -4875,11 +4639,9 @@ class GroupsStatsTab(QWidget):
         self._last_stats_data_key = None
         self._populate_groups_table()
         self._refresh_group_combos()
-        self._refresh_compare_combos()
         self._populate_table()
         self._populate_pairing_variable_combo()
         self._populate_test_groups_list()
-        self.state.invalidate_trex()
         self._update_group_count_label()
         self._update_run_button()
 
@@ -4896,7 +4658,6 @@ class GroupsStatsTab(QWidget):
 
     def _on_group_changed(self, sample_path: str, group_name: str):
         self.state.sample_groups[sample_path] = group_name
-        self.state.invalidate_trex()
         self._update_run_button()
         self._update_group_count_label()
 
@@ -4948,7 +4709,6 @@ class GroupsStatsTab(QWidget):
         runnable = n_group_ok and any_clustering and not dr_only_selected
         stats_running = self._stats_worker is not None and self._stats_worker.isRunning()
         self.run_stats_btn.setEnabled(runnable and not self._analysis_busy())
-        self.run_trex_btn.setEnabled(self.state.stats_runnable(shown))
         self.composition_btn.setEnabled(runnable and not stats_running)
         if hasattr(self, 'pca_btn'):
             self.pca_btn.setEnabled(runnable and not stats_running)
@@ -4993,12 +4753,9 @@ class GroupsStatsTab(QWidget):
         """
         Rebuild the Differential Statistics run combo -- clustering runs
         only. DR runs have no cluster labels, so Run Statistics /
-        Composition / PCA can never operate on one;
-        listing them here was a T-REX-era holdover from before T-REX got
-        its own dedicated trex_dr_run_combo (see below) -- it used to
-        share this combo instead. A run is included only if its recorded
-        training sample set overlaps the samples currently assigned to
-        group A or B.
+        Composition / PCA can never operate on one. A run is included
+        only if its recorded training sample set overlaps the samples
+        currently assigned to a group.
 
         Uses each entry's 'training_sample_ids' manifest field, NEVER
         'labels'/'embeddings' — this works from metadata alone (every
@@ -5134,38 +4891,6 @@ class GroupsStatsTab(QWidget):
             self.state.composition_run_id = ''
             self.state.composition_names = {}
             self.state.composition_colors = {}
-
-    def _populate_trex_dr_combo(self):
-        """T-REX needs its own DR-run selector (distinct from the Stats
-        run combo, which is clustering-only, and from Workspace's own
-        dr_combo, a different widget) -- see state.trex_dr_run_id."""
-        self.trex_dr_run_combo.blockSignals(True)
-        prev_run_id = self.trex_dr_run_combo.currentData()
-        self.trex_dr_run_combo.clear()
-        for entry in self.state.dr_runs:
-            self.trex_dr_run_combo.addItem(entry.get('label', ''), entry.get('run_id'))
-        if self.trex_dr_run_combo.count() == 0:
-            self.trex_dr_run_combo.addItem("(no DR runs yet)", None)
-        preferred_id = self.state.trex_dr_run_id or prev_run_id
-        idx = self.trex_dr_run_combo.findData(preferred_id) if preferred_id else -1
-        if idx >= 0:
-            self.trex_dr_run_combo.setCurrentIndex(idx)
-        else:
-            self.trex_dr_run_combo.setCurrentIndex(self.trex_dr_run_combo.count() - 1)
-        self.trex_dr_run_combo.blockSignals(False)
-        self.state.trex_dr_run_id = self.trex_dr_run_combo.currentData()
-
-    def _on_trex_dr_run_changed(self, _index=None):
-        self.state.trex_dr_run_id = self.trex_dr_run_combo.currentData()
-
-    def _selected_trex_dr_run(self) -> dict | None:
-        run_id = self.trex_dr_run_combo.currentData()
-        if run_id is None:
-            return None
-        for entry in self.state.dr_runs:
-            if entry.get('run_id') == run_id:
-                return drc_run_archive.hydrate_run(self.controller, entry)
-        return None
 
     def _selected_run_entry(self) -> dict | None:
         """
@@ -5363,7 +5088,6 @@ class GroupsStatsTab(QWidget):
                     else self.state.covariates.combine_first(new_cov).astype(str)
                 )
                 self._populate_pairing_variable_combo()
-            self.state.invalidate_trex()
             self._populate_table()
             self._update_run_button()
             if unknown_names:
@@ -5553,7 +5277,7 @@ class GroupsStatsTab(QWidget):
             finished = Signal(bool, str)
             progress = Signal(str)
 
-            def __init__(self_, run_freq, run_mfi, group_names, labels_override,
+            def __init__(self_, run_freq, run_mfi, labels_override,
                         include_type_markers, names_override, run_counts, af_state,
                         fdr_scope, adjust_covariates, use_treat, mfi_threshold,
                         mfi_hierarchical, state):
@@ -5563,7 +5287,6 @@ class GroupsStatsTab(QWidget):
                 self_._run_freq = run_freq
                 self_._run_mfi  = run_mfi
                 self_._run_counts = run_counts
-                self_._group_names = group_names
                 self_._labels_override = labels_override
                 self_._include_type_markers = include_type_markers
                 self_._names_override = names_override
@@ -5607,7 +5330,7 @@ class GroupsStatsTab(QWidget):
                 if mfi is not None:
                     self_.progress.emit(f"MFIs: {len(mfi)} rows tested.")
 
-        worker = _StatsWorker(run_freq, run_mfi, list(self.state.group_names), labels_for_stats,
+        worker = _StatsWorker(run_freq, run_mfi, labels_for_stats,
                              include_type_markers, names_for_stats, run_counts, af_state,
                              fdr_scope, adjust_covariates, use_treat, mfi_threshold,
                              mfi_hierarchical, stats_state)
@@ -6914,7 +6637,6 @@ class GroupsStatsTab(QWidget):
         counts_results_snap  = self.state.counts_results
         counts_df_snap       = self.state.counts_df
         mfi_results_snap     = self.state.mfi_results
-        mfi_df_snap          = self.state.mfi_df
         mfi_sample_df_snap   = self.state.mfi_sample_df
         stats_all_rel_snap   = list(self.state.stats_all_rel)
         stats_group_vec_snap = list(self.state.stats_group_vec)
@@ -6924,7 +6646,7 @@ class GroupsStatsTab(QWidget):
                 name_a, name_b, run_label, pval_threshold, fc_threshold,
                 freq_results_snap, freq_df_snap,
                 counts_results_snap, counts_df_snap,
-                mfi_results_snap, mfi_df_snap, mfi_sample_df_snap,
+                mfi_results_snap, mfi_sample_df_snap,
                 stats_all_rel_snap, stats_group_vec_snap,
                 mfi_threshold=mfi_threshold, channel_names=channel_names,
             )
@@ -6938,7 +6660,7 @@ class GroupsStatsTab(QWidget):
                                 pval_threshold, fc_threshold,
                                 freq_results, freq_df,
                                 counts_results, counts_df,
-                                mfi_results, mfi_df, mfi_sample_df,
+                                mfi_results, mfi_sample_df,
                                 stats_all_rel, stats_group_vec,
                                 mfi_threshold: float | None = None,
                                 channel_names: dict | None = None) -> dict:
@@ -6972,7 +6694,6 @@ class GroupsStatsTab(QWidget):
         counts_results_view  = _view_results(counts_results)
         counts_df_view       = _view_samples(counts_df)
         mfi_results_view     = _view_results(mfi_results)
-        mfi_df_view          = _view_samples(mfi_df)
         mfi_sample_df_view   = _view_samples(mfi_sample_df)
 
         results: dict = {}
@@ -7224,8 +6945,7 @@ class GroupsStatsTab(QWidget):
                      significant, …).
         sample_df  : raw feature matrix for the same comparison's samples
                      (rows=samples, cols=features), index=rel-paths.
-        group_a/group_b : the two group names this comparison represents
-                     (not state.compare_group_a/b, which belong to T-REX).
+        group_a/group_b : the two group names this comparison represents.
         run_label  : stamped in the upper-left corner (plot provenance)
         """
         group_by_sample = dict(zip(self.state.stats_all_rel, self.state.stats_group_vec))
@@ -7293,17 +7013,6 @@ class GroupsStatsTab(QWidget):
             QMessageBox.information(self, "Exported", f"Saved to {out_path}")
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
-
-    def _run_trex(self):
-        """Delegate T-REX computation to PluginWidget which owns the data loaders."""
-        # Walk up to PluginWidget
-        parent = self.parent()
-        while parent is not None:
-            if hasattr(parent, 'run_trex'):
-                parent.run_trex()
-                return
-            parent = parent.parent()
-        QMessageBox.warning(self, "T-REX", "Could not find parent PluginWidget.")
 
     def _export_results_csv(self):
         """Export all statistics results to a combined CSV."""
@@ -7499,10 +7208,10 @@ class WorkspaceTab(QWidget):
         self._relayout()
 
     def _on_theme_changed(self, text: str):
-        """Walk up to PluginWidget (same pattern GroupsStatsTab._run_trex
-        uses) so a Workspace-toggle change immediately redraws every
-        currently-visible plot in the other tabs too, rather than only
-        taking effect the next time each one happens to redraw on its own."""
+        """Walk up to PluginWidget so a Workspace-toggle change immediately
+        redraws every currently-visible plot in the other tabs too, rather
+        than only taking effect the next time each one happens to redraw
+        on its own."""
         self.state.plot_theme = text.lower()
         parent = self.parent()
         while parent is not None:
@@ -7641,7 +7350,7 @@ class PlotCard(QFrame):
     Controls (top toolbar):
       • DR algorithm selector
       • Sample selector (All Samples pooled, or individual)
-      • Colour mode: Clusters | Marker | Group (T-REX walled off, see _COLOUR_MODES)
+      • Colour mode: Clusters | Marker | Group
       • Marker channel selector (visible in Marker mode)
       • Magic wand (copy) and paste buttons
       • Close button
@@ -7688,7 +7397,6 @@ class PlotCard(QFrame):
 
     def _build_ui(self):
         from matplotlib.figure import Figure
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -8309,12 +8017,10 @@ class PlotCard(QFrame):
             self._draw_marker_scatter(ax, xy_disp, origin_disp,
                                       disp_idx, sample_row_offsets, run,
                                       marker_values_by_sample)
-        elif colour_mode == 'T-REX':
-            self._draw_trex_scatter(ax, xy_disp, lab_disp, emb_dict, run, origin_disp)
         elif colour_mode == 'Group':
             self._draw_group_scatter(ax, xy_disp, origin_disp)
 
-        # Apply label colour to colourbar (Marker / T-REX), title, and axis labels
+        # Apply label colour to colourbar (Marker), title, and axis labels
         lc = self._label_color
         ax.title.set_color(lc)
         ax.xaxis.label.set_color(lc)
@@ -8576,69 +8282,6 @@ class PlotCard(QFrame):
         cb.set_label(display_label, fontsize=_lf)
         cb.ax.tick_params(labelsize=_lf)
         ax.set_title(f"Marker: {display_label}", fontsize=8)
-
-    def _draw_trex_scatter(self, ax, xy, labels, emb_dict: dict, run: dict, origin):
-        """Colour by T-REX score using a red-blue diverging colourmap.
-        Aligned per-sample via origin (like _draw_marker_scatter) — T-REX
-        only scores samples in its Compare pair, which is often a SUBSET
-        of the samples in the current DR embedding, so a blanket total-
-        length comparison against all pooled samples was always going to
-        fail whenever other groups were also in the embedding."""
-        if not self.state.trex_scores:
-            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.4)
-            ax.set_title("T-REX: assign groups and run T-REX first", fontsize=7)
-            return
-
-        if self.state.trex_dr_run_id and run.get('run_id') != self.state.trex_dr_run_id:
-            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.3)
-            ax.set_title("T-REX was scored against a different DR run — "
-                        "switch to that run, or re-run T-REX for this one",
-                        fontsize=7)
-            return
-
-        run_gates = run.get('gates')
-        if run_gates is not None and sorted(run_gates) != sorted(self.state.selected_gates):
-            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.3)
-            ax.set_title(f"{run.get('label', '')}: gate changed since training — retrain DR",
-                        fontsize=7)
-            _log.warning(
-                "trex scatter: gate selection changed since run %r was trained "
-                "(trained on %r, now %r) — embeddings are stale",
-                run.get('label'), run_gates, self.state.selected_gates,
-            )
-            return
-
-        scores = np.full(len(xy), np.nan, dtype=np.float32)
-        for rel in np.unique(origin):
-            s = self.state.trex_scores.get(str(rel))
-            if s is None:
-                continue          # sample wasn't part of T-REX's Compare pair
-            mask = origin == rel
-            if int(mask.sum()) == len(s):
-                scores[mask] = s
-            else:
-                _log.warning(
-                    "trex scatter: %s has %d T-REX scores but %d displayed "
-                    "points — skipped", rel, len(s), int(mask.sum()))
-
-        finite = np.isfinite(scores)
-        if not finite.any():
-            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.4)
-            ax.set_title("T-REX: no scored samples in current view "
-                         "(check the Compare pair)", fontsize=7)
-            return
-
-        if (~finite).any():
-            ax.scatter(xy[~finite, 0], xy[~finite, 1], s=1, c='#cccccc',
-                      alpha=0.2, linewidths=0)
-        sc = ax.scatter(
-            xy[finite, 0], xy[finite, 1],
-            s=1, c=scores[finite], cmap='RdBu_r', vmin=-1, vmax=1, alpha=0.5, linewidths=0
-        )
-        self._cbar_ax.set_visible(True)
-        self._figure.colorbar(sc, cax=self._cbar_ax, label='T-REX score')
-        ax.set_title("T-REX enrichment (red=A, blue=B) — grey = not in Compare pair",
-                    fontsize=8)
 
     def _draw_group_scatter(self, ax, xy, origin):
         """
@@ -9189,9 +8832,6 @@ class _DrWorker(QThread):
         self.embed_calls = 0
         self.jit_included = False
 
-    def cancel(self):
-        self._cancelled = True
-
     @property
     def algo(self) -> str:
         return self._algo
@@ -9296,7 +8936,6 @@ class _DrWorker(QThread):
         # before repopulating, or leftover keys from an earlier (possibly
         # larger) sample set inflate the "embeddings: N sample(s)" count.
         plugin.state.embeddings[algo] = {}
-        plugin.state.embedding_features[algo] = {}
         plugin.state.embedding_rows[algo] = {}
 
         self._emit(f"{algo} training complete.  Embedding training samples …")
@@ -9331,8 +8970,7 @@ class _DrWorker(QThread):
                 continue
             all_sample_keys.append((abs_key, rel))
 
-        for store in (plugin.state.embeddings, plugin.state.embedding_features,
-                      plugin.state.embedding_rows):
+        for store in (plugin.state.embeddings, plugin.state.embedding_rows):
             store.setdefault(algo, {})
         embedded = plugin.state.embeddings[algo]
         if not training_only:
@@ -9386,10 +9024,6 @@ class _DrWorker(QThread):
                     self.finished.emit(False, "Cancelled.")
                     return
                 embedded[rel_path] = emb
-                # Same feature vectors that produced this embedding --
-                # cached so T-REX can align to them row-for-row later,
-                # with no live re-gating step in between.
-                plugin.state.embedding_features[algo][rel_path] = sample_data.astype(np.float32)
                 plugin.state.embedding_rows[algo][rel_path] = rows
             except Exception as e:
                 self._emit(f"    Could not embed {rel_path}: {e}")
@@ -12293,7 +11927,6 @@ class PluginWidget(QWidget):
             self.groups_stats_tab._clear_stale_run_results()
             self.groups_stats_tab._populate_run_combo()
             self.groups_stats_tab._sync_composition_to_run()
-            self.groups_stats_tab._populate_trex_dr_combo()
             self.groups_stats_tab._update_run_button()
         if hasattr(self, 'workspace_tab'):
             for card in self.workspace_tab._plot_cards:
@@ -12513,8 +12146,6 @@ class PluginWidget(QWidget):
             s.setValue('group_names',       list(self.state.group_names))
             s.setValue('group_patterns',    repr(self.state.group_patterns))
             s.setValue('group_colors',      repr(self.state.group_colors))
-            s.setValue('compare_group_a',   self.state.compare_group_a)
-            s.setValue('compare_group_b',   self.state.compare_group_b)
             # Sample PCA appearance/config
             s.setValue('pca_use_freq',      self.state.pca_use_freq)
             s.setValue('pca_use_counts',    self.state.pca_use_counts)
@@ -12744,7 +12375,6 @@ class PluginWidget(QWidget):
                 self.state.group_patterns = {
                     k: v for k, v in ((name_a, legacy_pat_a), (name_b, legacy_pat_b)) if v
                 }
-                self.state.compare_group_a, self.state.compare_group_b = name_a, name_b
                 _log.info(
                     "sample_groups: migrated %d entries from legacy A/B slot "
                     "format to named groups %r", len(loaded_groups), self.state.group_names
@@ -12774,10 +12404,6 @@ class PluginWidget(QWidget):
                         self.state.group_colors = eval(colors_repr)  # noqa: S307
                     except Exception:
                         pass
-                self.state.compare_group_a = s.value('compare_group_a', '') or (
-                    self.state.group_names[0] if self.state.group_names else '')
-                self.state.compare_group_b = s.value('compare_group_b', '') or (
-                    self.state.group_names[1] if len(self.state.group_names) > 1 else '')
 
             self.state.testing_group_selection = _qs_list(s, 'testing_group_selection')
             self.state.contrast_mode = s.value('contrast_mode', 'reference') or 'reference'
@@ -13130,7 +12756,6 @@ class PluginWidget(QWidget):
             ('active_dr_run_ids', dict(self._active_dr_run_id)),
             ('cluster_labels',    self.state.cluster_labels),
             ('cluster_rows',      self.state.cluster_rows),
-            ('trex_scores',       self.state.trex_scores),
             ('freq_results',      self.state.freq_results),
             ('counts_results',    self.state.counts_results),
             ('mfi_results',       self.state.mfi_results),
@@ -13233,8 +12858,6 @@ class PluginWidget(QWidget):
                 self.state.cluster_labels = payload['cluster_labels']
             if isinstance(payload.get('cluster_rows'), dict):
                 self.state.cluster_rows = payload['cluster_rows']
-            if isinstance(payload.get('trex_scores'), dict):
-                self.state.trex_scores = payload['trex_scores']
             if isinstance(payload.get('freq_results'), pd.DataFrame):
                 self.state.freq_results = payload['freq_results']
             if isinstance(payload.get('counts_results'), pd.DataFrame):
@@ -14341,7 +13964,6 @@ class PluginWidget(QWidget):
         """Archive a freshly completed DR training run (§0.2)."""
         reducer = self.state.trained_reducers.get(algo)
         embeddings = self.state.embeddings.get(algo, {})
-        embedding_features = self.state.embedding_features.get(algo, {})
         if reducer is None:
             return
         channels = [c for c in self.state.selected_channels
@@ -14352,7 +13974,6 @@ class PluginWidget(QWidget):
                 self.controller, self.state,
                 algorithm=algo,
                 embeddings=dict(embeddings),
-                embedding_features=dict(embedding_features),
                 gates=list(self.state.selected_gates),
                 training_sample_ids=list(self.state.training_sample_ids),
                 channels=channels,
@@ -14396,9 +14017,8 @@ class PluginWidget(QWidget):
         if not run_id:
             return
         embeddings = dict(self.state.embeddings.get(algo, {}))
-        embedding_features = dict(self.state.embedding_features.get(algo, {}))
         drc_run_archive.update_dr_run_embeddings(
-            self.controller, self.state, run_id, embeddings, embedding_features,
+            self.controller, self.state, run_id, embeddings,
             event_rows=dict(self.state.embedding_rows.get(algo, {})),
         )
         if hasattr(self, 'config_tab'):
@@ -14524,8 +14144,8 @@ class PluginWidget(QWidget):
                     or self.state.dr_status.get(algo) == 'done')
             if not live or self._source_dr_run_entry(algo) is not None:
                 continue
-            for store in (self.state.embeddings, self.state.embedding_features,
-                          self.state.embedding_rows, self.state.trained_reducers,
+            for store in (self.state.embeddings, self.state.embedding_rows,
+                          self.state.trained_reducers,
                           self.state.dr_timestamps, self._active_dr_run_id,
                           self._dr_train_params, self._dr_pool_size):
                 store.pop(algo, None)
@@ -14724,166 +14344,3 @@ class PluginWidget(QWidget):
         self.progress_message(
             "Clustering cancelled.  A step that cannot be interrupted may keep "
             "running in the background; its result is discarded.")
-
-    # ==================================================================
-    # T-REX (walled off)
-    # ==================================================================
-
-    def run_trex(self):
-        """
-        Build a T-REX kNN index over pooled Group A + B events and score all
-        samples.  Results stored in state.trex_scores.
-
-        Only events belonging to the selected T-REX DR run's own embedding
-        can ever be plotted with a score, so scoring is restricted to that
-        run's event set from the start -- rather than freshly re-gating
-        live data and hoping it still lines up with whatever's on screen.
-
-        Algorithm (Irish lab, DOI 10.1016/j.cels.2020.11.009):
-          1. Pool all gated events from Group A samples.
-          2. Pool all gated events from Group B samples.
-          3. Build hnswlib index over A ∪ B.
-          4. Per event: query k neighbours; score =
-             (n_A_neighbours / n_A_total) − (n_B_neighbours / n_B_total),
-             normalised so |score| ≤ 1.
-          5. Store per-sample arrays in state.trex_scores.
-        """
-        shown = set(self.groups_stats_tab._table_sample_paths())
-        if not self.state.stats_runnable(shown):
-            QMessageBox.warning(
-                self, "T-REX",
-                "Assign ≥ 3 samples to each group before running T-REX."
-            )
-            return
-
-        dr_run = self.groups_stats_tab._selected_trex_dr_run()
-        if dr_run is None:
-            QMessageBox.warning(
-                self, "T-REX",
-                "Select a DR run for T-REX to score against first "
-                "('T-REX DR run' above the Run T-REX button)."
-            )
-            return
-        emb_dict = dr_run.get('embeddings', {}) or {}
-        if not emb_dict:
-            QMessageBox.warning(
-                self, "T-REX",
-                f"\"{dr_run.get('label', '')}\" has no embeddings yet -- "
-                "run 'Apply to All Samples' for it first."
-            )
-            return
-        if not (dr_run.get('embedding_features') or {}):
-            QMessageBox.warning(
-                self, "T-REX",
-                f"\"{dr_run.get('label', '')}\" was archived before T-REX's "
-                "marker-space feature cache was added -- re-run 'Apply to "
-                "All Samples' for it (or retrain) to enable T-REX."
-            )
-            return
-
-        self.progress_message("Building T-REX kNN index …")
-
-        plugin_ref = self
-
-        class _TrexWorker(QThread):
-            finished = Signal(bool, str)
-            progress = Signal(str)
-
-            def __init__(self_, dr_run):
-                super().__init__()
-                self_._dr_run = dr_run
-
-            def run(self_):
-                try:
-                    self_._do_trex()
-                    self_.finished.emit(True, '')
-                except Exception as exc:
-                    traceback.print_exc()
-                    self_.finished.emit(False, str(exc))
-
-            def _do_trex(self_):
-                import hnswlib
-
-                state = plugin_ref.state
-                raw_subdir = plugin_ref.controller.experiment.settings['raw']['raw_samples_subdirectory']
-                emb_dict = self_._dr_run.get('embeddings', {}) or {}
-                feat_dict = self_._dr_run.get('embedding_features', {}) or {}
-
-                def _to_rel(sp):
-                    try:
-                        return str(Path(sp).relative_to(raw_subdir))
-                    except ValueError:
-                        return sp
-
-                # kNN runs in the original marker-feature space (feat_dict),
-                # not the 2D embedding -- true T-REX neighbours, per the
-                # published algorithm. feat_dict and emb_dict were cached
-                # together, row-for-row, at embedding time (_DrWorker), so
-                # scoring here still lines up exactly with what's plotted,
-                # with no live re-gating step involved anywhere.
-                cmp_a, cmp_b = state.compare_group_a, state.compare_group_b
-                a_rels = [_to_rel(sp) for sp, g in state.sample_groups.items()
-                          if g == cmp_a and _to_rel(sp) in feat_dict]
-                b_rels = [_to_rel(sp) for sp, g in state.sample_groups.items()
-                          if g == cmp_b and _to_rel(sp) in feat_dict]
-
-                self_.progress.emit("Pooling Group A features for T-REX …")
-                a_data = np.concatenate([feat_dict[rel] for rel in a_rels], axis=0) if a_rels else None
-                self_.progress.emit("Pooling Group B features for T-REX …")
-                b_data = np.concatenate([feat_dict[rel] for rel in b_rels], axis=0) if b_rels else None
-
-                if a_data is None or b_data is None:
-                    raise RuntimeError(
-                        "Neither group has any samples with cached "
-                        "marker-space features in the selected DR run — "
-                        "check the T-REX DR run selection and the Compare "
-                        "pair."
-                    )
-
-                n_a, n_b = len(a_data), len(b_data)
-                pooled = np.concatenate([a_data, b_data], axis=0).astype(np.float32)
-                group_labels = np.array([cmp_a] * n_a + [cmp_b] * n_b)
-
-                self_.progress.emit(f"Building hnswlib T-REX index ({len(pooled):,} events) …")
-                dim = pooled.shape[1]
-                idx_h = hnswlib.Index(space='l2', dim=dim)
-                idx_h.init_index(max_elements=len(pooled), ef_construction=200, M=16)
-                idx_h.add_items(pooled)
-                idx_h.set_ef(50)
-                state.trex_knn_index = idx_h
-                state.trex_knn_group_labels = group_labels
-
-                k = state.trex_k
-                all_rels = a_rels + b_rels
-                state.trex_scores = {}
-                for rel in all_rels:
-                    sample_data = feat_dict[rel].astype(np.float32)
-                    nn_labels, _ = idx_h.knn_query(sample_data, k=min(k, len(pooled)))
-                    scores = np.zeros(len(sample_data), dtype=np.float32)
-                    for i, neighbours in enumerate(nn_labels):
-                        n_a_nb = np.sum(group_labels[neighbours] == cmp_a)
-                        n_b_nb = np.sum(group_labels[neighbours] == cmp_b)
-                        score = (n_a_nb / max(n_a, 1)) - (n_b_nb / max(n_b, 1))
-                        scores[i] = score
-                    mx = max(abs(scores).max(), 1e-9)
-                    scores = scores / mx
-                    state.trex_scores[rel] = scores
-                    self_.progress.emit(f"  T-REX scored {rel}: {len(scores):,} events")
-
-                state.trex_dr_run_id = self_._dr_run.get('run_id')
-                self_.progress.emit(f"T-REX complete: scored {len(state.trex_scores)} samples.")
-
-        self._trex_worker = _TrexWorker(dr_run)
-        self._trex_worker.progress.connect(self.progress_message)
-        self._trex_worker.finished.connect(self._on_trex_finished)
-        self._trex_worker.start()
-
-    def _on_trex_finished(self, success: bool, error_msg: str):
-        if success:
-            self.progress_message("T-REX scores ready.  Switch to Workspace to view.")
-            # Refresh workspace if visible
-            if self.inner_tabs.currentIndex() == 3:
-                self.workspace_tab.refresh()
-        else:
-            QMessageBox.critical(self, "T-REX Error", error_msg)
-        self._trex_worker = None

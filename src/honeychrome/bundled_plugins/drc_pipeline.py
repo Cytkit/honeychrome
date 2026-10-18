@@ -566,7 +566,6 @@ def preview_features(controller, state, rel_path, af_state) -> np.ndarray:
 
 def sample_abs_path(controller, rel_path) -> "object":
     """Resolve a picker-relative sample path to an absolute Path."""
-    from pathlib import Path
     raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
     return controller.experiment_dir / raw_subdir / rel_path
 
@@ -717,24 +716,11 @@ def _downsample(data: np.ndarray, n: int, rng) -> np.ndarray:
     return data[idx]
 
 
-def load_training_pool(controller, state, seed: int = 42,
-                       af_state=None) -> np.ndarray | None:
-    """
-    Pool gated, transformed events from every training sample, each
-    downsampled to state.n_training_events, into one float32 array.
-
-    af_state: optional unmixing snapshot — see apply_unmixing_af_aware()
-        docstring. Pass this from any background worker thread; leave as
-        None only for main-thread callers.
-    """
-    data, _selections = load_training_pool_with_rows(controller, state, seed=seed,
-                                                     af_state=af_state)
-    return data
-
-
 def load_training_pool_with_rows(controller, state, seed: int = 42, af_state=None):
     """
-    load_training_pool(), plus which events each sample contributed:
+    Pool gated, transformed events from every training sample, each
+    downsampled to state.n_training_events, into one float32 array, plus
+    which events each sample contributed:
     ``(data, selections)`` with selections ``[(rel_path, idx), ...]`` in
     pool order, where ``idx`` indexes the sample's gated events (the rows
     of load_sample_features) and ``data`` holds those events in that order.

@@ -44,9 +44,6 @@ Contrasts: ``state.contrast_mode`` 'reference' fits once across every
 tested group and reads one coefficient per non-reference group;
 'pairwise' fits each pair of groups separately. Results carry a
 ``comparison`` column.
-
-``state.compare_group_a``/``state.compare_group_b`` are used only by
-T-REX, not by this module.
 """
 
 from __future__ import annotations
@@ -64,7 +61,6 @@ from honeychrome.controller_components import differential_stats as _ds
 from honeychrome.controller_components.differential_stats import (
     apply_significance,
     build_contrasts,
-    build_design,
     covariate_kind,
     log2_frequencies,
     run_glm_counts,
