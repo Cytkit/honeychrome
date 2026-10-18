@@ -186,7 +186,7 @@ fluorescence_channel_ids = [event_channels_pnn.index(c) for c in fluorescence_ch
 n_fluorophore_channels = len(fluorescence_channel_ids)
 
 width_ceiling = 50_000 # nanoseconds
-default_ceiling = 60
+default_ceiling = 20
 magnitude_ceiling = 2**18 # according to convention
 magnitude_ceilings = ['2**18 = 262144', '2**22 = 4194304', '2**24 = 16777216'] # 2**16 = 65536, 2**18 = 262144, 2**22 = 4194304, 2**24 = 16777216
 magnitude_ceilings_int = [262144, 4194304, 16777216]

@@ -1467,8 +1467,9 @@ class Controller(QObject):
                 transformation = self.data_for_cytometry_plots['transformations']['Time']
                 index = self.data_for_cytometry_plots['pnn'].index('Time')
                 upper_limit = self.data_for_cytometry_plots['event_data'][-1, index]
-                if upper_limit < transformation.limits[1] * 1.2:
-                    transformation.set_transform(limits=[0, upper_limit * 1.4])
+                if upper_limit > transformation.limits[1]:
+                    transformation.set_transform(limits=[0, upper_limit * 2])
+                    self.data_for_cytometry_plots['histograms'] = initialise_hists(self.data_for_cytometry_plots['plots'], self.data_for_cytometry_plots)
 
             self.calc_hists_and_stats()
 
