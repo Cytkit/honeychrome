@@ -1,25 +1,26 @@
 """
 automated_gating_tab.py — Automated Gating plugin for Honeychrome
 =================================================================
-Applies a gating model (``.agmodel``, made with the Gating Model Builder
-plugin) to experiment samples and compares the gated populations between
-sample groups:
+Builds a gating model (``.agmodel``), applies it to experiment samples and
+compares the gated populations between sample groups. The first five
+pages build the model (``ag_builder.BuilderPages``):
 
-  • Transforms — the axis transforms gating uses: the model's own by
-              default (those its gates were trained in), adjustable by
-              axis drag or Auto-transform, with a return to the model's.
-  • Setup   — load a model, align its channels to this experiment antigen by
-              antigen, convert its boundaries to the transforms, and choose
-              for each gate whether its stored boundary is applied as it is
-              (fixed) or recalculated on each sample (recalculate, with a
-              drift check against the stored boundary).
-  • Run     — pick samples and gate them in a background worker. Each sample
-              is unmixed with its own autofluorescence profile assignment
-              and restricted to its time-QC keep-mask when present. Only
-              counts, parent counts, per-population marker medians and a
-              display subsample (events and population memberships) are
-              kept per sample; the gated views show one population's gates
-              pooled over every sample and for each validation sample.
+  • Transforms, Import/Setup, Hierarchy, Train, Export — see ag_builder.py.
+              A saved model is loaded on Import/Setup, where its channels
+              are matched to this experiment antigen by antigen.
+
+and the last three apply it:
+
+  • Run     — choose for each gate whether its stored boundary is applied as
+              it is (fixed) or recalculated on each sample (recalculate,
+              with a drift check against the stored boundary); pick samples
+              and gate them in a background worker. Each sample is unmixed
+              with its own autofluorescence profile assignment and
+              restricted to its time-QC keep-mask when present. Only counts,
+              parent counts, per-population marker medians and a display
+              subsample (events and population memberships) are kept per
+              sample; the gated views show one population's gates pooled
+              over every sample and for each validation sample.
   • Results — sample groups and covariates, moderated tests of population
               frequencies (log-odds within the parent population), optional
               negative-binomial tests of counts, population-first tests of
@@ -30,16 +31,18 @@ sample groups:
               tested for coordinated shifts between the groups of the
               Results page (``ag_fsea``, page in ``ag_fsea_ui``).
 
+Run applies the model as it stands on the model pages, in their transforms,
+once every gate has a trained boundary. Gated results record a hash of the
+model they were made with (gates, boundaries, transforms and gate modes).
 Gated results, display subsamples and statistics are saved in the
 experiment's cache folder and restored when the experiment is opened again;
 each gating and statistics run is also written as CSV files to
 ``Automated_Gating_Results`` (named after the model, with a timestamp).
 
-Gate application lives in ``ag_core.py`` (shared with the builder),
-alignment and feature tables in ``ag_results.py``, and the statistics in
+Gate application lives in ``ag_core.py``, alignment and feature tables in
+``ag_results.py``, and the statistics in
 ``controller_components/differential_stats.py`` (shared with the
-DR/Clustering plugin). The two gating plugins have no runtime dependency on
-each other.
+DR/Clustering plugin).
 
 Plugin contract (plugin_loaders.py):
   plugin_name  str        — main-window tab title
@@ -97,6 +100,7 @@ _PLUGIN_DIR = _os.path.dirname(_os.path.abspath(__file__))
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
+import ag_builder  # noqa: E402
 import ag_core  # noqa: E402
 import ag_fsea  # noqa: E402
 import ag_fsea_ui  # noqa: E402
@@ -194,25 +198,6 @@ DRIFT_ACTIONS = {'flag': 'Flag only', 'reference': 'Use the stored boundary'}
 FDR_SCOPES = {'global': 'Pooled over comparisons', 'per_comparison': 'Within each comparison'}
 CONTRAST_MODES = {'reference': 'Each group against a reference', 'pairwise': 'All pairs of groups'}
 
-_ALIGN_COLOURS = {
-    ag_results.ALIGN_EXACT: '#d4edda',
-    ag_results.ALIGN_ANTIGEN: '#d4edda',
-    ag_results.ALIGN_CHANNEL: '#fff3cd',
-    ag_results.ALIGN_FUZZY: '#fff3cd',
-    ag_results.ALIGN_AMBIGUOUS: '#fff3cd',
-    None: '#f8d7da',
-}
-_ALIGN_TEXT = {
-    ag_results.ALIGN_EXACT: 'same channel and antigen',
-    ag_results.ALIGN_ANTIGEN: 'antigen on another channel',
-    ag_results.ALIGN_CHANNEL: 'same channel, different antigen — check',
-    ag_results.ALIGN_FUZZY: 'closest name only — check',
-    ag_results.ALIGN_AMBIGUOUS: 'antigen on several channels — check',
-    None: 'no match — choose a channel',
-    'manual': 'chosen by hand',
-}
-
-
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
@@ -277,23 +262,6 @@ def _live_transform_params(controller) -> dict:
     return {ch: ag_core.transform_params(tr) for ch, tr in live.items()}
 
 
-def model_transform_params(model: dict, alignment: dict, live_params: dict) -> dict:
-    """The transforms gating uses by default: the model's own (those its
-    boundaries were trained in), renamed to this experiment's channels; the
-    experiment's display transforms for channels the model has none for."""
-    out = {ch: dict(p) for ch, p in (live_params or {}).items()}
-    alignment = alignment or {}
-    stored = (model or {}).get('transforms') or {}
-    # Aligned channels last, so they win over an unaligned one of the same name.
-    order = sorted(stored, key=lambda mc: bool(alignment.get(mc)))
-    for model_ch in order:
-        params = stored[model_ch]
-        ch = alignment.get(model_ch) or model_ch
-        if ch in out and params:
-            out[ch] = dict(params)
-    return out
-
-
 def _export_stem(model_path: str) -> str:
     import drc_report
     return drc_report.sanitize_filename(Path(model_path).stem or 'automated_gating')
@@ -302,18 +270,6 @@ def _export_stem(model_path: str) -> str:
 def _sample_label(key: str) -> str:
     """Short display name for a sample key."""
     return Path(str(key)).stem
-
-
-def _gated_channels(gate_defs: list[dict]) -> list[str]:
-    """Channels used as an axis by any gate (including 1dsep view channels
-    and imported shapes), in hierarchy order."""
-    by_name = ag_core.gates_by_name(gate_defs)
-    out: list[str] = []
-    for g in ag_core.ordered_gate_defs(gate_defs):
-        for ch in ag_core.referenced_channels(ag_core.effective_gate_def(g, by_name)):
-            if ch and ch not in out:
-                out.append(ch)
-    return out
 
 
 def _population_labels(gate_defs: list[dict]) -> dict:
@@ -326,19 +282,13 @@ def _population_labels(gate_defs: list[dict]) -> dict:
     return out
 
 
-def _file_sha256(path) -> str:
-    try:
-        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-    except OSError:
-        return ''
-
-
-def _time_qc_available() -> bool:
-    try:
-        from honeychrome.controller_components import time_qc  # noqa: F401
-    except ImportError:
-        return False
-    return True
+def model_sha(model: dict) -> str:
+    """Hash of a model's gates, trained boundaries and transforms (not its
+    metadata or gate modes, which run_fingerprint covers)."""
+    payload = {k: (model or {}).get(k) for k in
+               ('gate_definitions', 'trained_boundaries', 'transforms')}
+    return hashlib.sha256(json.dumps(ag_core.to_jsonable(payload), sort_keys=True,
+                                     default=str).encode('utf-8')).hexdigest()
 
 
 def _status(bus, msg: str):
@@ -378,13 +328,16 @@ def _checkbox_item(checked: bool) -> QTableWidgetItem:
 
 @dataclass
 class GatingRunState:
-    """Automated gating session state.
+    """Automated gating session state (the Run, Results and Enrichment pages).
 
-    model          : the normalised model as loaded (the model's channel names).
-    alignment      : {model channel: experiment channel} for gated channels.
-    applied_model  : the model renamed to this experiment's channels and
-                     converted to its transforms; what the Run tab applies.
-    modes          : {gate: 'fixed' | 'recalculate'}.
+    model_path     : the model's file, when it was last saved or loaded
+                     (names the CSV files and the report).
+    applied_model  : the model built on the model pages, in this
+                     experiment's channels and the plugin's transforms;
+                     what the Run tab applies (set by PluginWidget).
+    model_sha      : model_sha(applied_model) (gates, boundaries, transforms).
+    modes          : {gate: 'fixed' | 'recalculate'}; saved with the model as
+                     its application block, with the drift settings.
     summaries      : {sample key: ag_results.summarise_sample() record}.
     load_info      : {sample key: event counts and AF profiles used}.
     display        : {sample key: display subsample and masks} — this
@@ -402,7 +355,7 @@ class GatingRunState:
                      transforms), so a paused run is only resumed with the
                      same settings.
     transform_params: {channel: transform parameters} gating uses (the
-                     model's by default).
+                     model pages' transforms).
     run_transforms : the transforms the gated results were made in (their
                      boundaries and display plots are in these units).
     report_populations: population keys ticked for the report.
@@ -414,12 +367,8 @@ class GatingRunState:
     fsea           : the last enrichment run (kept in ENRICHMENT_FILE).
     """
     model_path: str = ''
-    model: dict = field(default_factory=dict)
-    model_messages: list = field(default_factory=list)
-    alignment: dict = field(default_factory=dict)
-    alignment_methods: dict = field(default_factory=dict)
-    alignment_confirmed: bool = False
     applied_model: dict = field(default_factory=dict)
+    model_sha: str = ''
     modes: dict = field(default_factory=dict)
     drift_limit: float = ag_core.DEFAULT_DRIFT_LIMIT
     drift_action: str = 'flag'
@@ -436,10 +385,6 @@ class GatingRunState:
     pending_samples: list = field(default_factory=list)
     run_fingerprint: str = ''
     transform_params: dict = field(default_factory=dict)
-    transform_population: str = ''
-    transform_view: dict = field(default_factory=dict)
-    transform_model: str = ''
-    transform_custom: bool = False
     run_transforms: dict = field(default_factory=dict)
     report_populations: list = field(default_factory=list)
     pop_filter: str = 'significant'
@@ -505,16 +450,14 @@ class GatingRunState:
 
 
 _PERSISTED_FIELDS = (
-    'model_path', 'alignment', 'alignment_methods', 'alignment_confirmed', 'modes',
-    'drift_limit', 'drift_action', 'run_samples', 'validation_samples', 'include_controls',
+    'modes', 'drift_limit', 'drift_action', 'run_samples', 'validation_samples', 'include_controls',
     'display_events', 'group_names', 'group_patterns', 'sample_groups', 'covariates',
     'numeric_covariates', 'pairing', 'adjust_covariates', 'contrast_mode', 'reference_group', 'pval_threshold',
     'fc_threshold', 'marker_threshold', 'use_treat', 'fdr_scope', 'run_freq', 'run_counts',
     'run_markers', 'use_stats_parent', 'exclude_gating_markers', 'min_marker_events',
     'exclude_flagged', 'pca_use_freq', 'pca_use_counts', 'pca_use_markers', 'pca_n_loadings',
     'pred_use_freq', 'pred_use_markers', 'pred_lasso', 'pred_forest', 'pred_repeats',
-    'transform_params', 'transform_population', 'transform_view', 'transform_model',
-    'transform_custom', 'report_populations', 'pop_filter',
+    'report_populations', 'pop_filter',
     'fsea_library_path', 'fsea_species', 'fsea_anchor', 'fsea_feature_types',
     'fsea_marker_readout', 'fsea_rank_metric', 'fsea_n_perm', 'fsea_seed', 'fsea_min_set_size',
     'fsea_overrides',
@@ -523,514 +466,13 @@ _PERSISTED_FIELDS = (
 
 def run_fingerprint(state: 'GatingRunState', model_sha: str) -> str:
     """Hash of everything the gated results of a run depend on."""
-    payload = {'model': model_sha, 'alignment': state.alignment, 'modes': state.modes,
+    payload = {'model': model_sha, 'modes': state.modes,
                'drift_limit': state.drift_limit, 'drift_action': state.drift_action,
                'markers': state.marker_channels,
                'transforms': {ch: {k: v for k, v in (p or {}).items() if k != 'limits'}
                               for ch, p in (state.transform_params or {}).items()}}
     return hashlib.sha256(json.dumps(ag_core.to_jsonable(payload), sort_keys=True)
                           .encode('utf-8')).hexdigest()
-
-
-def prepare_applied_model(model: dict, alignment: dict, live_params: dict) -> tuple[dict, list[str]]:
-    """The model renamed to this experiment's channels and converted to its
-    transforms, with messages describing any conversion."""
-    aligned = ag_results.apply_alignment(model, alignment)
-    return ag_core.remap_model(aligned, live_params)
-
-
-# ---------------------------------------------------------------------------
-# Setup tab
-# ---------------------------------------------------------------------------
-
-class SetupTab(QWidget):
-    """Load a model, align its channels, and set how each gate is applied.
-
-    transforms_for : callable(model, alignment) -> {channel: transform
-                     parameters} the model is converted to when its
-                     alignment is accepted (the plugin's transforms).
-    """
-
-    model_ready = Signal()
-    model_loaded = Signal()
-
-    def __init__(self, state: GatingRunState, bus, controller, transforms_for=None, parent=None):
-        super().__init__(parent)
-        self.state = state
-        self.bus = bus
-        self.controller = controller
-        self._transforms_for = transforms_for
-        self._align_rows: list[str] = []
-        self._read_warnings: list[str] = []
-        self._gate_items: dict = {}
-        self._build_ui()
-
-    def _build_ui(self):
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 8, 8, 8)
-        outer.setSpacing(8)
-        outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_SETUP))
-
-        self.lbl_messages = QLabel("")
-        self.lbl_messages.setWordWrap(True)
-        self.lbl_messages.setStyleSheet("color: #856404;")
-        outer.addWidget(self.lbl_messages)
-
-        # One section open at a time; each page scrolls on its own.
-        self.toolbox = make_concertina()
-        outer.addWidget(self.toolbox, stretch=1)
-
-        # Model
-        model_page = QWidget()
-        ml = QVBoxLayout(model_page)
-        load_row = QHBoxLayout()
-        self.btn_load = QPushButton("Load Model…")
-        self.btn_load.clicked.connect(self._on_load_clicked)
-        load_row.addWidget(self.btn_load)
-        self.lbl_path = QLabel("No model loaded.")
-        self.lbl_path.setWordWrap(True)
-        load_row.addWidget(self.lbl_path, stretch=1)
-        ml.addLayout(load_row)
-        self.lbl_summary = QLabel("")
-        self.lbl_summary.setWordWrap(True)
-        self.lbl_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        ml.addWidget(self.lbl_summary)
-        ml.addStretch()
-
-        # Channel alignment
-        align_page = QWidget()
-        al = QVBoxLayout(align_page)
-        note = QLabel("Each model channel is matched to this experiment by antigen. Green rows "
-                      "matched by antigen; amber rows need checking; red rows need a channel.")
-        note.setWordWrap(True)
-        al.addWidget(note)
-        self.align_filter = FilterBar([('all', 'All channels'), ('check', 'Rows to check')],
-                                      placeholder="Search channels or antigens…")
-        self.align_filter.changed.connect(lambda _t, _m: self._filter_alignment())
-        al.addWidget(self.align_filter)
-        self.align_table = QTableWidget(0, 4)
-        self.align_table.setHorizontalHeaderLabels(
-            ["Model channel", "Model antigen", "Experiment channel", "Match"])
-        self.align_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.align_table.verticalHeader().setVisible(False)
-        self.align_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.align_table.setMinimumHeight(140)
-        al.addWidget(self.align_table, stretch=1)
-        acc_row = QHBoxLayout()
-        self.lbl_align_state = QLabel("")
-        self.lbl_align_state.setWordWrap(True)
-        acc_row.addWidget(self.lbl_align_state, stretch=1)
-        self.btn_accept = QPushButton("Accept Alignment")
-        self.btn_accept.setEnabled(False)
-        self.btn_accept.clicked.connect(self._on_accept_clicked)
-        acc_row.addWidget(self.btn_accept)
-        al.addLayout(acc_row)
-
-        # Gates
-        gates_page = QWidget()
-        gl = QVBoxLayout(gates_page)
-        opts = QHBoxLayout()
-        opts.addWidget(QLabel("Drift limit:"))
-        self.sb_drift = block_wheel(QDoubleSpinBox())
-        self.sb_drift.setRange(0.001, 1.0)
-        self.sb_drift.setDecimals(3)
-        self.sb_drift.setSingleStep(0.01)
-        self.sb_drift.setToolTip(
-            "For recalculated gates: the largest shift from the stored boundary, in "
-            "transformed axis units (the display axis spans about 0 to 1), before the "
-            "sample is flagged.")
-        self.sb_drift.valueChanged.connect(lambda v: setattr(self.state, 'drift_limit', float(v)))
-        opts.addWidget(self.sb_drift)
-        opts.addWidget(QLabel("  When exceeded:"))
-        self.cb_drift_action = block_wheel(QComboBox())
-        for key, text in DRIFT_ACTIONS.items():
-            self.cb_drift_action.addItem(text, key)
-        self.cb_drift_action.currentIndexChanged.connect(
-            lambda _i: setattr(self.state, 'drift_action', self.cb_drift_action.currentData()))
-        opts.addWidget(self.cb_drift_action)
-        opts.addWidget(QLabel("  Set all:"))
-        for mode in (ag_core.MODE_FIXED, ag_core.MODE_RECALCULATE):
-            b = QPushButton(MODE_LABELS[mode])
-            b.clicked.connect(lambda _c=False, m=mode: self._set_all_modes(m))
-            opts.addWidget(b)
-        opts.addStretch()
-        gl.addLayout(opts)
-        self.gate_filter = FilterBar(
-            [('all', 'All gates'), (ag_core.MODE_RECALCULATE, 'Recalculated gates'),
-             (ag_core.MODE_FIXED, 'Fixed gates')],
-            placeholder="Search gates, channels or algorithms…")
-        self.gate_filter.changed.connect(lambda _t, _m: self._filter_gates())
-        gl.addWidget(self.gate_filter)
-        self.gate_tree = QTreeWidget()
-        self.gate_tree.setColumnCount(6)
-        self.gate_tree.setHeaderLabels(["Gate", "Type", "X axis", "Y axis", "Algorithm", "Application"])
-        self.gate_tree.header().setSectionResizeMode(QHeaderView.Interactive)
-        self.gate_tree.setColumnWidth(0, 220)
-        self.gate_tree.setUniformRowHeights(True)
-        self.gate_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.gate_tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.gate_tree.customContextMenuRequested.connect(self._on_gate_menu)
-        self.gate_tree.itemDoubleClicked.connect(self._on_gate_double_clicked)
-        self.gate_tree.setToolTip("Double-click a gate to switch between fixed and recalculated; "
-                                  "right-click to set the selected gates.")
-        self.gate_tree.setMinimumHeight(160)
-        gl.addWidget(self.gate_tree, stretch=1)
-
-        self._page_model = add_concertina_page(self.toolbox, model_page, "Model")
-        self._page_align = add_concertina_page(
-            self.toolbox, align_page, "Channel alignment (channels used by the gates)")
-        self._page_gates = add_concertina_page(self.toolbox, gates_page, "Gates")
-
-    # ------------------------------------------------------------------
-
-    def refresh(self):
-        """Redraw from state (after a restore or an experiment change)."""
-        self.sb_drift.blockSignals(True)
-        self.sb_drift.setValue(float(self.state.drift_limit))
-        self.sb_drift.blockSignals(False)
-        idx = self.cb_drift_action.findData(self.state.drift_action)
-        self.cb_drift_action.blockSignals(True)
-        self.cb_drift_action.setCurrentIndex(max(idx, 0))
-        self.cb_drift_action.blockSignals(False)
-        if not self.state.model:
-            self.lbl_path.setText("No model loaded.")
-            self.lbl_summary.setText("")
-            self.align_table.setRowCount(0)
-            self.gate_tree.clear()
-            self._gate_items = {}
-            self.lbl_messages.setText("")
-            self.btn_accept.setEnabled(False)
-            self.lbl_align_state.setText("")
-            return
-        self.lbl_path.setText(self.state.model_path)
-        self._populate_summary()
-        self._populate_alignment(keep_current=True)
-        self._populate_gate_tree()
-        self._show_messages()
-        self._update_align_state()
-
-    def _on_load_clicked(self):
-        start = ''
-        try:
-            start = str(self.controller.experiment_dir)
-        except Exception:
-            pass
-        path, _ = QFileDialog.getOpenFileName(self, "Load Gating Model", start,
-                                              "Gating model (*.agmodel)")
-        if path:
-            self.load_model(path)
-
-    def load_model(self, path: str, alignment: dict | None = None,
-                   confirmed: bool = False) -> bool:
-        """Read *path*; propose an alignment unless one is given."""
-        from PySide6.QtWidgets import QApplication
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            model, warnings_list = ag_core.read_model(path)
-        except Exception as exc:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "Load failed", f"Could not read model:\n{exc}")
-            return False
-        try:
-            self.apply_loaded_model(path, model, warnings_list, alignment=alignment,
-                                    confirmed=confirmed)
-        finally:
-            QApplication.restoreOverrideCursor()
-        return True
-
-    def apply_loaded_model(self, path: str, model: dict, warnings_list: list,
-                           alignment: dict | None = None, confirmed: bool = False,
-                           applied: dict | None = None, messages: list | None = None):
-        """Show a model read from *path*. With *applied* (the model already
-        converted for *alignment*, e.g. by a background loader) the
-        alignment is taken as accepted."""
-        st = self.state
-        st.model_path = str(path)
-        st.model = model
-        self._read_warnings = list(warnings_list)
-        st.model_messages = list(warnings_list)
-        st.alignment_confirmed = False
-        st.applied_model = {}
-        app = model.get('application') or {}
-        if not st.modes or set(st.modes) != {g['gate_name'] for g in model['gate_definitions']}:
-            st.modes = dict(app.get('mode_per_gate') or {})
-        if alignment is not None:
-            st.alignment = dict(alignment)
-        else:
-            self._propose_alignment()
-        self.model_loaded.emit()
-        self.lbl_path.setText(st.model_path)
-        self._populate_summary()
-        self._populate_alignment(keep_current=True)
-        self._populate_gate_tree()
-        if applied is not None:
-            st.applied_model = applied
-            st.alignment_confirmed = True
-            st.model_messages = list(self._read_warnings) + list(messages or [])
-        elif confirmed and not ag_results.alignment_problems(self._gated_alignment()):
-            self._apply_alignment(quiet=True)
-        self._show_messages()
-        self._update_align_state()
-        self.toolbox.setCurrentIndex(self._page_gates if st.alignment_confirmed
-                                     else self._page_align)
-        _status(self.bus, f"Model loaded: {Path(path).name}")
-
-    def _model_gated_channels(self) -> list[str]:
-        return _gated_channels(self.state.model.get('gate_definitions') or [])
-
-    def _gated_alignment(self) -> dict:
-        return {mc: self.state.alignment.get(mc) for mc in self._model_gated_channels()}
-
-    def _propose_alignment(self):
-        from honeychrome.controller_components.label_matching import get_marker_db, match_marker
-        try:
-            marker_db = get_marker_db()
-            canonical = lambda name: match_marker(name, marker_db)  # noqa: E731
-        except Exception:
-            canonical = None
-        proposal = ag_results.align_channels(
-            self._model_gated_channels(), self.state.model.get('channel_map') or {},
-            _experiment_channels(self.controller), _experiment_antigens(self.controller),
-            canonical=canonical,
-        )
-        self.state.alignment = {mc: p['channel'] for mc, p in proposal.items()}
-        self.state.alignment_methods = {mc: p['method'] for mc, p in proposal.items()}
-
-    def _populate_summary(self):
-        m = self.state.model
-        meta = m.get('metadata') or {}
-        ts = m.get('training_summary') or {}
-        names = ts.get('training_sample_names') or []
-        gates = m.get('gate_definitions') or []
-        n_pops = sum(len(g.get('populations') or {}) for g in gates)
-        af = (m.get('af') or {}).get('sample_af_profiles') or {}
-        af_sets = sorted({', '.join(v) if v else 'none' for v in af.values()})
-        lines = [
-            f"<b>Experiment:</b> {meta.get('experiment_name', '—')} &nbsp; "
-            f"<b>Created:</b> {meta.get('created', '—')} &nbsp; "
-            f"<b>Honeychrome:</b> {meta.get('honeychrome_version', '—')}",
-            f"<b>Cytometer:</b> {meta.get('cytometer_hint', '—') or '—'} &nbsp; "
-            f"<b>Gates:</b> {len(gates)} &nbsp; <b>Populations:</b> {n_pops}",
-            f"<b>Trained on:</b> {len(names)} sample(s)"
-            + (f" — {', '.join(_sample_label(n) for n in names[:8])}"
-               + (" …" if len(names) > 8 else "") if names else ""),
-            f"<b>Training AF profiles:</b> {'; '.join(af_sets) if af_sets else '—'}",
-        ]
-        self.lbl_summary.setText("<br>".join(lines))
-
-    def _populate_alignment(self, keep_current: bool = True):
-        exp_pnn = _experiment_channels(self.controller)
-        antigens = _antigen_map(self.controller)
-        channel_map = self.state.model.get('channel_map') or {}
-        rows = self._model_gated_channels()
-        self._align_rows = rows
-        self.align_table.setRowCount(0)
-        for r, mc in enumerate(rows):
-            self.align_table.insertRow(r)
-            method = self.state.alignment_methods.get(mc)
-            colour = _ALIGN_COLOURS.get(method, _ALIGN_COLOURS[None]) if method != 'manual' \
-                else _ALIGN_COLOURS[ag_results.ALIGN_EXACT]
-            self.align_table.setItem(r, 0, _coloured_item(mc, colour))
-            self.align_table.setItem(r, 1, _coloured_item(channel_map.get(mc, ''), colour))
-            combo = block_wheel(QComboBox())
-            combo.addItem("— choose —", None)
-            for ch in exp_pnn:
-                if ch in ag_core.ALWAYS_EXCLUDED_CHANNELS:
-                    continue
-                label = antigens.get(ch, ch)
-                combo.addItem(ch if label == ch else f"{ch} — {label}", ch)
-            current = self.state.alignment.get(mc)
-            i = combo.findData(current) if current else 0
-            combo.setCurrentIndex(max(i, 0))
-            combo.currentIndexChanged.connect(
-                lambda _i, row=r, name=mc: self._on_align_changed(row, name))
-            self.align_table.setCellWidget(r, 2, combo)
-            self.align_table.setItem(r, 3, _coloured_item(_ALIGN_TEXT.get(method, ''), colour))
-        self._filter_alignment()
-
-    def _row_needs_check(self, mc: str) -> bool:
-        return (not self.state.alignment.get(mc)
-                or self.state.alignment_methods.get(mc) not in
-                (ag_results.ALIGN_EXACT, ag_results.ALIGN_ANTIGEN, 'manual'))
-
-    def _filter_alignment(self):
-        """Hide the alignment rows outside the search and the "show" choice."""
-        text, mode = self.align_filter.text(), self.align_filter.mode()
-        channel_map = (self.state.model or {}).get('channel_map') or {}
-        n_check = 0
-        for r, mc in enumerate(self._align_rows):
-            check = self._row_needs_check(mc)
-            n_check += int(check)
-            shown = text_matches(text, mc, channel_map.get(mc, ''), self.state.alignment.get(mc) or '')
-            if mode == 'check':
-                shown = shown and check
-            self.align_table.setRowHidden(r, not shown)
-        self.align_filter.set_mode_label('check', f"Rows to check ({n_check})")
-
-    def _on_align_changed(self, row: int, model_ch: str):
-        combo = self.align_table.cellWidget(row, 2)
-        if combo is None:
-            return
-        self.state.alignment[model_ch] = combo.currentData()
-        self.state.alignment_methods[model_ch] = 'manual' if combo.currentData() else None
-        colour = _ALIGN_COLOURS[ag_results.ALIGN_EXACT] if combo.currentData() else _ALIGN_COLOURS[None]
-        for col in (0, 1, 3):
-            item = self.align_table.item(row, col)
-            if item is not None:
-                item.setBackground(QColor(colour))
-        self.align_table.item(row, 3).setText(_ALIGN_TEXT['manual' if combo.currentData() else None])
-        if self.state.alignment_confirmed:
-            self.state.alignment_confirmed = False
-            self.state.applied_model = {}
-            self._show_messages()
-        self._update_align_state()
-        self.align_filter.set_mode_label(
-            'check', f"Rows to check ({sum(self._row_needs_check(m) for m in self._align_rows)})")
-
-    def _update_align_state(self):
-        problems = ag_results.alignment_problems(self._gated_alignment())
-        needs_check = [mc for mc in self._align_rows
-                       if self.state.alignment_methods.get(mc) not in
-                       (ag_results.ALIGN_EXACT, ag_results.ALIGN_ANTIGEN, 'manual')
-                       and self.state.alignment.get(mc)]
-        if self.state.alignment_confirmed:
-            text = "<b>Alignment accepted.</b> The Run tab uses it."
-        elif problems:
-            text = "<b>Before accepting:</b> " + "; ".join(problems)
-        elif needs_check:
-            text = "Check the amber rows, then accept: " + ", ".join(needs_check)
-        else:
-            text = "All gated channels matched by antigen."
-        self.lbl_align_state.setText(text)
-        self.btn_accept.setEnabled(bool(self.state.model) and not problems
-                                   and not self.state.alignment_confirmed)
-
-    def _on_accept_clicked(self):
-        self._apply_alignment(quiet=False)
-
-    def _apply_alignment(self, quiet: bool):
-        st = self.state
-        alignment = self._gated_alignment()
-        params = (self._transforms_for(st.model, alignment) if self._transforms_for is not None
-                  else _live_transform_params(self.controller))
-        try:
-            applied, messages = prepare_applied_model(st.model, alignment, params)
-        except Exception as exc:
-            if not quiet:
-                QMessageBox.critical(self, "Cannot apply model", str(exc))
-            log.exception("could not prepare the model")
-            return
-        st.applied_model = applied
-        st.alignment_confirmed = True
-        st.model_messages = list(self._read_warnings) + list(messages)
-        self._show_messages()
-        self._update_align_state()
-        if not quiet:
-            self.toolbox.setCurrentIndex(self._page_gates)
-            _status(self.bus, "Channel alignment accepted.")
-            self.model_ready.emit()
-
-    def _show_messages(self):
-        msgs = list(self.state.model_messages)
-        qc = (self.state.model.get('qc') or {}) if self.state.model else {}
-        if qc.get('enabled') and not _time_qc_available():
-            msgs.append("The model was trained on time-QC-filtered events, but time QC is "
-                        "not available in this installation; samples are gated unfiltered.")
-        self.lbl_messages.setText("<br>".join(msgs))
-
-    # -- gates ------------------------------------------------------------
-
-    def _populate_gate_tree(self):
-        """One row per gate, nested as in the hierarchy. The Application
-        column shows each gate's mode; double-click or the context menu
-        changes it."""
-        self.gate_tree.clear()
-        self._gate_items = {}
-        gates = self.state.model.get('gate_definitions') or []
-        antigens = _antigen_map(self.controller)
-
-        def axis_text(model_ch):
-            ch = self.state.alignment.get(model_ch) or model_ch or ''
-            return antigens.get(ch, ch) if ch else ''
-
-        for g in ag_core.ordered_gate_defs(gates):
-            name = g['gate_name']
-            item = QTreeWidgetItem([name, g.get('gate_type', ''), axis_text(g.get('gate_marker_x')),
-                                    axis_text(g.get('gate_marker_y')), g.get('algorithm', ''), ''])
-            item.setData(0, Qt.UserRole, name)
-            if g.get('gate_type') == 'replicate':
-                item.setToolTip(5, "A replicate gate copies its origin gate's boundary, "
-                                   "whichever mode the origin uses.")
-            parent = self._gate_items.get(g.get('parent_gate') or '')
-            if parent is not None:
-                parent.addChild(item)
-            else:
-                self.gate_tree.addTopLevelItem(item)
-            self._gate_items[name] = item
-            self._show_mode(name)
-        self.gate_tree.expandAll()
-        self._filter_gates()
-
-    def _show_mode(self, name: str):
-        item = self._gate_items.get(name)
-        if item is None:
-            return
-        mode = self.state.modes.get(name, ag_core.MODE_FIXED)
-        item.setText(5, MODE_LABELS.get(mode, mode))
-        item.setForeground(5, QColor('#a05a00') if mode == ag_core.MODE_RECALCULATE
-                           else QColor('#1e7d32'))
-
-    def _set_modes(self, names, mode: str):
-        for name in names:
-            self.state.modes[name] = mode
-            self._show_mode(name)
-        self._filter_gates()
-
-    def _on_gate_double_clicked(self, item, _column):
-        name = item.data(0, Qt.UserRole)
-        current = self.state.modes.get(name, ag_core.MODE_FIXED)
-        self._set_modes([name], ag_core.MODE_FIXED if current == ag_core.MODE_RECALCULATE
-                        else ag_core.MODE_RECALCULATE)
-
-    def _on_gate_menu(self, pos):
-        from PySide6.QtWidgets import QMenu
-        names = [it.data(0, Qt.UserRole) for it in self.gate_tree.selectedItems()]
-        if not names:
-            item = self.gate_tree.itemAt(pos)
-            names = [item.data(0, Qt.UserRole)] if item is not None else []
-        if not names:
-            return
-        menu = QMenu(self.gate_tree)
-        for mode in (ag_core.MODE_FIXED, ag_core.MODE_RECALCULATE):
-            act = menu.addAction(f"{MODE_LABELS[mode]} ({len(names)} gate"
-                                 f"{'s' if len(names) != 1 else ''})")
-            act.triggered.connect(lambda _c=False, m=mode, n=list(names): self._set_modes(n, m))
-        menu.exec(self.gate_tree.viewport().mapToGlobal(pos))
-
-    def _set_all_modes(self, mode: str):
-        self._set_modes([g['gate_name'] for g in self.state.model.get('gate_definitions') or []],
-                        mode)
-
-    def _filter_gates(self):
-        """Show the gates matching the search and the "show" choice, with
-        the gates above them."""
-        text, mode = self.gate_filter.text(), self.gate_filter.mode()
-        if not text and mode in ('', 'all'):
-            for item in self._gate_items.values():
-                item.setHidden(False)
-            return
-        visible = set()
-        for name, item in self._gate_items.items():
-            hit = text_matches(text, *(item.text(c) for c in range(6)))
-            if mode not in ('', 'all'):
-                hit = hit and self.state.modes.get(name, ag_core.MODE_FIXED) == mode
-            if hit:
-                node = item
-                while node is not None and id(node) not in visible:
-                    visible.add(id(node))
-                    node = node.parent()
-        for item in self._gate_items.values():
-            item.setHidden(id(item) not in visible)
 
 
 # ---------------------------------------------------------------------------
@@ -1252,7 +694,7 @@ class _GatingWorker(QThread):
 
     def _execute(self) -> int:
         index = {ch: i for i, ch in enumerate(self._channels)}
-        display_cols = [ch for ch in _gated_channels(self._gate_defs) if ch in index]
+        display_cols = [ch for ch in ag_results.gated_channels(self._gate_defs) if ch in index]
         display_idx = [index[ch] for ch in display_cols]
         limits = _axis_limits(self._transforms)
         n_done = 0
@@ -1321,7 +763,8 @@ def _gates_on(gate_defs: list[dict], node) -> list[dict]:
 
 
 class RunTab(QWidget):
-    """Pick samples, gate them, and inspect the result population by population.
+    """Set how each gate is applied, pick samples, gate them, and inspect the
+    result population by population.
 
     The gated views show the gates drawn on the population picked in the
     hierarchy: pooled over every gated sample (the stored boundaries) and,
@@ -1331,6 +774,8 @@ class RunTab(QWidget):
     result_transforms : callable -> {channel: Transform} the gated results
                         are in (for drawing them).
     display_dir       : callable -> folder the display records are saved in.
+    readiness         : callable -> '' when the model can be applied, else
+                        why not (shown in place of the page).
     """
 
     gating_finished = Signal(str)
@@ -1338,7 +783,7 @@ class RunTab(QWidget):
     COL_RUN, COL_VALIDATE, COL_SAMPLE, COL_AF = range(4)
 
     def __init__(self, state: GatingRunState, bus, controller, gating_transforms=None,
-                 result_transforms=None, display_dir=None, parent=None):
+                 result_transforms=None, display_dir=None, readiness=None, parent=None):
         super().__init__(parent)
         self.state = state
         self.bus = bus
@@ -1347,12 +792,15 @@ class RunTab(QWidget):
             lambda: self.controller.unmixed_transformations or {})
         self._result_transforms = result_transforms or self._gating_transforms
         self._display_dir = display_dir or (lambda: None)
+        self._readiness = readiness or (lambda: '')
         self._worker: _GatingWorker | None = None
         self._run_keys: list[str] = []
         self._before_run: dict | None = None
         self._filling = False
         self._pool_cache = None
         self._tree_for = None
+        self._gate_items: dict = {}
+        self._gates_for = None
         self._build_ui()
 
     def _build_ui(self):
@@ -1361,7 +809,7 @@ class RunTab(QWidget):
         outer.setSpacing(6)
         outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_RUN))
 
-        self.banner = QLabel("Load a model and accept its channel alignment on the Setup tab first.")
+        self.banner = QLabel("")
         self.banner.setWordWrap(True)
         self.banner.setStyleSheet("QLabel { color: #856404; background: #fff3cd; "
                                   "border: 1px solid #ffc107; border-radius: 4px; padding: 6px; }")
@@ -1375,6 +823,8 @@ class RunTab(QWidget):
         # One section open at a time; each page scrolls on its own.
         self.toolbox = make_concertina()
         cl.addWidget(self.toolbox)
+
+        gates_page = self._build_gates_page()
 
         top = QWidget()
         tl = QVBoxLayout(top)
@@ -1489,15 +939,79 @@ class RunTab(QWidget):
         split.setSizes([240, 760])
         bl.addWidget(split, stretch=1)
 
+        self._page_gates = add_concertina_page(self.toolbox, gates_page, "Gate application")
         self._page_samples = add_concertina_page(self.toolbox, top, "Samples and gating")
         self._page_views = self.toolbox.addItem(bottom, "Gated views")
+        self.toolbox.setCurrentIndex(self._page_samples)
+
+    def _build_gates_page(self) -> QWidget:
+        """Per-gate fixed or recalculated application and the drift check."""
+        gates_page = QWidget()
+        gl = QVBoxLayout(gates_page)
+        opts = QHBoxLayout()
+        opts.addWidget(QLabel("Drift limit:"))
+        self.sb_drift = block_wheel(QDoubleSpinBox())
+        self.sb_drift.setRange(0.001, 1.0)
+        self.sb_drift.setDecimals(3)
+        self.sb_drift.setSingleStep(0.01)
+        self.sb_drift.setToolTip(
+            "For recalculated gates: the largest shift from the stored boundary, in "
+            "transformed axis units (the display axis spans about 0 to 1), before the "
+            "sample is flagged.")
+        self.sb_drift.valueChanged.connect(lambda v: setattr(self.state, 'drift_limit', float(v)))
+        opts.addWidget(self.sb_drift)
+        opts.addWidget(QLabel("  When exceeded:"))
+        self.cb_drift_action = block_wheel(QComboBox())
+        for key, text in DRIFT_ACTIONS.items():
+            self.cb_drift_action.addItem(text, key)
+        self.cb_drift_action.currentIndexChanged.connect(
+            lambda _i: setattr(self.state, 'drift_action', self.cb_drift_action.currentData()))
+        opts.addWidget(self.cb_drift_action)
+        opts.addWidget(QLabel("  Set all:"))
+        for mode in (ag_core.MODE_FIXED, ag_core.MODE_RECALCULATE):
+            b = QPushButton(MODE_LABELS[mode])
+            b.clicked.connect(lambda _c=False, m=mode: self._set_all_modes(m))
+            opts.addWidget(b)
+        opts.addStretch()
+        gl.addLayout(opts)
+        self.gate_filter = FilterBar(
+            [('all', 'All gates'), (ag_core.MODE_RECALCULATE, 'Recalculated gates'),
+             (ag_core.MODE_FIXED, 'Fixed gates')],
+            placeholder="Search gates, channels or algorithms…")
+        self.gate_filter.changed.connect(lambda _t, _m: self._filter_gates())
+        gl.addWidget(self.gate_filter)
+        self.gate_tree = QTreeWidget()
+        self.gate_tree.setColumnCount(6)
+        self.gate_tree.setHeaderLabels(["Gate", "Type", "X axis", "Y axis", "Algorithm", "Application"])
+        self.gate_tree.header().setSectionResizeMode(QHeaderView.Interactive)
+        self.gate_tree.setColumnWidth(0, 220)
+        self.gate_tree.setUniformRowHeights(True)
+        self.gate_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.gate_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.gate_tree.customContextMenuRequested.connect(self._on_gate_menu)
+        self.gate_tree.itemDoubleClicked.connect(self._on_gate_double_clicked)
+        self.gate_tree.setToolTip("Double-click a gate to switch between fixed and recalculated; "
+                                  "right-click to set the selected gates.")
+        self.gate_tree.setMinimumHeight(160)
+        gl.addWidget(self.gate_tree, stretch=1)
+        return gates_page
 
     # ------------------------------------------------------------------
 
     def refresh(self):
-        ready = bool(self.state.alignment_confirmed and self.state.applied_model)
-        self.banner.setVisible(not ready)
+        reason = self._readiness()
+        # A run in progress stays on show (with Pause and Cancel) whatever the model does.
+        ready = not reason or self.is_running()
+        self.banner.setText(reason)
+        self.banner.setVisible(bool(reason))
         self.content.setVisible(ready)
+        self.sb_drift.blockSignals(True)
+        self.sb_drift.setValue(float(self.state.drift_limit))
+        self.sb_drift.blockSignals(False)
+        idx = self.cb_drift_action.findData(self.state.drift_action)
+        self.cb_drift_action.blockSignals(True)
+        self.cb_drift_action.setCurrentIndex(max(idx, 0))
+        self.cb_drift_action.blockSignals(False)
         self.chk_controls.blockSignals(True)
         self.chk_controls.setChecked(bool(self.state.include_controls))
         self.chk_controls.blockSignals(False)
@@ -1505,10 +1019,106 @@ class RunTab(QWidget):
         self.sb_display.setValue(int(self.state.display_events))
         self.sb_display.blockSignals(False)
         if ready:
+            self._populate_gate_tree()
             self._populate_samples()
             self._update_warnings()
             self._populate_views()
             self._draw_summary_table()
+
+    # -- gate application --------------------------------------------------
+
+    def _populate_gate_tree(self):
+        """One row per gate, nested as in the hierarchy. The Application
+        column shows each gate's mode; double-click or the context menu
+        changes it."""
+        gates = self.state.gate_defs()
+        key = (id(self.state.applied_model), len(gates))
+        if key == self._gates_for:
+            for name in self._gate_items:
+                self._show_mode(name)
+            return
+        self._gates_for = key
+        self.gate_tree.clear()
+        self._gate_items = {}
+        antigens = _antigen_map(self.controller)
+
+        def axis_text(ch):
+            return antigens.get(ch, ch) if ch else ''
+
+        for g in ag_core.ordered_gate_defs(gates):
+            name = g['gate_name']
+            item = QTreeWidgetItem([name, g.get('gate_type', ''), axis_text(g.get('gate_marker_x')),
+                                    axis_text(g.get('gate_marker_y')), g.get('algorithm', ''), ''])
+            item.setData(0, Qt.UserRole, name)
+            parent = self._gate_items.get(g.get('parent_gate') or '')
+            if parent is not None:
+                parent.addChild(item)
+            else:
+                self.gate_tree.addTopLevelItem(item)
+            self._gate_items[name] = item
+            self._show_mode(name)
+        self.gate_tree.expandAll()
+        self._filter_gates()
+
+    def _show_mode(self, name: str):
+        item = self._gate_items.get(name)
+        if item is None:
+            return
+        mode = self.state.modes.get(name, ag_core.MODE_FIXED)
+        item.setText(5, MODE_LABELS.get(mode, mode))
+        item.setForeground(5, QColor('#a05a00') if mode == ag_core.MODE_RECALCULATE
+                           else QColor('#1e7d32'))
+
+    def _set_modes(self, names, mode: str):
+        for name in names:
+            self.state.modes[name] = mode
+            self._show_mode(name)
+        self._filter_gates()
+
+    def _on_gate_double_clicked(self, item, _column):
+        name = item.data(0, Qt.UserRole)
+        current = self.state.modes.get(name, ag_core.MODE_FIXED)
+        self._set_modes([name], ag_core.MODE_FIXED if current == ag_core.MODE_RECALCULATE
+                        else ag_core.MODE_RECALCULATE)
+
+    def _on_gate_menu(self, pos):
+        from PySide6.QtWidgets import QMenu
+        names = [it.data(0, Qt.UserRole) for it in self.gate_tree.selectedItems()]
+        if not names:
+            item = self.gate_tree.itemAt(pos)
+            names = [item.data(0, Qt.UserRole)] if item is not None else []
+        if not names:
+            return
+        menu = QMenu(self.gate_tree)
+        for mode in (ag_core.MODE_FIXED, ag_core.MODE_RECALCULATE):
+            act = menu.addAction(f"{MODE_LABELS[mode]} ({len(names)} gate"
+                                 f"{'s' if len(names) != 1 else ''})")
+            act.triggered.connect(lambda _c=False, m=mode, n=list(names): self._set_modes(n, m))
+        menu.exec(self.gate_tree.viewport().mapToGlobal(pos))
+
+    def _set_all_modes(self, mode: str):
+        self._set_modes([g['gate_name'] for g in self.state.gate_defs()], mode)
+
+    def _filter_gates(self):
+        """Show the gates matching the search and the "show" choice, with
+        the gates above them."""
+        text, mode = self.gate_filter.text(), self.gate_filter.mode()
+        if not text and mode in ('', 'all'):
+            for item in self._gate_items.values():
+                item.setHidden(False)
+            return
+        visible = set()
+        for name, item in self._gate_items.items():
+            hit = text_matches(text, *(item.text(c) for c in range(6)))
+            if mode not in ('', 'all'):
+                hit = hit and self.state.modes.get(name, ag_core.MODE_FIXED) == mode
+            if hit:
+                node = item
+                while node is not None and id(node) not in visible:
+                    visible.add(id(node))
+                    node = node.parent()
+        for item in self._gate_items.values():
+            item.setHidden(id(item) not in visible)
 
     def _on_controls_toggled(self, on: bool):
         self.state.include_controls = bool(on)
@@ -1565,7 +1175,7 @@ class RunTab(QWidget):
 
     def _update_warnings(self):
         """Samples whose AF assignment was not represented in training."""
-        training = ((self.state.model or {}).get('af') or {}).get('sample_af_profiles') or {}
+        training = ((self.state.applied_model or {}).get('af') or {}).get('sample_af_profiles') or {}
         if not training:
             self.lbl_warnings.setText("")
             return
@@ -1617,18 +1227,22 @@ class RunTab(QWidget):
 
     def _on_run_clicked(self):
         st = self.state
+        reason = self._readiness()
+        if reason:
+            QMessageBox.information(self, "Cannot gate now", reason)
+            return
         keys = self._to_gate()
         if not keys:
             QMessageBox.information(self, "No samples", "Tick at least one sample to gate.")
             return
         channels = _experiment_channels(self.controller)
-        missing = [ch for ch in _gated_channels(st.gate_defs()) if ch not in channels]
+        missing = [ch for ch in ag_results.gated_channels(st.gate_defs()) if ch not in channels]
         if missing:
             QMessageBox.warning(self, "Channels missing",
                                 "Gated channels not in this experiment: " + ", ".join(missing))
             return
         markers = _marker_channels(self.controller)
-        model_sha = _file_sha256(st.model_path)
+        model_sha = st.model_sha
         saved_markers = st.marker_channels
         st.marker_channels = markers
         fingerprint = run_fingerprint(st, model_sha)
@@ -3882,8 +3496,8 @@ class ResultsTab(QWidget):
         lines = [
             f"Exported: {datetime.now().isoformat(timespec='seconds')}",
             f"Honeychrome: {getattr(honeychrome, '__version__', '')}",
-            f"Model: {st.model_path}",
-            f"Model SHA-256: {_file_sha256(st.model_path)}",
+            f"Model: {st.model_path or '(not saved)'}",
+            f"Model SHA-256 (gates, boundaries, transforms): {st.model_sha}",
             f"Model SHA-256 when gated: {st.results_model_sha}",
             "",
             "Gates:",
@@ -3893,8 +3507,7 @@ class ResultsTab(QWidget):
         lines += [
             f"Drift limit: {st.drift_limit} (transformed units); when exceeded: "
             f"{DRIFT_ACTIONS.get(st.drift_action)}",
-            "Channel alignment: " + ", ".join(f"{m} -> {e}" for m, e in st.alignment.items()),
-            f"Time QC available: {_time_qc_available()}",
+            f"Time QC available: {ag_builder.time_qc_available()}",
             "",
             "Samples (AF profiles; events in file; events gated; group; flags):",
         ]
@@ -3947,8 +3560,9 @@ class ResultsTab(QWidget):
 # ---------------------------------------------------------------------------
 
 class _StateLoader(QThread):
-    """Read an experiment's saved model, gated results, display records and
-    statistics off the main thread; finished(dict) carries what was read."""
+    """Read an experiment's gated results, display records and statistics
+    (and a model file to carry over, see PluginWidget.load_state) off the
+    main thread; finished(dict) carries what was read."""
 
     finished = Signal(object)
 
@@ -3990,23 +3604,15 @@ class _StateLoader(QThread):
 
     @staticmethod
     def _read_model(job: dict, out: dict):
+        """The model file Automated Gating used before the model pages were
+        added, when the model pages have no gates yet."""
         path = job.get('model_path')
         if not path:
             return
         if not Path(path).exists():
             out['model_missing'] = path
             return
-        model, warnings_list = ag_core.read_model(path)
-        out['model'], out['model_warnings'] = model, warnings_list
-        alignment = dict(job.get('alignment') or {})
-        gated = {mc: alignment.get(mc) for mc in _gated_channels(model.get('gate_definitions') or [])}
-        if not job.get('confirmed') or ag_results.alignment_problems(gated):
-            return
-        params = job.get('transform_params')
-        if not params or job.get('transform_model') != path:
-            params = model_transform_params(model, gated, job['live_params'])
-            out['transform_params'] = params
-        out['applied'], out['messages'] = prepare_applied_model(model, gated, params)
+        out['model'], out['model_warnings'] = ag_core.read_model(path)
 
     @staticmethod
     def _read_results(job: dict, out: dict):
@@ -4075,17 +3681,23 @@ def _write_json_atomic(path: Path, payload, jsonable: bool = False):
 class PluginWidget(QWidget):
     """Top-level widget for the Automated Gating plugin.
 
-    Owns GatingRunState, the plugin's transforms and the Transforms, Setup,
-    Run, Results and Enrichment pages, listed down the left-hand side.
+    Pages, listed down the left-hand side: Transforms, Import/Setup,
+    Hierarchy, Train and Export build the model (ag_builder.BuilderPages,
+    which owns the model state, the transforms and their persistence); Run,
+    Results and Enrichment apply it (GatingRunState). Run applies the model
+    as it stands on the model pages, in their transforms: state.applied_model
+    is rebuilt from them (_sync_applied_model) whenever one of the last three
+    pages is shown.
 
-    Persistence: settings (model file, alignment, gate modes, transforms,
-    sample selection, groups, covariates and statistics options) are kept in
-    QSettings per experiment as one JSON string. Gated results (counts,
-    medians and per-gate status) are kept in RESULTS_FILE in the experiment
-    folder, with the samples a paused run has still to gate, and each
-    sample's display record in DISPLAY_DIR; the last statistics run is kept
-    in STATS_FILE and the last enrichment run in ENRICHMENT_FILE, both
-    restored while they still match the gated results.
+    Persistence: the model pages keep their own QSettings group and session
+    file (see BuilderPages). The settings of the last three pages (gate
+    modes, drift settings, sample selection, groups, covariates and
+    statistics options) are kept in QSettings per experiment as one JSON
+    string. Gated results (counts, medians and per-gate status) are kept in
+    RESULTS_FILE in the experiment folder, with the samples a paused run has
+    still to gate, and each sample's display record in DISPLAY_DIR; the last
+    statistics run is kept in STATS_FILE and the last enrichment run in
+    ENRICHMENT_FILE, both restored while they still match the gated results.
     These are read in the background when the experiment is opened and
     written in the background after each run, when the gating results and
     statistics are also written as CSV files to EXPORT_DIR.
@@ -4099,7 +3711,6 @@ class PluginWidget(QWidget):
         _suppress_third_party_warnings()
 
         self.state = GatingRunState()
-        self.tf = tp.TransformSet()
         self._result_tf = (None, None)
         self._qsettings = QSettings('honeychrome', 'plugin_automated_gating')
         self._plugin_was_active = False
@@ -4108,13 +3719,16 @@ class PluginWidget(QWidget):
         self._loader = None
         self._loading = False
         self._writers: list = []
+        self._legacy = {'path': '', 'alignment': {}}
+        self._page_shown = None
+        self._model_stale = True
 
         self.label_disabled = QLabel(f"{plugin_name}: Loading...Set up the spectral model if you have not already done so.")
         self.label_disabled.setWordWrap(True)
         self.label_disabled.setStyleSheet(
             "QLabel { color: #856404; background: #fff3cd; "
             "border: 1px solid #ffc107; border-radius: 4px; padding: 8px; }")
-        self.label_loading = QLabel("Loading the saved model and results …")
+        self.label_loading = QLabel("Loading the saved results …")
         self.label_loading.setStyleSheet("color: #555; font-style: italic;")
         self.label_loading.setVisible(False)
 
@@ -4128,15 +3742,19 @@ class PluginWidget(QWidget):
         overall.addWidget(self.content_widget, stretch=1)
 
         self.inner_tabs = SideTabWidget()
-        self.transforms_tab = tp.PopulationTransformsPanel(
-            controller, self.tf, self._transform_samples, help_text=ag_help_texts.AG_TRANSFORMS,
-            reset_label="Revert to the model's transforms", reset=self._revert_transforms)
-        self.setup_tab = SetupTab(self.state, bus, controller,
-                                  transforms_for=self._transforms_for_model)
+        self.builder = ag_builder.BuilderPages(
+            bus, controller, self.inner_tabs, application=self._application,
+            extra_samples=lambda: list(self.state.run_samples) or self.state.gated_samples(),
+            train_blocked=lambda: ("Gating is running on the Run page; pause or cancel it "
+                                   "first." if self.run_tab.is_running() else ''),
+            parent=self)
+        self.tf = self.builder.tf
+        self.transforms_tab = self.builder.transforms_tab
         self.run_tab = RunTab(self.state, bus, controller,
                               gating_transforms=lambda: self.tf.objects,
                               result_transforms=self._result_transforms,
-                              display_dir=self._display_dir)
+                              display_dir=self._display_dir,
+                              readiness=self._run_readiness)
         self.results_tab = ResultsTab(self.state, bus, controller,
                                       result_transforms=self._result_transforms)
         self.enrichment_tab = ag_fsea_ui.EnrichmentTab(
@@ -4144,26 +3762,27 @@ class PluginWidget(QWidget):
             design_fn=lambda samples: statistics_design(self.state, samples),
             antigens_fn=lambda: _antigen_map(self.controller),
             experiment_dir_fn=lambda: str(self._loaded_experiment_dir or ''))
-        self.inner_tabs.addTab(self.transforms_tab, "Transforms", 'wave-sine')
-        self.inner_tabs.addTab(self.setup_tab, "Setup", 'settings')
         self.inner_tabs.addTab(self.run_tab, "Run", 'player-play')
         self.inner_tabs.addTab(self.results_tab, "Results", 'table')
         self.inner_tabs.addTab(self.enrichment_tab, "Enrichment", 'sparkles')
+        self._page_shown = self.inner_tabs.currentWidget()
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
         content_layout.addWidget(self.inner_tabs, stretch=1)
 
-        self.setup_tab.model_ready.connect(self._on_model_ready)
-        self.setup_tab.model_loaded.connect(self._on_model_loaded)
+        self.builder.modelImported.connect(self._on_model_imported)
+        self.builder.gateRenamed.connect(self._on_gate_renamed)
+        self.builder.modelTrained.connect(self._on_model_trained)
         self.run_tab.gating_finished.connect(self._on_gating_finished)
         self.results_tab.stats_finished.connect(self._on_stats_finished)
-        self.results_tab.report_populations_changed.connect(self.save_state)
+        self.results_tab.report_populations_changed.connect(self._save_run_state)
         self.enrichment_tab.enrichment_finished.connect(self._on_enrichment_finished)
-        self.transforms_tab.transformsChanged.connect(self._on_transform_changed)
-        self.transforms_tab.populationChanged.connect(
-            lambda name: setattr(self.state, 'transform_population', name))
 
         self.content_widget.setVisible(False)
+        # modeChangeRequested fires on every main-window tab switch (guarded
+        # on plugin_name); loadSampleRequested when a sample is picked in the
+        # sample browser (deferred one tick so the sample has loaded).
         self.bus.modeChangeRequested.connect(self._on_mode_change)
+        self.bus.loadSampleRequested.connect(self._on_sample_selected)
         QTimer.singleShot(0, self._deferred_initial_refresh)
 
     # ------------------------------------------------------------------
@@ -4185,10 +3804,16 @@ class PluginWidget(QWidget):
             self._plugin_was_active = True
             self._show_if_ready()
 
+    def _on_sample_selected(self, _sample_path: str):
+        if getattr(self.controller, 'current_mode', None) != plugin_name:
+            return
+        QTimer.singleShot(0, self.builder.on_sample_loaded)
+
     def _show_if_ready(self):
         if self.controller.experiment.process.get('unmixing_matrix') is not None:
             self.label_disabled.setVisible(False)
             self.content_widget.setVisible(True)
+            self._model_stale = True
             if not self._ensure_state_loaded() and not self._loading:
                 self._refresh_active_tab()
         else:
@@ -4196,8 +3821,9 @@ class PluginWidget(QWidget):
             self.content_widget.setVisible(False)
 
     def _ensure_state_loaded(self) -> bool:
-        """Load the persisted state when the experiment has changed (in the
-        background). Returns True when loading started."""
+        """Load the persisted state when the experiment has changed (the
+        model pages at once, the results in the background). Returns True
+        when loading started."""
         current_key = self._settings_key()
         if current_key == self._loaded_experiment_key:
             return False
@@ -4212,11 +3838,19 @@ class PluginWidget(QWidget):
         self._loaded_experiment_key = current_key
         self._loaded_experiment_dir = Path(self.controller.experiment_dir)
         self._result_tf = (None, None)
+        self.builder.switch_experiment(current_key, self._loaded_experiment_dir)
         self.load_state()
         return True
 
     def _on_inner_tab_changed(self, index: int):
-        self.save_state()
+        """Save what the page being left may have changed, then refresh the
+        page shown (the model pages' state is large, so it is saved only on
+        leaving one of them)."""
+        left, self._page_shown = self._page_shown, self.inner_tabs.widget(index)
+        if self.builder.owns(left):
+            self.builder.save_state()
+            self._model_stale = True
+        self._save_run_state()
         if not self._loading:
             self._refresh_tab_at(index)
 
@@ -4224,23 +3858,20 @@ class PluginWidget(QWidget):
         self._refresh_tab_at(self.inner_tabs.currentIndex())
 
     def _refresh_tab_at(self, index: int):
-        if index == 0:
-            self.transforms_tab.refresh(self.state.transform_population or None)
+        widget = self.inner_tabs.widget(index)
+        if self.builder.refresh_page(widget):
             return
-        tabs = [None, self.setup_tab, self.run_tab, self.results_tab, self.enrichment_tab]
-        if 0 < index < len(tabs):
-            tabs[index].refresh()
-
-    def _on_model_ready(self):
-        self.save_state()
-        self.inner_tabs.setCurrentWidget(self.run_tab)
+        if widget in (self.run_tab, self.results_tab, self.enrichment_tab):
+            if self._model_stale and not self.run_tab.is_running():
+                self._sync_applied_model()
+            widget.refresh()
 
     def _on_gating_finished(self, outcome: str = 'done'):
         self._result_tf = (None, None)
         self._write_results()
         self._write_stats()
         self._write_enrichment()
-        self.save_state()
+        self._save_run_state()
         if self.state.summaries and outcome in ('done', 'paused', 'failed'):
             self._export_results_csv()
 
@@ -4248,14 +3879,14 @@ class PluginWidget(QWidget):
         """Keep the statistics, and the settings they were run with, as soon
         as a run completes, and write them as CSV files."""
         self._write_stats()
-        self.save_state()
+        self._save_run_state()
         self._export_statistics_csv()
 
     def _on_enrichment_finished(self):
         """Keep the enrichment run, write it as CSV files and list it in
         the report."""
         self._write_enrichment()
-        self.save_state()
+        self._save_run_state()
         self._export_enrichment_csv()
         self.results_tab._populate_report_items()
 
@@ -4263,81 +3894,88 @@ class PluginWidget(QWidget):
         _status(self.bus, msg)
 
     # ------------------------------------------------------------------
-    # Transforms
+    # The model the Run page applies
     # ------------------------------------------------------------------
 
-    def _transform_samples(self) -> list[str]:
+    def _application(self) -> dict:
+        """The model's application block: each gate's mode and the drift
+        settings (set on the Run page)."""
         st = self.state
-        keys = list(st.run_samples) or st.gated_samples()
-        return keys
+        return {'mode_per_gate': {g['gate_name']: st.modes.get(g['gate_name'], ag_core.MODE_FIXED)
+                                  for g in self.builder.state.gate_definitions},
+                'drift_limit': float(st.drift_limit), 'drift_action': st.drift_action}
 
-    def _model_defaults(self, alignment: dict | None = None) -> dict:
+    def _on_model_trained(self):
+        """Training finished (it runs in the background) or a boundary was
+        adjusted: the Run page's model is out of date."""
+        self._model_stale = True
+        if self.inner_tabs.currentWidget() in (self.run_tab, self.results_tab,
+                                               self.enrichment_tab):
+            self._refresh_active_tab()
+
+    def _on_gate_renamed(self, old: str, new: str):
+        if old in self.state.modes:
+            self.state.modes[new] = self.state.modes.pop(old)
+
+    def _on_model_imported(self, info: dict):
+        """A saved model replaced the gates: take its gate modes and drift
+        settings."""
         st = self.state
-        if not st.model:
-            return _live_transform_params(self.controller)
-        if alignment is None:
-            alignment = {mc: st.alignment.get(mc)
-                         for mc in _gated_channels(st.model.get('gate_definitions') or [])}
-        return model_transform_params(st.model, alignment, _live_transform_params(self.controller))
+        app = info.get('application') or {}
+        st.modes = {str(k): v for k, v in (app.get('mode_per_gate') or {}).items()
+                    if v in MODE_LABELS}
+        if isinstance(app.get('drift_limit'), (int, float)):
+            st.drift_limit = float(app['drift_limit'])
+        if app.get('drift_action') in DRIFT_ACTIONS:
+            st.drift_action = app['drift_action']
+        self._save_run_state()
 
-    def _set_transforms(self, params: dict):
-        self.state.transform_params = params
-        self.tf.load(params, self.controller.unmixed_transformations or {})
-        self.transforms_tab.set_transforms()
-
-    def _transforms_for_model(self, model: dict, alignment: dict) -> dict:
-        """The transforms a model's boundaries are converted to when its
-        alignment is accepted: the user's, when they adjusted them for this
-        model, else the model's own."""
+    def _sync_applied_model(self):
+        """Point the Run, Results and Enrichment pages at the model as it
+        stands on the model pages (rebuilt only when it has changed)."""
+        self._model_stale = False
         st = self.state
-        if st.transform_model != st.model_path or not st.transform_custom or not st.transform_params:
-            self._set_transforms(self._model_defaults(alignment))
-            st.transform_model = st.model_path
-            st.transform_custom = False
-        return st.transform_params
+        st.modes = self._application()['mode_per_gate']
+        model = self.builder.model()
+        sha = model_sha(model)
+        if sha != st.model_sha or not st.applied_model:
+            try:
+                model = ag_core.normalize_model(model)[0]
+            except Exception:
+                log.exception("the model pages' gates do not form a valid hierarchy")
+            st.applied_model = model
+            st.model_sha = sha
+        st.model_path = str(self.builder.state.model_metadata.get('last_model_path') or '')
+        st.transform_params = self.tf.params()
 
-    def _on_model_loaded(self):
-        """A model was read: show its transforms unless the user's
-        adjustments for it are kept."""
-        st = self.state
-        if st.transform_model != st.model_path:
-            self._set_transforms(self._model_defaults())
-            st.transform_model = st.model_path
-            st.transform_custom = False
+    def _run_readiness(self) -> str:
+        """'' when the model can be applied, else why not."""
+        bs = self.builder.state
+        if not bs.gate_definitions:
+            return ("No gating model yet: import gates or load a saved model on the "
+                    "Import/Setup page, then train it.")
+        try:
+            ag_core.ordered_gate_defs(bs.gate_definitions)
+        except Exception as exc:
+            return f"The gate hierarchy cannot be applied: {exc}"
+        if self.builder.train_tab.is_running():
+            return "Training is running on the Train page; gating can start when it finishes."
+        if bs.training_progress:
+            return ("Training is paused on the Train page; resume or overwrite it there "
+                    "before gating.")
+        untrained = [g['gate_name'] for g in ag_core.ordered_gate_defs(bs.gate_definitions)
+                     if not bs.is_trained(g['gate_name'])]
+        if untrained:
+            return (f"{len(untrained)} gate(s) have no trained boundary yet: "
+                    + ", ".join(untrained[:8]) + (" …" if len(untrained) > 8 else "")
+                    + ". Train them on the Train page.")
+        if self._model_stale and not self.run_tab.is_running():
+            self._sync_applied_model()
+        return ''
 
-    def _on_transform_changed(self, channel: str, before: dict):
-        """The user adjusted a transform: keep the applied model's boundaries
-        in place in the data."""
-        st = self.state
-        after = ag_core.transform_params(self.tf.objects[channel])
-        st.transform_params[channel] = after
-        st.transform_custom = True
-        if st.applied_model:
-            ag_core.remap_channel_transform(
-                st.applied_model.get('gate_definitions') or [],
-                st.applied_model.setdefault('trained_boundaries', {}),
-                channel, before, after)
-            st.applied_model.setdefault('transforms', {})[channel] = after
-
-    def _revert_transforms(self):
-        """Back to the model's transforms (the experiment's without a model)."""
-        st = self.state
-        new = self._model_defaults()
-        old = dict(st.transform_params)
-        self._set_transforms(new)
-        st.transform_custom = False
-        st.transform_model = st.model_path
-        if st.applied_model:
-            for ch, params in new.items():
-                if ch in old and not ag_core.same_transform(old[ch], params):
-                    ag_core.remap_channel_transform(
-                        st.applied_model.get('gate_definitions') or [],
-                        st.applied_model.setdefault('trained_boundaries', {}),
-                        ch, old[ch], params)
-                    st.applied_model.setdefault('transforms', {})[ch] = params
-        self.save_state()
-        _status(self.bus, "Transforms reverted to the model's." if st.model
-                else "Transforms reset to the experiment's.")
+    # ------------------------------------------------------------------
+    # Transforms
+    # ------------------------------------------------------------------
 
     def _result_transforms(self) -> dict:
         """Transforms the gated results are in (those of the run), as
@@ -4377,12 +4015,15 @@ class PluginWidget(QWidget):
         return self._loaded_experiment_dir / DISPLAY_DIR
 
     def save_state(self):
-        """Persist settings for the experiment the state was loaded from."""
+        """Persist every page's settings for the experiment the state was
+        loaded from."""
+        self.builder.save_state()
+        self._save_run_state()
+
+    def _save_run_state(self):
+        """Persist the Run, Results and Enrichment settings."""
         if self._loaded_experiment_key is None or self._loading:
             return
-        view = self.transforms_tab.view()
-        if view is not None:
-            self.state.transform_view = view
         payload = {name: getattr(self.state, name) for name in _PERSISTED_FIELDS}
         s = self._qsettings
         s.beginGroup(self._loaded_experiment_key)
@@ -4392,8 +4033,13 @@ class PluginWidget(QWidget):
             s.endGroup()
 
     def load_state(self):
-        """Restore settings from QSettings, then read the model, gated
-        results, display records and statistics in the background."""
+        """Restore settings from QSettings, then read the gated results,
+        display records and statistics in the background.
+
+        Automated Gating used to load a model file itself; when the model
+        pages have no gates yet and such a file is remembered, it is read
+        too and imported with the channel alignment that was accepted for it.
+        """
         s = self._qsettings
         s.beginGroup(self._loaded_experiment_key or self._settings_key())
         try:
@@ -4415,17 +4061,14 @@ class PluginWidget(QWidget):
             if isinstance(value, expected):
                 setattr(self.state, name, value)
         st = self.state
-        self.tf.load(st.transform_params, self.controller.unmixed_transformations or {})
-        self.transforms_tab.set_view(st.transform_view)
         exp = self._loaded_experiment_dir
+        legacy_model = ''
+        if not self.builder.state.gate_definitions and payload.get('alignment_confirmed'):
+            legacy_model = str(payload.get('model_path') or '')
+        self._legacy = {'path': legacy_model, 'alignment': dict(payload.get('alignment') or {})}
         job = {
             'key': self._loaded_experiment_key,
-            'model_path': st.model_path,
-            'alignment': dict(st.alignment),
-            'confirmed': bool(payload.get('alignment_confirmed')),
-            'transform_params': deepcopy(st.transform_params),
-            'transform_model': st.transform_model,
-            'live_params': _live_transform_params(self.controller),
+            'model_path': legacy_model,
             'results_path': exp / RESULTS_FILE,
             'stats_path': exp / STATS_FILE,
             'enrichment_path': exp / ENRICHMENT_FILE,
@@ -4450,20 +4093,9 @@ class PluginWidget(QWidget):
         if out.get('key') != self._loaded_experiment_key:
             return
         st = self.state
-        if out.get('transform_params'):
-            st.transform_params = out['transform_params']
-            st.transform_model = st.model_path
-            st.transform_custom = False
-            self.tf.load(st.transform_params, self.controller.unmixed_transformations or {})
         if out.get('model') is not None:
-            self.setup_tab.apply_loaded_model(st.model_path, out['model'],
-                                              out.get('model_warnings') or [],
-                                              alignment=dict(st.alignment),
-                                              applied=out.get('applied'),
-                                              messages=out.get('messages'))
+            self._import_legacy_model(out['model'], out.get('model_warnings') or [])
         elif out.get('model_missing'):
-            st.model_path = ''
-            st.alignment_confirmed = False
             self.progress_message(f"The model file {out['model_missing']} is no longer available.")
         payload = out.get('results')
         if payload:
@@ -4478,18 +4110,39 @@ class PluginWidget(QWidget):
                                   if k not in st.summaries]
             st.run_fingerprint = str(payload.get('run_fingerprint') or '')
             st.display = dict(out.get('display') or {})
-            if st.summaries and st.results_model_sha and st.model_path \
-                    and _file_sha256(st.model_path) != st.results_model_sha:
-                self.progress_message("The saved gating results were made with a different "
-                                      "version of the model file; run gating again to update them.")
+            if int(payload.get('format_version') or 1) < 2:
+                # Hash of the model file, from before the model pages: not comparable.
+                st.results_model_sha = ''
         if out.get('stats'):
             st.stats = out['stats']
         if out.get('fsea'):
             st.fsea = out['fsea']
         for msg in out.get('errors') or []:
             self.progress_message(msg)
-        self.setup_tab.refresh()
+        self._sync_applied_model()
+        if st.summaries and st.results_model_sha and st.results_model_sha != st.model_sha:
+            self.progress_message("The saved gating results were made with a different "
+                                  "version of the model; run gating again to update them.")
         self._refresh_active_tab()
+
+    def _import_legacy_model(self, model: dict, warnings_list: list):
+        """Import the model file Automated Gating used before the model
+        pages were added, with the channel alignment accepted for it."""
+        path, alignment = self._legacy['path'], self._legacy['alignment']
+        gated = {mc: alignment.get(mc)
+                 for mc in ag_results.gated_channels(model.get('gate_definitions') or [])}
+        if ag_results.alignment_problems(gated):
+            self.progress_message("The previously used model needs its channels matched: "
+                                  "load it on the Import/Setup page.")
+            return
+        modes, drift = dict(self.state.modes), (self.state.drift_limit, self.state.drift_action)
+        names = {g['gate_name'] for g in model.get('gate_definitions') or []}
+        if self.builder.hierarchy_tab.import_saved_model(model, path, gated, warnings_list):
+            # Gate modes and drift settings chosen for this model win over the file's.
+            if modes and set(modes) == names:
+                self.state.modes = modes
+            self.state.drift_limit, self.state.drift_action = drift
+            self.save_state()
 
     def _results_path(self) -> Path | None:
         if self._loaded_experiment_dir is None:
@@ -4521,7 +4174,7 @@ class PluginWidget(QWidget):
         path = self._results_path()
         st = self.state
         payload = {
-            'format_version': 1,
+            'format_version': 2,
             'model_path': st.model_path,
             'model_sha256': st.results_model_sha,
             'marker_channels': list(st.marker_channels),

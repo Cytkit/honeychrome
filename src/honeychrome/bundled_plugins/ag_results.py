@@ -176,6 +176,18 @@ def alignment_problems(alignment: dict[str, str | None]) -> list[str]:
     return problems
 
 
+def gated_channels(gate_defs: list[dict]) -> list[str]:
+    """Channels used as an axis by any gate (including 1dsep view channels
+    and imported shapes), in hierarchy order."""
+    by_name = ag_core.gates_by_name(gate_defs)
+    out: list[str] = []
+    for g in ag_core.ordered_gate_defs(gate_defs):
+        for ch in ag_core.referenced_channels(ag_core.effective_gate_def(g, by_name)):
+            if ch and ch not in out:
+                out.append(ch)
+    return out
+
+
 def apply_alignment(model: dict, alignment: dict[str, str]) -> dict:
     """Copy of a normalised model with its channels renamed to the
     experiment's (gate axes, imported shapes, channel map and transform

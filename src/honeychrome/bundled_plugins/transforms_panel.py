@@ -1114,6 +1114,9 @@ class PopulationTransformsPanel(TransformInspector):
                         transforms, and the callable that does it (the host
                         replaces the TransformSet's objects and calls
                         set_transforms).
+    apply_label/apply : text and callable of an optional second button that
+                        sets other transforms (e.g. a loaded model's); the
+                        host enables it with set_apply_available().
     populationChanged(name) is emitted when the user picks a population.
     The channels shown default to the first fluorescence channels; the
     host saves view() and gives it back with set_view().
@@ -1125,11 +1128,13 @@ class PopulationTransformsPanel(TransformInspector):
     TARGET_EVENTS = TRANSFORM_TARGET_EVENTS
 
     def __init__(self, controller, transform_set: TransformSet, sample_keys, help_text: str = '',
-                 reset_label: str = '', reset=None, parent=None):
+                 reset_label: str = '', reset=None, apply_label: str = '', apply=None,
+                 parent=None):
         super().__init__(controller, help_text=help_text, parent=parent)
         self._set = transform_set
         self._sample_keys = sample_keys
         self._reset = reset
+        self._apply = apply
         self._population = 'root'
         self._loader = None
         self._wanted = None
@@ -1137,6 +1142,8 @@ class PopulationTransformsPanel(TransformInspector):
         self._pending_view = None
         self.reset_btn.setText(f"↺ {reset_label}")
         self.reset_btn.setVisible(reset is not None)
+        self.apply_btn.setText(apply_label)
+        self.apply_btn.setVisible(apply is not None)
 
     def _build_selection(self, layout: QVBoxLayout):
         row = QHBoxLayout()
@@ -1163,10 +1170,23 @@ class PopulationTransformsPanel(TransformInspector):
         self.reset_btn = QPushButton("↺ Reset")
         self.reset_btn.clicked.connect(self._on_reset)
         toolbar.addWidget(self.reset_btn)
+        self.apply_btn = QPushButton("Apply")
+        self.apply_btn.setEnabled(False)
+        self.apply_btn.clicked.connect(self._on_apply)
+        toolbar.addWidget(self.apply_btn)
 
     def _on_reset(self):
         if self._reset is not None:
             self._reset()
+
+    def _on_apply(self):
+        if self._apply is not None:
+            self._apply()
+
+    def set_apply_available(self, on: bool, tooltip: str = ''):
+        """Enable the apply button (see apply_label/apply)."""
+        self.apply_btn.setEnabled(bool(on))
+        self.apply_btn.setToolTip(tooltip)
 
     def _default_channels(self) -> list[str]:
         """Fluorescence channels in the cytometer's channel order."""

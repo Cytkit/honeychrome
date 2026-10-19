@@ -1,9 +1,9 @@
 """
-ag_help_texts.py — per-tab help text for the automated gating plugins
-======================================================================
-Companion module to ``gating_model_builder_tab.py`` and
-``automated_gating_tab.py`` (the file name does not end in ``_tab.py``, so
-the plugin loader does not treat it as a tab).
+ag_help_texts.py — per-page help text for the Automated Gating plugin
+=====================================================================
+Companion module to ``ag_builder.py`` and ``automated_gating_tab.py`` (the
+file name does not end in ``_tab.py``, so the plugin loader does not treat
+it as a tab).
 
 One HTML string per tab, shown and hidden with the core app's
 HelpToggleWidget (honeychrome.view_components.help_toggle_widget).
@@ -86,6 +86,24 @@ FlowJo gates are converted by the same rules as <b>Import from
 Hierarchy</b>. The gate preview is hidden while this section is open. The
 experiment's own gating is never changed. Review the imported gates on the
 Hierarchy tab before training.</li>
+<li><b>Load saved model…</b> opens a <b>.agmodel</b> file, from this
+experiment or another. A section expands under the buttons with a summary of
+where and how the model was trained (including the autofluorescence profiles
+of its training samples) and every channel its gates use, matched to this
+experiment by antigen (synonyms such as CD197 and CCR7 are recognised), so a
+panel that moved an antigen to another detector still lines up. Green rows
+matched by antigen. Amber rows need checking: the same detector carries a
+different antigen, the match is only by similar name, or the antigen is on
+more than one detector. Red rows have no match; choose a channel. <b>Import
+model — replace</b> replaces the gates with the model's, renamed to the
+channels chosen, with its trained boundaries and its gate modes (Run page),
+so it can be applied straight away, or reviewed and trained again. Training
+samples from another experiment are dropped. The model's own transforms (the
+ones it was trained in) are applied at once when the Transforms page has not
+been changed by hand (Auto-transform, an axis drag or a CSV) since its last
+reset; otherwise the boundaries are converted to the current transforms and
+a note under the gate list says the model's are available with <b>Apply the
+model's transforms</b> on the Transforms page.</li>
 <li><b>Add gate manually</b> creates a gate that is not on the main plots.</li>
 </ul>
 
@@ -224,40 +242,22 @@ tab).</p>
 '''
 
 BUILDER_EXPORT = '''
-<h3>Export — save or load a gating model</h3>
+<h3>Export — save the gating model</h3>
 <p><b>Save Model…</b> writes a <b>.agmodel</b> file: the gate hierarchy,
-the trained boundaries, the builder's transform of every channel (those on
-the Transforms tab), the training samples with their event counts and
-autofluorescence assignments, and time-QC details. The Automated Gating
-plugin applies it to new samples and shows them in its transforms by
-default.</p>
-<p><b>Load Model…</b> opens an existing model to inspect it or to continue
-training. Its transforms become the builder's, so its boundaries are shown
-where they were trained; channels without a stored transform (older model
-files) take this experiment's.</p>
+the trained boundaries, the transform of every channel (those on the
+Transforms tab), the training samples with their event counts and
+autofluorescence assignments, time-QC details, and each gate's fixed or
+recalculated mode with the drift settings (Run page). Load it in another
+experiment with <b>Load saved model…</b> on the Import/Setup page.</p>
 '''
 
-AG_SETUP = '''
-<h3>Setup — load a model and match it to this experiment</h3>
-<ol>
-<li><b>Load Model…</b> opens a <b>.agmodel</b> file from the Gating Model
-Builder. The summary shows where and how it was trained, including the
-autofluorescence profiles of the training samples.</li>
-<li><b>Channel alignment.</b> Every channel a gate uses is matched to this
-experiment by antigen (synonyms such as CD197 and CCR7 are recognised), so a
-panel that moved an antigen to another detector still lines up. Green rows
-matched by antigen. Amber rows need checking: the same detector carries a
-different antigen, the match is only by similar name, or the antigen is on
-more than one detector. Red rows have no match; choose a channel. Then click
-<b>Accept Alignment</b>.</li>
-<li>On accepting, the model's boundaries are converted to the transforms on
-the Transforms page (the model's own unless you changed them) where they
-differ; the message area lists the channels converted.</li>
-</ol>
-<p>Long lists can be searched, and the alignment table can show only the
-rows to check.</p>
+AG_RUN = '''
+<h3>Run — gate samples</h3>
+<p>Run applies the model as it stands on the model pages (Import/Setup,
+Hierarchy, Train), in the Transforms page's transforms, once every gate has a
+trained boundary and no training run is paused.</p>
 
-<h4>How each gate is applied</h4>
+<h4>Gate application</h4>
 <ul>
 <li><b>Fixed</b> (default) — the stored boundary is applied to every sample
 as it is.</li>
@@ -272,11 +272,10 @@ If the calculation fails (too few events), the stored boundary is used and
 the sample is flagged.</li>
 </ul>
 <p>Double-click a gate to switch it between fixed and recalculated, or
-right-click to set every selected gate.</p>
-'''
+right-click to set every selected gate. The modes and drift settings are
+saved with the model.</p>
 
-AG_RUN = '''
-<h3>Run — gate samples</h3>
+<h4>Gating</h4>
 <ol>
 <li>Tick the samples to gate in the <b>Gate</b> column. Single-stain controls
 and unstained samples are hidden unless <b>Show controls</b> is ticked. A
@@ -294,8 +293,8 @@ whole hierarchy using every event.</li>
 saves them with the experiment; the sample being gated is dropped. <b>Run
 Gating</b> then asks whether to <b>Resume</b> (gate only the ticked samples
 without results) or <b>Restart</b> (discard the results so far). A paused run
-can only be restarted once the model, the channel alignment, the gate
-settings or the transforms have changed. <b>Cancel</b> stops the same way but
+can only be restarted once the model, the gate settings or the transforms
+have changed. <b>Cancel</b> stops the same way but
 discards the run, keeping the results from before it.</p>
 
 <h4>Inspecting the result</h4>
@@ -441,8 +440,8 @@ same columns.</p>
 <li><b>Subsets</b> — each phenotype population within its parent, as log odds.</li>
 <li><b>Abundance</b> — each phenotype population within the <b>anchor</b>, so
 samples with different numbers of events, debris or dead cells compare on the
-same footing. The default is the model's anchor population: the one marked in
-the Gating Model Builder, else the viable cells (the deepest gate using a
+same footing. The default is the model's anchor population: the one marked on
+the Hierarchy page, else the viable cells (the deepest gate using a
 viability dye, recognised from the fluorophore database), else single cells,
 else <i>Cells</i>.</li>
 <li><b>Marker medians</b> — medians of phenotype populations only; medians
@@ -641,41 +640,17 @@ as a source for replicated thresholds.</p>
 it; train again to apply the change.</p>
 '''
 
-AG_TRANSFORMS = '''
-<h3>Transforms — the axis scales gating uses</h3>
-<p>Threshold gates are calculated on transformed (logicle) values, so where a
-gate falls depends on the transform. By default the transforms are the
-model's own, the ones it was trained in, so a recalculated gate behaves as it
-did in training; channels the model has none for use this experiment's.</p>
-<ul>
-<li>Pick a <b>population</b> of the experiment's gating hierarchy (the gates of
-the Unmixed Data tab; Singlets or Cells to start with). Its events are pooled
-from a few of the samples ticked on the Run page, each unmixed and gated as
-the main window does: about 30,000 events of the population in all, an equal
-share from each sample, read without loading the whole file.</li>
-<li>Select a channel on the right to see its histogram and biplots. Drag an
-axis to adjust it as on the main plots: the lower half of a logicle axis
-changes its width basis W, the upper half the displayed range.</li>
-<li><b>Auto-transform</b> sets W for every logicle channel from the events
-shown (Parks, Roederer and Moore 2006).</li>
-<li><b>Revert to the model's transforms</b> undoes your changes.</li>
-</ul>
-<p>The model's boundaries move with a transform, so they stay on the same
-events. Gating results record the transforms they were made in; changing the
-transforms means a paused run is restarted rather than resumed.</p>
-'''
-
 BUILDER_TRANSFORMS = '''
-<h3>Transforms — the axis scales the model is trained in</h3>
+<h3>Transforms — the axis scales the model is trained and applied in</h3>
 <p>Threshold algorithms work on transformed (logicle) values, so the transform
 of a channel changes where its gates are placed. The model is trained in
-these transforms and saves them; Automated Gating uses them by default.
-They start as this experiment's display transforms and are the builder's
-own: changing them here does not change the main window's plots.</p>
+these transforms, saves them, and the Run page gates samples in them. They
+start as this experiment's display transforms and are the plugin's own:
+changing them here does not change the main window's plots.</p>
 <ul>
 <li>Pick a <b>population</b> of the experiment's gating hierarchy (the gates of
 the Unmixed Data tab; Singlets or Cells to start with). Its events are pooled
-from the training samples (or the sample on show), each unmixed and gated as
+from the training samples (else the samples ticked on the Run page), each unmixed and gated as
 the main window does: about 30,000 events of the population in all, an equal
 share from each sample, read without loading the whole file.</li>
 <li>Select a channel on the right to see its histogram and biplots. Drag an
@@ -686,6 +661,9 @@ Hierarchy plots change the same transforms.</li>
 shown (Parks, Roederer and Moore 2006).</li>
 <li><b>Reset to the experiment's transforms</b> returns to the main window's
 transforms.</li>
+<li><b>Apply the model's transforms</b> uses the transforms a saved model
+was trained in (available after <b>Load saved model…</b> on the Import/Setup
+page, when the model stores them).</li>
 </ul>
 <p>Imported shapes and trained boundaries move with a transform, so they stay
 on the same events. Retrain after changing transforms to calculate the gates
