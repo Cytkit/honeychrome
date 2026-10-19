@@ -458,7 +458,7 @@ class ReportTab(QWidget):
       • one combined PDF with a title page, a divider per section, every
         checked figure, and every checked table (paginated)
       • settings.txt -- always written, regardless of what's ticked
-    into  experiment_dir / 'DR_Clustering_Reports' / '<run_label>_<timestamp>'.
+    into  experiment_dir / 'Honeycluster_Reports' / '<run_label>_<timestamp>'.
 
     Reporting run: whichever clustering run is currently selected in the
     Cluster Annotation tab (the one place in the plugin a clustering run
@@ -565,7 +565,7 @@ class ReportTab(QWidget):
             self.context_label.setText(f"Reporting on clustering run: {run_label}")
             safe_label = sanitize_filename(run_label)
             self.output_label.setText(
-                f"Report folder: {self.controller.experiment_dir / 'DR_Clustering_Reports' / (safe_label + '_<timestamp>')}"
+                f"Report folder: {self.controller.experiment_dir / 'Honeycluster_Reports' / (safe_label + '_<timestamp>')}"
             )
         else:
             self.context_label.setText(
@@ -638,7 +638,7 @@ class ReportTab(QWidget):
         run_label = cl_run.get('label') or 'clustering_run'
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         folder_name = f"{sanitize_filename(run_label)}_{timestamp}"
-        report_dir = self.controller.experiment_dir / 'DR_Clustering_Reports' / folder_name
+        report_dir = self.controller.experiment_dir / 'Honeycluster_Reports' / folder_name
 
         log.info("generate_report: writing %d item(s) to %s", len(items), report_dir)
 

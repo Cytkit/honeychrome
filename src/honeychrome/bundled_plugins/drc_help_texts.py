@@ -636,7 +636,7 @@ individually, to choose what to include.</li>
 </ol>
 <h4>Generate Report</h4>
 <p>Click <b>Generate Report</b> to write, into a timestamped folder
-under <tt>DR_Clustering_Reports</tt> in the experiment directory:</p>
+under <tt>Honeycluster_Reports</tt> in the experiment directory:</p>
 <ul>
 <li>One PNG (for figure items) and/or CSV (for table items) per ticked
 item, organised into a sub-folder per source tab.</li>
