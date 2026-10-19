@@ -89,7 +89,8 @@ def current_events(monkeypatch):
     gated = np.column_stack([rows.astype(float), rows.astype(float) * 2])
     monkeypatch.setattr(drc_pipeline, 'load_sample_rows', lambda c, s, rel, af_state=None: rows)
     monkeypatch.setattr(drc_pipeline, 'sample_abs_path', lambda c, rel: rel)
-    monkeypatch.setattr(drc_pipeline, 'load_unmixed_gated', lambda c, s, p, af_state=None: gated)
+    monkeypatch.setattr(drc_pipeline, 'load_unmixed_gated',
+                        lambda c, s, p, af_state=None, channels=None: gated)
     monkeypatch.setattr(ra, 'transform_with_params',
                         lambda c, g, channels, params: g.astype(np.float32))
     return rows

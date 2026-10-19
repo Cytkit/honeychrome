@@ -5,7 +5,7 @@ test_sample_gating.py
 sample is shown: its own per-sample gate overrides, its own range on
 per-sample (Time) axes, and the template everywhere else. Also checks its
 users: the Statistics tab (``StatisticsCalculator``) gives the same values
-whichever sample is displayed, and the DR/Clustering loader
+whichever sample is displayed, and the Honeycluster loader
 (``drc_pipeline.load_unmixed_gated``) gates per sample with a cache that
 follows override edits.
 
@@ -278,22 +278,25 @@ def test_dr_loader_gates_each_sample_with_its_own_gates(tmp_path, monkeypatch):
     monkeypatch.setattr(drc_pipeline, 'apply_unmixing_af_aware', lambda _c, raw, **_kw: raw)
     state = types.SimpleNamespace(selected_gates=['Cells'], gated_data_cache={})
 
+    controller.experiment.settings.setdefault('unmixed', {})['event_channels_pnn'] = list(PNN)
+
     def load(key):
-        return drc_pipeline.load_unmixed_gated(controller, state, tmp_path / key)
+        return drc_pipeline.load_unmixed_gated(controller, state, tmp_path / key,
+                                               channels=list(PNN)).values
 
     for key, events in SAMPLES.items():
-        np.testing.assert_array_equal(load(key), events[_expected(events)['Cells']])
+        np.testing.assert_array_equal(load(key), events[_expected(events)['Cells']].astype(np.float32))
     assert len(loads) == 3
     load('Raw/B.fcs')
     assert len(loads) == 3
 
     _override(controller, 'Raw/B.fcs', 'Cells', 30, 90)
     b = SAMPLES['Raw/B.fcs']
-    np.testing.assert_array_equal(load('Raw/B.fcs'), b[_expected(b, cells=(30, 90))['Cells']])
+    np.testing.assert_array_equal(load('Raw/B.fcs'), b[_expected(b, cells=(30, 90))['Cells']].astype(np.float32))
     assert len(loads) == 4
     c = SAMPLES['Raw/C.fcs']
-    np.testing.assert_array_equal(load('Raw/C.fcs'), c[_expected(c)['Cells']])
+    np.testing.assert_array_equal(load('Raw/C.fcs'), c[_expected(c)['Cells']].astype(np.float32))
     assert len(loads) == 4
 
     state.selected_gates = ['Stable']
-    np.testing.assert_array_equal(load('Raw/C.fcs'), c[_expected(c)['Stable']])
+    np.testing.assert_array_equal(load('Raw/C.fcs'), c[_expected(c)['Stable']].astype(np.float32))

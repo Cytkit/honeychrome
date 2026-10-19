@@ -787,3 +787,100 @@ def test_joined_regions_export_to_flowkit():
     gs = ag.model_to_gating_strategy([g], {'g': calc.threshold_boundaries(g, 0.5, 0.5)}, {})
     ids = {gid[0] for gid in gs.get_gate_ids()}
     assert {'g/in', 'g/side', 'g/top'} <= ids
+
+
+# ---------------------------------------------------------------------------
+# Threshold factor
+# ---------------------------------------------------------------------------
+
+_LOGICLE = {'id': 1, 'scale_t': 262144, 'logicle_w': 0.5, 'logicle_m': 4.5, 'logicle_a': 0.0}
+
+
+def _logicle_data(n=6000, seed=3):
+    """A on a logicle scale: a negative around 0 and a positive around 20,000."""
+    rng = np.random.default_rng(seed)
+    k = n // 6
+    raw = np.concatenate([rng.normal(0, 300, n - k), rng.normal(20000, 4000, k)])
+    tr = ag.make_transform(_LOGICLE)
+    return np.asarray(tr.apply(raw), dtype=float).reshape(-1, 1), {'A': 0}, tr
+
+
+@pytest.mark.numpy_only
+def test_threshold_factor_multiplies_in_raw_units():
+    tr = ag.make_transform(_LOGICLE)
+    t = float(tr.apply(np.array([1000.0]))[0])
+    scaled, note = ag.scale_threshold(t, 2.0, _LOGICLE)
+    assert note == ''
+    assert float(tr.inverse(np.array([scaled]))[0]) == pytest.approx(2000.0, rel=1e-6)
+    assert ag.scale_threshold(t, 1.0, _LOGICLE) == (t, '')
+    # At or below zero in raw units: unchanged, with a note.
+    t0 = float(tr.apply(np.array([-50.0]))[0])
+    unchanged, note = ag.scale_threshold(t0, 2.0, _LOGICLE)
+    assert unchanged == t0 and 'not applied' in note
+    # No transform: the values are raw.
+    assert ag.scale_threshold(3.0, 0.5, None) == (1.5, '')
+
+
+@pytest.mark.numpy_only
+def test_threshold_factor_moves_trained_1dsep_and_2dsep_thresholds():
+    data, idx, tr = _logicle_data()
+    g = _gate('g', '1dsep', 'A', algorithm='mixture')
+    base = ag.train_boundaries([g], data, idx, transforms={'A': _LOGICLE})
+    t1 = base.boundaries['g']['pos']['threshold_x']
+    g['gate_param'] = {'threshold_factor': 3.0}
+    res = ag.train_boundaries([g], data, idx, transforms={'A': _LOGICLE})
+    t3 = res.boundaries['g']['pos']['threshold_x']
+    raw1, raw3 = (float(tr.inverse(np.array([v]))[0]) for v in (t1, t3))
+    assert raw3 == pytest.approx(3.0 * raw1, rel=1e-6)
+
+    data2 = np.column_stack([data[:, 0], data[::-1, 0]])
+    q = _gate('q', '2dsep', 'A', 'B', algorithm='mixture')
+    q['gate_param'] = {'algorithm_x': 'mixture', 'algorithm_y': 'mixture',
+                       'threshold_factor_y': 0.5}
+    tfs = {'A': _LOGICLE, 'B': _LOGICLE}
+    res = ag.train_boundaries([q], data2, {'A': 0, 'B': 1}, transforms=tfs)
+    first = next(iter(res.boundaries['q'].values()))
+    q['gate_param'].pop('threshold_factor_y')
+    plain = next(iter(ag.train_boundaries([q], data2, {'A': 0, 'B': 1},
+                                          transforms=tfs).boundaries['q'].values()))
+    assert first['threshold_x'] == plain['threshold_x']
+    assert float(tr.inverse(np.array([first['threshold_y']]))[0]) == pytest.approx(
+        0.5 * float(tr.inverse(np.array([plain['threshold_y']]))[0]), rel=1e-6)
+
+
+@pytest.mark.numpy_only
+def test_threshold_factor_on_reference_population_but_not_on_copies():
+    data, idx, tr = _logicle_data()
+    shifted = tr.apply(tr.inverse(data[:, 0]) + 5000.0)
+    data = np.column_stack([data[:, 0], np.asarray(shifted, dtype=float)])
+    idx = {'A': 0, 'C': 1}
+    tfs = {'A': _LOGICLE, 'C': _LOGICLE}
+    ref = _gate('ref', '1dsep', 'A', number=1, algorithm='mixture')
+    ref['gate_param'] = {'threshold_factor': 2.0}
+    copy = _gate('copy', '1dsep', 'A', parent='ref', parent_pop='pos', number=2,
+                 algorithm='replicate')
+    copy['gate_param'] = {'replicate_x': {'gate': 'ref'}, 'threshold_factor': 5.0}
+    pop = _gate('pop', '1dsep', 'C', parent='ref', parent_pop='pos', number=3,
+                algorithm='replicate')
+    pop['gate_param'] = {'replicate_x': {'population': 'ref/neg', 'algorithm': 'tail'},
+                         'threshold_factor': 2.0}
+    res = ag.train_boundaries([ref, copy, pop], data, idx, transforms=tfs)
+    t_ref = res.boundaries['ref']['pos']['threshold_x']
+    assert res.boundaries['copy']['pos']['threshold_x'] == t_ref
+    neg = res.masks['ref']['neg']
+    plain = ag.compute_threshold(
+        ag.crop_to_region(ag.trim_quantiles(data[neg, 1], 0.001), 0.0, 0.99), 'tail')
+    expected = float(tr.inverse(np.array([plain]))[0]) * 2.0
+    got = float(tr.inverse(np.array([res.boundaries['pop']['pos']['threshold_x']]))[0])
+    assert got == pytest.approx(expected, rel=1e-6)
+
+
+@pytest.mark.numpy_only
+def test_threshold_factor_not_applied_is_reported():
+    rng = np.random.default_rng(4)
+    data = np.concatenate([rng.normal(-5.0, 0.5, 3000), rng.normal(-1.0, 0.5, 3000)])
+    g = _gate('g', '1dsep', 'A', algorithm='mixture')
+    g['gate_param'] = {'threshold_factor': 2.0}
+    res = ag.train_boundaries([g], data.reshape(-1, 1), {'A': 0})
+    assert res.boundaries['g']['pos']['threshold_x'] < 0
+    assert 'not applied' in res.status['g']['message']

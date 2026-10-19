@@ -143,7 +143,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QFileDialog, QMessageBox, QSizePolicy,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QColorDialog, QProgressBar, QSlider,
-    QDialog, QTextEdit, QApplication, QToolBox,
+    QDialog, QTextEdit, QApplication, QToolBox, QStackedWidget,
 )
 
 from honeychrome.controller_components.functions import (
@@ -198,6 +198,8 @@ import drc_cluster_id
 import drc_report
 import drc_help_texts
 import drc_predictive
+import drc_workspace_canvas
+import drc_workspace_export
 import drc_time_estimate
 import drc_run_align
 import drc_umap_index
@@ -648,43 +650,6 @@ def _new_scrollable_canvas(fig):
     return _ScrollableFigureCanvas(fig)
 
 
-class _AspectCanvasHolder(QWidget):
-    """
-    Pins a single child widget to a top-left rectangle that preserves a
-    configurable aspect ratio (height / width), maximised within the
-    holder's own size.
-
-    The child's geometry is managed directly, so the canvas's top stays
-    flush with the legend's top: both start at y=0 within plot_row's row,
-    and any leftover space appears to the right of or below the fitted
-    rectangle.
-    """
-    def __init__(self, child: QWidget, aspect_ratio: float = 1.0, parent=None):
-        super().__init__(parent)
-        self._child = child
-        child.setParent(self)
-        self._aspect_ratio = aspect_ratio  # height / width
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
-    def set_aspect_ratio(self, ratio: float):
-        self._aspect_ratio = max(float(ratio), 1e-6)
-        self._apply_geometry()
-
-    def _apply_geometry(self):
-        avail_w, avail_h = self.width(), self.height()
-        if avail_w <= 0 or avail_h <= 0:
-            return
-        if avail_h / avail_w > self._aspect_ratio:
-            w, h = avail_w, int(avail_w * self._aspect_ratio)
-        else:
-            h, w = avail_h, int(avail_h / self._aspect_ratio)
-        self._child.setGeometry(0, 0, w, h)
-
-    def resizeEvent(self, event):
-        self._apply_geometry()
-        super().resizeEvent(event)
-
-
 class _FrozenScrollArea(QScrollArea):
     """
     QScrollArea that never scrolls itself on mouse wheel. Used for the
@@ -707,6 +672,23 @@ _SideTabWidget = SideTabWidget
 # density and the 200-bin histogram of 20,000 events agree with the full
 # cluster to well within the resolution of the plots. None keeps every event.
 CLUSTER_PLOT_MAX_EVENTS = 20_000
+# Workspace legend: placements and spacing (in font-size units, as matplotlib's
+# legend() takes them); LEGEND_GAP_IN is the gap between plot and legend.
+LEGEND_POSITIONS = ('Separate', 'Right', 'Below', 'Off')
+LEGEND_HANDLE_LENGTH = 1.0
+LEGEND_HANDLE_PAD = 0.4
+LEGEND_LABEL_SPACING = 0.3
+LEGEND_COLUMN_SPACING = 1.0
+LEGEND_GAP_IN = 0.15
+# Workspace plot and page sizes (mm). LEGEND_ALLOWANCE_MM is reserved beside
+# or below a new plot before its legend has been drawn.
+MM_PER_INCH = 25.4
+PLOT_MIN_MM, PLOT_MAX_MM, PLOT_DEFAULT_MM = 20.0, 280.0, 60.0
+PAGE_MIN_MM, PAGE_MAX_MM = 50.0, 1000.0
+LEGEND_ALLOWANCE_MM = 30.0
+DUPLICATE_OFFSET_MM = 10.0
+INSPECTOR_MIN_WIDTH_PX = 320
+EXPORT_DPI_CHOICES = (300, 600)
 # Sample Group Assignment table column sizes (pixels): the sample name is
 # capped so a long name cannot push the other columns out of view;
 # covariates get room to type.
@@ -886,18 +868,11 @@ class PipelineState:
     cluster_names: dict[int, str] = field(default_factory=dict)
     # {cluster_id: display label — defaults to str(id) if absent}
     cluster_marker_values: dict[str, tuple] = field(default_factory=dict)
-    # {sample_path: (raw_values: np.ndarray, channel_names: list[str])} --
-    # snapshotted at the SAME instant labels are assigned (see
-    # drc_clustering.py's _snapshot_marker_values), so guaranteed
-    # row-for-row aligned to cluster_labels even if gates/channels are
-    # edited later. Archived into clustering_runs['marker_values'].
-    cluster_dr_positions: dict[str, np.ndarray] = field(default_factory=dict)
-    # {sample_path: np.ndarray} -- the exact DR-embedding rows a DR-space
-    # clustering run assigned labels against. Only populated when
-    # clustering ran in DR-embedding space. Archived into
-    # clustering_runs['dr_positions'] so the Cluster Annotation map can
-    # still plot correct positions even if the live state.embeddings for
-    # that algorithm have since been overwritten by a later DR run.
+    # {sample_path: (raw_values: np.ndarray, channel_names: list[str],
+    # rows: np.ndarray)} -- a per-cluster sample taken at the SAME instant
+    # labels are assigned (see drc_clustering.py's
+    # _snapshot_marker_values); rows index cluster_labels[sample_path].
+    # Archived into the run's marker-values bundle.
     cluster_rows: dict[str, np.ndarray] = field(default_factory=dict)
     # {sample_path: np.ndarray int32} -- event keys of cluster_labels' rows
     # (the gated events, or the source embedding's rows for a DR-space run).
@@ -1092,18 +1067,22 @@ class PipelineState:
     display_clipboard: dict | None = None
 
     # --- Data pipeline cache ---
-    gated_data_cache: dict[tuple, np.ndarray] = field(default_factory=dict)
-    gated_rows_cache: dict[tuple, np.ndarray] = field(default_factory=dict)
-    # Same keys as gated_data_cache: the FCS-file row of each gated event.
-    # {(abs_path_str, sorted_gates_tuple, id(transfer_matrix)): gated array}
-    # Populated by drc_pipeline.load_unmixed_gated(). Avoids re-reading and
-    # re-unmixing an FCS file from disk on every PlotCard.refresh() — the
-    # single biggest cost in Workspace "Marker" colouring. Intentionally
-    # unbounded for the life of the session (same pattern as the existing
-    # threshold_cache in autospectral_optimization_functions.py); a stale
-    # entry is simply never looked up again once its key's inputs change.
+    gated_data_cache: drc_pipeline.GatedCache = field(default_factory=drc_pipeline.GatedCache)
+    # Loaded samples (drc_pipeline.load_unmixed_gated): float32 values of
+    # the channels in use and each event's FCS-file row, keyed by file,
+    # gates, unmixing and the sample's gating. Capped at a quarter of the
+    # machine's memory, least recently used sample dropped first.
     # Holds a copied PlotCard display config for magic-wand paste
-    workspace_n_columns: int = 3
+    workspace_pages: list[dict] = field(default_factory=list)
+    # Workspace pages [{'preset', 'w_mm', 'h_mm'}]; empty = one A4 page
+    workspace_grid_mm: float = drc_workspace_canvas.DEFAULT_GRID_MM
+    workspace_snap: bool = True
+    workspace_show_grid: bool = True
+    workspace_texts: list[dict] = field(default_factory=list)
+    workspace_figures: list[dict] = field(default_factory=list)
+    # Workspace figures from other tabs: where they come from (tab, key,
+    # label), size, aspect lock, uid, layout, group, z -- not the figure
+    # Workspace text boxes and panel letters (spec, uid, layout, group, z)
     plot_theme: str = 'auto'
     # 'auto' | 'light' | 'dark' — Workspace toggle. 'auto' mirrors
     # the live app palette (the previous, only, behaviour); 'light'/'dark'
@@ -2719,7 +2698,7 @@ class TransformTab(TransformInspector):
         self.gate_tree = drc_gate_tree.GateTreeWidget()
         self.gate_tree.setToolTip(
             "Check one or more gates.  Their events are UNIONED for the "
-            "preview below and for DR/clustering training pools.  Checking "
+            "preview below and for Honeycluster training pools.  Checking "
             "a parent gate checks its whole subtree."
         )
         self.gate_tree.setMinimumHeight(140)
@@ -2809,7 +2788,7 @@ class TransformTab(TransformInspector):
             return
 
         # The Transforms tab always shows every channel (in PNN order);
-        # channel selection for DR/clustering happens in Configuration.
+        # channel selection for Honeycluster happens in Configuration.
         self.show_channels()
         self.redraw_all()
 
@@ -7077,19 +7056,24 @@ class WorkspaceTab(QWidget):
     """
     Tab — Workspace
     -------------------------------------------
-    Scrollable canvas of PlotCard widgets showing DR scatter plots.
-    Each PlotCard supports:
-      • DR algorithm selector
-      • Sample selector (single sample or all pooled)
-      • Colour mode: Clusters | Marker intensity
-      • Per-cluster colour pickers (right-click)
-      • Magic-wand display-config copy/paste
-      • PNG/PDF export
+    Figure composer: pages (A4 by default) on a zoomable canvas
+    (drc_workspace_canvas) holding plots, their separate legends, text
+    boxes, panel letters and figures copied from the Cluster Annotation and
+    Stats tabs, which can be moved, resized, aligned, grouped and stacked,
+    with undo. The inspector on the right shows the settings
+    of the selected item (a plot's PlotCard, a text box, a group) or, with
+    nothing selected, the current page. Pages export as PDF, SVG, PNG or
+    TIFF (drc_workspace_export) and are what the Report's Workspace section
+    offers.
 
-    marker intensity, magic-wand, PDF export.
+    Persisted: each plot's layout ({'page', 'x_mm', 'y_mm'}), group and
+    stacking order in its entry of state.plot_configs; text boxes and
+    letters in state.workspace_texts; figures from other tabs (where they
+    come from, not the figure) in state.workspace_figures; pages in
+    state.workspace_pages.
     """
 
-    plots_changed = Signal()  # emitted whenever a card is added or removed
+    plots_changed = Signal()  # an item was added or removed, or the layout changed
 
     def __init__(self, state: PipelineState, bus, controller, parent=None):
         super().__init__(parent)
@@ -7097,9 +7081,16 @@ class WorkspaceTab(QWidget):
         self.bus = bus
         self.controller = controller
         self._plot_cards: list['PlotCard'] = []
+        self._items: dict[str, drc_workspace_canvas.PlotItem] = {}
+        self._texts: dict[str, drc_workspace_canvas.TextItem] = {}
+        self._figures: dict[str, drc_workspace_canvas.SourceFigureItem] = {}
+        self._figure_sources: dict = {}   # tab name -> callable returning its ReportItems
+        self._restoring = False
         self._build_ui()
 
     def _build_ui(self):
+        from PySide6.QtGui import QKeySequence, QShortcut
+        from PySide6.QtWidgets import QMenu, QToolButton
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -7109,23 +7100,148 @@ class WorkspaceTab(QWidget):
         )
         outer.addWidget(self.help_widget)
 
-        # --- Toolbar ---
-        toolbar = QFrame()
-        toolbar.setFrameShape(QFrame.StyledPanel)
-        toolbar.setMaximumHeight(44)
-        tb_layout = QHBoxLayout(toolbar)
-        tb_layout.setContentsMargins(8, 4, 8, 4)
-        tb_layout.setSpacing(10)
+        self.scene = drc_workspace_canvas.WorkspaceScene(
+            self._pages_from_state(), grid_mm=self.state.workspace_grid_mm,
+            snap_enabled=self.state.workspace_snap, show_grid=self.state.workspace_show_grid,
+            parent=self)
+        self.undo_stack = self.scene.undo_stack
 
-        tb_layout.addWidget(QLabel("Columns:"))
-        self.col_combo = QComboBox()
-        self.col_combo.addItems(["2", "3", "4"])
-        self.col_combo.setCurrentText(str(self.state.workspace_n_columns))
-        self.col_combo.setFixedWidth(55)
-        self.col_combo.currentTextChanged.connect(self._on_column_count_changed)
-        _style_combo_popup(self.col_combo)
-        tb_layout.addWidget(self.col_combo)
+        # --- Toolbar row 1: insert, undo, arrange, export ---
+        row1 = QFrame()
+        row1.setFrameShape(QFrame.StyledPanel)
+        tb1 = QHBoxLayout(row1)
+        tb1.setContentsMargins(8, 4, 8, 2)
+        tb1.setSpacing(6)
+        self.add_plot_btn = QPushButton("＋ Add Plot")
+        self.add_plot_btn.clicked.connect(lambda _checked=False: self.add_plot())
+        tb1.addWidget(self.add_plot_btn)
+        self.add_text_btn = QPushButton("＋ Text")
+        self.add_text_btn.clicked.connect(lambda _checked=False: self.add_text('text'))
+        tb1.addWidget(self.add_text_btn)
+        self.add_letter_btn = QPushButton("＋ Panel Letter")
+        self.add_letter_btn.setToolTip(
+            "Add a panel letter (A, B, C … in reading order on the page) at the "
+            "top-left of the selected plot or group")
+        self.add_letter_btn.clicked.connect(lambda _checked=False: self.add_text('letter'))
+        tb1.addWidget(self.add_letter_btn)
+        self.add_figure_btn = QToolButton()
+        self.add_figure_btn.setText("＋ From Other Tabs ▾")
+        self.add_figure_btn.setToolTip(
+            "Add a figure from the Cluster Annotation or Stats tab (as it is shown there now)")
+        self.add_figure_btn.setPopupMode(QToolButton.InstantPopup)
+        self._figure_menu = QMenu(self.add_figure_btn)
+        self._figure_menu.aboutToShow.connect(
+            lambda: self._fill_figure_menu(self._figure_menu, None))
+        self.add_figure_btn.setMenu(self._figure_menu)
+        tb1.addWidget(self.add_figure_btn)
 
+        tb1.addSpacing(12)
+        self.undo_btn = QPushButton("↶ Undo")
+        self.undo_btn.clicked.connect(self.undo_stack.undo)
+        self.undo_stack.canUndoChanged.connect(self.undo_btn.setEnabled)
+        self.undo_btn.setEnabled(False)
+        tb1.addWidget(self.undo_btn)
+        self.redo_btn = QPushButton("↷ Redo")
+        self.redo_btn.clicked.connect(self.undo_stack.redo)
+        self.undo_stack.canRedoChanged.connect(self.redo_btn.setEnabled)
+        self.redo_btn.setEnabled(False)
+        tb1.addWidget(self.redo_btn)
+
+        tb1.addSpacing(12)
+        self.arrange_btn = QToolButton()
+        self.arrange_btn.setText("Arrange ▾")
+        self.arrange_btn.setPopupMode(QToolButton.InstantPopup)
+        arrange = QMenu(self.arrange_btn)
+        for mode, text in (('left', "Align left edges"), ('hcentre', "Align centres (horizontal)"),
+                           ('right', "Align right edges"), (None, None),
+                           ('top', "Align top edges"), ('vcentre', "Align centres (vertical)"),
+                           ('bottom', "Align bottom edges"), (None, None),
+                           ('hdistribute', "Distribute horizontally"),
+                           ('vdistribute', "Distribute vertically")):
+            if mode is None:
+                arrange.addSeparator()
+            else:
+                arrange.addAction(text, lambda m=mode: self.align_selected(m))
+        arrange.addSeparator()
+        arrange.addAction("Group", self.group_selected)
+        arrange.addAction("Ungroup", self.ungroup_selected)
+        arrange.addSeparator()
+        arrange.addAction("Bring to front", lambda: self.restack_selected(True))
+        arrange.addAction("Send to back", lambda: self.restack_selected(False))
+        self.arrange_btn.setMenu(arrange)
+        tb1.addWidget(self.arrange_btn)
+
+        tb1.addStretch()
+        self.export_btn = QPushButton("Export…")
+        self.export_btn.setToolTip("Export pages as PDF, SVG, PNG or TIFF")
+        self.export_btn.clicked.connect(self._export_pages)
+        tb1.addWidget(self.export_btn)
+        outer.addWidget(row1)
+
+        # --- Toolbar row 2: pages, zoom, grid, theme ---
+        row2 = QFrame()
+        row2.setFrameShape(QFrame.StyledPanel)
+        tb_layout = QHBoxLayout(row2)
+        tb_layout.setContentsMargins(8, 2, 8, 4)
+        tb_layout.setSpacing(6)
+        self.add_page_btn = QPushButton("＋ Page")
+        self.add_page_btn.setToolTip("Add a page after the current page")
+        self.add_page_btn.clicked.connect(self._add_page)
+        tb_layout.addWidget(self.add_page_btn)
+        self.remove_page_btn = QPushButton("− Page")
+        self.remove_page_btn.setToolTip("Remove the current page and everything on it")
+        self.remove_page_btn.clicked.connect(self._remove_page)
+        tb_layout.addWidget(self.remove_page_btn)
+
+        tb_layout.addSpacing(12)
+        zoom_out = QPushButton("−")
+        zoom_out.setFixedWidth(28)
+        zoom_out.setToolTip("Zoom out (Ctrl/⌘ + wheel, or pinch)")
+        zoom_out.clicked.connect(
+            lambda: self.view.set_zoom(self.view.zoom() / drc_workspace_canvas.ZOOM_STEP))
+        tb_layout.addWidget(zoom_out)
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setFixedWidth(44)
+        self.zoom_label.setAlignment(Qt.AlignCenter)
+        tb_layout.addWidget(self.zoom_label)
+        zoom_in = QPushButton("+")
+        zoom_in.setFixedWidth(28)
+        zoom_in.setToolTip("Zoom in (Ctrl/⌘ + wheel, or pinch)")
+        zoom_in.clicked.connect(
+            lambda: self.view.set_zoom(self.view.zoom() * drc_workspace_canvas.ZOOM_STEP))
+        tb_layout.addWidget(zoom_in)
+        actual = QPushButton("100%")
+        actual.setToolTip("Show pages at their printed size")
+        actual.clicked.connect(lambda: self.view.set_zoom(1.0))
+        tb_layout.addWidget(actual)
+        fit = QPushButton("Fit Page")
+        fit.clicked.connect(lambda: self.view.fit_page(self.scene.current_page))
+        tb_layout.addWidget(fit)
+
+        tb_layout.addSpacing(12)
+        self.snap_check = QCheckBox("Snap")
+        self.snap_check.setToolTip("Snap to the grid (hold Alt/⌥ to place freely)")
+        self.snap_check.setChecked(self.state.workspace_snap)
+        self.snap_check.toggled.connect(self._on_grid_changed)
+        tb_layout.addWidget(self.snap_check)
+        self.grid_combo = QComboBox()
+        for step in drc_workspace_canvas.GRID_STEPS_MM:
+            self.grid_combo.addItem(f"{step:g} mm", step)
+        idx = self.grid_combo.findData(self.state.workspace_grid_mm)
+        self.grid_combo.setCurrentIndex(
+            idx if idx >= 0 else self.grid_combo.findData(drc_workspace_canvas.DEFAULT_GRID_MM))
+        self.grid_combo.setToolTip(
+            "Snap step (also the arrow-key nudge). Show grid draws these steps; "
+            "when zoomed out, every 2nd, 3rd … step so lines stay apart.")
+        self.grid_combo.currentIndexChanged.connect(self._on_grid_changed)
+        _style_combo_popup(self.grid_combo)
+        tb_layout.addWidget(self.grid_combo)
+        self.show_grid_check = QCheckBox("Show grid")
+        self.show_grid_check.setChecked(self.state.workspace_show_grid)
+        self.show_grid_check.toggled.connect(self._on_grid_changed)
+        tb_layout.addWidget(self.show_grid_check)
+
+        tb_layout.addSpacing(12)
         tb_layout.addWidget(QLabel("Theme:"))
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(["Auto", "Light", "Dark"])
@@ -7138,102 +7254,806 @@ class WorkspaceTab(QWidget):
         self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
         _style_combo_popup(self.theme_combo)
         tb_layout.addWidget(self.theme_combo)
-
         tb_layout.addStretch()
+        outer.addWidget(row2)
 
-        self.add_plot_btn = QPushButton("＋ Add Plot")
-        self.add_plot_btn.setFixedHeight(30)
-        self.add_plot_btn.clicked.connect(self.add_plot)
-        tb_layout.addWidget(self.add_plot_btn)
+        # --- Canvas | inspector ---
+        self.view = drc_workspace_canvas.WorkspaceView(self.scene)
+        self.view.zoom_changed.connect(lambda z: self.zoom_label.setText(f"{z * 100:.0f}%"))
+        self.zoom_label.setText(f"{self.view.zoom() * 100:.0f}%")
+        self.scene.selectionChanged.connect(self._on_selection_changed)
+        self.scene.layout_changed.connect(self._on_layout_changed)
+        self.scene.current_page_changed.connect(self._on_current_page_changed)
+        self.scene.group_scale_requested.connect(self.scale_group)
+        self.scene.page_menu_requested.connect(self._show_page_menu)
 
-        self.export_pdf_btn = QPushButton("Export PDF")
-        self.export_pdf_btn.setFixedHeight(30)
-        self.export_pdf_btn.setToolTip("Export all plots as a multi-page PDF.")
-        self.export_pdf_btn.clicked.connect(self._export_pdf)
-        tb_layout.addWidget(self.export_pdf_btn)
+        self.inspector_title = QLabel()
+        self.inspector_title.setStyleSheet("font-weight: bold; padding: 4px;")
+        self.inspector_stack = QStackedWidget()
+        self.inspector_stack.addWidget(self._build_page_panel())    # 0
+        self.inspector_stack.addWidget(self._build_text_panel())    # 1
+        self.inspector_stack.addWidget(self._build_group_panel())   # 2
+        self.inspector_stack.addWidget(self._build_figure_panel())  # 3
+        inspector_scroll = QScrollArea()
+        inspector_scroll.setWidgetResizable(True)
+        inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        inspector_scroll.setWidget(self.inspector_stack)
+        inspector = QWidget()
+        inspector_layout = QVBoxLayout(inspector)
+        inspector_layout.setContentsMargins(0, 0, 0, 0)
+        inspector_layout.addWidget(self.inspector_title)
+        inspector_layout.addWidget(inspector_scroll, stretch=1)
+        inspector.setMinimumWidth(INSPECTOR_MIN_WIDTH_PX)
 
-        outer.addWidget(toolbar)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self.view)
+        splitter.addWidget(inspector)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        outer.addWidget(splitter, stretch=1)
 
-        # --- Scrollable canvas ---
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # --- Shortcuts (active while the canvas has focus) ---
+        for keys, slot in ((QKeySequence.StandardKey.Undo, self.undo_stack.undo),
+                           (QKeySequence.StandardKey.Redo, self.undo_stack.redo),
+                           (QKeySequence("Ctrl+G"), self.group_selected),
+                           (QKeySequence("Ctrl+Shift+G"), self.ungroup_selected)):
+            shortcut = QShortcut(keys, self.view)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(slot)
+        for key, (dx, dy) in ((Qt.Key_Left, (-1, 0)), (Qt.Key_Right, (1, 0)),
+                              (Qt.Key_Up, (0, -1)), (Qt.Key_Down, (0, 1))):
+            shortcut = QShortcut(QKeySequence(key), self.view)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda dx=dx, dy=dy: self.nudge_selected(dx, dy))
 
-        self.canvas = QWidget()
-        self.canvas_layout = QGridLayout(self.canvas)
-        self.canvas_layout.setSpacing(6)
-        self.canvas_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.scroll.setWidget(self.canvas)
-        outer.addWidget(self.scroll)
+        self._show_page_panel()
 
-        # Empty-canvas hint
-        self._placeholder = QLabel(
-            "No plots yet.\n\nClick  ＋ Add Plot  to create a DR scatter plot."
-        )
-        self._placeholder.setAlignment(Qt.AlignCenter)
-        self._placeholder.setStyleSheet("color: grey; font-style: italic;")
-        self.canvas_layout.addWidget(self._placeholder, 0, 0, 1, 4)
+    # ------------------------------------------------------------------
+    # Pages
+    # ------------------------------------------------------------------
 
-    def add_plot(self, refresh: bool = True):
+    def _pages_from_state(self) -> list[dict]:
+        return [dict(p) for p in self.state.workspace_pages] or [
+            dict(drc_workspace_canvas.DEFAULT_PAGE)]
+
+    def _build_page_panel(self) -> QWidget:
+        from PySide6.QtWidgets import QFormLayout
+        panel = QWidget()
+        form = QFormLayout(panel)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.page_spin = QSpinBox()
+        self.page_spin.setMinimum(1)
+        self.page_spin.valueChanged.connect(lambda v: self._on_current_page_changed(v - 1))
+        form.addRow("Page:", self.page_spin)
+        self.page_preset_combo = QComboBox()
+        self.page_preset_combo.addItems(list(drc_workspace_canvas.PAGE_PRESETS))
+        _style_combo_popup(self.page_preset_combo)
+        form.addRow("Size:", self.page_preset_combo)
+        self.page_orient_combo = QComboBox()
+        self.page_orient_combo.addItems(['Portrait', 'Landscape'])
+        _style_combo_popup(self.page_orient_combo)
+        form.addRow("Orientation:", self.page_orient_combo)
+        self.page_w_spin = QDoubleSpinBox()
+        self.page_h_spin = QDoubleSpinBox()
+        for spin in (self.page_w_spin, self.page_h_spin):
+            spin.setRange(PAGE_MIN_MM, PAGE_MAX_MM)
+            spin.setDecimals(1)
+            spin.setSuffix(" mm")
+        form.addRow("Width:", self.page_w_spin)
+        form.addRow("Height:", self.page_h_spin)
+        hint = QLabel("Select an item to edit it; right-click it for more actions. "
+                      "Ctrl/⌘ + wheel or pinch zooms; arrow keys nudge by the grid step; "
+                      "Ctrl/⌘ + G groups.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(_hint_style())
+        form.addRow(hint)
+        self.page_preset_combo.currentTextChanged.connect(self._on_page_settings_changed)
+        self.page_orient_combo.currentTextChanged.connect(self._on_page_settings_changed)
+        self.page_w_spin.valueChanged.connect(self._on_page_settings_changed)
+        self.page_h_spin.valueChanged.connect(self._on_page_settings_changed)
+        self._page_panel_loading = False
+        return panel
+
+    def _show_page_panel(self, title: str | None = None):
+        index = self.scene.current_page
+        page = self.scene.pages[index]
+        self._page_panel_loading = True
+        try:
+            self.page_spin.setMaximum(len(self.scene.pages))
+            self.page_spin.setValue(index + 1)
+            self.page_preset_combo.setCurrentText(page.get('preset', 'Custom'))
+            self.page_orient_combo.setCurrentText(
+                'Landscape' if page['w_mm'] > page['h_mm'] else 'Portrait')
+            self.page_w_spin.setValue(page['w_mm'])
+            self.page_h_spin.setValue(page['h_mm'])
+            custom = self.page_preset_combo.currentText() == 'Custom'
+            self.page_w_spin.setEnabled(custom)
+            self.page_h_spin.setEnabled(custom)
+        finally:
+            self._page_panel_loading = False
+        self.inspector_stack.setCurrentIndex(0)
+        self.inspector_title.setText(title or f"Page {index + 1} of {len(self.scene.pages)}")
+        self.remove_page_btn.setEnabled(len(self.scene.pages) > 1)
+
+    def _on_page_settings_changed(self, *_):
+        if self._page_panel_loading:
+            return
+        preset = self.page_preset_combo.currentText()
+        w, h = drc_workspace_canvas.page_size_for(
+            preset, self.page_orient_combo.currentText(),
+            (self.page_w_spin.value(), self.page_h_spin.value()))
+        self.scene.set_page(self.scene.current_page, {'preset': preset, 'w_mm': w, 'h_mm': h})
+        self._show_page_panel()
+
+    def _on_current_page_changed(self, index: int):
+        if self._page_panel_loading or not 0 <= index < len(self.scene.pages):
+            return
+        self.scene.current_page = index
+        if self.inspector_stack.currentIndex() == 0:
+            self._show_page_panel()
+
+    def _add_page(self):
+        self.scene.add_page(self.scene.current_page)
+        self.scene.current_page += 1
+        self._show_page_panel()
+        self.view.fit_page(self.scene.current_page)
+
+    def _remove_page(self):
+        """Remove the current page and what is on it (asks first if it is
+        not empty; not undoable)."""
+        index = self.scene.current_page
+        if len(self.scene.pages) <= 1:
+            return
+        on_page = [it for it in self.scene.top_items() if it.layout_mm['page'] == index]
+        if on_page:
+            answer = QMessageBox.question(
+                self, "Remove page",
+                f"Page {index + 1} holds {len(on_page)} item(s). Remove the page and them? "
+                "This cannot be undone.")
+            if answer != QMessageBox.Yes:
+                return
+        for item in on_page:
+            self._discard_item(item)
+        self.scene.remove_page(index)
+        self.undo_stack.clear()
+        self._show_page_panel()
+        self.plots_changed.emit()
+
+    def _on_grid_changed(self, *_):
+        self.state.workspace_snap = self.snap_check.isChecked()
+        self.state.workspace_grid_mm = float(self.grid_combo.currentData())
+        self.state.workspace_show_grid = self.show_grid_check.isChecked()
+        self.scene.set_grid(self.state.workspace_grid_mm, self.state.workspace_snap,
+                            self.state.workspace_show_grid)
+        self.plots_changed.emit()
+
+    # ------------------------------------------------------------------
+    # Plots
+    # ------------------------------------------------------------------
+
+    def _next_id(self, prefix: str, used) -> str:
+        n = 1
+        while f"{prefix}_{n}" in used:
+            n += 1
+        return f"{prefix}_{n}"
+
+    def _place(self, size_mm: tuple[float, float]) -> dict:
+        pages, (layout,) = drc_workspace_canvas.place_items(
+            self.scene.pages, self.scene.placed_layouts(), [size_mm],
+            start_page=self.scene.current_page)
+        if len(pages) != len(self.scene.pages):
+            self.scene.set_pages(pages)
+        return layout
+
+    def add_plot(self, refresh: bool = True, config: dict | None = None,
+                 layout: dict | None = None, plot_id: str | None = None,
+                 record: bool = True) -> 'PlotCard':
         """
-        Add a new PlotCard to the canvas.
-
-        refresh=False skips the initial draw — used when the caller is about
-        to call apply_config() immediately afterwards (e.g. restoring a
-        persisted layout), so the card doesn't render once with blank/default
-        combo values and then immediately again with the real ones.
+        Add a plot: a PlotCard (its settings, shown in the inspector) and a
+        PlotItem on the page. *config* is a saved display config to apply;
+        *layout* ({'page', 'x_mm', 'y_mm'}) places it, otherwise it goes in
+        the first free spot from the current page on (a page is added if
+        none is free). record=True makes it one undoable step.
         """
-        if self._placeholder is not None:
-            self._placeholder.setParent(None)
-            self._placeholder = None
-
-        plot_id = f"plot_{len(self._plot_cards) + 1}"
         card = PlotCard(
-            plot_id=plot_id,
+            plot_id=plot_id or self._next_id('plot', {c.plot_id for c in self._plot_cards}),
             state=self.state,
             bus=self.bus,
             controller=self.controller,
             workspace=self,
-            parent=self.canvas,
         )
+        if config:
+            card.apply_size_config(config)
+            card.group_id = config.get('group')
+            card.z_value = float(config.get('z') or 0.0)
+        item = drc_workspace_canvas.PlotItem(card)
+        item.action_requested.connect(self._on_item_action)
+        if layout is None:
+            layout = self._place(card.estimated_size_mm())
+        item.layout_mm = {'page': int(layout['page']), 'x_mm': float(layout['x_mm']),
+                          'y_mm': float(layout['y_mm'])}
+        item.group_id = card.group_id
+        item.setZValue(card.z_value)
+        card.layout_mm = item.layout_mm
+        self.scene.addItem(item)
+        self.scene.position_item(item)
         self._plot_cards.append(card)
-        self.state.plot_configs.append({'plot_id': plot_id})
-        # Save display config whenever a card changes (via each card's _schedule_refresh)
-
-        n_cols = self.state.workspace_n_columns
-        idx = len(self._plot_cards) - 1
-        row, col = divmod(idx, n_cols)
-        self.canvas_layout.addWidget(card, row, col)
-        if refresh:
+        self._items[card.plot_id] = item
+        self.inspector_stack.addWidget(card)
+        self.state.plot_configs.append({'plot_id': card.plot_id, 'layout': dict(item.layout_mm)})
+        if config:
+            card.apply_config(config)
+        elif refresh:
             card.refresh()
+        item.schedule_render()
+        if record and not self._restoring:
+            self._record_added([card.plot_id], "Add plot")
         self.plots_changed.emit()
+        return card
 
     def remove_card(self, card: 'PlotCard'):
-        """Remove a PlotCard from the canvas and state."""
-        if card in self._plot_cards:
-            self._plot_cards.remove(card)
-        self.state.plot_configs = [
-            c for c in self.state.plot_configs if c.get('plot_id') != card.plot_id
-        ]
-        self.canvas_layout.removeWidget(card)
-        card.deleteLater()
-        self._relayout()
-        if not self._plot_cards:
-            self._placeholder = QLabel(
-                "No plots yet.\n\nClick  ＋ Add Plot  to create a DR scatter plot."
-            )
-            self._placeholder.setAlignment(Qt.AlignCenter)
-            self._placeholder.setStyleSheet("color: grey; font-style: italic;")
-            self.canvas_layout.addWidget(self._placeholder, 0, 0, 1, 4)
+        """Remove a plot (undoable)."""
+        item = self._items.get(card.plot_id)
+        if item is not None:
+            self.remove_items([item])
+
+    def _discard_item(self, item):
+        """Remove a plot or text item for good (no undo record)."""
+        if isinstance(item, drc_workspace_canvas.PlotItem):
+            card = item.card
+            if card in self._plot_cards:
+                self._plot_cards.remove(card)
+            self._items.pop(card.plot_id, None)
+            self.state.plot_configs = [
+                c for c in self.state.plot_configs if c.get('plot_id') != card.plot_id]
+            self.inspector_stack.removeWidget(card)
+            card.deleteLater()
+        elif isinstance(item, drc_workspace_canvas.TextItem):
+            self._texts.pop(item.uid, None)
+        elif isinstance(item, drc_workspace_canvas.SourceFigureItem):
+            self._figures.pop(item.uid, None)
+        if item.scene() is not None:
+            self.scene.removeItem(item)
+        item.deleteLater()
+
+    def clear_plots(self):
+        for item in list(self.scene.top_items()):
+            self._discard_item(item)
+        self.undo_stack.clear()
+
+    # ------------------------------------------------------------------
+    # Text boxes and panel letters
+    # ------------------------------------------------------------------
+
+    def add_text(self, kind: str = 'text', spec: dict | None = None,
+                 layout: dict | None = None, uid: str | None = None,
+                 record: bool = True) -> 'drc_workspace_canvas.TextItem':
+        """Add a text box or panel letter. A new letter goes at the top-left
+        of the selected plot or group (else in a free spot) and takes the
+        next letter in reading order on its page."""
+        spec = dict(spec or {}, kind=kind)
+        box = drc_workspace_canvas.TextBox(uid or self._next_id('text', set(self._texts)), spec)
+        item = drc_workspace_canvas.TextItem(box)
+        item.action_requested.connect(self._on_item_action)
+        if layout is None:
+            layout = self._new_text_layout(item, near_selection=(kind == 'letter'))
+            if kind == 'letter' and box.spec['auto']:
+                box.set_spec(text=self.scene.next_letter(
+                    layout['page'], layout['x_mm'], layout['y_mm']))
+        item.layout_mm = {'page': int(layout['page']), 'x_mm': float(layout['x_mm']),
+                          'y_mm': float(layout['y_mm'])}
+        item.group_id = spec.get('group')
+        item.setZValue(float(spec.get('z') or 0.0))
+        self.scene.addItem(item)
+        self.scene.position_item(item)
+        self._texts[box.uid] = item
+        box.changed.connect(self._on_layout_changed)
+        if record and not self._restoring:
+            self.scene.relabel_letters()
+            self._record_added([box.uid], "Add text" if kind == 'text' else "Add panel letter")
+            self.scene.clearSelection()
+            item.setSelected(True)
+        self._on_layout_changed()
+        return item
+
+    def _new_text_layout(self, item, near_selection: bool) -> dict:
+        """Where a new text item goes: a panel letter at the top-left of the
+        selected plot or group; otherwise the last point clicked on a page
+        (the next one goes just below it); otherwise the first free spot."""
+        anchor = [it for it in self.scene.selected_figure_items() if it.parentItem() is None]
+        if anchor and near_selection:
+            gid = self.scene.selected_group()
+            rect = (self.scene.group_rect(gid) if gid else anchor[0].scene_rect_mm())
+            page = self.scene.page_index_at(rect.center().y())
+            ox, oy = self.scene.page_origin(page)
+            off = drc_workspace_canvas.LETTER_OFFSET_MM
+            return {'page': page, 'x_mm': max(0.0, rect.x() - ox - off),
+                    'y_mm': max(0.0, rect.y() - oy - off)}
+        return self._layout_at_last_click(item.size_mm())
+
+    def _layout_at_last_click(self, size_mm: tuple[float, float]) -> dict:
+        """At the last point clicked on a page if the item fits on the page
+        there; otherwise the first free spot."""
+        point = self.scene.last_click
+        if point is not None:
+            page, x, y = point
+            p = self.scene.pages[min(page, len(self.scene.pages) - 1)]
+            if x + size_mm[0] <= p['w_mm'] and y + size_mm[1] <= p['h_mm']:
+                self.scene.take_last_click(size_mm[1])
+                return {'page': page, 'x_mm': x, 'y_mm': y}
+        return self._place(size_mm)
+
+    def _build_text_panel(self) -> QWidget:
+        from PySide6.QtWidgets import QFormLayout, QPlainTextEdit
+        panel = QWidget()
+        form = QFormLayout(panel)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setFixedHeight(80)
+        self.text_edit.textChanged.connect(self._on_text_settings_changed)
+        form.addRow("Text:", self.text_edit)
+        self.text_auto_check = QCheckBox("Automatic letter (reading order)")
+        self.text_auto_check.toggled.connect(self._on_text_settings_changed)
+        form.addRow(self.text_auto_check)
+        self.text_size_spin = QDoubleSpinBox()
+        self.text_size_spin.setRange(4.0, 72.0)
+        self.text_size_spin.setDecimals(1)
+        self.text_size_spin.setSuffix(" pt")
+        self.text_size_spin.valueChanged.connect(self._on_text_settings_changed)
+        form.addRow("Size:", self.text_size_spin)
+        style_row = QHBoxLayout()
+        self.text_bold_check = QCheckBox("Bold")
+        self.text_bold_check.toggled.connect(self._on_text_settings_changed)
+        style_row.addWidget(self.text_bold_check)
+        self.text_italic_check = QCheckBox("Italic")
+        self.text_italic_check.toggled.connect(self._on_text_settings_changed)
+        style_row.addWidget(self.text_italic_check)
+        style_row.addStretch()
+        form.addRow(style_row)
+        self.text_align_combo = QComboBox()
+        self.text_align_combo.addItems(['left', 'centre', 'right'])
+        self.text_align_combo.currentTextChanged.connect(self._on_text_settings_changed)
+        _style_combo_popup(self.text_align_combo)
+        form.addRow("Lines:", self.text_align_combo)
+        self.text_colour_btn = QPushButton()
+        self.text_colour_btn.clicked.connect(self._pick_text_colour)
+        form.addRow("Colour:", self.text_colour_btn)
+        self._text_panel_item = None
+        self._text_panel_loading = False
+        return panel
+
+    def _show_text_panel(self, item):
+        spec = item.box.spec
+        self._text_panel_item = None
+        self._text_panel_loading = True
+        try:
+            self.text_edit.setPlainText(spec['text'])
+            is_letter = spec['kind'] == 'letter'
+            self.text_auto_check.setVisible(is_letter)
+            self.text_auto_check.setChecked(bool(spec['auto']))
+            self.text_size_spin.setValue(spec['size_pt'])
+            self.text_bold_check.setChecked(spec['bold'])
+            self.text_italic_check.setChecked(spec['italic'])
+            self.text_align_combo.setCurrentText(spec['align'])
+            self.text_colour_btn.setText(spec['colour'])
+            self.text_colour_btn.setStyleSheet(
+                f"background-color: {spec['colour']}; color: {_contrasting_text_color(spec['colour'])};")
+        finally:
+            self._text_panel_loading = False
+        self._text_panel_item = item
+        self.inspector_stack.setCurrentIndex(1)
+        self.inspector_title.setText("Panel letter" if is_letter else "Text")
+
+    def _on_text_settings_changed(self, *_):
+        item = self._text_panel_item
+        if self._text_panel_loading or item is None:
+            return
+        spec = item.box.spec
+        text = self.text_edit.toPlainText()
+        auto = self.text_auto_check.isChecked()
+        if spec['kind'] == 'letter' and text != spec['text'] and auto == spec['auto']:
+            auto = False   # a letter typed by hand is kept
+            self._text_panel_loading = True
+            self.text_auto_check.setChecked(False)
+            self._text_panel_loading = False
+        item.box.set_spec(text=text, auto=auto, size_pt=self.text_size_spin.value(),
+                          bold=self.text_bold_check.isChecked(),
+                          italic=self.text_italic_check.isChecked(),
+                          align=self.text_align_combo.currentText())
+        if spec['kind'] == 'letter':
+            self.scene.relabel_letters()
+            if auto:
+                self._text_panel_loading = True
+                self.text_edit.setPlainText(item.box.spec['text'])
+                self._text_panel_loading = False
+
+    def _pick_text_colour(self):
+        item = self._text_panel_item
+        if item is None:
+            return
+        colour = QColorDialog.getColor(QColor(item.box.spec['colour']), self, "Text colour")
+        if colour.isValid():
+            item.box.set_spec(colour=colour.name())
+            self._show_text_panel(item)
+
+    # ------------------------------------------------------------------
+    # Groups
+    # ------------------------------------------------------------------
+
+    def _build_group_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        self.group_label = QLabel()
+        self.group_label.setWordWrap(True)
+        layout.addWidget(self.group_label)
+        ungroup = QPushButton("Ungroup")
+        ungroup.clicked.connect(self.ungroup_selected)
+        layout.addWidget(ungroup)
+        hint = QLabel("Drag the group to move it; drag its orange corner to scale it "
+                      "(plots are redrawn at the new size, text keeps its size). "
+                      "Double-click an item to select it alone and edit it.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(_hint_style())
+        layout.addWidget(hint)
+        layout.addStretch()
+        return panel
+
+    def _selected_top_items(self) -> list:
+        return [it for it in self.scene.selected_figure_items() if it.parentItem() is None]
+
+    def group_selected(self):
+        items = self._selected_top_items()
+        if len(items) < 2:
+            return
+        used = {it.group_id for it in self.scene.top_items() if it.group_id}
+        gid = self._next_id('group', used)
+        self._set_groups_undoable({it.uid: gid for it in items}, "Group")
+
+    def ungroup_selected(self):
+        items = [it for it in self._selected_top_items() if it.group_id]
+        gids = {it.group_id for it in items}
+        members = [m for g in gids for m in self.scene.members(g)]
+        if members:
+            self._set_groups_undoable({m.uid: None for m in members}, "Ungroup")
+
+    def _set_groups_undoable(self, after: dict, text: str):
+        before = {uid: self.scene.item_by_uid(uid).group_id for uid in after}
+        self.undo_stack.push(drc_workspace_canvas.CallbackCommand(
+            text, lambda: self.scene.set_groups(after), lambda: self.scene.set_groups(before)))
+        self._on_selection_changed()
+
+    def scale_group(self, gid: str, scale: float):
+        """Scale a group about its top-left corner: positions scale, plots
+        are resized (fonts stay in pt), text keeps its size."""
+        members = self.scene.members(gid)
+        origin = self.scene.group_rect(gid).topLeft()
+
+        def snapshot():
+            return {m.uid: {'pos': (m.pos().x(), m.pos().y()),
+                            'size': m.card.plot_size_mm() if isinstance(
+                                m, drc_workspace_canvas.PlotItem) else None,
+                            'legend': m.card.legend_offset_mm if isinstance(
+                                m, drc_workspace_canvas.PlotItem) else None}
+                    for m in members}
+
+        before = snapshot()
+        after = {}
+        for uid, s in before.items():
+            x, y = s['pos']
+            size = s['size']
+            legend = s['legend']
+            after[uid] = {
+                'pos': (origin.x() + (x - origin.x()) * scale,
+                        origin.y() + (y - origin.y()) * scale),
+                'size': (size[0] * scale, size[1] * scale) if size else None,
+                'legend': (legend[0] * scale, legend[1] * scale) if legend else None,
+            }
+
+        def apply(states):
+            for uid, s in states.items():
+                item = self.scene.item_by_uid(uid)
+                if item is None:
+                    continue
+                if isinstance(item, drc_workspace_canvas.PlotItem):
+                    item.card.legend_offset_mm = s['legend']
+                    if s['size']:
+                        item.card.set_plot_size_mm(*s['size'])
+            self.scene.set_positions({uid: s['pos'] for uid, s in states.items()})
+
+        self.undo_stack.push(drc_workspace_canvas.CallbackCommand(
+            "Scale group", lambda: apply(after), lambda: apply(before)))
+
+    # ------------------------------------------------------------------
+    # Arrange
+    # ------------------------------------------------------------------
+
+    def _units(self) -> dict:
+        """Selected items as units to arrange: {key: (rect, [uids])}; a
+        fully selected group is one unit."""
+        units = {}
+        items = self._selected_top_items()
+        for it in items:
+            gid = it.group_id
+            if gid and set(self.scene.members(gid)) <= set(items):
+                units[f'group:{gid}'] = (self.scene.group_rect(gid),
+                                         [m.uid for m in self.scene.members(gid)])
+            else:
+                units[it.uid] = (it.scene_rect_mm(), [it.uid])
+        return units
+
+    def align_selected(self, mode: str):
+        units = self._units()
+        rects = {k: (r.x(), r.y(), r.width(), r.height()) for k, (r, _uids) in units.items()}
+        moves = drc_workspace_canvas.align_moves(rects, mode)
+        deltas = {uid: moves[k] for k, (_r, uids) in units.items() for uid in uids}
+        self.scene.move_items(deltas, "Align" if 'distribute' not in mode else "Distribute")
+
+    def restack_selected(self, to_front: bool):
+        items = self._selected_top_items()
+        if not items:
+            return
+        zs = [it.zValue() for it in self.scene.top_items()]
+        base = (max(zs) + 1) if to_front else (min(zs) - len(items))
+        ordered = sorted(items, key=lambda it: it.zValue())
+        before = {it.uid: it.zValue() for it in ordered}
+        after = {it.uid: base + i for i, it in enumerate(ordered)}
+
+        def apply(zmap):
+            for uid, z in zmap.items():
+                item = self.scene.item_by_uid(uid)
+                if item is not None:
+                    item.setZValue(z)
+            self._on_layout_changed()
+
+        self.undo_stack.push(drc_workspace_canvas.CallbackCommand(
+            "Bring to front" if to_front else "Send to back",
+            lambda: apply(after), lambda: apply(before)))
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Delete, Qt.Key_Backspace):
+            items = self._selected_top_items()
+            legends = [it for it in self.scene.selected_figure_items()
+                       if isinstance(it, drc_workspace_canvas.LegendItem)]
+            for legend in legends:
+                legend.card._legend_pos_combo.setCurrentText('Off')
+            if items:
+                self.remove_items(items)
+            if items or legends:
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def nudge_selected(self, dx: int, dy: int):
+        """Move the selection by one grid step (undoable)."""
+        step = self.state.workspace_grid_mm
+        self.scene.move_items({it.uid: (dx * step, dy * step)
+                               for it in self.scene.selected_figure_items()}, "Nudge")
+
+    # ------------------------------------------------------------------
+    # Adding / removing as undoable steps
+    # ------------------------------------------------------------------
+
+    def _snapshot(self, uid: str) -> dict | None:
+        item = self.scene.item_by_uid(uid)
+        if isinstance(item, drc_workspace_canvas.PlotItem):
+            item.card.layout_mm = dict(item.layout_mm)
+            item.card.group_id, item.card.z_value = item.group_id, item.zValue()
+            return {'kind': 'plot', 'config': item.card.get_display_config()}
+        if isinstance(item, drc_workspace_canvas.TextItem):
+            return {'kind': 'text', 'spec': dict(item.box.spec, group=item.group_id,
+                                                 z=item.zValue()),
+                    'layout': dict(item.layout_mm)}
+        if isinstance(item, drc_workspace_canvas.SourceFigureItem):
+            return {'kind': 'figure', 'spec': dict(item.figure_source.spec, group=item.group_id,
+                                                   z=item.zValue()),
+                    'layout': dict(item.layout_mm)}
+        return None
+
+    def _restore_snapshot(self, uid: str, snap: dict):
+        if snap['kind'] == 'plot':
+            cfg = snap['config']
+            self.add_plot(config=cfg, layout=cfg.get('layout'), plot_id=uid, record=False)
+        elif snap['kind'] == 'figure':
+            self.add_source_figure(snap['spec'], layout=snap['layout'], uid=uid, record=False)
+        else:
+            spec = snap['spec']
+            self.add_text(spec['kind'], spec=spec, layout=snap['layout'], uid=uid, record=False)
+
+    def _record_added(self, uids: list[str], text: str):
+        snaps = {}
+
+        def undo():
+            for uid in uids:
+                snaps[uid] = self._snapshot(uid)
+                item = self.scene.item_by_uid(uid)
+                if item is not None:
+                    self._discard_item(item)
+            self.scene.relabel_letters()
+            self.plots_changed.emit()
+
+        def redo():
+            for uid in uids:
+                if snaps.get(uid):
+                    self._restore_snapshot(uid, snaps[uid])
+            self.scene.relabel_letters()
+
+        self.undo_stack.push(drc_workspace_canvas.CallbackCommand(text, redo, undo, done=True))
+
+    def remove_items(self, items: list):
+        """Remove plots / text items as one undoable step."""
+        uids = [it.uid for it in items]
+        snaps = {uid: self._snapshot(uid) for uid in uids}
+
+        def redo():
+            for uid in uids:
+                item = self.scene.item_by_uid(uid)
+                if item is not None:
+                    snaps[uid] = self._snapshot(uid)
+                    self._discard_item(item)
+            self.scene.relabel_letters()
+            self._show_page_panel()
+            self.plots_changed.emit()
+
+        def undo():
+            for uid in uids:
+                if snaps.get(uid):
+                    self._restore_snapshot(uid, snaps[uid])
+            self.scene.relabel_letters()
+
+        self.undo_stack.push(drc_workspace_canvas.CallbackCommand(
+            f"Remove {len(uids)} item(s)", redo, undo))
+
+    # ------------------------------------------------------------------
+    # Restore / persist
+    # ------------------------------------------------------------------
+
+    def restore_layout(self, configs: list[dict], texts: list[dict] | None = None,
+                       figures: list[dict] | None = None):
+        """Rebuild the canvas from state.workspace_pages, saved plot
+        *configs*, saved *texts* and saved *figures* from other tabs (shown
+        as placeholders until their source can be found). Configs saved before the page canvas (no
+        'layout') are placed in order in the first free spots, adding pages
+        as needed."""
+        self._restoring = True
+        try:
+            self.clear_plots()
+            self.scene.current_page = 0
+            self.scene.set_pages(self._pages_from_state())
+            self._sync_grid_controls()
+            for cfg in configs:
+                self.add_plot(refresh=False, config=cfg, layout=cfg.get('layout'),
+                              plot_id=cfg.get('plot_id') or None)
+            for t in texts or []:
+                self.add_text(t.get('kind', 'text'), spec=t, layout=t.get('layout'),
+                              uid=t.get('uid'))
+            for f in figures or []:
+                if f.get('layout'):
+                    self.add_source_figure(f, layout=f['layout'], uid=f.get('uid'), record=False)
+        finally:
+            self._restoring = False
+        self.undo_stack.clear()
+        self.scene.relabel_letters()
+        self._on_layout_changed()
+        self._show_page_panel()
+        self.view.fit_page(0)
+
+    def _sync_grid_controls(self):
+        for widget in (self.snap_check, self.grid_combo, self.show_grid_check):
+            widget.blockSignals(True)
+        self.snap_check.setChecked(self.state.workspace_snap)
+        idx = self.grid_combo.findData(self.state.workspace_grid_mm)
+        self.grid_combo.setCurrentIndex(
+            idx if idx >= 0 else self.grid_combo.findData(drc_workspace_canvas.DEFAULT_GRID_MM))
+        self.show_grid_check.setChecked(self.state.workspace_show_grid)
+        for widget in (self.snap_check, self.grid_combo, self.show_grid_check):
+            widget.blockSignals(False)
+        self.scene.set_grid(self.state.workspace_grid_mm, self.state.workspace_snap,
+                            self.state.workspace_show_grid)
+
+    def _on_layout_changed(self):
+        """Pages, positions, groups, stacking or text changed: keep state
+        in step."""
+        if self._restoring:
+            return
+        self.state.workspace_pages = [dict(p) for p in self.scene.pages]
+        for card in self._plot_cards:
+            item = self._items[card.plot_id]
+            card.layout_mm = dict(item.layout_mm)
+            card.group_id, card.z_value = item.group_id, item.zValue()
+            card._sync_config_to_state()
+        self.state.workspace_texts = [
+            dict(it.box.spec, uid=it.uid, layout=dict(it.layout_mm), group=it.group_id,
+                 z=it.zValue())
+            for it in sorted(self._texts.values(), key=lambda t: t.uid)]
+        self.state.workspace_figures = [
+            dict(it.figure_source.spec, uid=it.uid, layout=dict(it.layout_mm),
+                 group=it.group_id, z=it.zValue())
+            for it in sorted(self._figures.values(), key=lambda f: f.uid)]
         self.plots_changed.emit()
 
-    def _on_column_count_changed(self, text: str):
-        try:
-            self.state.workspace_n_columns = int(text)
-        except ValueError:
-            pass
-        self._relayout()
+    # ------------------------------------------------------------------
+    # Selection and item actions
+    # ------------------------------------------------------------------
+
+    def _on_selection_changed(self):
+        from shiboken6 import isValid
+        if not isValid(self.scene):
+            return   # the scene is being destroyed
+        gid = self.scene.selected_group()
+        selected = self.scene.selected_figure_items()
+        if gid:
+            self.group_label.setText(f"Group of {len(self.scene.members(gid))} items")
+            self.inspector_stack.setCurrentIndex(2)
+            self.inspector_title.setText("Group")
+            return
+        if len(selected) == 1:
+            item = selected[0]
+            if isinstance(item, drc_workspace_canvas.TextItem):
+                self._show_text_panel(item)
+                return
+            if isinstance(item, drc_workspace_canvas.SourceFigureItem):
+                self._show_figure_panel(item)
+                return
+            card = item.card
+            self.inspector_stack.setCurrentWidget(card)
+            suffix = " legend" if isinstance(item, drc_workspace_canvas.LegendItem) else ""
+            self.inspector_title.setText(f"Plot {card.plot_id.split('_')[-1]}{suffix}")
+            top = item.parentItem() or item
+            self.scene.current_page = top.layout_mm['page']
+            return
+        self._show_page_panel(f"{len(selected)} items selected" if selected else None)
+
+    def _on_item_action(self, action: str, item):
+        card = getattr(item, 'card', None)
+        if action == 'duplicate':
+            layout = dict(item.layout_mm)
+            layout['x_mm'] += drc_workspace_canvas.DUPLICATE_OFFSET_MM
+            layout['y_mm'] += drc_workspace_canvas.DUPLICATE_OFFSET_MM
+            if isinstance(item, drc_workspace_canvas.TextItem):
+                spec = dict(item.box.spec, group=None)
+                new = self.add_text(spec['kind'], spec=spec, layout=layout)
+            elif isinstance(item, drc_workspace_canvas.SourceFigureItem):
+                spec = dict(item.figure_source.spec, group=None)
+                new = self.add_source_figure(spec, layout=layout)
+            else:
+                config = dict(card.get_display_config(), group=None)
+                new = self._items[self.add_plot(config=config, layout=layout).plot_id]
+            self.scene.clearSelection()
+            new.setSelected(True)
+        elif action == 'copy_style':
+            card._copy_display_config()
+        elif action == 'paste_style':
+            card._paste_display_config()
+        elif action == 'export_png':
+            self.export_item_png(item.parentItem() or item)
+        elif action == 'update_source':
+            self.update_source_figure(item)
+        elif action == 'original_size':
+            self._resize_source_undoable(item, item.figure_source.natural_mm)
+        elif action == 'letter':
+            self.scene.clearSelection()
+            item.setSelected(True)
+            self.add_text('letter')
+        elif action == 'edit_text':
+            self.scene.clearSelection()
+            item.setSelected(True)
+            self.text_edit.setFocus()
+            self.text_edit.selectAll()
+        elif action == 'dock_legend':
+            card.legend_offset_mm = None
+            self._items[card.plot_id].on_legend_changed()
+            card._sync_config_to_state()
+        elif action == 'hide_legend':
+            card._legend_pos_combo.setCurrentText('Off')
+        elif action == 'group':
+            self.group_selected()
+        elif action == 'ungroup':
+            self.ungroup_selected()
+        elif action in ('front', 'back'):
+            self.restack_selected(action == 'front')
+        elif action == 'delete':
+            self.remove_items(self._selected_top_items() or [item])
 
     def _on_theme_changed(self, text: str):
         """Walk up to PluginWidget so a Workspace-toggle change immediately
@@ -7248,57 +8068,335 @@ class WorkspaceTab(QWidget):
                 return
             parent = parent.parent()
 
-    def _relayout(self):
-        """Re-arrange all PlotCards after a column-count change."""
-        for card in self._plot_cards:
-            self.canvas_layout.removeWidget(card)
-        n_cols = self.state.workspace_n_columns
-        for idx, card in enumerate(self._plot_cards):
-            row, col = divmod(idx, n_cols)
-            self.canvas_layout.addWidget(card, row, col)
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
 
-    def _export_pdf(self):
-        """Export all PlotCards to a multi-page PDF."""
-        if not self._plot_cards:
-            QMessageBox.information(self, "Export PDF", "No plots to export.")
+    def _export_pages(self):
+        """Ask for format, pages, resolution and file, then export."""
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout
+        if not self.scene.top_items():
+            QMessageBox.information(self, "Export", "There is nothing on the pages to export.")
             return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Export pages")
+        form = QFormLayout(dlg)
+        fmt_combo = QComboBox()
+        fmt_combo.addItems(list(drc_workspace_export.FORMATS))
+        form.addRow("Format:", fmt_combo)
+        pages_combo = QComboBox()
+        pages_combo.addItems([f"All pages ({len(self.scene.pages)})",
+                              f"Current page ({self.scene.current_page + 1})"])
+        form.addRow("Pages:", pages_combo)
+        dpi_combo = QComboBox()
+        for dpi in EXPORT_DPI_CHOICES:
+            dpi_combo.addItem(f"{dpi} dpi", dpi)
+        dpi_combo.setToolTip("PNG/TIFF resolution; also used for the point layers of "
+                             "scatter plots in PDF and SVG")
+        form.addRow("Resolution:", dpi_combo)
+        editable = QCheckBox("Editable text (SVG)")
+        editable.setChecked(True)
+        editable.setToolTip("Keep text as text in SVG files (fonts must be installed where "
+                            "the file is opened); otherwise text is drawn as outlines")
+        form.addRow(editable)
+        fmt_combo.currentTextChanged.connect(lambda f: editable.setEnabled(f == 'SVG'))
+        editable.setEnabled(False)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        fmt = fmt_combo.currentText()
+        pages = (list(range(len(self.scene.pages))) if pages_combo.currentIndex() == 0
+                 else [self.scene.current_page])
+        ext = {'PDF': '.pdf', 'SVG': '.svg', 'PNG': '.png', 'TIFF': '.tif'}[fmt]
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Workspace PDF", "", "PDF files (*.pdf)"
-        )
+            self, f"Export {fmt}", f"Workspace{ext}", f"{fmt} files (*{ext})")
         if not path:
             return
-        path = _with_extension(path, '.pdf')
+        self.export_pages(path, fmt, pages, int(dpi_combo.currentData()),
+                          editable.isChecked())
+
+    def export_pages(self, path: str, fmt: str, pages: list[int], dpi: int,
+                     editable_text: bool = True) -> list:
+        """Export *pages* as *fmt*; returns the files written."""
+        from pathlib import Path as _Path
+        target = _Path(path)
         try:
-            from matplotlib.backends.backend_pdf import PdfPages
-            with PdfPages(path) as pdf:
-                for card in self._plot_cards:
-                    fig = card.get_figure()
-                    if fig is not None:
-                        pdf.savefig(fig, bbox_inches='tight')
+            if fmt == 'PDF':
+                written = [drc_workspace_export.export_pdf(
+                    target.with_suffix('.pdf'), self.scene, pages, dpi)]
+            elif fmt == 'SVG':
+                written = drc_workspace_export.export_svg(
+                    target, self.scene, pages, editable_text, dpi)
+            else:
+                written = drc_workspace_export.export_raster(target, self.scene, pages, fmt, dpi)
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.warning(self, "Export Error", str(e))
+            return []
+        names = "\n".join(p.name for p in written)
+        QMessageBox.information(self, "Exported", f"Saved to {target.parent}:\n{names}")
+        return written
+
+    def export_plot_png(self, card: 'PlotCard'):
+        """Export one plot, with its separate legend, as a 300 dpi PNG."""
+        item = self._items.get(card.plot_id)
+        if item is not None:
+            self.export_item_png(item)
+
+    def export_item_png(self, item):
+        """Export one item (a plot with its separate legend) as a 300 dpi PNG."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export PNG", f"{item.uid}.png", "PNG files (*.png)")
+        if not path:
+            return
+        path = _with_extension(path, '.png')
+        legend = getattr(item, 'legend_item', None)
+        parts = [item] + ([legend] if legend is not None else [])
+        entries, w, h = drc_workspace_export.entries_for(parts)
+        try:
+            array = drc_workspace_export.render_entries(
+                entries, w, h, drc_workspace_export.DEFAULT_EXPORT_DPI)
+            drc_workspace_export.save_raster(array, Path(path), 'PNG',
+                                             drc_workspace_export.DEFAULT_EXPORT_DPI)
             QMessageBox.information(self, "Exported", f"Saved to {path}")
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
 
     def refresh(self):
-        """Re-render all PlotCards from current PipelineState."""
+        """Re-render all plots from current PipelineState; figures from
+        other tabs are fetched again once those tabs have redrawn."""
         for card in self._plot_cards:
             card.refresh()
+        if self._figures:
+            QTimer.singleShot(0, self.update_all_source_figures)
+
+    # ------------------------------------------------------------------
+    # Figures from other tabs
+    # ------------------------------------------------------------------
+
+    def set_figure_sources(self, sources: dict):
+        """{tab name: zero-arg callable returning that tab's ReportItems};
+        the items with a figure can be added to the pages."""
+        self._figure_sources = dict(sources)
+
+    def _source_items(self, tab: str) -> list:
+        getter = self._figure_sources.get(tab)
+        if getter is None:
+            return []
+        try:
+            return [it for it in getter() if it.get_figure is not None]
+        except Exception:
+            traceback.print_exc()
+            return []
+
+    def _fill_figure_menu(self, menu, point):
+        """One submenu per source tab listing its figures; *point* (page,
+        x, y) is where they go (None: last click / free spot)."""
+        menu.clear()
+        for tab in self._figure_sources:
+            sub = menu.addMenu(tab)
+            items = self._source_items(tab)
+            if not items:
+                action = sub.addAction(f"(nothing to add yet — show it in the {tab} tab)")
+                action.setEnabled(False)
+            for report_item in items:
+                sub.addAction(report_item.label,
+                              lambda tab=tab, it=report_item: self._add_figure_at(tab, it, point))
+
+    def _add_figure_at(self, tab: str, report_item, point):
+        if point is not None:
+            self.scene.last_click = point
+        self.add_source_figure({'tab': tab, 'key': report_item.key, 'label': report_item.label})
+
+    def _fetch_source_figure(self, source):
+        """Find the source's ReportItem by (tab, key) and copy its figure in;
+        a placeholder when it is not available."""
+        spec = source.spec
+        match = next((it for it in self._source_items(spec['tab']) if it.key == spec['key']), None)
+        fig = None
+        if match is not None:
+            try:
+                fig = match.get_figure()
+            except Exception:
+                traceback.print_exc()
+        if fig is None:
+            source.set_unavailable()
+            return
+        copy, as_image = drc_workspace_canvas.detached_copy(fig)
+        page = self.scene.pages[self.scene.current_page]
+        source.set_figure(copy, as_image,
+                          page['w_mm'] * drc_workspace_canvas.SOURCE_FIGURE_MAX_FRACTION)
+
+    def add_source_figure(self, spec: dict, layout: dict | None = None,
+                          uid: str | None = None, record: bool = True):
+        """Add a figure from another tab (spec: 'tab', 'key', 'label', and
+        optionally 'w_mm', 'h_mm', 'aspect_locked', 'group', 'z'). A new one
+        goes at the last point clicked on a page, else in a free spot."""
+        source = drc_workspace_canvas.SourceFigure(
+            uid or self._next_id('figure', set(self._figures)),
+            {k: spec.get(k) for k in ('tab', 'key', 'label', 'w_mm', 'h_mm', 'aspect_locked')
+             if spec.get(k) is not None})
+        self._fetch_source_figure(source)
+        item = drc_workspace_canvas.SourceFigureItem(source)
+        item.action_requested.connect(self._on_item_action)
+        if layout is None:
+            layout = self._layout_at_last_click(item.size_mm())
+        item.layout_mm = {'page': int(layout['page']), 'x_mm': float(layout['x_mm']),
+                          'y_mm': float(layout['y_mm'])}
+        item.group_id = spec.get('group')
+        item.setZValue(float(spec.get('z') or 0.0))
+        self.scene.addItem(item)
+        self.scene.position_item(item)
+        self._figures[source.uid] = item
+        source.changed.connect(self._on_layout_changed)
+        if record and not self._restoring:
+            self._record_added([source.uid], f"Add {spec.get('label', 'figure')}")
+            self.scene.clearSelection()
+            item.setSelected(True)
+        self._on_layout_changed()
+        return item
+
+    def update_source_figure(self, item):
+        """Fetch the item's figure again from its tab (size kept)."""
+        self._fetch_source_figure(item.figure_source)
+        if self._figure_panel_item is item:
+            self._show_figure_panel(item)
+
+    def update_all_source_figures(self):
+        for item in list(self._figures.values()):
+            self._fetch_source_figure(item.figure_source)
+
+    def _resize_source_undoable(self, item, size):
+        if not size:
+            return
+        before = item.size_state()
+        item.apply_size_state(size)
+        self.scene.record_resize(item, before, item.size_state())
+        if self._figure_panel_item is item:
+            self._show_figure_panel(item)
+
+    def _build_figure_panel(self) -> QWidget:
+        from PySide6.QtWidgets import QFormLayout
+        panel = QWidget()
+        form = QFormLayout(panel)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.figure_source_label = QLabel()
+        self.figure_source_label.setWordWrap(True)
+        form.addRow("From:", self.figure_source_label)
+        self.figure_w_spin = QDoubleSpinBox()
+        self.figure_h_spin = QDoubleSpinBox()
+        for spin in (self.figure_w_spin, self.figure_h_spin):
+            spin.setRange(PLOT_MIN_MM, PAGE_MAX_MM)
+            spin.setDecimals(1)
+            spin.setSuffix(" mm")
+        self.figure_w_spin.valueChanged.connect(lambda v: self._on_figure_size_spin('w', v))
+        self.figure_h_spin.valueChanged.connect(lambda v: self._on_figure_size_spin('h', v))
+        form.addRow("Width:", self.figure_w_spin)
+        form.addRow("Height:", self.figure_h_spin)
+        self.figure_aspect_check = QCheckBox("Lock aspect ratio")
+        self.figure_aspect_check.toggled.connect(self._on_figure_aspect_toggled)
+        form.addRow(self.figure_aspect_check)
+        buttons = QHBoxLayout()
+        update = QPushButton("Update from source")
+        update.setToolTip("Copy the figure again as it is shown in its tab now")
+        update.clicked.connect(lambda: self._figure_panel_item and self.update_source_figure(
+            self._figure_panel_item))
+        buttons.addWidget(update)
+        original = QPushButton("Original size")
+        original.clicked.connect(lambda: self._figure_panel_item and self._resize_source_undoable(
+            self._figure_panel_item, self._figure_panel_item.figure_source.natural_mm))
+        buttons.addWidget(original)
+        form.addRow(buttons)
+        self.figure_status = QLabel()
+        self.figure_status.setWordWrap(True)
+        self.figure_status.setStyleSheet(_hint_style())
+        form.addRow(self.figure_status)
+        self._figure_panel_item = None
+        self._figure_panel_loading = False
+        return panel
+
+    def _show_figure_panel(self, item):
+        source = item.figure_source
+        spec = source.spec
+        self._figure_panel_item = None
+        self._figure_panel_loading = True
+        try:
+            self.figure_source_label.setText(f"{spec.get('tab', '')} — {spec.get('label', '')}")
+            self.figure_w_spin.setValue(spec.get('w_mm') or 0.0)
+            self.figure_h_spin.setValue(spec.get('h_mm') or 0.0)
+            self.figure_aspect_check.setChecked(bool(spec.get('aspect_locked', True)))
+            if not source.available:
+                status = (f"Not available: show it in the {spec.get('tab', '')} tab, then "
+                          "Update from source.")
+            elif source.as_image:
+                status = ("Copied as an image (the figure could not be copied as a figure), "
+                          "so it scales like a picture.")
+            else:
+                status = ("A copy of the figure as it was when added or last updated; fonts "
+                          "keep their size when it is resized.")
+            self.figure_status.setText(status)
+        finally:
+            self._figure_panel_loading = False
+        self._figure_panel_item = item
+        self.inspector_stack.setCurrentIndex(3)
+        self.inspector_title.setText("Figure")
+
+    def _on_figure_size_spin(self, which: str, value: float):
+        item = self._figure_panel_item
+        if self._figure_panel_loading or item is None:
+            return
+        w, h = item.size_state()
+        if not (w and h):
+            return
+        if which == 'w':
+            new = (value, value * h / w if self.figure_aspect_check.isChecked() else h)
+        else:
+            new = (value * w / h if self.figure_aspect_check.isChecked() else w, value)
+        self._resize_source_undoable(item, new)
+
+    def _on_figure_aspect_toggled(self, locked: bool):
+        item = self._figure_panel_item
+        if self._figure_panel_loading or item is None:
+            return
+        item.figure_source.spec['aspect_locked'] = bool(locked)
+        self._on_layout_changed()
+
+    def _show_page_menu(self, page: int, x_mm: float, y_mm: float, screen_pos):
+        """Right-click on an empty part of a page: add things there."""
+        from PySide6.QtWidgets import QMenu
+        point = (page, x_mm, y_mm)
+        menu = QMenu(self)
+        menu.addAction("Add text here", lambda: self._add_text_at('text', point))
+        menu.addAction("Add panel letter here", lambda: self._add_text_at('letter', point))
+        menu.addAction("Add plot here", lambda: self.add_plot(
+            layout={'page': page, 'x_mm': x_mm, 'y_mm': y_mm}))
+        figures = menu.addMenu("Add from other tabs")
+        self._fill_figure_menu(figures, point)
+        menu.exec(screen_pos)
+
+    def _add_text_at(self, kind: str, point):
+        self.scene.clearSelection()
+        self.scene.last_click = point
+        self.add_text(kind)
 
     def get_report_items(self) -> list:
-        """One drc_report.ReportItem per PlotCard currently on the
-        canvas -- reuses each card's own get_figure() (already the
-        currently-displayed Figure), no separate rendering path."""
+        """One drc_report.ReportItem per page with something on it: the page
+        as a figure (rendered at 300 dpi) for the combined PDF and PNG, plus
+        a vector PDF of the page written beside them."""
         items = []
-        for card in self._plot_cards:
-            label = (
-                f"{card.plot_id}: {card.dr_combo.currentText()} · "
-                f"{card.sample_combo.currentText()} · {card.colour_mode_combo.currentText()}"
-            )
+        for page in range(len(self.scene.pages)):
+            if not drc_workspace_export.page_entries(self.scene, page):
+                continue
             items.append(drc_report.ReportItem(
-                key=card.plot_id,
+                key=f'page_{page + 1}',
                 tab='Workspace',
-                label=label,
-                get_figure=card.get_figure,
+                label=f"Page {page + 1}",
+                get_figure=lambda p=page: drc_workspace_export.page_figure(self.scene, p),
+                write_files=lambda folder, p=page: drc_workspace_export.export_pdf(
+                    Path(folder) / f"Page {p + 1} (vector).pdf", self.scene, [p]),
             ))
         return items
 
@@ -7373,17 +8471,18 @@ class _ClusterTreeLayoutWorker(QThread):
 
 class PlotCard(QFrame):
     """
-    A single DR scatter plot on the workspace canvas.
+    One plot of the Workspace: its settings (shown in the Workspace
+    inspector) and its matplotlib figure, drawn offscreen on an Agg canvas
+    and shown on the page by a drc_workspace_canvas.PlotItem, which listens
+    to figure_changed.
 
-    Controls (top toolbar):
-      • DR algorithm selector
-      • Sample selector (All Samples pooled, or individual)
-      • Colour mode: Clusters | Marker | Group
-      • Marker channel selector (visible in Marker mode)
-      • Magic wand (copy) and paste buttons
-      • Close button
+    Settings: plot type, DR run, sample (all pooled or one), colour mode
+    (Clusters | Marker | Group), marker channel (Marker mode), clustering
+    run (Clusters mode and Cluster Tree), magic-wand copy/paste, PNG export,
+    remove, and appearance (plot size in mm, legend, fonts, grid, labels).
 
-    Right-click on a cluster/group legend colour swatch → colour picker.
+    The cluster/group legend is drawn in the figure: right-click an entry
+    → colour picker, double-click a cluster name → rename.
 
     Parameters
     ----------
@@ -7395,6 +8494,9 @@ class PlotCard(QFrame):
     """
 
     _COLOUR_MODES = ['Clusters', 'Marker', 'Group']
+
+    figure_changed = Signal()   # the figure was redrawn or resized
+    legend_changed = Signal()   # the separate legend was redrawn, shown or hidden
 
     def __init__(self, plot_id: str, state: PipelineState, bus, controller,
                  workspace: 'WorkspaceTab', parent=None):
@@ -7412,10 +8514,10 @@ class PlotCard(QFrame):
                                                # frozen at archive time, so its MST/layout
                                                # never changes; cached permanently per run_id.
 
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setFrameShadow(QFrame.Raised)
-        self.setMinimumSize(300, 400)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.layout_mm: dict | None = None   # {'page', 'x_mm', 'y_mm'}, set by WorkspaceTab
+        self.group_id: str | None = None     # Workspace group, set by WorkspaceTab
+        self.z_value: float = 0.0            # stacking order on the page
+        self.setFrameShape(QFrame.NoFrame)
 
         self._build_ui()
 
@@ -7425,250 +8527,226 @@ class PlotCard(QFrame):
 
     def _build_ui(self):
         from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from PySide6.QtWidgets import QFormLayout
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setSpacing(6)
 
-        # ---- Toolbar row 1: plot type | DR run | sample | colour mode | marker ----
-        row1 = QHBoxLayout()
-        row1.setSpacing(4)
+        # ---- What is plotted ----
+        self._form = QFormLayout()
+        self._form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
-        row1.addWidget(QLabel("Plot type:"))
         self.plot_type_combo = QComboBox()
         self.plot_type_combo.addItems(['Scatter', 'Cluster Tree'])
-        self.plot_type_combo.setFixedWidth(100)
         self.plot_type_combo.setToolTip(
             "Scatter: per-event DR embedding.\n"
             "Cluster Tree: minimum-spanning-tree view of a clustering run's "
-            "nodes (select it in the Overlay dropdown) -- SOM nodes for "
+            "nodes (pick it under Clustering run) -- SOM nodes for "
             "FlowSOM, per-cluster centroids for Leiden/HDBSCAN."
         )
         self.plot_type_combo.currentTextChanged.connect(self._on_plot_type_changed)
         _style_combo_popup(self.plot_type_combo)
-        row1.addWidget(self.plot_type_combo)
+        self._form.addRow("Plot type:", self.plot_type_combo)
 
-        row1.addWidget(QLabel("DR run:"))
         self.dr_combo = QComboBox()
-        self.dr_combo.setFixedWidth(120)
         self.dr_combo.setToolTip("Archived DR run to display")
         self.dr_combo.currentIndexChanged.connect(self._on_dr_run_changed)
         _style_combo_popup(self.dr_combo)
-        row1.addWidget(self.dr_combo)
+        self._form.addRow("DR run:", self.dr_combo)
 
-        row1.addWidget(QLabel("Sample:"))
         self.sample_combo = QComboBox()
-        self.sample_combo.setFixedWidth(130)
         self.sample_combo.setToolTip("Sample to display (or all pooled)")
         self.sample_combo.currentTextChanged.connect(self._schedule_refresh)
         _style_combo_popup(self.sample_combo)
-        row1.addWidget(self.sample_combo)
+        self._form.addRow("Sample:", self.sample_combo)
 
-        row1.addWidget(QLabel("Colour:"))
         self.colour_mode_combo = QComboBox()
         self.colour_mode_combo.addItems(self._COLOUR_MODES)
-        self.colour_mode_combo.setFixedWidth(85)
         self.colour_mode_combo.currentTextChanged.connect(self._on_colour_mode_changed)
         _style_combo_popup(self.colour_mode_combo)
-        row1.addWidget(self.colour_mode_combo)
+        self._form.addRow("Colour:", self.colour_mode_combo)
 
         self.marker_combo = QComboBox()
-        self.marker_combo.setFixedWidth(110)
         self.marker_combo.setToolTip("Channel to colour by (Marker mode)")
         self.marker_combo.currentTextChanged.connect(self._schedule_refresh)
-        self.marker_combo.setVisible(False)
         _style_combo_popup(self.marker_combo)
-        row1.addWidget(self.marker_combo)
+        self._form.addRow("Marker:", self.marker_combo)
 
-        row1.addStretch()
-
-        layout.addLayout(row1)
-
-        # ---- Toolbar row 2: overlay selector | warning | actions ----
-        row2 = QHBoxLayout()
-        row2.setSpacing(4)
-
-        # Clustering-run overlay selector — only meaningful in Clusters mode
-        self.cluster_run_label = QLabel("Overlay:")
-        self.cluster_run_label.setVisible(False)
-        row2.addWidget(self.cluster_run_label)
+        # Clustering run shown in Clusters colour mode and in Cluster Tree
         self.cluster_run_combo = QComboBox()
-        self.cluster_run_combo.setFixedWidth(120)
-        self.cluster_run_combo.setToolTip("Archived clustering run to overlay")
+        self.cluster_run_combo.setToolTip("Archived clustering run whose clusters colour the plot")
         self.cluster_run_combo.currentIndexChanged.connect(self._on_cluster_run_changed)
-        self.cluster_run_combo.setVisible(False)
         _style_combo_popup(self.cluster_run_combo)
-        row2.addWidget(self.cluster_run_combo)
-
-        # Compatibility warning — shown when the selected DR run's and
-        # clustering run's gate/sample sets don't line up.
+        # ⚠ when the DR run's and clustering run's gate/sample sets don't line up
         self._compat_warning = QLabel("⚠")
         self._compat_warning.setStyleSheet("color: #d9822b; font-weight: bold;")
         self._compat_warning.setVisible(False)
-        row2.addWidget(self._compat_warning)
+        cluster_row = QHBoxLayout()
+        cluster_row.setContentsMargins(0, 0, 0, 0)
+        cluster_row.addWidget(self.cluster_run_combo, stretch=1)
+        cluster_row.addWidget(self._compat_warning)
+        self._cluster_row_widget = QWidget()
+        self._cluster_row_widget.setLayout(cluster_row)
+        self._form.addRow("Clustering run:", self._cluster_row_widget)
 
-        row2.addStretch()
+        layout.addLayout(self._form)
 
-        # Magic wand (copy) button
-        self.wand_btn = QPushButton("🪄")
-        self.wand_btn.setFixedSize(26, 26)
-        self.wand_btn.setToolTip("Copy display config (magic wand)")
+        # ---- Actions ----
+        actions = QHBoxLayout()
+        actions.setSpacing(4)
+        self.wand_btn = QPushButton("🪄 Copy style")
+        self.wand_btn.setToolTip("Copy this plot's display settings (magic wand)")
         self.wand_btn.clicked.connect(self._copy_display_config)
-        row2.addWidget(self.wand_btn)
-
-        # Paste button
-        self.paste_btn = QPushButton("📋")
-        self.paste_btn.setFixedSize(26, 26)
-        self.paste_btn.setToolTip("Paste display config from magic wand")
+        actions.addWidget(self.wand_btn)
+        self.paste_btn = QPushButton("📋 Paste style")
+        self.paste_btn.setToolTip("Apply display settings copied from another plot")
         self.paste_btn.clicked.connect(self._paste_display_config)
-        row2.addWidget(self.paste_btn)
-
-        # Export PNG
+        actions.addWidget(self.paste_btn)
         self.png_btn = QPushButton("PNG")
-        self.png_btn.setFixedSize(36, 26)
         self.png_btn.setToolTip("Export this plot as PNG")
         self.png_btn.clicked.connect(self._export_png)
-        row2.addWidget(self.png_btn)
-
-        # Close
+        actions.addWidget(self.png_btn)
         self.close_btn = QPushButton("✕")
-        self.close_btn.setFixedSize(26, 26)
+        self.close_btn.setFixedWidth(30)
         self.close_btn.setToolTip("Remove this plot")
         self.close_btn.clicked.connect(lambda: self.workspace.remove_card(self))
-        row2.addWidget(self.close_btn)
+        actions.addWidget(self.close_btn)
+        layout.addLayout(actions)
 
-        layout.addLayout(row2)
+        # ---- Appearance ----
+        appearance = QGroupBox("Appearance")
+        app_form = QFormLayout(appearance)
+        app_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
-        # ---- Appearance controls row ----
-        self._appearance_box = QGroupBox("Appearance")
-        self._appearance_box.setCheckable(True)
-        self._appearance_box.setChecked(False)   # collapsed by default
-        self._appearance_box.toggled.connect(
-            lambda on: self._appearance_inner.setVisible(on))
-        app_outer = QVBoxLayout(self._appearance_box)
-        app_outer.setContentsMargins(4, 2, 4, 4)
-        app_outer.setSpacing(2)
+        # Plot size in mm; the legend adds to the figure's width (Right) or
+        # height (Below).
+        self._plot_w_spin = QDoubleSpinBox()
+        self._plot_w_spin.setRange(PLOT_MIN_MM, PLOT_MAX_MM)
+        self._plot_w_spin.setDecimals(1)
+        self._plot_w_spin.setSingleStep(1.0)
+        self._plot_w_spin.setSuffix(" mm")
+        self._plot_w_spin.setValue(PLOT_DEFAULT_MM)
+        self._plot_w_spin.setToolTip("Plot width, not counting a legend at the right")
+        self._plot_w_spin.valueChanged.connect(self._on_plot_w_changed)
+        app_form.addRow("Plot width:", self._plot_w_spin)
 
-        self._appearance_inner = QWidget()
-        app_inner_layout = QHBoxLayout(self._appearance_inner)
-        app_inner_layout.setContentsMargins(0, 0, 0, 0)
-        app_inner_layout.setSpacing(8)
+        self._plot_h_spin = QDoubleSpinBox()
+        self._plot_h_spin.setRange(PLOT_MIN_MM, PLOT_MAX_MM)
+        self._plot_h_spin.setDecimals(1)
+        self._plot_h_spin.setSingleStep(1.0)
+        self._plot_h_spin.setSuffix(" mm")
+        self._plot_h_spin.setValue(PLOT_DEFAULT_MM)
+        self._plot_h_spin.setToolTip("Plot height, not counting a legend below")
+        self._plot_h_spin.valueChanged.connect(self._on_plot_h_changed)
+        app_form.addRow("Plot height:", self._plot_h_spin)
 
-        # Gridlines
-        self._show_grid = QCheckBox("Grid")
-        self._show_grid.setChecked(False)
-        self._show_grid.stateChanged.connect(self._schedule_refresh)
-        app_inner_layout.addWidget(self._show_grid)
+        self._aspect_check = QCheckBox("Lock aspect ratio")
+        self._aspect_check.setChecked(True)
+        self._aspect_check.setToolTip(
+            "Keep the plot's width:height ratio when it is resized here or on the page")
+        self._aspect_check.toggled.connect(self._on_aspect_toggled)
+        app_form.addRow(self._aspect_check)
+        self._aspect_ratio = 1.0          # width / height kept while locked
+        self._applying_size = False
 
-        # Axis tick labels
-        self._show_ticks = QCheckBox("Tick labels")
-        self._show_ticks.setChecked(True)
-        self._show_ticks.stateChanged.connect(self._schedule_refresh)
-        app_inner_layout.addWidget(self._show_ticks)
+        self._legend_pos_combo = QComboBox()
+        self._legend_pos_combo.addItems(LEGEND_POSITIONS)
+        self._legend_pos_combo.setToolTip(
+            "Where the cluster/group legend is drawn.\n"
+            "Separate: its own box on the page, beside the plot until you move it; "
+            "drag its edges to change its columns.\n"
+            "Right / Below: part of the plot figure, added to its width / height.\n"
+            "Right-click an entry to change its colour or rename it; double-click a "
+            "cluster name to rename it.")
+        self._legend_pos_combo.currentTextChanged.connect(self._schedule_refresh)
+        _style_combo_popup(self._legend_pos_combo)
+        app_form.addRow("Legend:", self._legend_pos_combo)
 
-        # Axis title labels
-        self._show_axis_labels = QCheckBox("Axis labels")
-        self._show_axis_labels.setChecked(True)
-        self._show_axis_labels.stateChanged.connect(self._schedule_refresh)
-        app_inner_layout.addWidget(self._show_axis_labels)
+        self._legend_cols_spin = QSpinBox()
+        self._legend_cols_spin.setRange(0, 8)
+        self._legend_cols_spin.setValue(0)
+        self._legend_cols_spin.setSpecialValueText("Auto")
+        self._legend_cols_spin.setToolTip(
+            "Legend columns. Auto fits the entries to the plot's height (Separate, "
+            "Right) or width (Below).")
+        self._legend_cols_spin.valueChanged.connect(self._on_legend_cols_changed)
+        app_form.addRow("Legend columns:", self._legend_cols_spin)
 
-        app_inner_layout.addWidget(QLabel("Legend font:"))
         self._legend_font_spin = QSpinBox()
         self._legend_font_spin.setRange(6, 24)
         self._legend_font_spin.setValue(9)
-        self._legend_font_spin.setFixedWidth(48)
-        self._legend_font_spin.setToolTip("Font size for cluster legend labels")
+        self._legend_font_spin.setSuffix(" pt")
+        self._legend_font_spin.setToolTip("Font size of the legend and colourbar labels")
         self._legend_font_spin.valueChanged.connect(self._schedule_refresh)
-        app_inner_layout.addWidget(self._legend_font_spin)
+        app_form.addRow("Legend font:", self._legend_font_spin)
 
-        app_inner_layout.addWidget(QLabel("Axis font:"))
         self._axis_font_spin = QSpinBox()
         self._axis_font_spin.setRange(5, 20)
         self._axis_font_spin.setValue(7)
-        self._axis_font_spin.setFixedWidth(48)
+        self._axis_font_spin.setSuffix(" pt")
         self._axis_font_spin.valueChanged.connect(self._schedule_refresh)
-        app_inner_layout.addWidget(self._axis_font_spin)
+        app_form.addRow("Axis font:", self._axis_font_spin)
 
-        # Plot width/height in inches -- drives both the
-        # matplotlib figure's own size and _AspectCanvasHolder's ratio, so
-        # the rendered plot's proportions actually change rather than
-        # just the figure's internal DPI scaling.
-        app_inner_layout.addWidget(QLabel("Plot W:"))
-        self._plot_w_spin = QDoubleSpinBox()
-        self._plot_w_spin.setRange(2.0, 10.0)
-        self._plot_w_spin.setSingleStep(0.5)
-        self._plot_w_spin.setValue(4.0)
-        self._plot_w_spin.setFixedWidth(55)
-        self._plot_w_spin.setToolTip("Plot width (inches)")
-        self._plot_w_spin.valueChanged.connect(self._on_plot_dims_changed)
-        app_inner_layout.addWidget(self._plot_w_spin)
+        checks = QHBoxLayout()
+        self._show_grid = QCheckBox("Grid")
+        self._show_grid.setChecked(False)
+        self._show_grid.stateChanged.connect(self._schedule_refresh)
+        checks.addWidget(self._show_grid)
+        self._show_ticks = QCheckBox("Tick labels")
+        self._show_ticks.setChecked(True)
+        self._show_ticks.stateChanged.connect(self._schedule_refresh)
+        checks.addWidget(self._show_ticks)
+        self._show_axis_labels = QCheckBox("Axis labels")
+        self._show_axis_labels.setChecked(True)
+        self._show_axis_labels.stateChanged.connect(self._schedule_refresh)
+        checks.addWidget(self._show_axis_labels)
+        checks.addStretch()
+        app_form.addRow(checks)
 
-        app_inner_layout.addWidget(QLabel("Plot H:"))
-        self._plot_h_spin = QDoubleSpinBox()
-        self._plot_h_spin.setRange(2.0, 10.0)
-        self._plot_h_spin.setSingleStep(0.5)
-        self._plot_h_spin.setValue(4.0)
-        self._plot_h_spin.setFixedWidth(55)
-        self._plot_h_spin.setToolTip("Plot height (inches)")
-        self._plot_h_spin.valueChanged.connect(self._on_plot_dims_changed)
-        app_inner_layout.addWidget(self._plot_h_spin)
-
-        from PySide6.QtGui import QPalette
-        from PySide6.QtWidgets import QApplication
-        _palette = QApplication.instance().palette()
-        _default_label_color = (
-            'white' if _palette.color(QPalette.ColorRole.Base).value() < 128 else 'black'
-        )
-        self._label_color = _default_label_color
-        self._label_color_btn = QPushButton("Label colour")
-        self._label_color_btn.setFixedHeight(22)
-        self._label_color_btn.setToolTip("Colour for colourbar, title, and axis label text")
+        self._label_color: str | None = None   # None = Auto (follows the plot theme)
+        self._label_color_btn = QPushButton()
+        self._label_color_btn.setToolTip(
+            "Colour of the axis titles, plot title, colourbar and legend text")
         self._label_color_btn.clicked.connect(self._pick_label_color)
-        app_inner_layout.addWidget(self._label_color_btn)
+        self._label_auto_btn = QPushButton("Auto")
+        self._label_auto_btn.setToolTip(
+            "Follow the plot theme: black on Light, white on Dark")
+        self._label_auto_btn.clicked.connect(self._reset_label_color)
+        label_row = QHBoxLayout()
+        label_row.setContentsMargins(0, 0, 0, 0)
+        label_row.addWidget(self._label_color_btn, stretch=1)
+        label_row.addWidget(self._label_auto_btn)
+        label_row_widget = QWidget()
+        label_row_widget.setLayout(label_row)
+        app_form.addRow("Label colour:", label_row_widget)
         self._update_label_color_btn()
 
-        app_inner_layout.addStretch()
-        app_outer_layout_inner = QVBoxLayout()
-        app_outer_layout_inner.addWidget(self._appearance_inner)
-        self._appearance_inner.setVisible(False)
-        app_outer.addWidget(self._appearance_inner)
+        layout.addWidget(appearance)
+        layout.addStretch()
 
-        layout.addWidget(self._appearance_box)
-
-        # ---- Matplotlib canvas (aspect-ratio container, adjustable via Appearance) ----
-        self._plot_w_in = 4.0
-        self._plot_h_in = 4.0
+        # ---- Figure (drawn offscreen; the Workspace page shows it) ----
+        self._plot_w_in = PLOT_DEFAULT_MM / MM_PER_INCH
+        self._plot_h_in = PLOT_DEFAULT_MM / MM_PER_INCH
         self._figure = Figure(figsize=(self._plot_w_in, self._plot_h_in), layout='compressed')
-        self._canvas = _new_scrollable_canvas(self._figure)
-        self._canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self._canvas_container = _AspectCanvasHolder(
-            self._canvas, aspect_ratio=self._plot_h_in / self._plot_w_in
-        )
-
-        # ---- Plot area: square canvas + right legend panel ----
-        plot_row = QHBoxLayout()
-        plot_row.setSpacing(4)
-        plot_row.addWidget(self._canvas_container, stretch=1)
-
-        # Right-side legend: scrollable list of cluster swatches
-        legend_scroll = QScrollArea()
-        legend_scroll.setWidgetResizable(True)
-        legend_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        legend_scroll.setFixedWidth(120)
-        legend_scroll.setFrameShape(QFrame.NoFrame)
-        self._legend_widget = QWidget()
-        self._legend_layout = QVBoxLayout(self._legend_widget)
-        self._legend_layout.setContentsMargins(2, 2, 2, 2)
-        self._legend_layout.setSpacing(2)
-        self._legend_layout.setAlignment(Qt.AlignTop)
-        legend_scroll.setWidget(self._legend_widget)
-        self._legend_scroll = legend_scroll
-        plot_row.addWidget(legend_scroll)
-
-        layout.addLayout(plot_row, stretch=1)
+        FigureCanvasAgg(self._figure)
+        self._legend_extra_in = (0.0, 0.0)   # legend's addition to (width, height)
+        self._legend_pick_targets: dict = {}  # id(artist) -> ('cluster'|'group', key)
+        self.legend_pick_handled = False
+        self.legend_probe = False        # True: a pick only reports the entry (legend_probe_hit)
+        self.legend_probe_hit = None     # (kind, key, name)
+        self._figure.canvas.mpl_connect('pick_event', self._on_legend_pick)
+        # Separate legend: its own figure, shown by the page's LegendItem
+        self._legend_figure = Figure(figsize=(1.0, 1.0))
+        FigureCanvasAgg(self._legend_figure)
+        self._legend_figure.canvas.mpl_connect('pick_event', self._on_legend_pick)
+        self.legend_shown = False
+        self.legend_offset_mm: tuple[float, float] | None = None   # None = beside the plot
 
         # Populate selectors
         self._populate_selectors()
+        self._on_plot_type_changed(self.plot_type_combo.currentText())
 
     def _populate_selectors(self):
         """
@@ -7823,33 +8901,23 @@ class PlotCard(QFrame):
         self._compat_warning.setToolTip(warning or '')
 
     def _on_colour_mode_changed(self, mode: str):
-        self.marker_combo.setVisible(mode == 'Marker')
-        show_overlay = mode == 'Clusters'
-        self.cluster_run_label.setVisible(show_overlay)
-        self.cluster_run_combo.setVisible(show_overlay)
+        """Show the Marker row in Marker mode and the Clustering run row in
+        Clusters mode (and always in Cluster Tree)."""
+        is_tree = self.plot_type_combo.currentText() == 'Cluster Tree'
+        self._form.setRowVisible(self.marker_combo, mode == 'Marker' and not is_tree)
+        self._form.setRowVisible(self._cluster_row_widget, mode == 'Clusters' or is_tree)
         self._update_compatibility_warning()
         self._schedule_refresh()
 
     def _on_plot_type_changed(self, mode: str):
         """Toggle between the per-event Scatter view and the Cluster Tree
         view. Tree mode has no DR run / sample / marker concept — it only
-        needs a clustering run, picked via the Overlay combo (any
-        algorithm now, not just FlowSOM)."""
+        needs a clustering run (any algorithm)."""
         is_tree = (mode == 'Cluster Tree')
-
-        self.dr_combo.setVisible(not is_tree)
-        self.sample_combo.setVisible(not is_tree)
-        self.colour_mode_combo.setVisible(not is_tree)
-        self.marker_combo.setVisible(not is_tree and self.colour_mode_combo.currentText() == 'Marker')
-
-        self.cluster_run_label.setVisible(True)
-        self.cluster_run_combo.setVisible(True)
-        if not is_tree:
-            # Restore the normal Colour-mode-driven overlay visibility.
-            self._on_colour_mode_changed(self.colour_mode_combo.currentText())
-
+        for widget in (self.dr_combo, self.sample_combo, self.colour_mode_combo):
+            self._form.setRowVisible(widget, not is_tree)
         self._populate_cluster_run_combo()
-        self._schedule_refresh()
+        self._on_colour_mode_changed(self.colour_mode_combo.currentText())
 
     def _schedule_refresh(self, *_):
         self._sync_config_to_state()
@@ -7985,18 +9053,20 @@ class PlotCard(QFrame):
         is_dark = _resolve_is_dark(self.state)
 
         self._figure.clear()
-        # Always reserve the same narrow column for a colourbar
-        gs = self._figure.add_gridspec(1, 2, width_ratios=[20, 1], wspace=0.35)
-        ax = self._figure.add_subplot(gs[0, 0])
-        self._cbar_ax = self._figure.add_subplot(gs[0, 1])
-        self._cbar_ax.set_visible(False)
+        if colour_mode == 'Marker':
+            gs = self._figure.add_gridspec(1, 2, width_ratios=[20, 1], wspace=0.35)
+            ax = self._figure.add_subplot(gs[0, 0])
+            self._cbar_ax = self._figure.add_subplot(gs[0, 1])
+            self._cbar_ax.set_visible(False)
+        else:
+            ax = self._figure.add_subplot(111)
+            self._cbar_ax = None
         _style_figure_theme(self._figure, is_dark, axes=[ax])
-        # box_aspect pins the rendered box to square regardless
-        # of the reserved colourbar column or the embedding's own x/y
-        # range; adjustable='datalim' pads xlim/ylim to match instead of
-        # reshaping the box (which is what let a taller-than-wide data
-        # range make the box non-square before).
-        ax.set_box_aspect(1)
+        # box_aspect gives the axes box the plot's own height:width,
+        # whatever the colourbar column or the embedding's x/y range;
+        # adjustable='datalim' pads xlim/ylim to match instead of
+        # reshaping the box.
+        ax.set_box_aspect(self._plot_h_in / self._plot_w_in)
         ax.set_aspect('equal', adjustable='datalim')
         _af = self._axis_font_spin.value()
         if self._show_axis_labels.isChecked():
@@ -8027,7 +9097,7 @@ class PlotCard(QFrame):
             lab_disp    = lab
             origin_disp = origin
 
-        # cached so _rebuild_group_legend() (called right after
+        # cached so _legend_entries() (called right after
         # this method, and only from here) knows which samples/groups are
         # actually present in the CURRENT view without recomputing origin.
         self._last_origin_disp = origin_disp
@@ -8049,7 +9119,7 @@ class PlotCard(QFrame):
             self._draw_group_scatter(ax, xy_disp, origin_disp)
 
         # Apply label colour to colourbar (Marker), title, and axis labels
-        lc = self._label_color
+        lc = self._label_fg()
         ax.title.set_color(lc)
         ax.xaxis.label.set_color(lc)
         ax.yaxis.label.set_color(lc)
@@ -8058,7 +9128,7 @@ class PlotCard(QFrame):
                 cb_ax.tick_params(colors=lc)
                 cb_ax.yaxis.label.set_color(lc)
 
-        self._canvas.draw_idle()
+        self._legend_ax = ax
         self._rebuild_legend()
 
     # ------------------------------------------------------------------
@@ -8186,7 +9256,7 @@ class PlotCard(QFrame):
         self._figure.clear()
         ax = self._figure.add_subplot(111)
         _style_figure_theme(self._figure, is_dark, axes=[ax])
-        ax.set_box_aspect(1)
+        ax.set_box_aspect(self._plot_h_in / self._plot_w_in)
         ax.set_aspect('equal', adjustable='datalim')
         ax.axis('off')
 
@@ -8210,13 +9280,13 @@ class PlotCard(QFrame):
                    edgecolors=('#dddddd' if is_dark else '#222222'),
                    linewidths=0.4, zorder=2)
 
-        lc = self._label_color
+        lc = self._label_fg()
         ax.set_title(f"{cl_run.get('algorithm', '')} Cluster Tree — "
                     f"{cl_run.get('label', '')}", color=lc,
                     fontsize=self._axis_font_spin.value())
         ax.title.set_color(lc)
 
-        self._canvas.draw_idle()
+        self._legend_ax = ax
         self._rebuild_legend()
 
     def _draw_marker_scatter(self, ax, xy, origin, disp_idx, sample_row_offsets,
@@ -8228,7 +9298,7 @@ class PlotCard(QFrame):
         does no disk I/O of its own."""
         ch = self.marker_combo.currentData()
         if not ch or not self.state.selected_channels:
-            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#aaaaaa', alpha=0.4)
+            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#aaaaaa', alpha=0.4, rasterized=True)
             ax.set_title("Marker: no channel", fontsize=8)
             return
 
@@ -8242,7 +9312,7 @@ class PlotCard(QFrame):
         if mode != drc_run_align.JOIN_KEYS and (
                 mode == drc_run_align.JOIN_NONE or run_gates is None
                 or sorted(run_gates) != sorted(self.state.selected_gates)):
-            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.3)
+            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.3, rasterized=True)
             ax.set_title(f"{run.get('label', '')}: made before event keys and no longer "
                          "matches the current gating — retrain DR", fontsize=8)
             _log.warning("marker scatter: run %r cannot be matched to the current events",
@@ -8281,7 +9351,7 @@ class PlotCard(QFrame):
         display_label = _antigen_dash_labels(self.controller).get(ch, ch)
         if not finite.any():
             _log.warning("marker %s: no values could be loaded", ch)
-            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.4)
+            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.4, rasterized=True)
             ax.set_title(f"Marker {display_label}: no data", fontsize=8)
             return
 
@@ -8296,7 +9366,7 @@ class PlotCard(QFrame):
                    ch, vmin, vmax, int(finite.sum()))
         sc = ax.scatter(xy[finite, 0], xy[finite, 1], s=1,
                         c=log_values[finite], cmap='viridis',
-                        vmin=vmin, vmax=vmax, alpha=0.6, linewidths=0)
+                        vmin=vmin, vmax=vmax, alpha=0.6, linewidths=0, rasterized=True)
         self._cbar_ax.set_visible(True)
         cb = self._figure.colorbar(sc, cax=self._cbar_ax)
         tick_pos, tick_lab = _log1p_powers_of_ten_ticks(float(np.expm1(vmax)))
@@ -8328,13 +9398,14 @@ class PlotCard(QFrame):
         if 'Unassigned' in present:
             ordered.append('Unassigned')
         if not ordered:
-            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#7f7f7f', alpha=0.4)
+            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#7f7f7f', alpha=0.4, rasterized=True)
             ax.set_title("Group: no samples assigned", fontsize=8)
             return
         for grp in ordered:
             colour = _resolve_group_colour(self.state, grp) if grp != 'Unassigned' else '#7f7f7f'
             mask = groups == grp
-            ax.scatter(xy[mask, 0], xy[mask, 1], s=1, c=colour, alpha=0.6, linewidths=0)
+            ax.scatter(xy[mask, 0], xy[mask, 1], s=1, c=colour, alpha=0.6, linewidths=0,
+                       rasterized=True)
         ax.set_title("Group", fontsize=8)
 
     def _show_placeholder(self, text: str):
@@ -8344,129 +9415,246 @@ class PlotCard(QFrame):
                 transform=ax.transAxes, color='grey', fontsize=9,
                 wrap=True)
         ax.axis('off')
-        self._canvas.draw_idle()
+        self.figure_changed.emit()
 
     # ------------------------------------------------------------------
-    # Legend (cluster swatches with right-click colour picker)
+    # Legend (drawn in the figure; right-click colour, double-click rename)
     # ------------------------------------------------------------------
 
-    def _rebuild_legend(self):
-        """Rebuild the right-side legend (swatch + name label per cluster
-        or group). Clusters read from the currently-selected clustering
-        run's own 'colors'/'names' (these live per-run, not on a
-        single ambient dict). Group mode delegates to
-        _rebuild_group_legend(). In 'Cluster Tree' plot-type mode the
-        colour-mode combo is hidden (and may be holding a stale value from
-        whatever it was set to before switching into Tree mode), so Tree
-        mode always gets the cluster legend regardless of that combo's
-        current text."""
-        while self._legend_layout.count():
-            item = self._legend_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
+    def _legend_entries(self) -> tuple[str, list[tuple[object, str, str]]]:
+        """('cluster'|'group', [(key, name, colour), ...]) for the current
+        view; an empty list when it has no legend. Clusters come from the
+        selected clustering run's own 'colors'/'names'; groups are those
+        present in the current plot. Cluster Tree mode always uses the
+        cluster legend (its colour-mode combo is hidden and may be stale)."""
         is_tree = self.plot_type_combo.currentText() == 'Cluster Tree'
         mode = self.colour_mode_combo.currentText()
         if mode == 'Group' and not is_tree:
-            self._rebuild_group_legend()
-            return
+            origin_disp = getattr(self, '_last_origin_disp', None)
+            if origin_disp is None:
+                return 'group', []
+            rel_to_group = _sample_groups_by_rel(self.controller, self.state)
+            present = {rel_to_group.get(str(rel), 'Unassigned') for rel in origin_disp}
+            ordered = [g for g in self.state.group_names if g in present]
+            if 'Unassigned' in present:
+                ordered.append('Unassigned')
+            return 'group', [
+                (g, g, _resolve_group_colour(self.state, g) if g != 'Unassigned' else '#7f7f7f')
+                for g in ordered]
         if mode != 'Clusters' and not is_tree:
-            self._legend_scroll.setVisible(False)
-            return
+            return 'cluster', []
         cl_run = self._selected_cluster_run()
         colors = cl_run.get('colors', {}) if cl_run else {}
         names = cl_run.get('names', {}) if cl_run else {}
-        if not colors:
-            self._legend_scroll.setVisible(False)
+        return 'cluster', [(lbl, _cluster_display_name(names, lbl), colors[lbl])
+                           for lbl in sorted(colors.keys())]
+
+    def _legend_layout_for(self, names: list[str], font_pt: float,
+                           position: str) -> tuple[int, float, float]:
+        """(n_columns, extra width in, extra height in) of a legend with
+        these entries: the Cols spin, or Auto (as many rows as fit the plot
+        height at the right; as many columns as fit the plot width below)."""
+        em = font_pt / 72.0
+        row_h = em * (1.0 + LEGEND_LABEL_SPACING)
+        col_w = max(text_width_inches(n, font_pt) for n in names) + em * (
+            LEGEND_HANDLE_LENGTH + LEGEND_HANDLE_PAD)
+        col_gap = em * LEGEND_COLUMN_SPACING
+        n = len(names)
+        ncol = self._legend_cols_spin.value()
+        if position == 'Right':
+            if ncol <= 0:
+                rows_fit = max(1, int(self._plot_h_in * 0.9 / row_h))
+                ncol = -(-n // rows_fit)
+            ncol = min(ncol, n)
+            return ncol, LEGEND_GAP_IN + ncol * col_w + (ncol - 1) * col_gap, 0.0
+        if ncol <= 0:
+            ncol = max(1, int((self._plot_w_in + col_gap) / (col_w + col_gap)))
+        ncol = min(ncol, n)
+        rows = -(-n // ncol)
+        return ncol, 0.0, LEGEND_GAP_IN + rows * row_h
+
+    def _apply_figure_size(self):
+        """Figure = plot W x H plus the legend's extra width/height."""
+        w = self._plot_w_in + self._legend_extra_in[0]
+        h = self._plot_h_in + self._legend_extra_in[1]
+        self._figure.set_size_inches(w, h, forward=False)
+
+    def estimated_size_mm(self) -> tuple[float, float]:
+        """Figure size in mm; before the legend has been drawn, the plot
+        plus LEGEND_ALLOWANCE_MM on the side the legend goes."""
+        if self._legend_extra_in != (0.0, 0.0):
+            w_in, h_in = self._figure.get_size_inches()
+            return float(w_in) * MM_PER_INCH, float(h_in) * MM_PER_INCH
+        w, h = self._plot_w_spin.value(), self._plot_h_spin.value()
+        position = self._legend_pos_combo.currentText()
+        return (w + (LEGEND_ALLOWANCE_MM if position in ('Right', 'Separate') else 0.0),
+                h + (LEGEND_ALLOWANCE_MM if position == 'Below' else 0.0))
+
+    def _rebuild_legend(self):
+        """Draw the cluster/group legend into the figure beside (axes legend)
+        or below (figure legend) self._legend_ax, resize the figure to make
+        room for it and register
+        its entries for right-click recolour / double-click rename."""
+        ax = getattr(self, '_legend_ax', None)
+        self._legend_pick_targets = {}
+        if ax is not None and ax in self._figure.axes and ax.get_legend() is not None:
+            ax.get_legend().remove()
+        for old in list(self._figure.legends):
+            old.remove()
+        kind, entries = self._legend_entries()
+        position = self._legend_pos_combo.currentText()
+        valid = ax is not None and ax in self._figure.axes and bool(entries)
+        self.legend_shown = valid and position == 'Separate'
+        if self.legend_shown:
+            self._draw_separate_legend(kind, entries)
+        if not valid or position in ('Off', 'Separate'):
+            self._legend_extra_in = (0.0, 0.0)
+            self._apply_figure_size()
+            self.figure_changed.emit()
+            self.legend_changed.emit()
             return
 
-        self._legend_scroll.setVisible(True)
-        for lbl in sorted(colors.keys()):
-            color = colors[lbl]
-            name  = _cluster_display_name(names, lbl)
+        from matplotlib.lines import Line2D
+        font_pt = float(self._legend_font_spin.value())
+        names = [name for _key, name, _colour in entries]
+        ncol, extra_w, extra_h = self._legend_layout_for(names, font_pt, position)
+        handles = [Line2D([], [], linestyle='', marker='o', markersize=font_pt * 0.7,
+                          markerfacecolor=colour, markeredgewidth=0, label=name)
+                   for _key, name, colour in entries]
+        common = dict(handles=handles, ncol=ncol, fontsize=font_pt, frameon=False,
+                      borderaxespad=0.0, handlelength=LEGEND_HANDLE_LENGTH,
+                      handletextpad=LEGEND_HANDLE_PAD, labelspacing=LEGEND_LABEL_SPACING,
+                      columnspacing=LEGEND_COLUMN_SPACING, labelcolor=self._label_fg())
+        if position == 'Right':
+            leg = ax.legend(loc='upper left', bbox_to_anchor=(1.03, 1.0), **common)
+        else:
+            # Figure legend: the layout engine keeps it clear of the tick
+            # labels and axis title at any font size or plot size.
+            leg = self._figure.legend(loc='outside lower center', **common)
+        self._register_legend_picks(leg, kind, entries)
 
-            row = QHBoxLayout()
-            row.setSpacing(4)
+        self._legend_extra_in = (extra_w, extra_h)
+        self._apply_figure_size()
+        self.figure_changed.emit()
+        self.legend_changed.emit()
 
-            swatch = QPushButton()
-            swatch.setFixedSize(14, 14)
-            swatch.setStyleSheet(
-                f"background-color: {color}; border: 1px solid #555; border-radius: 2px;"
-            )
-            swatch.setToolTip("Right-click to change colour")
-            swatch.setContextMenuPolicy(Qt.CustomContextMenu)
-            swatch.customContextMenuRequested.connect(
-                lambda pos, l=lbl, s=swatch: self._pick_cluster_colour(l, s)
-            )
-            row.addWidget(swatch)
+    def _register_legend_picks(self, leg, kind, entries):
+        for (key, _name, _colour), handle, text in zip(entries, leg.legend_handles,
+                                                      leg.get_texts()):
+            handle.set_picker(5)
+            text.set_picker(True)
+            self._legend_pick_targets[id(handle)] = (kind, key, 'swatch', _name)
+            self._legend_pick_targets[id(text)] = (kind, key, 'name', _name)
 
-            name_lbl = QLabel(name)
-            name_lbl.setStyleSheet(f"font-size: {self._legend_font_spin.value()}px;")
-            name_lbl.setToolTip("Double-click to rename")
-            name_lbl.mouseDoubleClickEvent = lambda e, l=lbl: self._rename_cluster(l)
-            row.addWidget(name_lbl, stretch=1)
+    def _legend_metrics(self, names: list[str], font_pt: float) -> tuple[float, float, float]:
+        """(row height, column width, column gap) in inches of a legend with
+        these entries at font_pt, from matplotlib's font metrics."""
+        em = font_pt / 72.0
+        row_h = em * (1.0 + LEGEND_LABEL_SPACING)
+        col_w = max(text_width_inches(n, font_pt) for n in names) + em * (
+            LEGEND_HANDLE_LENGTH + LEGEND_HANDLE_PAD)
+        return row_h, col_w, em * LEGEND_COLUMN_SPACING
 
-            row_w = QWidget()
-            row_w.setLayout(row)
-            self._legend_layout.addWidget(row_w)
+    def _separate_legend_ncol(self, names: list[str], font_pt: float) -> int:
+        """Legend columns: the Columns setting, or Auto (as many rows as fit
+        the plot's height)."""
+        ncol = self._legend_cols_spin.value()
+        if ncol <= 0:
+            row_h, _col_w, _gap = self._legend_metrics(names, font_pt)
+            rows_fit = max(1, int(self._plot_h_in * 0.95 / row_h))
+            ncol = -(-len(names) // rows_fit)
+        return max(1, min(ncol, len(names)))
 
-        self._legend_layout.addStretch()
+    def _draw_separate_legend(self, kind, entries):
+        """Draw the legend alone into self._legend_figure, sized to fit it
+        (font size fixed in pt; the column count sets its shape)."""
+        from matplotlib.lines import Line2D
+        fig = self._legend_figure
+        fig.clear()
+        fig.patch.set_facecolor('#1e1e1e' if _resolve_is_dark(self.state) else 'white')
+        font_pt = float(self._legend_font_spin.value())
+        names = [name for _key, name, _colour in entries]
+        ncol = self._separate_legend_ncol(names, font_pt)
+        row_h, col_w, gap = self._legend_metrics(names, font_pt)
+        rows = -(-len(names) // ncol)
+        # Large enough to hold the legend while it is measured
+        fig.set_size_inches(ncol * (col_w + gap) + 1.0, rows * row_h + 1.0)
+        handles = [Line2D([], [], linestyle='', marker='o', markersize=font_pt * 0.7,
+                          markerfacecolor=colour, markeredgewidth=0, label=name)
+                   for _key, name, colour in entries]
+        leg = fig.legend(handles=handles, ncol=ncol, fontsize=font_pt, frameon=False,
+                         loc='upper left', bbox_to_anchor=(0.0, 1.0), borderaxespad=0.0,
+                         handlelength=LEGEND_HANDLE_LENGTH, handletextpad=LEGEND_HANDLE_PAD,
+                         labelspacing=LEGEND_LABEL_SPACING, columnspacing=LEGEND_COLUMN_SPACING,
+                         labelcolor=self._label_fg())
+        bb = leg.get_window_extent(fig.canvas.get_renderer())
+        fig.set_size_inches(max(bb.width / fig.dpi, 0.05), max(bb.height / fig.dpi, 0.05))
+        self._register_legend_picks(leg, kind, entries)
 
-    def _rebuild_group_legend(self):
-        """
-        Right-side legend for 'Group' colour mode — one swatch
-        per group actually present in the current plot's data (not every
-        defined group), right-click to recolour. Shares state.group_colors
-        with the Comparison Groups table's Colour column and the Sample
-        PCA plot, so a change from any of the three places is reflected
-        in all of them.
-        """
-        origin_disp = getattr(self, '_last_origin_disp', None)
-        if origin_disp is None:
-            self._legend_scroll.setVisible(False)
+    def legend_figure(self):
+        return self._legend_figure
+
+    def legend_columns(self) -> int:
+        return self._legend_cols_spin.value()
+
+    def set_legend_columns(self, ncol: int):
+        self._legend_cols_spin.setValue(int(ncol))
+
+    def set_legend_box_mm(self, w_mm: float, h_mm: float, edge: str):
+        """Reflow the separate legend from a box dragged to w_mm x h_mm: the
+        right edge sets how many columns fit the width; the bottom edge or
+        corner sets how many rows fit the height."""
+        kind, entries = self._legend_entries()
+        if not entries:
             return
-        rel_to_group = _sample_groups_by_rel(self.controller, self.state)
-        present = {rel_to_group.get(str(rel), 'Unassigned') for rel in origin_disp}
-        ordered = [g for g in self.state.group_names if g in present]
-        if 'Unassigned' in present:
-            ordered.append('Unassigned')
-        if not ordered:
-            self._legend_scroll.setVisible(False)
+        import matplotlib
+        names = [name for _key, name, _colour in entries]
+        font_pt = float(self._legend_font_spin.value())
+        row_h, col_w, gap = self._legend_metrics(names, font_pt)
+        border = 2 * matplotlib.rcParams['legend.borderpad'] * font_pt / 72.0
+        n = len(names)
+        if edge == 'right':
+            ncol = int((w_mm / MM_PER_INCH - border + gap) / (col_w + gap))
+        else:
+            rows = max(1, int((h_mm / MM_PER_INCH - border) / row_h))
+            ncol = -(-n // rows)
+        self.set_legend_columns(max(1, min(ncol, n)))
+
+    def _on_legend_cols_changed(self, *_):
+        if self._legend_pos_combo.currentText() == 'Separate':
+            self._sync_config_to_state()
+            self._rebuild_legend()
+        else:
+            self._schedule_refresh()
+
+    def _on_legend_pick(self, event):
+        """Double-click a cluster's name: rename it. While probing (the page
+        is building a right-click menu) only record which entry is there."""
+        target = self._legend_pick_targets.get(id(event.artist))
+        if target is None:
             return
+        kind, key, part, name = target
+        if self.legend_probe:
+            if self.legend_probe_hit is None:
+                self.legend_probe_hit = (kind, key, name)
+            return
+        if self.legend_pick_handled:
+            return
+        if event.mouseevent.dblclick and part == 'name' and kind == 'cluster':
+            self.legend_pick_handled = True
+            self._rename_cluster(key)
 
-        self._legend_scroll.setVisible(True)
-        for name in ordered:
-            colour = _resolve_group_colour(self.state, name) if name != 'Unassigned' else '#7f7f7f'
+    def legend_entry_action(self, action: str, kind: str, key):
+        """A legend entry's menu action: 'entry_colour' or 'entry_rename'."""
+        if action == 'entry_colour':
+            if kind == 'cluster':
+                self._pick_cluster_colour(key)
+            elif key != 'Unassigned':
+                self._pick_group_colour(key)
+        elif action == 'entry_rename' and kind == 'cluster':
+            self._rename_cluster(key)
 
-            row = QHBoxLayout()
-            row.setSpacing(4)
-
-            swatch = QPushButton()
-            swatch.setFixedSize(14, 14)
-            swatch.setStyleSheet(
-                f"background-color: {colour}; border: 1px solid #555; border-radius: 2px;"
-            )
-            if name != 'Unassigned':
-                swatch.setToolTip("Right-click to change colour")
-                swatch.setContextMenuPolicy(Qt.CustomContextMenu)
-                swatch.customContextMenuRequested.connect(
-                    lambda pos, n=name, s=swatch: self._pick_group_colour(n, s)
-                )
-            else:
-                swatch.setToolTip("Samples not assigned to a group")
-            row.addWidget(swatch)
-
-            name_lbl = QLabel(name)
-            name_lbl.setStyleSheet(f"font-size: {self._legend_font_spin.value()}px;")
-            row.addWidget(name_lbl, stretch=1)
-
-            row_w = QWidget()
-            row_w.setLayout(row)
-            self._legend_layout.addWidget(row_w)
-
-        self._legend_layout.addStretch()
-
-    def _pick_group_colour(self, name: str, swatch: QPushButton):
+    def _pick_group_colour(self, name: str):
         """Open a colour dialog to change a group's colour--
         writes to the same state.group_colors dict as the Comparison
         Groups table's Colour column and the Sample PCA plot, so the
@@ -8475,12 +9663,9 @@ class PlotCard(QFrame):
         colour = QColorDialog.getColor(QColor(current), self, f"Colour for group '{name}'")
         if colour.isValid():
             self.state.group_colors[name] = colour.name()
-            swatch.setStyleSheet(
-                f"background-color: {colour.name()}; border: 1px solid #555; border-radius: 2px;"
-            )
             self.refresh()
 
-    def _pick_cluster_colour(self, label: int, swatch: QPushButton):
+    def _pick_cluster_colour(self, label: int):
         """Open a colour dialog to change a cluster's colour. Persistence
         delegates to drc_scatter (— shared with the Cluster
         Annotation tab)."""
@@ -8490,11 +9675,7 @@ class PlotCard(QFrame):
         current = cl_run.get('colors', {}).get(label, '#aaaaaa')
         colour = QColorDialog.getColor(QColor(current), self, f"Colour for cluster {label}")
         if colour.isValid():
-            hex_col = colour.name()
-            drc_scatter.recolor_cluster(self.controller, cl_run, label, hex_col)
-            swatch.setStyleSheet(
-                f"background-color: {hex_col}; border: 1px solid #555; border-radius: 2px;"
-            )
+            drc_scatter.recolor_cluster(self.controller, cl_run, label, colour.name())
             self.refresh()
 
     def _rename_cluster(self, label: int):
@@ -8516,29 +9697,111 @@ class PlotCard(QFrame):
             self._rebuild_legend()
     
     def _on_plot_dims_changed(self):
-        """Plot W/H changed — resize the actual figure and update
-        the holder's aspect ratio so both the matplotlib canvas and the Qt
-        widget wrapping it agree on the new proportions."""
-        w = self._plot_w_spin.value()
-        h = self._plot_h_spin.value()
-        self._plot_w_in = w
-        self._plot_h_in = h
-        self._figure.set_size_inches(w, h)
-        self._canvas_container.set_aspect_ratio(h / w)
+        """Plot W/H (mm) changed — resize the figure (plus any legend)."""
+        self._plot_w_in = self._plot_w_spin.value() / MM_PER_INCH
+        self._plot_h_in = self._plot_h_spin.value() / MM_PER_INCH
+        self._apply_figure_size()
+        self.figure_changed.emit()
         self._schedule_refresh()
+
+    def _set_spin_quietly(self, spin, value: float):
+        spin.blockSignals(True)
+        spin.setValue(min(max(value, PLOT_MIN_MM), PLOT_MAX_MM))
+        spin.blockSignals(False)
+
+    def _on_plot_w_changed(self, value: float):
+        if self._aspect_check.isChecked() and not self._applying_size:
+            self._set_spin_quietly(self._plot_h_spin, value / self._aspect_ratio)
+        self._on_plot_dims_changed()
+
+    def _on_plot_h_changed(self, value: float):
+        if self._aspect_check.isChecked() and not self._applying_size:
+            self._set_spin_quietly(self._plot_w_spin, value * self._aspect_ratio)
+        self._on_plot_dims_changed()
+
+    def _on_aspect_toggled(self, locked: bool):
+        if locked:
+            self._aspect_ratio = self._plot_w_spin.value() / self._plot_h_spin.value()
+        self._sync_config_to_state()
+
+    def aspect_locked(self) -> bool:
+        return self._aspect_check.isChecked()
+
+    def plot_size_mm(self) -> tuple[float, float]:
+        return self._plot_w_spin.value(), self._plot_h_spin.value()
+
+    def set_plot_size_mm(self, w_mm: float, h_mm: float):
+        """Set the plot size exactly (the locked ratio follows it)."""
+        self._set_spin_quietly(self._plot_w_spin, w_mm)
+        self._set_spin_quietly(self._plot_h_spin, h_mm)
+        if self._aspect_check.isChecked():
+            self._aspect_ratio = self._plot_w_spin.value() / self._plot_h_spin.value()
+        self._on_plot_dims_changed()
+
+    def set_plot_size_from_item(self, w_mm: float, h_mm: float, edge: str):
+        """Resize from the page: the figure was dragged to w_mm x h_mm. The
+        plot takes what an attached legend leaves; with the aspect ratio
+        locked, the dragged edge decides and the other side follows."""
+        extra_w, extra_h = (v * MM_PER_INCH for v in self._legend_extra_in)
+        w, h = w_mm - extra_w, h_mm - extra_h
+        if self._aspect_check.isChecked():
+            w0, h0 = self.plot_size_mm()
+            w, h = drc_workspace_canvas.locked_size(w0, h0, w, h, edge)
+        self.set_plot_size_mm(w, h)
+
+    def apply_size_config(self, config: dict):
+        """Plot size, aspect lock, legend placement and legend offset from a
+        saved config, without redrawing, so a new plot can be placed before
+        it is drawn."""
+        widgets = (self._plot_w_spin, self._plot_h_spin, self._legend_pos_combo,
+                   self._aspect_check)
+        for widget in widgets:
+            widget.blockSignals(True)
+        if 'plot_w' in config:
+            self._plot_w_spin.setValue(float(config['plot_w']) * MM_PER_INCH)
+        if 'plot_h' in config:
+            self._plot_h_spin.setValue(float(config['plot_h']) * MM_PER_INCH)
+        if config.get('legend_pos') in LEGEND_POSITIONS:
+            self._legend_pos_combo.setCurrentText(config['legend_pos'])
+        if 'aspect_locked' in config:
+            self._aspect_check.setChecked(bool(config['aspect_locked']))
+        for widget in widgets:
+            widget.blockSignals(False)
+        offset = config.get('legend_offset')
+        self.legend_offset_mm = (float(offset[0]), float(offset[1])) if offset else None
+        self._aspect_ratio = self._plot_w_spin.value() / self._plot_h_spin.value()
+        self._plot_w_in = self._plot_w_spin.value() / MM_PER_INCH
+        self._plot_h_in = self._plot_h_spin.value() / MM_PER_INCH
+        self._apply_figure_size()
+
+    def _label_fg(self) -> str:
+        """Label colour in use: the one picked, or Auto (black on a light
+        plot theme, white on a dark one)."""
+        if self._label_color:
+            return self._label_color
+        return 'white' if _resolve_is_dark(self.state) else 'black'
 
     def _pick_label_color(self):
         """Open colour dialog to set colourbar / title text colour."""
-        colour = QColorDialog.getColor(QColor(self._label_color), self, "Label colour")
+        colour = QColorDialog.getColor(QColor(self._label_fg()), self, "Label colour")
         if colour.isValid():
             self._label_color = colour.name()
             self._update_label_color_btn()
             self._schedule_refresh()
 
+    def _reset_label_color(self):
+        self._label_color = None
+        self._update_label_color_btn()
+        self._schedule_refresh()
+
     def _update_label_color_btn(self):
-        """Update the button background to preview the chosen colour, with
-        contrasting text so the button stays legible regardless of which
-        colour is picked or the app's light/dark theme."""
+        """Show the chosen colour on the button (with contrasting text), or
+        'Auto' when the colour follows the plot theme."""
+        if self._label_color is None:
+            self._label_color_btn.setText("Auto (follows theme)")
+            self._label_color_btn.setStyleSheet("")
+            return
+        self._label_color_btn.setText(self._label_color)
         text_color = _contrasting_text_color(self._label_color)
         self._label_color_btn.setStyleSheet(
             f"background-color: {self._label_color}; color: {text_color};"
@@ -8560,9 +9823,16 @@ class PlotCard(QFrame):
             'show_axis_labels': self._show_axis_labels.isChecked(),
             'title_font':     self._legend_font_spin.value(),  # key kept for backward-compat with saved layouts
             'axis_font':      self._axis_font_spin.value(),
-            'label_color':    self._label_color,
-            'plot_w':         self._plot_w_spin.value(),
-            'plot_h':         self._plot_h_spin.value(),
+            'label_color':    self._label_color,   # None = Auto
+            'plot_w':         round(self._plot_w_spin.value() / MM_PER_INCH, 4),  # inches
+            'plot_h':         round(self._plot_h_spin.value() / MM_PER_INCH, 4),
+            'aspect_locked':  self._aspect_check.isChecked(),
+            'legend_pos':     self._legend_pos_combo.currentText(),
+            'legend_cols':    self._legend_cols_spin.value(),
+            'legend_offset':  list(self.legend_offset_mm) if self.legend_offset_mm else None,
+            'layout':         dict(self.layout_mm) if self.layout_mm else None,
+            'group':          self.group_id,
+            'z':              self.z_value,
         }
 
     def apply_config(self, config: dict):
@@ -8605,11 +9875,26 @@ class PlotCard(QFrame):
         if 'axis_font' in config:
             self._axis_font_spin.setValue(int(config['axis_font']))
         if 'label_color' in config:
-            self._label_color = config['label_color']
+            # 'white' / 'black' were the automatic defaults before Auto existed
+            colour = config['label_color']
+            self._label_color = None if colour in (None, 'auto', 'white', 'black') else colour
             self._update_label_color_btn()
+        if config.get('legend_pos') in LEGEND_POSITIONS:
+            self._legend_pos_combo.setCurrentText(config['legend_pos'])
+        if 'legend_cols' in config:
+            self._legend_cols_spin.setValue(int(config['legend_cols']))
         if 'plot_w' in config or 'plot_h' in config:
-            self._plot_w_spin.setValue(float(config.get('plot_w', self._plot_w_spin.value())))
-            self._plot_h_spin.setValue(float(config.get('plot_h', self._plot_h_spin.value())))
+            self._applying_size = True
+            try:
+                self._plot_w_spin.setValue(float(config.get(
+                    'plot_w', self._plot_w_spin.value() / MM_PER_INCH)) * MM_PER_INCH)
+                self._plot_h_spin.setValue(float(config.get(
+                    'plot_h', self._plot_h_spin.value() / MM_PER_INCH)) * MM_PER_INCH)
+            finally:
+                self._applying_size = False
+        if 'aspect_locked' in config:
+            self._aspect_check.setChecked(bool(config['aspect_locked']))
+        self._aspect_ratio = self._plot_w_spin.value() / self._plot_h_spin.value()
             # setValue's valueChanged already triggers _on_plot_dims_changed,
             # which calls _schedule_refresh() itself -- no need to also
             # fall through to the refresh call below for this one.
@@ -8634,17 +9919,8 @@ class PlotCard(QFrame):
         return self._figure
 
     def _export_png(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Plot", f"{self.plot_id}.png", "PNG files (*.png)"
-        )
-        if not path:
-            return
-        path = _with_extension(path, '.png')
-        try:
-            self._figure.savefig(path, dpi=150, bbox_inches='tight')
-            QMessageBox.information(self, "Exported", f"Saved to {path}")
-        except Exception as e:
-            QMessageBox.warning(self, "Export Error", str(e))
+        """Export this plot (with its separate legend) as PNG."""
+        self.workspace.export_plot_png(self)
 
 
 
@@ -9219,8 +10495,7 @@ class _SquareContainer(QWidget):
         # on-screen geometry (both 0 during initial construction, prior
         # to being shown/laid out) -- handing the canvas a literal 0x0
         # geometry here is what made matplotlib's constrained-layout
-        # engine warn about axes collapsing to zero. Same guard
-        # _AspectCanvasHolder._apply_geometry() already has.
+        # engine warn about axes collapsing to zero.
         if self.width() <= 0 or self.height() <= 0:
             super().resizeEvent(event)
             return
@@ -9437,7 +10712,7 @@ class ClusterAnnotationTab(QWidget):
          globals, so switching runs here never touches Workspace state.
       2. Cluster map — a DR scatter plot coloured by cluster, via its own
          DR-run selector. Rendering, legend editing, and the
-         DR/clustering compatibility warning all delegate to drc_scatter,
+         Honeycluster compatibility warning all delegate to drc_scatter,
          shared with Workspace's PlotCard so both render identically.
       3. Cluster label table — one row per cluster: editable name, colour
          swatch (double-click to change), event count, % of total. Both
@@ -10192,11 +11467,11 @@ class ClusterAnnotationTab(QWidget):
                           ) -> dict[str, dict[int, list]]:
         """
         Pool per-cluster raw values for each channel from the run's own
-        per-sample label arrays. Prefers the run's own 'marker_values'
-        snapshot (frozen at classification time -- see
-        drc_clustering.py's _snapshot_marker_values -- guaranteed
-        row-for-row aligned to 'labels' regardless of gate/channel edits
-        made since). For a sample without it, values are loaded from the
+        per-sample label arrays. Prefers the run's own stored marker
+        values (drc_run_archive.run_marker_values: taken at classification
+        time, a per-cluster sample whose rows index 'labels', or every
+        event for older runs -- unaffected by gate/channel edits made
+        since). For a sample without them, values are loaded from the
         current events and matched to the labels by event key, or row for row
         for a legacy run still in sync (live_mode, see
         drc_run_align.live_join_mode; computed here when not given, which
@@ -10211,7 +11486,7 @@ class ClusterAnnotationTab(QWidget):
         Returns {channel: {cluster_id: [per-sample arrays]}}.
         """
         labels_dict = cl_run.get('labels', {}) or {}
-        snapshot_dict = cl_run.get('marker_values', {}) or {}
+        snapshot_dict = drc_run_archive.run_marker_values(self.controller, cl_run)
         training_samples = cl_run.get('training_sample_ids', [])
         pooled: dict[str, dict[int, list]] = {ch: {} for ch in channels}
         self._violin_skipped_samples = []
@@ -10225,8 +11500,10 @@ class ClusterAnnotationTab(QWidget):
 
             snap = snapshot_dict.get(rel)
             if snap is not None:
-                values, names = snap
+                values, names = snap[0], snap[1]
                 values = np.asarray(values)
+                if len(snap) == 3:
+                    labels = labels[np.asarray(snap[2])]
                 if len(values) != len(labels):
                     _log.warning(
                         "_pool_violin_data: %s -- snapshot (%d) vs labels (%d) "
@@ -10491,7 +11768,7 @@ class ClusterAnnotationTab(QWidget):
             return
 
         labels_dict = cl_run.get('labels', {}) if cl_run else {}
-        own_positions = (cl_run.get('dr_positions', {}) if cl_run else {}) or {}
+        own_positions = None
         cl_params = (cl_run.get('params', {}) if cl_run else {}) or {}
         # Only trust the run's own frozen positions as a substitute when
         # they're nominally the SAME embedding space as what's on screen --
@@ -10508,6 +11785,8 @@ class ClusterAnnotationTab(QWidget):
                 lbl_raw, n,
                 label_rows=drc_run_align.run_rows(cl_run, rel) if cl_run else None,
                 emb_rows=drc_run_align.run_rows(dr_run, rel), mode=join_mode)
+            if not aligned_ok and lbl_raw is not None and same_algo and own_positions is None:
+                own_positions = self._run_dr_positions(cl_run)
             if aligned_ok:
                 xys.append(emb)
                 labs.append(lbl)
@@ -10546,6 +11825,19 @@ class ClusterAnnotationTab(QWidget):
                    "colour — DR run and clustering run don't share indexed events",
                    transform=ax.transAxes, fontsize=max(fontsize - 1, 6),
                    color='#d9822b', va='bottom', ha='left', zorder=10)
+
+    def _run_dr_positions(self, cl_run: dict) -> dict:
+        """The DR positions a DR-space clustering run classified: stored with
+        runs archived before 'params'['_dr_run_id'] existed, else its source
+        DR run's embeddings ({} if that run has been deleted)."""
+        stored = cl_run.get('dr_positions') or {}
+        if stored:
+            return stored
+        source_id = (cl_run.get('params') or {}).get('_dr_run_id')
+        for entry in self.state.dr_runs:
+            if source_id and entry.get('run_id') == source_id:
+                return drc_run_archive.hydrate_run(self.controller, entry).get('embeddings') or {}
+        return {}
 
     def _pop_out_map(self):
         """Regenerate the cluster map at a larger size in its own window,
@@ -11065,12 +12357,19 @@ class ClusterAnnotationTab(QWidget):
         )
         if reply != QMessageBox.Yes:
             return
+        # All names are assigned in memory, then persisted in one write:
+        # one rename_cluster() call per cluster wrote once per cluster, and
+        # checking each new name against not-yet-replaced old names
+        # rejected valid ones. The numbering below makes the new set unique.
+        names = cl_run.setdefault('names', {})
         seen: dict[str, int] = {}
         for cl_id in sorted(self._mem_labels.keys()):
-            base = self._mem_labels[cl_id]
+            base = self._mem_labels[cl_id].strip()
+            if not base:
+                continue
             seen[base] = seen.get(base, 0) + 1
-            name = base if seen[base] == 1 else f"{base} ({seen[base]})"
-            drc_scatter.rename_cluster(self.controller, cl_run, cl_id, name, self)
+            names[cl_id] = base if seen[base] == 1 else f"{base} ({seen[base]})"
+        drc_run_archive.update_run_fields(self.controller, cl_run, 'names')
         self._rebuild_map_legend(cl_run)
         self._populate_label_table()
 
@@ -11889,6 +13188,12 @@ class PluginWidget(QWidget):
             cluster_annotation_tab=self.cluster_annotation_tab,
         )
 
+        # Figures the Workspace can copy onto its pages
+        self.workspace_tab.set_figure_sources({
+            'Cluster Annotation': self.cluster_annotation_tab.get_report_items,
+            'Stats': self.groups_stats_tab.get_report_items,
+        })
+
         # Result figures are built on a worker thread; list them in the
         # report once they exist if it is the tab being shown.
         self.groups_stats_tab.results_drawn.connect(self._refresh_report_if_shown)
@@ -12008,15 +13313,10 @@ class PluginWidget(QWidget):
                     self.load_state()
                     if hasattr(self, 'workspace_tab'):
                         wt = self.workspace_tab
-                        wt.col_combo.setCurrentText(str(self.state.workspace_n_columns))
                         wt.theme_combo.setCurrentText(self.state.plot_theme.capitalize())
-                        for card in list(wt._plot_cards):
-                            wt.remove_card(card)
-                        pending = getattr(self, '_pending_plot_configs', [])
-                        for cfg in pending:
-                            wt.add_plot(refresh=False)
-                            if wt._plot_cards:
-                                wt._plot_cards[-1].apply_config(cfg)
+                        wt.restore_layout(getattr(self, '_pending_plot_configs', []),
+                                          self.state.workspace_texts,
+                                          self.state.workspace_figures)
                     if hasattr(self, 'groups_stats_tab'):
                         gst = self.groups_stats_tab
                         if hasattr(gst, 'chk_include_type_markers'):
@@ -12073,8 +13373,19 @@ class PluginWidget(QWidget):
         try:
             import json
             s.setValue('plot_configs', json.dumps(self.state.plot_configs))
+            self._save_workspace_settings(s)
         finally:
             s.endGroup()
+
+    def _save_workspace_settings(self, s):
+        """Workspace pages and grid, into the open QSettings group *s*."""
+        import json
+        s.setValue('workspace_pages', json.dumps(self.state.workspace_pages))
+        s.setValue('workspace_grid_mm', self.state.workspace_grid_mm)
+        s.setValue('workspace_snap', self.state.workspace_snap)
+        s.setValue('workspace_show_grid', self.state.workspace_show_grid)
+        s.setValue('workspace_texts', json.dumps(self.state.workspace_texts))
+        s.setValue('workspace_figures', json.dumps(self.state.workspace_figures))
 
     def _save_transforms_only(self):
         """
@@ -12215,7 +13526,7 @@ class PluginWidget(QWidget):
             s.setValue('n_clusters',        self.state.n_clusters if self.state.n_clusters is not None else '')
             s.setValue('active_cl_algo',    self.state.active_clustering_algorithm or '')
             s.setValue('cluster_colors',    repr(self.state.cluster_colors))
-            s.setValue('workspace_n_columns', self.state.workspace_n_columns)
+            self._save_workspace_settings(s)
             s.setValue('plot_theme', self.state.plot_theme)
             # plot_configs: only save serialisable display settings (no widgets)
             try:
@@ -12582,12 +13893,31 @@ class PluginWidget(QWidget):
                 except Exception:
                     pass
 
-            n_cols = s.value('workspace_n_columns', None)
-            if n_cols is not None:
-                try:
-                    self.state.workspace_n_columns = int(n_cols)
-                except (ValueError, TypeError):
-                    pass
+            try:
+                import json
+                pages = json.loads(s.value('workspace_pages', '') or '[]')
+                self.state.workspace_pages = [
+                    {'preset': str(p.get('preset', 'Custom')),
+                     'w_mm': float(p['w_mm']), 'h_mm': float(p['h_mm'])} for p in pages]
+            except (ValueError, TypeError, KeyError, AttributeError):
+                self.state.workspace_pages = []
+            try:
+                self.state.workspace_grid_mm = float(s.value(
+                    'workspace_grid_mm', drc_workspace_canvas.DEFAULT_GRID_MM))
+            except (ValueError, TypeError):
+                self.state.workspace_grid_mm = drc_workspace_canvas.DEFAULT_GRID_MM
+            self.state.workspace_snap = _qs_bool(s, 'workspace_snap', True)
+            self.state.workspace_show_grid = _qs_bool(s, 'workspace_show_grid', True)
+            try:
+                texts = json.loads(s.value('workspace_texts', '') or '[]')
+                self.state.workspace_texts = [t for t in texts if isinstance(t, dict)]
+            except (ValueError, TypeError):
+                self.state.workspace_texts = []
+            try:
+                figures = json.loads(s.value('workspace_figures', '') or '[]')
+                self.state.workspace_figures = [f for f in figures if isinstance(f, dict)]
+            except (ValueError, TypeError):
+                self.state.workspace_figures = []
 
             theme = s.value('plot_theme', None)
             if theme in ('auto', 'light', 'dark'):
@@ -12754,10 +14084,12 @@ class PluginWidget(QWidget):
 
     def _save_model_sidecar(self, experiment_dir: Path | None = None):
         """
-        Write embeddings, cluster labels, clustering tree data and stats
-        results to the experiment's current_state bundle (see drc_persist).
-        A field that cannot be stored is skipped with a log line rather than
-        failing the save.
+        Write clustering tree data, the active DR run ids and stats results
+        to the experiment's current_state bundle (see drc_persist). A field
+        that cannot be stored is skipped with a log line rather than failing
+        the save. Embeddings and cluster labels are not written here: every
+        run is archived when it completes, and the active DR runs'
+        embeddings are restored from the archive (_load_model_sidecar).
 
         Fitted UMAP/openTSNE/PaCMAP model objects are not written;
         only trained_reducers entries that are plain array dicts (the
@@ -12791,11 +14123,7 @@ class PluginWidget(QWidget):
                      if isinstance(model, dict)}
         payload = dict((
             ('trained_reducers',  tree_data),
-            ('embeddings',        self.state.embeddings),
-            ('embedding_rows',    self.state.embedding_rows),
             ('active_dr_run_ids', dict(self._active_dr_run_id)),
-            ('cluster_labels',    self.state.cluster_labels),
-            ('cluster_rows',      self.state.cluster_rows),
             ('freq_results',      self.state.freq_results),
             ('counts_results',    self.state.counts_results),
             ('mfi_results',       self.state.mfi_results),
@@ -12831,6 +14159,18 @@ class PluginWidget(QWidget):
                   f"(keys: {[k for k in payload if k not in skipped]})")
         except Exception as e:
             print(f"[DR Plugin] Could not save model sidecar: {e}")
+
+    def _restore_active_embeddings(self):
+        """state.embeddings / embedding_rows of each algorithm from its
+        active DR run in the archive (shared arrays, not copies)."""
+        for algo, run_id in self._active_dr_run_id.items():
+            entry = next((e for e in self.state.dr_runs if e.get('run_id') == run_id), None)
+            if entry is None:
+                continue
+            drc_run_archive.hydrate_run(self.controller, entry)
+            if entry.get('embeddings'):
+                self.state.embeddings[algo] = dict(entry['embeddings'])
+                self.state.embedding_rows[algo] = dict(entry.get('event_rows') or {})
 
     def _load_model_sidecar(self):
         """
@@ -12894,6 +14234,7 @@ class PluginWidget(QWidget):
                 self._active_dr_run_id = {
                     str(a): r for a, r in payload['active_dr_run_ids'].items()
                     if isinstance(r, str) and r}
+            self._restore_active_embeddings()
             if isinstance(payload.get('cluster_labels'), dict):
                 self.state.cluster_labels = payload['cluster_labels']
             if isinstance(payload.get('cluster_rows'), dict):
@@ -13372,8 +14713,7 @@ class PluginWidget(QWidget):
                 len(s.dr_runs), len(s.clustering_runs),
                 tuple(sorted(s.cluster_names.items())),
                 tuple(sorted(s.cluster_colors.items())),
-                len(s.plot_configs),
-                s.workspace_n_columns, s.plot_theme,
+                len(s.plot_configs), s.plot_theme,
             )
         elif index == 5:    # ReportTab -- cheap to rebuild; always refresh
             return None
@@ -14240,6 +15580,8 @@ class PluginWidget(QWidget):
         # current gating's otherwise.
         if drc_clustering.clusters_in_dr_space(algo, params):
             source_dr = self._source_dr_run_entry(params.get('_dr_algo') or '') or {}
+            # The run's DR positions are this run's embeddings
+            params['_dr_run_id'] = source_dr.get('run_id') or ''
             run_fingerprint = source_dr.get('sync_fingerprint')
             run_split = {'unmixing': source_dr.get('unmixing_fingerprint'),
                          'gating': source_dr.get('gating_fingerprint')}
@@ -14310,7 +15652,6 @@ class PluginWidget(QWidget):
                         params=dict(params),
                         n_events=n_events,
                         marker_values=dict(self.state.cluster_marker_values),
-                        dr_positions=dict(self.state.cluster_dr_positions),
                         tree_data=tree_data,
                         sync_fingerprint=run_fingerprint,
                         event_rows=_complete_rows(self.state.cluster_labels,

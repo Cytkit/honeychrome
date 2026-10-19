@@ -1,5 +1,5 @@
 """
-drc_pipeline.py — Data loading & transform pipeline for the DR/Clustering plugin
+drc_pipeline.py — Data loading & transform pipeline for the Honeycluster plugin
 ================================================================================
 Companion module to ``dr_clustering_tab.py`` (filename intentionally does NOT
 end in ``_tab.py``, so it is not picked up as a separate plugin tab).
@@ -30,6 +30,9 @@ Corrections relative to the original in-line implementation
 4.  load_unmixed_gated() unmixes each sample with its own AF profile
     assignment through the shared ``sample_loader`` module, so background
     loads match what the main window shows for that sample.
+5.  Loaded samples are cached as float32 values of the channels in use
+    only (GatedEvents in a GatedCache), up to a quarter of the machine's
+    memory, the least recently used sample dropped first.
 
 All functions take ``controller`` and ``state`` explicitly so they can be
 unit-tested without a live ``PluginWidget``.
@@ -39,6 +42,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from collections import OrderedDict
 
 import numpy as np
 
@@ -67,7 +72,7 @@ from drc_logging import (
 
 log = get_logger(__name__)
 
-# Meta channels that are never used as DR/clustering features. They are still
+# Meta channels that are never used as Honeycluster features. They are still
 # PRESENT as columns in the unmixed event matrix, so they must be excluded by
 # *name selection*, never by deleting them from the index map. AF Index is a
 # library position, not an intensity, so it is a label rather than a feature.
@@ -163,7 +168,8 @@ def transform_channels(controller, state, gated_data: np.ndarray,
 
     Parameters
     ----------
-    gated_data : (n_events, n_unmixed_full_channels) untransformed unmixed data
+    gated_data : (n_events, n_unmixed_full_channels) untransformed unmixed
+                 data, or a GatedEvents (its own named columns)
     channels   : channel names to slice + transform, in the order wanted
 
     Returns
@@ -177,7 +183,11 @@ def transform_channels(controller, state, gated_data: np.ndarray,
     ------
     RuntimeError if a transform cannot be applied (no silent arcsinh fallback).
     """
-    ch_idx = build_channel_index(controller)
+    if isinstance(gated_data, GatedEvents):
+        ch_idx = gated_data.index
+        gated_data = gated_data.values
+    else:
+        ch_idx = build_channel_index(controller)
     resolved = []
     for ch in channels:
         col = ch_idx.get(ch)
@@ -255,8 +265,15 @@ def select_untransformed_channels(controller, state, gated_data: np.ndarray) -> 
 
     Returns ``(values, channel_names)`` where ``values`` is
     ``(n_events, n_selected)`` and ``channel_names`` matches the column order.
+    gated_data may be a GatedEvents (its own named columns).
     """
-    resolved = resolve_selected_columns(controller, state)
+    if isinstance(gated_data, GatedEvents):
+        index = gated_data.index
+        resolved = [(ch, index[ch]) for ch in state.selected_channels
+                    if ch not in META_CHANNELS and ch in index]
+        gated_data = gated_data.values
+    else:
+        resolved = resolve_selected_columns(controller, state)
     cols = []
     names = []
     for ch, col_i in resolved:
@@ -368,29 +385,122 @@ def _gated_cache_key(controller, state, abs_path, af_state, sample_key) -> tuple
     )
 
 
-def _rows_cache(state) -> dict:
-    """state.gated_rows_cache, created on states that lack one."""
-    cache = getattr(state, 'gated_rows_cache', None)
-    if cache is None:
-        cache = {}
-        state.gated_rows_cache = cache
+class GatedEvents:
+    """
+    One sample's gated events as cached: untransformed unmixed values
+    (float32) of some channels, by name, and the FCS-file row of each event
+    (its event key, int32, ascending).  Indexing with rows selects events.
+    """
+    __slots__ = ('values', 'names', 'rows', 'index')
+
+    def __init__(self, values: np.ndarray, names: list[str], rows: np.ndarray):
+        self.values = values
+        self.names = list(names)
+        self.rows = rows
+        self.index = {ch: i for i, ch in enumerate(self.names)}
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx) -> 'GatedEvents':
+        return GatedEvents(self.values[idx], self.names, self.rows[idx])
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.values.nbytes + self.rows.nbytes)
+
+
+def default_cache_bytes() -> int:
+    """A quarter of the machine's physical memory (4 GB if unknown)."""
+    try:
+        import psutil
+        return int(psutil.virtual_memory().total // 4)
+    except Exception:
+        return 4 * 1024 ** 3
+
+
+class GatedCache:
+    """
+    Thread-safe least-recently-used cache of GatedEvents, keyed like
+    _gated_cache_key and capped at *max_bytes* (default_cache_bytes()).
+    The newest entry is always kept, even alone above the cap; *evictions*
+    counts entries dropped.
+    """
+
+    def __init__(self, max_bytes: int | None = None):
+        self.max_bytes = default_cache_bytes() if max_bytes is None else int(max_bytes)
+        self.evictions = 0
+        self._entries: OrderedDict = OrderedDict()
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None:
+                self._entries.move_to_end(key)
+            return entry
+
+    def put(self, key, entry: GatedEvents) -> None:
+        with self._lock:
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self._bytes -= old.nbytes
+            self._entries[key] = entry
+            self._bytes += entry.nbytes
+            while self._bytes > self.max_bytes and len(self._entries) > 1:
+                _key, dropped = self._entries.popitem(last=False)
+                self._bytes -= dropped.nbytes
+                self.evictions += 1
+
+    def __contains__(self, key) -> bool:
+        with self._lock:
+            return key in self._entries
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    @property
+    def nbytes(self) -> int:
+        return self._bytes
+
+
+def _gated_cache(state) -> GatedCache:
+    """state.gated_data_cache, replaced by a GatedCache on states lacking one."""
+    cache = getattr(state, 'gated_data_cache', None)
+    if not isinstance(cache, GatedCache):
+        cache = GatedCache()
+        state.gated_data_cache = cache
     return cache
 
 
-def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray:
+def _cached_channels(controller, state, channels) -> list[str]:
+    """Unmixed channels to keep for a sample: the selected ones (meta
+    channels excluded) plus *channels*, in unmixed column order."""
+    wanted = {c for c in state.selected_channels if c not in META_CHANNELS} \
+        if getattr(state, 'selected_channels', None) else set()
+    wanted |= set(channels or [])
+    return [ch for ch in get_unmixed_channels(controller) if ch in wanted]
+
+
+def load_unmixed_gated(controller, state, abs_path, af_state=None,
+                       channels: list[str] | None = None) -> GatedEvents:
     """
     Load one FCS file, unmix it with the transfer matrix, and apply the
-    selected gate(s).  Returns the UNTRANSFORMED unmixed gated matrix with
-    all unmixed columns (shape ``(n_gated, n_unmixed_full)``).
+    selected gate(s).  Returns the gated events as a GatedEvents holding the
+    UNTRANSFORMED unmixed values (float32) of the selected channels plus
+    *channels*, and the file row of every gated event (its event key, see
+    ``load_gated_rows``).
 
     The gates are this sample's own: its per-sample gate overrides and its
     own range on per-sample (Time) axes, not those of the sample shown in
     the main window (see ``per_sample_gating_functions.SampleGating``).
 
-    Cached on state.gated_data_cache, keyed by (file, gates, unmixing
-    matrix identity, the sample's gating).  The file row of every gated
-    event (its event key, see ``load_gated_rows``) is cached under the same
-    key in state.gated_rows_cache.
+    Cached in state.gated_data_cache (GatedCache), keyed by (file, gates,
+    unmixing matrix identity, the sample's gating).  A cached sample lacking
+    one of the channels asked for is loaded again and cached with the
+    channels it had plus the new ones.
 
     af_state: optional unmixing snapshot — see apply_unmixing_af_aware()
         docstring. Pass this from any background worker thread; leave as
@@ -401,12 +511,16 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray
 
     sample_key = sample_key_for_path(controller.experiment_dir, abs_path)
 
+    cache = _gated_cache(state)
     cache_key = _gated_cache_key(controller, state, abs_path, af_state, sample_key)
-    cached = state.gated_data_cache.get(cache_key)
-    if cached is not None and cache_key in _rows_cache(state):
+    wanted = _cached_channels(controller, state, channels)
+    cached = cache.get(cache_key)
+    if cached is not None and all(ch in cached.index for ch in wanted):
         log.debug("load_unmixed_gated: cache hit for %s",
                    getattr(abs_path, 'name', abs_path))
         return cached
+    if cached is not None:
+        wanted = _cached_channels(controller, state, list(cached.names) + wanted)
 
     _raw_settings = controller.experiment.settings['raw']
     whitelisted_pnn = _raw_settings.get('whitelisted_pnn') or None
@@ -436,12 +550,15 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None) -> np.ndarray
     sample_gating = SampleGating.from_controller(controller)
     mask = np.asarray(sample_gating.population_mask(
         sample_key, unmixed, pnn, list(state.selected_gates)), dtype=bool)
-    gated = unmixed[mask]
-    log.debug("  gated → %d events retained (%d removed)",
-              gated.shape[0], unmixed.shape[0] - gated.shape[0])
-    state.gated_data_cache[cache_key] = gated
-    _rows_cache(state)[cache_key] = np.flatnonzero(mask).astype(np.int32)
-    return gated
+    rows = np.flatnonzero(mask).astype(np.int32)
+    ch_idx = build_channel_index(controller)
+    names = [ch for ch in wanted if ch_idx.get(ch, unmixed.shape[1]) < unmixed.shape[1]]
+    values = unmixed[np.ix_(rows, [ch_idx[ch] for ch in names])].astype(np.float32)
+    log.debug("  gated → %d events retained (%d removed), %d channel(s) cached",
+              len(rows), unmixed.shape[0] - len(rows), len(names))
+    entry = GatedEvents(values, names, rows)
+    cache.put(cache_key, entry)
+    return entry
 
 
 def load_gated_rows(controller, state, abs_path, af_state=None) -> np.ndarray:
@@ -451,10 +568,7 @@ def load_gated_rows(controller, state, abs_path, af_state=None) -> np.ndarray:
     gated event, in the same order).  A file's rows never change, so these
     identify the same cells whatever the gating or unmixing later becomes.
     """
-    load_unmixed_gated(controller, state, abs_path, af_state=af_state)
-    sample_key = sample_key_for_path(controller.experiment_dir, abs_path)
-    return _rows_cache(state)[_gated_cache_key(controller, state, abs_path, af_state,
-                                               sample_key)]
+    return load_unmixed_gated(controller, state, abs_path, af_state=af_state).rows
 
 
 def load_sample_rows(controller, state, rel_path, af_state=None) -> np.ndarray | None:
@@ -472,7 +586,16 @@ def is_gated_cached(controller, state, rel_path, af_state=None) -> bool:
     abs_path = sample_abs_path(controller, rel_path)
     sample_key = sample_key_for_path(controller.experiment_dir, abs_path)
     key = _gated_cache_key(controller, state, abs_path, af_state, sample_key)
-    return key in state.gated_data_cache and key in _rows_cache(state)
+    return key in _gated_cache(state)
+
+
+def cached_first(controller, state, rel_paths, af_state=None) -> list[str]:
+    """*rel_paths* with the samples already cached first (each group in its
+    given order), so a loop over them uses what is cached before loading
+    the rest drops it."""
+    rel_paths = list(rel_paths)
+    cached = [rel for rel in rel_paths if is_gated_cached(controller, state, rel, af_state)]
+    return cached + [rel for rel in rel_paths if rel not in set(cached)]
 
 
 def sample_file_events(controller, rel_path) -> int:
@@ -485,13 +608,18 @@ def sample_file_events(controller, rel_path) -> int:
 
 def timed_preload(controller, state, rel_paths, af_state=None,
                   should_stop=None) -> tuple[float, int]:
-    """Read, unmix and gate the samples not cached yet (they stay cached for
-    the run).  Returns (seconds taken, FCS-file events read), the 'io'
+    """Read, unmix and gate the samples not cached yet, while the cache has
+    room for them (once it drops a sample, the rest are left for the run's
+    own loads).  Returns (seconds taken, FCS-file events read), the 'io'
     stage of drc_time_estimate."""
     import time
     seconds, events = 0.0, 0
+    cache = _gated_cache(state)
+    evictions = cache.evictions
     for rel in rel_paths:
         if should_stop is not None and should_stop():
+            break
+        if cache.evictions != evictions:
             break
         if is_gated_cached(controller, state, rel, af_state=af_state):
             continue
@@ -515,7 +643,7 @@ def _preview(controller, state, rel_path, af_state):
     abs_path = sample_abs_path(controller, rel_path)
     sample_key = sample_key_for_path(controller.experiment_dir, abs_path)
     key = _gated_cache_key(controller, state, abs_path, af_state, sample_key)
-    cached = state.gated_data_cache.get(key)
+    cached = _gated_cache(state).get(key)
     if cached is not None:
         return len(cached), True, cached
     previews = getattr(state, 'count_preview_cache', None)
@@ -617,7 +745,8 @@ def load_sample_transformed_values(controller, state, rel_path, channels: list[s
     af_state: optional AF snapshot — see apply_unmixing_af_aware() docstring.
     """
     try:
-        gated = load_unmixed_gated(controller, state, sample_abs_path(controller, rel_path), af_state=af_state)
+        gated = load_unmixed_gated(controller, state, sample_abs_path(controller, rel_path),
+                                   af_state=af_state, channels=channels)
         return transform_channels(controller, state, gated, channels)
     except Exception as exc:
         log.exception("could not load transformed values for %s: %s", rel_path, exc)

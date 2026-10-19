@@ -1,6 +1,6 @@
 """
 drc_cluster_id.py — Cluster ID suggestions (MEM + cell-type scoring) for the
-DR/Clustering plugin
+Honeycluster plugin
 ================================================================================
 Companion module to ``dr_clustering_tab.py`` (filename intentionally does NOT
 end in ``_tab.py``, so it is not picked up as a separate plugin tab).
@@ -52,6 +52,7 @@ import pandas as pd
 
 import drc_pipeline
 import drc_run_align
+import drc_run_archive
 from drc_logging import get_logger, log_stage
 
 log = get_logger(__name__)
@@ -63,16 +64,16 @@ log = get_logger(__name__)
 # (not just means) since MEM needs medians and IQRs, not just a mean.
 # ---------------------------------------------------------------------------
 
-def _stored_raw_values(cl_run: dict, channels: list[str]) -> dict | None:
+def _stored_raw_values(cl_run: dict, stored: dict, channels: list[str]) -> dict | None:
     """
-    {rel_path: (labels, raw values for *channels*)} from the run's own
-    'marker_values' (the untransformed values of the selected channels,
-    stored row-for-row with the labels when the run was classified -- see
-    drc_clustering._snapshot_marker_values), or None when any training
-    sample with labels lacks them or any of *channels*.
+    {rel_path: (labels, raw values for *channels*)} from the run's stored
+    marker values (*stored*, drc_run_archive.run_marker_values: the
+    untransformed values of the selected channels taken when the run was
+    classified, a per-cluster sample or, for older runs, every event), or
+    None when any training sample with labels lacks them or any of
+    *channels*.
     """
     labels_dict = cl_run.get('labels', {}) or {}
-    stored = cl_run.get('marker_values', {}) or {}
     out = {}
     for rel in cl_run.get('training_sample_ids', []):
         labels = labels_dict.get(rel)
@@ -81,8 +82,10 @@ def _stored_raw_values(cl_run: dict, channels: list[str]) -> dict | None:
         entry = stored.get(rel)
         if entry is None:
             return None
-        values, names = entry
-        names = list(names)
+        values, names = entry[0], list(entry[1])
+        labels = np.asarray(labels)
+        if len(entry) == 3:
+            labels = labels[np.asarray(entry[2])]
         if any(ch not in names for ch in channels) or len(values) != len(labels):
             return None
         values = np.asarray(values)
@@ -149,7 +152,8 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
     data is simply absent from the inner dict (callers must use .get()).
     """
     training_samples = cl_run.get('training_sample_ids', [])
-    stored = _stored_raw_values(cl_run, channels)
+    stored = _stored_raw_values(
+        cl_run, drc_run_archive.run_marker_values(controller, cl_run), channels)
     log.info(
         "pool_cluster_marker_values: pooling %d channel(s) across %d training "
         "sample(s), transformed scale, from %s",

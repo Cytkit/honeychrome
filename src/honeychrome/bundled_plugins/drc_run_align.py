@@ -212,7 +212,7 @@ def labels_for_current_events(controller, state, run: dict, rel_path: str,
     if new_mask.any() and can_label_new_events(run):
         gated = drc_pipeline.load_unmixed_gated(
             controller, state, drc_pipeline.sample_abs_path(controller, rel_path),
-            af_state=af_state)
+            af_state=af_state, channels=run['channels'])
         features = transform_with_params(controller, gated[new_mask], run['channels'],
                                          run['transform_params'])
         if features is not None:

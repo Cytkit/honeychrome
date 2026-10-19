@@ -1,5 +1,5 @@
 """
-drc_run_archive.py — Per-run cache/archive for the DR/Clustering plugin
+drc_run_archive.py — Per-run cache/archive for the Honeycluster plugin
 ========================================================================
 Companion module to ``dr_clustering_tab.py`` (filename intentionally does
 NOT end in ``_tab.py``, so it is not picked up as a separate plugin tab).
@@ -14,9 +14,16 @@ Layout under the experiment folder:
                            archived DR / clustering run's metadata.
       runs/<run_id>/     — one directory per archived run, holding only
                            that run's heavy payload (embeddings for a DR
-                           run; per-sample label arrays, colours, names,
-                           marker snapshots for a clustering run; for
-                           either, the event keys of every row).
+                           run; per-sample label arrays, colours, names
+                           for a clustering run; for either, the event
+                           keys of every row).
+      runs/<run_id>.marker_values/
+                         — a clustering run's sampled marker values (at
+                           most drc_clustering.MARKER_SAMPLE_PER_CLUSTER
+                           events per cluster), read only by what plots or
+                           scores them (run_marker_values), never by
+                           hydrate_run.  Runs archived before this keep
+                           every event's values in runs/<run_id>/.
 
 Runs archived since event keys exist have 'event_keys': True in the
 manifest and an 'event_rows' payload ({sample: FCS-file row of each of the
@@ -41,6 +48,8 @@ import json
 import uuid
 from datetime import datetime
 from pathlib import Path
+
+import numpy as np
 
 import drc_persist
 from drc_logging import get_logger, log_stage
@@ -86,6 +95,11 @@ def current_state_path_for(experiment_dir: Path) -> Path:
 def run_payload_path(controller, run_id: str) -> Path:
     """Bundle directory holding one archived run's heavy payload."""
     return runs_dir(controller) / run_id
+
+
+def marker_values_path(controller, run_id: str) -> Path:
+    """Bundle directory holding a clustering run's sampled marker values."""
+    return runs_dir(controller) / f'{run_id}.marker_values'
 
 
 def purge_legacy_pickles(controller) -> tuple[int, int]:
@@ -248,33 +262,20 @@ def save_run_payload(controller, run_id: str, payload: dict) -> None:
     drc_persist.save_bundle(run_payload_path(controller, run_id), payload)
 
 
-# The full set of heavy per-run fields hydrate_run() restores from disk --
-# keep this in sync with hydrate_run()'s 'clustering' branch below.
-_CLUSTERING_RUN_PAYLOAD_FIELDS = (
-    'labels', 'colors', 'names', 'marker_values', 'dr_positions',
-    'mem_labels', 'cell_type_suggestions', 'tree_data', 'event_rows',
-)
-
-
-def update_run_payload(controller, cl_run: dict) -> None:
+def update_run_fields(controller, cl_run: dict, *fields: str) -> None:
     """
-    Re-persist a clustering run's full heavy payload from its CURRENT
-    in-memory state, preserving every field hydrate_run() restores --
-    not just whichever one the caller changed. save_run_payload() is a
-    full overwrite, not a merge, so building a payload with only one or
-    two changed fields (as rename_cluster/recolor_cluster used to)
-    silently drops the rest from disk (tree_data, marker_values,
-    mem_labels, cell_type_suggestions, dr_positions) --
-    invisible in the current session, since the in-memory dict is
-    untouched, but gone the next time this run is hydrated fresh from
-    the manifest (experiment reopen / app relaunch).
-
-    cl_run must already be fully hydrated -- true for any run reached
-    via _selected_cluster_run()/hydrate_run(), which every caller of
-    this goes through.
+    Persist only *fields* ('names', 'colors') of a clustering run from its
+    in-memory state, rewriting the bundle's data.json and nothing else
+    (drc_persist.update_bundle_fields), so renaming or recolouring costs
+    the same whatever the run's size. A run with no bundle on disk is left
+    as it is, with a log warning.
     """
-    payload = {field: cl_run.get(field) for field in _CLUSTERING_RUN_PAYLOAD_FIELDS}
-    save_run_payload(controller, cl_run['run_id'], payload)
+    path = run_payload_path(controller, cl_run['run_id'])
+    if not drc_persist.bundle_exists(path):
+        log.warning("run %s has no payload on disk; %s not saved",
+                    cl_run['run_id'], ', '.join(fields))
+        return
+    drc_persist.update_bundle_fields(path, {field: cl_run.get(field) for field in fields})
 
 
 def load_run_payload(controller, run_id: str) -> dict | None:
@@ -288,6 +289,29 @@ def load_run_payload(controller, run_id: str) -> dict | None:
 
 def delete_run_payload(controller, run_id: str) -> None:
     drc_persist.delete_bundle(run_payload_path(controller, run_id))
+    drc_persist.delete_bundle(marker_values_path(controller, run_id))
+
+
+def run_marker_values(controller, entry: dict) -> dict:
+    """
+    A hydrated clustering run's stored marker values, read from disk on
+    first use and kept on *entry*; {} when the run has none.
+
+    {sample_path: (values, channel_names, rows)}: a per-cluster sample, rows
+    indexing that sample's labels (runs/<run_id>.marker_values/), or, for a
+    run archived before sampling, {sample_path: (values, channel_names)}
+    row for row with the labels (loaded by hydrate_run).
+    """
+    if 'marker_values' not in entry:
+        try:
+            payload = drc_persist.load_bundle(
+                marker_values_path(controller, entry['run_id'])) or {}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            log.warning("could not load marker values of run %s (%s)",
+                        entry.get('run_id'), exc)
+            payload = {}
+        entry['marker_values'] = payload.get('marker_values') or {}
+    return entry['marker_values']
 
 
 # ---------------------------------------------------------------------------
@@ -350,12 +374,21 @@ def update_dr_run_embeddings(controller, state, run_id: str, embeddings: dict,
     DR run after 'Apply to All Samples' embeds additional samples under the
     same trained model.  Does NOT create a new manifest entry or run_id —
     it is still the same run, just covering more samples.
+
+    Only the samples the stored run does not have yet are written (a new
+    array part, drc_persist.update_bundle_fields add_only); samples already
+    stored keep their stored positions, as 'Apply to All Samples' never
+    re-embeds them.
     """
-    payload = load_run_payload(controller, run_id) or {}
-    payload['embeddings'] = embeddings
+    fields = {'embeddings': embeddings}
     if event_rows is not None:
-        payload['event_rows'] = event_rows
-    save_run_payload(controller, run_id, payload)
+        fields['event_rows'] = event_rows
+    path = run_payload_path(controller, run_id)
+    if drc_persist.bundle_exists(path):
+        added = drc_persist.update_bundle_fields(path, fields, add_only=True)
+        log.info("DR run %s: stored %d new sample(s)", run_id, len(added.get('embeddings', [])))
+    else:
+        save_run_payload(controller, run_id, {'event_rows': {}, **fields})
     for entry in state.dr_runs:
         if entry.get('run_id') == run_id:
             entry['embeddings'] = embeddings
@@ -382,16 +415,22 @@ def update_cluster_id_suggestions(controller, state, run_id: str,
         (score_cell_types's output) -- stored as a CSV table in the
         run's bundle.
 
+    Only data.json and this table are rewritten
+    (drc_persist.update_bundle_fields), not the labels or event rows.
+
     Does NOT create a new manifest entry or run_id, and does NOT touch
     manifest.json -- mem_labels/cell_type_df are small enough, and
     specific enough to THIS payload, that they don't need their own
     manifest fields (same reasoning as 'names'/'colors' living only in
     the payload, never in the lightweight JSON manifest).
     """
-    payload = load_run_payload(controller, run_id) or {}
-    payload['mem_labels'] = mem_labels
-    payload['cell_type_suggestions'] = cell_type_df
-    save_run_payload(controller, run_id, payload)
+    path = run_payload_path(controller, run_id)
+    if drc_persist.bundle_exists(path):
+        drc_persist.update_bundle_fields(path, {'mem_labels': mem_labels,
+                                                'cell_type_suggestions': cell_type_df})
+    else:
+        log.warning("run %s has no payload on disk; Cluster ID suggestions not saved",
+                    run_id)
     for entry in state.clustering_runs:
         if entry.get('run_id') == run_id:
             entry['mem_labels'] = mem_labels
@@ -399,11 +438,20 @@ def update_cluster_id_suggestions(controller, state, run_id: str,
             break
 
 
+def _compact_labels(labels) -> np.ndarray:
+    """Cluster labels as int16 when they all fit, else unchanged."""
+    arr = np.asarray(labels)
+    if arr.size == 0 or (arr.min() >= np.iinfo(np.int16).min
+                         and arr.max() <= np.iinfo(np.int16).max):
+        return arr.astype(np.int16, copy=False)
+    return arr
+
+
 def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
                             colors, names, n_clusters, gates,
                             training_sample_ids, channels, params,
                             n_events, label=None,
-                            marker_values=None, dr_positions=None,
+                            marker_values=None,
                             tree_data=None, sync_fingerprint=None,
                             event_rows=None, split_fingerprints=None,
                             transform_params=None) -> dict:
@@ -412,17 +460,16 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
     archive_dr_run(), with 'labels' (per-sample label arrays), 'colors' and
     'names' as the heavy payload and n_clusters recorded in the manifest.
 
-    marker_values: optional {sample_path: (raw_values, channel_names)},
-        snapshotted at classification time (see drc_clustering.py's
-        _snapshot_marker_values) -- guaranteed row-for-row aligned to
-        cluster_labels regardless of any gate/channel edits made later.
-        Lets Cluster Annotation's violin plots read directly from this
-        instead of re-deriving alignment from live (re-gate-able) data.
-    dr_positions: optional {sample_path: np.ndarray}, the exact DR-embedding
-        rows a DR-space run assigned labels against -- only present when
-        the run was clustered in DR-embedding space. Lets the cluster map
-        plot correct positions even if state.embeddings for that algorithm
-        have since been overwritten by a later DR run.
+    marker_values: optional {sample_path: (raw_values, channel_names,
+        rows)}, a per-cluster sample taken at classification time (see
+        drc_clustering.py's _snapshot_marker_values); rows index that
+        sample's labels. Written to its own bundle (marker_values_path),
+        so hydrating the run does not read it; Cluster Annotation's violins
+        and Cluster ID read it through run_marker_values().
+    A DR-space run's positions are not stored: they are its source DR
+    run's embeddings (params['_dr_run_id']). Runs archived before this
+    carry them as 'dr_positions'.
+    cluster_labels are stored as int16 when every label fits.
     tree_data: optional {'node_weights': ndarray, 'node_to_meta': ndarray,
         'node_counts': ndarray} (FlowSOM additionally carries 'xdim'/
         'ydim') -- any clustering algorithm now: FlowSOM's SOM codebook,
@@ -444,19 +491,21 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
     run_id = _new_run_id()
     timestamp = datetime.now().isoformat(timespec='seconds')
     run_label = label or make_run_label('clustering', algorithm, gates)
+    cluster_labels = {rel: _compact_labels(lab) for rel, lab in cluster_labels.items()}
 
     save_run_payload(controller, run_id, {
         'labels': cluster_labels,
         'colors': colors,
         'names': names,
-        'marker_values': marker_values or {},
-        'dr_positions': dr_positions or {},
         # not computed yet at archive time
         'mem_labels': {},
         'cell_type_suggestions': None,
         'tree_data': tree_data,
         'event_rows': event_rows or {},
     })
+    if marker_values:
+        drc_persist.save_bundle(marker_values_path(controller, run_id),
+                                {'marker_values': marker_values})
 
     entry = _manifest_entry(
         run_id, 'clustering', run_label, algorithm, gates, training_sample_ids,
@@ -473,7 +522,6 @@ def archive_clustering_run(controller, state, *, algorithm, cluster_labels,
     full_entry['colors'] = colors
     full_entry['names'] = names
     full_entry['marker_values'] = marker_values or {}
-    full_entry['dr_positions'] = dr_positions or {}
     full_entry['mem_labels'] = {}
     full_entry['cell_type_suggestions'] = None
     full_entry['tree_data'] = tree_data
@@ -569,7 +617,8 @@ def hydrate_run(controller, entry: dict) -> dict:
         entry['labels'] = payload.get('labels', {})
         entry['colors'] = payload.get('colors', {})
         entry['names'] = payload.get('names', {})
-        entry['marker_values'] = payload.get('marker_values', {})
+        if 'marker_values' in payload:
+            entry['marker_values'] = payload['marker_values']
         entry['dr_positions'] = payload.get('dr_positions', {})
         entry['mem_labels'] = payload.get('mem_labels', {})
         entry['cell_type_suggestions'] = payload.get('cell_type_suggestions')

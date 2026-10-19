@@ -1,5 +1,5 @@
 """
-drc_persist.py — Pickle-free storage for the DR/Clustering plugin
+drc_persist.py — Pickle-free storage for the Honeycluster plugin
 =================================================================
 Companion module to ``dr_clustering_tab.py`` (filename intentionally does
 NOT end in ``_tab.py``, so it is not picked up as a separate plugin tab).
@@ -13,6 +13,8 @@ Stores one payload dict as a *bundle* directory:
         arrays.npz     every numpy array, under positional keys (a0, a1, …),
                        so no sample path (which contains '/') is ever used
                        as an archive member name
+        arrays_<n>.npz arrays added later by update_bundle_fields(), under
+                       keys p<n>_a0, p<n>_a1, …
         tables/*.csv   one CSV per pandas DataFrame; its index, column
                        labels and dtypes are recorded in data.json so it
                        reads back exactly
@@ -30,12 +32,21 @@ and data.json uses a few tagged objects for what JSON lacks:
 
 A bundle is written to a sibling ``<name>.tmp`` directory and swapped into
 place, so an interrupted save leaves the previous bundle readable.
+
+update_bundle_fields() replaces top-level fields (cluster names, colours,
+MEM labels, a suggestions table), or adds items to top-level dicts (new
+samples' embeddings), without reading or rewriting what is already stored:
+new arrays go to a new arrays_<n>.npz and new tables to new CSVs,
+data.json is swapped atomically, then files no longer referenced are
+removed. Its cost is the size of data.json and of what changed, not the
+size of the bundle.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 from pathlib import Path
@@ -52,6 +63,7 @@ FORMAT_VERSION = 1
 
 _DATA_FILE = 'data.json'
 _ARRAYS_FILE = 'arrays.npz'
+_ARRAY_PART_GLOB = 'arrays_*.npz'
 _TABLES_DIR = 'tables'
 
 
@@ -124,10 +136,10 @@ def load_bundle(directory: Path) -> dict | None:
         raise ValueError(f"unrecognised bundle format in {data_path}: "
                          f"{doc.get('format')!r} v{doc.get('version')!r}")
     arrays: dict[str, np.ndarray] = {}
-    npz_path = directory / _ARRAYS_FILE
-    if npz_path.exists():
-        with np.load(npz_path, allow_pickle=False) as npz:
-            arrays = {name: npz[name] for name in npz.files}
+    for npz_path in (directory / _ARRAYS_FILE, *sorted(directory.glob(_ARRAY_PART_GLOB))):
+        if npz_path.exists():
+            with np.load(npz_path, allow_pickle=False) as npz:
+                arrays.update({name: npz[name] for name in npz.files})
     return _Decoder(directory, arrays).decode(doc['payload'])
 
 
@@ -136,6 +148,83 @@ def bundle_exists(directory: Path) -> bool:
     directory = Path(directory)
     return ((directory / _DATA_FILE).exists()
             or (_sibling(directory, '.tmp') / _DATA_FILE).exists())
+
+
+def update_bundle_fields(directory: Path, fields: dict, add_only: bool = False) -> dict:
+    """
+    Replace (or add) top-level *fields* of an existing bundle without
+    reading or rewriting what it already stores.
+
+    add_only: each value is a dict whose items are added to the stored dict
+        of that name, skipping keys it already has (the stored items are
+        neither read nor changed); without it each value replaces the field.
+
+    New arrays go to a new arrays_<n>.npz and new DataFrames to new CSVs
+    under tables/. data.json is replaced with os.replace, so a reader sees
+    the old or the new bundle, never a mix; array parts and tables no longer
+    referenced are then removed. A missing bundle raises FileNotFoundError
+    before anything is written.
+
+    Returns {field: [keys added]} for add_only, else {}.
+    """
+    directory = Path(directory)
+    _recover(directory)
+    data_path = directory / _DATA_FILE
+    with open(data_path, 'r', encoding='utf-8') as f:
+        doc = json.load(f)
+    if doc.get('format') != FORMAT_NAME or doc.get('version') != FORMAT_VERSION:
+        raise ValueError(f"unrecognised bundle format in {data_path}: "
+                         f"{doc.get('format')!r} v{doc.get('version')!r}")
+    payload = doc['payload']
+    part = 1
+    while (directory / f'arrays_{part}.npz').exists():
+        part += 1
+    tables_dir = directory / _TABLES_DIR
+    enc = _Encoder(prefix=f'p{part}_a')
+    if tables_dir.is_dir():
+        enc.reserved = {p.stem for p in tables_dir.glob('*.csv')}
+    added: dict[str, list] = {}
+    encoded = {}
+    for key, value in fields.items():
+        if not isinstance(key, str):
+            raise TypeError(f"top-level payload keys must be str, got {key!r}")
+        if not add_only:
+            encoded[key] = enc.encode(value, key)
+            continue
+        stored = payload.get(key)
+        stored = stored if isinstance(stored, dict) else {}
+        if not all(isinstance(k, str) and not k.startswith('__') for k in value) or \
+                any(k.startswith('__') for k in stored):
+            raise TypeError(f"update_bundle_fields: add_only needs str-keyed dicts ({key!r})")
+        new = {k: v for k, v in value.items() if k not in stored}
+        added[key] = list(new)
+        encoded[key] = {**stored, **{k: enc.encode(v, k) for k, v in new.items()}}
+    if enc.arrays:
+        tmp_npz = directory / f'arrays_{part}.npz.tmp'
+        with open(tmp_npz, 'wb') as f:
+            np.savez(f, **enc.arrays)
+        os.replace(tmp_npz, directory / f'arrays_{part}.npz')
+    if enc.tables:
+        tables_dir.mkdir(exist_ok=True)
+        for stem, df in enc.tables:
+            _write_csv(df, tables_dir / f'{stem}.csv')
+    payload.update(encoded)
+    tmp_path = directory / (_DATA_FILE + '.tmp')
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(doc, f, indent=1, allow_nan=False, ensure_ascii=False)
+    os.replace(tmp_path, data_path)
+    tables, array_keys = set(), set()
+    for tag, ref in _references(payload):
+        (tables if tag == '__dataframe__' else array_keys).add(ref)
+    if tables_dir.is_dir():
+        for path in tables_dir.glob('*.csv'):
+            if f'{_TABLES_DIR}/{path.name}' not in tables:
+                path.unlink()
+    for path in directory.glob(_ARRAY_PART_GLOB):
+        prefix = 'p' + path.stem.split('_', 1)[1] + '_a'
+        if not any(k.startswith(prefix) for k in array_keys):
+            path.unlink()
+    return added
 
 
 def delete_bundle(directory: Path) -> None:
@@ -188,9 +277,12 @@ def _table_stem(name: str) -> str:
 class _Encoder:
     """Turns a payload into a JSON tree, collecting arrays and tables."""
 
-    def __init__(self):
+    def __init__(self, prefix: str = 'a'):
+        self.prefix = prefix
         self.arrays: dict[str, np.ndarray] = {}
         self.tables: list[tuple[str, pd.DataFrame]] = []
+        # Table stems already on disk (update_bundle_fields)
+        self.reserved: set[str] = set()
 
     def mark(self) -> tuple[int, int]:
         return len(self.arrays), len(self.tables)
@@ -230,7 +322,7 @@ class _Encoder:
                     'shape': list(obj.shape),
                     'values': [self.encode(v, name) for v in obj.ravel().tolist()],
                 }}
-            key = f'a{len(self.arrays)}'
+            key = f'{self.prefix}{len(self.arrays)}'
             self.arrays[key] = obj
             return {'__ndarray__': key}
         if isinstance(obj, pd.DataFrame):
@@ -247,7 +339,7 @@ class _Encoder:
         raise TypeError(f"cannot store a {type(obj).__module__}.{type(obj).__qualname__}")
 
     def _table(self, df: pd.DataFrame, name: str) -> dict:
-        used = {stem for stem, _ in self.tables}
+        used = {stem for stem, _ in self.tables} | self.reserved
         base = _table_stem(name)
         stem, n = base, 2
         while stem in used:
@@ -289,6 +381,22 @@ class _Encoder:
         else:
             spec['values'] = [self.encode(v, 'value') for v in col.tolist()]
         return spec
+
+
+def _references(tree):
+    """('__dataframe__', table file) and ('__ndarray__', array key) for every
+    table and array a data.json payload tree references."""
+    if isinstance(tree, list):
+        for value in tree:
+            yield from _references(value)
+    elif isinstance(tree, dict):
+        if len(tree) == 1 and '__dataframe__' in tree:
+            yield '__dataframe__', tree['__dataframe__']['file']
+        elif len(tree) == 1 and '__ndarray__' in tree:
+            yield '__ndarray__', tree['__ndarray__']
+        else:
+            for value in tree.values():
+                yield from _references(value)
 
 
 def _write_csv(df: pd.DataFrame, path: Path) -> None:

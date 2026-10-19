@@ -1,5 +1,5 @@
 """
-drc_clustering.py — Clustering for the DR/Clustering plugin
+drc_clustering.py — Clustering for the Honeycluster plugin
 ===========================================================
 Companion to ``dr_clustering_tab.py`` (filename intentionally NOT ``*_tab.py``).
 
@@ -42,6 +42,7 @@ question, controlled by two independent UI toggles collected into
 from __future__ import annotations
 
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +52,10 @@ import flowsom_consensus
 from drc_logging import get_logger, log_stage, log_array
 
 log = get_logger(__name__)
+
+# Marker values kept per cluster (all samples) for violins and Cluster ID
+MARKER_SAMPLE_PER_CLUSTER = 5000
+MARKER_SAMPLE_SEED = 42
 
 
 def clusters_in_dr_space(algo: str, params: dict) -> bool:
@@ -108,27 +113,86 @@ def assign_cluster_colors(state, labels: np.ndarray) -> None:
              len(state.cluster_colors), unique[:20])
 
 
+def _in_order(state, order: list[str]) -> None:
+    """Put the per-sample results in *order* (samples are processed with the
+    cached ones first, drc_pipeline.cached_first)."""
+    for name in ('cluster_labels', 'cluster_rows', 'cluster_marker_values',
+                 'cluster_marker_keys'):
+        results = getattr(state, name)
+        setattr(state, name, {**{rel: results[rel] for rel in order if rel in results},
+                              **results})
+
+
+def _bottom_k(labels: np.ndarray, keys: np.ndarray, k: int) -> np.ndarray:
+    """Rows holding the k smallest *keys* of each label >= 0, ascending (int32)."""
+    labels = np.asarray(labels)
+    order = np.lexsort((keys, labels))
+    sorted_labels = labels[order]
+    starts = np.flatnonzero(np.r_[True, sorted_labels[1:] != sorted_labels[:-1]])
+    group_start = np.repeat(starts, np.diff(np.r_[starts, len(order)]))
+    keep = (np.arange(len(order)) - group_start < k) & (sorted_labels >= 0)
+    return np.sort(order[keep]).astype(np.int32)
+
+
+def _prune_marker_sample(state, final: bool = False) -> None:
+    """
+    Keep each cluster's MARKER_SAMPLE_PER_CLUSTER smallest keys over every
+    sample snapshotted so far. Runs once the excess reaches the number
+    kept, so memory and cost stay proportional to clusters x cap; *final*
+    prunes whatever the excess.
+    """
+    rels = list(state.cluster_marker_values)
+    if not rels:
+        return
+    sampled_labels = [np.asarray(state.cluster_labels[rel])[state.cluster_marker_values[rel][2]]
+                      for rel in rels]
+    all_labels = np.concatenate(sampled_labels)
+    counts = np.bincount(all_labels) if len(all_labels) else np.zeros(0, dtype=np.int64)
+    excess = int(np.clip(counts - MARKER_SAMPLE_PER_CLUSTER, 0, None).sum())
+    if excess == 0 or (not final and excess < len(all_labels) - excess):
+        return
+    keys = np.concatenate([state.cluster_marker_keys[rel] for rel in rels])
+    keep = np.zeros(len(all_labels), dtype=bool)
+    keep[_bottom_k(all_labels, keys, MARKER_SAMPLE_PER_CLUSTER)] = True
+    start = 0
+    for rel, labels in zip(rels, sampled_labels):
+        mask = keep[start:start + len(labels)]
+        start += len(labels)
+        if mask.all():
+            continue
+        values, names, rows = state.cluster_marker_values[rel]
+        state.cluster_marker_values[rel] = (values[mask], names, rows[mask])
+        state.cluster_marker_keys[rel] = state.cluster_marker_keys[rel][mask]
+
+
 def _snapshot_marker_values(controller, state, rel_path: str, labels: np.ndarray,
                             af_state=None) -> None:
     """
-    Load UNTRANSFORMED marker values for *rel_path* right now -- the same
-    instant *labels* was computed -- and cache them in
-    state.cluster_marker_values, guaranteed row-for-row aligned to *labels*
-    since nothing about gates/channels can have changed in between. Cached
-    for archiving into the clustering run (see archive_clustering_run's
-    marker_values payload); skipped (with a log warning) if lengths still
-    don't match, which should only happen if two loads of the exact same
-    sample somehow disagree.
+    Sample one sample's untransformed selected-channel values for the
+    run's violins and Cluster ID, at the instant *labels* is computed, from
+    the same gated events (drc_pipeline's cache, so nothing is unmixed
+    again): state.cluster_marker_values[rel_path] = (values, channel_names,
+    rows), rows indexing *labels*.
+
+    Each event gets a seeded random key and each cluster keeps its
+    MARKER_SAMPLE_PER_CLUSTER smallest keys over all samples (bottom-k,
+    pruned as samples arrive), a uniform random sample without replacement
+    that is reproducible for the same samples. Noise (label < 0) is not
+    sampled. Skipped, with a log warning, if the gated events are not the
+    labelled ones.
     """
-    mv = drc_pipeline.load_sample_marker_values(controller, state, rel_path, af_state=af_state)
-    if mv is None:
+    try:
+        gated = drc_pipeline.load_unmixed_gated(
+            controller, state, drc_pipeline.sample_abs_path(controller, rel_path),
+            af_state=af_state)
+    except Exception as exc:
+        log.exception("_snapshot_marker_values: could not load %s: %s", rel_path, exc)
         return
-    values, names = mv
-    if len(values) != len(labels):
+    if len(gated) != len(labels):
         log.warning(
             "_snapshot_marker_values: %s -- marker values (%d) vs labels (%d) "
             "length mismatch even at classification time -- skipping snapshot.",
-            rel_path, len(values), len(labels),
+            rel_path, len(gated), len(labels),
         )
         return
     label_rows = (getattr(state, 'cluster_rows', {}) or {}).get(rel_path)
@@ -139,7 +203,13 @@ def _snapshot_marker_values(controller, state, rel_path: str, labels: np.ndarray
             log.warning("_snapshot_marker_values: %s -- the labelled events are not the "
                         "events gated now -- skipping snapshot.", rel_path)
             return
-    state.cluster_marker_values[rel_path] = (values, names)
+    rng = np.random.default_rng([MARKER_SAMPLE_SEED, zlib.crc32(rel_path.encode('utf-8'))])
+    keys = rng.random(len(labels))
+    rows = _bottom_k(labels, keys, MARKER_SAMPLE_PER_CLUSTER)
+    values, names = drc_pipeline.select_untransformed_channels(controller, state, gated[rows])
+    state.cluster_marker_values[rel_path] = (values, names, rows)
+    state.cluster_marker_keys[rel_path] = keys[rows]
+    _prune_marker_sample(state)
 
 
 # ---------------------------------------------------------------------------
@@ -242,8 +312,6 @@ def _assign_one_sample_approximate(controller, state, rel_path, predict_fn,
         state.cluster_rows[rel_path] = _sample_rows(controller, state, rel_path, dr_space,
                                                     af_state)
         _snapshot_marker_values(controller, state, rel_path, labels, af_state=af_state)
-        if dr_space:
-            state.cluster_dr_positions[rel_path] = np.asarray(sample_data)
     except Exception as e:
         _progress(progress, f"  Assignment failed for {rel_path}: {e}")
 
@@ -269,20 +337,20 @@ def _assign_by_slicing_or_predict(controller, state, pooled_data, boundaries, fi
     """
     state.cluster_labels = {}
     state.cluster_marker_values = {}
-    state.cluster_dr_positions = {}
+    state.cluster_marker_keys = {}
     state.cluster_rows = {}
 
-    trained_rel_paths = set()
-    for rel_path, start, end, was_downsampled in boundaries:
-        trained_rel_paths.add(rel_path)
+    order = [b[0] for b in boundaries]
+    by_rel = {b[0]: b for b in boundaries}
+    trained_rel_paths = set(order)
+    for rel in drc_pipeline.cached_first(controller, state, order, af_state):
+        rel_path, start, end, was_downsampled = by_rel[rel]
         if not was_downsampled:
             labels = fit_labels[start:end].astype(np.int32)
             state.cluster_labels[rel_path] = labels
             state.cluster_rows[rel_path] = _sample_rows(controller, state, rel_path,
                                                         dr_space, af_state)
             _snapshot_marker_values(controller, state, rel_path, labels, af_state=af_state)
-            if dr_space:
-                state.cluster_dr_positions[rel_path] = np.asarray(pooled_data[start:end])
             _progress(progress, f"  {rel_path}: {len(labels):,} events labelled directly "
                                 f"from the fit (no prediction needed)")
         else:
@@ -291,9 +359,15 @@ def _assign_by_slicing_or_predict(controller, state, pooled_data, boundaries, fi
 
     if assign_all:
         assignable = _assignable_sample_paths(controller, state, assign_all=True)
-        for rel_path in sorted(assignable - trained_rel_paths):
+        extra = sorted(assignable - trained_rel_paths)
+        order += extra
+        for rel_path in drc_pipeline.cached_first(controller, state, extra, af_state):
             _assign_one_sample_approximate(controller, state, rel_path, predict_fn,
                                            dr_space, progress, af_state)
+
+    _in_order(state, order)
+    _prune_marker_sample(state, final=True)
+    state.cluster_marker_keys = {}
 
     all_labels = (np.concatenate(list(state.cluster_labels.values()))
                   if state.cluster_labels else np.asarray(fit_labels, dtype=np.int32))
@@ -356,17 +430,17 @@ def run_flowsom(controller, state, params: dict, progress=None, af_state=None):
     Trains on every gated event from every training sample by
     default (params['_event_cap'] is None unless "Downsample training
     data" is checked). Unlike Leiden/HDBSCAN, a SOM never outputs
-    per-event labels directly -- mapping every event onto the trained
-    grid (assign_to_nodes, in flowsom_assign_all) is its native,
-    always-required mechanism, so there's no exact-slice shortcut to
-    take here even when nothing was downsampled.
+    per-event labels directly -- every event is mapped onto the trained
+    grid (assign_to_nodes, in flowsom_assign_all); a training sample that
+    was not downsampled is mapped from its rows of the training pool, so
+    it is not loaded and transformed a second time.
 
     af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()
         docstring. Must be passed when called from a background worker thread.
     """
     log_stage(log, "FLOWSOM")
     event_cap = params.get('_event_cap')
-    data, _boundaries = _pool_training_data_with_boundaries(
+    data, boundaries = _pool_training_data_with_boundaries(
         controller, state, event_cap, af_state=af_state)
     if data is None:
         raise RuntimeError(
@@ -402,7 +476,7 @@ def run_flowsom(controller, state, params: dict, progress=None, af_state=None):
     node_event_counts = flowsom_assign_all(
         controller, state, node_weights, node_to_meta,
         assign_all=params.get('_assign_all_samples', False),
-        progress=progress, af_state=af_state)
+        progress=progress, af_state=af_state, pool=(data, boundaries))
     state.n_clusters = k
     state.active_clustering_algorithm = 'FlowSOM'
     state.trained_reducers['FlowSOM'] = {
@@ -416,7 +490,7 @@ def run_flowsom(controller, state, params: dict, progress=None, af_state=None):
 
 def flowsom_assign_all(controller, state, node_weights, node_to_meta,
                        assign_all: bool = False, progress=None,
-                       af_state=None) -> np.ndarray:
+                       af_state=None, pool=None) -> np.ndarray:
     """Map each sample's events to SOM nodes, then to metaclusters.
 
     Returns node_counts: np.ndarray shape (n_nodes,) — total event count
@@ -428,23 +502,36 @@ def flowsom_assign_all(controller, state, node_weights, node_to_meta,
         every other non-control sample.
     af_state: optional AF snapshot — see drc_pipeline.apply_unmixing_af_aware()
         docstring. Must be passed when called from a background worker thread.
+    pool: optional (data, boundaries) from _pool_training_data_with_boundaries;
+        a sample in it that was not downsampled is mapped from its pool rows
+        (the same transformed float32 values load_sample_features returns).
     """
     assignable = _assignable_sample_paths(controller, state, assign_all)
+    pool_data, pool_bounds = pool if pool is not None else (None, [])
+    from_pool = {rel: (start, end) for rel, start, end, down in pool_bounds if not down}
     raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
     all_samples = list(controller.experiment.samples.get('all_samples', {}).keys())
 
     state.cluster_labels = {}
     state.cluster_marker_values = {}
+    state.cluster_marker_keys = {}
     state.cluster_rows = {}
     node_counts = np.zeros(len(node_weights), dtype=np.int64)
+    order = []
     for sample_key in all_samples:
         try:
             rel_path = str(Path(sample_key).relative_to(raw_subdir))
         except ValueError:
             rel_path = sample_key
-        if rel_path not in assignable:
-            continue
-        sample_data = drc_pipeline.load_sample_features(controller, state, rel_path, af_state=af_state)
+        if rel_path in assignable:
+            order.append(rel_path)
+    for rel_path in drc_pipeline.cached_first(controller, state, order, af_state):
+        if rel_path in from_pool:
+            start, end = from_pool[rel_path]
+            sample_data = pool_data[start:end]
+        else:
+            sample_data = drc_pipeline.load_sample_features(controller, state, rel_path,
+                                                            af_state=af_state)
         if sample_data is None:
             continue
         try:
@@ -461,6 +548,10 @@ def flowsom_assign_all(controller, state, node_weights, node_to_meta,
                                 f"({len(np.unique(labels))} metaclusters)")
         except Exception as e:
             _progress(progress, f"  FlowSOM assignment failed for {rel_path}: {e}")
+
+    _in_order(state, order)
+    _prune_marker_sample(state, final=True)
+    state.cluster_marker_keys = {}
 
     if state.cluster_labels:
         all_labels = np.concatenate(list(state.cluster_labels.values()))
@@ -794,7 +885,7 @@ class StagedResult:
         self._state = state
         self.cluster_labels = dict(state.cluster_labels)
         self.cluster_marker_values = dict(state.cluster_marker_values)
-        self.cluster_dr_positions = dict(state.cluster_dr_positions)
+        self.cluster_marker_keys = {}
         self.cluster_rows = dict(getattr(state, 'cluster_rows', {}) or {})
         self.cluster_colors = dict(state.cluster_colors)
         self.n_clusters = state.n_clusters
@@ -843,7 +934,6 @@ def commit_clustering_result(state, staged: StagedResult, algo: str) -> None:
     """Publish a finished run's results to the plugin state (main thread)."""
     state.cluster_labels = staged.cluster_labels
     state.cluster_marker_values = staged.cluster_marker_values
-    state.cluster_dr_positions = staged.cluster_dr_positions
     state.cluster_rows = staged.cluster_rows
     state.cluster_colors = staged.cluster_colors
     state.n_clusters = staged.n_clusters
