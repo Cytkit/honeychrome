@@ -1217,7 +1217,7 @@ def _filter_contaminant_events(
 def get_af_spectra(
     unstained_raw: np.ndarray,
     fluor_spectra: np.ndarray,
-    som_dim: int = 15,
+    som_dim: int = 10,
     min_cells: int = 100,
     random_state: int = 42,
     deduplicate: bool = True,

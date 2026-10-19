@@ -10,7 +10,8 @@ Sections
 1  Extract AF profile from an unstained sample (SOM, KMeans fallback).
 2  Manage stored AF profiles (spectral plot, CSV load/save/delete).
 3  Assign AF profiles to samples (grid: rows=samples, columns=profiles; unstained
-   and single-stained controls optionally included).
+   and single-stained controls optionally included), to all samples, to the
+   samples of a folder, or automatically from scatter (af_auto_assign).
 4  Side-by-side OLS vs AF-corrected biplot comparison, using the same
    density-heatmap rendering, logicle transforms, and axis-drag zoom as the
    Unmixed Data tab.
@@ -23,11 +24,13 @@ from pathlib import Path
 import numpy as np
 import colorcet as cc
 from PySide6.QtCore import Qt, QThread, Signal, QObject, QRectF, QSettings, QTimer, QEvent
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
     QPushButton, QSpinBox, QComboBox, QGroupBox,
     QFormLayout, QSizePolicy, QFileDialog, QListWidget, QListWidgetItem,
-    QAbstractItemView, QSplitter, QCheckBox, QGridLayout,
+    QAbstractItemView, QSplitter, QCheckBox, QHeaderView,
+    QTableWidget, QTableWidgetItem,
 )
 import pyqtgraph as pg
 import warnings
@@ -55,7 +58,12 @@ from honeychrome.controller_components.spread_model import (
 )
 from honeychrome.controller_components.transform import Transform
 from honeychrome.controller_components.sample_loader import resolve_af_for_profiles
-from honeychrome.controller_components.particle_type import is_bead_sample
+from honeychrome.controller_components.particle_type import (
+    is_bead_sample, scatter_channel_pair, scatter_ceilings,
+)
+from honeychrome.controller_components.af_auto_assign import (
+    POOR_FIT_SHARE, folder_groups, reference_sources, suggest_af_profiles,
+)
 from honeychrome.view_components.cytometry_plot_components import (
     InteractiveLabel,
     NoPanViewBox,
@@ -76,6 +84,16 @@ from honeychrome.view_components.help_texts import autospectral_af_help_text
 logger = logging.getLogger(__name__)
 
 TAB_NAME = 'AutoSpectral AF'
+
+# Assignment table column widths (pixels): defaults fit the text up to the
+# caps; the user can drag any divider down to the minimum.
+ASSIGN_MIN_COL_WIDTH = 40
+ASSIGN_MAX_NAME_WIDTH = 320
+ASSIGN_MAX_PROFILE_WIDTH = 200
+ASSIGN_COL_PADDING = 24
+ASSIGN_MIN_HEIGHT = 240
+ASSIGN_MAX_HEIGHT = 900
+AF_PROFILE_SUFFIX = ' AutoSpectral AF'
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +142,30 @@ class AfTrainingWorker(QObject):
                                 'envelope_sample': sample, 'spread': spread})
         except Exception as e:
             self.error.emit(str(e))
+
+
+class AfAutoAssignWorker(QObject):
+    """Runs af_auto_assign.suggest_af_profiles in a QThread; emits its result."""
+    finished = Signal(object)
+    error = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, experiment_dir, references, targets, pair, ceilings):
+        super().__init__()
+        self.experiment_dir = experiment_dir
+        self.references = references
+        self.targets = targets
+        self.pair = pair
+        self.ceilings = ceilings
+
+    def run(self):
+        try:
+            result = suggest_af_profiles(self.experiment_dir, self.references, self.targets,
+                                         self.pair, self.ceilings, progress=self.progress.emit)
+            self.finished.emit(result)
+        except Exception as e:
+            logger.exception('AutoSpectral: auto-assign failed')
+            self.error.emit(str(e) or type(e).__name__)
 
 
 class ComparisonWorker(QObject):
@@ -767,6 +809,9 @@ class AutoSpectralTab(QWidget):
 
         self._train_thread = None
         self._train_worker = None
+        self._auto_thread = None
+        self._auto_worker = None
+        self._auto_running = False
         self._cmp_thread = None
         self._cmp_worker = None
         self._cmp_running = False
@@ -877,7 +922,7 @@ class AutoSpectralTab(QWidget):
 
         self._som_dim_spin = QSpinBox()
         self._som_dim_spin.setRange(2, 30)
-        self._som_dim_spin.setValue(15)
+        self._som_dim_spin.setValue(10)
         self._som_dim_spin.setToolTip(
             'Side length of the square SOM grid (som.dim in R AutoSpectral); '
             'the grid has som.dim² nodes. KMeans with the same number of '
@@ -952,7 +997,9 @@ class AutoSpectralTab(QWidget):
             'Multiple profiles are concatenated before unmixing. '
             'Unticked samples use standard OLS unmixing. '
             'Unstained controls are listed first and are assigned the AF '
-            'profile extracted from their own data by default.'
+            'profile extracted from their own data by default. '
+            'Auto-assign gives each unassigned sample the profiles of the unstained '
+            'controls whose forward and side scatter it most resembles.'
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -977,46 +1024,75 @@ class AutoSpectralTab(QWidget):
         self._include_unstained_cb.toggled.connect(self._on_assignment_filter_changed)
         self._include_ssc_cb.toggled.connect(self._on_assignment_filter_changed)
 
-        # Frozen header row (profile names) — does not scroll vertically.
-        # Its own horizontal scrollbar is hidden and driven by the body's.
-        self._assign_header_scroll = QScrollArea()
-        self._assign_header_scroll.setWidgetResizable(True)
-        self._assign_header_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._assign_header_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._assign_header_scroll.setFrameShape(QScrollArea.NoFrame)
-        self._assign_header_widget = QWidget()
-        self._assign_header_layout = QGridLayout(self._assign_header_widget)
-        self._assign_header_layout.setSpacing(6)
-        self._assign_header_layout.setContentsMargins(0, 0, 0, 0)
-        self._assign_header_layout.setAlignment(Qt.AlignLeft)
-        self._assign_header_scroll.setWidget(self._assign_header_widget)
-        layout.addWidget(self._assign_header_scroll)
-
-        # Scrollable grid: rows = samples, columns = AF profiles
-        # Min/max here are just the pre-populate defaults; _rebuild_assignment_grid()
-        # re-sizes this to fit the actual sample count each time it's called.
-        self._assign_scroll = QScrollArea()
-        self._assign_scroll.setWidgetResizable(True)
-        self._assign_scroll.setMinimumHeight(240)
-        self._assign_scroll.setMaximumHeight(900)
-        self._assign_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._assign_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._assign_grid_widget = QWidget()
-        self._assign_grid_layout = QGridLayout(self._assign_grid_widget)
-        self._assign_grid_layout.setSpacing(6)
-        self._assign_grid_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self._assign_scroll.setWidget(self._assign_grid_widget)
-        layout.addWidget(self._assign_scroll)
-
-        # Keep header columns aligned with body columns when scrolling sideways.
-        self._assign_scroll.horizontalScrollBar().valueChanged.connect(
-            self._assign_header_scroll.horizontalScrollBar().setValue
+        # Rows = samples; column 0 = sample name, then one tick-box column per
+        # profile. One header, so labels stay over their columns; dividers
+        # are draggable and names elide in the middle when a column is narrow.
+        self._assign_table = QTableWidget()
+        self._assign_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._assign_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._assign_table.setFocusPolicy(Qt.NoFocus)
+        self._assign_table.setWordWrap(False)
+        self._assign_table.setTextElideMode(Qt.ElideMiddle)
+        self._assign_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._assign_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        rows = self._assign_table.verticalHeader()
+        rows.setVisible(False)
+        rows.setSectionResizeMode(QHeaderView.Fixed)
+        rows.setDefaultSectionSize(
+            max(QCheckBox().sizeHint().height(), self._assign_table.fontMetrics().height()) + 6
         )
+        header = self._assign_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setTextElideMode(Qt.ElideMiddle)
+        header.setMinimumSectionSize(ASSIGN_MIN_COL_WIDTH)
+        header.setStretchLastSection(False)
+        header.setSectionsMovable(False)
+        header.sectionResized.connect(self._on_assign_column_resized)
+        layout.addWidget(self._assign_table)
+
+        self._assign_empty_label = QLabel('No profiles or samples available yet.')
+        self._assign_empty_label.setVisible(False)
+        layout.addWidget(self._assign_empty_label)
+
+        # Widths the user dragged, by column key ('' = sample column, else
+        # profile name), kept across rebuilds for the session.
+        self._assign_col_widths: dict = {}
+        self._assign_col_keys: list = []
+        self._assign_rebuilding = False
 
         self._assign_checkboxes: dict = {}
 
         self._assign_status = QLabel('')
         layout.addWidget(self._assign_status)
+
+        group_row = QHBoxLayout()
+        group_row.addWidget(QLabel('Folder:'))
+        self._folder_combo = QComboBox()
+        self._folder_combo.setMinimumWidth(220)
+        self._folder_combo.setToolTip(
+            'Samples shown in the grid that are in this folder or its subfolders.'
+        )
+        group_row.addWidget(self._folder_combo)
+        self._assign_folder_btn = QPushButton('Assign Selected Profile to Folder')
+        self._assign_folder_btn.setToolTip(
+            'Assign the profile currently selected in the Stored AF Profiles list '
+            'to every sample shown in the grid that is in the chosen folder. '
+            'Already-assigned profiles are not duplicated.'
+        )
+        self._assign_folder_btn.clicked.connect(self._assign_selected_profile_to_folder)
+        group_row.addWidget(self._assign_folder_btn)
+        group_row.addStretch(1)
+        self._auto_assign_btn = QPushButton('Auto-assign from Scatter')
+        self._auto_assign_btn.setToolTip(
+            'For every sample shown in the grid with no AF profile (bead samples '
+            'excepted), choose the profile(s) of the unstained control(s) whose '
+            'FSC/SSC distribution best explains its own: Gaussian mixture models '
+            'of each unstained sample, combined by BIC. Existing assignments are '
+            'not changed. Review the result before unmixing.'
+        )
+        self._auto_assign_btn.clicked.connect(self._run_auto_assign)
+        group_row.addWidget(self._auto_assign_btn)
+        layout.addLayout(group_row)
 
         btn_row = QHBoxLayout()
 
@@ -1634,64 +1710,65 @@ class AutoSpectralTab(QWidget):
 
     def _rebuild_assignment_grid(self):
         """
-        Rebuild the samples × profiles checkbox grid.
+        Rebuild the samples × profiles table.
         Rows are chosen by _assignment_samples(): unstained controls first,
-        then samples, then single-stained controls if requested.
-        The profile-name header lives in a separate frozen widget/layout
-        (self._assign_header_layout) above the scrollable body grid, kept
-        column-aligned with it. Body row 0 = first sample (no header row
-        inside the scrolling grid anymore).
+        then samples, then single-stained controls if requested. Column 0 is
+        the sample name, then one tick-box column per profile. Column widths
+        default to the text (capped) unless the user has dragged them.
         """
         self._assign_checkboxes.clear()
-        while self._assign_header_layout.count():
-            item = self._assign_header_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-        while self._assign_grid_layout.count():
-            item = self._assign_grid_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
+        table = self._assign_table
+        self._assign_rebuilding = True
+        table.clear()
+        table.setRowCount(0)
+        table.setColumnCount(0)
 
         af_profiles = self.controller.experiment.process.get('af_profiles', {})
         profile_names = list(af_profiles.keys())
         shown_samples = self._assignment_samples()
         sample_af = self.controller.experiment.samples.get('sample_af_profiles', {})
+        self._refresh_folder_combo(shown_samples)
 
         if not profile_names or not shown_samples:
-            self._assign_grid_layout.addWidget(
-                QLabel('No profiles or samples available yet.'), 0, 0
-            )
-            self._assign_header_scroll.setFixedHeight(1)
-            self._assign_scroll.setMinimumHeight(60)
-            self._assign_scroll.setMaximumHeight(60)
+            self._assign_rebuilding = False
+            table.setVisible(False)
+            self._assign_empty_label.setVisible(True)
             return
+        self._assign_empty_label.setVisible(False)
+        table.setVisible(True)
 
-        # Header (frozen row, own layout — not row 0 of the scrolling body)
-        corner = QLabel('Sample')
-        corner.setStyleSheet('font-weight: bold;')
-        self._assign_header_layout.addWidget(corner, 0, 0, Qt.AlignLeft)
+        table.setColumnCount(len(profile_names) + 1)
+        table.setRowCount(len(shown_samples))
+        bold = table.font()
+        bold.setBold(True)
+        header_fm = QFontMetrics(bold)
+        body_fm = QFontMetrics(table.font())
 
-        AF_SUFFIX = ' AutoSpectral AF'
+        corner = QTableWidgetItem('Sample')
+        corner.setFont(bold)
+        corner.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        table.setHorizontalHeaderItem(0, corner)
+        defaults = [header_fm.horizontalAdvance('Sample')]
         for col, pname in enumerate(profile_names, start=1):
-            display = pname
-            if display.endswith(AF_SUFFIX):
-                display = display[:-len(AF_SUFFIX)]
-            if len(display) > 28:
-                display = display[:26] + '…'
-            lbl = QLabel(display)
-            lbl.setStyleSheet('font-weight: bold;')
-            lbl.setToolTip(pname)
-            self._assign_header_layout.addWidget(lbl, 0, col, Qt.AlignCenter)
+            display = pname[:-len(AF_PROFILE_SUFFIX)] if pname.endswith(AF_PROFILE_SUFFIX) else pname
+            item = QTableWidgetItem(display)
+            item.setFont(bold)
+            item.setToolTip(pname)
+            table.setHorizontalHeaderItem(col, item)
+            defaults.append(min(header_fm.horizontalAdvance(display) + ASSIGN_COL_PADDING,
+                                ASSIGN_MAX_PROFILE_WIDTH))
 
-        # Sample rows (scrolling body — row 0 is now the first sample)
         for row, (sample_path, display_name) in enumerate(shown_samples.items()):
-            name_lbl = QLabel(display_name)
-            name_lbl.setToolTip(sample_path)
+            name_item = QTableWidgetItem(display_name)
+            name_item.setToolTip(f'{display_name}\n{sample_path}')
+            name_item.setFlags(Qt.ItemIsEnabled)
             if sample_path == self.controller.current_sample_path:
-                name_lbl.setStyleSheet('font-weight: bold;')
-            self._assign_grid_layout.addWidget(name_lbl, row, 0, Qt.AlignLeft)
+                name_item.setFont(bold)
+                width = header_fm.horizontalAdvance(display_name)
+            else:
+                width = body_fm.horizontalAdvance(display_name)
+            defaults[0] = max(defaults[0], width)
+            table.setItem(row, 0, name_item)
 
             assigned = sample_af.get(sample_path, [])
             for col, pname in enumerate(profile_names, start=1):
@@ -1701,55 +1778,34 @@ class AutoSpectralTab(QWidget):
                 cb.checkStateChanged.connect(
                     self._make_assignment_handler(sample_path, pname, cb)
                 )
-                self._assign_grid_layout.addWidget(cb, row, col, Qt.AlignCenter)
+                cell = QWidget()
+                cell_layout = QHBoxLayout(cell)
+                cell_layout.setContentsMargins(0, 0, 0, 0)
+                cell_layout.setAlignment(Qt.AlignCenter)
+                cell_layout.addWidget(cb)
+                table.setCellWidget(row, col, cell)
                 self._assign_checkboxes[(sample_path, pname)] = cb
+        defaults[0] = min(defaults[0] + ASSIGN_COL_PADDING, ASSIGN_MAX_NAME_WIDTH)
 
-        # Force header and body columns to the same pixel width so checkboxes
-        # line up under their profile-name label, regardless of which is wider.
-        n_cols = len(profile_names) + 1
-        for col in range(n_cols):
-            header_item = self._assign_header_layout.itemAtPosition(0, col)
-            body_item = self._assign_grid_layout.itemAtPosition(0, col)
-            header_w = header_item.widget().sizeHint().width() if header_item else 0
-            body_w = body_item.widget().sizeHint().width() if body_item else 0
-            width = max(header_w, body_w)
-            self._assign_header_layout.setColumnMinimumWidth(col, width)
-            self._assign_grid_layout.setColumnMinimumWidth(col, width)
+        self._assign_col_keys = [''] + profile_names
+        for col, key in enumerate(self._assign_col_keys):
+            width = self._assign_col_widths.get(key, defaults[col])
+            table.setColumnWidth(col, max(width, ASSIGN_MIN_COL_WIDTH))
+        self._assign_rebuilding = False
 
-        # Size the header strip to fit one row of (bold) labels exactly.
-        self._assign_header_layout.activate()
-        row_height = max(
-            self._assign_header_layout.itemAtPosition(0, col).widget().sizeHint().height()
-            for col in range(n_cols)
-        )
-        margins = self._assign_header_layout.contentsMargins()
-        self._assign_header_scroll.setFixedHeight(
-            row_height + margins.top() + margins.bottom() + 10
-        )
+        # Fit every row up to the cap; the tab's outer scroll area handles
+        # page-level scrolling, the table's own scrollbar takes over beyond it.
+        content_height = (table.horizontalHeader().sizeHint().height()
+                          + table.verticalHeader().length()
+                          + 2 * table.frameWidth()
+                          + table.horizontalScrollBar().sizeHint().height())
+        table.setFixedHeight(max(ASSIGN_MIN_HEIGHT, min(content_height, ASSIGN_MAX_HEIGHT)))
 
-        # Size the body strip to fit ALL sample rows (up to a generous cap),
-        # so the grid doesn't need its own inner scrollbar for typical sample
-        # counts — the tab's outer QScrollArea handles page-level scrolling
-        # instead. Beyond the cap, the inner scrollbar takes back over.
-        self._assign_grid_layout.activate()
-        n_rows = len(shown_samples)
-        row_heights = [
-            self._assign_grid_layout.itemAtPosition(r, 0).widget().sizeHint().height()
-            for r in range(n_rows)
-        ]
-        grid_margins = self._assign_grid_layout.contentsMargins()
-        content_height = (
-            sum(row_heights)
-            + self._assign_grid_layout.spacing() * max(n_rows - 1, 0)
-            + grid_margins.top() + grid_margins.bottom()
-        )
-
-        MIN_ASSIGN_HEIGHT = 240   # doubled from the old fixed 120px minimum
-        MAX_ASSIGN_HEIGHT = 900   # safety cap for very large sample counts
-        target_height = max(MIN_ASSIGN_HEIGHT, min(content_height, MAX_ASSIGN_HEIGHT))
-        self._assign_scroll.setMinimumHeight(MIN_ASSIGN_HEIGHT)
-        self._assign_scroll.setMaximumHeight(MAX_ASSIGN_HEIGHT)
-        self._assign_scroll.setFixedHeight(target_height)
+    def _on_assign_column_resized(self, index: int, _old: int, new: int):
+        """Remember a width the user dragged, so rebuilds keep it."""
+        if self._assign_rebuilding or index >= len(self._assign_col_keys):
+            return
+        self._assign_col_widths[self._assign_col_keys[index]] = new
 
     def _make_assignment_handler(self, sample_path: str, profile_name: str, cb: QCheckBox):
         def handler(_state):
@@ -1824,8 +1880,24 @@ class AutoSpectralTab(QWidget):
                 f'AutoSpectral: AF cleared for {Path(sample_path).stem}.'
             )
 
-    def _assign_selected_profile_to_all(self):
-        """Assign the profile selected in the profile list to every sample shown in the grid."""
+    def _refresh_folder_combo(self, shown_samples):
+        """List the folders holding samples shown in the grid, keeping the selection."""
+        current = self._folder_combo.currentData()
+        groups = folder_groups(shown_samples)
+        self._folder_combo.blockSignals(True)
+        self._folder_combo.clear()
+        for folder, paths in groups.items():
+            self._folder_combo.addItem(f'{folder} ({len(paths)})', userData=folder)
+        if not groups:
+            self._folder_combo.addItem('No folders', userData=None)
+        index = self._folder_combo.findData(current) if current is not None else -1
+        self._folder_combo.setCurrentIndex(max(index, 0))
+        self._folder_combo.blockSignals(False)
+        self._folder_combo.setEnabled(bool(groups))
+        self._assign_folder_btn.setEnabled(bool(groups))
+
+    def _assign_selected_profile(self, target_samples: list, where: str = ''):
+        """Assign the profile selected in the profile list to target_samples."""
         item = self._profile_list.currentItem()
         if item is None:
             self._assign_status.setText(
@@ -1834,7 +1906,6 @@ class AutoSpectralTab(QWidget):
             return
 
         profile_name = item.text()
-        target_samples = list(self._assignment_samples())
 
         if not target_samples:
             self._assign_status.setText('No samples available.')
@@ -1852,23 +1923,154 @@ class AutoSpectralTab(QWidget):
 
         # If the current sample was affected, reinitialise its AF matrices and
         # re-apply unmixing so the Unmixed Data tab updates immediately.
-        if self.controller.current_sample_path in target_samples:
-            self.controller.initialise_af_matrices()
-            if self.controller.raw_event_data is not None:
-                self.controller.unmixed_event_data = self.controller._apply_unmixing(
-                    self.controller.raw_event_data
-                )
-                self.controller.clear_data_for_cytometry_plots()
-                self.controller.initialise_data_for_cytometry_plots()
+        self._reapply_unmixing_if_current(target_samples)
 
         self._rebuild_assignment_grid()
+        message = f'"{profile_name}" assigned to {len(target_samples)} sample(s){where}.'
+        self._assign_status.setText(message)
+        if self.bus:
+            self.bus.statusMessage.emit(f'AutoSpectral: {message}')
+
+    def _assign_selected_profile_to_all(self):
+        """Assign the profile selected in the profile list to every sample shown in the grid."""
+        self._assign_selected_profile(list(self._assignment_samples()))
+
+    def _assign_selected_profile_to_folder(self):
+        """Assign the selected profile to the shown samples in the chosen folder."""
+        folder = self._folder_combo.currentData()
+        if folder is None:
+            self._assign_status.setText('No folder selected.')
+            return
+        targets = folder_groups(self._assignment_samples()).get(folder, [])
+        self._assign_selected_profile(targets, where=f' in {folder}')
+
+    def _run_auto_assign(self):
+        """Suggest profiles for the unassigned samples shown in the grid, from scatter."""
+        if self._auto_running:
+            return
+        experiment = self.controller.experiment
+        samples = experiment.samples
+        sample_af = samples.get('sample_af_profiles', {})
+        all_samples = samples.get('all_samples', {})
+        targets = [p for p, name in self._assignment_samples().items()
+                   if not sample_af.get(p) and not is_bead_sample(samples, p, name)]
+        if not targets:
+            self._assign_status.setText(
+                'Auto-assign: every sample shown in the grid already has an AF profile '
+                '(bead samples are not auto-assigned).'
+            )
+            return
+        beads = [p for p in all_samples if is_bead_sample(samples, p)]
+        references = reference_sources(experiment.process.get('af_profiles', {}),
+                                       all_samples, exclude=beads)
+        raw_settings = experiment.settings['raw']
+        pair = scatter_channel_pair(raw_settings, experiment.cytometry.get('raw_plots'))
+        from PySide6.QtWidgets import QMessageBox
+        if not references or pair is None:
+            QMessageBox.information(
+                self, 'Auto-assign',
+                'No AF profile was extracted from an unstained cell sample of this experiment.'
+                if not references else
+                'The forward and side scatter channels could not be identified.'
+            )
+            return
+
+        self._auto_running = True
+        self._auto_assign_btn.setEnabled(False)
+        self._assign_status.setText(f'Auto-assign: scoring {len(targets)} sample(s)…')
+        self._auto_thread = QThread()
+        self._auto_worker = AfAutoAssignWorker(
+            self.controller.experiment_dir, references, targets, pair,
+            scatter_ceilings(raw_settings, pair),
+        )
+        self._auto_worker.moveToThread(self._auto_thread)
+        self._auto_thread.started.connect(self._auto_worker.run)
+        self._auto_worker.finished.connect(self._on_auto_assign_finished)
+        self._auto_worker.error.connect(self._on_auto_assign_error)
+        self._auto_worker.progress.connect(self._assign_status.setText)
+        self._auto_worker.finished.connect(self._auto_thread.quit)
+        self._auto_worker.error.connect(self._auto_thread.quit)
+        self._auto_thread.finished.connect(self._auto_thread.deleteLater)
+        self._auto_thread.start()
+
+    def _on_auto_assign_error(self, msg: str):
+        self._auto_running = False
+        self._auto_assign_btn.setEnabled(True)
+        self._assign_status.setText(f'Auto-assign failed: {msg}')
+
+    def _on_auto_assign_finished(self, result: dict):
+        """Apply the suggestions to samples still unassigned, then ask for a review."""
+        from PySide6.QtWidgets import QMessageBox
+
+        self._auto_running = False
+        self._auto_assign_btn.setEnabled(True)
+        samples = self.controller.experiment.samples
+        all_samples = samples.get('all_samples', {})
+        af_profiles = self.controller.experiment.process.get('af_profiles', {})
+        sample_af = samples.get('sample_af_profiles', {})
+
+        changed = []
+        for path, names in result['assignments'].items():
+            names = [n for n in names if n in af_profiles]
+            if path in all_samples and names and not sample_af.get(path):
+                sample_af[path] = names
+                changed.append(path)
+        if changed:
+            samples['sample_af_profiles'] = sample_af
+            self.bus.autoSaveRequested.emit()
+            self._reapply_unmixing_if_current(changed)
+        self._rebuild_assignment_grid()
+
+        def label(path):
+            return all_samples.get(path) or Path(path).stem
+
+        n_scored = len(result['assignments']) + len(result['skipped'])
+        counts = {}
+        for path in changed:
+            key = ' + '.join(sample_af[path])
+            counts[key] = counts.get(key, 0) + 1
+        lines = [f'AF profiles were assigned to {len(changed)} of {n_scored} unassigned '
+                 'sample(s) from their forward and side scatter.']
+        lines += [f'  • {key}: {n} sample(s)' for key, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+        if result['skipped']:
+            lines.append(f'{len(result["skipped"])} sample(s) were left unassigned: '
+                         + ', '.join(label(p) for p in result['skipped']) + '.')
+        if result['unused_references']:
+            lines.append('Unstained samples not used: '
+                         + ', '.join(label(p) for p in result['unused_references']) + '.')
+        poor = sorted(((d['outside'], p) for p, d in result['details'].items()
+                       if p in changed and d['outside'] >= POOR_FIT_SHARE), reverse=True)
+        if poor:
+            lines.append(f'{len(poor)} sample(s) have at least {POOR_FIT_SHARE:.0%} of events '
+                         'outside the scatter of their unstained controls (check these first): '
+                         + ', '.join(f'{label(p)} ({f:.0%})' for f, p in poor) + '.')
+        lines.append('')
+        lines.append('Please review the assignments in the grid. A sample is matched to the '
+                     'unstained controls it most resembles in scatter, which does not guarantee '
+                     'that its autofluorescence matches.')
+
+        details = []
+        for path in changed:
+            d = result['details'][path]
+            refs = ', '.join(f'{label(r)} {w:.0%}' for r, w in zip(d['references'], d['weights']))
+            details.append(f'{label(path)}: {" + ".join(sample_af[path])} [{refs}; '
+                           f'ΔBIC {d["delta_bic"]:.0f}; {d["outside"]:.1%} of events outside; '
+                           f'{d["n_events"]:,} events]')
+        for path, reason in result['skipped'].items():
+            details.append(f'{label(path)}: not assigned ({reason})')
+        for path, reason in result['unused_references'].items():
+            details.append(f'{label(path)} (unstained): not used ({reason})')
+
         self._assign_status.setText(
-            f'"{profile_name}" assigned to {len(target_samples)} sample(s).'
+            f'Auto-assign: {len(changed)} sample(s) assigned — please review the grid.'
         )
         if self.bus:
-            self.bus.statusMessage.emit(
-                f'AutoSpectral: "{profile_name}" assigned to {len(target_samples)} sample(s).'
-            )
+            self.bus.statusMessage.emit(f'AutoSpectral: auto-assigned {len(changed)} sample(s).')
+        box = QMessageBox(QMessageBox.Icon.Information, 'Auto-assign complete', '\n'.join(lines),
+                          QMessageBox.StandardButton.Ok, self)
+        if details:
+            box.setDetailedText('\n'.join(details))
+        box.exec()
 
     def _clear_all_af(self):
         all_samples = self.controller.experiment.samples.get('all_samples', {})
