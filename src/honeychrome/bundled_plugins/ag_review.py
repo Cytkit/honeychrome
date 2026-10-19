@@ -586,7 +586,8 @@ def without_axis(gate_def: dict, axis: str) -> dict:
     gp = out.get('gate_param') or {}
     new_gp = {k: v for k, v in gp.items()
               if not (k.endswith('_x') or k.endswith('_y')) and k != 'algorithm'}
-    for key in ('tail_fraction', 'mixture_components', 'axis_lo', 'axis_hi'):
+    for key in ('tail_fraction', 'mixture_components', 'axis_lo', 'axis_hi',
+                'threshold_factor'):
         if f'{key}_{keep}' in gp:
             new_gp[key] = gp[f'{key}_{keep}']
     if isinstance(gp.get(f'replicate_{keep}'), dict):
@@ -1050,6 +1051,9 @@ def split_2dsep(gate_defs: list[dict], gate_name: str, steps: list[dict],
             value = params.get(f'{key}_{axis}', 0.0)
             if value:
                 p[key] = float(value)
+        factor = ag_core.threshold_factor(params, f'_{axis}')
+        if factor != ag_core.DEFAULT_THRESHOLD_FACTOR:
+            p['threshold_factor'] = factor
         return p
 
     sign = ag_core.region_sign
@@ -1200,6 +1204,7 @@ SYNC_PARAM_KEYS = (
     'quantile_trim', 'width_sd', 'debris_axis', 'debris_density', 'edge_density',
     'edge_density_x', 'edge_density_y', 'cell_side', 'saturation_fraction',
     'mixture_cut', 'mixture_cut_x', 'mixture_cut_y',
+    'threshold_factor', 'threshold_factor_x', 'threshold_factor_y',
 )
 
 

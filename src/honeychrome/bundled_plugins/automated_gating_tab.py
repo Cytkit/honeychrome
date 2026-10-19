@@ -717,7 +717,7 @@ class _GatingWorker(QThread):
                     self._gate_defs, data_t, index, reference=self._reference,
                     modes=self._modes, drift_limit=self._drift_limit,
                     drift_action=self._drift_action, axis_limits=limits,
-                    stop_check=self._stopping,
+                    stop_check=self._stopping, transforms=self._transforms,
                 )
             except ag_core.GatingStopped:
                 break

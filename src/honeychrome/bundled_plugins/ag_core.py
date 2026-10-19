@@ -163,6 +163,10 @@ def default_axis_lo(algorithm: str | None) -> float:
 
 MODEL_FORMAT_VERSION = 2
 DEFAULT_TAIL_FRACTION = 0.0001
+# Calculated thresholds are multiplied by this factor in raw (untransformed)
+# units: 2 doubles the threshold intensity, 0.5 halves it.
+DEFAULT_THRESHOLD_FACTOR = 1.0
+THRESHOLD_FACTOR_RANGE = (0.01, 100.0)
 DEFAULT_EDGE_DENSITY = 0.002        # cells: density fall-off, fraction of the peak
 CELL_SIDE_CELLS = 'cells'           # cells: keep the events above the debris cut
 CELL_SIDE_DEBRIS = 'debris'         # cells: keep the events below it
@@ -684,6 +688,50 @@ def compute_threshold(x: np.ndarray, algorithm: str, params: dict | None = None)
     return threshold_tail(x, tail_fraction=tf)
 
 
+def threshold_factor(gate_param: dict | None, suffix: str = '') -> float:
+    """Threshold factor of one axis (``threshold_factor`` + *suffix*, falling
+    back to ``threshold_factor``)."""
+    gp = gate_param or {}
+    try:
+        return float(gp.get(f'threshold_factor{suffix}',
+                            gp.get('threshold_factor', DEFAULT_THRESHOLD_FACTOR)))
+    except (TypeError, ValueError):
+        return DEFAULT_THRESHOLD_FACTOR
+
+
+def _xform(transform):
+    """Object with apply()/inverse() for a Honeychrome Transform, a transform
+    parameter dict or such an object; None for the identity."""
+    if transform is None:
+        return None
+    if isinstance(transform, dict):
+        return make_transform(transform)
+    xform = getattr(transform, 'xform', None)
+    if xform is not None:
+        return xform
+    if hasattr(transform, 'apply') and hasattr(transform, 'inverse'):
+        return transform
+    return None
+
+
+def scale_threshold(t: float, factor: float, transform=None) -> tuple[float, str]:
+    """*t* (display units) multiplied by *factor* in raw units.
+
+    Returns (threshold, note); the note is non-empty when the factor could
+    not be applied (a threshold at or below zero in raw units).
+    """
+    f = float(factor)
+    if f == 1.0 or not np.isfinite(f) or f <= 0:
+        return float(t), ''
+    xf = _xform(transform)
+    raw = float(np.asarray(xf.inverse(np.array([float(t)])), dtype=float)[0]) if xf else float(t)
+    if not raw > 0:
+        return float(t), (f"threshold {raw:.4g} is not above zero in raw units; "
+                          f"factor {f:g} not applied")
+    new = raw * f
+    return (float(np.asarray(xf.apply(np.array([new])), dtype=float)[0]) if xf else new), ''
+
+
 def bimodality_delta_bic(x: np.ndarray, max_events: int = 5000, trim: float = 0.001,
                          seed: int = 0) -> float:
     """BIC(1 component) − BIC(2 components) of Gaussian mixtures on *x*.
@@ -934,10 +982,23 @@ class GateCalculator:
     axis_limits : {channel: (lo, hi)} display limits, used only to draw the
                   rectangles of threshold gates. Missing channels use the
                   data range.
+    transforms  : {channel: Transform or parameter dict} the data are in,
+                  for threshold factors (raw units). Missing channels are
+                  untransformed.
+    notes       : messages from the last ``calculate`` (factors not applied).
     """
 
-    def __init__(self, axis_limits: dict | None = None):
+    def __init__(self, axis_limits: dict | None = None, transforms: dict | None = None):
         self.axis_limits = dict(axis_limits or {})
+        self.transforms = dict(transforms or {})
+        self.notes: list[str] = []
+
+    def _scaled(self, t: float, gate_param: dict, suffix: str, channel: str) -> float:
+        t, note = scale_threshold(t, threshold_factor(gate_param, suffix),
+                                  self.transforms.get(channel))
+        if note:
+            self.notes.append(f"{channel}: {note}")
+        return t
 
     def _limits(self, channel: str, values: np.ndarray) -> tuple[float, float]:
         lim = self.axis_limits.get(channel)
@@ -956,6 +1017,7 @@ class GateCalculator:
                   gates copy their origin's boundary from here.
         """
         by_name = by_name or {}
+        self.notes = []
         gate_type = gate_def.get('gate_type', 'free')
         origin_name = gate_def.get('replicate_of') or (
             gate_def.get('origin_gate') if gate_type == 'replicate' else None)
@@ -1069,7 +1131,7 @@ class GateCalculator:
                               float(gp.get('axis_hi', 0.99)))
         if len(calc) < MIN_EVENTS:
             calc = col
-        t = compute_threshold(calc, algo, gp)
+        t = self._scaled(compute_threshold(calc, algo, gp), gp, '', ch)
         return self.threshold_boundaries(gate_def, t, None, full, None)
 
     def _calc_2dsep(self, data, gate_def, channel_index) -> dict:
@@ -1106,7 +1168,8 @@ class GateCalculator:
                                   float(gp.get(f'axis_hi_{axis}', 0.99)))
             if len(calc) < MIN_EVENTS:
                 calc = col
-            thresholds.append(compute_threshold(calc, algo, axis_params(axis)))
+            t = compute_threshold(calc, algo, axis_params(axis))
+            thresholds.append(self._scaled(t, gp, f'_{axis}', axis_channel(gate_def, axis)))
         return self.threshold_boundaries(gate_def, thresholds[0], thresholds[1],
                                          data[:, ix], data[:, iy])
 
@@ -1352,13 +1415,18 @@ def _threshold_on_channel(gate_def: dict, entries: dict, channel: str):
 
 
 def resolve_replicates(gate_def: dict, data: np.ndarray, channel_index: dict,
-                       result: 'GatingResult', by_name: dict) -> tuple[dict, str]:
+                       result: 'GatingResult', by_name: dict,
+                       transforms: dict | None = None,
+                       notes: list | None = None) -> tuple[dict, str]:
     """Copy of *gate_def* (an effective definition) with the thresholds of
     its replicated axes fixed in ``gate_param['fixed_threshold_x/y']``.
 
     *result* holds the gates applied so far to *data* (boundaries and
     population masks over its rows). Returns (definition, '') or
     (None, reason) when a source is missing or cannot be calculated.
+    A threshold calculated on a reference population is multiplied by the
+    axis's threshold factor (raw units, *transforms*); one copied from a
+    gate is copied as it is. Factors not applied are added to *notes*.
     """
     sources = replicate_sources(gate_def)
     if not sources:
@@ -1398,7 +1466,11 @@ def resolve_replicates(gate_def: dict, data: np.ndarray, channel_index: dict,
                       'mixture_components': gp.get(f'mixture_components{suffix}',
                                                    gp.get('mixture_components', 2)),
                       'mixture_cut': gp.get(f'mixture_cut{suffix}', gp.get('mixture_cut', 'outer'))}
-            t = compute_threshold(calc, algo, params)
+            t, note = scale_threshold(compute_threshold(calc, algo, params),
+                                      threshold_factor(gp, suffix),
+                                      (transforms or {}).get(channel))
+            if note and notes is not None:
+                notes.append(f"{channel}: {note}")
         gp[f'fixed_threshold_{axis}'] = float(t)
     return out, ''
 
@@ -1566,7 +1638,8 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
                drift_limit: float = DEFAULT_DRIFT_LIMIT,
                drift_action: str = 'flag',
                axis_limits: dict | None = None,
-               stop_check=None, keep_partial: bool = False) -> GatingResult:
+               stop_check=None, keep_partial: bool = False,
+               transforms: dict | None = None) -> GatingResult:
     """Run a gate hierarchy on one transformed event array.
 
     Without *reference* every gate is calculated from the data (training).
@@ -1580,11 +1653,12 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
     *stop_check*, when given, is called before each gate; when it returns
     True the run stops by raising GatingStopped, or, with *keep_partial*,
     returns the gates applied so far with ``stopped`` set.
+    *transforms* (see GateCalculator) are needed for threshold factors.
     """
     data = np.asarray(data)
     n = len(data)
     by_name = gates_by_name(gate_defs)
-    calc = GateCalculator(axis_limits)
+    calc = GateCalculator(axis_limits, transforms)
     modes = modes or {}
     result = GatingResult()
     root = np.ones(n, dtype=bool)
@@ -1622,14 +1696,20 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
                 status['flag'] = 'failed'
                 status['message'] = 'no stored boundary'
         else:
+            notes: list[str] = []
             try:
-                resolved, reason = resolve_replicates(eff, data, channel_index, result, by_name)
+                resolved, reason = resolve_replicates(eff, data, channel_index, result, by_name,
+                                                      transforms=calc.transforms, notes=notes)
                 if resolved is None:
                     status['message'] = reason
                     boundary = {}
                 else:
                     boundary = calc.calculate(parent_data, resolved, channel_index,
                                               trained=result.boundaries, by_name=by_name)
+                    notes.extend(calc.notes)
+                    if notes:
+                        log.warning("gate %s: %s", name, '; '.join(notes))
+                        status['message'] = '; '.join(notes)
             except Exception as exc:
                 log.warning("gate %s: calculation failed: %s", name, exc)
                 status['message'] = str(exc)
@@ -1682,7 +1762,7 @@ def run_gating(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
 
 def train_boundaries(gate_defs: list[dict], data: np.ndarray, channel_index: dict,
                      axis_limits: dict | None = None, done: dict | None = None,
-                     stop_check=None) -> GatingResult:
+                     stop_check=None, transforms: dict | None = None) -> GatingResult:
     """Calculate every gate from pooled training data (see run_gating).
 
     done       : {gate: boundary} already trained (a paused training run);
@@ -1694,11 +1774,13 @@ def train_boundaries(gate_defs: list[dict], data: np.ndarray, channel_index: dic
     """
     if not done:
         return run_gating(gate_defs, data, channel_index, reference=None,
-                          axis_limits=axis_limits, stop_check=stop_check, keep_partial=True)
+                          axis_limits=axis_limits, stop_check=stop_check, keep_partial=True,
+                          transforms=transforms)
     modes = {g['gate_name']: (MODE_FIXED if g['gate_name'] in done else MODE_RECALCULATE)
              for g in gate_defs}
     result = run_gating(gate_defs, data, channel_index, reference=dict(done), modes=modes,
-                        axis_limits=axis_limits, stop_check=stop_check, keep_partial=True)
+                        axis_limits=axis_limits, stop_check=stop_check, keep_partial=True,
+                        transforms=transforms)
     for status in result.status.values():
         if status.get('source') in ('recalculated', 'fixed'):
             status['source'] = 'trained'

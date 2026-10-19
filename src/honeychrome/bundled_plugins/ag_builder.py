@@ -246,6 +246,33 @@ def _axis_limits(transforms: dict) -> dict:
     return out
 
 
+THRESHOLD_FACTOR_TIP = (
+    "Threshold factor: the calculated threshold is multiplied by this in raw "
+    "(untransformed) intensity units. 2 places it at twice the calculated "
+    "intensity (stricter), 0.5 at half. 1 leaves it as calculated. Not "
+    "applied to a threshold at or below zero in raw units.")
+
+
+def _threshold_factor_spin(value: float) -> QDoubleSpinBox:
+    """Spin box for a threshold factor (ag_core.scale_threshold)."""
+    spin = QDoubleSpinBox()
+    spin.setRange(*ag_core.THRESHOLD_FACTOR_RANGE)
+    spin.setDecimals(2)
+    spin.setSingleStep(0.1)
+    spin.setSuffix(" ×")
+    spin.setValue(float(value))
+    spin.setToolTip(THRESHOLD_FACTOR_TIP)
+    return spin
+
+
+def _set_threshold_factor(params: dict, key: str, value: float):
+    """Store a threshold factor; the default is left out of gate_param."""
+    if float(value) == ag_core.DEFAULT_THRESHOLD_FACTOR:
+        params.pop(key, None)
+    else:
+        params[key] = float(value)
+
+
 def _axis_cells(g: dict, antigens: dict | None = None) -> tuple[str, str]:
     """Text of a gate's X and Y axis columns: each channel's marker (its
     antigen), or the channel name when it has none. A 1dsep gate's channels
@@ -466,6 +493,8 @@ class GateParamDialog(QDialog):
     mixture_cut
         Which two components, ordered by mean, cross at the threshold:
         ``outer`` (lowest and highest, default), ``lower`` or ``upper``.
+    threshold_factor
+        Multiplies the calculated threshold in raw units (default ``1``).
     width_sd
         Standard-deviation half-width for the singlet parallelogram.
         Default ``3``.
@@ -561,6 +590,9 @@ class GateParamDialog(QDialog):
         self.cb_mixture_cut = self._cut_combo(params.get('mixture_cut', 'outer'))
         form.addRow("Mixture cut", self.cb_mixture_cut)
 
+        self.sb_threshold_factor = _threshold_factor_spin(ag_core.threshold_factor(params))
+        form.addRow("Threshold factor", self.sb_threshold_factor)
+
         self.sb_width_sd = QDoubleSpinBox()
         self.sb_width_sd.setRange(0.5, 10.0)
         self.sb_width_sd.setDecimals(2)
@@ -653,6 +685,12 @@ class GateParamDialog(QDialog):
         grid.addWidget(self.cb_cut_y, 7, 2)
         grid.addWidget(QLabel("Mixture cut"), 7, 0)
 
+        grid.addWidget(QLabel("Threshold factor"), 8, 0)
+        self.sb_factor_x = _threshold_factor_spin(ag_core.threshold_factor(params, '_x'))
+        self.sb_factor_y = _threshold_factor_spin(ag_core.threshold_factor(params, '_y'))
+        grid.addWidget(self.sb_factor_x, 8, 1)
+        grid.addWidget(self.sb_factor_y, 8, 2)
+
         # Quantile trim (shared — one row)
         grid.addWidget(QLabel("Quantile trim"), 4, 0)
         self.sb_quantile_trim = QDoubleSpinBox()
@@ -730,6 +768,9 @@ class GateParamDialog(QDialog):
             params['axis_hi_x']            = float(self.sb_axis_hi_x.value())
             params['axis_lo_y']            = float(self.sb_axis_lo_y.value())
             params['axis_hi_y']            = float(self.sb_axis_hi_y.value())
+            params.pop('threshold_factor', None)
+            _set_threshold_factor(params, 'threshold_factor_x', self.sb_factor_x.value())
+            _set_threshold_factor(params, 'threshold_factor_y', self.sb_factor_y.value())
         else:
             params['axis_lo']            = float(self.sb_axis_lo.value())
             params['axis_hi']            = float(self.sb_axis_hi.value())
@@ -737,6 +778,7 @@ class GateParamDialog(QDialog):
             params['mixture_components'] = int(self.sb_mixture_components.value())
             params['mixture_cut']        = self.cb_mixture_cut.currentData()
             params['width_sd']           = float(self.sb_width_sd.value())
+            _set_threshold_factor(params, 'threshold_factor', self.sb_threshold_factor.value())
             if self._is_free:
                 for axis, sb in self.sb_edge.items():
                     params[f'edge_density_{axis}'] = float(sb.value())
@@ -1456,7 +1498,8 @@ class _RecommendWorker(QThread):
                                max_events=DEFAULT_EVENTS_PER_SAMPLE, seed=TRAINING_SEED)
             data = ag_core.transform_columns(out['unmixed'], self._channels, self._transforms)
             idx = {ch: i for i, ch in enumerate(self._channels)}
-            trained = ag_core.train_boundaries(self._gate_defs, data, idx)
+            trained = ag_core.train_boundaries(self._gate_defs, data, idx,
+                                               transforms=self._transforms)
             recs = {}
             for g in self._gate_defs:
                 parent = trained.parent_masks.get(g['gate_name'])
@@ -3657,7 +3700,7 @@ class HierarchyTab(QWidget):
         result = ag_core.run_gating(
             chain, transformed, {ch: i for i, ch in enumerate(pnn)},
             reference=reference, modes=modes, default_mode=ag_core.MODE_FIXED,
-            axis_limits=_axis_limits(transforms),
+            axis_limits=_axis_limits(transforms), transforms=transforms,
         )
         return result.population_mask(gate_def['parent_gate'], gate_def.get('parent_popul'))
 
@@ -4068,7 +4111,8 @@ class _TrainingWorker(QThread):
         index = {ch: i for i, ch in enumerate(self._channels)}
         result = ag_core.train_boundaries(self._gate_defs, data, index,
                                           axis_limits=_axis_limits(self._transforms),
-                                          done=self._done, stop_check=self._stopping)
+                                          done=self._done, stop_check=self._stopping,
+                                          transforms=self._transforms)
         del data
         if result.stopped and self._abort:
             return None
@@ -4639,7 +4683,7 @@ class TrainTab(QWidget):
         result = ag_core.run_gating(self.state.gate_definitions, data, index,
                                     reference=self.state.trained_boundaries,
                                     default_mode=ag_core.MODE_FIXED,
-                                    axis_limits=_axis_limits(transforms))
+                                    axis_limits=_axis_limits(transforms), transforms=transforms)
         for gate_name, entries in result.boundaries.items():
             stored = self.state.trained_boundaries.get(gate_name, {})
             for pop, entry in entries.items():
@@ -5210,7 +5254,7 @@ class _ReviewPlot(QWidget):
             log.exception("polygon edit failed")
 
 
-def _review_gating(defs, trained, data, index, limits, stop_check):
+def _review_gating(defs, trained, data, index, limits, stop_check, transforms=None):
     """Gate the review events with the hierarchy as reviewed: trained
     boundaries, shapes as drawn for gates still using them, and the
     trainable form of converted gates not yet trained."""
@@ -5225,7 +5269,7 @@ def _review_gating(defs, trained, data, index, limits, stop_check):
         modes[name] = ag_core.MODE_RECALCULATE
     return ag_core.run_gating(defs, data, index, reference=reference, modes=modes,
                               default_mode=ag_core.MODE_FIXED, axis_limits=limits,
-                              stop_check=stop_check, keep_partial=True)
+                              stop_check=stop_check, keep_partial=True, transforms=transforms)
 
 
 class _OverlapWorker(QThread):
@@ -5237,13 +5281,15 @@ class _OverlapWorker(QThread):
 
     MAX_EVENTS = 50_000
 
-    def __init__(self, gate_defs, trained, data, pnn, limits, limit, parent=None):
+    def __init__(self, gate_defs, trained, data, pnn, limits, limit, transforms=None,
+                 parent=None):
         super().__init__(parent)
         self._defs = gate_defs
         self._trained = trained
         self._data = data
         self._pnn = list(pnn)
         self._limits = limits
+        self._transforms = transforms
         self._limit = float(limit)
         self._abort = False
 
@@ -5254,7 +5300,7 @@ class _OverlapWorker(QThread):
         try:
             index = {c: i for i, c in enumerate(self._pnn)}
             result = _review_gating(self._defs, self._trained, self._data, index, self._limits,
-                                    lambda: self._abort)
+                                    lambda: self._abort, transforms=self._transforms)
             if self._abort:
                 self.finished.emit(False, "Cancelled.", {})
                 return
@@ -5333,9 +5379,10 @@ class _FlagWorker(QThread):
 
     def __init__(self, gate_defs, trained, data, pnn, limits, recommendations,
                  shift_limit: float, fraction_limit: float, zeros: dict | None = None,
-                 parent=None):
+                 transforms=None, parent=None):
         super().__init__(parent)
         self._zeros = dict(zeros or {})
+        self._transforms = transforms
         self._defs = gate_defs
         self._trained = trained
         self._data = data
@@ -5366,13 +5413,13 @@ class _FlagWorker(QThread):
         index = {c: i for i, c in enumerate(self._pnn)}
         by_name = ag_core.gates_by_name(defs)
         result = _review_gating(defs, self._trained, self._data, index, self._limits,
-                                lambda: self._abort)
+                                lambda: self._abort, transforms=self._transforms)
         if self._abort:
             return None
         anchor = ag_core.anchor_population(defs)
         candidates = [g for g in ag_core.ordered_gate_defs(defs)
                       if g.get('template') and g['gate_name'] not in self._trained]
-        calc = ag_core.GateCalculator(self._limits)
+        calc = ag_core.GateCalculator(self._limits, self._transforms)
         rng = np.random.default_rng(TRAINING_SEED)
         flags = {}
         for k, g in enumerate(candidates, 1):
@@ -5412,7 +5459,8 @@ class _FlagWorker(QThread):
                                                          evidence)
             eff = ag_core.effective_gate_def(proposed_def, by_name)
             try:
-                resolved, _reason = ag_core.resolve_replicates(eff, self._data, index, result, by_name)
+                resolved, _reason = ag_core.resolve_replicates(eff, self._data, index, result,
+                                                               by_name, transforms=self._transforms)
                 if resolved is None:
                     continue
                 proposed = calc.calculate(events, resolved, index, trained=result.boundaries,
@@ -6003,7 +6051,7 @@ class ReviewTab(QWidget):
         self._result = ag_core.run_gating(
             subset, self._data_t, {c: i for i, c in enumerate(pnn)},
             reference=reference, modes=modes, default_mode=ag_core.MODE_FIXED,
-            axis_limits=self._axis_limits())
+            axis_limits=self._axis_limits(), transforms=self.tf.objects)
         self._gated = names
 
     def _ensure_gated(self):
@@ -6261,6 +6309,8 @@ class ReviewTab(QWidget):
                 self._add_source_controls(row, pd, axis)
             if current == 'cells':
                 self._add_edge_density(row, pd)
+            if current in ag_core.THRESHOLD_ALGORITHMS:
+                self._add_threshold_factor(row, pd, axis)
         if imported:
             btn = QPushButton("Convert to trainable")
             btn.setToolTip("Train this gate with the chosen algorithm instead of applying the "
@@ -6440,6 +6490,7 @@ class ReviewTab(QWidget):
             row.addWidget(algo)
             if (current.get('algorithm') or 'tail') == 'tail':
                 self._add_tail_fraction(row, g, axis)
+            self._add_threshold_factor(row, g, axis)
 
     def _add_mixture_controls(self, row, g: dict, axis: str):
         """Components and cut of a 'mixture' axis: the threshold is where two
@@ -6510,6 +6561,30 @@ class ReviewTab(QWidget):
             return
         self._adopt_layout(g)
         g.setdefault('gate_param', {})[key] = float(value)
+        self._after_config_change(g)
+
+    def _add_threshold_factor(self, row, g: dict, axis: str):
+        """Factor multiplying an axis's calculated threshold in raw units."""
+        suffix = f'_{axis}' if g.get('gate_type') == '2dsep' else ''
+        spin = block_wheel(_threshold_factor_spin(
+            ag_core.threshold_factor(g.get('gate_param'), suffix)))
+        spin.setKeyboardTracking(False)
+        spin.valueChanged.connect(
+            lambda v, n=g['gate_name'], k=f'threshold_factor{suffix}':
+            self._on_threshold_factor(n, k, v))
+        row.addWidget(QLabel("Factor:"))
+        row.addWidget(spin)
+
+    def _on_threshold_factor(self, gate_name: str, key: str, value: float):
+        g = self.state.gate_by_name(gate_name)
+        if g is None:
+            return
+        self._adopt_layout(g)
+        gp = g.setdefault('gate_param', {})
+        if key != 'threshold_factor' and 'threshold_factor' in gp:
+            other = 'threshold_factor_y' if key.endswith('_x') else 'threshold_factor_x'
+            gp.setdefault(other, gp.pop('threshold_factor'))
+        _set_threshold_factor(gp, key, value)
         self._after_config_change(g)
 
     def _feed_forward_button(self, g: dict) -> QWidget:
@@ -6710,16 +6785,19 @@ class ReviewTab(QWidget):
             if len(sample) > self._PROPOSAL_EVENTS:
                 rng = np.random.default_rng(TRAINING_SEED)
                 sample = sample[np.sort(rng.choice(len(sample), self._PROPOSAL_EVENTS, replace=False))]
-            calc = ag_core.GateCalculator(limits)
+            calc = ag_core.GateCalculator(limits, self.tf.objects)
             try:
                 resolved, reason = ag_core.resolve_replicates(eff, self._data_t, index,
-                                                              self._result, by_name)
+                                                              self._result, by_name,
+                                                              transforms=self.tf.objects)
                 if resolved is None:
                     log.info("review: %s not calculated: %s", name, reason)
                     boundary = {}
                 else:
                     boundary = calc.calculate(sample, resolved, index,
                                               trained=self._result.boundaries, by_name=by_name)
+                    if calc.notes:
+                        log.info("review: %s: %s", name, '; '.join(calc.notes))
             except Exception as exc:
                 log.warning("review: %s could not be calculated with %s: %s", name, algo, exc)
                 boundary = {}
@@ -7228,7 +7306,8 @@ class ReviewTab(QWidget):
                              _experiment_channels(self.controller), self._axis_limits(),
                              dict(self.state.algorithm_recommendations),
                              self.sb_flag_shift.value(), self.sb_flag_fraction.value() / 100.0,
-                             zeros=self._zeros(), parent=self)
+                             zeros=self._zeros(), transforms=dict(self.tf.objects),
+                             parent=self)
         worker.progress.connect(lambda done, total: self.lbl_flag.setText(
             f"Checking {done} of {total} gate(s) … (click again to stop)"))
         worker.finished.connect(self._on_flags_ready)
@@ -7262,7 +7341,8 @@ class ReviewTab(QWidget):
         worker = _OverlapWorker(deepcopy(self.state.gate_definitions),
                                 deepcopy(self.state.trained_boundaries), np.array(self._data_t),
                                 _experiment_channels(self.controller), self._axis_limits(),
-                                self.sb_overlap.value() / 100.0, parent=self)
+                                self.sb_overlap.value() / 100.0,
+                                transforms=dict(self.tf.objects), parent=self)
         worker.finished.connect(self._on_overlaps_ready)
         self._overlap_worker = worker
         self.btn_overlap.setText("Stop checking")
