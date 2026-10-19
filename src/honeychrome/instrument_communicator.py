@@ -260,6 +260,7 @@ class Instrument(mp.Process):
         while True:
             cycle_n += 1
             start_time = time.perf_counter()
+            # print(start_time)
 
             blob_of_traces_as_array = self.device.read_out_traces()
             if blob_of_traces_as_array is not None:
@@ -300,7 +301,9 @@ class Instrument(mp.Process):
             with self.traces_cache_lock:
                 try:
                     if queue_end_index >= queue_begin_index:
-                        self.traces_cache[slice_begin:slice_end] = blob_np #todo fix: this crashes blob from cytkit driver but not others?
+                        # print(slice_end-slice_begin, blob_np.shape)
+                        self.traces_cache[slice_begin:slice_end] = blob_np
+                        # print('Not dead')
                     else:
                         # note number of events that didn't fit is queue_end_index
                         switch_index = (self.max_events_in_traces_cache - queue_begin_index) * self.trace_n_points
@@ -308,6 +311,7 @@ class Instrument(mp.Process):
                         self.traces_cache[:slice_end] = blob_np[switch_index:]  # put last events into front of queue array
                 except BaseException as e:
                     self.logger.exception(str(e))
+                    print('Base exception')
                     return
 
             with self.index_tail_traces_cache.get_lock():
@@ -324,8 +328,6 @@ if __name__ == '__main__':
 
     from honeychrome.main import setup_logging
     from honeychrome.settings import experiments_folder
-
-    mp.set_start_method("spawn")
 
     # Allocate shared memory block, plus head and tail indices
     traces_cache_shm = shared_memory.SharedMemory(create=True, size=np.zeros(traces_cache_size, dtype=traces_cache_dtype).nbytes)
@@ -370,7 +372,7 @@ if __name__ == '__main__':
     print(response)
 
     #wait for a bit
-    time.sleep(1)
+    time.sleep(120)
 
     print('Stop acquisition!')
     pipe_experiment_instrument_e.send({'command':'stop_acquisition'})

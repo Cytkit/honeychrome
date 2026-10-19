@@ -115,6 +115,8 @@ class CaptureDecoder:
             if pos == -1:
                 break
             if buffer[pos + 2: pos +4] != SYNC_WORD_1:
+                self.error_count += 1
+                pos += 2
                 continue
 
             # ---- 2. Do we have a full header in this buffer?
@@ -132,6 +134,7 @@ class CaptureDecoder:
                 # Bad header. Re-sync from the word *after* the first sync word,
                 # so we can still find a header that overlaps the bad one.
                 self.error_count += 1
+                pos += 2
                 continue
 
             # ---- 5. Do we have the full payload?

@@ -491,7 +491,7 @@ class CytkitDevice:
         self.sample_pump.stop()
 
         self.display.action_message("Acquisition finished.")
-        logger.info(f"[CytkitDriver] communication errors={self.decoder.error_count}")
+        logger.info(f"[CytkitDriver] Decoder errors={self.decoder.error_count}")
 
         self.capture.aggr_set_enable(False)
         self.capture.aggr_fifo_clear()
@@ -862,6 +862,7 @@ class CytkitDevice:
             self.capture.aggr_fifo_clear()
             self.decoder.reset()
             self.auto_resets += 1
+            logger.info(f'[CytkitDriver] FIFO auto resets {self.auto_resets}')
 
         if traces is not None:
             # n_decoded_events = len(event_index)
