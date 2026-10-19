@@ -87,6 +87,10 @@ Under Step 1, select your (first) unstained sample, and press the button Extract
 ### Assign the AF profiles to samples
 Under Step 2, select the AF profiles to apply to each sample. Multiple controls (columns) can be selected for each sample (row). Each cell in the sample will be automatically assigned its nearest cluster from of the selected controls for a more accurate AF subtraction.
 
+To assign many samples at once, select a profile in the Stored AF Profiles list and use **Assign Selected Profile to All Samples**, or choose a folder and use **Assign Selected Profile to Folder** (every sample shown in the grid in that folder or its subfolders).
+
+**Auto-assign from Scatter** fills in the samples shown in the grid that have no AF profile yet (bead samples are skipped; existing assignments are never changed). The forward and side scatter of each unstained sample with an AF profile is modelled as a Gaussian mixture, and each sample is given the profile(s) of the unstained sample(s) whose scatter best explains its own, chosen by BIC: a second or third profile is added only when it improves the fit and accounts for at least 10% of the events. A summary opens at the end, listing samples whose scatter lies partly outside every unstained sample assigned to them. Review the assignments before analysing: similar scatter does not guarantee similar autofluorescence.
+
 ![assign_af_step2.png](/assets/assign_af_step2.png)
 
 ### Inspect the AutoSpectral AF results against standard unmixing 
