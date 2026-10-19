@@ -1,6 +1,7 @@
 '''
 This is the default configuration for the instrument driver
 '''
+from honeychrome.settings import adc_channels
 
 # hardware settings
 pump_max = 255 # 0..255 sheath pump allowed PWM range in control loop
@@ -512,3 +513,7 @@ monitor_dictionary = {
     6: {'name': 'MON_ID_P_3_3V', 'i2_c_address': 0x84, 'i2_c_bus':'B'},
     7: {'name': 'MON_ID_P_1_8V', 'i2_c_address': 0x86, 'i2_c_bus':'B'},
 }
+
+adc_index_to_spectral_channel = {13:'B1', 12:'B2', 11:'B3', 10:'B4', 9:'B5', 8:'B6', 7:'B7', 6:'B8', 5:'B9', 4:'B10', 3:'B11', 2:'B12', 1:'B13', 0:'B14', 14:'FSC', 15:'SSC'}
+adc_index_to_spectral_channel_index = {key: adc_channels.index(value) for key, value in adc_index_to_spectral_channel.items()}
+spectral_channel_index_to_adc_channel_index = {adc_channels.index(value):key for key, value in adc_index_to_spectral_channel.items()}

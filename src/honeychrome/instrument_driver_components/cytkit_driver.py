@@ -7,7 +7,7 @@ import numpy as np
 from honeychrome.instrument_driver_components.cytkit_components.adcs import ADCs
 from honeychrome.instrument_driver_components.cytkit_components.capture import Capture
 from honeychrome.instrument_driver_components.cytkit_components.capture_decoder import CaptureDecoder
-from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max, connection_direction
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max, connection_direction, spectral_channel_index_to_adc_channel_index
 from honeychrome.instrument_driver_components.cytkit_components.dacs import DACs
 from honeychrome.instrument_driver_components.cytkit_components.display import Display
 from honeychrome.instrument_driver_components.cytkit_components.ft4222communicator import Ft4222Communicator
@@ -552,50 +552,50 @@ class CytkitDevice:
             if parameter == 'dacs':
                 if 'bias' in value:
                     for index in value['bias']:
-                        self.dacs.set_value_bias(index, value['bias'][index] + 3*256)
+                        self.dacs.set_value_bias(spectral_channel_index_to_adc_channel_index[index], value['bias'][index] + 3*256)
                 if 'ref' in value:
                     for index in value['ref']:
-                        self.dacs.set_value_ref(index, value['ref'][index])
+                        self.dacs.set_value_ref(spectral_channel_index_to_adc_channel_index[index], value['ref'][index])
                 message['dacs'] = value
 
             if parameter == 'adcs':
                 if 'enable' in value:
                     for index in value['enable']:
-                        self.adcs.real_set_enable(index, value['enable'][index])
-                        self.offset_corrector.set_enable(index, value['invert'][index])
+                        self.adcs.real_set_enable(spectral_channel_index_to_adc_channel_index[index], value['enable'][index])
+                        self.offset_corrector.set_enable(spectral_channel_index_to_adc_channel_index[index], value['invert'][index])
                 if 'invert' in value:
                     for index in value['invert']:
-                        self.offset_corrector.set_invert(index, value['invert'][index])
+                        self.offset_corrector.set_invert(spectral_channel_index_to_adc_channel_index[index], value['invert'][index])
                 if 'offset' in value:
                     for index in value['offset']:
-                        self.offset_corrector.set_level(index, value['offset'][index])
+                        self.offset_corrector.set_level(spectral_channel_index_to_adc_channel_index[index], value['offset'][index])
                 message['adcs'] = value
 
             if parameter == 'trigger':
                 if 'enable' in value:
                     for index in value['enable']:
-                        self.trigger.channel_set_enable(index, value['enable'][index])
+                        self.trigger.channel_set_enable(spectral_channel_index_to_adc_channel_index[index], value['enable'][index])
                 if 'mask' in value:
                     for index in value['mask']:
-                        self.trigger.channel_set_mask(index, value['mask'][index])
+                        self.trigger.channel_set_mask(spectral_channel_index_to_adc_channel_index[index], value['mask'][index])
                 if 'edge' in value:
                     for index in value['edge']:
-                        self.trigger.channel_set_edge(index, value['edge'][index])
+                        self.trigger.channel_set_edge(spectral_channel_index_to_adc_channel_index[index], value['edge'][index])
                 if 'level' in value:
                     for index in value['level']:
-                        self.trigger.channel_set_level(index, value['level'][index])
+                        self.trigger.channel_set_level(spectral_channel_index_to_adc_channel_index[index], value['level'][index])
                 if 'hyst' in value:
                     for index in value['hyst']:
-                        self.trigger.channel_set_hysteresis(index, value['hyst'][index])
+                        self.trigger.channel_set_hysteresis(spectral_channel_index_to_adc_channel_index[index], value['hyst'][index])
                 if 'delay' in value:
                     for index in value['delay']:
-                        self.trigger.channel_set_delay(index, value['delay'][index])
+                        self.trigger.channel_set_delay(spectral_channel_index_to_adc_channel_index[index], value['delay'][index])
                 if 'h_off' in value:
                     for index in value['h_off']:
-                        self.trigger.channel_set_holdoff(index, value['h_off'][index])
+                        self.trigger.channel_set_holdoff(spectral_channel_index_to_adc_channel_index[index], value['h_off'][index])
                 if 'skew' in value:
                     for index in value['skew']:
-                        self.capture.channel_set_trigger_skew(index, value['skew'][index])
+                        self.capture.channel_set_trigger_skew(spectral_channel_index_to_adc_channel_index[index], value['skew'][index])
                 if 'force' == value:
                     self.trigger.merge_force_trigger()
                 if 'clear' == value:
@@ -605,13 +605,13 @@ class CytkitDevice:
             if parameter == 'capture':
                 if 'enable' in value:
                     for index in value['enable']:
-                        self.capture.channel_set_enable(index, value['enable'][index])
+                        self.capture.channel_set_enable(spectral_channel_index_to_adc_channel_index[index], value['enable'][index])
                 if 'pre_trigger' in value:
                     for index in value['pre_trigger']:
-                        self.capture.channel_set_pre_trig_samples(index, value['pre_trigger'][index])
+                        self.capture.channel_set_pre_trig_samples(spectral_channel_index_to_adc_channel_index[index], value['pre_trigger'][index])
                 if 'post_trigger' in value:
                     for index in value['post_trigger']:
-                        self.capture.channel_set_post_trig_samples(index, value['post_trigger'][index])
+                        self.capture.channel_set_post_trig_samples(spectral_channel_index_to_adc_channel_index[index], value['post_trigger'][index])
                 if 'clear_fifo' == value:
                     self.capture.aggr_fifo_clear()
                 message['capture'] = value
@@ -761,18 +761,18 @@ class CytkitDevice:
         if 'dacs' in list_of_parameters:
             message['dacs'] = {'bias':{}, 'ref':{}}
             for index in range(16):
-                message['dacs']['bias'][index] = max(self.dacs.get_value_bias(index) - 3*256, 0) # floor of 768
-                message['dacs']['ref'][index] = self.dacs.get_value_ref(index)
+                message['dacs']['bias'][index] = max(self.dacs.get_value_bias(spectral_channel_index_to_adc_channel_index[index]) - 3*256, 0) # floor of 768
+                message['dacs']['ref'][index] = self.dacs.get_value_ref(spectral_channel_index_to_adc_channel_index[index])
 
         if 'adcs' in list_of_parameters:
             message['adcs'] = {'level':{}}
             for index in range(16):
-                message['adcs']['level'][index] = self.adcs.real_read_value(index)
+                message['adcs']['level'][index] = self.adcs.real_read_value(spectral_channel_index_to_adc_channel_index[index])
 
         if 'trigger' in list_of_parameters:
             message['trigger'] = {'events':{}}
             for index in range(16):
-                message['trigger']['events'][index] = self.trigger.channel_get_event_count(index)
+                message['trigger']['events'][index] = self.trigger.channel_get_event_count(spectral_channel_index_to_adc_channel_index[index])
             message['trigger']['events']['merge'] = self.event_rate_counter.trigger_event_count
 
         if 'capture' in list_of_parameters:
@@ -866,7 +866,9 @@ class CytkitDevice:
         if traces is not None:
             # n_decoded_events = len(event_index)
             # self.event_rate_counter.update(n_decoded_events) # this is the number of events for which at least some data was recovered
-            return traces.reshape(-1)
+            traces = np.ascontiguousarray(traces.reshape(-1), dtype=settings.traces_cache_dtype)
+
+            return traces
 
         return None
 

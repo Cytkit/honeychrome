@@ -214,6 +214,7 @@ class Instrument(mp.Process):
         if self.thread is not None and self.thread.is_alive():
             return {'source': '[Instrument driver]', 'status': 'Error', 'message': 'acquisition already running'}
 
+        self.stop_transfer.clear()
         status, message = self.device.start_acquisition()
         """Start transfer in a separate thread"""
         self.thread = threading.Thread(
@@ -226,6 +227,7 @@ class Instrument(mp.Process):
 
     def stop_acquisition(self):
         self.stop_transfer.set()
+        self.thread.join(timeout=5)
         status, message = self.device.stop_acquisition()
         return {'source': '[Instrument driver]', 'status': status, 'message': message}
 
@@ -296,16 +298,17 @@ class Instrument(mp.Process):
             slice_begin = queue_begin_index * self.trace_n_points
             slice_end = queue_end_index * self.trace_n_points
             with self.traces_cache_lock:
-                if queue_end_index >= queue_begin_index:
-                    try:
-                        self.traces_cache[slice_begin:slice_end] = blob_np #todo fix: this crashes in long acquisition
-                    except Exception as e:
-                        self.logger.exception(str(e))
-                else:
-                    # note number of events that didn't fit is queue_end_index
-                    switch_index = (self.max_events_in_traces_cache - queue_begin_index) * self.trace_n_points
-                    self.traces_cache[slice_begin:] = blob_np[:switch_index]  # put first events into back of queue array
-                    self.traces_cache[:slice_end] = blob_np[switch_index:]  # put last events into front of queue array
+                try:
+                    if queue_end_index >= queue_begin_index:
+                        self.traces_cache[slice_begin:slice_end] = blob_np #todo fix: this crashes blob from cytkit driver but not others?
+                    else:
+                        # note number of events that didn't fit is queue_end_index
+                        switch_index = (self.max_events_in_traces_cache - queue_begin_index) * self.trace_n_points
+                        self.traces_cache[slice_begin:] = blob_np[:switch_index]  # put first events into back of queue array
+                        self.traces_cache[:slice_end] = blob_np[switch_index:]  # put last events into front of queue array
+                except BaseException as e:
+                    self.logger.exception(str(e))
+                    return
 
             with self.index_tail_traces_cache.get_lock():
                 self.index_tail_traces_cache.value = cache_new_tail

@@ -72,7 +72,7 @@ def peak_measurements(tr, n_start, n_end, deltaT, area_indices, height_indices):
 
     traces_truncated_baseline_subtracted = tr[:,n_start:n_end] - baselines.reshape(-1,1)
     heights = np.max(traces_truncated_baseline_subtracted[height_indices,:], axis=1)
-    areas = np.sum(traces_truncated_baseline_subtracted[area_indices,:], axis=1)
+    areas = np.sum(traces_truncated_baseline_subtracted[area_indices,:], axis=1) * baseline_decay_rate
     width = (n_end - n_start) * deltaT * 1000 # width in nanoseconds
     centre = (n_start + n_end) * 0.5
     peak = areas, heights, width, centre

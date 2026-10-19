@@ -11,7 +11,7 @@ import numpy as np
 import struct
 from typing import NamedTuple
 from honeychrome import settings
-from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import adc_dictionary
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import adc_index_to_spectral_channel_index
 
 SYNC_WORD_0 = b'\xCA\xFE'
 SYNC_WORD_1 = b'\xF0\x0D'
@@ -72,7 +72,7 @@ class CaptureDecoder:
                         trace_end = min(trace_start + length, traces.shape[2])
                         usable = trace_end - trace_start
                         if length > 0:
-                            traces[n, packet.channel, trace_start:trace_end] = packet.samples[:usable]
+                            traces[n, adc_index_to_spectral_channel_index[packet.channel], trace_start:trace_end] = packet.samples[:usable]
                 else:
                     self.error_count += 1 # incomplete event
 
