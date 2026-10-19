@@ -87,12 +87,15 @@ class ReportItem:
     get_tables  Optional zero-arg callable returning {table_name: DataFrame}.
                 An item can supply BOTH get_figure and get_tables (e.g. a
                 results heatmap also exports its underlying results table).
+    write_files Optional callable taking the item's export folder, writing
+                any further files (e.g. a Workspace page as a vector PDF).
     """
     key: str
     tab: str
     label: str
     get_figure: Callable[[], Any] | None = None
     get_tables: Callable[[], dict] | None = None
+    write_files: Callable[[Any], Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +168,7 @@ def build_settings_document(
 ) -> str:
     """
     Plain-text settings document -- everything needed to describe how to
-    reproduce the analysis behind the report: samples, DR/clustering
+    reproduce the analysis behind the report: samples, Honeycluster
     algorithm + hyperparameters, per-channel transforms, channel roles,
     stats settings, and group assignments. Always generated, regardless
     of which report items were ticked (see ReportTab.generate_report).
@@ -177,7 +180,7 @@ def build_settings_document(
         lines.append(title)
         lines.append('=' * len(title))
 
-    lines.append('Honeychrome DR/Clustering -- Analysis Settings')
+    lines.append('Honeychrome Honeycluster -- Analysis Settings')
     lines.append(f"Experiment:       {controller.experiment_dir}")
     lines.append(f"Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -663,7 +666,7 @@ class ReportTab(QWidget):
             from matplotlib.backends.backend_pdf import PdfPages
             with PdfPages(str(pdf_path)) as pdf:
                 add_title_page(
-                    pdf, "Honeychrome DR/Clustering Report",
+                    pdf, "Honeychrome Honeycluster Report",
                     [
                         f"Experiment: {self.controller.experiment_dir}",
                         f"Clustering run: {run_label}",
@@ -727,7 +730,12 @@ def export_report_item(item: ReportItem, subfolder, pdf) -> None:
             log.warning("figure build failed for %r: %s", item.label, e)
         if fig is not None:
             fig.savefig(subfolder / f"{safe_label}.png", dpi=200, bbox_inches='tight')
-            pdf.savefig(fig, bbox_inches='tight')
+            pdf.savefig(fig, bbox_inches='tight', dpi=300)
+    if item.write_files is not None:
+        try:
+            item.write_files(subfolder)
+        except Exception as e:
+            log.warning("extra files failed for %r: %s", item.label, e)
     if item.get_tables is not None:
         try:
             tables = item.get_tables() or {}

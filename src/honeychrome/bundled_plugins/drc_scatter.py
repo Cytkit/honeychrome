@@ -56,12 +56,12 @@ def draw_cluster_scatter(ax, xy, labels, cl_run: dict | None, controller) -> Non
     cluster-map panel so both render identically.
     """
     if cl_run is None:
-        ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#aaaaaa', alpha=0.4)
+        ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#aaaaaa', alpha=0.4, rasterized=True)
         ax.set_title("No clustering run selected", fontsize=8)
         return
     if labels is None or len(labels) == 0:
         log.warning("cluster scatter: no labels for this selection")
-        ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#aaaaaa', alpha=0.4)
+        ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#aaaaaa', alpha=0.4, rasterized=True)
         return
 
     # If colours were never archived for this run (shouldn't normally
@@ -73,7 +73,7 @@ def draw_cluster_scatter(ax, xy, labels, cl_run: dict | None, controller) -> Non
         log.warning("cluster_colors empty for run %s — assigning palette on the fly",
                      cl_run.get('run_id'))
         colors.update(assign_run_cluster_colors(np.asarray(labels)))
-        drc_run_archive.update_run_payload(controller, cl_run)
+        drc_run_archive.update_run_fields(controller, cl_run, 'colors')
     names = cl_run.get('names', {})
 
     unique_labels = sorted(int(l) for l in np.unique(labels))
@@ -89,7 +89,7 @@ def draw_cluster_scatter(ax, xy, labels, cl_run: dict | None, controller) -> Non
         ax.scatter(
             xy[mask, 0], xy[mask, 1],
             s=1, c=color, alpha=0.5, linewidths=0,
-            label=label_text
+            label=label_text, rasterized=True
         )
     log.debug("cluster scatter: %d points, %d clusters, %d uncoloured",
               len(labels), len(unique_labels), n_grey)
@@ -100,7 +100,7 @@ def rename_cluster(controller, cl_run: dict | None, label: int, new_name: str,
     """
     Rename a cluster within cl_run, rejecting a name already used by
     another cluster in the SAME run. Persists immediately via
-    drc_run_archive.save_run_payload. Returns True on success, False if
+    drc_run_archive.update_run_fields (names only). Returns True on success, False if
     rejected (duplicate, blank, or cl_run is None).
 
     Shared by PlotCard's legend rename (Workspace) and the Cluster
@@ -122,7 +122,7 @@ def rename_cluster(controller, cl_run: dict | None, label: int, new_name: str,
             )
             return False
     names[label] = new_name
-    drc_run_archive.update_run_payload(controller, cl_run)
+    drc_run_archive.update_run_fields(controller, cl_run, 'names')
     return True
 
 
@@ -133,7 +133,7 @@ def recolor_cluster(controller, cl_run: dict | None, label: int, new_hex: str) -
         return
     colors = cl_run.setdefault('colors', {})
     colors[label] = new_hex
-    drc_run_archive.update_run_payload(controller, cl_run)
+    drc_run_archive.update_run_fields(controller, cl_run, 'colors')
 
 
 def compatibility_warning(dr_run: dict | None, cl_run: dict | None) -> str | None:

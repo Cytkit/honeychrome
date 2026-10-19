@@ -575,43 +575,62 @@ above.</p>
 '''
 
 workspace_tab_help_text = '''
-<h3>Workspace — build a scatter-plot canvas for your DR embeddings</h3>
+<h3>Workspace — lay out figures on pages</h3>
 <p><b>Prerequisite:</b> train at least one DR run in the Configuration
-tab before adding plots here. Colouring by Clusters, or viewing the
-FlowSOM Tree plot type, additionally requires a clustering run.</p>
+tab before adding plots here. Colouring by Clusters, or the Cluster Tree
+plot type, additionally requires a clustering run.</p>
 <ul>
-<li>Click <b>+ Add Plot</b> to add a new plot card to the grid; use
-<b>Columns</b> and <b>Theme</b> (Auto/Light/Dark, applies to every plot
-in the plugin) to control the layout.</li>
-<li>Each plot card lets you choose:
-  <ul>
-  <li><b>Plot type</b> — Scatter (per-event points on the chosen DR
-  embedding), or FlowSOM Tree (minimum-spanning-tree view over SOM
-  nodes, only available when a FlowSOM clustering run is selected as the
-  overlay).</li>
-  <li><b>DR run</b> and <b>Sample</b> — pool all samples together or
-  view one individually.</li>
-  <li><b>Colour mode</b> — Clusters (needs a clustering run selected as
-  the overlay), Marker (colour by a channel's intensity, pick the
-  channel from the marker selector), or Group (colour by comparison
-  group).</li>
-  </ul>
-</li>
-<li>Right-click a cluster or group's legend colour swatch to recolour
-it — the choice is shared with the Comparison Groups table in the Stats
-tab.</li>
-<li>Use the <b>magic wand</b> to copy a card's full display
-configuration (colour mode, appearance settings, etc.) and the
-<b>paste</b> button on another card to apply it — a fast way to keep
-several plots visually consistent.</li>
-<li>Each card can export its own <b>PNG</b>; use <b>Export PDF</b> in
-the toolbar to export every currently-open card as a single multi-page
-PDF.</li>
-<li>The <b>Appearance</b> panel on each card controls grid lines,
-tick/axis labels, legend and axis font size, and plot width/height.</li>
+<li>Plots, legends, text and panel letters sit on <b>pages</b> (A4 by
+default) at their printed size. <b>+ Page</b> / <b>− Page</b> add or remove
+pages; with nothing selected, the panel on the right sets the current
+page's size and orientation.</li>
+<li><b>+ Add Plot</b> places a plot in the first free space. Drag to move;
+drag the handles on the right edge, bottom edge or corner to resize. With
+<b>Lock aspect ratio</b> ticked (the default) a plot keeps its
+width:height; untick it to stretch freely. Items snap to the grid
+(<b>Snap</b>, grid spacing); hold Alt/⌥ to place them freely; arrow keys
+nudge the selection by one grid step.</li>
+<li><b>Legend: Separate</b> (the default) puts the cluster or group legend
+in its own box beside the plot. It moves with the plot, and can be dragged
+anywhere; dragging its edges reflows the entries into more or fewer
+columns (the font size stays as set). Right-click it to put it back beside
+the plot or hide it. <b>Right</b> / <b>Below</b> draw it inside the plot's figure
+instead.</li>
+<li>Right-click a legend entry for its colour or to rename it (cluster
+colours are shared with the Cluster Annotation tab, group colours with the
+Comparison Groups table); double-click a cluster name to rename it.</li>
+<li><b>+ Text</b> adds a text box where you last clicked on a page (further
+ones go below it); <b>+ Panel Letter</b> adds a bold letter at the top-left
+of the selected plot or group, or where you last clicked. Right-click an
+empty part of a page to add text, a letter, a plot or a figure exactly
+there. Letters are given A, B, C …
+in reading order on each page; type a letter yourself to fix it.</li>
+<li>Select several items (drag a box, or Shift-click) and use
+<b>Arrange</b> to align or distribute them, to <b>Group</b> them
+(Ctrl/⌘+G) into one figure panel, or to change their stacking order. A
+group moves as one; drag its orange corner to scale it (plots are redrawn
+at the new size, text keeps its size). Double-click an item in a group to
+edit it alone.</li>
+<li><b>+ From Other Tabs</b> copies a figure shown in the Cluster
+Annotation or Stats tab (cluster map, violins, marker heatmap and
+ridgelines; heatmaps, volcanoes, sample PCA, composition) onto the page.
+Resize it like a plot (aspect ratio locked by default; fonts keep their
+size). It is a copy: right-click → <b>Update from source</b> after changing
+it there. When the source is not there (for example after reopening the
+experiment before the statistics are recomputed) a placeholder holds its
+place until it can be updated.</li>
+<li><b>Undo</b> / <b>Redo</b> (Ctrl/⌘+Z, Ctrl/⌘+Shift+Z) cover moving,
+resizing, arranging, grouping, scaling and adding or removing items; not
+changes to a plot's settings or to pages.</li>
+<li>Select a plot to edit it in the panel on the right: plot type, DR run,
+sample, colour (Clusters with a choice of <b>Clustering run</b>, Marker or
+Group) and appearance (size in mm, legend, fonts in points, grid, labels;
+<b>Label colour</b> Auto follows the plot theme).</li>
+<li><b>Export…</b> writes the pages as PDF (vector), SVG (one file per page,
+text editable if you like), PNG or TIFF (300 or 600 dpi).</li>
 </ul>
-<p>Plots you leave open here are exactly what the Report tab's Workspace
-section will offer to include when you generate a report.</p>
+<p>The pages are what the Report tab's Workspace section offers to include
+when you generate a report.</p>
 '''
 
 report_tab_help_text = '''
