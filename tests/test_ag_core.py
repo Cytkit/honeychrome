@@ -83,7 +83,8 @@ def test_tail_sits_above_negative_population():
 @pytest.mark.numpy_only
 def test_kde_min_falls_back_on_single_peak():
     x = _unimodal()
-    assert ag.threshold_kde_min(x) == pytest.approx(ag.threshold_tail(x), abs=1e-9)
+    assert ag.threshold_kde_min(x) == pytest.approx(
+        ag.threshold_tail(x, ag.KDE_MIN_FALLBACK_TAIL), abs=1e-9)
 
 
 @pytest.mark.numpy_only
@@ -560,18 +561,65 @@ def test_2dsep_replicates_one_axis_and_calculates_the_other():
 
 
 @pytest.mark.numpy_only
-def test_cells_gate_cuts_debris_and_stays_open_above():
+def test_cells_gate_cuts_debris_and_bounds_the_cells():
     rng = np.random.default_rng(4)
     debris = np.column_stack([rng.normal(0.1, 0.03, 3000), rng.normal(0.1, 0.05, 3000)])
     cells = np.column_stack([rng.normal(0.5, 0.06, 7000), rng.normal(0.4, 0.1, 7000)])
     data = np.vstack([debris, cells])
-    g = _gate('Cells', 'free', 'FSC', 'SSC', algorithm='cells')
+    g = _gate('Cells', 'free', 'FSC', 'SSC', algorithm='cells', gate_param={'edge_density': 0.05})
     res = ag.train_boundaries([g], data, {'FSC': 0, 'SSC': 1},
                               axis_limits={'FSC': (0, 1), 'SSC': (0, 1)})
     box = np.asarray(res.boundaries['Cells']['in']['boundary'])
-    assert 0.15 < box[:, 0].min() < 0.35 and box[:, 0].max() > 1.0 and box[:, 1].min() < 0.0
+    assert 0.15 < box[:, 0].min() < 0.35 and 0.6 < box[:, 0].max() < 0.75
+    assert 0.1 < box[:, 1].min() < 0.25 and 0.55 < box[:, 1].max() < 0.7
     frac = res.boundaries['Cells']['in']['fraction']
     assert 0.65 < frac < 0.72
+
+
+def _cells_box(data, **gate_param):
+    g = _gate('Cells', 'free', 'FSC', 'SSC', algorithm='cells', gate_param=gate_param)
+    b = ag.GateCalculator({'FSC': (0, 1), 'SSC': (0, 1)}).calculate(data, g, {'FSC': 0, 'SSC': 1})
+    return np.asarray(b['in']['boundary'])
+
+
+@pytest.mark.numpy_only
+def test_cells_fall_off_defaults_to_0_002_and_is_set_per_axis():
+    rng = np.random.default_rng(4)
+    debris = np.column_stack([rng.normal(0.1, 0.03, 3000), rng.normal(0.1, 0.05, 3000)])
+    cells = np.column_stack([rng.normal(0.5, 0.06, 7000), rng.normal(0.4, 0.1, 7000)])
+    data = np.vstack([debris, cells])
+    default = _cells_box(data)
+    wide = _cells_box(data, edge_density=0.05)
+    assert ag.DEFAULT_EDGE_DENSITY == 0.002
+    assert default[:, 1].max() > wide[:, 1].max() + 0.02
+    assert default[:, 1].min() < wide[:, 1].min() - 0.02
+    # Only the y axis follows edge_density_y.
+    y_only = _cells_box(data, edge_density_x=0.05)
+    assert np.isclose(y_only[:, 1].max(), default[:, 1].max())
+    assert np.isclose(y_only[:, 0].max(), wide[:, 0].max())
+
+
+@pytest.mark.numpy_only
+def test_cells_debris_side_keeps_the_events_below_the_cut():
+    rng = np.random.default_rng(4)
+    debris = np.column_stack([rng.normal(0.1, 0.03, 3000), rng.normal(0.1, 0.05, 3000)])
+    cells = np.column_stack([rng.normal(0.5, 0.06, 7000), rng.normal(0.4, 0.1, 7000)])
+    data = np.vstack([debris, cells])
+    above = _cells_box(data)
+    below = _cells_box(data, cell_side=ag.CELL_SIDE_DEBRIS)
+    cut = above[:, 0].min()
+    assert np.isclose(below[:, 0].max(), cut)
+    assert below[:, 0].min() < 0.05 and below[:, 1].max() < 0.35
+
+
+@pytest.mark.numpy_only
+def test_density_edges_leave_out_sparse_tails_only():
+    rng = np.random.default_rng(6)
+    main = rng.normal(0.3, 0.05, 9000)
+    lo, hi = ag.density_edges(main, 0.05)
+    assert 0.15 < lo < 0.22 and 0.38 < hi < 0.45
+    second = np.concatenate([main, rng.normal(0.7, 0.05, 2000)])
+    assert ag.density_edges(second, 0.05)[1] > 0.75
 
 
 @pytest.mark.numpy_only
@@ -702,3 +750,40 @@ def test_paused_training_keeps_partial_results_and_resumes():
         assert resumed.boundaries[name]['pos']['threshold_x'] == pytest.approx(
             full.boundaries[name]['pos']['threshold_x'])
     assert {s.get('source') for s in resumed.status.values()} <= {'trained', None}
+
+
+# ---------------------------------------------------------------------------
+# Joined 2dsep regions
+# ---------------------------------------------------------------------------
+
+@pytest.mark.numpy_only
+def test_joined_regions_mask_outline_and_sides():
+    g = _gate('g', '2dsep', 'A', 'B')
+    g['populations'] = {'in': {'region': 'x-y-'}, 'L': {'region': 'x+y-|x-y+|x+y+'}}
+    data = np.array([[0.2, 0.2], [0.8, 0.2], [0.2, 0.8], [0.8, 0.8]])
+    calc = ag.GateCalculator({'A': (0.0, 1.0), 'B': (0.0, 1.0)})
+    b = calc.threshold_boundaries(g, 0.5, 0.5)
+    m = ag.population_masks(g, b, data, {'A': 0, 'B': 1})
+    assert m['in'].tolist() == [True, False, False, False]
+    assert m['L'].tolist() == [False, True, True, True]
+    from matplotlib.path import Path as MplPath
+    inside = MplPath(np.asarray(b['L']['boundary'])).contains_points(data)
+    assert inside.tolist() == [False, True, True, True]
+    assert ag.region_sign('x-y-|x-y+', 'x') == '-' and ag.region_sign('x-y-|x-y+', 'y') is None
+    assert ag.join_quadrants(['x+y+', 'x-y-']) == 'x-y-|x+y+'
+    side = ag.region_polygon('x-y-|x-y+', 0.5, 0.5, 0.0, 1.0, 0.0, 1.0)
+    assert np.asarray(side)[:, 0].max() == pytest.approx(0.5)
+    assert np.asarray(side)[:, 1].max() == pytest.approx(1.0)
+    pair = ag.region_polygon('x-y-|x+y+', 0.5, 0.5, 0.0, 1.0, 0.0, 1.0)
+    assert MplPath(np.asarray(pair)).contains_points(data).tolist() == [True, False, False, True]
+
+
+def test_joined_regions_export_to_flowkit():
+    pytest.importorskip('flowkit')
+    g = _gate('g', '2dsep', 'A', 'B')
+    g['populations'] = {'in': {'region': 'x-y-'}, 'side': {'region': 'x+y-|x+y+'},
+                        'top': {'region': 'x-y+'}}
+    calc = ag.GateCalculator({'A': (0.0, 1.0), 'B': (0.0, 1.0)})
+    gs = ag.model_to_gating_strategy([g], {'g': calc.threshold_boundaries(g, 0.5, 0.5)}, {})
+    ids = {gid[0] for gid in gs.get_gate_ids()}
+    assert {'g/in', 'g/side', 'g/top'} <= ids

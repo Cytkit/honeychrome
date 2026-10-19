@@ -175,7 +175,7 @@ def test_convert_target_ignores_gates_that_are_not_imported():
 def test_population_tree_nests_populations_and_views(gates):
     nodes = ag_review.population_tree(gates)
     by_key = {(n['gate'], n['pop']): n for n in nodes}
-    assert [n['label'] for n in nodes] == ['All events (root)', 'Cells', 'T', 'B', 'NK']
+    assert [n['label'] for n in nodes] == ['All events (root)', 'Cells  [anchor]', 'T', 'B', 'NK']
     assert by_key[('', 'root')]['parent'] is None
     assert by_key[('Cells', 'Cells')]['parent'] == ('', 'root')
     assert by_key[('T', 'T')]['parent'] == ('Cells', 'Cells')
@@ -462,6 +462,17 @@ def test_feed_forward_reaches_same_named_gates_below_only(cd25_tree):
     assert by['CD80+ (B)']['algorithm'] == 'imported'
 
 
+def test_feed_forward_everywhere_reaches_every_same_named_gate(cd25_tree):
+    by = ag_core.gates_by_name(cd25_tree)
+    by['CD80+ (Tem)'].update(algorithm='mixture', sync_origin=ag_review.SYNC_USER)
+    by['CD80+ (Tem)']['gate_param']['tail_fraction'] = 0.03
+    assert ag_review.feed_forward(cd25_tree, 'CD80+ (Tem)') == ([], [])
+    changed, skipped = ag_review.feed_forward(cd25_tree, 'CD80+ (Tem)', everywhere=True)
+    assert sorted(changed) == ['CD80+ (B)', 'CD80+ (Tconv)'] and skipped == []
+    assert all(by[n]['algorithm'] == 'mixture' and by[n]['gate_param']['tail_fraction'] == 0.03
+               for n in changed)
+
+
 def test_feed_forward_ignores_a_gate_still_as_drawn(cd25_tree):
     assert ag_review.feed_forward(cd25_tree, 'CD80+ (Tconv)') == ([], [])
 
@@ -498,3 +509,339 @@ def test_conversion_check_flags_large_moves_only():
     assert flag['shift'] == pytest.approx(0.2) and 'threshold' in flag['message']
     flag = ag_review.conversion_check(g, drawn, near, {'CD80+': 0.20}, {'CD80+': 0.45})
     assert flag['fraction'] == pytest.approx(0.25)
+
+
+# ---------------------------------------------------------------------------
+# Changing a gate between 1dsep and 2dsep, renaming its populations
+# ---------------------------------------------------------------------------
+
+def test_2dsep_to_1dsep_keeps_population_names_and_sides():
+    g = _shape_gate('CD14', x='SBUV540', y='SUV387',
+                    regions={'CD14+CD11b+': 'x+y-', 'CD14-': 'x-y-'})
+    pops, problem = ag_review.convert_threshold_regions(
+        g['populations'], '2dsep', 'SBUV540', 'SUV387', '1dsep', 'SBUV540', 'SUV387')
+    assert problem == ''
+    assert {p: m['region'] for p, m in pops.items()} == {'CD14+CD11b+': 'above', 'CD14-': 'below'}
+    pops, problem = ag_review.convert_threshold_regions(
+        g['populations'], '2dsep', 'SBUV540', 'SUV387', '1dsep', 'SUV387', 'SBUV540')
+    assert pops is None and 'same side' in problem
+    joined = {'A': {'region': 'x-y-|x+y-'}, 'B': {'region': 'x-y+'}}
+    pops, problem = ag_review.convert_threshold_regions(joined, '2dsep', 'X', 'Y', '1dsep', 'X', 'Y')
+    assert pops is None and 'both sides' in problem
+
+
+def test_1dsep_to_2dsep_turns_sides_into_halves():
+    pops = {'neg': {'region': 'below'}, 'pos': {'region': 'above'}}
+    out, problem = ag_review.convert_threshold_regions(pops, '1dsep', 'A', 'B', '2dsep', 'B', 'A')
+    assert problem == ''
+    assert out['pos']['region'] == 'x-y+|x+y+' and out['neg']['region'] == 'x-y-|x+y-'
+
+
+def test_rename_populations_moves_every_reference():
+    g = _shape_gate('Gate', regions={'neg': 'x-y-', 'pos': 'x+y+'})
+    child = dict(_poly_gate('Child', 2, 'C', 'D', 'Gate', 'pos'))
+    other = dict(_poly_gate('Other', 3, 'C', 'D'))
+    other['gate_param'] = {'replicate_x': {'population': 'Gate/pos', 'algorithm': 'tail'}}
+    other['stats_parent'] = {'gate': 'Gate/pos'}
+    trained = {'Gate': {'neg': {}, 'pos': {}}}
+    assert ag_review.orphaned_by_populations([g, child, other], 'Gate', {'pos'}) == ['Child']
+    ag_review.rename_populations([g, child, other], 'Gate', {'pos': 'CD14+'}, trained)
+    assert child['parent_popul'] == 'CD14+'
+    assert other['gate_param']['replicate_x']['population'] == 'Gate/CD14+'
+    assert other['stats_parent']['gate'] == 'Gate/CD14+'
+    assert set(g['template']) == {'neg', 'CD14+'} and set(trained['Gate']) == {'neg', 'CD14+'}
+
+
+def test_split_2dsep_keeps_a_population_covering_a_whole_side():
+    g = _shape_gate('G', regions={'L': 'x-y-|x-y+', 'P': 'x+y-', 'Q': 'x+y+'})
+    child = dict(_poly_gate('Kid', 2, 'C', 'D', 'G', 'L'))
+    steps = [{'channel': 'A', 'algorithm': 'tail', 'view': 'B', 'sep_axis': 'x'},
+             {'channel': 'B', 'algorithm': 'tail', 'view': 'A', 'sep_axis': 'y'}]
+    out, _names = ag_review.split_2dsep([g, child], 'G', steps)
+    by = {d['gate_name']: d for d in out}
+    first = by['G · A']
+    assert set(first['populations']) == {'L', 'A+'}
+    assert first['populations']['L']['region'] == 'below'
+    assert (by['Kid']['parent_gate'], by['Kid']['parent_popul']) == ('G · A', 'L')
+    with pytest.raises(ValueError):
+        ag_review.split_2dsep([g], 'G', list(reversed(steps)))
+
+
+# ---------------------------------------------------------------------------
+# Overlapping populations
+# ---------------------------------------------------------------------------
+
+def test_overlap_flags_a_population_defined_on_two_branches():
+    root_a = dict(_poly_gate('Mono', 1, 'A', 'B'))
+    root_b = dict(_poly_gate('Lin-', 2, 'C', 'D'))
+    deep = dict(_poly_gate('CD14+', 3, 'A', 'B', 'Lin-', 'Lin-'))
+    below = dict(_poly_gate('Act', 4, 'E', 'F', 'Mono', 'Mono'))
+    below_deep = dict(_poly_gate('Act2', 5, 'E', 'F', 'CD14+', 'CD14+'))
+    marker = dict(_poly_gate('HLADR+', 6, 'G', 'H', 'Lin-', 'Lin-'))
+    defs = [root_a, root_b, deep, below, below_deep, marker]
+    n = 1000
+    mono = np.zeros(n, bool); mono[:100] = True
+    lin = np.zeros(n, bool); lin[:500] = True
+    cd14 = np.zeros(n, bool); cd14[5:100] = True
+    masks = {('Mono', 'Mono'): mono, ('Lin-', 'Lin-'): lin, ('CD14+', 'CD14+'): cd14,
+             ('Act', 'Act'): mono.copy(), ('Act2', 'Act2'): cd14.copy(),
+             ('HLADR+', 'HLADR+'): mono.copy()}
+    pairs = ag_review.overlapping_populations(defs, masks)
+    assert [(a, b) for a, b, _s in pairs] == [(('Mono', 'Mono'), ('CD14+', 'CD14+'))]
+    assert pairs[0][2] == pytest.approx(0.95)
+    flags = ag_review.overlap_flags(pairs)
+    assert set(flags) == {'Mono', 'CD14+'} and 'CD14+' in flags['Mono']['message']
+    assert ag_review.overlapping_populations(defs, masks, limit=0.96) == []
+
+
+# ---------------------------------------------------------------------------
+# Fraction rule for imported threshold gates
+# ---------------------------------------------------------------------------
+
+def test_fraction_rule_sets_each_axis_from_the_drawn_fractions():
+    g = _shape_gate('G', regions={'DP': 'x+y+', 'L': 'x-y-|x+y-|x-y+'})
+    g['proposal_rule'] = ag_review.RULE_FRACTION
+    fr = ag_review.positive_fractions(g, {'DP': 0.02, 'L': 0.98})
+    assert fr == {'x': pytest.approx(0.02), 'y': pytest.approx(0.02)}
+    assert ag_review.proposed_axis_algorithms(g, None, fr) == {'x': 'tail', 'y': 'tail'}
+    fr = ag_review.positive_fractions(g, {'DP': 0.4, 'L': 0.6})
+    assert ag_review.proposed_axis_algorithms(g, None, fr) == {'x': 'mixture', 'y': 'mixture'}
+    g['gate_param'] = {'algorithm_y': 'otsu'}
+    assert ag_review.proposed_axis_algorithms(g, None, fr)['y'] == 'otsu'
+    g['gate_param'] = {}
+    assert ag_review.proposed_axis_algorithms(g, None, None) == {'x': 'mixture', 'y': 'mixture'}
+    d = ag_review.trainable_definition(dict(g, gate_param={}), 'tail', {'x': 'tail', 'y': 'mixture'})
+    assert ag_core.axis_algorithm(d, 'y') == 'mixture'
+
+
+def test_fraction_rule_on_a_1dsep_gate_with_a_view():
+    g = _shape_gate('G', gate_type='1dsep', regions={'pos': 'above'})
+    g['proposal_rule'] = ag_review.RULE_FRACTION
+    assert ag_review.convert_target(g, None, {'x': 0.9}) == ('mixture', '')
+    assert ag_review.convert_target(g, None, {'x': 0.1}) == ('tail', '')
+    g.pop('proposal_rule')
+    assert ag_review.convert_target(g, None, {'x': 0.1}) == ('mixture', '')
+
+
+# ---------------------------------------------------------------------------
+# Proposals from the review events
+# ---------------------------------------------------------------------------
+
+def _rect(x0, x1, y0, y1):
+    return [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]
+
+
+def _drawn(name, gate_type, x, y, shapes, parent=None, parent_pop='root', rule='fraction',
+           regions=None):
+    """Imported gate with drawn shapes {pop: polygon or ('range', lo, hi)}."""
+    chans = [x] if y is None else [x, y]
+    template, pops = {}, {}
+    for k, (p, shape) in enumerate(shapes.items()):
+        region = (regions or {}).get(p) or ('inside' if gate_type == 'free' else 'above')
+        if isinstance(shape, tuple):
+            lo, hi = shape[1], shape[2]
+            entry = {'shape_channels': [x], 'range': [lo, hi], 'boundary': _rect(lo, hi, 0, 1)}
+        else:
+            entry = {'shape_channels': chans, 'boundary': shape}
+        template[p] = dict(entry, region=region, label=p)
+        pops[p] = {'label': p, 'label_pos': k + 1, 'region': region}
+    return {'gate_name': name, 'gate_number': 1, 'gate_type': gate_type, 'gate_marker_x': x,
+            'gate_marker_y': y, 'sep_axis': 'x', 'parent_gate': parent,
+            'parent_popul': parent_pop, 'algorithm': ag_core.ALGORITHM_IMPORTED,
+            'proposed_algorithm': 'mixture', 'proposal_rule': rule, 'gate_param': {},
+            'stats_parent': {}, 'origin_gate': None, 'populations': pops, 'template': template}
+
+
+def _evidence(defs, data, index, name, zeros=None):
+    reference = {g['gate_name']: g['template'] for g in defs}
+    res = ag_core.run_gating(defs, data, index, reference=reference, default_mode=ag_core.MODE_FIXED,
+                             keep_partial=True)
+    g = ag_core.gates_by_name(defs)[name]
+    return ag_review.conversion_evidence(g, defs, data, index, res, None, zeros or {}), res
+
+
+def test_single_shape_axis_that_cuts_nothing_converts_to_1dsep():
+    rng = np.random.default_rng(1)
+    n = 6000
+    data = np.column_stack([rng.normal(0.5, 0.08, n),
+                            np.where(rng.random(n) < 0.5, rng.normal(0.25, 0.04, n),
+                                     rng.normal(0.7, 0.05, n))])
+    index = {'A': 0, 'B': 1}
+    wide = _drawn('CD3', '2dsep', 'A', 'B', {'CD3': _rect(0.0, 1.0, 0.45, 0.95)},
+                  regions={'CD3': 'x-y+'})
+    assert ag_review.separating_axis_dropped(wide, data, index) == 'x'
+    one = ag_review.without_axis(wide, 'x')
+    assert (one['gate_type'], one['gate_marker_x'], one['gate_marker_y'], one['sep_axis']) == \
+        ('1dsep', 'B', 'A', 'y')
+    assert one['populations']['CD3']['region'] == 'above'
+    assert ag_core.plot_channels(one) == ('A', 'B')
+    ev, _res = _evidence([wide], data, index, 'CD3')
+    assert ev['drop_axis'] == 'x'
+    proposed = ag_review.proposed_definition(wide, evidence=ev)
+    assert proposed['gate_type'] == '1dsep' and proposed['algorithm'] in ag_review.FIT_ALGORITHMS
+    narrow = _drawn('CD3', '2dsep', 'A', 'B', {'CD3': _rect(0.55, 1.0, 0.45, 0.95)},
+                    regions={'CD3': 'x+y+'})
+    assert ag_review.separating_axis_dropped(narrow, data, index) is None
+
+
+def _marker_tree(values):
+    """Cells (all events) → Sub (all events) → M+ histogram on M drawn from 0.3."""
+    n = len(values)
+    data = np.column_stack([np.full(n, 0.5), np.full(n, 0.5), values])
+    index = {'FSC': 0, 'SSC': 1, 'M': 2}
+    cells = _drawn('Cells', 'free', 'FSC', 'SSC', {'Cells': _rect(0, 1, 0, 1)}, rule=None)
+    sub = _drawn('Sub', 'free', 'FSC', 'SSC', {'Sub': _rect(0, 1, 0, 1)}, 'Cells', 'Cells',
+                 rule=None)
+    marker = _drawn('M+', '1dsep', 'M', None, {'M+': ('range', 0.3, 1.0)}, 'Sub', 'Sub',
+                    rule='histogram')
+    return [cells, sub, marker], data, index
+
+
+def test_1dsep_centred_on_zero_proposes_tail():
+    rng = np.random.default_rng(2)
+    defs, data, index = _marker_tree(rng.normal(0.2, 0.05, 5000))
+    ev, _res = _evidence(defs, data, index, 'M+', zeros={'M': 0.2})
+    assert ev['below_zero']['x'] > ag_review.CENTRED_BELOW_ZERO
+    assert ag_review.evidence_axes(ev)['x'][0] == 'tail'
+
+
+def test_1dsep_spanning_zero_takes_the_better_fit():
+    rng = np.random.default_rng(3)
+    values = np.concatenate([rng.normal(0.2, 0.03, 3000), rng.normal(0.6, 0.05, 3000)])
+    defs, data, index = _marker_tree(values)
+    ev, _res = _evidence(defs, data, index, 'M+', zeros={'M': 0.18})
+    assert ag_review.SPANS_ZERO_BELOW <= ev['below_zero']['x'] < ag_review.CENTRED_BELOW_ZERO
+    best = max(ev['fit'], key=ev['fit'].get)[0]
+    assert ag_review.evidence_axes(ev)['x'][0] == best
+    assert ag_review.convert_target(defs[2], evidence=ev)[0] == best
+
+
+def test_1dsep_mostly_positive_above_zero_replicates_from_the_population_above():
+    rng = np.random.default_rng(4)
+    values = np.concatenate([rng.normal(0.35, 0.03, 1500), rng.normal(0.6, 0.05, 4500)])
+    defs, data, index = _marker_tree(values)
+    ev, _res = _evidence(defs, data, index, 'M+', zeros={'M': 0.1})
+    assert ev['below_zero']['x'] < ag_review.SPANS_ZERO_BELOW
+    assert ev['positive']['x'] > ag_review.REPLICATE_POSITIVE
+    assert ev['reference'] == 'Cells/Cells'
+    assert ag_review.evidence_axes(ev)['x'][0] == ag_core.ALGORITHM_REPLICATE
+    proposed = ag_review.proposed_definition(defs[2], evidence=ev)
+    src = proposed['gate_param']['replicate_x']
+    assert src['population'] == 'Cells/Cells' and src['default'] is True
+    assert src['algorithm'] == 'mixture'
+    assert ag_review.default_source_axes(proposed) == ['x']
+    labels = [label for label, _src in ag_review.replicate_choices(defs, 'M+', 'x')]
+    assert "Anchor population: Cells (Cells)" in labels
+    # A hand-chosen source is kept.
+    chosen = dict(defs[2], gate_param={'replicate_x': {'population': 'Sub/Sub', 'algorithm': 'tail'}})
+    assert ag_review.proposed_definition(chosen, evidence=ev)['gate_param']['replicate_x'] == \
+        {'population': 'Sub/Sub', 'algorithm': 'tail'}
+
+
+def test_default_reference_sources_sync_as_each_gates_own():
+    root = _drawn('Root', 'free', 'F', 'S', {'Cells': _rect(0, 1, 0, 1)})
+    top = _drawn('Top', 'free', 'F', 'S', {'TopA': _rect(0, 1, 0, 1), 'TopB': _rect(0, 1, 0, 1)},
+                 'Root', 'Cells')
+    sub_a = _drawn('SubA', 'free', 'F', 'S', {'A': _rect(0, 1, 0, 1)}, 'Top', 'TopA')
+    a = _drawn('M+ (A)', '1dsep', 'M', None, {'M+': ('range', 0.3, 1.0)}, 'SubA', 'A')
+    b = _drawn('M+ (B)', '1dsep', 'M', None, {'M+': ('range', 0.3, 1.0)}, 'Top', 'TopB')
+    c = _drawn('M+ (C)', '1dsep', 'M', None, {'M+': ('range', 0.3, 1.0)}, 'Root', 'Cells')
+    for g in (a, b, c):
+        g['name_group'] = 'M+'
+    a.update(algorithm=ag_core.ALGORITHM_REPLICATE,
+             gate_param={'replicate_x': {'population': 'Root/Cells', 'algorithm': 'tail',
+                                         'default': True}})
+    defs = [root, top, sub_a, a, b, c]
+    changed, conflict = ag_review.apply_name_sync(defs, 'M+ (A)')
+    assert sorted(changed) == ['M+ (B)', 'M+ (C)'] and conflict is None
+    assert b['gate_param']['replicate_x'] == {'population': 'Root/Cells', 'algorithm': 'tail',
+                                              'default': True}
+    # Drawn on the anchor itself: no default reference.
+    assert c['gate_param']['replicate_x'] is None
+    assert ag_review.sync_fingerprint(a) == ag_review.sync_fingerprint(b)
+
+
+def test_anchor_is_the_viable_population_then_singlets_then_cells():
+    cells = _drawn('Cells', 'free', 'FSC-A', 'SSC-A', {'Cells': _rect(0, 1, 0, 1)})
+    singlets = dict(_drawn('Singlets', 'singlets', 'FSC-A', 'FSC-H', {'Single': _rect(0, 1, 0, 1)},
+                           'Cells', 'Cells'), gate_type='singlets')
+    live = _drawn('Live', '1dsep', 'ViaKrome 808', 'FSC-A',
+                  {'Dead': _rect(0.5, 1, 0, 1), 'Live': _rect(0, 0.5, 0, 1)}, 'Singlets', 'Single',
+                  regions={'Dead': 'above', 'Live': 'below'})
+    t = _drawn('T', 'free', 'CD3', 'CD4', {'T': _rect(0, 1, 0, 1)}, 'Live', 'Live')
+    assert ag_core.viability_channels(['ViaKrome 808', 'CD3', 'FSC-A']) == {'ViaKrome 808'}
+    assert ag_core.anchor_population([cells, singlets, live, t]) == 'Live/Live'
+    assert ag_core.anchor_population([cells, singlets, t]) == 'Singlets/Single'
+    assert ag_core.anchor_population([cells, t]) == 'Cells/Cells'
+    assert ag_core.anchor_population([t]) is None
+    t['populations']['T'][ag_core.ANCHOR_FLAG] = True
+    assert ag_core.anchor_population([cells, singlets, live, t]) == 'T/T'
+    del t['populations']['T'][ag_core.ANCHOR_FLAG]
+    below = _drawn('M+', '1dsep', 'M', None, {'M+': ('range', 0.3, 1.0)}, 'T', 'T')
+    on_anchor = _drawn('N+', '1dsep', 'N', None, {'N+': ('range', 0.3, 1.0)}, 'Live', 'Live')
+    defs = [cells, singlets, live, t, below, on_anchor]
+    assert ag_review.default_reference(defs, below) == 'Live/Live'
+    assert ag_review.default_reference(defs, on_anchor) is None
+
+
+def test_trimodal_axis_fits_a_three_component_cut():
+    rng = np.random.default_rng(7)
+    values = np.concatenate([rng.normal(0.2, 0.03, 4000), rng.normal(0.45, 0.04, 2500),
+                             rng.normal(0.75, 0.04, 1500)])
+    assert 0.55 < ag_core.threshold_mixture(values, 3, cut='upper') < 0.65
+    assert 0.27 < ag_core.threshold_mixture(values, 3, cut='lower') < 0.37
+    defs, data, index = _marker_tree(values)
+    defs[2]['template']['M+']['range'] = [0.6, 1.0]
+    defs[2]['template']['M+']['boundary'] = _rect(0.6, 1.0, 0, 1)
+    ev, _res = _evidence(defs, data, index, 'M+', zeros={'M': 0.18})
+    algo, reason, params = ag_review.evidence_axes(ev)['x']
+    assert algo == 'mixture' and params == {'mixture_components': 3, 'mixture_cut': 'upper'}
+    proposed = ag_review.proposed_definition(defs[2], evidence=ev)
+    assert proposed['gate_param']['mixture_components'] == 3
+    assert proposed['gate_param']['mixture_cut'] == 'upper'
+
+
+def test_split_steps_and_split_keeping_the_shapes_as_drawn():
+    g = _drawn('B', '2dsep', 'A', 'C',
+               {'nTnP': _rect(0.0, 0.5, 0.0, 1.0), 'PB': _rect(0.5, 1.0, 0.0, 0.3),
+                'Tr': _rect(0.5, 1.0, 0.3, 1.0)},
+               regions={'nTnP': 'x-y-|x-y+', 'PB': 'x+y-', 'Tr': 'x+y+'})
+    child = _drawn('Kid', 'free', 'F', 'S', {'K': _rect(0, 1, 0, 1)}, 'B', 'Tr')
+    steps = ag_review.split_steps(g)
+    assert [st['channel'] for st in steps] == ['A', 'C']
+    assert [st['sep_axis'] for st in steps] == ['x', 'y']
+    out, made = ag_review.split_2dsep([g, child], 'B', steps, names={'A': 'CD38', 'C': 'CD24'},
+                                      keep_drawn=True)
+    by = {d['gate_name']: d for d in out}
+    first, second = by[made[0]], by[made[1]]
+    assert made == ['B · CD38', 'B · CD24 (CD38+)']
+    assert set(first['populations']) == {'nTnP', 'CD38+'}
+    assert first['algorithm'] == ag_core.ALGORITHM_IMPORTED and first['proposal_rule'] == 'fraction'
+    hull = np.asarray(first['template']['CD38+']['boundary'])
+    assert hull[:, 0].min() == pytest.approx(0.5) and hull[:, 1].max() == pytest.approx(1.0)
+    assert set(second['template']) == {'PB', 'Tr'}
+    assert ag_core.plot_channels(second) == ('A', 'C')
+    assert by['Kid']['parent_gate'] == made[1]
+    assert ag_review.split_steps(_drawn('Q', '2dsep', 'A', 'C', {'P': _rect(0, 1, 0, 1)},
+                                        regions={'P': 'x+y+'})) is None
+
+
+def test_scatter_shape_on_the_debris_keeps_the_debris_side():
+    rng = np.random.default_rng(5)
+    data = np.vstack([np.column_stack([rng.normal(0.1, 0.03, 3000), rng.normal(0.1, 0.04, 3000)]),
+                      np.column_stack([rng.normal(0.5, 0.06, 7000), rng.normal(0.4, 0.1, 7000)])])
+    index = {'FSC': 0, 'SSC': 1}
+    low = _drawn('low', 'free', 'FSC', 'SSC', {'low': _rect(0.0, 0.2, 0.0, 0.25)}, rule=None)
+    ev, _res = _evidence([low], data, index, 'low')
+    assert ev['cell_side'] == ag_core.CELL_SIDE_DEBRIS
+    assert ag_review.proposed_definition(low, evidence=ev)['gate_param']['cell_side'] == \
+        ag_core.CELL_SIDE_DEBRIS
+    cells = _drawn('cells', 'free', 'FSC', 'SSC', {'cells': _rect(0.3, 0.8, 0.1, 0.8)}, rule=None)
+    assert _evidence([cells], data, index, 'cells')[0]['cell_side'] == ag_core.CELL_SIDE_CELLS
+
+
+def test_threshold_sides_of_a_joined_region():
+    g = {'gate_type': '2dsep', 'populations': {
+        'L': {'region': 'x-y-|x-y+'}, 'P': {'region': 'x+y-'}, 'Q': {'region': 'x+y+'}}}
+    assert ag_core.threshold_sides(g, 'x') == {'-', '+'}
+    assert ag_core.threshold_sides(g, 'y') == {'+'}
