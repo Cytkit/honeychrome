@@ -105,6 +105,8 @@ def setup_logging(log_file):
     # Silence specific libraries
     logging.getLogger('matplotlib').setLevel(logging.WARNING)
     logging.getLogger('numba').setLevel(logging.WARNING)
+    logging.getLogger('openTSNE').setLevel(logging.WARNING)
+    logging.getLogger('honeychrome.controller_components.label_matching').setLevel(logging.INFO)
     # logging.getLogger('PIL').setLevel(logging.WARNING)  # Often useful to block PIL too
 
     # Redirect warnings module to logging
