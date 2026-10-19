@@ -110,13 +110,19 @@ class _RecalcWorker(QObject):
         self._profile_updater = profile_updater
         self._controls = controls
         self._search_results = search_results
+        self.error: str | None = None   # read after finished
 
     @Slot()
     def run(self):
-        self._profile_updater.flush()
-        for control in self._controls:
-            self._profile_updater.generate(control, self._search_results)
-        self.finished.emit()
+        try:
+            self._profile_updater.flush()
+            for control in self._controls:
+                self._profile_updater.generate(control, self._search_results)
+        except Exception as e:
+            logger.exception('Profile recalculation failed')
+            self.error = f'Profile recalculation failed: {e}'
+        finally:
+            self.finished.emit()
 
 class ListTableModel(QtCore.QAbstractTableModel):
     dataEditedSignal = QtCore.Signal(int, int) # changed to track cosmetic vs function changes
@@ -1130,7 +1136,7 @@ class SpectralControlsEditor(QFrame):
 
         # if user gets through all above, run spectral auto generator
         self.setEnabled(False)
-        self.thread = QThread()
+        self.thread = QThread(QApplication.instance())  # survives a main window rebuild mid-run
         # Read bulk_negative_combo directly
         if self.bulk_particle_type_combo.currentText() != 'Cells':
             self.bulk_particle_type_combo.setCurrentText('Cells')
@@ -1149,13 +1155,16 @@ class SpectralControlsEditor(QFrame):
         self.spectral_auto_generator.moveToThread(self.thread)
         self.bus.spectralControlAdded.connect(self._on_spectral_control_added_by_autogenerator)
         self.thread.started.connect(self.spectral_auto_generator.run)
+        self.thread.finished.connect(QApplication.restoreOverrideCursor)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.spectral_auto_generator.generationFinished.connect(self.thread.quit)
         if auto_clean:
-            self.spectral_auto_generator.generationFinished.connect(self.thread.quit)
             self.thread.finished.connect(self._clean_after_autogenerate)
         else:
             self.bus.spectralModelUpdated.connect(self.thread.quit)
             self.thread.finished.connect(self.refresh_table_and_enable)
             self.thread.finished.connect(self._on_autogenerate_finished)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         self.thread.start()
 
     @Slot()
@@ -1427,6 +1436,7 @@ class SpectralControlsEditor(QFrame):
         import numpy as np
         from honeychrome.controller_components.functions import sample_from_fcs
         from honeychrome.controller_components.spectral_functions import get_raw_events
+        from honeychrome.controller_components.spread_model import raw_layout
         import honeychrome.settings as settings
 
         label = control.get('label', '')
@@ -1461,9 +1471,11 @@ class SpectralControlsEditor(QFrame):
             fl_col = fluor_ids.index(ch_global_idx)
 
             gate_label_for_load = base_gate_label if base_gate_label != 'root' else None
-            fl_events = get_raw_events(sample, fluor_ids,
+            layout = raw_layout(self.controller)
+            fl_events = get_raw_events(sample, layout['fl_ids'],
                                     gate_label=gate_label_for_load,
                                     gating_strategy=control_gating(self.controller),
+                                    col_order=layout['col_order'],
                                     sample_key=sample_rel_path)
             ch_values = fl_events[:, fl_col]
 
@@ -1744,13 +1756,16 @@ class SpectralControlsEditor(QFrame):
         self.clean_controls_btn.setText("Cleaning…")
         self.controller.warning_collector = []
 
-        self.cleaner_thread = QThread()
+        self.cleaner_thread = QThread(QApplication.instance())  # survives a main window rebuild mid-run
         self.spectral_cleaner = SpectralCleaner(self.bus, self.controller)
         self.spectral_cleaner.moveToThread(self.cleaner_thread)
 
         self.cleaner_thread.started.connect(self.spectral_cleaner.run)
         self.spectral_cleaner.cleaningFinished.connect(self.cleaner_thread.quit)
+        self.cleaner_thread.finished.connect(QApplication.restoreOverrideCursor)
+        self.cleaner_thread.finished.connect(self.cleaner_thread.deleteLater)
         self.cleaner_thread.finished.connect(self._on_clean_controls_finished)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         self.cleaner_thread.start()
 
     @Slot()
@@ -1777,11 +1792,12 @@ class SpectralControlsEditor(QFrame):
         # stays responsive. _on_force_recalc is not thread-safe (it touches Qt
         # widgets directly), so we do only the pure computation here and defer
         # the UI update to the main thread via a signal.
-        self._recalc_thread = QThread()
+        self._recalc_thread = QThread(QApplication.instance())  # survives a main window rebuild mid-run
         self._recalc_worker = _RecalcWorker(self.profile_updater, self.model._data, self.spectral_library_search_results)
         self._recalc_worker.moveToThread(self._recalc_thread)
         self._recalc_thread.started.connect(self._recalc_worker.run)
         self._recalc_worker.finished.connect(self._recalc_thread.quit)
+        self._recalc_thread.finished.connect(self._recalc_thread.deleteLater)
         self._recalc_thread.finished.connect(self._on_recalc_finished)
         self._recalc_thread.start()
 
@@ -1796,6 +1812,8 @@ class SpectralControlsEditor(QFrame):
         # One dialog for everything raised during the run, auto generation included
         title = 'Clean Controls:' if self._autoclean_warnings is None else 'Auto generate and Clean Controls:'
         messages = (self._autoclean_warnings or []) + list(self.spectral_cleaner.warnings)
+        if self._recalc_worker.error:
+            messages.append(self._recalc_worker.error)
         self._autoclean_warnings = None
         negative_labels = self.profile_updater.negative_profile_warnings or []
         self.profile_updater.negative_profile_warnings = None
