@@ -5,8 +5,9 @@ Batch FCS export through a caller-supplied unmixing function, with a
 run-time estimate and a confirm/cancel prompt for exports that use the
 compiled joint AF + fluorophore-variant kernel.
 
-Used by the AutoSpectral Optimization plugin and by plugins that build on
-its kernel. Typical use, on the main thread:
+Used for exports through the AutoSpectral optimisation kernel
+(``AutoSpectralOptExporter``) and by plugins that build on it. Typical use,
+on the main thread:
 
     layout = build_export_layout(controller)
     exporter = JointUnmixExporter(sample_paths, layout, unmix_fn, bus=bus)
@@ -822,3 +823,39 @@ class JointUnmixRun(QObject):
     def _on_export_thread_finished(self):
         self._exp_thread = None
         self.done.emit()
+
+
+class AutoSpectralOptExporter(JointUnmixExporter):
+    """
+    Batch FCS export with the joint AF + fluorophore-variant kernel.
+
+    Construct on the main thread: the export layout, the computed variants,
+    the Active set and the cached positivity thresholds are snapshotted
+    here. ``probe_fn`` is set when per-cell variant optimisation is on (at
+    least one Active fluorophore has variants), so JointUnmixRun can time the
+    run before it starts; AF-only unmixing is fast and is not timed.
+    """
+
+    def __init__(self, sample_paths, controller, bus, kernel_kwargs):
+        from autospectral_optimization_functions import (
+            active_variant_labels, cached_unmixed_thresholds, has_active_variants,
+            make_optimization_unmix_fn,
+        )
+
+        layout = build_export_layout(controller)
+        variants_meta = dict(getattr(controller, 'autospectral_variants', None) or {})
+        active_labels = active_variant_labels(controller.experiment.process)
+        unmix_fn = make_optimization_unmix_fn(
+            layout.reference_spectra,
+            list(layout.fluor_names),
+            variants_meta,
+            active_labels,
+            cached_unmixed_thresholds(controller, layout.reference_spectra),
+            kernel_kwargs,
+        )
+        super().__init__(sample_paths, layout, unmix_fn, bus=bus,
+                         unmixing_method='AutoSpectral Optimization')
+        if has_active_variants(variants_meta, active_labels):
+            self.probe_fn = lambda raw_fl, af: unmix_fn(raw_fl, None, af)
+        else:
+            self.probe_fn = None

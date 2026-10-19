@@ -408,7 +408,7 @@ def test_comparison_arrays_fill_af_channels(tmp_path):
     """The AF-corrected and Optimization comparison arrays carry per-cell
     AF Abundance and AF Index (as the main unmixed data does), so gates
     drawn on the AF channels select the same cells in the Compare plots."""
-    from autospectral_optimization_tab import JointComparisonWorker
+    from honeychrome.view_components.autospectral_variants_page import JointComparisonWorker
 
     controller = syn.FakeController(tmp_path)
     raw = syn.raw_events(3000, seed=5)

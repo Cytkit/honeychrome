@@ -223,9 +223,9 @@ class Controller(QObject):
 
     def _load_autospectral_variants(self):
         """Restore autospectral_variants from .kit autospectral_variants_data
-        and .autospectral_variants.npz sidecar. Backs the AutoSpectral
-        Optimization bundled plugin's Setup section (bundled_plugins/
-        autospectral_optimization_tab.py). Mirrors _load_cleaned_events
+        and .autospectral_variants.npz sidecar. Backs the AutoSpectral tab's
+        Spectral Variants page (view_components/autospectral_variants_page.py).
+        Mirrors _load_cleaned_events
         with one addition: each label is only restored if its saved profile_fingerprint
         still matches the current experiment.process['profiles'][label] — if the reference
         spectrum has changed since Setup was run, the cached variants no

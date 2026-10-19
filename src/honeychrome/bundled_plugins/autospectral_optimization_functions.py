@@ -2,9 +2,9 @@
 autospectral_optimization_functions.py
 -----------------------------------------
 AutoSpectral Optimization (per-cell fluorophore + AF joint unmixing) for
-Honeychrome. Lives entirely inside bundled_plugins — this plugin is self-contained, unlike the
-built-in AutoSpectral AF tab which is split across controller_components/
-and view_components/.
+Honeychrome, with its compiled kernel beside it in bundled_plugins/. The
+AutoSpectral tab's Spectral Variants page
+(view_components/autospectral_variants_page.py) is its user interface.
 
 Public API
 ----------
@@ -18,12 +18,11 @@ discover_fluor_variants(...)
     Per-fluorophore port of get.fluor.variants().
 
 calculate_optimize_necessity(spectra, fluor_names, delta_dict, ...)
-    Port of calculate.optimize.necessity(). Table section scoring.
+    Port of calculate.optimize.necessity(). Sets the Active fluorophores.
 
 unmix_autospectral_optimization(...)
-    Assembles the active-variant list from Table state and calls the
-    compiled joint kernel. Used by both the Compare and Unmix
-    sections.
+    Assembles the active-variant list and calls the compiled joint kernel.
+    Used by the Spectral Variants comparison and by exports.
 
 active_variant_labels / cached_unmixed_thresholds / make_optimization_unmix_fn
     Inputs and per-chunk unmixing function for batch export through
@@ -664,8 +663,8 @@ def discover_all_variants(
     reference spectrum (insufficient clean signal — not an error, just
     nothing to optimise for that fluorophore). The threshold arrays are the
     per-channel/per-fluorophore median across all unstained cell samples —
-    callers should cache these (see autospectral_optimization_tab.py's Setup
-    completion handler) and reuse them for Compare/Unmix instead of
+    callers should cache these (see the Spectral Variants page's completion
+    handler) and reuse them for comparisons and exports instead of
     recomputing from whatever stained sample is currently being processed.
     """
     raw_settings = controller.experiment.settings['raw']
@@ -1000,9 +999,8 @@ def unmix_autospectral_optimization(
                     compute_af_extracted_unmixed_thresholds()). Callers with
                     no cached value available (Setup hasn't been run this
                     session) should pass all-zeros rather than recomputing
-                    anything from the sample being processed — see
-                    autospectral_optimization_tab.py's Compare/Unmix
-                    fallback paths.
+                    anything from the sample being processed — see the
+                    Spectral Variants page's comparison fallback.
 
     Returns
     -------

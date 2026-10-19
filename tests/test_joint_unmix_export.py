@@ -452,7 +452,7 @@ def test_export_unmixed_sample_writes_extra_keywords(tmp_path):
 @pytest.mark.numpy_only
 def test_opt_exporter_times_the_run_only_with_active_variants(tmp_path):
     pytest.importorskip('pyqtgraph')
-    from autospectral_optimization_tab import AutoSpectralOptExporter
+    from joint_unmix_export import AutoSpectralOptExporter
 
     controller = syn.make_experiment(tmp_path, n_events=100)
     exporter = AutoSpectralOptExporter([syn.AF_SAMPLE], controller, None, {'n_threads': 1})
@@ -472,7 +472,7 @@ def test_opt_exporter_times_the_run_only_with_active_variants(tmp_path):
 def test_opt_exporter_writes_exactly_the_kernel_output(tmp_path):
     """The refactored exporter must write what a direct kernel call returns."""
     pytest.importorskip('pyqtgraph')
-    from autospectral_optimization_tab import AutoSpectralOptExporter
+    from joint_unmix_export import AutoSpectralOptExporter
     import autospectral_optimization_functions as aof
 
     controller = syn.make_experiment(tmp_path, n_events=3000)

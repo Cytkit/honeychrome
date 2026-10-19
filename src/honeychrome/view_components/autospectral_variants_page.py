@@ -1,20 +1,20 @@
 """
-autospectral_optimization_tab.py
------------------------------------
-Honeychrome bundled plugin: AutoSpectral Optimization (per-cell fluorophore +
-AF joint unmixing).
-
-Location: bundled_plugins/autospectral_optimization_tab.py (see
-plugin_loaders.py — discovered automatically as *_tab.py, gated behind
-'EnableBundledPlugin_autospectral_optimization_tab' in QSettings.
+autospectral_variants_page.py
+-----------------------------
+AutoSpectral tab page: Spectral Variants (per-cell fluorophore + AF
+optimisation with the compiled AutoSpectral kernel).
 
 Sections
--------------------------------------------------
-1. Setup    — discover per-fluorophore spectral variants
-2. Plot     — per-fluorophore variant density plot
-3. Table    — optimisation-necessity scores + Active override
-4. Compare  — standard vs. AutoSpectral Optimization biplot
-5. Unmix    — batch FCS export using the joint pipeline
+--------
+1  Compute Spectral Variants: discover per-fluorophore variants from the
+   single-stained controls (``discover_all_variants``); the necessity
+   recommendation sets which fluorophores are optimised.
+2  Plot Spectral Variants: a fluorophore's variants against its reference.
+3  Comparison: the current sample with per-cell AF | per-cell AF + spectral
+   variants.
+
+The numerics live in ``bundled_plugins/autospectral_optimization_functions.py``
+and the kernel wrapper beside it, imported from the bundled-plugins folder.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import Qt, QObject, QSettings, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTableWidgetItem,
+    QLabel, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
     QVBoxLayout, QWidget,
 )
 
@@ -39,50 +39,32 @@ from honeychrome.controller_components.autospectral_functions import (
 from honeychrome.controller_components.cytometer_whitelist import (
     get_detector_laser_map, LASER_LABEL_COLORS,
 )
+from honeychrome.controller_components.plugin_loaders import bundled_plugins_path
 from honeychrome.view_components.autospectral_tab import (
+    TAB_NAME,
     AfComparisonPlotWidget,
     pick_most_affected_channels,
 )
-from honeychrome.view_components.busy_cursor import with_busy_cursor
-from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
-from honeychrome.view_components.help_toggle_widget import WheelBlocker
-from honeychrome.view_components.help_texts import autospectral_optimization_help_text
-from honeychrome.view_components.ordered_multi_sample_picker import OrderedMultiSamplePicker
+from honeychrome.view_components.help_toggle_widget import HelpToggleWidget, WheelBlocker
+from honeychrome.view_components.help_texts import autospectral_variants_help_text
 from honeychrome.view_components.profiles_viewer import BottomAxisVerticalTickLabels
 import honeychrome.settings as settings
 
 logger = logging.getLogger(__name__)
 
-plugin_name = 'AutoSpectral Optimization'
-TAB_NAME = plugin_name
-
-# ---------------------------------------------------------------------------
-# Sibling-module imports — this plugin is self-contained inside
-# bundled_plugins/, so its own directory must be on sys.path before
-# importing autospectral_optimization_functions / autospectral_opt_kernel_wrapper,
-# regardless of how plugin_loaders.py loaded *this* file.
-# ---------------------------------------------------------------------------
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+if str(bundled_plugins_path) not in sys.path:
+    sys.path.insert(0, str(bundled_plugins_path))
 
 from autospectral_optimization_functions import (   # noqa: E402
     discover_all_variants,
     calculate_optimize_necessity,
     unmix_autospectral_optimization,
     fluorescence_channel_names,
-    active_variant_labels,
-    cached_unmixed_thresholds,
-    has_active_variants,
-    make_optimization_unmix_fn,
     af_envelope_for_profiles,
 )
 from autospectral_opt_kernel_wrapper import AUTOSPECTRAL_OPT_KERNEL_AVAILABLE  # noqa: E402
-from joint_unmix_export import (   # noqa: E402
-    JointUnmixExporter,
-    JointUnmixRun,
-    build_export_layout,
-)
+
+SHOW_ADVANCED_SETTING = 'autospectral_variants_show_advanced'
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +107,7 @@ class VariantSetupWorker(QObject):
                 output['variants'], output['raw_pos_thresholds'], output['unmixed_pos_thresholds'],
             )
         except Exception as e:
-            logger.exception('AutoSpectral Optimization: Setup failed')
+            logger.exception('AutoSpectral Spectral Variants: computing variants failed')
             self.error.emit(str(e))
 
 
@@ -220,65 +202,38 @@ class JointComparisonWorker(QObject):
             self.error.emit(str(e))
 
 
-class AutoSpectralOptExporter(JointUnmixExporter):
-    """
-    Batch FCS export with the joint AF + fluorophore-variant kernel for the
-    samples picked in the Unmix section.
-
-    Construct on the main thread: the export layout, the computed variants,
-    the Active set and the cached positivity thresholds are snapshotted
-    here. ``probe_fn`` is set when per-cell variant optimisation is on (at
-    least one Active fluorophore has variants), so JointUnmixRun can time the
-    run before it starts; AF-only unmixing is fast and is not timed.
-    """
-
-    def __init__(self, sample_paths, controller, bus, kernel_kwargs):
-        layout = build_export_layout(controller)
-        variants_meta = dict(getattr(controller, 'autospectral_variants', None) or {})
-        active_labels = active_variant_labels(controller.experiment.process)
-        unmix_fn = make_optimization_unmix_fn(
-            layout.reference_spectra,
-            list(layout.fluor_names),
-            variants_meta,
-            active_labels,
-            cached_unmixed_thresholds(controller, layout.reference_spectra),
-            kernel_kwargs,
-        )
-        super().__init__(sample_paths, layout, unmix_fn, bus=bus,
-                         unmixing_method='AutoSpectral Optimization')
-        if has_active_variants(variants_meta, active_labels):
-            self.probe_fn = lambda raw_fl, af: unmix_fn(raw_fl, None, af)
-        else:
-            self.probe_fn = None
+def _spin(widget):
+    """Wheel events and tab focus off, as for the tab's other spin boxes and combos."""
+    widget.installEventFilter(WheelBlocker(widget))
+    widget.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+    return widget
 
 
 # ---------------------------------------------------------------------------
-# PluginWidget
+# Page
 # ---------------------------------------------------------------------------
 
-class PluginWidget(QWidget):
-    def __init__(self, bus=None, controller=None, parent=None):
+class SpectralVariantsPage(QWidget):
+    """AutoSpectral tab page: compute, plot and compare per-cell spectral variants."""
+
+    def __init__(self, bus=None, controller=None, active_fn=None, parent=None):
         super().__init__(parent)
         self.bus = bus
         self.controller = controller
-        self._qsettings = QSettings('honeychrome', f'plugin_{plugin_name}')
+        # active_fn(page) -> bool: whether the page is on screen.
+        self._active_fn = active_fn
+        self._qsettings = QSettings('honeychrome', 'app_configuration')
 
-        # Setup worker/thread
         self._setup_thread = None
         self._setup_worker = None
 
-        # Comparison state
         self._cmp_thread = None
         self._cmp_worker = None
         self._cmp_running = False
         self._last_cmp_state = None
         self._pending_cmp_state = None
-        self._ols_data = None
         self._af_data = None
         self._opt_data = None
-
-        # Unmix state
-        self._unmix_run = None
 
         self._build_ui()
 
@@ -286,16 +241,13 @@ class PluginWidget(QWidget):
             self.bus.modeChangeRequested.connect(self._on_mode_change)
             self.bus.loadSampleRequested.connect(self._on_sample_loaded)
             self.bus.spectralProcessRefreshed.connect(self._on_process_refreshed)
-            self.bus.sampleTreeUpdated.connect(self._on_sample_tree_updated)
 
         if self._setup_done():
             self._refresh_plot_combo()
-            self._rebuild_table()
-
         self._refresh_all_guards()
 
     # ------------------------------------------------------------------
-    # Top-level layout
+    # Layout
     # ------------------------------------------------------------------
 
     def _build_ui(self):
@@ -303,8 +255,8 @@ class PluginWidget(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
 
         self._label_disabled = QLabel(
-            'AutoSpectral Optimization: calculate the unmixing matrix (Spectral '
-            'Process tab) before using this plugin.'
+            'Spectral Variants: calculate the unmixing matrix (Spectral Process tab) '
+            'before using this page.'
         )
         self._label_disabled.setWordWrap(True)
         self._label_disabled.setContentsMargins(8, 8, 8, 8)
@@ -315,63 +267,30 @@ class PluginWidget(QWidget):
         content_layout.setAlignment(Qt.AlignTop)
         content_layout.setSpacing(10)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(self._content)
-        outer.addWidget(scroll)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setWidget(self._content)
+        outer.addWidget(self._scroll)
 
-        from honeychrome.settings import heading_style
-        title_label = QLabel(plugin_name)
-        title_label.setStyleSheet(heading_style)
-        content_layout.addWidget(title_label)
-
-        self.help_label = QLabel(autospectral_optimization_help_text)
-        self.help_label.setTextFormat(Qt.RichText)
-        self.help_label.setWordWrap(True)
-        font = self.help_label.font()
-        font.setPointSize(14)
-        self.help_label.setFont(font)
-        content_layout.addWidget(self.help_label)
+        content_layout.addWidget(HelpToggleWidget(text=autospectral_variants_help_text))
 
         if not AUTOSPECTRAL_OPT_KERNEL_AVAILABLE:
             kernel_warning = QLabel(
                 '<b>Compiled kernel not found.</b> Run '
                 '<tt>build_autospectral_opt_kernel.py</tt> (in bundled_plugins/) '
-                'before using Setup, Compare, or Unmix.'
+                'before computing or comparing spectral variants.'
             )
             kernel_warning.setTextFormat(Qt.RichText)
             kernel_warning.setStyleSheet('color: #cc6600;')
             content_layout.addWidget(kernel_warning)
 
-        self.toggle_content_button = QCheckBox(f'Show {plugin_name} process')
-        saved_state = self._qsettings.value('show_content', 'false') == 'true'
-        self.toggle_content_button.setCheckable(True)
-        self.toggle_content_button.setChecked(saved_state)
-        content_layout.addWidget(self.toggle_content_button)
-
-        self.toggle_content = QWidget()
-        toggle_layout = QVBoxLayout(self.toggle_content)
-        self._build_advanced_settings(toggle_layout)
-        self._build_setup_section(toggle_layout)
-        self._build_plot_section(toggle_layout)
-        self._build_table_section(toggle_layout)
-        self._build_compare_section(toggle_layout)
-        self._build_unmix_section(toggle_layout)
-        content_layout.addWidget(self.toggle_content)
-        self.toggle_content.setVisible(saved_state)
-
-        self.toggle_content_button.toggled.connect(self.toggle_content.setVisible)
-        self.toggle_content_button.toggled.connect(self._save_visibility)
-        self.toggle_content_button.setStyleSheet(
-            'QCheckBox { font-size: 14pt; spacing: 10px; padding: 10px; }'
-        )
-
+        self._build_advanced_settings(content_layout)
+        self._build_setup_section(content_layout)
+        self._build_plot_section(content_layout)
+        self._build_compare_section(content_layout)
         content_layout.addStretch()
-
-    def _save_visibility(self, checked: bool):
-        self._qsettings.setValue('show_content', 'true' if checked else 'false')
 
     # ------------------------------------------------------------------
     # Advanced settings
@@ -379,7 +298,7 @@ class PluginWidget(QWidget):
 
     def _build_advanced_settings(self, parent_layout):
         self._adv_toggle = QCheckBox('Show Advanced Settings')
-        saved = self._qsettings.value('show_advanced', 'false') == 'true'
+        saved = self._qsettings.value(SHOW_ADVANCED_SETTING, 'false') == 'true'
         self._adv_toggle.setChecked(saved)
         parent_layout.addWidget(self._adv_toggle)
 
@@ -388,7 +307,7 @@ class PluginWidget(QWidget):
         adv_content.setVisible(saved)
         self._adv_toggle.toggled.connect(adv_content.setVisible)
         self._adv_toggle.toggled.connect(
-            lambda c: self._qsettings.setValue('show_advanced', 'true' if c else 'false')
+            lambda c: self._qsettings.setValue(SHOW_ADVANCED_SETTING, 'true' if c else 'false')
         )
 
         # --- Setup group ---
@@ -413,7 +332,7 @@ class PluginWidget(QWidget):
         )
         for w in (self._n_cells_spin, self._som_dim_spin, self._k_neighbors_spin, self._sim_threshold_spin,
                   self._dedup_threshold_spin, self._max_variants_spin):
-            w.installEventFilter(WheelBlocker(w)); w.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+            _spin(w)
         setup_form.addRow('n.cells:', self._n_cells_spin)
         setup_form.addRow('som.dim:', self._som_dim_spin)
         setup_form.addRow('k.neighbors:', self._k_neighbors_spin)
@@ -425,11 +344,13 @@ class PluginWidget(QWidget):
         # --- Necessity group ---
         necessity_grp = QGroupBox('Necessity')
         necessity_form = QFormLayout(necessity_grp)
-        self._necessity_threshold_spin = QDoubleSpinBox()
+        self._necessity_threshold_spin = _spin(QDoubleSpinBox())
         self._necessity_threshold_spin.setRange(0.0, 1.0); self._necessity_threshold_spin.setDecimals(3)
         self._necessity_threshold_spin.setSingleStep(0.005); self._necessity_threshold_spin.setValue(0.01)
-        self._necessity_threshold_spin.installEventFilter(WheelBlocker(self._necessity_threshold_spin))
-        self._necessity_threshold_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self._necessity_threshold_spin.setToolTip(
+            'Fluorophores whose normalised necessity score reaches this value are optimised '
+            'per cell; the others keep their reference spectrum. Applied when variants are computed.'
+        )
         necessity_form.addRow('optimize.necessity.threshold:', self._necessity_threshold_spin)
         adv_layout.addWidget(necessity_grp)
 
@@ -449,7 +370,7 @@ class PluginWidget(QWidget):
         self._threads_spin = QSpinBox(); self._threads_spin.setRange(1, _cpu_count); self._threads_spin.setValue(max(1, _cpu_count - 1))
         for w in (self._n_passes_spin, self._n_af_passes_spin, self._refine_af_quantile_spin,
                   self._noise_floor_spin, self._alpha_spin, self._collinear_threshold_spin, self._threads_spin):
-            w.installEventFilter(WheelBlocker(w)); w.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+            _spin(w)
         unmixing_form.addRow('n.passes:', self._n_passes_spin)
         unmixing_form.addRow('n.af.passes:', self._n_af_passes_spin)
         unmixing_form.addRow('refine.af.quantile:', self._refine_af_quantile_spin)
@@ -464,12 +385,10 @@ class PluginWidget(QWidget):
         # --- Comparison group ---
         comparison_grp = QGroupBox('Comparison')
         comparison_form = QFormLayout(comparison_grp)
-        self._comparison_max_events_spin = QSpinBox()
+        self._comparison_max_events_spin = _spin(QSpinBox())
         self._comparison_max_events_spin.setRange(1_000, 2_000_000)
         self._comparison_max_events_spin.setSingleStep(5_000)
         self._comparison_max_events_spin.setValue(30_000)
-        self._comparison_max_events_spin.installEventFilter(WheelBlocker(self._comparison_max_events_spin))
-        self._comparison_max_events_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         comparison_form.addRow('comparison.max_events:', self._comparison_max_events_spin)
         adv_layout.addWidget(comparison_grp)
 
@@ -499,6 +418,12 @@ class PluginWidget(QWidget):
     # Guards
     # ------------------------------------------------------------------
 
+    def is_active(self) -> bool:
+        """True while the page is on screen."""
+        if self._active_fn is None:
+            return self.controller is not None and self.controller.current_mode == TAB_NAME
+        return self._active_fn(self)
+
     def _gating_available(self) -> bool:
         return bool(self.controller and self.controller.experiment
                     and self.controller.experiment.process.get('unmixing_matrix') is not None)
@@ -518,24 +443,20 @@ class PluginWidget(QWidget):
         available = self._gating_available()
         self._label_disabled.setVisible(not available)
         self._content.setVisible(available)
+        self._scroll.setVisible(available)
         if not available:
             return
-
         setup_done = self._setup_done()
-        for w in (self._plot_combo, self._table):
-            w.setEnabled(setup_done)
-        self._plot_status.setText('' if setup_done else 'Run Setup first.')
-        self._table_status.setText('' if setup_done else 'Run Setup first.')
-
+        self._plot_combo.setEnabled(setup_done)
+        self._plot_status.setText('' if setup_done else 'Compute spectral variants first.')
         self._refresh_comparison_controls()
-        self._refresh_unmix_picker()
 
     # ------------------------------------------------------------------
-    # Setup section
+    # Compute Spectral Variants
     # ------------------------------------------------------------------
 
     def _build_setup_section(self, parent_layout):
-        grp = QGroupBox('1 — Setup: Compute Spectral Variants')
+        grp = QGroupBox('Compute Spectral Variants')
         layout = QFormLayout(grp)
 
         self._setup_btn = QPushButton('Compute Spectral Variants')
@@ -553,7 +474,7 @@ class PluginWidget(QWidget):
             self._setup_status.setText('Compiled kernel not found — see warning above.')
             return
         if self._setup_thread is not None:
-            self._setup_status.setText('Setup already running — please wait.')
+            self._setup_status.setText('Already computing — please wait.')
             return
 
         self._setup_btn.setEnabled(False)
@@ -587,10 +508,9 @@ class PluginWidget(QWidget):
 
     def _on_setup_finished(self, results: dict, raw_pos_thresholds, unmixed_pos_thresholds):
         self.controller.autospectral_variants = results
-        # Cached so Compare/Unmix/Export reuse these unstained-derived
-        # thresholds instead of recomputing from whatever stained sample
-        # happens to be loaded/exported. Must be set *before* the save call
-        # below so they're actually persisted with this Setup run's cache.
+        # Cached so the comparison and exports reuse these unstained-derived
+        # thresholds instead of recomputing them from whichever stained sample
+        # is loaded; set before the save so they are persisted with this run.
         self.controller.autospectral_raw_pos_thresholds = raw_pos_thresholds
         self.controller.autospectral_unmixed_pos_thresholds = unmixed_pos_thresholds
         self.controller._save_autospectral_variants()
@@ -617,12 +537,12 @@ class PluginWidget(QWidget):
         if self.bus:
             self.bus.autoSaveRequested.emit()
 
+        n_active = sum(1 for m in meta.values() if m['active'])
         self._setup_status.setText(
-            f'Done. {len(results)}/{len(fluor_names)} fluorophore(s) have '
-            f'computed variants (others fall back to the reference spectrum).'
+            f'Done. {len(results)}/{len(fluor_names)} fluorophore(s) have computed variants '
+            f'(others fall back to the reference spectrum); {n_active} optimised per cell.'
         )
         self._refresh_plot_combo()
-        self._rebuild_table()
         self._refresh_all_guards()
 
     def _on_setup_error(self, msg: str):
@@ -634,19 +554,17 @@ class PluginWidget(QWidget):
         self._setup_btn.setEnabled(True)
 
     # ------------------------------------------------------------------
-    # Plot section
+    # Plot Spectral Variants
     # ------------------------------------------------------------------
 
     def _build_plot_section(self, parent_layout):
-        grp = QGroupBox('2 — Plot: Spectral Variants')
+        grp = QGroupBox('Plot Spectral Variants')
         layout = QVBoxLayout(grp)
 
         row = QHBoxLayout()
         row.addWidget(QLabel('Fluorophore:'))
-        self._plot_combo = QComboBox()
+        self._plot_combo = _spin(QComboBox())
         self._plot_combo.setMinimumWidth(220)
-        self._plot_combo.installEventFilter(WheelBlocker(self._plot_combo))
-        self._plot_combo.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self._plot_combo.currentTextChanged.connect(self._draw_selected_variant)
         row.addWidget(self._plot_combo)
         row.addStretch()
@@ -661,7 +579,8 @@ class PluginWidget(QWidget):
         self._variant_plot.setMaximumHeight(440)
         self._variant_plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._variant_plot.setMouseEnabled(x=False, y=False)
-        self._variant_plot.viewport().installEventFilter(WheelBlocker(self))
+        self._wheel_blocker = WheelBlocker(self)
+        self._variant_plot.viewport().installEventFilter(self._wheel_blocker)
         layout.addWidget(self._variant_plot)
 
         parent_layout.addWidget(grp)
@@ -681,10 +600,9 @@ class PluginWidget(QWidget):
 
     def _labels_in_major_channel_order(self, labels) -> list:
         """
-        Orders fluorophore labels by their Major Channel's position in the
-        detector list — same convention as the Spectral Process tab
-        (spectral_model_editor.py::_sort_model_by_gate_channel), rather than
-        alphabetically. Labels with no resolvable gate_channel sort last.
+        Fluorophore labels ordered by their Major Channel's position in the
+        detector list (the Spectral Process tab's order); labels with no
+        resolvable gate_channel sort last.
         """
         channel_order = {ch: i for i, ch in enumerate(fluorescence_channel_names(self.controller))}
         gate_channel_by_label = {
@@ -706,9 +624,9 @@ class PluginWidget(QWidget):
 
         v_mats = entry['v_mats']
         profiles = self.controller.experiment.process.get('profiles', {})
-        reference_vec = np.array(profiles.get(label))
-        if reference_vec is None:
+        if profiles.get(label) is None:
             return
+        reference_vec = np.array(profiles[label])
 
         n_variants, n_ch = v_mats.shape
         x = np.arange(n_ch)
@@ -736,89 +654,17 @@ class PluginWidget(QWidget):
         low_alpha_pen = pg.mkPen(color=(200, 80, 80, 110), width=4)
         for row in v_mats:
             self._variant_plot.plot(x, np.maximum(row, 0), pen=low_alpha_pen)
-        # Reference spectrum drawn last, solid, on top — blue so it reads
-        # against both light and dark backgrounds.
+        # Reference drawn last, on top, in blue (reads on light and dark backgrounds).
         self._variant_plot.plot(x, np.maximum(reference_vec, 0), pen=pg.mkPen(color=(30, 144, 255), width=3))
 
         self._plot_status.setText(f'{n_variants} variant(s), {entry.get("n_events_used", "?")} event(s) used.')
 
     # ------------------------------------------------------------------
-    # Table section
-    # ------------------------------------------------------------------
-
-    def _build_table_section(self, parent_layout):
-        grp = QGroupBox('3 — Table: Optimisation Necessity')
-        layout = QVBoxLayout(grp)
-
-        self._table_status = QLabel('')
-        layout.addWidget(self._table_status)
-
-        self._table = CopyableTableWidget([], ['Fluorophore', 'Optimize Score', 'Recommended', 'Active'])
-        layout.addWidget(self._table)
-
-        parent_layout.addWidget(grp)
-
-    def _rebuild_table(self):
-        fluor_names = [c['label'] for c in self.controller.experiment.process.get('spectral_model', [])
-                       if c['label'] in self.controller.experiment.process.get('profiles', {})]
-        meta = self.controller.experiment.process.get('autospectral_variants_meta', {})
-
-        scored_labels = sorted(
-            (label for label in fluor_names if label in meta),
-            key=lambda lbl: meta[lbl]['optimize_score'],
-            reverse=True,
-        )
-        rows = [
-            {
-                'Fluorophore': label,
-                'Optimize Score': f'{meta[label]["optimize_score"]:.4f}',
-                'Recommended': 'Yes' if meta[label]['optimize_recommended'] else 'No',
-            }
-            for label in scored_labels
-        ]
-
-        old = self._table
-        self._table = CopyableTableWidget(rows, ['Fluorophore', 'Optimize Score', 'Recommended', 'Active'])
-        # Replace the widget in its parent layout.
-        layout = self.toggle_content.layout()
-        # Find and swap within the Table group box's own layout instead:
-        for i in range(layout.count()):
-            item = layout.itemAt(i)
-            w = item.widget() if item else None
-            if isinstance(w, QGroupBox) and w.title().startswith('3 —'):
-                grp_layout = w.layout()
-                grp_layout.replaceWidget(old, self._table) if old else grp_layout.addWidget(self._table)
-                if old:
-                    old.setParent(None)
-                break
-
-        for row_idx, label in enumerate([r['Fluorophore'] for r in rows]):
-            checkbox = QCheckBox()
-            checkbox.setChecked(bool(meta[label].get('active')))
-            checkbox.stateChanged.connect(
-                lambda state, lbl=label: self._on_active_checkbox_changed(lbl, state)
-            )
-            self._table.setCellWidget(row_idx, 3, checkbox)
-
-        self._table_status.setText(f'{len(rows)} fluorophore(s) with computed variants.')
-
-    def _on_active_checkbox_changed(self, label: str, state: int):
-        meta = self.controller.experiment.process.get('autospectral_variants_meta', {})
-        if label in meta:
-            meta[label]['active'] = bool(state)
-            if self.bus:
-                self.bus.autoSaveRequested.emit()
-
-    def _active_labels(self) -> set:
-        meta = self.controller.experiment.process.get('autospectral_variants_meta', {})
-        return {label for label, m in meta.items() if m.get('active')}
-
-    # ------------------------------------------------------------------
-    # Compare section
+    # Comparison
     # ------------------------------------------------------------------
 
     def _build_compare_section(self, parent_layout):
-        grp = QGroupBox('4 — Compare: Standard vs. AutoSpectral Optimization')
+        grp = QGroupBox('Comparison (Current Sample)')
         layout = QVBoxLayout(grp)
 
         row = QHBoxLayout()
@@ -830,27 +676,28 @@ class PluginWidget(QWidget):
         row.addStretch()
         layout.addLayout(row)
 
-        plots_row = QHBoxLayout()
-        self._plot_ols = AfComparisonPlotWidget('Standard OLS (No AF Correction)', self.controller,
-                                                has_af_channels=False)
-        self._plot_af = AfComparisonPlotWidget('AutoSpectral AF-Corrected', self.controller)
-        self._plot_opt = AfComparisonPlotWidget('AutoSpectral Optimization', self.controller)
-        plots_row.addWidget(self._plot_ols)
-        plots_row.addWidget(self._plot_af)
-        plots_row.addWidget(self._plot_opt)
-        layout.addLayout(plots_row)
+        splitter = QSplitter(Qt.Horizontal)
+        self._plot_af = AfComparisonPlotWidget('Per-cell AF', self.controller, parent=self)
+        self._plot_opt = AfComparisonPlotWidget('Per-cell AF + spectral variants', self.controller,
+                                                parent=self)
+        splitter.addWidget(self._plot_af)
+        splitter.addWidget(self._plot_opt)
+        splitter.setSizes([500, 500])
+        layout.addWidget(splitter)
 
-        self._plot_ols.sourceGateChanged.connect(self._on_ols_gate_changed)
-        self._plot_af.sourceGateChanged.connect(self._on_af_gate_changed)
-        self._plot_opt.sourceGateChanged.connect(self._on_opt_gate_changed)
-        self._plot_ols.channelChanged.connect(self._on_ols_channel_changed)
-        self._plot_af.channelChanged.connect(self._on_af_channel_changed)
-        self._plot_opt.channelChanged.connect(self._on_opt_channel_changed)
-        self._plot_ols.scalingChanged.connect(self._on_ols_scaling_changed)
-        self._plot_af.scalingChanged.connect(self._on_af_scaling_changed)
-        self._plot_opt.scalingChanged.connect(self._on_opt_scaling_changed)
+        for plot, other in ((self._plot_af, self._plot_opt), (self._plot_opt, self._plot_af)):
+            plot.sourceGateChanged.connect(other.set_source_gate)
+            plot.channelChanged.connect(lambda x, y, o=other: self._mirror(o, 'set_channels', x, y))
+            plot.scalingChanged.connect(lambda a, tr, o=other: self._mirror(o, 'set_scaling', a, tr))
 
         parent_layout.addWidget(grp)
+
+    @staticmethod
+    def _mirror(plot, method: str, *args):
+        """Apply a sibling's channel or scaling change without echoing it back."""
+        plot.blockSignals(True)
+        getattr(plot, method)(*args)
+        plot.blockSignals(False)
 
     def _refresh_comparison_controls(self):
         sample_path = getattr(self.controller, 'current_sample_path', None)
@@ -858,11 +705,24 @@ class PluginWidget(QWidget):
         setup_done = self._setup_done()
         self._cmp_run_btn.setEnabled(has_af and setup_done and AUTOSPECTRAL_OPT_KERNEL_AVAILABLE)
         if not setup_done:
-            self._cmp_status.setText('Run Setup first.')
+            self._cmp_status.setText('Compute spectral variants first.')
         elif not has_af:
-            self._cmp_status.setText('Current sample has no AF profile assigned — see AutoSpectral AF tab.')
+            self._cmp_status.setText(
+                'Current sample has no AF profile assigned — see the Autofluorescence page.')
         else:
             self._cmp_status.setText('')
+
+    def _clear_comparison_plots(self):
+        self._plot_af.clear()
+        self._plot_opt.clear()
+        self._af_data = None
+        self._opt_data = None
+        self._last_cmp_state = None
+        self._pending_cmp_state = None
+
+    def _active_labels(self) -> set:
+        meta = self.controller.experiment.process.get('autospectral_variants_meta', {})
+        return {label for label, m in meta.items() if m.get('active')}
 
     def _run_comparison(self):
         if self._cmp_running:
@@ -880,7 +740,7 @@ class PluginWidget(QWidget):
         if af_spectra is None or af_spectra.shape[0] < 2:
             self._cmp_status.setText(
                 'No AF profile (or fewer than 2 spectra) assigned to this sample — '
-                'see the AutoSpectral AF tab.'
+                'see the Autofluorescence page.'
             )
             return
 
@@ -907,9 +767,9 @@ class PluginWidget(QWidget):
             unmixed_pos_thresholds = cached_thresholds
         else:
             logger.warning(
-                'AutoSpectral Optimization comparison: no cached unstained-derived '
-                'thresholds (run Setup first) — falling back to all-zero thresholds '
-                'rather than recomputing from the currently loaded (stained) sample.'
+                'Spectral Variants comparison: no cached unstained-derived thresholds '
+                '(compute spectral variants first) — using all-zero thresholds rather than '
+                'recomputing from the loaded (stained) sample.'
             )
             unmixed_pos_thresholds = np.zeros(reference_spectra.shape[0])
 
@@ -923,14 +783,13 @@ class PluginWidget(QWidget):
             self._comparison_max_events_spin.value(),
             tuple(self._kernel_kwargs().items()),
         )
-        if state_key == self._last_cmp_state and self._ols_data is not None:
+        if state_key == self._last_cmp_state and self._af_data is not None:
             self._cmp_status.setText(
-                f'No change — redrawing from cached result ({self._ols_data.shape[0]:,} events).'
+                f'No change — redrawing from cached result ({self._af_data.shape[0]:,} events).'
             )
             self._initialise_comparison_plots()
             return
 
-        self._plot_ols.set_status('Computing...')
         self._plot_af.set_status('Computing...')
         self._plot_opt.set_status('Computing...')
         self._cmp_status.setText('Running unmixing on current sample...')
@@ -957,23 +816,20 @@ class PluginWidget(QWidget):
         self._cmp_thread.finished.connect(self._on_cmp_thread_finished)
         self._cmp_thread.start()
 
-    def _on_comparison_finished(self, ols_data, af_data, opt_data):
-        self._ols_data = ols_data
+    def _on_comparison_finished(self, _ols_data, af_data, opt_data):
         self._af_data = af_data
         self._opt_data = opt_data
         self._last_cmp_state = self._pending_cmp_state
-        self._cmp_status.setText(f'Done. {ols_data.shape[0]:,} events.')
-        self._plot_ols.set_status('')
+        self._cmp_status.setText(f'Done. {af_data.shape[0]:,} events.')
         self._plot_af.set_status('')
         self._plot_opt.set_status('')
         self._initialise_comparison_plots()
 
     def _on_comparison_error(self, msg: str):
-        self._plot_ols.set_status('Error')
         self._plot_af.set_status('Error')
         self._plot_opt.set_status('Error')
         self._cmp_status.setText(f'Error: {msg}')
-        logger.error(f'AutoSpectral Optimization comparison error: {msg}')
+        logger.error(f'Spectral Variants comparison error: {msg}')
 
     def _on_cmp_thread_finished(self):
         self._cmp_running = False
@@ -981,7 +837,9 @@ class PluginWidget(QWidget):
         self._cmp_worker = None
 
     def _initialise_comparison_plots(self):
-        if self._ols_data is None or self._af_data is None or self._opt_data is None:
+        """Feed both plots; default channels are the pair that changes most.
+        Existing channel, scaling and gate choices are kept."""
+        if self._af_data is None or self._opt_data is None:
             return
         c = self.controller
         pnn = c.experiment.settings['unmixed'].get('event_channels_pnn', [])
@@ -990,193 +848,57 @@ class PluginWidget(QWidget):
             return
         fl_names = [pnn[i] for i in fl_ids]
         ch_x, ch_y = fl_names[0], fl_names[1]
-
-        # Better default: the two channels that differ most between
-        # AF-corrected and Optimization results.
         try:
-            picked = pick_most_affected_channels(
-                self._af_data, self._opt_data, pnn, fl_names
-            )
+            picked = pick_most_affected_channels(self._af_data, self._opt_data, pnn, fl_names)
             if picked is not None:
                 ch_x, ch_y = picked
         except Exception as e:
-            logger.debug(
-                f'AutoSpectral Optimization comparison: channel auto-pick failed: {e}'
-            )
+            logger.debug(f'Spectral Variants comparison: channel auto-pick failed: {e}')
+        if self._plot_af._channel_x in fl_names and self._plot_af._channel_y in fl_names:
+            ch_x, ch_y = self._plot_af._channel_x, self._plot_af._channel_y
 
-        if (self._plot_ols._channel_x in fl_names and self._plot_ols._channel_y in fl_names):
-            ch_x, ch_y = self._plot_ols._channel_x, self._plot_ols._channel_y
-
-        self._plot_ols.set_event_data(self._ols_data)
-        self._plot_ols.initialise_from_controller(ch_x, ch_y)
-        self._plot_ols.redraw()
-
-        self._plot_af.set_event_data(self._af_data)
-        self._plot_af.initialise_from_controller(ch_x, ch_y)
-        self._plot_af.redraw()
-
-        self._plot_opt.set_event_data(self._opt_data)
-        self._plot_opt.initialise_from_controller(ch_x, ch_y)
-        self._plot_opt.redraw()
-
-    def _on_ols_gate_changed(self, gate_name: str):
-        self._plot_af.set_source_gate(gate_name)
-        self._plot_opt.set_source_gate(gate_name)
-
-    def _on_af_gate_changed(self, gate_name: str):
-        self._plot_ols.set_source_gate(gate_name)
-        self._plot_opt.set_source_gate(gate_name)
-
-    def _on_opt_gate_changed(self, gate_name: str):
-        self._plot_ols.set_source_gate(gate_name)
-        self._plot_af.set_source_gate(gate_name)
-
-    def _on_ols_channel_changed(self, ch_x: str, ch_y: str):
-        self._plot_af.blockSignals(True)
-        self._plot_af.set_channels(ch_x, ch_y)
-        self._plot_af.blockSignals(False)
-        self._plot_opt.blockSignals(True)
-        self._plot_opt.set_channels(ch_x, ch_y)
-        self._plot_opt.blockSignals(False)
-
-    def _on_af_channel_changed(self, ch_x: str, ch_y: str):
-        self._plot_ols.blockSignals(True)
-        self._plot_ols.set_channels(ch_x, ch_y)
-        self._plot_ols.blockSignals(False)
-        self._plot_opt.blockSignals(True)
-        self._plot_opt.set_channels(ch_x, ch_y)
-        self._plot_opt.blockSignals(False)
-
-    def _on_opt_channel_changed(self, ch_x: str, ch_y: str):
-        self._plot_ols.blockSignals(True)
-        self._plot_ols.set_channels(ch_x, ch_y)
-        self._plot_ols.blockSignals(False)
-        self._plot_af.blockSignals(True)
-        self._plot_af.set_channels(ch_x, ch_y)
-        self._plot_af.blockSignals(False)
-
-    def _on_ols_scaling_changed(self, axis_name: str, tr):
-        self._plot_af.blockSignals(True)
-        self._plot_af.set_scaling(axis_name, tr)
-        self._plot_af.blockSignals(False)
-        self._plot_opt.blockSignals(True)
-        self._plot_opt.set_scaling(axis_name, tr)
-        self._plot_opt.blockSignals(False)
-
-    def _on_af_scaling_changed(self, axis_name: str, tr):
-        self._plot_ols.blockSignals(True)
-        self._plot_ols.set_scaling(axis_name, tr)
-        self._plot_ols.blockSignals(False)
-        self._plot_opt.blockSignals(True)
-        self._plot_opt.set_scaling(axis_name, tr)
-        self._plot_opt.blockSignals(False)
-
-    def _on_opt_scaling_changed(self, axis_name: str, tr):
-        self._plot_ols.blockSignals(True)
-        self._plot_ols.set_scaling(axis_name, tr)
-        self._plot_ols.blockSignals(False)
-        self._plot_af.blockSignals(True)
-        self._plot_af.set_scaling(axis_name, tr)
-        self._plot_af.blockSignals(False)
-
-    # ------------------------------------------------------------------
-    # Unmix section
-    # ------------------------------------------------------------------
-
-    def _build_unmix_section(self, parent_layout):
-        grp = QGroupBox('5 — Unmix: Batch Export')
-        layout = QVBoxLayout(grp)
-
-        self._unmix_picker = OrderedMultiSamplePicker(title='Samples with an AF profile assigned')
-        layout.addWidget(self._unmix_picker)
-
-        row = QHBoxLayout()
-        self._unmix_btn = QPushButton('Export Selected Samples')
-        self._unmix_btn.clicked.connect(self._run_unmix_export)
-        row.addWidget(self._unmix_btn)
-        self._unmix_status = QLabel('')
-        row.addWidget(self._unmix_status)
-        row.addStretch()
-        layout.addLayout(row)
-
-        parent_layout.addWidget(grp)
-
-    def _refresh_unmix_picker(self):
-        if not self.controller or not self.controller.experiment:
-            return
-        all_samples = self.controller.experiment.samples.get('all_samples', {})
-        eligible = {path: name for path, name in all_samples.items() if self._sample_has_af_profile(path)}
-        self._path_by_display_name = {v: k for k, v in eligible.items()}
-        self._unmix_picker.set_items(sorted(eligible.values()))
-        if not eligible:
-            self._unmix_status.setText('No samples with an AF profile assigned — see the AutoSpectral AF tab.')
-        else:
-            self._unmix_status.setText('')
-        self._unmix_btn.setEnabled(bool(eligible) and self._setup_done() and AUTOSPECTRAL_OPT_KERNEL_AVAILABLE)
-
-    def _run_unmix_export(self):
-        if self._unmix_run is not None:
-            self._unmix_status.setText('Export already running — please wait.')
-            return
-        display_names = self._unmix_picker.get_ordered_list()
-        sample_paths = [self._path_by_display_name[n] for n in display_names if n in self._path_by_display_name]
-        if not sample_paths:
-            self._unmix_status.setText('No samples selected.')
-            return
-
-        try:
-            exporter = AutoSpectralOptExporter(
-                sample_paths, self.controller, self.bus, self._kernel_kwargs()
-            )
-        except Exception as e:
-            logger.exception('AutoSpectral Optimization: could not prepare the export')
-            self._unmix_status.setText(f'Error: {e}')
-            return
-
-        self._unmix_btn.setEnabled(False)
-        self._unmix_status.setText(f'Exporting {len(sample_paths)} sample(s)...')
-
-        self._unmix_run = JointUnmixRun(
-            exporter, parent_widget=self, probe_fn=exporter.probe_fn, bus=self.bus,
-        )
-        self._unmix_run.status.connect(self._unmix_status.setText)
-        self._unmix_run.progress.connect(self._on_unmix_progress)
-        self._unmix_run.finished.connect(self._on_unmix_finished)
-        self._unmix_run.error.connect(self._on_unmix_error)
-        self._unmix_run.done.connect(self._on_unmix_run_done)
-        self._unmix_run.start()
-
-    def _on_unmix_progress(self, n, total):
-        self._unmix_status.setText(f'Exporting... ({n}/{total})')
-
-    def _on_unmix_finished(self):
-        self._unmix_status.setText('Export complete.')
-
-    def _on_unmix_error(self, msg: str):
-        self._unmix_status.setText(f'Error: {msg}')
-        logger.error(f'AutoSpectral Optimization export error: {msg}')
-
-    def _on_unmix_run_done(self):
-        self._unmix_run = None
-        self._unmix_btn.setEnabled(True)
+        for plot, data in ((self._plot_af, self._af_data), (self._plot_opt, self._opt_data)):
+            kept = {}
+            for ch in (plot._channel_x, plot._channel_y):
+                if ch and ch in plot._transformations:
+                    tr = plot._transformations[ch]
+                    kept[ch] = (tr.id, tr.limits, tr.logicle_w, tr.logicle_a)
+            plot.set_event_data(data)
+            plot.initialise_from_controller(ch_x, ch_y)
+            for ch, (tid, limits, lw, la) in kept.items():
+                if ch in plot._transformations:
+                    tr = plot._transformations[ch]
+                    tr.logicle_w = lw
+                    tr.logicle_a = la
+                    tr.set_transform(tid, limits)
+            plot._configure_axes()
+            plot.redraw()
 
     # ------------------------------------------------------------------
     # Bus slots
     # ------------------------------------------------------------------
 
-    def _on_mode_change(self, _mode):
+    def on_activated(self):
+        """The page came on screen: refresh it and bring the comparison up to date."""
         self._refresh_all_guards()
+        self._refresh_plot_combo()
+        if self._cmp_run_btn.isEnabled():
+            QTimer.singleShot(0, self._run_comparison)
+
+    def _on_mode_change(self, mode):
+        if mode == TAB_NAME and self.is_active():
+            self.on_activated()
 
     def _on_sample_loaded(self, _path):
         QTimer.singleShot(0, self._on_sample_loaded_deferred)
 
     def _on_sample_loaded_deferred(self):
         self._refresh_comparison_controls()
+        if not self.is_active():
+            self._clear_comparison_plots()
+            return
         if self._cmp_run_btn.isEnabled():
             self._run_comparison()
 
     def _on_process_refreshed(self):
         self._refresh_all_guards()
-
-    def _on_sample_tree_updated(self):
-        self._refresh_unmix_picker()

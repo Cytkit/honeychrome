@@ -32,7 +32,7 @@ from honeychrome.view_components.gains_widget import GainsWidget
 from honeychrome.view_components.icon_loader import icon
 from honeychrome.view_components.sample_widget import SampleWidget
 from honeychrome.view_components.help_texts import process_help_text
-from honeychrome.view_components.autospectral_tab import AutoSpectralTab
+from honeychrome.view_components.autospectral_tab import AutoSpectralTab, TAB_NAME as AUTOSPECTRAL_TAB_NAME
 
 base_directory = Path.home() / experiments_folder
 
@@ -324,7 +324,7 @@ class MainWindow(QMainWindow):
         self.process_tab.setLayout(self.process_layout)
         self.tabs.addTab(scroll_area, "Spectral Process")
 
-        # --- AutoSpectral AF tab ---
+        # --- AutoSpectral tab ---
         self.autospectral_widget = AutoSpectralTab(bus, controller, parent=self)
         autospectral_tab_widget = QWidget()
         autospectral_tab_layout = QVBoxLayout()
@@ -332,7 +332,7 @@ class MainWindow(QMainWindow):
         autospectral_tab_layout.setSpacing(0)
         autospectral_tab_widget.setLayout(autospectral_tab_layout)
         autospectral_tab_layout.addWidget(self.autospectral_widget)
-        self.tabs.addTab(autospectral_tab_widget, "AutoSpectral AF")
+        self.tabs.addTab(autospectral_tab_widget, AUTOSPECTRAL_TAB_NAME)
 
         # --- Unmixed ---
         self.unmixed_tab = QWidget()

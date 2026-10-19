@@ -60,7 +60,7 @@ def _run_unmixed_exporter(controller):
 
 
 def _run_opt_exporter(controller, sample_keys):
-    from autospectral_optimization_tab import AutoSpectralOptExporter
+    from joint_unmix_export import AutoSpectralOptExporter
     errors = []
     exporter = AutoSpectralOptExporter(sample_keys, controller, None, {'n_threads': 1})
     exporter.error.connect(errors.append)

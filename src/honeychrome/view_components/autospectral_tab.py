@@ -1,20 +1,28 @@
 """
 autospectral_tab.py
 --------------------
-Honeychrome integrated tab: AutoSpectral AF Extraction.
+Honeychrome integrated tab: AutoSpectral.
 
 Location: src/honeychrome/view_components/autospectral_tab.py
 
-Sections
---------
-1  Extract AF profile from an unstained sample (SOM, KMeans fallback).
-2  Manage stored AF profiles (spectral plot, CSV load/save/delete).
-3  Assign AF profiles to samples (grid: rows=samples, columns=profiles; unstained
-   and single-stained controls optionally included), to all samples, to the
-   samples of a folder, or automatically from scatter (af_auto_assign).
-4  Side-by-side OLS vs AF-corrected biplot comparison, using the same
-   density-heatmap rendering, logicle transforms, and axis-drag zoom as the
-   Unmixed Data tab.
+Pages (side navigation)
+-----------------------
+Autofluorescence    AutofluorescencePage (this module)
+    1  Extract AF profile from an unstained sample (SOM, KMeans fallback).
+    2  Manage stored AF profiles (spectral plot, CSV load/save/delete; right-click
+       a trace to delete that spectrum).
+    3  Assign AF profiles to samples (grid: rows=samples, columns=profiles; unstained
+       and single-stained controls optionally included), to all samples, to the
+       samples of a folder, or automatically from scatter (af_auto_assign).
+    4  Side-by-side OLS vs AF-corrected biplot comparison, using the same
+       density-heatmap rendering, logicle transforms, and axis-drag zoom as the
+       Unmixed Data tab.
+Noise               placeholder
+Spectral Variants   SpectralVariantsPage (autospectral_variants_page.py)
+Spectral Correction placeholder
+
+Comparison plots open on the Singlets gate, else Cells, else root
+(default_comparison_gate).
 """
 
 import re
@@ -30,7 +38,7 @@ from PySide6.QtWidgets import (
     QPushButton, QSpinBox, QComboBox, QGroupBox,
     QFormLayout, QSizePolicy, QFileDialog, QListWidget, QListWidgetItem,
     QAbstractItemView, QSplitter, QCheckBox, QHeaderView,
-    QTableWidget, QTableWidgetItem,
+    QTableWidget, QTableWidgetItem, QMenu, QMessageBox,
 )
 import pyqtgraph as pg
 import warnings
@@ -71,7 +79,8 @@ from honeychrome.view_components.cytometry_plot_components import (
     TransparentGraphicsLayoutWidget,
 )
 from honeychrome.view_components.profiles_viewer import BottomAxisVerticalTickLabels
-from honeychrome.view_components.help_toggle_widget import WheelBlocker
+from honeychrome.view_components.help_toggle_widget import HelpToggleWidget, WheelBlocker
+from honeychrome.view_components.side_tab_widget import SideTabWidget
 from honeychrome.controller_components.cytometer_whitelist import (
     get_detector_laser_map, LASER_LABEL_COLORS,
 )
@@ -83,7 +92,13 @@ from honeychrome.view_components.help_texts import autospectral_af_help_text
 
 logger = logging.getLogger(__name__)
 
-TAB_NAME = 'AutoSpectral AF'
+TAB_NAME = 'AutoSpectral'
+PAGE_SETTING = 'autospectral_page'
+
+# Comparison plots open on the first of these gates that exists (any case).
+COMPARISON_GATE_PREFERENCE = ('Singlets', 'Cells')
+# A right-click this close to a profile trace (pixels) picks that spectrum.
+PROFILE_PICK_TOLERANCE_PX = 8
 
 # Assignment table column widths (pixels): defaults fit the text up to the
 # caps; the user can drag any divider down to the minimum.
@@ -245,6 +260,15 @@ def pick_most_affected_channels(
     return fl_names[top2[0]], fl_names[top2[1]]
 
 
+def default_comparison_gate(gate_names) -> str:
+    """The first of COMPARISON_GATE_PREFERENCE in gate_names (any case), else 'root'."""
+    by_lower = {str(g).lower(): g for g in gate_names}
+    for name in COMPARISON_GATE_PREFERENCE:
+        if name.lower() in by_lower:
+            return by_lower[name.lower()]
+    return 'root'
+
+
 # ---------------------------------------------------------------------------
 # AfComparisonPlotWidget
 # ---------------------------------------------------------------------------
@@ -287,8 +311,8 @@ class AfComparisonPlotWidget(QWidget):
         self._transformations: dict[str, Transform] = {}
         # Event data for this plot (full array, gate mask applied only for display)
         self._event_data: np.ndarray | None = None
-        # Current source gate name
-        self._source_gate: str = 'root'
+        # Current source gate name; None until _configure_title picks the default.
+        self._source_gate: str | None = None
         # Current channel names
         self._channel_x: str | None = None
         self._channel_y: str | None = None
@@ -400,6 +424,7 @@ class AfComparisonPlotWidget(QWidget):
         """
         Copy Transform objects from controller.unmixed_transformations,
         set initial channels, and configure axes.  Call after set_event_data().
+        The source gate is kept (default_comparison_gate the first time).
         """
         src = self.controller.unmixed_transformations or {}
         self._transformations = {}
@@ -408,7 +433,6 @@ class AfComparisonPlotWidget(QWidget):
 
         self._channel_x = channel_x
         self._channel_y = channel_y
-        self._source_gate = 'root'
         self._configure_axes()
 
     def set_channels(self, channel_x: str, channel_y: str):
@@ -524,7 +548,7 @@ class AfComparisonPlotWidget(QWidget):
 
         # Validate current gate still exists
         if self._source_gate not in gate_names:
-            self._source_gate = 'root'
+            self._source_gate = default_comparison_gate(gate_names)
 
         self.plot_title.setText(f'{self._title_text}  [{self._source_gate}]')
         self.plot_title.leftClickMenuItems = gate_names
@@ -617,7 +641,7 @@ class AfComparisonPlotWidget(QWidget):
     def _gate_using_af_channels(self) -> tuple[str, str] | None:
         """(gate, channel) for the first gate from root to the source gate
         that is drawn on an AF channel, or None."""
-        if self._source_gate == 'root':
+        if self._source_gate in (None, 'root'):
             return None
         gating = self.controller.unmixed_gating
         if gating is None:
@@ -656,7 +680,7 @@ class AfComparisonPlotWidget(QWidget):
         Returns None if 'root' is selected or if gating is unavailable.
         Returns a boolean ndarray of length len(event_data) otherwise.
         """
-        if self._source_gate == 'root':
+        if self._source_gate in (None, 'root'):
             return None
 
         gating = self.controller.unmixed_gating
@@ -799,13 +823,17 @@ class AfComparisonPlotWidget(QWidget):
 # Main tab widget
 # ---------------------------------------------------------------------------
 
-class AutoSpectralTab(QWidget):
-    """Permanent integrated tab for AutoSpectral AF extraction and evaluation."""
+class AutofluorescencePage(QWidget):
+    """AutoSpectral tab page: AF extraction, stored profiles, assignment and comparison."""
 
-    def __init__(self, bus=None, controller=None, parent=None):
+    def __init__(self, bus=None, controller=None, active_fn=None, parent=None):
         super().__init__(parent)
         self.bus = bus
         self.controller = controller
+        # active_fn(page) -> bool: whether the page is on screen.
+        self._active_fn = active_fn
+        # Plotted traces of the selected profile, one per spectrum row.
+        self._profile_curves: list = []
 
         self._train_thread = None
         self._train_worker = None
@@ -843,57 +871,18 @@ class AutoSpectralTab(QWidget):
         content_layout.setAlignment(Qt.AlignTop)
         content_layout.setSpacing(10)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(self._content)
-        outer.addWidget(scroll)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setWidget(self._content)
+        outer.addWidget(self._scroll)
 
-        from honeychrome.settings import heading_style
-        title_label = QLabel("AutoSpectral AF")
-        title_label.setStyleSheet(heading_style)
-        content_layout.addWidget(title_label)
-
-        # Help text (rich text / HTML)
-        self.help_label = QLabel(autospectral_af_help_text)
-        self.help_label.setTextFormat(Qt.RichText)
-        self.help_label.setWordWrap(True)
-        # self.help_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        font = self.help_label.font()
-        font.setPointSize(14)  # Set your desired font size
-        self.help_label.setFont(font)
-        content_layout.addWidget(self.help_label)
-
-        # toggle button and content
-        self.toggle_content_button = QCheckBox('Show AutoSpectral AF process')
-        self.settings = QSettings("honeychrome", "app_configuration")
-        saved_state = self.settings.value("show_autospectral_af", "false") == "true"
-        self.toggle_content_button.setCheckable(True)
-        self.toggle_content_button.setChecked(saved_state)
-        content_layout.addWidget(self.toggle_content_button)
-
-        self.toggle_content = QWidget()
-        toggle_content_layout = QVBoxLayout(self.toggle_content)
-        self._build_extraction_section(toggle_content_layout)
-        self._build_profile_manager_section(toggle_content_layout)
-        self._build_assignment_section(toggle_content_layout)
-        self._build_comparison_section(toggle_content_layout)
-        content_layout.addWidget(self.toggle_content)
-        self.toggle_content.setVisible(saved_state)
-
-        self.toggle_content_button.toggled.connect(self.toggle_content.setVisible)
-        self.toggle_content_button.toggled.connect(self.save_visibility)
-
-        self.toggle_content_button.setStyleSheet("""
-                    QCheckBox {
-                        font-size: 14pt;
-                        spacing: 10px;      /* Gap between checkmark and text */
-                        padding: 10px;      /* Internal padding */
-                    }
-                """)
-
-
+        content_layout.addWidget(HelpToggleWidget(text=autospectral_af_help_text))
+        self._build_extraction_section(content_layout)
+        self._build_profile_manager_section(content_layout)
+        self._build_assignment_section(content_layout)
+        self._build_comparison_section(content_layout)
         content_layout.addStretch()
 
         if self.bus:
@@ -901,9 +890,6 @@ class AutoSpectralTab(QWidget):
             self.bus.loadSampleRequested.connect(self._on_sample_loaded)
             self.bus.spectralProcessRefreshed.connect(self._on_process_refreshed)
             self.bus.sampleTreeUpdated.connect(self._populate_sample_combo)
-
-    def save_visibility(self, checked: bool):
-        self.settings.setValue("show_autospectral_af", "true" if checked else "false")
 
     # ======================================================================
     # Section builders
@@ -956,6 +942,10 @@ class AutoSpectralTab(QWidget):
         # prevent mouse scroll catching
         self._wheel_blocker = WheelBlocker(self)
         self._profile_plot.viewport().installEventFilter(self._wheel_blocker)
+        # Right-click on a trace offers to delete that spectrum.
+        self._profile_plot.getPlotItem().setMenuEnabled(False)
+        self._profile_plot.scene().sigMouseClicked.connect(self._on_profile_plot_clicked)
+        self._profile_plot.setToolTip('Right-click a spectrum to delete it from the profile.')
         layout.addWidget(self._profile_plot)
 
         self._profile_list = QListWidget()
@@ -1174,21 +1164,35 @@ class AutoSpectralTab(QWidget):
     # Bus signal handlers
     # ======================================================================
 
+    def is_active(self) -> bool:
+        """True while the page is on screen."""
+        if self._active_fn is None:
+            return self.controller.current_mode == TAB_NAME
+        return self._active_fn(self)
+
+    def on_activated(self):
+        """The page came on screen: refresh it and bring the comparison up to date."""
+        self._refresh_ui()
+        if self.controller.raw_event_data is not None:
+            QTimer.singleShot(0, self._run_comparison)
+
     def _on_mode_change(self, mode):
-        if mode == TAB_NAME:
-            self._refresh_ui()
-            if self.controller.raw_event_data is not None:
-                QTimer.singleShot(0, self._run_comparison)
+        if mode == TAB_NAME and self.is_active():
+            self.on_activated()
 
     def _on_sample_loaded(self, _sample_path):
         # Rebuild grid and controls immediately, then defer the comparison run
         # with a zero-delay timer so that load_sample() has fully completed
         # (raw_event_data, transfer_matrix etc. are all set) before we read them.
-        if self.controller.current_mode == TAB_NAME:
-            self._rebuild_assignment_grid()
-            self._refresh_comparison_controls()
+        if self.controller.current_mode != TAB_NAME:
+            return
+        if not self.is_active():
             self._clear_comparison_plots()
-            QTimer.singleShot(0, self._run_comparison)
+            return
+        self._rebuild_assignment_grid()
+        self._refresh_comparison_controls()
+        self._clear_comparison_plots()
+        QTimer.singleShot(0, self._run_comparison)
 
     def _on_process_refreshed(self):
         self._refresh_ui()
@@ -1203,6 +1207,7 @@ class AutoSpectralTab(QWidget):
         )
         self._label_disabled.setVisible(not has_unmixing)
         self._content.setVisible(has_unmixing)
+        self._scroll.setVisible(has_unmixing)
 
         if not has_unmixing:
             return
@@ -1510,10 +1515,100 @@ class AutoSpectralTab(QWidget):
             self._profile_plot_axis.setTicks(None)
             self._profile_plot_axis.tick_colors = {}
 
+        self._profile_curves = []
         for i, row in enumerate(af_spectra):
             pen = (pg.mkPen(color=(0, 0, 0), width=2) if i == 0
                 else pg.mkPen(color=colours[i], width=1))
-            self._profile_plot.plot(x, np.maximum(row, 0), pen=pen)
+            self._profile_curves.append(self._profile_plot.plot(x, np.maximum(row, 0), pen=pen))
+
+    def _profile_row_at(self, scene_pos) -> int | None:
+        """Spectrum row of the selected profile drawn nearest scene_pos, if
+        within PROFILE_PICK_TOLERANCE_PX (distance to the trace's segments)."""
+        item = self._profile_list.currentItem()
+        if item is None:
+            return None
+        entry = self.controller.experiment.process.get('af_profiles', {}).get(item.text())
+        if entry is None:
+            return None
+        vb = self._profile_plot.getViewBox()
+        if not vb.sceneBoundingRect().contains(scene_pos):
+            return None
+        point = vb.mapSceneToView(scene_pos)
+        px_w, px_h = vb.viewPixelSize()
+        if px_w <= 0 or px_h <= 0:
+            return None
+        spectra = np.maximum(np.asarray(entry['spectra'], dtype=float), 0)
+        n_ch = spectra.shape[1]
+        if n_ch < 2:
+            return None
+        # Trace vertices relative to the click, in pixels.
+        sx = (np.arange(n_ch) - point.x()) / px_w
+        sy = (spectra - point.y()) / px_h
+        ax, dx = sx[:-1], np.diff(sx)
+        ay, dy = sy[:, :-1], np.diff(sy, axis=1)
+        t = np.clip(-(ax * dx + ay * dy) / np.maximum(dx * dx + dy * dy, 1e-12), 0.0, 1.0)
+        distance = np.hypot(ax + t * dx, ay + t * dy).min(axis=1)
+        row = int(np.argmin(distance))
+        return row if distance[row] <= PROFILE_PICK_TOLERANCE_PX else None
+
+    def _on_profile_plot_clicked(self, event):
+        """Right-click on a trace: menu to delete that spectrum (not the mean)."""
+        if event.button() != Qt.MouseButton.RightButton:
+            return
+        item = self._profile_list.currentItem()
+        if item is None:
+            return
+        row = self._profile_row_at(event.scenePos())
+        if row is None:
+            return
+        event.accept()
+        name = item.text()
+        curve = self._profile_curves[row] if row < len(self._profile_curves) else None
+        old_pen = curve.opts['pen'] if curve is not None else None
+        if curve is not None:
+            curve.setPen(pg.mkPen(color=(230, 60, 60), width=3))
+        menu = QMenu(self)
+        if row == 0:
+            action = menu.addAction('The profile mean (row 0) cannot be deleted')
+            action.setEnabled(False)
+        else:
+            action = menu.addAction(f'Delete spectrum {row}…')
+        chosen = menu.exec(event.screenPos().toPoint())
+        if curve is not None:
+            curve.setPen(old_pen)
+        if row > 0 and chosen is action:
+            self._delete_profile_spectrum(name, row)
+
+    def _delete_profile_spectrum(self, name: str, row: int):
+        """Remove spectrum *row* (not the mean, row 0) from a stored profile, after confirmation."""
+        af_profiles = self.controller.experiment.process.get('af_profiles', {})
+        entry = af_profiles.get(name)
+        if entry is None or not 0 < row < len(entry['spectra']):
+            return
+        af_index = af_index_lookup(af_profiles, [name])
+        index_text = '' if af_index is None else f' (AF Index {int(af_index[row])})'
+        answer = QMessageBox.question(
+            self, 'Delete AF spectrum',
+            f'Delete spectrum {row}{index_text} from "{name}"?\n\n'
+            'The experiment\'s AF Index numbering changes, so gates drawn on AF Index '
+            'may select different spectra afterwards. Re-extract the profile to restore it.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        spectra = list(entry['spectra'])
+        del spectra[row]
+        entry['spectra'] = spectra
+        if self.bus:
+            self.bus.autoSaveRequested.emit()
+        self.controller.cache_af_profile(name)
+        self.controller.on_af_profiles_changed()
+        self._refresh_profile_list(select_name=name)
+        if self.bus:
+            self.bus.statusMessage.emit(
+                f'AutoSpectral: deleted spectrum {row} from "{name}" ({len(spectra)} remain).'
+            )
 
     def _save_selected_profile_csv(self):
         item = self._profile_list.currentItem()
@@ -2389,3 +2484,71 @@ class AutoSpectralTab(QWidget):
         except Exception as e:
             logger.error(f'AutoSpectral: _build_fluor_spectra: {e}')
             return None
+
+
+# ---------------------------------------------------------------------------
+# The AutoSpectral tab
+# ---------------------------------------------------------------------------
+
+class PlaceholderPage(QWidget):
+    """A page whose content is not built yet."""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(label)
+        layout.addStretch()
+
+
+class AutoSpectralTab(QWidget):
+    """
+    The AutoSpectral tab: Autofluorescence, Noise, Spectral Variants and
+    Spectral Correction pages beside a side navigation list. A page with
+    ``on_activated`` is told when it comes on screen; ``page_is_active``
+    tells a page whether it is on screen.
+    """
+
+    def __init__(self, bus=None, controller=None, parent=None):
+        super().__init__(parent)
+        self.bus = bus
+        self.controller = controller
+
+        from honeychrome.view_components.autospectral_variants_page import SpectralVariantsPage
+
+        self._pages = SideTabWidget()
+        self.af_page = AutofluorescencePage(bus, controller, active_fn=self.page_is_active, parent=self)
+        self.noise_page = PlaceholderPage('Noise modelling is not available in this build yet.')
+        self.variants_page = SpectralVariantsPage(bus, controller, active_fn=self.page_is_active,
+                                                  parent=self)
+        self.correction_page = PlaceholderPage('Spectral correction is not available in this build yet.')
+        for page, label, icon_name in (
+                (self.af_page, 'Autofluorescence', 'sparkles'),
+                (self.noise_page, 'Noise', 'wave-sine'),
+                (self.variants_page, 'Spectral Variants', 'shape'),
+                (self.correction_page, 'Spectral Correction', 'adjustments')):
+            self._pages.addTab(page, label, icon_name)
+
+        self._qsettings = QSettings('honeychrome', 'app_configuration')
+        saved = self._qsettings.value(PAGE_SETTING, 0, type=int)
+        if 0 <= saved < self._pages.count():
+            self._pages.setCurrentIndex(saved)
+        self._pages.currentChanged.connect(self._on_page_changed)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._pages)
+
+    def page_is_active(self, page) -> bool:
+        """True when the AutoSpectral tab is shown with *page* selected."""
+        return (self.controller is not None
+                and self.controller.current_mode == TAB_NAME
+                and self._pages.currentWidget() is page)
+
+    def _on_page_changed(self, index: int):
+        self._qsettings.setValue(PAGE_SETTING, index)
+        page = self._pages.widget(index)
+        if hasattr(page, 'on_activated') and self.page_is_active(page):
+            page.on_activated()
