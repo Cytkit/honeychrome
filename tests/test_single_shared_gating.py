@@ -128,6 +128,7 @@ def test_custom_sample_gate_still_round_trips_without_template_schema(tmp_path):
     reloaded.experiment.load(path)
     reloaded.raw_gating = from_gml(reloaded.experiment.cytometry['raw_gating'])
     reloaded._load_custom_sample_gates()
+    reloaded.raw_transformations = {}
     reloaded.current_sample_path = 'sample-A.fcs'
     reloaded.apply_custom_sample_gates('raw')
 

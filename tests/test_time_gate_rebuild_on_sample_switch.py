@@ -1,13 +1,14 @@
-"""Regression guard for `Controller._rebuild_per_sample_lookup_tables`.
+"""Regression guard for the Time-gate rebuild in `Controller.apply_custom_sample_gates`.
 
 A gate on the Time axis uses a `default` transform whose scale is re-fitted to
 each sample's own time range on load. Its lookup table must therefore be rebuilt
 on every sample switch, or the gate silently selects the wrong time window on the
-new sample. `_rebuild_per_sample_lookup_tables` (called from the full-recalc
-branch of `calc_hists_and_stats`) does this.
+new sample. `apply_custom_sample_gates` (called from
+`initialise_data_for_cytometry_plots`, after the default transforms are re-fitted
+and before `calc_hists_and_stats`) does this.
 
-This test drives that real entry point end to end. It fails if either the method
-or its call site is removed — so a future accidental deletion is caught.
+This test replays that sequence. It fails if the rebuild is removed from
+`apply_custom_sample_gates`, or if that call is removed from the sample-load path.
 """
 
 import numpy as np
@@ -27,7 +28,9 @@ def _load_sample(controller, event_data, time_limits):
     controller.raw_transformations['Time'].set_transform(id='default', limits=time_limits)  # per-sample Time scale
     controller.data_for_cytometry_plots['event_data'] = event_data
     # NB: deliberately no manual calculate_lookup_tables() here — the Time gate's
-    # table must be rebuilt by _rebuild_per_sample_lookup_tables inside this call.
+    # table must be rebuilt by apply_custom_sample_gates, as in
+    # initialise_data_for_cytometry_plots (calc_hists_and_stats does not rebuild).
+    controller.apply_custom_sample_gates()
     controller.calc_hists_and_stats()
     return controller.data_for_cytometry_plots['statistics']['TimeGate']['n_events_gate']
 
@@ -63,7 +66,7 @@ def test_time_gate_lookup_is_rebuilt_on_sample_switch():
     assert abs(count_a - truth_a) <= 2, f'Sample A gate count {count_a} != ~{truth_a}'
 
     # --- Switch to Sample B: Time spans 0..10000 (a 10x longer run) ------
-    # Only _rebuild_per_sample_lookup_tables (inside calc_hists_and_stats) can
+    # Only the Time-gate rebuild in apply_custom_sample_gates can
     # make the Time gate correct here. Remove it and this count reverts to the
     # stale window (~195 events around Time 1500..3400) and the assert fails.
     controller.current_sample_path = 'B.fcs'
@@ -73,5 +76,5 @@ def test_time_gate_lookup_is_rebuilt_on_sample_switch():
     assert abs(count_b - truth_b) <= 2, (
         f'Time gate mis-gated Sample B after switch: got {count_b} events, '
         f'expected ~{truth_b} (Time 300..700). '
-        f'Has _rebuild_per_sample_lookup_tables been removed or unwired?'
+        f'Has the Time-gate rebuild in apply_custom_sample_gates been removed or unwired?'
     )
