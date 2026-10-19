@@ -42,7 +42,7 @@ each gating and statistics run is also written as CSV files to
 Gate application lives in ``ag_core.py``, alignment and feature tables in
 ``ag_results.py``, and the statistics in
 ``controller_components/differential_stats.py`` (shared with the
-DR/Clustering plugin).
+Honeycluster plugin).
 
 Plugin contract (plugin_loaders.py):
   plugin_name  str        — main-window tab title

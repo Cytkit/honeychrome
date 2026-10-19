@@ -155,7 +155,7 @@ def log_channel_map(
     to a column (a classic source of silent misalignment).
     """
     log.debug(
-        "channel map: %d unmixed columns, %d selected for DR/clustering",
+        "channel map: %d unmixed columns, %d selected for Honeycluster",
         len(full_channels), len(selected_channels),
     )
     missing = [c for c in selected_channels if c not in ch_idx]

@@ -3,7 +3,7 @@ ag_report.py — report items for the Automated Gating plugin
 ===========================================================
 Builds the tickable items of the Automated Gating report as
 ``drc_report.ReportItem`` objects, so the report is written with the same
-PNG / CSV / PDF machinery as the DR/Clustering report
+PNG / CSV / PDF machinery as the Honeycluster report
 (``drc_report.export_report_item``). Pure matplotlib and pandas, no Qt
 widgets: every figure is built without a canvas.
 

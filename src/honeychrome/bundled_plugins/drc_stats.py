@@ -1,11 +1,11 @@
 """
-drc_stats.py — Differential statistics for the DR/Clustering plugin
+drc_stats.py — Differential statistics for the Honeycluster plugin
 ===================================================================
 Companion to ``dr_clustering_tab.py`` (filename intentionally NOT ``*_tab.py``).
 
 The test engine (design matrices, moderated fits, GLMs, significance) is
 shared with other plugins in ``controller_components/differential_stats.py``;
-this module assembles the DR/Clustering feature tables and runs it.
+this module assembles the Honeycluster feature tables and runs it.
 
 Tests cluster abundance and per-cluster marker expression between sample
 groups:

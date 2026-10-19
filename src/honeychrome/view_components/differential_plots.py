@@ -2,7 +2,7 @@
 differential_plots.py — figures for differential statistics results
 ===================================================================
 
-Matplotlib figure builders shared by the DR/Clustering and Automated Gating
+Matplotlib figure builders shared by the Honeycluster and Automated Gating
 plugins. Each returns a ``matplotlib.figure.Figure`` without a canvas, so it
 can be built on a worker thread and embedded later (e.g. in
 ``ExportablePlotWidget``).

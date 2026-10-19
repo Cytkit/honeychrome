@@ -22,9 +22,9 @@ window's plots:
   • TransformSet        — a plugin's transforms as Honeychrome Transform
                           objects, built from and saved as parameter dicts.
 
-The Honeycluster (DR/Clustering) plugin's Transforms tab is a
-TransformInspector too. The file name does not end in ``_tab.py``, so the
-plugin loader does not treat it as a tab.
+The Honeycluster plugin's Transforms tab is a TransformInspector too. The 
+file name does not end in ``_tab.py``, so the plugin loader does not treat
+it as a tab.
 """
 
 from __future__ import annotations

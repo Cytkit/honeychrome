@@ -5,7 +5,7 @@ Companion module to ``drc_clustering.py`` (filename intentionally NOT
 ``*_tab.py``, matching the ``drc_pipeline.py``/``drc_logging.py`` convention
 so ``plugin_loaders`` won't try to load it as a separate tab).
 
-Replaces ``saeyslab/flowsom`` + ``anndata``/``mudata`` for the DR/Clustering
+Replaces ``saeyslab/flowsom`` + ``anndata``/``mudata`` for the Honeycluster
 plugin's FlowSOM path. ``saeyslab/flowsom`` internally mutates AnnData/MuData
 arrays in place (e.g. writing NaN into a cluster-level MuData's ``.X``),
 which is incompatible with pandas 3.0's mandatory Copy-on-Write — no

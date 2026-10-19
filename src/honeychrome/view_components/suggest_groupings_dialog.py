@@ -2,7 +2,7 @@
 suggest_groupings_dialog.py — review and choose groupings found in sample names
 ==============================================================================
 
-Shared by the plugins that assign samples to comparison groups (DR/Clustering,
+Shared by the plugins that assign samples to comparison groups (Honeycluster,
 Automated Gating, FlowCode Analysis). The detection itself is
 ``differential_stats.suggest_groupings_from_names``; this module turns its
 suggestions into a list of choices, either automatically or through a dialog,

@@ -4,7 +4,7 @@ differential_stats.py — differential testing between sample groups
 
 Shared engine for group comparisons of per-sample features: cluster or
 gated-population frequencies, raw counts, and per-population marker
-intensities. Used by the DR/Clustering and Automated Gating plugins.
+intensities. Used by the Honeycluster and Automated Gating plugins.
 
 * ``run_moderated`` — moderated linear model per feature (``moderated_stats``:
   least squares, empirical Bayes variance moderation after Smyth 2004).

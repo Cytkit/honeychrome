@@ -4,7 +4,7 @@ som_kernel_wrapper.py
 Python interface to the compiled _som_kernel cffi extension (som_kernel.c):
 OpenMP batch self-organising map training and nearest-code mapping.
 
-Used by the DR/Clustering plugin's FlowSOM path (flowsom_consensus.py) and
+Used by the Honeycluster plugin's FlowSOM path (flowsom_consensus.py) and
 by autospectral_functions.get_som_codes() for AutoSpectral autofluorescence
 and fluorophore-variant clustering, which falls back to KMeans when this
 kernel is unavailable.

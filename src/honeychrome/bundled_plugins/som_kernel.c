@@ -2,7 +2,7 @@
  * som_kernel.c
  * ------------
  * Batch self-organising map (SOM) training and nearest-code assignment,
- * parallelised with OpenMP. Shared by the DR/Clustering plugin's FlowSOM
+ * parallelised with OpenMP. Shared by the Honeycluster plugin's FlowSOM
  * path (flowsom_consensus.py) and by AutoSpectral's autofluorescence and
  * fluorophore-variant clustering (autospectral_functions.get_som_codes).
  *

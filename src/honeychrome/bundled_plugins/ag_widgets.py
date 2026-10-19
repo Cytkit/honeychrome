@@ -3,7 +3,7 @@ ag_widgets.py — Qt helpers shared by the Gating Model Builder and Automated
 Gating plugins
 ===========================================================================
   • add_concertina_page — one-section-at-a-time accordion (QToolBox) whose
-                          pages scroll independently, as in the DR/Clustering
+                          pages scroll independently, as in the Honeycluster
                           configuration tab.
   • SquareHolder        — keeps a child widget square inside any parent size.
   • zoom_axis_transform — applies a ZoomAxis drag to a Honeychrome Transform,
