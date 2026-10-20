@@ -403,6 +403,14 @@ class SpectralControlsEditor(QFrame):
         btn_top_layout.addWidget(self.unmixing_method_combo)
         btn_top_layout.addWidget(self.force_recalc_btn)
         btn_top_layout.addStretch()
+        self.condition_number_label = QLabel()
+        self.condition_number_label.setToolTip(
+            'Condition number of the spectral profile matrix (fluorophores × detectors)\n'
+            'from the last spectral process refresh. Higher values mean less stable unmixing.'
+        )
+        btn_top_layout.addWidget(self.condition_number_label)
+        self._update_condition_number_label()
+        self.bus.spectralProcessRefreshed.connect(self._update_condition_number_label)
 
         # ---- Bulk unstained-negative row ----
         bulk_neg_layout = QHBoxLayout()
@@ -1373,6 +1381,10 @@ class SpectralControlsEditor(QFrame):
         if reclean:
             self._on_clean_controls()  # ends with the recalculation and one spectralModelUpdated
 
+    def _update_condition_number_label(self):
+        cond = self.controller.experiment.process.get('condition_number')
+        self.condition_number_label.setText('' if cond is None else f'Condition number: {cond:.1f}')
+
     def _has_cleaned(self, control: dict) -> bool:
         """Whether the control has a cleaned result made from its current sample,
         particle type and negative (Use Cleaned is offered only then)."""
@@ -1407,7 +1419,8 @@ class SpectralControlsEditor(QFrame):
         """Sample edited: the Particle Type follows the new sample's bead status,
         the negative is chosen for it (bead control: the matching unstained bead,
         else internal; cell control: kept if it is a cell unstained or internal,
-        else the default cell unstained), and the Pos/Neg gates are re-placed on it."""
+        else the default cell unstained), the major channel is found again on it
+        (unless locked) as auto-generate finds it, and the Pos/Neg gates are re-placed."""
         name_to_path = {name: path for path, name in self.samples['all_samples'].items()}
         path = name_to_path.get(control.get('sample_name'))
         if path is None:
@@ -1421,8 +1434,45 @@ class SpectralControlsEditor(QFrame):
             or (neg_path is not None and not is_bead_sample(self.samples, neg_path, neg_name)))
         if not keep_negative:
             control['universal_negative_name'] = self._default_negative(control)
+        if not control.get('gate_channel_locked'):
+            self._find_major_channel(control, path, name_to_path.get(control.get('universal_negative_name') or ''))
         if control.get('gate_channel'):
             self._move_pos_neg_gates_to_channel(control)
+
+    def _find_major_channel(self, control: dict, path: str, neg_path: str | None) -> None:
+        """Set gate_channel to the empirical peak of the control sample's base-gated
+        events after removing the AF direction, the AF reference being the negative
+        tube's base-gated mean, or the dimmest quarter of the sample without one
+        (as SpectralAutoGenerator.generate_spectral_control)."""
+        import numpy as np
+        from honeychrome.controller_components.functions import sample_from_fcs
+        from honeychrome.controller_components.spectral_functions import get_raw_events
+        from honeychrome.controller_components.spectral_cleaning import find_empirical_peak
+        from honeychrome.controller_components.spread_model import raw_layout
+
+        base_gate_label, _ = resolve_base_gate(self.controller.raw_gating, self.controller.experiment.process.get('base_gate_priority_order', []))
+        gate_label = base_gate_label if base_gate_label != 'root' else None
+        layout = raw_layout(self.controller)
+
+        def _events(rel_path):
+            sample = sample_from_fcs(str(self.controller.experiment_dir / rel_path))
+            return get_raw_events(sample, layout['fl_ids'], gate_label=gate_label,
+                                  gating_strategy=control_gating(self.controller),
+                                  col_order=layout['col_order'], sample_key=rel_path)
+        try:
+            pos_events = _events(path)
+            if len(pos_events) < 2:
+                return
+            neg_events = _events(neg_path) if neg_path and neg_path != path else None
+            if neg_events is not None and len(neg_events) > 1:
+                af_mean = neg_events.mean(axis=0)
+            else:
+                order = np.argsort(pos_events.max(axis=1))
+                af_mean = pos_events[order[:max(2, len(pos_events) // 4)]].mean(axis=0)
+            control['gate_channel'] = self.fluorescence_channels_pnn[find_empirical_peak(pos_events, af_mean)]
+            logger.info(f'SpectralModelEditor: "{control.get("label")}" major channel on the new sample: {control["gate_channel"]}')
+        except Exception as e:
+            logger.warning(f'SpectralModelEditor: could not find the major channel of "{control.get("label")}" on the new sample: {e}')
 
     def _sync_particle_type(self, control: dict) -> None:
         """Particle Type edited: mark or unmark the control's sample as beads, and

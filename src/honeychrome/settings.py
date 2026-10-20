@@ -238,6 +238,7 @@ process_default = {
     'spectral_model': [],
     'profiles': {},
     'negative_type': 'unstained', # or internal
+    'condition_number': None,
     'similarity_matrix': None,
     'hotspot_matrix': None,
     'unmixing_matrix': None,
