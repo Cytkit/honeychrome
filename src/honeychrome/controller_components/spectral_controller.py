@@ -15,8 +15,13 @@ from honeychrome.controller_components.spread_model import raw_layout
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.label_matching import match_fluorophore, match_marker, get_fluorophore_db, get_marker_db
 from honeychrome.controller_components.particle_type import is_bead_sample, match_bead_unstained
-from honeychrome.controller_components.spectral_reference_library import profile_id_from_description
-from honeychrome.controller_components.spectral_cleaning import find_empirical_peak, cosine_filter, knn_scatter_match, exclude_saturated, CleanResult
+from honeychrome.controller_components.spectral_reference_library import (
+    profile_id_from_description, cosine_similarity_to_reference, cosine_qc_warning_threshold,
+)
+from honeychrome.controller_components.spectral_cleaning import (
+    find_empirical_peak, cosine_filter, knn_scatter_match, exclude_saturated, CleanResult,
+    background_check, BACKGROUND_CHECK_VERSION, BACKGROUND_RATIO_MAX,
+)
 from honeychrome.controller_components.spectral_refinement import (
     RefineSettings, refine_row, subsample_negative, make_check_pool, crosstalk_check,
 )
@@ -49,6 +54,40 @@ def low_event_warning_text(entries) -> str | None:
     return (f'These spectral controls have fewer than {MIN_CONTROL_GATE_EVENTS} events in a gate used '
             f'for their spectrum, so the spectrum may be unreliable: {listed}.\n\n'
             f'Check these gates (including any customised for the control sample), or acquire more events.')
+
+
+def background_check_summary(label: str, check: dict | None) -> str | None:
+    """One line for a control whose background check found no clear stain
+    above its unstained; None when it passed or was not checked."""
+    verdict = (check or {}).get('verdict')
+    if not verdict:
+        return None
+    ratio = check.get('ratio')
+    if ratio is not None:
+        brightness = f'{ratio:.1f}× the unstained in {check.get("peak_channel")}'
+    else:
+        brightness = (f'{100 * check.get("positive_fraction", 0):.1f}% of events above the '
+                      f'unstained 99.5th percentile in {check.get("peak_channel")}')
+    if verdict == 'background':
+        return (f'{label}: looks like background ({brightness}, shape within '
+                f'{check["angle_deg"]:.0f}° of the unstained autofluorescence)')
+    return (f'{label}: weak signal ({brightness}, shape '
+            f'{check["angle_deg"]:.0f}° from the unstained autofluorescence)')
+
+
+def background_warning_text(cleaned_events, labels) -> str | None:
+    """One warning for the controls among *labels* whose stored background
+    check found no clear stain above their unstained; None when there are none."""
+    rows = [summary for label in labels
+            if (summary := background_check_summary(
+                label, (cleaned_events.get(label) or {}).get('background_check')))]
+    if not rows:
+        return None
+    return (f'These controls show no clear stain: after cleaning, their peak-channel signal is under '
+            f'{BACKGROUND_RATIO_MAX:g}× that of their unstained under the same event selection.\n'
+            + '\n'.join(f'  • {row}' for row in rows)
+            + '\n\nCheck that these controls are stained and that the right file is assigned. '
+              'They are marked ⚠ in the spectral model table.')
 
 
 class LowEventLog:
@@ -85,6 +124,20 @@ class LowEventLog:
 
     def text(self) -> str | None:
         return low_event_warning_text(self.entries or [])
+
+
+# Control fields a cleaned result depends on; a change to any of them makes it stale.
+CLEANED_RESULT_KEYS = ('sample_name', 'particle_type', 'universal_negative_name')
+
+
+def cleaned_result_matches(control: dict, cleaned: dict) -> bool:
+    """Whether *cleaned* (a controller.cleaned_events entry) was made from the
+    control's current sample, particle type and negative. Entries without a
+    stored fingerprint are accepted."""
+    fingerprint = cleaned.get('_fingerprint')
+    if not fingerprint:
+        return True
+    return all((fingerprint.get(k) or None) == (control.get(k) or None) for k in CLEANED_RESULT_KEYS)
 
 
 def _find_default_unstained_tube(samples: dict) -> str | None:
@@ -385,7 +438,7 @@ class ProfileUpdater:
                         # use cleaned event pool when available and opted in
                         cleaned_store = self.controller.cleaned_events
                         cleaned = cleaned_store.get(control['label']) if control.get('use_cleaned') is not False else None
-                        if cleaned is not None and cleaned.get('spectrum'):
+                        if cleaned is not None and cleaned.get('spectrum') and cleaned_result_matches(control, cleaned):
                             profile = np.array(cleaned['spectrum'], dtype=float)
                             if profile.max() <= 0:
                                 raise Exception(f'Cleaned spectrum for "{control["label"]}" is zero — re-run Clean Controls.')
@@ -1244,6 +1297,9 @@ class SpectralCleaner(QObject):
 
         # Warnings are handed to the caller, which shows them in one dialog
         # together with the profile QC warnings once recalculation is done.
+        background_text = background_warning_text(self.cleaned_events, [c['label'] for c in all_eligible])
+        if background_text:
+            self._collected_warnings.append(background_text)
         low_event_text = self._low_events.text()
         if low_event_text:
             self._collected_warnings.append(low_event_text)
@@ -1261,6 +1317,7 @@ class SpectralCleaner(QObject):
             'fluor_ch_ids': list(self.fluor_ch_ids),
             'refine': bool(self.refine),
             'gating': self._gating_fingerprint(control),
+            'background_check': BACKGROUND_CHECK_VERSION,
         }
 
     def _gating_fingerprint(self, control: dict) -> str:
@@ -1523,6 +1580,23 @@ class SpectralCleaner(QObject):
                         f'{len(refine_log)} pass(es).'
                     )
 
+            bg_check = None
+            # A spectrum passing the reference cosine QC is not background.
+            cosine = cosine_similarity_to_reference(
+                spectrum, [self.event_channels_pnn[i] for i in self.fluor_ch_ids],
+                label, self._cytometer_key,
+            ) if self._cytometer_key else None
+            cosine_ok = cosine is not None and cosine >= cosine_qc_warning_threshold(self._cytometer_key)
+            if not use_internal and spectrum.max() > 0 and not cosine_ok:
+                bg_check = background_check(
+                    pos_events, neg_events, neg_scatter, spectral_sub, spectrum, peak_ch_idx,
+                    n_candidates=settings.spectral_cleaning_n_candidates_retrieved,
+                    n_spectral=settings.spectral_cleaning_n_spectral_retrieved,
+                )
+                bg_check['peak_channel'] = self.event_channels_pnn[self.fluor_ch_ids[peak_ch_idx]]
+                bg_check['negative_name'] = loaded['negative_name']
+                logger.info(f'SpectralCleaner: "{label}" background check {bg_check}')
+
             result = CleanResult(
                 spectral_sub          = spectral_sub,
                 scatter_pos           = pos_scatter_sel,
@@ -1547,6 +1621,7 @@ class SpectralCleaner(QObject):
                 'fluor_ch_ids':          list(self.fluor_ch_ids),
                 'cytometer_key':         self._cytometer_key,
                 'warnings':              result.warnings,
+                'background_check':      bg_check,
                 '_fingerprint':          self._cleaning_fingerprint(control),
                 'spectral_sub':          result.spectral_sub,
                 'scatter_pos':           result.scatter_pos,

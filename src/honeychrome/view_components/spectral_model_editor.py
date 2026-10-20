@@ -9,12 +9,13 @@ from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, Q
 from honeychrome.controller_components.functions import raw_gates_list, resolve_base_gate
 from honeychrome.controller_components.spectral_controller import (
     SpectralAutoGenerator, ProfileUpdater, SpectralCleaner, LowEventLog, control_gating,
+    CLEANED_RESULT_KEYS, cleaned_result_matches, background_check_summary,
 )
 from honeychrome.controller_components.spectral_reference_library import (
     cosine_similarity_to_reference, SpectralReferenceLibrary, compute_config_key, describe_profile,
-    profile_id_from_description,
+    profile_id_from_description, cosine_qc_warning_threshold,
 )
-from honeychrome.view_components.cosine_qc_viewer import cosine_qc_warning_threshold, COSINE_QC_NOTE_BY_CYTOMETER
+from honeychrome.view_components.cosine_qc_viewer import COSINE_QC_NOTE_BY_CYTOMETER
 from honeychrome.controller_components.spectral_functions import sanitise_control_in_place, _find_default_unstained
 from honeychrome.controller_components.particle_type import is_bead_sample, set_bead_sample, match_bead_unstained
 from honeychrome.view_components.icon_loader import icon
@@ -132,6 +133,8 @@ class ListTableModel(QtCore.QAbstractTableModel):
         super().__init__(parent)
         self._data = data
         self.fluorescence_channels_pnn = fluorescence_channels_pnn
+        self.has_cleaned = lambda control: False  # set by the editor; Use Cleaned is checkable only then
+        self.background_flag = lambda control: None  # set by the editor; tooltip text for a ⚠ label
 
     def rowCount(self, parent=QModelIndex()):
         return len(self._data)
@@ -147,8 +150,17 @@ class ListTableModel(QtCore.QAbstractTableModel):
         val = self._data[row].get(key, None)
         if role in (Qt.DisplayRole, Qt.EditRole):
             if key == "use_cleaned":
-                return None   # checkbox widget handles display; suppress cell text
+                return None   # shown as a check state
+            if role == Qt.DisplayRole and key == "label" and self.background_flag(self._data[row]):
+                return f"⚠ {'' if val is None else val}"
             return "" if val is None else str(val)
+        if role == Qt.ToolTipRole and key == "label":
+            return self.background_flag(self._data[row])
+        if role == Qt.CheckStateRole and key == "use_cleaned" and self.has_cleaned(self._data[row]):
+            return Qt.Unchecked if val is False else Qt.Checked
+        if role == Qt.ToolTipRole and key == "use_cleaned" and self.has_cleaned(self._data[row]):
+            return ('Use cleaned event pool for profile extraction.\n'
+                    'Uncheck to revert to the standard gate-mean method for this control.')
         return None
 
     _COLUMN_TOOLTIPS = {
@@ -176,13 +188,22 @@ class ListTableModel(QtCore.QAbstractTableModel):
         base = Qt.ItemIsSelectable | Qt.ItemIsEnabled
         if colname in ("label", "antigen"):
             base |= Qt.ItemIsEditable
+        if colname == "use_cleaned" and self.has_cleaned(self._data[index.row()]):
+            base |= Qt.ItemIsUserCheckable
         return base
 
     def setData(self, index, value, role=Qt.EditRole):
-        if role != Qt.EditRole or not index.isValid():
+        if not index.isValid():
             return False
         row, col = index.row(), index.column()
         key = COLUMNS[col]
+        if role == Qt.CheckStateRole and key == "use_cleaned":
+            self._data[row][key] = Qt.CheckState(value) == Qt.Checked
+            self.dataChanged.emit(index, index, [Qt.CheckStateRole])
+            self.dataEditedSignal.emit(row, col)
+            return True
+        if role != Qt.EditRole:
+            return False
         # if key == "gate_channel":
         #     try:
         #         value = int(value)
@@ -271,6 +292,8 @@ class SpectralControlsEditor(QFrame):
         self.fluorescence_channels_pnn = []
         self.update_fluorescence_channels_pnn()
         self.model = ListTableModel(self.controller.experiment.process['spectral_model'], self.fluorescence_channels_pnn)
+        self.model.has_cleaned = self._has_cleaned
+        self.model.background_flag = self._background_flag
         self.samples = self.controller.experiment.samples
         self.raw_gating = self.controller.raw_gating
 
@@ -818,6 +841,11 @@ class SpectralControlsEditor(QFrame):
         try:
             for row in range(self.model.rowCount()):
                 self._add_comboboxes_to_row(row)
+            if self.model.rowCount():
+                uc_col = COLUMNS.index('use_cleaned')
+                self.model.dataChanged.emit(self.model.index(0, uc_col),
+                                            self.model.index(self.model.rowCount() - 1, uc_col),
+                                            [Qt.CheckStateRole])
         finally:
             self._refreshing_comboboxes = False
         self._update_clean_controls_enabled()
@@ -1010,53 +1038,6 @@ class SpectralControlsEditor(QFrame):
             elif col_name == "universal_negative_name":
                 self._add_or_replace_combobox_if_enabled(idx, enable_universal_negative_cb, universal_negative_options)
 
-        # "Use Cleaned" checkbox — visible only when cleaned data exist for this control
-        label = self.model._data[row].get('label') or ''
-        cleaned_available = (label in self.controller.cleaned_events
-                             and self.model._data[row].get('control_type') == SSC_CONTROL_TYPE)
-        uc_col = COLUMNS.index("use_cleaned")
-        uc_idx = self.model.index(row, uc_col)
-        proxy_uc_idx = self.proxy.mapFromSource(uc_idx)
-
-        old = self.view.indexWidget(proxy_uc_idx)
-        if old is not None:
-            self.view.setIndexWidget(proxy_uc_idx, None)
-            old.hide()
-            old.setParent(None)
-
-        if cleaned_available:
-            cb = QCheckBox()
-            cb.installEventFilter(WheelBlocker(cb))
-            # Default to checked if use_cleaned is True or not yet set
-            current_val = self.model._data[row].get('use_cleaned')
-            cb.setChecked(current_val is not False)  # True or None → checked; False → unchecked
-            cb.setToolTip('Use cleaned event pool for profile extraction.\nUncheck to revert to the standard gate-mean method for this control.')
-
-            def _on_toggle(checked, idx=uc_idx, row=row):
-                self.model._data[row]['use_cleaned'] = checked
-                # Re-run generate() for this control immediately
-                self.setEnabled(False)
-                self.profile_updater.flush()
-                control_valid = self.profile_updater.generate(
-                    self.model._data[row], self.spectral_library_search_results
-                )
-
-                def _finish_toggle():
-                    # refresh_comboboxes() rebuilds this row's checkbox, tearing
-                    # down the current one (setIndexWidget(..., None) + setParent(None)).
-                    # Doing that synchronously would delete this checkbox while its
-                    # own toggled() signal is still unwinding on the call stack —
-                    # a native-crash-causing reentrancy hazard. Defer to the next
-                    # event-loop tick so toggled() finishes first.
-                    self.refresh_comboboxes()
-                    self.setEnabled(True)
-                    if control_valid:
-                        self._emit_spectral_model_updated_when_mode_switch_done()
-
-                QTimer.singleShot(0, _finish_toggle)
-
-            cb.toggled.connect(_on_toggle)
-            self.view.setIndexWidget(proxy_uc_idx, cb)
                 
 
     def add_row(self):
@@ -1365,6 +1346,11 @@ class SpectralControlsEditor(QFrame):
 
         if changed_col == 'particle_type' and control.get('control_type') == SSC_CONTROL_TYPE:
             self._sync_particle_type(control)
+        if changed_col == 'sample_name' and control.get('control_type') == SSC_CONTROL_TYPE:
+            self._sync_sample(control)
+        reclean = (control.get('control_type') == SSC_CONTROL_TYPE
+                   and changed_col in CLEANED_RESULT_KEYS
+                   and self._invalidate_cleaned(control))
 
         sanitise_control_in_place(control)
         if control['control_type'] == 'Single Stained Spectral Control from Library':
@@ -1381,8 +1367,62 @@ class SpectralControlsEditor(QFrame):
                 # spectralModelUpdated once to recalculate the unmixing matrix.
                 pos_gate_label = control.get('gate_label') or f'Pos {control["label"]}'
                 self.bus.changedGatingHierarchy.emit('raw', pos_gate_label)
-            self.bus.spectralModelUpdated.emit()
+            if not reclean:
+                self.bus.spectralModelUpdated.emit()
         logger.info(f'SpectralModelEditor: updated {"valid" if control_valid else "invalid"} control {control}')
+        if reclean:
+            self._on_clean_controls()  # ends with the recalculation and one spectralModelUpdated
+
+    def _has_cleaned(self, control: dict) -> bool:
+        """Whether the control has a cleaned result made from its current sample,
+        particle type and negative (Use Cleaned is offered only then)."""
+        cleaned = self.controller.cleaned_events.get(control.get('label') or '')
+        return (control.get('control_type') == SSC_CONTROL_TYPE and bool(cleaned)
+                and cleaned_result_matches(control, cleaned))
+
+    def _background_flag(self, control: dict) -> str | None:
+        """Tooltip for a control whose current cleaned result shows no clear
+        stain above its unstained (SpectralCleaner background check), else None."""
+        if not self._has_cleaned(control):
+            return None
+        label = control.get('label') or ''
+        return background_check_summary(label, self.controller.cleaned_events[label].get('background_check'))
+
+    def _invalidate_cleaned(self, control: dict) -> bool:
+        """Drop the control's cleaned result once its sample, particle type or
+        negative no longer match it. Returns whether to clean again now (Show
+        AutoSpectral Cleaning and Automatically Clean ticked)."""
+        label = control.get('label') or ''
+        cleaned = self.controller.cleaned_events.get(label)
+        if not cleaned or cleaned_result_matches(control, cleaned):
+            return False
+        del self.controller.cleaned_events[label]
+        control['use_cleaned'] = None
+        logger.info(f'SpectralModelEditor: cleaned result of "{label}" invalidated — sample, particle type or negative changed')
+        if self.bus:
+            self.bus.cleaningResultsReady.emit()
+        return self.activate_cleaning_checkbox.isChecked() and self.auto_clean_checkbox.isChecked()
+
+    def _sync_sample(self, control: dict) -> None:
+        """Sample edited: the Particle Type follows the new sample's bead status,
+        the negative is chosen for it (bead control: the matching unstained bead,
+        else internal; cell control: kept if it is a cell unstained or internal,
+        else the default cell unstained), and the Pos/Neg gates are re-placed on it."""
+        name_to_path = {name: path for path, name in self.samples['all_samples'].items()}
+        path = name_to_path.get(control.get('sample_name'))
+        if path is None:
+            return
+        particle_type = 'Beads' if is_bead_sample(self.samples, path) else 'Cells'
+        control['particle_type'] = particle_type
+        neg_name = control.get('universal_negative_name') or ''
+        neg_path = name_to_path.get(neg_name)
+        keep_negative = particle_type == 'Cells' and (
+            neg_name in ('', INTERNAL_NEGATIVE_SENTINEL)
+            or (neg_path is not None and not is_bead_sample(self.samples, neg_path, neg_name)))
+        if not keep_negative:
+            control['universal_negative_name'] = self._default_negative(control)
+        if control.get('gate_channel'):
+            self._move_pos_neg_gates_to_channel(control)
 
     def _sync_particle_type(self, control: dict) -> None:
         """Particle Type edited: mark or unmark the control's sample as beads, and

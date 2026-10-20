@@ -45,6 +45,18 @@ def load_reference_library(cytometer_key: str) -> pd.DataFrame | None:
     return df.div(row_max, axis=0).fillna(0)
 
 
+# Controls below this cosine similarity to the reference library trigger a popup warning.
+COSINE_QC_WARNING_THRESHOLD = 0.97
+
+# Instruments whose spectra match the reference library less well get a lower threshold.
+# Keys are cytometer_key / db_col values (see cytometer_whitelist).
+COSINE_QC_WARNING_THRESHOLD_BY_CYTOMETER = {'ID7000': 0.90}
+
+
+def cosine_qc_warning_threshold(cytometer_key) -> float:
+    return COSINE_QC_WARNING_THRESHOLD_BY_CYTOMETER.get(cytometer_key, COSINE_QC_WARNING_THRESHOLD)
+
+
 def cosine_similarity_to_reference(
     spectrum: np.ndarray,
     channel_names: list[str],

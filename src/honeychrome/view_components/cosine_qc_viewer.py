@@ -33,22 +33,12 @@ from honeychrome.controller_components.cytometer_whitelist import (
 
 logger = logging.getLogger(__name__)
 
-# Controls below this cosine similarity to the reference library trigger a popup warning.
-COSINE_QC_WARNING_THRESHOLD = 0.97
-
-# Instruments whose spectra match the reference library less well get a lower threshold.
-# Keys are cytometer_key / db_col values (see cytometer_whitelist).
-COSINE_QC_WARNING_THRESHOLD_BY_CYTOMETER = {'ID7000': 0.90}
-
 # Caveat appended to the Clean Controls cosine QC warning for these instruments only.
 COSINE_QC_NOTE_BY_CYTOMETER = {
     'ID7000': ('Note: for the ID7000, a lower cosine similarity to the reference library is fairly '
                'normal (spectra match less well across instruments) and does not necessarily '
                'indicate a problem.'),
 }
-
-def cosine_qc_warning_threshold(cytometer_key) -> float:
-    return COSINE_QC_WARNING_THRESHOLD_BY_CYTOMETER.get(cytometer_key, COSINE_QC_WARNING_THRESHOLD)
 
 class CosineQCViewer(QFrame):
     """Spectral QC plot: calculated vs. reference spectrum with cosine score."""
@@ -299,7 +289,14 @@ class CosineQCViewer(QFrame):
             emp_ch = str(emp_idx)
             exp_ch = str(exp_idx)
         match_flag = '' if emp_ch == exp_ch else '  ⚠ peak mismatch'
+        bg = cleaned.get('background_check') or {}
+        bg_txt = ''
+        if bg:
+            ratio = bg.get('ratio')
+            ratio_txt = f'{ratio:.1f}×' if ratio is not None else f'{100 * bg.get("positive_fraction", 0):.1f}% above'
+            bg_flag = '  ⚠ no clear stain' if bg.get('verdict') else ''
+            bg_txt = f'  ·  vs unstained: {ratio_txt}, {bg.get("angle_deg", 0):.0f}° from AF{bg_flag}'
         self._status.setText(
             f'Cosine: {cs_txt}  ·  {n_surv} events  ·  '
-            f'peak: {emp_ch} (expected: {exp_ch}){match_flag}'
+            f'peak: {emp_ch} (expected: {exp_ch}){match_flag}{bg_txt}'
         )
