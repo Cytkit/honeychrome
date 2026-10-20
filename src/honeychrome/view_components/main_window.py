@@ -68,6 +68,7 @@ class MainWindow(QMainWindow):
         # Splitter layout captured when a plugin hides the sample panel, so
         # closing on that tab doesn't persist a zero-width left pane.
         self._splitter_state_with_browser = None
+        self._import_fcs_dialog = None   # one Import FCS dialog at a time
 
         # autosave if window closed
         self.destroyed.connect(lambda: self.controller.save_experiment())
@@ -583,8 +584,12 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def open_import_fcs_files_widget(self, failed_to_load_sample_warning=False):
-        dialog = ImportFCSFilesWidget(self, self.bus, self.controller, failed_to_load_sample_warning)
-        dialog.show()
+        if self._import_fcs_dialog is not None and self._import_fcs_dialog.isVisible():
+            self._import_fcs_dialog.raise_()
+            self._import_fcs_dialog.activateWindow()
+            return
+        self._import_fcs_dialog = ImportFCSFilesWidget(self, self.bus, self.controller, failed_to_load_sample_warning)
+        self._import_fcs_dialog.show()
 
     def save_state(self):
         # QByteArray returned by saveState() — stored directly in QSettings

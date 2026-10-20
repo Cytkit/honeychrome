@@ -101,12 +101,19 @@ class ImportFCSFilesWidget(QDialog):
         self.btn_submit.clicked.connect(self.submit)
 
     def submit(self):
-        self.thread = QThread()
+        if self.thread is not None:
+            return  # one reconfiguration per dialog
+        self.btn_submit.setEnabled(False)
+        self.btn_cancel.setEnabled(False)
+        self.thread = QThread(QApplication.instance())  # survives the main window rebuild this import triggers
         self.import_fcs_controller = ImportFCSController(self.controller.experiment, bus=self.bus)
         self.import_fcs_controller.moveToThread(self.thread)
         self.thread.started.connect(self.import_fcs_controller._reconfigure_experiment_from_fcs_files_impl)
         self.import_fcs_controller.finished.connect(self.thread.quit)
+        self.thread.finished.connect(QApplication.restoreOverrideCursor)
+        self.thread.finished.connect(self.thread.deleteLater)
         self.thread.finished.connect(self._on_thread_finished)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         self.thread.start()
 
     def _on_thread_finished(self):

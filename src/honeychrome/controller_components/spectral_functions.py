@@ -498,6 +498,7 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
 
     # populate process variables
     spectral_process = {
+        'condition_number': float(cond_number),
         'similarity_matrix': similarity_matrix.tolist(),
         'hotspot_matrix': hotspot_matrix.tolist(),
         'unmixing_matrix': unmixing_matrix.tolist(),

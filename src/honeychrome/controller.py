@@ -327,7 +327,7 @@ class Controller(QObject):
             'spectrum', 'n_removed_saturation', 'n_surviving_positive',
             'empirical_peak_ch_idx', 'expected_peak_ch_idx',
             'fluor_ch_ids', 'cytometer_key', 'warnings', '_fingerprint',
-            'spectrum_initial', 'refine_log', 'crosstalk',
+            'spectrum_initial', 'refine_log', 'crosstalk', 'background_check',
         }
         _ARRAY_KEYS = {
             'spectral_sub', 'scatter_pos', 'scatter_neg_matched',
@@ -2091,7 +2091,7 @@ class Controller(QObject):
             unmixed_settings = settings_default['unmixed'].copy()
             self.experiment.settings['unmixed'].update(unmixed_settings)
 
-            self.experiment.process.update({'similarity_matrix': None, 'hotspot_matrix': None, 'unmixing_matrix': None, 'spillover': None})
+            self.experiment.process.update({'condition_number': None, 'similarity_matrix': None, 'hotspot_matrix': None, 'unmixing_matrix': None, 'spillover': None})
             self.experiment.cytometry['plots'] = []
             self.experiment.cytometry['transforms'] = None
             self.experiment.cytometry['gating'] = None

@@ -444,13 +444,15 @@ class ScatterCleaningViewer(QFrame):
                 QApplication.setOverrideCursor(Qt.WaitCursor)
                 pos_sample = sample_from_fcs(str(experiment_dir / pos_rel))
                 all_ev = pos_sample.get_events('raw')
-                pos_scatter_all = all_ev[:, [abs_x, abs_y]].astype(float)
+                pos_pnn = list(pos_sample.pnn_labels)
+                pos_cols = [pos_pnn.index(ch_x), pos_pnn.index(ch_y)]  # this file's own layout
+                pos_scatter_all = all_ev[:, pos_cols].astype(float)
                 gate_label = control.get('gate_label')
                 if gate_label and raw_gating.find_matching_gate_paths(gate_label):
                     # the control sample's own gate (per-sample override included)
-                    mask = gate_event_mask(all_ev, list(pos_sample.pnn_labels), gate_label,
+                    mask = gate_event_mask(all_ev, pos_pnn, gate_label,
                                            control_gating(self.controller), pos_rel)
-                    pos_scatter_gated = all_ev[mask][:, [abs_x, abs_y]].astype(float)
+                    pos_scatter_gated = all_ev[mask][:, pos_cols].astype(float)
             except Exception as exc:
                 logger.warning(f'ScatterCleaningViewer: pos load failed for "{label}": {exc}')
             finally:
@@ -488,7 +490,8 @@ class ScatterCleaningViewer(QFrame):
                     QApplication.setOverrideCursor(Qt.WaitCursor)
                     neg_sample = sample_from_fcs(str(experiment_dir / neg_rel))
                     all_neg_ev = neg_sample.get_events('raw')
-                    neg_scatter_all = all_neg_ev[:, [abs_x, abs_y]].astype(float)
+                    neg_pnn = list(neg_sample.pnn_labels)
+                    neg_scatter_all = all_neg_ev[:, [neg_pnn.index(ch_x), neg_pnn.index(ch_y)]].astype(float)
                 except Exception as exc:
                     logger.warning(
                         f'ScatterCleaningViewer: neg load failed for "{label}": {exc}')
