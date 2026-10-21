@@ -90,7 +90,6 @@ class AcquisitionWidget(QWidget):
         self.standby_timer.setSingleShot(True)
         self.standby_timer.timeout.connect(self.initialise)
 
-    @with_busy_cursor
     def initialise(self):
         if self.bus is not None:
             self.bus.initialiseInstrument.emit() # if already initialised, this puts it to standby

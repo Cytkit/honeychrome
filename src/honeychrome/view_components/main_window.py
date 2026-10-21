@@ -535,6 +535,7 @@ class MainWindow(QMainWindow):
 
     def open_oscilloscope_widget(self):
         widget = OscilloscopeWidget(self.controller, self.bus)
+        widget.start_polling()
         if widget.isHidden():
             widget.show()
         else:
