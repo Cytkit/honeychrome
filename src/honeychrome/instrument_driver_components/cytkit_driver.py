@@ -188,6 +188,9 @@ class EventRateCounter(Thread):
         else:
             perf_interval = time_now - self.time_last
             self.event_rate = self.event_rate * (self.smoothing_time-perf_interval) + number_of_new_events
+        if self.event_rate < 0.5:
+            self.trigger.merge_force_trigger()
+
         self.time_last = time_now
 
     def reset(self):
@@ -887,6 +890,37 @@ if __name__ == '__main__':
     print(cytkit_device.set_state({'laser_enable' : True}))
 
     print('test pressure')
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['pressure']))
     print(cytkit_device.get_state(['pressure']))
 
     print('test temperatures')

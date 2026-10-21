@@ -86,27 +86,32 @@ class Pressure:
         pass
 
     def get_pressure(self, units, num_averages=10):
-        pressure_tally = []
-        for count in range(num_averages):
+        while True:
+            pressure_tally = []
+            for count in range(num_averages):
 
-            # Read the raw ADC pressure and temperature values
-            raw_pressure_value = self._sensor_get_raw_pressure()
-            raw_temperature_value = self._sensor_get_raw_temperature()
+                # Read the raw ADC pressure and temperature values
+                raw_pressure_value = self._sensor_get_raw_pressure()
+                raw_temperature_value = self._sensor_get_raw_temperature()
 
-            # Calculate the actual pressure
-            dT = raw_temperature_value - (self.calibration_data[5] * coefficient_data[5])
-            offset = (self.calibration_data[2] * coefficient_data[2]) + ((self.calibration_data[4] * dT) / coefficient_data[4])
-            sensitivity = (self.calibration_data[1] * coefficient_data[1]) + ((self.calibration_data[3] * dT) / coefficient_data[3])
+                # Calculate the actual pressure
+                dT = raw_temperature_value - (self.calibration_data[5] * coefficient_data[5])
+                offset = (self.calibration_data[2] * coefficient_data[2]) + ((self.calibration_data[4] * dT) / coefficient_data[4])
+                sensitivity = (self.calibration_data[1] * coefficient_data[1]) + ((self.calibration_data[3] * dT) / coefficient_data[3])
 
-            pressure = (raw_pressure_value * sensitivity) / (2097152 - offset) / 32768.0
-            pressure /= 10000.0
+                pressure = (raw_pressure_value * sensitivity) / (2097152 - offset) / 32768.0
+                pressure /= 10000.0
 
-            # Range check
-            if pressure < -1.0 or pressure > 1.0:
-                # Fault
-                return
+                # Range check
+                if abs(pressure) > 0.1 or abs(pressure-0.00510396) < 0.00001 or raw_pressure_value == 0 or raw_temperature_value == 0:
+                    # Fault
+                    continue
 
-            pressure_tally.append(pressure)
+                pressure_tally.append(pressure)
+
+            print(pressure_tally)
+            if len(pressure_tally)>0 and np.array(pressure_tally).std() < 1e-4:
+                break
 
         average_pressure = np.median(np.array(pressure_tally))
 

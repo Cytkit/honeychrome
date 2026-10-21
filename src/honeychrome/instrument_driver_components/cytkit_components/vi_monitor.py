@@ -1,5 +1,5 @@
 from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import monitor_dictionary
-
+import ctypes
 
 class VIMonitor:
     def __init__(self, I2CBusA, I2CBusB):
@@ -15,6 +15,7 @@ class VIMonitor:
 
     def read_current(self, channel):
         return_value = self._read_raw_value(channel, 0x01)
+        return_value = -ctypes.c_int16(return_value).value * 1000
         return return_value * 0.00025
 
     def _read_raw_value(self, channel, command):
