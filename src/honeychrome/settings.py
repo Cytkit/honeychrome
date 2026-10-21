@@ -139,6 +139,25 @@ line_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b',
           '#393b79', '#637939', '#8c6d31', '#843c39', '#7b4173', '#5254a3', '#6b6ecf', '#9c9ede', '#31a354', '#b5cf6b',
           '#e7ba52', '#ce6dbd', '#de9ed6', '#e7969c', '#7b4173']
 
+scatter_line_colours = ["#0000FF" , "#00FF00"]
+
+spectral_array_colors = [
+    "#00FFFF",  # 500 nm - cyan
+    "#00F5C8",  # 527 nm - cyan-green
+    "#00E68C",  # 554 nm - green
+    "#00D64D",  # 581 nm - green
+    "#4DD600",  # 608 nm - yellow-green
+    "#A6E600",  # 635 nm - yellow-green
+    "#E6D600",  # 662 nm - yellow
+    "#F2A000",  # 689 nm - orange
+    "#FF0000",  # 715 nm - pure red
+    "#E60033",  # 742 nm - deep red
+    "#CC0066",  # 769 nm - deeper red, purple tint
+    "#B30099",  # 796 nm - purplish red
+    "#9900CC",  # 823 nm - purple-red
+    "#8000FF",  # 850 nm - violet/purple
+]
+
 spectral_positive_gate_percent = 5 # take the top few percent of events
 spectral_negative_gate_percent = 25 # take the bottom few percent of events
 

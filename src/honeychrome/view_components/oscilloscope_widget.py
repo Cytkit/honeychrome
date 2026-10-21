@@ -5,7 +5,7 @@ from queue import Empty
 import pyqtgraph as pg
 
 from honeychrome.settings import n_time_points_in_event, adc_rate, instrument_settings, peak_detection_channel, threshold
-from honeychrome.settings import analyser_target_repeat_time, line_colors, adc_channels, scatter_channels, fluorescence_channels
+from honeychrome.settings import analyser_target_repeat_time, line_colors, spectral_array_colors, adc_channels, scatter_channels, fluorescence_channels
 from honeychrome.view_components.profiles_viewer import FlowLayout, LegendEntry
 
 import logging
@@ -69,7 +69,7 @@ class OscilloscopeWidget(QWidget):
                 self.legendLayout1.addWidget(entry)
 
             for i in self.fluorescence_channel_indices:
-                color = line_colors[i % len(line_colors)]
+                color = spectral_array_colors[i % len(spectral_array_colors)]
                 entry = LegendEntry(color, adc_channels[i])
                 self.legendLayout2.addWidget(entry)
 
@@ -124,7 +124,7 @@ class OscilloscopeWidget(QWidget):
 
             self.plot_widget2.clear()
             for i in self.fluorescence_channel_indices:
-                color = line_colors[i % len(line_colors)]
+                color = spectral_array_colors[i % len(spectral_array_colors)]
                 y = self.trace['traces'][i]
                 bound_height = self.trace['traces'][i][start:end].max() - self.trace['baselines'][i]
 

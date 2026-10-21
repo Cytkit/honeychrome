@@ -74,7 +74,10 @@ class PlotTracesWidget(QWidget):
             self.legendLayout1.clear()
         for i in range(len(adc_channels)):
             if traces[:,i,:].any():
-                color = settings.line_colors[i % len(adc_channels)]
+                if i in range(len(settings.fluorescence_channels)):
+                    color = settings.spectral_array_colors[i]
+                else:
+                    color = settings.line_colors[i % len(adc_channels)]
 
                 if refresh_legend:
                     entry = LegendEntry(color, adc_channels[i])
