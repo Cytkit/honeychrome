@@ -502,9 +502,13 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
          same way count as the same combination rather than splitting
          across their individual profile names.
       3. If none of the training samples have ANY AF profile assigned,
-         that unstained sample gets (transfer_matrix, None, None) --
-         unmixed WITHOUT per-cell AF correction, matching the run itself
-         having none.
+         that unstained sample is unmixed WITHOUT per-cell AF correction,
+         matching the run itself having none.
+
+    Each state is ``(UnmixSnapshot, AFState or None)``: the sample is
+    unmixed by the experiment's method (noise model, spectral variants,
+    spectral corrections, as the training samples are) with that AF
+    library (see drc_pipeline.apply_unmixing_af_aware).
 
     Returns {unstained_rel_path: af_state_or_None} for every unstained
     cell sample _resolve_unstained_cell_sample_paths finds --
@@ -552,6 +556,9 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
         )
         return combo
 
+    from honeychrome.controller_components.sample_loader import resolve_af_for_profiles
+
+    snap = drc_pipeline.snapshot_af_state(controller, unstained_paths)
     result: dict[str, tuple | None] = {}
     af_state_cache: dict[tuple, tuple | None] = {}
     for rel in unstained_paths:
@@ -576,14 +583,8 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
             profile_names = most_common_combo
 
         if profile_names not in af_state_cache:
-            resolved = (
-                drc_pipeline.resolve_af_state_for_profiles(controller, list(profile_names))
-                if profile_names else None
-            )
-            af_state_cache[profile_names] = (
-                resolved if resolved is not None
-                else (controller.transfer_matrix, None, None)
-            )
+            af = resolve_af_for_profiles(controller, list(profile_names)) if profile_names else None
+            af_state_cache[profile_names] = (snap, af)
         result[rel] = af_state_cache[profile_names]
 
     return result
@@ -622,10 +623,10 @@ def _load_unstained_gated_transformed(
     which this intentionally bypasses, and this is only called once per
     unstained sample per Cluster ID run, not a hot path.
 
-    af_state: the sample's unmixing state, ``(transfer_matrix,
-    af_precomputed, af_spectra)`` from resolve_unstained_af_states (see
-    apply_unmixing_af_aware()'s docstring). None unmixes without per-cell
-    AF correction.
+    af_state: the sample's unmixing state, ``(UnmixSnapshot, AFState or
+    None)`` from resolve_unstained_af_states, or ``(transfer_matrix,
+    af_precomputed, af_spectra)`` (see apply_unmixing_af_aware()'s
+    docstring). None unmixes without per-cell AF correction.
 
     Returns (values, channel_names) or None on error.
     """
@@ -651,7 +652,8 @@ def _load_unstained_gated_transformed(
 
         if af_state is None:
             af_state = (controller.transfer_matrix, None, None)
-        unmixed = drc_pipeline.apply_unmixing_af_aware(controller, raw, af_state=af_state)
+        unmixed = drc_pipeline.apply_unmixing_af_aware(controller, raw, af_state=af_state,
+                                                       sample_key=str(rel_path))
 
         # This sample's own gates: its per-sample overrides and Time range.
         from honeychrome.controller_components.per_sample_gating_functions import SampleGating

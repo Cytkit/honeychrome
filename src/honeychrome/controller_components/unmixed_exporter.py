@@ -44,15 +44,9 @@ class ExportTimeEstimateWorker(QObject):
 
 def time_estimate_message(estimate: dict) -> str:
     """Text for the confirm/cancel prompt before a slow export."""
-    from honeychrome.controller_components.plugin_loaders import bundled_plugins_path
-    import sys
-    if str(bundled_plugins_path) not in sys.path:
-        sys.path.insert(0, str(bundled_plugins_path))
-    from joint_unmix_export import format_duration
-
     return '\n'.join([
         f'Estimated unmixing time with the {estimate["method"]}: about '
-        f'{format_duration(estimate["seconds"])} for {estimate["samples"]} sample(s), '
+        f'{unmix_method.format_duration(estimate["seconds"])} for {estimate["samples"]} sample(s), '
         f'{estimate["events"]:,} events in total.',
         '',
         f'Based on a {estimate["probe_events"]:,}-event probe ({estimate["events_per_second"]:,.0f} events/sec). '
@@ -154,12 +148,6 @@ class UnmixedExporter(QObject):
         reading and writing are not included. None when no sample uses the
         slow method.
         """
-        from honeychrome.controller_components.plugin_loaders import bundled_plugins_path
-        import sys
-        if str(bundled_plugins_path) not in sys.path:
-            sys.path.insert(0, str(bundled_plugins_path))
-        from joint_unmix_export import allocate_probe_rows
-
         state = self.method_state
         samples, _folder_abs, _raw_abs, sample_key_to_abs = self._sample_selection()
         pnn_raw = self.controller.experiment.settings['raw']['event_channels_pnn']
@@ -184,7 +172,7 @@ class UnmixedExporter(QObject):
             return None
         counts = [item[4] for item in slow]
         elapsed, probed = 0.0, 0
-        for (sample_path, path, af, fl_ids, _n), k in zip(slow, allocate_probe_rows(counts, probe_events)):
+        for (sample_path, path, af, fl_ids, _n), k in zip(slow, unmix_method.allocate_probe_rows(counts, probe_events)):
             if k == 0:
                 continue
             reader = FcsEventReader(path, pnn_raw, None)

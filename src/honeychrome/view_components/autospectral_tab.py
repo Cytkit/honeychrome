@@ -2562,6 +2562,16 @@ class AutoSpectralTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._pages)
 
+    def show_page(self, name: str) -> bool:
+        """Select a page by name ('autofluorescence', 'noise', 'variants',
+        'correction'); False for an unknown name."""
+        page = {'autofluorescence': self.af_page, 'noise': self.noise_page, 'variants': self.variants_page,
+                'correction': self.correction_page}.get(str(name).lower())
+        if page is None:
+            return False
+        self._pages.setCurrentWidget(page)
+        return True
+
     def page_is_active(self, page) -> bool:
         """True when the AutoSpectral tab is shown with *page* selected."""
         return (self.controller is not None

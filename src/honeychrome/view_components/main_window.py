@@ -451,6 +451,7 @@ class MainWindow(QMainWindow):
         self.bus.progress.connect(self.update_progress)
         self.bus.statusMessage.connect(self.status_message)
         self.bus.sampleBrowserVisibilityRequested.connect(self._set_sample_browser_visible)
+        self.bus.showAutoSpectralPage.connect(self._show_autospectral_page)
 
         # widgets visibility state
         self._restore_visibility_state()
@@ -557,6 +558,15 @@ class MainWindow(QMainWindow):
         # it hidden re-requests that from its modeChangeRequested handler.
         self._set_sample_browser_visible(True)
         self.bus.modeChangeRequested.emit(tab_name)
+
+    @Slot(str)
+    def _show_autospectral_page(self, name: str):
+        """Open the AutoSpectral tab at the page *name* (asked for by a plugin)."""
+        if not self.autospectral_widget.show_page(name):
+            return
+        index = self.tabs.indexOf(self.autospectral_widget.parentWidget())
+        if index >= 0:
+            self.tabs.setCurrentIndex(index)
 
     @Slot(bool)
     def _set_sample_browser_visible(self, visible: bool):

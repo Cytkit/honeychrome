@@ -316,6 +316,16 @@ class SpectralCorrectionPage(QWidget):
         form.addRow('Seed:', self._seed_spin)
         layout.addLayout(form)
 
+        layout.addWidget(QLabel('Fluorophores kept fixed (never corrected):'))
+        self._fixed_list = QListWidget()
+        self._fixed_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self._fixed_list.setMaximumHeight(120)
+        self._fixed_list.setToolTip('Ticked fluorophores keep their spectra: Fix Unmix gathers no evidence with '
+                                    'them as the source and does not re-measure them. Tick FlowCode tag '
+                                    'fluorophores, whose FRET error the FlowCode plugin removes itself.')
+        self._fixed_list.itemChanged.connect(self._on_setup_changed)
+        layout.addWidget(self._fixed_list)
+
         self._build_advanced_settings(layout)
 
         row = QHBoxLayout()
@@ -552,6 +562,7 @@ class SpectralCorrectionPage(QWidget):
             self._events_spin.setValue(int(setup.n_events))
             self._seed_spin.setValue(int(setup.seed))
             self._set_param_values(setup.fix or {})
+            self._refresh_fixed(setup.fixed)
             self._refresh_gates(setup.gate)
             self._refresh_samples()
         finally:
@@ -634,6 +645,29 @@ class SpectralCorrectionPage(QWidget):
                                              + rows_height + 2 * self._group_table.frameWidth() + 2))
         self._fix_btn.setEnabled(bool(groups) and self._fix_thread is None and self._match_thread is None)
 
+    def _refresh_fixed(self, fixed):
+        names, _spectra = fluor_names_and_spectra(self.controller)
+        chosen = set(fixed or [])
+        self._fixed_list.blockSignals(True)
+        self._fixed_list.clear()
+        for name in names or []:
+            if name == fm.AF_NAME:
+                continue
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if name in chosen else Qt.Unchecked)
+            self._fixed_list.addItem(item)
+        self._fixed_list.blockSignals(False)
+
+    def _fixed_values(self) -> list:
+        out = []
+        for i in range(self._fixed_list.count()):
+            item = self._fixed_list.item(i)
+            if item.checkState() == Qt.Checked:
+                out.append(item.data(Qt.UserRole))
+        return out
+
     def _set_param_values(self, values: dict):
         defaults = fm.FixSettings()
         for key, w in self._param_widgets.items():
@@ -674,7 +708,8 @@ class SpectralCorrectionPage(QWidget):
         return sc.CorrectionSetup(
             samples=sample_choice, per_group=self._per_group_check.isChecked(),
             gate=self._gate_combo.currentData(), n_events=int(self._events_spin.value()),
-            seed=int(self._seed_spin.value()), unstained=unstained, include=include, fix=self._param_values())
+            seed=int(self._seed_spin.value()), unstained=unstained, include=include, fix=self._param_values(),
+            fixed=self._fixed_values() or None)
 
     def _save_setup(self):
         sc.save_setup(self._process(), self._current_setup())
@@ -748,6 +783,9 @@ class SpectralCorrectionPage(QWidget):
         noise = ' (noise model in use)' if noise_in_use(process) else ''
         lines.append(f'<b>Experiment\'s unmixing:</b> {unmix_method.method_label(method, lam)}{noise}; corrected '
                      'spectra feed it. Fix Unmix itself reads per-cell AF without the positivity prior.')
+        fixed = self._setup().fixed or []
+        if fixed:
+            lines.append(f'<b>Kept fixed:</b> {", ".join(fixed)}.')
         self._summary.setText('<br>'.join(lines))
 
     def _on_job_gate_changed(self):

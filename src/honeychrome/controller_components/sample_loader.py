@@ -61,7 +61,7 @@ __all__ = [
     'AFState', 'UnmixSnapshot', 'sample_key_for_path', 'af_profile_names',
     'resolve_af_for_profiles', 'snapshot_unmix_state', 'read_raw_events',
     'unmix_events', 'load_unmixed', 'seeded_subsample_indices', 'read_raw_subsample',
-    'control_sample_keys', 'analysis_sample_keys',
+    'control_sample_keys', 'analysis_sample_keys', 'array_digest', 'unmixing_signature',
 ]
 
 
@@ -216,6 +216,47 @@ def resolve_af_for_profiles(controller, profile_names) -> AFState | None:
         combined.update(precompute_joint_cov_extras(combined, spectra))
     return AFState(profile_names=tuple(usable), precomputed=combined, spectra=spectra,
                    index_map=af_index_lookup(af_profiles, usable))
+
+
+def array_digest(data: np.ndarray) -> str:
+    """Hex digest of an array's shape, dtype and contents (BLAKE2b, 128-bit)."""
+    arr = np.ascontiguousarray(data)
+    h = hashlib.blake2b(digest_size=16)
+    h.update(repr((arr.shape, arr.dtype.str)).encode())
+    h.update(arr.reshape(-1).view(np.uint8))
+    return h.hexdigest()
+
+
+def unmixing_signature(controller, sample_keys) -> dict:
+    """
+    What decides the unmixed values of *sample_keys* (``all_samples`` keys):
+    the transfer matrix, the spillover, each sample's AF profile assignment
+    and the spectra of the profiles used, and the unmixing method (its
+    fingerprint and each sample's spectra set) when it is not per-cell AF
+    with the base spectra. JSON-serialisable; main thread only.
+    """
+    keys = sorted(str(k) for k in sample_keys)
+    process = controller.experiment.process
+    af_profiles = process.get('af_profiles', {}) or {}
+    assignment = {k: [str(n) for n in af_profile_names(controller, k)] for k in keys}
+    used_profiles = sorted({n for names in assignment.values() for n in names})
+    spillover = process.get('spillover')
+    transfer_matrix = controller.transfer_matrix
+    out = {
+        'transfer_matrix': (array_digest(np.asarray(transfer_matrix, dtype=np.float64))
+                            if transfer_matrix is not None else ''),
+        'spillover': (array_digest(np.asarray(spillover, dtype=np.float64))
+                      if spillover is not None else ''),
+        'af_assignment': assignment,
+        'af_spectra': {
+            n: array_digest(np.asarray(af_profiles[n]['spectra'], dtype=np.float64))
+            for n in used_profiles if n in af_profiles
+        },
+    }
+    method = unmix_method.method_state(controller)
+    if method is not None:
+        out['method'] = {k: [method.fingerprint, method.set_for(k)] for k in keys}
+    return out
 
 
 def _time_qc_masks(controller, sample_keys) -> dict:
@@ -463,7 +504,7 @@ def read_raw_subsample(abs_path, snap, sample_key: str, max_events: int | None,
 def load_unmixed(experiment_dir, sample_key: str, snap: UnmixSnapshot,
                  keep_mask: np.ndarray | None = None,
                  max_events: int | None = None, seed: int = 42,
-                 return_af: bool = False) -> dict:
+                 return_af: bool = False, use_cache: bool = False) -> dict:
     """Load and unmix one sample with its own AF assignment.
 
     Parameters
@@ -478,6 +519,11 @@ def load_unmixed(experiment_dir, sample_key: str, snap: UnmixSnapshot,
                      only the selected events are read where the file
                      allows it (see ``read_raw_subsample``).
     return_af      : also return per-cell AF abundance and index.
+    use_cache      : without *max_events*, read the experiment's
+                     noise-model or variants result from the on-disk
+                     unmixing cache, or store it there
+                     (``unmix_method.unmix``'s ``cache_file``); a capped
+                     read is never cached.
 
     Returns
     -------
@@ -494,7 +540,8 @@ def load_unmixed(experiment_dir, sample_key: str, snap: UnmixSnapshot,
         Path(experiment_dir) / key, snap, key, max_events, seed=seed, keep_mask=mask)
 
     af = snap.af_for(key)
-    result = unmix_events(raw, snap, af, return_af=return_af, sample_key=key)
+    cache_file = Path(experiment_dir) / key if use_cache and max_events is None else None
+    result = unmix_events(raw, snap, af, return_af=return_af, sample_key=key, cache_file=cache_file)
     result.update({
         'event_index': event_index,
         'n_events_file': n_file,

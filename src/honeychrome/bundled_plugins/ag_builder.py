@@ -4090,7 +4090,7 @@ class _TrainingWorker(QThread):
             self.progress.emit(f"Loading {_sample_label(key)} ({i}/{len(self._keys)}) …")
             try:
                 out = load_unmixed(self._experiment_dir, key, self._snap,
-                                   max_events=self._cap, seed=self._seed)
+                                   max_events=self._cap, seed=self._seed, use_cache=True)
             except Exception as exc:
                 log.warning("could not load %s: %s", key, exc)
                 self.progress.emit(f"Could not load {_sample_label(key)}: {exc}")
@@ -4887,7 +4887,7 @@ class _ReviewWorker(QThread):
             chunks = []
             for key in self._keys:
                 out = load_unmixed(self._experiment_dir, key, self._snap,
-                                   max_events=self._max_events, seed=TRAINING_SEED)
+                                   max_events=self._max_events, seed=TRAINING_SEED, use_cache=True)
                 chunks.append(np.asarray(out['unmixed'], dtype=np.float32))
             self.finished.emit(True, '', np.concatenate(chunks, axis=0))
         except Exception as exc:

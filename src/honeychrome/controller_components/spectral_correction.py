@@ -126,6 +126,7 @@ class CorrectionSetup:
     unstained: dict | None = None            # {group: sample path or AUTO}
     include: dict | None = None               # {sample type: offered}, see SAMPLE_TYPES
     fix: dict | None = None                   # exposed FixSettings fields changed from their defaults
+    fixed: list | None = None                 # fluorophores Fix Unmix never corrects (FixSettings.fixed_fluorophores)
 
 
 def load_setup(process: dict) -> CorrectionSetup:
@@ -144,6 +145,7 @@ def fix_settings(setup: CorrectionSetup) -> fm.FixSettings:
     values = {k: v for k, v in (setup.fix or {}).items() if k in allowed}
     s = fm.FixSettings(**values)
     s.n_threads = unmix_method.n_threads_default()
+    s.fixed_fluorophores = tuple(str(n) for n in (setup.fixed or ()))
     return s
 
 

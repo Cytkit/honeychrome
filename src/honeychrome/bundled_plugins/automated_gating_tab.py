@@ -355,6 +355,9 @@ class GatingRunState:
                      alignment, gate modes, drift settings, marker channels,
                      transforms), so a paused run is only resumed with the
                      same settings.
+    run_unmixing   : digest of the experiment's unmixing when the results
+                     were gated (``unmixing_digest``; '' for results gated
+                     before it was kept).
     transform_params: {channel: transform parameters} gating uses (the
                      model pages' transforms).
     run_transforms : the transforms the gated results were made in (their
@@ -385,6 +388,7 @@ class GatingRunState:
     display: dict = field(default_factory=dict)
     pending_samples: list = field(default_factory=list)
     run_fingerprint: str = ''
+    run_unmixing: str = ''
     transform_params: dict = field(default_factory=dict)
     run_transforms: dict = field(default_factory=dict)
     report_populations: list = field(default_factory=list)
@@ -463,6 +467,16 @@ _PERSISTED_FIELDS = (
     'fsea_marker_readout', 'fsea_rank_metric', 'fsea_n_perm', 'fsea_seed', 'fsea_min_set_size',
     'fsea_overrides',
 )
+
+
+def unmixing_digest(controller) -> str:
+    """Digest of what decides every sample's unmixed values (transfer matrix,
+    spillover, AF assignments and spectra, the AutoSpectral tab's method and
+    spectral corrections). Main thread only."""
+    from honeychrome.controller_components.sample_loader import unmixing_signature
+    keys = list((controller.experiment.samples.get('all_samples') or {}).keys())
+    payload = json.dumps(ag_core.to_jsonable(unmixing_signature(controller, keys)), sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
 def run_fingerprint(state: 'GatingRunState', model_sha: str) -> str:
@@ -704,7 +718,7 @@ class _GatingWorker(QThread):
                 break
             self.progress.emit(f"Gating {_sample_label(key)} ({i}/{len(self._keys)}) …")
             try:
-                out = load_unmixed(self._experiment_dir, key, self._snap)
+                out = load_unmixed(self._experiment_dir, key, self._snap, use_cache=True)
             except Exception as exc:
                 log.warning("could not load %s: %s", key, exc)
                 self.progress.emit(f"Could not load {_sample_label(key)}: {exc}")
@@ -1176,21 +1190,30 @@ class RunTab(QWidget):
         self._update_warnings()
 
     def _update_warnings(self):
-        """Samples whose AF assignment was not represented in training."""
-        training = ((self.state.applied_model or {}).get('af') or {}).get('sample_af_profiles') or {}
-        if not training:
-            self.lbl_warnings.setText("")
-            return
-        seen = {tuple(v or []) for v in training.values()}
-        odd = [k for k in self._to_gate()
-               if tuple(af_profile_names(self.controller, k)) not in seen]
-        if odd:
-            self.lbl_warnings.setText(
-                "These samples use an AF profile assignment that none of the training "
-                "samples had, so their unmixing differs from the training data: "
-                + ", ".join(_sample_label(k) for k in odd[:10]) + (" …" if len(odd) > 10 else ""))
-        else:
-            self.lbl_warnings.setText("")
+        """Samples whose AF assignment was not represented in training, and
+        results gated with an unmixing that has changed since."""
+        lines = []
+        st = self.state
+        if st.summaries and st.run_unmixing and not self.is_running():
+            try:
+                changed = st.run_unmixing != unmixing_digest(self.controller)
+            except Exception as exc:
+                log.warning("could not read the unmixing: %s", exc)
+                changed = False
+            if changed:
+                lines.append("The unmixing has changed since these results were gated (AutoSpectral tab, "
+                             "AF profiles or spectral process): gate the samples again to update them.")
+        training = ((st.applied_model or {}).get('af') or {}).get('sample_af_profiles') or {}
+        if training:
+            seen = {tuple(v or []) for v in training.values()}
+            odd = [k for k in self._to_gate()
+                   if tuple(af_profile_names(self.controller, k)) not in seen]
+            if odd:
+                lines.append(
+                    "These samples use an AF profile assignment that none of the training "
+                    "samples had, so their unmixing differs from the training data: "
+                    + ", ".join(_sample_label(k) for k in odd[:10]) + (" …" if len(odd) > 10 else ""))
+        self.lbl_warnings.setText("\n".join(lines))
 
     def _to_gate(self) -> list[str]:
         """Ticked samples, gating or validation, in table order."""
@@ -1213,8 +1236,8 @@ class RunTab(QWidget):
                         "Restart discards the results so far and gates every ticked sample.")
             resume = box.addButton("Resume", QMessageBox.AcceptRole)
         else:
-            box.setText(f"The last run stopped with {n_done} sample(s) gated, but the model or "
-                        "its settings have changed since, so it cannot be resumed.\n\n"
+            box.setText(f"The last run stopped with {n_done} sample(s) gated, but the model, "
+                        "its settings or the unmixing have changed since, so it cannot be resumed.\n\n"
                         "Restart discards the results so far and gates every ticked sample.")
             resume = None
         restart = box.addButton("Restart", QMessageBox.DestructiveRole)
@@ -1254,11 +1277,13 @@ class RunTab(QWidget):
         st.marker_channels = markers
         fingerprint = run_fingerprint(st, model_sha)
         st.marker_channels = saved_markers
+        unmixing = unmixing_digest(self.controller)
         to_gate = list(keys)
         resume = False
         if st.pending_samples and st.summaries:
+            same_unmixing = not st.run_unmixing or st.run_unmixing == unmixing
             choice = self._ask_resume(len(st.summaries), len(st.pending_samples),
-                                      fingerprint == st.run_fingerprint)
+                                      fingerprint == st.run_fingerprint and same_unmixing)
             if choice is None:
                 token.release()
                 return
@@ -1280,7 +1305,7 @@ class RunTab(QWidget):
         self._before_run = {name: (dict(getattr(st, name)) if isinstance(getattr(st, name), dict)
                                    else deepcopy(getattr(st, name))) for name in (
             'run_samples', 'summaries', 'load_info', 'display', 'stats', 'fsea', 'marker_channels',
-            'results_model_sha', 'pending_samples', 'run_fingerprint', 'run_transforms')}
+            'results_model_sha', 'pending_samples', 'run_fingerprint', 'run_unmixing', 'run_transforms')}
         st.run_samples = keys
         if resume:
             keep = set(keys)
@@ -1296,6 +1321,7 @@ class RunTab(QWidget):
         st.marker_channels = markers
         st.results_model_sha = model_sha
         st.run_fingerprint = fingerprint
+        st.run_unmixing = unmixing
         st.run_transforms = deepcopy(st.transform_params)
         st.pending_samples = list(to_gate)
         self._run_keys = to_gate
@@ -4121,6 +4147,7 @@ class PluginWidget(QWidget):
             st.pending_samples = [k for k in (payload.get('pending_samples') or [])
                                   if k not in st.summaries]
             st.run_fingerprint = str(payload.get('run_fingerprint') or '')
+            st.run_unmixing = str(payload.get('run_unmixing') or '')
             st.display = dict(out.get('display') or {})
             if int(payload.get('format_version') or 1) < 2:
                 # Hash of the model file, from before the model pages: not comparable.
@@ -4195,6 +4222,7 @@ class PluginWidget(QWidget):
             'load_info': dict(st.load_info),
             'pending_samples': list(st.pending_samples),
             'run_fingerprint': st.run_fingerprint,
+            'run_unmixing': st.run_unmixing,
             'run_transforms': deepcopy(st.run_transforms),
         }
         self._start_writer(lambda: _write_json_atomic(path, payload), "Saving the gating results")

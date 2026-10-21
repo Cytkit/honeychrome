@@ -149,6 +149,7 @@ from PySide6.QtWidgets import (
 from honeychrome.controller_components.functions import (
     apply_gates_in_place,
 )
+from honeychrome.controller_components import unmix_method
 from honeychrome.controller_components.sample_loader import (
     sample_key_for_path, snapshot_unmix_state,
 )
@@ -9166,6 +9167,7 @@ class PlotCard(QFrame):
             tuple(sorted(samples)),
             tuple(sorted(self.state.selected_gates)),
             id(self.controller.transfer_matrix),
+            unmix_method.method_token(unmix_method.method_state(self.controller)),
         )
 
     def _start_marker_values_worker(self, samples: list[str], cache_key):

@@ -641,7 +641,9 @@ def _set_af(state: MethodState, set_id: str, af):
 
 def unmix_fluorescence(raw_fl: np.ndarray, state: MethodState, af, sample_key=None, method: str | None = None) -> dict:
     """
-    M2pg, the clamped-data weights or R2 on raw fluorescence events. Returns ``unmixed`` (n, F,
+    The sample's method on raw fluorescence events, with its spectra set:
+    R1 (per-cell AF, or the weighted OLS unmixing matrix without AF), M2pg,
+    the clamped-data weights or R2. Returns ``unmixed`` (n, F,
     uncompensated), ``af_scale`` and ``af_idx`` (0-based, -1 without AF).
     """
     from honeychrome.controller_components import gls_unmix as gu
@@ -652,6 +654,16 @@ def unmix_fluorescence(raw_fl: np.ndarray, state: MethodState, af, sample_key=No
     af = _set_af(state, set_id, af)
     extra = state.set_extras.get(set_id) or {} if set_id else {}
     raw_fl = np.ascontiguousarray(raw_fl, dtype=np.float64)
+    if method == R1:
+        n = len(raw_fl)
+        if af is None:
+            return {'unmixed': raw_fl @ unmixing_matrix_for(spectra, state.unmixing_weights).T,
+                    'af_scale': np.zeros(n), 'af_idx': np.full(n, -1, dtype=np.int64)}
+        from honeychrome.controller_components.autospectral_functions import apply_af_unmixing
+        res = apply_af_unmixing(raw_fl, af.precomputed, np.asarray(af.spectra, dtype=np.float64))
+        idx = np.asarray(res['af_idx'], dtype=np.int64)
+        return {'unmixed': res['unmixed'], 'af_scale': np.asarray(res['af_scale'], dtype=np.float64),
+                'af_idx': np.where(idx > 0, idx - 1, -1)}
     envelope = None if af is None or not af.precomputed else af.precomputed.get('envelope')
     if method in NOISE_METHODS:
         noise = state.noise
@@ -677,7 +689,7 @@ def unmix_fluorescence(raw_fl: np.ndarray, state: MethodState, af, sample_key=No
             v['active'], v['thresholds'], n_threads=state.n_threads, envelope=envelope, **v['kernel'])
         idx = np.asarray(res['af_idx'], dtype=np.int64)
         return {'unmixed': res['unmixed'], 'af_scale': res['af_scale'], 'af_idx': np.where(idx > 0, idx - 1, -1)}
-    raise ValueError(f'unmix_fluorescence: {method} is not a background method')
+    raise ValueError(f'unmix_fluorescence: unknown method {method}')
 
 
 def assemble(raw_event_data, transfer_matrix, settings, fl_result: dict, spillover=None, af=None) -> dict:
@@ -841,3 +853,32 @@ def time_probe(raw_fl: np.ndarray, state: MethodState, af, sample_key=None) -> f
     start = time.perf_counter()
     unmix_fluorescence(raw_fl, state, af, sample_key)
     return len(raw_fl) / max(time.perf_counter() - start, 1e-9)
+
+
+def format_duration(seconds) -> str:
+    """'45s', '12.5min' or '1.2hr'; 'unknown' for a missing or non-finite value."""
+    import math
+    if seconds is None or not math.isfinite(seconds):
+        return 'unknown'
+    if seconds < 60:
+        return f'{seconds:.0f}s'
+    if seconds < 3600:
+        return f'{seconds / 60:.1f}min'
+    return f'{seconds / 3600:.1f}hr'
+
+
+def allocate_probe_rows(counts, sample_n: int) -> list:
+    """Split ``min(sample_n, sum(counts))`` probe events across files in
+    proportion to their event counts (largest remainder), never more than a
+    file holds."""
+    counts = np.asarray(counts, dtype=np.int64)
+    total = int(counts.sum())
+    if total <= 0:
+        return [0] * len(counts)
+    n = min(int(sample_n), total)
+    exact = counts * n / total
+    alloc = np.floor(exact).astype(np.int64)
+    remainder = n - int(alloc.sum())
+    order = np.argsort(-(exact - alloc), kind='stable')
+    alloc[order[:remainder]] += 1
+    return np.minimum(alloc, counts).astype(int).tolist()

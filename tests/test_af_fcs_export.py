@@ -2,8 +2,8 @@
 test_af_fcs_export.py
 ---------------------
 FCS export of the per-cell AF channels (AF Abundance, AF Index) from
-UnmixedExporter and the AutoSpectral Optimization plugin's exporter, run on
-a synthetic experiment (see af_synthetic.py) and read back from disk.
+UnmixedExporter, run on a synthetic experiment (see af_synthetic.py) and
+read back from disk.
 
 Usage:
     pytest tests/test_af_fcs_export.py -m numpy_only
@@ -35,18 +35,6 @@ AF_A = hc_settings.af_abundance_channel
 AF_I = hc_settings.af_index_channel
 
 
-def _kernel_available():
-    from autospectral_opt_kernel_wrapper import AUTOSPECTRAL_OPT_KERNEL_AVAILABLE
-    return AUTOSPECTRAL_OPT_KERNEL_AVAILABLE
-
-
-requires_kernel = pytest.mark.skipif(
-    not _kernel_available(),
-    reason='compiled AutoSpectral Optimization kernel not built '
-           '(run bundled_plugins/build_autospectral_opt_kernel.py)',
-)
-
-
 def _keyword(text, n, field):
     """$PnX from a keyword dict whose keys may or may not keep '$' / case."""
     for key in (f'$P{n}{field}', f'P{n}{field}', f'p{n}{field.lower()}', f'$p{n}{field.lower()}'):
@@ -57,15 +45,6 @@ def _keyword(text, n, field):
 
 def _run_unmixed_exporter(controller):
     UnmixedExporter('Raw', False, None, controller).run()
-
-
-def _run_opt_exporter(controller, sample_keys):
-    from joint_unmix_export import AutoSpectralOptExporter
-    errors = []
-    exporter = AutoSpectralOptExporter(sample_keys, controller, None, {'n_threads': 1})
-    exporter.error.connect(errors.append)
-    exporter.run()
-    assert not errors, errors[0]
 
 
 # ---------------------------------------------------------------------------
@@ -124,48 +103,6 @@ def test_af_index_range_covers_every_library_index(tmp_path):
     n = pnn.index(AF_I) + 1
     assert float(_keyword(text, n, 'R')) == syn.N_AF_TOTAL + 1
     assert events[:, n - 1].max() < float(_keyword(text, n, 'R'))
-
-
-# ---------------------------------------------------------------------------
-# AutoSpectral Optimization exporter
-# ---------------------------------------------------------------------------
-
-@requires_kernel
-@pytest.mark.numpy_only
-def test_opt_export_writes_af_channels_once(tmp_path):
-    controller = syn.make_experiment(tmp_path)
-    _run_opt_exporter(controller, [syn.AF_SAMPLE])
-
-    pnn, events, _text = syn.read_fcs(syn.exported_path(tmp_path, syn.AF_SAMPLE))
-    assert len(pnn) == len(set(pnn)), f'duplicate $PnN: {pnn}'
-    af_index = events[:, pnn.index(AF_I)]
-    assert af_index.min() >= syn.N_OTHER_AF + 1 and af_index.max() <= syn.N_AF_TOTAL
-    assert np.all(events[:, pnn.index(AF_A)] >= 0)
-
-
-@requires_kernel
-@pytest.mark.numpy_only
-def test_opt_and_standard_export_agree_when_no_variants_are_active(tmp_path):
-    """With no fluorophore marked Active the optimization kernel runs in
-    AF-only mode, so both exporters describe the same unmixing and should
-    write the same fluorophore values under the same $SPILLOVER. A small
-    share of cells may differ where the two AF scorers pick different
-    variants; the 95% bar leaves room for that but not for a
-    compensation difference, which moves every cell."""
-    spillover = np.eye(syn.N_FLUOR)
-    spillover[0, 1] = 0.08
-    spillover[2, 1] = 0.05
-    controller = syn.make_experiment(tmp_path, spillover=spillover)
-
-    _run_unmixed_exporter(controller)
-    std_pnn, std, std_text = syn.read_fcs(syn.exported_path(tmp_path, syn.AF_SAMPLE))
-    _run_opt_exporter(controller, [syn.AF_SAMPLE])
-    opt_pnn, opt, opt_text = syn.read_fcs(syn.exported_path(tmp_path, syn.AF_SAMPLE))
-
-    std_fl = std[:, [std_pnn.index(c) for c in syn.FLUOR_LABELS]]
-    opt_fl = opt[:, [opt_pnn.index(c) for c in syn.FLUOR_LABELS]]
-    same = np.all(np.isclose(opt_fl, std_fl, rtol=1e-4, atol=1.0), axis=1)
-    assert same.mean() >= 0.95, f'only {same.mean():.1%} of events match'
 
 
 # ---------------------------------------------------------------------------

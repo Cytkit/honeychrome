@@ -75,6 +75,14 @@ Phase two
     joint fit is re-measured with every other row held at its spectrum;
     ``phase_two_fallback`` adopts that row (default), phase one's
     back-solved row, or rejects it.
+Fluorophores kept fixed
+    ``fixed_fluorophores`` names rows that are never corrected: a fixed
+    fluorophore is no pair's source in phase one (no evidence is gathered
+    and its off-diagonal spillover stays zero, so its back-solved row is its
+    spectrum) and phase two leaves its spectrum as it is ('fixed'). It still
+    counts as a target channel, as a lasso regressor and in the background.
+    For FlowCode tags, whose FRET error the FlowCode plugin removes in raw
+    space: a correction of their rows would remove it a second time.
 Smooth updates
     ``smooth_fix`` runs Fix My Unmix in rounds on fresh subsamples, each
     started from the current spectra, and moves the spectra a step
@@ -251,6 +259,7 @@ class FixSettings:
     smooth_updates: bool = True             # smooth_fix: rounds averaged, not one run adopted
     smooth_rounds: int = 5
     smooth_fraction: float = 0.5            # share of the stained events each round draws
+    fixed_fluorophores: tuple = ()          # rows never corrected (e.g. FlowCode tags); names not in the panel ignored
 
 
 # ---------------------------------------------------------------------------
@@ -1395,6 +1404,11 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
         raise ValueError('At least two panel fluorophores are required.')
     fnames = [names[i] for i in fl]
     spectra_fluor = spectra[fl]
+    fixed_names = [str(n) for n in (s.fixed_fluorophores or ())]
+    unknown = [n for n in fixed_names if n not in fnames]
+    if unknown:
+        logger.warning('Fix My Unmix: fluorophores to keep fixed not in the panel, ignored: %s', ', '.join(unknown))
+    fixed = np.array([n in fixed_names for n in fnames], dtype=bool)
     for fit in (stained, unstained):
         if fit['residual'].shape[1] != spectra.shape[1]:
             raise ValueError('The spectra and the spectral channels of the data do not match.')
@@ -1483,12 +1497,12 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
         ntm_t = np.ascontiguousarray(ntm.T)
         for src in range(n_fluor):
             chans = [c for c in range(n_fluor) if c != src]
-            w_src = float(evidence['weight'][src])
+            w_src = 0.0 if fixed[src] else float(evidence['weight'][src])
             source_log.append({'source': fnames[src], 'negative_bound': float(evidence['bound'][src]),
                                'clear_events': int(evidence['n_clear'][src]),
                                'baseline_events': float(evidence['baseline'][src]),
                                'excess_events': float(evidence['excess'][src]), 'source_weight': w_src,
-                               'af_likeness': np.nan, 'af_gated': False})
+                               'af_likeness': np.nan, 'af_gated': False, 'fixed': bool(fixed[src])})
             est = None
             if w_src > 0:
                 spread_var = np.zeros(len(chans)) if spread_fl is None else spread_fl[src, chans]
@@ -1685,6 +1699,8 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
             say(f'Phase two: {fnames[f]}')
             idx = np.flatnonzero(dominant == f)
             reject = 'not.flagged' if s.phase_two_rows == 'flagged' and not flagged[f] else None
+            if fixed[f]:
+                reject = 'fixed'
             cand = None
             if reject is None:
                 cand = extract_raw_signature(

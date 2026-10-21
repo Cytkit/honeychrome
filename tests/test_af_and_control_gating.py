@@ -32,6 +32,7 @@ from honeychrome.controller_components.per_sample_gating_functions import Sample
 from honeychrome.controller_components.sample_loader import snapshot_unmix_state, unmix_events
 from honeychrome.controller_components.transform import Transform
 from honeychrome.settings import INTERNAL_NEGATIVE_SENTINEL
+from test_unmix_method import fitted  # noqa: E402,F401  (fixture)
 
 _PLUGIN_DIR = Path(__file__).resolve().parents[1] / 'src' / 'honeychrome' / 'bundled_plugins'
 if str(_PLUGIN_DIR) not in sys.path:
@@ -173,10 +174,11 @@ def _cluster_id_controller(unstained_assignment):
     experiment = SimpleNamespace(
         samples=samples,
         process={'af_profiles': {'P': {'spectra': AF.tolist()}, 'Q': {'spectra': af_b.tolist()}}},
-        settings={'raw': {'raw_samples_subdirectory': 'Raw'}},
+        settings={'raw': {'raw_samples_subdirectory': 'Raw', 'event_channels_pnn': ['D1', 'D2', 'D3'],
+                          'fluorescence_channel_ids': [0, 1, 2]}},
     )
     return SimpleNamespace(
-        experiment=experiment, transfer_matrix=np.eye(3),
+        experiment=experiment, transfer_matrix=np.eye(3), filtered_raw_fluorescence_channel_ids=[0, 1, 2],
         af_precomputed_cache={'P': build_af_precomputed(FLUOR, AF), 'Q': build_af_precomputed(FLUOR, af_b)},
     ), af_b
 
@@ -187,12 +189,14 @@ def test_cluster_id_unstained_sample_uses_its_own_af_assignment():
     cl_run = {'training_sample_ids': ['S1.fcs', 'S2.fcs']}
     controller, af_b = _cluster_id_controller(['Q'])
     states = drc_cluster_id.resolve_unstained_af_states(controller, cl_run)
-    np.testing.assert_array_equal(states['Raw/Unstained.fcs'][2], af_b)
+    snap, af = states['Raw/Unstained.fcs']
+    np.testing.assert_array_equal(af.spectra, af_b)
+    assert af.profile_names == ('Q',) and snap.method is None
 
     # without one, the training samples' most common assignment stands in
     controller, _ = _cluster_id_controller(None)
     states = drc_cluster_id.resolve_unstained_af_states(controller, cl_run)
-    np.testing.assert_array_equal(states['Raw/Unstained.fcs'][2], AF)
+    np.testing.assert_array_equal(states['Raw/Unstained.fcs'][1].spectra, AF)
 
 
 def test_af_aware_unmixing_never_falls_back_to_the_displayed_sample():
@@ -365,3 +369,21 @@ def test_spectral_functions_gate_with_a_sample_gating(monkeypatch):
     fsc = CTRL_EVENTS[:, 3]
     assert len(own) == int(np.sum((fsc > 500) & (fsc < 900)))
     assert len(other) == int(np.sum((fsc > 100) & (fsc < 900)))
+
+
+def test_cluster_id_stand_in_is_unmixed_by_the_experiments_method(fitted, tmp_path):
+    """The stand-in library of an unstained sample goes through the
+    experiment's method (here M2pg), as the training samples do."""
+    import drc_pipeline
+    import test_unmix_method as T
+    from honeychrome.controller_components import sample_loader as sl
+
+    ctrl, _env = T.make_controller(fitted, tmp_path, {'noise_model': True})
+    snap = sl.snapshot_unmix_state(ctrl, include_qc=False)
+    af = snap.af_for(T.A)
+    raw = T._raw(fitted, T.B)
+    out = drc_pipeline.apply_unmixing_af_aware(ctrl, raw, af_state=(snap, af), sample_key=T.B)
+    np.testing.assert_array_equal(out, sl.unmix_events(raw, snap, af, sample_key=T.B)['unmixed'])
+    r1 = drc_pipeline.apply_unmixing_af_aware(
+        ctrl, raw, af_state=(ctrl.transfer_matrix, af.precomputed, af.spectra), sample_key=T.B)
+    assert not np.allclose(out, r1)

@@ -24,9 +24,9 @@ unmix_autospectral_optimization(...)
     Assembles the active-variant list and calls the compiled joint kernel.
     Used by the Spectral Variants comparison and by exports.
 
-active_variant_labels / cached_unmixed_thresholds / make_optimization_unmix_fn
-    Inputs and per-chunk unmixing function for batch export through
-    joint_unmix_export.JointUnmixExporter.
+active_variant_labels / has_active_variants / cached_unmixed_thresholds
+    The Active fluorophores and the cached positivity thresholds R2 unmixes
+    with (``unmix_method``).
 
 """
 
@@ -1129,7 +1129,7 @@ def af_envelope_for_profiles(controller, profile_names) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Batch export inputs — used with joint_unmix_export.JointUnmixExporter
+# Inputs of R2 (unmix_method) and plugins
 # ---------------------------------------------------------------------------
 
 def active_variant_labels(process: dict) -> set:
@@ -1162,36 +1162,3 @@ def cached_unmixed_thresholds(controller, reference_spectra: np.ndarray) -> np.n
     )
     n_fluors = 0 if reference_spectra is None else reference_spectra.shape[0]
     return np.zeros(n_fluors)
-
-
-def make_optimization_unmix_fn(
-    reference_spectra: np.ndarray,
-    fluor_names: list,
-    variants_meta: dict,
-    active_labels,
-    unmixed_pos_thresholds: np.ndarray,
-    kernel_kwargs: dict,
-):
-    """
-    Per-chunk unmixing function for JointUnmixExporter:
-    ``unmix_fn(raw_fl_chunk, raw_chunk, af)`` runs
-    unmix_autospectral_optimization() with the sample's AF library
-    (``af.spectra``). ``raw_chunk`` is not used.
-    """
-    fluor_names = list(fluor_names)
-    active_labels = set(active_labels)
-
-    def unmix_fn(raw_fl_chunk, raw_chunk, af):
-        return unmix_autospectral_optimization(
-            raw_fl_events=raw_fl_chunk,
-            reference_spectra=reference_spectra,
-            fluor_names=fluor_names,
-            af_spectra=af.spectra,
-            variants_meta=variants_meta,
-            active_labels=active_labels,
-            unmixed_pos_thresholds=unmixed_pos_thresholds,
-            envelope=getattr(af, 'envelope', None),
-            **kernel_kwargs,
-        )
-
-    return unmix_fn
