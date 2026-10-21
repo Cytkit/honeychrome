@@ -2,7 +2,7 @@
 Cytkit State plugin (hardware monitor and settings)
 """
 from PySide6.QtGui import QCursor, QIntValidator
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QTabWidget, QToolBox, QFormLayout, QComboBox, QCheckBox, QSpinBox, QHBoxLayout, QFrame, QTableWidget, QHeaderView, QLineEdit, QDoubleSpinBox
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QPushButton, QLabel, QTabWidget, QToolBox, QFormLayout, QComboBox, QCheckBox, QSpinBox, QHBoxLayout, QFrame, QTableWidget, QHeaderView, QLineEdit, QDoubleSpinBox, QGroupBox
 from PySide6.QtCore import Qt, Slot, Signal, QSize, QSettings, QTimer
 from PySide6.QtWidgets import QApplication
 import pyqtgraph as pg
@@ -1286,32 +1286,44 @@ class PluginWidget(QWidget):
         title = QLabel('Sample Pump')
         title.setStyleSheet(heading_style)
         layout.addWidget(title)
+        ramp_to_layout = QHBoxLayout()
+        sample_pump_ramp_to_spinbox = LabeledSpinBox('Set speed automatically with ramping:', -30000, 30000, 0, 1000)
+        sample_pump_ramp_to_button = QPushButton('Go!')
+        sample_pump_ramp_to_button.setFixedWidth(40)
+        sample_pump_ramp_to_button.clicked.connect(lambda value: self.set_instrument_state({'sample_pump_state': {'ramp_to': sample_pump_ramp_to_spinbox.spinbox.value()}}))
+        ramp_to_layout.addWidget(sample_pump_ramp_to_spinbox)
+        ramp_to_layout.addWidget(sample_pump_ramp_to_button)
+        help_text(ramp_to_layout, '🛈 [steps/s], positive or negative')
+        layout.addLayout(ramp_to_layout)
+
+        manual_controls = QGroupBox('Manual Sample Pump Controls')
+        manual_controls_layout = QVBoxLayout(manual_controls)
         self.sample_pump_enable_cb = QCheckBox("Sample Pump Enable")
         self.sample_pump_enable_cb.toggled.connect(lambda checked: self.set_instrument_state({'sample_pump_state': {'enable': checked}}))
-        layout.addWidget(self.sample_pump_enable_cb)
+        manual_controls_layout.addWidget(self.sample_pump_enable_cb)
         self.sample_pump_reverse_cb = QCheckBox("Sample Pump Reverse")
         self.sample_pump_reverse_cb.toggled.connect(lambda checked: self.set_instrument_state({'sample_pump_state': {'reverse': checked}}))
-        layout.addWidget(self.sample_pump_reverse_cb)
+        manual_controls_layout.addWidget(self.sample_pump_reverse_cb)
         self.sample_pump_ramp_cb = QCheckBox("Sample Pump Ramp")
         self.sample_pump_ramp_cb.toggled.connect(lambda checked: self.set_instrument_state({'sample_pump_state': {'ramp': checked}}))
-        layout.addWidget(self.sample_pump_ramp_cb)
+        manual_controls_layout.addWidget(self.sample_pump_ramp_cb)
         # frequency of pump steps 0.1 Hz, i.e. 10_000 for 1 kHz - fpga can do range(65_535)
         self.sample_pump_speed_spinbox = LabeledSpinBox('Sample Pump Speed', 0, 65_535, 0, 1000)
         self.sample_pump_speed_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'sample_pump_state': {'speed': value}}))
-        layout.addWidget(self.sample_pump_speed_spinbox)
-        help_text(layout, '🛈 Sample pump speed is the frequency of pump steps in units of 0.1 Hz')
+        manual_controls_layout.addWidget(self.sample_pump_speed_spinbox)
+        help_text(manual_controls_layout, '🛈 Sample pump speed is the frequency of pump steps in units of 0.1 Hz')
         # steps per cycle - speed increments per cycle
         self.sample_pump_rampSpC_spinbox = LabeledSpinBox('Sample Pump Ramp SpC', 0, 100, settings.sample_pump_steps_per_cycle, 1)
         self.sample_pump_rampSpC_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'sample_pump_state': {'steps_per_cycle': value}}))
-        layout.addWidget(self.sample_pump_rampSpC_spinbox)
-        help_text(layout, '🛈 Sample pump ramp SpC (speed increments per cycle) is the ramp step to make in units of 0.1 Hz when changing the pump speed')
+        manual_controls_layout.addWidget(self.sample_pump_rampSpC_spinbox)
+        help_text(manual_controls_layout, '🛈 Sample pump ramp SpC (speed increments per cycle) is the ramp step to make in units of 0.1 Hz when changing the pump speed')
         # clocks per cycle - how many clock cycles before increment ramp step
         # note 100 MHz FPGA clock
         self.sample_pump_rampCpC_spinbox = LabeledSpinBox('Sample Pump Ramp CpC', 0, 2_000_000_000, settings.sample_pump_clocks_per_cycle, 100)
         self.sample_pump_rampCpC_spinbox.spinbox.valueChanged.connect(lambda value: self.set_instrument_state({'sample_pump_state': {'clocks_per_cycle': value}}))
-        layout.addWidget(self.sample_pump_rampCpC_spinbox)
-        help_text(layout, '🛈 Sample pump ramp CpC (cycles per clock) is the number of FPGA clock cycles to count (at 2 GHz) before changing the sample pump speed by one step')
-
+        manual_controls_layout.addWidget(self.sample_pump_rampCpC_spinbox)
+        help_text(manual_controls_layout, '🛈 Sample pump ramp CpC (cycles per clock) is the number of FPGA clock cycles to count (at 2 GHz) before changing the sample pump speed by one step')
+        layout.addWidget(manual_controls)
 
         # sheath pump cb: enable
         # sheath pump spinbox: duty, freq

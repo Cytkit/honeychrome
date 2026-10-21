@@ -533,6 +533,8 @@ class CytkitDevice:
                 message['sheath_pump_state'] = value
 
             if parameter == 'sample_pump_state':
+                if 'ramp_to' in value:
+                    self.sample_pump.ramp_to(value['ramp_to'])
                 if 'enable' in value:
                     self.sample_pump.set_enable(value['enable'])
                 if 'reverse' in value:
