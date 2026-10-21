@@ -68,16 +68,19 @@ class PlotTracesWidget(QWidget):
 
         self.x = np.arange(settings.n_time_points_in_event) / settings.adc_rate
 
-    def set_traces(self, traces):
+    def set_traces(self, traces, refresh_legend=False):
         self.plot_widget1.clear()
-        self.legendLayout1.clear()
+        if refresh_legend:
+            self.legendLayout1.clear()
         for i in range(len(adc_channels)):
             if traces[:,i,:].any():
                 color = settings.line_colors[i % len(adc_channels)]
-                entry = LegendEntry(color, adc_channels[i])
-                self.legendLayout1.addWidget(entry)
-                solid_pen = pg.mkPen(color=color, width=1, style=Qt.SolidLine)
 
+                if refresh_legend:
+                    entry = LegendEntry(color, adc_channels[i])
+                    self.legendLayout1.addWidget(entry)
+
+                solid_pen = pg.mkPen(color=color, width=1, style=Qt.SolidLine)
                 for n in range(min(len(traces), 5)):
                     self.plot_widget1.plot(self.x, traces[n,i,:], pen=solid_pen)
 
@@ -1812,7 +1815,7 @@ class PluginWidget(QWidget):
                     else:
                         self.plot_traces_widget.raise_()
                         self.plot_traces_widget.activateWindow()
-                self.plot_traces_widget.set_traces(self.traces_blob_np)
+                self.plot_traces_widget.set_traces(self.traces_blob_np, not self.read_memory_cb.isChecked())
             else:
                 self.traces_blob_np = None
                 self.read_memory_output.setText(f'No traces captured.')

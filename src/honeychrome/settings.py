@@ -320,6 +320,7 @@ for row, name in enumerate(adc_channels):
     dac_ref_retrieved[name] = instrument_settings.value("ref", dac_ref_default, type=int)
     instrument_settings.endGroup()
 instrument_settings.endGroup()
+dac_bias_retrieved['All Channels'] = instrument_settings.value("bias", dac_bias_default, type=int)
 
 instrument_settings.beginGroup("adc_channels")
 adc_enabled_retrieved = {}
