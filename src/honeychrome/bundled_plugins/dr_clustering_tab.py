@@ -154,7 +154,7 @@ from honeychrome.controller_components.sample_loader import (
     sample_key_for_path, snapshot_unmix_state,
 )
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
-from honeychrome.controller_components.particle_type import is_bead_sample
+from honeychrome.controller_components.spectral_correction import offered_samples
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.transform import Transform
 from honeychrome.view_components.ordered_multi_sample_picker import OrderedMultiSamplePicker
@@ -2251,19 +2251,11 @@ class ConfigTab(QWidget):
         experiment = self.controller.experiment
         raw_subdir = experiment.settings['raw']['raw_samples_subdirectory']
         samples = experiment.samples
-        unstained = set(samples.get('unstained_samples', []))
-        single_stain = set(samples.get('single_stain_controls', []))
+        include = {'unstained': self.include_unstained_chk.isChecked(),
+                   'single_stain': self.include_single_stain_chk.isChecked(),
+                   'beads': self.include_beads_chk.isChecked()}
         pool = []
-        for s, name in samples.get('all_samples', {}).items():
-            type_checks = []
-            if s in unstained:
-                type_checks.append(self.include_unstained_chk)
-            if s in single_stain:
-                type_checks.append(self.include_single_stain_chk)
-            if is_bead_sample(samples, s, name):
-                type_checks.append(self.include_beads_chk)
-            if type_checks and not any(chk.isChecked() for chk in type_checks):
-                continue
+        for s in offered_samples(samples, include):
             try:
                 pool.append(str(Path(s).relative_to(raw_subdir)))
             except ValueError:

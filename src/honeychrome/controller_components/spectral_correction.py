@@ -154,15 +154,22 @@ def fix_settings(setup: CorrectionSetup) -> fm.FixSettings:
 # ---------------------------------------------------------------------------
 
 def sample_types(samples: dict, path: str, name: str | None = None) -> set:
-    """The control types of a sample among SAMPLE_TYPES (empty for a fully stained sample)."""
+    """
+    The control types of a sample among SAMPLE_TYPES (empty for a fully
+    stained sample). A sample is a single-stain control when it is tagged as
+    one or its exact file name is that of a tagged control (a copy of the
+    reference group elsewhere in the raw folder).
+    """
     from honeychrome.controller_components.gls_unmix import _is_unstained
     from honeychrome.controller_components.particle_type import is_bead_sample
 
     name = (samples.get('all_samples') or {}).get(path, '') if name is None else name
+    controls = samples.get('single_stain_controls') or []
+    control_files = {PurePosixPath(str(c).replace('\\', '/')).name for c in controls}
     out = set()
     if _is_unstained(samples, path, name):
         out.add('unstained')
-    if path in set(samples.get('single_stain_controls') or []):
+    if path in controls or PurePosixPath(str(path).replace('\\', '/')).name in control_files:
         out.add('single_stain')
     if is_bead_sample(samples, path, name):
         out.add('beads')
