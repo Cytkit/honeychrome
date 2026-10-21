@@ -159,6 +159,25 @@ def test_mfis_never_truncate_mismatched_samples():
     assert mfi.loc['b'].isna().all()
 
 
+def test_sample_mfis_reuse_the_samples_compute_mfis_loaded(monkeypatch):
+    state = types.SimpleNamespace(cluster_names={}, selected_channels=['x'])
+    labels = {'a': np.array([0, 1]), 'b': np.array([1, 1])}
+    calls = []
+
+    def load(_controller, _state, rel, _channels, af_state=None):
+        calls.append(rel)
+        return np.array([[1.0], [3.0]]), ['x']
+
+    monkeypatch.setattr(drc_stats.drc_pipeline, 'load_sample_transformed_values', load)
+    loaded = {}
+    mfi = drc_stats.compute_mfis(None, state, ['a', 'b'], 2, cluster_labels_override=labels,
+                                 channels=['x'], names_override={}, loaded=loaded)
+    sample = drc_stats.compute_sample_mfis(None, state, ['a', 'b'], channels=['x'], loaded=loaded)
+    assert calls == ['a', 'b']
+    assert mfi.loc['a'].tolist() == [1.0, 3.0] and np.isnan(mfi.loc['b'].tolist()[0])
+    assert sample['x'].tolist() == [2.0, 2.0]
+
+
 def test_statistics_inputs_for_legacy_run_use_stored_values(monkeypatch):
     run = {'labels': {'s': np.array([0, 1])},
            'marker_values': {'s': (np.array([[100.0, 1.0], [200.0, 2.0]]), ['x', 'y'])}}

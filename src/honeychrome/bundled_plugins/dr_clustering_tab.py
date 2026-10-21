@@ -12556,24 +12556,22 @@ class ClusterAnnotationTab(QWidget):
             self._recompute_marker_summary()
 
     def _apply_marker_summary_figures(self, main_fig, col_fig, row_fig, cbar_fig, ridge_fig):
+        # No draw() here: each canvas draws itself once when shown
         dpi = main_fig.get_dpi()
 
         main_canvas = _new_scrollable_canvas(main_fig)
         main_canvas.setFixedSize(int(main_fig.get_figwidth() * dpi), int(main_fig.get_figheight() * dpi))
         self._heatmap_scroll.setWidget(main_canvas)
-        main_canvas.draw()
 
         col_canvas = _new_scrollable_canvas(col_fig)
         col_canvas.setFixedSize(int(col_fig.get_figwidth() * dpi), int(col_fig.get_figheight() * dpi))
         self._heatmap_col_header_scroll.setWidget(col_canvas)
         self._heatmap_col_header_scroll.setFixedHeight(int(col_fig.get_figheight() * dpi))
-        col_canvas.draw()
 
         row_canvas = _new_scrollable_canvas(row_fig)
         row_canvas.setFixedSize(int(row_fig.get_figwidth() * dpi), int(row_fig.get_figheight() * dpi))
         self._heatmap_row_header_scroll.setWidget(row_canvas)
         self._heatmap_row_header_scroll.setFixedWidth(int(row_fig.get_figwidth() * dpi))
-        row_canvas.draw()
 
         self._heatmap_corner.setFixedSize(
             int(row_fig.get_figwidth() * dpi), int(col_fig.get_figheight() * dpi)
@@ -12583,13 +12581,12 @@ class ClusterAnnotationTab(QWidget):
         cbar_canvas = _new_scrollable_canvas(cbar_fig)
         cbar_canvas.setFixedSize(int(cbar_fig.get_figwidth() * cbar_dpi), int(cbar_fig.get_figheight() * cbar_dpi))
         self._heatmap_colorbar_scroll.setWidget(cbar_canvas)
-        cbar_canvas.draw()
 
         ridge_canvas = _new_scrollable_canvas(ridge_fig)
         dpi2 = ridge_fig.get_dpi()
-        ridge_canvas.setMinimumSize(int(ridge_fig.get_figwidth() * dpi2), int(ridge_fig.get_figheight() * dpi2))
+        # Fixed: a resize would redraw the whole grid
+        ridge_canvas.setFixedSize(int(ridge_fig.get_figwidth() * dpi2), int(ridge_fig.get_figheight() * dpi2))
         self._ridge_scroll.setWidget(ridge_canvas)
-        ridge_canvas.draw()
 
         # Default the splitter to the heatmap's own natural height, read
         # from Qt's own layout metrics rather than a guessed "chrome"
@@ -13265,7 +13262,13 @@ class PluginWidget(QWidget):
             for card in self.workspace_tab._plot_cards:
                 card._populate_selectors()
         if hasattr(self, 'cluster_annotation_tab'):
-            self.cluster_annotation_tab.refresh()
+            # Hidden: refresh on the next visit instead (the report reads its selection)
+            current = self.inner_tabs.currentWidget() if hasattr(self, 'inner_tabs') else None
+            if current is not None and current in (self.cluster_annotation_tab,
+                                                   getattr(self, 'report_tab', None)):
+                self.cluster_annotation_tab.refresh()
+            else:
+                self._last_tab_refresh_key.pop(2, None)
         if hasattr(self, 'report_tab'):
             self.report_tab.refresh()
 

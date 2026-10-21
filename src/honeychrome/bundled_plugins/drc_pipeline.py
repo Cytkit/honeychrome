@@ -52,6 +52,7 @@ from honeychrome.controller_components.functions import (
     apply_transfer_matrix,
 )
 from honeychrome.settings import af_index_channel
+from honeychrome.controller_components import unmix_method
 from honeychrome.controller_components.autospectral_functions import (
     apply_af_transfer,
 )
@@ -303,7 +304,8 @@ def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray, af_state=Non
       assignment is looked up in the snapshot by *sample_key*.
     * ``(transfer_matrix, af_precomputed, af_spectra)`` — an explicit AF
       library, used for unstained samples that borrow a stand-in library
-      (see drc_cluster_id.resolve_unstained_af_states).
+      (see drc_cluster_id.resolve_unstained_af_states). Unmixed with
+      per-cell AF, whatever the experiment's unmixing method.
     * ``None`` — main-thread callers only. The sample's assignment is
       resolved from the live controller, so *sample_key* is required: the
       AF matrices of the sample shown in the main window are never used
@@ -313,11 +315,12 @@ def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray, af_state=Non
     controller's transfer and AF matrices whenever a sample is (re)loaded.
     """
     if isinstance(af_state, UnmixSnapshot):
-        return unmix_events(raw_event_data, af_state, af_state.af_for(sample_key))['unmixed']
+        return unmix_events(raw_event_data, af_state, af_state.af_for(sample_key),
+                            sample_key=sample_key)['unmixed']
 
     if af_state is None and sample_key is not None:
         snap = snapshot_unmix_state(controller, [sample_key], include_qc=False)
-        return unmix_events(raw_event_data, snap, snap.af_for(sample_key))['unmixed']
+        return unmix_events(raw_event_data, snap, snap.af_for(sample_key), sample_key=sample_key)['unmixed']
 
     if af_state is None:
         raise ValueError('apply_unmixing_af_aware: pass sample_key or af_state; the AF matrices '
@@ -369,7 +372,8 @@ def snapshot_af_state(controller, sample_keys=None) -> UnmixSnapshot:
 def _af_cache_token(controller, af_state, sample_key) -> tuple:
     """Cache-key component describing how a sample is unmixed."""
     if isinstance(af_state, UnmixSnapshot):
-        return (id(af_state.transfer_matrix), af_state.af_profile_key(sample_key))
+        return (id(af_state.transfer_matrix), af_state.af_profile_key(sample_key),
+                af_state.method_key(sample_key))
     if af_state is not None:
         return (id(af_state[0]), id(af_state[1]))
     return (id(controller.transfer_matrix), tuple(af_profile_names(controller, sample_key)))
@@ -765,7 +769,8 @@ def array_digest(data: np.ndarray) -> str:
 def _fingerprint_parts(controller, gates, sample_ids) -> dict:
     """The two halves of a run's fingerprint: 'unmixing' (transfer matrix,
     spillover, each sample's AF profile assignment and the spectra of the
-    profiles used) and 'gating' (gates, those samples' per-sample
+    profiles used, and the unmixing method when it is not per-cell AF with
+    the base spectra) and 'gating' (gates, those samples' per-sample
     overrides, axis transforms)."""
     from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 
@@ -790,6 +795,9 @@ def _fingerprint_parts(controller, gates, sample_ids) -> dict:
             for n in used_profiles if n in af_profiles
         },
     }
+    method = unmix_method.method_state(controller)
+    if method is not None:
+        unmixing['method'] = {k: [method.fingerprint, method.set_for(k)] for k in keys}
     gating = {
         'gates': sorted(str(g) for g in gates),
         'gating': SampleGating.from_controller(controller, copy=False).signature(keys),

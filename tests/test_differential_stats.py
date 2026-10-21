@@ -121,6 +121,60 @@ def test_glm_offset_uses_per_feature_denominator():
     assert not bool(row['significant'])
 
 
+def test_glm_fits_are_statsmodels_fits():
+    """The batched GLM gives statsmodels' numbers exactly, with unmeasured
+    samples, an empty feature, an empty group, per-feature offsets and a
+    covariate."""
+    pytest.importorskip('statsmodels')
+    rng = np.random.default_rng(1)
+    groups = ['A'] * 6 + ['B'] * 6 + ['C'] * 6
+    cov = pd.DataFrame({'age': rng.normal(50, 10, 18)}, index=[f's{i}' for i in range(18)])
+    design, _names, _cols = ds.build_design(groups, 'A', None, cov)
+    mu = rng.lognormal(5, 1.5, (40, 1)) * np.exp(rng.normal(0, 0.5, (40, 18)))
+    counts = rng.negative_binomial(5, 5 / (5 + mu)).astype(float)
+    offsets = np.log(rng.lognormal(11, 0.3, (40, 18)))
+    counts[0] = 0.0                              # no events
+    counts[1, 12:] = 0.0                         # none in group C
+    counts[2, rng.random(18) < 0.3] = np.nan     # unmeasured samples
+    counts[3, 6:12] = np.nan                     # group B unmeasured
+    offsets[4, 5] = np.nan
+    fits = ds._glm_fit_features(counts, design, offsets)
+    n_batched = 0
+    for i, (fit, columns) in enumerate(fits):
+        ref, ref_columns = ds._glm_fit_observed(counts[i], design, offsets[i])
+        assert (fit is None) == (ref is None)
+        if ref is None:
+            continue
+        n_batched += isinstance(fit, ds._GLMFit)
+        assert np.array_equal(columns, ref_columns)
+        for k in ('params', 'bse', 'tvalues'):
+            assert np.array_equal(np.asarray(getattr(fit, k)), np.asarray(getattr(ref, k)))
+    assert fits[0] == (None, None) and n_batched >= 35
+
+
+@pytest.mark.numpy_only
+def test_stagewise_adjust_matches_per_family_definition():
+    from honeychrome.controller_components import moderated_stats as ms
+    rng = np.random.default_rng(2)
+    p = rng.beta(0.3, 1.0, 600)
+    p[rng.random(600) < 0.05] = np.nan
+    family = [f'c{k % 7}\x1f{k % 13}' for k in rng.permutation(600)]
+    got = ms.stagewise_adjust(p, family, 0.05)
+    fam = np.asarray(family, dtype=object)
+    labels = list(dict.fromkeys(family))
+    fam_p = np.array([ms.simes(p[fam == f]) for f in labels])
+    fam_adj = ms.bh_adjust(fam_p)
+    n_fam = int(np.isfinite(fam_p).sum())
+    selected = np.isfinite(fam_adj) & (fam_adj <= 0.05)
+    expected = np.where(np.isfinite(p), 1.0, np.nan)
+    for f, sel in zip(labels, selected):
+        if sel:
+            expected[fam == f] = np.minimum(ms.bh_adjust(p[fam == f]) * n_fam / selected.sum(), 1.0)
+    assert got['n_selected'] == int(selected.sum()) > 0 and got['n_families'] == n_fam
+    assert np.array_equal(got['adjusted'], expected, equal_nan=True)
+    assert np.array_equal(got['family_p'], fam_p[[labels.index(f) for f in family]], equal_nan=True)
+
+
 @pytest.mark.numpy_only
 def test_figures_build_without_canvas():
     pytest.importorskip('matplotlib')
