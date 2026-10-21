@@ -485,7 +485,7 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
     Each unstained sample used by calculate_unstained_channel_thresholds
     is unmixed with, in order of preference:
 
-      0. Its own AF profile assignment in the AutoSpectral AF tab, when it
+      0. Its own AF profile assignment on the AutoSpectral tab's Autofluorescence page, when it
          has one (e.g. from "assign to all"), as the main window unmixes it.
 
     An unstained sample without an assignment needs a stand-in, so that it
