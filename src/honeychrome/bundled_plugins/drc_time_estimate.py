@@ -495,7 +495,7 @@ def clustering_probe_fn(algo: str, params: dict) -> Callable[[np.ndarray], dict]
                 min_cluster_size=min(params['min_cluster_size'], limit),
                 min_samples=min(params['min_samples'], limit) or None,
                 cluster_selection_epsilon=params['cluster_selection_epsilon'],
-                core_dist_n_jobs=-1, prediction_data=True).fit(data))])
+                core_dist_n_jobs=max(1, (os.cpu_count() or 2) - 1), prediction_data=True).fit(data))])
     else:
         raise ValueError(f"Unknown clustering algorithm: {algo}")
     return probe

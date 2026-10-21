@@ -70,6 +70,9 @@ class ImportFCSController(QObject):
         # connect
         self.experiment = experiment
         self.bus = bus
+        # (message, is_warning) once the experiment has been reconfigured: the
+        # import dialog asks for the reload after this thread has ended, then shows it
+        self.reload_message = None
 
     def reconfigure_experiment_from_fcs_files(self):
         """Reconfigure on the calling thread (scripts). The app runs
@@ -535,12 +538,7 @@ class ImportFCSController(QObject):
                     if notes:
                         text = '\n\n'.join(notes) + '\n\n' + text
                     logger.info(text)
-                    if self.bus:
-                        self.bus.reloadExpRequested.emit()
-                        if notes:
-                            self.bus.warningMessage.emit(text)
-                        else:
-                            self.bus.popupMessage.emit(text)
+                    self.reload_message = (text, bool(notes))
                 else:
                     text = ('Cannot set up the experiment file: \n'
                             'the FCS files supplied do not have a consistent set of channels (channel names and ranges). \n'

@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt, QModelIndex, QTimer, QThread, Slot, QObject, QEve
 from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QStyledItemDelegate, QComboBox, QLineEdit, QMessageBox, QHeaderView, QLabel, QWidget, QCheckBox, QMenu, QInputDialog)
 
 from honeychrome.controller_components.functions import raw_gates_list, resolve_base_gate
+from honeychrome.controller_components.job_gate import acquire_job
 from honeychrome.controller_components.spectral_controller import (
     SpectralAutoGenerator, ProfileUpdater, SpectralCleaner, LowEventLog, control_gating,
     CLEANED_RESULT_KEYS, cleaned_result_matches, background_check_summary,
@@ -308,6 +309,7 @@ class SpectralControlsEditor(QFrame):
         self.bus.spectralModelUpdated.connect(self._sort_model_by_gate_channel)
         self._autogenerate_state = None  # set while auto-generation is holding warnings for one dialog
         self._autoclean_warnings = None  # auto-generation warnings carried into the Clean Controls dialog
+        self._job_token = None  # hold on the job gate for auto generate / Clean Controls / recalculation
         self.bus.spectralProcessRefreshed.connect(self._on_autogenerate_refreshed)
         self.bus.spectralControlAdded.connect(self.view.resizeToFit) #extends the table as autogeneration runs... looks interesting but a bit wonky
         self.bus.sampleTreeUpdated.connect(self.refresh_comboboxes) # check for changes to unstained samples
@@ -1075,7 +1077,22 @@ class SpectralControlsEditor(QFrame):
             self.bus.spectralModelUpdated.emit() #spectral model already scrubbed at this point - this will clear unmixing matrix
             self.bus.showSelectedProfiles.emit(None)
 
+    def _take_job(self, label: str) -> bool:
+        """Hold the job gate for *label*, or keep holding it under *label* within a chain."""
+        if self._job_token is not None and self._job_token.held:
+            self._job_token.hand_over(label)
+            return True
+        self._job_token = acquire_job(self.controller, label)
+        return self._job_token is not None
+
+    def _release_job(self):
+        token, self._job_token = self._job_token, None
+        if token is not None:
+            token.release()
+
     def auto_generate(self):
+        if not self._take_job('Auto generate spectral controls'):
+            return
         # labels and antigens to restore on the regenerated controls
         previous_controls = [
             {key: control.get(key) for key in ('label', 'antigen', 'sample_path', 'sample_name')}
@@ -1088,6 +1105,7 @@ class SpectralControlsEditor(QFrame):
             if reply == QMessageBox.Yes:
                 self.model.delete_rows_by_indices(list(range(len(self.model._data))))
             else:
+                self._release_job()
                 return
 
         # then if the user has samples but no single stain controls, ask if channel assignment is desired
@@ -1101,6 +1119,7 @@ class SpectralControlsEditor(QFrame):
                                              QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.Yes:
                     self.auto_conventional()
+                self._release_job()
                 return
 
             # then if the user has no samples at all, just warn
@@ -1110,6 +1129,7 @@ class SpectralControlsEditor(QFrame):
                                              'single stain controls in experiment configuration. '
                                              '\n\nAlternatively, you can add controls from the spectral library (if previously added) '
                                              'or assign channels (for conventional cytometry).')
+                self._release_job()
                 return
 
         # continue into Clean Controls, with one spectral process refresh at the end
@@ -1203,6 +1223,7 @@ class SpectralControlsEditor(QFrame):
             QTimer.singleShot(100, self._release_autogenerate_warnings)
             return
         self._autogenerate_state = None
+        self._release_job()
         messages = self.controller.warning_collector or []
         self.controller.warning_collector = None
         if messages and self.bus:
@@ -1764,6 +1785,14 @@ class SpectralControlsEditor(QFrame):
 
     @Slot()
     def _on_force_recalc(self):
+        if not self._take_job('Recalculate spectral process'):
+            return
+        try:
+            self._force_recalc()
+        finally:
+            self._release_job()
+
+    def _force_recalc(self):
         self.setEnabled(False)
         self.profile_updater.flush()  # remove profiles that are not in the model
         # Warnings from the profiles and the spectral process refresh are shown
@@ -1840,6 +1869,9 @@ class SpectralControlsEditor(QFrame):
                 self.bus.statusMessage.emit(
                     'Clean Controls needs an unstained cell sample as the negative reference — none found.'
                 )
+            self._release_job()
+            return
+        if not self._take_job('Clean Controls'):
             return
 
         self.setEnabled(False)
@@ -1889,6 +1921,9 @@ class SpectralControlsEditor(QFrame):
         self._recalc_worker.finished.connect(self._recalc_thread.quit)
         self._recalc_thread.finished.connect(self._recalc_thread.deleteLater)
         self._recalc_thread.finished.connect(self._on_recalc_finished)
+        self._recalc_thread.finished.connect(self._release_job)  # after _on_recalc_finished, also if it raised
+        if self._job_token is not None:
+            self._job_token.hand_over('Recalculate spectral process')
         self._recalc_thread.start()
 
     @Slot()

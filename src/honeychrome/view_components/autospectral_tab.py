@@ -65,6 +65,7 @@ from honeychrome.controller_components.spread_model import (
     compute_spread_entry,
 )
 from honeychrome.controller_components.transform import Transform
+from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
 from honeychrome.controller_components.sample_loader import resolve_af_for_profiles
 from honeychrome.controller_components.particle_type import (
     is_bead_sample, scatter_channel_pair, scatter_ceilings,
@@ -837,9 +838,11 @@ class AutofluorescencePage(QWidget):
 
         self._train_thread = None
         self._train_worker = None
+        self._train_token = None
         self._auto_thread = None
         self._auto_worker = None
         self._auto_running = False
+        self._auto_token = None
         self._cmp_thread = None
         self._cmp_worker = None
         self._cmp_running = False
@@ -921,6 +924,7 @@ class AutofluorescencePage(QWidget):
         self._extract_btn = QPushButton('Extract AF Profile')
         self._extract_btn.clicked.connect(self._run_extraction)
         layout.addRow(self._extract_btn)
+        guard_while_busy(self.controller, self._extract_btn)
 
         self._extract_status = QLabel('')
         layout.addRow(self._extract_status)
@@ -974,6 +978,8 @@ class AutofluorescencePage(QWidget):
         self._delete_btn.clicked.connect(self._delete_selected_profile)
         self._delete_btn.setEnabled(False)
         btn_row.addWidget(self._delete_btn)
+        # profiles and their assignment decide the unmixing: not changed under a running job
+        guard_while_busy(self.controller, load_btn, self._delete_btn)
 
         layout.addLayout(btn_row)
         parent_layout.addWidget(grp)
@@ -1105,6 +1111,8 @@ class AutofluorescencePage(QWidget):
         clear_all_btn.setToolTip('Remove all AF assignments for all samples.')
         clear_all_btn.clicked.connect(self._clear_all_af)
         btn_row.addWidget(clear_all_btn)
+        guard_while_busy(self.controller, self._assign_table, self._folder_combo, self._assign_folder_btn,
+                         self._auto_assign_btn, assign_all_btn, clear_sample_btn, clear_all_btn)
 
         layout.addLayout(btn_row)
         parent_layout.addWidget(grp)
@@ -1288,16 +1296,23 @@ class AutofluorescencePage(QWidget):
                 "Please remove these controls from the Spectral Process table before proceeding."
             )
             return
-        
+
+        token = acquire_job(self.controller, 'AutoSpectral: AF extraction')
+        if token is None:
+            self._extract_status.setText(self.controller.job_gate.busy_text())
+            return
+        self._train_token = token
         try:
             full_path = str(self.controller.experiment_dir / sample_path)
             sample = sample_from_fcs(full_path, self.bus)
             raw_event_data = sample.get_events(source='raw')
         except Exception as e:
+            token.release()
             self._extract_status.setText(f'Failed to load sample: {e}')
             return
 
         if raw_event_data is None or raw_event_data.shape[0] == 0:
+            token.release()
             self._extract_status.setText('Sample has no events.')
             return
 
@@ -1308,6 +1323,7 @@ class AutofluorescencePage(QWidget):
 
         fluor_spectra = self._build_fluor_spectra()
         if fluor_spectra is None:
+            token.release()
             self._extract_status.setText(
                 'Fluorophore profiles not found — ensure the spectral model is complete.'
             )
@@ -1341,6 +1357,7 @@ class AutofluorescencePage(QWidget):
         self._train_thread.start()
 
     def _on_extraction_finished(self, result: dict):
+        self._train_token.release()
         # Read source_fcs_path from the worker object (set before thread started)
         source_fcs_path = self._train_worker.source_fcs_path
         self._extract_btn.setEnabled(True)
@@ -1412,6 +1429,7 @@ class AutofluorescencePage(QWidget):
             )
 
     def _on_extraction_error(self, msg: str):
+        self._train_token.release()
         self._extract_btn.setEnabled(True)
         self._extract_status.setText(f'Error: {msg}')
         logger.error(f'AutoSpectral extraction error: {msg}')
@@ -1562,6 +1580,10 @@ class AutofluorescencePage(QWidget):
         if row is None:
             return
         event.accept()
+        gate = getattr(self.controller, 'job_gate', None)
+        if gate is not None and gate.is_held():
+            self._extract_status.setText(f'{gate.busy_text()}: AF spectra cannot be deleted until it has finished.')
+            return
         name = item.text()
         curve = self._profile_curves[row] if row < len(self._profile_curves) else None
         old_pen = curve.opts['pen'] if curve is not None else None
@@ -2069,6 +2091,11 @@ class AutofluorescencePage(QWidget):
                 'The forward and side scatter channels could not be identified.'
             )
             return
+        token = acquire_job(self.controller, 'AutoSpectral: AF auto-assign')
+        if token is None:
+            self._assign_status.setText(self.controller.job_gate.busy_text())
+            return
+        self._auto_token = token
 
         self._auto_running = True
         self._auto_assign_btn.setEnabled(False)
@@ -2089,6 +2116,7 @@ class AutofluorescencePage(QWidget):
         self._auto_thread.start()
 
     def _on_auto_assign_error(self, msg: str):
+        self._auto_token.release()
         self._auto_running = False
         self._auto_assign_btn.setEnabled(True)
         self._assign_status.setText(f'Auto-assign failed: {msg}')
@@ -2097,6 +2125,7 @@ class AutofluorescencePage(QWidget):
         """Apply the suggestions to samples still unassigned, then ask for a review."""
         from PySide6.QtWidgets import QMessageBox
 
+        self._auto_token.release()
         self._auto_running = False
         self._auto_assign_btn.setEnabled(True)
         samples = self.controller.experiment.samples
@@ -2222,6 +2251,9 @@ class AutofluorescencePage(QWidget):
             self._cmp_status.setText(
                 'Comparison already running — please wait.'
             )
+            return
+        if wait_if_busy(self.controller, ('AutoSpectral comparison', id(self)),
+                        lambda: self.is_active() and self._run_comparison(), self._cmp_status.setText):
             return
 
         if self.controller.raw_event_data is None:

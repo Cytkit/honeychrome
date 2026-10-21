@@ -513,14 +513,14 @@ def _run_to_done(run, timeout_ms=60_000):
     assert done, 'run did not finish'
 
 
-def _run_with_answer(tmp_path, answer, probe=True):
+def _run_with_answer(tmp_path, answer, probe=True, job_gate=None):
     controller = _three_af_samples(tmp_path, (2000, 3000, 4000))
     layout = jue.build_export_layout(controller)
     exporter = jue.JointUnmixExporter([syn.AF_SAMPLE, EXTRA_SAMPLE_2, EXTRA_SAMPLE_3],
                                       layout, _ols_unmix_fn(layout))
     probed = []
     probe_fn = (lambda raw_fl, af: probed.append(len(raw_fl))) if probe else None
-    run = jue.JointUnmixRun(exporter, probe_fn=probe_fn)
+    run = jue.JointUnmixRun(exporter, probe_fn=probe_fn, job_gate=job_gate)
     asked = []
     run._confirm = lambda text: (asked.append(text), answer)[1]
     outcome = []
@@ -547,6 +547,28 @@ def test_run_confirmed_at_the_prompt_exports_every_sample(tmp_path):
     assert outcome == ['finished']
     for key in (syn.AF_SAMPLE, EXTRA_SAMPLE_2, EXTRA_SAMPLE_3):
         assert syn.exported_path(tmp_path, key).exists()
+
+
+@pytest.mark.ui
+def test_run_holds_the_job_gate_and_releases_it(tmp_path):
+    from honeychrome.controller_components.job_gate import JobGate
+    gate = JobGate()
+    holders = []
+    gate.changed.connect(lambda: holders.append(gate.holder and gate.holder[0]))
+    asked, probed, outcome = _run_with_answer(tmp_path, answer=True, job_gate=gate)
+    assert outcome == ['finished'] and holders == ['Export unmixed samples', None]
+
+
+@pytest.mark.ui
+def test_run_refused_while_the_job_gate_is_held(tmp_path):
+    from honeychrome.controller_components.job_gate import JobGate
+    gate = JobGate()
+    token = gate.try_acquire('Honeycluster: UMAP training')
+    asked, probed, outcome = _run_with_answer(tmp_path, answer=True, job_gate=gate)
+    assert outcome == ['cancelled'] and not asked and not probed
+    assert gate.holder[0] == 'Honeycluster: UMAP training'
+    assert not (tmp_path / 'Unmixed').exists()
+    token.release()
 
 
 @pytest.mark.ui

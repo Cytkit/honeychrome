@@ -40,6 +40,7 @@ from honeychrome.controller_components import spectral_correction as sc
 from honeychrome.controller_components import unmix_method
 from honeychrome.controller_components.cytometer_whitelist import get_detector_laser_map, LASER_LABEL_COLORS
 from honeychrome.controller_components.functions import resolve_base_gate
+from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
 from honeychrome.controller_components.gls_unmix import fluor_names_and_spectra, noise_in_use, spectra_fingerprint
 from honeychrome.controller_components.particle_type import scatter_ceilings, scatter_channel_pair
 from honeychrome.controller_components.sample_loader import af_profile_names, resolve_af_for_profiles
@@ -168,6 +169,7 @@ class SpectralCorrectionPage(QWidget):
         self._match_thread = None
         self._match_worker = None
         self._fix_thread = None
+        self._job_token = None
         self._fix_worker = None
         self._cmp_thread = None
         self._cmp_worker = None
@@ -338,6 +340,10 @@ class SpectralCorrectionPage(QWidget):
             'method, in the main window, exports, Honeycluster, the gating plugins and Statistics.')
         self._use_check.toggled.connect(self._on_use_toggled)
         layout.addWidget(self._use_check)
+        # corrections decide the unmixing: not changed under a running job
+        guard_while_busy(self.controller, self._match_btn, self._fix_btn, self._use_check)
+        if getattr(self.controller, 'job_gate', None) is not None:
+            self.controller.job_gate.changed.connect(self._on_job_gate_changed)
 
         parent_layout.addWidget(grp)
 
@@ -407,6 +413,7 @@ class SpectralCorrectionPage(QWidget):
         layout.addWidget(self._result_summary)
 
         self._table = QTableWidget(0, len(TABLE_HEADERS))
+        guard_while_busy(self.controller, self._table)   # Active ticks
         self._table.setHorizontalHeaderLabels(TABLE_HEADERS)
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionMode(QAbstractItemView.NoSelection)
@@ -743,6 +750,12 @@ class SpectralCorrectionPage(QWidget):
                      'spectra feed it. Fix Unmix itself reads per-cell AF without the positivity prior.')
         self._summary.setText('<br>'.join(lines))
 
+    def _on_job_gate_changed(self):
+        """Availability of the Use tick and the run buttons again once the job gate is free."""
+        if not self.controller.job_gate.is_held():
+            self._refresh_use_check()
+            self._set_running(self._busy())
+
     def _refresh_use_check(self, *_args):
         if not self._available():
             return
@@ -773,6 +786,22 @@ class SpectralCorrectionPage(QWidget):
     def _busy(self) -> bool:
         return self._match_thread is not None or self._fix_thread is not None
 
+    def _take_job(self, label: str) -> bool:
+        """Hold the job gate for *label*, or keep holding it under *label* (match, then Fix Unmix)."""
+        if self._job_token is not None and self._job_token.held:
+            self._job_token.hand_over(label)
+            return True
+        self._job_token = acquire_job(self.controller, label)
+        if self._job_token is None:
+            self._fix_status.setText(self.controller.job_gate.busy_text())
+            return False
+        return True
+
+    def _release_job(self):
+        token, self._job_token = self._job_token, None
+        if token is not None:
+            token.release()
+
     def _set_running(self, running: bool):
         self._fix_btn.setEnabled(not running and bool(self._groups()))
         self._match_btn.setEnabled(not running)
@@ -792,6 +821,8 @@ class SpectralCorrectionPage(QWidget):
         if pair is None or not references:
             self._fix_status.setText('No unstained cell sample or scatter channels to match by: choose each '
                                      'group\'s unstained sample.')
+            return
+        if not self._take_job('AutoSpectral: Fix Unmix' if then_fix else 'AutoSpectral: match unstained'):
             return
         self._run_after_match = then_fix
         job = {'experiment_dir': str(c.experiment_dir), 'groups': groups, 'references': references,
@@ -831,6 +862,8 @@ class SpectralCorrectionPage(QWidget):
         if self._fix_after_match:
             self._fix_after_match = False
             self._start_fix()
+        else:
+            self._release_job()
 
     def _resolved_unstained(self) -> dict | None:
         """{group: unstained path}, or None when a group on Auto has no scatter match yet."""
@@ -858,12 +891,16 @@ class SpectralCorrectionPage(QWidget):
             return
         unstained = self._resolved_unstained()
         if unstained is None:
+            self._release_job()
             self._fix_status.setText('Choose an unstained sample for every group.')
+            return
+        if not self._take_job('AutoSpectral: Fix Unmix'):
             return
         self._save_setup()
         try:
             snap = sc.correction_snapshot(self.controller, self._current_setup(), unstained)
         except Exception as e:
+            self._release_job()
             self._fix_status.setText(f'Error: {e}')
             return
         self._set_running(True)
@@ -873,6 +910,7 @@ class SpectralCorrectionPage(QWidget):
                                          self._on_fix_thread_finished, self._fix_status.setText)
 
     def _on_fix_finished(self, run: dict):
+        self._release_job()
         process = self._process()
         names, spectra = fluor_names_and_spectra(self.controller)
         if spectra is None or run['base_fingerprint'] != spectra_fingerprint(names, spectra):
@@ -890,9 +928,11 @@ class SpectralCorrectionPage(QWidget):
         self._refresh_comparison_if_active()
 
     def _on_fix_error(self, msg: str):
+        self._release_job()
         self._fix_status.setText(f'Error: {msg}')
 
     def _on_fix_thread_finished(self):
+        self._release_job()
         self._fix_thread = None
         self._fix_worker = None
         self._set_running(False)
@@ -1098,6 +1138,9 @@ class SpectralCorrectionPage(QWidget):
     def _run_comparison(self):
         if self._cmp_running:
             self._cmp_status.setText('Comparison already running — please wait.')
+            return
+        if wait_if_busy(self.controller, ('AutoSpectral comparison', id(self)),
+                        lambda: self.is_active() and self._run_comparison(), self._cmp_status.setText):
             return
         c = self.controller
         if c.raw_event_data is None:

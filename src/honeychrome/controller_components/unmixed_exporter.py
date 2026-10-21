@@ -202,6 +202,17 @@ class UnmixedExporter(QObject):
                 'method': unmix_method.method_label(state.method, state.prior_lambda)}
 
     def run(self):
+        """Export every selected sample; ``finished`` is emitted on every path, failures included."""
+        try:
+            self._export_all()
+        except Exception as e:
+            logger.exception('UnmixedExporter: export failed')
+            if self.bus:
+                self.bus.progress.emit(0, 0)
+                self.bus.warningMessage.emit(f'Export failed: {e}')
+            self.finished.emit()
+
+    def _export_all(self):
         all_samples = self.controller.experiment.samples['all_samples']
         samples_to_calculate, folder_abs, raw_subdir_abs, sample_key_to_abs = self._sample_selection()
 

@@ -15,6 +15,7 @@ from honeychrome.settings import (colourmap_choice, graphics_export_formats, his
                       heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral,
                       spectral_cleaning_refine, auto_clean_controls, unmixing_cache_gb)
 import honeychrome.settings as settings
+from honeychrome.controller_components.job_gate import guard_while_busy
 
 
 import numpy as np
@@ -156,12 +157,13 @@ def colormap_to_qimage(cmap_name, width=256, height=20):
 
 
 class AppConfigDialog(QDialog):
-    def __init__(self, parent=None, bus=None):
+    def __init__(self, parent=None, bus=None, controller=None):
         super().__init__(parent)
         self.setWindowTitle("Application Configuration")
         self.resize(1000, 700)
         self.settings = QSettings("honeychrome", "app_configuration")
         self.bus = bus
+        self.controller = controller
 
         main_layout = QVBoxLayout(self)
 
@@ -327,6 +329,8 @@ class AppConfigDialog(QDialog):
         buttons.accepted.connect(self.handle_accept)
         buttons.rejected.connect(self.reject)
         buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(self.reset_to_defaults)
+        # OK reloads the experiment, which waits for a running heavy job
+        guard_while_busy(controller, buttons.button(QDialogButtonBox.Ok))
         main_layout.addWidget(buttons, alignment=Qt.AlignRight)
 
         # Load settings on start
@@ -426,6 +430,9 @@ class AppConfigDialog(QDialog):
                 self.settings.setValue(f"EnablePlugin_{file_path}", self.enable_plugin[file_path].isChecked())
 
     def handle_accept(self):
+        gate = getattr(self.controller, 'job_gate', None)
+        if gate is not None and gate.is_held():
+            return
         self.save_settings()
         self.accept()
         importlib.reload(settings)

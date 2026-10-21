@@ -152,6 +152,7 @@ from honeychrome.controller_components.functions import (
 from honeychrome.controller_components.sample_loader import (
     sample_key_for_path, snapshot_unmix_state,
 )
+from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
 from honeychrome.controller_components.particle_type import is_bead_sample
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.transform import Transform
@@ -1791,10 +1792,10 @@ class ConfigTab(QWidget):
         umap_grid.addWidget(QLabel("n_jobs:"), 2, 0)
         self.umap_n_jobs = QSpinBox()
         self.umap_n_jobs.setRange(-1, _os.cpu_count() or 1)
-        self.umap_n_jobs.setValue(-1)
+        self.umap_n_jobs.setValue(max(1, (_os.cpu_count() or 2) - 1))
         self.umap_n_jobs.setSpecialValueText('all cores')
         self.umap_n_jobs.setToolTip(
-            "-1 = use all available cores.  Default: all cores.\n"
+            "-1 = use all available cores.  Default: all cores but one.\n"
             "UMAP disables real multi-threading whenever a fixed random seed\n"
             "is set (needed for reproducible runs).\n"
             "Setting this above 1 drops the fixed seed for THIS run, so the\n"
@@ -1833,9 +1834,9 @@ class ConfigTab(QWidget):
         tsne_grid.addWidget(QLabel('n_jobs:'), 1, 0)
         self.tsne_n_jobs = QSpinBox()
         self.tsne_n_jobs.setRange(-1, 64)
-        self.tsne_n_jobs.setValue(-1)
+        self.tsne_n_jobs.setValue(max(1, (_os.cpu_count() or 2) - 1))
         self.tsne_n_jobs.setSpecialValueText('all cores')
-        self.tsne_n_jobs.setToolTip('-1 = use all available cores.  Default: -1')
+        self.tsne_n_jobs.setToolTip('-1 = use all available cores.  Default: all cores but one')
         tsne_grid.addWidget(self.tsne_n_jobs, 1, 1)
 
         dr_layout.addWidget(self._tsne_params)
@@ -5258,6 +5259,11 @@ class GroupsStatsTab(QWidget):
             self.results_computed.emit()
             return
 
+        token = acquire_job(self.controller, 'Honeycluster: statistics')
+        if token is None:
+            self.stats_status_label.setText(self.controller.job_gate.busy_text())
+            self.stats_status_label.setStyleSheet("color: orange;")
+            return
         self._set_stats_busy(True)
         self.stats_status_label.setText("⏳ Computing statistics …")
         self.stats_status_label.setStyleSheet("color: orange;")
@@ -5342,6 +5348,7 @@ class GroupsStatsTab(QWidget):
                              fdr_scope, adjust_covariates, use_treat, mfi_threshold,
                              mfi_hierarchical, stats_state)
         worker.progress.connect(lambda msg: print(f"[DR Stats] {msg}"))
+        worker.job_token = token
         worker.finished.connect(
             lambda success, err, key=data_key, w=worker:
                 self._on_stats_finished(success, err, key, w)
@@ -5526,6 +5533,13 @@ class GroupsStatsTab(QWidget):
                 "Run Statistics to update."
             )
             self.stats_status_label.setStyleSheet("color: orange;")
+
+    def on_job_gate_changed(self):
+        """Re-apply the availability rules of the run buttons once the job gate is free."""
+        gate = self.controller.job_gate
+        if not gate.is_held():
+            self._update_run_button()
+            self._refresh_predictive_controls()
 
     def _analysis_busy(self) -> bool:
         """True while a statistics or predictive-analysis job is running."""
@@ -6021,6 +6035,7 @@ class GroupsStatsTab(QWidget):
         # finish before the last reference to it is dropped.
         if worker is not None:
             worker.wait()
+            worker.job_token.release()
         if worker is None or self._stats_worker is worker:
             self._stats_worker = None
         self._set_stats_busy(False)
@@ -6111,6 +6126,11 @@ class GroupsStatsTab(QWidget):
         )
         repeats = self.pred_repeats_spin.value()
         run_label = self.state.stats_run_label or 'Active (unsaved)'
+        token = acquire_job(self.controller, 'Honeycluster: predictive analysis')
+        if token is None:
+            self.pred_status_label.setText(self.controller.job_gate.busy_text())
+            self.pred_status_label.setStyleSheet("color: orange;")
+            return
 
         class _PredictiveWorker(QThread):
             finished = Signal(bool, str)
@@ -6133,6 +6153,7 @@ class GroupsStatsTab(QWidget):
                     self_.finished.emit(False, str(exc))
 
         worker = _PredictiveWorker()
+        worker.job_token = token
         worker.progress.connect(self.pred_status_label.setText)
         worker.finished.connect(
             lambda ok, err, w=worker, st=status, msg=message:
@@ -6151,6 +6172,7 @@ class GroupsStatsTab(QWidget):
         # The signal is emitted from inside run(); wait() lets the thread
         # finish before the last reference to it is dropped.
         worker.wait()
+        worker.job_token.release()
         if self._predictive_worker is worker:
             self._predictive_worker = None
         self._set_cursor_busy('predictive', False)
@@ -9154,6 +9176,9 @@ class PlotCard(QFrame):
         memory-corruption hazard, not just a stale-data one)."""
         if self._marker_worker is not None:
             return   # already loading; its finish will re-trigger refresh()
+        if wait_if_busy(self.controller, ('Honeycluster marker values', id(self)), self.refresh,
+                        self._show_placeholder):
+            return
         af_state = drc_pipeline.snapshot_af_state(self.controller)
         worker = _MarkerValuesWorker(self.controller, self.state, samples, af_state)
         worker.finished.connect(
@@ -12214,6 +12239,10 @@ class ClusterAnnotationTab(QWidget):
             )
             return
 
+        token = acquire_job(self.controller, 'Honeycluster: Cluster ID')
+        if token is None:
+            self._suggestions_status.setText(self.controller.job_gate.busy_text())
+            return
         total_steps = drc_cluster_id.total_progress_steps(cl_run)
         self._suggestions_progress.setRange(0, total_steps)
         self._suggestions_progress.setValue(0)
@@ -12276,6 +12305,7 @@ class ClusterAnnotationTab(QWidget):
 
         worker = _ClusterIdWorker(cl_run, channels, mem_threshold, species, af_state,
                                    unstained_af_states)
+        worker.finished.connect(lambda *_: token.release())
         worker.progress.connect(self._suggestions_progress.setValue)
         worker.finished.connect(
             lambda success, err, result, run_id=cl_run.get('run_id'), n_channels=len(channels):
@@ -12399,6 +12429,9 @@ class ClusterAnnotationTab(QWidget):
             )
             return
         cluster_order = sorted(cl for cl in cl_run.get('colors', {}) if cl >= 0)
+        if wait_if_busy(self.controller, ('Honeycluster marker summary', id(self)),
+                        self._recompute_marker_summary, self._show_marker_summary_placeholder):
+            return
 
         # Pooling (disk I/O + unmixing) and figure construction
         # can take a while for large runs; both now happen on a
@@ -13108,6 +13141,9 @@ class PluginWidget(QWidget):
         # Cancelled workers (DR, clustering, run-time estimates) still
         # finishing an uninterruptible step; kept referenced until they end.
         self._detached_workers: list = []
+        # Holds on the application's job gate for a DR or clustering run,
+        # from before its time estimate until it ends
+        self._run_tokens: dict = {}
 
         # QSettings instance — keyed per experiment in save_state/load_state
         self._qsettings = QSettings('honeychrome', _SETTINGS_APP_KEY)
@@ -13194,6 +13230,14 @@ class PluginWidget(QWidget):
         # Result figures are built on a worker thread; list them in the
         # report once they exist if it is the tab being shown.
         self.groups_stats_tab.results_drawn.connect(self._refresh_report_if_shown)
+
+        # Run buttons greyed out while another heavy job runs in the application
+        guard_while_busy(controller, self.config_tab.dr_run_btn, self.config_tab.dr_apply_btn,
+                         self.config_tab.cl_run_btn, self.groups_stats_tab.run_stats_btn,
+                         self.groups_stats_tab.pred_run_btn,
+                         self.cluster_annotation_tab.compute_suggestions_btn)
+        if getattr(controller, 'job_gate', None) is not None:
+            controller.job_gate.changed.connect(self.groups_stats_tab.on_job_gate_changed)
 
         self.inner_tabs.addTab(self.transform_tab,    "Transforms",    'wave-sine')
         self.inner_tabs.addTab(self.config_tab,       "Configuration", 'settings')
@@ -14852,6 +14896,7 @@ class PluginWidget(QWidget):
         confirms, shorter ones start immediately.
         """
         if self._estimate_worker is not None:
+            self._release_run_token(kind)
             QMessageBox.information(self, "Estimating Run Time",
                                     "A run time estimate is already in progress.")
             return
@@ -14884,8 +14929,23 @@ class PluginWidget(QWidget):
         self._detached_workers.append(worker)
         self._estimate_worker = None
         self._set_estimating(kind, False)
+        self._release_run_token(kind)
         self.progress_message("Run cancelled before it started.")
         return True
+
+    def _acquire_run_token(self, kind: str, label: str) -> bool:
+        """Take the job gate for a 'dr' or 'cl' run; False (busy shown) when another job holds it."""
+        token = acquire_job(self.controller, label)
+        if token is None:
+            self.progress_message(self.controller.job_gate.busy_text())
+            return False
+        self._run_tokens[kind] = token
+        return True
+
+    def _release_run_token(self, kind: str):
+        token = self._run_tokens.pop(kind, None)
+        if token is not None:
+            token.release()
 
     def _on_run_estimated(self, estimate, proceed, worker=None):
         """Main thread: start the run, or ask first when it was timed."""
@@ -14918,6 +14978,7 @@ class PluginWidget(QWidget):
             proceed()
         else:
             self._set_estimating(estimate.kind, False)
+            self._release_run_token(estimate.kind)
             self.progress_message(
                 f"{drc_time_estimate.KIND_LABELS[estimate.kind]} cancelled.")
 
@@ -15178,6 +15239,8 @@ class PluginWidget(QWidget):
             QMessageBox.warning(self, "No Gate",
                                 "Select a gate in the Configuration tab.")
             return
+        if not self._acquire_run_token('dr', f'Honeycluster: {algo} training'):
+            return
 
         self._confirm_large_run(
             'dr', algo, params, lambda: self._start_dr_training(algo, params))
@@ -15190,13 +15253,20 @@ class PluginWidget(QWidget):
         # Snapshot AF/transfer-matrix state on the main thread before the
         # worker starts — see apply_unmixing_af_aware() docstring.
         af_state = drc_pipeline.snapshot_af_state(self.controller)
+        # The unmixing and gating the run is made with, for its archive entry
+        fingerprints = (
+            drc_pipeline.sync_fingerprint(self.controller, self.state.selected_gates,
+                                          self.state.training_sample_ids),
+            drc_pipeline.split_fingerprints(self.controller, self.state.selected_gates,
+                                            self.state.training_sample_ids))
 
         worker = _DrWorker('train', self, algo, params, training_only=True, af_state=af_state)
         worker.progress.connect(self.progress_message)
         worker.progress_value.connect(
             lambda cur, tot: self._on_dr_progress(cur, tot))
         worker.finished.connect(
-            lambda ok, err: self._on_dr_finished(algo, ok, err, task='train', params=params))
+            lambda ok, err: self._on_dr_finished(algo, ok, err, task='train', params=params,
+                                                 fingerprints=fingerprints))
         self._dr_worker = worker
         worker.start()
 
@@ -15219,6 +15289,8 @@ class PluginWidget(QWidget):
             QMessageBox.information(self, "DR Running",
                                     "A DR job is already running.  "
                                     "Click Cancel to stop it first.")
+            return
+        if not self._acquire_run_token('dr', f'Honeycluster: {algo} on all samples'):
             return
 
         self._set_dr_buttons_running(True)
@@ -15298,8 +15370,10 @@ class PluginWidget(QWidget):
         self.transform_tab.gate_tree.setEnabled(not self.config_tab.is_run_in_progress())
 
     def _on_dr_finished(self, algo: str, success: bool, error_msg: str,
-                        task: str = 'train', params: dict | None = None):
+                        task: str = 'train', params: dict | None = None,
+                        fingerprints: tuple | None = None):
         """Called on the main thread when the DR worker thread finishes."""
+        self._release_run_token('dr')
         self._set_dr_buttons_running(False)
         if success:
             if self.state.dr_status.get(algo) != 'done':
@@ -15307,7 +15381,7 @@ class PluginWidget(QWidget):
                 self.state.dr_status[algo] = 'done'
             if task == 'train':
                 self._dr_train_params[algo] = dict(params or {})
-                self._archive_dr_run(algo, params or {})
+                self._archive_dr_run(algo, params or {}, fingerprints)
             else:
                 self._update_archived_dr_run(algo)
             worker = self._dr_worker
@@ -15339,8 +15413,9 @@ class PluginWidget(QWidget):
             self.config_tab._refresh_cl_space_combo()
         self._dr_worker = None
 
-    def _archive_dr_run(self, algo: str, params: dict):
-        """Archive a freshly completed DR training run (§0.2)."""
+    def _archive_dr_run(self, algo: str, params: dict, fingerprints: tuple):
+        """Archive a freshly completed DR training run (§0.2), with the
+        (sync, split) fingerprints taken when it started."""
         reducer = self.state.trained_reducers.get(algo)
         embeddings = self.state.embeddings.get(algo, {})
         if reducer is None:
@@ -15358,13 +15433,9 @@ class PluginWidget(QWidget):
                 channels=channels,
                 params={**params, '_n_training_events': int(self.state.n_training_events)},
                 n_events=n_events,
-                sync_fingerprint=drc_pipeline.sync_fingerprint(
-                    self.controller, self.state.selected_gates,
-                    self.state.training_sample_ids),
+                sync_fingerprint=fingerprints[0],
                 event_rows=dict(self.state.embedding_rows.get(algo, {})),
-                split_fingerprints=drc_pipeline.split_fingerprints(
-                    self.controller, self.state.selected_gates,
-                    self.state.training_sample_ids),
+                split_fingerprints=fingerprints[1],
                 transform_params=self._run_transform_params(channels),
             )
         except Exception as e:
@@ -15435,12 +15506,15 @@ class PluginWidget(QWidget):
             QMessageBox.warning(self, "No Gate",
                                 "Select a gate in the Configuration tab.")
             return
+        if not self._acquire_run_token('cl', f'Honeycluster: {algo} clustering'):
+            return
 
         # Clustering in a DR space needs a usable embedding of every training
         # sample from a DR run that still exists.
         if params.get('_space') == 'dr':
             dr_algo = params.get('_dr_algo') or ''
             if not dr_algo:
+                self._release_run_token('cl')
                 QMessageBox.warning(
                     self, "No DR Embedding",
                     f"{algo} in DR space needs a PaCMAP, UMAP or tSNE embedding of "
@@ -15450,6 +15524,7 @@ class PluginWidget(QWidget):
                 return
             problem = self._dr_embedding_unusable(dr_algo)
             if problem:
+                self._release_run_token('cl')
                 QMessageBox.warning(
                     self, "DR Embedding Not Usable",
                     f"Cannot cluster on the {dr_algo} embedding:\n\n{problem}\n\n"
@@ -15473,6 +15548,7 @@ class PluginWidget(QWidget):
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
                 )
                 if reply != QMessageBox.Yes:
+                    self._release_run_token('cl')
                     return
 
         self._confirm_large_run(
@@ -15687,13 +15763,23 @@ class PluginWidget(QWidget):
 
         worker = _ClusterWorker(_do_cluster)
         worker.finished.connect(_on_cl_done)
+        token = self._run_tokens.get('cl')
+        if token is not None:
+            # after _on_cl_done, and also if it raised
+            worker.finished.connect(lambda _ok, _err: self._release_cl_token(token))
         self._cl_worker = worker
         if hasattr(self, 'config_tab'):
             self.config_tab.cl_cancel_btn.setEnabled(True)
         worker.start()
 
+    def _release_cl_token(self, token):
+        """Release *token* if it is still the clustering run's hold."""
+        if self._run_tokens.get('cl') is token:
+            self._release_run_token('cl')
+
     def _release_clustering_ui(self):
         """Unlock the clustering controls and hide its progress after a run ends."""
+        self._release_run_token('cl')
         if not hasattr(self, 'config_tab'):
             return
         ct = self.config_tab

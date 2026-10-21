@@ -38,6 +38,7 @@ from honeychrome.controller_components import noise_model as nm
 from honeychrome.controller_components import unmix_method
 from honeychrome.controller_components.autospectral_functions import apply_af_transfer
 from honeychrome.controller_components.functions import apply_transfer_matrix, resolve_base_gate
+from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
 from honeychrome.controller_components.particle_type import is_bead_sample
 from honeychrome.controller_components.plugin_loaders import bundled_plugins_path
 from honeychrome.controller_components.sample_loader import resolve_af_for_profiles
@@ -165,6 +166,7 @@ class NoisePage(QWidget):
         self._active_fn = active_fn
 
         self._fit_thread = None
+        self._fit_token = None
         self._fit_worker = None
         self._cmp_thread = None
         self._cmp_worker = None
@@ -315,6 +317,10 @@ class NoisePage(QWidget):
         self._clamped_check.toggled.connect(self._on_clamped_toggled)
         self._clamped_check.setVisible(False)
         layout.addWidget(self._clamped_check)
+        # the noise model's use and lambda decide the unmixing: not changed under a running job
+        guard_while_busy(self.controller, self._fit_btn, self._use_check, self._clamped_check, self._lambda_spin)
+        if getattr(self.controller, 'job_gate', None) is not None:
+            self.controller.job_gate.changed.connect(self._on_job_gate_changed)
 
         self._tables_toggle = QCheckBox('Show calibration and detector tables')
         layout.addWidget(self._tables_toggle)
@@ -417,6 +423,11 @@ class NoisePage(QWidget):
         self._refresh_summary()
         self._refresh_use_check()
         self._refresh_comparison_controls()
+
+    def _on_job_gate_changed(self):
+        """Availability of the Use ticks again once the job gate is free."""
+        if not self.controller.job_gate.is_held():
+            self._refresh_use_check()
 
     def _refresh_use_check(self):
         """The Use tick: enabled with a readable noise model, ticked while it is the experiment's method."""
@@ -606,6 +617,11 @@ class NoisePage(QWidget):
         except Exception as e:
             self._fit_status.setText(f'Error: {e}')
             return
+        token = acquire_job(self.controller, 'AutoSpectral: Model Noise')
+        if token is None:
+            self._fit_status.setText(self.controller.job_gate.busy_text())
+            return
+        self._fit_token = token
         self._fit_choice = (self._unstained_combo.currentData() or gu.AUTO, bead)
         self._fit_btn.setEnabled(False)
         self._fit_status.setText('Fitting the noise model...')
@@ -623,6 +639,7 @@ class NoisePage(QWidget):
         self._fit_thread.start()
 
     def _on_fit_finished(self, fit: gu.NoiseFit):
+        self._fit_token.release()
         c = self.controller
         try:
             gu.store_noise_fit(c.experiment.process, c.experiment_dir, fit, self._lambda_spin.value())
@@ -650,9 +667,11 @@ class NoisePage(QWidget):
             self._run_comparison()
 
     def _on_fit_error(self, msg: str):
+        self._fit_token.release()
         self._fit_status.setText(f'Error: {msg}')
 
     def _on_fit_thread_finished(self):
+        self._fit_token.release()
         self._fit_thread = None
         self._fit_worker = None
         self._fit_btn.setEnabled(True)
@@ -702,6 +721,9 @@ class NoisePage(QWidget):
     def _run_comparison(self):
         if self._cmp_running:
             self._cmp_status.setText('Comparison already running — please wait.')
+            return
+        if wait_if_busy(self.controller, ('AutoSpectral comparison', id(self)),
+                        lambda: self.is_active() and self._run_comparison(), self._cmp_status.setText):
             return
         c = self.controller
         if c.raw_event_data is None:

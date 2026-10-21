@@ -78,6 +78,7 @@ from PySide6.QtWidgets import (
 import honeychrome
 from honeychrome.settings import af_abundance_channel
 from honeychrome.controller_components import differential_stats as ds
+from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy
 from honeychrome.view_components import suggest_groupings_dialog as sgd
 from honeychrome.view_components.checkable_header import CheckableHeaderView
 from honeychrome.controller_components.functions import (
@@ -872,6 +873,7 @@ class RunTab(QWidget):
         run_row = QHBoxLayout()
         self.btn_run = QPushButton("Run Gating")
         self.btn_run.clicked.connect(self._on_run_clicked)
+        guard_while_busy(self.controller, self.btn_run)
         self.btn_pause = QPushButton("Pause")
         self.btn_pause.setEnabled(False)
         self.btn_pause.setToolTip("Stop after the sample being gated is dropped, keeping every "
@@ -1241,6 +1243,11 @@ class RunTab(QWidget):
             QMessageBox.warning(self, "Channels missing",
                                 "Gated channels not in this experiment: " + ", ".join(missing))
             return
+        token = acquire_job(self.controller, 'Automated Gating: gating')
+        if token is None:
+            self.lbl_status.setText(self.controller.job_gate.busy_text())
+            return
+        self._job_token = token
         markers = _marker_channels(self.controller)
         model_sha = st.model_sha
         saved_markers = st.marker_channels
@@ -1253,11 +1260,13 @@ class RunTab(QWidget):
             choice = self._ask_resume(len(st.summaries), len(st.pending_samples),
                                       fingerprint == st.run_fingerprint)
             if choice is None:
+                token.release()
                 return
             resume = choice == 'resume'
             if resume:
                 to_gate = [k for k in keys if k not in st.summaries]
                 if not to_gate:
+                    token.release()
                     st.pending_samples = []
                     self.lbl_status.setText("Every ticked sample is already gated.")
                     self.gating_finished.emit('done')
@@ -1265,6 +1274,7 @@ class RunTab(QWidget):
         try:
             snap = snapshot_unmix_state(self.controller, to_gate)
         except Exception as exc:
+            token.release()
             QMessageBox.warning(self, "Cannot gate", str(exc))
             return
         self._before_run = {name: (dict(getattr(st, name)) if isinstance(getattr(st, name), dict)
@@ -1340,6 +1350,7 @@ class RunTab(QWidget):
             return
         self._worker.abort()
         self._worker = None
+        self._job_token.release()
         self._before_run = None
         self._set_running(False)
         self.progress_bar.setVisible(False)
@@ -1362,6 +1373,7 @@ class RunTab(QWidget):
         what is left ('paused' and 'failed'), or put the results from before
         the run back ('cancelled')."""
         self._worker = None
+        self._job_token.release()
         self._set_running(False)
         self.progress_bar.setVisible(False)
         st = self.state

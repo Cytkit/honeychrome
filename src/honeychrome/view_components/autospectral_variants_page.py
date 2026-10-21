@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 from honeychrome.controller_components import gls_unmix as gu
 from honeychrome.controller_components import unmix_method
 from honeychrome.controller_components.functions import apply_transfer_matrix
+from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
 from honeychrome.controller_components.autospectral_functions import (
     build_af_precomputed, apply_af_unmixing,
 )
@@ -234,6 +235,7 @@ class SpectralVariantsPage(QWidget):
         self._qsettings = QSettings('honeychrome', 'app_configuration')
 
         self._setup_thread = None
+        self._setup_token = None
         self._setup_worker = None
 
         self._cmp_thread = None
@@ -530,8 +532,20 @@ class SpectralVariantsPage(QWidget):
         self._use_note.setWordWrap(True)
         self._use_note.setStyleSheet('color: #cc6600;')
         layout.addRow(self._use_note)
+        # the variants' use and kernel settings decide the unmixing: not changed under a running job
+        guard_while_busy(self.controller, self._setup_btn, self._use_check, self._n_passes_spin,
+                         self._n_af_passes_spin, self._refine_af_quantile_spin, self._cell_weight_check,
+                         self._noise_floor_spin, self._alpha_spin, self._collinear_threshold_spin,
+                         self._joint_pair_resolution_check)
+        if getattr(self.controller, 'job_gate', None) is not None:
+            self.controller.job_gate.changed.connect(self._on_job_gate_changed)
 
         parent_layout.addWidget(grp)
+
+    def _on_job_gate_changed(self):
+        """Availability of the Use tick again once the job gate is free."""
+        if not self.controller.job_gate.is_held():
+            self._refresh_use_check()
 
     def _refresh_use_check(self):
         """The Use tick: greyed while the noise model is in use (it takes precedence) or without variants."""
@@ -573,6 +587,11 @@ class SpectralVariantsPage(QWidget):
         if self._setup_thread is not None:
             self._setup_status.setText('Already computing — please wait.')
             return
+        token = acquire_job(self.controller, 'AutoSpectral: Compute Spectral Variants')
+        if token is None:
+            self._setup_status.setText(self.controller.job_gate.busy_text())
+            return
+        self._setup_token = token
 
         self._setup_btn.setEnabled(False)
         self._setup_status.setText('Computing spectral variants...')
@@ -604,6 +623,7 @@ class SpectralVariantsPage(QWidget):
             self.bus.progress.emit(n, total)
 
     def _on_setup_finished(self, results: dict, raw_pos_thresholds, unmixed_pos_thresholds):
+        self._setup_token.release()
         self.controller.autospectral_variants = results
         # Cached so the comparison and exports reuse these unstained-derived
         # thresholds instead of recomputing them from whichever stained sample
@@ -645,9 +665,11 @@ class SpectralVariantsPage(QWidget):
             self._method_changed()
 
     def _on_setup_error(self, msg: str):
+        self._setup_token.release()
         self._setup_status.setText(f'Error: {msg}')
 
     def _on_setup_thread_finished(self):
+        self._setup_token.release()
         self._setup_thread = None
         self._setup_worker = None
         self._setup_btn.setEnabled(True)
@@ -826,6 +848,9 @@ class SpectralVariantsPage(QWidget):
     def _run_comparison(self):
         if self._cmp_running:
             self._cmp_status.setText('Comparison already running — please wait.')
+            return
+        if wait_if_busy(self.controller, ('AutoSpectral comparison', id(self)),
+                        lambda: self.is_active() and self._run_comparison(), self._cmp_status.setText):
             return
         c = self.controller
         if c.raw_event_data is None:

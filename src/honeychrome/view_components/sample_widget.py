@@ -11,6 +11,7 @@ from pathvalidate import sanitize_filename
 from honeychrome.controller import base_directory
 from honeychrome.controller_components.exporter import ReportGenerator
 from honeychrome.controller_components.functions import get_all_subfolders_recursive
+from honeychrome.controller_components.job_gate import acquire_job
 from honeychrome.controller_components.particle_type import is_bead_sample, set_bead_sample
 from honeychrome.controller_components.unmixed_exporter import (
     ExportTimeEstimateWorker, UnmixedExporter, time_estimate_message,
@@ -305,6 +306,7 @@ class SampleWidget(QWidget):
         super().__init__(*args, **kwargs)
         self.bus = bus
         self.controller = controller
+        self._export_token = None  # hold on the job gate from the time estimate to the end of an export
 
         sample_toolbar = QToolBar("Sample Toolbar")
         sample_toolbar.setMovable(False)
@@ -417,8 +419,17 @@ class SampleWidget(QWidget):
 
     @Slot(str, bool)
     def start_export_thread(self, folder, subsample):
-        exporter = UnmixedExporter(folder, subsample, self.bus, self.controller)
-        if exporter.needs_time_probe():
+        token = acquire_job(self.controller, 'Export unmixed samples')
+        if token is None:
+            return
+        self._export_token = token
+        try:
+            exporter = UnmixedExporter(folder, subsample, self.bus, self.controller)
+            probe = exporter.needs_time_probe()
+        except Exception:
+            token.release()
+            raise
+        if probe:
             self._estimate_then_export(exporter)
         else:
             self._start_export(exporter)
@@ -426,6 +437,7 @@ class SampleWidget(QWidget):
     def _estimate_then_export(self, exporter):
         """Time the slow unmixing method on a probe, ask, then export."""
         if getattr(self, '_estimate_thread', None) is not None:
+            self._export_token.release()
             return
         if self.bus:
             self.bus.statusMessage.emit('Estimating unmixing time...')
@@ -457,8 +469,10 @@ class SampleWidget(QWidget):
                                      QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
         if reply == QMessageBox.Yes:
             self._start_export(exporter)
-        elif self.bus:
-            self.bus.statusMessage.emit('Export cancelled.')
+        else:
+            self._export_token.release()
+            if self.bus:
+                self.bus.statusMessage.emit('Export cancelled.')
 
     @Slot(str)
     def _on_export_estimate_error(self, msg):
@@ -468,6 +482,8 @@ class SampleWidget(QWidget):
                                      QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
         if reply == QMessageBox.Yes:
             self._start_export(exporter)
+        else:
+            self._export_token.release()
 
     def _start_export(self, exporter):
         self.thread = QThread()
@@ -477,7 +493,13 @@ class SampleWidget(QWidget):
         self.unmixed_exporter.finished.connect(self.thread.quit)
         self.unmixed_exporter.finished.connect(self.unmixed_exporter.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(self._on_export_thread_finished)
         self.thread.start()
+
+    @Slot()
+    def _on_export_thread_finished(self):
+        if self._export_token is not None:
+            self._export_token.release()
 
     def show_context_menu(self, position):
         # Get the index at the click position

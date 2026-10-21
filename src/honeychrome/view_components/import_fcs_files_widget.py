@@ -6,6 +6,7 @@ import sys
 
 from honeychrome.controller_components.functions import get_all_subfolders_recursive
 from honeychrome.controller_components.import_fcs_controller import ImportFCSController
+from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy
 from honeychrome.view_components.configuration_dialogs import ExperimentSettings
 from honeychrome.view_components.icon_loader import icon
 
@@ -19,6 +20,7 @@ class ImportFCSFilesWidget(QDialog):
 
         self.thread = None
         self.import_fcs_controller = None
+        self._job_token = None
 
         layout = QVBoxLayout(self)
 
@@ -99,10 +101,14 @@ class ImportFCSFilesWidget(QDialog):
         # Connections
         self.btn_cancel.clicked.connect(self.reject)
         self.btn_submit.clicked.connect(self.submit)
+        guard_while_busy(self.controller, self.btn_submit)
 
     def submit(self):
         if self.thread is not None:
             return  # one reconfiguration per dialog
+        self._job_token = acquire_job(self.controller, 'Import FCS files')
+        if self._job_token is None:
+            return
         self.btn_submit.setEnabled(False)
         self.btn_cancel.setEnabled(False)
         self.thread = QThread(QApplication.instance())  # survives the main window rebuild this import triggers
@@ -117,7 +123,13 @@ class ImportFCSFilesWidget(QDialog):
         self.thread.start()
 
     def _on_thread_finished(self):
+        self._job_token.release()
+        bus, result = self.bus, self.import_fcs_controller.reload_message
         self.accept()
+        if result is not None and bus is not None:
+            text, is_warning = result
+            bus.reloadExpRequested.emit()
+            (bus.warningMessage if is_warning else bus.popupMessage).emit(text)
 
     def open_samples_folder(self):
         QDesktopServices.openUrl(QUrl.fromLocalFile(self.controller.experiment_dir / self.controller.experiment.settings['raw']['raw_samples_subdirectory']))

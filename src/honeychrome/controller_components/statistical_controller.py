@@ -34,6 +34,17 @@ class StatisticsCalculator(QObject):
 
     @with_busy_cursor
     def run(self):
+        """Calculate every comparison; ``finished`` is emitted on every path, failures included."""
+        try:
+            self._calculate()
+        except Exception as e:
+            logger.exception('StatisticsCalculator: failed')
+            if self.bus:
+                self.bus.progress.emit(0, 0)
+                self.bus.statusMessage.emit(f'Statistics failed: {e}')
+            self.finished.emit()
+
+    def _calculate(self):
         all_samples = self.controller.experiment.samples['all_samples']
         experiment_statistics = self.controller.experiment.statistics
         sample_sets = [statistics_comparison['sample_set'] for statistics_comparison in experiment_statistics]

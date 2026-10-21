@@ -63,6 +63,7 @@ from honeychrome.controller_components.autospectral_functions import (
      )
 from honeychrome.settings import af_index_channel
 from honeychrome.controller_components import unmix_method
+from honeychrome.controller_components.job_gate import JobGate
 from honeychrome.controller_components.sample_loader import AFState
 
 base_directory = Path.home() / experiments_folder
@@ -111,6 +112,8 @@ class Controller(QObject):
         self.current_sample = None
         self.current_sample_path = None
         self.live_sample_path = None
+        # one heavy job at a time across the application
+        self.job_gate = JobGate(self)
         self.raw_event_data = None
         self.unmixed_event_data = None
         self.af_sidecar_data = None   # (n_cells, 2) float64: col 0 = af_scale, col 1 = af_idx; None when OLS
@@ -1173,9 +1176,13 @@ class Controller(QObject):
 
     @Slot(object)
     def _start_envelope_job(self, job: dict):
-        """Run an envelope job in a QThread; a request while one runs is repeated after it."""
+        """Run an envelope job in a QThread; a request while one runs is repeated after it,
+        one while a heavy job holds the gate after the gate is released."""
         if self._envelope_thread is not None:
             self._envelope_rerun = True
+            return
+        if self.job_gate.is_held():
+            self.job_gate.when_free('AF envelopes', self._request_missing_envelopes)
             return
         from honeychrome.controller_components.envelope_builder import EnvelopeBuildWorker
 
@@ -1454,6 +1461,13 @@ class Controller(QObject):
             return
         if self._method_thread is not None:
             self._method_job_pending = job
+            return
+        if self.job_gate.is_held():
+            self.job_gate.when_free('display unmixing', lambda: self._start_method_job(job))
+            if self.bus:
+                label = unmix_method.method_label(job['method'], job['state'].prior_lambda)
+                self.bus.statusMessage.emit(f'Showing per-cell AF; unmixing with the {label} waits for '
+                                            f'{self.job_gate.holder[0]}.')
             return
         from honeychrome.controller_components.method_unmix_worker import MethodUnmixWorker
 

@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 from honeychrome.controller_components.functions import q_settings
+from honeychrome.controller_components.job_gate import guard_while_busy
 # load_tabbed_plugins is imported inside _PluginLoaderWorker.run() to keep it off the main thread
 # from honeychrome.controller_components.plugin_loaders import load_tabbed_plugins
 from honeychrome.settings import file_extension, experiments_folder
@@ -15,8 +16,8 @@ from honeychrome.view_components.statistical_plotter import StatisticalCompariso
 os.environ["QT_LOGGING_RULES"] = "qt.core.qobject.connect=false" #suppress pyqtgraph graphicslayoutwidget warning
 
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QMainWindow, QFileDialog, QWidget, QHBoxLayout, QSplitter, QTabWidget, QStatusBar, QVBoxLayout, QLabel, QProgressBar, QScrollArea, QPushButton, QMenu, QGroupBox, QSpinBox
-from PySide6.QtCore import Qt, QSettings, QByteArray, Slot, QTimer, QThread, Signal as QtSignal
+from PySide6.QtWidgets import QMainWindow, QFileDialog, QWidget, QHBoxLayout, QSplitter, QTabWidget, QStatusBar, QVBoxLayout, QLabel, QProgressBar, QScrollArea, QPushButton, QMenu, QGroupBox, QSpinBox, QMessageBox
+from PySide6.QtCore import Qt, QSettings, QByteArray, QPoint, Slot, QTimer, QThread, Signal as QtSignal
 
 from honeychrome.view_components.gating_hierarchy_widget import GatingHierarchyWidget
 from honeychrome.view_components.heatmap_viewedit import HeatmapViewEditor
@@ -90,6 +91,8 @@ class MainWindow(QMainWindow):
         # process
         self.help_spectral_process = HelpToggleWidget(text=process_help_text, parent=self)
         self.spectral_controls_editor = SpectralControlsEditor(bus, self.controller, parent=self)
+        # the Spectral Process decides the unmixing: not edited under a running job
+        guard_while_busy(self.controller, self.spectral_controls_editor)
         self.profiles_viewer = ProfilesViewer(bus, self.controller, parent=self)
         self.scatter_cleaning_viewer = ScatterCleaningViewer(bus, self.controller, parent=self)
         self.cosine_qc_viewer = CosineQCViewer(bus, self.controller, parent=self)
@@ -97,6 +100,7 @@ class MainWindow(QMainWindow):
         self.hotspot_viewer = HeatmapViewEditor(bus, self.controller, 'hotspot_matrix', is_dark, parent=self)
         self.unmixing_viewer = HeatmapViewEditor(bus, self.controller, 'unmixing_matrix', is_dark, parent=self)
         self.compensation_editor = HeatmapViewEditor(bus, self.controller, 'spillover', is_dark, parent=self)
+        guard_while_busy(self.controller, self.compensation_editor)
         self.nxn_viewer = NxNGrid(bus, self.controller, is_dark=is_dark, parent=self)
 
         # unmixed
@@ -165,6 +169,9 @@ class MainWindow(QMainWindow):
         file_menu.addAction(action_export_all)
         file_menu.addAction(action_generate_report)
         file_menu.addAction(action_quit)
+        # these replace the experiment or run a heavy job
+        guard_while_busy(self.controller, action_new, action_new_from_this_template, action_new_from_choose_template,
+                         action_open, recent_menu.menuAction(), action_import_fcs_files, action_export_all)
 
         # edit menu
         action_app_config = QAction(icon('adjustments'), "App Configuration", self)
@@ -432,6 +439,15 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMaximumWidth(250)
         status.addPermanentWidget(self.progress_bar)
         self.progress_bar.setVisible(False)  # Hide initially
+        self.job_label = QLabel()
+        self.job_label.setToolTip('Right-click to release a job that has stopped without finishing.')
+        self.job_label.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.job_label.customContextMenuRequested.connect(self._job_label_menu)
+        status.addPermanentWidget(self.job_label)
+        self.job_label.setVisible(False)
+        if getattr(self.controller, 'job_gate', None) is not None:
+            self.controller.job_gate.changed.connect(self._show_running_job)
+            self._show_running_job()
         self.bus.progress.connect(self.update_progress)
         self.bus.statusMessage.connect(self.status_message)
         self.bus.sampleBrowserVisibilityRequested.connect(self._set_sample_browser_visible)
@@ -490,6 +506,34 @@ class MainWindow(QMainWindow):
             # Use functools.partial to bind filename to slot
             action.triggered.connect(functools.partial(self.bus.loadExpRequested.emit, path))
             recent_menu.addAction(action)
+
+    @Slot()
+    def _show_running_job(self):
+        holder = self.controller.job_gate.holder
+        self.job_label.setText(f'Running: {holder[0]}' if holder else '')
+        self.job_label.setVisible(holder is not None)
+
+    @Slot(QPoint)
+    def _job_label_menu(self, pos):
+        """Right-click on 'Running: <label>': release the job gate held by a job that has stopped."""
+        gate = self.controller.job_gate
+        holder = gate.holder
+        if holder is None:
+            return
+        menu = QMenu(self)
+        release = menu.addAction(f'Release "{holder[0]}"…')
+        if menu.exec(self.job_label.mapToGlobal(pos)) is not release:
+            return
+        reply = QMessageBox.warning(
+            self, 'Release the running job',
+            f'"{holder[0]}" is holding the job gate, so no other heavy job can start and the experiment '
+            'cannot be reloaded.\n\nRelease it only if the job has stopped: no progress and no result. '
+            'A job that is still running carries on, and a job started now runs alongside it.\n\n'
+            'Release it?',
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+        if reply == QMessageBox.Yes and gate.holder == holder:
+            gate.force_release('released by the user')
+            self.bus.statusMessage.emit(f'Released "{holder[0]}".')
 
     @Slot(int, int)
     def update_progress(self, n, m):
@@ -554,7 +598,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def app_config(self):
-        dialog = AppConfigDialog(self, self.bus)
+        dialog = AppConfigDialog(self, self.bus, self.controller)
         dialog.exec()
 
     def instrument_config(self):

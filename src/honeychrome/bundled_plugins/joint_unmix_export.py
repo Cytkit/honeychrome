@@ -11,9 +11,14 @@ on the main thread:
 
     layout = build_export_layout(controller)
     exporter = JointUnmixExporter(sample_paths, layout, unmix_fn, bus=bus)
-    run = JointUnmixRun(exporter, parent_widget=self, probe_fn=probe_fn)
+    run = JointUnmixRun(exporter, parent_widget=self, probe_fn=probe_fn,
+                        job_gate=getattr(controller, 'job_gate', None))
     run.done.connect(on_done)
     run.start()
+
+With ``job_gate`` (the application's ``controller.job_gate``), the run holds
+the gate from the estimate to the end of the export, and does not start
+while another heavy job holds it.
 
 ``unmix_fn(raw_fl_chunk, raw_chunk, af)`` is called once per chunk of each
 sample. ``raw_fl_chunk`` holds the fluorescence detectors used for
@@ -729,7 +734,8 @@ class JointUnmixRun(QObject):
 
     Create and start on the main thread. Without ``probe_fn`` the export
     starts straight away. ``done`` is emitted once at the end whatever the
-    outcome (finished, error or cancelled).
+    outcome (finished, error, cancelled, or refused because ``job_gate`` is
+    held by another job).
     """
     status = Signal(str)
     progress = Signal(int, int)
@@ -739,7 +745,7 @@ class JointUnmixRun(QObject):
     done = Signal()
 
     def __init__(self, exporter: JointUnmixExporter, parent_widget=None, probe_fn=None,
-                 sample_n: int = PROBE_EVENTS, bus=None):
+                 sample_n: int = PROBE_EVENTS, bus=None, job_gate=None, label: str = 'Export unmixed samples'):
         super().__init__()
         self._exporter = exporter
         self._parent_widget = parent_widget
@@ -749,8 +755,24 @@ class JointUnmixRun(QObject):
         self._est_thread = None
         self._est_worker = None
         self._exp_thread = None
+        self._job_gate = job_gate
+        self._label = label
+        self._token = None
+        self.done.connect(self._release_token)
+
+    def _release_token(self):
+        token, self._token = self._token, None
+        if token is not None:
+            token.release()
 
     def start(self):
+        if self._job_gate is not None:
+            self._token = self._job_gate.try_acquire(self._label)
+            if self._token is None:
+                self.status.emit(self._job_gate.busy_text())
+                self.cancelled.emit()
+                self.done.emit()
+                return
         if self._probe_fn is None:
             self._start_export()
             return
