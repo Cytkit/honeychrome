@@ -13,6 +13,11 @@ Sections
 3  Comparison: the current sample with per-cell AF | per-cell AF + spectral
    variants.
 
+Use spectral variants makes them the experiment's unmixing (R2, everywhere
+through unmix_method) while the noise model is not in use; the Unmixing
+settings are stored with the experiment (``process['unmixing']
+['variant_kernel']``).
+
 The numerics live in ``bundled_plugins/autospectral_optimization_functions.py``
 and the kernel wrapper beside it, imported from the bundled-plugins folder.
 """
@@ -32,6 +37,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from honeychrome.controller_components import gls_unmix as gu
+from honeychrome.controller_components import unmix_method
 from honeychrome.controller_components.functions import apply_transfer_matrix
 from honeychrome.controller_components.autospectral_functions import (
     build_af_precomputed, apply_af_unmixing,
@@ -65,6 +72,8 @@ from autospectral_optimization_functions import (   # noqa: E402
 from autospectral_opt_kernel_wrapper import AUTOSPECTRAL_OPT_KERNEL_AVAILABLE  # noqa: E402
 
 SHOW_ADVANCED_SETTING = 'autospectral_variants_show_advanced'
+# wait after the last Unmixing setting change before unmixing the displayed sample again
+KERNEL_REFRESH_MS = 600
 
 
 # ---------------------------------------------------------------------------
@@ -235,12 +244,19 @@ class SpectralVariantsPage(QWidget):
         self._af_data = None
         self._opt_data = None
 
+        self._kernel_timer = QTimer(self)
+        self._kernel_timer.setSingleShot(True)
+        self._kernel_timer.setInterval(KERNEL_REFRESH_MS)
+        self._kernel_timer.timeout.connect(self._on_kernel_settings_settled)
+
         self._build_ui()
+        self._load_kernel_settings()
 
         if self.bus:
             self.bus.modeChangeRequested.connect(self._on_mode_change)
             self.bus.loadSampleRequested.connect(self._on_sample_loaded)
             self.bus.spectralProcessRefreshed.connect(self._on_process_refreshed)
+            self.bus.unmixingMethodChanged.connect(self._refresh_use_check)
 
         if self._setup_done():
             self._refresh_plot_combo()
@@ -371,6 +387,11 @@ class SpectralVariantsPage(QWidget):
         for w in (self._n_passes_spin, self._n_af_passes_spin, self._refine_af_quantile_spin,
                   self._noise_floor_spin, self._alpha_spin, self._collinear_threshold_spin, self._threads_spin):
             _spin(w)
+        for w in (self._n_passes_spin, self._n_af_passes_spin, self._refine_af_quantile_spin,
+                  self._noise_floor_spin, self._alpha_spin, self._collinear_threshold_spin):
+            w.valueChanged.connect(self._on_kernel_setting_changed)
+        for w in (self._cell_weight_check, self._joint_pair_resolution_check):
+            w.toggled.connect(self._on_kernel_setting_changed)
         unmixing_form.addRow('n.passes:', self._n_passes_spin)
         unmixing_form.addRow('n.af.passes:', self._n_af_passes_spin)
         unmixing_form.addRow('refine.af.quantile:', self._refine_af_quantile_spin)
@@ -394,11 +415,40 @@ class SpectralVariantsPage(QWidget):
 
         parent_layout.addWidget(adv_content)
 
-        # Pre-set cell.weight from cytometer, still user-overridable.
-        db_col = None
-        if self.controller and self.controller.experiment:
-            db_col = self.controller.experiment.settings.get('raw', {}).get('cytometer_db_col')
-        self._cell_weight_check.setChecked(db_col == 'ID7000')
+    def _kernel_widgets(self) -> dict:
+        return {'n_passes': self._n_passes_spin, 'n_af_passes': self._n_af_passes_spin,
+                'refine_af_quantile': self._refine_af_quantile_spin, 'cell_weight': self._cell_weight_check,
+                'noise_floor': self._noise_floor_spin, 'alpha': self._alpha_spin,
+                'collinear_thresh': self._collinear_threshold_spin,
+                'joint_pair_resolution': self._joint_pair_resolution_check}
+
+    def _load_kernel_settings(self):
+        """Unmixing settings stored with the experiment (defaults otherwise) into the widgets."""
+        if not (self.controller and self.controller.experiment):
+            return
+        db_col = self.controller.experiment.settings.get('raw', {}).get('cytometer_db_col')
+        stored = unmix_method.variant_kernel_settings(self.controller.experiment.process, db_col)
+        for key, w in self._kernel_widgets().items():
+            w.blockSignals(True)
+            if isinstance(w, QCheckBox):
+                w.setChecked(bool(stored[key]))
+            else:
+                w.setValue(stored[key])
+            w.blockSignals(False)
+
+    def _on_kernel_setting_changed(self, *_args):
+        """Store the Unmixing settings with the experiment; unmix again if the variants are in use."""
+        process = self.controller.experiment.process
+        values = {k: v for k, v in self._kernel_kwargs().items() if k != 'n_threads'}
+        process.setdefault(unmix_method.UNMIXING_KEY, {})[unmix_method.VARIANT_KERNEL_KEY] = values
+        if self.bus:
+            self.bus.autoSaveRequested.emit()
+        if unmix_method.requested_method(process) == unmix_method.R2:
+            self._kernel_timer.start()
+
+    def _on_kernel_settings_settled(self):
+        if unmix_method.requested_method(self.controller.experiment.process) == unmix_method.R2:
+            self._method_changed()
 
     def _kernel_kwargs(self) -> dict:
         """Advanced Settings values, packaged for unmix_autospectral_optimization()."""
@@ -449,6 +499,7 @@ class SpectralVariantsPage(QWidget):
         setup_done = self._setup_done()
         self._plot_combo.setEnabled(setup_done)
         self._plot_status.setText('' if setup_done else 'Compute spectral variants first.')
+        self._refresh_use_check()
         self._refresh_comparison_controls()
 
     # ------------------------------------------------------------------
@@ -467,7 +518,53 @@ class SpectralVariantsPage(QWidget):
         self._setup_status.setWordWrap(True)
         layout.addRow(self._setup_status)
 
+        self._use_check = QCheckBox('Use spectral variants for the experiment\'s unmixing')
+        self._use_check.setToolTip(
+            'Samples with an AF profile are unmixed with per-cell spectral variants (the AutoSpectral kernel) '
+            'in the main window, exports, Honeycluster, the gating plugins and Statistics; samples without '
+            'one keep per-cell AF (OLS). The main window shows per-cell AF first and swaps the result in when '
+            'it is ready.')
+        self._use_check.toggled.connect(self._on_use_toggled)
+        layout.addRow(self._use_check)
+        self._use_note = QLabel('')
+        self._use_note.setWordWrap(True)
+        self._use_note.setStyleSheet('color: #cc6600;')
+        layout.addRow(self._use_note)
+
         parent_layout.addWidget(grp)
+
+    def _refresh_use_check(self):
+        """The Use tick: greyed while the noise model is in use (it takes precedence) or without variants."""
+        if not self._gating_available():
+            return
+        process = self.controller.experiment.process
+        noise_on = gu.noise_in_use(process)
+        usable = self._setup_done() and AUTOSPECTRAL_OPT_KERNEL_AVAILABLE
+        self._use_check.blockSignals(True)
+        self._use_check.setEnabled(usable and not noise_on)
+        self._use_check.setChecked(bool(unmix_method.unmixing_settings(process)['variants']))
+        self._use_check.blockSignals(False)
+        if noise_on:
+            self._use_note.setText('The noise model is in use (Noise page), so spectral variants are not used. '
+                                   'Untick it there to unmix with spectral variants.')
+        elif not usable and self._use_check.isChecked():
+            self._use_note.setText('Spectral variants are ticked but not available (compute them, or build the '
+                                   'kernel); samples are unmixed with per-cell AF.')
+        else:
+            self._use_note.setText('')
+
+    def _method_changed(self):
+        """The experiment's unmixing changed: unmix the displayed sample again and tell the other pages."""
+        if self.bus:
+            self.bus.autoSaveRequested.emit()
+        if self.controller is not None:
+            self.controller.refresh_unmixing()
+        if self.bus:
+            self.bus.unmixingMethodChanged.emit()
+
+    def _on_use_toggled(self, checked: bool):
+        unmix_method.set_unmixing(self.controller.experiment.process, variants=bool(checked))
+        self._method_changed()
 
     def _run_setup(self):
         if not AUTOSPECTRAL_OPT_KERNEL_AVAILABLE:
@@ -544,6 +641,8 @@ class SpectralVariantsPage(QWidget):
         )
         self._refresh_plot_combo()
         self._refresh_all_guards()
+        if unmix_method.requested_method(self.controller.experiment.process) == unmix_method.R2:
+            self._method_changed()
 
     def _on_setup_error(self, msg: str):
         self._setup_status.setText(f'Error: {msg}')
@@ -901,4 +1000,5 @@ class SpectralVariantsPage(QWidget):
             self._run_comparison()
 
     def _on_process_refreshed(self):
+        self._load_kernel_settings()
         self._refresh_all_guards()

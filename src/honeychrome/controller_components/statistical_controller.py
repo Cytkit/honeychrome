@@ -89,7 +89,8 @@ class StatisticsCalculator(QObject):
                     if np.isnan(raw_event_data).any():
                         raw_event_data = np.where(np.isnan(raw_event_data), 0.0, raw_event_data)
                     unmixed_event_data = unmix_events(raw_event_data, self.unmix_snapshot,
-                                                      self.unmix_snapshot.af_for(samples_to_calculate[n]))['unmixed']
+                                                      self.unmix_snapshot.af_for(samples_to_calculate[n]),
+                                                      sample_key=samples_to_calculate[n])['unmixed']
                     data_for_statistics_comparison.update({'event_data': unmixed_event_data})
 
                     gate_membership = self.sample_gating.memberships(samples_to_calculate[n], unmixed_event_data,

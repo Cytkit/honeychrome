@@ -16,10 +16,13 @@ Public API
 spread_snapshot(controller, fluor_names, fluor_spectra, unstained_path)
     Main-thread snapshot of everything compute_spread_entry needs.
 
-compute_spread_entry(snapshot, progress, loader)
+compute_spread_entry(snapshot, progress, loader, projection_sets)
     Spread for every control; safe to run on a worker thread. Returns the
     dict stored as experiment.process['af_spread'], or None when no control
-    gave an estimate.
+    gave an estimate. With projection_sets ({id: spectra}), the spread under
+    each of those spectra instead, {id: entry}: each control's residual is
+    taken against its own (snapshot) spectrum and projected through the
+    unmixing matrix of each set.
 
 spread_is_current(entry, fluor_names, fluor_spectra)
     Whether a stored spread still matches the current spectra.
@@ -95,6 +98,7 @@ def residual_model_spread_one(
     af_collinear_threshold: float = 0.95,
     max_events: int = 20_000,
     min_events: int = 20,
+    projection_spectra: dict | None = None,
 ) -> dict | None:
     """
     Spillover spread of one single-stain control by the Residual Model.
@@ -111,7 +115,9 @@ def residual_model_spread_one(
 
     Returns {'slope', 'intercept'} ((F,), NaN on the diagonal and where the
     fit did not converge) and 'n', or None with fewer than min_events
-    positive events.
+    positive events. With projection_spectra ({id: spectra}), 'sets' holds
+    {id: slope} for the same residual projected through each set's
+    unmixing matrix.
     """
     pos_raw = np.asarray(pos_raw, dtype=np.float64)
     unsaturated = ~np.any(pos_raw >= 0.999 * saturation_ceiling, axis=1)
@@ -145,15 +151,20 @@ def residual_model_spread_one(
     b_h = low_rank[:, -1]
     resid = corrected - low_rank @ design
 
-    unmix_full = np.linalg.solve(spectra @ spectra.T, spectra)
-    proj = resid @ unmix_full.T
+    def project(set_spectra):
+        unmix_full = np.linalg.solve(set_spectra @ set_spectra.T, set_spectra)
+        coef, converged = _binned_variance_line(b_h, resid @ unmix_full.T, N_BINS, MIN_BIN_EVENTS, HUBER_K)
+        intercept = np.where(converged, coef[0], np.nan)
+        slope = np.where(converged, coef[1], np.nan)
+        intercept[fluor_idx] = np.nan
+        slope[fluor_idx] = np.nan
+        return slope, intercept
 
-    coef, converged = _binned_variance_line(b_h, proj, N_BINS, MIN_BIN_EVENTS, HUBER_K)
-    intercept = np.where(converged, coef[0], np.nan)
-    slope = np.where(converged, coef[1], np.nan)
-    intercept[fluor_idx] = np.nan
-    slope[fluor_idx] = np.nan
-    return {'slope': slope, 'intercept': intercept, 'n': int(len(b_h))}
+    slope, intercept = project(spectra)
+    out = {'slope': slope, 'intercept': intercept, 'n': int(len(b_h))}
+    if projection_spectra:
+        out['sets'] = {key: project(np.asarray(s, dtype=np.float64))[0] for key, s in projection_spectra.items()}
+    return out
 
 
 def _align_spread(slope: np.ndarray) -> np.ndarray:
@@ -275,17 +286,20 @@ def _load_negative(loader, snapshot: dict, path: str | None):
     return None
 
 
-def compute_spread_entry(snapshot: dict, progress, loader=None) -> dict | None:
+def compute_spread_entry(snapshot: dict, progress, loader=None, projection_sets: dict | None = None):
     """
     Spillover spread for every control in the snapshot (see the module
     docstring). progress(text) is called before each control. Returns the
     dict stored as experiment.process['af_spread'], or None when no control
-    gave an estimate.
+    gave an estimate; with projection_sets, {id: such a dict} for the
+    spectra of each set (an id is left out when no control gave an
+    estimate).
     """
     loader = loader or load_events
     names, spectra, layout = snapshot['fluor_names'], snapshot['spectra'], snapshot['layout']
     n_fluors = len(names)
     slope = np.full((n_fluors, n_fluors), np.nan)
+    set_slopes = {key: np.full((n_fluors, n_fluors), np.nan) for key in (projection_sets or {})}
     negatives = {}
 
     def negative(path):
@@ -318,16 +332,30 @@ def compute_spread_entry(snapshot: dict, progress, loader=None) -> dict | None:
         n_sc = layout['n_scatter']
         row = residual_model_spread_one(
             pos_fl, pos_sc[:, :n_sc], neg_fl, neg_sc[:, :n_sc], spectra, rec['fluor_idx'], rec['peak'],
-            raw_thr[rec['peak']], af_pcs if rec['is_cell'] else None, rec['is_cell'], layout['ceiling'])
+            raw_thr[rec['peak']], af_pcs if rec['is_cell'] else None, rec['is_cell'], layout['ceiling'],
+            projection_spectra=projection_sets)
         if row is not None:
             slope[rec['fluor_idx']] = row['slope']
-    n_estimated = int(np.sum(np.isfinite(slope).any(axis=1)))
-    if n_estimated == 0:
-        return None
-    return {
-        'fluor_names': list(names),
-        'fluor_spectra': spectra.tolist(),
-        'spread': _align_spread(slope).tolist(),
-        'n_estimated': n_estimated,
-        'estimator': SPREAD_ESTIMATOR,
-    }
+            for key, values in (row.get('sets') or {}).items():
+                set_slopes[key][rec['fluor_idx']] = values
+
+    def entry(values, set_spectra):
+        n_estimated = int(np.sum(np.isfinite(values).any(axis=1)))
+        if n_estimated == 0:
+            return None
+        return {
+            'fluor_names': list(names),
+            'fluor_spectra': np.asarray(set_spectra, dtype=np.float64).tolist(),
+            'spread': _align_spread(values).tolist(),
+            'n_estimated': n_estimated,
+            'estimator': SPREAD_ESTIMATOR,
+        }
+
+    if projection_sets is None:
+        return entry(slope, spectra)
+    out = {}
+    for key, set_spectra in projection_sets.items():
+        built = entry(set_slopes[key], set_spectra)
+        if built is not None:
+            out[key] = built
+    return out

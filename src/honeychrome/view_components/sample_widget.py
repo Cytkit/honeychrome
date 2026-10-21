@@ -12,7 +12,9 @@ from honeychrome.controller import base_directory
 from honeychrome.controller_components.exporter import ReportGenerator
 from honeychrome.controller_components.functions import get_all_subfolders_recursive
 from honeychrome.controller_components.particle_type import is_bead_sample, set_bead_sample
-from honeychrome.controller_components.unmixed_exporter import UnmixedExporter
+from honeychrome.controller_components.unmixed_exporter import (
+    ExportTimeEstimateWorker, UnmixedExporter, time_estimate_message,
+)
 from honeychrome.view_components.batch_export_samples_modal import BatchExportSamplesModal
 from honeychrome.view_components.icon_loader import icon as load_icon, icon
 from honeychrome.view_components.new_sample_modal import NewSampleModal
@@ -415,8 +417,61 @@ class SampleWidget(QWidget):
 
     @Slot(str, bool)
     def start_export_thread(self, folder, subsample):
+        exporter = UnmixedExporter(folder, subsample, self.bus, self.controller)
+        if exporter.needs_time_probe():
+            self._estimate_then_export(exporter)
+        else:
+            self._start_export(exporter)
+
+    def _estimate_then_export(self, exporter):
+        """Time the slow unmixing method on a probe, ask, then export."""
+        if getattr(self, '_estimate_thread', None) is not None:
+            return
+        if self.bus:
+            self.bus.statusMessage.emit('Estimating unmixing time...')
+        self._pending_exporter = exporter
+        self._estimate_thread = QThread()
+        self._estimate_worker = ExportTimeEstimateWorker(exporter)
+        self._estimate_worker.moveToThread(self._estimate_thread)
+        self._estimate_thread.started.connect(self._estimate_worker.run)
+        self._estimate_worker.finished.connect(self._on_export_estimate)
+        self._estimate_worker.error.connect(self._on_export_estimate_error)
+        self._estimate_worker.finished.connect(self._estimate_thread.quit)
+        self._estimate_worker.error.connect(self._estimate_thread.quit)
+        self._estimate_thread.finished.connect(self._estimate_thread.deleteLater)
+        self._estimate_thread.finished.connect(self._on_estimate_thread_finished)
+        self._estimate_thread.start()
+
+    @Slot()
+    def _on_estimate_thread_finished(self):
+        self._estimate_thread = None
+        self._estimate_worker = None
+
+    @Slot(object)
+    def _on_export_estimate(self, estimate):
+        exporter, self._pending_exporter = self._pending_exporter, None
+        if estimate is None:
+            self._start_export(exporter)
+            return
+        reply = QMessageBox.question(self, 'Unmixing time', time_estimate_message(estimate),
+                                     QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
+        if reply == QMessageBox.Yes:
+            self._start_export(exporter)
+        elif self.bus:
+            self.bus.statusMessage.emit('Export cancelled.')
+
+    @Slot(str)
+    def _on_export_estimate_error(self, msg):
+        exporter, self._pending_exporter = self._pending_exporter, None
+        reply = QMessageBox.question(self, 'Unmixing time',
+                                     f'The unmixing time could not be estimated:\n{msg}\n\nStart the export anyway?',
+                                     QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
+        if reply == QMessageBox.Yes:
+            self._start_export(exporter)
+
+    def _start_export(self, exporter):
         self.thread = QThread()
-        self.unmixed_exporter = UnmixedExporter(folder, subsample, self.bus, self.controller)
+        self.unmixed_exporter = exporter
         self.unmixed_exporter.moveToThread(self.thread)
         self.thread.started.connect(self.unmixed_exporter.run)
         self.unmixed_exporter.finished.connect(self.thread.quit)

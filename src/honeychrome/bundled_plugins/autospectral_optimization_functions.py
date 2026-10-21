@@ -594,6 +594,12 @@ def _stored_af_spectra(controller, sample_path, channel_names: list) -> np.ndarr
     on its source file, or failing that on the default profile name
     ("<sample stem> AutoSpectral AF").
     """
+    found = _stored_af_profile(controller, sample_path, channel_names)
+    return None if found is None else found[2]
+
+
+def _stored_af_profile(controller, sample_path, channel_names: list) -> tuple | None:
+    """(name, entry, spectra) of the profile _stored_af_spectra matches, or None."""
     if not sample_path:
         return None
     profiles = controller.experiment.process.get('af_profiles') or {}
@@ -624,7 +630,7 @@ def _stored_af_spectra(controller, sample_path, channel_names: list) -> np.ndarr
             f'discover_all_variants: using stored AF profile "{name}" '
             f'({spectra.shape[0]} spectra) for "{sample_path}".'
         )
-        return spectra
+        return name, entry, spectra
     return None
 
 

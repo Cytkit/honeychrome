@@ -17,9 +17,9 @@ Autofluorescence    AutofluorescencePage (this module)
     4  Side-by-side OLS vs AF-corrected biplot comparison, using the same
        density-heatmap rendering, logicle transforms, and axis-drag zoom as the
        Unmixed Data tab.
-Noise               placeholder
+Noise               NoisePage (autospectral_noise_page.py)
 Spectral Variants   SpectralVariantsPage (autospectral_variants_page.py)
-Spectral Correction placeholder
+Spectral Correction SpectralCorrectionPage (autospectral_correction_page.py)
 
 Comparison plots open on the Singlets gate, else Cells, else root
 (default_comparison_gate).
@@ -2490,19 +2490,6 @@ class AutofluorescencePage(QWidget):
 # The AutoSpectral tab
 # ---------------------------------------------------------------------------
 
-class PlaceholderPage(QWidget):
-    """A page whose content is not built yet."""
-
-    def __init__(self, text: str, parent=None):
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        label = QLabel(text)
-        label.setWordWrap(True)
-        label.setContentsMargins(8, 8, 8, 8)
-        layout.addWidget(label)
-        layout.addStretch()
-
-
 class AutoSpectralTab(QWidget):
     """
     The AutoSpectral tab: Autofluorescence, Noise, Spectral Variants and
@@ -2516,14 +2503,16 @@ class AutoSpectralTab(QWidget):
         self.bus = bus
         self.controller = controller
 
+        from honeychrome.view_components.autospectral_correction_page import SpectralCorrectionPage
+        from honeychrome.view_components.autospectral_noise_page import NoisePage
         from honeychrome.view_components.autospectral_variants_page import SpectralVariantsPage
 
         self._pages = SideTabWidget()
         self.af_page = AutofluorescencePage(bus, controller, active_fn=self.page_is_active, parent=self)
-        self.noise_page = PlaceholderPage('Noise modelling is not available in this build yet.')
+        self.noise_page = NoisePage(bus, controller, active_fn=self.page_is_active, parent=self)
         self.variants_page = SpectralVariantsPage(bus, controller, active_fn=self.page_is_active,
                                                   parent=self)
-        self.correction_page = PlaceholderPage('Spectral correction is not available in this build yet.')
+        self.correction_page = SpectralCorrectionPage(bus, controller, active_fn=self.page_is_active, parent=self)
         for page, label, icon_name in (
                 (self.af_page, 'Autofluorescence', 'sparkles'),
                 (self.noise_page, 'Noise', 'wave-sine'),

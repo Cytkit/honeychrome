@@ -13,7 +13,7 @@ from honeychrome.settings import (colourmap_choice, graphics_export_formats, his
                       use_dummy_instrument, magnitude_ceilings, magnitude_ceiling, raw_settings, unmixed_settings, experiments_folder,
                       magnitude_ceilings_int, spectral_positive_gate_percent, spectral_negative_gate_percent, report_include_raw, report_include_unmixed, report_include_process, send_debug_data,
                       heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral,
-                      spectral_cleaning_refine, auto_clean_controls)
+                      spectral_cleaning_refine, auto_clean_controls, unmixing_cache_gb)
 import honeychrome.settings as settings
 
 
@@ -219,6 +219,13 @@ class AppConfigDialog(QDialog):
         self.max_display_events_spin.setToolTip('Maximum events shown in cytometry display plots. Does not affect spectral process or unmixing.')
         form.addRow("Max display events:", self.max_display_events_spin)
 
+        self.unmixing_cache_gb_spin = QSpinBox()
+        self.unmixing_cache_gb_spin.setRange(1, 500)
+        self.unmixing_cache_gb_spin.setSuffix(" GB")
+        self.unmixing_cache_gb_spin.setToolTip('Disk space per experiment (cache/unmixed) for samples unmixed with the noise model or '
+                                               'spectral variants, so they are not unmixed again. Least recently used files are removed first.')
+        form.addRow("Unmixing cache size:", self.unmixing_cache_gb_spin)
+
         self.histogram_resolution_spin = QSpinBox()
         self.histogram_resolution_spin.setRange(50, 400)
         self.histogram_resolution_spin.setSingleStep(50)
@@ -365,6 +372,7 @@ class AppConfigDialog(QDialog):
         self.nxn_tile_size_spin.setValue(self.settings.value("nxn_tile_size", tile_size_nxn_grid, type=int))
         self.subsample_number_spin.setValue(self.settings.value("subsample_number", subsample, type=int))
         self.max_display_events_spin.setValue(self.settings.value("max_display_events", max_display_events, type=int))
+        self.unmixing_cache_gb_spin.setValue(self.settings.value("unmixing_cache_gb", unmixing_cache_gb, type=int))
         self.histogram_resolution_spin.setValue(self.settings.value("histogram_resolution", hist_bins, type=int))
         self.density_cutoff_spin.setValue(self.settings.value("density_cutoff", density_cutoff, type=int))
         self.spectral_positive_gate_percent_spin.setValue(self.settings.value("spectral_positive_gate_percent", spectral_positive_gate_percent, type=int))
@@ -396,6 +404,7 @@ class AppConfigDialog(QDialog):
         self.settings.setValue("nxn_tile_size", self.nxn_tile_size_spin.value())
         self.settings.setValue("subsample_number", self.subsample_number_spin.value())
         self.settings.setValue("max_display_events", self.max_display_events_spin.value())
+        self.settings.setValue("unmixing_cache_gb", self.unmixing_cache_gb_spin.value())
         self.settings.setValue("histogram_resolution", self.histogram_resolution_spin.value())
         self.settings.setValue("density_cutoff", self.density_cutoff_spin.value())
         self.settings.setValue("spectral_positive_gate_percent", self.spectral_positive_gate_percent_spin.value())
@@ -439,6 +448,7 @@ class AppConfigDialog(QDialog):
         self.nxn_tile_size_spin.setValue(tile_size_nxn_grid)
         self.subsample_number_spin.setValue(subsample)
         self.max_display_events_spin.setValue(max_display_events)
+        self.unmixing_cache_gb_spin.setValue(unmixing_cache_gb)
         self.histogram_resolution_spin.setValue(hist_bins)
         self.density_cutoff_spin.setValue(density_cutoff)
         self.spectral_positive_gate_percent_spin.setValue(spectral_positive_gate_percent)

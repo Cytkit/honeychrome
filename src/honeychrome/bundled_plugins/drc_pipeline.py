@@ -291,7 +291,7 @@ def select_untransformed_channels(controller, state, gated_data: np.ndarray) -> 
 # ---------------------------------------------------------------------------
 
 def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray, af_state=None,
-                            sample_key=None) -> np.ndarray:
+                            sample_key=None, sample_file=None) -> np.ndarray:
     """
     Unmix *raw_event_data* with the AF library assigned to *sample_key*,
     without the side effects of Controller._apply_unmixing() (which would
@@ -313,14 +313,19 @@ def apply_unmixing_af_aware(controller, raw_event_data: np.ndarray, af_state=Non
 
     Background workers must pass a snapshot: the main thread reassigns the
     controller's transfer and AF matrices whenever a sample is (re)loaded.
+
+    sample_file: the sample's FCS file when *raw_event_data* is all of its
+    events; the experiment's noise-model or variants result is then read
+    from or written to the on-disk unmixing cache (unmix_method.unmix).
     """
     if isinstance(af_state, UnmixSnapshot):
         return unmix_events(raw_event_data, af_state, af_state.af_for(sample_key),
-                            sample_key=sample_key)['unmixed']
+                            sample_key=sample_key, cache_file=sample_file)['unmixed']
 
     if af_state is None and sample_key is not None:
         snap = snapshot_unmix_state(controller, [sample_key], include_qc=False)
-        return unmix_events(raw_event_data, snap, snap.af_for(sample_key), sample_key=sample_key)['unmixed']
+        return unmix_events(raw_event_data, snap, snap.af_for(sample_key), sample_key=sample_key,
+                            cache_file=sample_file)['unmixed']
 
     if af_state is None:
         raise ValueError('apply_unmixing_af_aware: pass sample_key or af_state; the AF matrices '
@@ -545,7 +550,7 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None,
         getattr(abs_path, 'name', abs_path), raw.shape[0], raw.shape[1],
     )
     unmixed = apply_unmixing_af_aware(controller, raw, af_state=af_state,
-                                      sample_key=sample_key)
+                                      sample_key=sample_key, sample_file=abs_path)
     log.debug(
         "  unmixed → %d events × %d channels (gates=%r)",
         unmixed.shape[0], unmixed.shape[1], state.selected_gates,

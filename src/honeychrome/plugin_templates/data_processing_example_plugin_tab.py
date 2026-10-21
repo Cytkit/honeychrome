@@ -236,9 +236,10 @@ class PluginWidget(QWidget):
             n_events = len(raw_event_data)
 
             if n_events > 0:
-                # apply unmixing: transfer matrix, with per-cell AF correction when the sample has an AF profile
+                # apply the experiment's unmixing: per-cell AF correction when the sample has an AF profile,
+                # or the noise model / spectral variants when chosen in the AutoSpectral tab
                 unmixed_event_data = unmix_events(raw_event_data, unmix_snapshot,
-                                                  unmix_snapshot.af_for(sample_key))['unmixed']
+                                                  unmix_snapshot.af_for(sample_key), sample_key=sample_key)['unmixed']
                 gated_sample_data = apply_gate(sample_gating, sample_key, unmixed_event_data, pnn, gate_name)
                 gated_sample_data_all.append(gated_sample_data)
                 self.progress_message(f'{datetime.now():%H:%M:%S} Loaded {sample_name}: {len(gated_sample_data)}/{n_events} events within {gate_name}')
@@ -321,7 +322,7 @@ class PluginWidget(QWidget):
 
                 if n_events > 0:
                     unmixed_event_data = unmix_events(raw_event_data, unmix_snapshot,
-                                                      unmix_snapshot.af_for(sample_key))['unmixed']
+                                                      unmix_snapshot.af_for(sample_key), sample_key=sample_key)['unmixed']
                     gated_sample_data = apply_gate(sample_gating, sample_key, unmixed_event_data, pnn, gate_name)
 
                     self.progress_message(f'{datetime.now():%H:%M:%S} Loaded {sample_path}: {len(gated_sample_data)}/{n_events} events within {gate_name}')

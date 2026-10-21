@@ -473,6 +473,26 @@ def refresh_envelope_entry(entry: dict | None, fluor_names, fluor_spectra: np.nd
                            entry.get('unstained_file', '')), True
 
 
+def envelope_needs_source(entry: dict | None, fluor_names, fluor_spectra: np.ndarray, experiment_dir,
+                          tolerance_deg: float = SPECTRA_TOLERANCE_DEG) -> bool:
+    """
+    True when a stored profile's negative envelope cannot be kept current
+    from what is stored (see refresh_envelope_entry): there is none, or its
+    unstained subsample cannot be found while the entry lacks a null variance
+    or the fluorophores have changed beyond tolerance_deg. Such an envelope
+    can only be built again from the profile's source sample.
+    """
+    envelope = (entry or {}).get('envelope')
+    if not envelope:
+        return True
+    if 'null_var' in envelope and spectra_unchanged(envelope.get('fluor_names', []),
+                                                    envelope.get('fluor_spectra', []),
+                                                    fluor_names, fluor_spectra, tolerance_deg):
+        return False
+    sidecar = str(envelope.get('unstained_file') or '')
+    return not (sidecar and (Path(experiment_dir) / AF_SUBDIR / sidecar).is_file())
+
+
 def build_runtime_envelope(entry: dict, spread_entry: dict | None, fluor_names,
                            fluor_spectra: np.ndarray, ceiling: float) -> dict | None:
     """
