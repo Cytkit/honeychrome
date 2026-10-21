@@ -274,51 +274,56 @@ class TraceAnalyser(mp.Process):
                 traces_batch_scaled = traces_batch_scaled * adc_scale_uv  # scale in uV, float32
 
                 # calculate area, height, width as defined in channel_dict and write to events_cache
+                baselines = None
+                n_start = 0
+                n_end = self.n_time_points_in_event - 1
+                peak = None
+                if self.threshold == 0:
+                    ### Simple calculation - only good if peaks already filtered and background-subtracted
+                    areas = traces_batch_scaled[:, self.indices_area_channels_in_traces, :].sum(axis=2)
+                    heights = traces_batch_scaled[:, self.indices_height_channels_in_traces, :].max(axis=2)
+                    widths = self.calculate_width(traces_batch_scaled[:, self.indices_peak_detection_channel_in_traces, :])
+                    last_event_index = n_new_events-1
 
-                ### Simple calculation - only good if peaks already filtered and background-subtracted
-                # areas = traces_batch_scaled[:, self.indices_area_channels_in_traces, :].sum(axis=2)
-                # heights = traces_batch_scaled[:, self.indices_height_channels_in_traces, :].max(axis=2)
-                # widths = self.calculate_width(traces_batch_scaled[:, self.indices_peak_detection_channel_in_traces, :])
+                else:
+                    ### More sophisticated calculation - loop over traces and perform background substraction
+                    keep_mask = np.zeros(n_new_events, dtype=np.bool)
+                    areas = np.zeros((n_new_events, len(self.indices_area_channels_in_events)))
+                    heights = np.zeros((n_new_events, len(self.indices_height_channels_in_events)))
+                    widths = np.zeros(n_new_events)
+                    last_event_index = 0
+                    for n, traces in enumerate(traces_batch_scaled):
+                        tr_peak_detection = traces[self.indices_peak_detection_channel_in_traces]
+                        if not (tr_peak_detection == tr_peak_detection).any():
+                            # print('all nan') # debug: why would an all nan trigger trace come through?
+                            continue
+                        n_start, n_end, tr_baseline = peak_start_stop_baseline(tr_peak_detection, self.threshold)
+                        # print(n_start, n_end, tr_baseline) # debug
+                        if n_start > 0:
+                            peak, baselines = peak_measurements(traces, n_start, n_end, deltaT, self.indices_area_channels_in_traces, self.indices_height_channels_in_traces)
+                            # print(peak, baselines) # debug
+                            areas[n], heights[n], widths[n], centre = peak
+                            keep_mask[n] = True
+                            last_event_index = n
 
-                ### More sophisticated calculation - loop over traces and perform background substraction
-                keep_mask = np.zeros(n_new_events, dtype=np.bool)
-                areas = np.zeros((n_new_events, len(self.indices_area_channels_in_events)))
-                heights = np.zeros((n_new_events, len(self.indices_height_channels_in_events)))
-                widths = np.zeros(n_new_events)
-                last_event_index = 0
-                for n, traces in enumerate(traces_batch_scaled):
-                    tr_peak_detection = traces[self.indices_peak_detection_channel_in_traces]
-                    if not (tr_peak_detection == tr_peak_detection).any():
-                        # print('all nan') # debug: why would an all nan trigger trace come through?
-                        continue
-                    n_start, n_end, tr_baseline = peak_start_stop_baseline(tr_peak_detection, self.threshold)
-                    # print(n_start, n_end, tr_baseline) # debug
-                    if n_start > 0:
-                        peak, baselines = peak_measurements(traces, n_start, n_end, deltaT, self.indices_area_channels_in_traces, self.indices_height_channels_in_traces)
-                        # print(peak, baselines) # debug
-                        areas[n], heights[n], widths[n], centre = peak
-                        keep_mask[n] = True
-                        last_event_index = n
+                    # keep only the ones above threshold
+                    areas = areas[keep_mask]
+                    heights = heights[keep_mask]
+                    widths = widths[keep_mask]
+                    n_new_events = np.sum(keep_mask)
 
-                # keep only the ones above threshold
-                areas = areas[keep_mask]
-                heights = heights[keep_mask]
-                widths = widths[keep_mask]
-                n_new_events = np.sum(keep_mask)
                 times = np.ones(n_new_events, dtype=np.int64) * int((time.perf_counter() - start_time) * 1000)
                 event_ids = np.array(range(events_tail, events_tail + n_new_events))
 
-                # if there were no peaks detected but at least one trace, push the last one to the oscilloscope queue
                 if last_event_index == 0:
-                    if n > 0:
-                        self.oscilloscope_traces_queue.put({'event_id': None, 'time': None,
-                                                            'traces': traces_batch_scaled[last_event_index],
-                                                            'n_start': n_start, 'n_end': n_end,
-                                                            'peak': None, 'baselines': default_baselines})
+                    # if there were no peaks detected but at least one trace, push the last one to the oscilloscope queue
+                    self.oscilloscope_traces_queue.put({'event_id': None, 'time': None,
+                                                        'traces': traces_batch_scaled[last_event_index],
+                                                        'n_start': n_start, 'n_end': n_end,
+                                                        'peak': None, 'baselines': default_baselines})
 
-                # if any above threshold, then push to events cache
-                if last_event_index > 0:
-
+                elif last_event_index > 0:
+                    # if any above threshold, then push to events cache
                     self.oscilloscope_traces_queue.put({'event_id': event_ids[-1], 'time': times[-1],
                                                         'traces': traces_batch_scaled[last_event_index],
                                                         'n_start': n_start, 'n_end': n_end, 'peak': peak,

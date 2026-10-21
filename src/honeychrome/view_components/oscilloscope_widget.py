@@ -4,7 +4,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 from queue import Empty
 import pyqtgraph as pg
 
-from honeychrome.settings import n_time_points_in_event, adc_rate, peak_detection_channel_retrieved, instrument_settings, peak_detection_channel, threshold
+from honeychrome.settings import n_time_points_in_event, adc_rate, instrument_settings, peak_detection_channel, threshold
 from honeychrome.settings import analyser_target_repeat_time, line_colors, adc_channels, scatter_channels, fluorescence_channels
 from honeychrome.view_components.profiles_viewer import FlowLayout, LegendEntry
 

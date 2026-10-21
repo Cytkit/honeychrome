@@ -109,7 +109,6 @@ class Pressure:
 
                 pressure_tally.append(pressure)
 
-            print(pressure_tally)
             if len(pressure_tally)>0 and np.array(pressure_tally).std() < 1e-4:
                 break
 
