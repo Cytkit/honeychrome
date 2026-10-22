@@ -2,8 +2,7 @@
 autospectral_opt_kernel_wrapper.py
 ------------------------------------
 Python interface to the compiled _autospectral_opt_kernel pybind11 extension
-(shared Armadillo core, see core_joint_unmix.hpp/.cpp and
-CONTEXT_AutoSpectral.md §4).
+(shared Armadillo core, see core_joint_unmix.hpp/.cpp).
 
 Usage
 -----

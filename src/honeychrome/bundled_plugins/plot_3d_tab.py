@@ -18,8 +18,8 @@ Module layout:
   13. PluginWidget + plugin_name (top-level tab, lifecycle + signal wiring)
   14. Standalone demo harness (`python plot_3d_tab.py`)
 
-IMPORTANT - a core-code landmine found while wiring up step 8, and how this
-file works around it without touching core code:
+IMPORTANT - a core-code landmine, and how this file works around it without
+touching core code:
 
   controller.set_mode()'s catch-all branch for plugin tabs sets
   `self.current_mode = tab_name` and `self.data_for_cytometry_plots = None`.
@@ -345,9 +345,8 @@ def colors_from_categorical_keys(keys, n_levels, cmap=None, background_rgba=(120
     """keys: from categorical_keys_from_chain(). Returns an (N,4) float
     array in 0..1, ready for GLScatterPlotItem.
 
-    Superseded by colors_from_gate_chain() below for the 3D plugin's own
-    gate-mode colouring (request #3) - left in place since nothing else in
-    this file calls it, but no longer wired into rebuild_colors()."""
+    Not used by rebuild_colors(); the plugin's gate-mode colouring uses
+    colors_from_gate_chain() below."""
     cmap = cmap or build_categorical_colormap()
     lut = cmap.getLookupTable(nPts=max(n_levels + 1, 2), alpha=True).astype(float)
     lut[0] = list(background_rgba)
@@ -358,9 +357,8 @@ def default_gate_colours(gate_names):
     """gate_names: e.g. selectable_gate_names(gating) - 'root' first. Builds
     ONE fixed RGBA (0..1) per gate name from the same glasbey_bw_minc_20
     palette already used elsewhere in the app, indexed by each gate's
-    position in the hierarchy - not resampled per source-gate selection like
-    the old categorical_keys_from_chain/colors_from_categorical_keys pair
-    was, so a given population always gets the same colour regardless of
+    position in the hierarchy - not resampled per source-gate selection, so
+    a given population always gets the same colour regardless of
     which gate a tile is currently colouring by."""
     cmap = build_categorical_colormap()
     lut = cmap.getLookupTable(nPts=max(len(gate_names), 2), alpha=True).astype(float) / 255.0
@@ -1619,7 +1617,7 @@ class Plot3DGridWidget(QtWidgets.QScrollArea):
         self.max_points = DEFAULT_MAX_POINTS
         self.default_show_grid = True
         self.default_plot_size = 2  # grid cells, both width and height - stays square
-        self.gate_colours = {}  # gate_name -> (r,g,b,a) 0..1, shared across all tiles (request #3)
+        self.gate_colours = {}  # gate_name -> (r,g,b,a) 0..1, shared across all tiles
 
         # queued cross-tab notifications - see module docstring's
         # "core-code landmine" note. Flushed by PluginWidget once the user
@@ -1772,8 +1770,8 @@ class Plot3DGridWidget(QtWidgets.QScrollArea):
             tile.refresh_gate_options()
 
     def refresh_gate_colours(self):
-        """Rebuild the shared gate->colour palette (request #3) from the
-        current gating hierarchy: keeps any colour Oliver has customised for
+        """Rebuild the shared gate->colour palette from the current gating
+        hierarchy: keeps any colour the user has customised for
         a gate that still exists, fills in a palette default for any new
         gate, and drops entries for gates that no longer exist."""
         gating = self.data_for_cytometry_plots.get('gating') if self.data_for_cytometry_plots else None

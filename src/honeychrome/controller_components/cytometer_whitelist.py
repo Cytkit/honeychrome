@@ -192,7 +192,7 @@ _CYTOMETER_PARAMS: dict[str, _CytParams] = {
         # an instrument name; engineers expect this fixed in a future
         # release. This pattern matches once that ships -- the literal
         # placeholder is matched separately in _match_cytometer() below as
-        # an interim workaround (confirmed value from Oliver, 2026-09-27).
+        # an interim workaround.
         cyt_kw_pattern  = r"CytoStellar",
         creator_pattern = None,
         non_spectral_pat = ["FSC", "SSC", "Time"],

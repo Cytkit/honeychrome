@@ -92,9 +92,9 @@ Plausibility bounds
     phase two rejects a row with more than ``plausibility_reject`` of its
     change (norm) out of bounds ('implausible') and resets the detectors
     out of bounds of the row it adopts to the reference value
-    (``plausibility_reset``; else to the bound). Bounding each pair
-    coefficient on its own, or shrinking whole phase-one steps, held back
-    real corrections (claude/FMU_PLAUSIBILITY_STUDY.md); both are gone.
+    (``plausibility_reset``; else to the bound). The box bounds back-solved
+    rows, not single pair coefficients or whole phase-one steps: bounding
+    those holds back real corrections.
 Shared directions (off by default)
     ``shared_direction``: when mutually unrelated sources (cosine below
     ``shared_cosine``) carry coefficients of the same sign into one channel,
@@ -202,21 +202,25 @@ class FixSettings:
     R's default, except ``spread_kappa`` (3: the Residual Model spread is
     narrower than the real cell-to-cell variation of stained cells) and
     ``convergence_quantile`` (1: phase one runs until the largest
-    off-diagonal error is below ``convergence_threshold``). The estimator
-    choices of R that proved worse (the bulk in the fit, the one-sided cut,
-    the binned envelope and the joint lasso as estimators) are gone.
+    off-diagonal error is below ``convergence_threshold``). R's estimator
+    options that proved less accurate (the bulk in the fit, the one-sided
+    cut, the binned envelope and the joint lasso as estimators) are not
+    offered.
 
-    Defaults from the bead-cell benchmark (``claude/FMU_BEAD_CELL_BENCHMARK.md``):
-    ``glasso_warm`` and ``hypernegative_dominant`` on; the other stop and
-    stall rules, ``seed_streams`` and the non-joint fallbacks other than
-    're-measured' stay off (no gain in accuracy, or a loss; 'applied' can
-    stop after one partly trusted step, below the flag threshold). The plausibility box (ratio 1, floor
-    0.01, reject 0.5, reset) is on from the plausibility study (``claude/FMU_PLAUSIBILITY_STUDY.md``): it
-    removes most of the co-expression and AF taken up on real panels at no cost on the bead-cell benchmark;
-    the shared-direction check and the AF penalty stay off. ``stop_rule='settled'`` and
-    ``disagreement_reference`` 'anchored' / 'envelope_corrected' (2026-10-22) are options, off, until benchmarked. ``smooth_updates``, ``smooth_rounds`` and ``smooth_fraction`` are
-    read by ``smooth_fix`` and ``spectral_correction``, not by
-    ``fix_my_unmix``.
+    The defaults were chosen on bead-to-cell spectral errors with known cell
+    references and checked on real panels. ``glasso_warm`` and
+    ``hypernegative_dominant`` are on; the other stop and stall rules,
+    ``seed_streams`` and the non-joint fallbacks other than 'remeasured' are
+    off (no gain in accuracy, or a loss; 'applied' can stop after one partly
+    trusted step, below the flag threshold). The plausibility box (ratio 1,
+    floor 0.01, reject 0.5, reset) is on: it removes most of the
+    co-expression and AF taken up on real panels at no cost on bead-to-cell
+    errors. The shared-direction check and the AF penalty are off.
+    ``stop_rule='settled'`` and ``disagreement_reference='envelope_corrected'``
+    lose no accuracy against 'all' and 'envelope' and are a quarter faster
+    with smooth updates; 'anchored' remains an option. ``smooth_updates``,
+    ``smooth_rounds`` and ``smooth_fraction`` are read by ``smooth_fix`` and
+    ``spectral_correction``, not by ``fix_my_unmix``.
     """
     max_iter: int = 20
     downsample: int = 0                     # 0: off; else events kept (stratified)
@@ -230,7 +234,7 @@ class FixSettings:
     compare_quantile: float = 0.5
     min_negative_frac: float = 0.10
     max_disagreement: float = 0.5
-    disagreement_reference: str = 'envelope'  # slope the binned median is compared with, see DISAGREEMENT_REFERENCES
+    disagreement_reference: str = 'envelope_corrected'  # slope the binned median is compared with, see DISAGREEMENT_REFERENCES
     envelope_scale_quantile: float = 0.25   # 'envelope_corrected': upper quantile of each bin's lower-tail scale
     min_hypernegative_frac: float = 0.01
     max_hypernegative_frac: float = 0.05
@@ -281,10 +285,10 @@ class FixSettings:
     max_coefficient: float = 0.5
     convergence_threshold: float = 0.01
     convergence_quantile: float = 1.0
-    stop_rule: str = 'all'                  # see STOP_RULES: every fitted error, the step applied, or trusted
+    stop_rule: str = 'settled'              # see STOP_RULES: every fitted error, the step applied, trusted, or settled
     stall_rule: str = 'trend'               # see STALL_RULES: 3-iteration trend of delta, or no new minimum
     stall_patience: int = 3                 # ... for stall_patience iterations
-    stop_trust: float = 0.1                 # 'settled': a coefficient below this trust does not hold phase one open
+    stop_trust: float = 0.05                # 'settled': a coefficient below this trust does not hold phase one open
     stop_confirm: int = 2                   # 'settled': iterations in a row every trusted error must be below threshold
     coefficient_decay: float = 0.05
     update_spectra: bool = True
