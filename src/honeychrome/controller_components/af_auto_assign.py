@@ -14,7 +14,15 @@ by weight). Every subset of 1 to MAX_REFERENCES candidates in which each
 reference keeps at least MIN_WEIGHT of the events is scored by
     BIC = -2 log L + (m - 1) ln n      (m references, n events)
 and the lowest wins. The sample is given every profile extracted from the
-references chosen, in stored profile order.
+references chosen, in stored profile order. max_references = 1 gives each
+sample its single best reference.
+
+Each reference density is fitted on another sample, so it never describes a
+sample exactly, and a second reference raises the likelihood far more than
+the (m - 1) ln n penalty: BIC alone almost always stacks. MIN_WEIGHT is the
+real guard. On a tissue experiment (143 samples, 12 tissue unstained
+controls) 0.10 gave 2.2 references per sample and the correct profile alone
+for 25 samples; 0.30 gave 1.45 and 64.
 
 Fit check: an event is outside a reference when its log density under that
 reference is below the OUTSIDE_QUANTILE quantile of the reference's own
@@ -61,7 +69,7 @@ logger = logging.getLogger(__name__)
 MAX_EVENTS = 20000          # events read per sample
 MIN_EVENTS = 200            # fewer usable events: no call
 MAX_COMPONENTS = 6          # components per reference mixture
-MIN_WEIGHT = 0.10           # smallest share a second or third reference may take
+MIN_WEIGHT = 0.30           # smallest share a second or third reference may take
 MAX_REFERENCES = 3          # references per sample
 CANDIDATE_WEIGHT = 0.02     # share in the all-reference fit to be a candidate
 MAX_CANDIDATES = 6
@@ -138,25 +146,26 @@ def fit_reference(xy: np.ndarray, max_components: int = MAX_COMPONENTS, seed: in
     return best
 
 
-def _mixture_loglik(log_dens: np.ndarray, weights: np.ndarray):
-    a = log_dens + np.log(np.maximum(weights, 1e-300))
-    top = a.max(axis=1, keepdims=True)
-    s = np.exp(a - top)
-    total = s.sum(axis=1, keepdims=True)
-    return float(np.sum(top[:, 0] + np.log(total[:, 0]))), s / total
-
-
 def mixture_weights(log_dens: np.ndarray, max_iter: int = EM_MAX_ITER, tol: float = EM_TOL):
     """EM mixing weights of fixed densities; *log_dens* is (n events, m)
-    log densities. Returns (weights, log-likelihood)."""
-    m = log_dens.shape[1]
+    log densities. Returns (weights, log-likelihood).
+
+    The densities are scaled by each event's largest one, once, so each EM
+    step is two matrix-vector products: s = L w, w <- w * (L^T (1 / s)) / n.
+    """
+    n, m = log_dens.shape
+    top = log_dens.max(axis=1)
+    dens = np.exp(log_dens - top[:, None])
+    offset = float(top.sum())
     weights = np.full(m, 1.0 / m)
-    ll, resp = _mixture_loglik(log_dens, weights)
+    mix = dens @ weights
+    ll = float(np.log(mix).sum()) + offset
     if m == 1:
         return weights, ll
     for _ in range(max_iter):
-        weights = resp.mean(axis=0)
-        new_ll, resp = _mixture_loglik(log_dens, weights)
+        weights = weights * (dens.T @ (1.0 / mix)) / n
+        mix = dens @ weights
+        new_ll = float(np.log(mix).sum()) + offset
         converged = new_ll - ll <= tol * abs(new_ll)
         ll = new_ll
         if converged:
@@ -180,6 +189,9 @@ def choose_references(log_dens: np.ndarray, min_weight: float = MIN_WEIGHT,
     best = int(np.argmax(single))
     bic_single = -2.0 * float(single[best])
     result = ([best], np.array([1.0]), float(single[best]), bic_single)
+    if max_references < 2:
+        return {'indices': [best], 'weights': [1.0], 'loglik': float(single[best]),
+                'bic': bic_single, 'bic_single': bic_single}
 
     w_all, _ = mixture_weights(log_dens)
     ranked = [int(r) for r in np.argsort(-w_all, kind='stable') if w_all[r] >= CANDIDATE_WEIGHT]
