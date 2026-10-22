@@ -3187,7 +3187,7 @@ class ResultsTab(QWidget):
 
     def _fill_population_view(self, layout, pop_key: str, title_label: QLabel):
         """Each compared group's pooled biplot, then the dot and violin plot."""
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from honeychrome.view_components.scalable_figure_widget import scrollable_canvas_class
         data = self._population_data(pop_key)
         if data is None:
             title_label.setText("")
@@ -3227,7 +3227,7 @@ class ResultsTab(QWidget):
             data['values'], data['groups'], f"{data['label']}: % of parent",
             ag_report.p_value_text(data['result']), is_dark=_is_dark_palette())
         import honeychrome.settings as hc_settings
-        canvas = FigureCanvasQTAgg(fig)
+        canvas = scrollable_canvas_class()(fig)
         size = int(getattr(hc_settings, 'cytometry_plot_width_target_retrieved', 220) or 220)
         canvas.setFixedSize(int(size * 1.3), size + 60)
         handler = getattr(fig, '_hover_handler', None)

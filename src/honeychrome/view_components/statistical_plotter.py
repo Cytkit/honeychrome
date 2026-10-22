@@ -375,11 +375,11 @@ class StatisticsPlotWidget(QWidget):
 
         # Matplotlib imports for embedding
         from matplotlib.figure import Figure
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from honeychrome.view_components.scalable_figure_widget import scrollable_canvas_class
 
         # Create matplotlib figure + canvas
         self.figure = Figure(constrained_layout=True)
-        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas = scrollable_canvas_class()(self.figure)
         self.canvas.setFixedSize(800, 600)
 
         self.delete_button = QPushButton('Delete')

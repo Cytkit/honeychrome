@@ -1107,8 +1107,9 @@ class SpectralCorrectionPage(QWidget):
             self._heatmap_layout.addWidget(label)
             self._heatmap_canvas = label
             return
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
         from matplotlib.figure import Figure
+
+        from honeychrome.view_components.scalable_figure_widget import scrollable_canvas_class
 
         detectors = [d.removesuffix('-A') for d in self._detector_names()]
         fig = Figure(figsize=(9, 0.6 + 0.28 * len(labels)), layout='constrained')
@@ -1120,7 +1121,7 @@ class SpectralCorrectionPage(QWidget):
         ticks = list(range(0, len(detectors), stride))
         ax.set_xticks(ticks, [detectors[i] for i in ticks], rotation=90, fontsize=6)
         fig.colorbar(im, ax=ax, label='Corrected − base (normalised)')
-        canvas = FigureCanvasQTAgg(fig)
+        canvas = scrollable_canvas_class()(fig)
         canvas.setMinimumHeight(int(120 + 22 * len(labels)))
         self._heatmap_layout.addWidget(canvas)
         self._heatmap_canvas = canvas
