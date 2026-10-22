@@ -6,7 +6,13 @@ Public API:
     find_empirical_peak(spec_events, af_mean)
     cosine_filter(spec_events, af_median, peak_ch_idx, ...)
     knn_scatter_match(spec_pos, scatter_pos, spec_neg, scatter_neg, k=3)
+    background_check(pos_events, neg_events, neg_scatter, spectral_sub, spectrum, peak_ch_idx, ...)
     CleanResult
+
+Background check (v1): only controls cleaned against an unstained tube are
+checked; internal-negative controls have no independent null and are skipped.
+SpectralCleaner also skips controls whose spectrum passes the reference
+library cosine QC; it runs when the cosine fails or there is no reference.
 """
 
 from __future__ import annotations
@@ -140,3 +146,106 @@ def cosine_filter(
     selected_idx = top_idx[keep_order]
 
     return selected_idx, cs_vals
+
+# ---------------------------------------------------------------------------
+# background_check
+# ---------------------------------------------------------------------------
+
+BACKGROUND_CHECK_VERSION = 1
+BACKGROUND_RATIO_MAX = 2.0            # control / unstained peak signal below this: no clear stain
+BACKGROUND_ANGLE_MAX_DEG = 15.0       # spectrum within this angle of the AF subspace: AF-shaped
+BACKGROUND_POSITIVE_FRACTION_MIN = 0.01   # fallback: events above the unstained 99.5th percentile
+BACKGROUND_AF_COMPONENTS = 3          # AF subspace = unstained mean + this many principal components
+BACKGROUND_NULL_SPLITS = 5
+BACKGROUND_SUBSPACE_EVENTS = 20_000
+_MIN_NULL_CANDIDATES = 20
+_MIN_NULL_KEPT = 10
+
+
+def background_check(
+    pos_events: np.ndarray,
+    neg_events: np.ndarray,
+    neg_scatter: np.ndarray,
+    spectral_sub: np.ndarray,
+    spectrum: np.ndarray,
+    peak_ch_idx: int,
+    n_candidates: int,
+    n_spectral: int,
+) -> dict:
+    """
+    Is a cleaned control distinguishable from its unstained negative?
+
+    ratio : median peak-channel signal of the control's cleaned events
+        (``spectral_sub``) over the same statistic from the identical
+        selection (top peak-channel quantile, cosine filter against the
+        unstained median, kNN scatter subtraction) run on the unstained
+        itself, split in half (one half as "control", the other as its
+        negative), median over 5 splits. The
+        candidate and kept fractions match the control's, so both sides
+        are the same order statistic.
+    angle_deg : angle between ``spectrum`` and the span of the unstained
+        mean and its top principal components.
+    positive_fraction : fraction of control events above the unstained
+        99.5th percentile in the peak channel; decides brightness when
+        the ratio is undefined.
+    verdict : 'background' (dim and AF-shaped), 'weak' (dim only) or None.
+    """
+    rng = np.random.default_rng(0)
+    n_pos, n_neg = len(pos_events), len(neg_events)
+
+    n_cand = min(n_candidates, n_pos)
+    cand_fraction = n_cand / max(n_pos, 1)
+    keep_fraction = min(n_spectral, n_cand) / max(n_cand, 1)
+
+    control_signal = float(np.median(spectral_sub[:, peak_ch_idx])) if len(spectral_sub) else float('nan')
+
+    null_signals = []
+    if n_neg >= 2 * _MIN_NULL_CANDIDATES:
+        af_median = np.median(neg_events, axis=0)
+        for _ in range(BACKGROUND_NULL_SPLITS):
+            perm = rng.permutation(n_neg)
+            half_a, half_b = perm[: n_neg // 2], perm[n_neg // 2:]
+            null_cand = max(_MIN_NULL_CANDIDATES, round(cand_fraction * len(half_a)))
+            null_keep = max(_MIN_NULL_KEPT, round(keep_fraction * null_cand))
+            spec_a = neg_events[half_a]
+            sel, _ = cosine_filter(spec_a, af_median, peak_ch_idx,
+                                   n_candidates=null_cand, n_spectral=null_keep)
+            sub, _ = knn_scatter_match(spec_a[sel], neg_scatter[half_a][sel],
+                                       neg_events[half_b], neg_scatter[half_b])
+            null_signals.append(float(np.median(sub[:, peak_ch_idx])))
+    null_signal = float(np.median(null_signals)) if null_signals else float('nan')
+    ratio = (control_signal / null_signal
+             if np.isfinite(null_signal) and null_signal > 0 and np.isfinite(control_signal)
+             else float('nan'))
+
+    threshold = np.quantile(neg_events[:, peak_ch_idx], 0.995)
+    positive_fraction = float(np.mean(pos_events[:, peak_ch_idx] > threshold))
+
+    sub_neg = (neg_events if n_neg <= BACKGROUND_SUBSPACE_EVENTS
+               else neg_events[rng.choice(n_neg, BACKGROUND_SUBSPACE_EVENTS, replace=False)])
+    mean = sub_neg.mean(axis=0)
+    _, _, vt = np.linalg.svd(sub_neg - mean, full_matrices=False)
+    basis, _ = np.linalg.qr(np.vstack([mean, vt[:BACKGROUND_AF_COMPONENTS]]).T)
+    s = np.asarray(spectrum, dtype=float)
+    s_norm = np.linalg.norm(s)
+    cos = np.linalg.norm(basis.T @ s) / s_norm if s_norm > 0 else 1.0
+    angle_deg = float(np.degrees(np.arccos(np.clip(cos, 0.0, 1.0))))
+
+    bright = (ratio >= BACKGROUND_RATIO_MAX if np.isfinite(ratio)
+              else positive_fraction >= BACKGROUND_POSITIVE_FRACTION_MIN)
+    if bright:
+        verdict = None
+    else:
+        verdict = 'background' if angle_deg < BACKGROUND_ANGLE_MAX_DEG else 'weak'
+
+    def _finite(x: float):
+        return x if np.isfinite(x) else None  # JSON-safe
+
+    return {
+        'ratio': _finite(ratio),
+        'control_signal': _finite(control_signal),
+        'null_signal': _finite(null_signal),
+        'angle_deg': angle_deg,
+        'positive_fraction': positive_fraction,
+        'verdict': verdict,
+    }

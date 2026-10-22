@@ -195,8 +195,9 @@ def compute_frequencies(state, all_rel, n_clusters, cluster_labels_override=None
     for i, rel in enumerate(all_rel):
         labels = np.asarray(cluster_labels[rel])
         total = max(int(np.sum(labels != drc_run_align.UNLABELLED)), 1)
-        for cl in range(n_clusters):
-            freq_mat[i, cl] = np.sum(labels == cl) / total * 100.0
+        in_range = (labels >= 0) & (labels < n_clusters)
+        freq_mat[i] = np.bincount(labels[in_range].astype(np.intp),
+                                  minlength=n_clusters) / total * 100.0
     df = pd.DataFrame(freq_mat, index=all_rel,
                       columns=[_label_for(state, cl, names_override) for cl in range(n_clusters)])
     log.info("frequency matrix: %s", df.shape)
@@ -218,8 +219,8 @@ def compute_counts(state, all_rel, n_clusters, cluster_labels_override=None,
     count_mat = np.zeros((len(all_rel), n_clusters), dtype=float)
     for i, rel in enumerate(all_rel):
         labels = np.asarray(cluster_labels[rel])
-        for cl in range(n_clusters):
-            count_mat[i, cl] = np.sum(labels == cl)
+        in_range = (labels >= 0) & (labels < n_clusters)
+        count_mat[i] = np.bincount(labels[in_range].astype(np.intp), minlength=n_clusters)
     df = pd.DataFrame(count_mat, index=all_rel,
                       columns=[_label_for(state, cl, names_override) for cl in range(n_clusters)])
     log.info("counts matrix: %s", df.shape)
@@ -268,7 +269,8 @@ def resolve_mfi_channels(state, include_type_markers: bool = False) -> list[str]
 def compute_mfis(controller, state, all_rel, n_clusters,
                  cluster_labels_override=None, channels=None,
                  names_override: dict | None = None,
-                 af_state=None, values_override: dict | None = None) -> pd.DataFrame | None:
+                 af_state=None, values_override: dict | None = None,
+                 loaded: dict | None = None) -> pd.DataFrame | None:
     """
     Per-sample mean intensity of each selected channel within each cluster.
 
@@ -292,6 +294,9 @@ def compute_mfis(controller, state, all_rel, n_clusters,
         the labels, used instead of the current events (a legacy run's own
         stored values, see drc_run_align.statistics_inputs).
 
+    loaded: optional dict, filled with each sample's loaded (values, names)
+        so compute_sample_mfis() can reuse them (not with values_override).
+
     A sample whose values and labels differ in length cannot be paired
     and is left out (NaN), never truncated.
     """
@@ -310,6 +315,8 @@ def compute_mfis(controller, state, all_rel, n_clusters,
                                                              af_state=af_state)
         if mv is None:
             continue
+        if loaded is not None and values_override is None:
+            loaded[rel] = mv
         if len(mv[0]) != len(np.asarray(cluster_labels[rel])):
             log.warning("compute_mfis: %s -- %d values vs %d labels; the run's events do not "
                         "match these values, sample left out", rel, len(mv[0]),
@@ -317,24 +324,29 @@ def compute_mfis(controller, state, all_rel, n_clusters,
             continue
         sample_vals[rel] = mv          # (values (n,n_sel), names)
 
-    frames = []
-    for ch in channels:
-        mfi_mat = np.full((len(all_rel), n_clusters), np.nan, dtype=float)
-        for i, rel in enumerate(all_rel):
-            mv = sample_vals.get(rel)
-            if mv is None:
-                continue
-            values, names = mv
+    # One pass per sample and channel: per-cluster sums / counts (float64)
+    mfi_mats = {ch: np.full((len(all_rel), n_clusters), np.nan, dtype=float) for ch in channels}
+    for i, rel in enumerate(all_rel):
+        mv = sample_vals.get(rel)
+        if mv is None:
+            continue
+        values, names = mv
+        lab = np.asarray(cluster_labels[rel])
+        in_range = (lab >= 0) & (lab < n_clusters)
+        idx = lab[in_range].astype(np.intp)
+        n = np.bincount(idx, minlength=n_clusters)
+        present = n > 0
+        for ch in channels:
             if ch not in names:
                 continue
-            col = values[:, names.index(ch)]
-            lab = np.asarray(cluster_labels[rel])
-            for cl in range(n_clusters):
-                sel = lab == cl
-                if sel.any():
-                    mfi_mat[i, cl] = float(np.mean(col[sel]))
+            sums = np.bincount(idx, weights=values[in_range, names.index(ch)],
+                               minlength=n_clusters)
+            mfi_mats[ch][i, present] = sums[present] / n[present]
+
+    frames = []
+    for ch in channels:
         frames.append(pd.DataFrame(
-            mfi_mat, index=all_rel,
+            mfi_mats[ch], index=all_rel,
             columns=[f'{_label_for(state, cl, names_override)}_{ch}' for cl in range(n_clusters)]))
 
     if not frames:
@@ -346,7 +358,7 @@ def compute_mfis(controller, state, all_rel, n_clusters,
 
 
 def compute_sample_mfis(controller, state, all_rel, channels=None,
-                        af_state=None) -> pd.DataFrame | None:
+                        af_state=None, loaded: dict | None = None) -> pd.DataFrame | None:
     """
     Per-sample mean intensity of each selected channel across the WHOLE
     sample (every gated event), independent of cluster assignment.
@@ -365,6 +377,9 @@ def compute_sample_mfis(controller, state, all_rel, channels=None,
 
     Returns (n_samples x n_channels), NaN where a sample has no events for
     a channel (rather than a fabricated 0).
+
+    loaded: samples already loaded by compute_mfis() (same channels and
+    af_state); the rest are loaded here.
     """
     log_stage(log, "SAMPLE MFI MATRIX")
     if channels is None:
@@ -375,7 +390,11 @@ def compute_sample_mfis(controller, state, all_rel, channels=None,
 
     sample_vals = {}
     for rel in all_rel:
-        mv = drc_pipeline.load_sample_transformed_values(controller, state, rel, channels, af_state=af_state)
+        if loaded is not None and rel in loaded:
+            mv = loaded[rel]
+        else:
+            mv = drc_pipeline.load_sample_transformed_values(controller, state, rel, channels,
+                                                             af_state=af_state)
         if mv is not None:
             sample_vals[rel] = mv
 
@@ -730,6 +749,7 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
                 "MFI testing: no 'state'-role channels selected — check "
                 "'Include clustering (type) markers' or assign roles."
             )
+        loaded = {}       # each sample read once for both MFI matrices
         mfi_df = compute_mfis(
             controller, state, all_rel, n_clusters,
             cluster_labels_override=cluster_labels_override,
@@ -737,6 +757,7 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
             names_override=names_override,
             af_state=af_state,
             values_override=values_override,
+            loaded=loaded,
         )
         if mfi_df is not None:
             meta = mfi_feature_table(state, n_clusters, mfi_channels, names_override)
@@ -753,6 +774,7 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
 
         state.mfi_sample_df = compute_sample_mfis(
             controller, state, all_rel, channels=mfi_channels, af_state=af_state,
+            loaded=loaded,
         )
 
     return freq_results, mfi_results, counts_results

@@ -2,9 +2,9 @@
 autospectral_optimization_functions.py
 -----------------------------------------
 AutoSpectral Optimization (per-cell fluorophore + AF joint unmixing) for
-Honeychrome. Lives entirely inside bundled_plugins — this plugin is self-contained, unlike the
-built-in AutoSpectral AF tab which is split across controller_components/
-and view_components/.
+Honeychrome, with its compiled kernel beside it in bundled_plugins/. The
+AutoSpectral tab's Spectral Variants page
+(view_components/autospectral_variants_page.py) is its user interface.
 
 Public API
 ----------
@@ -18,16 +18,15 @@ discover_fluor_variants(...)
     Per-fluorophore port of get.fluor.variants().
 
 calculate_optimize_necessity(spectra, fluor_names, delta_dict, ...)
-    Port of calculate.optimize.necessity(). Table section scoring.
+    Port of calculate.optimize.necessity(). Sets the Active fluorophores.
 
 unmix_autospectral_optimization(...)
-    Assembles the active-variant list from Table state and calls the
-    compiled joint kernel. Used by both the Compare and Unmix
-    sections.
+    Assembles the active-variant list and calls the compiled joint kernel.
+    Used by the Spectral Variants comparison and by exports.
 
-active_variant_labels / cached_unmixed_thresholds / make_optimization_unmix_fn
-    Inputs and per-chunk unmixing function for batch export through
-    joint_unmix_export.JointUnmixExporter.
+active_variant_labels / has_active_variants / cached_unmixed_thresholds
+    The Active fluorophores and the cached positivity thresholds R2 unmixes
+    with (``unmix_method``).
 
 """
 
@@ -595,6 +594,12 @@ def _stored_af_spectra(controller, sample_path, channel_names: list) -> np.ndarr
     on its source file, or failing that on the default profile name
     ("<sample stem> AutoSpectral AF").
     """
+    found = _stored_af_profile(controller, sample_path, channel_names)
+    return None if found is None else found[2]
+
+
+def _stored_af_profile(controller, sample_path, channel_names: list) -> tuple | None:
+    """(name, entry, spectra) of the profile _stored_af_spectra matches, or None."""
     if not sample_path:
         return None
     profiles = controller.experiment.process.get('af_profiles') or {}
@@ -625,7 +630,7 @@ def _stored_af_spectra(controller, sample_path, channel_names: list) -> np.ndarr
             f'discover_all_variants: using stored AF profile "{name}" '
             f'({spectra.shape[0]} spectra) for "{sample_path}".'
         )
-        return spectra
+        return name, entry, spectra
     return None
 
 
@@ -664,8 +669,8 @@ def discover_all_variants(
     reference spectrum (insufficient clean signal — not an error, just
     nothing to optimise for that fluorophore). The threshold arrays are the
     per-channel/per-fluorophore median across all unstained cell samples —
-    callers should cache these (see autospectral_optimization_tab.py's Setup
-    completion handler) and reuse them for Compare/Unmix instead of
+    callers should cache these (see the Spectral Variants page's completion
+    handler) and reuse them for comparisons and exports instead of
     recomputing from whatever stained sample is currently being processed.
     """
     raw_settings = controller.experiment.settings['raw']
@@ -1000,9 +1005,8 @@ def unmix_autospectral_optimization(
                     compute_af_extracted_unmixed_thresholds()). Callers with
                     no cached value available (Setup hasn't been run this
                     session) should pass all-zeros rather than recomputing
-                    anything from the sample being processed — see
-                    autospectral_optimization_tab.py's Compare/Unmix
-                    fallback paths.
+                    anything from the sample being processed — see the
+                    Spectral Variants page's comparison fallback.
 
     Returns
     -------
@@ -1125,7 +1129,7 @@ def af_envelope_for_profiles(controller, profile_names) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Batch export inputs — used with joint_unmix_export.JointUnmixExporter
+# Inputs of R2 (unmix_method) and plugins
 # ---------------------------------------------------------------------------
 
 def active_variant_labels(process: dict) -> set:
@@ -1158,36 +1162,3 @@ def cached_unmixed_thresholds(controller, reference_spectra: np.ndarray) -> np.n
     )
     n_fluors = 0 if reference_spectra is None else reference_spectra.shape[0]
     return np.zeros(n_fluors)
-
-
-def make_optimization_unmix_fn(
-    reference_spectra: np.ndarray,
-    fluor_names: list,
-    variants_meta: dict,
-    active_labels,
-    unmixed_pos_thresholds: np.ndarray,
-    kernel_kwargs: dict,
-):
-    """
-    Per-chunk unmixing function for JointUnmixExporter:
-    ``unmix_fn(raw_fl_chunk, raw_chunk, af)`` runs
-    unmix_autospectral_optimization() with the sample's AF library
-    (``af.spectra``). ``raw_chunk`` is not used.
-    """
-    fluor_names = list(fluor_names)
-    active_labels = set(active_labels)
-
-    def unmix_fn(raw_fl_chunk, raw_chunk, af):
-        return unmix_autospectral_optimization(
-            raw_fl_events=raw_fl_chunk,
-            reference_spectra=reference_spectra,
-            fluor_names=fluor_names,
-            af_spectra=af.spectra,
-            variants_meta=variants_meta,
-            active_labels=active_labels,
-            unmixed_pos_thresholds=unmixed_pos_thresholds,
-            envelope=getattr(af, 'envelope', None),
-            **kernel_kwargs,
-        )
-
-    return unmix_fn

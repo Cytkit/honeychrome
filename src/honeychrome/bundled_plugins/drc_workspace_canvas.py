@@ -372,6 +372,7 @@ class FigureItem(QGraphicsObject):
         self._w, self._h = 10.0, 10.0
         self._image: QImage | None = None
         self._image_stale = True
+        self._render_pending = True
         self._resize_edge = None
         self._resize_start = None
         self._isolated = False       # double-clicked out of its group
@@ -455,7 +456,11 @@ class FigureItem(QGraphicsObject):
         """Called when the figure's size changed."""
 
     def schedule_render(self):
-        self._render_timer.start()
+        # Started from paint(): Qt paints only items in view, so off-screen items are not rendered
+        self._render_pending = True
+        if self._render_timer.isActive():
+            self._render_timer.start()  # restart: keep the debounce during a zoom gesture
+        self.update()
 
     def render_dpi(self) -> float:
         scene = self.scene()
@@ -481,10 +486,13 @@ class FigureItem(QGraphicsObject):
         self._image = QImage(buf.tobytes(), w_px, h_px, 4 * w_px,
                              QImage.Format.Format_RGBA8888).copy()
         self._image_stale = False
+        self._render_pending = False
         self.update()
 
     def paint(self, painter, option, widget=None):
         rect = QRectF(0.0, 0.0, self._w, self._h)
+        if self._render_pending and not self._render_timer.isActive():
+            self._render_timer.start()
         if self._image is not None:
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
             painter.drawImage(rect, self._image)
@@ -613,7 +621,7 @@ class FigureItem(QGraphicsObject):
             return False
         from matplotlib.backend_bases import MouseEvent
         fig = self.figure()
-        if self._image_stale:
+        if self._image_stale or self._render_pending:
             self.render_now()
         dpi = fig.dpi
         x = pos.x() / MM_PER_IN * dpi

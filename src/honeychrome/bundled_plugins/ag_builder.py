@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
 )
 
 import honeychrome
+from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
 from honeychrome.controller_components.functions import (
     build_antigen_map,
     build_display_label_map,
@@ -3433,6 +3434,9 @@ class HierarchyTab(QWidget):
         """
         if self._recommend_worker is not None:
             return
+        if wait_if_busy(self.controller, ('Automated Gating recommendation', id(self)),
+                        self._recommend_algorithms):
+            return
         keys = list(self.state.training_samples) or analysis_sample_keys(self.controller)
         if not keys or not self.state.gate_definitions:
             self.bus.statusMessage.emit(
@@ -4086,7 +4090,7 @@ class _TrainingWorker(QThread):
             self.progress.emit(f"Loading {_sample_label(key)} ({i}/{len(self._keys)}) …")
             try:
                 out = load_unmixed(self._experiment_dir, key, self._snap,
-                                   max_events=self._cap, seed=self._seed)
+                                   max_events=self._cap, seed=self._seed, use_cache=True)
             except Exception as exc:
                 log.warning("could not load %s: %s", key, exc)
                 self.progress.emit(f"Could not load {_sample_label(key)}: {exc}")
@@ -4257,6 +4261,7 @@ class TrainTab(QWidget):
         run_row = QHBoxLayout()
         self.btn_run = QPushButton("Calculate Gates")
         self.btn_run.setToolTip("Calculate every gate's boundary from the selected training samples.")
+        guard_while_busy(self.controller, self.btn_run)
         self.btn_pause = QPushButton("Pause")
         self.btn_pause.setEnabled(False)
         self.btn_pause.setToolTip("Stop before the next gate, keeping every gate trained so far; "
@@ -4747,10 +4752,15 @@ class TrainTab(QWidget):
             QMessageBox.information(self, "No gates",
                                     "Import or add gates on the Import/Setup tab first.")
             return
+        token = acquire_job(self.controller, 'Automated Gating: training')
+        if token is None:
+            self.lbl_status.setText(self.controller.job_gate.busy_text())
+            return
         try:
             ag_core.ordered_gate_defs(self.state.gate_definitions)
             snap = snapshot_unmix_state(self.controller, selected)
         except Exception as exc:
+            token.release()
             QMessageBox.warning(self, "Cannot train", str(exc))
             return
         fingerprint = self._fingerprint(selected)
@@ -4760,6 +4770,7 @@ class TrainTab(QWidget):
             names = [n for n in progress.get('done') or [] if self.state.is_trained(n)]
             choice = self._ask_resume(len(names), progress.get('fingerprint') == fingerprint)
             if choice is None:
+                token.release()
                 return
             if choice == 'resume':
                 done = {n: deepcopy(self.state.trained_boundaries[n]) for n in names}
@@ -4784,6 +4795,7 @@ class TrainTab(QWidget):
             display_cap=display_cap, seed=TRAINING_SEED, done=done, parent=self,
         )
         self._worker.progress.connect(self._on_worker_progress)
+        self._worker.finished.connect(lambda *_: token.release())
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
 
@@ -4875,7 +4887,7 @@ class _ReviewWorker(QThread):
             chunks = []
             for key in self._keys:
                 out = load_unmixed(self._experiment_dir, key, self._snap,
-                                   max_events=self._max_events, seed=TRAINING_SEED)
+                                   max_events=self._max_events, seed=TRAINING_SEED, use_cache=True)
                 chunks.append(np.asarray(out['unmixed'], dtype=np.float32))
             self.finished.emit(True, '', np.concatenate(chunks, axis=0))
         except Exception as exc:
@@ -5941,6 +5953,9 @@ class ReviewTab(QWidget):
             return
         if self._worker is not None:
             self._wanted_keys = keys
+            return
+        if wait_if_busy(self.controller, ('Automated Gating review samples', id(self)), self._ensure_sample,
+                        self.lbl_status.setText):
             return
         try:
             snap = snapshot_unmix_state(self.controller, list(keys))

@@ -38,6 +38,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -617,6 +618,154 @@ def _glm_fit_observed(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
     return (fit, columns) if fit is not None else (None, None)
 
 
+class _GLMFit(NamedTuple):
+    """The parts of a statsmodels GLM result the contrasts read."""
+    params: np.ndarray
+    bse: np.ndarray
+    tvalues: np.ndarray
+    mu: np.ndarray
+
+
+_FLOAT_EPS = np.finfo(float).eps
+
+
+def _glm_deviance(Y: np.ndarray, mu: np.ndarray, alpha: np.ndarray | None) -> np.ndarray:
+    """Row-wise deviance with statsmodels' Poisson / NegativeBinomial
+    arithmetic, operation for operation."""
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        endog_mu = np.clip(Y / mu, _FLOAT_EPS, np.inf)
+        if alpha is None:
+            resid_dev = 2 * (Y * np.log(endog_mu) - (Y - mu))
+        else:
+            inv_alpha = 1 / alpha[:, None]
+            endog_alpha = Y + inv_alpha
+            mu_alpha = mu + inv_alpha
+            resid_dev = Y * np.log(endog_mu)
+            resid_dev -= endog_alpha * np.log(endog_alpha / mu_alpha)
+            resid_dev = 2 * resid_dev
+    return np.sum(resid_dev, axis=1)
+
+
+def _glm_irls(Y: np.ndarray, X: np.ndarray, offset: np.ndarray,
+              alpha: np.ndarray | None, maxiter: int = 100, tol: float = 1e-8) -> list:
+    """
+    statsmodels' GLM IRLS (GLM._fit_irls; log link, Poisson or negative
+    binomial with a per-row alpha) for many features sharing one design.
+    The element-wise steps run on every row at once; each row's weighted
+    least squares (np.linalg.lstsq), linear predictor and final pinv fit
+    run on that row alone, exactly as statsmodels runs them, so every row
+    reaches statsmodels' numbers and stops at statsmodels' iteration.
+
+    Y, offset: (features, samples); X: (samples, coefficients), full rank.
+    Returns a _GLMFit per row, or None where statsmodels would raise or not
+    converge within maxiter (the caller fits those rows with statsmodels).
+    """
+    from statsmodels.tools.tools import pinv_extended
+
+    out: list = [None] * Y.shape[0]
+    mu = (Y + Y.mean(axis=1, keepdims=True)) / 2.
+    lin_pred = np.log(np.clip(mu, _FLOAT_EPS, np.inf))
+    dev = _glm_deviance(Y, mu, alpha)
+    rows = np.flatnonzero(~np.isnan(dev))
+    weights = np.empty_like(Y)
+    wlsendog = np.empty_like(Y)
+    for iteration in range(maxiter):
+        if rows.size == 0:
+            break
+        y, m = Y[rows], mu[rows]
+        p = np.clip(m, _FLOAT_EPS, np.inf)
+        deriv = 1. / p
+        var = np.power(np.fabs(m), 1.) if alpha is None else p + alpha[rows, None] * p ** 2
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            w = 1. / (deriv ** 2 * var)
+            z = lin_pred[rows] + deriv * (y - m) - offset[rows]
+            w_half = np.sqrt(w)
+        finite = np.all(np.isfinite(w_half), axis=1) & np.all(np.isfinite(z), axis=1)
+        rows, w, z, w_half = rows[finite], w[finite], z[finite], w_half[finite]
+        new_lin = np.empty_like(z)
+        for j in range(rows.size):
+            params = np.linalg.lstsq(w_half[j][:, None] * X, w_half[j] * z[j], rcond=-1)[0]
+            new_lin[j] = np.dot(X, params)
+        new_lin += offset[rows]
+        with np.errstate(over='ignore'):
+            new_mu = np.exp(new_lin)
+        new_dev = _glm_deviance(Y[rows], new_mu, None if alpha is None else alpha[rows])
+        lin_pred[rows], mu[rows] = new_lin, new_mu
+        weights[rows], wlsendog[rows] = w, z
+        with np.errstate(invalid='ignore'):
+            converged = (np.abs(dev[rows] - new_dev) <= tol) | (dev[rows] == new_dev)
+        dev[rows] = new_dev
+        for i in rows[converged]:
+            sw = np.sqrt(weights[i])
+            pinv_wexog, _ = pinv_extended(sw[:, None] * X)
+            params = np.dot(pinv_wexog, sw * wlsendog[i])
+            bse = np.sqrt(np.diag(np.dot(pinv_wexog, np.transpose(pinv_wexog)) * 1.0))
+            fitted = np.exp(np.dot(X, params) + offset[i] + 0.)
+            out[i] = _GLMFit(params, bse, params / bse, fitted)
+        rows = rows[~converged]
+    return out
+
+
+def _glm_fit_batch(Y: np.ndarray, X: np.ndarray, offset: np.ndarray) -> list:
+    """
+    _glm_fit_one_feature for every row of Y (features sharing one design):
+    Poisson, the Cameron & Trivedi alpha from the Poisson fit, then the
+    negative binomial; Poisson where alpha is not positive. Rows _glm_irls
+    leaves unfitted go to _glm_fit_one_feature itself. Returns a _GLMFit,
+    statsmodels result or None per row.
+    """
+    from statsmodels.tools.tools import pinv_extended
+
+    poisson = _glm_irls(Y, X, offset, None)
+    alpha = np.full(Y.shape[0], np.nan)
+    for i, fit in enumerate(poisson):
+        if fit is not None:
+            aux_y = ((Y[i] - fit.mu) ** 2 - Y[i]) / fit.mu
+            pinv_mu, _ = pinv_extended(fit.mu[:, None])
+            alpha[i] = float(np.dot(pinv_mu, aux_y)[0])       # sm.OLS(aux_y, mu)
+    use_nb = np.array([fit is not None for fit in poisson]) & np.isfinite(alpha) & (alpha > 0)
+    nb_rows = np.flatnonzero(use_nb)
+    nb = _glm_irls(Y[nb_rows], X, offset[nb_rows], alpha[nb_rows])
+    n_poisson = sum(fit is not None for fit in poisson) - nb_rows.size
+    if n_poisson:
+        log.warning("NB GLM: %d feature(s) with a non-positive alpha estimate fitted as Poisson",
+                    n_poisson)
+
+    fits = list(poisson)
+    for j, i in enumerate(nb_rows):
+        fits[i] = nb[j]
+    return [fit if fit is not None else _glm_fit_one_feature(Y[i], X, offset[i])
+            for i, fit in enumerate(fits)]
+
+
+def _glm_fit_features(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray) -> list:
+    """
+    _glm_fit_observed for every feature (rows of counts and offsets), with
+    the features that share a pattern of measured samples fitted together
+    by _glm_fit_batch. Returns (fit, columns) or (None, None) per feature.
+    """
+    out = [(None, None)] * counts.shape[0]
+    patterns: dict[bytes, list[int]] = {}
+    for i in range(counts.shape[0]):
+        observed = np.isfinite(counts[i]) & np.isfinite(offsets[i])
+        if np.any(counts[i][observed]):        # no events: nothing to fit
+            patterns.setdefault(observed.tobytes(), []).append(i)
+    for key, rows in patterns.items():
+        observed = np.frombuffer(key, dtype=bool)
+        columns = np.flatnonzero(np.any(design[observed] != 0.0, axis=0))
+        if observed.sum() <= columns.size:
+            continue
+        sub_design = design[np.ix_(observed, columns)]
+        if np.linalg.matrix_rank(sub_design) < columns.size:
+            continue
+        cols = np.flatnonzero(observed)
+        fits = _glm_fit_batch(counts[np.ix_(rows, cols)], sub_design, offsets[np.ix_(rows, cols)])
+        for i, fit in zip(rows, fits):
+            if fit is not None:
+                out[i] = (fit, columns)
+    return out
+
+
 def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
                           contrasts: list[tuple[str, str]],
                           pairing_vec: list[str] | None,
@@ -646,8 +795,9 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
 
     LN2 = np.log(2.0)
     Z95 = 1.959963984540054
-    fits = [_glm_fit_observed(counts_df[f].values.astype(float), design_mat, offsets[f])
-            for f in features]
+    fits = _glm_fit_features(counts_df[features].values.T.astype(float), design_mat,
+                             np.array([offsets[f] for f in features], dtype=float)
+                             .reshape(len(features), len(counts_df)))
 
     frames = []
     for b, other in contrasts:

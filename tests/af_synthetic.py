@@ -128,8 +128,8 @@ def unmixed_settings():
 
 
 class FakeController:
-    """The attributes of controller.Controller read by UnmixedExporter,
-    AutoSpectralOptExporter and the 3D plot tiles."""
+    """The attributes of controller.Controller read by UnmixedExporter and
+    the 3D plot tiles."""
 
     def __init__(self, experiment_dir, spillover=None):
         fl = fluor_spectra()

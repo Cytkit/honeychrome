@@ -199,12 +199,24 @@ class View(QObject):
         </html>
         ''')
 
+    def _reload_refused(self) -> bool:
+        """True (with a status message) while a heavy job holds the job gate: the
+        main window is not rebuilt, nor the experiment replaced, under a running job."""
+        gate = getattr(self.controller, 'job_gate', None)
+        if gate is None or not gate.is_held():
+            return False
+        self.bus.statusMessage.emit(f'{gate.busy_text()}. The experiment can be opened, created or reloaded '
+                                    'once it has finished.')
+        return True
+
     @Slot()
     def reload_main_window(self):
         self.load_main_window_with_experiment_and_template(self.controller.experiment.experiment_path)
 
     @Slot(str)
     def load_main_window_with_experiment_and_template(self, experiment_file, new=False, template_path=None):
+        if self._reload_refused():
+            return
         try:
             self.current_window.blockSignals(True)
 
@@ -297,6 +309,8 @@ class View(QObject):
 
     @Slot()
     def new_experiment(self):
+        if self._reload_refused():
+            return
         new_file_dialog = NewFileDialog(self.current_window)
         new_file_dialog.finished.connect(self.save_new_file)
         new_file_dialog.show()
@@ -310,6 +324,8 @@ class View(QObject):
 
     @Slot()
     def open_experiment(self):
+        if self._reload_refused():
+            return
         file, _ = QFileDialog.getOpenFileName(self.current_window, "Open Experiment", base_directory, f"Experiment File (*.{file_extension})")
         if file:
             add_recent_file(file)
@@ -317,6 +333,8 @@ class View(QObject):
 
     @Slot()
     def new_from_template(self):
+        if self._reload_refused():
+            return
         template, _ = QFileDialog.getOpenFileName(self.current_window, "Select Template Experiment", base_directory, f"Experiment File (*.{file_extension})")
         if template:
             file, _ = QFileDialog.getSaveFileName(self.current_window, f"New Experiment from \"{Path(template)}\"", base_directory, f"Experiment File (*.{file_extension})")
@@ -327,6 +345,8 @@ class View(QObject):
 
     @Slot()
     def new_from_this_template(self, template_path=None):
+        if self._reload_refused():
+            return
         if template_path:
             path = Path(template_path)
         else:

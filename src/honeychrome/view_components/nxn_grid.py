@@ -486,6 +486,13 @@ class NxNGrid(QFrame):
             if not selection_model.isSelected(index):
                 return super().eventFilter(obj, event)
 
+            # the spillover is not changed under a running heavy job
+            gate = getattr(self.controller, 'job_gate', None)
+            if gate is not None and gate.is_held():
+                if self.bus:
+                    self.bus.statusMessage.emit(f'{gate.busy_text()}: the spillover can be edited once it has finished.')
+                return True
+
             old = self.controller.experiment.process['spillover'][rr][c]
             step = -settings.wheel_speed if event.angleDelta().y() > 0 else settings.wheel_speed
             new_value = float(old) + step

@@ -3,14 +3,13 @@ from copy import deepcopy
 import re
 
 import numpy as np
-from PySide6.QtCore import QObject, Signal, QTimer
+from PySide6.QtCore import QObject, Signal, Slot, QTimer
 from flowkit import GatingStrategy, Dimension, gates
 from flowio import FlowData
 
 from honeychrome.controller_components.functions import timer, apply_gates_in_place, apply_transfer_matrix, calc_stats, all_same, assign_default_transforms, generate_transformations
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import to_gml
 from honeychrome.settings import settings_default, process_default, cytometry_default, af_channels
-from honeychrome.view_components.busy_cursor import with_busy_cursor
 from honeychrome.controller_components.cytometer_whitelist import resolve_cytometer_params
 
 import logging
@@ -71,20 +70,30 @@ class ImportFCSController(QObject):
         # connect
         self.experiment = experiment
         self.bus = bus
+        # (message, is_warning) once the experiment has been reconfigured: the
+        # import dialog asks for the reload after this thread has ended, then shows it
+        self.reload_message = None
 
     def reconfigure_experiment_from_fcs_files(self):
-        """Thin wrapper — safe to call directly from the main thread only.
-
-        `import_fcs_files_widget.py` already runs the import on its own
-        QThread, so it connects to `_reconfigure_experiment_from_fcs_files_impl`
-        directly rather than this wrapper, to avoid nesting
-        @with_busy_cursor's WorkerThread/QEventLoop (and its main-thread-only
-        cursor calls) inside an already-background thread.
+        """Reconfigure on the calling thread (scripts). The app runs
+        `_reconfigure_experiment_from_fcs_files_impl` on its own QThread
+        (`import_fcs_files_widget.py`), with the busy cursor set on the GUI side.
         """
         self._reconfigure_experiment_from_fcs_files_impl()
 
-    @with_busy_cursor
+    @Slot()
     def _reconfigure_experiment_from_fcs_files_impl(self):
+        """Reconfigure the experiment from its FCS files; always ends with finished."""
+        try:
+            self._reconfigure()
+        except Exception as e:
+            logger.exception('ImportFCSController: reconfiguration failed')
+            if self.bus:
+                self.bus.warningMessage.emit(f'Cannot set up the experiment file:\n{e}')
+        finally:
+            self.finished.emit()
+
+    def _reconfigure(self):
         self.experiment.scan_sample_tree()
         experiment_dir = self.experiment.generate_subdirs()
         # single_stain_controls = self.experiment.samples['single_stain_controls']
@@ -529,12 +538,7 @@ class ImportFCSController(QObject):
                     if notes:
                         text = '\n\n'.join(notes) + '\n\n' + text
                     logger.info(text)
-                    if self.bus:
-                        self.bus.reloadExpRequested.emit()
-                        if notes:
-                            self.bus.warningMessage.emit(text)
-                        else:
-                            self.bus.popupMessage.emit(text)
+                    self.reload_message = (text, bool(notes))
                 else:
                     text = ('Cannot set up the experiment file: \n'
                             'the FCS files supplied do not have a consistent set of channels (channel names and ranges). \n'
@@ -558,8 +562,6 @@ class ImportFCSController(QObject):
             warnings.warn(text)
             if self.bus:
                 self.bus.warningMessage.emit(text)
-
-        self.finished.emit()
 
 
 

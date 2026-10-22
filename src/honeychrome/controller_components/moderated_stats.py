@@ -359,24 +359,24 @@ def stagewise_adjust(p, family, alpha: float) -> dict:
     'n_families'.
     """
     p = np.asarray(p, dtype=float)
-    fam = np.asarray(family, dtype=object)
-    labels = list(dict.fromkeys(fam.tolist()))
-    fam_p = np.array([simes(p[fam == f]) for f in labels], dtype=float)
+    # Families in order of first appearance; members kept in input order
+    codes, labels = pd.factorize(np.asarray(family, dtype=object), sort=False,
+                                 use_na_sentinel=False)
+    order = np.argsort(codes, kind='stable')
+    members = np.split(order, np.cumsum(np.bincount(codes, minlength=len(labels)))[:-1])
+    fam_p = np.array([simes(p[m]) for m in members], dtype=float)
     fam_adj = bh_adjust(fam_p)
     n_fam = int(np.isfinite(fam_p).sum())
     selected = np.isfinite(fam_adj) & (fam_adj <= alpha)
     n_sel = int(selected.sum())
 
-    family_p = np.full(p.shape, np.nan)
-    family_adj = np.full(p.shape, np.nan)
+    family_p = fam_p[codes]
+    family_adj = fam_adj[codes]
     adjusted = np.where(np.isfinite(p), 1.0, np.nan)
-    for f, fp, fa, sel in zip(labels, fam_p, fam_adj, selected):
-        members = fam == f
-        family_p[members] = fp
-        family_adj[members] = fa
-        if sel and n_sel > 0:
-            within = bh_adjust(p[members])
-            adjusted[members] = np.minimum(within * n_fam / n_sel, 1.0)
+    if n_sel > 0:
+        for k in np.flatnonzero(selected):
+            m = members[k]
+            adjusted[m] = np.minimum(bh_adjust(p[m]) * n_fam / n_sel, 1.0)
     return {'family_p': family_p, 'family_adj': family_adj, 'adjusted': adjusted,
             'n_selected': n_sel, 'n_families': n_fam}
 

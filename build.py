@@ -54,7 +54,7 @@ def get_project_files():
 # scikit-learn ships its own, older libomp in sklearn/.dylibs; it cannot be
 # shared (it lacks entry points Apple clang now calls) and is left alone.
 
-KERNEL_PREFIXES = ('_som_kernel', '_autospectral_opt_kernel')
+KERNEL_PREFIXES = ('_som_kernel', '_autospectral_opt_kernel', '_gls_m2p_kernel')
 APP_FRAMEWORKS_RPATH = '@executable_path/../Frameworks'
 LIBOMP_RPATH_REF = '@rpath/libomp.dylib'
 

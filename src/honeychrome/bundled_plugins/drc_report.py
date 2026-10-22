@@ -645,7 +645,7 @@ class ReportTab(QWidget):
 
         log.info("generate_report: writing %d item(s) to %s", len(items), report_dir)
 
-        # Item 3 -- visible progress while the PDF is built. No cancel
+        # Visible progress while the PDF is built. No cancel
         # button: this runs on the main thread inside one PdfPages
         # context, so interrupting partway through would leave a broken
         # PDF on disk rather than actually stopping cleanly.

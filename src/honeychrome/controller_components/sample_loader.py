@@ -14,12 +14,16 @@ The work is split in two:
     matrix, raw channel order, fluorescence channel positions, spillover,
     a deep copy of the experiment settings, and the AF library assigned to
     each requested sample (resolved from ``samples['sample_af_profiles']``
-    and the controller's precomputed AF cache). Also collects per-sample
-    time-QC keep-masks when the ``time_qc`` module is present.
+    and the controller's precomputed AF cache), and the experiment's
+    unmixing method (``unmix_method.method_state``: noise model, spectral
+    variants, per-sample corrected spectra; None for per-cell AF). Also
+    collects per-sample time-QC keep-masks when the ``time_qc`` module is
+    present.
 
 ``load_unmixed(experiment_dir, sample_key, snapshot)``
     Worker-safe. Reads one FCS file, applies an optional keep-mask and a
-    seeded event cap, and unmixes it with that sample's own AF library.
+    seeded event cap, and unmixes it with that sample's own AF library and
+    the experiment's unmixing method.
     Optionally returns the per-cell AF abundance and AF index. With a cap,
     only the selected events are read from list-mode float files (see
     ``read_raw_subsample``).
@@ -43,6 +47,7 @@ from pathlib import Path
 
 import numpy as np
 
+from honeychrome.controller_components import unmix_method
 from honeychrome.controller_components.autospectral_functions import (
     af_index_lookup,
     apply_af_transfer,
@@ -56,7 +61,7 @@ __all__ = [
     'AFState', 'UnmixSnapshot', 'sample_key_for_path', 'af_profile_names',
     'resolve_af_for_profiles', 'snapshot_unmix_state', 'read_raw_events',
     'unmix_events', 'load_unmixed', 'seeded_subsample_indices', 'read_raw_subsample',
-    'control_sample_keys', 'analysis_sample_keys',
+    'control_sample_keys', 'analysis_sample_keys', 'array_digest', 'unmixing_signature',
 ]
 
 
@@ -87,6 +92,8 @@ class UnmixSnapshot:
     ``transfer_matrix`` is a reference to the controller's array at snapshot
     time. The controller replaces that array rather than mutating it, so a
     worker holding this snapshot is unaffected by later reassignments.
+    ``method`` is the experiment's unmixing method
+    (``unmix_method.MethodState``), None for per-cell AF with the base spectra.
     """
     transfer_matrix: np.ndarray
     pnn_raw: tuple
@@ -96,6 +103,7 @@ class UnmixSnapshot:
     settings: dict
     af_by_sample: dict = field(default_factory=dict)
     qc_by_sample: dict = field(default_factory=dict)
+    method: object = None
 
     def af_for(self, sample_key: str | None) -> AFState | None:
         """AF library assigned to *sample_key*, or None for plain unmixing."""
@@ -107,6 +115,12 @@ class UnmixSnapshot:
         """Hashable description of the sample's AF assignment (for caches)."""
         af = self.af_for(sample_key)
         return af.profile_names if af is not None else ()
+
+    def method_key(self, sample_key: str | None) -> str:
+        """Hashable description of how the method unmixes the sample ('' for per-cell AF)."""
+        if self.method is None:
+            return ''
+        return self.method.sample_fingerprint(sample_key, self.af_for(sample_key))
 
     def legacy_af_state(self, sample_key: str | None) -> tuple:
         """``(transfer_matrix, af_precomputed, af_spectra)`` for *sample_key*."""
@@ -204,6 +218,47 @@ def resolve_af_for_profiles(controller, profile_names) -> AFState | None:
                    index_map=af_index_lookup(af_profiles, usable))
 
 
+def array_digest(data: np.ndarray) -> str:
+    """Hex digest of an array's shape, dtype and contents (BLAKE2b, 128-bit)."""
+    arr = np.ascontiguousarray(data)
+    h = hashlib.blake2b(digest_size=16)
+    h.update(repr((arr.shape, arr.dtype.str)).encode())
+    h.update(arr.reshape(-1).view(np.uint8))
+    return h.hexdigest()
+
+
+def unmixing_signature(controller, sample_keys) -> dict:
+    """
+    What decides the unmixed values of *sample_keys* (``all_samples`` keys):
+    the transfer matrix, the spillover, each sample's AF profile assignment
+    and the spectra of the profiles used, and the unmixing method (its
+    fingerprint and each sample's spectra set) when it is not per-cell AF
+    with the base spectra. JSON-serialisable; main thread only.
+    """
+    keys = sorted(str(k) for k in sample_keys)
+    process = controller.experiment.process
+    af_profiles = process.get('af_profiles', {}) or {}
+    assignment = {k: [str(n) for n in af_profile_names(controller, k)] for k in keys}
+    used_profiles = sorted({n for names in assignment.values() for n in names})
+    spillover = process.get('spillover')
+    transfer_matrix = controller.transfer_matrix
+    out = {
+        'transfer_matrix': (array_digest(np.asarray(transfer_matrix, dtype=np.float64))
+                            if transfer_matrix is not None else ''),
+        'spillover': (array_digest(np.asarray(spillover, dtype=np.float64))
+                      if spillover is not None else ''),
+        'af_assignment': assignment,
+        'af_spectra': {
+            n: array_digest(np.asarray(af_profiles[n]['spectra'], dtype=np.float64))
+            for n in used_profiles if n in af_profiles
+        },
+    }
+    method = unmix_method.method_state(controller)
+    if method is not None:
+        out['method'] = {k: [method.fingerprint, method.set_for(k)] for k in keys}
+    return out
+
+
 def _time_qc_masks(controller, sample_keys) -> dict:
     """Per-sample keep-masks from the time-QC module, when it is installed."""
     try:
@@ -275,6 +330,7 @@ def snapshot_unmix_state(controller, sample_keys=None,
         settings=settings,
         af_by_sample=af_by_sample,
         qc_by_sample=qc,
+        method=unmix_method.method_state(controller),
     )
 
 
@@ -307,13 +363,27 @@ def read_raw_events(abs_path, snap: UnmixSnapshot) -> np.ndarray:
 
 
 def unmix_events(raw_event_data: np.ndarray, snap: UnmixSnapshot,
-                 af: AFState | None, return_af: bool = False) -> dict:
-    """Unmix raw events, with AF correction when *af* is given.
+                 af: AFState | None, return_af: bool = False, sample_key: str | None = None,
+                 cache_file=None) -> dict:
+    """Unmix raw events, with AF correction when *af* is given, by the
+    snapshot's unmixing method for *sample_key*.
 
     Returns ``{'unmixed', 'af_scale', 'af_idx'}``. The AF arrays are None
     unless *return_af* is set; without AF correction they are zeros.
+    Without *sample_key* a sample is unmixed with the base spectra and, for
+    the noise model without AF, as cells. *cache_file* (the sample's FCS
+    file, for whole-sample loads) caches the method's result on disk (see
+    ``unmix_method.unmix``).
     """
     n = len(raw_event_data)
+    if getattr(snap, 'method', None) is not None:
+        result = unmix_method.unmix(raw_event_data, snap.transfer_matrix, snap.settings, snap.fl_ids_raw,
+                                    snap.spillover, af, snap.method, sample_key, cache_file=cache_file)
+        out = {'unmixed': result['unmixed'], 'af_scale': None, 'af_idx': None}
+        if return_af:
+            out['af_scale'] = result['af_scale']
+            out['af_idx'] = np.asarray(result['af_idx'], dtype=np.int32)
+        return out
     if af is not None:
         result = apply_af_transfer(
             raw_event_data,
@@ -434,7 +504,7 @@ def read_raw_subsample(abs_path, snap, sample_key: str, max_events: int | None,
 def load_unmixed(experiment_dir, sample_key: str, snap: UnmixSnapshot,
                  keep_mask: np.ndarray | None = None,
                  max_events: int | None = None, seed: int = 42,
-                 return_af: bool = False) -> dict:
+                 return_af: bool = False, use_cache: bool = False) -> dict:
     """Load and unmix one sample with its own AF assignment.
 
     Parameters
@@ -449,6 +519,11 @@ def load_unmixed(experiment_dir, sample_key: str, snap: UnmixSnapshot,
                      only the selected events are read where the file
                      allows it (see ``read_raw_subsample``).
     return_af      : also return per-cell AF abundance and index.
+    use_cache      : without *max_events*, read the experiment's
+                     noise-model or variants result from the on-disk
+                     unmixing cache, or store it there
+                     (``unmix_method.unmix``'s ``cache_file``); a capped
+                     read is never cached.
 
     Returns
     -------
@@ -465,7 +540,8 @@ def load_unmixed(experiment_dir, sample_key: str, snap: UnmixSnapshot,
         Path(experiment_dir) / key, snap, key, max_events, seed=seed, keep_mask=mask)
 
     af = snap.af_for(key)
-    result = unmix_events(raw, snap, af, return_af=return_af)
+    cache_file = Path(experiment_dir) / key if use_cache and max_events is None else None
+    result = unmix_events(raw, snap, af, return_af=return_af, sample_key=key, cache_file=cache_file)
     result.update({
         'event_index': event_index,
         'n_events_file': n_file,

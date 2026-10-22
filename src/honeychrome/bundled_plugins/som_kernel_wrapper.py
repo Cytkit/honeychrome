@@ -54,6 +54,11 @@ except ImportError:
 # Public interface
 # ---------------------------------------------------------------------------
 
+def _threads(n_threads: int) -> int:
+    """0 means every core but one, which is left for the user interface."""
+    return int(n_threads) if n_threads > 0 else max(1, (os.cpu_count() or 2) - 1)
+
+
 def train_som_batch(
     data:       np.ndarray,
     init_codes: np.ndarray,
@@ -72,7 +77,7 @@ def train_som_batch(
     nhbrdist   : (ncodes, ncodes) grid neighbourhood distances
     radii      : (n_epochs,) neighbourhood radius per epoch, strictly > 0
     dist       : 1=manhattan, 2=euclidean (default), 3=chebyshev, 4=cosine
-    n_threads  : OpenMP threads, 0 = all available cores (default)
+    n_threads  : OpenMP threads, 0 = every core but one (default)
 
     Returns codes : ndarray (ncodes, px) float64.
     """
@@ -103,7 +108,7 @@ def train_som_batch(
         ffi.cast('double *', radii.ctypes.data),
         ffi.cast('double *', codes_out.ctypes.data),
         n, px, ncodes, n_epochs,
-        dist, n_threads,
+        dist, _threads(n_threads),
     )
 
     return codes_out
@@ -116,7 +121,8 @@ def map_to_codes(
     n_threads: int = 0,
 ):
     """
-    Map each row of data to its nearest code.
+    Map each row of data to its nearest code. n_threads: OpenMP threads,
+    0 = every core but one (default).
 
     Returns (node_ids, dists):
         node_ids : ndarray (n,) int32, 0-based nearest-code index
@@ -146,7 +152,7 @@ def map_to_codes(
         ffi.cast('int32_t *', node_ids.ctypes.data),
         ffi.cast('double *', dists.ctypes.data),
         n, px, ncodes,
-        dist, n_threads,
+        dist, _threads(n_threads),
     )
 
     return node_ids, dists

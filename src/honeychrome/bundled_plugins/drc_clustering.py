@@ -41,6 +41,7 @@ question, controlled by two independent UI toggles collected into
 
 from __future__ import annotations
 
+import os
 import time
 import zlib
 from pathlib import Path
@@ -836,7 +837,7 @@ def run_hdbscan(controller, state, params: dict, progress=None, af_state=None) -
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
         cluster_selection_epsilon=cluster_selection_epsilon,
-        core_dist_n_jobs=-1,   # NOT 'n_jobs' -- different name than sklearn's HDBSCAN
+        core_dist_n_jobs=max(1, (os.cpu_count() or 2) - 1),   # NOT 'n_jobs' -- different name than sklearn's HDBSCAN
         prediction_data=True,  # required for approximate_predict() below
     ).fit(data)
     _add_time(state, 'fit', time.perf_counter() - start, len(data))

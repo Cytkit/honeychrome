@@ -1,4 +1,6 @@
-# CMakeLists.txt — AutoSpectral Optimization kernel (pybind11 + Armadillo)
+# CMakeLists.txt — AutoSpectral kernels: the Optimization kernel
+# (_autospectral_opt_kernel, pybind11 + Armadillo) and the M2p noise-model
+# GLS kernel (_gls_m2p_kernel, pybind11 + BLAS dgemm, no Armadillo).
 #
 # Prerequisites (macOS, local + CI):
 #   brew install armadillo libomp cmake
@@ -64,7 +66,19 @@ pybind11_add_module(_autospectral_opt_kernel
 target_include_directories(_autospectral_opt_kernel PRIVATE ${ARMADILLO_INCLUDE_DIRS})
 target_link_libraries(_autospectral_opt_kernel PRIVATE ${ARMADILLO_LIBRARIES})
 
-option(HONEYCHROME_OPENMP "Enable OpenMP in the AutoSpectral Optimization kernel" ON)
+# BLAS: Accelerate on macOS, the static OpenBLAS (BLA_STATIC above) on Windows,
+# the shared system BLAS on Linux (distribution static archives are not built
+# with -fPIC). The kernel calls dgemm_ with 32-bit integers.
+if(UNIX AND NOT APPLE)
+  set(BLA_STATIC OFF)
+endif()
+find_package(BLAS REQUIRED)
+pybind11_add_module(_gls_m2p_kernel gls_m2p_kernel.cpp)
+target_link_libraries(_gls_m2p_kernel PRIVATE ${BLAS_LIBRARIES})
+
+set(HONEYCHROME_KERNELS _autospectral_opt_kernel _gls_m2p_kernel)
+
+option(HONEYCHROME_OPENMP "Enable OpenMP in the AutoSpectral kernels" ON)
 
 if(HONEYCHROME_OPENMP)
   if(APPLE)
@@ -77,11 +91,12 @@ if(HONEYCHROME_OPENMP)
       RESULT_VARIABLE _libomp_prefix_result
     )
     if(_libomp_prefix_result EQUAL 0 AND LIBOMP_PREFIX)
-      target_compile_options(_autospectral_opt_kernel PRIVATE
-        -Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include)
-      target_link_directories(_autospectral_opt_kernel PRIVATE ${LIBOMP_PREFIX}/lib)
-      target_link_libraries(_autospectral_opt_kernel PRIVATE omp)
-      message(STATUS "AutoSpectral Optimization kernel: macOS OpenMP via libomp at ${LIBOMP_PREFIX}")
+      foreach(kernel IN LISTS HONEYCHROME_KERNELS)
+        target_compile_options(${kernel} PRIVATE -Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include)
+        target_link_directories(${kernel} PRIVATE ${LIBOMP_PREFIX}/lib)
+        target_link_libraries(${kernel} PRIVATE omp)
+      endforeach()
+      message(STATUS "AutoSpectral kernels: macOS OpenMP via libomp at ${LIBOMP_PREFIX}")
     else()
       message(WARNING
         "HONEYCHROME_OPENMP=ON but 'brew --prefix libomp' failed — "
@@ -90,8 +105,10 @@ if(HONEYCHROME_OPENMP)
     endif()
   else()
     find_package(OpenMP REQUIRED)
-    target_link_libraries(_autospectral_opt_kernel PRIVATE OpenMP::OpenMP_CXX)
+    foreach(kernel IN LISTS HONEYCHROME_KERNELS)
+      target_link_libraries(${kernel} PRIVATE OpenMP::OpenMP_CXX)
+    endforeach()
   endif()
 else()
-  message(STATUS "AutoSpectral Optimization kernel: building single-threaded (HONEYCHROME_OPENMP=OFF).")
+  message(STATUS "AutoSpectral kernels: building single-threaded (HONEYCHROME_OPENMP=OFF).")
 endif()

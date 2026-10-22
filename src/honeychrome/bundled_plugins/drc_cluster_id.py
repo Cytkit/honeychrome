@@ -5,10 +5,11 @@ Honeycluster plugin
 Companion module to ``dr_clustering_tab.py`` (filename intentionally does NOT
 end in ``_tab.py``, so it is not picked up as a separate plugin tab).
 
-Two independent scoring mechanisms feed the Cluster Annotation tab's Item 15
+Two independent scoring mechanisms feed the Cluster Annotation tab's
 "Cluster ID Suggestions" controls:
 
-  1. MEM (Marker Enrichment Modeling) -- ported from cluster_id.md.
+  1. MEM (Marker Enrichment Modeling; Diggins et al. 2017, Nat Methods
+     14:275).
      calculate_mem_scores() -> generate_mem_labels(). A descriptive
      statistic of the cluster's own data; safe to auto-adopt.
   2. Cell-type scoring -- score_cell_types(), using the marker-signature
@@ -28,8 +29,8 @@ Process tab's Antigen field (never overwritten -- only read and, for
 scoring, canonicalised at lookup time):
   - channels_missing_antigen() -- HARD gate. Any checked channel with no
     Antigen text at all blocks the whole computation (checked by the tab
-    before calling compute_cluster_id_suggestions). Without this, a blank
-    Antigen silently fell back to the channel's fluorophore Label in MEM
+    before calling compute_cluster_id_suggestions). Without it, a blank
+    Antigen would fall back to the channel's fluorophore Label in MEM
     Label output, mixing marker names and fluorophore names in the same
     run with no indication why.
   - build_channel_marker_map()'s `unmatched` return -- SOFT warning. An
@@ -140,7 +141,7 @@ def pool_cluster_marker_values(controller, state, cl_run: dict,
     thresholds) is a per-channel MARGINAL statistic; nothing compares
     events across channels, so there's no requirement that the same
     events survive downsampling in every channel. Pass None to disable
-    (use every pooled event -- the previous behaviour).
+    (use every pooled event).
 
     seed: numpy default_rng seed for the downsampling above. Fixed at 42
     (matching drc_pipeline.load_training_pool_with_rows's downsampling
@@ -290,17 +291,16 @@ def _log_pooled(result: dict):
 
 
 # ---------------------------------------------------------------------------
-# MEM scoring (ported from cluster_id.md)
+# MEM scoring
 # ---------------------------------------------------------------------------
 
 def calculate_mem_scores(pooled: dict[str, dict[int, np.ndarray]],
                           iqr_floor: float = 0.5) -> pd.DataFrame:
     """
-    Marker Enrichment Modeling score per (cluster, channel), ported from
-    cluster_id.md's calculate_mem_scores(). POP = this cluster's pooled
-    values for a channel; REF = every OTHER cluster's pooled values for
-    that channel (auto-reference), same background definition as the
-    original. This is a PER-CHANNEL comparison only -- POP and REF never
+    Marker Enrichment Modeling score per (cluster, channel). POP = this
+    cluster's pooled values for a channel; REF = every OTHER cluster's
+    pooled values for that channel (MEM's auto-reference). This is a
+    PER-CHANNEL comparison only -- POP and REF never
     mix data from other channels; the only place channels interact at all
     is the final rescale below.
 
@@ -485,7 +485,7 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
     Each unstained sample used by calculate_unstained_channel_thresholds
     is unmixed with, in order of preference:
 
-      0. Its own AF profile assignment in the AutoSpectral AF tab, when it
+      0. Its own AF profile assignment on the AutoSpectral tab's Autofluorescence page, when it
          has one (e.g. from "assign to all"), as the main window unmixes it.
 
     An unstained sample without an assignment needs a stand-in, so that it
@@ -502,9 +502,13 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
          same way count as the same combination rather than splitting
          across their individual profile names.
       3. If none of the training samples have ANY AF profile assigned,
-         that unstained sample gets (transfer_matrix, None, None) --
-         unmixed WITHOUT per-cell AF correction, matching the run itself
-         having none.
+         that unstained sample is unmixed WITHOUT per-cell AF correction,
+         matching the run itself having none.
+
+    Each state is ``(UnmixSnapshot, AFState or None)``: the sample is
+    unmixed by the experiment's method (noise model, spectral variants,
+    spectral corrections, as the training samples are) with that AF
+    library (see drc_pipeline.apply_unmixing_af_aware).
 
     Returns {unstained_rel_path: af_state_or_None} for every unstained
     cell sample _resolve_unstained_cell_sample_paths finds --
@@ -552,6 +556,9 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
         )
         return combo
 
+    from honeychrome.controller_components.sample_loader import resolve_af_for_profiles
+
+    snap = drc_pipeline.snapshot_af_state(controller, unstained_paths)
     result: dict[str, tuple | None] = {}
     af_state_cache: dict[tuple, tuple | None] = {}
     for rel in unstained_paths:
@@ -576,14 +583,8 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
             profile_names = most_common_combo
 
         if profile_names not in af_state_cache:
-            resolved = (
-                drc_pipeline.resolve_af_state_for_profiles(controller, list(profile_names))
-                if profile_names else None
-            )
-            af_state_cache[profile_names] = (
-                resolved if resolved is not None
-                else (controller.transfer_matrix, None, None)
-            )
+            af = resolve_af_for_profiles(controller, list(profile_names)) if profile_names else None
+            af_state_cache[profile_names] = (snap, af)
         result[rel] = af_state_cache[profile_names]
 
     return result
@@ -622,10 +623,10 @@ def _load_unstained_gated_transformed(
     which this intentionally bypasses, and this is only called once per
     unstained sample per Cluster ID run, not a hot path.
 
-    af_state: the sample's unmixing state, ``(transfer_matrix,
-    af_precomputed, af_spectra)`` from resolve_unstained_af_states (see
-    apply_unmixing_af_aware()'s docstring). None unmixes without per-cell
-    AF correction.
+    af_state: the sample's unmixing state, ``(UnmixSnapshot, AFState or
+    None)`` from resolve_unstained_af_states, or ``(transfer_matrix,
+    af_precomputed, af_spectra)`` (see apply_unmixing_af_aware()'s
+    docstring). None unmixes without per-cell AF correction.
 
     Returns (values, channel_names) or None on error.
     """
@@ -651,7 +652,8 @@ def _load_unstained_gated_transformed(
 
         if af_state is None:
             af_state = (controller.transfer_matrix, None, None)
-        unmixed = drc_pipeline.apply_unmixing_af_aware(controller, raw, af_state=af_state)
+        unmixed = drc_pipeline.apply_unmixing_af_aware(controller, raw, af_state=af_state,
+                                                       sample_key=str(rel_path))
 
         # This sample's own gates: its per-sample overrides and Time range.
         from honeychrome.controller_components.per_sample_gating_functions import SampleGating
@@ -820,7 +822,7 @@ def generate_mem_labels(mem_scores: pd.DataFrame, display_labels: dict[str, str]
                          threshold: float = 2.0) -> dict[int, str]:
     """
     Human-readable label per cluster from a MEM score matrix, e.g.
-    'CD4+6 CD8-5', ported from cluster_id.md's generate_mem_labels().
+    'CD4+6 CD8-5'.
     Markers with |score| < threshold are dropped as noise; a cluster with
     nothing above threshold gets 'Uncharacterized' (never blank, so it's
     still a meaningful one-click MEM Label adoption target).
@@ -887,7 +889,7 @@ def channels_missing_antigen(controller, channels: list[str]) -> list[str]:
     Label output that mixes marker names (e.g. "CD4") and fluorophore names
     (e.g. "BUV395") in the same run, which reads as one consistent kind of
     label but isn't. Rather than let that fallback fire, the tab calls this
-    FIRST and refuses to proceed (see Change 10 below) if anything comes
+    FIRST and refuses to proceed if anything comes
     back non-empty, forcing every checked channel to have an Antigen typed
     in before Cluster ID will run at all.
 
@@ -1020,8 +1022,7 @@ def filter_cell_type_db_by_species(cell_type_db: list[dict],
     drc_cell_type_database.csv), so a mouse-panel run still sees those.
 
     species=None (or '') returns cell_type_db unchanged -- callers that
-    haven't wired up a species selector (or want the old unrestricted
-    behaviour) aren't forced to pass anything.
+    score against every species aren't forced to pass anything.
     """
     if not species:
         log.info("filter_cell_type_db_by_species: no species set -- scoring against all %d entries", len(cell_type_db))

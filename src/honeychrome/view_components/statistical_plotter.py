@@ -2,6 +2,7 @@ from PySide6.QtCore import QThread, QTimer, Qt, QSettings
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QPushButton, QComboBox, QLabel, QVBoxLayout, QScrollArea, QMessageBox, QLayout
 from pathlib import Path
 from honeychrome.controller_components.functions import get_all_subfolders_recursive
+from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy
 from honeychrome.controller_components.statistical_controller import StatisticsCalculator
 import honeychrome.settings as settings
 from honeychrome.view_components.busy_cursor import with_busy_cursor
@@ -112,6 +113,7 @@ class StatisticalComparisonWidget(QWidget):
         self.refresh_button = QPushButton('Recalculate All Plots')
         self.refresh_button.setToolTip('Recalculates all statistical comparisons from all sample files and current gating hierarchy')
         self.refresh_button.clicked.connect(self.refresh_statistical_comparisons)
+        guard_while_busy(self.controller, self.refresh_button)
         self.clear_button = QPushButton('Clear All Plots')
         self.clear_button.setToolTip('Deletes all statistical comparison plots')
         self.clear_button.clicked.connect(self.clear_all_plots)
@@ -165,6 +167,7 @@ class StatisticalComparisonWidget(QWidget):
         self.statistic_combo.currentTextChanged.connect(self.on_statistic_selected)
         self.channel_combo.currentTextChanged.connect(self.on_channel_selected)
         self.create_button.clicked.connect(self.create_statistical_comparison)
+        guard_while_busy(self.controller, self.create_button)
 
         self.initialise()
 
@@ -304,12 +307,21 @@ class StatisticalComparisonWidget(QWidget):
             statistics_comparison['antigen channel'] = self.channel_combo.currentText()
         statistics_comparison['statistic'] = statistic
 
+        token = acquire_job(self.controller, 'Statistics')
+        if token is None:
+            return
         # add to statistics specification
         self.controller.experiment.statistics.append(statistics_comparison)
-        self.setEnabled(False)
-        self.refresh_statistical_comparisons()
+        self._start_statistics(token)
 
     def refresh_statistical_comparisons(self):
+        token = acquire_job(self.controller, 'Statistics')
+        if token is not None:
+            self._start_statistics(token)
+
+    def _start_statistics(self, token):
+        self._job_token = token
+        self.setEnabled(False)
         self.thread = QThread()
         self.statistics_calculator = StatisticsCalculator(self.bus, self.controller)
         self.statistics_calculator.moveToThread(self.thread)
@@ -320,6 +332,7 @@ class StatisticalComparisonWidget(QWidget):
         self.thread.start()
 
     def _on_thread_finished(self):
+        self._job_token.release()
         self.thread.deleteLater()
         self.setEnabled(True)
         self.initialise()
@@ -362,11 +375,11 @@ class StatisticsPlotWidget(QWidget):
 
         # Matplotlib imports for embedding
         from matplotlib.figure import Figure
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from honeychrome.view_components.scalable_figure_widget import scrollable_canvas_class
 
         # Create matplotlib figure + canvas
         self.figure = Figure(constrained_layout=True)
-        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas = scrollable_canvas_class()(self.figure)
         self.canvas.setFixedSize(800, 600)
 
         self.delete_button = QPushButton('Delete')

@@ -15,7 +15,7 @@ from honeychrome.controller_components.cytometer_whitelist import (
     get_detector_laser_map, LASER_LABEL_COLORS,
 )
 from honeychrome.view_components.cytometry_plot_components import (
-    ROTATED_LABEL_HEIGHT, TICK_TEXT_OFFSET,
+    RotatedLabelAxisMixin, TICK_TEXT_OFFSET,
 )
 
 
@@ -117,7 +117,7 @@ class LegendEntry(QWidget):
 
 
 
-class BottomAxisVerticalTickLabels(pg.AxisItem):
+class BottomAxisVerticalTickLabels(RotatedLabelAxisMixin, pg.AxisItem):
     def __init__(self, angle=45, **kwargs):
         self.angle = angle
         self._label_padding = 15
@@ -131,7 +131,9 @@ class BottomAxisVerticalTickLabels(pg.AxisItem):
     def setTicks(self, ticks):
         self.setStyle(tickTextOffset=TICK_TEXT_OFFSET)
         super().setTicks(ticks)
-        self.setHeight(ROTATED_LABEL_HEIGHT if self.angle and ticks else None)
+        # height follows the longest label (_updateHeight), as does the left margin
+        self.setHeight(None)
+        self._fit_left_margin()
         self.updateGeometry()
         self.update()
 
@@ -353,6 +355,7 @@ class ProfilesViewer(QFrame):
         from honeychrome.controller_components.spectral_functions import get_raw_events
         from honeychrome.controller_components.functions import sample_from_fcs
         from honeychrome.controller_components.spectral_controller import control_gating
+        from honeychrome.controller_components.spread_model import raw_layout
 
         self._hist_vb.clear()
 
@@ -373,6 +376,7 @@ class ProfilesViewer(QFrame):
         cleaned_store    = self.controller.cleaned_events
         event_channels_pnn = self.controller.experiment.settings['raw']['event_channels_pnn']
         fluor_ch_ids     = self.controller.filtered_raw_fluorescence_channel_ids
+        layout           = raw_layout(self.controller)  # column selectors for get_raw_events
         experiment_dir   = self.controller.experiment_dir
         all_samples      = self.controller.experiment.samples.get('all_samples', {})
         all_samples_rev  = {v: k for k, v in all_samples.items()}
@@ -447,8 +451,8 @@ class ProfilesViewer(QFrame):
                 pos_peak_raw = pos_events[:, peak_local_idx]
 
                 # Negative overlay: for external-negative controls load from the
-                # unstained file; for internal/beads load the Neg gate from the
-                # positive sample.
+                # unstained file; for internal/beads show the Neg gate of the
+                # positive sample (cleaning uses the bottom 10 % of the control instead).
                 neg_peak_raw = None
                 if use_internal:
                     # Internal: load Neg gate from positive sample
@@ -458,9 +462,9 @@ class ProfilesViewer(QFrame):
                             neg_gate_lbl = control.get('neg_gate_label') or f'Neg {label}'
                             if raw_gating.find_matching_gate_paths(neg_gate_lbl):
                                 # the control sample's own gate (per-sample override included)
-                                neg_ev = get_raw_events(sample, fluor_ch_ids, gate_label=neg_gate_lbl,
+                                neg_ev = get_raw_events(sample, layout['fl_ids'], gate_label=neg_gate_lbl,
                                                         gating_strategy=control_gating(self.controller),
-                                                        sample_key=rel_path)
+                                                        col_order=layout['col_order'], sample_key=rel_path)
                                 neg_peak_raw = neg_ev[:, peak_local_idx] if len(neg_ev) > 0 else None
                                 logger.info(
                                     f'_plot_peak_histograms: "{label}" internal neg — '
@@ -476,7 +480,7 @@ class ProfilesViewer(QFrame):
                     if neg_rel_path:
                         try:
                             neg_sample = sample_from_fcs(str(experiment_dir / neg_rel_path))
-                            neg_ev_all = get_raw_events(neg_sample, fluor_ch_ids)
+                            neg_ev_all = get_raw_events(neg_sample, layout['fl_ids'], col_order=layout['col_order'])
                             neg_peak_raw = neg_ev_all[:, peak_local_idx] if len(neg_ev_all) > 0 else None
                             logger.info(
                                 f'_plot_peak_histograms: "{label}" external neg "{neg_name}" — '
@@ -493,7 +497,7 @@ class ProfilesViewer(QFrame):
                 if rel_path:
                     try:
                         sample = sample_from_fcs(str(experiment_dir / rel_path))
-                        all_ev = get_raw_events(sample, fluor_ch_ids)
+                        all_ev = get_raw_events(sample, layout['fl_ids'], col_order=layout['col_order'])
                         x_all, y_all = _hist(all_ev[:, peak_local_idx])
                         item = pg.PlotDataItem(stepMode="center", fillLevel=0,
                                             brush=(*_COL_ALL_GRAY[:3], 60),
@@ -521,7 +525,7 @@ class ProfilesViewer(QFrame):
                                         pen=pg.mkPen(_COL_MATCHED, width=1, style=Qt.DashLine))
                     item.setData(x_neg, y_neg)
                     self._hist_vb.addItem(item)
-                    neg_legend = 'neg gate' if use_internal else 'matched −ve'
+                    neg_legend = 'Neg gate, not used by cleaning' if use_internal else 'matched −ve'
                     legend_items.append(('#50a0ff', f'{label} — {neg_legend} (dashed)'))
 
             else:
@@ -531,7 +535,7 @@ class ProfilesViewer(QFrame):
                     continue
                 try:
                     sample = sample_from_fcs(str(experiment_dir / rel_path))
-                    all_ev = get_raw_events(sample, fluor_ch_ids)
+                    all_ev = get_raw_events(sample, layout['fl_ids'], col_order=layout['col_order'])
                     x_all, y_all = _hist(all_ev[:, peak_local_idx])
                     item = pg.PlotDataItem(stepMode="center", fillLevel=0,
                                         brush=(*_COL_ALL_GRAY[:3], 150),

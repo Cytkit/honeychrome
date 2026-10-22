@@ -32,10 +32,9 @@ estimating a run does not load every sample first.
 
 Reference curves: Linux VM on an Apple M-series MacBook Air, 4 cores, all
 cores used, Tombi Lung (7 channels), numba 0.68, umap-learn 0.5.12, pacmap
-0.8.0, openTSNE 1.0.4 (claude/honeycluster_perf/bench_vm.csv; UMAP index
-and embed with hnswlib search: umap_embed_vm.csv).  The curve shapes agreed
-to within +/-0.05 in exponent between that machine and an x86 cloud machine,
-and held on the same Mac natively (bench_mac.csv); the factor absorbs the
+0.8.0, openTSNE 1.0.4; UMAP index and embed with hnswlib search.  The curve
+shapes agreed to within +/-0.05 in exponent between that machine and an x86
+cloud machine, and held on the same Mac natively; the factor absorbs the
 machine's speed.
 
 Pure numpy; no Qt.
@@ -145,7 +144,7 @@ TSNE_EXAGGERATION_ITERATIONS = 250
 # UMAP's embed reference: transforms searching an hnswlib index
 # (drc_umap_index) of a model fitted with 200 epochs; the transform
 # optimises for n_epochs // 3, which is 32% of its time at 200 epochs
-# (claude/honeycluster_perf/umap_embed_vm.csv, fitted within +/-13%)
+# (fitted within +/-13%)
 REFERENCE_UMAP_EMBED_EPOCHS = 200
 UMAP_EMBED_LAYOUT_SHARE = 0.32
 
@@ -186,7 +185,7 @@ def reference_seconds(algo: str, stage: str, events: int, params: dict,
 TSNE_FFT_MIN_EVENTS = 10_000
 # With OpenMP, Barnes-Hut uses every core and FFT barely any: on the
 # reference VM (4 threads) Barnes-Hut took 15-16.5 s at 10k, 33 s at 20k and
-# 99 s at 50k events, FFT 52 s, 70 s and 102 s (tsne_bh_vm.csv, bench_vm.csv)
+# 99 s at 50k events, FFT 52 s, 70 s and 102 s
 TSNE_FFT_MIN_EVENTS_OPENMP = 50_000
 # UMAP uses exact nearest neighbours below this many events (other code)
 UMAP_SMALL_DATA_EVENTS = 4_096
@@ -495,7 +494,7 @@ def clustering_probe_fn(algo: str, params: dict) -> Callable[[np.ndarray], dict]
                 min_cluster_size=min(params['min_cluster_size'], limit),
                 min_samples=min(params['min_samples'], limit) or None,
                 cluster_selection_epsilon=params['cluster_selection_epsilon'],
-                core_dist_n_jobs=-1, prediction_data=True).fit(data))])
+                core_dist_n_jobs=max(1, (os.cpu_count() or 2) - 1), prediction_data=True).fit(data))])
     else:
         raise ValueError(f"Unknown clustering algorithm: {algo}")
     return probe

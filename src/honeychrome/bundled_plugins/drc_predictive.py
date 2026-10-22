@@ -39,6 +39,8 @@ a feature it drops may still differ between groups.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -145,7 +147,8 @@ def _fit_forest(X, y, seed):
     for depth in _RF_DEPTHS:
         rf = RandomForestClassifier(n_estimators=_RF_TREES, max_depth=depth,
                                     class_weight='balanced_subsample', max_features='sqrt',
-                                    oob_score=True, n_jobs=-1, random_state=seed).fit(Xi, y)
+                                    oob_score=True, n_jobs=max(1, (os.cpu_count() or 2) - 1),
+                                    random_state=seed).fit(Xi, y)
         oob = rf.oob_decision_function_[:, 1]
         ok = np.isfinite(oob)
         auc = roc_auc_score(y[ok], oob[ok]) if len(np.unique(y[ok])) == 2 else -np.inf

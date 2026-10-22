@@ -400,7 +400,7 @@ def update_dr_run_embeddings(controller, state, run_id: str, embeddings: dict,
 def update_cluster_id_suggestions(controller, state, run_id: str,
                                    mem_labels: dict, cell_type_df) -> None:
     """
-    Persist Item 15's Cluster ID Suggestions (MEM Label + Suggested Type)
+    Persist the Cluster ID Suggestions (MEM Label + Suggested Type)
     for an already-archived clustering run -- same "update after the
     fact" pattern as update_dr_run_embeddings() above, needed for the
     same reason: suggestions are computed in a LATER step than
@@ -552,7 +552,7 @@ def delete_run(controller, state, run_id: str) -> None:
     """
     Remove a run everywhere: manifest entry, payload bundle, and the matching
     in-memory entry in state.dr_runs / state.clustering_runs.  Self-contained
-    so Item 6's management table only has to call this one function.
+    so the run management table only has to call this one function.
     """
     manifest = [e for e in read_manifest(controller) if e.get('run_id') != run_id]
     write_manifest(controller, manifest)

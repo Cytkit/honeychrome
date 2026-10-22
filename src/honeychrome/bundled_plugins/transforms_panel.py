@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 import honeychrome.settings as hc_settings
+from honeychrome.controller_components.job_gate import wait_if_busy
 
 __all__ = ['TransformInspector', 'PopulationTransformsPanel', 'TransformSet', 'BiplotTile',
            'transform_params', 'transform_from_params', 'parks_moore_w', 'magnitude_decades',
@@ -1301,6 +1302,9 @@ class PopulationTransformsPanel(TransformInspector):
             return
         self._wanted = request
         if self._loader is not None:
+            return
+        if wait_if_busy(self.controller, ('transforms population', id(self)),
+                        lambda: self.load_events(force=True), self.lbl_samples.setText):
             return
         try:
             snap = snapshot_unmix_state(self.controller, keys)

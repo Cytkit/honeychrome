@@ -95,6 +95,7 @@ hist_bins = 200 # for displaying histograms
 label_offset_default = (0, -0.03) # for gate labels
 subsample = 10_000 # for exporting FCS files
 max_display_events = 500_000  # cap on events shown in cytometry display plots (None = no cap)
+unmixing_cache_gb = 8  # per experiment: on-disk noise-model / variants unmixing results (cache/unmixed)
 density_cutoff = 1 # bin count to set to first level of colourmap in 2d histograms (below this level is transparent)
 
 line_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
@@ -238,6 +239,7 @@ process_default = {
     'spectral_model': [],
     'profiles': {},
     'negative_type': 'unstained', # or internal
+    'condition_number': None,
     'similarity_matrix': None,
     'hotspot_matrix': None,
     'unmixing_matrix': None,
@@ -264,6 +266,7 @@ cytometry_plot_width_target_retrieved = q_settings.value("cytometry_plot_size", 
 tile_size_nxn_grid_retrieved = q_settings.value("nxn_tile_size", tile_size_nxn_grid, type=int)
 subsample_retrieved = q_settings.value("subsample_number", subsample, type=int)
 max_display_events = q_settings.value("max_display_events", max_display_events, type=int)
+unmixing_cache_gb_retrieved = q_settings.value("unmixing_cache_gb", unmixing_cache_gb, type=int)
 hist_bins_retrieved = q_settings.value("histogram_resolution", hist_bins, type=int)
 density_cutoff_retrieved = q_settings.value("density_cutoff", density_cutoff, type=int)
 

@@ -33,7 +33,8 @@ import hashlib
 from datetime import datetime
 import numpy as np
 from pathlib import Path
-from PySide6.QtCore import QObject, Slot, QTimer
+from PySide6.QtCore import QCoreApplication, QObject, QThread, Qt, Signal, Slot, QTimer
+from PySide6.QtGui import QGuiApplication
 from flowkit import GatingStrategy, Sample, gates
 import threading
 from copy import deepcopy
@@ -61,6 +62,9 @@ from honeychrome.controller_components.autospectral_functions import (
         refresh_envelope_entry,
      )
 from honeychrome.settings import af_index_channel
+from honeychrome.controller_components import unmix_method
+from honeychrome.controller_components.job_gate import JobGate
+from honeychrome.controller_components.sample_loader import AFState
 
 base_directory = Path.home() / experiments_folder
 
@@ -87,6 +91,11 @@ cytometry_data_dictionary = {
 }
 
 class Controller(QObject):
+    # a background unmixing job for the displayed sample (queued to the main thread)
+    methodUnmixRequested = Signal(object)
+    # negative envelopes to build from AF profiles' source samples (queued to the main thread)
+    envelopeBuildRequested = Signal(object)
+
     def __init__(self,
         events_cache_name=None,
         events_cache_lock=None,
@@ -103,9 +112,24 @@ class Controller(QObject):
         self.current_sample = None
         self.current_sample_path = None
         self.live_sample_path = None
+        # one heavy job at a time across the application
+        self.job_gate = JobGate(self)
         self.raw_event_data = None
         self.unmixed_event_data = None
         self.af_sidecar_data = None   # (n_cells, 2) float64: col 0 = af_scale, col 1 = af_idx; None when OLS
+        # progressive display with the experiment's slow unmixing method (unmix_method)
+        self.progressive_unmixing = True
+        self._unmix_generation = 0
+        self._method_thread = None
+        self._method_worker = None
+        self._method_job_pending = None
+        self.methodUnmixRequested.connect(self._start_method_job, Qt.QueuedConnection)
+        # AF profiles whose envelope is built from their source sample (envelope_builder)
+        self._envelope_thread = None
+        self._envelope_worker = None
+        self._envelope_rerun = False
+        self._envelope_failed = set()
+        self.envelopeBuildRequested.connect(self._start_envelope_job, Qt.QueuedConnection)
 
         # ephemeral data on top of experiment
         self.filtered_raw_fluorescence_channel_ids = None
@@ -223,9 +247,9 @@ class Controller(QObject):
 
     def _load_autospectral_variants(self):
         """Restore autospectral_variants from .kit autospectral_variants_data
-        and .autospectral_variants.npz sidecar. Backs the AutoSpectral
-        Optimization bundled plugin's Setup section (bundled_plugins/
-        autospectral_optimization_tab.py). Mirrors _load_cleaned_events
+        and .autospectral_variants.npz sidecar. Backs the AutoSpectral tab's
+        Spectral Variants page (view_components/autospectral_variants_page.py).
+        Mirrors _load_cleaned_events
         with one addition: each label is only restored if its saved profile_fingerprint
         still matches the current experiment.process['profiles'][label] — if the reference
         spectrum has changed since Setup was run, the cached variants no
@@ -327,7 +351,7 @@ class Controller(QObject):
             'spectrum', 'n_removed_saturation', 'n_surviving_positive',
             'empirical_peak_ch_idx', 'expected_peak_ch_idx',
             'fluor_ch_ids', 'cytometer_key', 'warnings', '_fingerprint',
-            'spectrum_initial', 'refine_log', 'crosstalk',
+            'spectrum_initial', 'refine_log', 'crosstalk', 'background_check',
         }
         _ARRAY_KEYS = {
             'spectral_sub', 'scatter_pos', 'scatter_neg_matched',
@@ -1114,6 +1138,115 @@ class Controller(QObject):
             f'Controller: AF cache rebuilt — '
             f'{len(self.af_precomputed_cache)}/{len(af_profiles)} profiles cached.'
         )
+        self._request_missing_envelopes()
+
+    def _request_missing_envelopes(self):
+        """
+        Build, from its source sample, the negative envelope of every stored
+        AF profile that has none it can keep current (envelope_builder): in a
+        background thread when a Qt application runs, else at once. A profile
+        whose source cannot be read is not tried again for this experiment.
+        """
+        from honeychrome.controller_components.autospectral_functions import envelope_needs_source
+        from honeychrome.controller_components.spread_model import raw_layout
+
+        af_profiles = self.experiment.process.get('af_profiles') or {}
+        fluor_names = self._build_fluor_names()
+        fluor_spectra = self._build_fluor_spectra()
+        if not af_profiles or fluor_names is None or fluor_spectra is None or self.experiment_dir is None:
+            return
+        todo = {name: deepcopy(entry) for name, entry in af_profiles.items()
+                if (str(self.experiment_dir), name) not in self._envelope_failed
+                and envelope_needs_source(entry, fluor_names, fluor_spectra, self.experiment_dir)}
+        if not todo:
+            return
+        try:
+            layout = raw_layout(self)
+        except Exception as e:
+            logger.warning(f'AF envelope: channel layout unavailable ({e})')
+            return
+        job = {'experiment_dir': self.experiment_dir, 'profiles': todo, 'layout': layout,
+               'fluor_names': list(fluor_names), 'fluor_spectra': np.array(fluor_spectra, dtype=np.float64)}
+        if QCoreApplication.instance() is None:
+            from honeychrome.controller_components.envelope_builder import build_envelopes
+            built, failed = build_envelopes(job, lambda _text: None)
+            self._on_envelopes_built(job, built, failed)
+            return
+        self.envelopeBuildRequested.emit(job)
+
+    @Slot(object)
+    def _start_envelope_job(self, job: dict):
+        """Run an envelope job in a QThread; a request while one runs is repeated after it,
+        one while a heavy job holds the gate after the gate is released."""
+        if self._envelope_thread is not None:
+            self._envelope_rerun = True
+            return
+        if self.job_gate.is_held():
+            self.job_gate.when_free('AF envelopes', self._request_missing_envelopes)
+            return
+        from honeychrome.controller_components.envelope_builder import EnvelopeBuildWorker
+
+        if self.bus:
+            self.bus.statusMessage.emit('Building missing AF negative envelopes from their source samples...')
+        self._envelope_thread = QThread()
+        self._envelope_worker = EnvelopeBuildWorker(job)
+        self._envelope_worker.moveToThread(self._envelope_thread)
+        self._envelope_thread.started.connect(self._envelope_worker.run)
+        self._envelope_worker.finished.connect(self._on_envelopes_built)
+        self._envelope_worker.finished.connect(self._envelope_thread.quit)
+        self._envelope_thread.finished.connect(self._envelope_thread.deleteLater)
+        self._envelope_thread.finished.connect(self._on_envelope_thread_finished)
+        self._envelope_thread.start()
+
+    @Slot(object, object, object)
+    def _on_envelopes_built(self, job: dict, built: dict, failed: dict):
+        """Store envelopes built from source samples, re-cache those profiles and unmix again."""
+        from honeychrome.controller_components.autospectral_functions import save_envelope_sample
+
+        if job['experiment_dir'] != self.experiment_dir:
+            return
+        fluor_spectra = self._build_fluor_spectra()
+        if fluor_spectra is None or not np.array_equal(fluor_spectra, job['fluor_spectra']):
+            return
+        af_profiles = self.experiment.process.get('af_profiles') or {}
+        stored = []
+        for name, (entry, sample) in built.items():
+            profile = af_profiles.get(name)
+            if profile is None or not np.array_equal(np.asarray(profile['spectra']),
+                                                     np.asarray(job['profiles'][name]['spectra'])):
+                continue
+            try:
+                save_envelope_sample(sample, self.experiment_dir, entry['unstained_file'])
+            except OSError as e:
+                logger.warning(f'AF envelope: subsample of {name} not saved ({e})')
+                failed[name] = str(e)
+                continue
+            profile['envelope'] = entry
+            self.cache_af_profile(name)
+            stored.append(name)
+        for name in failed:
+            self._envelope_failed.add((str(self.experiment_dir), name))
+        if stored:
+            self.on_af_profiles_changed()
+            if self.bus:
+                self.bus.autoSaveRequested.emit()
+        message = []
+        if stored:
+            message.append('AF negative envelope built from the source sample for ' + ', '.join(stored) + '.')
+        if failed:
+            message.append('No negative envelope for ' + ', '.join(failed) + ' (source sample not readable); '
+                           'extract the profile again to add one.')
+            logger.warning(' '.join(message[-1:]))
+        if message and self.bus:
+            self.bus.statusMessage.emit(' '.join(message))
+
+    @Slot()
+    def _on_envelope_thread_finished(self):
+        self._envelope_thread = None
+        self._envelope_worker = None
+        if self._envelope_rerun:
+            self._envelope_rerun = False
+            self._request_missing_envelopes()
 
 
     def n_af_spectra(self) -> int | None:
@@ -1212,14 +1345,25 @@ class Controller(QObject):
 
 
     def _apply_unmixing(self, raw_event_data):
-        """Apply unmixing — AF-corrected if matrices are set, otherwise plain OLS/WLS.
+        """Apply unmixing — the experiment's method (unmix_method), else
+        AF-corrected if matrices are set, otherwise plain OLS/WLS.
 
         Always returns the unmixed event array (same shape contract as before).
         As a side-effect, populates self.af_sidecar_data with a (n_cells, 2)
         array [af_scale, af_idx] when AF correction is active, or sets it to
         None when plain OLS is used.  Callers must not rely on af_sidecar_data
         until after this method returns.
+
+        With the noise model or spectral variants as the method, the displayed
+        sample is returned unmixed by per-cell AF (or from the display cache)
+        and the method's result is swapped in from a background job
+        (_start_method_job). Live data stays on per-cell AF.
         """
+        self._unmix_generation += 1
+        live = self.live_sample_path is not None and self.current_sample_path == self.live_sample_path
+        state = None if live else unmix_method.method_state(self)
+        if state is not None:
+            return self._apply_method_unmixing(raw_event_data, state)
         if self.af_precomputed is not None and self.af_spectra is not None:
             # Remap full-PNN fluorescence indices to whitelisted-PNN column positions.
             # raw_event_data is loaded with col_order=whitelisted_pnn, so stored
@@ -1247,6 +1391,143 @@ class Controller(QObject):
         else:
             self.af_sidecar_data = None
             return apply_transfer_matrix(self.transfer_matrix, raw_event_data)
+
+    def _current_af_state(self) -> AFState | None:
+        """The displayed sample's AF library as set by initialise_af_matrices."""
+        if self.af_precomputed is None or self.af_spectra is None:
+            return None
+        names = self.experiment.samples.get('sample_af_profiles', {}).get(self.current_sample_path, []) or []
+        return AFState(profile_names=tuple(names), precomputed=self.af_precomputed,
+                       spectra=self.af_spectra, index_map=self.af_index_map)
+
+    def _raw_fl_ids(self) -> list:
+        """Fluorescence channel positions in the (whitelisted) raw event columns."""
+        _raw = self.experiment.settings['raw']
+        pnn_raw = _raw.get('whitelisted_pnn') or _raw['event_channels_pnn']
+        full_pnn_raw = _raw['event_channels_pnn']
+        return [pnn_raw.index(full_pnn_raw[i]) for i in self.filtered_raw_fluorescence_channel_ids]
+
+    def _set_unmixed_sidecar(self, result: dict, af):
+        self.af_sidecar_data = None if af is None else np.column_stack(
+            [result['af_scale'], np.asarray(result['af_idx'], dtype=np.float64)])
+
+    def _apply_method_unmixing(self, raw_event_data, state):
+        """_apply_unmixing with the experiment's method (see its docstring)."""
+        af = self._current_af_state()
+        key = self.current_sample_path
+        fl_ids = self._raw_fl_ids()
+        spillover = self.experiment.process.get('spillover')
+        settings_ = self.experiment.settings
+        method = state.effective_method(af, key)
+        if method == unmix_method.R1:
+            result = unmix_method.unmix(raw_event_data, self.transfer_matrix, settings_, fl_ids, spillover, af,
+                                        state, key)
+            self._set_unmixed_sidecar(result, af)
+            return result['unmixed']
+
+        sample_file = None if key is None or self.experiment_dir is None else Path(self.experiment_dir) / key
+        cache_key = (unmix_method.display_cache_key(state, key, af, raw_event_data, fl_ids, sample_file)
+                     if self.experiment_dir is not None else None)
+        if cache_key:
+            cached = unmix_method.load_display_cache(self.experiment_dir, cache_key, len(raw_event_data),
+                                                     len(state.fluor_names))
+            if cached is not None:
+                result = unmix_method.assemble(raw_event_data, self.transfer_matrix, settings_, cached, spillover, af)
+                self._set_unmixed_sidecar(result, af)
+                logger.info('Controller: %s from the unmixing cache for %s', method, key)
+                return result['unmixed']
+
+        job = {'generation': self._unmix_generation, 'raw': raw_event_data, 'state': state, 'af': af,
+               'sample_key': key, 'fl_ids': fl_ids, 'method': method, 'cache_key': cache_key,
+               'experiment_dir': self.experiment_dir}
+        if not self.progressive_unmixing or QCoreApplication.instance() is None:
+            fl = unmix_method.unmix_fluorescence(raw_event_data[:, fl_ids], state, af, key, method)
+            if cache_key:
+                unmix_method.store_display_cache(self.experiment_dir, cache_key, fl)
+            result = unmix_method.assemble(raw_event_data, self.transfer_matrix, settings_, fl, spillover, af)
+            self._set_unmixed_sidecar(result, af)
+            return result['unmixed']
+
+        result = unmix_method.unmix(raw_event_data, self.transfer_matrix, settings_, fl_ids, spillover, af,
+                                    state, key, force_r1=True)
+        self._set_unmixed_sidecar(result, af)
+        self.methodUnmixRequested.emit(job)
+        return result['unmixed']
+
+    @Slot(object)
+    def _start_method_job(self, job: dict):
+        """Run a display job in a QThread; one at a time, the latest request kept waiting."""
+        if job['generation'] != self._unmix_generation:
+            return
+        if self._method_thread is not None:
+            self._method_job_pending = job
+            return
+        if self.job_gate.is_held():
+            self.job_gate.when_free('display unmixing', lambda: self._start_method_job(job))
+            if self.bus:
+                label = unmix_method.method_label(job['method'], job['state'].prior_lambda)
+                self.bus.statusMessage.emit(f'Showing per-cell AF; unmixing with the {label} waits for '
+                                            f'{self.job_gate.holder[0]}.')
+            return
+        from honeychrome.controller_components.method_unmix_worker import MethodUnmixWorker
+
+        if self.bus:
+            label = unmix_method.method_label(job['method'], job['state'].prior_lambda)
+            self.bus.statusMessage.emit(f'Showing per-cell AF; unmixing with the {label} in the background...')
+        self._method_thread = QThread()
+        self._method_worker = MethodUnmixWorker(job)
+        self._method_worker.moveToThread(self._method_thread)
+        self._method_thread.started.connect(self._method_worker.run)
+        self._method_worker.finished.connect(self._on_method_job_finished)
+        self._method_worker.error.connect(self._on_method_job_error)
+        self._method_worker.finished.connect(self._method_thread.quit)
+        self._method_worker.error.connect(self._method_thread.quit)
+        self._method_thread.finished.connect(self._method_thread.deleteLater)
+        self._method_thread.finished.connect(self._on_method_thread_finished)
+        self._method_thread.start()
+
+    def _method_job_current(self, job: dict) -> bool:
+        return (job['generation'] == self._unmix_generation and self.raw_event_data is job['raw']
+                and self.experiment_dir == job['experiment_dir'] and self.transfer_matrix is not None)
+
+    @Slot(object, object)
+    def _on_method_job_finished(self, job: dict, fl_result: dict):
+        if not self._method_job_current(job):
+            return
+        if QGuiApplication.overrideCursor() is not None:
+            # a busy-cursor operation (e.g. load_sample) is still filling the plots
+            QTimer.singleShot(100, lambda: self._on_method_job_finished(job, fl_result))
+            return
+        af = job['af']
+        result = unmix_method.assemble(self.raw_event_data, self.transfer_matrix, self.experiment.settings,
+                                       fl_result, self.experiment.process.get('spillover'), af)
+        self.unmixed_event_data = result['unmixed']
+        self._set_unmixed_sidecar(result, af)
+        self.clear_data_for_cytometry_plots()
+        self.initialise_data_for_cytometry_plots()
+        if self.bus:
+            label = unmix_method.method_label(job['method'], job['state'].prior_lambda)
+            self.bus.statusMessage.emit(f'Showing {self.current_sample_path} unmixed with the {label}.')
+
+    @Slot(object, str)
+    def _on_method_job_error(self, job: dict, msg: str):
+        if self.bus and self._method_job_current(job):
+            self.bus.statusMessage.emit(f'Background unmixing failed ({msg}); showing per-cell AF.')
+
+    @Slot()
+    def _on_method_thread_finished(self):
+        self._method_thread = None
+        self._method_worker = None
+        pending, self._method_job_pending = self._method_job_pending, None
+        if pending is not None:
+            self._start_method_job(pending)
+
+    def refresh_unmixing(self):
+        """Unmix the displayed sample again after the unmixing method changed."""
+        if self.raw_event_data is not None and self.transfer_matrix is not None:
+            self.unmixed_event_data = self._apply_unmixing(self.raw_event_data)
+            self.clear_data_for_cytometry_plots()
+            self.initialise_data_for_cytometry_plots()
 
     @Slot(str, str)
     def new_sample(self, sample_name, sample_type):
@@ -2091,7 +2372,7 @@ class Controller(QObject):
             unmixed_settings = settings_default['unmixed'].copy()
             self.experiment.settings['unmixed'].update(unmixed_settings)
 
-            self.experiment.process.update({'similarity_matrix': None, 'hotspot_matrix': None, 'unmixing_matrix': None, 'spillover': None})
+            self.experiment.process.update({'condition_number': None, 'similarity_matrix': None, 'hotspot_matrix': None, 'unmixing_matrix': None, 'spillover': None})
             self.experiment.cytometry['plots'] = []
             self.experiment.cytometry['transforms'] = None
             self.experiment.cytometry['gating'] = None
