@@ -71,7 +71,7 @@ from honeychrome.controller_components.particle_type import (
     is_bead_sample, scatter_channel_pair, scatter_ceilings,
 )
 from honeychrome.controller_components.af_auto_assign import (
-    POOR_FIT_SHARE, folder_groups, reference_sources, suggest_af_profiles,
+    MAX_REFERENCES, POOR_FIT_SHARE, folder_groups, reference_sources, suggest_af_profiles,
 )
 from honeychrome.view_components.cytometry_plot_components import (
     InteractiveLabel,
@@ -166,18 +166,20 @@ class AfAutoAssignWorker(QObject):
     error = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, experiment_dir, references, targets, pair, ceilings):
+    def __init__(self, experiment_dir, references, targets, pair, ceilings, max_references):
         super().__init__()
         self.experiment_dir = experiment_dir
         self.references = references
         self.targets = targets
         self.pair = pair
         self.ceilings = ceilings
+        self.max_references = max_references
 
     def run(self):
         try:
             result = suggest_af_profiles(self.experiment_dir, self.references, self.targets,
-                                         self.pair, self.ceilings, progress=self.progress.emit)
+                                         self.pair, self.ceilings, progress=self.progress.emit,
+                                         max_references=self.max_references)
             self.finished.emit(result)
         except Exception as e:
             logger.exception('AutoSpectral: auto-assign failed')
@@ -1078,12 +1080,21 @@ class AutofluorescencePage(QWidget):
         self._assign_folder_btn.clicked.connect(self._assign_selected_profile_to_folder)
         group_row.addWidget(self._assign_folder_btn)
         group_row.addStretch(1)
+        self._auto_single_cb = QCheckBox('One profile per sample')
+        self._auto_single_cb.setChecked(True)
+        self._auto_single_cb.setToolTip(
+            'Auto-assign gives each sample the profile(s) of its single best-matching '
+            'unstained control. Untick to allow up to three unstained controls per '
+            'sample, each explaining at least 30% of its events.'
+        )
+        group_row.addWidget(self._auto_single_cb)
         self._auto_assign_btn = QPushButton('Auto-assign from Scatter')
         self._auto_assign_btn.setToolTip(
             'For every sample shown in the grid with no AF profile (bead samples '
             'excepted), choose the profile(s) of the unstained control(s) whose '
             'FSC/SSC distribution best explains its own: Gaussian mixture models '
-            'of each unstained sample, combined by BIC. Existing assignments are '
+            'of each unstained sample, combined by BIC (one control only when '
+            '"One profile per sample" is ticked). Existing assignments are '
             'not changed. Review the result before unmixing.'
         )
         self._auto_assign_btn.clicked.connect(self._run_auto_assign)
@@ -2104,6 +2115,7 @@ class AutofluorescencePage(QWidget):
         self._auto_worker = AfAutoAssignWorker(
             self.controller.experiment_dir, references, targets, pair,
             scatter_ceilings(raw_settings, pair),
+            1 if self._auto_single_cb.isChecked() else MAX_REFERENCES,
         )
         self._auto_worker.moveToThread(self._auto_thread)
         self._auto_thread.started.connect(self._auto_worker.run)
@@ -2149,41 +2161,70 @@ class AutofluorescencePage(QWidget):
             return all_samples.get(path) or Path(path).stem
 
         n_scored = len(result['assignments']) + len(result['skipped'])
-        counts = {}
+        # The message is a fixed-length summary, so the box fits the screen
+        # whatever the number of samples; per-sample lines go under Show Details.
+        by_size = {}
+        per_profile = {}
         for path in changed:
-            key = ' + '.join(sample_af[path])
-            counts[key] = counts.get(key, 0) + 1
+            by_size[len(sample_af[path])] = by_size.get(len(sample_af[path]), 0) + 1
+            for name in sample_af[path]:
+                per_profile[name] = per_profile.get(name, 0) + 1
+        sizes = ', '.join(f'{n} with {k} profile{"" if k == 1 else "s"}'
+                          for k, n in sorted(by_size.items()))
         lines = [f'AF profiles were assigned to {len(changed)} of {n_scored} unassigned '
-                 'sample(s) from their forward and side scatter.']
-        lines += [f'  • {key}: {n} sample(s)' for key, n in sorted(counts.items(), key=lambda kv: -kv[1])]
-        if result['skipped']:
-            lines.append(f'{len(result["skipped"])} sample(s) were left unassigned: '
-                         + ', '.join(label(p) for p in result['skipped']) + '.')
-        if result['unused_references']:
-            lines.append('Unstained samples not used: '
-                         + ', '.join(label(p) for p in result['unused_references']) + '.')
+                 'sample(s) from their forward and side scatter'
+                 + (f' ({sizes}).' if sizes else '.')]
+        if per_profile:
+            lines.append(f'{len(per_profile)} of {len(af_profiles)} AF profiles were used.')
         poor = sorted(((d['outside'], p) for p, d in result['details'].items()
                        if p in changed and d['outside'] >= POOR_FIT_SHARE), reverse=True)
         if poor:
             lines.append(f'{len(poor)} sample(s) have at least {POOR_FIT_SHARE:.0%} of events '
-                         'outside the scatter of their unstained controls (check these first): '
-                         + ', '.join(f'{label(p)} ({f:.0%})' for f, p in poor) + '.')
+                         'outside the scatter of their unstained controls: check these first '
+                         '(listed first under Show Details).')
+        if result['skipped']:
+            lines.append(f'{len(result["skipped"])} sample(s) were left unassigned '
+                         '(see Show Details).')
+        if result['unused_references']:
+            lines.append(f'{len(result["unused_references"])} unstained sample(s) were not '
+                         'used (see Show Details).')
         lines.append('')
         lines.append('Please review the assignments in the grid. A sample is matched to the '
                      'unstained controls it most resembles in scatter, which does not guarantee '
                      'that its autofluorescence matches.')
 
-        details = []
-        for path in changed:
+        def detail(path):
             d = result['details'][path]
             refs = ', '.join(f'{label(r)} {w:.0%}' for r, w in zip(d['references'], d['weights']))
-            details.append(f'{label(path)}: {" + ".join(sample_af[path])} [{refs}; '
-                           f'ΔBIC {d["delta_bic"]:.0f}; {d["outside"]:.1%} of events outside; '
-                           f'{d["n_events"]:,} events]')
-        for path, reason in result['skipped'].items():
-            details.append(f'{label(path)}: not assigned ({reason})')
-        for path, reason in result['unused_references'].items():
-            details.append(f'{label(path)} (unstained): not used ({reason})')
+            return (f'{label(path)}: {" + ".join(sample_af[path])} [{refs}; '
+                    f'ΔBIC {d["delta_bic"]:.0f}; {d["outside"]:.1%} of events outside; '
+                    f'{d["n_events"]:,} events]')
+
+        details = []
+        poor_paths = [p for _f, p in poor]
+        if poor_paths:
+            details.append(f'Check first (at least {POOR_FIT_SHARE:.0%} of events outside):')
+            details += [detail(p) for p in poor_paths]
+            details.append('')
+        others = [p for p in changed if p not in set(poor_paths)]
+        if others:
+            details.append('Assigned:')
+            details += [detail(p) for p in others]
+            details.append('')
+        if result['skipped']:
+            details.append('Not assigned:')
+            details += [f'{label(p)}: {reason}' for p, reason in result['skipped'].items()]
+            details.append('')
+        if result['unused_references']:
+            details.append('Unstained samples not used:')
+            details += [f'{label(p)}: {reason}' for p, reason in result['unused_references'].items()]
+            details.append('')
+        if per_profile:
+            details.append('Samples per AF profile:')
+            details += [f'{name}: {n}' for name, n in
+                        sorted(per_profile.items(), key=lambda kv: (-kv[1], kv[0]))]
+        while details and not details[-1]:
+            details.pop()
 
         self._assign_status.setText(
             f'Auto-assign: {len(changed)} sample(s) assigned — please review the grid.'
@@ -2194,6 +2235,14 @@ class AutofluorescencePage(QWidget):
                           QMessageBox.StandardButton.Ok, self)
         if details:
             box.setDetailedText('\n'.join(details))
+            # QMessageBox gives the details 100 px of height and wraps each
+            # sample over several lines; one line per sample, scrolled, reads better
+            from PySide6.QtWidgets import QTextEdit
+            details_view = box.findChild(QTextEdit)
+            if details_view is not None:
+                details_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+                details_view.setMinimumWidth(720)
+                details_view.setFixedHeight(280)
         box.exec()
 
     def _clear_all_af(self):
