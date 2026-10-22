@@ -84,6 +84,11 @@ MIN_EVENTS = 200
 # 'bool' or a tuple of (value, label) choices.
 EXPOSED_SETTINGS = (
     ('smooth_updates', 'Smooth updates (rounds averaged; slower)', 'bool', None, None, None, None),
+    ('plausibility_ratio', 'Plausible change: at most x start value per detector (0 = off)', 'float', 0.0, 10.0,
+     0.1, 2),
+    ('plausibility_floor', 'Plausible change: or at most (peak = 1)', 'float', 0.0, 0.2, 0.005, 3),
+    ('shared_direction', 'Shrink coefficients unrelated dyes share (co-expression)', 'bool', None, None, None, None),
+    ('af_penalty', 'Damp steps more AF-like than the dye itself', 'bool', None, None, None, None),
     ('max_iter', 'Maximum iterations', 'int', 1, 200, 1, None),
     ('convergence_threshold', 'Convergence threshold', 'float', 1e-5, 0.5, 0.001, 5),
     ('convergence_quantile', 'Convergence quantile', 'float', 0.5, 1.0, 0.01, 3),

@@ -56,7 +56,10 @@ Phase one
     is updated by the trust-damped error and decayed toward zero where
     trust is weak, until the ``convergence_quantile`` of the off-diagonal
     error (``stop_rule='all'``) or of the step applied (``'applied'``) falls
-    below ``convergence_threshold``, or delta stalls (``stall_rule``: its
+    below ``convergence_threshold`` (with ``'settled'``: the error of every
+    coefficient with at least ``stop_trust`` trust, for ``stop_confirm``
+    iterations in a row, so slopes too weakly trusted ever to finish do not
+    hold phase one open), or delta stalls (``stall_rule``: its
     3-iteration trend rises, or it sets no new minimum for
     ``stall_patience`` iterations). ``seed_streams`` gives every random
     draw its own generator keyed by (seed, purpose, fluorophore), so a
@@ -75,6 +78,37 @@ Phase two
     joint fit is re-measured with every other row held at its spectrum;
     ``phase_two_fallback`` adopts that row (default), phase one's
     back-solved row, or rejects it.
+Plausibility bounds
+    A detector of a row may change by at most ``plausibility_ratio`` x its
+    value in the reference row (the spectra the run, or ``smooth_fix``'s
+    rounds, started from) or ``plausibility_floor``, whichever is greater
+    (defaults 1 and 0.01: a value can at most double, a detector with no
+    signal can gain 1% of the peak). Real bead-to-cell errors fit inside
+    this box; a dim marker co-expressed on a dye's cells, or AF taken up
+    by it, does not, because it adds signal where the dye had none. Phase
+    one takes the part of each back-solved row outside the box back out of
+    its coefficients by least squares over the other rows (to the bound),
+    so a contaminated coefficient stops steering phase two's regressors;
+    phase two rejects a row with more than ``plausibility_reject`` of its
+    change (norm) out of bounds ('implausible') and resets the detectors
+    out of bounds of the row it adopts to the reference value
+    (``plausibility_reset``; else to the bound). Bounding each pair
+    coefficient on its own, or shrinking whole phase-one steps, held back
+    real corrections (claude/FMU_PLAUSIBILITY_STUDY.md); both are gone.
+Shared directions (off by default)
+    ``shared_direction``: when mutually unrelated sources (cosine below
+    ``shared_cosine``) carry coefficients of the same sign into one channel,
+    and each source's whole row change points at that channel's dye
+    (``shared_alignment``), the dye is more likely expressed on their cells
+    than every one of their rows wrong in the same way: each such
+    coefficient's fixed point is shrunk by (number of unrelated sources) **
+    -``shared_power``. Bead-to-cell errors share directions too (systematic
+    bead differences), so the check costs real corrections there.
+AF penalty (off by default)
+    ``af_penalty``: a source's step is damped when its row change is more
+    AF-like (squared cosine to the nearest AF spectrum) than the dye itself
+    by more than ``af_penalty_margin``, to nothing ``af_penalty_width``
+    further on, so an AF-like dye may still move in AF-like directions.
 Fluorophores kept fixed
     ``fixed_fluorophores`` names rows that are never corrected: a fixed
     fluorophore is no pair's source in phase one (no evidence is gathered
@@ -82,7 +116,12 @@ Fluorophores kept fixed
     spectrum) and phase two leaves its spectrum as it is ('fixed'). It still
     counts as a target channel, as a lasso regressor and in the background.
     For FlowCode tags, whose FRET error the FlowCode plugin removes in raw
-    space: a correction of their rows would remove it a second time.
+    space: a correction of their rows would remove it a second time. With
+    ``exclude_fixed_targets`` (off by default; the FlowCode plugin sets it)
+    a fixed fluorophore is also no pair's target channel, no lasso target
+    or regressor and no phase-two leakage target: it stays in the design,
+    the background and the dominance of events, so its signal is still
+    unmixed, but evidence in its channel never changes another row.
 Smooth updates
     ``smooth_fix`` runs Fix My Unmix in rounds on fresh subsamples, each
     started from the current spectra, and moves the spectra a step
@@ -145,7 +184,8 @@ HYPERNEGATIVE_RULES = ('after', 'new')
 PHASE_TWO_ROWS = ('all', 'flagged')
 PHASE_TWO_ADOPT = ('remeasured', 'backsolved')
 PHASE_TWO_FALLBACK = ('remeasured', 'backsolved', 'reject')
-STOP_RULES = ('all', 'applied', 'trusted')
+STOP_RULES = ('all', 'applied', 'trusted', 'settled')
+DISAGREEMENT_REFERENCES = ('envelope', 'anchored', 'envelope_corrected')
 STALL_RULES = ('trend', 'patience')
 # generator keys of seed_streams, one stream per purpose and fluorophore
 _STREAM_EVIDENCE, _STREAM_LASSO, _STREAM_SLOPES, _STREAM_DOWNSAMPLE, _STREAM_SMOOTH = 1, 2, 3, 4, 5
@@ -170,7 +210,11 @@ class FixSettings:
     ``glasso_warm`` and ``hypernegative_dominant`` on; the other stop and
     stall rules, ``seed_streams`` and the non-joint fallbacks other than
     're-measured' stay off (no gain in accuracy, or a loss; 'applied' can
-    stop after one partly trusted step, below the flag threshold). ``smooth_updates``, ``smooth_rounds`` and ``smooth_fraction`` are
+    stop after one partly trusted step, below the flag threshold). The plausibility box (ratio 1, floor
+    0.01, reject 0.5, reset) is on from the plausibility study (``claude/FMU_PLAUSIBILITY_STUDY.md``): it
+    removes most of the co-expression and AF taken up on real panels at no cost on the bead-cell benchmark;
+    the shared-direction check and the AF penalty stay off. ``stop_rule='settled'`` and
+    ``disagreement_reference`` 'anchored' / 'envelope_corrected' (2026-10-22) are options, off, until benchmarked. ``smooth_updates``, ``smooth_rounds`` and ``smooth_fraction`` are
     read by ``smooth_fix`` and ``spectral_correction``, not by
     ``fix_my_unmix``.
     """
@@ -186,6 +230,8 @@ class FixSettings:
     compare_quantile: float = 0.5
     min_negative_frac: float = 0.10
     max_disagreement: float = 0.5
+    disagreement_reference: str = 'envelope'  # slope the binned median is compared with, see DISAGREEMENT_REFERENCES
+    envelope_scale_quantile: float = 0.25   # 'envelope_corrected': upper quantile of each bin's lower-tail scale
     min_hypernegative_frac: float = 0.01
     max_hypernegative_frac: float = 0.05
     min_hypernegative_events: int = 200
@@ -218,6 +264,18 @@ class FixSettings:
     glasso_refit: bool = True               # least squares on the lasso's selection (relaxed lasso)
     af_gate: bool = False                   # drop row changes that look like an AF spectrum
     af_gate_max: float = 0.8                # ... cos^2 to the nearest AF library spectrum above this
+    plausibility_ratio: float = 1.0         # 0: off; else a detector may change by at most this x its reference value
+    plausibility_floor: float = 0.01        # ... or by this (peak = 1), whichever is greater
+    plausibility_reject: float = 0.5        # reject a row when more than this share of its change is out of bounds
+    plausibility_reset: bool = True         # an adopted row's detector out of bounds keeps its reference value
+    shared_direction: bool = False          # shrink coefficients that unrelated sources share into one channel
+    shared_cosine: float = 0.5              # ... sources above this cosine to each other are related (count once)
+    shared_min_slope: float = 0.01          # ... a source shares a direction with a coefficient of at least this
+    shared_alignment: float = 0.5           # ... and its whole row change at least this cosine to the channel's dye
+    shared_power: float = 1.0               # ... coefficient x (unrelated sources sharing it) ** -power
+    af_penalty: bool = False                # damp a source's step that is more AF-like than the dye itself
+    af_penalty_margin: float = 0.3          # ... no damping up to the dye's own AF likeness + margin
+    af_penalty_width: float = 0.3           # ... no trust beyond that + width
     source_dominant: bool = True
     spread_addback: bool = False
     max_coefficient: float = 0.5
@@ -226,6 +284,8 @@ class FixSettings:
     stop_rule: str = 'all'                  # see STOP_RULES: every fitted error, the step applied, or trusted
     stall_rule: str = 'trend'               # see STALL_RULES: 3-iteration trend of delta, or no new minimum
     stall_patience: int = 3                 # ... for stall_patience iterations
+    stop_trust: float = 0.1                 # 'settled': a coefficient below this trust does not hold phase one open
+    stop_confirm: int = 2                   # 'settled': iterations in a row every trusted error must be below threshold
     coefficient_decay: float = 0.05
     update_spectra: bool = True
     phase_two_rows: str = 'flagged'         # see PHASE_TWO_ROWS
@@ -260,6 +320,7 @@ class FixSettings:
     smooth_rounds: int = 5
     smooth_fraction: float = 0.5            # share of the stained events each round draws
     fixed_fluorophores: tuple = ()          # rows never corrected (e.g. FlowCode tags); names not in the panel ignored
+    exclude_fixed_targets: bool = False     # fixed rows are also no target channel, lasso regressor or leakage target
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +473,123 @@ def af_likeness(change: np.ndarray, af_spectra: np.ndarray) -> float:
         return 0.0
     cos = (lib @ change) / np.maximum(np.linalg.norm(lib, axis=1) * norm_c, _EPS)
     return float(np.max(cos ** 2))
+
+
+# ---------------------------------------------------------------------------
+# Plausibility bounds
+# ---------------------------------------------------------------------------
+
+def plausible_change(reference: np.ndarray, ratio: float, floor: float) -> np.ndarray:
+    """
+    The largest change each detector of a row may take (peak-normalised
+    reference rows): ``ratio`` x the reference value or ``floor``,
+    whichever is greater. A detector with no starting signal may gain no
+    more than the floor; a detector's value cannot more than double at
+    ratio 1.
+    """
+    ref = np.maximum(np.asarray(reference, dtype=np.float64), 0.0)
+    return np.maximum(ratio * ref, floor)
+
+
+def clip_to_plausible(row: np.ndarray, reference: np.ndarray, allow: np.ndarray,
+                      reset: bool = False) -> tuple[np.ndarray, float]:
+    """
+    ``row`` with each detector's change from ``reference`` clipped to
+    +/- ``allow`` (with ``reset``, a detector out of bounds takes no change
+    at all), peak-normalised and non-negative, and the share of the change
+    (Euclidean norm) that was out of bounds.
+    """
+    ref = np.asarray(reference, dtype=np.float64)
+    change = np.asarray(row, dtype=np.float64) - ref
+    norm_c = float(np.linalg.norm(change))
+    if not norm_c > 0:
+        return np.asarray(row, dtype=np.float64).copy(), 0.0
+    kept = np.clip(change, -allow, allow)
+    if reset:
+        kept = np.where(np.abs(change) > allow, 0.0, change)
+    out = np.maximum(ref + kept, 0.0)
+    peak = out.max()
+    out = out / peak if peak > 0 else ref.copy()
+    return out, float(np.linalg.norm(change - np.clip(change, -allow, allow)) / norm_c)
+
+
+def _plausible_project(spill: np.ndarray, spectra: np.ndarray, reference: np.ndarray, allow: np.ndarray,
+                       passes: int = 3, rows: np.ndarray | None = None,
+                       basis: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """
+    ``spill`` with each row's off-diagonal coefficients adjusted, by least
+    squares over the other rows' spectra, so that its back-solved row moves
+    back toward reference +/- allow where it lies outside (``passes``
+    rounds; a part of the excess outside the panel's span cannot be taken
+    back and is left to the clip of the adopted row). Returns the
+    spillover and, per row, the share of its change from the reference that
+    was out of bounds before the first pass (0 for rows inside). ``rows``
+    (bool) limits the rows adjusted and ``basis`` (bool) the rows whose
+    coefficients may be adjusted (default all).
+    """
+    out = spill.copy()
+    n = out.shape[0]
+    share = np.zeros(n)
+    rows = np.ones(n, dtype=bool) if rows is None else np.asarray(rows, dtype=bool)
+    basis_ok = np.ones(n, dtype=bool) if basis is None else np.asarray(basis, dtype=bool)
+    for f in np.flatnonzero(rows):
+        others = np.flatnonzero(basis_ok & (np.arange(n) != f))
+        if others.size == 0:
+            continue
+        cols = spectra[others].T                            # D x (others)
+        for k in range(passes):
+            row = np.maximum(out[f] @ spectra, 0.0)
+            peak = row.max()
+            if not peak > 0:
+                break
+            normed = row / peak
+            clipped, frac = clip_to_plausible(normed, reference[f], allow[f])
+            if k == 0:
+                share[f] = frac
+            if frac <= 1e-6:
+                break
+            delta = (clipped - normed) * peak
+            coef = np.linalg.lstsq(cols, delta, rcond=None)[0]
+            out[f, others] += coef
+    return out, share
+
+
+def cosine_between(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """(n, m) cosines between the rows of ``a`` and of ``b`` (0 for a zero row)."""
+    na = np.linalg.norm(a, axis=1, keepdims=True)
+    nb = np.linalg.norm(b, axis=1, keepdims=True)
+    return (a @ b.T) / np.maximum(na * nb.T, _EPS)
+
+
+def shared_direction_counts(marker: np.ndarray, trust: np.ndarray, candidates: list, cosine: np.ndarray,
+                            s: 'FixSettings', aligned: np.ndarray | None = None) -> np.ndarray:
+    """
+    Per coefficient (source, channel), how many mutually unrelated sources
+    (cosine below ``shared_cosine``; with ``aligned``, only the (source,
+    channel) pairs it marks count) carry a trusted slope of at least ``shared_min_slope``
+    with the same sign into that channel; 1 where it is not shared or the
+    source is related to the channel. Real residual spillover is a
+    property of each source's row, so unrelated rows erring toward the same
+    fluorophore point to that fluorophore being expressed on their cells.
+    """
+    counts = np.ones_like(marker)
+    by_channel: dict = {}
+    for src, ch, _r in candidates:
+        if aligned is not None and not aligned[src, ch]:
+            continue
+        if trust[src, ch] > 0 and abs(marker[src, ch]) >= s.shared_min_slope:
+            by_channel.setdefault((ch, marker[src, ch] > 0), []).append(src)
+    for (ch, _sign), members in by_channel.items():
+        if len(members) < 2:
+            continue
+        members = sorted(members, key=lambda m: -abs(marker[m, ch]))
+        picked = []
+        for m in members:
+            if all(cosine[m, p] < s.shared_cosine for p in picked):
+                picked.append(m)
+        if len(picked) >= 2:
+            counts[members, ch] = len(picked)
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -720,7 +898,16 @@ def envelope_slopes(x: np.ndarray, Y: np.ndarray, t_source: np.ndarray, T_target
     target-negative events in quantile bins of the source-positive
     abundance, and ``slope_alt`` the same through the ``compare_quantile``
     of all events, so ``disagreement`` between the two reports
-    co-expression. ``coverage`` is the share of target-negative events in
+    co-expression. The lower envelope falls with the spread as the source
+    brightens, so it runs steeper than the line it bounds. With
+    ``disagreement_reference='anchored'`` the median is compared with the
+    anchored slope instead, which has no such bias but moves with any
+    co-expression inside the band, as the median does; with
+    ``'envelope_corrected'`` each bin's envelope is moved back to its centre
+    by the bin's own lower-tail scale, ``(q(envelope_scale_quantile) -
+    q(envelope_quantile)) / (z(envelope_quantile) - z(envelope_scale_quantile))``,
+    which needs no spread model and stays below most co-expression. Either
+    way the envelope's own line still gives the standard error. ``coverage`` is the share of target-negative events in
     the brightest third of the source population, the identifiability test
     for co-expression. ``n_positive`` is the number of positive source
     events used.
@@ -791,10 +978,15 @@ def envelope_slopes(x: np.ndarray, Y: np.ndarray, t_source: np.ndarray, T_target
 
     env_val = np.full((len(groups), m), np.nan)
     med_val = np.empty((len(groups), m))
+    corrected = s.disagreement_reference == 'envelope_corrected'
+    scale_val = np.full((len(groups), m), np.nan) if corrected else None
     for b, g in enumerate(groups):
         yg = np.take(Yt, g, axis=1)
         med_val[b] = np.quantile(yg, s.compare_quantile, axis=1)
         env_val[b] = _masked_quantile(yg, np.take(neg, g, axis=1), s.envelope_quantile, s.min_bin_negative)
+        if corrected:
+            scale_val[b] = _masked_quantile(yg, np.take(neg, g, axis=1), s.envelope_scale_quantile,
+                                            s.min_bin_negative)
 
     def fit(value, weight):
         slope = np.full(m, np.nan)
@@ -811,7 +1003,14 @@ def envelope_slopes(x: np.ndarray, Y: np.ndarray, t_source: np.ndarray, T_target
     out['slope'] = env_slope
     out['se'] = env_se
     out['slope_alt'] = cmp_slope
-    out['disagreement'] = np.abs(env_slope - cmp_slope) / (np.abs(env_slope) + np.abs(cmp_slope) + _EPS)
+    if s.disagreement_reference == 'envelope':
+        ref_slope = env_slope
+    elif s.disagreement_reference == 'anchored':
+        ref_slope = np.where(np.isfinite(slope_t) & (np.abs(slope_t) <= s.max_coefficient), slope_t, np.nan)
+    else:
+        z_env, z_scale = -norm.ppf([s.envelope_quantile, s.envelope_scale_quantile])
+        ref_slope, _ = fit(env_val + z_env * (scale_val - env_val) / (z_env - z_scale), w_env)
+    out['disagreement'] = np.abs(ref_slope - cmp_slope) / (np.abs(ref_slope) + np.abs(cmp_slope) + _EPS)
     out['span'] = np.full(m, centre.max() - centre.min())
     return out
 
@@ -1298,6 +1497,12 @@ def _check_settings(s: FixSettings) -> None:
         raise ValueError(f'Unknown stop rule "{s.stop_rule}".')
     if s.stall_rule not in STALL_RULES:
         raise ValueError(f'Unknown stall rule "{s.stall_rule}".')
+    if s.stop_rule == 'settled' and (not 0.0 < s.stop_trust <= 1.0 or int(s.stop_confirm) < 1):
+        raise ValueError('The settled stop rule needs 0 < stop_trust <= 1 and stop_confirm >= 1.')
+    if s.disagreement_reference not in DISAGREEMENT_REFERENCES:
+        raise ValueError(f'Unknown disagreement reference "{s.disagreement_reference}".')
+    if not 0.0 < s.envelope_quantile < s.envelope_scale_quantile < 1.0:
+        raise ValueError('The envelope scale quantile must lie between the envelope quantile and 1.')
     if int(s.smooth_rounds) < 1 or not 0.0 < s.smooth_fraction <= 1.0:
         raise ValueError('Smooth updates need at least one round and 0 < fraction <= 1.')
     if s.hypernegative_scope not in ('pair', 'exclusive'):
@@ -1310,6 +1515,13 @@ def _check_settings(s: FixSettings) -> None:
         raise ValueError('The source event range needs 0 <= low < high.')
     if not (0.0 < s.negative_tail < 0.5):
         raise ValueError('The negative tail must lie between 0 and 0.5.')
+    if s.plausibility_ratio < 0 or s.plausibility_floor < 0 or not 0.0 < s.plausibility_reject <= 1.0:
+        raise ValueError('Plausibility bounds need ratio >= 0, floor >= 0 and 0 < reject share <= 1.')
+    if not 0.0 < s.shared_cosine < 1.0 or s.shared_min_slope < 0 or s.shared_power < 0 or \
+            not 0.0 <= s.shared_alignment <= 1.0:
+        raise ValueError('The shared-direction check needs 0 < cosine < 1, slope >= 0 and power >= 0.')
+    if s.af_penalty_width <= 0:
+        raise ValueError('The AF penalty needs a positive width.')
 
 
 def source_evidence(u: np.ndarray, u0: np.ndarray, thresholds: np.ndarray, spread: np.ndarray | None,
@@ -1362,7 +1574,8 @@ def source_evidence(u: np.ndarray, u0: np.ndarray, thresholds: np.ndarray, sprea
 def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, stained: dict,
                  background: Background, settings: FixSettings | None = None, spread: np.ndarray | None = None,
                  variant_deltas: list | None = None, true_spectra: np.ndarray | None = None,
-                 detector_names: list | None = None, progress=None) -> FixResult:
+                 detector_names: list | None = None, progress=None,
+                 reference_spectra: np.ndarray | None = None) -> FixResult:
     """
     Correct in-span reference-spectrum error from fully stained events.
 
@@ -1379,6 +1592,9 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                      or None; enables the variant leakage prior.
     true_spectra   : (F, D) ground truth, purely diagnostic (``recovery``).
     progress       : optional ``progress(text)`` callback.
+    reference_spectra : (F, D) rows the plausibility bounds are measured
+                     from (default ``spectra``; ``smooth_fix`` passes the
+                     spectra its rounds started from).
 
     See the module docstring for the method. Returns a FixResult whose
     ``spectra`` keep every row that failed a gate.
@@ -1403,12 +1619,15 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
     if n_fluor < 2:
         raise ValueError('At least two panel fluorophores are required.')
     fnames = [names[i] for i in fl]
+    names_idx = {n: i for i, n in enumerate(fnames)}
     spectra_fluor = spectra[fl]
     fixed_names = [str(n) for n in (s.fixed_fluorophores or ())]
     unknown = [n for n in fixed_names if n not in fnames]
     if unknown:
         logger.warning('Fix My Unmix: fluorophores to keep fixed not in the panel, ignored: %s', ', '.join(unknown))
     fixed = np.array([n in fixed_names for n in fnames], dtype=bool)
+    excluded = fixed if s.exclude_fixed_targets else np.zeros(n_fluor, dtype=bool)
+    kept = np.flatnonzero(~excluded)
     for fit in (stained, unstained):
         if fit['residual'].shape[1] != spectra.shape[1]:
             raise ValueError('The spectra and the spectral channels of the data do not match.')
@@ -1432,9 +1651,36 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
     if design.shape[0] > design.shape[1]:
         raise ValueError('The AF mean plus the panel exceeds the detector count.')
 
+    # rows the plausibility bounds, the shared-direction cosines and the dyes' own AF likeness are measured from
+    reference = spectra_fluor if reference_spectra is None else np.asarray(reference_spectra, dtype=np.float64)
+    if reference.shape[0] == len(names) and len(names) != n_fluor:
+        reference = reference[fl]
+    if reference.shape != spectra_fluor.shape:
+        raise ValueError('reference_spectra must match the panel spectra.')
+    reference = reference / np.maximum(reference.max(axis=1, keepdims=True), _EPS)
+    plausible = s.plausibility_ratio > 0
+    allow = plausible_change(reference, s.plausibility_ratio, s.plausibility_floor) if plausible else None
+    ref_cosine = cosine_similarity(reference) if s.shared_direction else None
+    dye_af = None
+    if s.af_penalty:
+        dye_af = np.array([af_likeness(reference[i], bg.af_spectra) for i in range(n_fluor)])
+
     prior = None
     if s.leakage_prior and variant_deltas is not None:
         prior = variant_leakage_prior(spectra_fluor, [variant_deltas[i] for i in fl], bg.basis, s.span_fraction)
+
+    def joint_lasso(u, tm, thresholds, neg_var, warm=None):
+        """``glasso_matrix`` over the channels that are not excluded (zero rows and columns for those)."""
+        rngs = streams(_STREAM_LASSO, n_fluor)
+        if not excluded.any():
+            return glasso_matrix(u, tm, thresholds, neg_var, rngs, s, warm)
+        rngs = [rngs[k] for k in kept] if isinstance(rngs, list) else rngs
+        out = np.zeros((n_fluor, n_fluor))
+        if kept.size < 2:
+            return out
+        out[np.ix_(kept, kept)] = glasso_matrix(u[:, kept], tm[:, kept], thresholds[kept], neg_var[kept], rngs, s,
+                                                None if warm is None else warm[np.ix_(kept, kept)])
+        return out
 
     stained_fit = {k: stained[k] for k in ('abundance', 'residual', 'af_idx', 'af_scale')}
     unstained_fit = {k: unstained[k] for k in ('abundance', 'residual', 'af_idx', 'af_scale')}
@@ -1459,6 +1705,7 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
     history = [] if s.keep_history else None
     delta_history = [np.nan, np.nan, np.nan]
     delta_best, since_best = np.inf, 0
+    below_run = 0                           # iterations in a row below the threshold
     pair_log = []
     source_log = []
     stop_reason = 'iteration limit'
@@ -1490,19 +1737,20 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
         anchored = np.zeros((n_fluor, n_fluor))
         if s.glasso_check and not s.glasso_warm:
             say(f'Phase one: iteration {it}, joint lasso')
-            joint = glasso_matrix(u, tm, thresholds, neg_var, streams(_STREAM_LASSO, n_fluor), s)
+            joint = joint_lasso(u, tm, thresholds, neg_var)
         slope_rngs = streams(_STREAM_SLOPES, n_fluor)
         u_t = np.ascontiguousarray(u.T)                     # channels x events
         tm_t = np.ascontiguousarray(tm.T)
         ntm_t = np.ascontiguousarray(ntm.T)
         for src in range(n_fluor):
-            chans = [c for c in range(n_fluor) if c != src]
+            chans = [c for c in range(n_fluor) if c != src and not excluded[c]]
             w_src = 0.0 if fixed[src] else float(evidence['weight'][src])
             source_log.append({'source': fnames[src], 'negative_bound': float(evidence['bound'][src]),
                                'clear_events': int(evidence['n_clear'][src]),
                                'baseline_events': float(evidence['baseline'][src]),
                                'excess_events': float(evidence['excess'][src]), 'source_weight': w_src,
-                               'af_likeness': np.nan, 'af_gated': False, 'fixed': bool(fixed[src])})
+                               'af_likeness': np.nan, 'af_penalty': np.nan, 'plausible_project': 0.0, 'af_gated': False,
+                               'fixed': bool(fixed[src])})
             est = None
             if w_src > 0:
                 spread_var = np.zeros(len(chans)) if spread_fl is None else spread_fl[src, chans]
@@ -1518,7 +1766,8 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                        'coverage': np.nan, 'span': np.nan,
                        'slope_glasso': np.nan if joint is None else float(joint[src, ch]),
                        'glasso_agreement': np.nan, 'source_weight': w_src, 'hypernegative_base': np.nan,
-                       'hypernegative_after': np.nan, 'hypernegative_new': np.nan, 'trust': 0.0}
+                       'hypernegative_after': np.nan, 'hypernegative_new': np.nan,
+                       'shared_sources': 1, 'shared_factor': 1.0, 'trust': 0.0}
                 slope_use = np.nan
                 if est is not None:
                     slope_use = est['slope_anchored'][ci]
@@ -1560,7 +1809,7 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
 
         if s.glasso_check and s.glasso_warm:
             say(f'Phase one: iteration {it}, joint lasso')
-            joint = glasso_matrix(u, tm, thresholds, neg_var, streams(_STREAM_LASSO, n_fluor), s, anchored)
+            joint = joint_lasso(u, tm, thresholds, neg_var, anchored)
             for src, ch, r in candidates:
                 g = float(joint[src, ch])
                 agree = 0.0 if g == 0.0 else max(0.0, 1.0 - abs(marker[src, ch] - g) / (abs(marker[src, ch]) + abs(g)))
@@ -1603,11 +1852,40 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                                hypernegative_new=max(after - base, 0.0), trust=float(trust[src, ch]))
 
         slope_error = marker - eye
+        # the error each step applies (the shared-direction check moves it)
+        step_error = slope_error
+        if s.shared_direction:
+            # the whole coefficient (what the spillover already holds plus the error left) is judged and
+            # shrunk, so the shrunk coefficient is the fixed point; a damped step would only slow the approach
+            # to the same fixed point
+            whole = (spill - eye) + slope_error
+            aligned = None
+            if s.shared_alignment > 0:
+                # co-expression moves a source's row toward the co-expressed dye's spectrum; a real row error
+                # reaches several channels at once, each coefficient only one part of its direction
+                change = (whole * off_diag) @ spectra_fluor
+                aligned = cosine_between(change, spectra_fluor) >= s.shared_alignment
+            shared = shared_direction_counts(whole, trust, candidates, ref_cosine, s, aligned)
+            factor = np.where(shared > 1, shared ** -s.shared_power, 1.0)
+            step_error = np.where(factor < 1.0, factor * whole - (spill - eye), slope_error)
+            for src, ch, r in candidates:
+                if shared[src, ch] > 1:
+                    pair_log[r].update(shared_sources=int(shared[src, ch]), shared_factor=float(factor[src, ch]))
+
         # the change each source's back-solved row would take this step
-        row_change = ((trust * slope_error) * off_diag) @ (spill @ spectra_fluor)
+        row_change = ((trust * step_error) * off_diag) @ (spill @ spectra_fluor)
         for src in range(n_fluor):
             like = af_likeness(row_change[src], bg.af_spectra)
             source_log[src]['af_likeness'] = like
+            if s.af_penalty and like > 0:
+                # an AF-like dye may move in AF-like directions; an AF-unlike one only as far as the margin
+                low = dye_af[src] + s.af_penalty_margin
+                keep = 1.0 - float(smoothstep(like, low, low + s.af_penalty_width))
+                source_log[src]['af_penalty'] = keep
+                if keep < 1.0:
+                    trust[src, off_diag[src]] *= keep
+                    for r in rows_of[src]:
+                        pair_log[r]['trust'] = float(trust[src, names_idx[pair_log[r]['channel']]])
             if s.af_gate and like > s.af_gate_max:
                 trust[src, off_diag[src]] = 0.0
                 source_log[src]['af_gated'] = True
@@ -1619,13 +1897,16 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
 
         # 'all' judges every fitted error, trusted or not; 'applied' the step this iteration takes;
         # 'trusted' the whole error of every coefficient with any trust (a partly trusted step is small
-        # while its error is not)
+        # while its error is not); 'settled' the whole error of every coefficient with at least
+        # stop_trust trust, so a slope too weakly trusted ever to finish does not hold phase one open
         if s.stop_rule == 'all':
             judged_error = slope_error
         elif s.stop_rule == 'applied':
             judged_error = trust * slope_error
-        else:
+        elif s.stop_rule == 'trusted':
             judged_error = np.where(trust > 0, slope_error, 0.0)
+        else:
+            judged_error = np.where(trust >= s.stop_trust, slope_error, 0.0)
         off = np.abs(judged_error[off_diag])
         delta = float(np.std(judged_error, ddof=1))
         delta_q = float(np.quantile(off, s.convergence_quantile))
@@ -1637,7 +1918,7 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                     it, delta, 100 * s.convergence_quantile, delta_q, delta_max, n_fitted)
 
         # trust damps the step only, so the fixed point stays the identity
-        nxt = spill + (trust * slope_error) @ spill
+        nxt = spill + (trust * step_error) @ spill
         decay = 1.0 - s.coefficient_decay * (1.0 - trust)
         np.fill_diagonal(decay, 1.0)
         nxt = nxt * decay
@@ -1650,8 +1931,17 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
             stop_reason = 'diagonal left the positive range'
             logger.warning('Fix My Unmix: spillover diagonal left the positive range; stopping.')
             break
-        spill = nxt / diag[:, None]
-        if delta_q < s.convergence_threshold:
+        nxt = nxt / diag[:, None]
+        if plausible:
+            # the part of a source's back-solved row outside its box is taken back out of its coefficients
+            # (to the bound: resetting detectors here, mid-fit, holds back real corrections on their way)
+            # (fixed rows are not adjusted; excluded channels take no coefficient)
+            nxt, moved_back = _plausible_project(nxt, spectra_fluor, reference, allow, rows=~fixed, basis=~excluded)
+            for src in np.flatnonzero(moved_back > 0):
+                source_log[src]['plausible_project'] = float(moved_back[src])
+        spill = nxt
+        below_run = below_run + 1 if delta_q < s.convergence_threshold else 0
+        if below_run >= (int(s.stop_confirm) if s.stop_rule == 'settled' else 1):
             stop_reason = 'converged'
             break
         delta_history = delta_history[1:] + [delta]
@@ -1692,7 +1982,7 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
         background_raw = residual[background_idx] if background_idx.size else None
         cond_curr = condition_number(design)
         k_bg = bg.n_bg
-        panel_rows = list(range(k_bg, k_bg + n_fluor))
+        panel_rows = [k_bg + i for i in range(n_fluor) if not excluded[i]]
         # a row phase one left alone has no in-span change to re-measure
         flagged = np.max(np.abs(spill - eye), axis=1) >= s.convergence_threshold
         for f in range(n_fluor):
@@ -1715,7 +2005,7 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
             not_joint = cand is not None and s.multivariate and n_fluor > 1 and not cand['stats']['joint']
             if reject is None and not_joint and s.phase_two_fallback == 'reject':
                 reject = 'not.joint'
-            leak_before = leak_after = cond_after = resid_change = like = np.nan
+            leak_before = leak_after = cond_after = resid_change = like = implausible = np.nan
             trial = None
             if reject is None:
                 # 'backsolved' keeps phase two as the judge but adopts phase one's own row
@@ -1728,8 +2018,13 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                 else:
                     trial = spectra_new.copy()
                     trial[f] = stepped / stepped.max()
+                    if plausible:
+                        # each detector keeps within the plausibility box of the reference row
+                        trial[f], implausible = clip_to_plausible(trial[f], reference[f], allow[f], s.plausibility_reset)
+                        if implausible > s.plausibility_reject:
+                            reject = 'implausible'
                     like = af_likeness(trial[f] - spectra_new[f], bg.af_spectra)
-                    if s.af_gate and like > s.af_gate_max:
+                    if reject is None and s.af_gate and like > s.af_gate_max:
                         reject = 'af.like'
             if reject is None:
                 design_trial = np.vstack([bg.basis, trial])
@@ -1761,7 +2056,7 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                         'peak_curr', 'peak_new', 'peak_new_rel'):
                 entry[key] = st.get(key, np.nan)
             entry['vif_partner'] = fnames[st['vif_partner']] if st.get('vif_partner', -1) >= 0 else ''
-            entry.update(af_likeness=like, leak_before=leak_before, leak_after=leak_after,
+            entry.update(af_likeness=like, implausible_frac=implausible, leak_before=leak_before, leak_after=leak_after,
                          condition_after=cond_after, resid_change=resid_change, accepted=reject is None,
                          reason='accepted' if reject is None else reject)
             signature_log.append(entry)
@@ -1846,6 +2141,9 @@ def smooth_fix(spectra: np.ndarray, fluor_names: list, project, n_stained: int, 
         raise ValueError('smooth_fix needs rounds >= 1 and 0 < fraction <= 1.')
     rng = np.random.default_rng([s.seed, _STREAM_SMOOTH])
     current = start.copy()
+    reference = _normalise_rows(np.asarray(kwargs.get('reference_spectra', start), dtype=np.float64))
+    allow = plausible_change(reference, s.plausibility_ratio, s.plausibility_floor) \
+        if s.plausibility_ratio > 0 else None
     n_keep = max(1, int(round(fraction * n_stained)))
     log, result = [], None
     for r in range(int(rounds)):
@@ -1854,11 +2152,15 @@ def smooth_fix(spectra: np.ndarray, fluor_names: list, project, n_stained: int, 
         unstained, stained, background = project(current, keep)
         s_round = FixSettings(**{**asdict(s), 'seed': s.seed + r})
         result = fix_my_unmix(current, fluor_names, unstained, stained, background, s_round,
-                              progress=lambda t, r=r: say(f'Round {r + 1}: {t}'), **kwargs)
+                              progress=lambda t, r=r: say(f'Round {r + 1}: {t}'),
+                              **{'reference_spectra': start, **kwargs})
         moved = row_angle(current, result.spectra)
         # only the rows this round changed take a step, so the others stay exactly as they were
         step = np.any(result.spectra != current, axis=1)
         current[step] = _normalise_rows(current[step] + (result.spectra[step] - current[step]) / (r + 1))
+        if allow is not None:
+            for f in np.flatnonzero(step):
+                current[f] = clip_to_plausible(current[f], reference[f], allow[f], s.plausibility_reset)[0]
         log.append({'round': r + 1, 'n_events': int(len(keep)), 'stop_reason': result.settings['stop_reason'],
                     'iterations': len(result.convergence_log),
                     'accepted': [result.fluor_names[i] for i in np.flatnonzero(result.accepted)],
