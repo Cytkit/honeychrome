@@ -23,6 +23,7 @@ deltaT = 1/adc_rate # [us]
 adc_scale_uv = 183.11 # microvolts per unit adc scale (default for Cytkit)
 
 # instrument automation settings
+automatically_adjust_trigger_over_baseline = True
 standby_time = 600_000 # ms to automatically put instrument to standby (switch off laser and pumps)
 pressure_set_point = -20 # Pa
 temperature_set_point = 30 # degC
@@ -37,7 +38,7 @@ sample_pump_flush_speed = 20000 # steps/0.1s
 sample_pump_flush_time = 30. # s
 sample_pump_backflush_speed = 20000 # steps/0.1s
 sample_pump_backflush_time = 30. # s
-sample_pump_settle_time = 5. # s
+sample_pump_settle_time = 2. # s
 sample_pump_acquisition_rate = 30 # uL/min
 sample_pump_steps_per_cycle = 1
 sample_pump_clocks_per_cycle = 2000
@@ -314,6 +315,7 @@ report_include_process_retrieved = q_settings.value("report_include_process", re
 
 use_dummy_instrument_retrieved = instrument_settings.value("use_dummy_instrument", use_dummy_instrument, type=bool)
 
+automatically_adjust_trigger_over_baseline_retrieved = instrument_settings.value('automatically_adjust_trigger_over_baseline', automatically_adjust_trigger_over_baseline, type=int)
 pressure_set_point_retrieved = instrument_settings.value('pressure_set_point', pressure_set_point, type=int)
 temperature_set_point_retrieved = instrument_settings.value('temperature_set_point', temperature_set_point, type=int)
 sample_pump_steps_per_microlitre_retrieved = instrument_settings.value('sample_pump_steps_per_microlitre', sample_pump_steps_per_microlitre, type=int)
@@ -338,8 +340,12 @@ for row, name in enumerate(adc_channels):
     dac_bias_retrieved[name] = instrument_settings.value("bias", dac_bias_default if name not in ['FSC', 'SSC'] else 0, type=int)
     dac_ref_retrieved[name] = instrument_settings.value("ref", dac_ref_default, type=int)
     instrument_settings.endGroup()
-instrument_settings.endGroup()
+
+instrument_settings.beginGroup('All Channels')
 dac_bias_retrieved['All Channels'] = instrument_settings.value("bias", dac_bias_default, type=int)
+instrument_settings.endGroup()
+
+instrument_settings.endGroup()
 
 instrument_settings.beginGroup("adc_channels")
 adc_enabled_retrieved = {}

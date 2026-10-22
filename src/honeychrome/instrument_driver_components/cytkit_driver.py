@@ -7,7 +7,7 @@ import numpy as np
 from honeychrome.instrument_driver_components.cytkit_components.adcs import ADCs
 from honeychrome.instrument_driver_components.cytkit_components.capture import Capture
 from honeychrome.instrument_driver_components.cytkit_components.capture_decoder import CaptureDecoder
-from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max, connection_direction, spectral_channel_index_to_adc_channel_index
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max, connection_direction, spectral_channel_index_to_adc_channel_index, adc_index_to_spectral_channel_index
 from honeychrome.instrument_driver_components.cytkit_components.dacs import DACs
 from honeychrome.instrument_driver_components.cytkit_components.display import Display
 from honeychrome.instrument_driver_components.cytkit_components.ft4222communicator import Ft4222Communicator
@@ -310,6 +310,9 @@ class CytkitDevice:
         self.fifo_flooded = None
         self.fifo_level = None
 
+        self.auto_adjust_over_baseline = settings.automatically_adjust_trigger_over_baseline_retrieved
+        self.trigger_merge_list = None
+        self.threshold = settings.threshold_retrieved * 1000 / settings.adc_scale_uv  # convert mV to adc units
         self.pressure_set_point = settings.pressure_set_point_retrieved
         self.temperature_set_point = settings.temperature_set_point_retrieved
 
@@ -418,6 +421,7 @@ class CytkitDevice:
             }})
             logger.info(f'[CytkitDriver] setup: {message}')
         self.trigger.merge_set_enable(True)
+        self.get_state(['trigger']) # implicitly refreshes trigger merge list
 
         # capture state
         for row, name in enumerate(settings.adc_channels):
@@ -468,14 +472,14 @@ class CytkitDevice:
 
 
     def start_acquisition(self):
-        # self.display.action_message(["Acquisition", "Priming..."])
-        # self.sample_pump.stop()
-        # self.sample_pump.ramp_to(self.sample_pump_priming_speed)
-        # time.sleep(self.sample_pump_priming_time)
-        #
-        # self.display.action_message(["Acquisition", f"Settling rate {self.sample_pump_acquisition_rate} uL/min"])
-        # self.sample_pump.ramp_to(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
-        # time.sleep(self.sample_pump_settle_time)
+        self.display.action_message(["Acquisition", "Priming..."])
+        self.sample_pump.stop()
+        self.sample_pump.ramp_to(self.sample_pump_priming_speed)
+        time.sleep(self.sample_pump_priming_time)
+
+        self.display.action_message(["Acquisition", f"Settling rate {self.sample_pump_acquisition_rate} uL/min"])
+        self.sample_pump.ramp_to(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
+        time.sleep(self.sample_pump_settle_time)
 
         self.capture.reset_clock()
         self.capture.aggr_fifo_clear()
@@ -605,6 +609,14 @@ class CytkitDevice:
                     self.trigger.merge_force_trigger()
                 if 'clear' == value:
                     self.trigger.clear_all_counts()
+                if 'auto_adjust_over_baseline' == value:
+                    self.auto_adjust_over_baseline = value['auto_adjust_over_baseline']
+                if 'threshold' == value:
+                    self.threshold = value['threshold'] * 1000 / settings.adc_scale_uv  # convert mV to adc units
+                if 'peak_detection_channel' == value:
+                    index = settings.adc_channels.index(value['peak_detection_channel'])
+                    self.trigger.merge_set_merge_mask(1<<spectral_channel_index_to_adc_channel_index[index])
+
                 message['trigger'] = value
 
             if parameter == 'capture':
@@ -629,6 +641,14 @@ class CytkitDevice:
 
                 self.ft4222.register_write(value['register'], x)
                 message['register_setter'] = {'register': value['register'], 'value': x}
+
+            if parameter == 'oscilloscope_trace':
+                if self.auto_adjust_over_baseline:
+                    trace = value['oscilloscope_trace']
+                    baselines = trace['baselines']
+                    for row in self.trigger_merge_list:
+                        level = int(baselines[row] + self.threshold)
+                        self.trigger.channel_set_level(spectral_channel_index_to_adc_channel_index[row], level)
 
             if parameter == 'pressure_set_point':
                 self.pressure_set_point = value
@@ -779,6 +799,10 @@ class CytkitDevice:
             for index in range(16):
                 message['trigger']['events'][index] = self.trigger.channel_get_event_count(spectral_channel_index_to_adc_channel_index[index])
             message['trigger']['events']['merge'] = self.event_rate_counter.trigger_event_count
+            merge_mask = self.trigger.merge_get_merge_mask()
+            self.trigger_merge_list = [adc_index_to_spectral_channel_index[index] for index in range(16) if merge_mask & 1<<index]
+            for index in self.trigger_merge_list:
+                message['trigger']['level'][index] = self.trigger.channel_get_level(spectral_channel_index_to_adc_channel_index[index])
 
         if 'capture' in list_of_parameters:
             self.fifo_level = self.capture.aggr_get_fifo_level()

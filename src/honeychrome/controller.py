@@ -1063,7 +1063,19 @@ class Controller(QObject):
 
     @Slot(dict)
     def config_peak_detection(self, params):
+        # save peak detection channel and threshold
+        settings.instrument_settings.value("peak_detection_channel", params['peak_detection_channel'])
+        settings.instrument_settings.value("threshold", params['threshold'], type=int)
+
+        # send to analyser
         self.pipe_connection_analyser.send({'command': 'configure', 'data': params})
+        response = self.pipe_connection_analyser.recv()
+        logger.info(response)
+
+        # send to instrument
+        self.pipe_connection_instrument.send({'command': 'set_instrument_state', 'data': {'trigger': params}})
+        response = self.pipe_connection_instrument.recv()
+        logger.info(response)
 
     @Slot()
     def initialise_instrument(self):

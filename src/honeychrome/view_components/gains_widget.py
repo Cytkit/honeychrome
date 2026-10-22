@@ -82,8 +82,8 @@ class GainsWidget(QWidget):
         spinbox.valueChanged.connect(slider.setValue)
 
         slider.valueChanged.connect(spinbox.setValue)
+        slider.valueChanged.connect(lambda value: self.bus.gainChanged.emit(ch_name, value))
         if ch_name != 'All Channels':
-            slider.valueChanged.connect(lambda value: self.bus.gainChanged.emit(ch_name, value))
             self.setAllChannels.connect(spinbox.setValue)
             self.setAllChannels.connect(slider.setValue)
         else:

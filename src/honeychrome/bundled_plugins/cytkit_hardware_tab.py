@@ -799,6 +799,12 @@ class TriggerChannelTable(QWidget):
     def update_events(self, row: int, value) -> None:
         self.events_labels[row].setText("—" if value is None else str(value))
 
+    def update_level(self, row: int, value) -> None:
+        w = self.level_spins[row]
+        w.blockSignals(True)
+        w.setValue(value)
+        w.blockSignals(False)
+
     # ---------- accessors ----------
 
     def is_enabled(self, row: int) -> bool:
@@ -1179,6 +1185,11 @@ class PluginWidget(QWidget):
         title = QLabel('Automation Settings')
         title.setStyleSheet(heading_style)
         layout.addWidget(title)
+
+        self.automatically_adjust_trigger_over_baseline_cb = QCheckBox('Automatically Adjust Trigger Over Baseline')
+        self.automatically_adjust_trigger_over_baseline_cb.setEnabled(settings.automatically_adjust_trigger_over_baseline_retrieved)
+        self.automatically_adjust_trigger_over_baseline_cb.toggled.connect(self.automatically_adjust_trigger_over_baseline)
+        layout.addWidget(self.automatically_adjust_trigger_over_baseline_cb)
 
         self.pressure_set_point_spin = LabeledSpinBox(min=-40, max=0, step=1, default=settings.pressure_set_point_retrieved, text='Sheath pressure (vacuum) set point [Pa]')
         self.pressure_set_point_spin.spinbox.valueChanged.connect(self.set_pressure_set_point)
@@ -1801,6 +1812,10 @@ class PluginWidget(QWidget):
                             self.trigger_table.update_events(index, value)
                         elif index == 'merge':
                             self.merged_count.setText(f'{value}' if value else "—")
+                if 'level' in response['message']['trigger']:
+                    for index in response['message']['trigger']['level']:
+                        value = response['message']['trigger']['level'][index]
+                        self.trigger_table.update_level(index, value)
 
         if 'capture' in response['message']:
             if response['message']['capture']:
@@ -1858,6 +1873,11 @@ class PluginWidget(QWidget):
             self.bus.statusMessage.emit(f'{response['source']} {response['status']}: {response['message']}')
 
         logger.info(response)
+
+    @Slot(bool)
+    def automatically_adjust_trigger_over_baseline(self, enabled):
+        instrument_settings.setValue("automatically_adjust_trigger_over_baseline_retrieved", enabled)
+        self.set_instrument_state({'trigger': {'auto_adjust_over_baseline': enabled}})
 
     @Slot(int)
     def set_pressure_set_point(self, set_point):

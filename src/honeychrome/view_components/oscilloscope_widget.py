@@ -173,6 +173,7 @@ class OscilloscopeWidget(QWidget):
         while True:
             try:
                 latest = self.controller.oscilloscope_traces_queue.get_nowait()
+                self.send_baselines_to_instrument_driver(latest) #todo consider removing this or moving to controller / trace analyst
             except Empty:
                 break
         if latest is not None:
@@ -251,3 +252,8 @@ class OscilloscopeWidget(QWidget):
     def closeEvent(self, event):
         self.timer.stop()
         event.accept()
+
+    def send_baselines_to_instrument_driver(self, trace):
+        self.controller.pipe_connection_instrument.send({'command': 'set_instrument_state', 'data': {'oscilloscope_trace': trace}})
+        response = self.controller.pipe_connection_instrument.recv()
+        logger.info(response)

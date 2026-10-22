@@ -10,9 +10,6 @@ from ft4222.SPIMaster import Mode, Clock, SlaveSelect
 from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import operation_write, operation_read, dummy_bytes, lookup_address
 from honeychrome.settings import traces_cache_dtype
 
-empty_array = np.array([], dtype=np.uint16)
-
-
 class Ft4222Communicator:
     def __init__(self):
         self.devA = None
@@ -111,7 +108,7 @@ class Ft4222Communicator:
             remaining = total_bytes - bytes_read
             current_chunk = min(chunk_size, remaining)
 
-            # Write three bytes and read the current chunk
+            # Write no bytes and read the current chunk
             chunk = self.devB.spiMaster_MultiReadWrite(b'', b'', current_chunk)
             data.extend(chunk)
             bytes_read += len(chunk)
@@ -128,53 +125,3 @@ class Ft4222Communicator:
                 buffer = self.sample_read_buffer(bytes_to_read)
 
         return buffer
-
-    # def memory_read(self, total_bytes, chunk_size=65535):
-    #     # read out block of memory in chunks
-    #     data = bytearray(total_bytes)
-    #     bytes_read = 0
-    #     while bytes_read < total_bytes:
-    #         # Calculate how many bytes to read in this chunk
-    #         remaining = total_bytes - bytes_read
-    #         current_chunk = min(chunk_size, remaining)
-    #
-    #         # Write address and read the chunk
-    #         chunk = self.devB.spiMaster_MultiReadWrite(b'', b'', current_chunk)
-    #         data.extend(chunk)
-    #         bytes_read += len(chunk)
-    #
-    #     return bytes(data)
-    #
-    #
-    # def get_memory_head_tail_n_events(self):
-    #
-    #     byte_string_to_write = operation_write + registers_map['MEM_ADDR_L'].to_bytes(2) + dummy_bytes
-    #     byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
-    #     memory_head = int.from_bytes(byte_string_output)
-    #
-    #     byte_string_to_write = operation_write + registers_map['MEM_ADDR_H'].to_bytes(2) + dummy_bytes
-    #     byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
-    #     memory_tail = int.from_bytes(byte_string_output)
-    #
-    #     byte_string_to_write = operation_write + registers_map['MEM_ADDR_U'].to_bytes(2) + dummy_bytes
-    #     byte_string_output = self.devA.spiMaster_MultiReadWrite(0, byte_string_to_write, 4)
-    #     n_events_in_memory = int.from_bytes(byte_string_output)
-    #
-    #     return memory_head, memory_tail, n_events_in_memory
-    #
-    # def pop_from_memory(self, memory_head, memory_tail):
-    #     """
-    #     Read out memory starting at memory_head, keep going until memory_tail read, wrap if necessary
-    #     return numpy array blob
-    #     """
-    #     if memory_tail > memory_head:
-    #         blob_np = np.frombuffer(self.memory_read(memory_head, memory_tail - memory_head), dtype=traces_cache_dtype)
-    #     elif memory_tail < memory_head:
-    #         blob_np = np.concatenate((
-    #             np.frombuffer(self.memory_read(memory_head, memory_end_address - memory_head), dtype=traces_cache_dtype),
-    #             np.frombuffer(self.memory_read(memory_start_address, memory_tail), dtype=traces_cache_dtype)
-    #         ))
-    #     else:
-    #         blob_np = empty_array
-    #
-    #     return blob_np
