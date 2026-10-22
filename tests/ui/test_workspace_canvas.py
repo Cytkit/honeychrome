@@ -75,3 +75,20 @@ def test_figure_is_rendered_when_scrolled_into_view(qtbot):
     ox, oy = scene.page_origin(1)
     view.centerOn(ox + 40, oy + 40)
     qtbot.waitUntil(lambda: off_screen._image is not None)
+
+
+def test_continuous_zoom_renders_only_after_the_gesture_ends(qtbot):
+    view, scene, on_screen, _off_screen = _workspace(qtbot)
+    view.fit_page(0)
+    qtbot.waitUntil(lambda: on_screen._image is not None)
+    _settle(qtbot)
+    image_before = on_screen._image
+
+    ox, oy = scene.page_origin(0)
+    for _ in range(12):           # a trackpad pinch: steps closer together than the render delay
+        view.set_zoom(view.zoom() * 1.05)
+        view.centerOn(ox + 40, oy + 40)
+        qtbot.wait(wc.RENDER_DELAY_MS // 6)
+        assert on_screen._image is image_before
+
+    qtbot.waitUntil(lambda: on_screen._image is not image_before)

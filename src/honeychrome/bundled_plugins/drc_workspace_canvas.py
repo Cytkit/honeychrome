@@ -458,6 +458,8 @@ class FigureItem(QGraphicsObject):
     def schedule_render(self):
         # Started from paint(): Qt paints only items in view, so off-screen items are not rendered
         self._render_pending = True
+        if self._render_timer.isActive():
+            self._render_timer.start()  # restart: keep the debounce during a zoom gesture
         self.update()
 
     def render_dpi(self) -> float:
