@@ -15,7 +15,7 @@ from honeychrome.controller_components.cytometer_whitelist import (
     get_detector_laser_map, LASER_LABEL_COLORS,
 )
 from honeychrome.view_components.cytometry_plot_components import (
-    ROTATED_LABEL_HEIGHT, TICK_TEXT_OFFSET,
+    RotatedLabelAxisMixin, TICK_TEXT_OFFSET,
 )
 
 
@@ -117,7 +117,7 @@ class LegendEntry(QWidget):
 
 
 
-class BottomAxisVerticalTickLabels(pg.AxisItem):
+class BottomAxisVerticalTickLabels(RotatedLabelAxisMixin, pg.AxisItem):
     def __init__(self, angle=45, **kwargs):
         self.angle = angle
         self._label_padding = 15
@@ -131,7 +131,9 @@ class BottomAxisVerticalTickLabels(pg.AxisItem):
     def setTicks(self, ticks):
         self.setStyle(tickTextOffset=TICK_TEXT_OFFSET)
         super().setTicks(ticks)
-        self.setHeight(ROTATED_LABEL_HEIGHT if self.angle and ticks else None)
+        # height follows the longest label (_updateHeight), as does the left margin
+        self.setHeight(None)
+        self._fit_left_margin()
         self.updateGeometry()
         self.update()
 
