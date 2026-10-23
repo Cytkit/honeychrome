@@ -7,6 +7,8 @@ from honeychrome.settings import adc_channels
 pump_max = 255 # 0..255 sheath pump allowed PWM range in control loop
 fan_max = 255 # 0..255 fan allowed PWM range in control loop
 control_loop_interval = 2 # s
+event_counter_interval = 1 # s
+smoothing_time = 2 # s
 min_speed = 100 # guard against speed 0 --> speed 100 is 1e9/10 clocks, i.e. 1e7, or 0.1 s at 100 MHz
 max_speed = 20000
 connection_direction = -1

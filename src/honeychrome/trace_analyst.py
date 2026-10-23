@@ -207,8 +207,8 @@ class TraceAnalyser(mp.Process):
                 if 'threshold' in parameters:
                     self.threshold = parameters['threshold'] * 1000 # uV
 
-                self.logger.info('[Trace Analyser] Channel configuration set')
-                response_to_experiment_control = {'status':'OK', 'message':'[Trace Analyser] channel configuration set'}
+                self.logger.info('[Trace Analyser] Peak detection configuration set')
+                response_to_experiment_control = {'status':'OK', 'message':'[Trace Analyser] Peak detection configuration set'}
 
             elif incoming_from_experiment_control['command'] == 'quit':
                 self.stop_analyser.set()
@@ -274,7 +274,7 @@ class TraceAnalyser(mp.Process):
                 traces_batch_scaled = traces_batch_scaled * adc_scale_uv  # scale in uV, float32
 
                 # calculate area, height, width as defined in channel_dict and write to events_cache
-                baselines = None
+                baselines = np.zeros(self.n_channels_trace)
                 n_start = 0
                 n_end = self.n_time_points_in_event - 1
                 peak = None
@@ -284,6 +284,13 @@ class TraceAnalyser(mp.Process):
                     heights = traces_batch_scaled[:, self.indices_height_channels_in_traces, :].max(axis=2)
                     widths = self.calculate_width(traces_batch_scaled[:, self.indices_peak_detection_channel_in_traces, :])
                     last_event_index = n_new_events-1
+                    times = np.ones(n_new_events, dtype=np.int64) * int((time.perf_counter() - start_time) * 1000)
+                    event_ids = np.array(range(events_tail, events_tail + n_new_events))
+
+                    self.oscilloscope_traces_queue.put({'event_id': None, 'time': None,
+                                                        'traces': traces_batch_scaled[last_event_index],
+                                                        'n_start': n_start, 'n_end': n_end,
+                                                        'peak': None, 'baselines': default_baselines})
 
                 else:
                     ### More sophisticated calculation - loop over traces and perform background substraction
@@ -298,6 +305,8 @@ class TraceAnalyser(mp.Process):
                             # print('all nan') # debug: why would an all nan trigger trace come through?
                             continue
                         n_start, n_end, tr_baseline = peak_start_stop_baseline(tr_peak_detection, self.threshold)
+                        # baselines[self.indices_peak_detection_channel_in_traces] = tr_baseline
+
                         # print(n_start, n_end, tr_baseline) # debug
                         if n_start > 0:
                             peak, baselines = peak_measurements(traces, n_start, n_end, deltaT, self.indices_area_channels_in_traces, self.indices_height_channels_in_traces)
@@ -312,22 +321,25 @@ class TraceAnalyser(mp.Process):
                     widths = widths[keep_mask]
                     n_new_events = np.sum(keep_mask)
 
-                times = np.ones(n_new_events, dtype=np.int64) * int((time.perf_counter() - start_time) * 1000)
-                event_ids = np.array(range(events_tail, events_tail + n_new_events))
+                    times = np.ones(n_new_events, dtype=np.int64) * int((time.perf_counter() - start_time) * 1000)
+                    event_ids = np.array(range(events_tail, events_tail + n_new_events))
 
-                if last_event_index == 0:
-                    # if there were no peaks detected but at least one trace, push the last one to the oscilloscope queue
-                    self.oscilloscope_traces_queue.put({'event_id': None, 'time': None,
-                                                        'traces': traces_batch_scaled[last_event_index],
-                                                        'n_start': n_start, 'n_end': n_end,
-                                                        'peak': None, 'baselines': default_baselines})
+                    # push to events cache anything above threshold, or failing that, any trace at all
+                    if n_new_events > 0:
+                        last_event_time = times[-1]
+                        last_event_id = event_ids[-1]
+                    else:
+                        last_event_time = None
+                        last_event_id = None
+                        baselines = np.median(traces[:, n_start:n_end], axis=1)
 
-                elif last_event_index > 0:
-                    # if any above threshold, then push to events cache
-                    self.oscilloscope_traces_queue.put({'event_id': event_ids[-1], 'time': times[-1],
+                    self.oscilloscope_traces_queue.put({'event_id': last_event_id, 'time': last_event_time,
                                                         'traces': traces_batch_scaled[last_event_index],
                                                         'n_start': n_start, 'n_end': n_end, 'peak': peak,
                                                         'baselines': baselines})
+
+                if n_new_events > 0:
+                    # update events cache
                     with self.events_cache_lock:
                         self.events_cache[events_tail:events_tail + n_new_events, self.indices_area_channels_in_events] = areas
                         self.events_cache[events_tail:events_tail + n_new_events, self.indices_height_channels_in_events] = heights
@@ -338,20 +350,21 @@ class TraceAnalyser(mp.Process):
                         ### debug print latest events
                         #self.logger.info(self.events_cache[events_tail:events_tail + n_new_events])
 
+                    events_tail += n_new_events
+                    with self.index_tail_events_cache.get_lock():
+                        self.index_tail_events_cache.value = events_tail
+
+                    if not cycle_n % verbosity_divider:
+                        self.logger.info(f'[Trace Analyser] analysed {n_new_events} events (traces cache old head:{traces_head}, new head and tail:{traces_tail}), (events cache head:{events_head}, tail:{events_tail})')
                 else:
                     if not cycle_n % verbosity_divider:
                         self.logger.info(f'[Trace Analyser] {len(keep_mask)} traces returned but none above threshold')
 
-                # update head of traces cache and tail of events cache
-                events_tail += n_new_events
-                if not cycle_n % verbosity_divider:
-                    self.logger.info(f'[Trace Analyser] analysed {n_new_events} events (traces cache old head:{traces_head}, new head and tail:{traces_tail}), (events cache head:{events_head}, tail:{events_tail})')
+                # update head of traces cache
                 traces_head = traces_tail
-
                 with self.index_head_traces_cache.get_lock():
                     self.index_head_traces_cache.value = traces_head
-                with self.index_tail_events_cache.get_lock():
-                    self.index_tail_events_cache.value = events_tail
+
 
 
             else:

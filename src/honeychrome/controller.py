@@ -153,6 +153,7 @@ class Controller(QObject):
 
         # Oscilloscope traces queue
         self.oscilloscope_traces_queue = oscilloscope_traces_queue
+        self.peak_detection_threshold = None
 
         # signals: note controller actions are connected in view
         self.bus = None
@@ -1065,7 +1066,8 @@ class Controller(QObject):
     def config_peak_detection(self, params):
         # save peak detection channel and threshold
         settings.instrument_settings.value("peak_detection_channel", params['peak_detection_channel'])
-        settings.instrument_settings.value("threshold", params['threshold'], type=int)
+        threshold_retrieved = settings.instrument_settings.value("threshold", params['threshold'], type=int)
+        self.peak_detection_threshold = threshold_retrieved
 
         # send to analyser
         self.pipe_connection_analyser.send({'command': 'configure', 'data': params})
@@ -1475,7 +1477,7 @@ class Controller(QObject):
                 self.data_for_cytometry_plots['event_data'] = self.unmixed_event_data
 
             # for Time transformation, set limits to observed data
-            if self.data_for_cytometry_plots['event_data'] is not None and len(self.data_for_cytometry_plots['event_data']):
+            if self.data_for_cytometry_plots and self.data_for_cytometry_plots['event_data'] is not None and len(self.data_for_cytometry_plots['event_data']):
                 transformation = self.data_for_cytometry_plots['transformations']['Time']
                 index = self.data_for_cytometry_plots['pnn'].index('Time')
                 upper_limit = self.data_for_cytometry_plots['event_data'][-1, index]

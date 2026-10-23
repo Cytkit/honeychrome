@@ -7,7 +7,7 @@ import numpy as np
 from honeychrome.instrument_driver_components.cytkit_components.adcs import ADCs
 from honeychrome.instrument_driver_components.cytkit_components.capture import Capture
 from honeychrome.instrument_driver_components.cytkit_components.capture_decoder import CaptureDecoder
-from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max, connection_direction, spectral_channel_index_to_adc_channel_index, adc_index_to_spectral_channel_index
+from honeychrome.instrument_driver_components.cytkit_components.cytkit_configuration import registers_map, monitor_dictionary, dac_dictionary, pump_max, control_loop_interval, fan_max, connection_direction, spectral_channel_index_to_adc_channel_index, adc_index_to_spectral_channel_index, event_counter_interval, smoothing_time
 from honeychrome.instrument_driver_components.cytkit_components.dacs import DACs
 from honeychrome.instrument_driver_components.cytkit_components.display import Display
 from honeychrome.instrument_driver_components.cytkit_components.ft4222communicator import Ft4222Communicator
@@ -157,7 +157,6 @@ class EventRateCounter(Thread):
         self.event_rate = 0
         self.trigger_event_count = 0
         self.trigger = trigger
-        self.smoothing_time = 2
 
         self._stop_event = Event()
         self._lock = Lock()
@@ -170,11 +169,14 @@ class EventRateCounter(Thread):
             with self._lock:
                 old_trigger_event_count = self.trigger_event_count
                 self.trigger_event_count = self.trigger.merge_get_event_count()
-                new_events = self.trigger_event_count - old_trigger_event_count
+                new_events = max(0, self.trigger_event_count - old_trigger_event_count)
                 self.recount(new_events)  # this is the number of merge trigger events
 
             if not n % verbosity_divider:
                 logger.info(f"[EventRateCounter] trigger event count={self.trigger_event_count} event rate={self.event_rate}")
+
+            if self.event_rate < 1.0:
+                self.trigger.merge_force_trigger()
 
             self._stop_event.wait(self.interval)   # interruptible sleep
 
@@ -182,14 +184,14 @@ class EventRateCounter(Thread):
         time_now = time.perf_counter()
         if not self.time_last:
             self.time_last = time_now
-        elif self.event_rate == 0 or time_now - self.time_last > self.smoothing_time:
-            perf_interval = time_now - self.time_last
-            self.event_rate = number_of_new_events/perf_interval
         else:
             perf_interval = time_now - self.time_last
-            self.event_rate = self.event_rate * (self.smoothing_time-perf_interval) + number_of_new_events
-        if self.event_rate < 0.5:
-            self.trigger.merge_force_trigger()
+            if self.event_rate == 0 or perf_interval > smoothing_time:
+                self.event_rate = number_of_new_events/perf_interval
+            else:
+                instant_event_rate = number_of_new_events/perf_interval
+                mix_factor = perf_interval/smoothing_time
+                self.event_rate = self.event_rate * (1-mix_factor) + instant_event_rate * mix_factor
 
         self.time_last = time_now
 
@@ -368,7 +370,7 @@ class CytkitDevice:
         self.temperature_control_worker = TemperatureControlWorker(self.pressure, self.fan, self.temperature_set_point, fan_max, control_loop_interval)
         self.pressure_control_worker.start()
         self.temperature_control_worker.start()
-        self.event_rate_counter = EventRateCounter(self.trigger, control_loop_interval)
+        self.event_rate_counter = EventRateCounter(self.trigger, event_counter_interval)
         self.event_rate_counter.start()
         self.sample_pump_flow_rate_getter = SamplePumpFlowRateGetter(self, self.sample_pump)
         self.sample_pump_flow_rate_getter.start()
@@ -472,14 +474,14 @@ class CytkitDevice:
 
 
     def start_acquisition(self):
-        self.display.action_message(["Acquisition", "Priming..."])
-        self.sample_pump.stop()
-        self.sample_pump.ramp_to(self.sample_pump_priming_speed)
-        time.sleep(self.sample_pump_priming_time)
-
-        self.display.action_message(["Acquisition", f"Settling rate {self.sample_pump_acquisition_rate} uL/min"])
-        self.sample_pump.ramp_to(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
-        time.sleep(self.sample_pump_settle_time)
+        # self.display.action_message(["Acquisition", "Priming..."])
+        # self.sample_pump.stop()
+        # self.sample_pump.ramp_to(self.sample_pump_priming_speed)
+        # time.sleep(self.sample_pump_priming_time)
+        #
+        # self.display.action_message(["Acquisition", f"Settling rate {self.sample_pump_acquisition_rate} uL/min"])
+        # self.sample_pump.ramp_to(int(self.sample_pump_acquisition_rate/6 * self.sample_pump_steps_per_microlitre))
+        # time.sleep(self.sample_pump_settle_time)
 
         self.capture.reset_clock()
         self.capture.aggr_fifo_clear()
@@ -609,13 +611,16 @@ class CytkitDevice:
                     self.trigger.merge_force_trigger()
                 if 'clear' == value:
                     self.trigger.clear_all_counts()
-                if 'auto_adjust_over_baseline' == value:
+                if 'auto_adjust_over_baseline' in value:
                     self.auto_adjust_over_baseline = value['auto_adjust_over_baseline']
-                if 'threshold' == value:
+                if 'threshold' in value:
                     self.threshold = value['threshold'] * 1000 / settings.adc_scale_uv  # convert mV to adc units
-                if 'peak_detection_channel' == value:
+                    logger.info(f'[CytkitDriver] set threshold {self.threshold} (ADC units)')
+                if 'peak_detection_channel' in value:
                     index = settings.adc_channels.index(value['peak_detection_channel'])
-                    self.trigger.merge_set_merge_mask(1<<spectral_channel_index_to_adc_channel_index[index])
+                    trigger_merge_mask = 1<<spectral_channel_index_to_adc_channel_index[index]
+                    self.trigger.merge_set_merge_mask(trigger_merge_mask)
+                    logger.info(f'[CytkitDriver] set peak detection channel {value['peak_detection_channel']} trigger merge mask {trigger_merge_mask}')
 
                 message['trigger'] = value
 
@@ -644,11 +649,15 @@ class CytkitDevice:
 
             if parameter == 'oscilloscope_trace':
                 if self.auto_adjust_over_baseline:
-                    trace = value['oscilloscope_trace']
+                    trace = value
                     baselines = trace['baselines']
-                    for row in self.trigger_merge_list:
-                        level = int(baselines[row] + self.threshold)
-                        self.trigger.channel_set_level(spectral_channel_index_to_adc_channel_index[row], level)
+                    if baselines is not None:
+                        for row in self.trigger_merge_list:
+                            if not np.isnan(baselines[row]):
+                                level = int(baselines[row]/settings.adc_scale_uv  + self.threshold)
+                                level = min(level, 16383)
+                                self.trigger.channel_set_level(spectral_channel_index_to_adc_channel_index[row], level)
+                                logger.info(f'[CytkitDriver] setting trigger {settings.adc_channels[row]}: baseline {baselines[row]}, threshold {self.threshold}, level {level}')
 
             if parameter == 'pressure_set_point':
                 self.pressure_set_point = value
@@ -707,7 +716,8 @@ class CytkitDevice:
                 'fan_state',
                 'sheath_pump_state',
                 'sample_pump_state',
-                'dacs'
+                'dacs',
+                'trigger'
             ]
 
         message = {}
@@ -795,7 +805,7 @@ class CytkitDevice:
                 message['adcs']['level'][index] = self.adcs.real_read_value(spectral_channel_index_to_adc_channel_index[index])
 
         if 'trigger' in list_of_parameters:
-            message['trigger'] = {'events':{}}
+            message['trigger'] = {'events':{}, 'level':{}}
             for index in range(16):
                 message['trigger']['events'][index] = self.trigger.channel_get_event_count(spectral_channel_index_to_adc_channel_index[index])
             message['trigger']['events']['merge'] = self.event_rate_counter.trigger_event_count

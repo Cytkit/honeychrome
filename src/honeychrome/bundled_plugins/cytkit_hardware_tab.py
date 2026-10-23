@@ -805,6 +805,14 @@ class TriggerChannelTable(QWidget):
         w.setValue(value)
         w.blockSignals(False)
 
+        name = adc_channels[row]
+        s = instrument_settings
+        s.beginGroup(self.SETTINGS_GROUP)
+        s.beginGroup(name)
+        s.setValue("level", self.level_spins[row].value())
+        s.endGroup()
+        s.endGroup()
+
     # ---------- accessors ----------
 
     def is_enabled(self, row: int) -> bool:

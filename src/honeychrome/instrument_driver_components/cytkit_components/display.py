@@ -328,13 +328,13 @@ class Display(Thread):
             if self.animate_logo:
                 frame, draw = load_and_convert_frame("logo front panel dark antenna.png")
                 self.oled.display(frame)
-                time.sleep(1)
+                time.sleep(0.5)
 
                 frame, draw = load_and_convert_frame("logo front panel dark flash.png")
                 self.oled.display(frame)
-                time.sleep(1)
+                time.sleep(0.5)
 
-                for frame_count in range(30):
+                for frame_count in range(10):
                     if frame_count % 2 == 0:
                         frame, draw = load_and_convert_frame("logo front panel template.png")
                     else:
@@ -350,7 +350,7 @@ class Display(Thread):
                 draw_text_lr(draw, 127, 50, "Connected!", font4x6, 0, anchor='r')
                 self.frame = frame
                 self.draw = draw
-                self.message_timeout = 2
+                self.message_timeout = 1
                 self.animate_logo = False
                 self.transmission_animation = True
 
@@ -402,7 +402,7 @@ class Display(Thread):
         self.frame = deepcopy(frame_info)
         self.draw = ImageDraw.Draw(self.frame)
 
-        event_rate = self.event_rate_object.event_rate if self.event_rate_object else 0
+        event_rate = np.floor(self.event_rate_object.event_rate) if self.event_rate_object else 0
         sample_flow_rate = self.sample_pump_object.flow_rate if self.sample_pump_object else 0
         pressure = self.pressure_object.pressure if self.pressure_object and self.pressure_object.pressure else 0
         temperature = self.temperature_object.temperature if self.temperature_object and self.temperature_object.temperature else 0

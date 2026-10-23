@@ -189,6 +189,9 @@ class OscilloscopeWidget(QWidget):
         if self.trace is None:
             return
         try:
+            if self.controller.peak_detection_threshold:
+                self.threshold = self.controller.peak_detection_threshold * 1000 # uV
+
             start = int(self.trace['n_start'])
             end = int(self.trace['n_end'])
 
