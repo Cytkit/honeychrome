@@ -596,9 +596,11 @@ def _group_colours(groups: list[str]) -> dict:
 
 
 def make_pca_figure(pca: dict, is_dark: bool, sample_labels: dict | None = None,
-                    show_loadings: bool = True, label_points: bool = False):
+                    show_loadings: bool = True, label_points: bool = False,
+                    group_colours: dict | None = None):
     """Samples on PC1 × PC2 coloured by group, with the top loadings as
-    arrows; hovering names a sample or loading (fig._hover_handler)."""
+    arrows; hovering names a sample or loading (fig._hover_handler).
+    *group_colours* ({group: colour}) overrides the default palette."""
     from matplotlib.figure import Figure
     from honeychrome.view_components import differential_plots as dp
 
@@ -606,7 +608,7 @@ def make_pca_figure(pca: dict, is_dark: bool, sample_labels: dict | None = None,
     ax = fig.add_subplot(111)
     fg = 'white' if is_dark else 'black'
     scores, loadings, groups = pca['scores'], pca['loadings'], pca['groups']
-    colours = _group_colours(groups)
+    colours = {g: (group_colours or {}).get(g) or c for g, c in _group_colours(groups).items()}
     names = [(sample_labels or {}).get(s, str(s).replace('\\', '/').rsplit('/', 1)[-1])
              for s in scores.index]
     for grp, colour in colours.items():

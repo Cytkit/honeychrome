@@ -236,6 +236,79 @@ def sample_event_totals(state, all_rel, cluster_labels_override=None) -> np.ndar
                      for rel in all_rel], dtype=float)
 
 
+def export_tables(state, mem_labels: dict | None = None,
+                  cell_types: pd.DataFrame | None = None) -> dict:
+    """
+    The last statistics run as one tidy table per file, for graphing and
+    analysis in other software: {name: DataFrame}.
+
+    ``cluster_frequencies`` (% of a sample's labelled events),
+    ``cluster_counts`` and ``cluster_mfis`` have one row per sample and one
+    column per cluster (per cluster and channel for the MFIs). Each row
+    starts with the sample name and path, its group and its covariates.
+    Frequencies and counts then give ``n_events``, the sample's labelled
+    events: the frequency denominator, noise included, recovered from the
+    largest cluster's count and share.
+
+    ``clusters`` lists each cluster's id, name and event count over the
+    samples tested, with the MEM label and suggested cell type when
+    ``mem_labels`` ({cluster id: label}) and ``cell_types`` (the Cluster
+    Annotation suggestions, indexed by cluster id) are given.
+
+    ``differential_frequencies``, ``differential_counts`` and
+    ``differential_mfis`` are the test results as computed, one row per
+    feature and comparison. A test that was not run gives no table.
+    """
+    out = {}
+    matrices = {name: df for name, df in (('cluster_frequencies', state.freq_df),
+                                          ('cluster_counts', state.counts_df),
+                                          ('cluster_mfis', state.mfi_df))
+                if df is not None and not df.empty}
+    freq_df, counts_df = matrices.get('cluster_frequencies'), matrices.get('cluster_counts')
+
+    per_cluster = counts_df if counts_df is not None else freq_df
+    if per_cluster is not None:
+        cluster_ids = list(range(per_cluster.shape[1]))
+        clusters = pd.DataFrame({'cluster_id': cluster_ids,
+                                 'cluster_name': list(per_cluster.columns)})
+        if counts_df is not None:
+            clusters['n_events'] = counts_df.sum(axis=0).astype(int).to_numpy()
+        if mem_labels:
+            clusters['mem_label'] = [mem_labels.get(cl, '') for cl in cluster_ids]
+        if cell_types is not None and 'suggested_type' in cell_types.columns:
+            clusters['suggested_type'] = (cell_types['suggested_type'].reindex(cluster_ids)
+                                          .fillna('').to_numpy())
+        out['clusters'] = clusters
+
+    if matrices:
+        index = next(iter(matrices.values())).index
+        group_of = dict(zip(state.stats_all_rel, state.stats_group_vec))
+        meta = pd.DataFrame({'sample': [Path(rel).name for rel in index],
+                             'sample_path': list(index),
+                             'group': [group_of.get(rel, '') for rel in index]},
+                            index=index)
+        if state.covariates is not None:
+            meta = meta.join(state.covariates.reindex(index), rsuffix='_covariate')
+        n_events = None
+        if freq_df is not None and counts_df is not None:
+            rows = np.arange(len(counts_df))
+            top = counts_df.to_numpy().argmax(axis=1)
+            top_count = counts_df.to_numpy()[rows, top]
+            share = freq_df.to_numpy()[rows, top] / 100.0
+            n_events = pd.Series(np.rint(top_count / np.where(share > 0, share, np.nan)),
+                                 index=index, name='n_events')
+        for name, df in matrices.items():
+            parts = [meta] if n_events is None or name == 'cluster_mfis' else [meta, n_events]
+            out[name] = pd.concat(parts + [df], axis=1)
+
+    for name, results in (('differential_frequencies', state.freq_results),
+                          ('differential_counts', state.counts_results),
+                          ('differential_mfis', state.mfi_results)):
+        if results is not None and not results.empty:
+            out[name] = results
+    return out
+
+
 def mfi_feature_table(state, n_clusters: int, channels: list[str],
                       names_override: dict | None = None) -> pd.DataFrame:
     """
@@ -614,6 +687,12 @@ _TOO_FEW_CLUSTERS_HINT = (
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+def _normalisation(state) -> str:
+    """Library-size method of the abundance tests ('total' or 'robust')."""
+    method = getattr(state, 'stats_normalisation', 'total')
+    return method if method in ('total', 'robust') else 'total'
+
+
 def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
                    pval_threshold: float, fc_threshold: float,
                    cluster_labels_override=None,
@@ -655,7 +734,11 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
     mfi_hierarchical: cluster-first testing of MFIs.
     include_type_markers: when False, the MFI branch tests 'state'-role
         channels only. When True, tests every selected channel.
-    run_counts: also run the negative-binomial GLM on raw counts.
+    run_counts: also run the negative-binomial GLM on raw counts, tested by
+        state.stats_counts_method ('wald' or 'ql').
+
+    The Frequency and Counts library sizes follow state.stats_normalisation
+    ('total' or 'robust', differential_stats.library_sizes).
     """
     log_stage(log, "DIFFERENTIAL STATISTICS")
     if mfi_threshold is None:
@@ -720,6 +803,7 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
             names_override=names_override,
         )
         totals = sample_event_totals(state, all_rel, cluster_labels_override)
+        totals = _ds.library_sizes(counts_df[tested], totals, _normalisation(state))
         freq_results = run_moderated(
             log2_frequencies(counts_df[tested], totals), group_vec, contrasts, state.contrast_mode,
             pval_threshold, fc_threshold, pairing_vec=pairing_vec, fdr_scope=fdr_scope,
@@ -731,14 +815,17 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
 
     if run_counts:
         # The library-size offset is each sample's total over all clusters,
-        # including those left out of the test.
-        row_totals = counts_df.sum(axis=1)
+        # including those left out of the test (robustly rescaled on request).
+        row_totals = pd.Series(
+            _ds.library_sizes(counts_df[tested], counts_df.sum(axis=1).values, _normalisation(state)),
+            index=counts_df.index)
         offset_df = pd.DataFrame({c: row_totals for c in tested}, index=counts_df.index)
         counts_results = run_glm_counts(counts_df[tested], group_vec, contrasts,
                                         state.contrast_mode, pval_threshold, fc_threshold,
                                         pairing_vec=pairing_vec, fdr_scope=fdr_scope,
                                         covariates=covariates, use_treat=use_treat,
-                                        offset_df=offset_df)
+                                        offset_df=offset_df,
+                                        method=getattr(state, 'stats_counts_method', 'wald'))
         state.counts_results = counts_results
         state.counts_df = counts_df      # raw (samples × clusters) counts
 

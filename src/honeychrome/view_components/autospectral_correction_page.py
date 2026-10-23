@@ -12,11 +12,11 @@ Sections
    an Include tick box), run together or per raw
    subfolder, each group's unstained sample (Auto: scatter match), gate,
    events and seed; Advanced Settings; Fix Unmix; whether the experiment is
-   unmixed with the corrected spectra.
+   unmixed with the corrected spectra, and which raw subfolders' samples.
 3  Results: per group, the spectral change heatmap, before/after traces and
    the table of changed fluorophores with their Active ticks.
-4  Comparison: the current sample with the base and the corrected spectra,
-   both by the experiment's method.
+4  Comparison: the current sample, whichever it is, with the base spectra
+   and with the corrected spectra it takes, both by the experiment's method.
 
 The numerics live in controller_components/fix_my_unmix.py and the
 experiment-level run and storage in spectral_correction.py.
@@ -182,6 +182,7 @@ class SpectralCorrectionPage(QWidget):
         self._left_data = None
         self._right_data = None
         self._last_cmp_state = None
+        self._cmp_note = ''
         self._pending_cmp_state = None
         self._loading = False
         self._param_widgets = {}
@@ -194,6 +195,7 @@ class SpectralCorrectionPage(QWidget):
             self.bus.loadSampleRequested.connect(self._on_sample_loaded)
             self.bus.spectralProcessRefreshed.connect(self._on_process_refreshed)
             self.bus.sampleTreeUpdated.connect(self._refresh_samples)
+            self.bus.sampleTreeUpdated.connect(self._refresh_apply_to)
             self.bus.unmixingMethodChanged.connect(self._refresh_summary)
 
     # ------------------------------------------------------------------
@@ -321,8 +323,7 @@ class SpectralCorrectionPage(QWidget):
         self._fixed_list.setSelectionMode(QAbstractItemView.NoSelection)
         self._fixed_list.setMaximumHeight(120)
         self._fixed_list.setToolTip('Ticked fluorophores keep their spectra: Fix Unmix gathers no evidence with '
-                                    'them as the source and does not re-measure them. Tick FlowCode tag '
-                                    'fluorophores, whose FRET error the FlowCode plugin removes itself.')
+                                    'them as the source and does not re-measure them.')
         self._fixed_list.itemChanged.connect(self._on_setup_changed)
         layout.addWidget(self._fixed_list)
 
@@ -346,12 +347,22 @@ class SpectralCorrectionPage(QWidget):
 
         self._use_check = QCheckBox('Use spectral corrections for the experiment\'s unmixing')
         self._use_check.setToolTip(
-            'Each corrected sample is unmixed with its group\'s corrected spectra (Active rows) by the experiment\'s '
-            'method, in the main window, exports, Honeycluster, the gating plugins and Statistics.')
+            'Every fully stained sample (not an unstained, single-stain or bead sample) is unmixed with the '
+            'corrected spectra (Active rows) by the experiment\'s method, in the main window, exports, Honeycluster, '
+            'the gating plugins and Statistics; after a run per group, a sample takes the corrections of its own '
+            'raw subfolder.')
         self._use_check.toggled.connect(self._on_use_toggled)
         layout.addWidget(self._use_check)
+        layout.addWidget(QLabel('Apply the corrections to the samples of:'))
+        self._apply_list = QListWidget()
+        self._apply_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self._apply_list.setMaximumHeight(100)
+        self._apply_list.setToolTip('Raw subfolders whose fully stained samples are unmixed with the corrected '
+                                    'spectra; the samples of an unticked subfolder keep the base spectra.')
+        self._apply_list.itemChanged.connect(self._on_apply_to_changed)
+        layout.addWidget(self._apply_list)
         # corrections decide the unmixing: not changed under a running job
-        guard_while_busy(self.controller, self._match_btn, self._fix_btn, self._use_check)
+        guard_while_busy(self.controller, self._match_btn, self._fix_btn, self._use_check, self._apply_list)
         if getattr(self.controller, 'job_gate', None) is not None:
             self.controller.job_gate.changed.connect(self._on_job_gate_changed)
 
@@ -802,6 +813,27 @@ class SpectralCorrectionPage(QWidget):
         self._use_check.setEnabled(bool(entry))
         self._use_check.setChecked(bool(entry) and unmix_method.unmixing_settings(self._process())['corrections'])
         self._use_check.blockSignals(False)
+        self._refresh_apply_to()
+
+    def _refresh_apply_to(self, *_args):
+        """The raw subfolders offered for the corrections, ticked as stored (all when nothing is stored)."""
+        if not self._available():
+            return
+        entry = self._entry()
+        folders = sc.sample_folders(self.controller.experiment.samples)
+        for g in ((entry or {}).get('groups') or {}).values():
+            folders += [sc.group_of(str(k)) for k in g.get('samples') or []]
+        apply_to = unmix_method.unmixing_settings(self._process())['corrections_apply_to']
+        self._apply_list.blockSignals(True)
+        self._apply_list.clear()
+        for folder in dict.fromkeys(folders):
+            item = QListWidgetItem(folder)
+            item.setData(Qt.UserRole, folder)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if apply_to is None or folder in apply_to else Qt.Unchecked)
+            self._apply_list.addItem(item)
+        self._apply_list.setEnabled(bool(entry))
+        self._apply_list.blockSignals(False)
 
     def _method_changed(self):
         """The experiment's unmixing changed: unmix the displayed sample again and tell the other pages."""
@@ -815,6 +847,17 @@ class SpectralCorrectionPage(QWidget):
     def _on_use_toggled(self, checked: bool):
         unmix_method.set_unmixing(self._process(), corrections=bool(checked))
         self._method_changed()
+        self._refresh_comparison_if_active()
+
+    def _on_apply_to_changed(self, _item):
+        items = [self._apply_list.item(i) for i in range(self._apply_list.count())]
+        ticked = [it.data(Qt.UserRole) for it in items if it.checkState() == Qt.Checked]
+        unmix_method.set_unmixing(self._process(),
+                                  corrections_apply_to=None if len(ticked) == len(items) else ticked)
+        if unmix_method.unmixing_settings(self._process())['corrections']:
+            self._method_changed()
+        elif self.bus:
+            self.bus.autoSaveRequested.emit()
         self._refresh_comparison_if_active()
 
     # ------------------------------------------------------------------
@@ -1190,12 +1233,23 @@ class SpectralCorrectionPage(QWidget):
             return
         entry = self._entry()
         key = c.current_sample_path
-        group = sc.group_for_sample(entry, key)
-        if group is None:
+        if not entry:
             self._clear_comparison_plots()
-            self._cmp_status.setText('The current sample is not among the corrected samples.' if entry
-                                     else 'Run Fix Unmix first.')
+            self._cmp_status.setText('Run Fix Unmix first.')
             return
+        samples = c.experiment.samples
+        unmixing = unmix_method.unmixing_settings(self._process())
+        group = sc.correction_membership(entry, samples, unmixing['corrections_apply_to']).get(str(key))
+        self._cmp_note = ''
+        if group is None or not unmixing['corrections']:
+            group = group or sc.correction_group(entry, samples, key)
+            if group is None:
+                self._clear_comparison_plots()
+                self._cmp_status.setText('No corrected spectra for the current sample\'s raw subfolder: Fix '
+                                         'Unmix ran per group without it.')
+                return
+            self._cmp_note = (' Preview: the experiment\'s unmixing does not use the corrected spectra for this '
+                              'sample.')
         names, spectra = fluor_names_and_spectra(c)
         corrected = sc.group_spectra(entry, group, names, spectra, active_only=True)
         profiles = self._assigned_profiles()
@@ -1216,7 +1270,8 @@ class SpectralCorrectionPage(QWidget):
         state_key = (key, tuple(profiles), unmix_method.method_token(state_base),
                      unmix_method.method_token(state_corrected), cap)
         if state_key == self._last_cmp_state and self._left_data is not None:
-            self._cmp_status.setText(f'No change — redrawing from cached result ({self._left_data.shape[0]:,} events).')
+            self._cmp_status.setText(f'No change — redrawing from cached result ({self._left_data.shape[0]:,} events).'
+                                     + self._cmp_note)
             self._initialise_comparison_plots()
             return
         with_af = af is not None
@@ -1243,7 +1298,7 @@ class SpectralCorrectionPage(QWidget):
         self._left_data = left
         self._right_data = right
         self._last_cmp_state = self._pending_cmp_state
-        self._cmp_status.setText(f'Done. {left.shape[0]:,} events.')
+        self._cmp_status.setText(f'Done. {left.shape[0]:,} events.' + self._cmp_note)
         self._plot_left.set_status('')
         self._plot_right.set_status('')
         self._initialise_comparison_plots()

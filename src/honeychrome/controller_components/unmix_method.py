@@ -36,8 +36,13 @@ Spectral Correction page)
                                                      'active': bool}}}}}
 
     With ``process['unmixing']['corrections']`` ticked, each sample of a
-    group is unmixed with the base spectra whose Active rows are replaced by
-    its group's corrected spectra. What depends on the spectra follows each
+    group, and every other fully stained sample (not an unstained, single-stain
+    or bead sample) of the experiment, or of the group's raw subfolder when
+    Fix Unmix ran per group, is unmixed with the base spectra whose Active
+    rows are replaced by its group's corrected spectra
+    (``spectral_correction.correction_membership``);
+    ``process['unmixing']['corrections_apply_to']``, when set, keeps the
+    corrections to the samples of the raw subfolders it lists. What depends on the spectra follows each
     set (``set_extras``): the AF envelopes' null variance is rebuilt from
     each profile's stored unstained subsample; the spillover spread is the
     group's (recomputed from the controls by Fix Unmix) or the base one,
@@ -96,7 +101,7 @@ R2 = 'R2'
 NOISE_METHODS = (M2PG, CLAMPED)
 
 UNMIXING_DEFAULTS = {'noise_model': False, 'variants': False, 'prior_lambda': 1.0, 'corrections': False,
-                     'weights': None}
+                     'corrections_apply_to': None, 'weights': None}
 
 # The Spectral Variants page's Unmixing defaults (threads are set at run time).
 VARIANT_KERNEL_DEFAULTS = {
@@ -208,11 +213,13 @@ def digest(*parts) -> str:
 # Spectral corrections
 # ---------------------------------------------------------------------------
 
-def corrections_in_effect(process: dict, names: list, base: np.ndarray) -> tuple:
+def corrections_in_effect(process: dict, names: list, base: np.ndarray, samples: dict | None = None) -> tuple:
     """
     ``(sets, membership)``: corrected spectra per group (only groups with an
-    Active change) and each member sample's group, from the overlay when it
-    is ticked and was made on the current base spectra.
+    Active change) and the group of each sample unmixed with them, from the
+    overlay when it is ticked and was made on the current base spectra.
+    Without ``samples`` (the experiment's sample table) only the samples Fix
+    Unmix used are members.
     """
     if not unmixing_settings(process)['corrections']:
         return {}, {}
@@ -220,11 +227,12 @@ def corrections_in_effect(process: dict, names: list, base: np.ndarray) -> tuple
     if not entry.get('groups'):
         return {}, {}
     from honeychrome.controller_components.gls_unmix import spectra_fingerprint
+    from honeychrome.controller_components.spectral_correction import correction_membership
     if entry.get('base_fingerprint') != spectra_fingerprint(names, base):
         logger.warning('Spectral corrections were made on earlier spectra and are not applied; '
                        'run Fix Unmix again.')
         return {}, {}
-    sets, membership = {}, {}
+    sets = {}
     for group, g in entry['groups'].items():
         spectra = np.array(base, dtype=np.float64, copy=True)
         changed = False
@@ -238,8 +246,8 @@ def corrections_in_effect(process: dict, names: list, base: np.ndarray) -> tuple
                 changed = True
         if changed:
             sets[str(group)] = spectra
-            for key in g.get('samples') or []:
-                membership[str(key)] = str(group)
+    members = correction_membership(entry, samples or {}, unmixing_settings(process)['corrections_apply_to'])
+    membership = {key: group for key, group in members.items() if group in sets}
     return sets, membership
 
 
@@ -389,8 +397,8 @@ def method_state(controller, corrections: tuple | None = None) -> MethodState | 
     if spectra is None:
         return None
     method = requested_method(process)
-    corrected, membership = (corrections_in_effect(process, names, spectra) if corrections is None
-                             else corrections)
+    corrected, membership = (corrections_in_effect(process, names, spectra, controller.experiment.samples)
+                             if corrections is None else corrections)
     if method == R1 and not corrected:
         return None
 
@@ -433,6 +441,8 @@ def method_state(controller, corrections: tuple | None = None) -> MethodState | 
 
     parts = {'method': method, 'names': list(names), 'spectra': spectra, 'ceiling': ceiling,
              'weights': weights, 'corrected': corrected}
+    if corrections is None and corrected:
+        parts['corrections_apply_to'] = unmixing_settings(process)['corrections_apply_to']
     if method in NOISE_METHODS:
         parts.update(noise=[noise.entry.get('fingerprint'), noise.entry.get('fitted'), noise.cell_null_var,
                             noise.bead_null_var, noise.entry.get('flat_phi'), noise.entry.get('clamped_weights')],

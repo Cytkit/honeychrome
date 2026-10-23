@@ -16,7 +16,9 @@ Pure computation for the Automated Gating plugin (no Qt, no controller):
   group assignments and covariates as a table with one row per sample.
 * ``sample_pca`` / ``predictive_matrix`` — sample-level PCA and the feature
   matrix for the predictive analysis (``drc_predictive``), both from the
-  per-sample values of the last statistics run.
+  per-sample values of the last statistics run;
+  ``sample_analysis_to_jsonable`` / ``sample_analysis_from_jsonable`` save
+  and restore their results.
 * ``pack_display`` / ``display_population_mask`` / ``display_parent_mask`` /
   ``save_display`` / ``load_display`` — the display subsample kept per
   gated sample for plotting: its events and every population's membership
@@ -435,12 +437,15 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                    fdr_scope: str = 'global', run_freq: bool = True, run_counts: bool = False,
                    run_markers: bool = True, use_stats_parent: bool = True,
                    exclude_gating_markers: bool = True,
-                   min_marker_events: int = DEFAULT_MIN_MARKER_EVENTS) -> dict:
+                   min_marker_events: int = DEFAULT_MIN_MARKER_EVENTS,
+                   counts_method: str = 'wald') -> dict:
     """Compare gated populations between sample groups.
 
     * Frequencies: log2 odds of each population within its parent (or its
       stats parent), moderated linear model.
-    * Counts: negative-binomial GLM with the log parent count as offset.
+    * Counts: negative-binomial GLM with the log parent count as offset,
+      tested by *counts_method* ('wald' or 'ql', see
+      ``differential_stats.run_glm_counts``).
     * Marker medians: moderated linear model on per-population medians, one
       family per population (population-first testing).
 
@@ -501,7 +506,7 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
         if run_counts:
             out['counts'] = ds.run_glm_counts(counts, group_vec, contrasts, contrast_mode,
                                               pval_threshold, fc_threshold,
-                                              offset_df=denom, **common)
+                                              offset_df=denom, method=counts_method, **common)
             out['counts_values'] = counts
             empty = [k for k in counts.columns if not (counts[k].fillna(0) > 0).any()]
             if empty:
@@ -594,6 +599,47 @@ def stats_from_jsonable(payload: dict) -> dict:
     if counts is not None and 'df.total' in counts.columns:
         counts['df.total'] = counts['df.total'].fillna(np.inf)
     return out
+
+
+_PCA_FRAMES = ('scores', 'loadings')
+_PREDICTIVE_FRAMES = ('performance', 'roc', 'importance', 'panel')
+
+
+def _result_to_jsonable(result: dict, frames: tuple) -> dict | None:
+    if not result:
+        return None
+    out = ag_core.to_jsonable({k: v for k, v in result.items() if k not in frames})
+    for key in frames:
+        frame = result.get(key)
+        out[key] = _frame_to_jsonable(frame) if frame is not None else None
+    return out
+
+
+def _result_from_jsonable(payload: dict | None, frames: tuple) -> dict:
+    if not payload:
+        return {}
+    out = {k: v for k, v in payload.items() if k not in frames}
+    for key in frames:
+        obj = payload.get(key)
+        out[key] = _frame_from_jsonable(obj) if obj else pd.DataFrame()
+    return out
+
+
+def sample_analysis_to_jsonable(pca: dict, predictive: dict) -> dict:
+    """The sample PCA (``sample_pca``) and the predictive analysis
+    (``drc_predictive.run_predictive``) as JSON-safe values, for saving;
+    either may be empty."""
+    return {'pca': _result_to_jsonable(pca, _PCA_FRAMES),
+            'predictive': _result_to_jsonable(predictive, _PREDICTIVE_FRAMES)}
+
+
+def sample_analysis_from_jsonable(payload: dict) -> tuple[dict, dict]:
+    """(pca, predictive) that ``sample_analysis_to_jsonable`` saved, {} for
+    either that was not."""
+    pca = _result_from_jsonable(payload.get('pca'), _PCA_FRAMES)
+    if pca:
+        pca['explained_variance_ratio'] = tuple(pca['explained_variance_ratio'])
+    return pca, _result_from_jsonable(payload.get('predictive'), _PREDICTIVE_FRAMES)
 
 
 def reapply_thresholds(stats: dict, pval_threshold: float, fc_threshold: float,
