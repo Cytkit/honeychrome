@@ -514,6 +514,16 @@ counts and frequency barplots follow the equivalent summaries in
 cyCONDOR [12].</p>
 <p><b>Export Results CSV</b> writes out the full statistics table for the
 currently viewed comparison.</p>
+<p><b>Export Tables…</b> writes the last statistics run into a folder you
+choose, one CSV file per table, each with a single header row so that R,
+Python, Prism or a spreadsheet can read it directly. The sample tables
+(<i>cluster_frequencies</i>, <i>cluster_counts</i>, <i>cluster_mfis</i>)
+have one row per sample, with its group and covariates, then one column
+per cluster; frequencies and counts also give <i>n_events</i>, the number
+of labelled events the percentages are taken from. <i>clusters</i> lists
+each cluster's id, name and event count, with the MEM label and suggested
+cell type when Cluster ID suggestions were computed for the run. The
+<i>differential_*</i> files hold the test results of every comparison.</p>
 
 <h4>5. Sample PCA</h4>
 <p>PCA (Principal Component Analysis) takes the per-sample summary table

@@ -3593,6 +3593,16 @@ class GroupsStatsTab(QWidget):
         self.export_results_btn.setEnabled(False)
         self.export_results_btn.clicked.connect(self._export_results_csv)
         run_row.addWidget(self.export_results_btn)
+
+        self.export_tables_btn = QPushButton("Export Tables…")
+        self.export_tables_btn.setToolTip(
+            "Write the last statistics run into a folder as one CSV file per table: "
+            "per-sample cluster frequencies, counts and MFIs (with group and covariates), "
+            "the cluster list, and the differential results of each test."
+        )
+        self.export_tables_btn.setEnabled(False)
+        self.export_tables_btn.clicked.connect(self._export_tables)
+        run_row.addWidget(self.export_tables_btn)
         stats_layout.addLayout(run_row)
 
         # ---- Viewing comparison ----
@@ -5287,6 +5297,7 @@ class GroupsStatsTab(QWidget):
             self.stats_status_label.setText("✓ Statistics complete (replotted — run unchanged).")
             self.stats_status_label.setStyleSheet("color: green;")
             self.export_results_btn.setEnabled(True)
+            self.export_tables_btn.setEnabled(True)
             self._draw_results()
             self.results_computed.emit()
             return
@@ -5431,7 +5442,7 @@ class GroupsStatsTab(QWidget):
         """
         self._set_cursor_busy('stats', busy)
         controls = [self.run_stats_btn, self.composition_btn,
-                    self.export_results_btn]
+                    self.export_results_btn, self.export_tables_btn]
         if hasattr(self, 'pca_btn'):
             controls.append(self.pca_btn)
         if busy:
@@ -6090,6 +6101,7 @@ class GroupsStatsTab(QWidget):
             "✓ Statistics complete." + (f"\n{note}" if note else ''))
         self.stats_status_label.setStyleSheet("color: green;")
         self.export_results_btn.setEnabled(True)
+        self.export_tables_btn.setEnabled(True)
         self._update_pca_source_availability()
         self._refresh_predictive_controls()
         self._draw_results()
@@ -7104,6 +7116,33 @@ class GroupsStatsTab(QWidget):
                     df.to_csv(f, index=False)
                     f.write("\n")
             QMessageBox.information(self, "Exported", f"Saved to {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Export Error", str(e))
+
+    def _export_tables(self):
+        """Write the last statistics run's tables, one CSV file each, into a
+        folder named by the user (see drc_stats.export_tables)."""
+        run = next((entry for entry in self.state.clustering_runs
+                    if entry.get('run_id') == self.state.stats_run_id), None)
+        if run is not None:
+            run = drc_run_archive.hydrate_run(self.controller, run)
+        run = run or {}
+        tables = drc_stats.export_tables(
+            self.state, run.get('mem_labels'), run.get('cell_type_suggestions'))
+        if not tables:
+            QMessageBox.warning(self, "No Results", "No statistics results to export.")
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self, "Export Tables to Folder", str(self.controller.experiment_dir))
+        if not folder:
+            return
+        stem = drc_report.sanitize_filename(self.state.stats_run_label or 'honeycluster')
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        try:
+            for name, table in tables.items():
+                table.to_csv(Path(folder) / f"{stem}_{stamp}_{name}.csv", index=False)
+            QMessageBox.information(
+                self, "Exported", f"Saved {len(tables)} files to {folder}")
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
 
@@ -14147,6 +14186,7 @@ class PluginWidget(QWidget):
             if (self.state.freq_results is not None or self.state.mfi_results is not None
                     or self.state.counts_results is not None):
                 self.groups_stats_tab.export_results_btn.setEnabled(True)
+                self.groups_stats_tab.export_tables_btn.setEnabled(True)
                 # Reset the guard so refresh() redraws on first tab switch.
                 self.groups_stats_tab._last_drawn_cluster_names = {}
 
