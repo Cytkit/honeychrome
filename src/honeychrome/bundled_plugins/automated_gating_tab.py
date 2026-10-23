@@ -410,6 +410,7 @@ class GatingRunState:
     fdr_scope: str = 'global'
     run_freq: bool = True
     run_counts: bool = False
+    counts_method: str = 'wald'
     run_markers: bool = True
     use_stats_parent: bool = True
     exclude_gating_markers: bool = True
@@ -459,7 +460,7 @@ _PERSISTED_FIELDS = (
     'display_events', 'group_names', 'group_patterns', 'sample_groups', 'covariates',
     'numeric_covariates', 'pairing', 'adjust_covariates', 'contrast_mode', 'reference_group', 'pval_threshold',
     'fc_threshold', 'marker_threshold', 'use_treat', 'fdr_scope', 'run_freq', 'run_counts',
-    'run_markers', 'use_stats_parent', 'exclude_gating_markers', 'min_marker_events',
+    'counts_method', 'run_markers', 'use_stats_parent', 'exclude_gating_markers', 'min_marker_events',
     'exclude_flagged', 'pca_use_freq', 'pca_use_counts', 'pca_use_markers', 'pca_n_loadings',
     'pred_use_freq', 'pred_use_markers', 'pred_lasso', 'pred_forest', 'pred_repeats',
     'report_populations', 'pop_filter',
@@ -2242,8 +2243,18 @@ class ResultsTab(QWidget):
         self.sb_min_events.setToolTip(
             "A population's marker medians are tested only when it has at least this many "
             "events in every sample compared.")
-        for w in (self.chk_freq, self.chk_counts, self.chk_markers, self.chk_stats_parent,
-                  self.chk_exclude_gating):
+        self.cb_counts_method = QComboBox()
+        self.cb_counts_method.addItem("Wald", 'wald')
+        self.cb_counts_method.addItem("Quasi-likelihood F", 'ql')
+        self.cb_counts_method.setToolTip(
+            "Wald: each population's own negative-binomial dispersion and a z test; finds too "
+            "many hits with few samples per group or a paired design. Quasi-likelihood F: "
+            "dispersions shrunk towards a common value, then a moderated quasi-dispersion per "
+            "population; holds its false-positive rate with few samples.")
+        for w in (self.chk_freq, self.chk_counts):
+            form.addRow(w)
+        form.addRow("Counts test:", self.cb_counts_method)
+        for w in (self.chk_markers, self.chk_stats_parent, self.chk_exclude_gating):
             form.addRow(w)
         form.addRow("Min. events for medians:", self.sb_min_events)
 
@@ -2300,6 +2311,9 @@ class ResultsTab(QWidget):
 
         self.chk_freq.toggled.connect(lambda v: setattr(self.state, 'run_freq', bool(v)))
         self.chk_counts.toggled.connect(lambda v: setattr(self.state, 'run_counts', bool(v)))
+        self.cb_counts_method.currentIndexChanged.connect(
+            lambda _i: self._filling or setattr(self.state, 'counts_method',
+                                                self.cb_counts_method.currentData() or 'wald'))
         self.chk_markers.toggled.connect(lambda v: setattr(self.state, 'run_markers', bool(v)))
         self.chk_stats_parent.toggled.connect(
             lambda v: setattr(self.state, 'use_stats_parent', bool(v)))
@@ -2343,7 +2357,8 @@ class ResultsTab(QWidget):
             self.sb_min_events.blockSignals(True)
             self.sb_min_events.setValue(int(st.min_marker_events))
             self.sb_min_events.blockSignals(False)
-            for cb, v in ((self.cb_mode, st.contrast_mode), (self.cb_fdr, st.fdr_scope)):
+            for cb, v in ((self.cb_mode, st.contrast_mode), (self.cb_fdr, st.fdr_scope),
+                          (self.cb_counts_method, st.counts_method)):
                 cb.blockSignals(True)
                 cb.setCurrentIndex(max(cb.findData(v), 0))
                 cb.blockSignals(False)
@@ -2439,6 +2454,7 @@ class ResultsTab(QWidget):
             pval_threshold=st.pval_threshold, fc_threshold=st.fc_threshold,
             marker_threshold=st.marker_threshold, use_treat=st.use_treat,
             fdr_scope=st.fdr_scope, run_freq=st.run_freq, run_counts=st.run_counts,
+            counts_method=st.counts_method,
             run_markers=st.run_markers, use_stats_parent=st.use_stats_parent,
             exclude_gating_markers=st.exclude_gating_markers,
             min_marker_events=st.min_marker_events,
@@ -3564,6 +3580,7 @@ class ResultsTab(QWidget):
                 + (', '.join(f"{c} (numeric)" if c in st.numeric_covariates else c
                              for c in st.adjust_covariates) or 'none'),
                 f"  FDR <= {st.pval_threshold} ({st.fdr_scope}); TREAT: {st.use_treat}",
+                f"  Counts test: {'quasi-likelihood F' if st.counts_method == 'ql' else 'Wald'}",
                 f"  Frequency/count threshold: {st.fc_threshold}; marker threshold: {st.marker_threshold}",
                 f"  Frequencies relative to stats parent where defined: {st.use_stats_parent}",
                 f"  Gating markers left out of marker tests: {st.exclude_gating_markers}; "

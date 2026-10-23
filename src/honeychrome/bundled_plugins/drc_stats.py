@@ -614,6 +614,12 @@ _TOO_FEW_CLUSTERS_HINT = (
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+def _normalisation(state) -> str:
+    """Library-size method of the abundance tests ('total' or 'robust')."""
+    method = getattr(state, 'stats_normalisation', 'total')
+    return method if method in ('total', 'robust') else 'total'
+
+
 def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
                    pval_threshold: float, fc_threshold: float,
                    cluster_labels_override=None,
@@ -655,7 +661,11 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
     mfi_hierarchical: cluster-first testing of MFIs.
     include_type_markers: when False, the MFI branch tests 'state'-role
         channels only. When True, tests every selected channel.
-    run_counts: also run the negative-binomial GLM on raw counts.
+    run_counts: also run the negative-binomial GLM on raw counts, tested by
+        state.stats_counts_method ('wald' or 'ql').
+
+    The Frequency and Counts library sizes follow state.stats_normalisation
+    ('total' or 'robust', differential_stats.library_sizes).
     """
     log_stage(log, "DIFFERENTIAL STATISTICS")
     if mfi_threshold is None:
@@ -720,6 +730,7 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
             names_override=names_override,
         )
         totals = sample_event_totals(state, all_rel, cluster_labels_override)
+        totals = _ds.library_sizes(counts_df[tested], totals, _normalisation(state))
         freq_results = run_moderated(
             log2_frequencies(counts_df[tested], totals), group_vec, contrasts, state.contrast_mode,
             pval_threshold, fc_threshold, pairing_vec=pairing_vec, fdr_scope=fdr_scope,
@@ -731,14 +742,17 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
 
     if run_counts:
         # The library-size offset is each sample's total over all clusters,
-        # including those left out of the test.
-        row_totals = counts_df.sum(axis=1)
+        # including those left out of the test (robustly rescaled on request).
+        row_totals = pd.Series(
+            _ds.library_sizes(counts_df[tested], counts_df.sum(axis=1).values, _normalisation(state)),
+            index=counts_df.index)
         offset_df = pd.DataFrame({c: row_totals for c in tested}, index=counts_df.index)
         counts_results = run_glm_counts(counts_df[tested], group_vec, contrasts,
                                         state.contrast_mode, pval_threshold, fc_threshold,
                                         pairing_vec=pairing_vec, fdr_scope=fdr_scope,
                                         covariates=covariates, use_treat=use_treat,
-                                        offset_df=offset_df)
+                                        offset_df=offset_df,
+                                        method=getattr(state, 'stats_counts_method', 'wald'))
         state.counts_results = counts_results
         state.counts_df = counts_df      # raw (samples × clusters) counts
 

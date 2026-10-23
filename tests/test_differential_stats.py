@@ -244,3 +244,83 @@ def test_sparse_features_counts_samples_above_zero():
                            'unmeasured': [np.nan, np.nan, 4.0, 2.0]})
     assert ds.sparse_features(counts, 3) == ['none', 'two', 'unmeasured']
     assert ds.sparse_features(counts, 1) == ['none']
+
+
+def _paired_null(rng, n_mice=6, n_features=40, total=400, alpha=0.5):
+    """Spleen and tissue per mouse, NB counts around mouse-specific shares,
+    no group effect."""
+    base = rng.lognormal(0, 0.5, n_features)
+    rows, groups, pairs = [], [], []
+    for m in range(n_mice):
+        share = base * rng.lognormal(0, 0.7, n_features)
+        mu = total * share / share.sum()
+        for g in ('A', 'B'):
+            rows.append(rng.negative_binomial(1 / alpha, 1 / (1 + alpha * mu)))
+            groups.append(g)
+            pairs.append(f'm{m}')
+    idx = [f's{i}' for i in range(len(rows))]
+    return pd.DataFrame(rows, index=idx, columns=[f'f{j}' for j in range(n_features)]), groups, pairs
+
+
+def test_ql_counts_test_holds_its_false_positive_rate():
+    """Paired null data: the quasi-likelihood F test stays near the nominal
+    5%; the Wald test is far above it."""
+    pytest.importorskip('statsmodels')
+    rng = np.random.default_rng(11)
+    rates = {'ql': [], 'wald': []}
+    for _rep in range(25):
+        counts, groups, pairs = _paired_null(rng)
+        contrasts = ds.build_contrasts(['A', 'B'], 'reference', 'A')
+        for method in rates:
+            res = ds.run_glm_counts(counts, groups, contrasts, 'reference', 0.05, 0.0, pairing_vec=pairs,
+                                    use_treat=False, method=method)
+            p = res['P.Value'].values
+            rates[method].append(np.mean(p[np.isfinite(p)] < 0.05))
+    assert np.mean(rates['ql']) < 0.075
+    assert np.mean(rates['wald']) > 0.12
+
+
+def test_ql_results_rethreshold_to_the_f_test():
+    """SE and df.total stored by the QL test give back its F-test p-value,
+    so threshold changes need no refit; unmeasured groups are untestable."""
+    pytest.importorskip('statsmodels')
+    from scipy import stats
+    rng = np.random.default_rng(4)
+    counts, groups, pairs = _paired_null(rng, total=2000)
+    counts.loc[counts.index[::2], 'f0'] = np.nan            # never measured in group A
+    contrasts = ds.build_contrasts(['A', 'B'], 'reference', 'A')
+    res = ds.run_glm_counts(counts.astype(float), groups, contrasts, 'reference', 0.05, 0.0,
+                            pairing_vec=pairs, use_treat=False, method='ql')
+    res = res.set_index('feature')
+    assert np.isnan(res.loc['f0', 'logFC'])
+    tested = res.drop(index='f0')
+    f_stat = tested['t'].values ** 2
+    df_total = tested['df.total'].values
+    expected = (stats.chi2.sf(f_stat, 1) if np.all(np.isinf(df_total))
+                else stats.f.sf(f_stat, 1, df_total))
+    np.testing.assert_allclose(tested['P.Value'], expected, rtol=1e-8)
+    again = ds.apply_significance(res.reset_index(), 0.05, 0.0, use_treat=False).set_index('feature')
+    np.testing.assert_allclose(again['P.Value'], res['P.Value'])
+
+
+@pytest.mark.numpy_only
+def test_library_sizes():
+    rng = np.random.default_rng(2)
+    share = rng.lognormal(0, 0.5, 30)
+    share /= share.sum()
+    clone = share.copy()
+    clone[1:] *= 0.4 / clone[1:].sum()
+    clone[0] = 0.6
+    counts = pd.DataFrame([rng.poisson(5000 * share), rng.poisson(5000 * clone)],
+                          columns=[f'c{i}' for i in range(30)])
+    totals = counts.sum(axis=1).values
+    np.testing.assert_allclose(ds.library_sizes(counts, totals, 'total'), totals)
+    robust = ds.library_sizes(counts, totals, 'robust')
+    # the clone sample's other features sit at 0.4 of its total
+    ratio = (robust[1] / totals[1]) / (robust[0] / totals[0])
+    assert 0.33 < ratio < 0.48
+    control = ds.library_sizes(counts, totals, 'control', control=['c5', 'c6', 'c7'])
+    ctrl = counts[['c5', 'c6', 'c7']].sum(axis=1).values
+    np.testing.assert_allclose(control / control.sum(), ctrl / ctrl.sum(), rtol=1e-3)
+    with pytest.raises(ValueError):
+        ds.library_sizes(counts, totals, 'control', control=[])

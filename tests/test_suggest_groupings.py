@@ -60,3 +60,25 @@ def test_automatic_choice_takes_the_group_and_the_pairing():
 def test_automatic_choice_is_empty_without_a_group():
     sgd = pytest.importorskip('honeychrome.view_components.suggest_groupings_dialog')
     assert sgd.automatic_groupings(suggest_groupings_from_names(['a_1.fcs', 'b_2.fcs'])) == []
+
+
+def test_cohort_is_not_a_pairing_and_dotted_mouse_tags_survive():
+    """Tissue x mouse names with a cohort tag, a dotted mouse tag and a folder
+    suffix whose field count varies: every name keeps its leading fields, the
+    per-mouse field survives the dot, and the cohort, which repeats within a
+    tissue, is never a pairing variable."""
+    folders = {'Spleen': 'Spleen, axLN, mLN', 'Liver': 'PP, Liver, SI IEL', 'PP': 'PP, Liver, SI IEL'}
+    mice = [('LSRB31.3a', '001'), ('LSRB31.3b', '002'), ('LSRB36.2d', '003'), ('LSRB36.2e', '004')]
+    keys = [f'Raw/{folders[t]}/A{i} {t}_Library1_{tag}_{n}_{folders[t]}.fcs'
+            for t in folders for i, (tag, n) in enumerate(mice)]
+    result = suggest_groupings_from_names(keys, {k: k.split('/')[-1][:-4] for k in keys})
+    assert result['irregular_samples'] == []
+    by_examples = {tuple(s['examples'][:2]): s for s in result['suggestions']}
+    assert len(by_examples[('001', '002')]['values']) == len(keys)
+    assert len(by_examples[('Liver', 'PP')]['values']) == len(keys)
+    assert all(s['role_guess'] != 'pairing' for s in result['suggestions']
+               if s['examples'][:2] == ['LSRB31', 'LSRB36'])
+    # with the tissue as the smallest field, the mouse field pairs it
+    keys = [f'Raw/A{i} {t}_Library1_{n}.fcs' for t in folders for i, (_tag, n) in enumerate(mice)]
+    roles = {tuple(s['examples'][:2]): s['role_guess'] for s in suggest_groupings_from_names(keys)['suggestions']}
+    assert roles[('Liver', 'PP')] == 'group' and roles[('001', '002')] == 'pairing'

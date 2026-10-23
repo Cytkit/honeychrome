@@ -947,6 +947,13 @@ class PipelineState:
     stats_use_treat: bool = True
     # True: p-values test |effect| > threshold (TREAT). False: test
     #   effect != 0 and use the threshold only as a filter.
+    stats_counts_method: str = 'wald'
+    # Counts test: 'wald' (per-cluster dispersion, z) or 'ql'
+    #   (quasi-likelihood F with shrunk dispersions).
+    stats_normalisation: str = 'total'
+    # Library size of the Counts and Frequency tests: 'total' (events over
+    #   all clusters) or 'robust' (trimmed rescaling that a few expanding
+    #   clusters cannot move).
     stats_mfi_threshold: float = 0.03
     # |difference| threshold for MFIs, in transformed (Transforms-tab) units.
     stats_mfi_hierarchical: bool = True
@@ -3462,6 +3469,32 @@ class GroupsStatsTab(QWidget):
             "is corrected as one flat list."
         )
         method_row.addWidget(self.chk_mfi_hierarchical)
+        method_row.addSpacing(20)
+        method_row.addWidget(QLabel("Counts test:"))
+        self.counts_method_combo = QComboBox()
+        self.counts_method_combo.addItem("Wald", 'wald')
+        self.counts_method_combo.addItem("Quasi-likelihood F", 'ql')
+        self.counts_method_combo.setToolTip(
+            "Wald: each cluster's own negative-binomial dispersion and a z "
+            "test; finds too many hits with few samples per group or a "
+            "paired design. Quasi-likelihood F: dispersions shrunk towards a "
+            "common value, then a moderated quasi-dispersion per cluster; "
+            "holds its false-positive rate with few samples."
+        )
+        method_row.addWidget(self.counts_method_combo)
+        method_row.addSpacing(10)
+        method_row.addWidget(QLabel("Library size:"))
+        self.normalisation_combo = QComboBox()
+        self.normalisation_combo.addItem("Total events", 'total')
+        self.normalisation_combo.addItem("Robust (trimmed)", 'robust')
+        self.normalisation_combo.setToolTip(
+            "What the Frequency and Counts tests compare each cluster "
+            "against. Total: the sample's events over all clusters, so one "
+            "expanding cluster pushes every other cluster down. Robust: the "
+            "total rescaled by a trimmed ratio of sums that a few dominant "
+            "clusters cannot move."
+        )
+        method_row.addWidget(self.normalisation_combo)
         method_row.addStretch()
         stats_layout.addLayout(method_row)
 
@@ -4239,6 +4272,10 @@ class GroupsStatsTab(QWidget):
         self.pairing_variable_combo.setEnabled(self.state.paired)
         self.chk_treat.setChecked(self.state.stats_use_treat)
         self.chk_mfi_hierarchical.setChecked(self.state.stats_mfi_hierarchical)
+        self.counts_method_combo.setCurrentIndex(
+            max(self.counts_method_combo.findData(self.state.stats_counts_method), 0))
+        self.normalisation_combo.setCurrentIndex(
+            max(self.normalisation_combo.findData(self.state.stats_normalisation), 0))
         self.mfi_fc_spin.setValue(self.state.stats_mfi_threshold)
         self.radio_reference.blockSignals(True)
         self.radio_pairwise.blockSignals(True)
@@ -5226,6 +5263,8 @@ class GroupsStatsTab(QWidget):
         self.state.stats_use_treat = self.chk_treat.isChecked()
         self.state.stats_mfi_threshold = mfi_threshold
         self.state.stats_mfi_hierarchical = self.chk_mfi_hierarchical.isChecked()
+        self.state.stats_counts_method = self.counts_method_combo.currentData() or 'wald'
+        self.state.stats_normalisation = self.normalisation_combo.currentData() or 'total'
         use_treat = self.state.stats_use_treat
         mfi_hierarchical = self.state.stats_mfi_hierarchical
 
@@ -5443,6 +5482,8 @@ class GroupsStatsTab(QWidget):
             self.state.reference_group, self.state.paired, self.state.pairing_variable,
             tuple(adjust_covariates), covariate_values,
             tuple(c for c in adjust_covariates if c in self.state.numeric_covariates),
+            self.state.stats_counts_method if run_counts else None,
+            self.state.stats_normalisation if (run_freq or run_counts) else None,
         )
         roles_fingerprint = tuple(sorted(self.state.marker_roles.items()))
         transform_fingerprint = ()
@@ -13548,6 +13589,8 @@ class PluginWidget(QWidget):
             s.setValue('stats_adjust_covariates', list(self.state.stats_adjust_covariates))
             s.setValue('numeric_covariates', list(self.state.numeric_covariates))
             s.setValue('stats_use_treat',   self.state.stats_use_treat)
+            s.setValue('stats_counts_method', self.state.stats_counts_method)
+            s.setValue('stats_normalisation', self.state.stats_normalisation)
             s.setValue('stats_mfi_threshold', self.state.stats_mfi_threshold)
             s.setValue('stats_mfi_hierarchical', self.state.stats_mfi_hierarchical)
             s.setValue('stats_fdr_scope', self.state.stats_fdr_scope)
@@ -13815,6 +13858,12 @@ class PluginWidget(QWidget):
             fdr_scope = s.value('stats_fdr_scope', None)
             if fdr_scope in ('global', 'per_comparison'):
                 self.state.stats_fdr_scope = fdr_scope
+            counts_method = s.value('stats_counts_method', None)
+            if counts_method in ('wald', 'ql'):
+                self.state.stats_counts_method = counts_method
+            normalisation = s.value('stats_normalisation', None)
+            if normalisation in ('total', 'robust'):
+                self.state.stats_normalisation = normalisation
             for qs_key, attr in (('stats_pval_threshold', 'stats_pval_threshold'),
                                  ('stats_fc_threshold', 'stats_fc_threshold')):
                 stored = s.value(qs_key, None)

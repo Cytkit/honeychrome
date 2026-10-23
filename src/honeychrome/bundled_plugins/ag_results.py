@@ -435,12 +435,15 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                    fdr_scope: str = 'global', run_freq: bool = True, run_counts: bool = False,
                    run_markers: bool = True, use_stats_parent: bool = True,
                    exclude_gating_markers: bool = True,
-                   min_marker_events: int = DEFAULT_MIN_MARKER_EVENTS) -> dict:
+                   min_marker_events: int = DEFAULT_MIN_MARKER_EVENTS,
+                   counts_method: str = 'wald') -> dict:
     """Compare gated populations between sample groups.
 
     * Frequencies: log2 odds of each population within its parent (or its
       stats parent), moderated linear model.
-    * Counts: negative-binomial GLM with the log parent count as offset.
+    * Counts: negative-binomial GLM with the log parent count as offset,
+      tested by *counts_method* ('wald' or 'ql', see
+      ``differential_stats.run_glm_counts``).
     * Marker medians: moderated linear model on per-population medians, one
       family per population (population-first testing).
 
@@ -501,7 +504,7 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
         if run_counts:
             out['counts'] = ds.run_glm_counts(counts, group_vec, contrasts, contrast_mode,
                                               pval_threshold, fc_threshold,
-                                              offset_df=denom, **common)
+                                              offset_df=denom, method=counts_method, **common)
             out['counts_values'] = counts
             empty = [k for k in counts.columns if not (counts[k].fillna(0) > 0).any()]
             if empty:
