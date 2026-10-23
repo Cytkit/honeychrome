@@ -29,7 +29,7 @@ import sys
 import numpy as np
 from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
     QLabel, QPushButton, QScrollArea, QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
@@ -64,6 +64,9 @@ LAMBDA_REFRESH_MS = 600
 SOURCE_HEADERS = ['Source', 'Kind', 'Events', 'Median obs/pred', 'Detectors in band', 'chi2 p < 0.001',
                   'Median chi2/df']
 DETECTOR_HEADERS = ['Detector', 'sigma0', 'kappa', 'c', 'sigma0^2 kappa', 'Flags']
+# Widest the first (name) column of the calibration tables opens, in pixels;
+# longer names are elided in the middle and shown whole in the tooltip.
+NAME_COLUMN_MAX_WIDTH = 280
 # (option key, label, value when ticked, value when not); keys of NoiseSetupSettings or its .noise
 ESTIMATOR_OPTIONS = (
     ('bead_af_rows', 'Bead negatives and bead controls: the negative\'s own AF rows (3)', 3, 0),
@@ -575,6 +578,17 @@ class NoisePage(QWidget):
     def _replace_table(self, attr: str, rows: list, headers: list):
         old = getattr(self, attr)
         new = CopyableTableWidget(rows, headers)
+        header = new.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        new.setTextElideMode(Qt.ElideMiddle)
+        new.setWordWrap(False)
+        for r in range(new.rowCount()):
+            item = new.item(r, 0)
+            if item is not None:
+                item.setToolTip(item.text())
+        new.resizeColumnsToContents()
+        new.setColumnWidth(0, min(new.columnWidth(0), NAME_COLUMN_MAX_WIDTH))
         self._tables.layout().replaceWidget(old, new)
         old.setParent(None)
         old.deleteLater()
