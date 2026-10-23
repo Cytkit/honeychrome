@@ -35,6 +35,7 @@ class OscilloscopeWidget(QWidget):
 
         self.label = QLabel('')
         self._last_label_text = None
+        self.local_trace_queue = []
 
         # ---- Plot widgets ----
         self.plot_widget1 = pg.PlotWidget()
@@ -155,30 +156,33 @@ class OscilloscopeWidget(QWidget):
         self.trace = None
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.check_queue)
-        self.timer.setInterval(int(analyser_target_repeat_time * 1000 / 4))
+        self.timer.setInterval(int(analyser_target_repeat_time * 1000 / 5))
         self.timer.start()
 
     @Slot()
     def start_polling(self):
         if not self.timer.isActive():
-            self.timer.start(int(analyser_target_repeat_time * 1000 / 4))
+            self.timer.start(int(analyser_target_repeat_time * 1000 / 5))
 
     # ------------------------------------------------------------------
     # Queue handling
     # ------------------------------------------------------------------
     @Slot()
     def check_queue(self):
-        """Drain the queue completely; render only the newest trace."""
-        latest = None
+        """Drain the queue completely; render only the newest traces."""
         while True:
             try:
                 latest = self.controller.oscilloscope_traces_queue.get_nowait()
+                self.local_trace_queue.append(latest)
                 self.send_baselines_to_instrument_driver(latest) #todo consider removing this or moving to controller / trace analyst
             except Empty:
                 break
-        if latest is not None:
-            self.trace = latest
+        if len(self.local_trace_queue) > 0:
+            if len(self.local_trace_queue) > 5:
+                self.local_trace_queue = self.local_trace_queue[-5:]
+            self.trace = self.local_trace_queue.pop(0)
             self._update_plot()
+
 
     # ------------------------------------------------------------------
     # Plot update (in-place setData — no clear(), no new items)

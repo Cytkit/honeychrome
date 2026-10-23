@@ -326,17 +326,21 @@ class TraceAnalyser(mp.Process):
 
                     # push to events cache anything above threshold, or failing that, any trace at all
                     if n_new_events > 0:
-                        last_event_time = times[-1]
-                        last_event_id = event_ids[-1]
-                    else:
-                        last_event_time = None
-                        last_event_id = None
-                        baselines = np.median(traces[:, n_start:n_end], axis=1)
+                        traces_indices_to_push = np.flatnonzero(keep_mask)[:min(5, n_new_events)]
+                        for n, index in enumerate(traces_indices_to_push):
+                            last_event_time = times[-1]
+                            last_event_id = event_ids[n]
 
-                    self.oscilloscope_traces_queue.put({'event_id': last_event_id, 'time': last_event_time,
-                                                        'traces': traces_batch_scaled[last_event_index],
-                                                        'n_start': n_start, 'n_end': n_end, 'peak': peak,
-                                                        'baselines': baselines})
+                            self.oscilloscope_traces_queue.put({'event_id': last_event_id, 'time': last_event_time,
+                                                                'traces': traces_batch_scaled[index],
+                                                                'n_start': n_start, 'n_end': n_end, 'peak': peak,
+                                                                'baselines': baselines})
+                    else:
+                        baselines = np.median(traces[:, n_start:n_end], axis=1)
+                        self.oscilloscope_traces_queue.put({'event_id': None, 'time': None,
+                                                            'traces': traces_batch_scaled[last_event_index],
+                                                            'n_start': n_start, 'n_end': n_end, 'peak': peak,
+                                                            'baselines': baselines})
 
                 if n_new_events > 0:
                     # update events cache
