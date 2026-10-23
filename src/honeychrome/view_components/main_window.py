@@ -367,7 +367,7 @@ class MainWindow(QMainWindow):
         self.statistics_tab.setLayout(self.statistics_layout)
         self.statistics_layout.addWidget(self.tip_statistics)
         self.statistics_layout.addWidget(self.statistical_comparison_widget)
-        self.tabs.addTab(self.statistics_tab, "Statistics")
+        self.tabs.addTab(self.statistics_tab, "Simple Stats")
 
         # --- visibility wiring ---
         self.bus.cleaningActivated.connect(self.cleaning_section.setVisible)

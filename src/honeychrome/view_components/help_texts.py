@@ -254,3 +254,18 @@ autospectral_correction_help_text = '''
 </ul>
 </td>''' + colibri_cell + '''</tr></table>
 '''
+
+simple_stats_help_text = '''
+<h3>Compare samples according to gates or channels.</h3>
+<p>Select a set of samples. You can compare samples in a flat list or a set of folders.</p>
+<p>Compare population stats according to your gating hierarchy, or intensities according to your channels</p>
+<p>Available plot types:</p> 
+<ul>
+<li>bar charts</li>
+<li>box-and-whisker charts</li>
+<li>1D histogram overlays</li>
+<li>heatmaps</li>
+</ul>
+<p>If you are looking for high-dimensional statistical analysis, enable the Honeycluster plugin in Edit > App Configuration!</p>
+<br/>
+'''
