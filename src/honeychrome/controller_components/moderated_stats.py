@@ -52,7 +52,7 @@ from scipy import special, stats
 __all__ = [
     'LinearFit', 'ModeratedFit', 'lm_fit', 'e_bayes', 'top_table',
     'treat_pvalues', 'bh_adjust', 'simes', 'stagewise_adjust',
-    'fit_prior_variance', 'trigamma_inverse',
+    'fit_prior_variance', 'trigamma_inverse', 'estimable_columns',
 ]
 
 _MIN_FEATURES = 3
@@ -89,6 +89,38 @@ class ModeratedFit(LinearFit):
 # Linear model
 # ---------------------------------------------------------------------------
 
+def estimable_columns(X) -> tuple[np.ndarray, np.ndarray]:
+    """
+    A full-rank basis of the columns of X that are not all zero, and which
+    of its coefficients are estimable.
+
+    Columns are taken left to right and kept while each adds to the rank,
+    so a column that is a combination of earlier ones is left out without
+    changing the space the fit spans. With treatment coding this drops one
+    blocking indicator when the reference blocking level has no observed
+    sample (e.g. a feature measured only in mice whose names sort after
+    the first mouse). A kept column's coefficient is estimable when
+    removing that column lowers the rank; otherwise its value depends on
+    which columns were left out and it must not be read.
+
+    Returns (kept column indices, estimable flag per kept column). For a
+    full-rank X these are its non-zero columns, all estimable.
+    """
+    X = np.asarray(X, dtype=float)
+    nonzero = np.flatnonzero(np.any(X != 0.0, axis=0))
+    if nonzero.size == 0:
+        return nonzero, np.zeros(0, dtype=bool)
+    rank = np.linalg.matrix_rank(X[:, nonzero])
+    if rank == nonzero.size:
+        return nonzero, np.ones(nonzero.size, dtype=bool)
+    kept: list[int] = []
+    for j in nonzero:
+        if np.linalg.matrix_rank(X[:, kept + [int(j)]]) > len(kept):
+            kept.append(int(j))
+    estimable = np.array([np.linalg.matrix_rank(X[:, nonzero[nonzero != j]]) < rank for j in kept])
+    return np.asarray(kept, dtype=int), estimable
+
+
 def lm_fit(expr, design) -> LinearFit:
     """
     Fit ``expr[g] ~ design`` by least squares for every feature g.
@@ -99,8 +131,12 @@ def lm_fit(expr, design) -> LinearFit:
     Each feature uses only its observed samples. Design columns that are
     all zero over those samples (e.g. a blocking level whose samples are
     all missing) are dropped for that feature and their coefficients are
-    NaN. If the remaining columns are still rank-deficient the feature is
-    not estimable: all its coefficients are NaN and its residual df is 0.
+    NaN. If the remaining columns are rank-deficient, the fit uses the
+    full-rank basis of ``estimable_columns``; coefficients that are not
+    estimable (e.g. a group compared with a baseline that has no observed
+    sample) are NaN, and the residual df is the observed samples less the
+    rank. A feature with no estimable coefficient is not estimable: all its
+    coefficients are NaN and its residual df is 0.
     """
     Y = np.asarray(expr, dtype=float)
     X = np.asarray(design, dtype=float)
@@ -134,13 +170,11 @@ def lm_fit(expr, design) -> LinearFit:
         if n_o == 0:
             continue
         Xo = X[obs]
-        cols = np.flatnonzero(np.any(Xo != 0.0, axis=0))
-        if cols.size == 0:
+        cols, estimable = estimable_columns(Xo)
+        if not estimable.any():
             continue
         Xc = Xo[:, cols]
-        rank = np.linalg.matrix_rank(Xc)
-        if rank < cols.size:
-            continue
+        rank = cols.size
         Q, R = np.linalg.qr(Xc)
         Rinv = np.linalg.inv(R)
         unscaled = np.sqrt(np.sum(Rinv ** 2, axis=1))       # diag((XᵀX)⁻¹)
@@ -151,6 +185,9 @@ def lm_fit(expr, design) -> LinearFit:
         idx = np.asarray(rows)
         coef[np.ix_(idx, cols)] = B.T
         stdu[np.ix_(idx, cols)] = unscaled
+        hidden = cols[~estimable]
+        coef[np.ix_(idx, hidden)] = np.nan
+        stdu[np.ix_(idx, hidden)] = np.nan
         df_res[idx] = d
         if d > 0:
             sigma2[idx] = np.sum(resid ** 2, axis=0) / d

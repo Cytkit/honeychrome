@@ -716,20 +716,20 @@ def _glm_fit_one_feature(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
 
 def _glm_fit_observed(y: np.ndarray, design: np.ndarray, offset: np.ndarray):
     """Fit one feature on the samples where it was measured (finite count
-    and offset). Design columns that are all zero over those samples (a
-    group with no measured sample) are left out. Returns (fit, columns of
-    *design* the fit's parameters belong to), or (None, None) when the
-    feature cannot be tested: too few measured samples for the remaining
-    columns, or a rank-deficient design."""
+    and offset), on the full-rank basis of ``moderated_stats.estimable_columns``
+    (columns all zero over those samples, e.g. a group with no measured
+    sample, and columns aliased with earlier ones are left out). Returns
+    (fit, columns of *design* the fit's parameters belong to, −1 for a
+    parameter whose coefficient is not estimable), or (None, None) when
+    the feature cannot be tested: too few measured samples for the basis,
+    or no estimable coefficient."""
     observed = np.isfinite(y) & np.isfinite(offset)
-    columns = np.flatnonzero(np.any(design[observed] != 0.0, axis=0))
-    if observed.sum() <= columns.size:
+    columns, estimable = ms.estimable_columns(design[observed])
+    if observed.sum() <= columns.size or not estimable.any():
         return None, None
     sub_design = design[np.ix_(observed, columns)]
-    if np.linalg.matrix_rank(sub_design) < columns.size:
-        return None, None
     fit = _glm_fit_one_feature(y[observed], sub_design, offset[observed])
-    return (fit, columns) if fit is not None else (None, None)
+    return (fit, np.where(estimable, columns, -1)) if fit is not None else (None, None)
 
 
 class _GLMFit(NamedTuple):
@@ -866,17 +866,16 @@ def _glm_fit_features(counts: np.ndarray, design: np.ndarray, offsets: np.ndarra
             patterns.setdefault(observed.tobytes(), []).append(i)
     for key, rows in patterns.items():
         observed = np.frombuffer(key, dtype=bool)
-        columns = np.flatnonzero(np.any(design[observed] != 0.0, axis=0))
-        if observed.sum() <= columns.size:
+        columns, estimable = ms.estimable_columns(design[observed])
+        if observed.sum() <= columns.size or not estimable.any():
             continue
         sub_design = design[np.ix_(observed, columns)]
-        if np.linalg.matrix_rank(sub_design) < columns.size:
-            continue
+        readable = np.where(estimable, columns, -1)
         cols = np.flatnonzero(observed)
         fits = _glm_fit_batch(counts[np.ix_(rows, cols)], sub_design, offsets[np.ix_(rows, cols)])
         for i, fit in zip(rows, fits):
             if fit is not None:
-                out[i] = (fit, columns)
+                out[i] = (fit, readable)
     return out
 
 
@@ -891,7 +890,7 @@ _MIN_PRIOR_VARIANCE = 0.25          # floor of the log-dispersion prior variance
 class _Block(NamedTuple):
     """Features measured in the same samples, fitted on one sub-design."""
     rows: np.ndarray        # feature indices
-    columns: np.ndarray     # design columns kept
+    columns: np.ndarray     # design columns kept (−1: not estimable)
     Y: np.ndarray           # counts, features × observed samples
     O: np.ndarray           # log offsets
     X: np.ndarray           # sub-design
@@ -1014,12 +1013,11 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
     blocks, mus = [], []
     for key, rows in patterns.items():
         observed = np.frombuffer(key, dtype=bool)
-        columns = np.flatnonzero(np.any(design[observed] != 0.0, axis=0))
-        if observed.sum() <= columns.size:
+        columns, estimable = ms.estimable_columns(design[observed])
+        if observed.sum() <= columns.size or not estimable.any():
             continue
         X = design[np.ix_(observed, columns)]
-        if np.linalg.matrix_rank(X) < columns.size:
-            continue
+        columns = np.where(estimable, columns, -1)
         rows = np.asarray(rows)
         obs = np.flatnonzero(observed)
         Y, O = counts[np.ix_(rows, obs)], offsets[np.ix_(rows, obs)]
