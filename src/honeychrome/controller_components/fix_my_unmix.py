@@ -226,9 +226,10 @@ class FixSettings:
     too), ``coefficient_decay`` 0, ``convergence_threshold`` 0.003,
     ``plausibility_floor`` 0.003 and ``unstained_threshold`` 0.95 for the
     upper boundary (the lower one keeps the 0.99 quantile,
-    ``lower_unstained_threshold``). Together they cut the summed
-    bead-to-cell error by a fifth and the residual spillover between the
-    scored pairs of a fully stained panel by about two fifths, and lower the
+    ``lower_unstained_threshold``, as a lower boundary at the 5th percentile
+    puts about 5% of a correctly corrected population below it and the
+    hypernegative check then takes the trust of correct coefficients).
+    Together they cut the summed bead-to-cell error by a fifth and lower the
     change into detectors where a dye has no signal on two of the three
     panels, at no cost in run time or in agreement between halves of the
     events. ``smooth_updates``,
