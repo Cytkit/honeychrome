@@ -125,8 +125,8 @@ class TraceAnalyser(mp.Process):
         self.indices_peak_detection_channel_in_traces = adc_channels.index(peak_detection_channel_retrieved)
         self.index_time_channel_in_events = event_channels_pnn.index('Time')
         self.index_event_id_in_events = event_channels_pnn.index('event_id')
-        self.indices_area_channels_in_events = [event_channels_pnn.index(c + '-A') for c in area_channels]
-        self.indices_height_channels_in_events = [event_channels_pnn.index(c + '-H') for c in height_channels]
+        self.indices_area_channels_in_events = [event_channels_pnn.index(c + '-A') for c in adc_channels if c in area_channels]
+        self.indices_height_channels_in_events = [event_channels_pnn.index(c + '-H') for c in adc_channels if c in height_channels]
         self.index_width_channel_in_events = [event_channels_pnn.index(c + '-W') for c in width_channels][0] # there is only one
         self.n_channels_per_event = n_channels_per_event
         self.threshold = threshold_retrieved * 1000 # uV

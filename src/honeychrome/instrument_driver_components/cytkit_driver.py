@@ -611,13 +611,18 @@ class CytkitDevice:
                     self.trigger.merge_force_trigger()
                 if 'clear' == value:
                     self.trigger.clear_all_counts()
+
                 if 'auto_adjust_over_baseline' in value:
                     self.auto_adjust_over_baseline = value['auto_adjust_over_baseline']
+
                 if 'threshold' in value:
                     self.threshold = value['threshold'] * 1000 / settings.adc_scale_uv  # convert mV to adc units
                     logger.info(f'[CytkitDriver] set threshold {self.threshold} (ADC units)')
+
                 if 'peak_detection_channel' in value:
                     index = settings.adc_channels.index(value['peak_detection_channel'])
+                    self.trigger.channel_set_enable(spectral_channel_index_to_adc_channel_index[index], True)
+                    self.capture.channel_set_enable(spectral_channel_index_to_adc_channel_index[index], True)
                     trigger_merge_mask = 1<<spectral_channel_index_to_adc_channel_index[index]
                     self.trigger.merge_set_merge_mask(trigger_merge_mask)
                     logger.info(f'[CytkitDriver] set peak detection channel {value['peak_detection_channel']} trigger merge mask {trigger_merge_mask}')
