@@ -303,6 +303,38 @@ def test_ql_results_rethreshold_to_the_f_test():
     np.testing.assert_allclose(again['P.Value'], res['P.Value'])
 
 
+def test_feature_missing_in_the_first_pairing_level_is_tested():
+    """A feature not measured in any sample of the first-sorted pairing
+    level is tested, with the same result as when that level sorts last;
+    one with no sample in the baseline group stays untestable."""
+    pytest.importorskip('statsmodels')
+    rng = np.random.default_rng(5)
+    counts, groups, pairs = _paired_null(rng, total=2000)
+    counts = counts.astype(float)
+    counts.loc[[s for s, m in zip(counts.index, pairs) if m == 'm0'], 'f1'] = np.nan
+    counts.loc[counts.index[::2], 'f2'] = np.nan            # never measured in group A
+    renamed = ['m9' if m == 'm0' else m for m in pairs]
+    contrasts = ds.build_contrasts(['A', 'B'], 'reference', 'A')
+    freqs = np.log2(counts + 0.5)
+    runs = {}
+    for name, pairing in (('first', pairs), ('last', renamed)):
+        runs[name] = {
+            'moderated': ds.run_moderated(freqs, groups, contrasts, 'reference', 0.05, 0.0,
+                                          pairing_vec=pairing, use_treat=False),
+            'ql': ds.run_glm_counts(counts, groups, contrasts, 'reference', 0.05, 0.0,
+                                    pairing_vec=pairing, use_treat=False, method='ql'),
+            'wald': ds.run_glm_counts(counts, groups, contrasts, 'reference', 0.05, 0.0,
+                                      pairing_vec=pairing, use_treat=False, method='wald'),
+        }
+    for test in ('moderated', 'ql', 'wald'):
+        first = runs['first'][test].set_index('feature')
+        last = runs['last'][test].set_index('feature')
+        assert np.isfinite(first.loc['f1', 'logFC'])
+        assert np.isnan(first.loc['f2', 'logFC'])
+        np.testing.assert_allclose(first['logFC'], last['logFC'], rtol=1e-6, atol=1e-9, equal_nan=True)
+        np.testing.assert_allclose(first['P.Value'], last['P.Value'], rtol=1e-6, atol=1e-12, equal_nan=True)
+
+
 @pytest.mark.numpy_only
 def test_library_sizes():
     rng = np.random.default_rng(2)
