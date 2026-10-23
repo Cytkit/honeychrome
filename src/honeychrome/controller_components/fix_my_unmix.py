@@ -115,13 +115,11 @@ Fluorophores kept fixed
     and its off-diagonal spillover stays zero, so its back-solved row is its
     spectrum) and phase two leaves its spectrum as it is ('fixed'). It still
     counts as a target channel, as a lasso regressor and in the background.
-    For FlowCode tags, whose FRET error the FlowCode plugin removes in raw
-    space: a correction of their rows would remove it a second time. With
-    ``exclude_fixed_targets`` (off by default; the FlowCode plugin sets it)
-    a fixed fluorophore is also no pair's target channel, no lasso target
-    or regressor and no phase-two leakage target: it stays in the design,
-    the background and the dominance of events, so its signal is still
-    unmixed, but evidence in its channel never changes another row.
+    With ``exclude_fixed_targets`` (off by default) a fixed fluorophore is 
+    also no pair's target channel, no lasso target or regressor and no 
+    phase-two leakage target: it stays in the design, the background and the
+    dominance of events, so its signal is still unmixed, but evidence in its
+    channel never changes another row.
 Smooth updates
     ``smooth_fix`` runs Fix My Unmix in rounds on fresh subsamples, each
     started from the current spectra, and moves the spectra a step
@@ -323,7 +321,7 @@ class FixSettings:
     smooth_updates: bool = True             # smooth_fix: rounds averaged, not one run adopted
     smooth_rounds: int = 5
     smooth_fraction: float = 0.5            # share of the stained events each round draws
-    fixed_fluorophores: tuple = ()          # rows never corrected (e.g. FlowCode tags); names not in the panel ignored
+    fixed_fluorophores: tuple = ()          # rows never corrected; names not in the panel ignored
     exclude_fixed_targets: bool = False     # fixed rows are also no target channel, lasso regressor or leakage target
 
 

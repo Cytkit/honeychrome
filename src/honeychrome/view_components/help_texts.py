@@ -1,3 +1,13 @@
+from pathlib import Path
+
+# Colibri Cytometry hummingbird shown beside the AutoSpectral further reading;
+# Qt picks colibri@2x.png on high-DPI screens.
+colibri_cell = (
+    '<td width="12%" align="right" valign="middle">'
+    f'<img src="{(Path(__file__).parent / "assets" / "colibri.png").as_posix()}" width="110" height="72">'
+    '</td>'
+)
+
 process_help_text = '''
 <h3>Spectral Process Help</h3>
 <p>
@@ -130,6 +140,7 @@ autospectral_af_help_text = '''
 <p><b>Note on unstained samples:</b> If you intend to use <b>AutoSpectral AF</b>, do <em>not</em> add unstained samples to the Spectral Process table. Unstained samples should only be used as the negative reference (assigned via the "Unstained Negative" column), not as spectral controls in their own right. Including them as controls will produce manual AF extraction profiles and can be used as an alternative to AutoSpectral AF.</p>
 <p><b>While another job runs</b> (the status bar shows <i>Running: …</i>), Extract AF Profile, Load CSV, Delete Selected, the assignment grid and its buttons are greyed out, and a spectrum cannot be deleted. The comparison waits and updates when the job has finished. A job that stopped without finishing can be released by right-clicking <i>Running: …</i> in the status bar.</p>
 <p><b>Further reading</b></p>
+<table width="100%" cellspacing="0" cellpadding="0"><tr><td width="88%" valign="top">
 <ul>
 <li>Burton OT et al. AutoSpectral improves spectral flow cytometry accuracy through optimised spectral unmixing and autofluorescence-matching at the cellular level. <i>bioRxiv</i> 2025. <a href="https://doi.org/10.1101/2025.10.27.684855">doi:10.1101/2025.10.27.684855</a></li>
 <li>Nguyen R, Perfetto S, Mahnke YD, Chattopadhyay P, Roederer M. Quantifying spillover spreading for comparing instrument performance and aiding in multicolor panel design. <i>Cytometry A</i> 2013; 83(3): 306–315. <a href="https://doi.org/10.1002/cyto.a.22251">doi:10.1002/cyto.a.22251</a></li>
@@ -138,6 +149,7 @@ autospectral_af_help_text = '''
 <li><a href="https://www.colibri-cytometry.com/post/autospectral-single-cell-autofluorescence">AutoSpectral AF on the Colibri Cytometry blog</a></li>
 <li><a href="https://github.com/DrCytometer/AutoSpectral">AutoSpectral package on GitHub</a></li>
 </ul>
+</td>''' + colibri_cell + '''</tr></table>
 '''
 
 autospectral_cleaning_help_text = '''
@@ -187,6 +199,7 @@ autospectral_noise_help_text = '''
 <p><b>While another job runs</b> (the status bar shows <i>Running: …</i>), Model Noise, the <i>Use</i> tick boxes and λ are greyed out. The main window keeps showing per-cell AF and swaps in the noise-model result when the job has finished; the comparison waits likewise. A job that stopped without finishing can be released by right-clicking <i>Running: …</i> in the status bar.</p>
 <p><b>Credit:</b> Paul Heisig (UMC Amsterdam) and David Novo, whose work and discussions shaped the noise model and noise-weighted unmixing.</p>
 <p><b>Further reading</b></p>
+<table width="100%" cellspacing="0" cellpadding="0"><tr><td width="88%" valign="top">
 <ul>
 <li>Novo D, Grégori G, Rajwa B. Generalized unmixing model for multispectral flow cytometry utilizing nonsquare compensation matrices. <i>Cytometry A</i> 2013; 83(5): 508–520. <a href="https://doi.org/10.1002/cyto.a.22272">doi:10.1002/cyto.a.22272</a></li>
 <li>Novo D. A comparison of spectral unmixing to conventional compensation for the calculation of fluorochrome abundances from flow cytometric data. <i>Cytometry A</i> 2022. <a href="https://doi.org/10.1002/cyto.a.24669">doi:10.1002/cyto.a.24669</a></li>
@@ -194,6 +207,7 @@ autospectral_noise_help_text = '''
 <li>Rajwa B, Roederer M. Lost in translation: harmonizing terminology and defining mathematical tools for panel optimization. <i>Cytometry A</i> 2025. <a href="https://doi.org/10.1002/cyto.a.24972">doi:10.1002/cyto.a.24972</a></li>
 <li>Cai X, Garcia-Garcia S, Kuhnen L, Gianniou M, Garcia Vallejo JJ. Unmixing spread estimation based on residual model in spectral flow cytometry. <i>bioRxiv</i> 2026. <a href="https://doi.org/10.64898/2026.01.27.701929">doi:10.64898/2026.01.27.701929</a></li>
 </ul>
+</td>''' + colibri_cell + '''</tr></table>
 '''
 
 autospectral_variants_help_text = '''
@@ -209,11 +223,13 @@ autospectral_variants_help_text = '''
 </ol>
 <p><b>While another job runs</b> (the status bar shows <i>Running: …</i>), Compute Spectral Variants, <i>Use spectral variants</i> and the Unmixing settings are greyed out. The main window keeps showing per-cell AF and swaps in the spectral-variants result when the job has finished; the comparison waits likewise. A job that stopped without finishing can be released by right-clicking <i>Running: …</i> in the status bar.</p>
 <p><b>Further reading</b></p>
+<table width="100%" cellspacing="0" cellpadding="0"><tr><td width="88%" valign="top">
 <ul>
 <li>Burton OT et al. AutoSpectral improves spectral flow cytometry accuracy through optimised spectral unmixing and autofluorescence-matching at the cellular level. <i>bioRxiv</i> 2025. <a href="https://doi.org/10.1101/2025.10.27.684855">doi:10.1101/2025.10.27.684855</a></li>
 <li><a href="https://www.colibri-cytometry.com/post/introducing-autospectral-an-optimized-unmixing-workflow">AutoSpectral on the Colibri Cytometry blog</a></li>
 <li><a href="https://github.com/DrCytometer/AutoSpectral">AutoSpectral package on GitHub</a></li>
 </ul>
+</td>''' + colibri_cell + '''</tr></table>
 '''
 autospectral_correction_help_text = '''
 <h3>Spectral Correction: Fix My Unmix</h3>
@@ -221,7 +237,7 @@ autospectral_correction_help_text = '''
 <ol>
 <li><b>Setup</b> lists what the other pages provide: the AF profiles (every sample is unmixed with its own, by per-cell AF), the spillover spread (it widens the positivity boundaries), the spectral variants (a prior on how large each correction can plausibly be) and the experiment's unmixing method, which the corrected spectra feed.</li>
 <li><b>Samples:</b> by default every sample that is not a bead sample, an unstained sample or a single-stain control, run together; the <i>Include</i> tick boxes offer those types too. <i>Concatenate per group</i> runs each raw subfolder on its own, and each sample is then unmixed with its own group's corrected spectra. Each group needs an unstained sample for its positivity thresholds: <i>Auto</i> takes the unstained cell sample whose scatter fits the group best. The events are drawn equally from the group's samples, in the gate.</li>
-<li><b>Fluorophores kept fixed:</b> ticked fluorophores keep their spectra; Fix Unmix gathers no evidence with them as the source and does not re-measure them. Tick the tag fluorophores of a FlowCode experiment: their FRET error is removed by the FlowCode plugin, and correcting their spectra here would remove it a second time. The FlowCode plugin ticks them when it opens this page.</li>
+<li><b>Fluorophores kept fixed:</b> ticked fluorophores keep their spectra; Fix Unmix gathers no evidence with them as the source and does not re-measure them.</li>
 <li><b>Fix Unmix</b> runs in two phases. Phase one fits, for every pair of fluorophores, the residual spillover from the clearly positive cells of one into the cells negative for the other, with a trust weight for each coefficient; phase two re-measures the spectrum of each fluorophore phase one changed from the cells it dominates, and adopts it only if it passes every check (fit, offset, angle, collinearity, conditioning, leakage). Every run starts from the base spectra. With <i>Smooth updates</i> (Advanced Settings, on by default) Fix My Unmix runs five rounds, each on a fresh half of the events unmixed with the current spectra, and moves the spectra only part of the way toward each round's result, so the noise of one subsample is averaged rather than adopted; it takes longer than a single pass. Every change is held to a plausible size (Advanced Settings, <i>Plausible change</i>): a detector may change by at most its starting value (it can at most double) or by 0.01 of the peak, whichever is greater, so a dye cannot pick up signal where it had none, as it does when another dye is expressed on the same cells; a fluorophore whose change lies mostly outside these bounds keeps its spectrum. Two further checks are off by default: shrinking coefficients that several unrelated dyes share toward the same dye (a marker expressed on the cells of several others), and damping steps that look more like autofluorescence than the dye itself does.</li>
 <li><b>Results:</b> the change of every corrected spectrum (heatmap and before/after traces), and a table of the fluorophores phase one changed with the angle adopted, the angle phase one implied and phase two's verdict. Untick <i>Active</i> to keep a fluorophore's base spectrum. What depends on the spectra follows the corrected ones: the AF envelopes are rebuilt, the spillover spread is recomputed from the controls, and spectral variants and positivity thresholds move with each correction (the noise model describes the detectors and is kept).</li>
 <li><b>Use spectral corrections for the experiment's unmixing</b> (ticked after Fix Unmix): every corrected sample is unmixed with its group's corrected spectra by the experiment's method (per-cell AF, the noise model or spectral variants), in the main window, exports, Honeycluster, the gating plugins and Statistics. The corrections are cleared when the base spectra change.</li>
@@ -229,8 +245,10 @@ autospectral_correction_help_text = '''
 </ol>
 <p><b>While another job runs</b> (the status bar shows <i>Running: …</i>), Match Unstained, Fix Unmix, <i>Use spectral corrections</i> and the <i>Active</i> ticks are greyed out, and the comparison waits until the job has finished. Match Unstained followed by Fix Unmix runs as one job. A job that stopped without finishing can be released by right-clicking <i>Running: …</i> in the status bar.</p>
 <p><b>Further reading</b></p>
+<table width="100%" cellspacing="0" cellpadding="0"><tr><td width="88%" valign="top">
 <ul>
 <li>Burton OT et al. AutoSpectral improves spectral flow cytometry accuracy through optimised spectral unmixing and autofluorescence-matching at the cellular level. <i>bioRxiv</i> 2025. <a href="https://doi.org/10.1101/2025.10.27.684855">doi:10.1101/2025.10.27.684855</a></li>
 <li><a href="https://github.com/DrCytometer/AutoSpectral">AutoSpectral package on GitHub</a> (<tt>fix.my.unmix()</tt>)</li>
 </ul>
+</td>''' + colibri_cell + '''</tr></table>
 '''

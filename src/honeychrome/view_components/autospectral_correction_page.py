@@ -321,8 +321,7 @@ class SpectralCorrectionPage(QWidget):
         self._fixed_list.setSelectionMode(QAbstractItemView.NoSelection)
         self._fixed_list.setMaximumHeight(120)
         self._fixed_list.setToolTip('Ticked fluorophores keep their spectra: Fix Unmix gathers no evidence with '
-                                    'them as the source and does not re-measure them. Tick FlowCode tag '
-                                    'fluorophores, whose FRET error the FlowCode plugin removes itself.')
+                                    'them as the source and does not re-measure them.')
         self._fixed_list.itemChanged.connect(self._on_setup_changed)
         layout.addWidget(self._fixed_list)
 

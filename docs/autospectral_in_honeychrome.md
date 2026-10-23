@@ -148,7 +148,7 @@ Single-stained controls give each fluorophore's spectrum, but a reference spectr
 1. The **Setup** box lists what the earlier pages provide: the AF profiles, the spillover spread, the spectral variants and the experiment's unmixing method.
 2. Choose the **fully stained samples**. By default every sample that is not a bead sample, an unstained sample or a single-stain control is used, concatenated (**Default Samples** restores this). Tick **Concatenate per group** to correct each raw subfolder on its own; each sample is then unmixed with its own group's corrected spectra.
 3. Each group needs an unstained sample: **Auto** picks the unstained cell sample whose scatter fits the group best (**Match Unstained** shows the choice), or choose one yourself. Set the gate and the number of events per group.
-4. Optionally tick fluorophores under **Fluorophores kept fixed**. In a FlowCode experiment, the FlowCode plugin ticks its tag fluorophores here, because their error is corrected by the plugin.
+4. Optionally tick fluorophores under **Fluorophores kept fixed**.
 5. Press **Fix Unmix**. Every run starts again from the base spectra. With **Smooth updates** (Advanced Settings, on by default) it runs five rounds on fresh halves of the events and averages them; this takes about three times as long as a single pass.
 6. Review the **Results**: a table of the fluorophores that changed, with the angle of the change and an **Active** tick for each, the before/after spectra, and a heatmap of the change (**Show spectral change heatmap**). Untick **Active** to keep a fluorophore's original spectrum.
 7. **Use spectral corrections for the experiment's unmixing** is ticked after the run.
