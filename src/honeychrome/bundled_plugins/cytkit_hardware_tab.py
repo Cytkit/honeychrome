@@ -813,6 +813,12 @@ class TriggerChannelTable(QWidget):
         s.endGroup()
         s.endGroup()
 
+    def config_triggers_from_instrument_config(self, params) -> None:
+        trigger_channel = params['peak_detection_channel']
+        for row, name in enumerate(adc_channels):
+            self.enable_boxes[row].setChecked(True if name==trigger_channel else False)
+            self.mask_boxes[row].setChecked(True if name==trigger_channel else False)
+
     # ---------- accessors ----------
 
     def is_enabled(self, row: int) -> bool:
@@ -1456,6 +1462,8 @@ class PluginWidget(QWidget):
         layout.addLayout(set_trigger_over_baseline_layout)
         self.set_trigger_over_baseline_text = QLabel('')
         layout.addWidget(self.set_trigger_over_baseline_text)
+
+        self.bus.configPeakDetection.connect(self.trigger_table.config_triggers_from_instrument_config)
 
         layout.addStretch()
         toolbox.addTab(tab, "Triggers")
