@@ -151,9 +151,9 @@ Single-stained controls give each fluorophore's spectrum, but a reference spectr
 4. Optionally tick fluorophores under **Fluorophores kept fixed**.
 5. Press **Fix Unmix**. Every run starts again from the base spectra. With **Smooth updates** (Advanced Settings, on by default) it runs five rounds on fresh halves of the events and averages them; this takes about three times as long as a single pass.
 6. Review the **Results**: a table of the fluorophores that changed, with the angle of the change and an **Active** tick for each, the before/after spectra, and a heatmap of the change (**Show spectral change heatmap**). Untick **Active** to keep a fluorophore's original spectrum.
-7. **Use spectral corrections for the experiment's unmixing** is ticked after the run.
+7. **Use spectral corrections for the experiment's unmixing** is ticked after the run. Every fully stained sample of the experiment (not an unstained, single-stain or bead sample) is then unmixed with the corrected spectra; after a run per group, each sample takes its own raw subfolder's corrections, and a subfolder Fix Unmix did not run on keeps the base spectra. Untick a raw subfolder under **Apply the corrections to the samples of** to keep its samples on the base spectra.
 
-The comparison shows the current sample with the base spectra and with its group's corrected spectra, both with the experiment's unmixing method, on the pair of channels that changes most.
+The comparison shows the current sample, whichever it is, with the base spectra and with the corrected spectra it takes, both with the experiment's unmixing method, on the pair of channels that changes most. For a sample the experiment's unmixing does not correct (a control, an unticked subfolder, or with the corrections unticked) the comparison is marked as a preview.
 
 The corrections are kept as an overlay: your single-stain control spectra in the Spectral Process are not changed. If you change those spectra (for example by re-cleaning the controls), the corrections no longer apply and are cleared, with a message on the page; run Fix Unmix again.
 

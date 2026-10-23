@@ -211,12 +211,27 @@ class FixSettings:
     ``seed_streams`` and the non-joint fallbacks other than 'remeasured' are
     off (no gain in accuracy, or a loss; 'applied' can stop after one partly
     trusted step, below the flag threshold). The plausibility box (ratio 1,
-    floor 0.01, reject 0.5, reset) is on: it removes most of the
+    floor 0.003, reject 0.5, reset) is on: it removes most of the
     co-expression and AF taken up on real panels at no cost on bead-to-cell
     errors. The shared-direction check and the AF penalty are off.
     ``stop_rule='settled'`` and ``disagreement_reference='envelope_corrected'``
     lose no accuracy against 'all' and 'envelope' and are a quarter faster
-    with smooth updates; 'anchored' remains an option. ``smooth_updates``,
+    with smooth updates; 'anchored' remains an option.
+
+    Six defaults come from a factorial scan on bead-to-cell errors (Aurora,
+    FACSDiscover A8, ID7000) checked on three real panels over three seeds
+    and disjoint halves of the events: ``max_angle`` 30 (a large real
+    correction, e.g. a tandem on the A8, needs about 20 degrees),
+    ``phase_two_rows`` 'all' (rows phase one did not move are re-measured
+    too), ``coefficient_decay`` 0, ``convergence_threshold`` 0.003,
+    ``plausibility_floor`` 0.003 and ``unstained_threshold`` 0.95 for the
+    upper boundary (the lower one keeps the 0.99 quantile,
+    ``lower_unstained_threshold``). Together they cut the summed
+    bead-to-cell error by a fifth and the residual spillover between the
+    scored pairs of a fully stained panel by about two fifths, and lower the
+    change into detectors where a dye has no signal on two of the three
+    panels, at no cost in run time or in agreement between halves of the
+    events. ``smooth_updates``,
     ``smooth_rounds`` and ``smooth_fraction`` are read by ``smooth_fix`` and
     ``spectral_correction``, not by ``fix_my_unmix``.
     """
@@ -224,7 +239,8 @@ class FixSettings:
     downsample: int = 0                     # 0: off; else events kept (stratified)
     downsample_background_frac: float = 0.3
     downsample_min_stratum: int = 2000
-    unstained_threshold: float = 0.99
+    unstained_threshold: float = 0.95
+    lower_unstained_threshold: float = 0.99   # the lower (hypernegative) boundary's quantile, 1 - this, of the unstained
     unstained_margin: float = 1.3
     spread_kappa: float = 3.0
     negative_tail: float = 0.001            # tail share of the sample's negative population left above its bound
@@ -267,7 +283,7 @@ class FixSettings:
     af_gate: bool = False                   # drop row changes that look like an AF spectrum
     af_gate_max: float = 0.8                # ... cos^2 to the nearest AF library spectrum above this
     plausibility_ratio: float = 1.0         # 0: off; else a detector may change by at most this x its reference value
-    plausibility_floor: float = 0.01        # ... or by this (peak = 1), whichever is greater
+    plausibility_floor: float = 0.003       # ... or by this (peak = 1), whichever is greater
     plausibility_reject: float = 0.5        # reject a row when more than this share of its change is out of bounds
     plausibility_reset: bool = True         # an adopted row's detector out of bounds keeps its reference value
     shared_direction: bool = False          # shrink coefficients that unrelated sources share into one channel
@@ -281,16 +297,16 @@ class FixSettings:
     source_dominant: bool = True
     spread_addback: bool = False
     max_coefficient: float = 0.5
-    convergence_threshold: float = 0.01
+    convergence_threshold: float = 0.003
     convergence_quantile: float = 1.0
     stop_rule: str = 'settled'              # see STOP_RULES: every fitted error, the step applied, trusted, or settled
     stall_rule: str = 'trend'               # see STALL_RULES: 3-iteration trend of delta, or no new minimum
     stall_patience: int = 3                 # ... for stall_patience iterations
     stop_trust: float = 0.05                # 'settled': a coefficient below this trust does not hold phase one open
     stop_confirm: int = 2                   # 'settled': iterations in a row every trusted error must be below threshold
-    coefficient_decay: float = 0.05
+    coefficient_decay: float = 0.0
     update_spectra: bool = True
-    phase_two_rows: str = 'flagged'         # see PHASE_TWO_ROWS
+    phase_two_rows: str = 'all'             # see PHASE_TWO_ROWS
     phase_two_adopt: str = 'remeasured'     # see PHASE_TWO_ADOPT
     phase_two_fallback: str = 'remeasured'  # see PHASE_TWO_FALLBACK: a row too small for the joint fit
     step: float = 1.0
@@ -300,7 +316,7 @@ class FixSettings:
     max_resid: float = 0.03
     max_intercept: float = 0.03
     min_bg_align: float = -0.9
-    max_angle: float = 15.0
+    max_angle: float = 30.0
     max_clamp_frac: float = 0.15
     max_anchor: float = 0.10
     max_vif: float = 500.0
@@ -1457,8 +1473,15 @@ class FixResult:
 
 
 def _thresholds(unstained_comp: np.ndarray, s: FixSettings) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Flat upper and lower boundaries from the unstained events. The lower one
+    has its own quantile: a share of a correctly unmixed population as large
+    as 1 - its quantile lies below it, so it must stay well under
+    ``max_hypernegative_frac`` or the hypernegative check takes the trust of
+    correct coefficients.
+    """
     upper = s.unstained_margin * np.quantile(unstained_comp, s.unstained_threshold, axis=0)
-    lower = s.unstained_margin * np.quantile(unstained_comp, 1.0 - s.unstained_threshold, axis=0)
+    lower = s.unstained_margin * np.quantile(unstained_comp, 1.0 - s.lower_unstained_threshold, axis=0)
     return upper, lower
 
 
@@ -1517,6 +1540,8 @@ def _check_settings(s: FixSettings) -> None:
         raise ValueError('The source event range needs 0 <= low < high.')
     if not (0.0 < s.negative_tail < 0.5):
         raise ValueError('The negative tail must lie between 0 and 0.5.')
+    if not (0.5 < s.unstained_threshold < 1.0 and 0.5 < s.lower_unstained_threshold < 1.0):
+        raise ValueError('The unstained quantiles must lie between 0.5 and 1.')
     if s.plausibility_ratio < 0 or s.plausibility_floor < 0 or not 0.0 < s.plausibility_reject <= 1.0:
         raise ValueError('Plausibility bounds need ratio >= 0, floor >= 0 and 0 < reject share <= 1.')
     if not 0.0 < s.shared_cosine < 1.0 or s.shared_min_slope < 0 or s.shared_power < 0 or \

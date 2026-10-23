@@ -81,38 +81,21 @@ MIN_EVENTS = 200
 
 # FixSettings fields the page exposes (Advanced Settings), in display order:
 # (field, label, kind, minimum, maximum, step, decimals); kind 'int', 'float',
-# 'bool' or a tuple of (value, label) choices.
+# 'bool' or a tuple of (value, label) choices. Only settings that trade one
+# panel or one goal against another are offered, within the range tested: the
+# positivity boundary (spread kappa, unstained quantile and margin) and the
+# plausibility floor move some panels' rows more and others' less, smooth
+# updates trade accuracy for time, and the shared-direction check removes
+# co-expression at some cost in accuracy. The other settings stay at their
+# defaults: moving them was worse or made no difference.
 EXPOSED_SETTINGS = (
-    ('smooth_updates', 'Smooth updates (rounds averaged; slower)', 'bool', None, None, None, None),
-    ('plausibility_ratio', 'Plausible change: at most x start value per detector (0 = off)', 'float', 0.0, 10.0,
-     0.1, 2),
-    ('plausibility_floor', 'Plausible change: or at most (peak = 1)', 'float', 0.0, 0.2, 0.005, 3),
+    ('spread_kappa', 'Spread kappa (SDs)', 'float', 2.0, 4.0, 0.5, 2),
+    ('unstained_threshold', 'Unstained quantile', 'float', 0.95, 0.99, 0.01, 3),
+    ('unstained_margin', 'Unstained margin', 'float', 1.3, 2.0, 0.1, 2),
+    ('plausibility_floor', 'Plausible change: start value per detector, or at least (peak = 1)', 'float',
+     0.003, 0.01, 0.001, 3),
     ('shared_direction', 'Shrink coefficients unrelated dyes share (co-expression)', 'bool', None, None, None, None),
-    ('af_penalty', 'Damp steps more AF-like than the dye itself', 'bool', None, None, None, None),
-    ('max_iter', 'Maximum iterations', 'int', 1, 200, 1, None),
-    ('convergence_threshold', 'Convergence threshold', 'float', 1e-5, 0.5, 0.001, 5),
-    ('convergence_quantile', 'Convergence quantile', 'float', 0.5, 1.0, 0.01, 3),
-    ('unstained_threshold', 'Unstained quantile', 'float', 0.9, 0.9999, 0.001, 4),
-    ('unstained_margin', 'Unstained margin', 'float', 1.0, 5.0, 0.1, 2),
-    ('spread_kappa', 'Spread kappa (SDs)', 'float', 0.0, 10.0, 0.5, 2),
-    ('max_coefficient', 'Maximum coefficient', 'float', 0.01, 2.0, 0.05, 3),
-    ('coefficient_decay', 'Coefficient decay', 'float', 0.0, 0.99, 0.01, 3),
-    ('min_hypernegative_frac', 'Hypernegative: trust starts falling at', 'float', 0.0, 0.5, 0.005, 3),
-    ('max_hypernegative_frac', 'Hypernegative: zero trust at', 'float', 0.001, 1.0, 0.005, 3),
-    ('hypernegative_rule', 'Hypernegative: judged on',
-     (('after', 'Share left below the boundary'), ('new', 'Share newly pushed below it')), None, None, None, None),
-    ('source_events_low', 'Clear source positives beyond unstained: no trust at', 'int', 0, 1_000_000, 10, None),
-    ('source_events_high', 'Clear source positives beyond unstained: full trust at', 'int', 1, 1_000_000, 10,
-     None),
-    ('glasso_check', 'Joint lasso check on pair coefficients', 'bool', None, None, None, None),
-    ('af_gate', 'AF gate on row changes', 'bool', None, None, None, None),
-    ('af_gate_max', 'AF gate: maximum likeness (cos² to an AF spectrum)', 'float', 0.0, 1.0, 0.05, 3),
-    ('phase_two_rows', 'Phase two: rows re-measured',
-     (('flagged', 'Only rows phase one changed'), ('all', 'All')), None, None, None, None),
-    ('phase_two_adopt', 'Phase two: row adopted when the gates pass',
-     (('remeasured', 'Re-measured signature'), ('backsolved', 'Phase-one back-solved row')), None, None, None, None),
-    ('max_angle', 'Phase two: maximum change (deg)', 'float', 0.1, 90.0, 1.0, 2),
-    ('downsample', 'Stratified downsample (0 = off)', 'int', 0, 10_000_000, 10_000, None),
+    ('smooth_updates', 'Smooth updates (rounds averaged; slower)', 'bool', None, None, None, None),
 )
 
 
@@ -145,9 +128,17 @@ def save_setup(process: dict, setup: CorrectionSetup) -> None:
 
 
 def fix_settings(setup: CorrectionSetup) -> fm.FixSettings:
-    """FixSettings from the exposed fields stored in the setup; the rest at their defaults."""
-    allowed = {key for key, *_rest in EXPOSED_SETTINGS}
-    values = {k: v for k, v in (setup.fix or {}).items() if k in allowed}
+    """FixSettings from the exposed fields stored in the setup, held to their ranges; the rest at their
+    defaults."""
+    exposed = {key: (kind, lo, hi) for key, _label, kind, lo, hi, _step, _decimals in EXPOSED_SETTINGS}
+    values = {}
+    for key, value in (setup.fix or {}).items():
+        if key not in exposed:
+            continue
+        kind, lo, hi = exposed[key]
+        if kind in ('int', 'float'):
+            value = min(max(value, lo), hi)          # a value stored before the range was narrowed
+        values[key] = value
     s = fm.FixSettings(**values)
     s.n_threads = unmix_method.n_threads_default()
     s.fixed_fluorophores = tuple(str(n) for n in (setup.fixed or ()))
@@ -659,3 +650,54 @@ def group_for_sample(entry: dict | None, sample_key) -> str | None:
         if str(sample_key) in [str(s) for s in g.get('samples') or []]:
             return group
     return None
+
+
+def correction_group(entry: dict | None, samples: dict, sample_key, name: str | None = None) -> str | None:
+    """
+    The stored group whose corrected spectra a sample takes, whether or not
+    the corrections are applied to it: the group of a sample the run used;
+    else the one group when the run concatenated every sample, or the group of
+    the sample's raw subfolder when it ran per group (None when that
+    subfolder has none).
+    """
+    groups = (entry or {}).get('groups') or {}
+    used = group_for_sample(entry, sample_key)
+    if used is not None:
+        return used
+    group = group_of(str(sample_key)) if (entry or {}).get('per_group') else ALL_GROUP
+    return group if group in groups else None
+
+
+def correction_membership(entry: dict | None, samples: dict, apply_to=None) -> dict:
+    """
+    {sample key: group} of the samples unmixed with a stored group's corrected
+    spectra: every sample the run used, and every other fully stained sample
+    (not unstained, single-stain or bead) by ``correction_group``. With
+    ``apply_to`` (raw subfolders, see ``group_of``) only the samples in those
+    subfolders.
+    """
+    groups = (entry or {}).get('groups') or {}
+    out = {}
+    for group, g in groups.items():
+        for key in g.get('samples') or []:
+            out[str(key)] = str(group)
+    for path, name in ((samples or {}).get('all_samples') or {}).items():
+        path = str(path)
+        if path in out or sample_types(samples, path, name):
+            continue
+        group = correction_group(entry, samples, path, name)
+        if group is not None:
+            out[path] = group
+    if apply_to is not None:
+        keep = {str(f) for f in apply_to}
+        out = {k: g for k, g in out.items() if group_of(k) in keep}
+    return out
+
+
+def sample_folders(samples: dict) -> list:
+    """The raw subfolders (``group_of``) holding a fully stained sample, in experiment order."""
+    out = []
+    for path, name in ((samples or {}).get('all_samples') or {}).items():
+        if not sample_types(samples, path, name):
+            out.append(group_of(str(path)))
+    return list(dict.fromkeys(out))
