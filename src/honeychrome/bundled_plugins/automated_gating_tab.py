@@ -53,6 +53,7 @@ import hashlib
 import json
 import os as _os
 import sys
+import uuid
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field, fields as dataclass_fields
@@ -182,6 +183,7 @@ DISPLAY_SEED = 42
 RESULTS_FILE = Path('cache') / 'automated_gating' / 'results.json'
 STATS_FILE = Path('cache') / 'automated_gating' / 'stats.json'
 ENRICHMENT_FILE = Path('cache') / 'automated_gating' / 'enrichment.json'
+SAMPLE_ANALYSIS_FILE = Path('cache') / 'automated_gating' / 'sample_analysis.json'
 DISPLAY_DIR = Path('cache') / 'automated_gating' / 'display'
 EXPORT_DIR = Path('Automated_Gating_Results')
 # Events per group in the population comparison's pooled biplots.
@@ -348,7 +350,8 @@ class GatingRunState:
                      continuous numbers (e.g. age); the rest are categories.
     stats          : results of the last statistics run (kept in STATS_FILE).
     pca, predictive: the last sample PCA and predictive analysis (from the
-                     statistics run's per-sample values) — this session only.
+                     statistics run's per-sample values; kept in
+                     SAMPLE_ANALYSIS_FILE with the run_id of that run).
     pending_samples: samples of a paused (or interrupted) run still to be
                      gated; empty when the last run finished.
     run_fingerprint: what the gated results depend on (model file, channel
@@ -871,8 +874,10 @@ class RunTab(QWidget):
         self.sample_table = QTableWidget(0, 4)
         self.sample_table.setHorizontalHeaderLabels(["Gate", "Validate", "Sample", "AF profiles"])
         hh = self.sample_table.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(self.COL_SAMPLE, QHeaderView.Stretch)
+        hh.setSectionResizeMode(QHeaderView.Interactive)
+        hh.setStretchLastSection(False)
+        self.sample_table.setTextElideMode(Qt.ElideMiddle)
+        self.sample_table.setWordWrap(False)
         self.sample_table.verticalHeader().setVisible(False)
         self.sample_table.setToolTip(
             "Tick samples to gate. Validation samples are gated too, and their gates are "
@@ -1157,9 +1162,16 @@ class RunTab(QWidget):
                 self.sample_table.setItem(r, self.COL_VALIDATE, _checkbox_item(key in val))
                 name = _coloured_item(key)
                 name.setData(Qt.UserRole, key)
+                name.setToolTip(key)
                 self.sample_table.setItem(r, self.COL_SAMPLE, name)
                 profiles = af_profile_names(self.controller, key)
                 self.sample_table.setItem(r, self.COL_AF, _coloured_item(', '.join(profiles) or '—'))
+            # Columns fit their contents once; the sample name is capped (and
+            # elided in the middle) so the AF profiles stay in view.
+            self.sample_table.resizeColumnsToContents()
+            self.sample_table.setColumnWidth(
+                self.COL_SAMPLE,
+                min(self.sample_table.columnWidth(self.COL_SAMPLE), SAMPLE_COLUMN_MAX_WIDTH))
         finally:
             self._filling = False
 
@@ -1319,6 +1331,8 @@ class RunTab(QWidget):
             st.display = {}
         st.stats = {}
         st.fsea = {}
+        st.pca = {}
+        st.predictive = {}
         st.marker_channels = markers
         st.results_model_sha = model_sha
         st.run_fingerprint = fingerprint
@@ -1757,6 +1771,7 @@ class ResultsTab(QWidget):
 
     stats_finished = Signal()
     report_populations_changed = Signal()
+    sample_analysis_changed = Signal()
 
     def __init__(self, state: GatingRunState, bus, controller, result_transforms=None,
                  parent=None):
@@ -1775,6 +1790,7 @@ class ResultsTab(QWidget):
         self._volcano_tables: dict = {}
         self._row_figures: dict = {}
         self._figures_for = None
+        self._focus_figure = None
         self._shown_population = None
         # Automatic Suggest Groupings: the sample list it last ran for (it
         # runs once per list) and the state to restore on Undo.
@@ -1808,7 +1824,7 @@ class ResultsTab(QWidget):
         add_concertina_page(self.toolbox, self.explore_page, "Sample PCA and prediction")
         self.figures_tabs = QTabWidget()
         self.figures_tabs.setMinimumHeight(400)
-        add_concertina_page(self.toolbox, self.figures_tabs, "Figures")
+        self._page_figures = add_concertina_page(self.toolbox, self.figures_tabs, "Figures")
         self.browser_page = QWidget()
         self._build_browser_page()
         self._page_browser = add_concertina_page(self.toolbox, self.browser_page, "Populations")
@@ -2477,6 +2493,9 @@ class ResultsTab(QWidget):
         if not ok:
             self.lbl_stats.setText(f"<span style='color:#b00020'>{error}</span>")
             return
+        # Identifies the run, so a saved PCA or predictive analysis is only
+        # restored with the statistics it was made from.
+        result['run_id'] = uuid.uuid4().hex
         self.state.stats = result
         # PCA and predictive results describe the previous statistics run.
         self.state.pca = {}
@@ -2615,6 +2634,21 @@ class ResultsTab(QWidget):
             self._connect_figure(widget.canvas, fig, item.get('results'))
             self.figures_tabs.addTab(widget, item['title'])
         self._add_extra_figures()
+        if self._focus_figure:
+            title, self._focus_figure = self._focus_figure, None
+            self._open_figure(title)
+
+    def _open_figure(self, title: str):
+        """Open the Figures page on the figure called *title*; while the
+        figures are being rebuilt, once they are shown."""
+        self.toolbox.setCurrentIndex(self._page_figures)
+        if self._figure_worker is not None:
+            self._focus_figure = title
+            return
+        for i in range(self.figures_tabs.count()):
+            if self.figures_tabs.tabText(i) == title:
+                self.figures_tabs.setCurrentIndex(i)
+                return
 
     def _connect_figure(self, canvas, fig, results=None):
         """Hover labels, and click-through to the Populations page: a
@@ -2871,6 +2905,8 @@ class ResultsTab(QWidget):
         st.pca = pca
         self._add_extra_figures()
         self._populate_report_items()
+        self._open_figure("Sample PCA")
+        self.sample_analysis_changed.emit()
         _status(self.bus, f"Sample PCA of {len(pca['scores'])} samples.")
 
     def _on_run_predictive(self):
@@ -2907,35 +2943,37 @@ class ResultsTab(QWidget):
         self.lbl_pred.setText(f"Running on {X.shape[1]} features, "
                               f"{sum(n_per_group.values())} samples …")
         worker = _CallWorker(_run, parent=self)
-        worker.finished.connect(
-            lambda ok, err, res, s=status, m=message: self._on_predictive_finished(ok, err, res, s, m))
+        worker.finished.connect(self._on_predictive_finished)
         self._predictive_worker = worker
         worker.start()
 
-    def _on_predictive_finished(self, ok: bool, error: str, result: object, status: str,
-                                message: str):
+    def _on_predictive_finished(self, ok: bool, error: str, result: object):
         self._predictive_worker = None
         self.btn_pred.setEnabled(bool(self.state.stats))
         if not ok:
             self.lbl_pred.setText(f"<span style='color:#b00020'>{error}</span>")
             return
         self.state.predictive = result
-        summary = result['summary']
-        text = (f"Minimal panel: {summary['minimal_panel']} feature(s) (best panel AUC "
-                f"{summary['best_panel_auc']:.2f}).")
-        if status == 'warn':
-            text += f" {message}"
-        self.lbl_pred.setText(text)
         self._show_predictive_table()
         self._add_extra_figures()
         self._populate_report_items()
+        self.sample_analysis_changed.emit()
         _status(self.bus, "Predictive analysis complete.")
 
     def _show_predictive_table(self):
+        """The last predictive analysis: its summary line and performance
+        table."""
         _clear_layout(self.pred_table_holder)
         res = self.state.predictive
         if not res:
             return
+        summary = res['summary']
+        if self._predictive_worker is None:
+            text = (f"Minimal panel: {summary['minimal_panel']} feature(s) (best panel AUC "
+                    f"{summary['best_panel_auc']:.2f}).")
+            if summary.get('status') == 'warn':
+                text += f" {summary.get('message', '')}"
+            self.lbl_pred.setText(text)
         rows = [{'Model': r['model'],
                  'AUC': f"{r['auc_mean']:.3f} ± {r['auc_sd']:.3f}",
                  'Balanced accuracy': f"{r['balanced_accuracy_mean']:.3f} ± "
@@ -3643,7 +3681,26 @@ class _StateLoader(QThread):
         except Exception as exc:
             log.exception("could not read the saved enrichment")
             out['errors'].append(f"Could not read the saved enrichment: {exc}")
+        try:
+            self._read_sample_analysis(job, out)
+        except Exception as exc:
+            log.exception("could not read the saved sample PCA and predictive analysis")
+            out['errors'].append(f"Could not read the saved sample PCA and predictive "
+                                 f"analysis: {exc}")
         self.finished.emit(out)
+
+    @staticmethod
+    def _read_sample_analysis(job: dict, out: dict):
+        """The last sample PCA and predictive analysis, while they belong to
+        the statistics run that was read."""
+        path = job.get('sample_analysis_path')
+        run_id = (out.get('stats') or {}).get('run_id')
+        if path is None or not run_id or not Path(path).exists():
+            return
+        payload = json.loads(Path(path).read_text(encoding='utf-8'))
+        if payload.get('stats_run_id') != run_id:
+            return
+        out['pca'], out['predictive'] = ag_results.sample_analysis_from_jsonable(payload)
 
     @staticmethod
     def _read_enrichment(job: dict, out: dict):
@@ -3752,7 +3809,9 @@ class PluginWidget(QWidget):
     RESULTS_FILE in the experiment folder, with the samples a paused run has
     still to gate, and each sample's display record in DISPLAY_DIR; the last
     statistics run is kept in STATS_FILE and the last enrichment run in
-    ENRICHMENT_FILE, both restored while they still match the gated results.
+    ENRICHMENT_FILE, both restored while they still match the gated results;
+    the last sample PCA and predictive analysis are kept in
+    SAMPLE_ANALYSIS_FILE and restored with the statistics run they came from.
     These are read in the background when the experiment is opened and
     written in the background after each run, when the gating results and
     statistics are also written as CSV files to EXPORT_DIR.
@@ -3830,6 +3889,7 @@ class PluginWidget(QWidget):
         self.run_tab.gating_finished.connect(self._on_gating_finished)
         self.results_tab.stats_finished.connect(self._on_stats_finished)
         self.results_tab.report_populations_changed.connect(self._save_run_state)
+        self.results_tab.sample_analysis_changed.connect(self._write_sample_analysis)
         self.enrichment_tab.enrichment_finished.connect(self._on_enrichment_finished)
 
         self.content_widget.setVisible(False)
@@ -3926,6 +3986,7 @@ class PluginWidget(QWidget):
         self._write_results()
         self._write_stats()
         self._write_enrichment()
+        self._write_sample_analysis()
         self._save_run_state()
         if self.state.summaries and outcome in ('done', 'paused', 'failed'):
             self._export_results_csv()
@@ -3934,6 +3995,7 @@ class PluginWidget(QWidget):
         """Keep the statistics, and the settings they were run with, as soon
         as a run completes, and write them as CSV files."""
         self._write_stats()
+        self._write_sample_analysis()
         self._save_run_state()
         self._export_statistics_csv()
 
@@ -4127,6 +4189,7 @@ class PluginWidget(QWidget):
             'results_path': exp / RESULTS_FILE,
             'stats_path': exp / STATS_FILE,
             'enrichment_path': exp / ENRICHMENT_FILE,
+            'sample_analysis_path': exp / SAMPLE_ANALYSIS_FILE,
             'display_dir': exp / DISPLAY_DIR,
             'thresholds': {'pval': st.pval_threshold, 'fc': st.fc_threshold,
                            'marker': st.marker_threshold, 'fdr_scope': st.fdr_scope,
@@ -4173,6 +4236,10 @@ class PluginWidget(QWidget):
             st.stats = out['stats']
         if out.get('fsea'):
             st.fsea = out['fsea']
+        if out.get('pca'):
+            st.pca = out['pca']
+        if out.get('predictive'):
+            st.predictive = out['predictive']
         for msg in out.get('errors') or []:
             self.progress_message(msg)
         self._sync_applied_model()
@@ -4286,6 +4353,31 @@ class PluginWidget(QWidget):
                                       'result': ag_fsea.result_to_jsonable(result)})
 
         self._start_writer(_job, "Saving the enrichment")
+
+    def _write_sample_analysis(self):
+        """Write the last sample PCA and predictive analysis to
+        SAMPLE_ANALYSIS_FILE (in the background) with the run_id of the
+        statistics run they came from, or remove the file when there is
+        neither."""
+        if not self._controller_shows_loaded_experiment():
+            return
+        path = self._loaded_experiment_dir / SAMPLE_ANALYSIS_FILE
+        st = self.state
+        run_id = (st.stats or {}).get('run_id')
+        if not (st.pca or st.predictive) or not run_id:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                log.exception("could not remove %s", path)
+            return
+        pca, predictive = dict(st.pca), dict(st.predictive)
+
+        def _job():
+            payload = ag_results.sample_analysis_to_jsonable(pca, predictive)
+            payload.update({'format_version': 1, 'stats_run_id': run_id})
+            _write_json_atomic(path, payload)
+
+        self._start_writer(_job, "Saving the sample PCA and predictive analysis")
 
     def _export_enrichment_csv(self):
         """Write the enrichment tables as CSV files to EXPORT_DIR (background)."""
