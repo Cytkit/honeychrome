@@ -233,6 +233,8 @@ autospectral_variants_help_text = '''
 '''
 autospectral_correction_help_text = '''
 <h3>Spectral Correction: Fix My Unmix</h3>
+<p>This will attempt to automatically identify and fix minor unmixing issues in the samples. It has been tested on many data sets, but still likely requires further tuning.</p>
+<ol>
 <p>Single-stained controls give each fluorophore's spectrum, but a reference spectrum can still be slightly wrong for the fully stained cells: a tandem dye that has degraded differently, a control stained on beads, a different buffer. Part of such an error lies inside the span of the other spectra, and no residual check can see it; it shows as residual spillover, cells negative for a marker reading above or below zero in proportion to another marker. Fix My Unmix (from the AutoSpectral package's <tt>fix.my.unmix()</tt>) measures that spillover on fully stained samples, where a marker-negative population must read zero, and corrects the spectra.</p>
 <ol>
 <li><b>Setup</b> lists what the other pages provide: the AF profiles (every sample is unmixed with its own, by per-cell AF), the spillover spread (it widens the positivity boundaries), the spectral variants (a prior on how large each correction can plausibly be) and the experiment's unmixing method, which the corrected spectra feed.</li>
