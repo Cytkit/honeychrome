@@ -67,17 +67,28 @@ Phase one
 Phase two
     Each changed fluorophore's signature (``phase_two_rows``) is re-measured
     from background-subtracted raw data of the events it dominates
-    (``extract_raw_signature``, every other panel abundance fitted jointly)
-    and adopted only if it passes every gate. Because the regressors are the
-    phase-one-compensated abundances, the in-span part of a re-measured row
-    is the back-solved phase-one row plus noise; ``phase_two_adopt=
-    'backsolved'`` adopts phase one's own row when the candidate passes. The
-    optional residual gate compares the OLS residual of the fluorophore's
-    positive events before and after the change; it is blind to the in-span
-    part of a change by construction. A row with too few events for the
-    joint fit is re-measured with every other row held at its spectrum;
-    ``phase_two_fallback`` adopts that row (default), phase one's
-    back-solved row, or rejects it.
+    (``extract_raw_signature``) and adopted only if it passes every gate.
+    The abundances fitted jointly with the signature are those of the dyes
+    present in that population (``phase_two_active='present'``: above their
+    boundary in a share of its events, correlated with the target, or with
+    a mean |abundance| of a fraction of their boundary), so a population of
+    a few hundred events still gets a joint fit; with ``'all'`` every panel
+    abundance is a regressor and a small population falls back to a fit
+    with every other row held at its spectrum, which books any co-expression
+    or skew of those rows against the target (``phase_two_fallback`` adopts
+    that row, phase one's back-solved row, or rejects it). Because the
+    regressors are the phase-one-compensated abundances, the in-span part of
+    a re-measured row is the back-solved phase-one row plus noise;
+    ``phase_two_adopt='backsolved'`` adopts phase one's own row when the
+    candidate passes. When the re-measured row fails a gate that says
+    nothing against the row itself (``rescue_reasons``: leakage,
+    conditioning, or no fit) and phase one's evidence for the row is strong
+    (``rescue_min_weight``), the back-solved row is tried as a second
+    candidate through the same box, AF, angle, conditioning and leakage
+    gates (``phase_two_rescue='backsolved'``). The optional residual gate
+    compares the OLS residual of the fluorophore's positive events before
+    and after the change; it is blind to the in-span part of a change by
+    construction.
 Plausibility bounds
     A detector of a row may change by at most ``plausibility_ratio`` x its
     value in the reference row (the spectra the run, or ``smooth_fix``'s
@@ -121,11 +132,16 @@ Fluorophores kept fixed
     dominance of events, so its signal is still unmixed, but evidence in its
     channel never changes another row.
 Smooth updates
-    ``smooth_fix`` runs Fix My Unmix in rounds on fresh subsamples, each
-    started from the current spectra, and moves the spectra a step
-    1 / (round + 1) toward each round's result, so a subsample's noise is
-    averaged rather than adopted. The Spectral Correction page uses it
-    unless ``smooth_updates`` is switched off.
+    ``smooth_fix`` runs Fix My Unmix in rounds on fresh subsamples. With
+    ``smooth_mode='damped'`` each round starts from the current spectra and
+    moves them a step 1 / (round + 1) toward its result, so a subsample's
+    noise is averaged rather than adopted. With ``'consensus'`` every round
+    runs from the starting spectra on its own subsample, and a row is
+    adopted as the mean of the rounds that accepted it only when at least
+    ``consensus_min_rounds`` of them did and their mean angle to that mean
+    is at most ``consensus_max_spread`` of the move it makes: only
+    corrections the rounds agree on are kept. The Spectral Correction page
+    uses smooth updates unless ``smooth_updates`` is switched off.
 
 The pair slopes run in a compiled kernel (``bundled_plugins/
 fix_my_unmix_kernel.cpp``, built by ``build_fix_my_unmix_kernel.py``) when it
@@ -185,6 +201,9 @@ PHASE_TWO_FALLBACK = ('remeasured', 'backsolved', 'reject')
 STOP_RULES = ('all', 'applied', 'trusted', 'settled')
 DISAGREEMENT_REFERENCES = ('envelope', 'anchored', 'envelope_corrected')
 STALL_RULES = ('trend', 'patience')
+PHASE_TWO_ACTIVE = ('all', 'present')
+PHASE_TWO_RESCUE = ('off', 'backsolved')
+SMOOTH_MODES = ('damped', 'consensus')
 # generator keys of seed_streams, one stream per purpose and fluorophore
 _STREAM_EVIDENCE, _STREAM_LASSO, _STREAM_SLOPES, _STREAM_DOWNSAMPLE, _STREAM_SMOOTH = 1, 2, 3, 4, 5
 
@@ -222,8 +241,7 @@ class FixSettings:
     FACSDiscover A8, ID7000) checked on three real panels over three seeds
     and disjoint halves of the events: ``max_angle`` 30 (a large real
     correction, e.g. a tandem on the A8, needs about 20 degrees),
-    ``phase_two_rows`` 'all' (rows phase one did not move are re-measured
-    too), ``coefficient_decay`` 0, ``convergence_threshold`` 0.003,
+    ``coefficient_decay`` 0, ``convergence_threshold`` 0.003,
     ``plausibility_floor`` 0.003 and ``unstained_threshold`` 0.95 for the
     upper boundary (the lower one keeps the 0.99 quantile,
     ``lower_unstained_threshold``, as a lower boundary at the 5th percentile
@@ -232,9 +250,18 @@ class FixSettings:
     Together they cut the summed bead-to-cell error by a fifth and lower the
     change into detectors where a dye has no signal on two of the three
     panels, at no cost in run time or in agreement between halves of the
-    events. ``smooth_updates``,
-    ``smooth_rounds`` and ``smooth_fraction`` are read by ``smooth_fix`` and
-    ``spectral_correction``, not by ``fix_my_unmix``.
+    events. The scan's ``phase_two_rows`` 'all' was taken back: it let a
+    dye without clearly positive events be re-measured from whatever events
+    it dominated. Phase two regresses on the dyes present in a population
+    (``phase_two_active`` 'present') and tries phase one's back-solved row
+    when the re-measured one fails a leakage, conditioning or no-fit gate
+    (``phase_two_rescue`` 'backsolved'): on three fully stained panels this
+    removed the skews the re-measurement introduced between collinear dyes
+    and corrected residual spillover the re-measurement had rejected, at no
+    cost on Aurora and A8 bead-to-cell errors and a cost on ID7000 BD beads.
+    ``smooth_updates``, ``smooth_rounds``, ``smooth_fraction`` and
+    ``smooth_mode`` are read by ``smooth_fix`` and ``spectral_correction``,
+    not by ``fix_my_unmix``.
     """
     max_iter: int = 20
     downsample: int = 0                     # 0: off; else events kept (stratified)
@@ -307,9 +334,16 @@ class FixSettings:
     stop_confirm: int = 2                   # 'settled': iterations in a row every trusted error must be below threshold
     coefficient_decay: float = 0.0
     update_spectra: bool = True
-    phase_two_rows: str = 'all'             # see PHASE_TWO_ROWS
+    phase_two_rows: str = 'flagged'         # see PHASE_TWO_ROWS
     phase_two_adopt: str = 'remeasured'     # see PHASE_TWO_ADOPT
     phase_two_fallback: str = 'remeasured'  # see PHASE_TWO_FALLBACK: a row too small for the joint fit
+    phase_two_active: str = 'present'       # see PHASE_TWO_ACTIVE: the dyes fitted jointly with a signature
+    phase_two_present_frac: float = 0.02    # present: above its boundary in this share of the population
+    phase_two_present_corr: float = 0.3     # ... or its abundance correlated with the target's at least this
+    phase_two_present_mean: float = 0.5     # ... or its mean |abundance| at least this x its boundary
+    phase_two_rescue: str = 'backsolved'    # see PHASE_TWO_RESCUE: phase one's row when the re-measured one fails
+    rescue_reasons: tuple = ('leakage', 'conditioning', 'no.fit', 'not.joint')   # ... after these rejections
+    rescue_min_weight: float = 0.5          # ... for rows whose source weight is at least this
     step: float = 1.0
     intercept: bool = True
     min_explained: float = 0.8
@@ -338,6 +372,9 @@ class FixSettings:
     smooth_updates: bool = True             # smooth_fix: rounds averaged, not one run adopted
     smooth_rounds: int = 5
     smooth_fraction: float = 0.5            # share of the stained events each round draws
+    smooth_mode: str = 'damped'             # see SMOOTH_MODES: damped steps, or rounds from the start with consensus
+    consensus_min_rounds: float = 0.6       # consensus: share of the rounds that must accept a row
+    consensus_max_spread: float = 0.5       # ... their mean angle to their mean row, as a share of its move
     fixed_fluorophores: tuple = ()          # rows never corrected; names not in the panel ignored
     exclude_fixed_targets: bool = False     # fixed rows are also no target channel, lasso regressor or leakage target
 
@@ -1519,6 +1556,17 @@ def _check_settings(s: FixSettings) -> None:
         raise ValueError(f'Unknown phase-two adoption "{s.phase_two_adopt}".')
     if s.phase_two_fallback not in PHASE_TWO_FALLBACK:
         raise ValueError(f'Unknown phase-two fallback "{s.phase_two_fallback}".')
+    if s.phase_two_active not in PHASE_TWO_ACTIVE:
+        raise ValueError(f'Unknown phase-two active set "{s.phase_two_active}".')
+    if s.phase_two_rescue not in PHASE_TWO_RESCUE:
+        raise ValueError(f'Unknown phase-two rescue "{s.phase_two_rescue}".')
+    if s.smooth_mode not in SMOOTH_MODES:
+        raise ValueError(f'Unknown smooth mode "{s.smooth_mode}".')
+    if not (0.0 <= s.phase_two_present_frac <= 1.0 and 0.0 <= s.phase_two_present_corr <= 1.0
+            and s.phase_two_present_mean >= 0.0 and 0.0 <= s.rescue_min_weight <= 1.0):
+        raise ValueError('The present-dye shares and the rescue weight must lie between 0 and 1.')
+    if not (0.0 < s.consensus_min_rounds <= 1.0 and s.consensus_max_spread >= 0.0):
+        raise ValueError('Consensus needs 0 < min rounds <= 1 and a spread >= 0.')
     if s.stop_rule not in STOP_RULES:
         raise ValueError(f'Unknown stop rule "{s.stop_rule}".')
     if s.stall_rule not in STALL_RULES:
@@ -2021,8 +2069,26 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                 reject = 'fixed'
             cand = None
             if reject is None:
+                active = None
+                if s.phase_two_active == 'present' and idx.size:
+                    # only the dyes present in the row's population are regressors of its signature: above
+                    # their boundary in a share of its events, following the target's abundance, or carrying a
+                    # mean |abundance| of a fraction of their boundary; a small population then still gets a
+                    # joint fit instead of the fallback that books every other row's error against it
+                    u_pop = u[idx]
+                    tm_pop = tm[idx]
+                    frac = np.mean(u_pop > tm_pop, axis=0)
+                    with np.errstate(invalid='ignore', divide='ignore'):
+                        corr = np.corrcoef(u_pop, rowvar=False)[f]
+                    corr = np.where(np.isfinite(corr), np.abs(corr), 0.0)
+                    mean_abs = np.mean(np.abs(u_pop), axis=0) / np.maximum(np.mean(tm_pop, axis=0), _EPS)
+                    present = ((frac >= s.phase_two_present_frac) | (corr >= s.phase_two_present_corr)
+                               | (mean_abs >= s.phase_two_present_mean))
+                    present &= ~excluded
+                    present[f] = True
+                    active = [f] + [g for g in np.flatnonzero(present) if g != f]
                 cand = extract_raw_signature(
-                    residual[idx], spectra_new, u[idx], f, None, s.intercept, s.multivariate, s.ridge,
+                    residual[idx], spectra_new, u[idx], f, active, s.intercept, s.multivariate, s.ridge,
                     s.n_levels, s.min_bin_events, s.min_negative_events, background_raw, det_names)
                 if cand is None:
                     reject = 'no.fit'
@@ -2035,26 +2101,30 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                 reject = 'not.joint'
             leak_before = leak_after = cond_after = resid_change = like = implausible = np.nan
             trial = None
-            if reject is None:
-                # 'backsolved' keeps phase two as the judge but adopts phase one's own row
-                use_backsolved = s.phase_two_adopt == 'backsolved' or (
-                    not_joint and s.phase_two_fallback == 'backsolved')
-                target = backsolved[f] if use_backsolved else cand['signature']
+            rescued = None
+
+            def judge(target, f=f, idx=idx, design=design, cond_curr=cond_curr):
+                """The row gates on a candidate row for f: the plausibility box, the AF gate, conditioning,
+                leakage and the residual gate. Returns (reject, trial, like, implausible, cond_after,
+                leak_before, leak_after, resid_change)."""
+                reject = None
+                trial = None
+                like = implausible = cond_after = leak_before = leak_after = resid_change = np.nan
                 stepped = np.maximum(spectra_new[f] + s.step * (target - spectra_new[f]), 0.0)
                 if stepped.max() <= 0:
-                    reject = 'no.fit'
-                else:
-                    trial = spectra_new.copy()
-                    trial[f] = stepped / stepped.max()
-                    if plausible:
-                        # each detector keeps within the plausibility box of the reference row
-                        trial[f], implausible = clip_to_plausible(trial[f], reference[f], allow[f], s.plausibility_reset)
-                        if implausible > s.plausibility_reject:
-                            reject = 'implausible'
-                    like = af_likeness(trial[f] - spectra_new[f], bg.af_spectra)
-                    if reject is None and s.af_gate and like > s.af_gate_max:
-                        reject = 'af.like'
-            if reject is None:
+                    return 'no.fit', trial, like, implausible, cond_after, leak_before, leak_after, resid_change
+                trial = spectra_new.copy()
+                trial[f] = stepped / stepped.max()
+                if plausible:
+                    # each detector keeps within the plausibility box of the reference row
+                    trial[f], implausible = clip_to_plausible(trial[f], reference[f], allow[f], s.plausibility_reset)
+                    if implausible > s.plausibility_reject:
+                        reject = 'implausible'
+                like = af_likeness(trial[f] - spectra_new[f], bg.af_spectra)
+                if reject is None and s.af_gate and like > s.af_gate_max:
+                    reject = 'af.like'
+                if reject is not None:
+                    return reject, trial, like, implausible, cond_after, leak_before, leak_after, resid_change
                 design_trial = np.vstack([bg.basis, trial])
                 cond_after = condition_number(design_trial)
                 leak_seed = s.seed + (f + 1) * 1009
@@ -2073,13 +2143,31 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                         (s.residual_gate == 'no_increase' and resid_change > s.residual_margin)
                         or (s.residual_gate == 'decrease' and resid_change > -s.residual_margin)):
                     reject = 'residual'
-                if reject is None:
-                    spectra_new = trial
-                    design = design_trial
-                    cond_curr = cond_after
-            entry = {'index': f, 'fluorophore': fnames[f], 'n_events': int(idx.size)}
+                return reject, trial, like, implausible, cond_after, leak_before, leak_after, resid_change
+
+            if reject is None:
+                # 'backsolved' keeps phase two as the judge but adopts phase one's own row
+                use_backsolved = s.phase_two_adopt == 'backsolved' or (
+                    not_joint and s.phase_two_fallback == 'backsolved')
+                target = backsolved[f] if use_backsolved else cand['signature']
+                reject, trial, like, implausible, cond_after, leak_before, leak_after, resid_change = judge(target)
+            # the back-solved row as a second candidate when the re-measured one failed a gate that says
+            # nothing against the row itself and phase one's evidence for the row is strong
+            if (reject is not None and s.phase_two_rescue == 'backsolved' and reject in s.rescue_reasons
+                    and flagged[f] and not fixed[f]
+                    and float(source_log[f]['source_weight']) >= s.rescue_min_weight
+                    and float(row_angle(spectra_new[f:f + 1], backsolved[f:f + 1])[0]) <= s.max_angle):
+                judged = judge(backsolved[f])
+                if judged[0] is None:
+                    rescued = reject
+                    reject, trial, like, implausible, cond_after, leak_before, leak_after, resid_change = judged
+            if reject is None:
+                spectra_new = trial
+                design = np.vstack([bg.basis, trial])
+                cond_curr = cond_after
+            entry = {'index': f, 'fluorophore': fnames[f], 'n_events': int(idx.size), 'rescued_from': rescued}
             st = cand['stats'] if cand is not None else {}
-            for key in ('n_bins', 'joint', 'x_span', 'explained', 'explained_total', 'resid_rel', 'intercept_rel',
+            for key in ('n_bins', 'n_active', 'joint', 'x_span', 'explained', 'explained_total', 'resid_rel', 'intercept_rel',
                         'bg_align', 'clamp_frac', 'anchor_rel', 'vif_target', 'vif_max', 'deg_change',
                         'peak_curr', 'peak_new', 'peak_new_rel'):
                 entry[key] = st.get(key, np.nan)
@@ -2174,34 +2262,65 @@ def smooth_fix(spectra: np.ndarray, fluor_names: list, project, n_stained: int, 
         if s.plausibility_ratio > 0 else None
     n_keep = max(1, int(round(fraction * n_stained)))
     log, result = [], None
+    consensus = s.smooth_mode == 'consensus'
+    round_rows, round_accepted = [], []
     for r in range(int(rounds)):
         say(f'Round {r + 1} of {rounds}')
         keep = np.arange(n_stained) if n_keep >= n_stained else np.sort(rng.choice(n_stained, n_keep, replace=False))
-        unstained, stained, background = project(current, keep)
+        # consensus: every round is an independent run from the start on its own events
+        unstained, stained, background = project(start if consensus else current, keep)
         s_round = FixSettings(**{**asdict(s), 'seed': s.seed + r})
-        result = fix_my_unmix(current, fluor_names, unstained, stained, background, s_round,
+        result = fix_my_unmix(start if consensus else current, fluor_names, unstained, stained, background, s_round,
                               progress=lambda t, r=r: say(f'Round {r + 1}: {t}'),
                               **{'reference_spectra': start, **kwargs})
         moved = row_angle(current, result.spectra)
-        # only the rows this round changed take a step, so the others stay exactly as they were
-        step = np.any(result.spectra != current, axis=1)
-        current[step] = _normalise_rows(current[step] + (result.spectra[step] - current[step]) / (r + 1))
-        if allow is not None:
-            for f in np.flatnonzero(step):
-                current[f] = clip_to_plausible(current[f], reference[f], allow[f], s.plausibility_reset)[0]
+        if consensus:
+            round_rows.append(result.spectra.copy())
+            round_accepted.append(result.accepted.copy())
+        else:
+            # only the rows this round changed take a step, so the others stay exactly as they were
+            step = np.any(result.spectra != current, axis=1)
+            current[step] = _normalise_rows(current[step] + (result.spectra[step] - current[step]) / (r + 1))
+            if allow is not None:
+                for f in np.flatnonzero(step):
+                    current[f] = clip_to_plausible(current[f], reference[f], allow[f], s.plausibility_reset)[0]
         log.append({'round': r + 1, 'n_events': int(len(keep)), 'stop_reason': result.settings['stop_reason'],
                     'iterations': len(result.convergence_log),
                     'accepted': [result.fluor_names[i] for i in np.flatnonzero(result.accepted)],
                     'max_deg_round': float(moved.max()) if moved.size else 0.0})
+    agreement = {}
+    if consensus:
+        # a row is adopted as the mean of the rounds that accepted it when enough rounds did and they
+        # agree: their mean angle to that mean is at most consensus_max_spread of the move it makes
+        acc = np.array(round_accepted)
+        rows = np.array(round_rows)
+        for f in range(start.shape[0]):
+            k = int(acc[:, f].sum())
+            if k < s.consensus_min_rounds * len(round_rows):
+                continue
+            chosen = rows[acc[:, f], f]
+            mean = _normalise_rows(chosen.mean(axis=0, keepdims=True))
+            spread = float(row_angle(chosen, np.repeat(mean, len(chosen), axis=0)).mean())
+            move = float(row_angle(start[f:f + 1], mean)[0])
+            agreement[f] = (spread, move)
+            if move > 0 and spread <= s.consensus_max_spread * move:
+                current[f] = mean[0]
+                if allow is not None:
+                    current[f] = clip_to_plausible(current[f], reference[f], allow[f], s.plausibility_reset)[0]
     # a row counts as accepted when the rounds moved it; its reason says in how many rounds it was
     moved = np.any(current != start, axis=1)
     for entry in result.signature_log:
         f = entry['index']
         k = sum(result.fluor_names[f] in r['accepted'] for r in log)
         entry['rounds_accepted'] = k
+        if f in agreement:
+            entry['consensus_spread'], entry['consensus_move'] = agreement[f]
         if moved[f]:
             entry['accepted'] = True
             entry['reason'] = 'accepted' if k == len(log) else f'accepted in {k} of {len(log)} rounds'
+        elif f in agreement:
+            entry['accepted'] = False
+            entry['reason'] = 'rounds.disagree'
     result.spectra_start = start
     result.spectra = current
     result.smooth_log = log
