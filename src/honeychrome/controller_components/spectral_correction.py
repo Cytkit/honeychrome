@@ -74,7 +74,7 @@ SETUP_KEY = 'spectral_correction_setup'
 AUTO = '__auto__'
 ALL_GROUP = 'All samples'
 TOP_FOLDER = '(experiment folder)'
-DEFAULT_EVENTS = 200_000
+DEFAULT_EVENTS = 400_000
 DEFAULT_SEED = 42
 SAMPLE_TYPES = ('unstained', 'single_stain', 'beads')
 MIN_EVENTS = 200
@@ -85,9 +85,11 @@ MIN_EVENTS = 200
 # panel or one goal against another are offered, within the range tested: the
 # positivity boundary (spread kappa, unstained quantile and margin) and the
 # plausibility floor move some panels' rows more and others' less, smooth
-# updates trade accuracy for time, and the shared-direction check removes
-# co-expression at some cost in accuracy. The other settings stay at their
-# defaults: moving them was worse or made no difference.
+# updates trade accuracy for time, their consensus mode keeps only the
+# corrections the rounds agree on at the cost of the rest, and the
+# shared-direction check removes co-expression at some cost in accuracy. The
+# other settings stay at their defaults: moving them was worse or made no
+# difference.
 EXPOSED_SETTINGS = (
     ('spread_kappa', 'Spread kappa (SDs)', 'float', 2.0, 4.0, 0.5, 2),
     ('unstained_threshold', 'Unstained quantile', 'float', 0.95, 0.99, 0.01, 3),
@@ -96,6 +98,9 @@ EXPOSED_SETTINGS = (
      0.003, 0.01, 0.001, 3),
     ('shared_direction', 'Shrink coefficients unrelated dyes share (co-expression)', 'bool', None, None, None, None),
     ('smooth_updates', 'Smooth updates (rounds averaged; slower)', 'bool', None, None, None, None),
+    ('smooth_mode', 'Smooth updates: keep',
+     (('damped', 'Every round\'s result, averaged'), ('consensus', 'Only corrections the rounds agree on')),
+     None, None, None, None),
 )
 
 
