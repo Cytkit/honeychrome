@@ -85,7 +85,21 @@ Phase two
     conditioning, or no fit) and phase one's evidence for the row is strong
     (``rescue_min_weight``), the back-solved row is tried as a second
     candidate through the same box, AF, angle, conditioning and leakage
-    gates (``phase_two_rescue='backsolved'``). The optional residual gate
+    gates (``phase_two_rescue='backsolved'``). A tandem fluorophore whose
+    parent is in the panel (``tandems``, from the fluorophore database's
+    ``tandem.parent``) has a third candidate when the others fail: its
+    starting row with only its parent fraction changed, by phase one's
+    tandem-to-parent coefficient when that is at least
+    ``tandem_min_coefficient`` (``tandem_candidate``). Breakdown emits the
+    parent, and a reference with more breakdown than the sample carries
+    too much of it, so the parent direction is the expected one: the
+    candidate passes the angle, conditioning and leakage gates but not the
+    plausibility box. The leakage gate sums the off-target medians of the
+    row's own population over the channels that population is negative for
+    (``leakage_channels='negative'``: fewer than half its events above the
+    channel's boundary); a marker expressed on the same cells is not
+    leakage, and would otherwise swamp the residual the row corrects. The
+    optional residual gate
     compares the OLS residual of the fluorophore's positive events before
     and after the change; it is blind to the in-span part of a change by
     construction.
@@ -204,6 +218,7 @@ STALL_RULES = ('trend', 'patience')
 PHASE_TWO_ACTIVE = ('all', 'present')
 PHASE_TWO_RESCUE = ('off', 'backsolved')
 SMOOTH_MODES = ('damped', 'consensus')
+LEAKAGE_CHANNELS = ('all', 'negative')
 # generator keys of seed_streams, one stream per purpose and fluorophore
 _STREAM_EVIDENCE, _STREAM_LASSO, _STREAM_SLOPES, _STREAM_DOWNSAMPLE, _STREAM_SMOOTH = 1, 2, 3, 4, 5
 
@@ -344,6 +359,9 @@ class FixSettings:
     phase_two_rescue: str = 'backsolved'    # see PHASE_TWO_RESCUE: phase one's row when the re-measured one fails
     rescue_reasons: tuple = ('leakage', 'conditioning', 'no.fit', 'not.joint')   # ... after these rejections
     rescue_min_weight: float = 0.5          # ... for rows whose source weight is at least this
+    leakage_channels: str = 'negative'      # see LEAKAGE_CHANNELS: the channels the leakage gate sums over
+    tandem_candidate: bool = True           # a tandem row: the parent-fraction row when the others fail
+    tandem_min_coefficient: float = 0.01    # ... with a tandem -> parent coefficient of at least this
     step: float = 1.0
     intercept: bool = True
     min_explained: float = 0.8
@@ -1562,6 +1580,10 @@ def _check_settings(s: FixSettings) -> None:
         raise ValueError(f'Unknown phase-two rescue "{s.phase_two_rescue}".')
     if s.smooth_mode not in SMOOTH_MODES:
         raise ValueError(f'Unknown smooth mode "{s.smooth_mode}".')
+    if s.leakage_channels not in LEAKAGE_CHANNELS:
+        raise ValueError(f'Unknown leakage channels "{s.leakage_channels}".')
+    if s.tandem_min_coefficient < 0:
+        raise ValueError('The tandem coefficient floor must be >= 0.')
     if not (0.0 <= s.phase_two_present_frac <= 1.0 and 0.0 <= s.phase_two_present_corr <= 1.0
             and s.phase_two_present_mean >= 0.0 and 0.0 <= s.rescue_min_weight <= 1.0):
         raise ValueError('The present-dye shares and the rescue weight must lie between 0 and 1.')
@@ -1651,7 +1673,7 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                  background: Background, settings: FixSettings | None = None, spread: np.ndarray | None = None,
                  variant_deltas: list | None = None, true_spectra: np.ndarray | None = None,
                  detector_names: list | None = None, progress=None,
-                 reference_spectra: np.ndarray | None = None) -> FixResult:
+                 reference_spectra: np.ndarray | None = None, tandems: list | None = None) -> FixResult:
     """
     Correct in-span reference-spectrum error from fully stained events.
 
@@ -1671,6 +1693,9 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
     reference_spectra : (F, D) rows the plausibility bounds are measured
                      from (default ``spectra``; ``smooth_fix`` passes the
                      spectra its rounds started from).
+    tandems        : ``(row, parent_row)`` pairs over the rows of ``spectra``
+                     (``tandem_pairs``): tandem fluorophores whose parent is
+                     in the panel, for the parent-fraction candidate.
 
     See the module docstring for the method. Returns a FixResult whose
     ``spectra`` keep every row that failed a gate.
@@ -2059,6 +2084,11 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
         cond_curr = condition_number(design)
         k_bg = bg.n_bg
         panel_rows = [k_bg + i for i in range(n_fluor) if not excluded[i]]
+        parent_of = {}
+        for row, parent in (tandems or ()):
+            row, parent = int(row), int(parent)
+            if row in fl and parent in fl and row != parent:
+                parent_of[fl.index(row)] = fl.index(parent)
         # a row phase one left alone has no in-span change to re-measure
         flagged = np.max(np.abs(spill - eye), axis=1) >= s.convergence_threshold
         for f in range(n_fluor):
@@ -2102,11 +2132,19 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
             leak_before = leak_after = cond_after = resid_change = like = implausible = np.nan
             trial = None
             rescued = None
+            candidate = 'remeasured'
+            # the leakage gate sums the off-target medians of the row's population; with 'negative' only over
+            # the channels that population is negative for, so a marker expressed on the same cells (a median
+            # of a third of the target's, with every cell above its boundary) is not counted as leakage
+            leak_rows = panel_rows
+            if s.leakage_channels == 'negative' and idx.size:
+                share = np.mean(u[idx] > tm[idx], axis=0)
+                leak_rows = [k_bg + g for g in range(n_fluor) if not excluded[g] and (g == f or share[g] < 0.5)]
 
-            def judge(target, f=f, idx=idx, design=design, cond_curr=cond_curr):
-                """The row gates on a candidate row for f: the plausibility box, the AF gate, conditioning,
-                leakage and the residual gate. Returns (reject, trial, like, implausible, cond_after,
-                leak_before, leak_after, resid_change)."""
+            def judge(target, box=True, f=f, idx=idx, design=design, cond_curr=cond_curr, leak_rows=leak_rows):
+                """The row gates on a candidate row for f: the plausibility box and the AF gate (``box``),
+                conditioning, leakage and the residual gate. Returns (reject, trial, like, implausible,
+                cond_after, leak_before, leak_after, resid_change)."""
                 reject = None
                 trial = None
                 like = implausible = cond_after = leak_before = leak_after = resid_change = np.nan
@@ -2115,21 +2153,21 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                     return 'no.fit', trial, like, implausible, cond_after, leak_before, leak_after, resid_change
                 trial = spectra_new.copy()
                 trial[f] = stepped / stepped.max()
-                if plausible:
+                if plausible and box:
                     # each detector keeps within the plausibility box of the reference row
                     trial[f], implausible = clip_to_plausible(trial[f], reference[f], allow[f], s.plausibility_reset)
                     if implausible > s.plausibility_reject:
                         reject = 'implausible'
                 like = af_likeness(trial[f] - spectra_new[f], bg.af_spectra)
-                if reject is None and s.af_gate and like > s.af_gate_max:
+                if reject is None and box and s.af_gate and like > s.af_gate_max:
                     reject = 'af.like'
                 if reject is not None:
                     return reject, trial, like, implausible, cond_after, leak_before, leak_after, resid_change
                 design_trial = np.vstack([bg.basis, trial])
                 cond_after = condition_number(design_trial)
                 leak_seed = s.seed + (f + 1) * 1009
-                leak_before = leakage(residual[idx], design, k_bg + f, panel_rows, np.random.default_rng(leak_seed))
-                leak_after = leakage(residual[idx], design_trial, k_bg + f, panel_rows,
+                leak_before = leakage(residual[idx], design, k_bg + f, leak_rows, np.random.default_rng(leak_seed))
+                leak_after = leakage(residual[idx], design_trial, k_bg + f, leak_rows,
                                      np.random.default_rng(leak_seed))
                 positive = np.flatnonzero(u[:, f] > tm[:, f])
                 resid_change = residual_change(residual[positive], design, design_trial,
@@ -2160,12 +2198,29 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                 judged = judge(backsolved[f])
                 if judged[0] is None:
                     rescued = reject
+                    candidate = 'backsolved'
                     reject, trial, like, implausible, cond_after, leak_before, leak_after, resid_change = judged
+            # a tandem row whose other candidates failed: the start row with only its parent fraction changed
+            # by phase one's tandem -> parent coefficient (breakdown, or a reference with more breakdown than
+            # the sample); the parent direction is the expected one, so the plausibility box does not apply
+            tandem_coef = float(spill[f, parent_of[f]]) if f in parent_of else np.nan
+            if (reject is not None and s.tandem_candidate and f in parent_of and not fixed[f] and flagged[f]
+                    and abs(tandem_coef) >= s.tandem_min_coefficient):
+                target = spectra_fluor[f] + tandem_coef * spectra_fluor[parent_of[f]]
+                if target.max() > 0 and float(row_angle(spectra_new[f:f + 1], target[None, :])[0]) <= s.max_angle:
+                    judged = judge(target / target.max(), box=False)
+                    if judged[0] is None:
+                        rescued = reject
+                        candidate = 'parent'
+                        reject, trial, like, implausible, cond_after, leak_before, leak_after, resid_change = judged
             if reject is None:
                 spectra_new = trial
                 design = np.vstack([bg.basis, trial])
                 cond_curr = cond_after
-            entry = {'index': f, 'fluorophore': fnames[f], 'n_events': int(idx.size), 'rescued_from': rescued}
+            entry = {'index': f, 'fluorophore': fnames[f], 'n_events': int(idx.size), 'rescued_from': rescued,
+                     'candidate': candidate if reject is None else '',
+                     'tandem_parent': fnames[parent_of[f]] if f in parent_of else '',
+                     'tandem_coefficient': tandem_coef}
             st = cand['stats'] if cand is not None else {}
             for key in ('n_bins', 'n_active', 'joint', 'x_span', 'explained', 'explained_total', 'resid_rel', 'intercept_rel',
                         'bg_align', 'clamp_frac', 'anchor_rel', 'vif_target', 'vif_max', 'deg_change',
@@ -2211,6 +2266,30 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
         recovery=recovery, n_events=n_events, n_events_fit=len(stained_fit['abundance']),
         settings=settings_dict, background=bg,
     )
+
+
+def tandem_pairs(fluor_names: list, fluor_db: list | None = None) -> list:
+    """
+    ``(row, parent_row)`` over ``fluor_names`` for every tandem fluorophore
+    whose parent is also in the panel, by the fluorophore database's
+    ``tandem.parent`` (Protein and SIRIGEN tandems; names matched
+    canonically). A tandem whose parent is not in the panel is left out.
+    """
+    from honeychrome.controller_components.label_matching import get_fluorophore_db, match_fluorophore
+
+    db = get_fluorophore_db() if fluor_db is None else fluor_db
+    by_name = {str(row.get('fluorophore', '')).strip().upper(): row for row in db}
+    names = [str(n) for n in fluor_names]
+    canonical = [(match_fluorophore(n, db) or n).strip().upper() for n in names]
+    out = []
+    for i, name in enumerate(canonical):
+        parent = str((by_name.get(name) or {}).get('tandem.parent') or '').strip().upper()
+        if not parent or names[i] == AF_NAME:
+            continue
+        parent_row = next((j for j, c in enumerate(canonical) if c == parent and j != i), None)
+        if parent_row is not None:
+            out.append((i, parent_row))
+    return out
 
 
 def _normalise_rows(rows: np.ndarray) -> np.ndarray:
