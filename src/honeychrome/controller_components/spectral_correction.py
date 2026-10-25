@@ -367,6 +367,7 @@ def correction_snapshot(controller, setup: CorrectionSetup, unstained: dict) -> 
         'libraries': libraries, 'af_of': af_of, 'af_profiles': af_profiles, 'spread': spread, 'deltas': deltas,
         'n_variants': int(sum(d is not None for d in deltas)),
         'settings': fix_settings(setup), 'n_events': int(setup.n_events), 'seed': int(setup.seed),
+        'tandems': fm.tandem_pairs([names[i] for i in fl]),
         'per_group': bool(setup.per_group), 'base_fingerprint': spectra_fingerprint(list(names), spectra),
         'spread_snapshot': spread_snapshot(controller, list(names), np.asarray(spectra, dtype=np.float64),
                                            unstained[next(iter(groups))]),
@@ -454,6 +455,7 @@ def run_group(snap: dict, group: str, progress, loader=None) -> dict:
     spread = None if snap['spread'] is None else snap['spread'][np.ix_(snap['fl'], snap['fl'])]
     deltas = [snap['deltas'][i] for i in snap['fl']] if snap['n_variants'] else None
     run_kw = dict(spread=spread, variant_deltas=deltas, detector_names=list(snap['layout']['detectors']),
+                  tandems=snap.get('tandems'),
                   progress=say)
     started = time.perf_counter()
     if smooth:
