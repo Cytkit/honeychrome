@@ -1164,3 +1164,11 @@ def build_display_label_map(pnn, spectral_model):
         antigen = label_to_antigen.get(name, '')
         result[name] = f'{antigen} {name}'.strip() if antigen else name
     return result
+
+
+from scipy import signal
+# sos_butter = signal.butter(16, 1, fs=2.5, output='sos')
+sos_ellip = signal.ellip(16, 1, 40, 0.5, fs=2.5, output='sos')
+def smoothing_filter(trace):
+    trace = signal.sosfiltfilt(sos_ellip, trace)
+    return trace

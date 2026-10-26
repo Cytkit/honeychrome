@@ -13,6 +13,7 @@ import threading
 import numpy as np
 import time
 
+from honeychrome.controller_components.functions import smoothing_filter
 from honeychrome.settings import traces_cache_size, max_events_in_traces_cache, trace_n_points, n_channels_trace, adc_rate, threshold_retrieved, n_time_points_in_event, window_extension_length_pre, baseline_decay_rate, window_extension_length_post, timeout_length, deltaT, adc_scale_uv
 from honeychrome.settings import max_events_in_cache, n_channels_per_event, event_channels_pnn, analyser_target_repeat_time, baseline_length
 from honeychrome.settings import adc_channels, peak_detection_channel_retrieved, area_channels, height_channels, width_channels, scatter_channels, fluorescence_channels
@@ -300,6 +301,8 @@ class TraceAnalyser(mp.Process):
                     widths = np.zeros(n_new_events)
                     last_event_index = 0
                     for n, traces in enumerate(traces_batch_scaled):
+                        for i in range(len(traces)):
+                            traces[i] = smoothing_filter(traces[i])
                         tr_peak_detection = traces[self.indices_peak_detection_channel_in_traces]
                         if not (tr_peak_detection == tr_peak_detection).any():
                             # print('all nan') # debug: why would an all nan trigger trace come through?

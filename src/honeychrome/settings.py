@@ -210,6 +210,7 @@ default_ceiling = 20
 magnitude_ceiling = 2**18 # according to convention
 magnitude_ceilings = ['2**18 = 262144', '2**22 = 4194304', '2**24 = 16777216'] # 2**16 = 65536, 2**18 = 262144, 2**22 = 4194304, 2**24 = 16777216
 magnitude_ceilings_int = [262144, 4194304, 16777216]
+# channel_pnr = [262144 if n in scatter_channel_ids else 4194304 for n, channel in enumerate(event_channels_pnn)]
 
 linear_a = 100
 logicle_w = 0.5
@@ -234,7 +235,8 @@ raw_settings = {
     'scatter_channel_ids': scatter_channel_ids,
     'n_scatter_channels': n_scatter_channels,
     'fluorescence_channel_ids': fluorescence_channel_ids,
-    'n_fluorophore_channels': n_fluorophore_channels
+    'n_fluorophore_channels': n_fluorophore_channels,
+    # 'channel_pnr': channel_pnr
 }
 
 unmixed_settings = {
