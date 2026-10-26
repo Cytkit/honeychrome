@@ -1342,16 +1342,21 @@ def apply_name_sync(gate_defs: list[dict], gate_name: str) -> tuple[list[str], s
     return changed, None
 
 
+def _sync_groups(gate_defs: list[dict]) -> list[list[dict]]:
+    """Every group of two or more replicates (see sync_members), in the
+    order their first member appears; one pass over the gates."""
+    groups: dict[tuple, list[dict]] = {}
+    for g in gate_defs:
+        if g.get('gate_name'):
+            groups.setdefault(_sync_key(g), []).append(g)
+    return [members for members in groups.values() if len(members) > 1]
+
+
 def sync_conflicts(gate_defs: list[dict]) -> list[str]:
     """Names of the groups of same-named gates whose user-set members use
     different configurations, so the others are not updated."""
-    seen, out = set(), []
-    for g in gate_defs:
-        key = _sync_key(g)
-        if key in seen:
-            continue
-        seen.add(key)
-        members = sync_members(gate_defs, g['gate_name'])
+    out = []
+    for members in _sync_groups(gate_defs):
         prints = {sync_fingerprint(m) for m in members if _user_set(m)}
         if len(prints) > 1:
             out.append(_group_label(members))
@@ -1361,13 +1366,8 @@ def sync_conflicts(gate_defs: list[dict]) -> list[str]:
 def conflicting_gate_names(gate_defs: list[dict]) -> set:
     """Names of every gate in a same-named group whose user-set members use
     different configurations (see sync_conflicts)."""
-    seen, out = set(), set()
-    for g in gate_defs:
-        key = _sync_key(g)
-        if key in seen:
-            continue
-        seen.add(key)
-        members = sync_members(gate_defs, g['gate_name'])
+    out = set()
+    for members in _sync_groups(gate_defs):
         if len({sync_fingerprint(m) for m in members if _user_set(m)}) > 1:
             out |= {m['gate_name'] for m in members}
     return out
