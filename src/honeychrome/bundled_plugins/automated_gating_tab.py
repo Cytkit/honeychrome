@@ -2,14 +2,15 @@
 automated_gating_tab.py — Automated Gating plugin for Honeychrome
 =================================================================
 Builds a gating model (``.agmodel``), applies it to experiment samples and
-compares the gated populations between sample groups. The first five
-pages build the model (``ag_builder.BuilderPages``):
+compares the gated populations between sample groups. Five pages build
+the model (``ag_builder.BuilderPages``):
 
-  • Transforms, Import/Setup, Hierarchy, Train, Export — see ag_builder.py.
+  • Transforms, Import/Setup, Hierarchy, Train — see ag_builder.py; Export,
+              the last page, saves the model.
               A saved model is loaded on Import/Setup, where its channels
               are matched to this experiment antigen by antigen.
 
-and the last three apply it:
+and three apply it, after Train:
 
   • Run     — choose for each gate whether its stored boundary is applied as
               it is (fixed) or recalculated on each sample (recalculate,
@@ -63,7 +64,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from PySide6.QtCore import Qt, QTimer, Signal, QSettings, QThread
+from PySide6.QtCore import Qt, QTimer, Signal, QThread
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
@@ -80,6 +81,7 @@ import honeychrome
 from honeychrome.settings import af_abundance_channel
 from honeychrome.controller_components import differential_stats as ds
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy
+from honeychrome.controller_components import experiment_state
 from honeychrome.view_components import suggest_groupings_dialog as sgd
 from honeychrome.view_components.checkable_header import CheckableHeaderView
 from honeychrome.controller_components.functions import (
@@ -372,6 +374,10 @@ class GatingRunState:
                      statistic; permutations; seed; minimum set size;
                      {population key: cell type} overrides).
     fsea           : the last enrichment run (kept in ENRICHMENT_FILE).
+
+    results_revision (not a field) counts the times one of _RESULT_FIELDS
+    was given another object, so the pages can tell whether the results
+    they show are still current without comparing them.
     """
     model_path: str = ''
     applied_model: dict = field(default_factory=dict)
@@ -443,6 +449,12 @@ class GatingRunState:
     fsea_overrides: dict = field(default_factory=dict)
     fsea: dict = field(default_factory=dict)
 
+    def __setattr__(self, name, value):
+        if name in _RESULT_FIELDS and value is not self.__dict__.get(name):
+            object.__setattr__(self, 'results_revision',
+                               self.__dict__.get('results_revision', 0) + 1)
+        object.__setattr__(self, name, value)
+
     def gate_defs(self) -> list[dict]:
         return list((self.applied_model or {}).get('gate_definitions') or [])
 
@@ -457,6 +469,15 @@ class GatingRunState:
     def flags(self, key: str) -> list[str]:
         return ag_results.sample_flags(self.summaries.get(key) or {}, self.load_info.get(key))
 
+
+# Large results, tracked by GatingRunState.results_revision.
+_RESULT_FIELDS = ('applied_model', 'summaries', 'load_info', 'display', 'stats', 'pca',
+                  'predictive', 'fsea')
+# Further fields the Run, Results and Enrichment pages show (with
+# _PERSISTED_FIELDS), compared by content.
+_VIEW_FIELDS = ('model_path', 'model_sha', 'results_model_sha', 'marker_channels',
+                'pending_samples', 'run_fingerprint', 'run_unmixing', 'transform_params',
+                'run_transforms')
 
 _PERSISTED_FIELDS = (
     'modes', 'drift_limit', 'drift_action', 'run_samples', 'validation_samples', 'include_controls',
@@ -787,7 +808,8 @@ class RunTab(QWidget):
 
     The gated views show the gates drawn on the population picked in the
     hierarchy: pooled over every gated sample (the stored boundaries) and,
-    in a row each, for every validation sample (its own boundaries).
+    in a row each, for the sample selected in the main window's sample
+    panel and for every validation sample (their own boundaries).
 
     gating_transforms : callable -> {channel: Transform} gating uses.
     result_transforms : callable -> {channel: Transform} the gated results
@@ -826,7 +848,7 @@ class RunTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
-        outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_RUN))
+        outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_RUN, scrolling=True))
 
         self.banner = QLabel("")
         self.banner.setWordWrap(True)
@@ -838,6 +860,9 @@ class RunTab(QWidget):
         cl = QVBoxLayout(self.content)
         cl.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self.content, stretch=1)
+        # Takes the space when the content is hidden, so the help and the
+        # banner stay at the top.
+        outer.addStretch()
 
         # One section open at a time; each page scrolls on its own.
         self.toolbox = make_concertina()
@@ -928,6 +953,13 @@ class RunTab(QWidget):
                                    "over every gated sample's display events.")
         self.chk_pooled.toggled.connect(lambda _on: self._draw_tiles())
         view_row.addWidget(self.chk_pooled)
+        self.chk_selected = QCheckBox("Selected sample")
+        self.chk_selected.setChecked(True)
+        self.chk_selected.setToolTip("A row of the population's gates with the own boundaries "
+                                     "of the sample selected in the sample panel, once it has "
+                                     "been gated.")
+        self.chk_selected.toggled.connect(lambda _on: self._draw_tiles())
+        view_row.addWidget(self.chk_selected)
         self.lbl_views = QLabel("")
         self.lbl_views.setStyleSheet("color: #555; font-style: italic;")
         view_row.addWidget(self.lbl_views, stretch=1)
@@ -1479,6 +1511,29 @@ class RunTab(QWidget):
         st = self.state
         return [k for k in st.validation_samples if k in st.display and k in st.summaries]
 
+    def _selected_shown(self) -> str | None:
+        """The gated sample selected in the main window's sample panel,
+        when it has plots and is not already shown as a validation sample."""
+        if not self.chk_selected.isChecked():
+            return None
+        current = getattr(self.controller, 'current_sample_path', None)
+        if not current:
+            return None
+        current = str(current).replace('\\', '/')
+        st = self.state
+        for k in st.display:
+            if str(k).replace('\\', '/') == current:
+                if k in st.summaries and k not in st.validation_samples:
+                    return k
+                return None
+        return None
+
+    def selected_sample_changed(self):
+        """The main window selected another sample: redraw the gated views
+        when they show the selected sample."""
+        if self.chk_selected.isChecked() and self.toolbox.currentIndex() == self._page_views:
+            self._draw_tiles()
+
     def _pooled(self, samples: list[str], gate_def: dict):
         """Pooled display events of *samples* (concatenated once) with
         *gate_def*'s parent mask."""
@@ -1526,16 +1581,22 @@ class RunTab(QWidget):
         self.lbl_views.setText(
             f"{len(st.display)} sample(s) with plots; {len(validation)} validation sample(s) shown"
             + (f" ({len(missing)} ticked but not gated)" if missing else ''))
+        selected = self._selected_shown()
         rows = ([('pooled', None)] if self.chk_pooled.isChecked() else []) + \
-            [('sample', k) for k in validation]
+            ([('selected', selected)] if selected else []) + \
+            [('validation', k) for k in validation]
         r = 0
         for kind, key in rows:
             head = QLabel("<b>All gated samples</b> <small>(stored boundaries, % of pooled "
                           "display events)</small>" if kind == 'pooled' else
-                          f"<b>{_sample_label(key)}</b> <small>[validation"
+                          f"<b>{_sample_label(key)}</b> <small>[{kind}"
                           + (f"; {st.sample_groups[key]}" if st.sample_groups.get(key) else '')
                           + "]</small>")
-            self.tile_grid.addWidget(head, r, 0, 1, max(1, len(shown)))
+            # Space above each heading after the first, so it sits with the
+            # row of plots it names (below it), not the row above.
+            head.setContentsMargins(0, 18 if r else 0, 0, 0)
+            self.tile_grid.addWidget(head, r, 0, 1, max(1, len(shown)),
+                                     Qt.AlignLeft | Qt.AlignBottom)
             r += 1
             for c, g in enumerate(shown):
                 name = g['gate_name']
@@ -1568,7 +1629,8 @@ class RunTab(QWidget):
                 self.tile_grid.addWidget(tile, r, c)
             r += 1
         if not rows:
-            self.tile_grid.addWidget(QLabel("Tick 'Pooled' or some validation samples."), 0, 0)
+            self.tile_grid.addWidget(QLabel("Tick 'Pooled', select a gated sample in the sample "
+                                            "panel or tick some validation samples."), 0, 0)
 
     def _draw_summary_table(self):
         _clear_layout(self.summary_holder)
@@ -1802,7 +1864,7 @@ class ResultsTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
-        outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_RESULTS))
+        outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_RESULTS, scrolling=True))
         cmp_row = QHBoxLayout()
         cmp_row.addWidget(QLabel("<b>Comparison:</b>"))
         self.cb_comparison = QComboBox()
@@ -3794,18 +3856,19 @@ class PluginWidget(QWidget):
     """Top-level widget for the Automated Gating plugin.
 
     Pages, listed down the left-hand side: Transforms, Import/Setup,
-    Hierarchy, Train and Export build the model (ag_builder.BuilderPages,
-    which owns the model state, the transforms and their persistence); Run,
-    Results and Enrichment apply it (GatingRunState). Run applies the model
-    as it stands on the model pages, in their transforms: state.applied_model
-    is rebuilt from them (_sync_applied_model) whenever one of the last three
-    pages is shown.
+    Hierarchy and Train build the model (ag_builder.BuilderPages, which owns
+    the model state, the transforms and their persistence); Run, Results and
+    Enrichment apply it (GatingRunState); Export, last, saves the model (a
+    BuilderPages page). Run applies the model as it stands on the model
+    pages, in their transforms: state.applied_model is rebuilt from them
+    (_sync_applied_model) whenever Run, Results or Enrichment is shown.
 
-    Persistence: the model pages keep their own QSettings group and session
-    file (see BuilderPages). The settings of the last three pages (gate
-    modes, drift settings, sample selection, groups, covariates and
-    statistics options) are kept in QSettings per experiment as one JSON
-    string. Gated results (counts, medians and per-gate status) are kept in
+    Persistence: everything is kept in the experiment folder, tied to the
+    .kit it belongs to (see experiment_state). The model pages keep their
+    own settings and session file (see BuilderPages). The settings of the
+    last three pages (gate modes, drift settings, sample selection, groups,
+    covariates and statistics options) are kept as one JSON string in
+    cache/automated_gating/state.json. Gated results (counts, medians and per-gate status) are kept in
     RESULTS_FILE in the experiment folder, with the samples a paused run has
     still to gate, and each sample's display record in DISPLAY_DIR; the last
     statistics run is kept in STATS_FILE and the last enrichment run in
@@ -3826,7 +3889,8 @@ class PluginWidget(QWidget):
 
         self.state = GatingRunState()
         self._result_tf = (None, None)
-        self._qsettings = QSettings('honeychrome', 'plugin_automated_gating')
+        # The loaded experiment's settings store, opened by load_state.
+        self._store = None
         self._plugin_was_active = False
         self._loaded_experiment_key = None
         self._loaded_experiment_dir = None
@@ -3836,6 +3900,12 @@ class PluginWidget(QWidget):
         self._legacy = {'path': '', 'alignment': {}}
         self._page_shown = None
         self._model_stale = True
+        # The model pages' signature the applied model was last built from,
+        # the run settings last written to QSettings, and, per Run/Results/
+        # Enrichment page, the view key it last showed (see _view_key).
+        self._synced_signature = None
+        self._saved_run_state = None
+        self._shown_keys: dict = {}
 
         self.label_disabled = QLabel(f"{plugin_name}: Loading...Set up the spectral model if you have not already done so.")
         self.label_disabled.setWordWrap(True)
@@ -3854,8 +3924,11 @@ class PluginWidget(QWidget):
         overall.setContentsMargins(6, 6, 6, 6)
         overall.addWidget(self.label_disabled)
         overall.addWidget(self.content_widget, stretch=1)
+        overall.addStretch()
 
-        self.inner_tabs = SideTabWidget()
+        # Each page scrolls on its own, so a wide page never sets a minimum
+        # width for the main window's tabs (and so for the sample panel).
+        self.inner_tabs = SideTabWidget(scroll_pages=True)
         self.builder = ag_builder.BuilderPages(
             bus, controller, self.inner_tabs, application=self._application,
             extra_samples=lambda: list(self.state.run_samples) or self.state.gated_samples(),
@@ -3879,6 +3952,7 @@ class PluginWidget(QWidget):
         self.inner_tabs.addTab(self.run_tab, "Run", 'player-play')
         self.inner_tabs.addTab(self.results_tab, "Results", 'table')
         self.inner_tabs.addTab(self.enrichment_tab, "Enrichment", 'sparkles')
+        self.inner_tabs.addTab(self.builder.export_tab, "Export", 'file-export')
         self._page_shown = self.inner_tabs.currentWidget()
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
         content_layout.addWidget(self.inner_tabs, stretch=1)
@@ -3923,6 +3997,8 @@ class PluginWidget(QWidget):
         if getattr(self.controller, 'current_mode', None) != plugin_name:
             return
         QTimer.singleShot(0, self.builder.on_sample_loaded)
+        if self.inner_tabs.currentWidget() is self.run_tab:
+            QTimer.singleShot(0, self.run_tab.selected_sample_changed)
 
     def _show_if_ready(self):
         if self.controller.experiment.process.get('unmixing_matrix') is not None:
@@ -3939,7 +4015,7 @@ class PluginWidget(QWidget):
         """Load the persisted state when the experiment has changed (the
         model pages at once, the results in the background). Returns True
         when loading started."""
-        current_key = self._settings_key()
+        current_key = self._experiment_key()
         if current_key == self._loaded_experiment_key:
             return False
         # A run's results belong to the experiment it started in.
@@ -3953,33 +4029,68 @@ class PluginWidget(QWidget):
         self._loaded_experiment_key = current_key
         self._loaded_experiment_dir = Path(self.controller.experiment_dir)
         self._result_tf = (None, None)
+        self._synced_signature = None
+        self._shown_keys = {}
         self.builder.switch_experiment(current_key, self._loaded_experiment_dir)
         self.load_state()
         return True
 
     def _on_inner_tab_changed(self, index: int):
-        """Save what the page being left may have changed, then refresh the
-        page shown (the model pages' state is large, so it is saved only on
-        leaving one of them)."""
+        """The page being left shows the state as it stands, so it is noted
+        as current and what changed is saved; then the page shown is
+        refreshed if the state or its context changed since it was last
+        shown."""
         left, self._page_shown = self._page_shown, self.inner_tabs.widget(index)
+        signature = self.builder.signature()
         if self.builder.owns(left):
-            self.builder.save_state()
+            self.builder.page_left(left, signature)
             self._model_stale = True
+        elif left in self._shown_keys:
+            # A page keeps its own settings up to date while it is shown; the
+            # rest of its key (results, model, context) stays as it was when
+            # it was last refreshed, since those can change in the background.
+            key = list(self._shown_keys[left])
+            key[1] = self._settings_digest()
+            self._shown_keys[left] = tuple(key)
         self._save_run_state()
         if not self._loading:
-            self._refresh_tab_at(index)
+            self._refresh_tab_at(index, signature)
 
     def _refresh_active_tab(self):
         self._refresh_tab_at(self.inner_tabs.currentIndex())
 
-    def _refresh_tab_at(self, index: int):
+    def _run_pages(self) -> tuple:
+        return (self.run_tab, self.results_tab, self.enrichment_tab)
+
+    def _settings_digest(self) -> str:
+        st = self.state
+        return ag_core.content_digest(
+            {name: getattr(st, name) for name in _PERSISTED_FIELDS + _VIEW_FIELDS})
+
+    def _view_key(self, signature: str) -> tuple:
+        """What the Run, Results and Enrichment pages show: the model pages'
+        state, the run settings (second), the results and the experiment
+        around them."""
+        st = self.state
+        return (signature, self._settings_digest(), st.results_revision,
+                len(st.summaries), len(st.display), self.run_tab.is_running(),
+                ag_builder.view_context(self.controller))
+
+    def _refresh_tab_at(self, index: int, signature: str | None = None):
         widget = self.inner_tabs.widget(index)
-        if self.builder.refresh_page(widget):
+        if self.builder.refresh_page(widget, signature):
             return
-        if widget in (self.run_tab, self.results_tab, self.enrichment_tab):
+        if widget in self._run_pages():
+            signature = signature or self.builder.signature()
             if self._model_stale and not self.run_tab.is_running():
-                self._sync_applied_model()
+                self._sync_applied_model(signature)
+            if self._shown_keys.get(widget) == self._view_key(signature):
+                if widget is self.run_tab:
+                    # The unmixing is not part of the view key: check it.
+                    self.run_tab._update_warnings()
+                return
             widget.refresh()
+            self._shown_keys[widget] = self._view_key(signature)
 
     def _on_gating_finished(self, outcome: str = 'done'):
         self._result_tf = (None, None)
@@ -4047,21 +4158,25 @@ class PluginWidget(QWidget):
             st.drift_action = app['drift_action']
         self._save_run_state()
 
-    def _sync_applied_model(self):
+    def _sync_applied_model(self, signature: str | None = None):
         """Point the Run, Results and Enrichment pages at the model as it
-        stands on the model pages (rebuilt only when it has changed)."""
+        stands on the model pages (rebuilt only when it has changed;
+        *signature*: the model pages' current signature, when known)."""
         self._model_stale = False
         st = self.state
         st.modes = self._application()['mode_per_gate']
-        model = self.builder.model()
-        sha = model_sha(model)
-        if sha != st.model_sha or not st.applied_model:
-            try:
-                model = ag_core.normalize_model(model)[0]
-            except Exception:
-                log.exception("the model pages' gates do not form a valid hierarchy")
-            st.applied_model = model
-            st.model_sha = sha
+        signature = signature or self.builder.signature()
+        if signature != self._synced_signature or not st.applied_model:
+            model = self.builder.model()
+            sha = model_sha(model)
+            if sha != st.model_sha or not st.applied_model:
+                try:
+                    model = ag_core.normalize_model(model)[0]
+                except Exception:
+                    log.exception("the model pages' gates do not form a valid hierarchy")
+                st.applied_model = model
+                st.model_sha = sha
+            self._synced_signature = signature
         st.model_path = str(self.builder.state.model_metadata.get('last_model_path') or '')
         st.transform_params = self.tf.params()
 
@@ -4111,12 +4226,15 @@ class PluginWidget(QWidget):
     # Persistence
     # ------------------------------------------------------------------
 
-    def _settings_key(self) -> str:
+    def _experiment_key(self) -> tuple:
+        """The experiment shown: its folder and the id of its .kit, so a new
+        experiment created at the same path counts as a different one."""
         try:
             exp_dir = str(self.controller.experiment_dir)
         except Exception:
             exp_dir = 'unknown'
-        return exp_dir.replace('\\', '/').replace(':', '_').replace(' ', '_')
+        return (experiment_state.legacy_group_key(exp_dir),
+                str(getattr(self.controller.experiment, 'experiment_id', '') or ''))
 
     def _controller_shows_loaded_experiment(self) -> bool:
         if self._loaded_experiment_dir is None:
@@ -4139,30 +4257,29 @@ class PluginWidget(QWidget):
 
     def _save_run_state(self):
         """Persist the Run, Results and Enrichment settings."""
-        if self._loaded_experiment_key is None or self._loading:
+        if self._store is None or self._loading:
             return
         payload = {name: getattr(self.state, name) for name in _PERSISTED_FIELDS}
-        s = self._qsettings
-        s.beginGroup(self._loaded_experiment_key)
-        try:
-            s.setValue('state_json', json.dumps(ag_core.to_jsonable(payload)))
-        finally:
-            s.endGroup()
+        text = json.dumps(ag_core.to_jsonable(payload))
+        if self._saved_run_state == (self._loaded_experiment_key, text):
+            return
+        self._store.setValue('state_json', text)
+        self._store.sync()
+        self._saved_run_state = (self._loaded_experiment_key, text)
 
     def load_state(self):
-        """Restore settings from QSettings, then read the gated results,
-        display records and statistics in the background.
+        """Restore the settings, then read the gated results, display records
+        and statistics in the background. Opening the settings store first
+        sets aside results another experiment left in this folder.
 
         Automated Gating used to load a model file itself; when the model
         pages have no gates yet and such a file is remembered, it is read
         too and imported with the channel alignment that was accepted for it.
         """
-        s = self._qsettings
-        s.beginGroup(self._loaded_experiment_key or self._settings_key())
-        try:
-            raw = s.value('state_json', '')
-        finally:
-            s.endGroup()
+        self._store = experiment_state.open_store(
+            self.controller, 'automated_gating', legacy_app_key='plugin_automated_gating',
+            experiment_dir=self._loaded_experiment_dir)
+        raw = self._store.value('state_json', '')
         try:
             payload = json.loads(raw) if raw else {}
         except (TypeError, ValueError):

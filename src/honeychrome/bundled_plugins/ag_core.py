@@ -65,6 +65,7 @@ Model application modes
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import json
 import logging
@@ -2201,6 +2202,27 @@ def to_jsonable(obj):
     """Copy of *obj* with numpy values converted to JSON types and
     non-finite floats replaced by None."""
     return _jsonable(obj)
+
+
+def _digest_default(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, (set, frozenset)):
+        return sorted(obj, key=str)
+    return str(obj)
+
+
+def content_digest(obj) -> str:
+    """SHA-256 of *obj* written as sorted JSON: a quick test of whether
+    nested state has changed. Numpy values are converted; other objects
+    count by their text."""
+    try:
+        text = json.dumps(obj, sort_keys=True, default=_digest_default)
+    except (TypeError, ValueError):
+        text = json.dumps(_jsonable(obj), sort_keys=True, default=_digest_default)
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
 def serialisable_boundaries(boundaries: dict) -> dict:

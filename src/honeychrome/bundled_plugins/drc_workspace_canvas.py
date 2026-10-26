@@ -1,5 +1,5 @@
 """
-drc_workspace_canvas.py — page canvas for Honeycluster's Workspace tab
+drc_workspace_canvas.py — page canvas for Honeycluster's Layout tab
 ======================================================================
 Companion module to ``dr_clustering_tab.py`` (not ``*_tab.py``, so the plugin
 loader does not pick it up as a tab).

@@ -201,6 +201,7 @@ class Controller(QObject):
             self.experiment.load(template_path)
             logger.info(f'Controller: template loaded {template_path}')
             self.experiment.experiment_path = str(experiment_path)
+            self.experiment.new_identity()
         else:
             self.experiment.create(experiment_path) # initialises and saves experiment
         self.experiment.settings['auto_clean_controls'] = settings.auto_clean_controls_retrieved  # app default for new experiments
@@ -323,7 +324,9 @@ class Controller(QObject):
 
     @with_busy_cursor
     def load_experiment(self, experiment_path):
-        self.experiment.load(experiment_path)
+        if self.experiment.load(experiment_path):
+            # Keep the id just given to an experiment saved before ids existed.
+            self.experiment.save()
         self.experiment_dir = self.experiment.generate_subdirs()
         add_recent_file(experiment_path)
 

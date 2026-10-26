@@ -39,6 +39,9 @@ import pandas as pd
 import ag_core
 import ag_results
 from drc_report import ReportItem
+from honeychrome.view_components.differential_plots import (
+    GROUP_COLOURS as _GROUP_COLOURS, make_group_values_figure,
+)
 
 SECTIONS = ('Samples', 'Gates', 'Statistics', 'Populations', 'Enrichment')
 
@@ -47,8 +50,6 @@ __all__ = ['SECTIONS', 'pooled_display', 'pooled_population', 'boundary_fraction
            'build_report_items', 'make_pca_figure', 'make_roc_figure', 'make_importance_figure',
            'make_panel_figure', 'predictive_subtitle', 'make_group_values_figure',
            'make_population_comparison_figure', 'p_value_text', 'enrichment_report_items']
-
-_GROUP_COLOURS = ('#4477AA', '#EE6677', '#228833', '#CCBB44', '#66CCEE', '#AA3377', '#BBBBBB')
 
 
 def pooled_display(display: dict, samples: list[str], gate_name: str,
@@ -509,52 +510,6 @@ def p_value_text(result: dict | None) -> str:
     if result.get('FDR') is not None:
         text += f", FDR = {result['FDR']:.3g}"
     return text
-
-
-def make_group_values_figure(values: dict, group_order: list[str], title: str,
-                             p_text: str = '', is_dark: bool = False, ax=None):
-    """Dot and violin plot of one population's % of parent per sample,
-    one column per group, with the test result above.
-
-    values : {group: [(sample, value)]}.
-    """
-    from matplotlib.figure import Figure
-    from honeychrome.view_components import differential_plots as dp
-
-    fig = None
-    if ax is None:
-        fig = Figure(figsize=(3.8, 4.2), constrained_layout=True)
-        ax = fig.add_subplot(111)
-    groups = [g for g in group_order if values.get(g)] + \
-        [g for g in values if g not in group_order and values.get(g)]
-    colours = _group_colours(groups)
-    fg = 'white' if is_dark else 'black'
-    rng = np.random.default_rng(0)
-    hover_xy, hover_labels = [], []
-    for i, g in enumerate(groups):
-        ys = np.array([v for _s, v in values[g]], dtype=float)
-        if len(ys) >= 2 and np.ptp(ys) > 0:
-            parts = ax.violinplot([ys], positions=[i], widths=0.7, showextrema=False)
-            for body in parts['bodies']:
-                body.set_facecolor(colours[g])
-                body.set_alpha(0.3)
-        xs = i + rng.uniform(-0.12, 0.12, len(ys))
-        ax.scatter(xs, ys, s=22, color=colours[g], edgecolors=fg, linewidths=0.4, zorder=3)
-        ax.hlines(float(np.median(ys)), i - 0.25, i + 0.25, color=fg, linewidth=1.2, zorder=4)
-        for (s, v), x in zip(values[g], xs):
-            hover_xy.append((x, v))
-            hover_labels.append(f"{str(s).replace(chr(92), '/').rsplit('/', 1)[-1]}: {v:.2f}%")
-    ax.set_xticks(range(len(groups)), [f"{g}\n(n={len(values[g])})" for g in groups], fontsize=8)
-    ax.set_xlim(-0.6, len(groups) - 0.4)
-    ax.set_ylabel('% of parent')
-    ax.set_title(title + (f"\n{p_text}" if p_text else ''), fontsize=9)
-    if fig is not None:
-        if hover_xy:
-            hover = np.asarray(hover_xy, dtype=float)
-            overlay = ax.scatter(hover[:, 0], hover[:, 1], s=60, alpha=0, zorder=6)
-            fig._hover_handler = dp.make_scatter_hover_handler(fig, ax, overlay, hover_labels, is_dark)
-        dp.style_figure_theme(fig, is_dark)
-    return fig
 
 
 def make_population_comparison_figure(gate_def: dict, pop: str, panels: list, transforms: dict,

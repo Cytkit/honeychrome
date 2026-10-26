@@ -524,20 +524,17 @@ def resolve_unstained_af_states(controller, cl_run: dict) -> dict[str, tuple | N
     all_samples_names = samples.get('all_samples', {})
     sample_af_profiles = samples.get('sample_af_profiles', {})
     af_profiles = controller.experiment.process.get('af_profiles', {})
-    raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
 
     most_common_combo: tuple = ()
     most_common_resolved = False
 
     def _resolve_most_common_combo() -> tuple:
         # sample_af_profiles is keyed the same way as all_samples
-        # (experiment_dir-relative) -- training_sample_ids is picker-
-        # relative (relative to raw_samples_subdirectory), same conversion
-        # _load_unstained_gated_transformed's rel_path convention note
-        # documents elsewhere in this module.
+        # (experiment_dir-relative); training_sample_ids are picker-relative,
+        # so each is mapped back through sample_abs_path.
         assignments = []
         for rel in cl_run.get('training_sample_ids', []):
-            key = str(Path(raw_subdir) / rel)
+            key = str(drc_pipeline.sample_abs_path(controller, rel).relative_to(controller.experiment_dir))
             assigned = tuple(sample_af_profiles.get(key, []))
             if assigned:
                 assignments.append(assigned)

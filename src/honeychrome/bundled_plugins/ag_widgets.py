@@ -34,6 +34,8 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QWidget,
 )
 
+import honeychrome.settings as settings
+
 __all__ = ['make_concertina', 'add_concertina_page', 'SquareHolder',
            'zoom_axis_transform', 'PopulationTree', 'block_wheel',
            'algorithm_combo', 'colour_algorithm_items', 'set_combo_colour', 'FilterBar',
@@ -129,7 +131,8 @@ def zoom_axis_transform(axis, vb, axis_name: str, tr):
 
     scale_changed = False
     if tr.id == 1 and position < 0.5 * vmax:
-        tr.logicle_w = max(0.01, tr.logicle_w / factor)
+        w_step = settings.logicle_w_drag_step if factor < 1 else -settings.logicle_w_drag_step
+        tr.logicle_w = min(tr.logicle_m / 2.0, max(0.0, tr.logicle_w + w_step))
         tr.set_transform()
         scale_changed = True
     else:

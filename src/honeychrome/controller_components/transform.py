@@ -123,12 +123,19 @@ class Transform:
 
     def logicle_ticks(self):
         top_tick = int(np.log10(self.xform.inverse(np.array([self.limits[1]])))[0]) + 1
-        bottom_tick = int(np.log10(np.abs(self.xform.inverse(np.array([self.limits[0]]))))[0]) + 1
+        bottom_value = np.abs(self.xform.inverse(np.array([self.limits[0]])))[0]
         threshold = 0.2
         cutoff_tick = np.argmax(np.diff(self.xform.apply(np.logspace(0, top_tick, top_tick+1))) > threshold)
         # print([self.logicle_w, self.logicle_m, top_tick, cutoff_tick])
+        # A scale without negative range (W = 0 puts its bottom at exactly 0)
+        # gets no negative ticks.
+        if bottom_value > 0:
+            bottom_tick = int(np.log10(bottom_value)) + 1
+            n_negative = max([bottom_tick-cutoff_tick+1, 0])
+        else:
+            bottom_tick, n_negative = cutoff_tick, 0
         major_values = np.concatenate([
-            -np.logspace(bottom_tick, cutoff_tick, max([bottom_tick-cutoff_tick+1, 0])),  # Negative values
+            -np.logspace(bottom_tick, cutoff_tick, n_negative),  # Negative values
             [0],
             np.logspace(cutoff_tick, top_tick, max([top_tick-cutoff_tick+1, 0]))  # Positive values
         ])

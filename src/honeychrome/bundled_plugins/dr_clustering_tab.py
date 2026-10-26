@@ -30,7 +30,8 @@ Dependencies:
   pip-install path, not the lazy-import discipline.
 
 Transforms:
-  Transform preview, auto-transform, CSV import/export, QSettings persistence.
+  Transform preview, auto-transform, CSV import/export, persistence in the
+  experiment folder (controller_components.experiment_state).
 
 DR pipeline:
   ConfigTab DR section: algorithm radios, per-algorithm hyperparameter panels,
@@ -157,6 +158,7 @@ from honeychrome.controller_components.job_gate import acquire_job, guard_while_
 from honeychrome.controller_components.spectral_correction import offered_samples
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.transform import Transform
+from honeychrome.controller_components import experiment_state
 from honeychrome.view_components.ordered_multi_sample_picker import OrderedMultiSamplePicker
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
@@ -165,10 +167,13 @@ from honeychrome.view_components import suggest_groupings_dialog as sgd
 from honeychrome.view_components.checkable_header import CheckableHeaderView
 from honeychrome.controller_components.differential_stats import suggest_groupings_from_names
 from honeychrome.view_components.differential_plots import (
+    make_group_values_figure,
     make_heatmap_figure,
     make_marker_summary_figure,
     make_scatter_hover_handler as _make_scatter_hover_handler,
     make_volcano_figure,
+    message_figure,
+    significance_column,
     stamp_run_label,
     style_figure_theme as _style_figure_theme,
     text_width_inches,
@@ -260,18 +265,11 @@ plugin_name = 'Honeycluster'
 # older version keep their values except the defaults that changed since.
 DR_DEFAULTS_VERSION = 2
 
-# QSettings 'application' identifier for this plugin's persisted
-# gates/channels/DR-clustering state -- deliberately frozen to the
-# plugin's ORIGINAL name, independent of plugin_name (the display
-# name shown on the tab). QSettings('honeychrome', app) scopes an
-# entirely separate store per distinct *app* string (a different INI
-# file on Linux, a different plist domain on macOS) -- so renaming
-# plugin_name for the tab label would silently orphan every
-# experiment's already-saved settings under the old app string,
-# exactly reproducing the "my data vanished on restart" symptom
-# this plugin already fixed once. Never derive this from plugin_name;
-# if it ever needs to change, add an explicit migration in
-# load_state() that reads the old key when the new one is empty.
+# QSettings 'application' identifier of this plugin, frozen to the plugin's
+# original name (independent of plugin_name, the name on the tab). It holds
+# the application-wide run-time calibration, and the experiment settings of
+# experiments saved before they were kept in the experiment folder, which
+# experiment_state.open_store moves there once.
 _SETTINGS_APP_KEY = 'plugin_DR / Clustering / Statistics'
 
 
@@ -2733,8 +2731,7 @@ class TransformTab(TransformInspector):
         self.transformsPersistRequested.emit()
 
     def _available_channels(self) -> list[str]:
-        skip = {'ribbon', 'Time', 'event_id'}
-        all_ch = [ch for ch in self._transforms if ch not in skip]
+        all_ch = self._channel_order()
         sel = self.state.selected_channels
         return [ch for ch in all_ch if ch in sel] if sel else all_ch
 
@@ -2918,7 +2915,7 @@ class TransformTab(TransformInspector):
         QMessageBox.information(
             self, "Auto-Transform",
             f"W computed for {n_updated} Logicle channel(s) from {source_note},\n"
-            f"using the Parks & Moore method (lower-quarter quantile of negatives).\n\n"
+            f"using the Parks & Moore method (5th percentile of the negative events).\n\n"
             f"These transforms are kept with this analysis and are not written "
             f"to the experiment.  Reload from experiment restores the "
             f"transforms defined in Unmixed Data."
@@ -3098,6 +3095,7 @@ class GroupsStatsTab(QWidget):
         outer_scroll.setFrameShape(QFrame.NoFrame)
         outer_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         outer.addWidget(outer_scroll)
+        self._outer_scroll = outer_scroll
 
         content = QWidget()
         outer_scroll.setWidget(content)
@@ -4352,7 +4350,7 @@ class GroupsStatsTab(QWidget):
             )
 
         # PCA controls -- sync widget state from self.state
-        # now, since load_state() restores QSettings into self.state but
+        # now, since load_state() restores the saved settings into self.state but
         # runs after these widgets were already built (with construction-
         # time defaults), so nothing else re-syncs them. Signals blocked
         # so this doesn't itself fire _on_pca_option_changed.
@@ -6361,7 +6359,7 @@ class GroupsStatsTab(QWidget):
     # ------------------------------------------------------------------
 
     def _add_results_tab(self, fig, tab_title: str, export_stem: str, maker, maker_kwargs,
-                        key: str | None = None):
+                        key: str | None = None, values_table=None):
         """
         Add a plot tab (with pop-out + export) to self._results_tabs.
 
@@ -6414,6 +6412,7 @@ class GroupsStatsTab(QWidget):
         # canvas exists yet when they run; connect it now that one does.
         if hasattr(fig, '_hover_handler'):
             canvas.mpl_connect('motion_notify_event', fig._hover_handler)
+        self._connect_value_menu(canvas, fig, key, maker_kwargs)
 
         scroll = QScrollArea()
         scroll.setWidget(canvas)
@@ -6462,6 +6461,7 @@ class GroupsStatsTab(QWidget):
             # connecting too.
             if hasattr(dlg_fig, '_hover_handler'):
                 dlg_canvas.mpl_connect('motion_notify_event', dlg_fig._hover_handler)
+            self._connect_value_menu(dlg_canvas, dlg_fig, key, maker_kwargs)
             dlg_toolbar = NavigationToolbar2QT(dlg_canvas, None)
 
             class _PlotDialog(QDialog):
@@ -6499,11 +6499,20 @@ class GroupsStatsTab(QWidget):
         popout_btn = QPushButton("⤢ Pop Out")
         popout_btn.setFixedWidth(80)
         popout_btn.clicked.connect(_pop_out)
-        export_btn = QPushButton(f"Export {tab_title}")
+        # values_table: callable -> DataFrame behind the figure; the tab then
+        # offers it as CSV beside the figure export.
+        export_btn = QPushButton("Export Figure" if values_table is not None
+                                 else f"Export {tab_title}")
         export_btn.clicked.connect(lambda checked=False, f=fig, s=export_stem:
                                    self._export_figure(f, s))
         btn_row.addWidget(popout_btn)
         btn_row.addWidget(export_btn)
+        if values_table is not None:
+            csv_btn = QPushButton("Export Values (CSV)")
+            csv_btn.setToolTip("Write each sample's value, with its group, as a CSV file.")
+            csv_btn.clicked.connect(lambda checked=False, s=export_stem:
+                                    self._export_values_csv(values_table(), s))
+            btn_row.addWidget(csv_btn)
         btn_row.addSpacing(16)
 
         # manual resize slider for the inline canvas.
@@ -6548,6 +6557,209 @@ class GroupsStatsTab(QWidget):
         else:
             idx = self._results_tabs.addTab(container, tab_title)
             self._results_tabs.setCurrentIndex(idx)
+
+    # Per-sample values behind the results figures that can show them:
+    # {kind: (PipelineState table, value label, hover-label suffix)}.
+    _VALUE_TABLES = {
+        'freq': ('freq_df', '% of events', '%'),
+        'counts': ('counts_df', 'Events', ''),
+        'mfi': ('mfi_df', 'Mean intensity (Transforms-tab scale)', ''),
+        'mfi_heatmap': ('mfi_sample_df', 'Mean intensity (Transforms-tab scale)', ''),
+    }
+    _VALUE_KINDS = {
+        'freq_heatmap': 'freq', 'freq_volcano': 'freq',
+        'counts_heatmap': 'counts', 'counts_volcano': 'counts',
+        'mfi_volcano': 'mfi', 'mfi_clusters': 'mfi', 'mfi_heatmap': 'mfi_heatmap',
+    }
+
+    def _connect_value_menu(self, canvas, fig, key, maker_kwargs):
+        """Right-click on a heatmap row, a volcano point or an MFI Clusters
+        cell offers that feature's per-sample values as a dot and violin
+        plot, in a window or as a results tab (which the report lists)."""
+        if self._VALUE_KINDS.get(key) is None:
+            return
+        canvas.mpl_connect('button_press_event',
+                           lambda event: self._on_value_click(event, fig, key, maker_kwargs))
+        canvas.setToolTip("Right-click a row or point for its per-sample values "
+                          "(dot and violin plot).")
+
+    def _on_value_click(self, event, fig, key: str, maker_kwargs: dict):
+        if event.button != 3:
+            return
+        feature = self._clicked_feature(event, fig, key, maker_kwargs)
+        if feature is None:
+            return
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QMenu
+        kind = self._VALUE_KINDS[key]
+        kwargs = self._values_kwargs(kind, feature, maker_kwargs)
+        menu = QMenu(self)
+        menu.addSection(self._feature_display_label(kind, feature))
+        act_window = menu.addAction("Show per-sample values in a window")
+        act_tab = menu.addAction("Add per-sample values as a results tab (listed in the report)")
+        act_window.triggered.connect(lambda: self._values_window(kwargs))
+        act_tab.triggered.connect(lambda: self._values_tab(kwargs))
+        menu.exec(QCursor.pos())
+
+    def _clicked_feature(self, event, fig, key: str, maker_kwargs: dict) -> str | None:
+        """Feature under a right-click: an MFI Clusters cell, a heatmap row
+        or the volcano point within 12 pixels."""
+        ax = event.inaxes
+        if ax is None or event.x is None:
+            return None
+        if ax is getattr(fig, '_row_axes', None) and event.ydata is not None:
+            row = int(round(event.ydata))
+            cells = getattr(fig, '_cell_keys', None)
+            if cells is not None:
+                col = int(round(event.xdata)) if event.xdata is not None else -1
+                if 0 <= row < len(cells) and 0 <= col < len(cells[row]) \
+                        and isinstance(cells[row][col], str):
+                    return cells[row][col]
+                return None
+            keys = getattr(fig, '_row_keys', None) or []
+            return str(keys[row]) if 0 <= row < len(keys) else None
+        table = maker_kwargs.get('results_df')
+        if not key.endswith('_volcano') or table is None or table.empty \
+                or not {'logFC', 'feature'}.issubset(table.columns):
+            return None
+        col, _label = significance_column(table, self.state.stats_fdr_scope)
+        xy = np.column_stack([table['logFC'].values.astype(float),
+                              -np.log10(np.maximum(table[col].values.astype(float), 1e-300))])
+        ok = np.isfinite(xy).all(axis=1)
+        if not ok.any():
+            return None
+        px = ax.transData.transform(xy[ok])
+        d = np.hypot(px[:, 0] - event.x, px[:, 1] - event.y)
+        i = int(np.argmin(d))
+        if d[i] > 12:
+            return None
+        return str(table[ok].iloc[i]['feature'])
+
+    def _feature_display_label(self, kind: str, feature: str) -> str:
+        """A feature's name with its channel shown as the Antigen (falling
+        back to the Label), as on the MFI plots."""
+        disp = _antigen_or_label_map(self.controller)
+        if kind == 'mfi_heatmap':
+            return disp.get(feature, feature)
+        if kind == 'mfi':
+            for ch, name in disp.items():
+                if feature.endswith(f'_{ch}'):
+                    return f"{feature[:-len(ch) - 1]}_{name}"
+        return str(feature)
+
+    def _values_kwargs(self, kind: str, feature: str, maker_kwargs: dict) -> dict:
+        """Arguments of _make_values_figure for *feature* of the comparison a
+        results figure shows, with the feature's test result."""
+        p_text = ''
+        results = maker_kwargs.get('results_df')
+        if results is not None and 'feature' in results.columns:
+            rows = results[results['feature'] == feature]
+            if len(rows) and 'P.Value' in rows.columns:
+                p_text = f"p = {float(rows['P.Value'].iloc[0]):.3g}"
+                col, _label = significance_column(results, self.state.stats_fdr_scope)
+                if col != 'P.Value':
+                    p_text += f", FDR = {float(rows[col].iloc[0]):.3g}"
+        return dict(kind=kind, feature=feature, group_a=maker_kwargs.get('group_a', ''),
+                    group_b=maker_kwargs.get('group_b', ''), p_text=p_text)
+
+    def _feature_values(self, kind: str, feature: str, group_a: str, group_b: str) -> dict:
+        """{group: [(sample, value)]} of one feature in the comparison's two
+        groups, from the current statistics tables (finite values only)."""
+        table_name = self._VALUE_TABLES[kind][0]
+        table = getattr(self.state, table_name, None)
+        values: dict = {}
+        if table is not None and feature in table.columns:
+            group_of = dict(zip(self.state.stats_all_rel, self.state.stats_group_vec))
+            for rel in table.index:
+                group = group_of.get(rel)
+                if group not in (group_a, group_b):
+                    continue
+                v = float(table.at[rel, feature])
+                if np.isfinite(v):
+                    values.setdefault(group, []).append((rel, v))
+        return values
+
+    def _values_table(self, kwargs: dict) -> pd.DataFrame:
+        """The values a per-sample values tab plots: sample, group, value."""
+        value_label = self._VALUE_TABLES[kwargs['kind']][1]
+        values = self._feature_values(kwargs['kind'], kwargs['feature'],
+                                      kwargs['group_a'], kwargs['group_b'])
+        rows = [{'sample': rel, 'group': group,
+                 'feature': self._feature_display_label(kwargs['kind'], kwargs['feature']),
+                 value_label: v}
+                for group in (kwargs['group_a'], kwargs['group_b'])
+                for rel, v in values.get(group, [])]
+        return pd.DataFrame(rows, columns=['sample', 'group', 'feature', value_label])
+
+    def _export_values_csv(self, table: pd.DataFrame, stem: str):
+        """Save a values table as CSV, by default in the experiment folder."""
+        start = str(Path(self.controller.experiment_dir) / f"{stem}.csv")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Values", start, "CSV files (*.csv)")
+        if not path:
+            return
+        path = _with_extension(path, '.csv')
+        try:
+            table.to_csv(path, index=False)
+            QMessageBox.information(self, "Exported", f"Saved to {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Export Error", str(e))
+
+    def _make_values_figure(self, kind: str, feature: str, group_a: str, group_b: str,
+                            p_text: str = ''):
+        """Dot and violin plot of one feature's per-sample values in the
+        comparison's two groups, from the current statistics tables."""
+        value_label, suffix = self._VALUE_TABLES[kind][1:]
+        title = self._feature_display_label(kind, feature)
+        is_dark = _resolve_is_dark(self.state)
+        values = self._feature_values(kind, feature, group_a, group_b)
+        if not values:
+            return message_figure("No per-sample values for this feature in the current "
+                                  "statistics.", title, is_dark)
+        return make_group_values_figure(
+            values, [group_a, group_b], title, p_text, is_dark=is_dark,
+            value_label=value_label, value_suffix=suffix,
+            group_colours={name: _resolve_group_colour(self.state, name)
+                           for name in (group_a, group_b) if name})
+
+    def _values_window(self, kwargs: dict):
+        """The per-sample values of one feature in their own window."""
+        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+        fig = self._make_values_figure(**kwargs)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(self._feature_display_label(kwargs['kind'], kwargs['feature']))
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        canvas = _new_scrollable_canvas(fig)
+        if hasattr(fig, '_hover_handler'):
+            canvas.mpl_connect('motion_notify_event', fig._hover_handler)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(NavigationToolbar2QT(canvas, dlg))
+        layout.addWidget(canvas, stretch=1)
+        dpi = fig.get_dpi()
+        dlg.resize(int(fig.get_figwidth() * dpi) + 24, int(fig.get_figheight() * dpi) + 80)
+        dlg.show()
+
+    def _values_tab(self, kwargs: dict):
+        """The per-sample values of one feature as a results tab."""
+        label = self._feature_display_label(kwargs['kind'], kwargs['feature'])
+        key = (f"values:{kwargs['kind']}:{kwargs['feature']}:"
+               f"{kwargs['group_b']} vs {kwargs['group_a']}")
+        self._add_results_tab(
+            self._make_values_figure(**kwargs), f"Values: {label}",
+            re.sub(r'[^\w.-]+', '_', f"values_{label}"),
+            maker=self._make_values_figure, maker_kwargs=kwargs, key=key,
+            values_table=lambda k=kwargs: self._values_table(k))
+        # The tab area is as tall as its tallest figure, so the view is moved
+        # to the top of the tabs, where the new (small) figure is shown.
+        QTimer.singleShot(0, self._scroll_to_results_tabs)
+
+    def _scroll_to_results_tabs(self):
+        """Scroll the Stats page so the results tab bar is at the top."""
+        content = self._outer_scroll.widget()
+        if content is None:
+            return
+        y = self._results_tabs.mapTo(content, self._results_tabs.rect().topLeft()).y()
+        self._outer_scroll.verticalScrollBar().setValue(y)
 
     def _on_results_tab_close_requested(self, index: int):
         """Manually close any results tab (Freq/MFI heatmap/volcano,
@@ -7006,6 +7218,9 @@ class GroupsStatsTab(QWidget):
         cb = fig.colorbar(im, cax=ax_cb)
         cb.ax.tick_params(labelsize=7)
         cb.set_label('log1p-MFI', fontsize=7)
+        # Row identities (channels), for the right-click per-sample values.
+        fig._row_axes = ax_hm
+        fig._row_keys = [feat_labels_raw[i] for i in row_order]
 
         _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
@@ -8207,7 +8422,7 @@ class WorkspaceTab(QWidget):
                  else [self.scene.current_page])
         ext = {'PDF': '.pdf', 'SVG': '.svg', 'PNG': '.png', 'TIFF': '.tif'}[fmt]
         path, _ = QFileDialog.getSaveFileName(
-            self, f"Export {fmt}", f"Workspace{ext}", f"{fmt} files (*{ext})")
+            self, f"Export {fmt}", f"Layout{ext}", f"{fmt} files (*{ext})")
         if not path:
             return
         self.export_pages(path, fmt, pages, int(dpi_combo.currentData()),
@@ -8487,7 +8702,7 @@ class WorkspaceTab(QWidget):
                 continue
             items.append(drc_report.ReportItem(
                 key=f'page_{page + 1}',
-                tab='Workspace',
+                tab='Layout',
                 label=f"Page {page + 1}",
                 get_figure=lambda p=page: drc_workspace_export.page_figure(self.scene, p),
                 write_files=lambda folder, p=page: drc_workspace_export.export_pdf(
@@ -11169,6 +11384,14 @@ class ClusterAnnotationTab(QWidget):
         self._marker_summary_worker = None
         self._marker_summary_rerun_pending = False
         self._marker_summary_busy = False
+        # Size slider percentages, and the canvases they scale with their
+        # natural pixel sizes (set when figures are shown).
+        self._heatmap_scale_pct = 100
+        self._ridge_scale_pct = 100
+        self._heatmap_canvases = None
+        self._heatmap_natural = None
+        self._ridge_canvas = None
+        self._ridge_natural = None
 
         page = QWidget()
         page_layout = QVBoxLayout(page)
@@ -11190,6 +11413,9 @@ class ClusterAnnotationTab(QWidget):
         heatmap_box = QGroupBox("Median MFI per Cluster (Transformed)")
         self._heatmap_box = heatmap_box
         heatmap_outer_layout = QVBoxLayout(heatmap_box)
+        heatmap_outer_layout.addLayout(self._size_slider_row(
+            self._heatmap_scale_pct, self._on_heatmap_scale,
+            "Resize the heatmap. The cluster and marker names keep their size."))
 
         # Frozen-header grid: (0,0) corner spacer, (0,1) marker-name
         # header (scrolls horizontally in lock-step), (1,0) cluster-name
@@ -11259,6 +11485,9 @@ class ClusterAnnotationTab(QWidget):
 
         ridge_box = QGroupBox("Marker Ridgeline Grid")
         ridge_layout = QVBoxLayout(ridge_box)
+        ridge_layout.addLayout(self._size_slider_row(
+            self._ridge_scale_pct, self._on_ridge_scale,
+            "Resize the ridgeline grid. It is redrawn when the slider is released."))
         self._ridge_scroll = QScrollArea()
         self._ridge_scroll.setWidgetResizable(True)
         self._ridge_placeholder = QLabel(
@@ -11283,6 +11512,82 @@ class ClusterAnnotationTab(QWidget):
         self._marker_summary_tab_index = self.annotation_sub_tabs.addTab(
             page, "Marker Heatmap / Ridgelines"
         )
+
+    @staticmethod
+    def _size_slider_row(pct: int, on_change, tooltip: str) -> QHBoxLayout:
+        """'Size:' slider (20-200%) with its percentage, as on the Stats
+        results tabs. *on_change(pct)* runs when the slider is released, so
+        a large figure is redrawn once rather than at every step."""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel("Size:"))
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(20, 200)
+        slider.setValue(pct)
+        slider.setFixedWidth(120)
+        slider.setTracking(False)
+        slider.setToolTip(tooltip)
+        label = QLabel(f"{pct}%")
+        label.setFixedWidth(36)
+        slider.sliderMoved.connect(lambda v: label.setText(f"{v}%"))
+        slider.valueChanged.connect(lambda v: (label.setText(f"{v}%"), on_change(v)))
+        row.addWidget(slider)
+        row.addWidget(label)
+        row.addStretch()
+        return row
+
+    def _on_heatmap_scale(self, pct: int):
+        self._heatmap_scale_pct = int(pct)
+        self._scale_heatmap()
+
+    def _on_ridge_scale(self, pct: int):
+        self._ridge_scale_pct = int(pct)
+        self._scale_ridges()
+
+    def _scale_heatmap(self):
+        """Size the heatmap at the Size slider's percentage of its natural
+        size. The cluster-name strip keeps its width and the marker-name
+        strip its height, so the names stay readable; the splitter's top
+        pane is then fitted to the heatmap box's new height."""
+        if self._heatmap_canvases is None:
+            return
+        main_canvas, col_canvas, row_canvas = self._heatmap_canvases
+        (main_w, main_h), col_h, row_w = self._heatmap_natural
+        factor = self._heatmap_scale_pct / 100.0
+        w = max(40, int(main_w * factor))
+        h = max(40, int(main_h * factor))
+        main_canvas.setFixedSize(w, h)
+        col_canvas.setFixedSize(w, col_h)
+        self._heatmap_col_header_scroll.setFixedHeight(col_h)
+        row_canvas.setFixedSize(row_w, h)
+        self._heatmap_row_header_scroll.setFixedWidth(row_w)
+        self._heatmap_corner.setFixedSize(row_w, col_h)
+
+        # Default the splitter to the heatmap's own natural height, read
+        # from Qt's own layout metrics: pin the main heatmap viewport to its
+        # content height just long enough to ask heatmap_box for its real
+        # sizeHint (title bar and margins included), then release the pin.
+        self._heatmap_box.setMaximumHeight(16_777_215)  # QWIDGETSIZE_MAX
+        self._heatmap_scroll.setFixedHeight(h)
+        self._heatmap_box.adjustSize()
+        ideal_top_h = self._heatmap_box.sizeHint().height()
+        self._heatmap_scroll.setMinimumHeight(0)
+        self._heatmap_scroll.setMaximumHeight(16_777_215)
+
+        # Cap the heatmap pane at its content height. Stretch factor 0 (set
+        # at splitter construction) keeps it there, and ridge_box, the
+        # splitter's only stretch=1 pane, absorbs the remaining height.
+        self._heatmap_box.setMaximumHeight(ideal_top_h)
+        self._summary_splitter.setSizes([ideal_top_h, 1_000_000])
+
+    def _scale_ridges(self):
+        """Size the ridgeline grid at the Size slider's percentage of its
+        natural size (the grid is redrawn at the new size)."""
+        if self._ridge_canvas is None:
+            return
+        w, h = self._ridge_natural
+        factor = self._ridge_scale_pct / 100.0
+        self._ridge_canvas.setFixedSize(max(40, int(w * factor)), max(40, int(h * factor)))
 
     # ------------------------------------------------------------------
     # Refresh (called on tab activation)
@@ -12610,6 +12915,9 @@ class ClusterAnnotationTab(QWidget):
         )
 
     def _show_marker_summary_placeholder(self, text: str):
+        # setWidget deletes the canvases, so the Size sliders forget them.
+        self._heatmap_canvases = None
+        self._ridge_canvas = None
         for scroll in (self._heatmap_scroll, self._ridge_scroll):
             placeholder = QLabel(text)
             placeholder.setStyleSheet("color: grey; font-style: italic;")
@@ -12667,21 +12975,16 @@ class ClusterAnnotationTab(QWidget):
         dpi = main_fig.get_dpi()
 
         main_canvas = _new_scrollable_canvas(main_fig)
-        main_canvas.setFixedSize(int(main_fig.get_figwidth() * dpi), int(main_fig.get_figheight() * dpi))
         self._heatmap_scroll.setWidget(main_canvas)
-
         col_canvas = _new_scrollable_canvas(col_fig)
-        col_canvas.setFixedSize(int(col_fig.get_figwidth() * dpi), int(col_fig.get_figheight() * dpi))
         self._heatmap_col_header_scroll.setWidget(col_canvas)
-        self._heatmap_col_header_scroll.setFixedHeight(int(col_fig.get_figheight() * dpi))
-
         row_canvas = _new_scrollable_canvas(row_fig)
-        row_canvas.setFixedSize(int(row_fig.get_figwidth() * dpi), int(row_fig.get_figheight() * dpi))
         self._heatmap_row_header_scroll.setWidget(row_canvas)
-        self._heatmap_row_header_scroll.setFixedWidth(int(row_fig.get_figwidth() * dpi))
-
-        self._heatmap_corner.setFixedSize(
-            int(row_fig.get_figwidth() * dpi), int(col_fig.get_figheight() * dpi)
+        self._heatmap_canvases = (main_canvas, col_canvas, row_canvas)
+        self._heatmap_natural = (
+            (int(main_fig.get_figwidth() * dpi), int(main_fig.get_figheight() * dpi)),
+            int(col_fig.get_figheight() * dpi),
+            int(row_fig.get_figwidth() * dpi),
         )
 
         cbar_dpi = cbar_fig.get_dpi()
@@ -12691,37 +12994,13 @@ class ClusterAnnotationTab(QWidget):
 
         ridge_canvas = _new_scrollable_canvas(ridge_fig)
         dpi2 = ridge_fig.get_dpi()
-        # Fixed: a resize would redraw the whole grid
-        ridge_canvas.setFixedSize(int(ridge_fig.get_figwidth() * dpi2), int(ridge_fig.get_figheight() * dpi2))
+        # Fixed size: a resize redraws the whole grid
+        self._ridge_canvas = ridge_canvas
+        self._ridge_natural = (int(ridge_fig.get_figwidth() * dpi2),
+                               int(ridge_fig.get_figheight() * dpi2))
+        self._scale_ridges()
         self._ridge_scroll.setWidget(ridge_canvas)
-
-        # Default the splitter to the heatmap's own natural height, read
-        # from Qt's own layout metrics rather than a guessed "chrome"
-        # constant -- pin the one flexible piece (the main
-        # heatmap viewport, normally stretched by heatmap_grid) to its
-        # exact content height just long enough to ask heatmap_box for its
-        # real sizeHint (title bar + margins included, computed by the
-        # actual style rather than estimated), then release the pin so
-        # the viewport goes back to its normal flexible behaviour.
-        main_h_px = int(main_fig.get_figheight() * dpi)
-        self._heatmap_scroll.setFixedHeight(main_h_px)
-        self._heatmap_box.adjustSize()
-        ideal_top_h = self._heatmap_box.sizeHint().height()
-        self._heatmap_scroll.setMinimumHeight(0)
-        self._heatmap_scroll.setMaximumHeight(16_777_215)  # QWIDGETSIZE_MAX
-
-        # Cap the heatmap pane at exactly its content height instead of
-        # reading the splitter's CURRENT height (which is 0 the first
-        # time this runs, before the tab has ever been shown, and which
-        # otherwise grows the pane past its content on every later
-        # window/splitter resize since both panes used to share stretch
-        # factor 1). With the cap in place, requesting more than the pane
-        # can take below just clamps to the cap -- stretch factor 0 (set
-        # at splitter construction) keeps it pinned there afterward, and
-        # ridge_box, the splitter's only stretch=1 pane, absorbs whatever
-        # height the heatmap pane doesn't need.
-        self._heatmap_box.setMaximumHeight(ideal_top_h)
-        self._summary_splitter.setSizes([ideal_top_h, 1_000_000])
+        self._scale_heatmap()
 
     def _transform_and_pool_matrix_values(self, pooled_by_channel: dict, channels: list[str],
                                           cluster_order: list[int]) -> dict[str, dict[int, np.ndarray]]:
@@ -13219,8 +13498,9 @@ class PluginWidget(QWidget):
         # from before its time estimate until it ends
         self._run_tokens: dict = {}
 
-        # QSettings instance — keyed per experiment in save_state/load_state
-        self._qsettings = QSettings('honeychrome', _SETTINGS_APP_KEY)
+        # The loaded experiment's settings, kept in its folder (see
+        # experiment_state); opened by load_state.
+        self._store = None
 
         # Guard: suppress save_state during the load sequence (content_widget
         # becoming visible fires currentChanged → save before load completes).
@@ -13233,7 +13513,7 @@ class PluginWidget(QWidget):
         self._plugin_was_active = False
 
         # Tracks which experiment's persisted state is currently loaded into
-        # self.state. initialise_gui() only re-reads QSettings and rebuilds
+        # self.state. initialise_gui() only re-reads the settings and rebuilds
         # the workspace when this changes — see initialise_gui() for why.
         # _loaded_experiment_dir is the matching experiment_dir, cached so
         # save_state() can still correctly flush self.state to where it
@@ -13317,7 +13597,7 @@ class PluginWidget(QWidget):
         self.inner_tabs.addTab(self.config_tab,       "Configuration", 'settings')
         self.inner_tabs.addTab(self.cluster_annotation_tab, "Cluster Annotation", 'shape')
         self.inner_tabs.addTab(self.groups_stats_tab, "Stats",         'table')
-        self.inner_tabs.addTab(self.workspace_tab,    "Workspace",     'border-all')
+        self.inner_tabs.addTab(self.workspace_tab,    "Layout",        'border-all')
         self.inner_tabs.addTab(self.report_tab,       "Report",        'file-description')
 
         self.inner_tabs.currentChanged.connect(self._on_inner_tab_changed)
@@ -13419,9 +13699,9 @@ class PluginWidget(QWidget):
                 all_samples = _non_control_sample_paths(self.controller)
                 self.state.initialise_sample_groups(all_samples)
 
-                current_key = self._settings_key()
+                current_key = self._experiment_key()
                 if current_key != self._loaded_experiment_key:
-                    # Only reload from QSettings / rebuild the workspace when
+                    # Only reload the settings / rebuild the workspace when
                     # we're switching to a different experiment.
                     self._last_tab_refresh_key = {}
                     # Claim the experiment BEFORE the restore work below.
@@ -13465,18 +13745,18 @@ class PluginWidget(QWidget):
             _log.info("started UMAP JIT warm-up (%s path)", 'parallel' if parallel else 'serial')
 
     # ------------------------------------------------------------------
-    # State persistence (QSettings — keyed by experiment directory)
+    # State persistence (the experiment folder's cache/dr_clustering)
     # ------------------------------------------------------------------
 
-    def _settings_key(self) -> str:
-        """Return a QSettings group key unique to this experiment."""
+    def _experiment_key(self) -> tuple:
+        """The experiment shown: its folder and the id of its .kit, so a new
+        experiment created at the same path counts as a different one."""
         try:
             exp_dir = str(self.controller.experiment_dir)
         except Exception:
             exp_dir = 'unknown'
-        # Sanitise to a safe settings key
-        safe = exp_dir.replace('\\', '/').replace(':', '_').replace(' ', '_')
-        return safe
+        return (experiment_state.legacy_group_key(exp_dir),
+                str(getattr(self.controller.experiment, 'experiment_id', '') or ''))
 
     def _save_plot_configs_only(self):
         """
@@ -13486,20 +13766,16 @@ class PluginWidget(QWidget):
         full save_state() writes (trained reducers, embeddings, cluster
         labels) — that would be far too expensive to redo on every click.
         """
-        if self._loading:
+        if self._loading or self._store is None:
             return
-        key = self._settings_key()
-        s = self._qsettings
-        s.beginGroup(key)
-        try:
-            import json
-            s.setValue('plot_configs', json.dumps(self.state.plot_configs))
-            self._save_workspace_settings(s)
-        finally:
-            s.endGroup()
+        import json
+        s = self._store
+        s.setValue('plot_configs', json.dumps(self.state.plot_configs))
+        self._save_workspace_settings(s)
+        s.sync()
 
     def _save_workspace_settings(self, s):
-        """Workspace pages and grid, into the open QSettings group *s*."""
+        """Workspace pages and grid, into the settings store *s*."""
         import json
         s.setValue('workspace_pages', json.dumps(self.state.workspace_pages))
         s.setValue('workspace_grid_mm', self.state.workspace_grid_mm)
@@ -13513,17 +13789,13 @@ class PluginWidget(QWidget):
         Persist just the saved transforms, to the experiment the state was
         loaded for (see save_state).
         """
-        if self._loading or self._loaded_experiment_key is None:
+        if self._loading or self._store is None:
             return
         if not self.state.saved_transforms:
             return
         import json
-        s = self._qsettings
-        s.beginGroup(self._loaded_experiment_key)
-        try:
-            s.setValue('saved_transforms', json.dumps(self.state.saved_transforms))
-        finally:
-            s.endGroup()
+        self._store.setValue('saved_transforms', json.dumps(self.state.saved_transforms))
+        self._store.sync()
 
     def _sync_transform_state(self):
         """
@@ -13543,13 +13815,15 @@ class PluginWidget(QWidget):
 
     def save_state(self):
         """
-        Persist the plugin's PipelineState to QSettings so the user can
-        pick up where they left off next time this experiment is opened.
+        Persist the plugin's PipelineState in the experiment folder so the
+        user can pick up where they left off next time this experiment is
+        opened.
 
-        Lightweight scalar/list values go to QSettings.
+        Lightweight scalar/list values go to the settings store
+        (cache/dr_clustering/state.json, see experiment_state).
         Embeddings, cluster labels and stats results are written to a
-        sidecar bundle in the experiment's cache folder (avoids QSettings
-        size limits); see _save_model_sidecar.
+        sidecar bundle in the experiment's cache folder; see
+        _save_model_sidecar.
 
         self.controller.experiment can already point at a DIFFERENT
         experiment than the one self.state actually belongs to (e.g.
@@ -13558,7 +13832,7 @@ class PluginWidget(QWidget):
         before this plugin's own load_state() has run for the new
         experiment). Recomputing the destination live in that situation
         would silently write the OLD experiment's results into the NEW
-        one's QSettings group and sidecar file. Instead, flush to the
+        one's settings and sidecar file. Instead, flush to the
         cached key/dir this state was actually loaded under -- this is
         still synchronous and completes before the caller moves on, so no
         delay or user-facing message is needed, just the right target.
@@ -13578,7 +13852,7 @@ class PluginWidget(QWidget):
                 "this instance yet (self.state is still default-constructed)."
             )
             return
-        current_key = self._settings_key()
+        current_key = self._experiment_key()
         if current_key != self._loaded_experiment_key:
             _log.info(
                 "save_state: controller has switched to %r, but state.* still "
@@ -13590,8 +13864,9 @@ class PluginWidget(QWidget):
         else:
             key = current_key
             sidecar_dir = self.controller.experiment_dir
-        s = self._qsettings
-        s.beginGroup(key)
+        s = self._store
+        if s is None:
+            return
         try:
             # Guard against clobbering a good saved selection with a
             # transiently empty one -- same reasoning as
@@ -13771,7 +14046,7 @@ class PluginWidget(QWidget):
                 self.state.n_clusters, self.state.active_clustering_algorithm,
             )
         finally:
-            s.endGroup()
+            s.sync()
 
         # Heavy state (embeddings, cluster labels, stats) to the sidecar bundle
         self._save_model_sidecar(sidecar_dir)
@@ -13779,12 +14054,16 @@ class PluginWidget(QWidget):
 
     def load_state(self):
         """
-        Restore persisted PipelineState from QSettings.
-        Called once per experiment load, before tabs are refreshed.
+        Restore persisted PipelineState from the experiment folder (opening
+        its settings store first, which sets aside another experiment's
+        cache; see experiment_state). Called once per experiment load,
+        before tabs are refreshed.
         """
-        key = self._settings_key()
-        s = self._qsettings
-        s.beginGroup(key)
+        key = self._experiment_key()
+        self._store = experiment_state.open_store(
+            self.controller, 'dr_clustering', legacy_app_key=_SETTINGS_APP_KEY,
+            experiment_dir=self._loaded_experiment_dir)
+        s = self._store
         try:
             gates = _qs_list(s, 'selected_gates')
             if gates:
@@ -14158,8 +14437,6 @@ class PluginWidget(QWidget):
                 "continuing to the model sidecar with whatever was read.",
                 key,
             )
-        finally:
-            s.endGroup()
 
         # temporary diagnostic
         _log.info(
@@ -15121,6 +15398,11 @@ class PluginWidget(QWidget):
         if algo == 'UMAP':
             with drc_jit.numba_section(self.progress_message):
                 return reducer.transform(data)
+        if algo == 'tSNE':
+            # FFT for every batch: openTSNE's 'auto' picks Barnes-Hut below
+            # 10,000 new events, which rebuilds a quadtree of the whole
+            # reference map on every iteration
+            reducer.gradient_descent_params['negative_gradient_method'] = 'fft'
         return reducer.transform(data)
 
     def _get_sample_data(self, rel_path: str, algo: str, af_state=None) -> np.ndarray | None:
@@ -15246,8 +15528,7 @@ class PluginWidget(QWidget):
         )
         # fit() returns a TSNEEmbedding that supports .transform()
         embedding = tsne.fit(training_data)
-        # transform() inherits the fit's gradient method; 'auto' keeps
-        # openTSNE's choice by the size of each batch of new events
+        # _dr_transform sets the gradient method used for new events
         embedding.gradient_descent_params['negative_gradient_method'] = 'auto'
         # transform() first centres the fitted map in place (on its bounding
         # box); centre it now, so the pool's own fit coordinates (P2) and

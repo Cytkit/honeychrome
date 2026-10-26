@@ -175,7 +175,7 @@ class EnrichmentTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
-        outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_ENRICHMENT))
+        outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_ENRICHMENT, scrolling=True))
         row = QHBoxLayout()
         row.addWidget(QLabel("<b>Comparison:</b>"))
         self.cb_comparison = QComboBox()

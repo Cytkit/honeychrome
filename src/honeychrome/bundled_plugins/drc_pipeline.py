@@ -44,6 +44,7 @@ import hashlib
 import json
 import threading
 from collections import OrderedDict
+from pathlib import Path
 
 import numpy as np
 
@@ -709,8 +710,18 @@ def preview_features(controller, state, rel_path, af_state) -> np.ndarray:
 
 
 def sample_abs_path(controller, rel_path) -> "object":
-    """Resolve a picker-relative sample path to an absolute Path."""
+    """
+    Resolve a picker-relative sample path to an absolute Path.
+
+    Picker paths are relative to the raw samples subdirectory. A sample
+    stored outside it (for example in a linked folder beside it) keeps its
+    experiment-relative all_samples key instead and resolves from the
+    experiment folder.
+    """
     raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
+    all_samples = controller.experiment.samples.get('all_samples', {})
+    if str(Path(raw_subdir) / rel_path) not in all_samples and str(rel_path) in all_samples:
+        return controller.experiment_dir / rel_path
     return controller.experiment_dir / raw_subdir / rel_path
 
 

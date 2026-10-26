@@ -100,6 +100,13 @@ class ExperimentModel:
         self.process: dict = deepcopy(process_default)
         self.cytometry: dict = deepcopy(cytometry_default)
         self.statistics: list = []
+        # Identifies this .kit, so state kept in the experiment folder (see
+        # controller_components.experiment_state) is never taken up by a new
+        # experiment created at the same path.
+        self.experiment_id: str = ''
+        # True for an experiment saved before ids existed: its plugin state
+        # may still be in QSettings, to be moved to the folder once.
+        self.legacy_plugin_state: bool = False
 
         self.progress_indicator = 0
 
@@ -111,6 +118,7 @@ class ExperimentModel:
         self.process = deepcopy(process_default)
         self.cytometry = deepcopy(cytometry_default)
         self.statistics = []
+        self.new_identity()
 
         ### set up default raw gating, raw transforms, raw plots ---- check that this corresponds with default channels
         self.cytometry['raw_transforms'] = assign_default_transforms(self.settings['raw'])
@@ -168,7 +176,14 @@ class ExperimentModel:
         ### save ###
         self.save()
 
-    def load(self, experiment_path):
+    def new_identity(self):
+        """Give the experiment a new id, as a new experiment."""
+        self.experiment_id = uuid.uuid4().hex
+        self.legacy_plugin_state = False
+
+    def load(self, experiment_path) -> bool:
+        """Read a .kit. Returns True when the file had no experiment id and
+        one was given to it, so the caller can save to keep it."""
         self.experiment_path = str(experiment_path)
         with open(self.experiment_path, "rb") as f:
             file_data = json.load(f)
@@ -183,6 +198,14 @@ class ExperimentModel:
         self.cytometry.setdefault('raw_custom_sample_gates', {})
         self.cytometry.setdefault('unmixed_custom_sample_gates', {})
 
+        self.experiment_id = str(file_data.get('experiment_id') or '')
+        self.legacy_plugin_state = bool(file_data.get('legacy_plugin_state', False))
+        if self.experiment_id:
+            return False
+        self.experiment_id = uuid.uuid4().hex
+        self.legacy_plugin_state = True
+        return True
+
     def save(self):
         if self.experiment_path is None:
             raise ValueError("No file path set for saving")
@@ -191,8 +214,11 @@ class ExperimentModel:
             'samples':self.samples,
             'process':self.process,
             'cytometry':self.cytometry,
-            'statistics':self.statistics
+            'statistics':self.statistics,
+            'experiment_id': self.experiment_id,
         }
+        if self.legacy_plugin_state:
+            file_data['legacy_plugin_state'] = True
         json_string = json.dumps(file_data, indent=2)
         # json_string = json_string.replace('\\n', '\n') # to pretty print the gml sections... unfortunately not compatible with json standard
 

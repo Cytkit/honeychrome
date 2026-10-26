@@ -760,7 +760,8 @@ class AfComparisonPlotWidget(QWidget):
 
         if tr.id == 1:  # logicle
             if map_pos < 0.5 * vmax:
-                tr.logicle_w = tr.logicle_w / factor
+                w_step = settings.logicle_w_drag_step if factor < 1 else -settings.logicle_w_drag_step
+                tr.logicle_w = min(tr.logicle_m / 2.0, max(0.0, tr.logicle_w + w_step))
                 tr.set_transform()
             else:
                 new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
