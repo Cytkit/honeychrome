@@ -8,7 +8,8 @@ can be built on a worker thread and embedded later (e.g. in
 ``ExportablePlotWidget``).
 
 * ``make_heatmap_figure`` — per-sample values of the significant features,
-  with row and column dendrograms and a group colour bar.
+  with row and column dendrograms and a group colour bar; optionally the
+  samples kept in blocks (e.g. FlowCode libraries) under a second bar.
 * ``make_volcano_figure`` — effect size against adjusted p-value, 95% CI
   bars and a hover tooltip on significant points. Given the two groups, a
   ramp below the x axis shows which side is higher in which group.
@@ -16,6 +17,8 @@ can be built on a worker thread and embedded later (e.g. in
   intensity differences, significant markers marked with a dot.
 * ``make_comparison_heatmap_figure`` — comparison × feature grid of effect
   sizes, coloured only where significant: every comparison of a run at once.
+* ``make_group_values_figure`` — dot and violin plot of one feature's
+  per-sample values, one column per group.
 
 Hover tooltips need a canvas: a figure builder stores its handler as
 ``fig._hover_handler``; connect it with
@@ -37,11 +40,14 @@ __all__ = [
     'message_figure', 'make_heatmap_figure', 'make_volcano_figure',
     'group_pair_colours', 'draw_direction_ramp',
     'make_marker_summary_figure', 'make_comparison_heatmap_figure', 'significance_column',
-    'wrap_label', 'text_width_inches', 'cell_grid_lines',
+    'wrap_label', 'text_width_inches', 'cell_grid_lines', 'make_group_values_figure',
+    'GROUP_COLOURS',
 ]
 
 GROUP_COLOUR_A = '#4477AA'
 GROUP_COLOUR_B = '#EE6677'
+# Default colours of groups by their order, where no group colours are set.
+GROUP_COLOURS = ('#4477AA', '#EE6677', '#228833', '#CCBB44', '#66CCEE', '#AA3377', '#BBBBBB')
 MAX_STATIC_LABELS = 10
 VOLCANO_LABEL_WRAP = 24     # characters per line for volcano point labels
 
@@ -348,7 +354,9 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
                         is_dark: bool = False, run_label: str = '',
                         value_label: str | None = None,
                         feature_labels: dict | None = None,
-                        group_colours: dict | None = None):
+                        group_colours: dict | None = None,
+                        sample_blocks: dict | None = None,
+                        block_colours: dict | None = None):
     """
     Per-sample heatmap of the significant features, with row and column
     dendrograms and a two-group colour bar. The group key sits below the
@@ -364,6 +372,13 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
                       ('MFI', 'Counts', otherwise '% frequency').
     feature_labels  : optional {feature: display label} for the row labels.
     group_colours   : optional {group: colour}; default two fixed colours.
+    sample_blocks   : optional {sample id: block}, e.g. the FlowCode library
+                      of each sample, whose features are only measured in
+                      some blocks. The samples are clustered within each
+                      block, the blocks drawn side by side with a gap (in
+                      *block_colours* order, then first seen), a second bar
+                      in *block_colours* ({block: colour}) marks them, and
+                      NaN is drawn as background (not measured by design).
     """
     from matplotlib.figure import Figure
     from matplotlib.gridspec import GridSpec
@@ -405,13 +420,35 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
             return list(range(data.shape[0])), None
 
     row_order, Zr = _hclust(mat_for_clustering.T)   # features
-    col_order, Zc = _hclust(mat_for_clustering)     # samples
+    block_trees = []
+    if sample_blocks:
+        # Columns block by block, each block's samples in its own cluster
+        # order, None for the gap between two blocks.
+        names = list(block_colours or {})
+        names += [b for b in dict.fromkeys(sample_blocks.get(s, '') for s in sample_labels) if b not in names]
+        columns = []
+        for block in names:
+            members = [i for i, s in enumerate(sample_labels) if sample_blocks.get(s, '') == block]
+            if not members:
+                continue
+            if columns:
+                columns.append(None)
+            order, Zb = _hclust(mat_for_clustering[members])
+            block_trees.append((len(columns), Zb))
+            columns.extend(members[i] for i in order)
+        Zc = None
+    else:
+        col_order, Zc = _hclust(mat_for_clustering)     # samples
+        columns = list(col_order)
+    n_cols = len(columns)
 
-    mat_ord = mat[:, row_order][col_order, :].T   # (n_features, n_samples)
+    blank = np.full(len(row_order), np.nan)
+    mat_ord = (np.column_stack([mat[i, row_order] if i is not None else blank for i in columns])
+               if columns else np.empty((len(row_order), 0)))   # (n_features, n_cols)
     labels = feature_labels or {}
     feat_labels = [labels.get(cols_present[i], cols_present[i]) for i in row_order]
-    samp_labels = [sample_labels[i] for i in col_order]
-    grp_ord = [group_by_sample.get(sample_labels[i], group_a) for i in col_order]
+    samp_labels = [sample_labels[i] if i is not None else '' for i in columns]
+    grp_ord = [group_by_sample.get(sample_labels[i], group_a) if i is not None else None for i in columns]
 
     # Sizes in inches: the plot's rows and columns, then the margins
     # around them (title and run label above; colour bar labels on the
@@ -424,22 +461,23 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
     dend_w = 1.0
     label_w = max(text_width_inches(str(f), 7) for f in feat_labels) * 1.2 + 0.25
     cbar_w = 0.3
-    title_text = wrap_label(title, max(20, int((5.0 + n_samples * col_w) / 0.09)))
+    bars_h = grp_h * (2 if sample_blocks else 1)
+    title_text = wrap_label(title, max(20, int((5.0 + n_cols * col_w) / 0.09)))
     left_m = 0.2
     right_m = 1.0
     top_m = (RUN_LABEL_BAND_INCHES if run_label else 0.1) + 0.22 * (title_text.count('\n') + 1) + 0.15
     two_columns = text_width_inches(f"{group_a}        {group_b}", 7) + 1.0 < (
-        n_samples * col_w + dend_w + label_w + cbar_w)
-    bottom_m = 0.4 if two_columns else 0.65
-    fig_w = max(5.0, left_m + dend_w + n_samples * col_w + label_w + cbar_w + right_m)
-    fig_h = max(4.0, top_m + dend_h + grp_h + n_features * row_h + xlabel_h + bottom_m)
+        n_cols * col_w + dend_w + label_w + cbar_w)
+    bottom_m = 0.4 if two_columns else 0.65 + 0.15 * len(block_trees)
+    fig_w = max(5.0, left_m + dend_w + n_cols * col_w + label_w + cbar_w + right_m)
+    fig_h = max(4.0, top_m + dend_h + bars_h + n_features * row_h + xlabel_h + bottom_m)
 
     fig = Figure(figsize=(fig_w, fig_h))
     gs = GridSpec(
         4, 4,
         figure=fig,
-        height_ratios=[dend_h, grp_h, n_features * row_h, xlabel_h],
-        width_ratios=[dend_w, n_samples * col_w, label_w, cbar_w],
+        height_ratios=[dend_h, bars_h, n_features * row_h, xlabel_h],
+        width_ratios=[dend_w, n_cols * col_w, label_w, cbar_w],
         hspace=0.02,
         wspace=0.0,
     )
@@ -447,32 +485,60 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
 
     ax_cdend = fig.add_subplot(gs[0, 1])
     ax_cdend.axis('off')
-    if n_samples > 1 and Zc is not None:
+    if block_trees:
+        # Each block's dendrogram over its own columns, on a common height.
+        segments = []
+        for start, Zb in block_trees:
+            if Zb is None:
+                continue
+            dend = dendrogram(Zb, no_plot=True)
+            segments += [([start + (x - 5.0) / 10.0 for x in xs], ys)
+                         for xs, ys in zip(dend['icoord'], dend['dcoord'])]
+        for xs, ys in segments:
+            ax_cdend.plot(xs, ys, color='#555555', linewidth=1.0)
+        ax_cdend.set_xlim(-0.5, n_cols - 0.5)
+        top = max((max(ys) for _xs, ys in segments), default=0.0)
+        ax_cdend.set_ylim(0.0, top * 1.05 if top > 0 else 1.0)
+    elif n_cols > 1 and Zc is not None:
         try:
             dendrogram(Zc, ax=ax_cdend, color_threshold=0,
                        above_threshold_color='#555555',
                        link_color_func=lambda _: '#555555',
                        no_labels=True)
-            ax_cdend.set_xlim(-0.5, n_samples * 10 - 0.5)
+            ax_cdend.set_xlim(-0.5, n_cols * 10 - 0.5)
         except Exception:
             pass
     ax_cdend.set_title(title_text, fontsize=10, pad=4)
 
     ax_grp = fig.add_subplot(gs[1, 1])
-    ax_grp.set_xlim(0, n_samples)
-    ax_grp.set_ylim(0, 1)
+    ax_grp.set_xlim(0, n_cols)
+    ax_grp.set_ylim(0, 2 if sample_blocks else 1)
     ax_grp.axis('off')
     colour_a, colour_b = group_pair_colours(group_a, group_b, group_colours)
+    top_row = 1 if sample_blocks else 0
     for xi, grp in enumerate(grp_ord):
+        if grp is None:
+            continue
         colour = colour_a if grp == group_a else colour_b
-        ax_grp.add_patch(mpatches.Rectangle((xi, 0), 1, 1, color=colour,
+        ax_grp.add_patch(mpatches.Rectangle((xi, top_row), 1, 1, color=colour,
                                             transform=ax_grp.transData))
     handles = [
         mpatches.Patch(color=colour_a, label=group_a),
         mpatches.Patch(color=colour_b, label=group_b),
     ]
+    if sample_blocks:
+        shown = {}
+        for xi, i in enumerate(columns):
+            if i is None:
+                continue
+            block = sample_blocks.get(sample_labels[i], '')
+            colour = (block_colours or {}).get(block, '#7f7f7f')
+            shown.setdefault(block, colour)
+            ax_grp.add_patch(mpatches.Rectangle((xi, 0), 1, 0.9, color=colour,
+                                                transform=ax_grp.transData))
+        handles += [mpatches.Patch(color=colour, label=block) for block, colour in shown.items()]
     fig.legend(handles=handles, loc='lower center', fontsize=7,
-               frameon=True, ncol=2 if two_columns else 1)
+               frameon=True, ncol=len(handles) if two_columns else 1)
 
     ax_rdend = fig.add_subplot(gs[2, 0])
     ax_rdend.axis('off')
@@ -494,14 +560,15 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
                vmin + 0.01)
     import matplotlib
     cmap = matplotlib.colormaps['viridis'].copy()
-    cmap.set_bad('#bdbdbd')
+    # With blocks, NaN is a feature another block carries: drawn as background.
+    cmap.set_bad((0.0, 0.0, 0.0, 0.0) if sample_blocks else '#bdbdbd')
     # One quad per cell: unlike an image, draw time does not grow with the
     # canvas size, which matters for heatmaps of several hundred rows.
-    im = ax_hm.pcolormesh(np.arange(-0.5, n_samples, 1), np.arange(-0.5, n_features, 1),
+    im = ax_hm.pcolormesh(np.arange(-0.5, n_cols, 1), np.arange(-0.5, n_features, 1),
                           np.ma.masked_invalid(mat_ord), cmap=cmap, vmin=vmin, vmax=vmax)
-    ax_hm.set_xlim(-0.5, n_samples - 0.5)
+    ax_hm.set_xlim(-0.5, n_cols - 0.5)
     ax_hm.set_ylim(n_features - 0.5, -0.5)
-    ax_hm.set_xticks(range(n_samples))
+    ax_hm.set_xticks(range(n_cols))
     ax_hm.set_xticklabels([Path(str(s)).stem for s in samp_labels],
                           rotation=45, ha='right', fontsize=7)
     ax_hm.set_yticks(range(n_features))
@@ -509,7 +576,7 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
     ax_hm.yaxis.set_label_position('right')
     ax_hm.yaxis.tick_right()
     ax_hm.grid(False)
-    cell_grid_lines(ax_hm, n_samples, n_features, 'white', 0.6)
+    cell_grid_lines(ax_hm, n_cols, n_features, 'white', 0.6)
 
     ax_cb = fig.add_subplot(gs[2, 3])
     cb = fig.colorbar(im, cax=ax_cb)
@@ -746,6 +813,13 @@ def make_marker_summary_figure(results_df: pd.DataFrame, title: str, channel_nam
         fig._row_keys = [ids.get(f, f) for f in fam_order]
     else:
         fig._row_keys = list(fam_order)
+    # Each cell's feature name (None where untested), for clicking a cell.
+    if 'feature' in fam_df.columns:
+        cells = (fam_df.drop_duplicates(['cluster', 'channel'])
+                 .pivot(index='cluster', columns='channel', values='feature')
+                 .reindex(index=fam_order, columns=channels))
+        fig._cell_keys = [[v if isinstance(v, str) else None for v in row]
+                          for row in cells.values.tolist()]
     style_figure_theme(fig, is_dark)
     stamp_run_label(fig, run_label)
     return fig
@@ -832,4 +906,57 @@ def make_comparison_heatmap_figure(results_df: pd.DataFrame, title: str, is_dark
     axes[0].set_title(title, fontsize=10)
     style_figure_theme(fig, is_dark)
     stamp_run_label(fig, run_label)
+    return fig
+
+
+def make_group_values_figure(values: dict, group_order: list[str], title: str,
+                             p_text: str = '', is_dark: bool = False, ax=None,
+                             value_label: str = '% of parent', value_suffix: str = '%',
+                             group_colours: dict | None = None):
+    """Dot and violin plot of one feature's per-sample values, one column
+    per group, with the test result above.
+
+    values        : {group: [(sample, value)]}.
+    value_label   : y-axis label; *value_suffix* follows each value in the
+                    hover labels.
+    group_colours : optional {group: colour}; other groups take GROUP_COLOURS
+                    by their order.
+    """
+    from matplotlib.figure import Figure
+
+    fig = None
+    if ax is None:
+        fig = Figure(figsize=(3.8, 4.2), constrained_layout=True)
+        ax = fig.add_subplot(111)
+    groups = [g for g in group_order if values.get(g)] + \
+        [g for g in values if g not in group_order and values.get(g)]
+    colours = {g: (group_colours or {}).get(g) or GROUP_COLOURS[i % len(GROUP_COLOURS)]
+               for i, g in enumerate(dict.fromkeys(groups))}
+    fg = 'white' if is_dark else 'black'
+    rng = np.random.default_rng(0)
+    hover_xy, hover_labels = [], []
+    for i, g in enumerate(groups):
+        ys = np.array([v for _s, v in values[g]], dtype=float)
+        if len(ys) >= 2 and np.ptp(ys) > 0:
+            parts = ax.violinplot([ys], positions=[i], widths=0.7, showextrema=False)
+            for body in parts['bodies']:
+                body.set_facecolor(colours[g])
+                body.set_alpha(0.3)
+        xs = i + rng.uniform(-0.12, 0.12, len(ys))
+        ax.scatter(xs, ys, s=22, color=colours[g], edgecolors=fg, linewidths=0.4, zorder=3)
+        ax.hlines(float(np.median(ys)), i - 0.25, i + 0.25, color=fg, linewidth=1.2, zorder=4)
+        for (s, v), x in zip(values[g], xs):
+            hover_xy.append((x, v))
+            hover_labels.append(f"{str(s).replace(chr(92), '/').rsplit('/', 1)[-1]}: "
+                                f"{v:.2f}{value_suffix}")
+    ax.set_xticks(range(len(groups)), [f"{g}\n(n={len(values[g])})" for g in groups], fontsize=8)
+    ax.set_xlim(-0.6, len(groups) - 0.4)
+    ax.set_ylabel(value_label)
+    ax.set_title(title + (f"\n{p_text}" if p_text else ''), fontsize=9)
+    if fig is not None:
+        if hover_xy:
+            hover = np.asarray(hover_xy, dtype=float)
+            overlay = ax.scatter(hover[:, 0], hover[:, 1], s=60, alpha=0, zorder=6)
+            fig._hover_handler = make_scatter_hover_handler(fig, ax, overlay, hover_labels, is_dark)
+        style_figure_theme(fig, is_dark)
     return fig
