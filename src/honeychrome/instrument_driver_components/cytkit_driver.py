@@ -573,7 +573,7 @@ class CytkitDevice:
                 if 'enable' in value:
                     for index in value['enable']:
                         self.adcs.real_set_enable(spectral_channel_index_to_adc_channel_index[index], value['enable'][index])
-                        self.offset_corrector.set_enable(spectral_channel_index_to_adc_channel_index[index], value['invert'][index])
+                        self.offset_corrector.set_enable(spectral_channel_index_to_adc_channel_index[index], value['enable'][index])
                 if 'invert' in value:
                     for index in value['invert']:
                         self.offset_corrector.set_invert(spectral_channel_index_to_adc_channel_index[index], value['invert'][index])
@@ -617,7 +617,7 @@ class CytkitDevice:
 
                 if 'threshold' in value:
                     self.threshold = value['threshold'] * 1000 / settings.adc_scale_uv  # convert mV to adc units
-                    logger.info(f'[CytkitDriver] set threshold {self.threshold} (ADC units)')
+                    logger.info(f'[CytkitDriver] set threshold {value['threshold']} mV, {self.threshold} (ADC units)')
 
                 if 'peak_detection_channel' in value:
                     index = settings.adc_channels.index(value['peak_detection_channel'])
@@ -660,9 +660,9 @@ class CytkitDevice:
                         for row in self.trigger_merge_list:
                             if not np.isnan(baselines[row]):
                                 level = int(baselines[row]/settings.adc_scale_uv  + self.threshold)
-                                level = min(level, 16383)
+                                level = max(min(level, 16383), 0)
                                 self.trigger.channel_set_level(spectral_channel_index_to_adc_channel_index[row], level)
-                                logger.info(f'[CytkitDriver] setting trigger {settings.adc_channels[row]}: baseline {baselines[row]}, threshold {self.threshold}, level {level}')
+                                logger.info(f'[CytkitDriver] setting trigger {settings.adc_channels[row]}: baseline {baselines[row]} uV, baseline {int(baselines[row]*settings.adc_scale_uv/1000)} (ADC), threshold {self.threshold}, level {level}')
 
             if parameter == 'pressure_set_point':
                 self.pressure_set_point = value

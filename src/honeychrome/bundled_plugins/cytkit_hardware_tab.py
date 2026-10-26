@@ -1201,7 +1201,7 @@ class PluginWidget(QWidget):
         layout.addWidget(title)
 
         self.automatically_adjust_trigger_over_baseline_cb = QCheckBox('Automatically Adjust Trigger Over Baseline')
-        self.automatically_adjust_trigger_over_baseline_cb.setEnabled(settings.automatically_adjust_trigger_over_baseline_retrieved)
+        self.automatically_adjust_trigger_over_baseline_cb.setChecked(settings.automatically_adjust_trigger_over_baseline_retrieved)
         self.automatically_adjust_trigger_over_baseline_cb.toggled.connect(self.automatically_adjust_trigger_over_baseline)
         layout.addWidget(self.automatically_adjust_trigger_over_baseline_cb)
 
@@ -1892,7 +1892,8 @@ class PluginWidget(QWidget):
 
     @Slot(bool)
     def automatically_adjust_trigger_over_baseline(self, enabled):
-        instrument_settings.setValue("automatically_adjust_trigger_over_baseline_retrieved", enabled)
+        instrument_settings.setValue("automatically_adjust_trigger_over_baseline", enabled)
+        logger.info(f'[CytkitHardwareTab] automatically_adjust_trigger_over_baseline set to {enabled}')
         self.set_instrument_state({'trigger': {'auto_adjust_over_baseline': enabled}})
 
     @Slot(int)

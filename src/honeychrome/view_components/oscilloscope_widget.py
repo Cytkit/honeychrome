@@ -5,7 +5,7 @@ from queue import Empty
 import pyqtgraph as pg
 
 from honeychrome.settings import n_time_points_in_event, adc_rate, instrument_settings, peak_detection_channel, threshold
-from honeychrome.settings import analyser_target_repeat_time, line_colors, spectral_array_colors, adc_channels, scatter_channels, fluorescence_channels
+from honeychrome.settings import analyser_target_repeat_time, scatter_line_colours, spectral_array_colors, adc_channels, scatter_channels, fluorescence_channels
 from honeychrome.view_components.profiles_viewer import FlowLayout, LegendEntry
 
 import logging
@@ -80,7 +80,7 @@ class OscilloscopeWidget(QWidget):
 
         # ---- Legend entries ----
         for i in self.scatter_channel_indices:
-            color = line_colors[i % len(line_colors)]
+            color = scatter_line_colours[i % len(scatter_line_colours)]
             self.legendLayout1.addWidget(LegendEntry(color, adc_channels[i]))
         for i in self.fluorescence_channel_indices:
             color = spectral_array_colors[i % len(spectral_array_colors)]
@@ -93,11 +93,11 @@ class OscilloscopeWidget(QWidget):
 
         # ---- Pre-create pens (hoisted out of the hot path) ----
         self._scatter_solid_pens = [
-            pg.mkPen(color=line_colors[i % len(line_colors)], width=2, style=Qt.SolidLine)
+            pg.mkPen(color=scatter_line_colours[i % len(scatter_line_colours)], width=2, style=Qt.SolidLine)
             for i in self.scatter_channel_indices
         ]
         self._scatter_dotted_pens = [
-            pg.mkPen(color=line_colors[i % len(line_colors)], width=5, style=Qt.DotLine)
+            pg.mkPen(color=scatter_line_colours[i % len(scatter_line_colours)], width=5, style=Qt.DotLine)
             for i in self.scatter_channel_indices
         ]
         self._fluorescence_solid_pens = [
@@ -121,7 +121,7 @@ class OscilloscopeWidget(QWidget):
         self.scatter_curves = []       # list[(channel_idx, PlotDataItem)]
         self.scatter_vstart = []       # list[(channel_idx, PlotDataItem)]
         self.scatter_vend = []         # list[(channel_idx, PlotDataItem)]
-        self.scatter_thresh = None     # PlotDataItem or None
+        self.scatter_thresh = self.plot_widget1.plot([], [], pen=None)     # PlotDataItem or None
 
         for slot, i in enumerate(self.scatter_channel_indices):
             solid = self._scatter_solid_pens[slot]
@@ -138,7 +138,7 @@ class OscilloscopeWidget(QWidget):
         self.fluorescence_curves = []
         self.fluorescence_vstart = []
         self.fluorescence_vend = []
-        self.fluorescence_thresh = None
+        self.fluorescence_thresh = self.plot_widget2.plot([], [], pen=None)     # PlotDataItem or None
 
         for slot, i in enumerate(self.fluorescence_channel_indices):
             solid = self._fluorescence_solid_pens[slot]
@@ -158,6 +158,24 @@ class OscilloscopeWidget(QWidget):
         self.timer.timeout.connect(self.check_queue)
         self.timer.setInterval(int(analyser_target_repeat_time * 1000 / 5))
         self.timer.start()
+
+        self.bus.configPeakDetection.connect(self.configure_peak_detection)
+
+    @Slot(dict)
+    def configure_peak_detection(self, params):
+        self.peak_detection_channel_index = adc_channels.index(params['peak_detection_channel'])
+        self.threshold = params['threshold'] * 1000  # uV
+
+        if self.peak_detection_channel_index in self.scatter_channel_indices:
+            index = self.scatter_channel_indices.index(self.peak_detection_channel_index)
+            dotted = self._scatter_dotted_pens[index]
+            self.scatter_thresh.setPen(dotted)
+            self.fluorescence_thresh.setPen(None)
+        else:
+            index = self.fluorescence_channel_indices.index(self.peak_detection_channel_index)
+            dotted = self._fluorescence_dotted_pens[index]
+            self.scatter_thresh.setPen(None)
+            self.fluorescence_thresh.setPen(dotted)
 
     @Slot()
     def start_polling(self):
@@ -193,9 +211,6 @@ class OscilloscopeWidget(QWidget):
         if self.trace is None:
             return
         try:
-            if self.controller.peak_detection_threshold:
-                self.threshold = self.controller.peak_detection_threshold * 1000 # uV
-
             start = int(self.trace['n_start'])
             end = int(self.trace['n_end'])
 

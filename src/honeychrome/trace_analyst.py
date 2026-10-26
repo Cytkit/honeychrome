@@ -20,7 +20,7 @@ from honeychrome.settings import adc_channels, peak_detection_channel_retrieved,
 
 verbosity_divider = int(1/analyser_target_repeat_time)
 gap = 4 # gap between start of end of baseline and start of peak
-left_gap = 0 # gap before trace starts
+left_gap = 4 # gap before trace starts
 
 default_baselines = np.zeros(n_channels_trace)
 
@@ -188,13 +188,11 @@ class TraceAnalyser(mp.Process):
                 response_to_experiment_control = {'status': 'OK', 'message': '[Trace Analyser] started'}
 
             elif incoming_from_experiment_control['command'] == 'stop':
-                self.stop_analyser.set()
                 if thread:
                     if thread.is_alive():
-                        thread.join(0.1)
-                        while thread.is_alive():
-                            self.logger.info('[Trace Analyser] Waiting until analysis thread ends')
-                            time.sleep(0.25)
+                        self.stop_analyser.set()
+                        thread.join(timeout=5)
+
                 response_to_experiment_control = {'status':'OK', 'message':'[Trace Analyser] stopped'}
 
             elif incoming_from_experiment_control['command'] == 'configure':
@@ -212,13 +210,10 @@ class TraceAnalyser(mp.Process):
                 response_to_experiment_control = {'status':'OK', 'message':'[Trace Analyser] Peak detection configuration set'}
 
             elif incoming_from_experiment_control['command'] == 'quit':
-                self.stop_analyser.set()
                 if thread:
                     if thread.is_alive():
-                        thread.join(0.1)
-                        while thread.is_alive():
-                            self.logger.info('[Trace Analyser] Waiting until analysis thread ends')
-                            time.sleep(0.25)
+                        self.stop_analyser.set()
+                        thread.join(timeout=5)
                 response_to_experiment_control = {'status':'OK', 'message':'[Trace Analyser] quit'}
                 self.pipe_connection.send(response_to_experiment_control)
                 break
@@ -239,7 +234,8 @@ class TraceAnalyser(mp.Process):
         while not self.stop_analyser.is_set():
             cycle_start_time = time.perf_counter()
             cycle_n += 1
-
+            event_time = int((cycle_start_time - start_time) * 1000)
+            trace_push_count = 0
             '''
             input cached traces
             for all new events, calculate area, height, width as specified in channel_dict, add all channels to events array as specified
@@ -318,27 +314,24 @@ class TraceAnalyser(mp.Process):
                             keep_mask[n] = True
                             last_event_index = n
 
+                            if trace_push_count < 5:
+                                trace_push_count += 1
+                                self.oscilloscope_traces_queue.put({'event_id': events_tail, 'time': event_time,
+                                                                    'traces': traces,
+                                                                    'n_start': n_start, 'n_end': n_end, 'peak': peak,
+                                                                    'baselines': baselines})
+
                     # keep only the ones above threshold
                     areas = areas[keep_mask]
                     heights = heights[keep_mask]
                     widths = widths[keep_mask]
                     n_new_events = np.sum(keep_mask)
 
-                    times = np.ones(n_new_events, dtype=np.int64) * int((time.perf_counter() - start_time) * 1000)
+                    times = np.ones(n_new_events, dtype=np.int64) * event_time
                     event_ids = np.array(range(events_tail, events_tail + n_new_events))
 
                     # push to events cache anything above threshold, or failing that, any trace at all
-                    if n_new_events > 0:
-                        traces_indices_to_push = np.flatnonzero(keep_mask)[:min(5, n_new_events)]
-                        for n, index in enumerate(traces_indices_to_push):
-                            last_event_time = times[-1]
-                            last_event_id = event_ids[n]
-
-                            self.oscilloscope_traces_queue.put({'event_id': last_event_id, 'time': last_event_time,
-                                                                'traces': traces_batch_scaled[index],
-                                                                'n_start': n_start, 'n_end': n_end, 'peak': peak,
-                                                                'baselines': baselines})
-                    else:
+                    if trace_push_count == 0:
                         baselines = np.median(traces[:, n_start:n_end], axis=1)
                         self.oscilloscope_traces_queue.put({'event_id': None, 'time': None,
                                                             'traces': traces_batch_scaled[last_event_index],

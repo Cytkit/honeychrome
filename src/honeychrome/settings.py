@@ -317,7 +317,7 @@ report_include_process_retrieved = q_settings.value("report_include_process", re
 
 use_dummy_instrument_retrieved = instrument_settings.value("use_dummy_instrument", use_dummy_instrument, type=bool)
 
-automatically_adjust_trigger_over_baseline_retrieved = instrument_settings.value('automatically_adjust_trigger_over_baseline', automatically_adjust_trigger_over_baseline, type=int)
+automatically_adjust_trigger_over_baseline_retrieved = instrument_settings.value('automatically_adjust_trigger_over_baseline', automatically_adjust_trigger_over_baseline, type=bool)
 pressure_set_point_retrieved = instrument_settings.value('pressure_set_point', pressure_set_point, type=int)
 temperature_set_point_retrieved = instrument_settings.value('temperature_set_point', temperature_set_point, type=int)
 sample_pump_steps_per_microlitre_retrieved = instrument_settings.value('sample_pump_steps_per_microlitre', sample_pump_steps_per_microlitre, type=int)
@@ -356,7 +356,7 @@ adc_offset_retrieved = {}
 for row, name in enumerate(adc_channels):
     instrument_settings.beginGroup(name)
     adc_enabled_retrieved[name] = instrument_settings.value("enabled", True, type=bool)
-    adc_inverted_retrieved[name] = instrument_settings.value("inverted", False if name=='SSC' else True, type=bool)
+    adc_inverted_retrieved[name] = instrument_settings.value("inverted", False if name=='FSC' else True, type=bool)
     adc_offset_retrieved[name] = instrument_settings.value("offset", 0, type=int)
     instrument_settings.endGroup()
 instrument_settings.endGroup()
