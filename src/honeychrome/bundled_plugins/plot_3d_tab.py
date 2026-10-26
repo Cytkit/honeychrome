@@ -1030,7 +1030,8 @@ class Plot3DPlotWidget(QtWidgets.QFrame):
                 press_frac = strip._press_pos.x() / strip.width()
             value_at_press = lo + press_frac * (hi - lo)
             if value_at_press < 0.5 * hi:
-                tr.logicle_w = tr.logicle_w / factor
+                w_step = settings.logicle_w_drag_step if factor < 1 else -settings.logicle_w_drag_step
+                tr.logicle_w = min(tr.logicle_m / 2.0, max(0.0, tr.logicle_w + w_step))
                 tr.set_transform()
             else:
                 new_min = (lo - tr.zero) * factor + tr.zero

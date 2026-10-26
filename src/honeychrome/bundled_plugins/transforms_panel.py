@@ -46,7 +46,7 @@ import honeychrome.settings as hc_settings
 from honeychrome.controller_components.job_gate import wait_if_busy
 
 __all__ = ['TransformInspector', 'PopulationTransformsPanel', 'TransformSet', 'BiplotTile',
-           'transform_params', 'transform_from_params', 'parks_moore_w', 'magnitude_decades',
+           'transform_params', 'transform_from_params', 'parks_moore_w',
            'antigen_dash_labels', 'default_population', 'pool_population_events',
            'SKIP_CHANNELS', 'TRANSFORM_TARGET_EVENTS']
 
@@ -55,8 +55,12 @@ TRANSFORM_KEYS = ('id', 'scale_t', 'linear_a', 'logicle_w', 'logicle_m', 'logicl
                   'log_m', 'limits')
 _ZOOM_RATE = 1.04
 # Events of the chosen population pooled over the samples for display and
-# Auto-transform: ample for the 25th percentile of the negative events.
+# Auto-transform: ample for the 5th percentile of the negative events.
 TRANSFORM_TARGET_EVENTS = 30_000
+# Auto-transform headroom: W is chosen so the axis reaches about this many
+# times the 5th-percentile negative value (W rises by log10(k) / 2), keeping
+# the negative tail on scale rather than piled up at the axis edge.
+AUTO_W_HEADROOM = 2
 # Most events read from one sample while topping up a rare population.
 MAX_EVENTS_READ_PER_SAMPLE = 2_000_000
 
@@ -125,31 +129,19 @@ def transform_from_params(params: dict, template=None):
     return tr
 
 
-def magnitude_decades(controller) -> float:
-    """Logicle M (decades) from the cytometer's range: log10(ceiling) − 1,
-    so the top-of-scale decade is excluded as in the Gating-ML spec (a
-    1 × 10⁶ instrument gives M = 5)."""
-    try:
-        ceiling = controller.experiment.settings['raw']['magnitude_ceiling']
-        if ceiling and ceiling > 0:
-            return math.log10(float(ceiling)) - 1.0
-    except (KeyError, TypeError, ValueError, AttributeError):
-        pass
-    return 4.5
-
-
 def parks_moore_w(arrays, top: float, decades: float) -> float:
-    """Logicle width basis for one channel (Parks, Roederer & Moore 2006):
-    W = (M − log10(T / |q|)) / 2, with q the 25th percentile of the negative
-    events pooled over *arrays*; 0.5 without negative events. Clamped to
-    [0, M/2]."""
+    """Logicle width basis for one channel, after Parks, Roederer & Moore
+    2006 (Eq. 6): W = (M − log10(T / (k·|r|))) / 2, with r the 5th percentile
+    of the negative events pooled over *arrays*, k = AUTO_W_HEADROOM, T the
+    channel's top of scale and M the channel's own logicle M (decades); 0.5
+    without negative events. Clamped to [0, M/2]."""
     negatives = [np.asarray(a)[np.asarray(a) < 0] for a in arrays]
     negatives = [a for a in negatives if len(a)]
     if not negatives:
         return 0.5
-    q = float(np.percentile(np.concatenate(negatives), 25))
+    r = float(np.percentile(np.concatenate(negatives), 5))
     try:
-        w = (decades - math.log10(top / abs(q))) / 2.0
+        w = (decades - math.log10(top / (AUTO_W_HEADROOM * abs(r)))) / 2.0
     except (ValueError, ZeroDivisionError):
         w = 0.5
     return max(0.0, min(decades / 2.0, w))
@@ -426,6 +418,10 @@ class TransformInspector(QWidget):
 
     _XFORM_LABELS = {0: 'Linear', 1: 'Logicle', 2: 'Log', 'default': 'Default'}
 
+    # True where the panel fills its page with no scroll area around it, so
+    # its help text needs its own scroll area (HelpToggleWidget scrolling).
+    _HELP_SCROLLS = False
+
     def __init__(self, controller, help_text: str = '', parent=None):
         super().__init__(parent)
         ensure_qt_imports()
@@ -471,13 +467,11 @@ class TransformInspector(QWidget):
         QMessageBox.information(
             self, "Auto-Transform",
             f"W set for {n_updated} logicle channel(s) from {source_note} "
-            "(Parks, Roederer & Moore: from the lower quartile of the negative events).")
-
-    def magnitude_decades(self) -> float:
-        return magnitude_decades(self.controller)
+            "(Parks, Roederer & Moore: from the 5th percentile of the negative events).")
 
     def _available_channels(self) -> list[str]:
-        return [ch for ch in self._transforms if ch not in SKIP_CHANNELS]
+        """Channels offered in the biplot menus, in the channel list's order."""
+        return self._channel_order()
 
     def _default_channels(self) -> list[str]:
         """Channels to show first, in order: the first is selected in the
@@ -492,7 +486,7 @@ class TransformInspector(QWidget):
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(6)
         if self._help_text:
-            self.help_widget = HelpToggleWidget(text=self._help_text)
+            self.help_widget = HelpToggleWidget(text=self._help_text, scrolling=self._HELP_SCROLLS)
             outer.addWidget(self.help_widget)
 
         # Selection, controls and plots flow down the left; the channel list
@@ -794,7 +788,8 @@ class TransformInspector(QWidget):
         else:
             map_pos = 0.5
         if tr.id == 1 and map_pos < 0.5 * vmax:
-            tr.logicle_w = max(0.01, tr.logicle_w / factor)
+            w_step = hc_settings.logicle_w_drag_step if factor < 1 else -hc_settings.logicle_w_drag_step
+            tr.logicle_w = min(tr.logicle_m / 2.0, max(0.0, tr.logicle_w + w_step))
             tr.set_transform()
         else:
             new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
@@ -991,7 +986,6 @@ class TransformInspector(QWidget):
         data, source_note = self.auto_transform_data()
         if data is None:
             return
-        decades = self.magnitude_decades()
         n_updated = 0
         QApplication.setOverrideCursor(Qt.BusyCursor)
         QApplication.processEvents()
@@ -1003,7 +997,7 @@ class TransformInspector(QWidget):
                 if not arrays:
                     continue
                 before = transform_params(tr)
-                tr.logicle_w = round(parks_moore_w(arrays, tr.scale_t, decades), 3)
+                tr.logicle_w = round(parks_moore_w(arrays, tr.scale_t, tr.logicle_m), 3)
                 tr.set_transform()
                 self._on_transform_edited(ch, tr, before)
                 n_updated += 1
@@ -1127,6 +1121,7 @@ class PopulationTransformsPanel(TransformInspector):
 
     MAX_SAMPLES = 6
     TARGET_EVENTS = TRANSFORM_TARGET_EVENTS
+    _HELP_SCROLLS = True
 
     def __init__(self, controller, transform_set: TransformSet, sample_keys, help_text: str = '',
                  reset_label: str = '', reset=None, apply_label: str = '', apply=None,

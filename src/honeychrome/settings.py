@@ -166,6 +166,8 @@ linear_a = 100
 logicle_w = 0.5
 logicle_m = 4.5
 logicle_a = 0
+# Change in logicle W per axis-drag step (the old 4% step at W = 0.5).
+logicle_w_drag_step = 0.02
 log_m = 6
 
 # Per-cell autofluorescence channels, appended to every unmixed channel list.
