@@ -254,3 +254,18 @@ autospectral_correction_help_text = '''
 </ul>
 </td>''' + colibri_cell + '''</tr></table>
 '''
+
+simple_stats_help_text = '''
+<h3>The Simple Stats tab allows you to compare samples or groups of samples.</h3>
+<p>To make a statistical comparison, first select a set of samples. You can compare samples in a flat list or a set of folders.</p>
+<p>Then select a chart type. Select from the following available plot types:</p> 
+<ul>
+<li>bar chart</li>
+<li>box-and-whisker chart</li>
+<li>1D histogram overlay</li>
+<li>heatmap</li>
+</ul>
+<p>Then select a gate to compare between samples. Finally select a statistic to plot, which can either be numbers or proportions of cells, or a mean intensity of a marker.</p> 
+<p>(Note: if you are looking for high-dimensional statistical analysis, enable the Honeycluster plugin in Edit > App Configuration!)</p>
+<br/>
+'''

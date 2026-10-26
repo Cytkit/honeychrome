@@ -9,6 +9,10 @@ from honeychrome.view_components.busy_cursor import with_busy_cursor
 
 from PySide6.QtCore import Qt, QPoint, QRect, QSize
 
+from honeychrome.view_components.help_texts import simple_stats_help_text
+from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
+
+
 class FlowLayout(QLayout):
     def __init__(self, parent=None, margin=0, spacing=-1):
         super().__init__(parent)
@@ -132,6 +136,7 @@ class StatisticalComparisonWidget(QWidget):
 
         # --- new plot menu ---
         menu = QWidget()
+        main_layout.addWidget(HelpToggleWidget(text=simple_stats_help_text))
         main_layout.addWidget(menu)
         main_layout.addStretch(100)
 
