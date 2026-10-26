@@ -256,16 +256,16 @@ autospectral_correction_help_text = '''
 '''
 
 simple_stats_help_text = '''
-<h3>Compare samples according to gates or channels.</h3>
-<p>Select a set of samples. You can compare samples in a flat list or a set of folders.</p>
-<p>Compare population stats according to your gating hierarchy, or intensities according to your channels</p>
-<p>Available plot types:</p> 
+<h3>The Simple Stats tab allows you to compare samples or groups of samples.</h3>
+<p>To make a statistical comparison, first select a set of samples. You can compare samples in a flat list or a set of folders.</p>
+<p>Then select a chart type. Select from the following available plot types:</p> 
 <ul>
-<li>bar charts</li>
-<li>box-and-whisker charts</li>
-<li>1D histogram overlays</li>
-<li>heatmaps</li>
+<li>bar chart</li>
+<li>box-and-whisker chart</li>
+<li>1D histogram overlay</li>
+<li>heatmap</li>
 </ul>
-<p>If you are looking for high-dimensional statistical analysis, enable the Honeycluster plugin in Edit > App Configuration!</p>
+<p>Then select a gate to compare between samples. Finally select a statistic to plot, which can either be numbers or proportions of cells, or a mean intensity of a marker.</p> 
+<p>(Note: if you are looking for high-dimensional statistical analysis, enable the Honeycluster plugin in Edit > App Configuration!)</p>
 <br/>
 '''
