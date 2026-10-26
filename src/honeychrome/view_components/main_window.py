@@ -576,6 +576,9 @@ class MainWindow(QMainWindow):
         if not visible:
             self._splitter_state_with_browser = self.splitter.saveState()
         self.left_container.setHidden(not visible)
+        if visible and self._splitter_state_with_browser is not None:
+            # Back at the width it had before a plugin hid it.
+            self.splitter.restoreState(self._splitter_state_with_browser)
 
     def closeEvent(self, event):
         self.save_state()
