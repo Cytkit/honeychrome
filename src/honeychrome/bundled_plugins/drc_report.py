@@ -21,14 +21,14 @@ Provides:
   • export_report_item        — write one item's PNG / CSV files and add
                                 it to the PDF (also used by the Automated
                                 Gating plugin's report)
-  • ReportTab(QWidget)        — the tab itself: three sections (Workspace,
+  • ReportTab(QWidget)        — the tab itself: three sections (Layout,
                                 Cluster Annotation, Stats), each populated
                                 from that tab's own get_report_items().
 
 Design notes
 ------------
 Items reflect whatever is CURRENTLY rendered/computed in each source tab
-(the currently open Workspace plot cards, the currently open Stats result
+(the currently open Layout plot cards, the currently open Stats result
 tabs, the currently selected Cluster Annotation run) -- there is no
 separate "reporting run" selector here and no recomputation from scratch.
 This keeps the Report tab a thin read-only consumer of the other tabs'
@@ -76,7 +76,7 @@ class ReportItem:
     key         Stable identifier within its source tab (used to look the
                 item back up after a refresh; the checkbox state itself
                 is tracked by label -- see ReportTab._populate_section).
-    tab         Source tab name -- 'Workspace' | 'Cluster Annotation' |
+    tab         Source tab name -- 'Layout' | 'Cluster Annotation' |
                 'Stats' -- also the sub-folder these get exported into.
     label       Display text for the checkbox, and the exported file stem.
     get_figure  Optional zero-arg callable returning a fresh, canvas-less
@@ -88,7 +88,7 @@ class ReportItem:
                 An item can supply BOTH get_figure and get_tables (e.g. a
                 results heatmap also exports its underlying results table).
     write_files Optional callable taking the item's export folder, writing
-                any further files (e.g. a Workspace page as a vector PDF).
+                any further files (e.g. a Layout page as a vector PDF).
     """
     key: str
     tab: str
@@ -446,14 +446,14 @@ def add_dataframe_pages(pdf, df, title: str, max_rows_per_page: int = 35) -> Non
 # Report tab
 # ---------------------------------------------------------------------------
 
-_SECTIONS = ('Workspace', 'Cluster Annotation', 'Stats')
+_SECTIONS = ('Layout', 'Cluster Annotation', 'Stats')
 
 
 class ReportTab(QWidget):
     """
     Tab 6 -- Report
     -----------------------------------
-    Three tick-list sections, one per source tab (Workspace, Cluster
+    Three tick-list sections, one per source tab (Layout, Cluster
     Annotation, Stats), each populated from that tab's own
     get_report_items(). "Generate Report" writes:
       • one PNG (figure items) and/or CSV (table items) per checked item,
@@ -577,7 +577,7 @@ class ReportTab(QWidget):
             self.output_label.setText("")
         self.generate_btn.setEnabled(cl_run is not None)
 
-        self._populate_section('Workspace', self.workspace_tab.get_report_items())
+        self._populate_section('Layout', self.workspace_tab.get_report_items())
         self._populate_section('Cluster Annotation', self.cluster_annotation_tab.get_report_items())
         self._populate_section('Stats', self.groups_stats_tab.get_report_items())
 
