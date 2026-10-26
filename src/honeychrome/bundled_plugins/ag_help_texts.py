@@ -8,36 +8,8 @@ it as a tab).
 One HTML string per page, shown and hidden with the core app's
 HelpToggleWidget (honeychrome.view_components.help_toggle_widget). Each
 page's help starts with what the page is for and what to do on it, then
-gives the details; every page ends with where it fits in the workflow and
-a shared glossary.
+gives the details; every page ends with a shared glossary.
 """
-
-# Pages in workflow order: (page name, what it is for).
-_PAGES = (
-    ('Transforms', 'check the axis scales the gates are calculated on (usually fine as '
-                   'they are)'),
-    ('Import/Setup', 'bring in a gating strategy. <i>Start here.</i>'),
-    ('Hierarchy', 'check each gate on a sample and convert it to a calculated '
-                  '(trainable) gate'),
-    ('Train', 'calculate every gate from the training samples'),
-    ('Run', 'gate your samples with the model'),
-    ('Results', 'compare groups of samples'),
-    ('Enrichment', 'test curated immune states between groups (optional; needs at '
-                   'least 30 samples)'),
-    ('Export', 'save the model to reuse it (optional; any time after Train)'),
-)
-
-
-def _workflow(page: str) -> str:
-    """The workflow as a numbered list, with *page* marked."""
-    items = []
-    for name, purpose in _PAGES:
-        if name == page:
-            items.append(f'<li><b>{name}</b>: {purpose} <b>◀ this page</b></li>')
-        else:
-            items.append(f'<li>{name}: {purpose}</li>')
-    return ('<h4>Where this page fits</h4>\n<ol>\n' + '\n'.join(items) + '\n</ol>\n')
-
 
 _GLOSSARY = '''
 <h4>Glossary</h4>
@@ -151,7 +123,7 @@ Import/Setup page, when the model stores them.</li>
 <li>Imported shapes and trained boundaries move with a scale, so they stay
 on the same events.</li>
 </ul>
-''' + _workflow('Transforms') + _GLOSSARY
+''' + _GLOSSARY
 
 
 BUILDER_HIERARCHY = '''
@@ -163,7 +135,6 @@ On this page you bring the gates in. You then check them on the
 them on the <b>Run</b> page. Automated gating suits well-characterised
 populations in a fixed panel. To discover populations you do not know in
 advance, use clustering instead [1, 3].</p>
-''' + _workflow('Import/Setup') + '''
 <h4>What to do here</h4>
 <ol>
 <li>Bring in a gating strategy in one of three ways:
@@ -527,7 +498,7 @@ page offers that as the <b>Recalculate</b> mode.</p>
 [3]<a href="https://doi.org/10.1371/journal.pcbi.1003806">Finak et al. 2014, PLOS Computational Biology (OpenCyto)</a><br/>
 [4]<a href="https://doi.org/10.1093/bioinformatics/btu677">Malek et al. 2015, Bioinformatics (flowDensity)</a><br/>
 </p>
-''' + _workflow('Hierarchy') + _GLOSSARY
+''' + _GLOSSARY
 
 
 BUILDER_TRAIN = '''
@@ -588,7 +559,7 @@ before stay.</li>
 <li>Training results, and a paused run's progress, are kept with the
 experiment and restored when you come back to it.</li>
 </ul>
-''' + _workflow('Train') + _GLOSSARY
+''' + _GLOSSARY
 
 
 BUILDER_EXPORT = '''
@@ -612,7 +583,7 @@ the scale of every channel (Transforms page), the training samples with
 their event counts and autofluorescence assignments, time-QC details, and
 each gate's Fixed or Recalculate mode with the drift settings (Run
 page).</p>
-''' + _workflow('Export') + _GLOSSARY
+''' + _GLOSSARY
 
 
 AG_RUN = '''
@@ -699,7 +670,7 @@ drifted, and events removed by time QC.</li>
 it again. Each run's counts and medians are also written as CSV files to
 <i>Automated_Gating_Results</i> in the experiment folder.</li>
 </ul>
-''' + _workflow('Run') + _GLOSSARY
+''' + _GLOSSARY
 
 
 AG_RESULTS = '''
@@ -824,7 +795,7 @@ choice.</li>
 [6]<a href="https://doi.org/10.1002/alz.70952">Humblet-Baron et al. 2025, Alzheimer's &amp; Dementia (systems immunology of Alzheimer's disease)</a><br/>
 [7]<a href="https://doi.org/10.1038/s41467-026-70895-1">Veiga et al. 2026, Nature Communications (autoinflammation of unknown origin)</a><br/>
 </p>
-''' + _workflow('Results') + _GLOSSARY
+''' + _GLOSSARY
 
 
 AG_ENRICHMENT = '''
@@ -931,4 +902,4 @@ score.</li>
 <li>Phipson B, Smyth GK (2010) Permutation p-values should never be zero.
 Stat Appl Genet Mol Biol 9: Article 39.</li>
 </ol>
-''' + _workflow('Enrichment') + _GLOSSARY
+''' + _GLOSSARY

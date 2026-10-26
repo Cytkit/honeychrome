@@ -15,10 +15,9 @@ workflow and a shared glossary.
 
 # Tabs in workflow order: (tab name, what it is for).
 _TABS = (
-    ('Transforms', 'check the axis scales the events are loaded in (usually fine as '
-                   'they are)'),
+    ('Transforms', 'check the axis scales the events are loaded in'),
     ('Configuration', 'choose the cells, markers and samples, then make a map (DR) and '
-                      'clusters. <i>Start here.</i>'),
+                      'clusters.'),
     ('Cluster Annotation', 'see what each cluster expresses and name it'),
     ('Stats', 'compare groups of samples cluster by cluster'),
     ('Layout', 'lay out figures on pages for export'),
