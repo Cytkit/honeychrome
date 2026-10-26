@@ -4,7 +4,10 @@ Vertical section navigation for multi-page plugins.
 ``SideTabWidget`` shows a plugin's sections as a list down the left-hand
 side (an icon and a horizontal label each) beside a page stack that fills
 the rest of the window, so a plugin's own sections read as distinct from the
-main window's tab bar and the page in use gets the whole width. It exposes
+main window's tab bar and the page in use gets the whole width. With
+``scroll_pages=True`` each page sits in its own scroll area, so a page wider
+or taller than the window scrolls instead of setting a minimum size for the
+whole main window (which would stop the sample panel's splitter). It exposes
 the part of the QTabWidget API plugins use: addTab, setTabText,
 currentIndex, setCurrentIndex, currentWidget, setCurrentWidget, widget,
 indexOf, count and currentChanged.
@@ -13,7 +16,7 @@ indexOf, count and currentChanged.
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QFrame, QHBoxLayout, QListWidget, QListWidgetItem,
-    QSizePolicy, QStackedWidget, QWidget,
+    QScrollArea, QSizePolicy, QStackedWidget, QWidget,
 )
 
 __all__ = ['SideTabWidget']
@@ -24,8 +27,12 @@ class SideTabWidget(QWidget):
 
     currentChanged = Signal(int)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, scroll_pages: bool = False):
         super().__init__(parent)
+        self._scroll_pages = scroll_pages
+        # The pages in stack order; with scroll_pages the stack holds the
+        # scroll area around each page instead of the page itself.
+        self._pages: list[QWidget] = []
         self._nav = QListWidget()
         self._nav.setIconSize(QSize(20, 20))
         self._nav.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -51,7 +58,16 @@ class SideTabWidget(QWidget):
 
     def addTab(self, widget: QWidget, label: str, icon_name: str | None = None) -> int:
         """Add a page; *icon_name* is a Tabler icon from the app's assets."""
-        index = self._stack.addWidget(widget)
+        holder = widget
+        if self._scroll_pages:
+            holder = QScrollArea()
+            holder.setWidgetResizable(True)
+            holder.setFrameShape(QFrame.NoFrame)
+            holder.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            holder.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            holder.setWidget(widget)
+        index = self._stack.addWidget(holder)
+        self._pages.append(widget)
         item = QListWidgetItem(label)
         if icon_name:
             from honeychrome.view_components.icon_loader import icon
@@ -76,18 +92,21 @@ class SideTabWidget(QWidget):
         self._nav.setCurrentRow(index)
 
     def currentWidget(self) -> QWidget | None:
-        return self._stack.currentWidget()
+        return self.widget(self._stack.currentIndex())
 
     def setCurrentWidget(self, widget: QWidget):
-        index = self._stack.indexOf(widget)
+        index = self.indexOf(widget)
         if index >= 0:
             self.setCurrentIndex(index)
 
     def widget(self, index: int) -> QWidget | None:
-        return self._stack.widget(index)
+        return self._pages[index] if 0 <= index < len(self._pages) else None
 
     def indexOf(self, widget: QWidget) -> int:
-        return self._stack.indexOf(widget)
+        for i, page in enumerate(self._pages):
+            if page is widget:
+                return i
+        return -1
 
     def count(self) -> int:
         return self._stack.count()
