@@ -1167,8 +1167,14 @@ def build_display_label_map(pnn, spectral_model):
 
 
 from scipy import signal
-# sos_butter = signal.butter(8, 1, fs=2.5, output='sos')
-sos_ellip = signal.ellip(8, 1, 40, 0.5, fs=2.5, output='sos')
+sos_butter = signal.butter(8, 0.5, fs=2.5, output='sos')
 def smoothing_filter(trace):
-    trace = signal.sosfiltfilt(sos_ellip, trace)
+    trace = signal.sosfiltfilt(sos_butter, trace)
     return trace
+
+# sos_ellip = signal.ellip(8, 1, 40, 0.5, fs=2.5, output='sos')
+# w, h = signal.sosfreqz(sos_ellip, worN=[0], fs=2.5)
+# scale = 1/abs(h[0])**2
+# def smoothing_filter(trace):
+#     trace = signal.sosfiltfilt(sos_ellip, trace) * scale
+#     return trace
