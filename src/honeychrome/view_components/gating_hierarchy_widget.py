@@ -94,45 +94,31 @@ class DictTreeModel(QAbstractItemModel):
                     self.setup_model_data(child, item)
 
     def update_statistics(self, new_statistics):
-        """Update the statistics without rebuilding the tree"""
+        """Update the statistics without rebuilding the tree. Nothing to do
+        when the statistics object is the one already shown (unchanged)."""
+        if new_statistics is getattr(self, 'statistics', None):
+            return
         self.statistics = new_statistics
         # print(json.dumps(new_statistics, indent=2))
 
         # Start recursive update from root
         self._update_tree_item_data(self.root_item)
 
-        # # Notify the view that all data has changed todo for some reason the simple call to dataChanged doesn't work. layoutchanged works but it presumably slow. dataChanged for all items one by one works. Don't know why
-        # self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1), [Qt.DisplayRole])
-        # self.layoutChanged.emit()  # More reliable for structural changes
-
-        # Emit dataChanged for all items in the tree
+        # Notify the view, one dataChanged range per group of sibling rows
         self._emit_data_changed_for_tree(self.root_item)
 
     def _emit_data_changed_for_tree(self, item, parent_index=QModelIndex()):
-        """Recursively emit dataChanged for all items in the tree"""
-        if not item:
+        """Emit dataChanged for the statistics columns of every row below
+        *item*: one range per group of siblings, as a dataChanged range must
+        share a single parent. One emission per row would make the
+        ResizeToContents columns re-measure the whole tree for every row."""
+        if not item.child_items:
             return
-
-        # Emit for this item if it's not the root
-        if item != self.root_item:
-            # Find this item's row
-            if item.parent_item:
-                row = item.parent_item.child_items.index(item)
-                # Create indexes for all columns
-                indexes = []
-                for col in range(self.columnCount()):
-                    index = self.createIndex(row, col, item)
-                    if index.isValid():
-                        indexes.append(index)
-
-                # Emit dataChanged for this row
-                if indexes:
-                    self.dataChanged.emit(indexes[0], indexes[-1], [Qt.DisplayRole])
-
-        # Process children
-        for i, child in enumerate(item.child_items):
-            child_parent_index = self.createIndex(i, 0, item) if item != self.root_item else QModelIndex()
-            self._emit_data_changed_for_tree(child, child_parent_index)
+        self.dataChanged.emit(self.index(0, 1, parent_index),
+                              self.index(len(item.child_items) - 1, self.columnCount() - 1, parent_index),
+                              [Qt.DisplayRole])
+        for row, child in enumerate(item.child_items):
+            self._emit_data_changed_for_tree(child, self.index(row, 0, parent_index))
 
     def _update_tree_item_data(self, item):
         """Recursively update TreeItem data based on new statistics"""

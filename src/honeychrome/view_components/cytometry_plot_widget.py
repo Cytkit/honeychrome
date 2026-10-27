@@ -1057,7 +1057,7 @@ class CytometryPlotWidget(QFrame):
                 # scale w in bottom half, limits in top half
                 if axis_vb_map_to_view < 0.5 * max:
                     w_step = settings.logicle_w_drag_step if factor < 1 else -settings.logicle_w_drag_step
-                    self.transformations[channel].logicle_w = min(self.transformations[channel].logicle_m / 2.0, max(0.0, self.transformations[channel].logicle_w + w_step))
+                    self.transformations[channel].logicle_w = float(np.clip(self.transformations[channel].logicle_w + w_step, 0.0, self.transformations[channel].logicle_m / 2.0))
                     self.transformations[channel].set_transform()
                 else:
                     new_max = (max - axis.zoomZero) * factor + axis.zoomZero
