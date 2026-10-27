@@ -3,7 +3,7 @@
 ; Non-commercial use only
 
 #define MyAppName "honeychrome"
-#define MyAppVersion "0.8.3"
+#define MyAppVersion "1.0.0"
 #define MyAppPublisher "Cytkit"
 #define MyAppURL "https://cytkit.com"
 #define MyAppURLSupport "https://github.com/salmansamson/honeychrome"

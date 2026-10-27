@@ -6,6 +6,9 @@ import subprocess
 import sys
 import platform
 
+from PyInstaller.utils.hooks import collect_submodules
+
+
 def clean():
     """Clean build directories"""
     for folder in ['dist', 'build']:
@@ -189,10 +192,36 @@ def check_single_libomp(app):
         sys.exit(1)
     print(f'libomp check passed: one copy at {os.path.relpath(next(iter(copies)), app)}')
 
+def collect_all_submodules(package_root, package_name):
+    """Walk the package directory and return every importable module name."""
+    modules = []
+    for dirpath, _dirnames, filenames in os.walk(package_root):
+        # Skip __pycache__ and other non-package dirs
+        if '__pycache__' in dirpath:
+            continue
+        for fname in filenames:
+            if not fname.endswith('.py'):
+                continue
+            if fname == '__init__.py':
+                # The directory itself is a package
+                rel = os.path.relpath(dirpath, package_root)
+                if rel == '.':
+                    modules.append(package_name)
+                else:
+                    modules.append(f"{package_name}.{rel.replace(os.sep, '.')}")
+            else:
+                rel = os.path.relpath(dirpath, package_root)
+                stem = fname[:-3]
+                if rel == '.':
+                    modules.append(f"{package_name}.{stem}")
+                else:
+                    modules.append(f"{package_name}.{rel.replace(os.sep, '.')}.{stem}")
+    return modules
 
 def main():
     clean()
     icon_path = os.path.join('src', 'honeychrome', 'view_components', 'assets', 'cytkit_web_logo.ico')
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
 
     args = ['src/honeychrome/main.py',
             '--name=honeychrome',
@@ -209,9 +238,14 @@ def main():
         args.append('--windowed')
 
     # Make the honeychrome package importable by external plugin scripts
-    args.append('--hidden-import=honeychrome')
-    args.append('--hidden-import=honeychrome.settings')
-    args.append('--hidden-import=honeychrome.plugin_loaders')
+    honeychrome_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src', 'honeychrome')
+    for mod in collect_all_submodules(honeychrome_root, 'honeychrome'):
+        args.append(f'--hidden-import={mod}')
+
+    hidden_imports = collect_all_submodules(honeychrome_root, 'honeychrome')
+    print("Collected:", hidden_imports)
+    for mod in hidden_imports:
+        args.append(f'--hidden-import={mod}')
     args.append('--runtime-hook=hooks/runtime-patch-syspath.py')
 
     # Add project files
@@ -261,7 +295,8 @@ def main():
         check_single_libomp(app)
 
     # Show size
-    exe_path = os.path.join('dist', 'honeychrome')
+    exe_name = 'honeychrome.exe' if platform.system() == 'Windows' else 'honeychrome'
+    exe_path = os.path.join('dist', 'honeychrome', exe_name)
     if os.path.exists(exe_path):
         size = os.path.getsize(exe_path) / (1024 * 1024)  # MB
         print(f"Build complete! Executable size: {size:.2f} MB")

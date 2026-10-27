@@ -2,7 +2,7 @@
 
 # --- CONFIGURATION ---
 APP_NAME="honeychrome"
-VERSION="0.8.3"
+VERSION="1.0.0"
 DMG_NAME="${APP_NAME}-v${VERSION}-macos.dmg"
 VOL_NAME="${APP_NAME} Installer"
 
