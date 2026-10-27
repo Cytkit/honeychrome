@@ -107,7 +107,6 @@ jobs:
         working-directory: src/honeychrome/bundled_plugins
         env:
           HONEYCHROME_OPENMP: "1"
-          CL: "/openmp:llvm"
           VCPKG_BINARY_SOURCES: clear;files,${{ steps.vcpkg.outputs.cache }},readwrite
         run: |
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install armadillo:x64-windows-static-md

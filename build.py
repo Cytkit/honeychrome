@@ -94,13 +94,7 @@ def macho_rpaths(binary):
     return rpaths
 
 def has_rpath(binary, rpath):
-    """Check if the Mach-O binary already contains the specified LC_RPATH."""
-    result = subprocess.run(
-        ['otool', '-l', binary],
-        capture_output=True, text=True, check=True
-    )
-    # LC_RPATH entries in otool output appear as: cmd LC_RPATH / path <value> (offset ...)
-    return f'path {rpath} ' in result.stdout or f'path {rpath}\n' in result.stdout
+    return rpath in macho_rpaths(binary)
 
 def link_kernels_to_bundled_libomp(kernel_dir):
     """Point the kernels' libomp load command at @rpath/libomp.dylib, with
@@ -128,10 +122,16 @@ def link_kernels_to_bundled_libomp(kernel_dir):
                 subprocess.run(['install_name_tool', '-change', ref, LIBOMP_RPATH_REF, kernel],
                                check=True)
                 changed = True
-        rpaths = macho_rpaths(kernel)
         for rpath in (APP_FRAMEWORKS_RPATH, os.path.dirname(libomp)):
             if not has_rpath(kernel, rpath):
-                subprocess.run(['install_name_tool', '-add_rpath', rpath, kernel], check=True)
+                try:
+                    subprocess.run(['install_name_tool', '-add_rpath', rpath, kernel], check=True, capture_output=True, text=True)
+                except subprocess.CalledProcessError as e:
+                    # Older linkers / duplicate rpath: "would duplicate path"
+                    if 'would duplicate path' in (e.stderr or ''):
+                        print(f'{fname}: rpath already present ({rpath})')
+                    else:
+                        raise
                 changed = True
         if changed:
             subprocess.run(['codesign', '--force', '--sign', '-', kernel], check=True)

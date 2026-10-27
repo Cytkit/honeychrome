@@ -144,8 +144,9 @@ void som_train_batch(
             double *my_sums   = thread_sums   + (size_t)tid * ncodes * px;
             double *my_counts = thread_counts + (size_t)tid * ncodes;
 
+            int ev;
             #pragma omp for schedule(static)
-            for (int ev = 0; ev < n; ev++) {
+            for (ev = 0; ev < n; ev++) {
                 const double *p = data + (size_t)ev * px;
                 int nearest = 0;
                 double neard = distf(p, codes_out, px);
@@ -177,7 +178,8 @@ void som_train_batch(
         double inv_sq_radius = -1.0 / (radius * radius);
 
         #pragma omp parallel for schedule(static)
-        for (int di = 0; di < ncodes; di++) {
+        int di;
+        for (di = 0; di < ncodes; di++) {
             double *out_row = codes_out + (size_t)di * px;
             double *row_sum = malloc((size_t)px * sizeof(double));
             for (int j = 0; j < px; j++) row_sum[j] = 0.0;
@@ -234,7 +236,8 @@ void som_map_to_codes(
     #endif
 
     #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; i++) {
+    int i;
+    for (i = 0; i < n; i++) {
         const double *p = data + (size_t)i * px;
         int nearest = 0;
         double neard = distf(p, codes, px);
