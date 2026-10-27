@@ -2027,7 +2027,8 @@ class Controller(QObject):
         for m, n in enumerate(indices_plots_to_recalculate):
             self.data_for_cytometry_plots['histograms'][n] = hists[m]
 
-        self.data_for_cytometry_plots['statistics'] = initialise_stats(self.data_for_cytometry_plots['gating'])
+        if gates_to_recalculate:
+            self.data_for_cytometry_plots['statistics'] = initialise_stats(self.data_for_cytometry_plots['gating'])
         self.calc_hists_and_stats(gates_to_calculate=gates_to_recalculate, indices_plots_to_calculate=indices_plots_to_recalculate)
         logger.info(f'Controller: plots recalculated {indices_plots_to_recalculate}')
         logger.info(f'Controller: gates recalculated {gates_to_recalculate}')
@@ -2116,7 +2117,8 @@ class Controller(QObject):
         if data['event_data'] is not None:
             # apply gates to event data
             # if gates_to_calculate is none, then initialise gates_membership dict, otherwise reference it from data_for_cytometry_plots
-            if not gates_to_calculate:
+            recalc_all = gates_to_calculate is None
+            if recalc_all:
                 gating = data['gating']
                 if gating is None:
                     return
@@ -2126,8 +2128,9 @@ class Controller(QObject):
                 # data['gate_membership']['root'] = np.ones(len(data['event_data']), dtype=np.bool_)
                 gates_to_calculate = [g[0] for g in data['gating'].get_gate_ids()]
             apply_gates_in_place(data, gates_to_calculate=gates_to_calculate)
-            statistics = calc_stats(data)
-            data['statistics'] = statistics
+            if recalc_all or gates_to_calculate:
+                statistics = calc_stats(data)
+                data['statistics'] = statistics
 
             hists = calc_hists(data,
                                indices_plots_to_calculate=indices_plots_to_calculate,
