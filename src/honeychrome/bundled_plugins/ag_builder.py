@@ -8104,12 +8104,15 @@ class BuilderPages(QObject):
 
     def on_sample_loaded(self):
         """The main window loaded another sample: the Import/Setup page's
-        preview and the Hierarchy page's review sample follow it."""
+        preview, the Hierarchy page's review sample and the Transforms page's
+        events (when they come from the main window's sample) follow it."""
         current = self.inner_tabs.currentWidget()
         if current is self.hierarchy_tab:
             self.hierarchy_tab.refresh_preview()
         elif current is self.review_tab:
             self.review_tab.main_sample_changed()
+        elif current is self.transforms_tab:
+            self.transforms_tab.load_events()
 
     def _edit_from_review(self, gate_name: str):
         """Edit a gate from the Hierarchy page's tree with the Import/Setup
