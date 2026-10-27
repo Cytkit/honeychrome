@@ -114,6 +114,7 @@ def link_kernels_to_bundled_libomp(kernel_dir):
             continue
         kernel = os.path.join(kernel_dir, fname)
         refs = macho_libomp_refs(kernel)
+        print(f'{fname}: rpaths={macho_rpaths(kernel)}')
         if not refs:
             continue
         changed = False
@@ -124,15 +125,11 @@ def link_kernels_to_bundled_libomp(kernel_dir):
                 changed = True
         for rpath in (APP_FRAMEWORKS_RPATH, os.path.dirname(libomp)):
             if not has_rpath(kernel, rpath):
-                try:
+                if rpath not in macho_rpaths(kernel):
                     subprocess.run(['install_name_tool', '-add_rpath', rpath, kernel], check=True, capture_output=True, text=True)
-                except subprocess.CalledProcessError as e:
-                    # Older linkers / duplicate rpath: "would duplicate path"
-                    if 'would duplicate path' in (e.stderr or ''):
-                        print(f'{fname}: rpath already present ({rpath})')
-                    else:
-                        raise
-                changed = True
+                    changed = True
+                else:
+                    print(f'{fname}: rpath already present ({rpath})')
         if changed:
             subprocess.run(['codesign', '--force', '--sign', '-', kernel], check=True)
         print(f'{fname}: libomp via {LIBOMP_RPATH_REF}, rpaths {macho_rpaths(kernel)}')

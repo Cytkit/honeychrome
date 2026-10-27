@@ -599,7 +599,7 @@ arma::mat unmix_autospectral_joint_core(
   };
 
 #pragma omp for schedule(dynamic, 64)
-  for (uword i = 0; i < N; ++i) {
+  for (long long i = 0; i < (long long)N; ++i) {
     const vec cell_raw = raw_data.unsafe_col(i);
     uword j_af; double k_af;
     score_af(cell_raw, j_af, k_af);
@@ -619,7 +619,7 @@ arma::mat unmix_autospectral_joint_core(
 
 for (int af_pass = 1; af_pass < n_af_passes; ++af_pass) {
 #pragma omp for schedule(dynamic, 64)
-  for (uword i = 0; i < N; ++i) {
+  for (long long i = 0; i < (long long)N; ++i) {
     if (!still_active[i]) continue;
     uword j_ref; double k_ref;
     const double score_ref = score_af(resid_mat.col(i), j_ref, k_ref);
@@ -633,7 +633,7 @@ for (int af_pass = 1; af_pass < n_af_passes; ++af_pass) {
 }
 
 #pragma omp for schedule(dynamic, 64)
-  for (uword i = 0; i < N; ++i) {
+  for (long long i = 0; i < (long long)N; ++i) {
 
     const vec cell_raw   = raw_data.unsafe_col(i);
     cell_resid            = resid_mat.col(i);
