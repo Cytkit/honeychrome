@@ -177,8 +177,8 @@ void som_train_batch(
         if (radius < min_radius) radius = min_radius;
         double inv_sq_radius = -1.0 / (radius * radius);
 
-        #pragma omp parallel for schedule(static)
         int di;
+        #pragma omp parallel for schedule(static)
         for (di = 0; di < ncodes; di++) {
             double *out_row = codes_out + (size_t)di * px;
             double *row_sum = malloc((size_t)px * sizeof(double));
@@ -235,8 +235,8 @@ void som_map_to_codes(
     omp_set_num_threads(n_threads);
     #endif
 
-    #pragma omp parallel for schedule(static)
     int i;
+    #pragma omp parallel for schedule(static)
     for (i = 0; i < n; i++) {
         const double *p = data + (size_t)i * px;
         int nearest = 0;
