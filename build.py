@@ -93,6 +93,14 @@ def macho_rpaths(binary):
                     break
     return rpaths
 
+def has_rpath(binary, rpath):
+    """Check if the Mach-O binary already contains the specified LC_RPATH."""
+    result = subprocess.run(
+        ['otool', '-l', binary],
+        capture_output=True, text=True, check=True
+    )
+    # LC_RPATH entries in otool output appear as: cmd LC_RPATH / path <value> (offset ...)
+    return f'path {rpath} ' in result.stdout or f'path {rpath}\n' in result.stdout
 
 def link_kernels_to_bundled_libomp(kernel_dir):
     """Point the kernels' libomp load command at @rpath/libomp.dylib, with
@@ -122,7 +130,7 @@ def link_kernels_to_bundled_libomp(kernel_dir):
                 changed = True
         rpaths = macho_rpaths(kernel)
         for rpath in (APP_FRAMEWORKS_RPATH, os.path.dirname(libomp)):
-            if rpath not in rpaths:
+            if not has_rpath(kernel, rpath):
                 subprocess.run(['install_name_tool', '-add_rpath', rpath, kernel], check=True)
                 changed = True
         if changed:

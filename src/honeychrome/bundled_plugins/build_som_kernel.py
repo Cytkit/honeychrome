@@ -68,7 +68,7 @@ if sys.platform == 'win32':
     extra_compile_args = ['/O2', '/fp:fast']
     extra_link_args = []
     if use_openmp:
-        extra_compile_args.append('/openmp')
+        extra_compile_args.append('/openmp:llvm')
 else:
     libraries = ['m']
     extra_compile_args = ['-O3', '-ffast-math']
