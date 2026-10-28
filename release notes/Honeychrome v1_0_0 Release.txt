@@ -1,0 +1,12 @@
+Honeychrome v1.0.0 Release Notes
+
+Version 1.0.0 is finally here!
+
+New features:
+* Improved and faster AutoSpectral workflow
+* Automatic gating plugin
+* HoneyCluster plugin: the modern spectral workflow, including dimensionality reduction, clustering, annotation and statistics
+* Per-sample gating: right click on a gate to customise it for the current sample
+* Spectral library: look up profiles of matching fluorophores for your instrument
+
+Many bug fixes
