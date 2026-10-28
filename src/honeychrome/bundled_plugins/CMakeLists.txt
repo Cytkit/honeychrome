@@ -123,6 +123,11 @@ if(HONEYCHROME_OPENMP)
     foreach(kernel IN LISTS HONEYCHROME_KERNELS)
       target_link_libraries(${kernel} PRIVATE OpenMP::OpenMP_CXX)
     endforeach()
+    if(MSVC)
+      # The GLS kernel's `omp simd` loops need MSVC's experimental OpenMP
+      # mode; plain /openmp implements OpenMP 2.0, which has no simd
+      target_compile_options(_gls_m2p_kernel PRIVATE /openmp:experimental)
+    endif()
   endif()
 else()
   message(STATUS "AutoSpectral kernels: building single-threaded (HONEYCHROME_OPENMP=OFF).")

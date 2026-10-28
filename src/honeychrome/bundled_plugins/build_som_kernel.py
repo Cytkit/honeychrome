@@ -78,7 +78,8 @@ else:
             brew_prefix = os.popen('brew --prefix libomp 2>/dev/null').read().strip()
             if brew_prefix:
                 extra_compile_args += ['-Xpreprocessor', '-fopenmp', f'-I{brew_prefix}/include']
-                extra_link_args += [f'-L{brew_prefix}/lib', '-lomp']
+                # Header room for build.py to re-point libomp and add rpaths
+                extra_link_args += [f'-L{brew_prefix}/lib', '-lomp', '-Wl,-headerpad_max_install_names']
                 print(f'[build] macOS OpenMP via libomp at {brew_prefix}')
             else:
                 print('[build] WARNING: libomp not found. Building single-threaded.')

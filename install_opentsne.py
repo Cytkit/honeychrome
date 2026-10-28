@@ -18,7 +18,10 @@ The build is then checked:
   * openTSNE's _tsne extension links libomp;
   * every OpenMP entry point the extensions call is exported by that libomp;
   * openTSNE imports and loads that libomp;
-  * a Barnes-Hut fit on all cores is clearly faster than on one.
+  * the Barnes-Hut optimisation on all cores keeps more than one core busy
+    (CPU time / wall time), which a build without OpenMP cannot.  The
+    wall-clock speed-up is printed but not tested: on a shared CI machine a
+    single timing varies too much to be a reliable test.
 
 Run it after ``pip install -r requirements.txt`` and ``brew install libomp``.
 The version is read from requirements.txt.
@@ -33,12 +36,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-MIN_SPEEDUP = 1.25
+MIN_CONCURRENCY = 1.5
 
 SELF_TEST = r'''
 import ctypes, os, sys, time
 import numpy as np
 import openTSNE
+from openTSNE import affinity, initialization, TSNEEmbedding
 
 libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
 libc._dyld_get_image_name.restype = ctypes.c_char_p
@@ -50,19 +54,22 @@ assert os.path.realpath(sys.argv[2]) in omp, f'openTSNE did not load {sys.argv[2
 rng = np.random.default_rng(0)
 centres = rng.normal(scale=4.0, size=(8, 7))
 x = (centres[rng.integers(0, 8, 5000)] + rng.normal(size=(5000, 7))).astype(np.float32)
+cores = os.cpu_count()
+aff = affinity.PerplexityBasedNN(x, perplexity=30, n_jobs=cores, random_state=42)
+init = initialization.pca(x, random_state=42)
 
-def fit(n_jobs):
-    t = time.perf_counter()
-    openTSNE.TSNE(n_jobs=n_jobs, negative_gradient_method='bh', n_iter=100,
-                  early_exaggeration_iter=50, random_state=42).fit(x)
-    return time.perf_counter() - t
+def optimise(n_jobs):
+    wall, cpu = time.perf_counter(), time.process_time()
+    emb = TSNEEmbedding(init, aff, n_jobs=n_jobs, negative_gradient_method='bh', random_state=42)
+    emb.optimize(n_iter=50, exaggeration=12).optimize(n_iter=100)
+    return time.perf_counter() - wall, time.process_time() - cpu
 
-fit(1)
-one, many = fit(1), fit(-1)
-speedup = one / many
-print(f'Barnes-Hut 5,000 events: {one:.1f}s on 1 thread, {many:.1f}s on {os.cpu_count()}: '
-      f'{speedup:.2f}x')
-assert speedup >= float(sys.argv[1]), f'no speed-up from threads ({speedup:.2f}x)'
+optimise(cores)
+(one, _), (many, many_cpu) = optimise(1), optimise(cores)
+concurrency = many_cpu / many
+print(f'Barnes-Hut 5,000 events: {one:.1f}s on 1 thread, {many:.1f}s on {cores} '
+      f'({one / many:.2f}x); CPU time / wall time on {cores}: {concurrency:.2f}')
+assert concurrency >= float(sys.argv[1]), f'threads did not run concurrently ({concurrency:.2f})'
 '''
 
 
@@ -145,7 +152,7 @@ def main() -> int:
         print('openTSNE was built without OpenMP (omp.h not picked up).')
         return 1
 
-    subprocess.check_call([sys.executable, '-c', SELF_TEST, str(MIN_SPEEDUP), str(libomp)])
+    subprocess.check_call([sys.executable, '-c', SELF_TEST, str(MIN_CONCURRENCY), str(libomp)])
     print('openTSNE built with OpenMP and verified.')
     return 0
 
