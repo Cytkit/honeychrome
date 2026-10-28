@@ -86,6 +86,7 @@ class Pressure:
         pass
 
     def get_pressure(self, units, num_averages=10):
+        fault = 0
         while True:
             pressure_tally = []
             for count in range(num_averages):
@@ -104,12 +105,12 @@ class Pressure:
 
                 # Range check
                 if abs(pressure) > 0.1 or abs(pressure-0.00510396) < 0.00001 or raw_pressure_value == 0 or raw_temperature_value == 0:
-                    # Fault
+                    fault +=1
                     continue
 
                 pressure_tally.append(pressure)
 
-            if len(pressure_tally)>0 and np.array(pressure_tally).std() < 1e-4:
+            if (len(pressure_tally)>0 and np.array(pressure_tally).std() < 1e-4) or fault > num_averages:
                 break
 
         average_pressure = np.median(np.array(pressure_tally))

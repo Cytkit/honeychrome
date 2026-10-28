@@ -21,7 +21,8 @@ from honeychrome.settings import adc_channels, peak_detection_channel_retrieved,
 verbosity_divider = int(1/analyser_target_repeat_time)
 gap = 4 # gap between start of end of baseline and start of peak
 left_gap = 4 # gap before trace starts
-
+channel_input_mask_for_subtraction = np.array([True if ch in ['B11', 'B12', 'B13', 'B14'] else False for ch in adc_channels])
+channel_output_mask_for_subtraction = np.array([True if ch in fluorescence_channels else False for ch in adc_channels])
 default_baselines = np.zeros(n_channels_trace)
 
 def peak_start_stop_baseline(tr, threshold):
@@ -269,6 +270,8 @@ class TraceAnalyser(mp.Process):
                 traces_batch_scaled = blob_np.reshape(-1, self.n_channels_trace, self.n_time_points_in_event).astype(np.float32)
                 traces_batch_scaled[traces_batch_scaled==65535] = np.nan
                 traces_batch_scaled = traces_batch_scaled * adc_scale_uv  # scale in uV, float32
+
+                traces_batch_scaled[:,channel_output_mask_for_subtraction,:] -= traces_batch_scaled[:,channel_input_mask_for_subtraction, :].mean(axis=1)[:,None,:]
 
                 # calculate area, height, width as defined in channel_dict and write to events_cache
                 baselines = np.zeros(self.n_channels_trace)

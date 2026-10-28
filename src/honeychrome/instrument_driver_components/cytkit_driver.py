@@ -3,6 +3,7 @@ import time
 from threading import Thread, Event, Lock
 
 import numpy as np
+from PySide6.QtCore import QSettings
 
 from honeychrome.instrument_driver_components.cytkit_components.adcs import ADCs
 from honeychrome.instrument_driver_components.cytkit_components.capture import Capture
@@ -22,6 +23,8 @@ from honeychrome.instrument_driver_components.cytkit_components.sheath_pump impo
 from honeychrome.instrument_driver_components.cytkit_components.trigger import Trigger
 from honeychrome.instrument_driver_components.cytkit_components.vi_monitor import VIMonitor
 from honeychrome import settings
+
+instrument_state = QSettings("honeychrome", "instrument_state")
 
 import logging
 logger = logging.getLogger(__name__)
@@ -357,7 +360,8 @@ class CytkitDevice:
         self.laser.set_interlock_effects(force=False, stop_fan=False, stop_sheath=False, stop_sample=False, stop_laser=True)
         self.laser.set_interlock_inversion(0) # 1 is normally open, i.e. make circuit to trigger interlock stop laser
         self.laser.set_interlock_mask(1) # currently should be 1, i.e. only one interlock circuit
-        self.get_state(['zero_pressure']) # calibrate assuming pressure zero before start
+        # self.get_state(['zero_pressure']) # calibrate assuming pressure zero before start # actually don't do this - save the calibrated value instead
+        self.pressure.set_offset(instrument_state.value("zero_pressure", 0, type=float), 'PRES_UNITS_PA')
         self.sample_pump.stop()
         self.sample_pump.set_steps_per_cycle(settings.sample_pump_steps_per_cycle)
         self.sample_pump.set_clocks_per_cycle(settings.sample_pump_clocks_per_cycle)
@@ -746,10 +750,14 @@ class CytkitDevice:
             message['pressure'] = value
 
         if 'zero_pressure' in list_of_parameters:
-            value = self.pressure.get_pressure('PRES_UNITS_PA', 100)
+            self.pressure.set_offset(0, 'PRES_UNITS_PA')
+            value = self.pressure.get_pressure('PRES_UNITS_PA', 10)
+            instrument_state.setValue("zero_pressure", float(value))
+            instrument_state.sync()
             self.pressure.set_offset(value, 'PRES_UNITS_PA')
             value = self.pressure.get_pressure('PRES_UNITS_PA', 10)
             message['pressure'] = value
+            message['zero_pressure'] = value
 
         if 'temperatures' in list_of_parameters:
             message['temperatures'] = {}
@@ -930,37 +938,7 @@ if __name__ == '__main__':
 
     print('test pressure')
     print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
-    print(cytkit_device.get_state(['pressure']))
+    print(cytkit_device.get_state(['zero_pressure']))
 
     print('test temperatures')
     print(cytkit_device.get_state(['temperatures'])) # not yet working

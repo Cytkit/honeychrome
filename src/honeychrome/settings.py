@@ -31,9 +31,9 @@ sample_pump_steps_per_microlitre = 109 # measured value: at speed 20000*0.1Hz, t
 sample_flow_rate = 30 # microlitres per minute
 
 sample_pump_priming_speed = 20000 # steps/0.1s
-sample_pump_priming_time = 10. # s
+sample_pump_priming_time = 11. # s
 sample_pump_unpriming_speed = 20000 # steps/0.1s
-sample_pump_unpriming_time = 10. # s
+sample_pump_unpriming_time = 11. # s
 sample_pump_flush_speed = 20000 # steps/0.1s
 sample_pump_flush_time = 30. # s
 sample_pump_backflush_speed = 20000 # steps/0.1s
@@ -356,7 +356,7 @@ adc_offset_retrieved = {}
 for row, name in enumerate(adc_channels):
     instrument_settings.beginGroup(name)
     adc_enabled_retrieved[name] = instrument_settings.value("enabled", True, type=bool)
-    adc_inverted_retrieved[name] = instrument_settings.value("inverted", False if name=='FSC' else True, type=bool)
+    adc_inverted_retrieved[name] = instrument_settings.value("inverted", False if name=='SSC' else True, type=bool)
     adc_offset_retrieved[name] = instrument_settings.value("offset", 0, type=int)
     instrument_settings.endGroup()
 instrument_settings.endGroup()

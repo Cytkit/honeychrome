@@ -84,7 +84,7 @@ class PlotTracesWidget(QWidget):
                     self.legendLayout1.addWidget(entry)
 
                 solid_pen = pg.mkPen(color=color, width=1, style=Qt.SolidLine)
-                for n in range(min(len(traces), 5)):
+                for n in range(min(len(traces), 4)):
                     self.plot_widget1.plot(self.x, traces[n,i,:], pen=solid_pen)
 
 class DacChannelTable(QWidget):
@@ -1205,7 +1205,7 @@ class PluginWidget(QWidget):
         self.automatically_adjust_trigger_over_baseline_cb.toggled.connect(self.automatically_adjust_trigger_over_baseline)
         layout.addWidget(self.automatically_adjust_trigger_over_baseline_cb)
 
-        self.pressure_set_point_spin = LabeledSpinBox(min=-40, max=0, step=1, default=settings.pressure_set_point_retrieved, text='Sheath pressure (vacuum) set point [Pa]')
+        self.pressure_set_point_spin = LabeledSpinBox(min=-100, max=0, step=1, default=settings.pressure_set_point_retrieved, text='Sheath pressure (vacuum) set point [Pa]')
         self.pressure_set_point_spin.spinbox.valueChanged.connect(self.set_pressure_set_point)
         layout.addWidget(self.pressure_set_point_spin)
 
@@ -1771,6 +1771,9 @@ class PluginWidget(QWidget):
         if 'pressure' in response['message']:
             self.pressure_value.setText(f'{response['message']['pressure']} Pa')
 
+        if 'zero_pressure' in response['message']:
+            self.pressure_value.setText(f'{response['message']['pressure']} Pa')
+
         if 'temperatures' in response['message']:
             if response['message']['temperatures']:
                 self.temp_p_sensor_label.setText(f'{response['message']['temperatures']['temp_p_sensor']:0.2f} C')
@@ -1858,9 +1861,6 @@ class PluginWidget(QWidget):
                 else:
                     if not self.plot_traces_widget.isVisible():
                         self.plot_traces_widget.show()
-                    else:
-                        self.plot_traces_widget.raise_()
-                        self.plot_traces_widget.activateWindow()
                 self.plot_traces_widget.set_traces(self.traces_blob_np, not self.read_memory_cb.isChecked())
             else:
                 self.traces_blob_np = None
