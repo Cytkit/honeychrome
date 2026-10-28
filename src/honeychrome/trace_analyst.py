@@ -21,7 +21,7 @@ from honeychrome.settings import adc_channels, peak_detection_channel_retrieved,
 verbosity_divider = int(1/analyser_target_repeat_time)
 gap = 4 # gap between start of end of baseline and start of peak
 left_gap = 4 # gap before trace starts
-channel_input_mask_for_subtraction = np.array([True if ch in ['B11', 'B12', 'B13', 'B14'] else False for ch in adc_channels])
+channel_input_mask_for_subtraction = np.array([True if ch in ['B1', 'B11', 'B12', 'B13'] else False for ch in adc_channels])
 channel_output_mask_for_subtraction = np.array([True if ch in fluorescence_channels else False for ch in adc_channels])
 default_baselines = np.zeros(n_channels_trace)
 
