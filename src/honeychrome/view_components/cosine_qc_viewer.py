@@ -33,8 +33,12 @@ from honeychrome.controller_components.cytometer_whitelist import (
 
 logger = logging.getLogger(__name__)
 
-# Controls below this cosine similarity to the reference library trigger a popup warning.
-COSINE_QC_WARNING_THRESHOLD = 0.97
+# Caveat appended to the Clean Controls cosine QC warning for these instruments only.
+COSINE_QC_NOTE_BY_CYTOMETER = {
+    'ID7000': ('Note: for the ID7000, a lower cosine similarity to the reference library is fairly '
+               'normal (spectra match less well across instruments) and does not necessarily '
+               'indicate a problem.'),
+}
 
 class CosineQCViewer(QFrame):
     """Spectral QC plot: calculated vs. reference spectrum with cosine score."""
@@ -102,7 +106,7 @@ class CosineQCViewer(QFrame):
         content_layout.addLayout(legend_row)
 
         # Plot — same axis class and widget type as ProfilesViewer
-        self._axis_bottom = BottomAxisVerticalTickLabels()
+        self._axis_bottom = BottomAxisVerticalTickLabels(angle=45)
         self._plot_widget = TransparentPlotWidget(
             axisItems={'bottom': self._axis_bottom}
         )
@@ -233,6 +237,10 @@ class CosineQCViewer(QFrame):
                         ref_vals = np.zeros(len(spectrum))
                         for c in common:
                             ref_vals[fluor_pnn.index(c)] = ref.loc[label, c]
+                        # Re-normalise (L-infinity) over detectors present
+                        ref_peak = ref_vals.max()
+                        if ref_peak > 0:
+                            ref_vals = ref_vals / ref_peak
                         self._plot_widget.plot(
                             x, ref_vals,
                             pen=pg.mkPen(self._COL_REF, width=2),
@@ -281,7 +289,14 @@ class CosineQCViewer(QFrame):
             emp_ch = str(emp_idx)
             exp_ch = str(exp_idx)
         match_flag = '' if emp_ch == exp_ch else '  ⚠ peak mismatch'
+        bg = cleaned.get('background_check') or {}
+        bg_txt = ''
+        if bg:
+            ratio = bg.get('ratio')
+            ratio_txt = f'{ratio:.1f}×' if ratio is not None else f'{100 * bg.get("positive_fraction", 0):.1f}% above'
+            bg_flag = '  ⚠ no clear stain' if bg.get('verdict') else ''
+            bg_txt = f'  ·  vs unstained: {ratio_txt}, {bg.get("angle_deg", 0):.0f}° from AF{bg_flag}'
         self._status.setText(
             f'Cosine: {cs_txt}  ·  {n_surv} events  ·  '
-            f'peak: {emp_ch} (expected: {exp_ch}){match_flag}'
+            f'peak: {emp_ch} (expected: {exp_ch}){match_flag}{bg_txt}'
         )

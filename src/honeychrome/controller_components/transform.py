@@ -4,6 +4,10 @@ import honeychrome.settings as settings
 
 transforms_menu_items = ['Linear', 'Logicle', 'Log']
 
+# Linear axes spanning at most this many raw units get plain-number ticks
+# (see Transform._small_range_ticks); wider ones keep the 10^n labels.
+SMALL_LINEAR_RANGE = 1000
+
 class Transform:
     def __init__(self, scale_t=262144, linear_a=100, logicle_w=0.5, logicle_m=4.5, logicle_a=0, log_m=6):
         self.xform = None
@@ -35,7 +39,12 @@ class Transform:
         elif self.id == 2: #'log'
             self.set_log()
         else: #self.id == 'default':
-            self.limits[1] = max([self.limits[1], settings.default_ceiling]) # todo this is a temporary fix to the time gates issue. Should be replaced with sample gate instances for all time gates
+            # Per-sample Time axis: use the limits passed in (the controller sets
+            # these to each loaded sample's own observed range in
+            # initialise_data_for_cytometry_plots). Previously the upper limit was
+            # forced up to settings.default_ceiling, which squashed short runs and
+            # was the "temporary fix" for time gates across samples of different
+            # lengths — now the axis fits each sample.
             self.set_default()
 
     def set_linear(self):
@@ -93,7 +102,11 @@ class Transform:
         self.xform = None
         limits = self.limits
         range = limits[1] - limits[0] + 1
-        self.scale_bins = int(range) # unit resolution for time
+        # Cap the bin count: Time can span tens of thousands of units, but a
+        # per-unit grid makes a Time gate's 2D lookup table (bins_time x bins_other)
+        # tens of millions of cells — slow to rebuild per sample. A few thousand
+        # bins is plenty for both the Time histogram and gating.
+        self.scale_bins = min(int(range), settings.default_time_max_bins)
         self.scale = np.concatenate((
             [-np.inf],
             np.linspace(limits[0], limits[1], self.scale_bins),
@@ -110,12 +123,19 @@ class Transform:
 
     def logicle_ticks(self):
         top_tick = int(np.log10(self.xform.inverse(np.array([self.limits[1]])))[0]) + 1
-        bottom_tick = int(np.log10(np.abs(self.xform.inverse(np.array([self.limits[0]]))))[0]) + 1
+        bottom_value = np.abs(self.xform.inverse(np.array([self.limits[0]])))[0]
         threshold = 0.2
         cutoff_tick = np.argmax(np.diff(self.xform.apply(np.logspace(0, top_tick, top_tick+1))) > threshold)
         # print([self.logicle_w, self.logicle_m, top_tick, cutoff_tick])
+        # A scale without negative range (W = 0 puts its bottom at exactly 0)
+        # gets no negative ticks.
+        if bottom_value > 0:
+            bottom_tick = int(np.log10(bottom_value)) + 1
+            n_negative = max([bottom_tick-cutoff_tick+1, 0])
+        else:
+            bottom_tick, n_negative = cutoff_tick, 0
         major_values = np.concatenate([
-            -np.logspace(bottom_tick, cutoff_tick, max([bottom_tick-cutoff_tick+1, 0])),  # Negative values
+            -np.logspace(bottom_tick, cutoff_tick, n_negative),  # Negative values
             [0],
             np.logspace(cutoff_tick, top_tick, max([top_tick-cutoff_tick+1, 0]))  # Positive values
         ])
@@ -175,6 +195,9 @@ class Transform:
         return [minor_ticks, major_ticks]
 
     def linear_ticks(self):
+        lo_raw, hi_raw = (float(v) for v in self.xform.inverse(np.asarray(self.limits, dtype=float)))
+        if 0 < hi_raw - lo_raw <= SMALL_LINEAR_RANGE:
+            return self._small_range_ticks(lo_raw, hi_raw)
         top_tick = 10**(int(np.log10(self.xform.inverse(self.limits[1]))) + 1)
         major_values = np.linspace(0,top_tick,10)
         minor_values = np.linspace(0,top_tick,50)
@@ -208,6 +231,21 @@ class Transform:
             major_ticks.append((val, label))
 
         minor_ticks = [(val, '') for val in trans_minor_values]
+        return [minor_ticks, major_ticks]
+
+    def _small_range_ticks(self, lo_raw, hi_raw):
+        """Plain-number ticks for a linear axis spanning a small range, such
+        as AF Index (0 to the number of AF spectra): about eight major ticks
+        at a 1, 2 or 5 x 10^n step, with five minor ticks per step."""
+        raw_step = (hi_raw - lo_raw) / 8
+        magnitude = 10 ** np.floor(np.log10(raw_step))
+        step = next(m * magnitude for m in (1, 2, 5, 10) if m * magnitude >= raw_step)
+        major = np.arange(np.ceil(lo_raw / step) * step, hi_raw + step * 1e-9, step)
+        minor_step = step / 5
+        minor = np.arange(np.ceil(lo_raw / minor_step) * minor_step, hi_raw + minor_step * 1e-9, minor_step)
+        label = (lambda v: f"{v:.0f}") if step >= 1 else (lambda v: f"{v:g}")
+        major_ticks = [(float(t), label(v)) for t, v in zip(self.xform.apply(major), major)]
+        minor_ticks = [(float(t), '') for t in self.xform.apply(minor)]
         return [minor_ticks, major_ticks]
 
     def default_ticks(self):

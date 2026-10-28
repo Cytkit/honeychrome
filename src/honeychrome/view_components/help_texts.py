@@ -1,3 +1,13 @@
+from pathlib import Path
+
+# Colibri Cytometry hummingbird shown beside the AutoSpectral further reading;
+# Qt picks colibri@2x.png on high-DPI screens.
+colibri_cell = (
+    '<td width="12%" align="right" valign="middle">'
+    f'<img src="{(Path(__file__).parent / "assets" / "colibri.png").as_posix()}" width="110" height="72">'
+    '</td>'
+)
+
 process_help_text = '''
 <h3>Spectral Process Help</h3>
 <p>
@@ -17,9 +27,11 @@ which lists all FCS files within the Single Stain Controls subfolder. Under <i>p
 
 <li>
 <b>Single Stained Control from Library:</b> 
-if the required single stained control sample is not present in the current experiment, it may be loaded from previous experiments, if available. 
-(Note that all single stained spectral controls are stored in the <tt>spectral_controls_library.db</tt> database in the Experiments folder.) 
-Enter the <i>label</i> to search for a match in the database (exact matches only).
+if the required single stained control sample is not present in the current experiment, it may be loaded from the Reference Library. 
+To add a control to the Reference Library, right-click it in this table and choose <i>Save to Reference Library</i>. 
+The library also ships with reference spectra for supported instruments, and can be browsed from <i>View &gt; Reference Library</i>. 
+Enter the <i>label</i> (matching the fluorophore name, ignoring case) and choose a match under <i>sample name</i>. 
+Only profiles recorded with the same instrument and detector configuration are listed.
 </li>
 
 <li>
@@ -55,9 +67,9 @@ minus the fluorescence of the negatively gated <i>unstained</i> sample. "Pos Uns
 </li>
 
 <li>
-If any singly stained spectral control is missing, you may load it from previous experiments (if an exact match is available). 
+If any singly stained spectral control is missing, you may load it from the Reference Library. 
 Select <i>control type</i> as "Single Stained Control from Library", and enter the label name. 
-Exact matches from previously processed data will be returned under <i>sample name</i>.
+Matching profiles for this instrument configuration will be listed under <i>sample name</i>.
 </li>
 </ol>
 
@@ -115,24 +127,29 @@ nxn_help_text = '''
 '''
 
 autospectral_af_help_text = '''
-<h5>This is an optional enhancement of the spectral process, which implements the autofluorescence (AF) extraction part of the AutoSpectral package (AutoSpectral AF).</h5>
-<p>By following the steps below, you can extract each cell’s individual autofluorescent background in a manner specific to that cell, producing better unmixing with less spread.</p>
-<ol>
-<li>Extract AF profile from an unstained sample. This can be repeated for each unstained control that you have available, generating multiple AF profiles. </li>
-<li>Only unstained cell control samples will appear as options. Mark your unstained samples by right-clicking on the sample and selecting "Mark as Unstained".</li>
-<li>Default: 200 clusters (duplicates will be removed, so you will see fewer). After extraction, the clusters can be inspected by clicking on the Stored AF Profiles list.</li>
-<li>Assign the AF profiles to Samples. Each cell in the sample is automatically assigned its nearest cluster from of the selected controls for a more accurate AF subtraction.</li>
-<li>Inspect the AutoSpectral AF results against standard unmixing. Negative spread and other artifacts caused by inhomogeneous autofluorescence should be much improved.</li>
-<li>
-</ol>
-<p>AutoSpectral AF is intended for use in spectral unmixing, not in conventional flow with compensation.</p>
-<p><b>Note on unstained samples:</b> If you intend to use <b>AutoSpectral AF</b>, do <em>not</em> add unstained samples to the Spectral Process table. Unstained samples should only be used as the negative reference (assigned via the "Unstained Negative" column), not as spectral controls in their own right. Including them as controls will produce manual AF extraction profiles and can be used as an alternative to AutoSpectral AF.</p>
-<p>Documentation:</p>
+<h3>Autofluorescence: per-cell AF extraction</h3>
+<p>Autofluorescence (AF) differs from cell to cell, in brightness and in spectrum. Subtracting one average AF spectrum leaves the rest of that variation in the fluorophore channels, where it shows as negative spread and skewed negatives. AutoSpectral AF extracts a set of AF spectra from each unstained sample and, for every cell, chooses the AF spectrum from the assigned profile(s) that fits it best. The other pages of this tab start from this result: the noise model, the spectral variants and the spectral corrections all use the per-cell AF of each sample.</p>
 <ul>
+<li><b>Step 1, Extract AF Profile:</b> choose an unstained cell sample and press <i>Extract AF Profile</i>. Only samples marked as unstained are listed: right-click a sample in the sample browser and choose "Mark as Unstained". The AF events are clustered on a self-organising map of <i>SOM grid size</i> × <i>SOM grid size</i> nodes (default 10, so at most 100 spectra; near-duplicates are removed, so there are usually fewer). Repeat for each unstained sample, for example one per tissue or cell preparation.</li>
+<li><b>Stored AF Profiles:</b> select a profile to see its spectra; the profile mean (row 0) is drawn in black. Right-click a spectrum in the plot to delete it from the profile. The mean cannot be deleted, and deleting a spectrum renumbers the experiment's AF Index, so gates drawn on AF Index may select different spectra afterwards. <i>Delete Selected</i> removes a whole profile and its assignments; profiles can be saved to and loaded from CSV.</li>
+<li><b>Step 2, Assign AF Profiles to Samples:</b> tick the profile(s) for each sample (row). A sample can take several profiles; each cell then gets the best-fitting spectrum from all of them. <i>Assign Selected Profile to All Samples</i> and <i>to Folder</i> assign the profile selected in Stored AF Profiles to every sample shown in the grid, or to those in one folder. <i>Auto-assign from Scatter</i> fills in the samples without a profile (bead samples excepted; existing assignments are not changed): each unstained sample's FSC/SSC distribution is modelled as a Gaussian mixture, and each sample gets the profile(s) of the unstained sample whose scatter best explains its own. With <i>One profile per sample</i> ticked (the default) that is a single unstained sample; unticked, up to three are chosen by BIC, a second or third being added only when it improves the fit and accounts for at least 30% of the events. A summary opens at the end; <i>Show Details</i> lists first the samples whose scatter lies partly outside every unstained sample assigned to them. Review the result: similar scatter does not guarantee similar AF.</li>
+<li><b>Step 3, Side-by-Side Comparison:</b> the current sample (selected in the sample browser) unmixed by OLS without AF, and with per-cell AF. <i>Assigned to sample</i> uses the Step 2 assignment; choosing one profile previews it without changing the assignment. The plots open on the Singlets gate, else Cells, else the root.</li>
+</ul>
+<p><b>Where per-cell AF is used:</b> every sample with an assigned profile is unmixed with per-cell AF in the main window, unmixed exports, Honeycluster, the gating plugins and Statistics, unless the noise model or spectral variants are in use (Noise and Spectral Variants pages), which start from it. Two extra channels are added: <i>AF Abundance</i> (how much AF was removed) and <i>AF Index</i> (which AF spectrum was chosen). Per-cell AF is meant for spectral unmixing, not for conventional compensation.</p>
+<p><b>How a cell's AF spectrum is chosen:</b> new profiles store a <b>negative envelope</b>: the spread of each fluorophore in the unstained sample once the profile's mean AF is removed, as a function of AF brightness, to which the spillover spread of the single-stain controls is added for each cell. A cell's AF is chosen without crediting an AF spectrum for cancelling real fluorophore signal: each channel is judged once, at the profile's mean AF, by its probability of being positive against that distribution of the negative, and counts towards choosing the AF in proportion to its probability of being negative. A negative channel is fitted towards zero; the more clearly positive a channel is, the less it counts, and no channel switches on or off at a boundary. Events with a saturated detector are unmixed from the remaining detectors. The envelope follows the spectral model automatically while the spectra move by less than 2 degrees; larger changes rebuild it from 5,000 stored unstained events, and extracting a profile re-estimates the spread. Envelopes stored by an earlier version are upgraded from the same stored events. Profiles without an envelope (from older experiments or loaded from CSV) use the previous scoring.</p>
+<p><b>Note on unstained samples:</b> If you intend to use <b>AutoSpectral AF</b>, do <em>not</em> add unstained samples to the Spectral Process table. Unstained samples should only be used as the negative reference (assigned via the "Unstained Negative" column), not as spectral controls in their own right. Including them as controls will produce manual AF extraction profiles and can be used as an alternative to AutoSpectral AF.</p>
+<p><b>While another job runs</b> (the status bar shows <i>Running: …</i>), Extract AF Profile, Load CSV, Delete Selected, the assignment grid and its buttons are greyed out, and a spectrum cannot be deleted. The comparison waits and updates when the job has finished. A job that stopped without finishing can be released by right-clicking <i>Running: …</i> in the status bar.</p>
+<p><b>Further reading</b></p>
+<table width="100%" cellspacing="0" cellpadding="0"><tr><td width="88%" valign="top">
+<ul>
+<li>Burton OT et al. AutoSpectral improves spectral flow cytometry accuracy through optimised spectral unmixing and autofluorescence-matching at the cellular level. <i>bioRxiv</i> 2025. <a href="https://doi.org/10.1101/2025.10.27.684855">doi:10.1101/2025.10.27.684855</a></li>
+<li>Nguyen R, Perfetto S, Mahnke YD, Chattopadhyay P, Roederer M. Quantifying spillover spreading for comparing instrument performance and aiding in multicolor panel design. <i>Cytometry A</i> 2013; 83(3): 306–315. <a href="https://doi.org/10.1002/cyto.a.22251">doi:10.1002/cyto.a.22251</a></li>
+<li>Cai X, Garcia-Garcia S, Kuhnen L, Gianniou M, Garcia Vallejo JJ. Unmixing spread estimation based on residual model in spectral flow cytometry. <i>bioRxiv</i> 2026. <a href="https://doi.org/10.64898/2026.01.27.701929">doi:10.64898/2026.01.27.701929</a></li>
 <li><a href="https://www.colibri-cytometry.com/post/introducing-autospectral-an-optimized-unmixing-workflow">AutoSpectral on the Colibri Cytometry blog</a></li>
 <li><a href="https://www.colibri-cytometry.com/post/autospectral-single-cell-autofluorescence">AutoSpectral AF on the Colibri Cytometry blog</a></li>
-<li><a href="https://github.com/DrCytometer/AutoSpectral">AutoSpectral package on Github</a></li>
+<li><a href="https://github.com/DrCytometer/AutoSpectral">AutoSpectral package on GitHub</a></li>
 </ul>
+</td>''' + colibri_cell + '''</tr></table>
 '''
 
 autospectral_cleaning_help_text = '''
@@ -142,7 +159,7 @@ autospectral_cleaning_help_text = '''
 <h4>Workflow</h4>
 <ol>
 <li><b>Set up the basic scatter gates in the Raw Data tab:</b> for ease of use, set broad gates that capture all events of interest, including large and small cells but not doublets. The cleaning pipeline will automatically select the relevant events for each control based on the positive gate and particle type.</li>
-<li><b>Run "Auto generate spectral controls":</b> do this in the Spectral Model Editor to set up the single stained controls, if you haven't already. This will add positive and negative gates to the raw gating for each control.</li>
+<li><b>Run "Auto generate spectral controls":</b> do this in the Spectral Model Editor to set up the single stained controls, if you haven't already. This will add positive and negative gates to the raw gating for each control. With "Automatically Clean" ticked (beside "Show AutoSpectral Cleaning"), the controls are then cleaned straight away, as in the "Clean Controls" step below; use "Clean Controls" to re-run cleaning after changing gates, negatives or particle types.</li>
 <li><b>Ensure that "Particle type" is set correctly for each control:</b> this determines the scatter-matching process. If particle type is incorrect, the cleaning will not work well.</li>
 <li><b>For best results, use "Unstained Negative" profiles (instead of "Internal Negatives":</b> these provide a more accurate negative reference for the spectral profiles than the default internal negatives.</li>
 <li><b>Assign unstained negatives:</b> Ensure each cell control has an "Unstained Negative" assigned in the table. Right-click a sample in the Sample panel and select "Mark as Unstained" to make it available as a negative reference.</li>
@@ -163,5 +180,92 @@ autospectral_cleaning_help_text = '''
 <li><b>Proceed:</b> to unmixing, AutoSpectral AF extraction if desired, and downstream analysis or batch export as normal, using the cleaned profiles.</li>
 </ol>
 <p>Documentation: <a href="https://drcytometer.github.io/AutoSpectral/articles/09_Cleaning.html">AutoSpectral package on Github</a></p>
+<br/>
+'''
+
+autospectral_noise_help_text = '''
+<h3>Noise: noise-weighted unmixing</h3>
+<p>Every detector reads with noise: a constant floor (σ<sub>0</sub>, electronic noise) plus photon shot noise that grows with the signal. Ordinary least squares (OLS) trusts every detector equally. Weighting each detector by the inverse of its noise variance (generalised least squares, GLS) lets the quiet detectors count for more and the noisy ones for less, and a positivity prior then pulls fluorophores that a cell is clearly negative for towards zero, so their spread no longer lands in the other channels.</p>
+<ol>
+<li><b>Model Noise</b> fits, for every detector <i>d</i>, Var(<i>y<sub>d</sub></i>) = σ<sub>0,d</sub><sup>2</sup> + <i>μ<sub>d</sub></i> / κ<sub>d</sub> from the single-stained controls, an unstained cell sample and unstained beads (which anchor σ<sub>0</sub>). Each control is split 70/30: the model is fitted on 70% of the events and checked on the other 30%. Each control is described by its spectrum, its own spectral variants (found on the training events) and, for cell controls, the autofluorescence (AF) of its negative, so per-cell spectral variation is not mistaken for noise. A good model predicts the held-out residual variance within 0.8–1.25 for at least 80% of the control cells.</li>
+<li><b>Event selection:</b> the noise model picks its own events and ignores the gates. Each sample is read in full; the densest population on FSC-A × SSC-A is found and the 95% ellipse around it kept (saturated scatter events included, as bright beads saturate it on some cytometers), then the singlets on FSC-A / FSC-H. Doublets and aggregates of beads would otherwise read as extra noise at high signal. The tables give the selected and total events per sample.</li>
+<li><b>Estimator options</b> (validation; off by default): <i>the negative's own AF rows</i> lets bead negatives and bead controls carry their own bead autofluorescence, which varies from bead to bead; <i>one design row per laser</i> lets each control's signal vary between laser intercepts; the <i>per-control quadratic term</i> absorbs spread specific to one control, so it does not bias κ; <i>σ<sub>0</sub> per particle class</i> fits one floor for beads and one for cells (κ shared), as beads and cells differ in pulse width; <i>σ<sub>0</sub> from the same laser</i> replaces a floor the data could not pin down by the median of the other detectors on that laser, instead of 1% of the median.</li>
+<li><b>Clamped data:</b> some exports write values clamped at zero, with no negative values on any detector (seen on the Attune Xenith and Bigfoot). Their noise is cut off at zero, which the noise model does not describe. When the unstained cells and bead negatives have no detector with 1% of values at or below zero, Model Noise leaves the noise model off and unmixes with Poisson weights from the fitted κ with a floor of 10 photoelectrons, scaled to the unstained cells' residual variance, and the positivity prior; the noise model can still be ticked.</li>
+<li><b>Unmixing with the noise model</b> starts from the per-cell AF result, with each cell's AF spectrum chosen in the geometry of the weighted fit (one weight per detector for the sample). It then refits every fluorophore and the AF abundance by GLS with the positivity prior: each fluorophore is shrunk in proportion to how likely the cell is to be negative for it, judged against the spread of the negative (from the AF profile's negative envelope and the spillover spread). Each channel is reported with its own prior removed, so a dim positive keeps its scale.</li>
+<li><b>Positivity prior (λ)</b> sets how strongly likely-negative fluorophores are shrunk. Higher values narrow the negatives further, at the cost of over-estimating dim cells positive for two near-identical dyes: across four large panels, λ = 0.5 gave negatives about 20% narrower than the AutoSpectral optimisation with about +9% bias on such double positives, and λ = 1 (the default) about 28% narrower with about +14%.</li>
+<li><b>Use the noise model for the experiment's unmixing</b> (ticked after Model Noise): every sample is unmixed with the noise model in the main window, unmixed exports, Honeycluster, the gating plugins and Statistics. The main window shows per-cell AF at once and swaps the noise-model result in when it is ready; results are cached, so a sample shown again appears at once. Changing lambda unmixes the displayed sample again. Spectral variants are not used while this is ticked.</li>
+<li><b>Comparison:</b> the current sample unmixed with per-cell AF, and with per-cell AF plus the noise model. A sample without an AF profile is shown as OLS against the noise model without AF.</li>
+</ol>
+<p><b>While another job runs</b> (the status bar shows <i>Running: …</i>), Model Noise, the <i>Use</i> tick boxes and λ are greyed out. The main window keeps showing per-cell AF and swaps in the noise-model result when the job has finished; the comparison waits likewise. A job that stopped without finishing can be released by right-clicking <i>Running: …</i> in the status bar.</p>
+<p><b>Credit:</b> Paul Heisig (UMC Amsterdam) and David Novo, whose work and discussions shaped the noise model and noise-weighted unmixing.</p>
+<p><b>Further reading</b></p>
+<table width="100%" cellspacing="0" cellpadding="0"><tr><td width="88%" valign="top">
+<ul>
+<li>Novo D, Grégori G, Rajwa B. Generalized unmixing model for multispectral flow cytometry utilizing nonsquare compensation matrices. <i>Cytometry A</i> 2013; 83(5): 508–520. <a href="https://doi.org/10.1002/cyto.a.22272">doi:10.1002/cyto.a.22272</a></li>
+<li>Novo D. A comparison of spectral unmixing to conventional compensation for the calculation of fluorochrome abundances from flow cytometric data. <i>Cytometry A</i> 2022. <a href="https://doi.org/10.1002/cyto.a.24669">doi:10.1002/cyto.a.24669</a></li>
+<li>Kmet R, Novo D. Reducing spreading: removing the impact of irrelevant dyes improves unmixed flow cytometry data. <i>Cytometry A</i> 2025. <a href="https://doi.org/10.1002/cyto.a.24957">doi:10.1002/cyto.a.24957</a></li>
+<li>Rajwa B, Roederer M. Lost in translation: harmonizing terminology and defining mathematical tools for panel optimization. <i>Cytometry A</i> 2025. <a href="https://doi.org/10.1002/cyto.a.24972">doi:10.1002/cyto.a.24972</a></li>
+<li>Cai X, Garcia-Garcia S, Kuhnen L, Gianniou M, Garcia Vallejo JJ. Unmixing spread estimation based on residual model in spectral flow cytometry. <i>bioRxiv</i> 2026. <a href="https://doi.org/10.64898/2026.01.27.701929">doi:10.64898/2026.01.27.701929</a></li>
+</ul>
+</td>''' + colibri_cell + '''</tr></table>
+'''
+
+autospectral_variants_help_text = '''
+<h3>Spectral Variants: per-cell fluorophore spectra</h3>
+<p>A fluorophore's emission spectrum is not quite the same in every cell: tandem dyes break down to different degrees, and the local environment of a dye shifts its spectrum a little. This page finds that variation in each single-stained control and lets unmixing choose, for every cell, the variant of each fluorophore that fits it best, together with the cell's autofluorescence (AF). It is the per-cell optimisation of the AutoSpectral package, run by a compiled kernel.</p>
+<p><b>Prerequisite:</b> a sample can only be compared here once AF profile(s) with at least two spectra are assigned to it on the <b>Autofluorescence</b> page.</p>
+<p>AF profiles that carry a negative envelope (see the <b>Autofluorescence</b> page) are scored with it here too, including the saturated-detector refit: events with a saturated detector are unmixed, variants included, from the remaining detectors. Profiles without an envelope use the previous scoring.</p>
+<ol>
+<li><b>Compute Spectral Variants:</b> discovers spectral variation for each fluorophore from its single-stained control, by clustering background-corrected, scatter-matched positive events. Near-identical variants are then merged: a variant within <i>dedup.threshold</i> (default 1% of the peak, in any single detector) of the reference or of a better-populated variant is dropped, and the threshold is raised for a fluorophore until no more than <i>max.variants</i> (default 10) remain; the two variants furthest from the reference are always kept. Fluorophores with too little clean signal fall back to the single reference spectrum (not an error — just nothing to optimise for that one). Positivity thresholds reuse AF profiles already extracted from each unstained sample; AF is extracted only for unstained samples without a stored profile. A necessity score then estimates how much each fluorophore's variation would change the unmixing of the rest of the panel; fluorophores at or above <i>optimize.necessity.threshold</i> (Advanced Settings) are optimised per cell, the others keep their reference spectrum.</li>
+<li><b>Plot Spectral Variants:</b> shows the discovered variant spectra (faint) against the reference spectrum (solid) for a selected fluorophore.</li>
+<li><b>Use spectral variants for the experiment's unmixing:</b> samples with an AF profile are unmixed with per-cell spectral variants in the main window, unmixed exports (after a time estimate), Honeycluster, the gating plugins and Statistics; samples without one keep per-cell AF. The Unmixing settings in Advanced Settings are stored with the experiment. Not available while the noise model is in use (Noise page).</li>
+<li><b>Comparison:</b> the current sample unmixed with per-cell AF alone and with per-cell AF plus spectral variants, subsampled for speed (<i>comparison.max_events</i> in Advanced Settings).</li>
+</ol>
+<p><b>While another job runs</b> (the status bar shows <i>Running: …</i>), Compute Spectral Variants, <i>Use spectral variants</i> and the Unmixing settings are greyed out. The main window keeps showing per-cell AF and swaps in the spectral-variants result when the job has finished; the comparison waits likewise. A job that stopped without finishing can be released by right-clicking <i>Running: …</i> in the status bar.</p>
+<p><b>Further reading</b></p>
+<table width="100%" cellspacing="0" cellpadding="0"><tr><td width="88%" valign="top">
+<ul>
+<li>Burton OT et al. AutoSpectral improves spectral flow cytometry accuracy through optimised spectral unmixing and autofluorescence-matching at the cellular level. <i>bioRxiv</i> 2025. <a href="https://doi.org/10.1101/2025.10.27.684855">doi:10.1101/2025.10.27.684855</a></li>
+<li><a href="https://www.colibri-cytometry.com/post/introducing-autospectral-an-optimized-unmixing-workflow">AutoSpectral on the Colibri Cytometry blog</a></li>
+<li><a href="https://github.com/DrCytometer/AutoSpectral">AutoSpectral package on GitHub</a></li>
+</ul>
+</td>''' + colibri_cell + '''</tr></table>
+'''
+autospectral_correction_help_text = '''
+<h3>Spectral Correction: Fix My Unmix</h3>
+<p>This will attempt to automatically identify and fix minor unmixing issues in the samples. It has been tested on many data sets, but still likely requires further tuning.</p>
+<ol>
+<p>Single-stained controls give each fluorophore's spectrum, but a reference spectrum can still be slightly wrong for the fully stained cells: a tandem dye that has degraded differently, a control stained on beads, a different buffer. Part of such an error lies inside the span of the other spectra, and no residual check can see it; it shows as residual spillover, cells negative for a marker reading above or below zero in proportion to another marker. Fix My Unmix (from the AutoSpectral package's <tt>fix.my.unmix()</tt>) measures that spillover on fully stained samples, where a marker-negative population must read zero, and corrects the spectra.</p>
+<ol>
+<li><b>Setup</b> lists what the other pages provide: the AF profiles (every sample is unmixed with its own, by per-cell AF), the spillover spread (it widens the positivity boundaries), the spectral variants (a prior on how large each correction can plausibly be) and the experiment's unmixing method, which the corrected spectra feed.</li>
+<li><b>Samples:</b> by default every sample that is not a bead sample, an unstained sample or a single-stain control, run together; the <i>Include</i> tick boxes offer those types too. <i>Concatenate per group</i> runs each raw subfolder on its own, and each sample is then unmixed with its own group's corrected spectra. Each group needs an unstained sample for its positivity thresholds: <i>Auto</i> takes the unstained cell sample whose scatter fits the group best. The events are drawn equally from the group's samples, in the gate.</li>
+<li><b>Fluorophores kept fixed:</b> ticked fluorophores keep their spectra; Fix Unmix gathers no evidence with them as the source and does not re-measure them.</li>
+<li><b>Fix Unmix</b> runs in two phases. Phase one fits, for every pair of fluorophores, the residual spillover from the clearly positive cells of one into the cells negative for the other, with a trust weight for each coefficient; phase two re-measures the spectrum of every fluorophore phase one changed from the cells it dominates, fitting it jointly with the dyes present on those cells, and adopts it only if it passes every check (fit, offset, angle, collinearity, conditioning, leakage); when the re-measured spectrum fails a leakage, conditioning or no-fit check and phase one's evidence for the fluorophore is strong, phase one's own back-solved spectrum is tried through the same checks instead; a tandem whose parent is in the panel (PE-Cy7 and PE, say) has a last candidate, its starting spectrum with only the parent fraction changed by the tandem-to-parent coefficient phase one measured, which is what tandem breakdown, or a reference with more breakdown than the sample, looks like. The leakage check counts only the channels the fluorophore's own cells are negative for, so a marker expressed on the same cells does not block a correction. Every run starts from the base spectra. With <i>Smooth updates</i> (Advanced Settings, on by default) Fix My Unmix runs five rounds, each on a fresh half of the events unmixed with the current spectra, and moves the spectra only part of the way toward each round's result, so the noise of one subsample is averaged rather than adopted; it takes longer than a single pass. <i>Smooth updates: keep</i> set to <i>Only corrections the rounds agree on</i> runs every round from the base spectra instead and adopts a fluorophore only when most rounds corrected it and their results agree (their mean angle to the average within half the change), which keeps the corrections that reproduce between halves of the events and drops the rest. Every change is held to a plausible size (Advanced Settings, <i>Plausible change</i>): a detector may change by at most its starting value (it can at most double) or by 0.003 of the peak, whichever is greater, so a dye cannot pick up signal where it had none, as it does when another dye is expressed on the same cells; a fluorophore whose change lies mostly outside these bounds keeps its spectrum. Two further checks are off by default: shrinking coefficients that several unrelated dyes share toward the same dye (a marker expressed on the cells of several others), and damping steps that look more like autofluorescence than the dye itself does.</li>
+<li><b>Results:</b> the change of every corrected spectrum (heatmap and before/after traces), and a table of the fluorophores phase one changed or phase two corrected, with the angle adopted, the angle phase one implied and phase two's verdict. Untick <i>Active</i> to keep a fluorophore's base spectrum. What depends on the spectra follows the corrected ones: the AF envelopes are rebuilt, the spillover spread is recomputed from the controls, and spectral variants and positivity thresholds move with each correction (the noise model describes the detectors and is kept).</li>
+<li><b>Use spectral corrections for the experiment's unmixing</b> (ticked after Fix Unmix): every fully stained sample (not an unstained, single-stain or bead sample) is unmixed with the corrected spectra by the experiment's method (per-cell AF, the noise model or spectral variants), in the main window, exports, Honeycluster, the gating plugins and Statistics. After a run per group, each sample takes its own raw subfolder's corrections; a subfolder Fix Unmix did not run on keeps the base spectra. Untick a raw subfolder under <i>Apply the corrections to the samples of</i> to keep its samples on the base spectra. The corrections are cleared when the base spectra change.</li>
+<li><b>Comparison:</b> the current sample, whichever it is, with the base spectra and with the corrected spectra it takes, both by the experiment's method, on the channel pair that changes most. For a sample the experiment's unmixing does not correct (a control, an unticked subfolder, or with <i>Use spectral corrections</i> unticked) it is marked as a preview.</li>
+</ol>
+<p><b>While another job runs</b> (the status bar shows <i>Running: …</i>), Match Unstained, Fix Unmix, <i>Use spectral corrections</i> and the <i>Active</i> ticks are greyed out, and the comparison waits until the job has finished. Match Unstained followed by Fix Unmix runs as one job. A job that stopped without finishing can be released by right-clicking <i>Running: …</i> in the status bar.</p>
+<p><b>Further reading</b></p>
+<table width="100%" cellspacing="0" cellpadding="0"><tr><td width="88%" valign="top">
+<ul>
+<li>Burton OT et al. AutoSpectral improves spectral flow cytometry accuracy through optimised spectral unmixing and autofluorescence-matching at the cellular level. <i>bioRxiv</i> 2025. <a href="https://doi.org/10.1101/2025.10.27.684855">doi:10.1101/2025.10.27.684855</a></li>
+<li><a href="https://github.com/DrCytometer/AutoSpectral">AutoSpectral package on GitHub</a> (<tt>fix.my.unmix()</tt>)</li>
+</ul>
+</td>''' + colibri_cell + '''</tr></table>
+'''
+
+simple_stats_help_text = '''
+<h3>The Simple Stats tab allows you to compare samples or groups of samples.</h3>
+<p>To make a statistical comparison, first select a set of samples. You can compare samples in a flat list or a set of folders.</p>
+<p>Then select a chart type. Select from the following available plot types:</p> 
+<ul>
+<li>bar chart</li>
+<li>box-and-whisker chart</li>
+<li>1D histogram overlay</li>
+<li>heatmap</li>
+</ul>
+<p>Then select a gate to compare between samples. Finally select a statistic to plot, which can either be numbers or proportions of cells, or a mean intensity of a marker.</p> 
+<p>(Note: if you are looking for high-dimensional statistical analysis, enable the Honeycluster plugin in Edit > App Configuration!)</p>
 <br/>
 '''

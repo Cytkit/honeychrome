@@ -170,6 +170,9 @@ class ReportGenerator(QObject):
                     f"Sample: {str(current_sample_path)}\n"
                     f"Event count: {current_sample.event_count}\n"
                     f'Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}\n')
+            if self.controller.raw_event_data is not None and len(self.controller.raw_event_data) < current_sample.event_count:
+                # Subset note after Joan Escrivà Font's pull request #16
+                desc += f'Displayed events: {len(self.controller.raw_event_data):,} (random subset); plotted gates and statistics use this subset.\n'
             try:
                 desc += f"Sample acquired: {current_sample.get_metadata()['date']}; begin time: {current_sample.get_metadata()['btim']}; end time: {current_sample.get_metadata()['etim']}"
             except:
@@ -213,7 +216,7 @@ class ReportGenerator(QObject):
                     plot_widget.setFixedSize(width, height)
                     plot_widget.plot_histogram()
                     for roi in plot_widget.rois:
-                        roi.label.add_statistic_to_name()
+                        roi.label.update_label_statistic_and_gate()
                     png_buffer = pm_to_png_buffer(get_widget_pixmap(plot_widget, scale_factor=scale_factor))
                     add_inline_picture(doc, png_buffer, own_line)
 

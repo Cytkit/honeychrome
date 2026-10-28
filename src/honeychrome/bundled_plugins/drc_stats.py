@@ -1,0 +1,867 @@
+"""
+drc_stats.py — Differential statistics for the Honeycluster plugin
+===================================================================
+Companion to ``dr_clustering_tab.py`` (filename intentionally NOT ``*_tab.py``).
+
+The test engine (design matrices, moderated fits, GLMs, significance) is
+shared with other plugins in ``controller_components/differential_stats.py``;
+this module assembles the Honeycluster feature tables and runs it.
+
+Tests cluster abundance and per-cluster marker expression between sample
+groups:
+
+* Frequencies — log2 of each cluster's share of a sample's events, tested
+  with a moderated linear model (``moderated_stats``: least squares per
+  cluster, empirical Bayes variance moderation after Smyth 2004).
+* Counts — raw event counts per cluster, tested with a negative-binomial
+  GLM (statsmodels) with a log(total events) offset.
+* MFIs — mean transformed intensity of each marker within each cluster,
+  tested with the same moderated linear model. A cluster with no events in
+  a sample is missing (NaN) for that sample, not 0.
+
+Every test builds one design matrix: an intercept, one indicator per
+non-baseline group, optional pairing (blocking) levels, and optional
+adjustment covariates — numeric columns enter as centred continuous
+terms, anything else as treatment-coded factors.
+
+Significance is set by ``apply_significance``:
+
+* TREAT (McCarthy & Smyth 2009): with ``use_treat`` the p-value tests
+  whether |effect| exceeds the threshold, instead of filtering on the
+  estimate after testing for a non-zero effect.
+* FDR: Benjamini–Hochberg, pooled over every comparison ('global') or
+  within each comparison ('per_comparison').
+* Cluster-first MFI testing (``hierarchical=True``): clusters are screened
+  first (Simes-combined p-value of their markers, BH across clusters);
+  markers are then tested only inside selected clusters, at the level
+  adjusted for the number of clusters selected (Benjamini & Bogomolov
+  2014).
+
+Results carry the estimate's standard error and degrees of freedom, so a
+threshold change re-derives p-values and significance without refitting.
+
+Contrasts: ``state.contrast_mode`` 'reference' fits once across every
+tested group and reads one coefficient per non-reference group;
+'pairwise' fits each pair of groups separately. Results carry a
+``comparison`` column.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import PCA
+
+import drc_pipeline
+import drc_run_align
+from drc_logging import get_logger, log_stage
+from honeychrome.controller_components import differential_stats as _ds
+from honeychrome.controller_components.differential_stats import (
+    apply_significance,
+    build_contrasts,
+    covariate_kind,
+    log2_frequencies,
+    run_glm_counts,
+    run_moderated,
+    sparse_features,
+)
+
+log = get_logger(__name__)
+
+# A cluster is tested for differential abundance only when it has events in
+# at least this many samples; below that the comparison reflects the
+# samples' event totals, not the cluster.
+MIN_NONZERO_SAMPLES = 3
+
+
+# ---------------------------------------------------------------------------
+# Group resolution
+# ---------------------------------------------------------------------------
+
+def resolve_test_groups(controller, state, cluster_labels_override=None):
+    """
+    Resolve every group in ``state.testing_group_selection`` 
+    (falls back to every defined group if the selection is empty) to
+    rel-path keys present in ``cluster_labels_override`` (or
+    ``state.cluster_labels`` if not supplied).
+
+    Groups with < 3 labelled samples are silently DROPPED from the
+    returned dict rather than raising — a user testing 5 groups where one
+    only has 2 samples should still get results for the other 4;
+    ``build_contrasts``/the caller decide whether what's left is enough.
+
+    Returns dict[group_name, list[rel_path]] for qualifying groups only.
+    Raises RuntimeError if fewer than 2 groups qualify.
+    """
+    log_stage(log, "RESOLVE TEST GROUPS")
+    cluster_labels = cluster_labels_override if cluster_labels_override is not None \
+        else state.cluster_labels
+    raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
+
+    def _to_rel(sp):
+        try:
+            return str(Path(sp).relative_to(raw_subdir))
+        except ValueError:
+            return sp
+
+    selection = state.testing_group_selection or list(state.group_names)
+    result = {}
+    for name in selection:
+        rels = []
+        for sp, g in state.sample_groups.items():
+            if g != name:
+                continue
+            rel = _to_rel(sp)
+            if rel in cluster_labels:
+                rels.append(rel)
+        log.info("group %r: %d with cluster labels", name, len(rels))
+        if len(rels) >= 3:
+            result[name] = rels
+        else:
+            log.info("group %r dropped from testing (only %d qualifying samples)",
+                     name, len(rels))
+
+    if len(result) < 2:
+        raise RuntimeError(
+            "Need at least 2 groups with ≥3 labelled samples each in "
+            "'Groups to Test'. Qualifying: "
+            + (", ".join(f"{k}={len(v)}" for k, v in result.items()) or "none")
+        )
+    return result
+
+
+def missing_covariate_values(state, all_rel: list[str], names: list[str]) -> dict[str, list[str]]:
+    """
+    {covariate name: [rel paths with no value]} for each of ``names``
+    that is missing (or blank) for at least one sample in ``all_rel``.
+    """
+    return _ds.missing_covariate_values(state.covariates, all_rel, names)
+
+
+def covariate_frame(state, all_rel: list[str], names: list[str]) -> pd.DataFrame | None:
+    """
+    Adjustment covariates for ``all_rel`` (rows in that order): the columns
+    in ``state.numeric_covariates`` as floats, the others as strings.
+    Returns None when ``names`` is empty. Raises RuntimeError if any sample
+    lacks a value or a numeric covariate has a value that is not a number.
+    """
+    return _ds.covariate_frame(state.covariates, all_rel, names,
+                               numeric=list(state.numeric_covariates))
+
+
+def n_clusters_from_labels(state, all_rel, cluster_labels_override=None) -> int:
+    """Number of (non-noise) clusters across the given samples. 0-based labels,
+    so result = max_label + 1. Guards the all-noise case."""
+    cluster_labels = cluster_labels_override if cluster_labels_override is not None \
+        else state.cluster_labels
+    positive = [int(lbl)
+                for rel in all_rel
+                for lbl in np.unique(cluster_labels[rel]) if lbl >= 0]
+    if not positive:
+        raise RuntimeError("No non-noise clusters to test.")
+    n = int(max(positive) + 1)
+    log.info("n_clusters across %d samples: %d", len(all_rel), n)
+    return n
+
+
+# ---------------------------------------------------------------------------
+# Feature matrices
+# ---------------------------------------------------------------------------
+
+def _label_for(state, cl: int, names_override: dict | None) -> str:
+    """
+    Resolve a cluster's display name. When names_override is given (the
+    SELECTED run's own 'names' dict — see drc_scatter.py), it is
+    authoritative and state.cluster_names is never consulted, so labels
+    can't bleed in from an unrelated run. Falls back to the legacy global
+    dict only for the "Active (unsaved)" pseudo-run, which has no run
+    entry of its own yet.
+    """
+    if names_override is not None:
+        if cl in names_override:
+            return names_override[cl]
+        return 'Noise' if cl < 0 else str(cl)
+    return state.cluster_label(cl)
+
+
+def compute_frequencies(state, all_rel, n_clusters, cluster_labels_override=None,
+                        names_override: dict | None = None) -> pd.DataFrame:
+    """Per-sample % of events in each cluster → (n_samples × n_clusters)."""
+    cluster_labels = cluster_labels_override if cluster_labels_override is not None \
+        else state.cluster_labels
+    freq_mat = np.zeros((len(all_rel), n_clusters), dtype=float)
+    for i, rel in enumerate(all_rel):
+        labels = np.asarray(cluster_labels[rel])
+        total = max(int(np.sum(labels != drc_run_align.UNLABELLED)), 1)
+        in_range = (labels >= 0) & (labels < n_clusters)
+        freq_mat[i] = np.bincount(labels[in_range].astype(np.intp),
+                                  minlength=n_clusters) / total * 100.0
+    df = pd.DataFrame(freq_mat, index=all_rel,
+                      columns=[_label_for(state, cl, names_override) for cl in range(n_clusters)])
+    log.info("frequency matrix: %s", df.shape)
+    return df
+
+
+def compute_counts(state, all_rel, n_clusters, cluster_labels_override=None,
+                   names_override: dict | None = None) -> pd.DataFrame:
+    """
+    Per-sample RAW event count in each cluster → (n_samples by n_clusters).
+
+    Same shape/index/columns as compute_frequencies() — just unnormalized.
+    This is the counterpart the GLM-on-counts path needs alongside the
+    existing percentage matrix; run_statistics() computes both from the same
+    already-resolved all_rel/n_clusters rather than each re-deriving them.
+    """
+    cluster_labels = cluster_labels_override if cluster_labels_override is not None \
+        else state.cluster_labels
+    count_mat = np.zeros((len(all_rel), n_clusters), dtype=float)
+    for i, rel in enumerate(all_rel):
+        labels = np.asarray(cluster_labels[rel])
+        in_range = (labels >= 0) & (labels < n_clusters)
+        count_mat[i] = np.bincount(labels[in_range].astype(np.intp), minlength=n_clusters)
+    df = pd.DataFrame(count_mat, index=all_rel,
+                      columns=[_label_for(state, cl, names_override) for cl in range(n_clusters)])
+    log.info("counts matrix: %s", df.shape)
+    return df
+
+
+def sample_event_totals(state, all_rel, cluster_labels_override=None) -> np.ndarray:
+    """Events per sample, including noise (-1) labels but not events the run
+    could not label (drc_run_align.UNLABELLED) — the frequency denominator."""
+    cluster_labels = cluster_labels_override if cluster_labels_override is not None \
+        else state.cluster_labels
+    return np.array([np.sum(np.asarray(cluster_labels[rel]) != drc_run_align.UNLABELLED)
+                     for rel in all_rel], dtype=float)
+
+
+def export_tables(state, mem_labels: dict | None = None,
+                  cell_types: pd.DataFrame | None = None) -> dict:
+    """
+    The last statistics run as one tidy table per file, for graphing and
+    analysis in other software: {name: DataFrame}.
+
+    ``cluster_frequencies`` (% of a sample's labelled events),
+    ``cluster_counts`` and ``cluster_mfis`` have one row per sample and one
+    column per cluster (per cluster and channel for the MFIs). Each row
+    starts with the sample name and path, its group and its covariates.
+    Frequencies and counts then give ``n_events``, the sample's labelled
+    events: the frequency denominator, noise included, recovered from the
+    largest cluster's count and share.
+
+    ``clusters`` lists each cluster's id, name and event count over the
+    samples tested, with the MEM label and suggested cell type when
+    ``mem_labels`` ({cluster id: label}) and ``cell_types`` (the Cluster
+    Annotation suggestions, indexed by cluster id) are given.
+
+    ``differential_frequencies``, ``differential_counts`` and
+    ``differential_mfis`` are the test results as computed, one row per
+    feature and comparison. A test that was not run gives no table.
+    """
+    out = {}
+    matrices = {name: df for name, df in (('cluster_frequencies', state.freq_df),
+                                          ('cluster_counts', state.counts_df),
+                                          ('cluster_mfis', state.mfi_df))
+                if df is not None and not df.empty}
+    freq_df, counts_df = matrices.get('cluster_frequencies'), matrices.get('cluster_counts')
+
+    per_cluster = counts_df if counts_df is not None else freq_df
+    if per_cluster is not None:
+        cluster_ids = list(range(per_cluster.shape[1]))
+        clusters = pd.DataFrame({'cluster_id': cluster_ids,
+                                 'cluster_name': list(per_cluster.columns)})
+        if counts_df is not None:
+            clusters['n_events'] = counts_df.sum(axis=0).astype(int).to_numpy()
+        if mem_labels:
+            clusters['mem_label'] = [mem_labels.get(cl, '') for cl in cluster_ids]
+        if cell_types is not None and 'suggested_type' in cell_types.columns:
+            clusters['suggested_type'] = (cell_types['suggested_type'].reindex(cluster_ids)
+                                          .fillna('').to_numpy())
+        out['clusters'] = clusters
+
+    if matrices:
+        index = next(iter(matrices.values())).index
+        group_of = dict(zip(state.stats_all_rel, state.stats_group_vec))
+        meta = pd.DataFrame({'sample': [Path(rel).name for rel in index],
+                             'sample_path': list(index),
+                             'group': [group_of.get(rel, '') for rel in index]},
+                            index=index)
+        if state.covariates is not None:
+            meta = meta.join(state.covariates.reindex(index), rsuffix='_covariate')
+        n_events = None
+        if freq_df is not None and counts_df is not None:
+            rows = np.arange(len(counts_df))
+            top = counts_df.to_numpy().argmax(axis=1)
+            top_count = counts_df.to_numpy()[rows, top]
+            share = freq_df.to_numpy()[rows, top] / 100.0
+            n_events = pd.Series(np.rint(top_count / np.where(share > 0, share, np.nan)),
+                                 index=index, name='n_events')
+        for name, df in matrices.items():
+            parts = [meta] if n_events is None or name == 'cluster_mfis' else [meta, n_events]
+            out[name] = pd.concat(parts + [df], axis=1)
+
+    for name, results in (('differential_frequencies', state.freq_results),
+                          ('differential_counts', state.counts_results),
+                          ('differential_mfis', state.mfi_results)):
+        if results is not None and not results.empty:
+            out[name] = results
+    return out
+
+
+def mfi_feature_table(state, n_clusters: int, channels: list[str],
+                      names_override: dict | None = None) -> pd.DataFrame:
+    """
+    One row per compute_mfis() column, in the same order: feature name,
+    cluster display label, cluster index and channel.
+    """
+    rows = []
+    for ch in channels:
+        for cl in range(n_clusters):
+            label = _label_for(state, cl, names_override)
+            rows.append({'feature': f'{label}_{ch}', 'cluster': label,
+                         'cluster_id': cl, 'channel': ch})
+    return pd.DataFrame(rows)
+
+
+def resolve_mfi_channels(state, include_type_markers: bool = False) -> list[str]:
+    """
+    Return the channel list MFI significance testing should use, filtered
+    by marker role (diffcyt's type/state split). 'type'
+    channels (those that drove the clustering assignment) can be excluded by
+    default, to avoid the same channel driving both the cluster call and
+    its own significance test. include_type_markers=True restores the
+    previous all-selected-channels behaviour.
+    """
+    channels = [c for c in state.selected_channels if c not in drc_pipeline.META_CHANNELS]
+    if include_type_markers:
+        return channels
+    return [ch for ch in channels if state.marker_roles.get(ch, 'state') != 'type']
+
+
+def compute_mfis(controller, state, all_rel, n_clusters,
+                 cluster_labels_override=None, channels=None,
+                 names_override: dict | None = None,
+                 af_state=None, values_override: dict | None = None,
+                 loaded: dict | None = None) -> pd.DataFrame | None:
+    """
+    Per-sample mean intensity of each selected channel within each cluster.
+
+    Returns (n_samples by (n_clusters · n_channels)), columns ordered
+    channel-major (every cluster for the first channel, then the next).
+    Loads each sample's selected-channel values ONCE via drc_pipeline, each
+    channel on its own configured Transforms-tab scale (Logicle/
+    biexponential/linear — the same scale the main cytometry plots and
+    Transforms tab use), then iterates channels in memory. A cluster with
+    no events in a sample is NaN there: it has no intensity to compare.
+
+    channels: explicit channel list to test. Defaults to every
+              selected channel when not supplied,
+              so any other caller keeps working unchanged.
+
+    af_state: optional unmixing snapshot, captured on the main thread
+        before this (background-thread) call —
+        see drc_pipeline.apply_unmixing_af_aware() docstring for why this
+        must not be read live off ``controller`` from a worker thread.
+    values_override: {rel: (transformed values, names)} row for row with
+        the labels, used instead of the current events (a legacy run's own
+        stored values, see drc_run_align.statistics_inputs).
+
+    loaded: optional dict, filled with each sample's loaded (values, names)
+        so compute_sample_mfis() can reuse them (not with values_override).
+
+    A sample whose values and labels differ in length cannot be paired
+    and is left out (NaN), never truncated.
+    """
+    log_stage(log, "MFI MATRIX")
+    cluster_labels = cluster_labels_override if cluster_labels_override is not None \
+        else state.cluster_labels
+    if channels is None:
+        channels = [c for c in state.selected_channels if c not in drc_pipeline.META_CHANNELS]
+
+    sample_vals = {}
+    for rel in all_rel:
+        if values_override is not None:
+            mv = values_override.get(rel)
+        else:
+            mv = drc_pipeline.load_sample_transformed_values(controller, state, rel, channels,
+                                                             af_state=af_state)
+        if mv is None:
+            continue
+        if loaded is not None and values_override is None:
+            loaded[rel] = mv
+        if len(mv[0]) != len(np.asarray(cluster_labels[rel])):
+            log.warning("compute_mfis: %s -- %d values vs %d labels; the run's events do not "
+                        "match these values, sample left out", rel, len(mv[0]),
+                        len(np.asarray(cluster_labels[rel])))
+            continue
+        sample_vals[rel] = mv          # (values (n,n_sel), names)
+
+    # One pass per sample and channel: per-cluster sums / counts (float64)
+    mfi_mats = {ch: np.full((len(all_rel), n_clusters), np.nan, dtype=float) for ch in channels}
+    for i, rel in enumerate(all_rel):
+        mv = sample_vals.get(rel)
+        if mv is None:
+            continue
+        values, names = mv
+        lab = np.asarray(cluster_labels[rel])
+        in_range = (lab >= 0) & (lab < n_clusters)
+        idx = lab[in_range].astype(np.intp)
+        n = np.bincount(idx, minlength=n_clusters)
+        present = n > 0
+        for ch in channels:
+            if ch not in names:
+                continue
+            sums = np.bincount(idx, weights=values[in_range, names.index(ch)],
+                               minlength=n_clusters)
+            mfi_mats[ch][i, present] = sums[present] / n[present]
+
+    frames = []
+    for ch in channels:
+        frames.append(pd.DataFrame(
+            mfi_mats[ch], index=all_rel,
+            columns=[f'{_label_for(state, cl, names_override)}_{ch}' for cl in range(n_clusters)]))
+
+    if not frames:
+        log.warning("no MFI features could be built")
+        return None
+    full = pd.concat(frames, axis=1)
+    log.info("MFI matrix: %s", full.shape)
+    return full
+
+
+def compute_sample_mfis(controller, state, all_rel, channels=None,
+                        af_state=None, loaded: dict | None = None) -> pd.DataFrame | None:
+    """
+    Per-sample mean intensity of each selected channel across the WHOLE
+    sample (every gated event), independent of cluster assignment.
+
+    Companion to compute_mfis() (cluster x channel, for the per-cluster
+    differential MFI test / Volcano) — that granularity isn't right for a
+    heatmap: with dozens of clusters it either needs one heatmap per
+    cluster or collapses to whichever single cluster happens to pass
+    significance, and a cluster with zero cells in one group produces a
+    fabricated near-zero MFI there rather than a real biological zero.
+    This is the plain sample-level view for the MFI Heatmap instead:
+    no cluster breakdown, no significance filtering.
+
+    Each channel is on its own configured Transforms-tab scale (Logicle/
+    biexponential/linear), same as compute_mfis().
+
+    Returns (n_samples x n_channels), NaN where a sample has no events for
+    a channel (rather than a fabricated 0).
+
+    loaded: samples already loaded by compute_mfis() (same channels and
+    af_state); the rest are loaded here.
+    """
+    log_stage(log, "SAMPLE MFI MATRIX")
+    if channels is None:
+        channels = [c for c in state.selected_channels if c not in drc_pipeline.META_CHANNELS]
+    if not channels:
+        log.warning("no sample-level MFI features could be built")
+        return None
+
+    sample_vals = {}
+    for rel in all_rel:
+        if loaded is not None and rel in loaded:
+            mv = loaded[rel]
+        else:
+            mv = drc_pipeline.load_sample_transformed_values(controller, state, rel, channels,
+                                                             af_state=af_state)
+        if mv is not None:
+            sample_vals[rel] = mv
+
+    mfi_mat = np.full((len(all_rel), len(channels)), np.nan, dtype=float)
+    for j, ch in enumerate(channels):
+        for i, rel in enumerate(all_rel):
+            mv = sample_vals.get(rel)
+            if mv is None:
+                continue
+            values, names = mv
+            if ch not in names:
+                continue
+            col = values[:, names.index(ch)]
+            if len(col):
+                mfi_mat[i, j] = float(np.mean(col))
+
+    df = pd.DataFrame(mfi_mat, index=all_rel, columns=list(channels))
+    log.info("sample MFI matrix: %s", df.shape)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Sample PCA
+# ---------------------------------------------------------------------------
+
+def compute_sample_pca(state, use_freq: bool, use_counts: bool, use_mfi: bool,
+                       n_loadings: int = 10) -> dict | None:
+    """
+    Sample-level PCA over any combination of the per-sample feature
+    matrices Run Statistics already computed (``state.freq_df`` /
+    ``state.counts_df`` / ``state.mfi_df`` — samples x cluster-features,
+    raw scale). Independent of "Viewing comparison": uses every sample
+    across every group in ``state.stats_group_vec``, not one pairwise
+    comparison at a time.
+
+    Each requested matrix's columns are z-scored independently before
+    concatenation, so frequency (%), count (raw events), and MFI
+    (log1p-intensity) don't dominate one another on scale alone. A single
+    joint 2-component PCA is then fit on the combined, standardized
+    matrix.
+
+    Loadings are scaled by sqrt(explained_variance) per axis (a
+    correlation-biplot convention) and reduced to the top ``n_loadings``
+    by 2-D vector length, so the arrows shown are the most differentiating
+    variables rather than every feature in the (potentially huge)
+    cluster x channel matrix.
+
+    Returns None if no requested source is available/populated, or if
+    fewer than 2 samples or 2 non-degenerate (non-zero-variance) features
+    remain. Otherwise a dict:
+      'scores':   DataFrame (n_samples x ['PC1','PC2']), index=rel-path,
+                  in state.stats_all_rel order.
+      'loadings': DataFrame (<=n_loadings x ['PC1','PC2']), index=feature
+                  label, already reduced to the top-N.
+      'explained_variance_ratio': (float, float) — PC1, PC2.
+      'groups':   list[str] aligned 1:1 to scores.index.
+      'sources':  list[str] subset of ['Freq','Counts','MFI'] — which
+                  matrices actually contributed (for the plot title).
+    """
+    log_stage(log, "SAMPLE PCA")
+
+    sources, frames = [], []
+    if use_freq and state.freq_df is not None and not state.freq_df.empty:
+        sources.append('Freq')
+        frames.append(state.freq_df.add_prefix('Freq: '))
+    if use_counts and state.counts_df is not None and not state.counts_df.empty:
+        sources.append('Counts')
+        frames.append(state.counts_df.add_prefix('Counts: '))
+    if use_mfi and state.mfi_df is not None and not state.mfi_df.empty:
+        sources.append('MFI')
+        frames.append(state.mfi_df.add_prefix('MFI: '))
+
+    if not frames:
+        log.warning("Sample PCA: no requested source is available -- "
+                   "run Statistics with Frequencies/Counts/MFIs checked first.")
+        return None
+
+    combined = pd.concat(frames, axis=1, join='inner')
+    if combined.shape[0] < 2:
+        log.warning("Sample PCA: fewer than 2 samples after aligning sources.")
+        return None
+
+    # Drop zero-variance columns -- guards the z-score division and keeps
+    # a cluster with an identical value in every sample from contributing
+    # a meaningless (but numerically NaN-producing) loading.
+    stds = combined.std(axis=0, ddof=0)
+    combined = combined[stds[stds > 1e-12].index]
+    if combined.shape[1] < 2:
+        log.warning("Sample PCA: fewer than 2 non-degenerate features to run PCA on.")
+        return None
+
+    means = combined.mean(axis=0)
+    stds = combined.std(axis=0, ddof=0)
+    # Missing MFIs (cluster absent from a sample) sit at the column mean.
+    z = ((combined - means) / stds).fillna(0.0)
+
+    n_comp = min(2, z.shape[0], z.shape[1])
+    pca = PCA(n_components=n_comp)
+    pcs = pca.fit_transform(z.values)
+
+    if n_comp < 2:
+        pcs = np.hstack([pcs, np.zeros((pcs.shape[0], 2 - n_comp))])
+        explained = list(pca.explained_variance_ratio_) + [0.0] * (2 - n_comp)
+    else:
+        explained = list(pca.explained_variance_ratio_[:2])
+
+    scores = pd.DataFrame(pcs[:, :2], index=combined.index, columns=['PC1', 'PC2'])
+
+    # Correlation-biplot scaling: component loadings * sqrt(eigenvalue),
+    # so arrow length reflects how much variance that feature explains on
+    # each axis (not just the raw eigenvector direction).
+    load_mat = np.zeros((z.shape[1], 2))
+    for c in range(n_comp):
+        load_mat[:, c] = pca.components_[c] * np.sqrt(max(pca.explained_variance_[c], 0.0))
+    loadings = pd.DataFrame(load_mat, index=combined.columns, columns=['PC1', 'PC2'])
+
+    magnitude = np.sqrt(loadings['PC1'] ** 2 + loadings['PC2'] ** 2)
+    top_idx = magnitude.sort_values(ascending=False).head(max(1, int(n_loadings))).index
+    loadings_top = loadings.loc[top_idx]
+
+    group_by_rel = dict(zip(state.stats_all_rel, state.stats_group_vec))
+    groups = [group_by_rel.get(rel, 'Unassigned') for rel in scores.index]
+
+    log.info("Sample PCA: %s, %d samples, %d features (%d shown as loadings), "
+             "PC1=%.1f%% PC2=%.1f%%",
+             '+'.join(sources), scores.shape[0], combined.shape[1], len(loadings_top),
+             explained[0] * 100, explained[1] * 100)
+
+    return {
+        'scores': scores,
+        'loadings': loadings_top,
+        'explained_variance_ratio': tuple(explained[:2]),
+        'groups': groups,
+        'sources': sources,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Composition views
+# ---------------------------------------------------------------------------
+
+def get_counts_table(controller, state, group_var: str = 'sample',
+                     cluster_labels_override=None,
+                     names_override: dict | None = None) -> pd.DataFrame:
+    """
+    Raw event counts per cluster (CyCONDOR's getTable(), counts variant).
+
+    group_var: 'sample' → one row per sample (rel-path index).
+               'group'  → one row per qualifying tested group (display
+                          name), summed across that group's samples.
+    Returns (n_rows × n_clusters) DataFrame, columns = cluster display
+    labels. Also the natural building block for CSV export alongside the
+    existing "Save Statistics CSVs" pattern.
+    """
+    log_stage(log, "COUNTS TABLE")
+    group_rel = resolve_test_groups(controller, state, cluster_labels_override=cluster_labels_override)
+    qualifying = [g for g in (state.testing_group_selection or state.group_names) if g in group_rel]
+    all_rel = [rel for g in qualifying for rel in group_rel[g]]
+    group_vec = [g for g in qualifying for _rel in group_rel[g]]
+    n_clusters = n_clusters_from_labels(
+        state, all_rel, cluster_labels_override=cluster_labels_override
+    )
+    cluster_labels = cluster_labels_override if cluster_labels_override is not None \
+        else state.cluster_labels
+    cols = [_label_for(state, cl, names_override) for cl in range(n_clusters)]
+
+    per_sample = np.zeros((len(all_rel), n_clusters), dtype=int)
+    for i, rel in enumerate(all_rel):
+        labels = np.asarray(cluster_labels[rel])
+        for cl in range(n_clusters):
+            per_sample[i, cl] = int(np.sum(labels == cl))
+
+    if group_var == 'sample':
+        df = pd.DataFrame(per_sample, index=all_rel, columns=cols)
+    elif group_var == 'group':
+        masks = [np.array([g == name for g in group_vec]) for name in qualifying]
+        summed = np.stack([
+            per_sample[m].sum(axis=0) if m.any() else np.zeros(n_clusters)
+            for m in masks
+        ])
+        df = pd.DataFrame(summed, index=qualifying, columns=cols)
+    else:
+        raise ValueError(f"group_var must be 'sample' or 'group', got {group_var!r}")
+
+    log.info("counts table (%s): %s", group_var, df.shape)
+    return df
+
+
+def get_frequency_table(controller, state, group_var: str = 'sample',
+                        cluster_labels_override=None,
+                        names_override: dict | None = None) -> pd.DataFrame:
+    """
+    Per-row % of events per cluster (CyCONDOR's getTable(), frequency
+    variant). Same shape/grouping as get_counts_table, row-normalized to
+    100%.
+    """
+    counts_df = get_counts_table(
+        controller, state, group_var=group_var,
+        cluster_labels_override=cluster_labels_override,
+        names_override=names_override,
+    )
+    totals = counts_df.sum(axis=1).replace(0, 1)   # guard empty rows
+    freq_df = counts_df.div(totals, axis=0) * 100.0
+    log.info("frequency table (%s): %s", group_var, freq_df.shape)
+    return freq_df
+
+
+_TOO_FEW_CLUSTERS_HINT = (
+    "This usually means the current clustering run produced too few clusters "
+    "for differential testing. Increase clustering granularity (e.g. lower "
+    "HDBSCAN's min_cluster_size) and re-run, or test a space/run with more "
+    "clusters."
+)
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+def _normalisation(state) -> str:
+    """Library-size method of the abundance tests ('total' or 'robust')."""
+    method = getattr(state, 'stats_normalisation', 'total')
+    return method if method in ('total', 'robust') else 'total'
+
+
+def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
+                   pval_threshold: float, fc_threshold: float,
+                   cluster_labels_override=None,
+                   include_type_markers: bool = False,
+                   names_override: dict | None = None,
+                   run_counts: bool = False,
+                   af_state=None,
+                   fdr_scope: str = 'global',
+                   covariate_names: list[str] | None = None,
+                   use_treat: bool = True,
+                   mfi_threshold: float | None = None,
+                   mfi_hierarchical: bool = True,
+                   align_run: dict | None = None,
+                   align_mode: str | None = None):
+    """
+    Run the requested differential tests. Writes results onto ``state`` and
+    returns ``(freq_results, mfi_results, counts_results)`` (any may be
+    None).
+
+    align_run / align_mode: a hydrated archived clustering run that is not
+    in sync with the current gating and unmixing, and how it can be matched
+    to the current events (drc_run_align.live_join_mode).  Its labels are
+    then matched to the current gated events by event key before testing
+    (see drc_run_align.statistics_inputs); state.stats_alignment_note says
+    how well they matched.
+
+    Resolves state.testing_group_selection (falling back to every defined
+    group), builds the contrast list from state.contrast_mode/
+    reference_group, the pairing vector (if state.paired and
+    state.pairing_variable names a covariates column) and the adjustment
+    covariates, all shared across freq/counts/mfi so the three tests
+    report the same comparisons from the same design.
+
+    fc_threshold  : |log2 fold change| threshold for Frequencies and Counts.
+    mfi_threshold : |difference| threshold for MFIs, in transformed units
+                    (defaults to fc_threshold).
+    covariate_names: state.covariates columns to adjust for.
+    use_treat     : test against the thresholds (TREAT) rather than zero.
+    mfi_hierarchical: cluster-first testing of MFIs.
+    include_type_markers: when False, the MFI branch tests 'state'-role
+        channels only. When True, tests every selected channel.
+    run_counts: also run the negative-binomial GLM on raw counts, tested by
+        state.stats_counts_method ('wald' or 'ql').
+
+    The Frequency and Counts library sizes follow state.stats_normalisation
+    ('total' or 'robust', differential_stats.library_sizes).
+    """
+    log_stage(log, "DIFFERENTIAL STATISTICS")
+    if mfi_threshold is None:
+        mfi_threshold = fc_threshold
+
+    values_override = None
+    state.stats_alignment_note = ''
+    if align_run is not None and align_mode is not None:
+        cluster_labels_override, values_override, note = drc_run_align.statistics_inputs(
+            controller, state, align_run, align_mode, af_state=af_state)
+        state.stats_alignment_note = note
+
+    group_rel = resolve_test_groups(controller, state, cluster_labels_override=cluster_labels_override)
+    qualifying = [g for g in (state.testing_group_selection or state.group_names) if g in group_rel]
+    contrasts = build_contrasts(qualifying, state.contrast_mode, state.reference_group)
+
+    all_rel = [rel for g in qualifying for rel in group_rel[g]]
+    group_vec = [g for g in qualifying for _rel in group_rel[g]]
+
+    pairing_vec = None
+    if state.paired and state.pairing_variable and state.covariates is not None \
+            and state.pairing_variable in state.covariates.columns:
+        cov = state.covariates[state.pairing_variable]
+        # Any rel missing a covariate value gets its own singleton blocking
+        # level rather than failing the whole run.
+        pairing_vec = [str(cov[rel]) if rel in cov.index else f"__unpaired_{rel}"
+                       for rel in all_rel]
+
+    adjust = [c for c in (covariate_names or [])
+              if not (pairing_vec is not None and c == state.pairing_variable)]
+    covariates = covariate_frame(state, all_rel, adjust)
+    if covariates is not None:
+        log.info("adjusting for covariates: %s", list(covariates.columns))
+
+    n_clusters = n_clusters_from_labels(
+        state, all_rel, cluster_labels_override=cluster_labels_override
+    )
+
+    freq_results = mfi_results = counts_results = None
+
+    # Group metadata for the heatmap and the 'Viewing comparison' selector.
+    state.stats_all_rel = all_rel
+    state.stats_group_vec = group_vec
+    state.stats_comparisons = contrasts
+
+    if run_freq or run_counts:
+        counts_df = compute_counts(
+            state, all_rel, n_clusters,
+            cluster_labels_override=cluster_labels_override,
+            names_override=names_override,
+        )
+        sparse = set(sparse_features(counts_df, MIN_NONZERO_SAMPLES))
+        if sparse:
+            log.info("abundance tests skip %d cluster(s) with events in fewer than %d samples: %s",
+                     len(sparse), MIN_NONZERO_SAMPLES, ", ".join(sorted(sparse)))
+        tested = [c for c in counts_df.columns if c not in sparse]
+
+    if run_freq:
+        freq_df = compute_frequencies(
+            state, all_rel, n_clusters,
+            cluster_labels_override=cluster_labels_override,
+            names_override=names_override,
+        )
+        totals = sample_event_totals(state, all_rel, cluster_labels_override)
+        totals = _ds.library_sizes(counts_df[tested], totals, _normalisation(state))
+        freq_results = run_moderated(
+            log2_frequencies(counts_df[tested], totals), group_vec, contrasts, state.contrast_mode,
+            pval_threshold, fc_threshold, pairing_vec=pairing_vec, fdr_scope=fdr_scope,
+            covariates=covariates, use_treat=use_treat,
+            too_few_hint=_TOO_FEW_CLUSTERS_HINT,
+        )
+        state.freq_results = freq_results
+        state.freq_df = freq_df          # % per cluster (display)
+
+    if run_counts:
+        # The library-size offset is each sample's total over all clusters,
+        # including those left out of the test (robustly rescaled on request).
+        row_totals = pd.Series(
+            _ds.library_sizes(counts_df[tested], counts_df.sum(axis=1).values, _normalisation(state)),
+            index=counts_df.index)
+        offset_df = pd.DataFrame({c: row_totals for c in tested}, index=counts_df.index)
+        counts_results = run_glm_counts(counts_df[tested], group_vec, contrasts,
+                                        state.contrast_mode, pval_threshold, fc_threshold,
+                                        pairing_vec=pairing_vec, fdr_scope=fdr_scope,
+                                        covariates=covariates, use_treat=use_treat,
+                                        offset_df=offset_df,
+                                        method=getattr(state, 'stats_counts_method', 'wald'))
+        state.counts_results = counts_results
+        state.counts_df = counts_df      # raw (samples × clusters) counts
+
+    if run_mfi:
+        mfi_channels = resolve_mfi_channels(state, include_type_markers=include_type_markers)
+        if not mfi_channels:
+            log.warning(
+                "MFI testing: no 'state'-role channels selected — check "
+                "'Include clustering (type) markers' or assign roles."
+            )
+        loaded = {}       # each sample read once for both MFI matrices
+        mfi_df = compute_mfis(
+            controller, state, all_rel, n_clusters,
+            cluster_labels_override=cluster_labels_override,
+            channels=mfi_channels,
+            names_override=names_override,
+            af_state=af_state,
+            values_override=values_override,
+            loaded=loaded,
+        )
+        if mfi_df is not None:
+            meta = mfi_feature_table(state, n_clusters, mfi_channels, names_override)
+            meta = meta[meta['feature'].isin(mfi_df.columns)].drop_duplicates('feature')
+            mfi_results = run_moderated(
+                mfi_df, group_vec, contrasts, state.contrast_mode,
+                pval_threshold, mfi_threshold, pairing_vec=pairing_vec, fdr_scope=fdr_scope,
+                covariates=covariates, use_treat=use_treat,
+                feature_meta=meta, hierarchical=mfi_hierarchical,
+                too_few_hint=_TOO_FEW_CLUSTERS_HINT,
+            )
+            state.mfi_results = mfi_results
+            state.mfi_df = mfi_df        # raw (samples × cluster·channel) MFIs
+
+        state.mfi_sample_df = compute_sample_mfis(
+            controller, state, all_rel, channels=mfi_channels, af_state=af_state,
+            loaded=loaded,
+        )
+
+    return freq_results, mfi_results, counts_results

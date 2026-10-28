@@ -126,7 +126,9 @@ Follow these steps to clone the repository and run the application from source:
 4.  **Upgrade pip and install dependencies:**
     ```bash
     pip install --upgrade pip
+    python install_annoy.py
     pip install -r requirements.txt
+    python install_opentsne.py   # macOS only (needs `brew install libomp`); elsewhere it does nothing
     ```
 
 5.  **Install the package in editable mode:**

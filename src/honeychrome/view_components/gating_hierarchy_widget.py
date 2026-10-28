@@ -11,13 +11,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 class TreeItem:
-    def __init__(self, name, event_count, p_root, p_parent, event_conc, parent=None):
+    def __init__(self, name, event_count, p_root, p_parent, event_conc, parent=None, gate_type=None):
         self.name = name
         self.event_count = event_count
         self.event_conc = event_conc
         self.p_root = p_root
         self.p_parent = p_parent
         self.parent_item = parent
+        self.gate_type = gate_type   # flowkit gate type, e.g. 'RectangleGate' | 'Quadrant'
         self.child_items = []
 
     def append_child(self, item):
@@ -83,7 +84,8 @@ class DictTreeModel(QAbstractItemModel):
                 p_parent = ''
                 event_conc = ''
 
-            item = TreeItem(name, n_events_gate, p_root, p_parent, event_conc, parent_item)
+            item = TreeItem(name, n_events_gate, p_root, p_parent, event_conc, parent_item,
+                            gate_type=hierarchy_dict_node.get('gate_type'))
             parent_item.append_child(item)
 
             if 'children' in hierarchy_dict_node.keys():
@@ -92,45 +94,31 @@ class DictTreeModel(QAbstractItemModel):
                     self.setup_model_data(child, item)
 
     def update_statistics(self, new_statistics):
-        """Update the statistics without rebuilding the tree"""
+        """Update the statistics without rebuilding the tree. Nothing to do
+        when the statistics object is the one already shown (unchanged)."""
+        if new_statistics is getattr(self, 'statistics', None):
+            return
         self.statistics = new_statistics
         # print(json.dumps(new_statistics, indent=2))
 
         # Start recursive update from root
         self._update_tree_item_data(self.root_item)
 
-        # # Notify the view that all data has changed todo for some reason the simple call to dataChanged doesn't work. layoutchanged works but it presumably slow. dataChanged for all items one by one works. Don't know why
-        # self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1), [Qt.DisplayRole])
-        # self.layoutChanged.emit()  # More reliable for structural changes
-
-        # Emit dataChanged for all items in the tree
+        # Notify the view, one dataChanged range per group of sibling rows
         self._emit_data_changed_for_tree(self.root_item)
 
     def _emit_data_changed_for_tree(self, item, parent_index=QModelIndex()):
-        """Recursively emit dataChanged for all items in the tree"""
-        if not item:
+        """Emit dataChanged for the statistics columns of every row below
+        *item*: one range per group of siblings, as a dataChanged range must
+        share a single parent. One emission per row would make the
+        ResizeToContents columns re-measure the whole tree for every row."""
+        if not item.child_items:
             return
-
-        # Emit for this item if it's not the root
-        if item != self.root_item:
-            # Find this item's row
-            if item.parent_item:
-                row = item.parent_item.child_items.index(item)
-                # Create indexes for all columns
-                indexes = []
-                for col in range(self.columnCount()):
-                    index = self.createIndex(row, col, item)
-                    if index.isValid():
-                        indexes.append(index)
-
-                # Emit dataChanged for this row
-                if indexes:
-                    self.dataChanged.emit(indexes[0], indexes[-1], [Qt.DisplayRole])
-
-        # Process children
-        for i, child in enumerate(item.child_items):
-            child_parent_index = self.createIndex(i, 0, item) if item != self.root_item else QModelIndex()
-            self._emit_data_changed_for_tree(child, child_parent_index)
+        self.dataChanged.emit(self.index(0, 1, parent_index),
+                              self.index(len(item.child_items) - 1, self.columnCount() - 1, parent_index),
+                              [Qt.DisplayRole])
+        for row, child in enumerate(item.child_items):
+            self._emit_data_changed_for_tree(child, self.index(row, 0, parent_index))
 
     def _update_tree_item_data(self, item):
         """Recursively update TreeItem data based on new statistics"""
@@ -298,6 +286,9 @@ class GatingHierarchyWidget(QWidget):
         self.tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.show_context_menu)
 
+        # gate names customised for the current sample (per-sample custom gates)
+        self._custom_gates = set()
+
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -327,9 +318,18 @@ class GatingHierarchyWidget(QWidget):
         if self.bus is not None:
             self.bus.changedGatingHierarchy.connect(self.update_hierarchy)
             self.bus.histsStatsRecalculated.connect(self.update_data)
+            self.bus.customGatesChanged.connect(self.on_custom_gates_changed)
 
         # Install event filter on tree view
         self.tree_view.installEventFilter(self)
+
+    @Slot(str, list)
+    def on_custom_gates_changed(self, scope, names):
+        """Track which gates are customised for the current sample in this scope,
+        so the context menu offers Customise vs Revert/Adopt for each gate."""
+        if scope != self.mode:
+            return
+        self._custom_gates = set(names or [])
 
     def eventFilter(self, obj, event):
         if obj == self.tree_view and event.type() == event.Type.KeyPress:
@@ -365,6 +365,28 @@ class GatingHierarchyWidget(QWidget):
             menu = QMenu(self)
             copy_action = menu.addAction(f"Copy hierarchy statistics from {item_name} downwards")
             copy_action.triggered.connect(lambda : self.model.copy_hierarchy(index))
+
+            # Per-sample custom gates: customise this gate for the current sample,
+            # or (if already customised) revert to / adopt as the shared template.
+            # A QuadrantGate's four quadrants are not gates in their own right —
+            # FlowKit refuses to return them ("specify the owning QuadrantGate"),
+            # and their geometry comes entirely from the parent's dividers — so
+            # customise the parent instead of offering a dead action here.
+            item = index.internalPointer()
+            is_quadrant = getattr(item, 'gate_type', None) == 'Quadrant'
+            if self.bus is not None and item_name and item_name != 'root' and not is_quadrant:
+                menu.addSeparator()
+                if item_name in self._custom_gates:
+                    revert_action = menu.addAction(f"Revert '{item_name}' to template")
+                    revert_action.triggered.connect(
+                        lambda: self.bus.revertGateRequested.emit(self.mode, item_name))
+                    adopt_action = menu.addAction(f"Adopt '{item_name}' custom gate as template")
+                    adopt_action.triggered.connect(
+                        lambda: self.bus.adoptGateRequested.emit(self.mode, item_name))
+                else:
+                    customise_action = menu.addAction(f"Customise '{item_name}' for this sample")
+                    customise_action.triggered.connect(
+                        lambda: self.bus.customiseGateRequested.emit(self.mode, item_name))
 
         # todo add delete/rename, should be integrated with delete/rename menus on plots
         #

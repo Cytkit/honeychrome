@@ -1,19 +1,27 @@
 import json
 import sys
 import re
-from datetime import datetime
 from typing import List, Any, Dict
 from PySide6 import QtCore
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QThread, Slot, QObject, QEvent, QSize, Signal, QSettings
-from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QStyledItemDelegate, QComboBox, QLineEdit, QMessageBox, QHeaderView, QLabel, QWidget, QCheckBox)
+from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QStyledItemDelegate, QComboBox, QLineEdit, QMessageBox, QHeaderView, QLabel, QWidget, QCheckBox, QMenu, QInputDialog)
 
-from honeychrome.controller_components.functions import raw_gates_list
-from honeychrome.controller_components.spectral_controller import SpectralAutoGenerator, ProfileUpdater, SpectralCleaner, spectral_library
-from honeychrome.controller_components.spectral_reference_library import cosine_similarity_to_reference
-from honeychrome.view_components.cosine_qc_viewer import COSINE_QC_WARNING_THRESHOLD
+from honeychrome.controller_components.functions import raw_gates_list, resolve_base_gate
+from honeychrome.controller_components.job_gate import acquire_job
+from honeychrome.controller_components.spectral_controller import (
+    SpectralAutoGenerator, ProfileUpdater, SpectralCleaner, LowEventLog, control_gating,
+    CLEANED_RESULT_KEYS, cleaned_result_matches, background_check_summary,
+)
+from honeychrome.controller_components.spectral_reference_library import (
+    cosine_similarity_to_reference, SpectralReferenceLibrary, compute_config_key, describe_profile,
+    profile_id_from_description, cosine_qc_warning_threshold,
+)
+from honeychrome.view_components.cosine_qc_viewer import COSINE_QC_NOTE_BY_CYTOMETER
 from honeychrome.controller_components.spectral_functions import sanitise_control_in_place, _find_default_unstained
+from honeychrome.controller_components.particle_type import is_bead_sample, set_bead_sample, match_bead_unstained
 from honeychrome.view_components.icon_loader import icon
 from honeychrome.settings import spectral_model_column_labels, heading_style, INTERNAL_NEGATIVE_SENTINEL
+import honeychrome.settings as settings
 from honeychrome.view_components.busy_cursor import with_busy_cursor
 from honeychrome.view_components.help_toggle_widget import WheelBlocker, HelpToggleWidget
 from honeychrome.view_components.help_texts import autospectral_cleaning_help_text
@@ -23,7 +31,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 COLUMNS = list(spectral_model_column_labels.keys())
-CONTROL_TYPES = ["Single Stained Spectral Control", "Single Stained Spectral Control from Library", "Channel Assignment"]
+SSC_CONTROL_TYPE = "Single Stained Spectral Control"
+CONTROL_TYPES = [SSC_CONTROL_TYPE, "Single Stained Spectral Control from Library", "Channel Assignment"]
+# Fields kept aside when a single stained control is switched to another type,
+# and put back if it is switched back.
+SSC_BACKUP_FIELDS = ("particle_type", "gate_channel", "gate_channel_locked", "sample_name", "sample_path",
+                     "gate_label", "neg_gate_label", "universal_negative_name", "use_cleaned")
 PARTICLE_TYPES = ["Beads", "Cells"]
 NEGATIVE_TYPES = ["Internal Negative", "Unstained Negative"]
 
@@ -99,13 +112,19 @@ class _RecalcWorker(QObject):
         self._profile_updater = profile_updater
         self._controls = controls
         self._search_results = search_results
+        self.error: str | None = None   # read after finished
 
     @Slot()
     def run(self):
-        self._profile_updater.flush()
-        for control in self._controls:
-            self._profile_updater.generate(control, self._search_results)
-        self.finished.emit()
+        try:
+            self._profile_updater.flush()
+            for control in self._controls:
+                self._profile_updater.generate(control, self._search_results)
+        except Exception as e:
+            logger.exception('Profile recalculation failed')
+            self.error = f'Profile recalculation failed: {e}'
+        finally:
+            self.finished.emit()
 
 class ListTableModel(QtCore.QAbstractTableModel):
     dataEditedSignal = QtCore.Signal(int, int) # changed to track cosmetic vs function changes
@@ -115,6 +134,8 @@ class ListTableModel(QtCore.QAbstractTableModel):
         super().__init__(parent)
         self._data = data
         self.fluorescence_channels_pnn = fluorescence_channels_pnn
+        self.has_cleaned = lambda control: False  # set by the editor; Use Cleaned is checkable only then
+        self.background_flag = lambda control: None  # set by the editor; tooltip text for a ⚠ label
 
     def rowCount(self, parent=QModelIndex()):
         return len(self._data)
@@ -123,15 +144,24 @@ class ListTableModel(QtCore.QAbstractTableModel):
         return len(COLUMNS)
 
     def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid():
+        if not index.isValid() or index.row() >= len(self._data):
             return None
         row, col = index.row(), index.column()
         key = COLUMNS[col]
         val = self._data[row].get(key, None)
         if role in (Qt.DisplayRole, Qt.EditRole):
             if key == "use_cleaned":
-                return None   # checkbox widget handles display; suppress cell text
+                return None   # shown as a check state
+            if role == Qt.DisplayRole and key == "label" and self.background_flag(self._data[row]):
+                return f"⚠ {'' if val is None else val}"
             return "" if val is None else str(val)
+        if role == Qt.ToolTipRole and key == "label":
+            return self.background_flag(self._data[row])
+        if role == Qt.CheckStateRole and key == "use_cleaned" and self.has_cleaned(self._data[row]):
+            return Qt.Unchecked if val is False else Qt.Checked
+        if role == Qt.ToolTipRole and key == "use_cleaned" and self.has_cleaned(self._data[row]):
+            return ('Use cleaned event pool for profile extraction.\n'
+                    'Uncheck to revert to the standard gate-mean method for this control.')
         return None
 
     _COLUMN_TOOLTIPS = {
@@ -159,19 +189,36 @@ class ListTableModel(QtCore.QAbstractTableModel):
         base = Qt.ItemIsSelectable | Qt.ItemIsEnabled
         if colname in ("label", "antigen"):
             base |= Qt.ItemIsEditable
+        if colname == "use_cleaned" and self.has_cleaned(self._data[index.row()]):
+            base |= Qt.ItemIsUserCheckable
         return base
 
     def setData(self, index, value, role=Qt.EditRole):
-        if role != Qt.EditRole or not index.isValid():
+        if not index.isValid():
             return False
         row, col = index.row(), index.column()
         key = COLUMNS[col]
+        if role == Qt.CheckStateRole and key == "use_cleaned":
+            self._data[row][key] = Qt.CheckState(value) == Qt.Checked
+            self.dataChanged.emit(index, index, [Qt.CheckStateRole])
+            self.dataEditedSignal.emit(row, col)
+            return True
+        if role != Qt.EditRole:
+            return False
         # if key == "gate_channel":
         #     try:
         #         value = int(value)
         #     except ValueError:
         #         return False
-        self._data[row][key] = value
+        if key == "control_type":
+            previous = self._data[row].get(key)
+            if previous == SSC_CONTROL_TYPE and value != SSC_CONTROL_TYPE:
+                self._data[row]["ssc_backup"] = {k: self._data[row][k] for k in SSC_BACKUP_FIELDS if k in self._data[row]}
+            self._data[row][key] = value
+            if value == SSC_CONTROL_TYPE and previous != SSC_CONTROL_TYPE:
+                self._data[row].update(self._data[row].pop("ssc_backup", None) or {})
+        else:
+            self._data[row][key] = value
         self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
         # changed to return col so we can track cosmetic vs functional changes
         self.dataEditedSignal.emit(row, col)
@@ -246,6 +293,8 @@ class SpectralControlsEditor(QFrame):
         self.fluorescence_channels_pnn = []
         self.update_fluorescence_channels_pnn()
         self.model = ListTableModel(self.controller.experiment.process['spectral_model'], self.fluorescence_channels_pnn)
+        self.model.has_cleaned = self._has_cleaned
+        self.model.background_flag = self._background_flag
         self.samples = self.controller.experiment.samples
         self.raw_gating = self.controller.raw_gating
 
@@ -258,11 +307,19 @@ class SpectralControlsEditor(QFrame):
         self.view.setModel(self.proxy)
         self.bus.spectralModelUpdated.connect(self.view.resizeToFit)
         self.bus.spectralModelUpdated.connect(self._sort_model_by_gate_channel)
+        self._autogenerate_state = None  # set while auto-generation is holding warnings for one dialog
+        self._autoclean_warnings = None  # auto-generation warnings carried into the Clean Controls dialog
+        self._job_token = None  # hold on the job gate for auto generate / Clean Controls / recalculation
+        self.bus.spectralProcessRefreshed.connect(self._on_autogenerate_refreshed)
         self.bus.spectralControlAdded.connect(self.view.resizeToFit) #extends the table as autogeneration runs... looks interesting but a bit wonky
         self.bus.sampleTreeUpdated.connect(self.refresh_comboboxes) # check for changes to unstained samples
+        self.bus.beadSampleToggled.connect(self._on_bead_sample_toggled)
         self.bus.rawGateRenamed.connect(self._on_raw_gate_renamed)
-        self.bus.rawGateRenamed.connect(lambda old_name, new_name: self.refresh_comboboxes())
         self.view.selectionModel().selectionChanged.connect(self._show_selected_profiles)
+
+        # right-click a control to save its spectrum to the Reference Library
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._show_row_context_menu)
 
         # Different resize modes for different columns
         # Column 0: label
@@ -348,6 +405,14 @@ class SpectralControlsEditor(QFrame):
         btn_top_layout.addWidget(self.unmixing_method_combo)
         btn_top_layout.addWidget(self.force_recalc_btn)
         btn_top_layout.addStretch()
+        self.condition_number_label = QLabel()
+        self.condition_number_label.setToolTip(
+            'Condition number of the spectral profile matrix (fluorophores × detectors)\n'
+            'from the last spectral process refresh. Higher values mean less stable unmixing.'
+        )
+        btn_top_layout.addWidget(self.condition_number_label)
+        self._update_condition_number_label()
+        self.bus.spectralProcessRefreshed.connect(self._update_condition_number_label)
 
         # ---- Bulk unstained-negative row ----
         bulk_neg_layout = QHBoxLayout()
@@ -423,6 +488,24 @@ class SpectralControlsEditor(QFrame):
             'scatter-matching and noise exclusion diagnostic plots.'
         )
 
+        self.auto_clean_checkbox = QCheckBox("Automatically Clean")
+        self.auto_clean_checkbox.setStyleSheet("""
+            QCheckBox {
+                font-size: 13pt;
+                spacing: 8px;
+                padding: 6px 0px;
+            }
+        """)
+        self.auto_clean_checkbox.setToolTip(
+            'Continue "Auto generate spectral controls" straight into Clean Controls,\n'
+            'refreshing the spectral process once at the end.\n'
+            'Needs "Show AutoSpectral Cleaning" and an unstained cell sample.\n'
+            'Saved with this experiment; the default for new experiments is in App Settings.'
+        )
+        auto_clean = self.controller.experiment.settings.get('auto_clean_controls')
+        self.auto_clean_checkbox.setChecked(settings.auto_clean_controls_retrieved if auto_clean is None else bool(auto_clean))
+        self.auto_clean_checkbox.setEnabled(False)  # follows Show AutoSpectral Cleaning
+
         self.cleaning_help_widget = HelpToggleWidget(
             title="Show Cleaning Help",
             text=autospectral_cleaning_help_text,
@@ -434,6 +517,7 @@ class SpectralControlsEditor(QFrame):
 
         # ---- Wiring ----
         self.activate_cleaning_checkbox.toggled.connect(self._on_activate_cleaning_toggled)
+        self.auto_clean_checkbox.toggled.connect(self._on_auto_clean_toggled)
 
         # ---- Main layout ----
         layout = QVBoxLayout()
@@ -442,7 +526,11 @@ class SpectralControlsEditor(QFrame):
         layout.addWidget(title)
         title.setStyleSheet(heading_style)
         layout.addWidget(QLabel("Note: editing this table resets unmixed cytometry (plots, gates and fine-tuning (spillover) matrix)"))
-        layout.addWidget(self.activate_cleaning_checkbox)
+        cleaning_row = QHBoxLayout()
+        cleaning_row.addWidget(self.activate_cleaning_checkbox)
+        cleaning_row.addWidget(self.auto_clean_checkbox)
+        cleaning_row.addStretch()
+        layout.addLayout(cleaning_row)
         layout.addWidget(self.cleaning_help_widget)
         layout.addLayout(btn_top_layout)
         layout.addWidget(self._bulk_neg_widget)
@@ -451,6 +539,11 @@ class SpectralControlsEditor(QFrame):
         layout.addLayout(btn_layout)
         self.setLayout(layout)
 
+        # curated reference library; maps profile id -> profile for "from Library" controls
+        self.reference_library = SpectralReferenceLibrary()
+        self.reference_library.ensure_honeychrome_rows_populated()
+        self.spectral_library_search_results = {}
+
         # Build combobox widgets after layout setup
         self.refresh_comboboxes()
         # Hide cleaning columns by default
@@ -458,7 +551,6 @@ class SpectralControlsEditor(QFrame):
         self.thread = None
         self.spectral_auto_generator = None
         self.profile_updater = ProfileUpdater(self.controller, self.bus)
-        self.spectral_library_search_results = None
         # Populate bulk-negative combo now that all widgets exist
         self._refresh_bulk_negative_combo()
 
@@ -479,9 +571,15 @@ class SpectralControlsEditor(QFrame):
             self.cleaning_help_widget.help_label.setVisible(True)
             self.cleaning_help_widget.help_button.setText("Hide Help")
         self._set_cleaning_columns_visible(checked)
+        self.auto_clean_checkbox.setEnabled(checked)
         QSettings("honeychrome", "app_configuration").setValue("show_autospectral_cleaning", checked)
         if self.bus:
             self.bus.cleaningActivated.emit(checked)
+
+    def _on_auto_clean_toggled(self, checked: bool):
+        self.controller.experiment.settings['auto_clean_controls'] = checked
+        if self.bus:
+            self.bus.autoSaveRequested.emit()
 
     def _save_cleaning_help_state(self):
         # Called after toggle_help has already flipped the label, so isVisible()
@@ -503,34 +601,19 @@ class SpectralControlsEditor(QFrame):
         if self.negatives_combo.currentText() == 'Using unstained negative':
             self.controller.experiment.process['negative_type'] = 'unstained'
             self.negatives_combo.setToolTip('Negative set to "Neg Unstained" gate on Unstained sample')
-            default_unstained = _find_default_unstained(self.samples['all_samples'])
+            default_unstained = _find_default_unstained(self.samples)
             if not default_unstained:
                 unstained_paths = self.samples.get('unstained_samples', [])
                 if unstained_paths:
                     default_unstained = self.samples['all_samples'].get(unstained_paths[0])
 
-            # Find a bead-specific unstained: must be manually tagged AND match bead regex.
-            manually_tagged = set(self.samples.get('unstained_samples', []))
-            default_unstained_bead = None
-            for path, name in self.samples['all_samples'].items():
-                is_unstained = (
-                    path in manually_tagged
-                    or bool(re.search(r'unstained', name, re.IGNORECASE))
-                    or bool(re.search(r'unstained', path, re.IGNORECASE))
-                )
-                if not is_unstained:
-                    continue
-                if re.search(r'bead', name, re.IGNORECASE) or re.search(r'bead', path, re.IGNORECASE):
-                    default_unstained_bead = name
-                    break
-                
             for control in self.model._data:
                 if control.get('control_type') == 'Single Stained Spectral Control':
                     if not control.get('universal_negative_name'):
                         if control.get('particle_type') == 'Cells' and default_unstained:
                             control['universal_negative_name'] = default_unstained
-                        elif control.get('particle_type') == 'Beads' and default_unstained_bead:
-                            control['universal_negative_name'] = default_unstained_bead
+                        elif control.get('particle_type') == 'Beads':
+                            control['universal_negative_name'] = self._default_negative(control)
                         else:
                             control['universal_negative_name'] = INTERNAL_NEGATIVE_SENTINEL
         else:
@@ -649,7 +732,7 @@ class SpectralControlsEditor(QFrame):
             )
             if not is_unstained:
                 continue
-            is_bead = bool(re.search(r'[Bb]eads', tube_name))
+            is_bead = is_bead_sample(self.samples, p, tube_name)
             if particle_type == 'Beads' and not is_bead:
                 continue
             if particle_type == 'Cells' and is_bead:
@@ -692,7 +775,7 @@ class SpectralControlsEditor(QFrame):
             )
             if not is_unstained:
                 continue
-            if re.search(r'bead', name, re.IGNORECASE) or re.search(r'bead', path, re.IGNORECASE):
+            if is_bead_sample(self.samples, path, name):
                 continue
             return True
         return False
@@ -764,9 +847,15 @@ class SpectralControlsEditor(QFrame):
         if getattr(self, '_refreshing_comboboxes', False):
             return
         self._refreshing_comboboxes = True
+        self.spectral_library_search_results = {}  # rebuilt row by row below
         try:
             for row in range(self.model.rowCount()):
                 self._add_comboboxes_to_row(row)
+            if self.model.rowCount():
+                uc_col = COLUMNS.index('use_cleaned')
+                self.model.dataChanged.emit(self.model.index(0, uc_col),
+                                            self.model.index(self.model.rowCount() - 1, uc_col),
+                                            [Qt.CheckStateRole])
         finally:
             self._refreshing_comboboxes = False
         self._update_clean_controls_enabled()
@@ -817,6 +906,42 @@ class SpectralControlsEditor(QFrame):
                 cb.currentTextChanged.connect(lambda val, i=idx: self.model.setData(i, val))
 
 
+    def _reference_library_matches(self, label):
+        """Reference library profiles matching this label for the current
+        instrument and channel configuration."""
+        label = (label or '').strip()
+        if not label:
+            return []
+        raw = self.controller.experiment.settings['raw']
+        config_key = compute_config_key(raw.get('cytometer_db_col') or '', list(self.fluorescence_channels_pnn))
+        try:
+            return self.reference_library.find_matches(label, config_key)
+        except Exception as exc:
+            logger.warning(f'SpectralControlsEditor: reference library lookup failed: {exc}')
+            return []
+
+    def _select_default_library_profile(self, control):
+        """Give a "from Library" control a valid Reference Library profile and
+        take its major channel from that profile.
+
+        Switching a control to this type leaves the earlier sample name behind,
+        which names no library profile. If the current choice is not among the
+        matches for this label, select the first match (the profile marked as
+        the reference, else the most recently updated) so a profile is
+        available immediately. The major channel is the profile's own, so the
+        control keeps its place in the table, which is ordered by major
+        channel. With no match the sample name and major channel are cleared."""
+        matches = self._reference_library_matches(control.get('label'))
+        self.spectral_library_search_results.update({p.id: p.profile for p in matches})
+        selected_id = profile_id_from_description(control.get('sample_name'))
+        chosen = next((p for p in matches if p.id == selected_id), matches[0] if matches else None)
+        if chosen is None:
+            control['sample_name'] = ''
+            control['gate_channel'] = ''
+            return
+        control['sample_name'] = describe_profile(chosen)
+        control['gate_channel'] = chosen.gate_channel or max(chosen.profile, key=chosen.profile.get)
+
     def _add_comboboxes_to_row(self, row):
         current_control_list = []
         unused_raw_channels = []
@@ -845,40 +970,12 @@ class SpectralControlsEditor(QFrame):
         elif self.model._data[row]['control_type'] == 'Single Stained Spectral Control from Library':
             enable_particle_types_cb = False
             enable_gate_channel_cb = False
-            if self.model._data[row]['label']:
-                enable_gate_label_cb = False
-                search_results = spectral_library.search_for_label(self.model._data[row]['label'].strip())
-                if search_results:
-                    enable_sample_name_cb = True
-                    # Annotate each result with its display string (or None if channels
-                    # don't match this instrument), then derive the combobox list from
-                    # those annotations.  Using a single loop avoids the index-mismatch
-                    # that occurred when results were filtered but indices weren't remapped.
-                    for index in search_results:
-                        if list(json.loads(search_results[index]['profile_dict']).keys()) == self.fluorescence_channels_pnn:
-                            search_results[index]['current_control_list'] = (
-                                '[Spectral Library] '
-                                + search_results[index]['sample_name'] + ', '
-                                + ('Major Channel: ' + search_results[index]['gate_channel'] + ', ' if search_results[index]['gate_channel'] else '')
-                                + 'Experiment: ' + search_results[index]['experiment_root_directory'] + ', '
-                                + datetime.fromtimestamp(search_results[index]['timestamp']).strftime('%Y-%m-%d %H:%M:%S') + ' '
-                            )
-                        else:
-                            search_results[index]['current_control_list'] = None
-
-                    current_control_list = [
-                        search_results[index]['current_control_list']
-                        for index in search_results
-                        if search_results[index]['current_control_list'] is not None
-                    ]
-                    self.spectral_library_search_results = search_results # store search_results for profile generator
-                else:
-                    enable_sample_name_cb = False
-            else:
-                enable_particle_types_cb = False
-                enable_gate_channel_cb = False
-                enable_sample_name_cb = False
-                enable_gate_label_cb = False
+            enable_gate_label_cb = False
+            matches = self._reference_library_matches(self.model._data[row]['label'])
+            # profile id -> profile, merged across rows for the profile generator
+            self.spectral_library_search_results.update({p.id: p.profile for p in matches})
+            current_control_list = [describe_profile(p) for p in matches]
+            enable_sample_name_cb = bool(matches)
 
         else:
             enable_particle_types_cb = False
@@ -904,7 +1001,7 @@ class SpectralControlsEditor(QFrame):
             )
             if not is_unstained:
                 continue
-            is_bead = bool(re.search(r'[Bb]eads', tube_name))
+            is_bead = is_bead_sample(self.samples, p, tube_name)
             if particle_type == 'Beads' and not is_bead:
                 continue
             if particle_type == 'Cells' and is_bead:
@@ -951,52 +1048,6 @@ class SpectralControlsEditor(QFrame):
             elif col_name == "universal_negative_name":
                 self._add_or_replace_combobox_if_enabled(idx, enable_universal_negative_cb, universal_negative_options)
 
-        # "Use Cleaned" checkbox — visible only when cleaned data exist for this control
-        label = self.model._data[row].get('label') or ''
-        cleaned_available = label in self.controller.cleaned_events
-        uc_col = COLUMNS.index("use_cleaned")
-        uc_idx = self.model.index(row, uc_col)
-        proxy_uc_idx = self.proxy.mapFromSource(uc_idx)
-
-        old = self.view.indexWidget(proxy_uc_idx)
-        if old is not None:
-            self.view.setIndexWidget(proxy_uc_idx, None)
-            old.hide()
-            old.setParent(None)
-
-        if cleaned_available:
-            cb = QCheckBox()
-            cb.installEventFilter(WheelBlocker(cb))
-            # Default to checked if use_cleaned is True or not yet set
-            current_val = self.model._data[row].get('use_cleaned')
-            cb.setChecked(current_val is not False)  # True or None → checked; False → unchecked
-            cb.setToolTip('Use cleaned event pool for profile extraction.\nUncheck to revert to the standard gate-mean method for this control.')
-
-            def _on_toggle(checked, idx=uc_idx, row=row):
-                self.model._data[row]['use_cleaned'] = checked
-                # Re-run generate() for this control immediately
-                self.setEnabled(False)
-                self.profile_updater.flush()
-                control_valid = self.profile_updater.generate(
-                    self.model._data[row], self.spectral_library_search_results
-                )
-
-                def _finish_toggle():
-                    # refresh_comboboxes() rebuilds this row's checkbox, tearing
-                    # down the current one (setIndexWidget(..., None) + setParent(None)).
-                    # Doing that synchronously would delete this checkbox while its
-                    # own toggled() signal is still unwinding on the call stack —
-                    # a native-crash-causing reentrancy hazard. Defer to the next
-                    # event-loop tick so toggled() finishes first.
-                    self.refresh_comboboxes()
-                    self.setEnabled(True)
-                    if control_valid:
-                        self._emit_spectral_model_updated_when_mode_switch_done()
-
-                QTimer.singleShot(0, _finish_toggle)
-
-            cb.toggled.connect(_on_toggle)
-            self.view.setIndexWidget(proxy_uc_idx, cb)
                 
 
     def add_row(self):
@@ -1026,13 +1077,35 @@ class SpectralControlsEditor(QFrame):
             self.bus.spectralModelUpdated.emit() #spectral model already scrubbed at this point - this will clear unmixing matrix
             self.bus.showSelectedProfiles.emit(None)
 
+    def _take_job(self, label: str) -> bool:
+        """Hold the job gate for *label*, or keep holding it under *label* within a chain."""
+        if self._job_token is not None and self._job_token.held:
+            self._job_token.hand_over(label)
+            return True
+        self._job_token = acquire_job(self.controller, label)
+        return self._job_token is not None
+
+    def _release_job(self):
+        token, self._job_token = self._job_token, None
+        if token is not None:
+            token.release()
+
     def auto_generate(self):
+        if not self._take_job('Auto generate spectral controls'):
+            return
+        # labels and antigens to restore on the regenerated controls
+        previous_controls = [
+            {key: control.get(key) for key in ('label', 'antigen', 'sample_path', 'sample_name')}
+            for control in self.model._data
+        ]
+
         # if spectral model already exists, ask if user wants it cleared
         if self.model.rowCount():
             reply = QMessageBox.question(self, "Auto generate spectral model", f"This will overwrite the spectral model. Are you sure you wish to continue?", QMessageBox.Yes | QMessageBox.No)
             if reply == QMessageBox.Yes:
                 self.model.delete_rows_by_indices(list(range(len(self.model._data))))
             else:
+                self._release_job()
                 return
 
         # then if the user has samples but no single stain controls, ask if channel assignment is desired
@@ -1046,6 +1119,7 @@ class SpectralControlsEditor(QFrame):
                                              QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.Yes:
                     self.auto_conventional()
+                self._release_job()
                 return
 
             # then if the user has no samples at all, just warn
@@ -1055,11 +1129,23 @@ class SpectralControlsEditor(QFrame):
                                              'single stain controls in experiment configuration. '
                                              '\n\nAlternatively, you can add controls from the spectral library (if previously added) '
                                              'or assign channels (for conventional cytometry).')
+                self._release_job()
                 return
+
+        # continue into Clean Controls, with one spectral process refresh at the end
+        auto_clean = self.activate_cleaning_checkbox.isChecked() and self.auto_clean_checkbox.isChecked()
+        if auto_clean and not self._has_unstained_cell_sample():
+            auto_clean = False
+            if self.bus:
+                self.bus.statusMessage.emit('Automatic cleaning skipped: no unstained cell sample found.')
+
+        # particle types come from the bead list: check samples not yet checked
+        if self.controller.experiment.check_bead_samples():
+            self.bus.sampleTreeUpdated.emit()
 
         # if user gets through all above, run spectral auto generator
         self.setEnabled(False)
-        self.thread = QThread()
+        self.thread = QThread(QApplication.instance())  # survives a main window rebuild mid-run
         # Read bulk_negative_combo directly
         if self.bulk_particle_type_combo.currentText() != 'Cells':
             self.bulk_particle_type_combo.setCurrentText('Cells')
@@ -1067,14 +1153,81 @@ class SpectralControlsEditor(QFrame):
         if not preferred or preferred == INTERNAL_NEGATIVE_SENTINEL:
             preferred = None
         self.spectral_auto_generator = SpectralAutoGenerator(self.bus, self.controller,
-                                                             preferred_unstained=preferred)
+                                                             preferred_unstained=preferred,
+                                                             previous_controls=previous_controls,
+                                                             defer_model_update=auto_clean)
 
+        # Profile QC warnings raised by the recalculation are held and shown in one
+        # dialog once the run has finished and the plots have been rebuilt.
+        self.controller.warning_collector = []
+        self._autogenerate_state = None if auto_clean else {'finished': False, 'refreshed': False}
         self.spectral_auto_generator.moveToThread(self.thread)
         self.bus.spectralControlAdded.connect(self._on_spectral_control_added_by_autogenerator)
         self.thread.started.connect(self.spectral_auto_generator.run)
-        self.bus.spectralModelUpdated.connect(self.thread.quit)
-        self.thread.finished.connect(self.refresh_table_and_enable)
+        self.thread.finished.connect(QApplication.restoreOverrideCursor)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.spectral_auto_generator.generationFinished.connect(self.thread.quit)
+        if auto_clean:
+            self.thread.finished.connect(self._clean_after_autogenerate)
+        else:
+            self.bus.spectralModelUpdated.connect(self.thread.quit)
+            self.thread.finished.connect(self.refresh_table_and_enable)
+            self.thread.finished.connect(self._on_autogenerate_finished)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         self.thread.start()
+
+    @Slot()
+    def _clean_after_autogenerate(self):
+        """Auto generation has ended without refreshing the spectral process: clean
+        the new controls. The recalculation after cleaning emits spectralModelUpdated
+        and shows the warnings of both steps in one dialog."""
+        self._autoclean_warnings = list(self.controller.warning_collector or [])
+        self._on_clean_controls()
+
+    @Slot()
+    def _on_autogenerate_finished(self):
+        """The auto-generation thread has ended. The warnings are shown once the
+        spectral process refresh has also completed, with a fallback in case it never does."""
+        if self._autogenerate_state is None:
+            return
+        self._autogenerate_state['finished'] = True
+        self._show_autogenerate_warnings_when_ready()
+        QTimer.singleShot(5000, self._release_autogenerate_warnings)
+
+    @Slot()
+    def _on_autogenerate_refreshed(self):
+        """The spectral process refresh has completed and has already added its warnings."""
+        if self._autogenerate_state is None:
+            return
+        self._autogenerate_state['refreshed'] = True
+        self._show_autogenerate_warnings_when_ready()
+
+    def _show_autogenerate_warnings_when_ready(self):
+        state = self._autogenerate_state
+        if state is not None and state['finished'] and state['refreshed']:
+            self._release_autogenerate_warnings()
+
+    def _release_autogenerate_warnings(self):
+        """Show the warnings collected during auto-generation in a single dialog.
+
+        The refresh that completes the run is wrapped in with_busy_cursor, whose
+        nested event loop is still running when the refresh signal arrives. A
+        modal dialog opened inside that loop loses its modality when the loop
+        exits, and can drop behind the main window, so the dialog waits until
+        the busy cursor has been released (for at most about 10 s)."""
+        state = self._autogenerate_state
+        if state is None:
+            return
+        if QApplication.overrideCursor() is not None and state.get('deferrals', 0) < 100:
+            state['deferrals'] = state.get('deferrals', 0) + 1
+            QTimer.singleShot(100, self._release_autogenerate_warnings)
+            return
+        self._autogenerate_state = None
+        self._release_job()
+        messages = self.controller.warning_collector or []
+        self.controller.warning_collector = None
+        if messages and self.bus:
+            self.bus.warningMessage.emit('\n\n'.join(messages))
 
     def auto_conventional(self):
         # first make sure all channels selected
@@ -1220,7 +1373,17 @@ class SpectralControlsEditor(QFrame):
             if control['gate_channel'] != current_gate_channel:
                 self._move_pos_neg_gates_to_channel(control)
 
+        if changed_col == 'particle_type' and control.get('control_type') == SSC_CONTROL_TYPE:
+            self._sync_particle_type(control)
+        if changed_col == 'sample_name' and control.get('control_type') == SSC_CONTROL_TYPE:
+            self._sync_sample(control)
+        reclean = (control.get('control_type') == SSC_CONTROL_TYPE
+                   and changed_col in CLEANED_RESULT_KEYS
+                   and self._invalidate_cleaned(control))
+
         sanitise_control_in_place(control)
+        if control['control_type'] == 'Single Stained Spectral Control from Library':
+            self._select_default_library_profile(control)
         self.profile_updater.flush()
         control_valid = self.profile_updater.generate(control, self.spectral_library_search_results)
         self.refresh_comboboxes()
@@ -1233,8 +1396,145 @@ class SpectralControlsEditor(QFrame):
                 # spectralModelUpdated once to recalculate the unmixing matrix.
                 pos_gate_label = control.get('gate_label') or f'Pos {control["label"]}'
                 self.bus.changedGatingHierarchy.emit('raw', pos_gate_label)
-            self.bus.spectralModelUpdated.emit()
+            if not reclean:
+                self.bus.spectralModelUpdated.emit()
         logger.info(f'SpectralModelEditor: updated {"valid" if control_valid else "invalid"} control {control}')
+        if reclean:
+            self._on_clean_controls()  # ends with the recalculation and one spectralModelUpdated
+
+    def _update_condition_number_label(self):
+        cond = self.controller.experiment.process.get('condition_number')
+        self.condition_number_label.setText('' if cond is None else f'Condition number: {cond:.1f}')
+
+    def _has_cleaned(self, control: dict) -> bool:
+        """Whether the control has a cleaned result made from its current sample,
+        particle type and negative (Use Cleaned is offered only then)."""
+        cleaned = self.controller.cleaned_events.get(control.get('label') or '')
+        return (control.get('control_type') == SSC_CONTROL_TYPE and bool(cleaned)
+                and cleaned_result_matches(control, cleaned))
+
+    def _background_flag(self, control: dict) -> str | None:
+        """Tooltip for a control whose current cleaned result shows no clear
+        stain above its unstained (SpectralCleaner background check), else None."""
+        if not self._has_cleaned(control):
+            return None
+        label = control.get('label') or ''
+        return background_check_summary(label, self.controller.cleaned_events[label].get('background_check'))
+
+    def _invalidate_cleaned(self, control: dict) -> bool:
+        """Drop the control's cleaned result once its sample, particle type or
+        negative no longer match it. Returns whether to clean again now (Show
+        AutoSpectral Cleaning and Automatically Clean ticked)."""
+        label = control.get('label') or ''
+        cleaned = self.controller.cleaned_events.get(label)
+        if not cleaned or cleaned_result_matches(control, cleaned):
+            return False
+        del self.controller.cleaned_events[label]
+        control['use_cleaned'] = None
+        logger.info(f'SpectralModelEditor: cleaned result of "{label}" invalidated — sample, particle type or negative changed')
+        if self.bus:
+            self.bus.cleaningResultsReady.emit()
+        return self.activate_cleaning_checkbox.isChecked() and self.auto_clean_checkbox.isChecked()
+
+    def _sync_sample(self, control: dict) -> None:
+        """Sample edited: the Particle Type follows the new sample's bead status,
+        the negative is chosen for it (bead control: the matching unstained bead,
+        else internal; cell control: kept if it is a cell unstained or internal,
+        else the default cell unstained), the major channel is found again on it
+        (unless locked) as auto-generate finds it, and the Pos/Neg gates are re-placed."""
+        name_to_path = {name: path for path, name in self.samples['all_samples'].items()}
+        path = name_to_path.get(control.get('sample_name'))
+        if path is None:
+            return
+        particle_type = 'Beads' if is_bead_sample(self.samples, path) else 'Cells'
+        control['particle_type'] = particle_type
+        neg_name = control.get('universal_negative_name') or ''
+        neg_path = name_to_path.get(neg_name)
+        keep_negative = particle_type == 'Cells' and (
+            neg_name in ('', INTERNAL_NEGATIVE_SENTINEL)
+            or (neg_path is not None and not is_bead_sample(self.samples, neg_path, neg_name)))
+        if not keep_negative:
+            control['universal_negative_name'] = self._default_negative(control)
+        if not control.get('gate_channel_locked'):
+            self._find_major_channel(control, path, name_to_path.get(control.get('universal_negative_name') or ''))
+        if control.get('gate_channel'):
+            self._move_pos_neg_gates_to_channel(control)
+
+    def _find_major_channel(self, control: dict, path: str, neg_path: str | None) -> None:
+        """Set gate_channel to the empirical peak of the control sample's base-gated
+        events after removing the AF direction, the AF reference being the negative
+        tube's base-gated mean, or the dimmest quarter of the sample without one
+        (as SpectralAutoGenerator.generate_spectral_control)."""
+        import numpy as np
+        from honeychrome.controller_components.functions import sample_from_fcs
+        from honeychrome.controller_components.spectral_functions import get_raw_events
+        from honeychrome.controller_components.spectral_cleaning import find_empirical_peak
+        from honeychrome.controller_components.spread_model import raw_layout
+
+        base_gate_label, _ = resolve_base_gate(self.controller.raw_gating, self.controller.experiment.process.get('base_gate_priority_order', []))
+        gate_label = base_gate_label if base_gate_label != 'root' else None
+        layout = raw_layout(self.controller)
+
+        def _events(rel_path):
+            sample = sample_from_fcs(str(self.controller.experiment_dir / rel_path))
+            return get_raw_events(sample, layout['fl_ids'], gate_label=gate_label,
+                                  gating_strategy=control_gating(self.controller),
+                                  col_order=layout['col_order'], sample_key=rel_path)
+        try:
+            pos_events = _events(path)
+            if len(pos_events) < 2:
+                return
+            neg_events = _events(neg_path) if neg_path and neg_path != path else None
+            if neg_events is not None and len(neg_events) > 1:
+                af_mean = neg_events.mean(axis=0)
+            else:
+                order = np.argsort(pos_events.max(axis=1))
+                af_mean = pos_events[order[:max(2, len(pos_events) // 4)]].mean(axis=0)
+            control['gate_channel'] = self.fluorescence_channels_pnn[find_empirical_peak(pos_events, af_mean)]
+            logger.info(f'SpectralModelEditor: "{control.get("label")}" major channel on the new sample: {control["gate_channel"]}')
+        except Exception as e:
+            logger.warning(f'SpectralModelEditor: could not find the major channel of "{control.get("label")}" on the new sample: {e}')
+
+    def _sync_particle_type(self, control: dict) -> None:
+        """Particle Type edited: mark or unmark the control's sample as beads, and
+        replace an unstained negative of the other particle type."""
+        particle_type = control.get('particle_type')
+        if particle_type not in ('Beads', 'Cells'):
+            return
+        name_to_path = {name: path for path, name in self.samples['all_samples'].items()}
+        path = name_to_path.get(control.get('sample_name'))
+        if path and set_bead_sample(self.samples, path, particle_type == 'Beads'):
+            self.bus.sampleTreeUpdated.emit()
+
+        neg_name = control.get('universal_negative_name') or ''
+        if neg_name == INTERNAL_NEGATIVE_SENTINEL or (not neg_name and particle_type == 'Cells'):
+            return  # internal, or blank (the global cell unstained)
+        neg_path = name_to_path.get(neg_name)
+        if neg_path is not None and is_bead_sample(self.samples, neg_path, neg_name) == (particle_type == 'Beads'):
+            return
+        control['universal_negative_name'] = self._default_negative(control)
+
+    def _default_negative(self, control: dict) -> str:
+        """Bead control: the unstained bead sample matching its scatter; cell control:
+        the default cell unstained; else the internal negative."""
+        if control.get('particle_type') == 'Cells':
+            return _find_default_unstained(self.samples) or INTERNAL_NEGATIVE_SENTINEL
+        name_to_path = {name: path for path, name in self.samples['all_samples'].items()}
+        match = match_bead_unstained(self.samples, name_to_path.get(control.get('sample_name')))
+        return self.samples['all_samples'][match] if match else INTERNAL_NEGATIVE_SENTINEL
+
+    @Slot(str)
+    def _on_bead_sample_toggled(self, path: str) -> None:
+        """Mark/Unmark as Beads in the sample tree: set the Particle Type of the
+        single-stain controls made from that sample to match."""
+        particle_type = 'Beads' if is_bead_sample(self.samples, path) else 'Cells'
+        name = self.samples['all_samples'].get(path)
+        col = COLUMNS.index('particle_type')
+        for row, control in enumerate(self.model._data):
+            if (control.get('control_type') == SSC_CONTROL_TYPE
+                    and control.get('sample_name') == name
+                    and control.get('particle_type') != particle_type):
+                self.model.setData(self.model.index(row, col), particle_type)
 
     @with_busy_cursor
     def _move_pos_neg_gates_to_channel(self, control: dict) -> None:
@@ -1247,6 +1547,7 @@ class SpectralControlsEditor(QFrame):
         import numpy as np
         from honeychrome.controller_components.functions import sample_from_fcs
         from honeychrome.controller_components.spectral_functions import get_raw_events
+        from honeychrome.controller_components.spread_model import raw_layout
         import honeychrome.settings as settings
 
         label = control.get('label', '')
@@ -1263,18 +1564,7 @@ class SpectralControlsEditor(QFrame):
             return
 
         # Resolve base gate (same priority order as SpectralAutoGenerator)
-        base_gate_priority = self.controller.experiment.process.get('base_gate_priority_order', [])
-        raw_gate_names = [g[0].lower() for g in raw_gating.get_gate_ids()]
-        base_gate_label = 'root'
-        for gate in base_gate_priority:
-            if gate.lower() in raw_gate_names:
-                base_gate_label = gate
-                break
-
-        if base_gate_label != 'root' and raw_gating.find_matching_gate_paths(base_gate_label):
-            base_path = tuple(list(raw_gating.find_matching_gate_paths(base_gate_label)[0]) + [base_gate_label])
-        else:
-            base_path = ('root',)
+        base_gate_label, base_path = resolve_base_gate(raw_gating, self.controller.experiment.process.get('base_gate_priority_order', []))
 
         # Derive gate bounds from the control sample on the new channel
         all_samples_reverse = {v: k for k, v in self.controller.experiment.samples['all_samples'].items()}
@@ -1292,9 +1582,12 @@ class SpectralControlsEditor(QFrame):
             fl_col = fluor_ids.index(ch_global_idx)
 
             gate_label_for_load = base_gate_label if base_gate_label != 'root' else None
-            fl_events = get_raw_events(sample, fluor_ids,
+            layout = raw_layout(self.controller)
+            fl_events = get_raw_events(sample, layout['fl_ids'],
                                     gate_label=gate_label_for_load,
-                                    gating_strategy=raw_gating)
+                                    gating_strategy=control_gating(self.controller),
+                                    col_order=layout['col_order'],
+                                    sample_key=sample_rel_path)
             ch_values = fl_events[:, fl_col]
 
             pos_pct = settings.spectral_positive_gate_percent_retrieved
@@ -1488,19 +1781,35 @@ class SpectralControlsEditor(QFrame):
                 self.model.index(0, 0),
                 self.model.index(self.model.rowCount() - 1, self.model.columnCount() - 1),
             )
+            self.refresh_comboboxes()
 
     @Slot()
     def _on_force_recalc(self):
+        if not self._take_job('Recalculate spectral process'):
+            return
+        try:
+            self._force_recalc()
+        finally:
+            self._release_job()
+
+    def _force_recalc(self):
         self.setEnabled(False)
         self.profile_updater.flush()  # remove profiles that are not in the model
+        # Warnings from the profiles and the spectral process refresh are shown
+        # together once the recalculation is done.
+        own_collector = self.controller.warning_collector is None
+        if own_collector:
+            self.controller.warning_collector = []
+        self.profile_updater.low_events = LowEventLog(self.controller, self.bus, collect=True)
 
         for index, control in enumerate(self.model._data):
             label = control.get('label', '')
 
-            # Skip this control if its profile is already present and the gate
-            # it references still exists in raw gating (i.e. nothing has changed
-            # that would invalidate it).  This avoids unnecessary re-extraction
-            # when only one or two controls have changed.
+            # Skip this control if its profile is already present, the gate it
+            # references still exists in raw gating, and none of the gates its
+            # profile was computed from has moved (template or per-sample
+            # override). This avoids unnecessary re-extraction when only one or
+            # two controls have changed.
             if label and label in self.profile_updater.profiles:
                 # Library controls depend on spectral_library_search_results which is
                 # only populated after refresh_comboboxes runs — always regenerate them
@@ -1511,8 +1820,10 @@ class SpectralControlsEditor(QFrame):
                     not gate_label
                     or bool(self.raw_gating.find_matching_gate_paths(gate_label))
                 )
-                if gate_still_valid and not is_library:
-                    logger.info(f'SpectralModelEditor: skipping recalc for "{label}" — profile present and gate valid')
+                gating_unchanged = (self.profile_updater.profile_gating.get(label)
+                                    == self.profile_updater.gating_signature(control))
+                if gate_still_valid and gating_unchanged and not is_library:
+                    logger.info(f'SpectralModelEditor: skipping recalc for "{label}" — profile present and gates unchanged')
                     continue
 
             control_valid = self.profile_updater.generate(control, self.spectral_library_search_results)
@@ -1521,8 +1832,20 @@ class SpectralControlsEditor(QFrame):
                 # Do not break — attempt remaining controls so the user sees all
                 # failures at once rather than stopping at the first one.
 
-        self.bus.spectralModelUpdated.emit()
-        self.refresh_table_and_enable()
+        low_event_text = self.profile_updater.low_events.text()
+        self.profile_updater.low_events = LowEventLog(self.controller, self.bus, collect=False)
+        if low_event_text:
+            self.controller.warning_collector.append(low_event_text)
+
+        try:
+            self.bus.spectralModelUpdated.emit()
+            self.refresh_table_and_enable()
+        finally:
+            if own_collector:
+                messages = self.controller.warning_collector or []
+                self.controller.warning_collector = None
+                if messages and self.bus:
+                    self.bus.warningMessage.emit('\n\n'.join(messages))
         logger.info(f'SpectralModelEditor: forced recalculation complete')
 
     def _on_unmixing_method_changed(self, method_key: str):
@@ -1546,18 +1869,25 @@ class SpectralControlsEditor(QFrame):
                 self.bus.statusMessage.emit(
                     'Clean Controls needs an unstained cell sample as the negative reference — none found.'
                 )
+            self._release_job()
+            return
+        if not self._take_job('Clean Controls'):
             return
 
         self.setEnabled(False)
         self.clean_controls_btn.setText("Cleaning…")
+        self.controller.warning_collector = []
 
-        self.cleaner_thread = QThread()
+        self.cleaner_thread = QThread(QApplication.instance())  # survives a main window rebuild mid-run
         self.spectral_cleaner = SpectralCleaner(self.bus, self.controller)
         self.spectral_cleaner.moveToThread(self.cleaner_thread)
 
         self.cleaner_thread.started.connect(self.spectral_cleaner.run)
         self.spectral_cleaner.cleaningFinished.connect(self.cleaner_thread.quit)
+        self.cleaner_thread.finished.connect(QApplication.restoreOverrideCursor)
+        self.cleaner_thread.finished.connect(self.cleaner_thread.deleteLater)
         self.cleaner_thread.finished.connect(self._on_clean_controls_finished)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         self.cleaner_thread.start()
 
     @Slot()
@@ -1576,16 +1906,24 @@ class SpectralControlsEditor(QFrame):
         # Rebuild comboboxes now so that spectral_library_search_results is populated before the recalc worker runs
         self.refresh_comboboxes()
 
+        # Negative-profile and low-event warnings from the recalculation are reported with the rest
+        self.profile_updater.negative_profile_warnings = []
+        self.profile_updater.low_events = LowEventLog(self.controller, self.bus, collect=True)
+
         # Run profile regeneration in a background thread so the main thread
         # stays responsive. _on_force_recalc is not thread-safe (it touches Qt
         # widgets directly), so we do only the pure computation here and defer
         # the UI update to the main thread via a signal.
-        self._recalc_thread = QThread()
+        self._recalc_thread = QThread(QApplication.instance())  # survives a main window rebuild mid-run
         self._recalc_worker = _RecalcWorker(self.profile_updater, self.model._data, self.spectral_library_search_results)
         self._recalc_worker.moveToThread(self._recalc_thread)
         self._recalc_thread.started.connect(self._recalc_worker.run)
         self._recalc_worker.finished.connect(self._recalc_thread.quit)
+        self._recalc_thread.finished.connect(self._recalc_thread.deleteLater)
         self._recalc_thread.finished.connect(self._on_recalc_finished)
+        self._recalc_thread.finished.connect(self._release_job)  # after _on_recalc_finished, also if it raised
+        if self._job_token is not None:
+            self._job_token.hand_over('Recalculate spectral process')
         self._recalc_thread.start()
 
     @Slot()
@@ -1595,17 +1933,111 @@ class SpectralControlsEditor(QFrame):
         if self.bus:
             self.bus.cleaningResultsReady.emit()
         logger.info('SpectralControlsEditor: Clean Controls run complete.')
-        self._warn_low_cosine_controls()
 
-    def _warn_low_cosine_controls(self):
-        """Show a single warning popup listing controls with cosine similarity
-        below COSINE_QC_WARNING_THRESHOLD.  Controls without a reference entry
-        are silently skipped."""
+        # One dialog for everything raised during the run, auto generation included
+        title = 'Clean Controls:' if self._autoclean_warnings is None else 'Auto generate and Clean Controls:'
+        messages = (self._autoclean_warnings or []) + list(self.spectral_cleaner.warnings)
+        if self._recalc_worker.error:
+            messages.append(self._recalc_worker.error)
+        self._autoclean_warnings = None
+        negative_labels = self.profile_updater.negative_profile_warnings or []
+        self.profile_updater.negative_profile_warnings = None
+        if negative_labels:
+            labels = ', '.join(f'"{label}"' for label in negative_labels)
+            messages.append(
+                f'Negative profile: the negative gate has higher mean fluorescence than the '
+                f'positive for {labels}. Check the negative assigned to these controls.'
+            )
+        low_event_text = self.profile_updater.low_events.text()
+        self.profile_updater.low_events = LowEventLog(self.controller, self.bus, collect=False)
+        if low_event_text:
+            messages.append(low_event_text)
+        messages += self.controller.warning_collector or []
+        self.controller.warning_collector = None
+        low_cosine_text = self._low_cosine_warning_text()
+        if low_cosine_text:
+            messages.append(low_cosine_text)
+        if messages and self.bus:
+            self.bus.warningMessage.emit(title + '\n\n' + '\n\n'.join(messages))
+
+    def _show_row_context_menu(self, position):
+        """Right-click menu on a control row: save its spectrum to the Reference
+        Library, carrying the antigen / particle type / major channel / source
+        sample across from this tab."""
+        index = self.view.indexAt(position)
+        if not index.isValid():
+            return
+        row = self.proxy.mapToSource(index).row()
+        control = self.model._data[row]
+        profile = (self.controller.experiment.process.get('profiles') or {}).get(control.get('label'))
+
+        menu = QMenu(self)
+        action = menu.addAction('Save to Reference Library')
+        action.setEnabled(bool(profile))
+        if not profile:
+            action.setToolTip('Generate a profile for this control first')
+        action.triggered.connect(lambda: self._save_control_to_reference_library(control, profile))
+        menu.exec(self.view.viewport().mapToGlobal(position))
+
+    def _save_control_to_reference_library(self, control, profile):
+        """Persist one generated control spectrum as a curated reference profile."""
+        label = (control.get('label') or '').strip()
+        channels = list(self.fluorescence_channels_pnn)
+        if not label or not profile or len(profile) != len(channels):
+            QMessageBox.warning(self, 'Save to Reference Library',
+                                'This control has no profile matching the current channels.')
+            return
+
+        name, ok = QInputDialog.getText(self, 'Save to Reference Library',
+                                        'Fluorophore name:', text=label)
+        name = (name or '').strip()
+        if not ok or not name:
+            return
+        notes, _ = QInputDialog.getText(self, 'Save to Reference Library', 'Notes (optional):')
+
+        raw = self.controller.experiment.settings['raw']
+        cytometer_key = raw.get('cytometer_db_col') or ''
+        try:
+            library = SpectralReferenceLibrary()
+            library.save_profile(
+                fluorophore=name,
+                profile=dict(zip(channels, [float(v) for v in profile])),
+                cytometer_key=cytometer_key,
+                config_key=compute_config_key(cytometer_key, channels),
+                channel_names=channels,
+                antigen=control.get('antigen') or None,
+                particle_type=control.get('particle_type') or None,
+                gate_channel=control.get('gate_channel') or None,
+                source_sample_name=control.get('sample_name') or None,
+                source_experiment_dir=str(self.controller.experiment_dir or ''),
+                notes=(notes or '').strip() or None,
+            )
+        except Exception as exc:
+            logger.warning(f'Save to Reference Library failed: {exc}')
+            QMessageBox.critical(self, 'Save to Reference Library', str(exc))
+            return
+
+        message = f'Saved "{name}" to the Reference Library.'
+        if not cytometer_key:
+            message += ' (Instrument not identified — saved as "unknown".)'
+        if self.bus is not None:
+            self.bus.statusMessage.emit(message)
+            self.bus.referenceLibraryChanged.emit()  # refresh an open Reference Library window
+        logger.info(f'SpectralControlsEditor: {message}')
+
+    def _low_cosine_warning_text(self) -> str | None:
+        """Text listing spectral-model controls with cosine similarity below
+        the threshold for their instrument (cosine_qc_warning_threshold), or None.
+        Controls without a reference entry are silently skipped."""
         cleaned = self.controller.cleaned_events
         pnn     = self.controller.experiment.settings['raw']['event_channels_pnn']
+        model_labels = {control.get('label') for control in self.model._data}
 
-        low: list[tuple[str, float]] = []
+        low: list[tuple[str, float, float]] = []
+        low_cytometer_keys: set = set()
         for label, entry in cleaned.items():
+            if label not in model_labels:
+                continue
             if not entry.get('spectrum'):
                 continue
             cytometer_key = entry.get('cytometer_key')
@@ -1622,28 +2054,38 @@ class SpectralControlsEditor(QFrame):
             cs = cosine_similarity_to_reference(spectrum, fluor_pnn, label, cytometer_key)
             if cs is None:
                 continue  # no reference available — skip
-            if cs < COSINE_QC_WARNING_THRESHOLD:
-                low.append((label, cs))
+            threshold = cosine_qc_warning_threshold(cytometer_key)
+            if cs < threshold:
+                low.append((label, cs, threshold))
+                low_cytometer_keys.add(cytometer_key)
 
         if not low:
-            return
+            return None
 
-        lines = '\n'.join(
-            f'  • {label}  (cosine = {cs:.4f})'
-            for label, cs in low
+        thresholds = sorted({threshold for _, _, threshold in low})
+        if len(thresholds) == 1:
+            threshold_text = f'{thresholds[0]}'
+            lines = '\n'.join(f'  • {label}  (cosine = {cs:.4f})' for label, cs, _ in low)
+        else:  # mixed instruments: state each control's own threshold
+            threshold_text = 'its instrument threshold'
+            lines = '\n'.join(
+                f'  • {label}  (cosine = {cs:.4f}, threshold {threshold})'
+                for label, cs, threshold in low
+            )
+        instrument_notes = ''.join(
+            f'\n\n{COSINE_QC_NOTE_BY_CYTOMETER[key]}'
+            for key in sorted(low_cytometer_keys, key=str)
+            if key in COSINE_QC_NOTE_BY_CYTOMETER
         )
-        msg = QMessageBox(self)
-        msg.setWindowTitle('Cosine QC Warning')
-        msg.setIcon(QMessageBox.Icon.Warning)
-        msg.setText(
-            f'The following {len(low)} control(s) have a cosine similarity to the '
-            f'reference library below {COSINE_QC_WARNING_THRESHOLD}:\n\n'
+        return (
+            f'Cosine QC: the following {len(low)} control(s) have a cosine similarity to the '
+            f'reference library below {threshold_text}:\n\n'
             f'{lines}\n\n'
             f'Check the Cosine QC plots for details. If the Major Channel is '
             f'incorrect, update it in the Spectral Model table and re-run '
             f'Clean Controls.'
+            + instrument_notes
         )
-        msg.exec()
 
 
     @Slot(list)

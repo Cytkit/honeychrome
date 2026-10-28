@@ -11,7 +11,11 @@ from pathvalidate import sanitize_filename
 from honeychrome.controller import base_directory
 from honeychrome.controller_components.exporter import ReportGenerator
 from honeychrome.controller_components.functions import get_all_subfolders_recursive
-from honeychrome.controller_components.unmixed_exporter import UnmixedExporter
+from honeychrome.controller_components.job_gate import acquire_job
+from honeychrome.controller_components.particle_type import is_bead_sample, set_bead_sample
+from honeychrome.controller_components.unmixed_exporter import (
+    ExportTimeEstimateWorker, UnmixedExporter, time_estimate_message,
+)
 from honeychrome.view_components.batch_export_samples_modal import BatchExportSamplesModal
 from honeychrome.view_components.icon_loader import icon as load_icon, icon
 from honeychrome.view_components.new_sample_modal import NewSampleModal
@@ -113,6 +117,16 @@ class DictTreeModel(QAbstractItemModel):
         return bool(re.search(r'unstained', tube_name, re.IGNORECASE)
                     or re.search(r'unstained', path, re.IGNORECASE))
 
+    def _sample_icon(self, path, nevents):
+        """Droplet: dark green for bead samples, blue for unstained, plain otherwise."""
+        if not nevents > 0:
+            return load_icon('droplet-empty')
+        if is_bead_sample(self.full_data, path):
+            return load_icon('droplet', colour='#1e6b34')
+        if self._is_unstained(path):
+            return load_icon('droplet', colour='#4a90d9')
+        return load_icon('droplet')
+
     def setup_all_samples_from_dict(self, paths):
         title = 'All Samples'
         parent_item = TreeItem(None, title, "", self.root_item)
@@ -121,10 +135,7 @@ class DictTreeModel(QAbstractItemModel):
             if path not in self.full_data['single_stain_controls']:
                 title = self.full_data['all_samples'][path]
                 nevents = self.full_data['all_sample_nevents'][path]
-                if self._is_unstained(path):
-                    icon = load_icon('droplet', colour='#4a90d9') if nevents > 0 else load_icon('droplet-empty')
-                else:
-                    icon = load_icon('droplet') if nevents > 0 else load_icon('droplet-empty')
+                icon = self._sample_icon(path, nevents)
                 parts = path.replace("\\", "/").split("/")
                 node = parent_item
                 for part in parts[1:-1]:
@@ -139,10 +150,7 @@ class DictTreeModel(QAbstractItemModel):
         self.root_item.append_child(parent_item)
         for path in data:
             nevents = self.full_data['all_sample_nevents'][path]
-            if self._is_unstained(path):
-                icon = load_icon('droplet', colour='#4a90d9') if nevents > 0 else load_icon('droplet-empty')
-            else:
-                icon = load_icon('droplet') if nevents > 0 else load_icon('droplet-empty')
+            icon = self._sample_icon(path, nevents)
             item = TreeItem(icon, str(Path(path).stem), nevents, path, parent_item)
             parent_item.append_child(item)
 
@@ -163,10 +171,7 @@ class DictTreeModel(QAbstractItemModel):
         elif isinstance(data, list):
             for path in data:
                 nevents = self.full_data['all_sample_nevents'][path]
-                if self._is_unstained(path):
-                    icon = load_icon('droplet', colour='#4a90d9') if nevents > 0 else load_icon('droplet-empty')
-                else:
-                    icon = load_icon('droplet') if nevents > 0 else load_icon('droplet-empty')
+                icon = self._sample_icon(path, nevents)
                 item = TreeItem(icon, str(Path(path).stem), nevents, path, parent_item)
                 parent_item.append_child(item)
         else:
@@ -301,6 +306,7 @@ class SampleWidget(QWidget):
         super().__init__(*args, **kwargs)
         self.bus = bus
         self.controller = controller
+        self._export_token = None  # hold on the job gate from the time estimate to the end of an export
 
         sample_toolbar = QToolBar("Sample Toolbar")
         sample_toolbar.setMovable(False)
@@ -413,14 +419,87 @@ class SampleWidget(QWidget):
 
     @Slot(str, bool)
     def start_export_thread(self, folder, subsample):
+        token = acquire_job(self.controller, 'Export unmixed samples')
+        if token is None:
+            return
+        self._export_token = token
+        try:
+            exporter = UnmixedExporter(folder, subsample, self.bus, self.controller)
+            probe = exporter.needs_time_probe()
+        except Exception:
+            token.release()
+            raise
+        if probe:
+            self._estimate_then_export(exporter)
+        else:
+            self._start_export(exporter)
+
+    def _estimate_then_export(self, exporter):
+        """Time the slow unmixing method on a probe, ask, then export."""
+        if getattr(self, '_estimate_thread', None) is not None:
+            self._export_token.release()
+            return
+        if self.bus:
+            self.bus.statusMessage.emit('Estimating unmixing time...')
+        self._pending_exporter = exporter
+        self._estimate_thread = QThread()
+        self._estimate_worker = ExportTimeEstimateWorker(exporter)
+        self._estimate_worker.moveToThread(self._estimate_thread)
+        self._estimate_thread.started.connect(self._estimate_worker.run)
+        self._estimate_worker.finished.connect(self._on_export_estimate)
+        self._estimate_worker.error.connect(self._on_export_estimate_error)
+        self._estimate_worker.finished.connect(self._estimate_thread.quit)
+        self._estimate_worker.error.connect(self._estimate_thread.quit)
+        self._estimate_thread.finished.connect(self._estimate_thread.deleteLater)
+        self._estimate_thread.finished.connect(self._on_estimate_thread_finished)
+        self._estimate_thread.start()
+
+    @Slot()
+    def _on_estimate_thread_finished(self):
+        self._estimate_thread = None
+        self._estimate_worker = None
+
+    @Slot(object)
+    def _on_export_estimate(self, estimate):
+        exporter, self._pending_exporter = self._pending_exporter, None
+        if estimate is None:
+            self._start_export(exporter)
+            return
+        reply = QMessageBox.question(self, 'Unmixing time', time_estimate_message(estimate),
+                                     QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
+        if reply == QMessageBox.Yes:
+            self._start_export(exporter)
+        else:
+            self._export_token.release()
+            if self.bus:
+                self.bus.statusMessage.emit('Export cancelled.')
+
+    @Slot(str)
+    def _on_export_estimate_error(self, msg):
+        exporter, self._pending_exporter = self._pending_exporter, None
+        reply = QMessageBox.question(self, 'Unmixing time',
+                                     f'The unmixing time could not be estimated:\n{msg}\n\nStart the export anyway?',
+                                     QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
+        if reply == QMessageBox.Yes:
+            self._start_export(exporter)
+        else:
+            self._export_token.release()
+
+    def _start_export(self, exporter):
         self.thread = QThread()
-        self.unmixed_exporter = UnmixedExporter(folder, subsample, self.bus, self.controller)
+        self.unmixed_exporter = exporter
         self.unmixed_exporter.moveToThread(self.thread)
         self.thread.started.connect(self.unmixed_exporter.run)
         self.unmixed_exporter.finished.connect(self.thread.quit)
         self.unmixed_exporter.finished.connect(self.unmixed_exporter.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(self._on_export_thread_finished)
         self.thread.start()
+
+    @Slot()
+    def _on_export_thread_finished(self):
+        if self._export_token is not None:
+            self._export_token.release()
 
     def show_context_menu(self, position):
         # Get the index at the click position
@@ -459,6 +538,14 @@ class SampleWidget(QWidget):
                     mark_action.triggered.connect(lambda checked, p=path: self.toggle_unstained(p))
                     menu.addAction(mark_action)
 
+                    # Beads toggle
+                    is_bead = is_bead_sample(self.controller.experiment.samples, path)
+                    bead_action = QAction("Unmark as Beads" if is_bead else "Mark as Beads", self)
+                    bead_action.setCheckable(True)
+                    bead_action.setChecked(is_bead)
+                    bead_action.triggered.connect(lambda checked, p=path: self.toggle_beads(p))
+                    menu.addAction(bead_action)
+
                     source_folder = str(self.controller.experiment_dir / self.controller.experiment.settings['raw']['raw_samples_subdirectory'])
                     folders = get_all_subfolders_recursive(source_folder, self.controller.experiment_dir)
                     move_actions = []
@@ -472,7 +559,11 @@ class SampleWidget(QWidget):
         menu.exec(self.tree_view.viewport().mapToGlobal(position))
 
     def open_item(self, selected):
-        datum = self.model.data(selected.indexes()[2])
+        indexes = selected.indexes()
+        if len(indexes) < 3:
+            return
+        datum = self.model.data(indexes[2])
+
         if isinstance(datum, str):
             if datum: # i.e. not empty
                 path = datum
@@ -496,9 +587,10 @@ class SampleWidget(QWidget):
         sample_name = str(sample_path.stem)
         dlg = SampleRenameDialog(sample_name, existing_names=self.model.full_data['all_samples'].values(), parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_name = dlg.getText()
+            # a path separator would move the file into a non-existent subfolder
+            new_name = dlg.getText().replace('/', '_').replace('\\', '_')
             if new_name.strip():
-                sample_path.rename((sample_path.parent / new_name).with_suffix('.fcs'))
+                sample_path.rename(sample_path.parent / f'{new_name}.fcs')
                 self.refresh_sample_tree()
 
     def delete_item(self, path):
@@ -514,6 +606,16 @@ class SampleWidget(QWidget):
             unstained.remove(path)
         else:
             unstained.append(path)
+        self.bus.autoSaveRequested.emit()
+        self.model.refresh_tree()
+        self.tree_view.expandAll()
+        if self.bus:
+            self.bus.sampleTreeUpdated.emit()
+
+    def toggle_beads(self, path):
+        samples = self.controller.experiment.samples
+        set_bead_sample(samples, path, not is_bead_sample(samples, path))
+        self.bus.beadSampleToggled.emit(path)
         self.bus.autoSaveRequested.emit()
         self.model.refresh_tree()
         self.tree_view.expandAll()

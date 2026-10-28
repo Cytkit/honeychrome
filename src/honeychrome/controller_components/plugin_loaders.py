@@ -26,6 +26,12 @@ def load_plugin_modules():
     Safe to call from a background thread."""
     loaded_modules = {}
 
+    # The old Gating Model Builder setting enables Automated Gating, which
+    # now holds its pages.
+    if settings.value("EnableBundledPlugin_gating_model_builder_tab", False, type=bool):
+        settings.setValue("EnableBundledPlugin_automated_gating_tab", True)
+        settings.remove("EnableBundledPlugin_gating_model_builder_tab")
+
     # Bundled/approved plugins: available in both the frozen app and source
     # runs, sourced only from bundled_plugins_path — never from the
     # user-writable Experiments/plugins folder.

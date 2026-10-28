@@ -24,11 +24,13 @@ class EventBus(QObject):
     batchAddSamples = Signal()
     newSampleRequested = Signal(str, str)
     sampleTreeUpdated = Signal()
+    beadSampleToggled = Signal(str)
     selectSample = Signal(str)
     showExportModal = Signal()
     batchExportRequested = Signal(str, bool)
     generateSampleReport = Signal()
     openImportFCSWidget = Signal(bool)
+    sampleBrowserVisibilityRequested = Signal(bool)  # a plugin hides/shows the left sample panel for its own tab
 
     ### view
     aboutHoneychrome = Signal()
@@ -71,14 +73,26 @@ class EventBus(QObject):
     axesReset = Signal(list)
     histsStatsRecalculated = Signal(str, list)
     updateRois = Signal(str, int)
+    refreshCustomRois = Signal(str)
+
+    ### per-sample custom gates (one shared template, per-sample gate overrides)
+    # UI -> controller: customise / revert / adopt a gate for the current sample (scope, gate_name)
+    customiseGateRequested = Signal(str, str)
+    revertGateRequested = Signal(str, str)
+    adoptGateRequested = Signal(str, str)
+    # controller -> UI: the current sample's customised gate names for a scope (scope, [gate_names])
+    customGatesChanged = Signal(str, list) # the list of custom gates changes for a scope
 
     ### spectral process
     showSelectedProfiles = Signal(list)
     spectralControlAdded = Signal()
     spectralModelUpdated = Signal()
+    referenceLibraryChanged = Signal()  # a profile was added to the Reference Library
     cleaningActivated = Signal(bool)   # True = cleaning UI active, False = hidden
     cleaningResultsReady = Signal()    # emitted after Clean Controls recalc finishes
     spectralProcessRefreshed = Signal()
+    unmixingMethodChanged = Signal()   # the experiment's unmixing method (AutoSpectral tab ticks) changed
+    showAutoSpectralPage = Signal(str)  # open the AutoSpectral tab at a page: autofluorescence, noise, variants, correction
     requestUpdateProcessHists = Signal()
     spilloverSelectedCellChanged = Signal(str, str)
     rawGateRenamed = Signal(str, str)   # (old_name, new_name) — propagate raw gate rename to spectral model

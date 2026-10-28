@@ -1,18 +1,28 @@
 """
 autospectral_tab.py
 --------------------
-Honeychrome integrated tab: AutoSpectral AF Extraction.
+Honeychrome integrated tab: AutoSpectral.
 
 Location: src/honeychrome/view_components/autospectral_tab.py
 
-Sections
---------
-1  Extract AF profile from an unstained sample (KMeans).
-2  Manage stored AF profiles (spectral plot, CSV load/save/delete).
-3  Assign AF profiles to samples (grid: rows=non-SSC samples, columns=profiles).
-4  Side-by-side OLS vs AF-corrected biplot comparison, using the same
-   density-heatmap rendering, logicle transforms, and axis-drag zoom as the
-   Unmixed Data tab.
+Pages (side navigation)
+-----------------------
+Autofluorescence    AutofluorescencePage (this module)
+    1  Extract AF profile from an unstained sample (SOM, KMeans fallback).
+    2  Manage stored AF profiles (spectral plot, CSV load/save/delete; right-click
+       a trace to delete that spectrum).
+    3  Assign AF profiles to samples (grid: rows=samples, columns=profiles; unstained
+       and single-stained controls optionally included), to all samples, to the
+       samples of a folder, or automatically from scatter (af_auto_assign).
+    4  Side-by-side OLS vs AF-corrected biplot comparison, using the same
+       density-heatmap rendering, logicle transforms, and axis-drag zoom as the
+       Unmixed Data tab.
+Noise               NoisePage (autospectral_noise_page.py)
+Spectral Variants   SpectralVariantsPage (autospectral_variants_page.py)
+Spectral Correction SpectralCorrectionPage (autospectral_correction_page.py)
+
+Comparison plots open on the Singlets gate, else Cells, else root
+(default_comparison_gate).
 """
 
 import re
@@ -22,11 +32,13 @@ from pathlib import Path
 import numpy as np
 import colorcet as cc
 from PySide6.QtCore import Qt, QThread, Signal, QObject, QRectF, QSettings, QTimer, QEvent
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
     QPushButton, QSpinBox, QComboBox, QGroupBox,
     QFormLayout, QSizePolicy, QFileDialog, QListWidget, QListWidgetItem,
-    QAbstractItemView, QSplitter, QCheckBox, QGridLayout,
+    QAbstractItemView, QSplitter, QCheckBox, QHeaderView,
+    QTableWidget, QTableWidgetItem, QMenu, QMessageBox,
 )
 import pyqtgraph as pg
 import warnings
@@ -34,16 +46,33 @@ import warnings
 from honeychrome.controller_components.functions import (
     sample_from_fcs,
     apply_transfer_matrix,
+    apply_gates_in_place,
     build_display_label_map,
 )
 from honeychrome.controller_components.autospectral_functions import (
     get_af_spectra,
-    precompute_af_matrices,
     apply_af_transfer,
     save_af_profile_csv,
     load_af_profile_csv,
+    af_index_lookup,
+    make_envelope_entry,
+    envelope_sample_name,
+    save_envelope_sample,
+)
+from honeychrome.controller_components.spread_model import (
+    spread_is_current,
+    spread_snapshot,
+    compute_spread_entry,
 )
 from honeychrome.controller_components.transform import Transform
+from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
+from honeychrome.controller_components.sample_loader import resolve_af_for_profiles
+from honeychrome.controller_components.particle_type import (
+    is_bead_sample, scatter_channel_pair, scatter_ceilings,
+)
+from honeychrome.controller_components.af_auto_assign import (
+    MAX_REFERENCES, POOR_FIT_SHARE, folder_groups, reference_sources, suggest_af_profiles,
+)
 from honeychrome.view_components.cytometry_plot_components import (
     InteractiveLabel,
     NoPanViewBox,
@@ -51,7 +80,8 @@ from honeychrome.view_components.cytometry_plot_components import (
     TransparentGraphicsLayoutWidget,
 )
 from honeychrome.view_components.profiles_viewer import BottomAxisVerticalTickLabels
-from honeychrome.view_components.help_toggle_widget import WheelBlocker
+from honeychrome.view_components.help_toggle_widget import HelpToggleWidget, WheelBlocker
+from honeychrome.view_components.side_tab_widget import SideTabWidget
 from honeychrome.controller_components.cytometer_whitelist import (
     get_detector_laser_map, LASER_LABEL_COLORS,
 )
@@ -63,7 +93,23 @@ from honeychrome.view_components.help_texts import autospectral_af_help_text
 
 logger = logging.getLogger(__name__)
 
-TAB_NAME = 'AutoSpectral AF'
+TAB_NAME = 'AutoSpectral'
+PAGE_SETTING = 'autospectral_page'
+
+# Comparison plots open on the first of these gates that exists (any case).
+COMPARISON_GATE_PREFERENCE = ('Singlets', 'Cells')
+# A right-click this close to a profile trace (pixels) picks that spectrum.
+PROFILE_PICK_TOLERANCE_PX = 8
+
+# Assignment table column widths (pixels): defaults fit the text up to the
+# caps; the user can drag any divider down to the minimum.
+ASSIGN_MIN_COL_WIDTH = 40
+ASSIGN_MAX_NAME_WIDTH = 320
+ASSIGN_MAX_PROFILE_WIDTH = 200
+ASSIGN_COL_PADDING = 24
+ASSIGN_MIN_HEIGHT = 240
+ASSIGN_MAX_HEIGHT = 900
+AF_PROFILE_SUFFIX = ' AutoSpectral AF'
 
 
 # ---------------------------------------------------------------------------
@@ -71,29 +117,73 @@ TAB_NAME = 'AutoSpectral AF'
 # ---------------------------------------------------------------------------
 
 class AfTrainingWorker(QObject):
-    """Runs get_af_spectra in a QThread."""
+    """
+    Runs get_af_spectra in a QThread, then builds the negative envelope and,
+    when spread_job is given, estimates the spillover spread. Emits a dict
+    with af_spectra, envelope, envelope_sample and spread.
+    """
     finished = Signal(object)
     error = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, unstained_raw, fluor_spectra, n_clusters, source_fcs_path):
+    def __init__(self, unstained_raw, fluor_spectra, som_dim, source_fcs_path,
+                 fluor_names=None, spread_job=None):
         super().__init__()
         self.unstained_raw = unstained_raw
         self.fluor_spectra = fluor_spectra
-        self.n_clusters = n_clusters
+        self.som_dim = som_dim
         self.source_fcs_path = source_fcs_path   # stored so the slot can read it
+        self.fluor_names = fluor_names
+        self.spread_job = spread_job
 
     def run(self):
         try:
-            self.progress.emit('Fitting KMeans clusters to unstained sample...')
+            self.progress.emit('Clustering unstained sample and refining AF spectra...')
             af_spectra = get_af_spectra(
                 self.unstained_raw,
                 self.fluor_spectra,
-                n_clusters=self.n_clusters,
+                som_dim=self.som_dim,
             )
-            self.finished.emit(af_spectra)
+            envelope, sample, spread = None, None, None
+            if self.fluor_names is not None:
+                self.progress.emit('Building the negative envelope')
+                envelope, sample = make_envelope_entry(
+                    self.unstained_raw, self.fluor_names, self.fluor_spectra, af_spectra)
+                if self.spread_job is not None:
+                    try:
+                        spread = self.spread_job(self.progress.emit)
+                    except Exception as e:
+                        logger.warning(f'AutoSpectral: spillover spread not estimated: {e}')
+            self.finished.emit({'af_spectra': af_spectra, 'envelope': envelope,
+                                'envelope_sample': sample, 'spread': spread})
         except Exception as e:
             self.error.emit(str(e))
+
+
+class AfAutoAssignWorker(QObject):
+    """Runs af_auto_assign.suggest_af_profiles in a QThread; emits its result."""
+    finished = Signal(object)
+    error = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, experiment_dir, references, targets, pair, ceilings, max_references):
+        super().__init__()
+        self.experiment_dir = experiment_dir
+        self.references = references
+        self.targets = targets
+        self.pair = pair
+        self.ceilings = ceilings
+        self.max_references = max_references
+
+    def run(self):
+        try:
+            result = suggest_af_profiles(self.experiment_dir, self.references, self.targets,
+                                         self.pair, self.ceilings, progress=self.progress.emit,
+                                         max_references=self.max_references)
+            self.finished.emit(result)
+        except Exception as e:
+            logger.exception('AutoSpectral: auto-assign failed')
+            self.error.emit(str(e) or type(e).__name__)
 
 
 class ComparisonWorker(QObject):
@@ -103,7 +193,7 @@ class ComparisonWorker(QObject):
 
     def __init__(self, raw_event_data, transfer_matrix,
                  af_precomputed, af_spectra, exp_settings,
-                 filtered_fl_ids_raw, spillover=None):
+                 filtered_fl_ids_raw, spillover=None, af_index_map=None):
         super().__init__()
         self.raw_event_data = raw_event_data
         self.transfer_matrix = transfer_matrix
@@ -112,6 +202,7 @@ class ComparisonWorker(QObject):
         self.exp_settings = exp_settings
         self.filtered_fl_ids_raw = filtered_fl_ids_raw
         self.spillover = spillover
+        self.af_index_map = af_index_map
 
     def run(self):
         try:
@@ -126,10 +217,59 @@ class ComparisonWorker(QObject):
                 self.exp_settings,
                 filtered_fl_ids_raw=self.filtered_fl_ids_raw,
                 spillover=self.spillover,
+                af_index_map=self.af_index_map,
             )
             self.finished.emit(ols_data, af_result['unmixed'])
         except Exception as e:
             self.error.emit(str(e))
+
+
+def pick_most_affected_channels(
+    data_a: np.ndarray,
+    data_b: np.ndarray,
+    pnn: list[str],
+    fl_names: list[str],
+    min_scale: float = 1e-6,
+) -> tuple[str, str] | None:
+    """
+    Return the two fluorescence channels with the largest *proportional*
+    change between data_a and data_b (e.g. OLS vs AF-corrected, or
+    AF-corrected vs Optimization).
+
+    Raw mean(|a - b|) is biased toward whichever channels happen to have the
+    largest dynamic range. Instead, each channel's mean absolute difference
+    is normalised by that channel's own robust spread (5th-95th percentile
+    of data_a), so a small absolute shift in an otherwise quiet channel can
+    outrank a larger absolute shift in a channel that is naturally bright/
+    noisy. min_scale floors the denominator to avoid blow-ups on flat or
+    all-zero channels.
+
+    Returns None if fewer than two fluorescence channels are available or the
+    arrays don't align with pnn.
+    """
+    if len(fl_names) < 2:
+        return None
+    try:
+        cols = [pnn.index(ch) for ch in fl_names]
+    except ValueError:
+        return None
+    a = data_a[:, cols]
+    b = data_b[:, cols]
+    diff = np.abs(a - b).mean(axis=0)
+    scale = np.percentile(a, 95, axis=0) - np.percentile(a, 5, axis=0)
+    scale = np.maximum(scale, min_scale)
+    proportional_diff = diff / scale
+    top2 = np.argsort(proportional_diff)[-2:][::-1]
+    return fl_names[top2[0]], fl_names[top2[1]]
+
+
+def default_comparison_gate(gate_names) -> str:
+    """The first of COMPARISON_GATE_PREFERENCE in gate_names (any case), else 'root'."""
+    by_lower = {str(g).lower(): g for g in gate_names}
+    for name in COMPARISON_GATE_PREFERENCE:
+        if name.lower() in by_lower:
+            return by_lower[name.lower()]
+    return 'root'
 
 
 # ---------------------------------------------------------------------------
@@ -160,17 +300,22 @@ class AfComparisonPlotWidget(QWidget):
     # Emitted when a zoom/scaling is applied on one axis, so the sibling can mirror.
     scalingChanged = Signal(str, object)  # (axis_name, Transform)
 
-    def __init__(self, title: str, controller, parent=None):
+    def __init__(self, title: str, controller, parent=None, has_af_channels: bool = True):
         super().__init__(parent)
         self.controller = controller
         self._title_text = title
+        # False for plain (OLS) unmixed data, which has no AF Abundance or AF
+        # Index values: a source gate drawn on those channels cannot be
+        # applied, and the plot says so instead of drawing.
+        self._has_af_channels = has_af_channels
+        self._af_gate_message = ''
 
         # Local copies of Transform objects (not shared with Unmixed Data tab)
         self._transformations: dict[str, Transform] = {}
         # Event data for this plot (full array, gate mask applied only for display)
         self._event_data: np.ndarray | None = None
-        # Current source gate name
-        self._source_gate: str = 'root'
+        # Current source gate name; None until _configure_title picks the default.
+        self._source_gate: str | None = None
         # Current channel names
         self._channel_x: str | None = None
         self._channel_y: str | None = None
@@ -282,6 +427,7 @@ class AfComparisonPlotWidget(QWidget):
         """
         Copy Transform objects from controller.unmixed_transformations,
         set initial channels, and configure axes.  Call after set_event_data().
+        The source gate is kept (default_comparison_gate the first time).
         """
         src = self.controller.unmixed_transformations or {}
         self._transformations = {}
@@ -290,7 +436,6 @@ class AfComparisonPlotWidget(QWidget):
 
         self._channel_x = channel_x
         self._channel_y = channel_y
-        self._source_gate = 'root'
         self._configure_axes()
 
     def set_channels(self, channel_x: str, channel_y: str):
@@ -406,7 +551,7 @@ class AfComparisonPlotWidget(QWidget):
 
         # Validate current gate still exists
         if self._source_gate not in gate_names:
-            self._source_gate = 'root'
+            self._source_gate = default_comparison_gate(gate_names)
 
         self.plot_title.setText(f'{self._title_text}  [{self._source_gate}]')
         self.plot_title.leftClickMenuItems = gate_names
@@ -431,6 +576,18 @@ class AfComparisonPlotWidget(QWidget):
 
         x_col = pnn.index(self._channel_x)
         y_col = pnn.index(self._channel_y)
+
+        blocked = None if self._has_af_channels else self._gate_using_af_channels()
+        if blocked is not None:
+            gate_name, channel = blocked
+            self._af_gate_message = (f"Gate '{gate_name}' uses {channel}, which unmixing "
+                                     f"without AF correction does not produce.")
+            self.img.clear()
+            self.set_status(self._af_gate_message)
+            return
+        if self._af_gate_message:
+            self._af_gate_message = ''
+            self.set_status('')
 
         # Start with all events; gate masking will narrow this down if needed.
         event_data = self._event_data
@@ -484,20 +641,49 @@ class AfComparisonPlotWidget(QWidget):
     # Internal: gate membership computation
     # ------------------------------------------------------------------
 
+    def _gate_using_af_channels(self) -> tuple[str, str] | None:
+        """(gate, channel) for the first gate from root to the source gate
+        that is drawn on an AF channel, or None."""
+        if self._source_gate in (None, 'root'):
+            return None
+        gating = self.controller.unmixed_gating
+        if gating is None:
+            return None
+        try:
+            paths = gating.find_matching_gate_paths(self._source_gate)
+        except Exception:
+            return None
+        if not paths:
+            return None
+        for gate_name in [g for g in paths[0] if g != 'root'] + [self._source_gate]:
+            try:
+                gate = gating.get_gate(gate_name)
+                if gate.gate_type == 'QuadrantGate':
+                    channels = [d.dimension_ref for d in gate.dimensions]
+                else:
+                    channels = list(gate.get_dimension_ids())
+            except Exception:
+                continue
+            for ch in channels:
+                if ch in settings.af_channels:
+                    return gate_name, ch
+        return None
+
     def _compute_gate_mask(self, event_data: np.ndarray) -> np.ndarray | None:
         """
         Compute a per-event boolean mask for self._source_gate applied to
-        event_data, using the controller's unmixed_lookup_tables,
-        unmixed_transformations, and unmixed_gating.
+        event_data, with the controller's unmixed_lookup_tables,
+        unmixed_transformations and unmixed_gating: the gating the main
+        window applies to the displayed sample, whose events these are.
 
-        This replicates the logic of apply_gates_in_place() from functions.py,
-        walking the full gate ancestry so that child gates correctly inherit
-        their parent's membership.
+        The gate and its ancestors are evaluated with apply_gates_in_place,
+        so child gates inherit their parent's membership and quadrants are
+        resolved through their quadrant gate.
 
         Returns None if 'root' is selected or if gating is unavailable.
         Returns a boolean ndarray of length len(event_data) otherwise.
         """
-        if self._source_gate == 'root':
+        if self._source_gate in (None, 'root'):
             return None
 
         gating = self.controller.unmixed_gating
@@ -508,88 +694,33 @@ class AfComparisonPlotWidget(QWidget):
         if gating is None or not lookup_tables or not transforms or not pnn:
             return None
 
-        # Build the full ancestry path to the target gate, root-first
         try:
             paths = gating.find_matching_gate_paths(self._source_gate)
         except Exception:
             return None
         if not paths:
             return None
+        gate_sequence = [g for g in paths[0] if g != 'root'] + [self._source_gate]
 
-        # Ancestry: all gates in the path from root to target (exclusive of
-        # 'root' itself since every event is in root), then the target gate.
-        ancestry_path = list(paths[0])   # e.g. ('root', 'Cells')
-        gate_sequence = [g for g in ancestry_path if g != 'root'] + [self._source_gate]
-        # Deduplicate while preserving order (target may already be last)
-        seen = set()
-        gate_sequence_dedup = []
-        for g in gate_sequence:
-            if g not in seen:
-                seen.add(g)
-                gate_sequence_dedup.append(g)
-
-        n_events = len(event_data)
-        # Start with all-True (every event is in 'root')
-        cumulative_mask = np.ones(n_events, dtype=bool)
-
-        for gate_name in gate_sequence_dedup:
-            if gate_name not in lookup_tables:
-                # Gate not found in lookup tables — skip
-                logger.warning(
-                    f'AfComparisonPlotWidget._compute_gate_mask: '
-                    f'"{gate_name}" not in unmixed_lookup_tables'
-                )
-                return None
-
-            try:
-                gate = gating.get_gate(gate_name)
-                channels = gate.get_dimension_ids()
-
-                if len(channels) == 1:
-                    xchan = channels[0]
-                    if xchan not in pnn:
-                        return None
-                    ix = pnn.index(xchan)
-                    x = event_data[:, ix]
-                    scale_x = transforms[xchan].scale
-                    idx = np.searchsorted(scale_x, x) - 2
-                    lt = lookup_tables[gate_name]
-                    idx = np.clip(idx, 0, len(lt) - 1)
-                    gate_mask = lt[idx]
-
-                else:  # 2-channel gate
-                    if gate.gate_type == 'QuadrantGate':
-                        xchan = gate.dimensions[0].dimension_ref
-                        ychan = gate.dimensions[1].dimension_ref
-                    else:
-                        xchan = channels[0]
-                        ychan = channels[1]
-                    if xchan not in pnn or ychan not in pnn:
-                        return None
-                    ix = pnn.index(xchan)
-                    iy = pnn.index(ychan)
-                    x = event_data[:, ix]
-                    y = event_data[:, iy]
-                    scale_x = transforms[xchan].scale
-                    scale_y = transforms[ychan].scale
-                    idx_x = np.searchsorted(scale_x, x) - 2
-                    idx_y = np.searchsorted(scale_y, y) - 2
-                    bins_x = transforms[xchan].scale_bins + 1
-                    flat_idx = idx_x * bins_x + idx_y
-                    lt = lookup_tables[gate_name]
-                    flat_idx = np.clip(flat_idx, 0, len(lt) - 1)
-                    gate_mask = lt[flat_idx]
-
-                cumulative_mask = cumulative_mask & gate_mask.astype(bool)
-
-            except Exception as e:
-                logger.error(
-                    f'AfComparisonPlotWidget._compute_gate_mask: '
-                    f'error computing mask for "{gate_name}": {e}'
-                )
-                return None
-
-        return cumulative_mask
+        data = {'event_data': event_data, 'pnn': list(pnn), 'transformations': transforms,
+                'lookup_tables': lookup_tables, 'gating': gating,
+                'gate_membership': {'root': np.ones(len(event_data), dtype=bool)}}
+        try:
+            apply_gates_in_place(data, gates_to_calculate=gate_sequence)
+        except Exception as e:
+            logger.error(
+                f'AfComparisonPlotWidget._compute_gate_mask: '
+                f'error computing mask for "{self._source_gate}": {e}'
+            )
+            return None
+        mask = data['gate_membership'].get(self._source_gate)
+        if mask is None:
+            logger.warning(
+                f'AfComparisonPlotWidget._compute_gate_mask: '
+                f'"{self._source_gate}" could not be evaluated on these events'
+            )
+            return None
+        return np.asarray(mask, dtype=bool)
 
     # ------------------------------------------------------------------
     # Internal: zoom (mirrors CytometryPlotWidget.apply_zoom)
@@ -629,7 +760,8 @@ class AfComparisonPlotWidget(QWidget):
 
         if tr.id == 1:  # logicle
             if map_pos < 0.5 * vmax:
-                tr.logicle_w = tr.logicle_w / factor
+                w_step = settings.logicle_w_drag_step if factor < 1 else -settings.logicle_w_drag_step
+                tr.logicle_w = min(tr.logicle_m / 2.0, max(0.0, tr.logicle_w + w_step))
                 tr.set_transform()
             else:
                 new_max = (vmax - axis.zoomZero) * factor + axis.zoomZero
@@ -695,16 +827,25 @@ class AfComparisonPlotWidget(QWidget):
 # Main tab widget
 # ---------------------------------------------------------------------------
 
-class AutoSpectralTab(QWidget):
-    """Permanent integrated tab for AutoSpectral AF extraction and evaluation."""
+class AutofluorescencePage(QWidget):
+    """AutoSpectral tab page: AF extraction, stored profiles, assignment and comparison."""
 
-    def __init__(self, bus=None, controller=None, parent=None):
+    def __init__(self, bus=None, controller=None, active_fn=None, parent=None):
         super().__init__(parent)
         self.bus = bus
         self.controller = controller
+        # active_fn(page) -> bool: whether the page is on screen.
+        self._active_fn = active_fn
+        # Plotted traces of the selected profile, one per spectrum row.
+        self._profile_curves: list = []
 
         self._train_thread = None
         self._train_worker = None
+        self._train_token = None
+        self._auto_thread = None
+        self._auto_worker = None
+        self._auto_running = False
+        self._auto_token = None
         self._cmp_thread = None
         self._cmp_worker = None
         self._cmp_running = False
@@ -736,57 +877,18 @@ class AutoSpectralTab(QWidget):
         content_layout.setAlignment(Qt.AlignTop)
         content_layout.setSpacing(10)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(self._content)
-        outer.addWidget(scroll)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setWidget(self._content)
+        outer.addWidget(self._scroll)
 
-        from honeychrome.settings import heading_style
-        title_label = QLabel("AutoSpectral AF")
-        title_label.setStyleSheet(heading_style)
-        content_layout.addWidget(title_label)
-
-        # Help text (rich text / HTML)
-        self.help_label = QLabel(autospectral_af_help_text)
-        self.help_label.setTextFormat(Qt.RichText)
-        self.help_label.setWordWrap(True)
-        # self.help_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        font = self.help_label.font()
-        font.setPointSize(14)  # Set your desired font size
-        self.help_label.setFont(font)
-        content_layout.addWidget(self.help_label)
-
-        # toggle button and content
-        self.toggle_content_button = QCheckBox('Show AutoSpectral AF process')
-        self.settings = QSettings("honeychrome", "app_configuration")
-        saved_state = self.settings.value("show_autospectral_af", "false") == "true"
-        self.toggle_content_button.setCheckable(True)
-        self.toggle_content_button.setChecked(saved_state)
-        content_layout.addWidget(self.toggle_content_button)
-
-        self.toggle_content = QWidget()
-        toggle_content_layout = QVBoxLayout(self.toggle_content)
-        self._build_extraction_section(toggle_content_layout)
-        self._build_profile_manager_section(toggle_content_layout)
-        self._build_assignment_section(toggle_content_layout)
-        self._build_comparison_section(toggle_content_layout)
-        content_layout.addWidget(self.toggle_content)
-        self.toggle_content.setVisible(saved_state)
-
-        self.toggle_content_button.toggled.connect(self.toggle_content.setVisible)
-        self.toggle_content_button.toggled.connect(self.save_visibility)
-
-        self.toggle_content_button.setStyleSheet("""
-                    QCheckBox {
-                        font-size: 14pt;
-                        spacing: 10px;      /* Gap between checkmark and text */
-                        padding: 10px;      /* Internal padding */
-                    }
-                """)
-
-
+        content_layout.addWidget(HelpToggleWidget(text=autospectral_af_help_text))
+        self._build_extraction_section(content_layout)
+        self._build_profile_manager_section(content_layout)
+        self._build_assignment_section(content_layout)
+        self._build_comparison_section(content_layout)
         content_layout.addStretch()
 
         if self.bus:
@@ -794,9 +896,6 @@ class AutoSpectralTab(QWidget):
             self.bus.loadSampleRequested.connect(self._on_sample_loaded)
             self.bus.spectralProcessRefreshed.connect(self._on_process_refreshed)
             self.bus.sampleTreeUpdated.connect(self._populate_sample_combo)
-
-    def save_visibility(self, checked: bool):
-        self.settings.setValue("show_autospectral_af", "true" if checked else "false")
 
     # ======================================================================
     # Section builders
@@ -813,19 +912,22 @@ class AutoSpectralTab(QWidget):
         self._sample_combo.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         layout.addRow('Unstained sample:', self._sample_combo)
 
-        self._n_clusters_spin = QSpinBox()
-        self._n_clusters_spin.setRange(4, 1000)
-        self._n_clusters_spin.setValue(200)
-        self._n_clusters_spin.setToolTip(
-            'KMeans cluster count (equivalent to som.dim² in R AutoSpectral).'
+        self._som_dim_spin = QSpinBox()
+        self._som_dim_spin.setRange(2, 30)
+        self._som_dim_spin.setValue(10)
+        self._som_dim_spin.setToolTip(
+            'Side length of the square SOM grid (som.dim in R AutoSpectral); '
+            'the grid has som.dim² nodes. KMeans with the same number of '
+            'clusters is used when the compiled SOM kernel is unavailable.'
         )
-        self._n_clusters_spin.installEventFilter(WheelBlocker(self._n_clusters_spin))
-        self._n_clusters_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        layout.addRow('AF clusters:', self._n_clusters_spin)
+        self._som_dim_spin.installEventFilter(WheelBlocker(self._som_dim_spin))
+        self._som_dim_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        layout.addRow('SOM grid size:', self._som_dim_spin)
 
         self._extract_btn = QPushButton('Extract AF Profile')
         self._extract_btn.clicked.connect(self._run_extraction)
         layout.addRow(self._extract_btn)
+        guard_while_busy(self.controller, self._extract_btn)
 
         self._extract_status = QLabel('')
         layout.addRow(self._extract_status)
@@ -836,7 +938,7 @@ class AutoSpectralTab(QWidget):
         grp = QGroupBox('Stored AF Profiles')
         layout = QVBoxLayout(grp)
 
-        self._profile_plot_axis = BottomAxisVerticalTickLabels()
+        self._profile_plot_axis = BottomAxisVerticalTickLabels(angle=45)
         self._profile_plot = pg.PlotWidget(axisItems={'bottom': self._profile_plot_axis})
         self._profile_plot.setLabel('left', 'Intensity')
         self._profile_plot.showGrid(x=True, y=True, alpha=0.3)
@@ -847,6 +949,10 @@ class AutoSpectralTab(QWidget):
         # prevent mouse scroll catching
         self._wheel_blocker = WheelBlocker(self)
         self._profile_plot.viewport().installEventFilter(self._wheel_blocker)
+        # Right-click on a trace offers to delete that spectrum.
+        self._profile_plot.getPlotItem().setMenuEnabled(False)
+        self._profile_plot.scene().sigMouseClicked.connect(self._on_profile_plot_clicked)
+        self._profile_plot.setToolTip('Right-click a spectrum to delete it from the profile.')
         layout.addWidget(self._profile_plot)
 
         self._profile_list = QListWidget()
@@ -875,6 +981,8 @@ class AutoSpectralTab(QWidget):
         self._delete_btn.clicked.connect(self._delete_selected_profile)
         self._delete_btn.setEnabled(False)
         btn_row.addWidget(self._delete_btn)
+        # profiles and their assignment decide the unmixing: not changed under a running job
+        guard_while_busy(self.controller, load_btn, self._delete_btn)
 
         layout.addLayout(btn_row)
         parent_layout.addWidget(grp)
@@ -887,58 +995,119 @@ class AutoSpectralTab(QWidget):
             'Tick the AF profile(s) for each sample. '
             'Multiple profiles are concatenated before unmixing. '
             'Unticked samples use standard OLS unmixing. '
-            'Single Stain Controls are excluded.'
+            'Unstained controls are listed first and are assigned the AF '
+            'profile extracted from their own data by default. '
+            'Auto-assign gives each unassigned sample the profiles of the unstained '
+            'controls whose forward and side scatter it most resembles.'
         )
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        # Frozen header row (profile names) — does not scroll vertically.
-        # Its own horizontal scrollbar is hidden and driven by the body's.
-        self._assign_header_scroll = QScrollArea()
-        self._assign_header_scroll.setWidgetResizable(True)
-        self._assign_header_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._assign_header_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._assign_header_scroll.setFrameShape(QScrollArea.NoFrame)
-        self._assign_header_widget = QWidget()
-        self._assign_header_layout = QGridLayout(self._assign_header_widget)
-        self._assign_header_layout.setSpacing(6)
-        self._assign_header_layout.setContentsMargins(0, 0, 0, 0)
-        self._assign_header_layout.setAlignment(Qt.AlignLeft)
-        self._assign_header_scroll.setWidget(self._assign_header_widget)
-        layout.addWidget(self._assign_header_scroll)
-
-        # Scrollable grid: rows = non-SSC samples, columns = AF profiles
-        # Min/max here are just the pre-populate defaults; _rebuild_assignment_grid()
-        # re-sizes this to fit the actual sample count each time it's called.
-        self._assign_scroll = QScrollArea()
-        self._assign_scroll.setWidgetResizable(True)
-        self._assign_scroll.setMinimumHeight(240)
-        self._assign_scroll.setMaximumHeight(900)
-        self._assign_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._assign_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._assign_grid_widget = QWidget()
-        self._assign_grid_layout = QGridLayout(self._assign_grid_widget)
-        self._assign_grid_layout.setSpacing(6)
-        self._assign_grid_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self._assign_scroll.setWidget(self._assign_grid_widget)
-        layout.addWidget(self._assign_scroll)
-
-        # Keep header columns aligned with body columns when scrolling sideways.
-        self._assign_scroll.horizontalScrollBar().valueChanged.connect(
-            self._assign_header_scroll.horizontalScrollBar().setValue
+        filter_row = QHBoxLayout()
+        self._include_unstained_cb = QCheckBox('Include unstained controls')
+        self._include_unstained_cb.setChecked(True)
+        self._include_unstained_cb.setToolTip(
+            'Show unstained controls (listed at the top of the grid).'
         )
+        filter_row.addWidget(self._include_unstained_cb)
+
+        self._include_ssc_cb = QCheckBox('Include single-stained controls')
+        self._include_ssc_cb.setChecked(False)
+        self._include_ssc_cb.setToolTip(
+            'Show single-stained controls (listed after the samples). '
+            'Also includes unstained controls.'
+        )
+        filter_row.addWidget(self._include_ssc_cb)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
+        self._include_unstained_cb.toggled.connect(self._on_assignment_filter_changed)
+        self._include_ssc_cb.toggled.connect(self._on_assignment_filter_changed)
+
+        # Rows = samples; column 0 = sample name, then one tick-box column per
+        # profile. One header, so labels stay over their columns; dividers
+        # are draggable and names elide in the middle when a column is narrow.
+        self._assign_table = QTableWidget()
+        self._assign_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._assign_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._assign_table.setFocusPolicy(Qt.NoFocus)
+        self._assign_table.setWordWrap(False)
+        self._assign_table.setTextElideMode(Qt.ElideMiddle)
+        self._assign_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._assign_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        rows = self._assign_table.verticalHeader()
+        rows.setVisible(False)
+        rows.setSectionResizeMode(QHeaderView.Fixed)
+        rows.setDefaultSectionSize(
+            max(QCheckBox().sizeHint().height(), self._assign_table.fontMetrics().height()) + 6
+        )
+        header = self._assign_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setTextElideMode(Qt.ElideMiddle)
+        header.setMinimumSectionSize(ASSIGN_MIN_COL_WIDTH)
+        header.setStretchLastSection(False)
+        header.setSectionsMovable(False)
+        header.sectionResized.connect(self._on_assign_column_resized)
+        layout.addWidget(self._assign_table)
+
+        self._assign_empty_label = QLabel('No profiles or samples available yet.')
+        self._assign_empty_label.setVisible(False)
+        layout.addWidget(self._assign_empty_label)
+
+        # Widths the user dragged, by column key ('' = sample column, else
+        # profile name), kept across rebuilds for the session.
+        self._assign_col_widths: dict = {}
+        self._assign_col_keys: list = []
+        self._assign_rebuilding = False
 
         self._assign_checkboxes: dict = {}
 
         self._assign_status = QLabel('')
         layout.addWidget(self._assign_status)
 
+        group_row = QHBoxLayout()
+        group_row.addWidget(QLabel('Folder:'))
+        self._folder_combo = QComboBox()
+        self._folder_combo.setMinimumWidth(220)
+        self._folder_combo.setToolTip(
+            'Samples shown in the grid that are in this folder or its subfolders.'
+        )
+        group_row.addWidget(self._folder_combo)
+        self._assign_folder_btn = QPushButton('Assign Selected Profile to Folder')
+        self._assign_folder_btn.setToolTip(
+            'Assign the profile currently selected in the Stored AF Profiles list '
+            'to every sample shown in the grid that is in the chosen folder. '
+            'Already-assigned profiles are not duplicated.'
+        )
+        self._assign_folder_btn.clicked.connect(self._assign_selected_profile_to_folder)
+        group_row.addWidget(self._assign_folder_btn)
+        group_row.addStretch(1)
+        self._auto_single_cb = QCheckBox('One profile per sample')
+        self._auto_single_cb.setChecked(True)
+        self._auto_single_cb.setToolTip(
+            'Auto-assign gives each sample the profile(s) of its single best-matching '
+            'unstained control. Untick to allow up to three unstained controls per '
+            'sample, each explaining at least 30% of its events.'
+        )
+        group_row.addWidget(self._auto_single_cb)
+        self._auto_assign_btn = QPushButton('Auto-assign from Scatter')
+        self._auto_assign_btn.setToolTip(
+            'For every sample shown in the grid with no AF profile (bead samples '
+            'excepted), choose the profile(s) of the unstained control(s) whose '
+            'FSC/SSC distribution best explains its own: Gaussian mixture models '
+            'of each unstained sample, combined by BIC (one control only when '
+            '"One profile per sample" is ticked). Existing assignments are '
+            'not changed. Review the result before unmixing.'
+        )
+        self._auto_assign_btn.clicked.connect(self._run_auto_assign)
+        group_row.addWidget(self._auto_assign_btn)
+        layout.addLayout(group_row)
+
         btn_row = QHBoxLayout()
 
         assign_all_btn = QPushButton('Assign Selected Profile to All Samples')
         assign_all_btn.setToolTip(
             'Assign the profile currently selected in the Stored AF Profiles list '
-            'to all non-SSC samples. Already-assigned profiles are not duplicated.'
+            'to every sample shown in the grid. Already-assigned profiles are not duplicated.'
         )
         assign_all_btn.clicked.connect(self._assign_selected_profile_to_all)
         btn_row.addWidget(assign_all_btn)
@@ -954,6 +1123,8 @@ class AutoSpectralTab(QWidget):
         clear_all_btn.setToolTip('Remove all AF assignments for all samples.')
         clear_all_btn.clicked.connect(self._clear_all_af)
         btn_row.addWidget(clear_all_btn)
+        guard_while_busy(self.controller, self._assign_table, self._folder_combo, self._assign_folder_btn,
+                         self._auto_assign_btn, assign_all_btn, clear_sample_btn, clear_all_btn)
 
         layout.addLayout(btn_row)
         parent_layout.addWidget(grp)
@@ -989,7 +1160,7 @@ class AutoSpectralTab(QWidget):
         plot_splitter = QSplitter(Qt.Horizontal)
 
         self._plot_ols = AfComparisonPlotWidget(
-            'OLS (no AF)', self.controller, parent=self
+            'OLS (no AF)', self.controller, parent=self, has_af_channels=False
         )
         self._plot_ols.sourceGateChanged.connect(self._on_ols_gate_changed)
         self._plot_ols.channelChanged.connect(self._on_ols_channel_changed)
@@ -1013,21 +1184,35 @@ class AutoSpectralTab(QWidget):
     # Bus signal handlers
     # ======================================================================
 
+    def is_active(self) -> bool:
+        """True while the page is on screen."""
+        if self._active_fn is None:
+            return self.controller.current_mode == TAB_NAME
+        return self._active_fn(self)
+
+    def on_activated(self):
+        """The page came on screen: refresh it and bring the comparison up to date."""
+        self._refresh_ui()
+        if self.controller.raw_event_data is not None:
+            QTimer.singleShot(0, self._run_comparison)
+
     def _on_mode_change(self, mode):
-        if mode == TAB_NAME:
-            self._refresh_ui()
-            if self.controller.raw_event_data is not None:
-                QTimer.singleShot(0, self._run_comparison)
+        if mode == TAB_NAME and self.is_active():
+            self.on_activated()
 
     def _on_sample_loaded(self, _sample_path):
         # Rebuild grid and controls immediately, then defer the comparison run
         # with a zero-delay timer so that load_sample() has fully completed
         # (raw_event_data, transfer_matrix etc. are all set) before we read them.
-        if self.controller.current_mode == TAB_NAME:
-            self._rebuild_assignment_grid()
-            self._refresh_comparison_controls()
+        if self.controller.current_mode != TAB_NAME:
+            return
+        if not self.is_active():
             self._clear_comparison_plots()
-            QTimer.singleShot(0, self._run_comparison)
+            return
+        self._rebuild_assignment_grid()
+        self._refresh_comparison_controls()
+        self._clear_comparison_plots()
+        QTimer.singleShot(0, self._run_comparison)
 
     def _on_process_refreshed(self):
         self._refresh_ui()
@@ -1042,12 +1227,14 @@ class AutoSpectralTab(QWidget):
         )
         self._label_disabled.setVisible(not has_unmixing)
         self._content.setVisible(has_unmixing)
+        self._scroll.setVisible(has_unmixing)
 
         if not has_unmixing:
             return
 
         self._populate_sample_combo()
         self._refresh_profile_list()
+        self._assign_unstained_own_profiles()
         self._rebuild_assignment_grid()
         self._refresh_comparison_controls()
 
@@ -1069,7 +1256,7 @@ class AutoSpectralTab(QWidget):
         # Search all samples for unstained negatives, excluding bead files.
         candidates = [
             p for p in all_samples
-            if not re.search(r'[Bb]eads', all_samples.get(p, ''), re.IGNORECASE)
+            if not is_bead_sample(samples, p)
             and (
                 p in manually_tagged
                 or re.search(r'unstained', all_samples.get(p, ''), re.IGNORECASE)
@@ -1121,16 +1308,23 @@ class AutoSpectralTab(QWidget):
                 "Please remove these controls from the Spectral Process table before proceeding."
             )
             return
-        
+
+        token = acquire_job(self.controller, 'AutoSpectral: AF extraction')
+        if token is None:
+            self._extract_status.setText(self.controller.job_gate.busy_text())
+            return
+        self._train_token = token
         try:
             full_path = str(self.controller.experiment_dir / sample_path)
             sample = sample_from_fcs(full_path, self.bus)
             raw_event_data = sample.get_events(source='raw')
         except Exception as e:
+            token.release()
             self._extract_status.setText(f'Failed to load sample: {e}')
             return
 
         if raw_event_data is None or raw_event_data.shape[0] == 0:
+            token.release()
             self._extract_status.setText('Sample has no events.')
             return
 
@@ -1141,17 +1335,28 @@ class AutoSpectralTab(QWidget):
 
         fluor_spectra = self._build_fluor_spectra()
         if fluor_spectra is None:
+            token.release()
             self._extract_status.setText(
                 'Fluorophore profiles not found — ensure the spectral model is complete.'
             )
             return
 
+        fluor_names = self.controller._build_fluor_names()
+        spread_job = None
+        if fluor_names is not None and not spread_is_current(
+                self.controller.experiment.process.get('af_spread'), fluor_names, fluor_spectra):
+            snapshot = spread_snapshot(self.controller, fluor_names, fluor_spectra, sample_path)
+
+            def spread_job(progress):
+                return compute_spread_entry(snapshot, progress)
+
         self._extract_btn.setEnabled(False)
-        self._extract_status.setText('Running KMeans clustering...')
+        self._extract_status.setText('Extracting AF spectra...')
 
         self._train_thread = QThread()
         self._train_worker = AfTrainingWorker(
-            raw_fl, fluor_spectra, self._n_clusters_spin.value(), sample_path
+            raw_fl, fluor_spectra, self._som_dim_spin.value(), sample_path,
+            fluor_names=fluor_names, spread_job=spread_job,
         )
         self._train_worker.moveToThread(self._train_thread)
         self._train_thread.started.connect(self._train_worker.run)
@@ -1163,16 +1368,19 @@ class AutoSpectralTab(QWidget):
         self._train_thread.finished.connect(self._train_thread.deleteLater)
         self._train_thread.start()
 
-    def _on_extraction_finished(self, af_spectra: np.ndarray):
+    def _on_extraction_finished(self, result: dict):
+        self._train_token.release()
         # Read source_fcs_path from the worker object (set before thread started)
         source_fcs_path = self._train_worker.source_fcs_path
         self._extract_btn.setEnabled(True)
+        af_spectra = result['af_spectra']
         n_af = af_spectra.shape[0]
 
         pnn_raw = self.controller.experiment.settings['raw']['event_channels_pnn']
         fl_ids = self.controller.filtered_raw_fluorescence_channel_ids
         channel_names = [pnn_raw[i] for i in fl_ids]
 
+        csv_save_error = None
         try:
             profile_name = save_af_profile_csv(
                 af_spectra, channel_names, source_fcs_path,
@@ -1180,6 +1388,7 @@ class AutoSpectralTab(QWidget):
             )
         except Exception as e:
             logger.error(f'AutoSpectral: failed to save CSV: {e}')
+            csv_save_error = str(e)
             profile_name = Path(source_fcs_path).stem + ' AutoSpectral AF'
 
         af_profiles = self.controller.experiment.process.get('af_profiles', {})
@@ -1188,17 +1397,42 @@ class AutoSpectralTab(QWidget):
             'source_fcs': str(source_fcs_path),
             'channel_names': channel_names,
         }
+        envelope = result['envelope']
+        if envelope is not None:
+            envelope['unstained_file'] = envelope_sample_name(profile_name)
+            try:
+                save_envelope_sample(result['envelope_sample'], self.controller.experiment_dir,
+                                     envelope['unstained_file'])
+            except OSError as e:
+                logger.warning(f'AutoSpectral: failed to save the unstained subsample: {e}')
+            af_profiles[profile_name]['envelope'] = envelope
+        if result['spread'] is not None:
+            self.controller.experiment.process['af_spread'] = result['spread']
         self.controller.experiment.process['af_profiles'] = af_profiles
         self.bus.autoSaveRequested.emit()
 
-        # Cache precomputed matrices for the new profile immediately —
-        # this is the only linalg.solve call needed; sample loading just does hstack.
-        self.controller.cache_af_profile(profile_name)
+        # Cache precomputed matrices for the new profile immediately; a new
+        # spread applies to every profile with an envelope.
+        if result['spread'] is not None:
+            self.controller.cache_all_af_profiles()
+        else:
+            self.controller.cache_af_profile(profile_name)
+        self.controller.on_af_profiles_changed()
 
-        self._extract_status.setText(
-            f'Done. Profile "{profile_name}" stored ({n_af} AF spectra).'
-        )
-        self._refresh_profile_list()
+        self._assign_profile_to_sample(str(source_fcs_path), profile_name)
+
+        if csv_save_error:
+            self._extract_status.setText(
+                f'Profile "{profile_name}" stored in-memory, but saving its CSV '
+                f'failed: {csv_save_error}'
+            )
+        else:
+            spread_note = (f' Spillover spread estimated from {result["spread"]["n_estimated"]} controls.'
+                           if result['spread'] is not None else '')
+            self._extract_status.setText(
+                f'Done. Profile "{profile_name}" stored ({n_af} AF spectra).{spread_note}'
+            )
+        self._refresh_profile_list(select_name=profile_name)
         self._rebuild_assignment_grid()
 
         if self.bus:
@@ -1207,6 +1441,7 @@ class AutoSpectralTab(QWidget):
             )
 
     def _on_extraction_error(self, msg: str):
+        self._train_token.release()
         self._extract_btn.setEnabled(True)
         self._extract_status.setText(f'Error: {msg}')
         logger.error(f'AutoSpectral extraction error: {msg}')
@@ -1215,9 +1450,18 @@ class AutoSpectralTab(QWidget):
     # Section 2 — profile list and spectral plot
     # ======================================================================
 
-    def _refresh_profile_list(self):
-        """Rebuild profile list, restore or default selection, and draw the plot."""
-        current_name = (
+    def _refresh_profile_list(self, select_name: str | None = None):
+        """Rebuild profile list, restore or default selection, and draw the plot.
+
+        select_name, when given, takes priority over whatever was previously
+        selected. Callers that just (re-)created or loaded a specific profile
+        (extraction, CSV load) pass it here so that profile is the one shown —
+        otherwise, if a *different* profile happened to be selected in the
+        list already, the "restore previous selection" behaviour below would
+        silently keep showing that unrelated profile and the just-updated
+        spectra would never appear on screen.
+        """
+        current_name = select_name or (
             self._profile_list.currentItem().text()
             if self._profile_list.currentItem() else None
         )
@@ -1301,10 +1545,104 @@ class AutoSpectralTab(QWidget):
             self._profile_plot_axis.setTicks(None)
             self._profile_plot_axis.tick_colors = {}
 
+        self._profile_curves = []
         for i, row in enumerate(af_spectra):
             pen = (pg.mkPen(color=(0, 0, 0), width=2) if i == 0
                 else pg.mkPen(color=colours[i], width=1))
-            self._profile_plot.plot(x, np.maximum(row, 0), pen=pen)
+            self._profile_curves.append(self._profile_plot.plot(x, np.maximum(row, 0), pen=pen))
+
+    def _profile_row_at(self, scene_pos) -> int | None:
+        """Spectrum row of the selected profile drawn nearest scene_pos, if
+        within PROFILE_PICK_TOLERANCE_PX (distance to the trace's segments)."""
+        item = self._profile_list.currentItem()
+        if item is None:
+            return None
+        entry = self.controller.experiment.process.get('af_profiles', {}).get(item.text())
+        if entry is None:
+            return None
+        vb = self._profile_plot.getViewBox()
+        if not vb.sceneBoundingRect().contains(scene_pos):
+            return None
+        point = vb.mapSceneToView(scene_pos)
+        px_w, px_h = vb.viewPixelSize()
+        if px_w <= 0 or px_h <= 0:
+            return None
+        spectra = np.maximum(np.asarray(entry['spectra'], dtype=float), 0)
+        n_ch = spectra.shape[1]
+        if n_ch < 2:
+            return None
+        # Trace vertices relative to the click, in pixels.
+        sx = (np.arange(n_ch) - point.x()) / px_w
+        sy = (spectra - point.y()) / px_h
+        ax, dx = sx[:-1], np.diff(sx)
+        ay, dy = sy[:, :-1], np.diff(sy, axis=1)
+        t = np.clip(-(ax * dx + ay * dy) / np.maximum(dx * dx + dy * dy, 1e-12), 0.0, 1.0)
+        distance = np.hypot(ax + t * dx, ay + t * dy).min(axis=1)
+        row = int(np.argmin(distance))
+        return row if distance[row] <= PROFILE_PICK_TOLERANCE_PX else None
+
+    def _on_profile_plot_clicked(self, event):
+        """Right-click on a trace: menu to delete that spectrum (not the mean)."""
+        if event.button() != Qt.MouseButton.RightButton:
+            return
+        item = self._profile_list.currentItem()
+        if item is None:
+            return
+        row = self._profile_row_at(event.scenePos())
+        if row is None:
+            return
+        event.accept()
+        gate = getattr(self.controller, 'job_gate', None)
+        if gate is not None and gate.is_held():
+            self._extract_status.setText(f'{gate.busy_text()}: AF spectra cannot be deleted until it has finished.')
+            return
+        name = item.text()
+        curve = self._profile_curves[row] if row < len(self._profile_curves) else None
+        old_pen = curve.opts['pen'] if curve is not None else None
+        if curve is not None:
+            curve.setPen(pg.mkPen(color=(230, 60, 60), width=3))
+        menu = QMenu(self)
+        if row == 0:
+            action = menu.addAction('The profile mean (row 0) cannot be deleted')
+            action.setEnabled(False)
+        else:
+            action = menu.addAction(f'Delete spectrum {row}…')
+        chosen = menu.exec(event.screenPos().toPoint())
+        if curve is not None:
+            curve.setPen(old_pen)
+        if row > 0 and chosen is action:
+            self._delete_profile_spectrum(name, row)
+
+    def _delete_profile_spectrum(self, name: str, row: int):
+        """Remove spectrum *row* (not the mean, row 0) from a stored profile, after confirmation."""
+        af_profiles = self.controller.experiment.process.get('af_profiles', {})
+        entry = af_profiles.get(name)
+        if entry is None or not 0 < row < len(entry['spectra']):
+            return
+        af_index = af_index_lookup(af_profiles, [name])
+        index_text = '' if af_index is None else f' (AF Index {int(af_index[row])})'
+        answer = QMessageBox.question(
+            self, 'Delete AF spectrum',
+            f'Delete spectrum {row}{index_text} from "{name}"?\n\n'
+            'The experiment\'s AF Index numbering changes, so gates drawn on AF Index '
+            'may select different spectra afterwards. Re-extract the profile to restore it.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        spectra = list(entry['spectra'])
+        del spectra[row]
+        entry['spectra'] = spectra
+        if self.bus:
+            self.bus.autoSaveRequested.emit()
+        self.controller.cache_af_profile(name)
+        self.controller.on_af_profiles_changed()
+        self._refresh_profile_list(select_name=name)
+        if self.bus:
+            self.bus.statusMessage.emit(
+                f'AutoSpectral: deleted spectrum {row} from "{name}" ({len(spectra)} remain).'
+            )
 
     def _save_selected_profile_csv(self):
         item = self._profile_list.currentItem()
@@ -1362,8 +1700,9 @@ class AutoSpectralTab(QWidget):
 
         # Cache precomputed matrices for the loaded profile.
         self.controller.cache_af_profile(profile_name)
+        self.controller.on_af_profiles_changed()
 
-        self._refresh_profile_list()
+        self._refresh_profile_list(select_name=profile_name)
         self._rebuild_assignment_grid()
         if self.bus:
             self.bus.statusMessage.emit(
@@ -1387,78 +1726,178 @@ class AutoSpectralTab(QWidget):
         self.controller.experiment.samples['sample_af_profiles'] = sample_af
         self.bus.autoSaveRequested.emit()
 
-        self.controller.initialise_af_matrices()
+        self.controller.on_af_profiles_changed()
         self._refresh_profile_list()
         self._rebuild_assignment_grid()
         if self.bus:
             self.bus.statusMessage.emit(f'AutoSpectral: deleted profile "{name}".')
 
     # ======================================================================
-    # Section 3 — assignment grid (non-SSC samples only)
+    # Section 3 — assignment grid
     # ======================================================================
+
+    def _is_unstained_sample(self, sample_path: str, display_name: str = '') -> bool:
+        """True if the sample is tagged as unstained or its name says so."""
+        samples = self.controller.experiment.samples
+        if sample_path in samples.get('unstained_samples', []):
+            return True
+        name = display_name or samples.get('all_samples', {}).get(sample_path, '')
+        return bool(
+            re.search(r'unstained', name, re.IGNORECASE)
+            or re.search(r'unstained', str(sample_path), re.IGNORECASE)
+        )
+
+    def _assignment_samples(self) -> dict:
+        """
+        Samples shown in the assignment grid, as {path: display name}.
+        Order: unstained controls, then ordinary samples, then single-stained
+        controls. Unstained controls are shown when either control checkbox is
+        ticked; single-stained controls only when their own checkbox is ticked.
+        """
+        samples = self.controller.experiment.samples
+        all_samples = samples.get('all_samples', {})
+        ssc = set(samples.get('single_stain_controls', []))
+        include_ssc = self._include_ssc_cb.isChecked()
+        include_unstained = include_ssc or self._include_unstained_cb.isChecked()
+
+        unstained_rows = {}
+        sample_rows = {}
+        ssc_rows = {}
+        for path, name in all_samples.items():
+            if self._is_unstained_sample(path, name):
+                if include_unstained:
+                    unstained_rows[path] = name
+            elif path in ssc:
+                if include_ssc:
+                    ssc_rows[path] = name
+            else:
+                sample_rows[path] = name
+        return {**unstained_rows, **sample_rows, **ssc_rows}
+
+    def _on_assignment_filter_changed(self, _checked=False):
+        """Ticking single-stained controls forces unstained controls on."""
+        include_ssc = self._include_ssc_cb.isChecked()
+        if include_ssc:
+            self._include_unstained_cb.blockSignals(True)
+            self._include_unstained_cb.setChecked(True)
+            self._include_unstained_cb.blockSignals(False)
+        self._include_unstained_cb.setEnabled(not include_ssc)
+        self._rebuild_assignment_grid()
+
+    def _profiles_from_sample(self, sample_path: str) -> list:
+        """Names of stored AF profiles that were extracted from sample_path."""
+        af_profiles = self.controller.experiment.process.get('af_profiles', {})
+        return [
+            name for name, entry in af_profiles.items()
+            if str(entry.get('source_fcs', '')) == str(sample_path)
+        ]
+
+    def _reapply_unmixing_if_current(self, sample_paths):
+        """Refresh AF matrices and unmixing when the loaded sample is in sample_paths."""
+        if self.controller.current_sample_path not in sample_paths:
+            return
+        self.controller.initialise_af_matrices()
+        if self.controller.raw_event_data is not None:
+            self.controller.unmixed_event_data = self.controller._apply_unmixing(
+                self.controller.raw_event_data
+            )
+            self.controller.clear_data_for_cytometry_plots()
+            self.controller.initialise_data_for_cytometry_plots()
+
+    def _assign_profile_to_sample(self, sample_path: str, profile_name: str):
+        """Add profile_name to the sample's assignment if not already present."""
+        sample_af = self.controller.experiment.samples.get('sample_af_profiles', {})
+        assigned = list(sample_af.get(sample_path, []))
+        if profile_name not in assigned:
+            assigned.append(profile_name)
+        sample_af[sample_path] = assigned
+        self.controller.experiment.samples['sample_af_profiles'] = sample_af
+        self.bus.autoSaveRequested.emit()
+        self._reapply_unmixing_if_current([sample_path])
+
+    def _assign_unstained_own_profiles(self):
+        """
+        Give each unstained control the AF profile(s) extracted from its own
+        data. Only samples with no assignment record are touched, so an
+        assignment the user has edited or cleared is never overwritten.
+        """
+        samples = self.controller.experiment.samples
+        sample_af = samples.get('sample_af_profiles', {})
+        changed = []
+        for path, name in samples.get('all_samples', {}).items():
+            if path in sample_af or not self._is_unstained_sample(path, name):
+                continue
+            own = self._profiles_from_sample(path)
+            if own:
+                sample_af[path] = own
+                changed.append(path)
+        if not changed:
+            return
+        samples['sample_af_profiles'] = sample_af
+        self.bus.autoSaveRequested.emit()
+        self._reapply_unmixing_if_current(changed)
 
     def _rebuild_assignment_grid(self):
         """
-        Rebuild the samples × profiles checkbox grid.
-        Only non-Single-Stain-Control samples are shown.
-        The profile-name header lives in a separate frozen widget/layout
-        (self._assign_header_layout) above the scrollable body grid, kept
-        column-aligned with it. Body row 0 = first sample (no header row
-        inside the scrolling grid anymore).
+        Rebuild the samples × profiles table.
+        Rows are chosen by _assignment_samples(): unstained controls first,
+        then samples, then single-stained controls if requested. Column 0 is
+        the sample name, then one tick-box column per profile. Column widths
+        default to the text (capped) unless the user has dragged them.
         """
         self._assign_checkboxes.clear()
-        while self._assign_header_layout.count():
-            item = self._assign_header_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-        while self._assign_grid_layout.count():
-            item = self._assign_grid_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
+        table = self._assign_table
+        self._assign_rebuilding = True
+        table.clear()
+        table.setRowCount(0)
+        table.setColumnCount(0)
 
         af_profiles = self.controller.experiment.process.get('af_profiles', {})
         profile_names = list(af_profiles.keys())
-        all_samples = self.controller.experiment.samples.get('all_samples', {})
-        ssc = set(self.controller.experiment.samples.get('single_stain_controls', []))
-        # Exclude SSC from the assignment grid
-        non_ssc = {p: n for p, n in all_samples.items() if p not in ssc}
+        shown_samples = self._assignment_samples()
         sample_af = self.controller.experiment.samples.get('sample_af_profiles', {})
+        self._refresh_folder_combo(shown_samples)
 
-        if not profile_names or not non_ssc:
-            self._assign_grid_layout.addWidget(
-                QLabel('No profiles or non-SSC samples available yet.'), 0, 0
-            )
-            self._assign_header_scroll.setFixedHeight(1)
-            self._assign_scroll.setMinimumHeight(60)
-            self._assign_scroll.setMaximumHeight(60)
+        if not profile_names or not shown_samples:
+            self._assign_rebuilding = False
+            table.setVisible(False)
+            self._assign_empty_label.setVisible(True)
             return
+        self._assign_empty_label.setVisible(False)
+        table.setVisible(True)
 
-        # Header (frozen row, own layout — not row 0 of the scrolling body)
-        corner = QLabel('Sample')
-        corner.setStyleSheet('font-weight: bold;')
-        self._assign_header_layout.addWidget(corner, 0, 0, Qt.AlignLeft)
+        table.setColumnCount(len(profile_names) + 1)
+        table.setRowCount(len(shown_samples))
+        bold = table.font()
+        bold.setBold(True)
+        header_fm = QFontMetrics(bold)
+        body_fm = QFontMetrics(table.font())
 
-        AF_SUFFIX = ' AutoSpectral AF'
+        corner = QTableWidgetItem('Sample')
+        corner.setFont(bold)
+        corner.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        table.setHorizontalHeaderItem(0, corner)
+        defaults = [header_fm.horizontalAdvance('Sample')]
         for col, pname in enumerate(profile_names, start=1):
-            display = pname
-            if display.endswith(AF_SUFFIX):
-                display = display[:-len(AF_SUFFIX)]
-            if len(display) > 28:
-                display = display[:26] + '…'
-            lbl = QLabel(display)
-            lbl.setStyleSheet('font-weight: bold;')
-            lbl.setToolTip(pname)
-            self._assign_header_layout.addWidget(lbl, 0, col, Qt.AlignCenter)
+            display = pname[:-len(AF_PROFILE_SUFFIX)] if pname.endswith(AF_PROFILE_SUFFIX) else pname
+            item = QTableWidgetItem(display)
+            item.setFont(bold)
+            item.setToolTip(pname)
+            table.setHorizontalHeaderItem(col, item)
+            defaults.append(min(header_fm.horizontalAdvance(display) + ASSIGN_COL_PADDING,
+                                ASSIGN_MAX_PROFILE_WIDTH))
 
-        # Sample rows (scrolling body — row 0 is now the first sample)
-        for row, (sample_path, display_name) in enumerate(non_ssc.items()):
-            name_lbl = QLabel(display_name)
-            name_lbl.setToolTip(sample_path)
+        for row, (sample_path, display_name) in enumerate(shown_samples.items()):
+            name_item = QTableWidgetItem(display_name)
+            name_item.setToolTip(f'{display_name}\n{sample_path}')
+            name_item.setFlags(Qt.ItemIsEnabled)
             if sample_path == self.controller.current_sample_path:
-                name_lbl.setStyleSheet('font-weight: bold;')
-            self._assign_grid_layout.addWidget(name_lbl, row, 0, Qt.AlignLeft)
+                name_item.setFont(bold)
+                width = header_fm.horizontalAdvance(display_name)
+            else:
+                width = body_fm.horizontalAdvance(display_name)
+            defaults[0] = max(defaults[0], width)
+            table.setItem(row, 0, name_item)
 
             assigned = sample_af.get(sample_path, [])
             for col, pname in enumerate(profile_names, start=1):
@@ -1468,55 +1907,34 @@ class AutoSpectralTab(QWidget):
                 cb.checkStateChanged.connect(
                     self._make_assignment_handler(sample_path, pname, cb)
                 )
-                self._assign_grid_layout.addWidget(cb, row, col, Qt.AlignCenter)
+                cell = QWidget()
+                cell_layout = QHBoxLayout(cell)
+                cell_layout.setContentsMargins(0, 0, 0, 0)
+                cell_layout.setAlignment(Qt.AlignCenter)
+                cell_layout.addWidget(cb)
+                table.setCellWidget(row, col, cell)
                 self._assign_checkboxes[(sample_path, pname)] = cb
+        defaults[0] = min(defaults[0] + ASSIGN_COL_PADDING, ASSIGN_MAX_NAME_WIDTH)
 
-        # Force header and body columns to the same pixel width so checkboxes
-        # line up under their profile-name label, regardless of which is wider.
-        n_cols = len(profile_names) + 1
-        for col in range(n_cols):
-            header_item = self._assign_header_layout.itemAtPosition(0, col)
-            body_item = self._assign_grid_layout.itemAtPosition(0, col)
-            header_w = header_item.widget().sizeHint().width() if header_item else 0
-            body_w = body_item.widget().sizeHint().width() if body_item else 0
-            width = max(header_w, body_w)
-            self._assign_header_layout.setColumnMinimumWidth(col, width)
-            self._assign_grid_layout.setColumnMinimumWidth(col, width)
+        self._assign_col_keys = [''] + profile_names
+        for col, key in enumerate(self._assign_col_keys):
+            width = self._assign_col_widths.get(key, defaults[col])
+            table.setColumnWidth(col, max(width, ASSIGN_MIN_COL_WIDTH))
+        self._assign_rebuilding = False
 
-        # Size the header strip to fit one row of (bold) labels exactly.
-        self._assign_header_layout.activate()
-        row_height = max(
-            self._assign_header_layout.itemAtPosition(0, col).widget().sizeHint().height()
-            for col in range(n_cols)
-        )
-        margins = self._assign_header_layout.contentsMargins()
-        self._assign_header_scroll.setFixedHeight(
-            row_height + margins.top() + margins.bottom() + 10
-        )
+        # Fit every row up to the cap; the tab's outer scroll area handles
+        # page-level scrolling, the table's own scrollbar takes over beyond it.
+        content_height = (table.horizontalHeader().sizeHint().height()
+                          + table.verticalHeader().length()
+                          + 2 * table.frameWidth()
+                          + table.horizontalScrollBar().sizeHint().height())
+        table.setFixedHeight(max(ASSIGN_MIN_HEIGHT, min(content_height, ASSIGN_MAX_HEIGHT)))
 
-        # Size the body strip to fit ALL sample rows (up to a generous cap),
-        # so the grid doesn't need its own inner scrollbar for typical sample
-        # counts — the tab's outer QScrollArea handles page-level scrolling
-        # instead. Beyond the cap, the inner scrollbar takes back over.
-        self._assign_grid_layout.activate()
-        n_rows = len(non_ssc)
-        row_heights = [
-            self._assign_grid_layout.itemAtPosition(r, 0).widget().sizeHint().height()
-            for r in range(n_rows)
-        ]
-        grid_margins = self._assign_grid_layout.contentsMargins()
-        content_height = (
-            sum(row_heights)
-            + self._assign_grid_layout.spacing() * max(n_rows - 1, 0)
-            + grid_margins.top() + grid_margins.bottom()
-        )
-
-        MIN_ASSIGN_HEIGHT = 240   # doubled from the old fixed 120px minimum
-        MAX_ASSIGN_HEIGHT = 900   # safety cap for very large sample counts
-        target_height = max(MIN_ASSIGN_HEIGHT, min(content_height, MAX_ASSIGN_HEIGHT))
-        self._assign_scroll.setMinimumHeight(MIN_ASSIGN_HEIGHT)
-        self._assign_scroll.setMaximumHeight(MAX_ASSIGN_HEIGHT)
-        self._assign_scroll.setFixedHeight(target_height)
+    def _on_assign_column_resized(self, index: int, _old: int, new: int):
+        """Remember a width the user dragged, so rebuilds keep it."""
+        if self._assign_rebuilding or index >= len(self._assign_col_keys):
+            return
+        self._assign_col_widths[self._assign_col_keys[index]] = new
 
     def _make_assignment_handler(self, sample_path: str, profile_name: str, cb: QCheckBox):
         def handler(_state):
@@ -1591,8 +2009,24 @@ class AutoSpectralTab(QWidget):
                 f'AutoSpectral: AF cleared for {Path(sample_path).stem}.'
             )
 
-    def _assign_selected_profile_to_all(self):
-        """Assign the profile selected in the profile list to every non-SSC sample."""
+    def _refresh_folder_combo(self, shown_samples):
+        """List the folders holding samples shown in the grid, keeping the selection."""
+        current = self._folder_combo.currentData()
+        groups = folder_groups(shown_samples)
+        self._folder_combo.blockSignals(True)
+        self._folder_combo.clear()
+        for folder, paths in groups.items():
+            self._folder_combo.addItem(f'{folder} ({len(paths)})', userData=folder)
+        if not groups:
+            self._folder_combo.addItem('No folders', userData=None)
+        index = self._folder_combo.findData(current) if current is not None else -1
+        self._folder_combo.setCurrentIndex(max(index, 0))
+        self._folder_combo.blockSignals(False)
+        self._folder_combo.setEnabled(bool(groups))
+        self._assign_folder_btn.setEnabled(bool(groups))
+
+    def _assign_selected_profile(self, target_samples: list, where: str = ''):
+        """Assign the profile selected in the profile list to target_samples."""
         item = self._profile_list.currentItem()
         if item is None:
             self._assign_status.setText(
@@ -1601,16 +2035,13 @@ class AutoSpectralTab(QWidget):
             return
 
         profile_name = item.text()
-        all_samples = self.controller.experiment.samples.get('all_samples', {})
-        ssc = set(self.controller.experiment.samples.get('single_stain_controls', []))
-        non_ssc = [p for p in all_samples if p not in ssc]
 
-        if not non_ssc:
-            self._assign_status.setText('No non-SSC samples available.')
+        if not target_samples:
+            self._assign_status.setText('No samples available.')
             return
 
         sample_af = self.controller.experiment.samples.get('sample_af_profiles', {})
-        for sample_path in non_ssc:
+        for sample_path in target_samples:
             assigned = list(sample_af.get(sample_path, []))
             if profile_name not in assigned:
                 assigned.append(profile_name)
@@ -1621,26 +2052,203 @@ class AutoSpectralTab(QWidget):
 
         # If the current sample was affected, reinitialise its AF matrices and
         # re-apply unmixing so the Unmixed Data tab updates immediately.
-        if self.controller.current_sample_path in non_ssc:
-            self.controller.initialise_af_matrices()
-            if self.controller.raw_event_data is not None:
-                self.controller.unmixed_event_data = self.controller._apply_unmixing(
-                    self.controller.raw_event_data
-                )
-                self.controller.clear_data_for_cytometry_plots()
-                self.controller.initialise_data_for_cytometry_plots()
+        self._reapply_unmixing_if_current(target_samples)
 
         self._rebuild_assignment_grid()
+        message = f'"{profile_name}" assigned to {len(target_samples)} sample(s){where}.'
+        self._assign_status.setText(message)
+        if self.bus:
+            self.bus.statusMessage.emit(f'AutoSpectral: {message}')
+
+    def _assign_selected_profile_to_all(self):
+        """Assign the profile selected in the profile list to every sample shown in the grid."""
+        self._assign_selected_profile(list(self._assignment_samples()))
+
+    def _assign_selected_profile_to_folder(self):
+        """Assign the selected profile to the shown samples in the chosen folder."""
+        folder = self._folder_combo.currentData()
+        if folder is None:
+            self._assign_status.setText('No folder selected.')
+            return
+        targets = folder_groups(self._assignment_samples()).get(folder, [])
+        self._assign_selected_profile(targets, where=f' in {folder}')
+
+    def _run_auto_assign(self):
+        """Suggest profiles for the unassigned samples shown in the grid, from scatter."""
+        if self._auto_running:
+            return
+        experiment = self.controller.experiment
+        samples = experiment.samples
+        sample_af = samples.get('sample_af_profiles', {})
+        all_samples = samples.get('all_samples', {})
+        targets = [p for p, name in self._assignment_samples().items()
+                   if not sample_af.get(p) and not is_bead_sample(samples, p, name)]
+        if not targets:
+            self._assign_status.setText(
+                'Auto-assign: every sample shown in the grid already has an AF profile '
+                '(bead samples are not auto-assigned).'
+            )
+            return
+        beads = [p for p in all_samples if is_bead_sample(samples, p)]
+        references = reference_sources(experiment.process.get('af_profiles', {}),
+                                       all_samples, exclude=beads)
+        raw_settings = experiment.settings['raw']
+        pair = scatter_channel_pair(raw_settings, experiment.cytometry.get('raw_plots'))
+        from PySide6.QtWidgets import QMessageBox
+        if not references or pair is None:
+            QMessageBox.information(
+                self, 'Auto-assign',
+                'No AF profile was extracted from an unstained cell sample of this experiment.'
+                if not references else
+                'The forward and side scatter channels could not be identified.'
+            )
+            return
+        token = acquire_job(self.controller, 'AutoSpectral: AF auto-assign')
+        if token is None:
+            self._assign_status.setText(self.controller.job_gate.busy_text())
+            return
+        self._auto_token = token
+
+        self._auto_running = True
+        self._auto_assign_btn.setEnabled(False)
+        self._assign_status.setText(f'Auto-assign: scoring {len(targets)} sample(s)…')
+        self._auto_thread = QThread()
+        self._auto_worker = AfAutoAssignWorker(
+            self.controller.experiment_dir, references, targets, pair,
+            scatter_ceilings(raw_settings, pair),
+            1 if self._auto_single_cb.isChecked() else MAX_REFERENCES,
+        )
+        self._auto_worker.moveToThread(self._auto_thread)
+        self._auto_thread.started.connect(self._auto_worker.run)
+        self._auto_worker.finished.connect(self._on_auto_assign_finished)
+        self._auto_worker.error.connect(self._on_auto_assign_error)
+        self._auto_worker.progress.connect(self._assign_status.setText)
+        self._auto_worker.finished.connect(self._auto_thread.quit)
+        self._auto_worker.error.connect(self._auto_thread.quit)
+        self._auto_thread.finished.connect(self._auto_thread.deleteLater)
+        self._auto_thread.start()
+
+    def _on_auto_assign_error(self, msg: str):
+        self._auto_token.release()
+        self._auto_running = False
+        self._auto_assign_btn.setEnabled(True)
+        self._assign_status.setText(f'Auto-assign failed: {msg}')
+
+    def _on_auto_assign_finished(self, result: dict):
+        """Apply the suggestions to samples still unassigned, then ask for a review."""
+        from PySide6.QtWidgets import QMessageBox
+
+        self._auto_token.release()
+        self._auto_running = False
+        self._auto_assign_btn.setEnabled(True)
+        samples = self.controller.experiment.samples
+        all_samples = samples.get('all_samples', {})
+        af_profiles = self.controller.experiment.process.get('af_profiles', {})
+        sample_af = samples.get('sample_af_profiles', {})
+
+        changed = []
+        for path, names in result['assignments'].items():
+            names = [n for n in names if n in af_profiles]
+            if path in all_samples and names and not sample_af.get(path):
+                sample_af[path] = names
+                changed.append(path)
+        if changed:
+            samples['sample_af_profiles'] = sample_af
+            self.bus.autoSaveRequested.emit()
+            self._reapply_unmixing_if_current(changed)
+        self._rebuild_assignment_grid()
+
+        def label(path):
+            return all_samples.get(path) or Path(path).stem
+
+        n_scored = len(result['assignments']) + len(result['skipped'])
+        # The message is a fixed-length summary, so the box fits the screen
+        # whatever the number of samples; per-sample lines go under Show Details.
+        by_size = {}
+        per_profile = {}
+        for path in changed:
+            by_size[len(sample_af[path])] = by_size.get(len(sample_af[path]), 0) + 1
+            for name in sample_af[path]:
+                per_profile[name] = per_profile.get(name, 0) + 1
+        sizes = ', '.join(f'{n} with {k} profile{"" if k == 1 else "s"}'
+                          for k, n in sorted(by_size.items()))
+        lines = [f'AF profiles were assigned to {len(changed)} of {n_scored} unassigned '
+                 'sample(s) from their forward and side scatter'
+                 + (f' ({sizes}).' if sizes else '.')]
+        if per_profile:
+            lines.append(f'{len(per_profile)} of {len(af_profiles)} AF profiles were used.')
+        poor = sorted(((d['outside'], p) for p, d in result['details'].items()
+                       if p in changed and d['outside'] >= POOR_FIT_SHARE), reverse=True)
+        if poor:
+            lines.append(f'{len(poor)} sample(s) have at least {POOR_FIT_SHARE:.0%} of events '
+                         'outside the scatter of their unstained controls: check these first '
+                         '(listed first under Show Details).')
+        if result['skipped']:
+            lines.append(f'{len(result["skipped"])} sample(s) were left unassigned '
+                         '(see Show Details).')
+        if result['unused_references']:
+            lines.append(f'{len(result["unused_references"])} unstained sample(s) were not '
+                         'used (see Show Details).')
+        lines.append('')
+        lines.append('Please review the assignments in the grid. A sample is matched to the '
+                     'unstained controls it most resembles in scatter, which does not guarantee '
+                     'that its autofluorescence matches.')
+
+        def detail(path):
+            d = result['details'][path]
+            refs = ', '.join(f'{label(r)} {w:.0%}' for r, w in zip(d['references'], d['weights']))
+            return (f'{label(path)}: {" + ".join(sample_af[path])} [{refs}; '
+                    f'ΔBIC {d["delta_bic"]:.0f}; {d["outside"]:.1%} of events outside; '
+                    f'{d["n_events"]:,} events]')
+
+        details = []
+        poor_paths = [p for _f, p in poor]
+        if poor_paths:
+            details.append(f'Check first (at least {POOR_FIT_SHARE:.0%} of events outside):')
+            details += [detail(p) for p in poor_paths]
+            details.append('')
+        others = [p for p in changed if p not in set(poor_paths)]
+        if others:
+            details.append('Assigned:')
+            details += [detail(p) for p in others]
+            details.append('')
+        if result['skipped']:
+            details.append('Not assigned:')
+            details += [f'{label(p)}: {reason}' for p, reason in result['skipped'].items()]
+            details.append('')
+        if result['unused_references']:
+            details.append('Unstained samples not used:')
+            details += [f'{label(p)}: {reason}' for p, reason in result['unused_references'].items()]
+            details.append('')
+        if per_profile:
+            details.append('Samples per AF profile:')
+            details += [f'{name}: {n}' for name, n in
+                        sorted(per_profile.items(), key=lambda kv: (-kv[1], kv[0]))]
+        while details and not details[-1]:
+            details.pop()
+
         self._assign_status.setText(
-            f'"{profile_name}" assigned to {len(non_ssc)} sample(s).'
+            f'Auto-assign: {len(changed)} sample(s) assigned — please review the grid.'
         )
         if self.bus:
-            self.bus.statusMessage.emit(
-                f'AutoSpectral: "{profile_name}" assigned to all {len(non_ssc)} non-SSC sample(s).'
-            )
+            self.bus.statusMessage.emit(f'AutoSpectral: auto-assigned {len(changed)} sample(s).')
+        box = QMessageBox(QMessageBox.Icon.Information, 'Auto-assign complete', '\n'.join(lines),
+                          QMessageBox.StandardButton.Ok, self)
+        if details:
+            box.setDetailedText('\n'.join(details))
+            # QMessageBox gives the details 100 px of height and wraps each
+            # sample over several lines; one line per sample, scrolled, reads better
+            from PySide6.QtWidgets import QTextEdit
+            details_view = box.findChild(QTextEdit)
+            if details_view is not None:
+                details_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+                details_view.setMinimumWidth(720)
+                details_view.setFixedHeight(280)
+        box.exec()
 
     def _clear_all_af(self):
-        self.controller.experiment.samples['sample_af_profiles'] = {}
+        all_samples = self.controller.experiment.samples.get('all_samples', {})
+        self.controller.experiment.samples['sample_af_profiles'] = {p: [] for p in all_samples}
         self.controller.experiment.save()
 
         self.controller.initialise_af_matrices()
@@ -1694,6 +2302,9 @@ class AutoSpectralTab(QWidget):
                 'Comparison already running — please wait.'
             )
             return
+        if wait_if_busy(self.controller, ('AutoSpectral comparison', id(self)),
+                        lambda: self.is_active() and self._run_comparison(), self._cmp_status.setText):
+            return
 
         if self.controller.raw_event_data is None:
             self._cmp_status.setText('No sample loaded.')
@@ -1707,9 +2318,14 @@ class AutoSpectralTab(QWidget):
             af_spectra = self.controller.get_combined_af_spectra_for_sample(
                 self.controller.current_sample_path
             )
+            af_index_map = self.controller.get_af_index_map_for_sample(
+                self.controller.current_sample_path
+            )
         else:
-            entry = self.controller.experiment.process.get('af_profiles', {}).get(profile_key)
+            af_profiles = self.controller.experiment.process.get('af_profiles', {})
+            entry = af_profiles.get(profile_key)
             af_spectra = np.array(entry['spectra']) if entry else None
+            af_index_map = af_index_lookup(af_profiles, [profile_key])
 
         if af_spectra is None:
             self._cmp_status.setText(
@@ -1723,22 +2339,25 @@ class AutoSpectralTab(QWidget):
             self._cmp_status.setText('Fluorophore profiles unavailable.')
             return
 
-        # Use cached precomputed matrices where possible.
-        # For the "assigned" case, controller.af_precomputed is already the
-        # correctly combined result — no recomputation needed.
-        # For a single named profile, use its cached entry if available.
-        if profile_key == '__assigned__' and self.controller.af_precomputed is not None:
-            af_precomputed = self.controller.af_precomputed
-        elif profile_key != '__assigned__' and profile_key in self.controller.af_precomputed_cache:
-            af_precomputed = self.controller.af_precomputed_cache[profile_key]
+        # The AF matrices the main window unmixes with, negative envelope
+        # included: the sample's combined assignment, or the chosen profile
+        # (computed and cached now if it is not cached yet).
+        if profile_key == '__assigned__':
+            assigned = (self.controller.experiment.samples
+                        .get('sample_af_profiles', {})
+                        .get(self.controller.current_sample_path, []))
+            af = resolve_af_for_profiles(self.controller, assigned)
+            af_precomputed = None if af is None else af.precomputed
+            if af is not None:
+                af_spectra, af_index_map = af.spectra, af.index_map
         else:
-            # Fallback: compute now (e.g. profile was just loaded from CSV and
-            # cache hasn't been populated yet, or fluor_spectra changed).
-            try:
-                af_precomputed = precompute_af_matrices(fluor_spectra, af_spectra)
-            except Exception as e:
-                self._cmp_status.setText(f'Precompute error: {e}')
-                return
+            af_precomputed = self.controller.precomputed_for_profile(profile_key)
+        if af_precomputed is None:
+            self._cmp_status.setText(
+                'AF matrices are not available yet for this profile. '
+                'Wait for the spectral process to finish, then run the comparison again.'
+            )
+            return
 
         self._plot_ols.set_status('Computing...')
         self._plot_af.set_status('Computing...')
@@ -1749,9 +2368,15 @@ class AutoSpectralTab(QWidget):
         # valid — skip the worker and just redraw.
         spillover = self.controller.experiment.process.get('spillover')
         spillover_key = tuple(np.array(spillover).ravel()) if spillover is not None else None
-        # Use a content hash of the precomputed P matrix rather than id()
-        p_matrix = af_precomputed.get('P') if af_precomputed is not None else None
-        af_key = bytes(p_matrix.data) if p_matrix is not None else None
+        # Use a content hash of the AF spectra actually being applied, not P:
+        # P = solve(fluor_spectra @ fluor_spectra.T, fluor_spectra) depends only
+        # on the fluorophore library, not on which AF profile(s) are assigned
+        # (see combine_af_precomputed's docstring — P is shared across profiles),
+        # so keying on P made this cache blind to AF-assignment changes while
+        # staying on "Assigned to sample": ticking a different profile changed
+        # af_spectra but never af_key, so a stale cached result was reused and
+        # "No change — redrawing..." was reported incorrectly.
+        af_key = bytes(np.ascontiguousarray(af_spectra).data) if af_spectra is not None else None
         state_key = (
             self.controller.current_sample_path,
             profile_key,
@@ -1784,6 +2409,7 @@ class AutoSpectralTab(QWidget):
             self.controller.experiment.settings,
             _fl_ids_remapped,
             spillover=self.controller.experiment.process.get('spillover'),
+            af_index_map=af_index_map,
         )
         self._cmp_worker.moveToThread(self._cmp_thread)
         self._cmp_thread.started.connect(self._cmp_worker.run)
@@ -1836,6 +2462,17 @@ class AutoSpectralTab(QWidget):
         # Default: first two fluorescence channels
         ch_x = fl_names[0]
         ch_y = fl_names[1]
+
+        # Better default: the two channels most affected by AF correction
+        # (largest mean |OLS - AF| difference).
+        try:
+            picked = pick_most_affected_channels(
+                self._ols_data, self._af_data, pnn, fl_names
+            )
+            if picked is not None:
+                ch_x, ch_y = picked
+        except Exception as e:
+            logger.debug(f'AutoSpectral comparison: channel auto-pick failed: {e}')
 
         # Preserve existing channel selections if both plots already have them
         if (self._plot_ols._channel_x in fl_names
@@ -1929,3 +2566,70 @@ class AutoSpectralTab(QWidget):
         except Exception as e:
             logger.error(f'AutoSpectral: _build_fluor_spectra: {e}')
             return None
+
+
+# ---------------------------------------------------------------------------
+# The AutoSpectral tab
+# ---------------------------------------------------------------------------
+
+class AutoSpectralTab(QWidget):
+    """
+    The AutoSpectral tab: Autofluorescence, Noise, Spectral Variants and
+    Spectral Correction pages beside a side navigation list. A page with
+    ``on_activated`` is told when it comes on screen; ``page_is_active``
+    tells a page whether it is on screen.
+    """
+
+    def __init__(self, bus=None, controller=None, parent=None):
+        super().__init__(parent)
+        self.bus = bus
+        self.controller = controller
+
+        from honeychrome.view_components.autospectral_correction_page import SpectralCorrectionPage
+        from honeychrome.view_components.autospectral_noise_page import NoisePage
+        from honeychrome.view_components.autospectral_variants_page import SpectralVariantsPage
+
+        self._pages = SideTabWidget()
+        self.af_page = AutofluorescencePage(bus, controller, active_fn=self.page_is_active, parent=self)
+        self.noise_page = NoisePage(bus, controller, active_fn=self.page_is_active, parent=self)
+        self.variants_page = SpectralVariantsPage(bus, controller, active_fn=self.page_is_active,
+                                                  parent=self)
+        self.correction_page = SpectralCorrectionPage(bus, controller, active_fn=self.page_is_active, parent=self)
+        for page, label, icon_name in (
+                (self.af_page, 'Autofluorescence', 'sparkles'),
+                (self.noise_page, 'Noise', 'wave-sine'),
+                (self.variants_page, 'Spectral Variants', 'shape'),
+                (self.correction_page, 'Spectral Correction', 'adjustments')):
+            self._pages.addTab(page, label, icon_name)
+
+        self._qsettings = QSettings('honeychrome', 'app_configuration')
+        saved = self._qsettings.value(PAGE_SETTING, 0, type=int)
+        if 0 <= saved < self._pages.count():
+            self._pages.setCurrentIndex(saved)
+        self._pages.currentChanged.connect(self._on_page_changed)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._pages)
+
+    def show_page(self, name: str) -> bool:
+        """Select a page by name ('autofluorescence', 'noise', 'variants',
+        'correction'); False for an unknown name."""
+        page = {'autofluorescence': self.af_page, 'noise': self.noise_page, 'variants': self.variants_page,
+                'correction': self.correction_page}.get(str(name).lower())
+        if page is None:
+            return False
+        self._pages.setCurrentWidget(page)
+        return True
+
+    def page_is_active(self, page) -> bool:
+        """True when the AutoSpectral tab is shown with *page* selected."""
+        return (self.controller is not None
+                and self.controller.current_mode == TAB_NAME
+                and self._pages.currentWidget() is page)
+
+    def _on_page_changed(self, index: int):
+        self._qsettings.setValue(PAGE_SETTING, index)
+        page = self._pages.widget(index)
+        if hasattr(page, 'on_activated') and self.page_is_active(page):
+            page.on_activated()

@@ -50,7 +50,103 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel pytz pandas matplotlib pyinstaller
+          python install_annoy.py
           pip install -r requirements.txt
+
+      # openTSNE's macOS wheels have no OpenMP; build it with OpenMP (checked)
+      - name: Build openTSNE with OpenMP (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          brew install libomp
+          python install_opentsne.py
+
+      # The kernels are bundled as data by build.py; without them the app uses its numpy paths
+      - name: Build AutoSpectral kernels (macOS)
+        if: startsWith(matrix.os, 'macos')
+        working-directory: src/honeychrome/bundled_plugins
+        env:
+          HONEYCHROME_OPENMP: "1"
+        run: |
+          brew install armadillo
+          command -v cmake >/dev/null || brew install cmake
+          python build_som_kernel.py
+          python build_autospectral_opt_kernel.py
+          python build_fix_my_unmix_kernel.py
+
+      # Adds cl.exe, MakeAppx.exe, and MSVC linker to PATH
+      - name: Set up Windows SDK Tools
+        if: matrix.os == 'windows-2022'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Prepare vcpkg cache (Windows)
+        if: matrix.os == 'windows-2022'
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $cache = Join-Path $env:RUNNER_TEMP 'vcpkg-cache'
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          "cache=$cache" >> $env:GITHUB_OUTPUT
+          "commit=$(git -C $env:VCPKG_INSTALLATION_ROOT rev-parse --short HEAD)" >> $env:GITHUB_OUTPUT
+
+      - name: Cache vcpkg packages (Windows)
+        if: matrix.os == 'windows-2022'
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.vcpkg.outputs.cache }}
+          key: vcpkg-armadillo-x64-windows-static-md-${{ steps.vcpkg.outputs.commit }}
+          restore-keys: |
+            vcpkg-armadillo-x64-windows-static-md-
+
+      # Static Armadillo, OpenBLAS and CLAPACK built against the dynamic C runtime,
+      # so the kernels carry no extra DLLs apart from the OpenMP runtime
+      - name: Build AutoSpectral kernels (Windows)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        working-directory: src/honeychrome/bundled_plugins
+        env:
+          HONEYCHROME_OPENMP: "1"
+          VCPKG_BINARY_SOURCES: clear;files,${{ steps.vcpkg.outputs.cache }},readwrite
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install armadillo:x64-windows-static-md
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $vcpkgCmake = "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -replace '\\', '/'
+          $toolchain = Join-Path $env:RUNNER_TEMP 'vcpkg_static_md.cmake'
+          Set-Content -Path $toolchain -Encoding ascii -Value @(
+            'set(VCPKG_TARGET_TRIPLET x64-windows-static-md CACHE STRING "")',
+            "include(`"$vcpkgCmake`")"
+          )
+          $env:CMAKE_TOOLCHAIN_FILE = $toolchain
+          foreach ($script in 'build_som_kernel.py', 'build_autospectral_opt_kernel.py', 'build_fix_my_unmix_kernel.py') {
+            python $script
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          # OpenMP runtime, loaded from beside the kernels in the app
+          $vcomp = Get-ChildItem -Path $env:VCToolsRedistDir -Recurse -Filter vcomp140.dll |
+            Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC\d+\.OpenMP\\' -and $_.FullName -notmatch 'onecore|debug' } |
+            Select-Object -First 1
+          if (-not $vcomp) { Write-Error 'vcomp140.dll not found under VCToolsRedistDir'; exit 1 }
+          Copy-Item $vcomp.FullName .
+          foreach ($kernel in Get-ChildItem -Filter '_*kernel*.pyd') { dumpbin /nologo /dependents $kernel.FullName }
+
+      - name: Check the kernels load
+        if: ${{ !startsWith(matrix.os, 'ubuntu') }}
+        working-directory: src/honeychrome/bundled_plugins
+        shell: python
+        run: |
+          import importlib
+          import sys
+          sys.path.insert(0, '.')
+          failed = []
+          for name in ('_som_kernel', '_autospectral_opt_kernel', '_gls_m2p_kernel', '_fmu_kernel'):
+              try:
+                  importlib.import_module(name)
+                  print(f'loaded {name}')
+              except ImportError as exc:
+                  print(f'FAILED {name}: {exc}')
+                  failed.append(name)
+          sys.exit(1 if failed else 0)
 
       # --- Platform Specific Steps ---
 
@@ -78,9 +174,13 @@ jobs:
           security unlock-keychain -p "" build.keychain
 
           brew install libomp
-          python src/honeychrome/controller_components/build_af_kernel.py
 
           make build
+          find dist/honeychrome.app -name '_*kernel*.so' -print0 | while IFS= read -r -d '' k; do
+            if otool -L "$k" | tail -n +2 | grep -E '/opt/homebrew|/usr/local'; then
+              echo "::warning title=Kernel dependency::$(basename "$k") links a Homebrew library that is not in the app"
+            fi
+          done
           brew install create-dmg
           chmod +x create_dmg_mac.sh
           rm -f *.dmg
@@ -89,21 +189,6 @@ jobs:
           echo "--- Contents of dist/honeychrome.app/Contents/ ---"
           ls -R dist/honeychrome.app/Contents/
           ./create_dmg_mac.sh
-
-      # Adds cl.exe, MakeAppx.exe, and MSVC linker to PATH
-      - name: Set up Windows SDK Tools
-        if: matrix.os == 'windows-2022'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Build AF C kernel (Windows)
-        if: matrix.os == 'windows-2022'
-        shell: cmd
-        env:
-          HONEYCHROME_OPENMP: "1"
-        run: |
-          python src/honeychrome/controller_components/build_af_kernel.py
 
       - name: Build Windows
         if: matrix.os == 'windows-2022'

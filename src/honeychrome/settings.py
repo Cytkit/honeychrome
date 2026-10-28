@@ -133,6 +133,7 @@ hist_bins = 200 # for displaying histograms
 label_offset_default = (0, -0.03) # for gate labels
 subsample = 10_000 # for exporting FCS files
 max_display_events = 500_000  # cap on events shown in cytometry display plots (None = no cap)
+unmixing_cache_gb = 8  # per experiment: on-disk noise-model / variants unmixing results (cache/unmixed)
 density_cutoff = 1 # bin count to set to first level of colourmap in 2d histograms (below this level is transparent)
 
 line_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
@@ -164,6 +165,8 @@ spectral_negative_gate_percent = 25 # take the bottom few percent of events
 
 spectral_cleaning_n_candidates = 1000 # cosine filter: top-N events by peak channel, ranked before AF-similarity filtering
 spectral_cleaning_n_spectral = 200 # cosine filter: number of least-AF-similar events kept for the cleaned profile
+spectral_cleaning_refine = True # re-measure cleaned spectra on all gated events and check the panel for residual spillover
+auto_clean_controls = True # new experiments: Auto generate continues into Clean Controls (needs Show AutoSpectral Cleaning)
 
 spectral_model_column_labels = {
     "label": "Label",
@@ -206,7 +209,12 @@ fluorescence_channel_ids = [event_channels_pnn.index(c) for c in fluorescence_ch
 n_fluorophore_channels = len(fluorescence_channel_ids)
 
 width_ceiling = 50_000 # nanoseconds
-default_ceiling = 20
+default_ceiling = 60
+default_time_gate_ignore_start_seconds = 10
+# Max bins for the 'default' (Time) transform. Time can span tens of thousands
+# of units; a per-unit grid makes a Time gate's 2D lookup table huge and slow to
+# rebuild per sample. A few thousand bins is plenty for the histogram and gating.
+default_time_max_bins = 2048
 magnitude_ceiling = 2**18 # according to convention
 magnitude_ceilings = ['2**18 = 262144', '2**22 = 4194304', '2**24 = 16777216'] # 2**16 = 65536, 2**18 = 262144, 2**22 = 4194304, 2**24 = 16777216
 magnitude_ceilings_int = [262144, 4194304, 16777216]
@@ -216,7 +224,20 @@ linear_a = 100
 logicle_w = 0.5
 logicle_m = 4.5
 logicle_a = 0
+# Change in logicle W per axis-drag step (the old 4% step at W = 0.5).
+logicle_w_drag_step = 0.02
 log_m = 6
+
+# Per-cell autofluorescence channels, appended to every unmixed channel list.
+# AF-corrected unmixing fills them; plain unmixing (no AF profile assigned)
+# leaves them at 0. AF Index numbers every AF spectrum in the experiment 1..N
+# (profiles in stored order, spectra within a profile by spectral angle to the
+# profile mean; 0 = no AF correction); its linear range is N, or
+# default_af_index_range when there are no AF profiles.
+af_abundance_channel = 'AF Abundance'
+af_index_channel = 'AF Index'
+af_channels = (af_abundance_channel, af_index_channel)
+default_af_index_range = 100
 
 raw_settings = {
     'raw_samples_subdirectory': 'Raw',
@@ -269,6 +290,8 @@ samples_default = {
     'all_sample_nevents': {},
     'sample_af_profiles': {},
     'unstained_samples': [],
+    'bead_samples': [],
+    'bead_checked_samples': [],
 }
 
 process_default = {
@@ -277,6 +300,7 @@ process_default = {
     'spectral_model': [],
     'profiles': {},
     'negative_type': 'unstained', # or internal
+    'condition_number': None,
     'similarity_matrix': None,
     'hotspot_matrix': None,
     'unmixing_matrix': None,
@@ -302,6 +326,7 @@ cytometry_plot_width_target_retrieved = q_settings.value("cytometry_plot_size", 
 tile_size_nxn_grid_retrieved = q_settings.value("nxn_tile_size", tile_size_nxn_grid, type=int)
 subsample_retrieved = q_settings.value("subsample_number", subsample, type=int)
 max_display_events = q_settings.value("max_display_events", max_display_events, type=int)
+unmixing_cache_gb_retrieved = q_settings.value("unmixing_cache_gb", unmixing_cache_gb, type=int)
 hist_bins_retrieved = q_settings.value("histogram_resolution", hist_bins, type=int)
 density_cutoff_retrieved = q_settings.value("density_cutoff", density_cutoff, type=int)
 
@@ -310,6 +335,8 @@ spectral_negative_gate_percent_retrieved = q_settings.value("spectral_negative_g
 
 spectral_cleaning_n_candidates_retrieved = q_settings.value("spectral_cleaning_n_candidates", spectral_cleaning_n_candidates, type=int)
 spectral_cleaning_n_spectral_retrieved = q_settings.value("spectral_cleaning_n_spectral", spectral_cleaning_n_spectral, type=int)
+spectral_cleaning_refine_retrieved = q_settings.value("spectral_cleaning_refine", spectral_cleaning_refine, type=bool)
+auto_clean_controls_retrieved = q_settings.value("auto_clean_controls", auto_clean_controls, type=bool)
 
 report_include_raw_retrieved = q_settings.value("report_include_raw", report_include_raw, type=bool)
 report_include_unmixed_retrieved = q_settings.value("report_include_unmixed", report_include_unmixed, type=bool)

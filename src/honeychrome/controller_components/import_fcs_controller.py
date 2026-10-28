@@ -3,14 +3,13 @@ from copy import deepcopy
 import re
 
 import numpy as np
-from PySide6.QtCore import QObject, Signal, QTimer
+from PySide6.QtCore import QObject, Signal, Slot, QTimer
 from flowkit import GatingStrategy, Dimension, gates
 from flowio import FlowData
 
 from honeychrome.controller_components.functions import timer, apply_gates_in_place, apply_transfer_matrix, calc_stats, all_same, assign_default_transforms, generate_transformations
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import to_gml
-from honeychrome.settings import settings_default, process_default, cytometry_default
-from honeychrome.view_components.busy_cursor import with_busy_cursor
+from honeychrome.settings import settings_default, process_default, cytometry_default, af_channels
 from honeychrome.controller_components.cytometer_whitelist import resolve_cytometer_params
 
 import logging
@@ -20,6 +19,30 @@ logger = logging.getLogger(__name__)
 # equivalent per-channel setting under $PnG (gain) instead. Either is
 # accepted as "the detector setting for channel n".
 _PNV_PATTERN = re.compile(r'^p(\d+)[vg]$', re.IGNORECASE)
+
+
+# Scatter, time and width channels by name, for cytometers not in the database.
+_NON_FLUOR_PATTERN = re.compile(r'FSC|SSC|Time|Width', re.IGNORECASE)
+# Channels Honeychrome writes into its unmixed FCS exports; never detectors.
+_HONEYCHROME_DERIVED_CHANNELS = frozenset({'event_id', *af_channels})
+
+
+def unrecognised_fluorescence_ids(pnn, whitelisted):
+    """Positions in pnn of the fluorescence detectors of an unrecognised cytometer.
+
+    flowio's own classification only excludes literal "FSC"/"SSC", so
+    detectors like SSC_1-4 or VSSC1-Width would count as fluorescence.
+    Channels are taken as detectors when they are whitelisted, are not
+    scatter, time or width by name, and are not event_id or AF Abundance /
+    AF Index (present when a Honeychrome unmixed export is imported).
+    """
+    whitelisted = set(whitelisted)
+    return [
+        i for i, ch in enumerate(pnn)
+        if ch in whitelisted
+        and ch not in _HONEYCHROME_DERIVED_CHANNELS
+        and not _NON_FLUOR_PATTERN.search(ch)
+    ]
 
 
 def _extract_pnv_values(text_dict, n_channels):
@@ -47,20 +70,30 @@ class ImportFCSController(QObject):
         # connect
         self.experiment = experiment
         self.bus = bus
+        # (message, is_warning) once the experiment has been reconfigured: the
+        # import dialog asks for the reload after this thread has ended, then shows it
+        self.reload_message = None
 
     def reconfigure_experiment_from_fcs_files(self):
-        """Thin wrapper — safe to call directly from the main thread only.
-
-        `import_fcs_files_widget.py` already runs the import on its own
-        QThread, so it connects to `_reconfigure_experiment_from_fcs_files_impl`
-        directly rather than this wrapper, to avoid nesting
-        @with_busy_cursor's WorkerThread/QEventLoop (and its main-thread-only
-        cursor calls) inside an already-background thread.
+        """Reconfigure on the calling thread (scripts). The app runs
+        `_reconfigure_experiment_from_fcs_files_impl` on its own QThread
+        (`import_fcs_files_widget.py`), with the busy cursor set on the GUI side.
         """
         self._reconfigure_experiment_from_fcs_files_impl()
 
-    @with_busy_cursor
+    @Slot()
     def _reconfigure_experiment_from_fcs_files_impl(self):
+        """Reconfigure the experiment from its FCS files; always ends with finished."""
+        try:
+            self._reconfigure()
+        except Exception as e:
+            logger.exception('ImportFCSController: reconfiguration failed')
+            if self.bus:
+                self.bus.warningMessage.emit(f'Cannot set up the experiment file:\n{e}')
+        finally:
+            self.finished.emit()
+
+    def _reconfigure(self):
         self.experiment.scan_sample_tree()
         experiment_dir = self.experiment.generate_subdirs()
         # single_stain_controls = self.experiment.samples['single_stain_controls']
@@ -216,15 +249,9 @@ class ImportFCSController(QObject):
                         self.experiment.settings['raw']['scatter_param'] = cyt_info.scatter_param
                     else:
                         _whitelisted_set = set(whitelisted_pnn)
-                        # flowio's own classification only excludes literal "FSC"/"SSC",
-                        # so detectors like SSC_1-4 or VSSC1-Width get misclassified as
-                        # fluorescence. Derive fluorescence channels by name pattern
-                        # instead, matching the convention used for recognised cytometers.
-                        _non_fluor_pat = re.compile(r'FSC|SSC|Time|Width', re.IGNORECASE)
-                        fluorescence_channel_ids = [
-                            i for i, ch in enumerate(representative_pnn)
-                            if ch in _whitelisted_set and not _non_fluor_pat.search(ch)
-                        ]
+                        fluorescence_channel_ids = unrecognised_fluorescence_ids(
+                            representative_pnn, _whitelisted_set,
+                        )
                         scatter_channel_ids = [
                             i for i in scatter_channel_ids
                             if representative_pnn[i] in _whitelisted_set
@@ -376,6 +403,10 @@ class ImportFCSController(QObject):
                             else:
                                 morph_y = None
 
+                    # default gates need a raw transform, which exists only for whitelisted channels
+                    if morph_x not in whitelisted_pnn or morph_y not in whitelisted_pnn:
+                        morph_x = morph_y = None
+
                     if (morph_x is not None) and (morph_y is not None):
                         sing_x = morph_x
                         sing_y = None
@@ -391,6 +422,8 @@ class ImportFCSController(QObject):
                         elif 'FSC' in height_channels and 'FSC-H' in event_channels_pnn:
                             sing_y = 'FSC-H'
                         else:
+                            sing_y = None
+                        if sing_y not in whitelisted_pnn:
                             sing_y = None
 
                     time_plot = None
@@ -505,12 +538,7 @@ class ImportFCSController(QObject):
                     if notes:
                         text = '\n\n'.join(notes) + '\n\n' + text
                     logger.info(text)
-                    if self.bus:
-                        self.bus.reloadExpRequested.emit()
-                        if notes:
-                            self.bus.warningMessage.emit(text)
-                        else:
-                            self.bus.popupMessage.emit(text)
+                    self.reload_message = (text, bool(notes))
                 else:
                     text = ('Cannot set up the experiment file: \n'
                             'the FCS files supplied do not have a consistent set of channels (channel names and ranges). \n'
@@ -534,8 +562,6 @@ class ImportFCSController(QObject):
             warnings.warn(text)
             if self.bus:
                 self.bus.warningMessage.emit(text)
-
-        self.finished.emit()
 
 
 

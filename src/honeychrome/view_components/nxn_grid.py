@@ -7,7 +7,7 @@ from PySide6.QtGui import QColor, QPalette, QImage, QPixmap, QPen
 import colorcet as cc
 
 import honeychrome.settings as settings
-from honeychrome.controller_components.functions import define_process_plots
+from honeychrome.controller_components.functions import define_process_plots, resolve_base_gate
 from honeychrome.view_components.help_texts import nxn_help_text
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 
@@ -320,12 +320,7 @@ class NxNGrid(QFrame):
 
         else: # nxn grid is in the exporter - just update the plots, histograms and generate the model and view
             # refresh list of plots with preferred source gate
-            source_gate = 'root'
-            unmixed_gate_names = [g[0].lower() for g in self.controller.unmixed_gating.get_gate_ids()]
-            for gate in self.controller.experiment.process['base_gate_priority_order']:
-                if gate.lower() in unmixed_gate_names:
-                    source_gate = gate
-                    break
+            source_gate, _ = resolve_base_gate(self.controller.unmixed_gating, self.controller.experiment.process['base_gate_priority_order'])
             logger.info(f'NxN Grid: using {source_gate} as base gate for process NxN plots')
             process_plots = define_process_plots(self.controller.experiment.settings['unmixed']['fluorescence_channels'], self.controller.experiment.settings['unmixed']['fluorescence_channels'], source_gate=source_gate)
             self.controller.data_for_cytometry_plots_process.update({'plots': process_plots})
@@ -490,6 +485,13 @@ class NxNGrid(QFrame):
             selection_model = self.view.selectionModel()
             if not selection_model.isSelected(index):
                 return super().eventFilter(obj, event)
+
+            # the spillover is not changed under a running heavy job
+            gate = getattr(self.controller, 'job_gate', None)
+            if gate is not None and gate.is_held():
+                if self.bus:
+                    self.bus.statusMessage.emit(f'{gate.busy_text()}: the spillover can be edited once it has finished.')
+                return True
 
             old = self.controller.experiment.process['spillover'][rr][c]
             step = -settings.wheel_speed if event.angleDelta().y() > 0 else settings.wheel_speed

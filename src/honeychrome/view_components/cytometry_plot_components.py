@@ -1,7 +1,8 @@
 from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QObject, QEvent, QPoint
-from PySide6.QtGui import QFont, QPen, QColor, QCursor, QWheelEvent, QMouseEvent
-from PySide6.QtWidgets import QApplication, QMenu, QScrollArea
+from PySide6.QtGui import QFont, QPen, QColor, QCursor, QWheelEvent, QMouseEvent, QPainter, QPicture
+from PySide6.QtWidgets import QApplication, QMenu, QScrollArea, QGraphicsGridLayout
 import pyqtgraph as pg
+import math
 
 import logging
 logger = logging.getLogger(__name__)
@@ -9,7 +10,100 @@ logger = logging.getLogger(__name__)
 import warnings
 warnings.filterwarnings("ignore", message="t.core.qobject.connect: QObject::connect(QStyleHints, QStyleHints): unique connections require a pointer to member function of a QObject subclass")
 
-class ZoomAxis(pg.AxisItem):
+TICK_TEXT_OFFSET = 10          # gap between the axis line and the labels
+
+
+class RotatedLabelAxisMixin:
+    """For bottom AxisItems that draw their tick labels at self.angle, trailing
+    down-left from the tick (see drawPicture). pyqtgraph sizes a bottom axis for
+    horizontal text and clips text to boundingRect, so long rotated detector
+    names got cut. This sizes the axis height from the longest label, widens
+    boundingRect over the labels' leftward reach, and widens the parent
+    layout's left margin when that reach is wider than the columns to the left
+    of the axis. Call setHeight(None) and _fit_left_margin() after setTicks."""
+
+    _label_reach = (0.0, 0.0)      # (down, left) px of the longest rotated label
+    _left_margin_default = None    # parent layout's own left margin while widened
+
+    def _measure_label_reach(self):
+        """(down, left): how far the longest rotated label reaches below the top
+        of the label row and left of its tick, in pixels. Measured the way
+        generateDrawSpecs measures text and drawPicture places it."""
+        if not (getattr(self, '_tickLevels', None) is not None and self._labels_are_rotated()):
+            return 0.0, 0.0
+        picture = QPicture()
+        painter = QPainter(picture)
+        try:
+            if self.style['tickFont']:
+                painter.setFont(self.style['tickFont'])
+            sin_a = math.sin(math.radians(self.angle))
+            cos_a = math.cos(math.radians(self.angle))
+            down = left = 0.0
+            for level in self._tickLevels:
+                for _, text in level:
+                    br = painter.boundingRect(QRectF(0, 0, 100, 100), int(Qt.AlignCenter), str(text))
+                    w = br.width() + 4                  # drawPicture's 4 px gap at the tick
+                    h = br.height() / 2
+                    down = max(down, w * sin_a + h * cos_a)
+                    left = max(left, w * cos_a + h * sin_a)
+        finally:
+            painter.end()
+        return down, left
+
+    def _updateHeight(self):
+        # pyqtgraph sizes a bottom axis for horizontal text; rotated labels need
+        # the vertical reach of the longest one instead.
+        reach = self._measure_label_reach()
+        if reach != self._label_reach:
+            self.prepareGeometryChange()       # boundingRect follows the left reach
+            self._label_reach = reach
+        if self.fixedHeight is not None or not self.isVisible() or reach == (0.0, 0.0):
+            return super()._updateHeight()
+        h = self.style['tickTextOffset'][1] + max(0, self.style['tickLength']) + reach[0]
+        if self.label.isVisible():
+            h += self.label.boundingRect().height() * 0.8
+        h = math.ceil(h)
+        self.setMaximumHeight(h)
+        self.setMinimumHeight(h)
+        self.picture = None
+
+    def boundingRect(self):
+        # Labels trail down-left past the axis' left edge. Include that strip, or
+        # pyqtgraph's clip to boundingRect (drawPicture) cuts the first labels.
+        rect = super().boundingRect()
+        left = self._label_reach[1]
+        return rect.adjusted(-math.ceil(left), 0, 0, 0) if left else rect
+
+    def _fit_left_margin(self):
+        """Widen the parent layout's left margin when the longest label would
+        reach further left than the columns left of the axis (left axis and its
+        label), i.e. past the widget's edge; hand the margin back once it fits.
+        Conservative: treats every label as if its tick sat on the axis' left edge."""
+        if self.orientation != 'bottom':
+            return
+        layout = getattr(self.parentItem(), 'layout', None)
+        if not isinstance(layout, QGraphicsGridLayout):
+            return
+        reach = self._label_reach[1]
+        if not reach and self._left_margin_default is None:
+            return                              # never widened: leave the layout alone
+        left, top, right, bottom = layout.getContentsMargins()
+        if self._left_margin_default is None:
+            self._left_margin_default = left
+        default = self._left_margin_default
+        left_columns = self.geometry().left() - left
+        target = max(default, math.ceil(reach - left_columns))
+        if target != left:
+            layout.setContentsMargins(target, top, right, bottom)
+        if target == default:
+            self._left_margin_default = None    # margin handed back
+
+    def resizeEvent(self, ev=None):
+        super().resizeEvent(ev)
+        # the left axis' width settles after its first paint
+        self._fit_left_margin()
+
+class ZoomAxis(RotatedLabelAxisMixin, pg.AxisItem):
     def __init__(self, orientation, viewbox, angle=0, **kwargs):
         self.angle = angle
         self._label_padding = 15
@@ -34,12 +128,31 @@ class ZoomAxis(pg.AxisItem):
         """Override setTicks to optionally update rotation angle."""
         if angle is not None:
             self.angle = angle
-            # Adjust spacing dynamically with rotation (cast to int)
-            extra_offset = int(10 + abs(self.angle) * 0.4)
-            self.setStyle(tickTextOffset=extra_offset)
+            self.setStyle(tickTextOffset=TICK_TEXT_OFFSET)
         super().setTicks(ticks)
+        if self.orientation == 'bottom':
+            # height follows the longest rotated label (_updateHeight), as does the left margin
+            self.setHeight(None)
+            self._fit_left_margin()
         self.updateGeometry()
         self.update()
+
+    def _labels_are_rotated(self):
+        """Only the explicitly set detector labels are drawn at an angle; the
+        automatic numeric ticks of an empty plot stay horizontal."""
+        return self.orientation == 'bottom' and self.angle and self._tickLevels
+
+    def generateDrawSpecs(self, p):
+        if not self._labels_are_rotated():
+            return super().generateDrawSpecs(p)
+        # Rotated labels extend past the axis rect, so widen it for pyqtgraph's
+        # edge-cull check or the first and last detectors lose their label.
+        orig_boundingRect = self.boundingRect
+        self.boundingRect = lambda: orig_boundingRect().adjusted(-500, 0, 500, 0)
+        try:
+            return super().generateDrawSpecs(p)
+        finally:
+            self.boundingRect = orig_boundingRect
 
     def drawPicture(self, p, axisSpec, tickSpecs, textSpecs):
         # Draw tick lines normally (skip text)
@@ -47,6 +160,7 @@ class ZoomAxis(pg.AxisItem):
 
         tick_colors = getattr(self, 'tick_colors', {})   # safe even if called before __init__ finishes
         default_pen = p.pen()
+        rotated = self._labels_are_rotated()
 
         p.save()
         try:
@@ -56,13 +170,14 @@ class ZoomAxis(pg.AxisItem):
                     color = tick_colors.get(text)
                     p.setPen(QPen(color) if color else default_pen)
 
-                    if self.orientation == 'bottom' and self.angle == 90:
-                        tick_anchor = QPointF(rect.center().x(), rect.top())
-                        p.translate(tick_anchor)
+                    if rotated:
+                        # Anchor at the tick and let the label trail away down-left,
+                        # so labels never overlap each other.
+                        p.translate(QPointF(rect.center().x(), rect.top()))
                         p.rotate(-self.angle)
-                        label_padding = -15 
-                        text_rect = QRectF(label_padding, -rect.height() / 2, rect.width(), rect.height())
-                        p.drawText(text_rect, int(Qt.AlignLeft | Qt.AlignVCenter), text)
+                        text_rect = QRectF(-rect.width() - 4, -rect.height() / 2,
+                                           rect.width(), rect.height())
+                        p.drawText(text_rect, int(Qt.AlignRight | Qt.AlignVCenter), text)
                     else:
                         p.drawText(rect, int(flags), text)
                 finally:

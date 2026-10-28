@@ -1,4 +1,5 @@
 import networkx as nx
+from copy import deepcopy
 from flowkit import GatingStrategy
 from flowkit._models.gates import QuadrantGate, BooleanGate
 # from flowkit._resources import gml_schema
@@ -214,16 +215,35 @@ def from_gml(xml):
 
     return gating_strategy
 
-# otb: have added this here. if you prefer, move to spectral_model_editor.py
+
+def gate_to_gml(gate):
+    """Serialize a single gate to a standalone GatingML 2.0 string.
+
+    Reuses :func:`to_gml` by placing the gate alone (at root) in a throwaway
+    GatingStrategy — so a per-sample custom gate is persisted with the exact
+    same serializer as the template, with no bespoke per-gate-type code.
+    """
+    mini = GatingStrategy()
+    mini.add_gate(deepcopy(gate), gate_path=('root',))
+    return to_gml(mini)
+
+
+def gate_from_gml(xml, gate_name):
+    """Reconstruct a single gate (by name) from a GatingML string produced by
+    :func:`gate_to_gml`."""
+    return from_gml(xml).get_gate(gate_name)
+
+
 def _rename_channel_in_gml(gml_string: str, old_name: str, new_name: str) -> str:
     """
     Rename a single fluorescence channel in a GatingML 2.0 XML string.
 
     Channel names appear as the 'data-type:name' attribute on
     'data-type:fcs-dimension' elements, and as the 'id' attribute on
-    'transforms:*' transform elements (which are also keyed by channel name).
-    Both are renamed by exact attribute-value match, so "PE" never touches
-    "PE-Cy7", "PE-CF594", etc.
+    'transforms:*' transform elements (which are also keyed by channel name),
+    and as the 'gating:transformation-ref' attribute on gate dimensions and
+    quadrant dividers that point at those transforms. All are renamed by exact
+    attribute-value match, so "PE" never touches "PE-Cy7", "PE-CF594", etc.
 
     Returns the serialised XML string unchanged if old_name is not found.
     """
@@ -233,6 +253,8 @@ def _rename_channel_in_gml(gml_string: str, old_name: str, new_name: str) -> str
     NS_XFORM = 'http://www.isac-net.org/std/Gating-ML/v2.0/transformations'
     DT_NAME = f'{{{NS_DT}}}name'
     XFORM_ID = f'{{{NS_XFORM}}}id'  # transforms:id is namespace-qualified
+    NS_GATING = 'http://www.isac-net.org/std/Gating-ML/v2.0/gating'
+    GATING_XFORM_REF = f'{{{NS_GATING}}}transformation-ref'
 
     root = etree.fromstring(gml_string.encode())
     changed = False
@@ -247,6 +269,12 @@ def _rename_channel_in_gml(gml_string: str, old_name: str, new_name: str) -> str
     for elem in root.iter():
         if elem.get(XFORM_ID) == old_name and elem.tag.startswith(f'{{{NS_XFORM}}}'):
             elem.set(XFORM_ID, new_name)
+            changed = True
+
+    # 3. gate dimension / quadrant divider references to those transforms
+    for elem in root.iter():
+        if elem.get(GATING_XFORM_REF) == old_name:
+            elem.set(GATING_XFORM_REF, new_name)
             changed = True
 
     if not changed:

@@ -12,8 +12,11 @@ from honeychrome.settings import (colourmap_choice, graphics_export_formats, his
                                   tile_size_nxn_grid, subsample, max_display_events, hist_bins, density_cutoff, peak_detection_channel, adc_channels, height_channels,
                                   use_dummy_instrument, sample_pump_steps_per_microlitre, magnitude_ceilings, magnitude_ceiling, raw_settings, unmixed_settings, experiments_folder,
                                   magnitude_ceilings_int, spectral_positive_gate_percent, spectral_negative_gate_percent, report_include_raw, report_include_unmixed, report_include_process, send_debug_data,
-                                  heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral)
+                                  heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral,
+                                  width_channels, spectral_cleaning_refine, auto_clean_controls, unmixing_cache_gb)
+
 import honeychrome.settings as settings
+from honeychrome.controller_components.job_gate import guard_while_busy
 
 
 import numpy as np
@@ -36,6 +39,23 @@ if meipass:
 else:
     BUNDLED_PLUGIN_DIR = Path(__file__).resolve().parent.parent / "bundled_plugins"
 bundled_plugins_path = Path(BUNDLED_PLUGIN_DIR)
+
+_PLUGIN_NAME_PATTERN = re.compile(r"^plugin_name\s*=\s*(['\"])([^'\"\\\n]+)\1", re.MULTILINE)
+
+
+def plugin_display_name(file_path):
+    """Name a tabbed plugin gives itself (its module-level ``plugin_name``),
+    read from the source without importing it; the file name if it has none."""
+    try:
+        match = _PLUGIN_NAME_PATTERN.search(Path(file_path).read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError):
+        match = None
+    return match.group(2).strip() if match else Path(file_path).stem
+
+
+def sorted_plugin_files(folder):
+    """Tabbed plugin files in a folder, ordered by display name."""
+    return sorted(Path(folder).glob("*_tab.py"), key=lambda path: plugin_display_name(path).lower())
 
 def path_to_folder_name_readable(original_path):
     # 1. Convert to string and resolve
@@ -68,9 +88,19 @@ def create_folder_link(experiment_path, link_name, target_path):
     if not target.is_dir():
         raise ValueError(f"Target is not a directory: {target}")
 
-    if link.exists():
+    if os.path.lexists(link):
         print(f"Link path already exists: {link}.")
-        link.replace(link.with_suffix('.old'))
+        if link.is_symlink():
+            link.unlink()  # removes the link only, not its target
+        elif sys.platform == "win32" and link.is_junction():
+            os.rmdir(link)  # removes the junction only, not its target
+        else:
+            backup = link.with_name(link.name + '.old')
+            n = 1
+            while os.path.lexists(backup):
+                backup = link.with_name(f'{link.name}.old{n}')
+                n += 1
+            link.replace(backup)
 
     # 2. Try Standard Symlink (Works on Linux, macOS, and Windows with Dev Mode/Admin)
     try:
@@ -128,12 +158,13 @@ def colormap_to_qimage(cmap_name, width=256, height=20):
 
 
 class AppConfigDialog(QDialog):
-    def __init__(self, parent=None, bus=None):
+    def __init__(self, parent=None, bus=None, controller=None):
         super().__init__(parent)
         self.setWindowTitle("Application Configuration")
         self.resize(1000, 700)
         self.settings = QSettings("honeychrome", "app_configuration")
         self.bus = bus
+        self.controller = controller
 
         main_layout = QVBoxLayout(self)
 
@@ -191,6 +222,13 @@ class AppConfigDialog(QDialog):
         self.max_display_events_spin.setToolTip('Maximum events shown in cytometry display plots. Does not affect spectral process or unmixing.')
         form.addRow("Max display events:", self.max_display_events_spin)
 
+        self.unmixing_cache_gb_spin = QSpinBox()
+        self.unmixing_cache_gb_spin.setRange(1, 500)
+        self.unmixing_cache_gb_spin.setSuffix(" GB")
+        self.unmixing_cache_gb_spin.setToolTip('Disk space per experiment (cache/unmixed) for samples unmixed with the noise model or '
+                                               'spectral variants, so they are not unmixed again. Least recently used files are removed first.')
+        form.addRow("Unmixing cache size:", self.unmixing_cache_gb_spin)
+
         self.histogram_resolution_spin = QSpinBox()
         self.histogram_resolution_spin.setRange(50, 400)
         self.histogram_resolution_spin.setSingleStep(50)
@@ -224,6 +262,19 @@ class AppConfigDialog(QDialog):
         form.addRow("Control cleaning: events retained (least AF-similar):", self.spectral_cleaning_n_spectral_spin)
         self.spectral_cleaning_n_spectral_spin.setToolTip('Number of candidate events retained for the cleaned spectral profile, ranked by lowest cosine similarity to the unstained AF reference.')
 
+        self.spectral_cleaning_refine_cb = QCheckBox()
+        form.addRow("Control cleaning: refine spectra on all gated events:", self.spectral_cleaning_refine_cb)
+        self.spectral_cleaning_refine_cb.setToolTip(
+            'After cleaning, re-measure each spectrum on the whole gated population of its control and '
+            'check the full panel for residual spillover (robust fit).')
+
+        self.auto_clean_controls_cb = QCheckBox()
+        form.addRow("Control cleaning: clean automatically after Auto generate (new experiments):", self.auto_clean_controls_cb)
+        self.auto_clean_controls_cb.setToolTip(
+            'Default for the "Automatically Clean" box in new experiments. When ticked, "Auto generate spectral '
+            'controls" continues straight into Clean Controls, provided "Show AutoSpectral Cleaning" is ticked. '
+            'Each experiment can override this in the Spectral Process tab.')
+
         self.report_include_raw_cb = QCheckBox("Raw Data")
         self.report_include_unmixed_cb = QCheckBox("Unmixed Data")
         self.report_include_process_cb = QCheckBox("Spectral Process")
@@ -233,15 +284,17 @@ class AppConfigDialog(QDialog):
 
         # Bundled/approved plugins — always shown, dev and frozen
         self.enable_bundled_plugin = {}
-        for file_path in bundled_plugins_path.glob("*_tab.py"):
-            self.enable_bundled_plugin[file_path] = QCheckBox(f"Enable {file_path.stem}")
+        for file_path in sorted_plugin_files(bundled_plugins_path):
+            self.enable_bundled_plugin[file_path] = QCheckBox(f"Enable {plugin_display_name(file_path)}")
+            self.enable_bundled_plugin[file_path].setToolTip(file_path.name)
             form.addRow("Bundled plugin", self.enable_bundled_plugin[file_path])
 
         # Arbitrary user-added plugins — full Python (dev) environment only
         if not meipass:
             self.enable_plugin = {}
-            for file_path in plugins_path.glob("*_tab.py"):
-                self.enable_plugin[file_path] = QCheckBox(f"Enable {file_path.stem}")
+            for file_path in sorted_plugin_files(plugins_path):
+                self.enable_plugin[file_path] = QCheckBox(f"Enable {plugin_display_name(file_path)}")
+                self.enable_plugin[file_path].setToolTip(file_path.name)
                 form.addRow(f"Tabbed plugin", self.enable_plugin[file_path])
         else:
             form.addRow(QLabel("Note: custom user plugins require running Honeychrome in a full Python environment. Bundled plugins above are still available."))
@@ -277,6 +330,8 @@ class AppConfigDialog(QDialog):
         buttons.accepted.connect(self.handle_accept)
         buttons.rejected.connect(self.reject)
         buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(self.reset_to_defaults)
+        # OK reloads the experiment, which waits for a running heavy job
+        guard_while_busy(controller, buttons.button(QDialogButtonBox.Ok))
         main_layout.addWidget(buttons, alignment=Qt.AlignRight)
 
         # Load settings on start
@@ -322,12 +377,15 @@ class AppConfigDialog(QDialog):
         self.nxn_tile_size_spin.setValue(self.settings.value("nxn_tile_size", tile_size_nxn_grid, type=int))
         self.subsample_number_spin.setValue(self.settings.value("subsample_number", subsample, type=int))
         self.max_display_events_spin.setValue(self.settings.value("max_display_events", max_display_events, type=int))
+        self.unmixing_cache_gb_spin.setValue(self.settings.value("unmixing_cache_gb", unmixing_cache_gb, type=int))
         self.histogram_resolution_spin.setValue(self.settings.value("histogram_resolution", hist_bins, type=int))
         self.density_cutoff_spin.setValue(self.settings.value("density_cutoff", density_cutoff, type=int))
         self.spectral_positive_gate_percent_spin.setValue(self.settings.value("spectral_positive_gate_percent", spectral_positive_gate_percent, type=int))
         self.spectral_negative_gate_percent_spin.setValue(self.settings.value("spectral_negative_gate_percent", spectral_negative_gate_percent, type=int))
         self.spectral_cleaning_n_candidates_spin.setValue(self.settings.value("spectral_cleaning_n_candidates", spectral_cleaning_n_candidates, type=int))
         self.spectral_cleaning_n_spectral_spin.setValue(self.settings.value("spectral_cleaning_n_spectral", spectral_cleaning_n_spectral, type=int))
+        self.spectral_cleaning_refine_cb.setChecked(self.settings.value("spectral_cleaning_refine", spectral_cleaning_refine, type=bool))
+        self.auto_clean_controls_cb.setChecked(self.settings.value("auto_clean_controls", auto_clean_controls, type=bool))
 
         self.report_include_raw_cb.setChecked(self.settings.value("report_include_raw", report_include_raw, type=bool))
         self.report_include_unmixed_cb.setChecked(self.settings.value("report_include_unmixed", report_include_unmixed, type=bool))
@@ -351,12 +409,15 @@ class AppConfigDialog(QDialog):
         self.settings.setValue("nxn_tile_size", self.nxn_tile_size_spin.value())
         self.settings.setValue("subsample_number", self.subsample_number_spin.value())
         self.settings.setValue("max_display_events", self.max_display_events_spin.value())
+        self.settings.setValue("unmixing_cache_gb", self.unmixing_cache_gb_spin.value())
         self.settings.setValue("histogram_resolution", self.histogram_resolution_spin.value())
         self.settings.setValue("density_cutoff", self.density_cutoff_spin.value())
         self.settings.setValue("spectral_positive_gate_percent", self.spectral_positive_gate_percent_spin.value())
         self.settings.setValue("spectral_negative_gate_percent", self.spectral_negative_gate_percent_spin.value())
         self.settings.setValue("spectral_cleaning_n_candidates", self.spectral_cleaning_n_candidates_spin.value())
         self.settings.setValue("spectral_cleaning_n_spectral", self.spectral_cleaning_n_spectral_spin.value())
+        self.settings.setValue("spectral_cleaning_refine", self.spectral_cleaning_refine_cb.isChecked())
+        self.settings.setValue("auto_clean_controls", self.auto_clean_controls_cb.isChecked())
         self.settings.setValue("report_include_raw", self.report_include_raw_cb.isChecked())
         self.settings.setValue("report_include_unmixed", self.report_include_unmixed_cb.isChecked())
         self.settings.setValue("report_include_process", self.report_include_process_cb.isChecked())
@@ -370,6 +431,9 @@ class AppConfigDialog(QDialog):
                 self.settings.setValue(f"EnablePlugin_{file_path}", self.enable_plugin[file_path].isChecked())
 
     def handle_accept(self):
+        gate = getattr(self.controller, 'job_gate', None)
+        if gate is not None and gate.is_held():
+            return
         self.save_settings()
         self.accept()
         importlib.reload(settings)
@@ -392,12 +456,15 @@ class AppConfigDialog(QDialog):
         self.nxn_tile_size_spin.setValue(tile_size_nxn_grid)
         self.subsample_number_spin.setValue(subsample)
         self.max_display_events_spin.setValue(max_display_events)
+        self.unmixing_cache_gb_spin.setValue(unmixing_cache_gb)
         self.histogram_resolution_spin.setValue(hist_bins)
         self.density_cutoff_spin.setValue(density_cutoff)
         self.spectral_positive_gate_percent_spin.setValue(spectral_positive_gate_percent)
         self.spectral_negative_gate_percent_spin.setValue(spectral_negative_gate_percent)
         self.spectral_cleaning_n_candidates_spin.setValue(spectral_cleaning_n_candidates)
         self.spectral_cleaning_n_spectral_spin.setValue(spectral_cleaning_n_spectral)
+        self.spectral_cleaning_refine_cb.setChecked(spectral_cleaning_refine)
+        self.auto_clean_controls_cb.setChecked(auto_clean_controls)
         self.report_include_raw_cb.setChecked(report_include_raw)
         self.report_include_unmixed_cb.setChecked(report_include_unmixed)
         self.report_include_process_cb.setChecked(report_include_process)

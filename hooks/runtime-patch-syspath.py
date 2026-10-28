@@ -7,3 +7,4 @@ import sys, os
 meipass = getattr(sys, '_MEIPASS', None)
 if meipass and meipass not in sys.path:
     sys.path.insert(0, meipass)
+    print(f"[runtime-hook] inserted {meipass} into sys.path")

@@ -18,8 +18,8 @@ Module layout:
   13. PluginWidget + plugin_name (top-level tab, lifecycle + signal wiring)
   14. Standalone demo harness (`python plot_3d_tab.py`)
 
-IMPORTANT - a core-code landmine found while wiring up step 8, and how this
-file works around it without touching core code:
+IMPORTANT - a core-code landmine, and how this file works around it without
+touching core code:
 
   controller.set_mode()'s catch-all branch for plugin tabs sets
   `self.current_mode = tab_name` and `self.data_for_cytometry_plots = None`.
@@ -103,6 +103,8 @@ GRID_DEFAULT_SIZE = 20.0       # pyqtgraph GLGridItem native size
 GRID_RESIZE_METHOD = 'scale'
 DEFAULT_DISPLAY_RANGE = 10.0
 TILE_WIDTH_TARGET = 420        # plugin-local equivalent of settings.cytometry_plot_width_target_retrieved
+AXIS_NAME_OFFSET = 1.45        # axis-name distance from cube centre, in half-extents
+TICK_FRONT_ALPHA = 0.12        # tick alpha fraction when in front of the data
 
 # --------------------------------------------------------------------------
 # Theme helpers - mirrors view.py's pg.setConfigOptions convention.
@@ -114,6 +116,10 @@ def gl_background_color(is_dark):
 
 def gl_foreground_rgba(is_dark):
     return (235, 235, 235, 255) if is_dark else (20, 20, 20, 255)
+
+
+def gl_tick_rgba(is_dark):
+    return (150, 150, 150, 255) if is_dark else (110, 110, 110, 255)
 
 
 # --------------------------------------------------------------------------
@@ -186,12 +192,60 @@ def ticks_for_axis(tr, display_range=DEFAULT_DISPLAY_RANGE, n_fallback_ticks=6):
     return [(normalise_value(value, lo, hi, display_range), label) for value, label in pairs]
 
 
+class DepthFadedTextItem(gl.GLTextItem):
+    """
+    GLTextItem whose alpha falls as its anchor moves to the viewer's side of
+    the cube centre. GLTextItem paints with QPainter after the GL pass, so
+    it has no depth test and always draws over the data; fading by position
+    along the view direction keeps tick text from competing with points
+    that sit between the camera and the axis.
+    """
+
+    def __init__(self, display_range=DEFAULT_DISPLAY_RANGE, front_alpha=TICK_FRONT_ALPHA, **kwds):
+        self._depth_scale = display_range / 2.0 * np.sqrt(3.0)  # corner distance from centre
+        self._front_alpha = front_alpha
+        super().__init__(**kwds)
+
+    def _alpha_scale(self):
+        cam = self.view().cameraPosition()
+        to_cam = np.array([cam.x(), cam.y(), cam.z()])
+        dist = np.linalg.norm(to_cam)
+        if dist == 0.0:
+            return 1.0
+        depth = float(np.dot(np.asarray(self.pos, dtype=float), to_cam / dist)) / self._depth_scale
+        t = float(np.clip((depth + 0.1) / 0.5, 0.0, 1.0))
+        smooth = t * t * (3.0 - 2.0 * t)
+        return 1.0 - (1.0 - self._front_alpha) * smooth
+
+    def paint(self):
+        if len(self.text) < 1:
+            return
+        self.setupGLState()
+
+        color = QtGui.QColor(self.color)
+        color.setAlphaF(color.alphaF() * self._alpha_scale())
+        if color.alpha() < 3:
+            return
+
+        project = self.compute_projection()
+        vec3 = QtGui.QVector3D(*self.pos)
+        text_pos = self.align_text(project.map(vec3).toPointF())
+
+        painter = QtGui.QPainter(self.view())
+        painter.setPen(color)
+        painter.setFont(self.font)
+        painter.setRenderHints(QtGui.QPainter.RenderHint.Antialiasing | QtGui.QPainter.RenderHint.TextAntialiasing)
+        painter.drawText(text_pos, self.text)
+        painter.end()
+
+
 def build_tick_items(ticks_per_axis, display_range, fg_color):
     """
     ticks_per_axis: list of 3 lists of (normalised_position, label) pairs,
-    one per axis (x, y, z) - e.g. from ticks_for_axis(). One GLTextItem per
+    one per axis (x, y, z) - e.g. from ticks_for_axis(). One text item per
     tick, positioned at the tick's coordinate on its own axis and pinned to
-    the cube floor on the other two. No glOptions override -
+    the cube floor on the other two. Each fades when it lies between the
+    camera and the data (see DepthFadedTextItem). No glOptions override -
     GLTextItem's own 'additive' default is the only blend mode it actually
     renders with in this environment.
     """
@@ -201,8 +255,8 @@ def build_tick_items(ticks_per_axis, display_range, fg_color):
         for norm_pos, label in ticks:
             pos = [-half, -half, -half]
             pos[axis_i] = norm_pos
-            items.append(gl.GLTextItem(
-                pos=tuple(pos), text=label, color=fg_color,
+            items.append(DepthFadedTextItem(
+                display_range=display_range, pos=tuple(pos), text=label, color=fg_color,
             ))
     return items
 
@@ -210,20 +264,22 @@ def build_axis_name_items(channel_labels, display_range, fg_color):
     """
     One GLTextItem per axis (x, y, z), showing that axis's antigen:marker
     label - separate from build_tick_items()'s per-gridline tick values.
-    Positioned just past the cube's outer edge (rather than at a tick
-    position) so it doesn't overlap tick text or data points. Floats in
-    the GL scene like the tick text, so it stays attached to its axis as
-    the plot is rotated - unlike the legend_label fallback, which is a flat
-    2D widget under the canvas and does not rotate with the scene.
+    Centred on the axis midpoint and pushed outward from the cube edge on
+    the other two axes, so it clears the tick text at every viewing angle
+    and does not overlap data points. Floats in the GL scene like the tick
+    text, so it stays attached to its axis as the plot is rotated - unlike
+    the legend_label fallback, which is a flat 2D widget under the canvas
+    and does not rotate with the scene.
     """
     items = []
     half = display_range / 2.0
-    edge = half * 1.15  # just past the cube edge, clear of tick text
+    outer = -half * AXIS_NAME_OFFSET
+    centred = QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignVCenter
     for axis_i, label in enumerate(channel_labels):
-        pos = [-half, -half, -half]
-        pos[axis_i] = edge
+        pos = [outer, outer, outer]
+        pos[axis_i] = 0.0
         items.append(gl.GLTextItem(
-            pos=tuple(pos), text=label, color=fg_color,
+            pos=tuple(pos), text=label, color=fg_color, alignment=centred,
         ))
     return items
 
@@ -289,9 +345,8 @@ def colors_from_categorical_keys(keys, n_levels, cmap=None, background_rgba=(120
     """keys: from categorical_keys_from_chain(). Returns an (N,4) float
     array in 0..1, ready for GLScatterPlotItem.
 
-    Superseded by colors_from_gate_chain() below for the 3D plugin's own
-    gate-mode colouring (request #3) - left in place since nothing else in
-    this file calls it, but no longer wired into rebuild_colors()."""
+    Not used by rebuild_colors(); the plugin's gate-mode colouring uses
+    colors_from_gate_chain() below."""
     cmap = cmap or build_categorical_colormap()
     lut = cmap.getLookupTable(nPts=max(n_levels + 1, 2), alpha=True).astype(float)
     lut[0] = list(background_rgba)
@@ -302,9 +357,8 @@ def default_gate_colours(gate_names):
     """gate_names: e.g. selectable_gate_names(gating) - 'root' first. Builds
     ONE fixed RGBA (0..1) per gate name from the same glasbey_bw_minc_20
     palette already used elsewhere in the app, indexed by each gate's
-    position in the hierarchy - not resampled per source-gate selection like
-    the old categorical_keys_from_chain/colors_from_categorical_keys pair
-    was, so a given population always gets the same colour regardless of
+    position in the hierarchy - not resampled per source-gate selection, so
+    a given population always gets the same colour regardless of
     which gate a tile is currently colouring by."""
     cmap = build_categorical_colormap()
     lut = cmap.getLookupTable(nPts=max(len(gate_names), 2), alpha=True).astype(float) / 255.0
@@ -697,6 +751,37 @@ class Plot3DGLView(gl.GLViewWidget):
             self.tile.select_plot_on_parent_grid()
             QtCore.QTimer.singleShot(0, self.tile.open_in_modal)
 
+    def _zoom_by_scroll(self, delta):
+        self.opts['distance'] *= 0.999 ** delta
+        self.update()
+
+    def wheelEvent(self, ev):
+        """
+        Mouse wheel (angle deltas only) zooms. Trackpad scrolling carries
+        pixel deltas on both axes plus momentum events, so it pans instead
+        (Ctrl + scroll zooms); pinch is handled in event().
+        """
+        pixel = ev.pixelDelta()
+        if pixel.isNull():
+            angle = ev.angleDelta()
+            self._zoom_by_scroll(angle.y() or angle.x())
+        elif ev.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier:
+            self._zoom_by_scroll(pixel.y())
+        else:
+            self.pan(pixel.x(), pixel.y(), 0, relative='view-upright')
+        self.tile.persist_camera_state()
+        ev.accept()
+
+    def event(self, ev):
+        if (ev.type() == QtCore.QEvent.Type.NativeGesture
+                and ev.gestureType() == QtCore.Qt.NativeGestureType.ZoomNativeGesture):
+            self.opts['distance'] /= max(1.0 + ev.value(), 0.1)
+            self.update()
+            self.tile.persist_camera_state()
+            ev.accept()
+            return True
+        return super().event(ev)
+
 
 # --------------------------------------------------------------------------
 # Plot3DPlotWidget - rendering pipeline + full interactivity: GateTitleBar,
@@ -945,7 +1030,8 @@ class Plot3DPlotWidget(QtWidgets.QFrame):
                 press_frac = strip._press_pos.x() / strip.width()
             value_at_press = lo + press_frac * (hi - lo)
             if value_at_press < 0.5 * hi:
-                tr.logicle_w = tr.logicle_w / factor
+                w_step = settings.logicle_w_drag_step if factor < 1 else -settings.logicle_w_drag_step
+                tr.logicle_w = min(tr.logicle_m / 2.0, max(0.0, tr.logicle_w + w_step))
                 tr.set_transform()
             else:
                 new_min = (lo - tr.zero) * factor + tr.zero
@@ -989,6 +1075,10 @@ class Plot3DPlotWidget(QtWidgets.QFrame):
                 "showing all events untriaged"
             )
             mask = np.ones(len(self.event_data), dtype=np.bool_)
+        if len(mask) != len(self.event_data):
+            # gate_membership still belongs to the previous sample
+            mask = np.ones(len(self.event_data), dtype=np.bool_)
+
         return mask
 
     def resample(self):
@@ -1076,12 +1166,13 @@ class Plot3DPlotWidget(QtWidgets.QFrame):
 
     def _build_ticks(self):
         fg = gl_foreground_rgba(True)  # canvas is forced dark - see _build_ui
+        tick_fg = gl_tick_rgba(True)
         ticks_per_axis = [ticks_for_axis(tr, self.display_range) for tr in self.transforms]
         channel_labels = [self.pnn_labels.get(ch, ch) for ch in self.channels]
         if self._ticks_available:
             for item in self.tick_items:
                 self.gl_view.removeItem(item)
-            self.tick_items = build_tick_items(ticks_per_axis, self.display_range, fg)
+            self.tick_items = build_tick_items(ticks_per_axis, self.display_range, tick_fg)
 
             for item in self.axis_name_items:
                 self.gl_view.removeItem(item)
@@ -1157,6 +1248,8 @@ class Plot3DPlotWidget(QtWidgets.QFrame):
             tr = self.transformations[channel]
             col_idx = self.id_channels[axis_i]
             channel_min, channel_max = np.percentile(self.event_data[:, col_idx], [1, 99])
+            if not channel_max > 0:  # e.g. AF channels on a sample without AF correction
+                continue
 
             if tr.id == 1:  # logicle
                 tr.scale_t = 1.5 * channel_max
@@ -1195,7 +1288,8 @@ class Plot3DPlotWidget(QtWidgets.QFrame):
         # Data tab's cached histograms get recalculated next time it's
         # visited.
         settings_unmixed = self.controller.experiment.settings['unmixed']
-        new_transforms = generate_transformations(assign_default_transforms(settings_unmixed, channels=self.channels))
+        new_transforms = generate_transformations(assign_default_transforms(
+            settings_unmixed, channels=self.channels, n_af_spectra=self.controller.n_af_spectra()))
 
         for channel in self.channels:
             if self.controller.current_sample_path != self.controller.live_sample_path:
@@ -1524,7 +1618,7 @@ class Plot3DGridWidget(QtWidgets.QScrollArea):
         self.max_points = DEFAULT_MAX_POINTS
         self.default_show_grid = True
         self.default_plot_size = 2  # grid cells, both width and height - stays square
-        self.gate_colours = {}  # gate_name -> (r,g,b,a) 0..1, shared across all tiles (request #3)
+        self.gate_colours = {}  # gate_name -> (r,g,b,a) 0..1, shared across all tiles
 
         # queued cross-tab notifications - see module docstring's
         # "core-code landmine" note. Flushed by PluginWidget once the user
@@ -1677,8 +1771,8 @@ class Plot3DGridWidget(QtWidgets.QScrollArea):
             tile.refresh_gate_options()
 
     def refresh_gate_colours(self):
-        """Rebuild the shared gate->colour palette (request #3) from the
-        current gating hierarchy: keeps any colour Oliver has customised for
+        """Rebuild the shared gate->colour palette from the current gating
+        hierarchy: keeps any colour the user has customised for
         a gate that still exists, fills in a palette default for any new
         gate, and drops entries for gates that no longer exist."""
         gating = self.data_for_cytometry_plots.get('gating') if self.data_for_cytometry_plots else None

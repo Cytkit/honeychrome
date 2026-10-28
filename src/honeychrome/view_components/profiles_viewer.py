@@ -14,6 +14,9 @@ from honeychrome.view_components.help_toggle_widget import WheelBlocker
 from honeychrome.controller_components.cytometer_whitelist import (
     get_detector_laser_map, LASER_LABEL_COLORS,
 )
+from honeychrome.view_components.cytometry_plot_components import (
+    RotatedLabelAxisMixin, TICK_TEXT_OFFSET,
+)
 
 
 # --------------------- Flow Layout -------------------------
@@ -114,9 +117,9 @@ class LegendEntry(QWidget):
 
 
 
-class BottomAxisVerticalTickLabels(pg.AxisItem):
-    def __init__(self, **kwargs):
-        self.angle = 90
+class BottomAxisVerticalTickLabels(RotatedLabelAxisMixin, pg.AxisItem):
+    def __init__(self, angle=45, **kwargs):
+        self.angle = angle
         self._label_padding = 15
         self.orientation = 'bottom'
         self.tick_colors: dict = {}        # must be before super().__init__()
@@ -126,17 +129,25 @@ class BottomAxisVerticalTickLabels(pg.AxisItem):
         self.setStyle(tickTextOffset=30, tickLength=5)
 
     def setTicks(self, ticks):
-        extra_offset = int(10 + abs(self.angle) * 0.4)
-        self.setStyle(tickTextOffset=extra_offset)
+        self.setStyle(tickTextOffset=TICK_TEXT_OFFSET)
         super().setTicks(ticks)
+        # height follows the longest label (_updateHeight), as does the left margin
+        self.setHeight(None)
+        self._fit_left_margin()
         self.updateGeometry()
         self.update()
 
+    def _labels_are_rotated(self):
+        """Only the explicitly set detector labels are drawn at an angle; the
+        automatic numeric ticks of an empty plot stay horizontal."""
+        return self.orientation == 'bottom' and self.angle and self._tickLevels
+
     def generateDrawSpecs(self, p):
-        # Temporarily expand boundingRect so pyqtgraph's edge-cull check
-        # (br & rect != rect) never drops labels at the first/last detectors.
-        # After rotation in drawPicture, labels extend upward into the axis
-        # area, not sideways, so no horizontal clipping actually occurs.
+        if not self._labels_are_rotated():
+            return super().generateDrawSpecs(p)
+        # Rotated labels extend past the axis rect, so widen it for pyqtgraph's
+        # edge-cull check (br & rect != rect) or the first and last detectors
+        # lose their label.
         orig_boundingRect = self.boundingRect
 
         def _expanded_boundingRect():
@@ -155,6 +166,7 @@ class BottomAxisVerticalTickLabels(pg.AxisItem):
 
         tick_colors = getattr(self, 'tick_colors', {})
         default_pen = p.pen()
+        rotated = self._labels_are_rotated()
 
         p.save()
         try:
@@ -164,13 +176,14 @@ class BottomAxisVerticalTickLabels(pg.AxisItem):
                     color = tick_colors.get(text)
                     p.setPen(QPen(color) if color else default_pen)
 
-                    if self.orientation == 'bottom' and self.angle == 90:
-                        tick_anchor = QPointF(rect.center().x(), rect.top())
-                        p.translate(tick_anchor)
+                    if rotated:
+                        # Anchor at the tick and let the label trail away down-left,
+                        # so labels never overlap each other.
+                        p.translate(QPointF(rect.center().x(), rect.top()))
                         p.rotate(-self.angle)
-                        label_padding = -15
-                        text_rect = QRectF(label_padding, -rect.height() / 2, rect.width(), rect.height())
-                        p.drawText(text_rect, int(Qt.AlignLeft | Qt.AlignVCenter), text)
+                        text_rect = QRectF(-rect.width() - 4, -rect.height() / 2,
+                                           rect.width(), rect.height())
+                        p.drawText(text_rect, int(Qt.AlignRight | Qt.AlignVCenter), text)
                     else:
                         p.drawText(rect, int(flags), text)
                 finally:
@@ -210,7 +223,7 @@ class ProfilesViewer(QFrame):
         self.layout.addWidget(self.legendContainer)
 
         # Create the PyQtGraph widget
-        bottom_axis_vertical_tick_labels = BottomAxisVerticalTickLabels()
+        bottom_axis_vertical_tick_labels = BottomAxisVerticalTickLabels(angle=45)
         self.plot_widget = TransparentPlotWidget(axisItems={'bottom': bottom_axis_vertical_tick_labels})
         self.layout.addWidget(self.plot_widget, stretch=1)
         vb = self.plot_widget.getViewBox()
@@ -341,6 +354,8 @@ class ProfilesViewer(QFrame):
         
         from honeychrome.controller_components.spectral_functions import get_raw_events
         from honeychrome.controller_components.functions import sample_from_fcs
+        from honeychrome.controller_components.spectral_controller import control_gating
+        from honeychrome.controller_components.spread_model import raw_layout
 
         self._hist_vb.clear()
 
@@ -361,6 +376,7 @@ class ProfilesViewer(QFrame):
         cleaned_store    = self.controller.cleaned_events
         event_channels_pnn = self.controller.experiment.settings['raw']['event_channels_pnn']
         fluor_ch_ids     = self.controller.filtered_raw_fluorescence_channel_ids
+        layout           = raw_layout(self.controller)  # column selectors for get_raw_events
         experiment_dir   = self.controller.experiment_dir
         all_samples      = self.controller.experiment.samples.get('all_samples', {})
         all_samples_rev  = {v: k for k, v in all_samples.items()}
@@ -435,19 +451,20 @@ class ProfilesViewer(QFrame):
                 pos_peak_raw = pos_events[:, peak_local_idx]
 
                 # Negative overlay: for external-negative controls load from the
-                # unstained file; for internal/beads load the Neg gate from the
-                # positive sample.
+                # unstained file; for internal/beads show the Neg gate of the
+                # positive sample (cleaning uses the bottom 10 % of the control instead).
                 neg_peak_raw = None
                 if use_internal:
                     # Internal: load Neg gate from positive sample
                     if rel_path and raw_gating:
                         try:
                             sample = sample_from_fcs(str(experiment_dir / rel_path))
-                            all_ev = get_raw_events(sample, fluor_ch_ids)
                             neg_gate_lbl = control.get('neg_gate_label') or f'Neg {label}'
                             if raw_gating.find_matching_gate_paths(neg_gate_lbl):
-                                neg_mask = raw_gating.gate_sample(sample).get_gate_membership(neg_gate_lbl)
-                                neg_ev = all_ev[neg_mask]
+                                # the control sample's own gate (per-sample override included)
+                                neg_ev = get_raw_events(sample, layout['fl_ids'], gate_label=neg_gate_lbl,
+                                                        gating_strategy=control_gating(self.controller),
+                                                        col_order=layout['col_order'], sample_key=rel_path)
                                 neg_peak_raw = neg_ev[:, peak_local_idx] if len(neg_ev) > 0 else None
                                 logger.info(
                                     f'_plot_peak_histograms: "{label}" internal neg — '
@@ -463,7 +480,7 @@ class ProfilesViewer(QFrame):
                     if neg_rel_path:
                         try:
                             neg_sample = sample_from_fcs(str(experiment_dir / neg_rel_path))
-                            neg_ev_all = get_raw_events(neg_sample, fluor_ch_ids)
+                            neg_ev_all = get_raw_events(neg_sample, layout['fl_ids'], col_order=layout['col_order'])
                             neg_peak_raw = neg_ev_all[:, peak_local_idx] if len(neg_ev_all) > 0 else None
                             logger.info(
                                 f'_plot_peak_histograms: "{label}" external neg "{neg_name}" — '
@@ -480,7 +497,7 @@ class ProfilesViewer(QFrame):
                 if rel_path:
                     try:
                         sample = sample_from_fcs(str(experiment_dir / rel_path))
-                        all_ev = get_raw_events(sample, fluor_ch_ids)
+                        all_ev = get_raw_events(sample, layout['fl_ids'], col_order=layout['col_order'])
                         x_all, y_all = _hist(all_ev[:, peak_local_idx])
                         item = pg.PlotDataItem(stepMode="center", fillLevel=0,
                                             brush=(*_COL_ALL_GRAY[:3], 60),
@@ -508,7 +525,7 @@ class ProfilesViewer(QFrame):
                                         pen=pg.mkPen(_COL_MATCHED, width=1, style=Qt.DashLine))
                     item.setData(x_neg, y_neg)
                     self._hist_vb.addItem(item)
-                    neg_legend = 'neg gate' if use_internal else 'matched −ve'
+                    neg_legend = 'Neg gate, not used by cleaning' if use_internal else 'matched −ve'
                     legend_items.append(('#50a0ff', f'{label} — {neg_legend} (dashed)'))
 
             else:
@@ -518,7 +535,7 @@ class ProfilesViewer(QFrame):
                     continue
                 try:
                     sample = sample_from_fcs(str(experiment_dir / rel_path))
-                    all_ev = get_raw_events(sample, fluor_ch_ids)
+                    all_ev = get_raw_events(sample, layout['fl_ids'], col_order=layout['col_order'])
                     x_all, y_all = _hist(all_ev[:, peak_local_idx])
                     item = pg.PlotDataItem(stepMode="center", fillLevel=0,
                                         brush=(*_COL_ALL_GRAY[:3], 150),

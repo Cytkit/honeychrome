@@ -21,7 +21,9 @@ help:
 venv:
 	python3 -m venv .venv
 	$(PYTHON) -m pip install --upgrade pip
+	$(PYTHON) install_annoy.py
 	$(PYTHON) -m pip install -r requirements.txt
+	$(PYTHON) install_opentsne.py
 	$(PYTHON) -m pip install pyinstaller
 
 build:
@@ -37,7 +39,7 @@ clean:
 	@echo "Cleaned up build artifacts."
 
 # Variables for packaging
-VERSION = 0.8.3
+VERSION = 1.0.0
 PKG_NAME = honeychrome-v$(VERSION)-linux-x64
 
 package: build

@@ -8,6 +8,10 @@ from flowkit import GatingStrategy
 import honeychrome.settings as settings
 
 logger = logging.getLogger(__name__)
+
+PROFILE_COSINE_WARNING_THRESHOLD = 0.95  # cross-profile cosine similarity QC threshold
+CONDITION_NUMBER_WARNING_MIN = 10  # never warn about the condition number below this, however few fluorophores
+
 # otb: get_best_channel can now be removed entirely
 def get_best_channel(sample, gating_strategy, base_gate_label, fluorescence_channel_ids):
     from sklearn.decomposition import PCA
@@ -80,9 +84,15 @@ def _gate_events_via_lookup(
     ancestors, without calling gate_sample() on the full event array.
 
     Uses the lookup-table pattern from apply_gates_in_place() / controller.py:
-    gate a small coordinate grid (transform bin edges), then map events via
-    np.searchsorted.  Handles RectangleGate, PolygonGate, and EllipsoidGate
-    uniformly — no per-gate-type special-casing required.
+    gate a small coordinate grid, then map events via np.searchsorted.
+    Handles RectangleGate, PolygonGate, and EllipsoidGate uniformly — no
+    per-gate-type special-casing required.
+
+    Template gates only: per-sample overrides are not applied. A
+    GatingStrategy holds FlowKit transforms, which have no display bins, so
+    the grid is linear across the data's range (512 points in 1-D, 256 x 256
+    in 2-D). Use gate_event_mask with a SampleGating to gate a sample as the
+    main window does.
 
     Parameters
     ----------
@@ -172,6 +182,34 @@ def _gate_events_via_lookup(
 
     return mask
 
+def gate_event_mask(all_events: np.ndarray, pnn: list, gate_label: str, gating,
+                    sample_key: str | None = None) -> np.ndarray:
+    """
+    Boolean mask (n_events,) of the events inside gate_label and its ancestors.
+
+    gating is either
+      * a SampleGating (``SampleGating.from_controller(controller, scope='raw')``):
+        the events are gated as the main window gates *sample_key* when it is
+        displayed, with that sample's per-sample gate overrides, its own Time
+        range and the display bins; or
+      * a FlowKit GatingStrategy: template gates only, rasterised on a grid
+        spanning the data (_gate_events_via_lookup).
+
+    Build the SampleGating where the gates are used: it reads the live
+    gating, so gates added or moved before the call are included.
+    """
+    from honeychrome.controller_components.per_sample_gating_functions import SampleGating
+
+    if isinstance(gating, SampleGating):
+        return gating.population_mask(sample_key, all_events, list(pnn), [gate_label])
+    return _gate_events_via_lookup(all_events, pnn, gate_label, gating)
+
+
+def _gating_strategy(gating):
+    """The FlowKit GatingStrategy behind *gating* (a SampleGating or a GatingStrategy)."""
+    return getattr(gating, 'gating', gating)
+
+
 def get_profile(
     sample,
     gate_label: str,
@@ -180,10 +218,16 @@ def get_profile(
     preloaded_events: np.ndarray | None = None,
     preloaded_pnn: list | None = None,
     event_channels_pnn: list | None = None,
+    sample_key: str | None = None,
+    return_n_events: bool = False,
 ):
     """
     Return mean fluorescence profile for events within gate_label.
 
+    raw_gating          : SampleGating or GatingStrategy (see gate_event_mask).
+    sample_key          : the sample's experiment key, used with a SampleGating.
+    return_n_events     : also return the number of events in the gate, as
+                          ``(profile, n_events)``.
     preloaded_events    : (n_events, n_channels) float64, already loaded by the
                           caller.  If None, loaded here from sample.
     preloaded_pnn       : channel name list matching preloaded_events column
@@ -204,11 +248,12 @@ def get_profile(
         pnn = sample.pnn_labels
 
     if gate_label != 'root':
-        event_mask = _gate_events_via_lookup(all_events, pnn, gate_label, raw_gating)
+        event_mask = gate_event_mask(all_events, pnn, gate_label, raw_gating, sample_key)
     else:
         event_mask = np.ones(len(all_events), dtype=np.bool_)
+    n_events = int(event_mask.sum())
 
-    if event_mask.sum() > 0:
+    if n_events > 0:
         profile = all_events[event_mask].mean(axis=0)
         if preloaded_pnn is not None and event_channels_pnn is not None:
             # fluorescence_channel_ids index into event_channels_pnn (full list).
@@ -226,6 +271,8 @@ def get_profile(
         profile = np.zeros(len(fluorescence_channel_ids))
         warnings.warn('No events in gate')
 
+    if return_n_events:
+        return profile, n_events
     return profile
 
 def compute_sample_means_for_wls(
@@ -341,6 +388,39 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
     similarity_matrix = cosine_similarity(Mnorm)
     hotspot_matrix = np.sqrt(np.abs(np.linalg.inv(similarity_matrix)))
 
+    # --- Spectral profile QC: condition number + inter-profile cosine similarity ---
+    # M is (n_fluorophores, n_channels); a high condition number here means the
+    # unmixing system (M @ Omega_inv @ M.T) is close to singular.
+    conditioning_warnings = []
+    n_profiles = unmixed_length
+    cond_number = np.linalg.cond(M)
+    if cond_number > max(n_profiles, CONDITION_NUMBER_WARNING_MIN):
+        msg = (
+            f'Spectral profile matrix is ill-conditioned: condition number '
+            f'{cond_number:.1f} exceeds the number of fluorophores ({n_profiles}). '
+            f'Unmixing may be unstable — check for redundant or highly similar profiles.'
+        )
+        conditioning_warnings.append(msg)
+        logger.warning(f'calculate_spectral_process: {msg}')
+
+    high_similarity_pairs = [
+        (fluorescence_channels[i], fluorescence_channels[j], similarity_matrix[i, j])
+        for i in range(n_profiles)
+        for j in range(i + 1, n_profiles)
+        if similarity_matrix[i, j] > PROFILE_COSINE_WARNING_THRESHOLD
+    ]
+    if high_similarity_pairs:
+        pairs_text = ', '.join(
+            f'"{a}" / "{b}" ({sim:.3f})' for a, b, sim in high_similarity_pairs
+        )
+        msg = (
+            f'The following profile pair(s) have cosine similarity above '
+            f'{PROFILE_COSINE_WARNING_THRESHOLD}: {pairs_text}. '
+            f'These fluorophores may unmix poorly.'
+        )
+        conditioning_warnings.append(msg)
+        logger.warning(f'calculate_spectral_process: {msg}')
+
     # calculate unmixing matrix
     variance_per_detector = np.ones(raw_length)  # trivial example... try something better like cv on each detector for brightest fluorophores?
     # otb: pure variance is too noisy and varies between samples. could be done per experiment
@@ -369,7 +449,8 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
         pnn_raw[raw_settings['time_channel_id']]
         if raw_settings['time_channel_id'] is not None else 'Time'
     )
-    event_channels_pnn = [time_channel_name_raw, 'event_id'] + scatter_channels_pnn + fluorescence_channels_pnn
+    event_channels_pnn = ([time_channel_name_raw, 'event_id'] + scatter_channels_pnn
+                          + fluorescence_channels_pnn + list(settings.af_channels))
     area_channels = [s.removesuffix('-A') for s in event_channels_pnn if s.endswith("-A")]
     height_channels = [s.removesuffix('-H') for s in event_channels_pnn if s.endswith("-H")]
     width_channels = [s.removesuffix('-W') for s in event_channels_pnn if s.endswith("-W")]
@@ -381,6 +462,7 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
     n_scatter_channels = len(scatter_channel_ids)
     fluorescence_channel_ids = [event_channels_pnn.index(c) for c in fluorescence_channels_pnn]
     n_fluorophore_channels = len(fluorescence_channel_ids)
+    af_channel_ids = [event_channels_pnn.index(c) for c in settings.af_channels]
 
     unmixed_settings = {
         'unmixed_samples_subdirectory': 'Unmixed',
@@ -398,7 +480,8 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
         'scatter_channel_ids': scatter_channel_ids,
         'n_scatter_channels': n_scatter_channels,
         'fluorescence_channel_ids': fluorescence_channel_ids,
-        'n_fluorophore_channels': n_fluorophore_channels
+        'n_fluorophore_channels': n_fluorophore_channels,
+        'af_channel_ids': af_channel_ids,
     }
 
     # Preserve existing spillover if it is the right size; otherwise reset to identity.
@@ -415,6 +498,7 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
 
     # populate process variables
     spectral_process = {
+        'condition_number': float(cond_number),
         'similarity_matrix': similarity_matrix.tolist(),
         'hotspot_matrix': hotspot_matrix.tolist(),
         'unmixing_matrix': unmixing_matrix.tolist(),
@@ -435,7 +519,7 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
     # for label in event_channels_pnn:
     #     gating.transformations[label] = transformations[label].xform
 
-    return unmixed_settings, spectral_process
+    return unmixed_settings, spectral_process, conditioning_warnings
 
 def sanitise_control_in_place(control):
     if control['control_type'] == 'Single Stained Spectral Control':
@@ -457,9 +541,12 @@ def sanitise_control_in_place(control):
     # print(json.dumps(control, indent=2))
 
 def _find_default_unstained(samples: dict) -> str | None:
-    """Return the tube name of the first sample whose path or name matches 'unstained', or None."""
+    """Return the tube name of the first non-bead sample whose path or name matches 'unstained', or None."""
     import re
-    for path, name in samples.items():
+    from honeychrome.controller_components.particle_type import is_bead_sample
+    for path, name in samples.get('all_samples', {}).items():
+        if is_bead_sample(samples, path, name):
+            continue
         if re.search(r'unstained', path, re.IGNORECASE) or re.search(r'unstained', name, re.IGNORECASE):
             return name
     return None
@@ -472,6 +559,7 @@ def get_raw_events(
     gating_strategy=None,
     extra_channel_ids: list | None = None,
     col_order: list | None = None,
+    sample_key: str | None = None,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Return a (n_events, n_channels) float64 array of raw fluorescence values.
@@ -486,6 +574,9 @@ def get_raw_events(
 
     col_order: if supplied, passed to get_events() to select/reorder columns by
     PnN name (used for FACSDiscover files with inconsistent derived-parameter sets).
+
+    gating_strategy may be a SampleGating, with sample_key the sample's
+    experiment key, to gate the sample with its own gates (see gate_event_mask).
     """
     try:
         all_events = sample.get_events('raw', col_order=col_order)
@@ -499,13 +590,13 @@ def get_raw_events(
         all_events = np.where(np.isnan(all_events), 0.0, all_events)
 
     if gate_label and gating_strategy:
-        gate_paths = gating_strategy.find_matching_gate_paths(gate_label)
+        gate_paths = _gating_strategy(gating_strategy).find_matching_gate_paths(gate_label)
         if gate_paths:
             # col_order is the whitelisted_pnn list when set, otherwise None.
             # all_events was loaded with col_order, so its columns match
             # col_order (or sample.pnn_labels when col_order is None).
             pnn = col_order if col_order is not None else sample.pnn_labels
-            event_mask = _gate_events_via_lookup(all_events, pnn, gate_label, gating_strategy)
+            event_mask = gate_event_mask(all_events, pnn, gate_label, gating_strategy, sample_key)
         else:
             warnings.warn(f'get_raw_events: gate "{gate_label}" not found — returning all events.')
             event_mask = np.ones(len(all_events), dtype=np.bool_)

@@ -1,0 +1,1587 @@
+"""
+ag_flowjo.py — FlowJo workspace import for the Gating Model Builder
+====================================================================
+
+Pure computation, no Qt and no controller: reads a FlowJo 10 workspace
+(``.wsp``) or workspace template (``.wspt``), matches the parameters its
+gates use to the experiment's unmixed channels, and converts the gates into
+Gating Model Builder gate definitions with their imported boundaries.
+
+The file name does not end in ``_tab.py``, so the plugin loader does not
+treat it as a tab.
+
+Coordinates
+-----------
+FlowJo stores gate coordinates in raw (untransformed) parameter units, and
+draws polygon and ellipse edges on its own display scale (biex, logicle,
+arcsinh or log). The parser keeps every coordinate in raw units. Conversion
+to Honeychrome's display scale happens only in ``build_gate_definitions``:
+rectangle bounds convert exactly; polygon edges are densified on FlowJo's
+display scale first, so their shape survives the change of transform;
+ellipses become 10-vertex polygons of the same area.
+
+Workflow
+--------
+1. ``read_workspace(path)``         → FJWorkspace with one FJSource per group
+                                       or sample that carries gates.
+2. ``gated_parameters(source)``     → the FlowJo parameters the gates use.
+3. ``align_parameters(...)``        → proposed {FlowJo parameter: channel}.
+4. ``plan_import(source, mapping)`` → which populations import and which are
+                                       dropped, with reasons.
+5. ``build_gate_definitions(...)``  → gate definitions for the builder, each
+                                       carrying its shapes as drawn in
+                                       ``template`` (applied by the
+                                       ``imported`` algorithm in ag_core) and
+                                       the trainable gate it converts to.
+"""
+
+from __future__ import annotations
+
+import difflib
+import math
+import re
+import xml.etree.ElementTree as ET
+from copy import deepcopy
+from dataclasses import dataclass, field
+
+import numpy as np
+
+import ag_core
+
+__all__ = [
+    'FJTransform', 'FJGate', 'FJPopulation', 'FJSource', 'FJWorkspace',
+    'read_workspace', 'parse_workspace', 'gated_parameters', 'parameter_stem',
+    'ExperimentChannels', 'align_parameters', 'mapping_problems',
+    'MATCH_NAME', 'MATCH_FLUOROPHORE', 'MATCH_FLUOROPHORE_LABEL_DIFFERS',
+    'MATCH_ANTIGEN', 'MATCH_FUZZY', 'MATCH_MANUAL', 'CONFIDENT_MATCHES',
+    'ImportPlan', 'plan_import', 'build_gate_definitions',
+    'ALGORITHM_IMPORTED', 'source_from_gating', 'upgrade_gate_definitions',
+    'histogram_algorithm', 'HISTOGRAM_MIXTURE_FREQUENCY',
+]
+
+ALGORITHM_IMPORTED = ag_core.ALGORITHM_IMPORTED
+
+MATCH_NAME = 'name'                       # identical channel name (scatter, time)
+MATCH_FLUOROPHORE = 'fluorophore'         # same fluorophore, label agrees or is absent
+MATCH_FLUOROPHORE_LABEL_DIFFERS = 'fluorophore_label_differs'
+MATCH_ANTIGEN = 'antigen'                 # fluorophore unknown; matched on the $PnS label
+MATCH_FUZZY = 'fuzzy'                     # closest name only
+MATCH_MANUAL = 'manual'                   # chosen by the user
+CONFIDENT_MATCHES = frozenset({MATCH_NAME, MATCH_FLUOROPHORE, MATCH_MANUAL})
+
+_POPULATION_NODES = ('Population', 'AndNode', 'OrNode', 'NotNode')
+_AREA_SUFFIX = re.compile(r'-A$')
+_HEIGHT_WIDTH_SUFFIX = re.compile(r'-[HW]$')
+_DEFAULT_PREFIXES = ('Comp-', 'Unmixed-', 'Spectral-')
+ELLIPSE_VERTICES = ag_core.ELLIPSE_VERTICES   # ellipses import as polygons
+# A histogram gate whose population holds more than this fraction of its
+# parent is proposed 'mixture' instead of 'tail'.
+HISTOGRAM_MIXTURE_FREQUENCY = 0.25
+# Quadrant layout of sibling shapes drawn on two fluorescence parameters
+# (see _quadrant_layout): grid cells per axis over the shapes' extent, the
+# share of a quadrant a shape must cover to claim it, and how much more
+# mismatch (as a share of the drawn area) a one-parameter layout may have
+# than the best two-parameter one and still be preferred.
+LAYOUT_GRID = 80
+LAYOUT_MIN_COVER = 0.25
+LAYOUT_1D_TOLERANCE = 0.05
+LAYOUT_EMPTY_COVER = 0.1
+LAYOUT_TIE = 0.01
+LAYOUT_1D_MAX_EXTRA = 0.09
+# Weight of a quadrant cell given to a shape that does not cover it, against
+# a drawn cell given to another shape or none (drawn shapes seldom fill the
+# quadrant they select).
+LAYOUT_UNDRAWN_WEIGHT = 0.25
+
+
+def _ellipse_scale(n_points: int) -> float:
+    """Radius factor giving an n-vertex polygon the area of its ellipse."""
+    return ag_core.ellipse_area_scale(n_points)
+
+
+def _local(name: str) -> str:
+    """Tag or attribute name without its XML namespace."""
+    return name.rsplit('}', 1)[-1] if '}' in name else name.rsplit(':', 1)[-1]
+
+
+def _attr(el, name: str, default=None):
+    """Attribute by local name, ignoring any namespace prefix."""
+    for k, v in el.attrib.items():
+        if _local(k) == name:
+            return v
+    return default
+
+
+def _children(el, name: str):
+    return [c for c in el if _local(c.tag) == name]
+
+
+def _child(el, name: str):
+    for c in el:
+        if _local(c.tag) == name:
+            return c
+    return None
+
+
+def _float(v):
+    if v is None or v == '':
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+# ---------------------------------------------------------------------------
+# Parsed workspace
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FJTransform:
+    """A FlowJo display transform for one parameter.
+
+    kind   : 'linear', 'log', 'logicle', 'biex', 'fasinh', 'hyperlog' or the
+             element name of anything else.
+    params : the element's attributes (local names, values as strings).
+    """
+    kind: str
+    params: dict = field(default_factory=dict)
+
+    def display(self):
+        """FlowKit transform reproducing FlowJo's display scale, or None
+        when the scale is linear (edges stay straight) or unknown."""
+        p = {k: _float(v) for k, v in self.params.items()}
+        from flowkit import transforms as fk
+        try:
+            if self.kind == 'biex':
+                return fk.WSPBiexTransform(
+                    negative=p.get('neg') or 0.0, width=p.get('width') or -10.0,
+                    positive=p.get('pos') or 4.418540,
+                    max_value=p.get('maxRange') or 262144.0)
+            if self.kind == 'logicle':
+                return fk.LogicleTransform(
+                    param_t=p.get('T') or 262144.0, param_w=p.get('W') or 0.5,
+                    param_m=p.get('M') or 4.5, param_a=p.get('A') or 0.0)
+            if self.kind == 'fasinh':
+                return fk.AsinhTransform(
+                    param_t=p.get('T') or 262144.0, param_m=p.get('M') or 4.5,
+                    param_a=p.get('A') or 0.0)
+            if self.kind == 'hyperlog':
+                return fk.HyperlogTransform(
+                    param_t=p.get('T') or 262144.0, param_w=p.get('W') or 0.5,
+                    param_m=p.get('M') or 4.5, param_a=p.get('A') or 0.0)
+            if self.kind == 'log':
+                return fk.LogTransform(param_t=p.get('offset') or 1.0,
+                                       param_m=p.get('decades') or 4.0)
+        except Exception:
+            return None
+        return None
+
+
+@dataclass
+class FJGate:
+    """One FlowJo gate in raw parameter units.
+
+    kind      : 'rectangle', 'polygon', 'ellipse', or the XML element name of
+                an unsupported gate type.
+    channels  : FlowJo parameter names ($PnN), one per dimension.
+    bounds    : rectangle (min, max) per dimension; None is open-ended.
+    vertices  : polygon vertices.
+    foci/edge : ellipse foci and the four edge points FlowJo stores.
+    inside    : False when FlowJo selects the events outside the shape.
+    quad_id   : FlowJo's quadrant index for quadrant pieces, else None.
+    """
+    kind: str
+    channels: list = field(default_factory=list)
+    bounds: list = field(default_factory=list)
+    vertices: list = field(default_factory=list)
+    foci: list = field(default_factory=list)
+    edge: list = field(default_factory=list)
+    inside: bool = True
+    quad_id: int | None = None
+    gate_id: str = ''
+    parent_id: str | None = None
+
+
+@dataclass
+class FJPopulation:
+    """A node of a FlowJo gating tree.
+
+    node_type is 'Population' for a gated population; Boolean nodes
+    ('AndNode', 'OrNode', 'NotNode') carry no gate of their own.
+    path is the population names from the top of the tree to this node.
+    """
+    name: str
+    path: tuple
+    node_type: str = 'Population'
+    gate: FJGate | None = None
+    count: int | None = None
+    children: list = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        return '/'.join(self.path)
+
+
+@dataclass
+class FJSource:
+    """A gating tree that can be imported: a group's template gates or one
+    sample's own gates, with the parameter labels and FlowJo transforms
+    that apply to it."""
+    kind: str
+    name: str
+    roots: list = field(default_factory=list)
+    sample_id: str | None = None
+    labels: dict = field(default_factory=dict)
+    transforms: dict = field(default_factory=dict)
+    count: int | None = None
+    sample_name: str | None = None
+
+    def iter_populations(self):
+        """Every node, parents before children."""
+        stack = list(reversed(self.roots))
+        while stack:
+            pop = stack.pop()
+            yield pop
+            stack.extend(reversed(pop.children))
+
+    @property
+    def n_populations(self) -> int:
+        return sum(1 for _ in self.iter_populations())
+
+    @property
+    def title(self) -> str:
+        kind = 'Group' if self.kind == 'group' else 'Sample'
+        return f"{kind}: {self.name} ({self.n_populations} populations)"
+
+
+@dataclass
+class FJWorkspace:
+    path: str
+    flowjo_version: str = ''
+    sources: list = field(default_factory=list)
+    affixes: list = field(default_factory=list)
+    cytometer: str = ''
+
+    def default_source(self) -> FJSource | None:
+        """The group with the most populations, else the sample with the most."""
+        groups = [s for s in self.sources if s.kind == 'group' and s.n_populations]
+        if groups:
+            return max(groups, key=lambda s: s.n_populations)
+        samples = [s for s in self.sources if s.n_populations]
+        return max(samples, key=lambda s: s.n_populations) if samples else None
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+def read_workspace(path) -> FJWorkspace:
+    """Parse a FlowJo ``.wsp`` or ``.wspt`` file."""
+    root = ET.parse(str(path)).getroot()
+    return parse_workspace(root, str(path))
+
+
+def parse_workspace(root, path: str = '') -> FJWorkspace:
+    """Parse a FlowJo workspace from its XML root element."""
+    if _local(root.tag) != 'Workspace':
+        raise ValueError("Not a FlowJo workspace: the root element is "
+                         f"<{_local(root.tag)}>, not <Workspace>.")
+    ws = FJWorkspace(path=path, flowjo_version=_attr(root, 'flowJoVersion', '') or '')
+    ws.affixes = _matrix_affixes(root)
+
+    cyt_transforms = {}
+    cyts = _child(root, 'Cytometers')
+    if cyts is not None:
+        for cyt in _children(cyts, 'Cytometer'):
+            ws.cytometer = ws.cytometer or (_attr(cyt, 'cyt', '') or '')
+            store = _child(cyt, 'TransformStore')
+            if store is not None:
+                for xf_parent in store.iter():
+                    if _local(xf_parent.tag) == 'Transforms':
+                        cyt_transforms.update(_parse_transforms(xf_parent))
+
+    samples = {}
+    sample_list = _child(root, 'SampleList')
+    for s in (_children(sample_list, 'Sample') if sample_list is not None else []):
+        node = _child(s, 'SampleNode')
+        if node is None:
+            continue
+        sid = _attr(node, 'sampleID') or _attr(_child(s, 'DataSet') or node, 'sampleID')
+        xf_el = _child(s, 'Transformations')
+        transforms = dict(cyt_transforms)
+        if xf_el is not None:
+            transforms.update(_parse_transforms(xf_el))
+        labels = _parameter_labels(_child(s, 'Keywords'))
+        src = FJSource(kind='sample', name=_attr(node, 'name', '') or f'Sample {sid}',
+                       sample_id=sid, labels=labels, transforms=transforms,
+                       count=_int(_attr(node, 'count')))
+        src.roots = _parse_subpopulations(node, ())
+        samples[sid] = src
+
+    groups = []
+    groups_el = _child(root, 'Groups')
+    for gnode in (_children(groups_el, 'GroupNode') if groups_el is not None else []):
+        roots = _parse_subpopulations(gnode, ())
+        if not roots:
+            continue
+        group = _child(gnode, 'Group')
+        refs = []
+        if group is not None:
+            sr = _child(group, 'SampleRefs')
+            refs = [_attr(r, 'sampleID') for r in (_children(sr, 'SampleRef') if sr is not None else [])]
+        members = [samples[r] for r in refs if r in samples]
+        member = members[0] if members else None
+        # A group's counts belong to a sample only when it has just one.
+        single = member if len(members) == 1 else None
+        groups.append(FJSource(
+            kind='group', name=_attr(gnode, 'name', '') or 'Group', roots=roots,
+            labels=dict(member.labels) if member else {},
+            transforms=dict(member.transforms) if member else dict(cyt_transforms),
+            count=single.count if single else None,
+            sample_name=single.name if single else None,
+        ))
+    ws.sources = groups + [s for s in samples.values()]
+    return ws
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _matrix_affixes(root) -> list:
+    """(prefix, suffix) of every compensation or unmixing matrix."""
+    out = []
+    for el in root.iter():
+        if _local(el.tag) == 'spilloverMatrix':
+            pair = (_attr(el, 'prefix', '') or '', _attr(el, 'suffix', '') or '')
+            if pair != ('', '') and pair not in out:
+                out.append(pair)
+    for p in _DEFAULT_PREFIXES:
+        if (p, '') not in out:
+            out.append((p, ''))
+    return out
+
+
+def _parse_transforms(el) -> dict:
+    """{parameter name: FJTransform} from a Transformations/Transforms element."""
+    out = {}
+    for xf in el:
+        params = {_local(k): v for k, v in xf.attrib.items()}
+        for p in xf.iter():
+            if _local(p.tag) == 'parameter':
+                name = _attr(p, 'name')
+                if name:
+                    out[name] = FJTransform(kind=_local(xf.tag), params=params)
+    return out
+
+
+def _parameter_labels(keywords_el) -> dict:
+    """{$PnN: $PnS} from a sample's Keywords element."""
+    if keywords_el is None:
+        return {}
+    kw = {}
+    for k in _children(keywords_el, 'Keyword'):
+        kw[_attr(k, 'name', '')] = _attr(k, 'value', '') or ''
+    labels = {}
+    for key, value in kw.items():
+        m = re.fullmatch(r'\$P(\d+)N', key)
+        if m:
+            labels[value] = (kw.get(f'$P{m.group(1)}S') or '').strip()
+    return labels
+
+
+def _parse_subpopulations(node, path: tuple) -> list:
+    sub = _child(node, 'Subpopulations')
+    if sub is None:
+        return []
+    out = []
+    for child in sub:
+        tag = _local(child.tag)
+        if tag not in _POPULATION_NODES:
+            continue
+        name = _attr(child, 'name', '') or ''
+        pop = FJPopulation(name=name, path=path + (name,), node_type=tag,
+                           count=_int(_attr(child, 'count')))
+        if tag == 'Population':
+            gate_el = _child(child, 'Gate')
+            if gate_el is not None:
+                pop.gate = _parse_gate(gate_el)
+        pop.children = _parse_subpopulations(child, pop.path)
+        out.append(pop)
+    return out
+
+
+def _dimension_name(dim) -> str:
+    for el in dim.iter():
+        if _local(el.tag) in ('fcs-dimension', 'new-dimension'):
+            return _attr(el, 'name', '') or ''
+    return ''
+
+
+def _vertices(el) -> list:
+    out = []
+    for v in _children(el, 'vertex'):
+        coords = [_float(_attr(c, 'value')) for c in _children(v, 'coordinate')]
+        if len(coords) >= 2 and None not in coords[:2]:
+            out.append((coords[0], coords[1]))
+    return out
+
+
+def _parse_gate(gate_el) -> FJGate:
+    shape = next((c for c in gate_el if _local(c.tag).endswith('Gate')), None)
+    if shape is None:
+        return FJGate(kind='none', gate_id=_attr(gate_el, 'id', '') or '')
+    tag = _local(shape.tag)
+    dims = _children(shape, 'dimension')
+    kind = {'RectangleGate': 'rectangle', 'PolygonGate': 'polygon',
+            'EllipsoidGate': 'ellipse'}.get(tag, tag)
+    gate = FJGate(
+        kind=kind,
+        channels=[_dimension_name(d) for d in dims],
+        inside=(_attr(shape, 'eventsInside', '1') or '1') != '0',
+        gate_id=_attr(gate_el, 'id', '') or '',
+        parent_id=_attr(gate_el, 'parent_id'),
+    )
+    qid = _int(_attr(shape, 'quadId'))
+    gate.quad_id = qid if qid is not None and qid >= 0 else None
+    if kind == 'rectangle':
+        gate.bounds = [(_float(_attr(d, 'min')), _float(_attr(d, 'max'))) for d in dims]
+    elif kind == 'polygon':
+        gate.vertices = _vertices(shape)
+    elif kind == 'ellipse':
+        foci = _child(shape, 'foci')
+        edge = _child(shape, 'edge')
+        gate.foci = _vertices(foci) if foci is not None else []
+        gate.edge = _vertices(edge) if edge is not None else []
+    return gate
+
+
+def gated_parameters(source: FJSource) -> list[str]:
+    """FlowJo parameters used by the source's gates, in order of first use."""
+    out = []
+    for pop in source.iter_populations():
+        for ch in (pop.gate.channels if pop.gate else []):
+            if ch and ch not in out:
+                out.append(ch)
+    return out
+
+
+def parameter_stem(name: str, affixes) -> str:
+    """Parameter name without its matrix prefix/suffix (e.g. 'Comp-')."""
+    stem = str(name)
+    for prefix, suffix in affixes or [(p, '') for p in _DEFAULT_PREFIXES]:
+        if prefix and stem.startswith(prefix):
+            stem = stem[len(prefix):]
+        if suffix and stem.endswith(suffix):
+            stem = stem[:-len(suffix)]
+    return stem
+
+
+# ---------------------------------------------------------------------------
+# Parameter alignment
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExperimentChannels:
+    """The experiment side of the alignment.
+
+    channels    : unmixed channel names ($PnN), in order.
+    fluorescence: the fluorescence channels among them.
+    scatter     : the scatter channels.
+    antigens    : {channel: antigen} from the spectral model.
+    transforms  : {channel: transform parameter dict} (ag_core.transform_params).
+    singlet_pair: (area, height-or-width) forward-scatter pair, or None.
+    """
+    channels: list
+    fluorescence: list = field(default_factory=list)
+    scatter: list = field(default_factory=list)
+    antigens: dict = field(default_factory=dict)
+    transforms: dict = field(default_factory=dict)
+    singlet_pair: tuple | None = None
+
+
+def _norm(name: str) -> str:
+    return re.sub(r'[\s_\-.+]+', '', str(name or '')).lower()
+
+
+def _label_tokens(label: str) -> list[str]:
+    """A $PnS label split into marker names: 'CD8_CD11b' → ['CD8', 'CD11b']."""
+    return [t.strip() for t in re.split(r'[_/,;|]+', str(label or '')) if t.strip()]
+
+
+def align_parameters(params: list[str], labels: dict, exp: ExperimentChannels,
+                     affixes=None, fluor_match=None, marker_match=None) -> dict[str, dict]:
+    """Propose an experiment channel for each FlowJo parameter.
+
+    Matching order:
+      1. the same channel name, after removing the matrix prefix
+         (scatter, time and anything else named identically);
+      2. the same fluorophore (fluorophore_database names and synonyms) on
+         an area parameter; the $PnS label is checked against the channel's
+         antigen and a disagreement is reported;
+      3. the $PnS label against the channel antigens, marker by marker for
+         combined labels such as 'CD4_IgM';
+      4. the closest channel name (difflib, cutoff 0.8).
+    Fluorescence height and width parameters are not matched: Honeychrome
+    unmixes area only.
+
+    fluor_match  : callable name → canonical fluorophore or None.
+    marker_match : callable name → canonical marker or None.
+
+    Returns {parameter: {'channel', 'method', 'note', 'label'}}.
+    """
+    fluor_match = fluor_match or (lambda _n: None)
+    marker_match = marker_match or (lambda _n: None)
+    scatter = set(exp.scatter)
+
+    def safe(fn, value):
+        try:
+            return fn(value)
+        except Exception:
+            return None
+
+    exp_fluor: dict[str, list[str]] = {}
+    for ch in exp.fluorescence:
+        key = safe(fluor_match, ch) or ch
+        exp_fluor.setdefault(_norm(key), []).append(ch)
+
+    def marker_key(name):
+        return _norm(safe(marker_match, name) or name)
+
+    exp_marker: dict[str, list[str]] = {}
+    for ch in exp.fluorescence:
+        antigen = (exp.antigens.get(ch) or '').strip()
+        if antigen and antigen != ch:
+            exp_marker.setdefault(marker_key(antigen), []).append(ch)
+
+    out = {}
+    for p in params:
+        label = (labels or {}).get(p, '') or ''
+        stem = parameter_stem(p, affixes)
+        channel, method, note = None, None, ''
+        tokens = [marker_key(t) for t in _label_tokens(label)]
+
+        if stem in exp.channels or p in exp.channels:
+            channel, method = (stem if stem in exp.channels else p), MATCH_NAME
+        elif _HEIGHT_WIDTH_SUFFIX.search(stem) and not any(
+                stem.startswith(s.rsplit('-', 1)[0]) for s in scatter):
+            note = 'Height and width parameters are not unmixed in Honeychrome.'
+        else:
+            base = _AREA_SUFFIX.sub('', stem)
+            canon = safe(fluor_match, base)
+            hits = exp_fluor.get(_norm(canon), []) if canon else []
+            if len(hits) == 1:
+                channel, method = hits[0], MATCH_FLUOROPHORE
+                antigen = (exp.antigens.get(channel) or '').strip()
+                if tokens and antigen and antigen != channel \
+                        and marker_key(antigen) not in tokens:
+                    method = MATCH_FLUOROPHORE_LABEL_DIFFERS
+                    note = f"FlowJo label '{label}', experiment antigen '{antigen}'."
+            elif len(hits) > 1:
+                channel, method = hits[0], MATCH_FUZZY
+                note = 'Fluorophore is on more than one channel: ' + ', '.join(hits)
+            if channel is None and tokens:
+                found = []
+                for t in tokens:
+                    for ch in exp_marker.get(t, []):
+                        if ch not in found:
+                            found.append(ch)
+                if len(found) == 1:
+                    channel, method = found[0], MATCH_ANTIGEN
+                    fl = f" ({canon})" if canon else ''
+                    note = f"Matched on the label '{label}'; fluorophore{fl} not found."
+                elif len(found) > 1:
+                    channel, method = found[0], MATCH_FUZZY
+                    note = f"Label '{label}' matches " + ', '.join(found)
+            if channel is None:
+                pool = list(exp.fluorescence) + list(exp.scatter)
+                close = difflib.get_close_matches(base, pool, n=1, cutoff=0.8)
+                if close:
+                    channel, method = close[0], MATCH_FUZZY
+                    note = 'Closest channel name only.'
+        out[p] = {'channel': channel, 'method': method, 'note': note, 'label': label}
+    return out
+
+
+def mapping_problems(mapping: dict) -> list[str]:
+    """Reasons a {FlowJo parameter: channel or None} mapping cannot be
+    finalised. A dropped parameter is mapped to None explicitly and is not a
+    problem; a parameter missing from the mapping is."""
+    problems = []
+    used: dict[str, list[str]] = {}
+    for p, ch in mapping.items():
+        if ch:
+            used.setdefault(ch, []).append(p)
+    for ch, ps in used.items():
+        stems = {_AREA_SUFFIX.sub('', parameter_stem(p, None)) for p in ps}
+        if len(stems) > 1:
+            problems.append(f"{ch} is assigned to more than one FlowJo parameter: "
+                            + ", ".join(ps))
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# Import planning: which populations survive the mapping
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ImportPlan:
+    """keep    : population keys that will be imported, in tree order.
+    dropped : {population key: reason}; a dropped population's descendants
+              are dropped with it.
+    """
+    keep: list = field(default_factory=list)
+    dropped: dict = field(default_factory=dict)
+
+    def messages(self) -> list[str]:
+        """One line per dropped branch (descendants summarised)."""
+        lines = []
+        tops = [k for k in self.dropped
+                if not any(k != o and k.startswith(o + '/') for o in self.dropped)]
+        for k in tops:
+            n_desc = sum(1 for o in self.dropped if o.startswith(k + '/'))
+            tail = f" and {n_desc} population(s) below it" if n_desc else ''
+            lines.append(f"Dropped '{k}'{tail}: {self.dropped[k]}")
+        return lines
+
+
+def _unsupported_reason(pop: FJPopulation) -> str | None:
+    if pop.node_type != 'Population':
+        return f"Boolean gates ({pop.node_type.replace('Node', '')}) are not imported."
+    g = pop.gate
+    if g is None or g.kind == 'none':
+        return 'The population has no gate.'
+    if g.kind not in ('rectangle', 'polygon', 'ellipse'):
+        return f"{g.kind} gates are not supported."
+    if not g.inside:
+        return 'Gates that select events outside the shape are not supported.'
+    if g.kind == 'polygon' and (len(g.vertices) < 3 or len(g.channels) != 2):
+        return 'The polygon is incomplete.'
+    if g.kind == 'ellipse' and (len(g.edge) < 4 or len(g.channels) != 2):
+        return 'The ellipse is incomplete.'
+    if g.kind == 'rectangle' and not any(lo is not None or hi is not None for lo, hi in g.bounds):
+        return 'The rectangle has no bounds.'
+    return None
+
+
+def plan_import(source: FJSource, mapping: dict) -> ImportPlan:
+    """Decide which populations import under *mapping*.
+
+    A population is dropped when its gate type is unsupported or any of its
+    parameters maps to no channel; every population below it is dropped
+    with it."""
+    plan = ImportPlan()
+
+    def visit(pop: FJPopulation, parent_dropped: str | None):
+        reason = None
+        if parent_dropped is not None:
+            reason = f"its parent '{parent_dropped}' was dropped."
+        else:
+            reason = _unsupported_reason(pop)
+            if reason is None:
+                missing = [ch for ch in pop.gate.channels if not mapping.get(ch)]
+                if missing:
+                    reason = 'no channel for ' + ', '.join(missing) + '.'
+        if reason is None:
+            plan.keep.append(pop.key)
+            for c in pop.children:
+                visit(c, None)
+        else:
+            plan.dropped[pop.key] = reason
+            top = parent_dropped if parent_dropped is not None else pop.key
+            for c in pop.children:
+                visit(c, top)
+
+    for r in source.roots:
+        visit(r, None)
+    return plan
+
+
+# ---------------------------------------------------------------------------
+# The experiment's own gating hierarchy as an import source
+# ---------------------------------------------------------------------------
+
+def _ellipsoid_vertices(gate, n_points: int | None = None) -> list:
+    """Vertices of a polygon tracing a FlowKit EllipsoidGate with the
+    ellipse's area (coordinates are display units)."""
+    n_points = n_points or ELLIPSE_VERTICES
+    centre = np.asarray(gate.coordinates, dtype=float).ravel()
+    cov = np.asarray(gate.covariance_matrix, dtype=float)
+    chol = np.linalg.cholesky(cov * float(gate.distance_square))
+    t = np.linspace(0, 2 * np.pi, n_points, endpoint=False)
+    k = _ellipse_scale(n_points)
+    pts = centre + k * (chol @ np.vstack([np.cos(t), np.sin(t)])).T
+    return [tuple(p) for p in pts]
+
+
+def _kit_gate(gate) -> FJGate:
+    """FJGate (display-unit coordinates) from a FlowKit gate."""
+    kind = getattr(gate, 'gate_type', '')
+    channels = list(gate.get_dimension_ids())
+    if kind == 'RectangleGate':
+        bounds = [(_float(getattr(d, 'min', None)), _float(getattr(d, 'max', None)))
+                  for d in gate.dimensions]
+        return FJGate(kind='rectangle', channels=channels, bounds=bounds)
+    if kind == 'PolygonGate':
+        verts = [tuple(float(c) for c in v) for v in gate.vertices]
+        return FJGate(kind='polygon', channels=channels, vertices=verts)
+    if kind == 'EllipsoidGate':
+        return FJGate(kind='polygon', channels=channels, vertices=_ellipsoid_vertices(gate))
+    return FJGate(kind=kind or 'unknown', channels=channels)
+
+
+def _quadrant_gates(gate) -> dict:
+    """{quadrant name: FJGate rectangle} for a FlowKit QuadrantGate. Each
+    quadrant is the rectangle between its divider ranges, open at the ends."""
+    dividers = list(gate.dimensions)
+    channels = [d.dimension_ref for d in dividers]
+    out = {}
+    for qid, quadrant in gate.quadrants.items():
+        bounds = []
+        for div in dividers:
+            rng = None
+            getter = getattr(quadrant, 'get_divider_range', None)
+            if callable(getter):
+                try:
+                    rng = getter(div.id)
+                except Exception:
+                    rng = None
+            if rng is None:
+                rng = (getattr(quadrant, '_divider_ranges', None) or {}).get(div.id)
+            lo, hi = rng if isinstance(rng, (list, tuple)) and len(rng) == 2 else (None, None)
+            bounds.append((_float(lo), _float(hi)))
+        out[str(qid)] = FJGate(kind='rectangle', channels=channels, bounds=bounds)
+    return out
+
+
+def source_from_gating(gating, name: str = 'Experiment hierarchy') -> FJSource:
+    """An FJSource built from a FlowKit GatingStrategy whose coordinates
+    are Honeychrome display units (the experiment's own gating).
+
+    Each gate becomes a population named after the gate, ellipsoids are
+    traced as polygons, and a quadrant gate becomes one rectangle
+    population per quadrant, named after the quadrant, with the gates under
+    a quadrant as its children. Build gate definitions from it with
+    ``build_gate_definitions(..., native_display=True)``.
+    """
+    src = FJSource(kind='hierarchy', name=name)
+    nodes: dict = {}
+
+    def attach(pop: FJPopulation, parent):
+        (parent.children if parent is not None else src.roots).append(pop)
+
+    for gname, gpath in gating.get_gate_ids():
+        gpath = tuple(gpath)
+        if gating._get_gate_node(gname, gpath).gate_type == 'Quadrant':
+            continue
+        parent = nodes.get(gpath) if gpath != ('root',) else None
+        base = parent.path if parent is not None else ()
+        gate = gating.get_gate(gname)
+        if getattr(gate, 'gate_type', '') == 'QuadrantGate':
+            for qname, qgate in _quadrant_gates(gate).items():
+                pop = FJPopulation(name=qname, path=base + (qname,), gate=qgate)
+                attach(pop, parent)
+                nodes[gpath + (gname, qname)] = pop
+            continue
+        pop = FJPopulation(name=gname, path=base + (gname,), gate=_kit_gate(gate))
+        attach(pop, parent)
+        nodes[gpath + (gname,)] = pop
+    return src
+
+
+# ---------------------------------------------------------------------------
+# Conversion to gate definitions
+# ---------------------------------------------------------------------------
+
+def _safe_name(name: str) -> str:
+    """Population and gate names may not contain '/' (it separates gate and
+    population in population keys)."""
+    return str(name).replace('/', '∕').strip() or 'gate'
+
+
+class _Axes:
+    """Raw ↔ display conversions for one experiment channel and the FlowJo
+    parameter mapped to it."""
+
+    def __init__(self, fj_param: str, channel: str, source: FJSource, exp: ExperimentChannels,
+                 native: bool = False):
+        self.fj_param = fj_param
+        self.channel = channel
+        self.native = native
+        fjt = None if native else source.transforms.get(fj_param)
+        self.fj = fjt.display() if fjt is not None else None
+        params = exp.transforms.get(channel)
+        self.hc = ag_core.make_transform(params) if params else None
+        self.hc_linear = native or not params or params.get('id') == 0
+        lim = (params or {}).get('limits')
+        self.limits = (float(lim[0]), float(lim[1])) if lim and len(lim) >= 2 else None
+        self.zero = float(self._raw_to_display(np.zeros(1))[0])
+
+    def _raw_to_display(self, raw):
+        raw = np.asarray(raw, dtype=float)
+        return np.asarray(self.hc.apply(raw), dtype=float) if self.hc is not None else raw
+
+    def to_display(self, raw):
+        """Raw units → Honeychrome display units. Native coordinates are
+        already display units and pass through unchanged."""
+        raw = np.asarray(raw, dtype=float)
+        return raw if self.native else self._raw_to_display(raw)
+
+    def to_fj(self, raw):
+        raw = np.asarray(raw, dtype=float)
+        return np.asarray(self.fj.apply(raw), dtype=float) if self.fj is not None else raw
+
+    def from_fj(self, disp):
+        disp = np.asarray(disp, dtype=float)
+        return np.asarray(self.fj.inverse(disp), dtype=float) if self.fj is not None else disp
+
+
+def _polygon_display(raw_xy, ax: _Axes, ay: _Axes, points_per_edge: int = 32) -> list:
+    """Raw polygon (FlowJo edges straight on FlowJo's display scale) →
+    closed polygon on Honeychrome's display scale."""
+    raw_xy = np.asarray(raw_xy, dtype=float)
+    if len(raw_xy) and not np.allclose(raw_xy[0], raw_xy[-1]):
+        raw_xy = np.vstack([raw_xy, raw_xy[:1]])
+    straight = (ax.fj is None and ay.fj is None and ax.hc_linear and ay.hc_linear)
+    if not straight:
+        fj_xy = np.column_stack([ax.to_fj(raw_xy[:, 0]), ay.to_fj(raw_xy[:, 1])])
+        fj_xy = ag_core.densify_polygon(fj_xy, points_per_edge)
+        raw_xy = np.column_stack([ax.from_fj(fj_xy[:, 0]), ay.from_fj(fj_xy[:, 1])])
+    disp = np.column_stack([ax.to_display(raw_xy[:, 0]), ay.to_display(raw_xy[:, 1])])
+    return [[float(a), float(b)] for a, b in disp]
+
+
+def _ellipse_raw(gate: FJGate, ax: _Axes, ay: _Axes, n_points: int = ELLIPSE_VERTICES) -> list:
+    """Raw vertices of a polygon tracing a FlowJo ellipse with the
+    ellipse's area. FlowJo's four edge points are the ends of the two axes
+    on its display scale."""
+    e = np.asarray(gate.edge[:4], dtype=float)
+    fj = np.column_stack([ax.to_fj(e[:, 0]), ay.to_fj(e[:, 1])])
+    centre = fj.mean(axis=0)
+    u = (fj[0] - fj[1]) / 2.0
+    v = (fj[2] - fj[3]) / 2.0
+    t = np.linspace(0, 2 * np.pi, n_points, endpoint=False)
+    k = _ellipse_scale(n_points)
+    pts = centre + k * (np.outer(np.cos(t), u) + np.outer(np.sin(t), v))
+    raw = np.column_stack([ax.from_fj(pts[:, 0]), ay.from_fj(pts[:, 1])])
+    return [tuple(p) for p in raw]
+
+
+def _limits_fill(bound, ax: _Axes) -> tuple[float, float]:
+    """Replace open rectangle sides with points one display span beyond the
+    axis limits, so off-scale events stay inside."""
+    lo, hi = bound
+    lim = ax.limits or (0.0, 1.0)
+    span = float(lim[1] - lim[0]) or 1.0
+    return (lo if lo is not None else float(lim[0]) - span,
+            hi if hi is not None else float(lim[1]) + span)
+
+
+def _closed(poly) -> list:
+    pts = [[float(a), float(b)] for a, b in poly]
+    if pts and pts[0] != pts[-1]:
+        pts.append(list(pts[0]))
+    return pts
+
+
+@dataclass
+class _Piece:
+    """One population converted to display units, before grouping.
+
+    shape   : the shape as drawn, a template entry without population
+              fields: 'shape_channels' plus 'boundary' (closed polygon) and,
+              for one channel, 'range'.
+    extent  : (lo, hi) per channel of the drawn shape; None is open-ended.
+    signs   : per channel, '+' when the shape lies entirely above the
+              channel's raw zero, '-' when it reaches zero or below, None
+              for scatter channels.
+    """
+    pop: FJPopulation
+    channels: list
+    shape: dict
+    extent: list = field(default_factory=list)
+    signs: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+    singlets: bool = False
+
+
+def _is_singlet_pair(chans: list, exp: ExperimentChannels) -> bool:
+    """True for a scatter area channel against the height or width of the
+    same scatter detector (forward or side scatter singlet gates)."""
+    if len(chans) != 2:
+        return False
+    if exp.singlet_pair:
+        area, other = exp.singlet_pair
+        stem = area.rsplit('-', 1)[0]
+        alternatives = {other, f'{stem}-H', f'{stem}-W'} - {area}
+        if area in chans and set(chans) & alternatives:
+            return True
+    scatter = set(exp.scatter)
+    if not all(c in scatter for c in chans):
+        return False
+    stems = [c.rsplit('-', 1) for c in chans]
+    if any(len(st) != 2 for st in stems) or stems[0][0] != stems[1][0]:
+        return False
+    return {stems[0][1], stems[1][1]} in ({'A', 'H'}, {'A', 'W'})
+
+
+def _forward_scatter_axis(chans: list, exp: ExperimentChannels) -> str:
+    """'y' when the forward-scatter area channel is a plot's y channel,
+    else 'x' (the debris cut of a cell gate is made on forward scatter)."""
+    area = exp.singlet_pair[0] if exp.singlet_pair else None
+    return 'y' if area is not None and len(chans) == 2 and chans[1] == area else 'x'
+
+
+def _piece(pop: FJPopulation, source: FJSource, mapping: dict,
+           exp: ExperimentChannels, native: bool = False) -> _Piece:
+    g = pop.gate
+    chans = [mapping[c] for c in g.channels]
+    axes = [_Axes(fj, ch, source, exp, native) for fj, ch in zip(g.channels, chans)]
+    scatter = set(exp.scatter)
+    notes = []
+    if g.kind == 'polygon':
+        poly = _polygon_display(g.vertices, axes[0], axes[1])
+        extent = [(min(p[k] for p in poly), max(p[k] for p in poly)) for k in range(2)]
+    elif g.kind == 'ellipse':
+        raw = np.asarray(_ellipse_raw(g, axes[0], axes[1]), dtype=float)
+        poly = _closed(np.column_stack([axes[0].to_display(raw[:, 0]),
+                                        axes[1].to_display(raw[:, 1])]))
+        extent = [(min(p[k] for p in poly), max(p[k] for p in poly)) for k in range(2)]
+        notes.append(f"Ellipse traced as a {ELLIPSE_VERTICES}-vertex polygon of the same area.")
+    else:
+        extent = []
+        for (lo, hi), ax in zip(g.bounds, axes):
+            extent.append((float(ax.to_display([lo])[0]) if lo is not None else None,
+                           float(ax.to_display([hi])[0]) if hi is not None else None))
+        if len(chans) == 1:
+            lo, hi = _limits_fill(extent[0], axes[0])
+            shape = {'shape_channels': [chans[0]], 'range': [lo, hi],
+                     'boundary': [[lo, 0.0], [hi, 0.0], [hi, 1.0], [lo, 1.0], [lo, 0.0]]}
+        else:
+            x0, x1 = _limits_fill(extent[0], axes[0])
+            y0, y1 = _limits_fill(extent[1], axes[1])
+            poly = [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]
+    if g.kind in ('polygon', 'ellipse') or len(chans) == 2:
+        shape = {'shape_channels': list(chans), 'boundary': poly}
+    signs = []
+    for ch, ax, (lo, _hi) in zip(chans, axes, extent):
+        if ch in scatter and len(chans) == 2:
+            signs.append(None)
+        else:
+            signs.append('+' if lo is not None and lo > ax.zero else '-')
+    return _Piece(pop, chans, shape, extent, signs, notes,
+                  singlets=_is_singlet_pair(chans, exp))
+
+
+def _region_1d(sign: str) -> str:
+    return ag_core.REGION_ABOVE if sign == '+' else ag_core.REGION_BELOW
+
+
+def _plan_gate(grp: list[_Piece]) -> dict:
+    """Trainable form of a group of sibling pieces drawn on one plot.
+
+    Returns {'gate_type', 'sep' (separation channel index for 1dsep),
+    'regions' ([region per piece]), 'algorithm' (proposed)}.
+    """
+    first = grp[0]
+    if first.singlets:
+        return {'gate_type': 'singlets', 'sep': None,
+                'regions': [ag_core.REGION_INSIDE] * len(grp), 'algorithm': 'singlets'}
+    if len(first.channels) == 1:
+        return {'gate_type': '1dsep', 'sep': 0,
+                'regions': [_region_1d(p.signs[0]) for p in grp], 'algorithm': 'tail'}
+    fluor = [k for k, s in enumerate(first.signs) if s is not None]
+    if not fluor:
+        return {'gate_type': 'free', 'sep': None,
+                'regions': [ag_core.REGION_INSIDE] * len(grp), 'algorithm': 'cells'}
+    if len(fluor) == 1:
+        k = fluor[0]
+        return {'gate_type': '1dsep', 'sep': k,
+                'regions': [_region_1d(p.signs[k]) for p in grp], 'algorithm': 'mixture'}
+    layout = _quadrant_layout(grp) if len(grp) > 1 else None
+    if layout is not None:
+        return dict(layout, algorithm='mixture')
+    return {'gate_type': '2dsep', 'sep': None,
+            'regions': [f"x{p.signs[0]}y{p.signs[1]}" for p in grp], 'algorithm': 'mixture'}
+
+
+def _quadrant_layout(grp: list[_Piece]) -> dict | None:
+    """Thresholds and regions that best reproduce sibling shapes drawn on
+    two fluorescence parameters, or None when no layout gives every shape
+    a region of its own.
+
+    Over a grid on the shapes' joint extent, each pair of thresholds splits
+    the plot into quadrants; a quadrant goes to the shape covering most of
+    it when that shape covers at least LAYOUT_MIN_COVER of it and most of
+    what is drawn in it. A shape's
+    region is the union of its quadrants, so a shape spanning both sides of
+    a threshold (the x- side, or an L around another shape) keeps all of
+    it. The layout with the fewest mismatched cells (drawn but given to
+    another shape or none, plus LAYOUT_UNDRAWN_WEIGHT times those given but
+    not drawn) wins. The gate
+    separates on one parameter only (1dsep) when one threshold alone does
+    nearly as well (within LAYOUT_1D_TOLERANCE of the drawn area) and the
+    other does not leave two shapes wholly on opposite sides, or when
+    the other threshold separates no two shapes in a layout within
+    LAYOUT_TIE of the best and the one-parameter layout is within
+    LAYOUT_1D_MAX_EXTRA of it: no two shapes lie wholly on
+    opposite sides of it, and each shape's quadrants, mirrored across it,
+    are its own or left undrawn (less than LAYOUT_EMPTY_COVER of the
+    quadrant drawn).
+    """
+    from matplotlib.path import Path as MplPath
+    polys = [np.asarray(p.shape.get('boundary') or [], dtype=float) for p in grp]
+    if any(pl.ndim != 2 or len(pl) < 3 for pl in polys):
+        return None
+    pts = np.vstack(polys)
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    if not np.all(hi > lo):
+        return None
+    n = LAYOUT_GRID
+    cx = lo[0] + (np.arange(n) + 0.5) * (hi[0] - lo[0]) / n
+    cy = lo[1] + (np.arange(n) + 0.5) * (hi[1] - lo[1]) / n
+    gx, gy = np.meshgrid(cx, cy)
+    centres = np.column_stack([gx.ravel(), gy.ravel()])
+    cover = np.stack([MplPath(pl).contains_points(centres).reshape(n, n) for pl in polys])
+    drawn = cover.any(axis=0)
+    if not drawn.any() or not all(c.any() for c in cover):
+        return None
+    total = float(drawn.sum())
+
+    def cum(a):
+        out = np.zeros((n + 1, n + 1))
+        out[1:, 1:] = np.cumsum(np.cumsum(a, axis=0), axis=1)
+        return out
+
+    sums = [cum(c.astype(float)) for c in cover]
+    sum_drawn = cum(drawn.astype(float))
+
+    def box(c, r0, r1, c0, c1):
+        return c[r1, c1] - c[r0, c1] - c[r1, c0] + c[r0, c0]
+
+    def assign(cells):
+        """cells: {label: (r0, r1, c0, c1)} → (cost, {label: piece index})"""
+        cost, owner = 0.0, {}
+        for lab, (r0, r1, c0, c1) in cells.items():
+            area = (r1 - r0) * (c1 - c0)
+            if area <= 0:
+                continue
+            got = [box(sm, r0, r1, c0, c1) for sm in sums]
+            k = int(np.argmax(got))
+            in_drawn = box(sum_drawn, r0, r1, c0, c1)
+            if got[k] >= LAYOUT_MIN_COVER * area and got[k] >= 0.5 * in_drawn:
+                owner[lab] = k
+                cost += (in_drawn - got[k]) + LAYOUT_UNDRAWN_WEIGHT * (area - got[k])
+            else:
+                cost += in_drawn
+        return cost, owner
+
+    def quadrants(i, j):
+        return {'x-y-': (0, j, 0, i), 'x+y-': (0, j, i, n),
+                'x-y+': (j, n, 0, i), 'x+y+': (j, n, i, n)}
+
+    # Every pair of thresholds at once (same rules as assign).
+    gi, gj = np.meshgrid(np.arange(1, n), np.arange(1, n), indexing='ij')
+    zero, full = np.zeros_like(gi), np.full_like(gi, n)
+    total_cost = np.zeros(gi.shape)
+    claimed = np.zeros((len(grp),) + gi.shape, dtype=bool)
+    for r0, r1, c0, c1 in quadrants(gi, gj).values():
+        r0 = zero if np.isscalar(r0) else r0
+        r1 = full if np.isscalar(r1) else r1
+        c0 = zero if np.isscalar(c0) else c0
+        c1 = full if np.isscalar(c1) else c1
+        area = (r1 - r0) * (c1 - c0)
+        got = np.stack([box(sm, r0, r1, c0, c1) for sm in sums])
+        k = np.argmax(got, axis=0)
+        best_got = np.take_along_axis(got, k[None], axis=0)[0]
+        in_drawn = box(sum_drawn, r0, r1, c0, c1)
+        owned = ((area > 0) & (best_got >= LAYOUT_MIN_COVER * area)
+                 & (best_got >= 0.5 * in_drawn))
+        total_cost += np.where(owned, (in_drawn - best_got)
+                               + LAYOUT_UNDRAWN_WEIGHT * (area - best_got), in_drawn)
+        for p in range(len(grp)):
+            claimed[p] |= owned & (k == p)
+    valid = claimed.all(axis=0)
+    layouts = []
+    if valid.any():
+        floor = float(total_cost[valid].min())
+        for i, j in zip(*np.nonzero(valid & (total_cost <= floor + LAYOUT_TIE * total))):
+            cells = quadrants(int(gi[i, j]), int(gj[i, j]))
+            cost, owner = assign(cells)
+            layouts.append((cost, owner, cells))
+    best2 = min(layouts, key=lambda lay: lay[0]) if layouts else None
+    best1 = {}
+    for k_axis in (0, 1):
+        for i in range(1, n):
+            cells = ({'-': (0, n, 0, i), '+': (0, n, i, n)} if k_axis == 0
+                     else {'-': (0, i, 0, n), '+': (i, n, 0, n)})
+            cost, owner = assign(cells)
+            if len(set(owner.values())) == len(grp) and (
+                    k_axis not in best1 or cost < best1[k_axis][0]):
+                best1[k_axis] = (cost, owner, k_axis)
+
+    def splits(layout, axis_pos: int) -> bool:
+        """True when two shapes lie wholly on opposite sides of the
+        threshold of quadrant character *axis_pos* (1: x, 3: y)."""
+        sides: dict = {}
+        for q, k in layout[1].items():
+            sides.setdefault(k, set()).add(q[axis_pos])
+        return {next(iter(v)) for v in sides.values() if len(v) == 1} == {'+', '-'}
+
+    def redundant(layout, axis_pos: int) -> bool:
+        """True when the threshold of quadrant character *axis_pos* (1: x,
+        3: y) separates no two shapes in a two-parameter layout."""
+        _c, owner, cells = layout
+        if splits(layout, axis_pos):
+            return False
+        for q, k in owner.items():
+            m = q[:axis_pos] + ('+' if q[axis_pos] == '-' else '-') + q[axis_pos + 1:]
+            if owner.get(m, k) != k:
+                return False
+            if m not in owner:
+                r0, r1, c0, c1 = cells[m]
+                area = (r1 - r0) * (c1 - c0)
+                if area and box(sum_drawn, r0, r1, c0, c1) >= LAYOUT_EMPTY_COVER * area:
+                    return False
+        return True
+
+    one_d = [best1[k] for k in (0, 1) if k in best1]
+    if best2 is not None:
+        near = layouts
+        allowed = [best1[k] for k, pos in ((0, 3), (1, 1))
+                   if k in best1 and best1[k][0] <= best2[0] + LAYOUT_1D_MAX_EXTRA * total
+                   and any(redundant(lay, pos) for lay in near)]
+        close = [best1[k] for k, pos in ((0, 3), (1, 1))
+                 if k in best1 and not splits(best2, pos)
+                 and best1[k][0] <= best2[0] + LAYOUT_1D_TOLERANCE * total]
+        one_d = allowed + close
+    if one_d:
+        _cost, owner, k_axis = min(one_d, key=lambda b: b[0])
+        regions = [None] * len(grp)
+        for side, k in owner.items():
+            regions[k] = _region_1d(side)
+        return {'gate_type': '1dsep', 'sep': k_axis, 'regions': regions}
+    if best2 is None:
+        return None
+    quads: list[list[str]] = [[] for _ in grp]
+    for q, k in best2[1].items():
+        quads[k].append(q)
+    return {'gate_type': '2dsep', 'sep': None,
+            'regions': [ag_core.join_quadrants(q) for q in quads]}
+
+
+def _group_siblings(pieces: list[_Piece], merge: bool) -> list[list[_Piece]]:
+    """Sibling pieces drawn on the same parameters become one gate, one
+    population each, as long as each takes a different side of the
+    thresholds; scatter-only shapes and pieces that would share a region
+    stay on their own."""
+    groups: list[list[_Piece]] = []
+    for p in pieces:
+        placed = False
+        if merge and not p.singlets and any(s is not None for s in p.signs):
+            for grp in groups:
+                q = grp[0]
+                if q.channels != p.channels or q.singlets:
+                    continue
+                regions = _plan_gate(grp + [p])['regions']
+                if len(set(regions)) == len(regions):
+                    grp.append(p)
+                    placed = True
+                    break
+        if not placed:
+            groups.append([p])
+    return groups
+
+
+def _describe(gdef: dict, plan: dict, exp_labels) -> str:
+    """One line saying what a gate converts to."""
+    gtype = gdef['gate_type']
+    pops = ', '.join(f"{n} {v['region']}" for n, v in gdef['populations'].items())
+    algo = plan['algorithm']
+    tail = f"; proposed algorithm '{algo}'" if algo else ''
+    if gtype == '1dsep':
+        view = gdef.get('gate_marker_y') or 'Histogram'
+        axis = ag_core.separation_axis(gdef)
+        return (f"1dsep separating on {exp_labels(gdef['gate_marker_x'])} (sep, {axis} axis), "
+                f"view {exp_labels(view)}: {pops}{tail}.")
+    if gtype == '2dsep':
+        return (f"2dsep on {exp_labels(gdef['gate_marker_x'])} × "
+                f"{exp_labels(gdef['gate_marker_y'])}: {pops}{tail}.")
+    if gtype == 'singlets':
+        return f"Singlet gate{tail}."
+    axis = (gdef.get('gate_param') or {}).get('debris_axis', 'x')
+    debris = gdef.get('gate_marker_y') if axis == 'y' else gdef.get('gate_marker_x')
+    return (f"Scatter gate on {exp_labels(gdef['gate_marker_x'])} × "
+            f"{exp_labels(gdef['gate_marker_y'])}: cell gate cutting debris on "
+            f"{exp_labels(debris)}{tail}.")
+
+
+def _histogram_positive_fraction(grp: list, gplan: dict, parent_count) -> float | None:
+    """Fraction of the parent on the positive side of a histogram gate, from
+    the counts recorded at import, or None when they were not recorded."""
+    if not parent_count:
+        return None
+    above = [p for p, r in zip(grp, gplan['regions']) if r == ag_core.REGION_ABOVE]
+    below = [p for p, r in zip(grp, gplan['regions']) if r != ag_core.REGION_ABOVE]
+    if above and all(p.pop.count is not None for p in above):
+        return sum(p.pop.count for p in above) / float(parent_count)
+    if below and all(p.pop.count is not None for p in below):
+        return 1.0 - sum(p.pop.count for p in below) / float(parent_count)
+    return None
+
+
+def histogram_algorithm(positive_fraction) -> str:
+    """'mixture' for a histogram gate whose positive population holds more
+    than HISTOGRAM_MIXTURE_FREQUENCY of its parent, else 'tail'."""
+    if positive_fraction is not None and positive_fraction > HISTOGRAM_MIXTURE_FREQUENCY:
+        return 'mixture'
+    return 'tail'
+
+
+def build_gate_definitions(source: FJSource, mapping: dict, exp: ExperimentChannels,
+                           merge_siblings: bool = True,
+                           existing_names: set | None = None,
+                           workspace_name: str = '',
+                           native_display: bool = False,
+                           origin: str = 'FlowJo') -> tuple[list[dict], dict]:
+    """Convert the importable populations of *source* into gate definitions.
+
+    mapping : {FlowJo parameter: experiment channel or None}; populations
+              using an unmapped parameter are dropped (see plan_import).
+
+    Every gate keeps its shapes exactly as drawn in ``template`` (algorithm
+    ``imported``; ``template_original`` keeps a copy for resetting) and
+    records the trainable gate it converts to in its type, axes, regions
+    and ``proposed_algorithm``:
+
+      * a polygon or rectangle on the forward-scatter singlet pair →
+        'singlets'; that gate is moved to the top of the hierarchy and the
+        gates drawn above it are placed directly below it;
+      * ellipses are traced as 10-vertex polygons of the same area;
+      * sibling gates drawn on the same pair of parameters, with at least
+        one fluorescence parameter, become one gate with one population
+        each (2dsep, or 1dsep on the fluorescence parameter when the other
+        is scatter); proposed algorithm 'mixture';
+      * a histogram (1-D) gate → 1dsep with a histogram view; 'tail', or
+        'mixture' when its positive population held more than 25% of the
+        parent in the recorded counts (``proposal_rule`` 'histogram' lets
+        the Hierarchy tab apply the rule to the review sample when no counts
+        were recorded);
+      * a single gate on a pair → 1dsep separating on the fluorescence
+        parameter when the other is scatter, 2dsep when both are
+        fluorescence; 'mixture';
+      * threshold gates other than histograms are proposed 'mixture' with
+        ``proposal_rule`` 'fraction': on the Hierarchy tab each axis takes
+        'mixture' when the shapes as drawn hold more than 25% of the parent
+        on its positive side in the review samples, else 'tail' (the
+        histogram rule on every axis; the workspace's counts are not used,
+        as a template's group counts do not describe the samples);
+      * an area against height or width gate of the same scatter detector →
+        'singlets' (only the first moves to the top);
+      * shapes drawn only on scatter parameters stay 'free'; proposed
+        'cells', a debris cut on forward scatter.
+
+    Gate names are unique. Gates sharing a name (e.g. 'TIGIT+' drawn on
+    many populations) are told apart by the population they are drawn on,
+    'TIGIT+ (Tem)', adding the populations above it only when that is not
+    enough, 'TIGIT+ (CD4+ › Tem)'; the shared name is kept in
+    ``name_group`` so the Hierarchy tab can treat them as replicates.
+
+    The side of a fluorescence parameter comes from the drawn coordinates:
+    entirely above the channel's raw zero selects the positive side,
+    reaching zero or below selects the negative side. Sibling shapes on two
+    fluorescence parameters instead take the quadrant layout that best
+    reproduces them (_quadrant_layout): a shape may take several quadrants
+    (a whole side, or an L around another shape), and a parameter that
+    separates no two shapes is dropped (1dsep on the other).
+
+    native_display : the source's coordinates are already Honeychrome display
+              units (see source_from_gating), so no transform is applied.
+    origin  : recorded in each gate's ``source`` ('FlowJo' or
+              'Experiment hierarchy').
+
+    Returns (gate_defs, report) where report has 'plan' (ImportPlan),
+    'notes' ({gate name: [str]}) and 'populations' ({FlowJo population key:
+    'gate/pop'}).
+    """
+    plan = plan_import(source, mapping)
+    keep = set(plan.keep)
+    used = set(existing_names or ())
+    gate_defs: list[dict] = []
+    notes: dict[str, list[str]] = {}
+    pop_map: dict[str, tuple[str, str]] = {}
+
+    def label(ch):
+        antigen = (exp.antigens.get(ch) or '').strip()
+        return f"{ch} ({antigen})" if antigen and antigen != ch else str(ch)
+
+    temp_names: set = set()
+    bases: dict[str, str] = {}
+    parent_paths: dict[str, tuple] = {}
+
+    def unique(name: str, parent_path: tuple) -> str:
+        base = _safe_name(name)
+        cand, k = base, 2
+        while cand in temp_names:
+            cand = f"{base}\x00{k}"
+            k += 1
+        temp_names.add(cand)
+        bases[cand] = base
+        parent_paths[cand] = parent_path
+        return cand
+
+    def emit(parent: FJPopulation | None, children: list[FJPopulation]):
+        kids = [c for c in children if c.key in keep]
+        if not kids:
+            return
+        parent_gate, parent_pop = (pop_map[parent.key] if parent is not None
+                                   else (None, 'root'))
+        pieces = [_piece(c, source, mapping, exp, native_display) for c in kids]
+        for grp in _group_siblings(pieces, merge_siblings):
+            names = [p.pop.name for p in grp]
+            gname = unique(names[0] if len(grp) == 1 else ' & '.join(names),
+                           tuple(parent.path) if parent is not None else ())
+            gplan = _plan_gate(grp)
+            gdef, pops = _gate_def(grp, gplan, gname, parent_gate, parent_pop)
+            gdef['gate_number'] = len(gate_defs) + 1
+            gdef['template_original'] = deepcopy(gdef['template'])
+            parent_count = parent.count if parent is not None else source.count
+            if gdef['gate_type'] == '1dsep' and len(grp[0].channels) == 1:
+                gdef['proposal_rule'] = 'histogram'
+                gdef['proposed_algorithm'] = histogram_algorithm(
+                    _histogram_positive_fraction(grp, gplan, parent_count))
+                gplan = dict(gplan, algorithm=gdef['proposed_algorithm'])
+            elif gdef['gate_type'] in ag_core.THRESHOLD_TYPES:
+                gdef['proposal_rule'] = 'fraction'
+            elif gdef['gate_type'] == 'free':
+                gdef['gate_param']['debris_axis'] = _forward_scatter_axis(grp[0].channels, exp)
+            gdef['source'] = {
+                'origin': origin,
+                'workspace': workspace_name,
+                'gating_source': source.title,
+                'sample': source.name if source.kind == 'sample' else source.sample_name,
+                'parent_count': parent_count,
+                'populations': {pname: p.pop.key for pname, p in pops.items()},
+                'counts': {pname: p.pop.count for pname, p in pops.items()},
+                'parameters': {ch: fj for p in grp for fj, ch in zip(p.pop.gate.channels, p.channels)},
+            }
+            gate_defs.append(gdef)
+            notes[gname] = [_describe(gdef, gplan, label)] + [n for p in grp for n in p.notes]
+            for pname, p in pops.items():
+                pop_map[p.pop.key] = (gname, pname)
+        for c in kids:
+            emit(c, c.children)
+
+    emit(None, source.roots)
+    renamed = _final_names(bases, parent_paths, used)
+    for g in gate_defs:
+        g['name_group'] = bases[g['gate_name']]
+        g['gate_name'] = renamed[g['gate_name']]
+        if g.get('parent_gate') in renamed:
+            g['parent_gate'] = renamed[g['parent_gate']]
+    notes = {renamed.get(k, k): v for k, v in notes.items()}
+    pop_map = {k: (renamed.get(v[0], v[0]), v[1]) for k, v in pop_map.items()}
+    moved, below = _singlets_first(gate_defs, exp.singlet_pair[0] if exp.singlet_pair else None)
+    if moved:
+        singlets = moved[0]
+        # FlowJo's singlet population is now the last moved gate's
+        # population; the moved gates' own FlowJo populations have no
+        # equivalent in the new order.
+        by_pop = {v: k for k, v in pop_map.items()}
+        single_key = next(k for k, v in pop_map.items() if v[0] == singlets)
+        pop_map[single_key] = below
+        for name in moved[1:]:
+            for pop in ag_core.gates_by_name(gate_defs)[name]['populations']:
+                key = by_pop.get((name, pop))
+                if key is not None and pop_map.get(key) == (name, pop):
+                    del pop_map[key]
+        notes.setdefault(singlets, []).append(
+            "Moved to the top of the hierarchy; " + ', '.join(f"'{m}'" for m in moved[1:])
+            + " now sit" + ('s' if len(moved) == 2 else '') + " directly below it.")
+    report = {
+        'plan': plan,
+        'notes': notes,
+        'populations': {k: ag_core.population_key(*v) for k, v in pop_map.items()},
+    }
+    return gate_defs, report
+
+
+def _final_names(bases: dict, parent_paths: dict, taken: set) -> dict:
+    """{temporary name: unique gate name}. A name used by one gate only, and
+    not taken, is kept. Gates sharing a name are qualified by the names of
+    the populations they are drawn on, the closest first and as few as make
+    them distinct: 'TIGIT+ (Tem)', 'TIGIT+ (CD4+ › Tem)'. Numbers are the
+    last resort."""
+    groups: dict[str, list[str]] = {}
+    for temp, base in bases.items():
+        groups.setdefault(base, []).append(temp)
+    out: dict[str, str] = {}
+    used = set(taken)
+    for base, members in groups.items():
+        if len(members) == 1 and base not in used:
+            out[members[0]] = base
+            used.add(base)
+    for base, members in groups.items():
+        if members[0] in out:
+            continue
+        paths = [tuple(parent_paths[m]) or ('All events',) for m in members]
+        depth = max(len(p) for p in paths)
+        chosen = None
+        for k in range(1, depth + 1):
+            cands = [f"{base} ({' › '.join(_safe_name(n) for n in p[-k:])})" for p in paths]
+            if len(set(cands)) == len(cands) and not set(cands) & used:
+                chosen = cands
+                break
+        if chosen is None:
+            chosen = []
+            for p in paths:
+                cand = f"{base} ({' › '.join(_safe_name(n) for n in p)})"
+                stem, k = cand, 2
+                while cand in used or cand in chosen:
+                    cand = f"{stem} {k}"
+                    k += 1
+                chosen.append(cand)
+        for m, cand in zip(members, chosen):
+            out[m] = cand
+            used.add(cand)
+    return out
+
+
+def _singlets_first(gate_defs: list[dict], forward_area: str | None = None
+                    ) -> tuple[list[str], tuple | None]:
+    """Make the first forward-scatter singlet gate (on *forward_area*; any
+    singlet gate when none is) the top of the hierarchy.
+
+    The gates on the path from the root to it are placed directly below it,
+    in their original order, and the singlet gate's own daughters move to
+    the last of them. Their recorded parent counts no longer describe the
+    new parents, so they are cleared. Returns ([singlet gate, moved
+    gates…], (gate, population) the singlet gate's daughters now sit in),
+    or ([], None) when nothing moved.
+    """
+    by_name = ag_core.gates_by_name(gate_defs)
+    singlets = [g for g in gate_defs if g.get('gate_type') == 'singlets']
+    single = next((g for g in singlets
+                   if forward_area in (g.get('gate_marker_x'), g.get('gate_marker_y'))),
+                  singlets[0] if singlets and forward_area is None else None)
+    if single is None or not single.get('parent_gate'):
+        return [], None
+    chain = []
+    name = single.get('parent_gate')
+    while name and name in by_name and name not in chain:
+        chain.append(name)
+        name = by_name[name].get('parent_gate')
+    chain.reverse()
+    last_gate, last_pop = single['parent_gate'], single['parent_popul']
+    single_pop = next(iter(single.get('populations') or {}), 'root')
+    for g in gate_defs:
+        if g.get('parent_gate') == single['gate_name']:
+            g['parent_gate'], g['parent_popul'] = last_gate, last_pop
+    top = by_name[chain[0]]
+    single['parent_gate'], single['parent_popul'] = None, 'root'
+    top['parent_gate'], top['parent_popul'] = single['gate_name'], single_pop
+    for name in [single['gate_name']] + chain:
+        src = by_name[name].get('source')
+        if src is not None:
+            src['parent_count'] = None
+    for k, g in enumerate(ag_core.ordered_gate_defs(gate_defs), start=1):
+        g['gate_number'] = k
+    gate_defs.sort(key=lambda g: g['gate_number'])
+    return [single['gate_name']] + chain, (last_gate, last_pop)
+
+
+def _gate_def(grp: list[_Piece], gplan: dict, gname: str, parent_gate,
+              parent_pop) -> tuple[dict, dict]:
+    first = grp[0]
+    gtype = gplan['gate_type']
+    chans = list(first.channels)
+    sep_axis = 'x'
+    if gtype == '1dsep':
+        k = gplan['sep']
+        view = chans[1 - k] if len(chans) == 2 else None
+        marker_x, marker_y = chans[k], view
+        sep_axis = 'y' if k == 1 else 'x'
+    else:
+        marker_x = chans[0]
+        marker_y = chans[1] if len(chans) > 1 else None
+    defaults = ag_core.default_populations_for_type(gtype)
+    pos_by_region = {v['region']: v['label_pos'] for v in defaults.values()}
+    populations: dict[str, dict] = {}
+    template: dict[str, dict] = {}
+    pops_by_name: dict[str, _Piece] = {}
+    for p, region in zip(grp, gplan['regions']):
+        pname = _safe_name(p.pop.name)
+        populations[pname] = {'label': pname, 'label_pos': pos_by_region.get(region, 1),
+                              'region': region}
+        entry = deepcopy(p.shape)
+        entry.update({'threshold_x': None, 'threshold_y': None,
+                      'region': region, 'label': pname})
+        template[pname] = entry
+        pops_by_name[pname] = p
+    gdef = {
+        'gate_name': gname,
+        'gate_type': gtype,
+        'gate_marker_x': marker_x,
+        'gate_marker_y': marker_y,
+        'sep_axis': sep_axis,
+        'parent_gate': parent_gate,
+        'parent_popul': parent_pop,
+        'algorithm': ALGORITHM_IMPORTED,
+        'proposed_algorithm': gplan['algorithm'],
+        'gate_param': {},
+        'stats_parent': {},
+        'origin_gate': None,
+        'populations': populations,
+        'template': template,
+    }
+    return gdef, pops_by_name
+
+
+_NUMBERED = re.compile(r'^(.*\S) \((\d+)\)$')
+
+
+def upgrade_gate_definitions(gate_defs: list[dict]) -> int:
+    """Bring gates imported before the current rules up to date, in place,
+    without renaming them: the shared imported name (``name_group``, the
+    name without a ' (2)' style suffix), the histogram rule on histogram
+    gates still as drawn and the fraction rule on other threshold gates
+    still as drawn with the import's proposal, and 'cells' as the proposal
+    for scatter shapes. Returns the number of gates changed."""
+    changed = 0
+    for g in gate_defs:
+        before = (g.get('name_group'), g.get('proposal_rule'), g.get('proposed_algorithm'),
+                  (g.get('gate_param') or {}).get('debris_axis'))
+        if g.get('source') and not g.get('name_group'):
+            m = _NUMBERED.match(g['gate_name'])
+            g['name_group'] = m.group(1) if m else g['gate_name']
+        imported = g.get('algorithm') == ALGORITHM_IMPORTED and g.get('source')
+        if imported and g.get('gate_type') == '1dsep' and not g.get('gate_marker_y') \
+                and not g.get('proposal_rule') and g.get('proposed_algorithm') in (None, 'tail'):
+            g['proposal_rule'] = 'histogram'
+            src = g.get('source') or {}
+            parent = src.get('parent_count')
+            counts = src.get('counts') or {}
+            regions = ag_core.population_regions(g)
+            above = [counts.get(p) for p, r in regions.items() if r == ag_core.REGION_ABOVE]
+            below = [counts.get(p) for p, r in regions.items() if r != ag_core.REGION_ABOVE]
+            frac = None
+            if parent and above and None not in above:
+                frac = sum(above) / float(parent)
+            elif parent and below and None not in below:
+                frac = 1.0 - sum(below) / float(parent)
+            g['proposed_algorithm'] = histogram_algorithm(frac)
+        elif imported and g.get('gate_type') in ag_core.THRESHOLD_TYPES \
+                and not g.get('proposal_rule') and g.get('proposed_algorithm') in (None, 'mixture'):
+            g['proposal_rule'] = 'fraction'
+        if g.get('gate_type') == 'free' and g.get('proposed_algorithm') in (None, 'ellipse'):
+            g['proposed_algorithm'] = 'cells'
+            g.setdefault('gate_param', {}).setdefault('debris_axis', 'x')
+        after = (g.get('name_group'), g.get('proposal_rule'), g.get('proposed_algorithm'),
+                 (g.get('gate_param') or {}).get('debris_axis'))
+        changed += before != after
+    return changed

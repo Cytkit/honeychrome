@@ -59,7 +59,7 @@ class OrderedMultiSamplePicker(QFrame):
         # --- Right Side: Selected & Ordered ---
         self.select_frame = self._create_styled_frame()
         right_layout = QVBoxLayout(self.select_frame)
-        right_layout.addWidget(QLabel("Selected Samples (Ordered List)"))
+        right_layout.addWidget(QLabel("Selected Samples"))
         self.selected_list = QListWidget()
         self.selected_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         right_layout.addWidget(self.selected_list)

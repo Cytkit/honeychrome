@@ -40,11 +40,13 @@ from flowkit import GatingStrategy, Dimension, gates
 import numpy as np
 import warnings
 import os
+import uuid
 from flowio import FlowData
 from typing import Optional
 
 from honeychrome.controller_components.functions import generate_transformations, assign_default_transforms
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import to_gml
+from honeychrome.controller_components.particle_type import update_bead_samples
 from honeychrome.settings import settings_default, samples_default, process_default, cytometry_default, sample_name_source
 
 import logging
@@ -56,7 +58,8 @@ def check_for_windows_junction(path):
     return False
 
 def safe_save(content, filename):
-    temp_name = filename + '.tmp'
+    # unique per save, so overlapping saves cannot consume each other's temp file
+    temp_name = f'{filename}.{uuid.uuid4().hex[:8]}.tmp'
 
     # Write to temp file
     with open(temp_name, 'w') as f:
@@ -97,6 +100,13 @@ class ExperimentModel:
         self.process: dict = deepcopy(process_default)
         self.cytometry: dict = deepcopy(cytometry_default)
         self.statistics: list = []
+        # Identifies this .kit, so state kept in the experiment folder (see
+        # controller_components.experiment_state) is never taken up by a new
+        # experiment created at the same path.
+        self.experiment_id: str = ''
+        # True for an experiment saved before ids existed: its plugin state
+        # may still be in QSettings, to be moved to the folder once.
+        self.legacy_plugin_state: bool = False
 
         self.progress_indicator = 0
 
@@ -108,6 +118,7 @@ class ExperimentModel:
         self.process = deepcopy(process_default)
         self.cytometry = deepcopy(cytometry_default)
         self.statistics = []
+        self.new_identity()
 
         ### set up default raw gating, raw transforms, raw plots ---- check that this corresponds with default channels
         self.cytometry['raw_transforms'] = assign_default_transforms(self.settings['raw'])
@@ -159,10 +170,20 @@ class ExperimentModel:
         self.cytometry['raw_gating'] = to_gml(raw_gating)
         self.cytometry['raw_plots'] = raw_plots
 
+        self.cytometry.setdefault('raw_custom_sample_gates', {})
+        self.cytometry.setdefault('unmixed_custom_sample_gates', {})
+
         ### save ###
         self.save()
 
-    def load(self, experiment_path):
+    def new_identity(self):
+        """Give the experiment a new id, as a new experiment."""
+        self.experiment_id = uuid.uuid4().hex
+        self.legacy_plugin_state = False
+
+    def load(self, experiment_path) -> bool:
+        """Read a .kit. Returns True when the file had no experiment id and
+        one was given to it, so the caller can save to keep it."""
         self.experiment_path = str(experiment_path)
         with open(self.experiment_path, "rb") as f:
             file_data = json.load(f)
@@ -174,6 +195,17 @@ class ExperimentModel:
         self.cytometry = file_data['cytometry']
         self.statistics = file_data['statistics']
 
+        self.cytometry.setdefault('raw_custom_sample_gates', {})
+        self.cytometry.setdefault('unmixed_custom_sample_gates', {})
+
+        self.experiment_id = str(file_data.get('experiment_id') or '')
+        self.legacy_plugin_state = bool(file_data.get('legacy_plugin_state', False))
+        if self.experiment_id:
+            return False
+        self.experiment_id = uuid.uuid4().hex
+        self.legacy_plugin_state = True
+        return True
+
     def save(self):
         if self.experiment_path is None:
             raise ValueError("No file path set for saving")
@@ -182,8 +214,11 @@ class ExperimentModel:
             'samples':self.samples,
             'process':self.process,
             'cytometry':self.cytometry,
-            'statistics':self.statistics
+            'statistics':self.statistics,
+            'experiment_id': self.experiment_id,
         }
+        if self.legacy_plugin_state:
+            file_data['legacy_plugin_state'] = True
         json_string = json.dumps(file_data, indent=2)
         # json_string = json_string.replace('\\n', '\n') # to pretty print the gml sections... unfortunately not compatible with json standard
 
@@ -192,12 +227,14 @@ class ExperimentModel:
     def generate_subdirs(self):
         experiment_pl = Path(self.experiment_path)
         experiment_dir = experiment_pl.parent / experiment_pl.stem
-        experiment_dir_single_stain_controls = self.settings['raw']['single_stain_controls_subdirectory']
-        (experiment_dir / experiment_dir_single_stain_controls).mkdir(parents=True, exist_ok=True)
-        experiment_dir_raw_samples = self.settings['raw']['raw_samples_subdirectory']
-        (experiment_dir / experiment_dir_raw_samples).mkdir(parents=True, exist_ok=True)
-        experiment_dir_unmixed_samples = self.settings['unmixed']['unmixed_samples_subdirectory']
-        (experiment_dir / experiment_dir_unmixed_samples).mkdir(parents=True, exist_ok=True)
+
+        for subdir in (self.settings['raw']['single_stain_controls_subdirectory'], self.settings['raw']['raw_samples_subdirectory'], self.settings['unmixed']['unmixed_samples_subdirectory']):
+            subdir_path = experiment_dir / subdir
+            if os.path.lexists(subdir_path) and not subdir_path.exists():
+                # link to a folder that is not currently available (e.g. unsynced or unmapped)
+                logger.warning(f'Linked folder {subdir_path} points to a location that is not available')
+                continue
+            subdir_path.mkdir(parents=True, exist_ok=True)
 
         return experiment_dir
 
@@ -210,10 +247,11 @@ class ExperimentModel:
         experiment_dir_raw_samples = self.settings['raw']['raw_samples_subdirectory']
         experiment_dir_unmixed_samples = self.settings['unmixed']['unmixed_samples_subdirectory']
 
+        # '._*' files are macOS AppleDouble metadata, not FCS data
         single_stain_controls = [str(p.relative_to(experiment_dir)) for p in
-                                 sorted((experiment_dir / experiment_dir_single_stain_controls).glob('**/*.fcs'))]
+                                 sorted((experiment_dir / experiment_dir_single_stain_controls).glob('**/*.fcs')) if not p.name.startswith('._')]
         raw_samples = [str(p.relative_to(experiment_dir)) for p in
-                       sorted((experiment_dir / experiment_dir_raw_samples).glob('**/*.fcs'))]
+                       sorted((experiment_dir / experiment_dir_raw_samples).glob('**/*.fcs')) if not p.name.startswith('._')]
 
         # add all single stain controls to raw samples if not already present
         for sample_path in single_stain_controls:
@@ -223,8 +261,15 @@ class ExperimentModel:
         # load samples one by one, print name, datetime, number of events, file location
         all_sample_nevents = {}
         all_samples = {}
+        unreadable = set()
         for sample_path in raw_samples:
-            sample_metadata = FlowData(experiment_dir / sample_path, only_text=True, use_header_offsets=True)
+            try:
+                sample_metadata = FlowData(experiment_dir / sample_path, only_text=True, use_header_offsets=True)
+            except Exception as e:
+                logger.warning(f'scan_sample_tree: skipping unreadable file {sample_path}: {e}')
+                unreadable.add(sample_path)
+                continue
+
             all_sample_nevents[sample_path] = sample_metadata.event_count
             if sample_name_source_instance == 'tubename':
                 all_samples[sample_path] = sample_metadata.text['tubename']
@@ -233,6 +278,7 @@ class ExperimentModel:
             else:  # use filenames
                 all_samples[sample_path] = Path(sample_path).stem
 
+        single_stain_controls = [p for p in single_stain_controls if p not in unreadable]
         for sample_path in single_stain_controls:
             if sample_path not in self.samples['single_stain_controls']:
                 self.samples['single_stain_controls'].append(sample_path)
@@ -268,6 +314,22 @@ class ExperimentModel:
             p for p in self.samples['unstained_samples']
             if p in self.samples['all_samples']
         ]
+
+        self.check_bead_samples()
+
+    def check_bead_samples(self) -> list:
+        """Check samples not yet checked for beads (particle_type.update_bead_samples),
+        taking the particle types already set in the Spectral Model as given."""
+        name_to_path = {name: path for path, name in self.samples['all_samples'].items()}
+        known_types = {
+            name_to_path[c['sample_name']]: c.get('particle_type')
+            for c in self.process.get('spectral_model', [])
+            if c.get('control_type') == 'Single Stained Spectral Control'
+            and c.get('sample_name') in name_to_path
+        }
+        experiment_dir = Path(self.experiment_path).parent / Path(self.experiment_path).stem
+        return update_bead_samples(self.samples, experiment_dir, self.settings['raw'],
+                                   self.cytometry.get('raw_plots'), known_types=known_types)
 
 
 if __name__ == '__main__':

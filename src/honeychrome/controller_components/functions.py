@@ -1,7 +1,9 @@
+import os
 import numpy as np
 import struct
+from copy import deepcopy
 from flowio.exceptions import FCSParsingError
-from flowkit import Sample, QuadrantDivider, Dimension, gates
+from flowkit import GatingStrategy, Sample, QuadrantDivider, Dimension, gates
 from PySide6.QtCore import QSettings
 from queue import Empty
 from time import perf_counter, sleep
@@ -9,6 +11,9 @@ from functools import wraps
 from pathlib import Path
 from honeychrome.controller_components.transform import Transform
 from honeychrome.settings import linear_a, logicle_w, logicle_m, logicle_a, log_m
+from honeychrome.settings import (
+    af_abundance_channel, af_index_channel, af_channels, default_af_index_range,
+)
 
 q_settings = QSettings("honeychrome", "ExperimentSelector")
 
@@ -86,8 +91,8 @@ def _load_fcs_with_repaired_delimiter(path):
         col_names.append(keywords.get(f'$P{i}N', f'Channel_{i}'))
 
     sample = Sample(arr, channel_labels=col_names, sample_id=str(Path(path).name))
-    # Attach keywords so get_metadata() callers see them
-    sample._flowdata_object.text.update(keywords)
+    # Attach keywords so get_metadata() callers see them (FlowIO key convention)
+    sample.metadata.update({k.lstrip('$').lower(): v for k, v in keywords.items()})
     return sample
 
 
@@ -124,8 +129,12 @@ def sample_from_fcs(path, bus=None):
                         f'Attempting delimiter repair.')
         sample = _load_fcs_with_repaired_delimiter(path)
 
-    # Replace literal 'NA' keyword values (some FACSDiscover files write these).
-    meta = sample.get_metadata()
+    _blank_na_keywords(sample.get_metadata(), path)
+    return sample
+
+
+def _blank_na_keywords(meta, path):
+    """Replace literal 'NA' keyword values (some FACSDiscover files write these)."""
     if meta:
         na_keys = [k for k, v in meta.items() if str(v).strip().upper() == 'NA']
         for k in na_keys:
@@ -133,7 +142,154 @@ def sample_from_fcs(path, bus=None):
         if na_keys:
             logger.debug('sample_from_fcs: NA keywords zeroed in %s: %s', path, na_keys)
 
-    return sample
+
+# Events per block when reading, unmixing and writing large files.
+FCS_CHUNK_EVENTS = 2_000_000
+
+
+class FcsEventReader:
+    """
+    Raw events of one FCS file in a fixed channel order, read a block of
+    events at a time so a large file is never held in memory whole.
+
+    List-mode 32-bit float files (``$DATATYPE`` F, as spectral cytometers
+    write) are memory-mapped and pre-processed exactly as FlowKit's 'raw'
+    events are (via FlowIO): Time scaled by ``$TIMESTEP``, then PnE log
+    decades, then PnG gain (never on Time). Any other file, or one that FlowIO
+    reads only with offset corrections, is loaded whole through
+    sample_from_fcs() and served from memory in the same blocks.
+
+    Blocks are float64, with NaN replaced by 0; channels absent from the file
+    are 0.
+
+    path     : FCS file path.
+    channels : PnN names, in output column order.
+
+    Attributes: ``n_events``, ``keywords`` (TEXT keywords as
+    sample.get_metadata() returns them) and ``streamed`` (False when the file
+    was loaded whole).
+    """
+
+    def __init__(self, path, channels, bus=None):
+        self.path = Path(path)
+        self.channels = list(channels)
+        self.n_events = 0
+        self.keywords = {}
+        self._events = None       # memmap (n_events, n_par) or the loaded raw events
+        self._columns = None      # file column of each output channel, -1 if absent
+        self._scaling = []        # (output column, timestep, decades, pnr, log0, gain)
+        self.streamed = self._open_memmap()
+        if not self.streamed:
+            self._load_whole(bus)
+
+    def _open_memmap(self) -> bool:
+        import flowio
+        try:
+            fd = flowio.FlowData(str(self.path), only_text=True)
+            text = fd.text
+            n_par = int(text['par'])
+            n_tot = int(text['tot'])
+            byte_order = {'1,2,3,4': '<', '4,3,2,1': '>'}.get(text.get('byteord', ''))
+            if (text.get('mode', '').lower() != 'l' or text.get('datatype', '').lower() != 'f'
+                    or byte_order is None
+                    or any(int(text.get(f'p{i}b', 0)) != 32 for i in range(1, n_par + 1))):
+                return False
+            if fd.version == '2.0':
+                data_start, data_stop = int(fd.header['data_start']), int(fd.header['data_stop'])
+            else:
+                data_start, data_stop = int(text['begindata']), int(text['enddata'])
+            if data_start <= 0 or data_stop - data_start + 1 != n_tot * n_par * 4:
+                return False
+
+            time_step = None
+            if 'timestep' in text and fd.time_index is not None:
+                try:
+                    time_step = float(text['timestep'])
+                except ValueError:
+                    if text['timestep'].strip() != '':
+                        return False
+                    time_step = 1.0
+        except Exception as exc:
+            logger.debug(f'FcsEventReader: {self.path} will be loaded whole ({exc})')
+            return False
+
+        file_column = {label: i for i, label in enumerate(fd.pnn_labels)}
+        self._columns = np.array([file_column.get(ch, -1) for ch in self.channels], dtype=np.int64)
+        for j, c in enumerate(self._columns):
+            if c < 0:
+                continue
+            meta = fd.channels[int(c) + 1]
+            decades, log0 = meta['pne']
+            self._scaling.append((j, time_step if c == fd.time_index else None,
+                                  decades, meta['pnr'], log0, meta['png']))
+        self._events = np.memmap(str(self.path), dtype=np.dtype(f'{byte_order}f4'), mode='r',
+                                 offset=data_start, shape=(n_tot, n_par))
+        self.n_events = n_tot
+        self.keywords = fd.text
+        _blank_na_keywords(self.keywords, self.path)
+        return True
+
+    def _load_whole(self, bus):
+        sample = sample_from_fcs(self.path, bus)
+        self._events = sample.get_events(source='raw')
+        file_column = {label: i for i, label in enumerate(sample.pnn_labels)}
+        self._columns = np.array([file_column.get(ch, -1) for ch in self.channels], dtype=np.int64)
+        self.n_events = int(self._events.shape[0])
+        self.keywords = sample.get_metadata()
+
+    def read(self, start: int, stop: int) -> np.ndarray:
+        """Events start:stop as an (n, len(channels)) float64 array."""
+        block = self._events[start:stop]
+        out = np.zeros((len(block), len(self.channels)), dtype=np.float64)
+        present = self._columns >= 0
+        out[:, present] = block[:, self._columns[present]]
+        for j, time_step, decades, pnr, log0, gain in self._scaling:
+            col = out[:, j]
+            if time_step is not None:
+                col = col * time_step
+            if decades > 0:
+                col = (10 ** (decades * col / pnr)) * log0
+            if gain != 1.0 and gain != 0:
+                col = col / gain
+            out[:, j] = col
+        np.nan_to_num(out, copy=False, nan=0.0)
+        return out
+
+    def close(self):
+        """Release the file mapping or the loaded events."""
+        self._events = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def subsample_event_rows(n_events: int, subsample: 'int | None') -> 'np.ndarray | None':
+    """Sorted random event indices for a subsampled export, or None to keep every event."""
+    if subsample is None or subsample >= n_events:
+        return None
+    return np.sort(np.random.choice(n_events, subsample, replace=False))
+
+
+def iter_event_blocks(n_events: int, rows: 'np.ndarray | None' = None,
+                      chunk_events: int = FCS_CHUNK_EVENTS):
+    """
+    Yield (start, stop, local_rows) for consecutive blocks of a file's events.
+    local_rows indexes the events of *rows* (sorted, as from
+    subsample_event_rows) that fall in the block, or is None when every event
+    is kept. Blocks without a selected event are skipped.
+    """
+    for start in range(0, n_events, chunk_events):
+        stop = min(start + chunk_events, n_events)
+        if rows is None:
+            yield start, stop, None
+            continue
+        lo, hi = np.searchsorted(rows, [start, stop])
+        if hi > lo:
+            yield start, stop, rows[lo:hi] - start
 
 def define_process_plots(fluorescence_channels_x, fluorescence_channels_y, source_gate):
     process_plots = [{'type': 'hist2d', 'channel_x': x, 'channel_y': y, 'source_gate': source_gate, 'child_gates': []} if x != y
@@ -202,6 +358,9 @@ def export_unmixed_sample(
     unmixing_method: str = 'OLS',
     unmixing_weights: 'np.ndarray | None' = None,
     extra_whitelist: 'frozenset | set' = frozenset(),
+    af_index_map: 'np.ndarray | None' = None,
+    n_af_index: 'int | None' = None,
+    extra_keywords: 'dict | None' = None,
 ) -> None:
     """
     Write an unmixed FCS file with full FCS 3.1 compliant metadata.
@@ -226,19 +385,84 @@ def export_unmixed_sample(
     unmixing_method   : written to UNMIXINGMETHOD keyword.
     extra_whitelist   : additional channel names to carry through from the raw file
                         verbatim. Pass imaging_carry_through_set for FACSDiscover.
+    af_index_map      : experiment-wide AF Index of each af_spectra row
+                        (af_index_lookup); labels the AUTOFLUORESCENCE rows.
+    n_af_index        : largest experiment-wide AF Index (the total number of
+                        AF spectra in the experiment); sets the AF Index range.
+    extra_keywords    : additional TEXT keywords (name -> value), written after
+                        the standard ones; a name matching a standard keyword
+                        replaces it.
     """
-    # Optional subsampling
-    if subsample is not None and subsample < export_event_data.shape[0]:
-        idx = np.sort(np.random.choice(export_event_data.shape[0], subsample, replace=False))
-        export_event_data = export_event_data[idx]
+    rows = subsample_event_rows(export_event_data.shape[0], subsample)
+    if rows is not None:
+        export_event_data = export_event_data[rows]
 
-    # Zero out null channels in a copy (event_id, AF Index when not meaningful, etc.)
-    null_set = {'event_id'} | set(extra_null_channels or [])
-    if null_set & set(export_pnn):
-        export_event_data = export_event_data.copy()
-        for col_name in null_set:
-            if col_name in export_pnn:
-                export_event_data[:, export_pnn.index(col_name)] = 0.0
+    export_unmixed_sample_stream(
+        sample_name=sample_name,
+        unmixed_folder=unmixed_folder,
+        chunks=[export_event_data],
+        n_events=export_event_data.shape[0],
+        export_pnn=export_pnn,
+        spillover=spillover,
+        raw_keywords=raw_keywords,
+        spectral_model=spectral_model,
+        unmixed_settings=unmixed_settings,
+        raw_settings=raw_settings,
+        af_spectra=af_spectra,
+        unmixing_spectra=unmixing_spectra,
+        version=version,
+        extra_null_channels=extra_null_channels,
+        unmixing_method=unmixing_method,
+        unmixing_weights=unmixing_weights,
+        extra_whitelist=extra_whitelist,
+        af_index_map=af_index_map,
+        n_af_index=n_af_index,
+        extra_keywords=extra_keywords,
+    )
+
+
+def export_unmixed_sample_stream(
+    sample_name: str,
+    unmixed_folder: 'Path | str',
+    chunks,
+    n_events: int,
+    export_pnn: list,
+    spillover: np.ndarray,
+    raw_keywords: 'dict[str, str]',
+    spectral_model: list,
+    unmixed_settings: dict,
+    raw_settings: dict,
+    af_spectra: 'np.ndarray | None',
+    unmixing_spectra: 'np.ndarray | None',
+    version: str,
+    extra_null_channels: 'list | None' = None,
+    unmixing_method: str = 'OLS',
+    unmixing_weights: 'np.ndarray | None' = None,
+    extra_whitelist: 'frozenset | set' = frozenset(),
+    af_index_map: 'np.ndarray | None' = None,
+    n_af_index: 'int | None' = None,
+    extra_keywords: 'dict | None' = None,
+) -> None:
+    """
+    Write an unmixed FCS file from blocks of events, so the whole file is
+    never held in memory. Same output as export_unmixed_sample().
+
+    chunks   : iterable of (n_i, len(export_pnn)) float arrays in event order,
+               consumed as the file is written (typically a generator that
+               reads and unmixes one block at a time).
+    n_events : total number of events across chunks; written to $TOT.
+
+    The other parameters are as for export_unmixed_sample().
+    """
+    null_columns = [export_pnn.index(name) for name in {'event_id'} | set(extra_null_channels or [])
+                    if name in export_pnn]
+
+    def zeroed(blocks):
+        for block in blocks:
+            if null_columns:
+                block = block.copy()
+                block[:, null_columns] = 0.0
+            yield block
 
     file_name = sample_name + ' (Unmixed).fcs'
     file_path = Path(unmixed_folder) / file_name
@@ -246,7 +470,8 @@ def export_unmixed_sample(
     keywords = define_fcs_keywords(
         raw_keywords=raw_keywords,
         pnn=export_pnn,
-        event_data=export_event_data,
+        event_data=None,
+        n_events=n_events,
         spectral_model=spectral_model,
         unmixed_settings=unmixed_settings,
         raw_settings=raw_settings,
@@ -258,14 +483,18 @@ def export_unmixed_sample(
         unmixing_method=unmixing_method,
         unmixing_weights=unmixing_weights,
         extra_whitelist=extra_whitelist,
+        af_index_map=af_index_map,
+        n_af_index=n_af_index,
     )
+    if extra_keywords:
+        keywords.update({str(k): str(v) for k, v in extra_keywords.items()})
 
-    write_fcs(export_event_data, keywords, file_path)
+    write_fcs_stream(zeroed(chunks), n_events, len(export_pnn), keywords, file_path)
 
 def define_fcs_keywords(
     raw_keywords: 'dict[str, str]',
     pnn: list,
-    event_data: np.ndarray,
+    event_data: 'np.ndarray | None',
     spectral_model: list,
     unmixed_settings: dict,
     raw_settings: dict,
@@ -277,6 +506,9 @@ def define_fcs_keywords(
     unmixing_method: str = 'OLS',
     unmixing_weights: 'np.ndarray | None' = None,
     extra_whitelist: 'frozenset | set' = frozenset(),
+    af_index_map: 'np.ndarray | None' = None,
+    n_af_index: 'int | None' = None,
+    n_events: 'int | None' = None,
 ) -> dict:
     """
     Build a complete FCS 3.1 TEXT keyword dict for an unmixed export file.
@@ -286,7 +518,8 @@ def define_fcs_keywords(
     ----------
     raw_keywords      : dict returned by sample.get_metadata()['text'] on the raw FCS.
     pnn               : ordered list of output channel names (the export column order).
-    event_data        : (n_events, n_channels) array — used only for $TOT.
+    event_data        : (n_events, n_channels) array — used only for $TOT; may be
+                        None when n_events is given.
     spectral_model    : controller.experiment.process['spectral_model'] list of dicts.
     unmixed_settings  : controller.experiment.settings['unmixed'].
     raw_settings      : controller.experiment.settings['raw'].
@@ -300,6 +533,11 @@ def define_fcs_keywords(
     extra_whitelist   : additional channel names to carry through from the raw file
                         verbatim (same treatment as scatter/time). Used for FACSDiscover
                         imaging channels: pass imaging_carry_through_set from the caller.
+    af_index_map      : experiment-wide AF Index of each af_spectra row, or None
+                        to number the rows 1..n in stored order.
+    n_af_index        : largest AF Index value the AF Index channel can hold;
+                        defaults to the number of af_spectra rows.
+    n_events          : event count for $TOT, in place of event_data.shape[0].
     """
     import re
     from datetime import datetime, timezone
@@ -377,13 +615,16 @@ def define_fcs_keywords(
             })
 
         elif ch == 'AF Index':
-            n_profiles = af_spectra.shape[0] if af_spectra is not None else 1
+            if n_af_index:
+                n_index = int(n_af_index)
+            else:
+                n_index = af_spectra.shape[0] if af_spectra is not None else 1
             param_keywords.update({
                 f'{prefix}N': 'AF Index',
                 f'{prefix}S': 'Autofluorescence Index',
                 f'{prefix}B': BIT_DEPTH,
                 f'{prefix}E': '0,0',
-                f'{prefix}R': str(n_profiles),
+                f'{prefix}R': str(n_index + 1),  # indices run 1..n_index
                 f'{prefix}G': '1',
                 f'{prefix}DISPLAY': 'LIN',
             })
@@ -443,9 +684,16 @@ def define_fcs_keywords(
             spectra_kw['FLUOROCHROMES'] = ','.join(fluor_names_short)
 
     if af_spectra is not None and af_spectra.ndim == 2:
-        af_row_names = [f'AF{i + 1}' for i in range(af_spectra.shape[0])]
+        # Rows are named by the value the AF Index channel holds for them,
+        # and written in AF Index order.
+        if af_index_map is not None and len(af_index_map) == af_spectra.shape[0]:
+            af_row_index = np.asarray(af_index_map, dtype=np.int64)
+        else:
+            af_row_index = np.arange(1, af_spectra.shape[0] + 1)
+        row_order = np.argsort(af_row_index, kind='stable')
+        af_row_names = [f'AF{int(i)}' for i in af_row_index[row_order]]
         if af_spectra.shape[1] == len(det_names):
-            spectra_kw['AUTOFLUORESCENCE'] = _fmt_matrix(af_spectra, af_row_names, det_names)
+            spectra_kw['AUTOFLUORESCENCE'] = _fmt_matrix(af_spectra[row_order], af_row_names, det_names)
 
     if unmixing_weights is not None and unmixing_weights.ndim == 1:
         if len(unmixing_weights) == len(det_names):
@@ -457,7 +705,7 @@ def define_fcs_keywords(
     provenance = {
         '$FIL':           file_name,
         '$PAR':           str(len(pnn)),
-        '$TOT':           str(event_data.shape[0]),
+        '$TOT':           str(n_events if n_events is not None else event_data.shape[0]),
         '$DATATYPE':      'F',
         '$BYTEORD':       '1,2,3,4',
         '$MODE':          'L',
@@ -527,15 +775,66 @@ def write_fcs(
     Data written as little-endian float32, row-major (one event per row).
     Mirrors writeFCS.R from AutoSpectral.
     """
-    import struct
+    n_events = event_data.shape[0]
+    blocks = (event_data[start:start + chunk_rows] for start in range(0, n_events, chunk_rows))
+    write_fcs_stream(blocks, n_events, event_data.shape[1], keywords, file_path, write_rows=chunk_rows)
 
-    DELIM = '|'
+
+def write_fcs_stream(
+    chunks,
+    n_events: int,
+    n_channels: int,
+    keywords: dict[str, str],
+    file_path: Path | str,
+    write_rows: int = 131_072,
+) -> None:
+    """
+    Write a minimal FCS 3.1 file from blocks of events, as write_fcs() does
+    for a whole array. The event count must be known before the first block,
+    because $TOT and the DATA offsets precede the data.
+
+    chunks     : iterable of (n_i, n_channels) arrays in event order; each is
+                 written as little-endian float32, row-major.
+    n_events   : total number of events across chunks.
+    n_channels : number of channels ($PAR).
+
+    The file is written next to file_path with a '.part' suffix and renamed
+    once complete, so an interrupted export leaves no truncated FCS file.
+    """
     file_path = Path(file_path)
+    head = _fcs_header_and_text(keywords, n_events, n_channels, file_path)
+    part_path = file_path.with_name(file_path.name + '.part')
+    written = 0
+    try:
+        with open(part_path, 'wb') as fh:
+            fh.write(head)
+            for chunk in chunks:
+                if chunk.ndim != 2 or chunk.shape[1] != n_channels:
+                    raise ValueError(f'write_fcs_stream: block of shape {chunk.shape} '
+                                     f'does not have {n_channels} channels')
+                for start in range(0, chunk.shape[0], write_rows):
+                    fh.write(chunk[start:start + write_rows].astype('<f4').tobytes())  # little-endian float32
+                written += chunk.shape[0]
+            if written != n_events:
+                raise ValueError(f'write_fcs_stream: {written} events written, {n_events} declared '
+                                 f'for {file_path}')
+            fh.write(b'00000000')  # CRC placeholder
+        os.replace(part_path, file_path)
+    except BaseException:
+        part_path.unlink(missing_ok=True)
+        raise
+
+
+def _fcs_header_and_text(keywords: dict[str, str], n_events: int, n_channels: int,
+                         file_path: Path) -> bytes:
+    """HEADER and TEXT segments of an FCS 3.1 file whose float32 DATA segment
+    holds n_events x n_channels values and follows the TEXT directly."""
+    DELIM = '|'
 
     # Mandatory field overrides (ensure consistency)
     kw = dict(keywords)
-    kw['$TOT']           = str(event_data.shape[0])
-    kw['$PAR']           = str(event_data.shape[1])
+    kw['$TOT']           = str(n_events)
+    kw['$PAR']           = str(n_channels)
     kw['$DATATYPE']      = 'F'
     kw['$BYTEORD']       = '1,2,3,4'
     kw['$NEXTDATA']      = '0'
@@ -557,7 +856,7 @@ def write_fcs(
     text = _build_text(kw)
     text_bytes = text.encode('utf-8')
     TEXT_END = TEXT_START + len(text_bytes) - 1
-    data_bytes = event_data.shape[0] * event_data.shape[1] * 4  # float32
+    data_bytes = n_events * n_channels * 4  # float32
 
     # Iterative layout: grow TEXT_END until $BEGINDATA/$ENDDATA digit-lengths stabilise.
     # Seed with the actual encoded lengths of the placeholder values already in kw.
@@ -579,7 +878,7 @@ def write_fcs(
         kw['$BEGINDATA'] = str(DATA_START)
         kw['$ENDDATA']   = str(DATA_END)
         text = _build_text(kw)
-        text_bytes = text.encode('latin-1')
+        text_bytes = text.encode('utf-8')
         new_TEXT_END = TEXT_START + len(text_bytes) - 1
         new_DATA_START = new_TEXT_END + 1
         new_DATA_END   = new_DATA_START + data_bytes - 1
@@ -602,20 +901,7 @@ def write_fcs(
         + _h(DATA_START)  + _h(DATA_END)
         + '       0'      + '       0'   # STEXT always 0
     )
-
-    with open(file_path, 'wb') as fh:
-        fh.write(header.encode('ascii'))
-        fh.write(text_bytes)
-        # Write event data in chunks (row-major, float32 little-endian)
-        rows_remaining = event_data.shape[0]
-        offset = 0
-        while rows_remaining > 0:
-            rows = min(chunk_rows, rows_remaining)
-            chunk = event_data[offset:offset + rows, :]
-            fh.write(chunk.astype('<f4').tobytes())   # little-endian float32
-            offset         += rows
-            rows_remaining -= rows
-        fh.write(b'00000000')  # CRC placeholder
+    return header.encode('ascii') + text_bytes
 
 
 # All subfolders recursively
@@ -636,7 +922,71 @@ def timer(func):
         return result
     return wrapper
 
-def assign_default_transforms(settings, channels=None):
+def af_channel_transform(label, magnitude_ceiling, n_af_spectra=None):
+    """Default transform for an AF channel.
+
+    AF Abundance: logicle with the fluorescence channels' parameters.
+    AF Index: linear from 0 to the number of AF spectra (n_af_spectra, or
+    default_af_index_range when unknown), so each library variant has its
+    own position on the axis.
+    """
+    if label == af_index_channel:
+        n = int(n_af_spectra) if n_af_spectra else default_af_index_range
+        return {'scale_t': max(n, 1), 'linear_a': 0, 'logicle_w': logicle_w, 'logicle_m': logicle_m,
+                'logicle_a': logicle_a, 'log_m': log_m, 'id': 0, 'limits': [0, 1]}
+    return {'scale_t': magnitude_ceiling, 'linear_a': linear_a, 'logicle_w': logicle_w,
+            'logicle_m': logicle_m, 'logicle_a': logicle_a, 'log_m': log_m, 'id': 1,
+            'limits': [0, 1]}
+
+
+def ensure_af_channels(unmixed_settings, transforms=None, n_af_spectra=None):
+    """Add the AF channels to an unmixed channel list that lacks them.
+
+    Appends AF Abundance and AF Index to ``event_channels_pnn`` (after every
+    existing channel, so no existing channel index changes), records their
+    positions in ``af_channel_ids``, and adds default transforms for them to
+    *transforms* when given. Idempotent. Returns True when anything changed.
+    """
+    pnn = unmixed_settings.get('event_channels_pnn')
+    if not pnn:
+        return False
+    changed = False
+    for label in af_channels:
+        if label not in pnn:
+            pnn.append(label)
+            changed = True
+    ids = [pnn.index(label) for label in af_channels]
+    if unmixed_settings.get('af_channel_ids') != ids:
+        unmixed_settings['af_channel_ids'] = ids
+        changed = True
+    if transforms is not None:
+        for label in af_channels:
+            if label not in transforms:
+                transforms[label] = af_channel_transform(
+                    label, unmixed_settings.get('magnitude_ceiling'), n_af_spectra)
+                changed = True
+    return changed
+
+
+def sync_af_index_transform(transforms, n_af_spectra=None):
+    """Size the stored AF Index axis to the experiment-wide AF Index range.
+
+    Sets the AF Index transform's scale_t to n_af_spectra (the total number
+    of AF spectra across the experiment's profiles), or to
+    default_af_index_range when there are none. Other settings of the
+    transform are kept. Returns True when anything changed.
+    """
+    if not transforms or af_index_channel not in transforms:
+        return False
+    n = max(int(n_af_spectra), 1) if n_af_spectra else default_af_index_range
+    entry = transforms[af_index_channel]
+    if entry.get('scale_t') == n:
+        return False
+    entry['scale_t'] = n
+    return True
+
+
+def assign_default_transforms(settings, channels=None, n_af_spectra=None):
     if channels is None:
         channels = settings['event_channels_pnn']
     transforms = {}
@@ -646,6 +996,9 @@ def assign_default_transforms(settings, channels=None):
                             'logicle_a': logicle_a, 'log_m': log_m, 'id': 1, 'limits': [0, 1]}
 
     for label in channels:
+        if label in af_channels:
+            transforms[label] = af_channel_transform(label, settings['magnitude_ceiling'], n_af_spectra)
+            continue
         index = settings['event_channels_pnn'].index(label)
         channel_pnr = settings.get('channel_pnr')
         if index in settings['scatter_channel_ids']:
@@ -688,12 +1041,17 @@ def assign_default_transforms(settings, channels=None):
 
 def update_transforms(transforms, transformations):
     for label in transformations:
+        if label not in transforms:
+            logger.warning(f'update_transforms: no stored transform for "{label}" - not saved')
+            continue
+
         transformation = transformations[label]
         linear_a = transformation.linear_a
         logicle_w = transformation.logicle_w
         logicle_m = transformation.logicle_m
         logicle_a = transformation.logicle_a
         scale_t = transformation.scale_t
+        log_m = transformation.log_m
         id = transformation.id
         limits = transformation.limits
         if scale_t is not None:
@@ -820,6 +1178,69 @@ def define_ellipse_gate(pos, size, angle, channel_x, channel_y, transformations)
     return dim_x, dim_y, coordinates, covariance_matrix, distance_square
 
 
+def gate_lookup_tables(gate, gate_name: str, transformations: dict) -> dict:
+    """
+    Rasterise one gate's boundary onto the bin grid of its channels'
+    transforms: ``{name: bool array}``, one entry for an ordinary gate and
+    one per quadrant for a quadrant gate. Each array is the gate membership
+    of the bin centres of ``transform.scale`` (row-major over x then y for
+    two channels), which ``apply_gates_in_place`` indexes with each event's
+    bin. The table depends only on the gate geometry and the transforms, not
+    on any events, so it can be applied to any data in the same channels.
+
+    ``gate`` is the effective gate to rasterise (a sample's custom gate or
+    the template); ``transformations`` maps channel names to Honeychrome
+    ``Transform`` objects.
+    """
+    import honeychrome.settings as hc_settings
+
+    channels = gate.get_dimension_ids()
+    temp_gating_strategy = GatingStrategy()
+
+    if gate.gate_type == 'QuadrantGate':
+        xchan = gate.dimensions[0].dimension_ref
+        ychan = gate.dimensions[1].dimension_ref
+        channels = [xchan, ychan]
+        transform_x = transformations[xchan]
+        transform_y = transformations[ychan]
+        unit_2d = np.ones((hc_settings.hist_bins_retrieved + 1, hc_settings.hist_bins_retrieved + 1), dtype=np.bool_)
+        mask_ones_2d = np.nonzero(unit_2d)
+        mask_coords = np.column_stack((transform_x.scale[mask_ones_2d[0] + 1], transform_y.scale[mask_ones_2d[1] + 1]))
+        temp_gating_strategy.add_gate(gate, gate_path=('root',))
+        temp_gating_strategy.transformations[xchan] = transform_x.xform
+        temp_gating_strategy.transformations[ychan] = transform_y.xform
+        for divider in gate.dimensions:
+            # stale transformation_ref values point at the divider's own channel transform
+            if divider.transformation_ref and divider.transformation_ref not in (xchan, ychan):
+                temp_gating_strategy.transformations[divider.transformation_ref] = \
+                    transformations[divider.dimension_ref].xform
+    else:
+        if len(channels) == 1:
+            transform_x = transformations[channels[0]]
+            unit_1d = np.ones(transform_x.scale_bins + 1, dtype=np.bool_)
+            mask_coords = transform_x.scale[np.nonzero(unit_1d)[0] + 1]
+        else:
+            transform_x = transformations[channels[0]]
+            transform_y = transformations[channels[1]]
+            unit_2d = np.ones((transform_x.scale_bins + 1, transform_y.scale_bins + 1), dtype=np.bool_)
+            mask_ones_2d = np.nonzero(unit_2d)
+            mask_coords = np.column_stack((transform_x.scale[mask_ones_2d[0] + 1],
+                                           transform_y.scale[mask_ones_2d[1] + 1]))
+        temp_gating_strategy.add_gate(gate, gate_path=('root',))
+        for channel in gate.dimensions:
+            xform = transformations[channel.id].xform
+            temp_gating_strategy.transformations[channel.id] = xform
+            # stale transformation_ref values point at the channel's own transform
+            if channel.transformation_ref and channel.transformation_ref != channel.id:
+                temp_gating_strategy.transformations[channel.transformation_ref] = xform
+
+    mask_as_fksample = Sample(mask_coords, channel_labels=channels, sample_id='mask_as_fksample')
+    results = temp_gating_strategy.gate_sample(mask_as_fksample, verbose=True)
+    if gate.gate_type == 'QuadrantGate':
+        return {name: results.get_gate_membership(name) for name in gate.quadrants.keys()}
+    return {gate_name: results.get_gate_membership(gate_name)}
+
+
 def apply_gates_in_place(data_for_cytometry_plots, gates_to_calculate=None):
     # calculate only gates in gates_to_calculate
     # gates_to_calculate should be in order of ancestry (parent to child)
@@ -843,6 +1264,22 @@ def apply_gates_in_place(data_for_cytometry_plots, gates_to_calculate=None):
                     parent_id = ('root',)
 
                 channels = gate.get_dimension_ids()
+                # guard against skipped parents, missing channels and stale masks
+                if gate.gate_type == 'QuadrantGate':
+                    gate_channels = [dim.dimension_ref for dim in gate.dimensions]
+                else:
+                    gate_channels = channels
+                missing_channels = [ch for ch in gate_channels if ch not in pnn]
+                if parent_id[0] not in gate_membership or missing_channels:
+                    if missing_channels:
+                        logger.warning(f'apply_gates_in_place: gate "{gate_id[0]}" uses channels {missing_channels} not in this data - skipped')
+                    # an unevaluable gate must not keep a mask from a previous sample
+                    gate_membership.pop(gate_id[0], None)
+                    if gate.gate_type == 'QuadrantGate':
+                        for name in gate.quadrants:
+                            gate_membership.pop(name, None)
+                    continue
+
                 if len(channels) == 1:
                     xchan = channels[0]
                     ix = pnn.index(xchan)
@@ -851,7 +1288,8 @@ def apply_gates_in_place(data_for_cytometry_plots, gates_to_calculate=None):
                     scale_x = transform_x.scale
                     indices_x_data_searchsorted = np.searchsorted(scale_x, x) - 2
                     if len(scale_x) > len(lookup_tables[gate_id[0]]):
-                        indices_x_data_searchsorted[indices_x_data_searchsorted >= len(lookup_tables[gate_id[0]])] = len(lookup_tables[gate_id[0]]) - 1 #todo temporary solution until we implement custom sample gates for time
+                        # `scale` includes two infinity sentinels around the bins.
+                        indices_x_data_searchsorted[indices_x_data_searchsorted >= len(lookup_tables[gate_id[0]])] = len(lookup_tables[gate_id[0]]) - 1
                     indices_data_digitized_flattened = indices_x_data_searchsorted
 
                 else:#len(channels) == 2:
@@ -871,20 +1309,37 @@ def apply_gates_in_place(data_for_cytometry_plots, gates_to_calculate=None):
                     scale_y = transform_y.scale
                     indices_x_data_searchsorted = np.searchsorted(scale_x, x) - 2
                     indices_y_data_searchsorted = np.searchsorted(scale_y, y) - 2
-                    hist_bins_x = transform_x.scale_bins + 1
-                    indices_data_digitized_flattened = indices_x_data_searchsorted * hist_bins_x + indices_y_data_searchsorted
+                    # The lookup table is a row-major flatten of shape
+                    # (x_bins+1, y_bins+1): element (i, j) lives at i*(y_bins+1)+j.
+                    # So the row stride is the NUMBER OF Y BINS, not x. This only
+                    # matters when x and y have different bin counts (e.g. a
+                    # Time x fluorescence gate — Time has far more bins); for equal
+                    # bin counts (the usual case) it's the same either way.
+                    row_stride = transform_y.scale_bins + 1
+                    indices_data_digitized_flattened = indices_x_data_searchsorted * row_stride + indices_y_data_searchsorted
 
                 if gate.gate_type == 'QuadrantGate':
                     quadrant_names = gate.quadrants.keys()
                     for name in quadrant_names:
                         if name not in lookup_tables: # guard: lookup table may not exist yet if called before calculate_lookup_tables
+                            gate_membership.pop(name, None)
                             continue
-                        mask = lookup_tables[name][indices_data_digitized_flattened]
+                        table = lookup_tables[name]
+                        idx = indices_data_digitized_flattened
+                        # A transient transform-scale mismatch can exceed the table.
+                        if idx.size and (idx.max() >= len(table) or idx.min() < 0):
+                            idx = np.clip(idx, 0, len(table) - 1)
+                        mask = table[idx]
                         gate_membership[name] = mask * gate_membership[parent_id[0]]
                 else:
                     if gate_id[0] not in lookup_tables:
+                        gate_membership.pop(gate_id[0], None)
                         continue
-                    mask = lookup_tables[gate_id[0]][indices_data_digitized_flattened]
+                    table = lookup_tables[gate_id[0]]
+                    idx = indices_data_digitized_flattened
+                    if idx.size and (idx.max() >= len(table) or idx.min() < 0):
+                        idx = np.clip(idx, 0, len(table) - 1)
+                    mask = table[idx]
                     gate_membership[gate_id[0]] = mask * gate_membership[parent_id[0]]
 
     # return gate_membership
@@ -896,6 +1351,12 @@ def initialise_hists(plots, data_for_cytometry_plots):
     hists = []
     if plots:
         for n, plot in enumerate(plots):
+            missing = [plot[k] for k in ('channel_x', 'channel_y') if k in plot and plot[k] not in (transformations or {})]
+            if missing:
+                pnn = data_for_cytometry_plots.get('pnn') or []
+                logger.error(f'initialise_hists: plot {n} {plot} has no transform for {missing} '
+                             f'(in pnn: {[ch in pnn for ch in missing]}; {len(transformations or {})} transforms, {len(plots)} plots)')
+
             if plot['type'] == 'hist1d':
                 bins = transformations[plot['channel_x']].scale_bins
                 histogram = np.zeros(bins+1)
@@ -944,6 +1405,7 @@ def calc_hists(data_for_cytometry_plots, indices_plots_to_calculate=None, status
         mask = gate_membership.get(source_gate)
         if mask is None:
             logger.warning(f"calc_hists: gate '{source_gate}' not in gate_membership — skipping plot {n}] - is this due to _reinitialise_process_plots_worker from a background thread and gate_membership is only partially built when calc_hists is called concurrently?")
+            hists.append(None)  # keep results aligned with plots
             continue
 
         if plot['type'] == 'hist1d':
@@ -1053,6 +1515,9 @@ def calc_stats(data_for_cytometry_plots, initialise=True):
     return statistics
 
 def calc_ribbon_plot(event_data, mask, fluoro_indices, transform, density_cutoff):
+    if len(fluoro_indices) == 0:
+        return np.zeros((len(transform.scale) - 1, 0))
+
     heatmap = np.apply_along_axis(lambda x: np.histogram(x, bins=transform.scale)[0], axis=0, arr=event_data[mask][:, fluoro_indices])
 
     # make sure all unit bins get lowest LUT
@@ -1113,8 +1578,9 @@ def calc_hist2d(event_data, mask, id_channel_x, id_channel_y, transform_x, trans
             mask_1 = (heatmap >= density_cutoff)
             heatmap[mask_1] += inside_max_value//255+1  # Maps to LUT[1]
 
-            global_max_value = np.percentile(heatmap[mask_1], 99.9)
-            np.clip(heatmap, 0, global_max_value, out=heatmap)
+            if mask_1.any():
+                global_max_value = np.percentile(heatmap[mask_1], 99.9)
+                np.clip(heatmap, 0, global_max_value, out=heatmap)
 
     return heatmap
 
@@ -1130,6 +1596,60 @@ def raw_gates_list(gating):
     gate_ids = gating.get_gate_ids()
     gate_list = [g[0] for g in gate_ids]
     return gate_list
+
+def resolve_base_gate(gating, priority_order):
+    """
+    Return (gate_name, gate_path) for the first gate in priority_order present in gating.
+
+    Matching is case-insensitive, but the returned name is the gate's actual name, so it
+    can be passed to FlowKit lookups. gate_path is the full path to use as the parent
+    path when adding a child gate. Falls back to ('root', ('root',)).
+    """
+    if gating is not None:
+        actual_names = {g[0].lower(): g[0] for g in gating.get_gate_ids()}
+        for candidate in priority_order or []:
+            name = actual_names.get(candidate.lower())
+            if name is not None:
+                paths = gating.find_matching_gate_paths(name)
+                if paths:
+                    return name, tuple(paths[0]) + (name,)
+    return 'root', ('root',)
+
+def gate_channels(gate):
+    """Channels a gate is drawn on (for a quadrant gate, its dividers' channels)."""
+    return [getattr(dim, 'dimension_ref', None) or dim.id for dim in getattr(gate, 'dimensions', None) or []]
+
+def prune_gating_to_channels(gating, channels):
+    """Remove from ``gating`` every gate drawn on a channel not in ``channels``,
+    together with its descendants. Returns the names of all removed gates."""
+    available = set(channels)
+    removed = []
+    for gate_name, gate_path in gating.get_gate_ids():
+        if gate_name in removed:
+            continue
+        gate = gating._get_gate_node(gate_name, gate_path).gate
+        if isinstance(gate, gates.Quadrant) or set(gate_channels(gate)) <= available:
+            continue
+        branch = gate_path + (gate_name,)
+        removed.append(gate_name)
+        removed += [name for name, path in gating.get_gate_ids() if path[:len(branch)] == branch]
+        gating.remove_gate(gate_name, gate_path=gate_path)
+    return removed
+
+def prune_plots_to_channels(plots, channels, gate_names):
+    """Copies of the plots whose axes are all in ``channels`` and whose source
+    gate is in ``gate_names``, keeping only child gates in ``gate_names``."""
+    available = set(channels)
+    valid_gates = set(gate_names) | {'root'}
+    kept = []
+    for plot in plots:
+        axes = [plot[key] for key in ('channel_x', 'channel_y', 'channel_z') if plot.get(key)]
+        if not set(axes) <= available or plot.get('source_gate', 'root') not in valid_gates:
+            continue
+        new_plot = deepcopy(plot)
+        new_plot['child_gates'] = [g for g in new_plot.get('child_gates', []) if g in valid_gates]
+        kept.append(new_plot)
+    return kept
 
 def get_set_or_initialise_label_offset(plot, gate_name, label_offset=None):
     if 'label_offsets' not in plot:
@@ -1164,6 +1684,19 @@ def build_display_label_map(pnn, spectral_model):
         antigen = label_to_antigen.get(name, '')
         result[name] = f'{antigen} {name}'.strip() if antigen else name
     return result
+
+
+def build_antigen_map(pnn, spectral_model):
+    """
+    Returns a dict {pnn_name: antigen} for all channels, from the spectral
+    model's controls. Channels without an antigen (scatter, time, AF
+    channels, unlabelled fluorophores) map to ''.
+    """
+    label_to_antigen = {
+        control['label']: (control.get('antigen') or '').strip()
+        for control in (spectral_model or [])
+    }
+    return {name: label_to_antigen.get(name, '') for name in (pnn or [])}
 
 
 from scipy import signal

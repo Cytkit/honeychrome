@@ -59,6 +59,7 @@ from honeychrome.view_components.new_file_dialog import NewFileDialog
 from honeychrome import __version__
 
 import pyqtgraph as pg
+from shiboken6 import isValid
 
 base_directory = str(Path.home() / experiments_folder)
 
@@ -149,6 +150,11 @@ class View(QObject):
         self.bus.axesReset.connect(self.controller.reset_axes_transforms)
         self.bus.updateChildGateLabelOffset.connect(self.controller.update_child_gate_label_offset)
 
+        # per-sample custom gates (customise / revert / adopt a single gate)
+        self.bus.customiseGateRequested.connect(self.controller.customise_gate)
+        self.bus.revertGateRequested.connect(self.controller.revert_gate_to_template)
+        self.bus.adoptGateRequested.connect(self.controller.adopt_custom_gate_as_template)
+
         # change spectral model, unmix!, change fine tuning matrix
         self.bus.spectralModelUpdated.connect(self.controller.refresh_spectral_process)
         self.bus.spectralProcessRefreshed.connect(lambda : self.init_plot_grids_and_gating_trees('unmixed'))
@@ -196,12 +202,24 @@ class View(QObject):
         </html>
         ''')
 
+    def _reload_refused(self) -> bool:
+        """True (with a status message) while a heavy job holds the job gate: the
+        main window is not rebuilt, nor the experiment replaced, under a running job."""
+        gate = getattr(self.controller, 'job_gate', None)
+        if gate is None or not gate.is_held():
+            return False
+        self.bus.statusMessage.emit(f'{gate.busy_text()}. The experiment can be opened, created or reloaded '
+                                    'once it has finished.')
+        return True
+
     @Slot()
     def reload_main_window(self):
         self.load_main_window_with_experiment_and_template(self.controller.experiment.experiment_path)
 
     @Slot(str)
     def load_main_window_with_experiment_and_template(self, experiment_file, new=False, template_path=None):
+        if self._reload_refused():
+            return
         try:
             self.current_window.blockSignals(True)
 
@@ -241,7 +259,7 @@ class View(QObject):
 
     @Slot(str)
     def init_plot_grids_and_gating_trees(self, scope=''):
-        if self.main_window is None:
+        if self.main_window is None or not isValid(self.main_window):
             return
         # reinitialises widgets
         # called for new/load experiment, or on spectral process updated (just for scope = 'unmixed')
@@ -294,6 +312,8 @@ class View(QObject):
 
     @Slot()
     def new_experiment(self):
+        if self._reload_refused():
+            return
         new_file_dialog = NewFileDialog(self.current_window)
         new_file_dialog.finished.connect(self.save_new_file)
         new_file_dialog.show()
@@ -307,6 +327,8 @@ class View(QObject):
 
     @Slot()
     def open_experiment(self):
+        if self._reload_refused():
+            return
         file, _ = QFileDialog.getOpenFileName(self.current_window, "Open Experiment", base_directory, f"Experiment File (*.{file_extension})")
         if file:
             add_recent_file(file)
@@ -314,6 +336,8 @@ class View(QObject):
 
     @Slot()
     def new_from_template(self):
+        if self._reload_refused():
+            return
         template, _ = QFileDialog.getOpenFileName(self.current_window, "Select Template Experiment", base_directory, f"Experiment File (*.{file_extension})")
         if template:
             file, _ = QFileDialog.getSaveFileName(self.current_window, f"New Experiment from \"{Path(template)}\"", base_directory, f"Experiment File (*.{file_extension})")
@@ -323,8 +347,14 @@ class View(QObject):
                 self.load_main_window_with_experiment_and_template(file, new=True, template_path=template)
 
     @Slot()
-    def new_from_this_template(self):
-        path = self.controller.experiment_dir.with_suffix('.kit')
+    def new_from_this_template(self, template_path=None):
+        if self._reload_refused():
+            return
+        if template_path:
+            path = Path(template_path)
+        else:
+            path = self.controller.experiment_dir.with_suffix('.kit')
+
         new_file, _ = QFileDialog.getSaveFileName(self.current_window, f"New Experiment from \"{Path(path)}\"", base_directory, f"Experiment File (*.{file_extension})")
         if new_file:
             file = Path(new_file).with_suffix('.kit')

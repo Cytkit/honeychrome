@@ -1,35 +1,183 @@
 import json
 import re
+import time
 import warnings
+from collections import Counter
 
 import numpy as np
-from PySide6.QtCore import QObject, Signal, QTimer
+from PySide6.QtCore import QObject, Signal, Slot, QTimer
 # from PySide6.QtWidgets import QApplication
 from flowkit import Dimension, gates
 
-from honeychrome.controller_components.functions import timer, sample_from_fcs
+from honeychrome.controller_components.functions import timer, sample_from_fcs, resolve_base_gate
 from honeychrome.controller_components.spectral_functions import get_profile, get_raw_events
+from honeychrome.controller_components.spread_model import raw_layout
+from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.label_matching import match_fluorophore, match_marker, get_fluorophore_db, get_marker_db
-from honeychrome.controller_components.spectral_librarian import SpectralLibrary
-from honeychrome.controller_components.spectral_cleaning import find_empirical_peak, cosine_filter, knn_scatter_match, exclude_saturated, CleanResult
+from honeychrome.controller_components.particle_type import is_bead_sample, match_bead_unstained
+from honeychrome.controller_components.spectral_reference_library import (
+    profile_id_from_description, cosine_similarity_to_reference, cosine_qc_warning_threshold,
+)
+from honeychrome.controller_components.spectral_cleaning import (
+    find_empirical_peak, cosine_filter, knn_scatter_match, exclude_saturated, CleanResult,
+    background_check, BACKGROUND_CHECK_VERSION, BACKGROUND_RATIO_MAX,
+)
+from honeychrome.controller_components.spectral_refinement import (
+    RefineSettings, refine_row, subsample_negative, make_check_pool, crosstalk_check,
+)
 from honeychrome.controller_components.functions import sample_from_fcs
 from honeychrome.experiment_model import check_fcs_matches_experiment
-from honeychrome.view_components.busy_cursor import with_busy_cursor
 import honeychrome.settings as settings
 from honeychrome.settings import INTERNAL_NEGATIVE_SENTINEL        
 
 import logging
 logger = logging.getLogger(__name__)
 
-# connect to spectral library
-spectral_library = SpectralLibrary()
+MIN_CONTROL_GATE_EVENTS = 500   # fewer gated events than this gives a noisy control spectrum
 
-def _find_default_unstained_tube(all_samples: dict) -> str | None:
-    """Return tube name of the first sample whose path or name contains 'unstained'."""
-    for path, name in all_samples.items():
+
+def control_gating(controller) -> SampleGating:
+    """Raw gating of each sample as the main window applies it when that
+    sample is displayed: its per-sample gate overrides and its own Time
+    range. It reads the live gating, so build it where the gates are used
+    (gates added or moved earlier in a run are then included)."""
+    return SampleGating.from_controller(controller, scope='raw', copy=False)
+
+
+def low_event_warning_text(entries) -> str | None:
+    """One warning for (name, gate, n_events) entries of control gates with
+    fewer than MIN_CONTROL_GATE_EVENTS events; None when there are none."""
+    rows = list(dict.fromkeys(tuple(e) for e in entries))
+    if not rows:
+        return None
+    listed = '; '.join(f'"{name}": {n:,} event(s) in "{gate}"' for name, gate, n in rows)
+    return (f'These spectral controls have fewer than {MIN_CONTROL_GATE_EVENTS} events in a gate used '
+            f'for their spectrum, so the spectrum may be unreliable: {listed}.\n\n'
+            f'Check these gates (including any customised for the control sample), or acquire more events.')
+
+
+def background_check_summary(label: str, check: dict | None) -> str | None:
+    """One line for a control whose background check found no clear stain
+    above its unstained; None when it passed or was not checked."""
+    verdict = (check or {}).get('verdict')
+    if not verdict:
+        return None
+    ratio = check.get('ratio')
+    if ratio is not None:
+        brightness = f'{ratio:.1f}× the unstained in {check.get("peak_channel")}'
+    else:
+        brightness = (f'{100 * check.get("positive_fraction", 0):.1f}% of events above the '
+                      f'unstained 99.5th percentile in {check.get("peak_channel")}')
+    if verdict == 'background':
+        return (f'{label}: looks like background ({brightness}, shape within '
+                f'{check["angle_deg"]:.0f}° of the unstained autofluorescence)')
+    return (f'{label}: weak signal ({brightness}, shape '
+            f'{check["angle_deg"]:.0f}° from the unstained autofluorescence)')
+
+
+def background_warning_text(cleaned_events, labels) -> str | None:
+    """One warning for the controls among *labels* whose stored background
+    check found no clear stain above their unstained; None when there are none."""
+    rows = [summary for label in labels
+            if (summary := background_check_summary(
+                label, (cleaned_events.get(label) or {}).get('background_check')))]
+    if not rows:
+        return None
+    return (f'These controls show no clear stain: after cleaning, their peak-channel signal is under '
+            f'{BACKGROUND_RATIO_MAX:g}× that of their unstained under the same event selection.\n'
+            + '\n'.join(f'  • {row}' for row in rows)
+            + '\n\nCheck that these controls are stained and that the right file is assigned. '
+              'They are marked ⚠ in the spectral model table.')
+
+
+class LowEventLog:
+    """Collects control gates with too few events. With *collect* the
+    entries are held for one combined warning (``text()``); otherwise each is
+    reported at once, through the controller's warning collector when one is
+    active."""
+
+    def __init__(self, controller, bus, collect: bool):
+        self.controller = controller
+        self.bus = bus
+        self.entries: list | None = [] if collect else None
+
+    def note(self, name: str, gate_label: str, n_events: int):
+        if n_events >= MIN_CONTROL_GATE_EVENTS:
+            return
+        entry = (str(name), str(gate_label), int(n_events))
+        logger.warning(f'Spectral control "{name}": only {n_events} event(s) in gate "{gate_label}"')
+        if self.entries is not None:
+            if entry not in self.entries:
+                self.entries.append(entry)
+            return
+        self.report(low_event_warning_text([entry]))
+
+    def report(self, text: str | None):
+        """Show *text* now, or hold it in the controller's warning collector when one is active."""
+        if not text:
+            return
+        collector = self.controller.warning_collector
+        if collector is not None:
+            collector.append(text)
+        elif self.bus:
+            self.bus.warningMessage.emit(text)
+
+    def text(self) -> str | None:
+        return low_event_warning_text(self.entries or [])
+
+
+# Control fields a cleaned result depends on; a change to any of them makes it stale.
+CLEANED_RESULT_KEYS = ('sample_name', 'particle_type', 'universal_negative_name')
+
+
+def cleaned_result_matches(control: dict, cleaned: dict) -> bool:
+    """Whether *cleaned* (a controller.cleaned_events entry) was made from the
+    control's current sample, particle type and negative. Entries without a
+    stored fingerprint are accepted."""
+    fingerprint = cleaned.get('_fingerprint')
+    if not fingerprint:
+        return True
+    return all((fingerprint.get(k) or None) == (control.get(k) or None) for k in CLEANED_RESULT_KEYS)
+
+
+def _find_default_unstained_tube(samples: dict) -> str | None:
+    """Return tube name of the first non-bead sample whose path or name contains 'unstained'."""
+    for path, name in samples['all_samples'].items():
+        if is_bead_sample(samples, path, name):
+            continue
         if re.search(r'unstained', path, re.IGNORECASE) or re.search(r'unstained', name, re.IGNORECASE):
             return name
     return None
+
+def restore_user_labels(spectral_model, profiles, previous_controls):
+    """Give each regenerated control the label and antigen it had in the previous
+    model, matched by control tube (sample path, else a unique sample name), so
+    the unmixed channel names and the gates drawn on them carry over. A label is
+    left as generated where restoring it would duplicate another control's.
+    Renames the profiles to match. Returns {generated label: restored label}."""
+    by_path, by_name = {}, {}
+    for previous in previous_controls or []:
+        for index, key in ((by_path, previous.get('sample_path')), (by_name, previous.get('sample_name'))):
+            if key:
+                index[key] = None if key in index else previous  # None: ambiguous
+    matches = [by_path.get(control.get('sample_path')) or by_name.get(control.get('sample_name'))
+               for control in spectral_model]
+    targets = [(previous.get('label') or control['label']) if previous else control['label']
+               for control, previous in zip(spectral_model, matches)]
+    counts = Counter(targets)
+    renamed = {}
+    for control, previous, target in zip(spectral_model, matches, targets):
+        if previous is None:
+            continue
+        if target != control['label'] and counts[target] == 1:
+            renamed[control['label']] = target
+            control['label'] = target
+        control['antigen'] = previous.get('antigen') or ''
+    if renamed:
+        restored = {renamed.get(label, label): profile for label, profile in profiles.items()}
+        profiles.clear()
+        profiles.update(restored)
+    return renamed
 
 class ProfileUpdater:
     def __init__(self, controller, bus):
@@ -45,6 +193,14 @@ class ProfileUpdater:
         self.fluorescence_channels_pnn = []
         self.unstained_negative = None          # legacy mean-vector cache — kept for existing generate() path
         self._negative_events_cache: dict[str, np.ndarray] = {}
+        # Labels of controls with a negative profile. When a list, generate()
+        # appends to it for the caller to report; when None, it warns at once.
+        self.negative_profile_warnings: list[str] | None = None
+        # Control gates with too few events; replace with a collecting log
+        # around a batch of generate() calls to report them together.
+        self.low_events = LowEventLog(controller, bus, collect=False)
+        # Gating each stored profile was computed with (see gating_signature).
+        self.profile_gating: dict[str, str] = {}
         self.refresh()
 
     def refresh(self):
@@ -75,19 +231,54 @@ class ProfileUpdater:
         #     if self.bus:
         #         self.bus.warningMessage.emit('Selected number of fluorophores has changed. Previous controls have been flushed.')
 
+    def _unstained_sample_path(self) -> str | None:
+        """The sample the global (cell) unstained negative is taken from: the first
+        non-bead sample marked as unstained, else the first named unstained or negative."""
+        for path in self.samples.get('unstained_samples', []):
+            if path in self.samples['all_samples'] and not is_bead_sample(self.samples, path):
+                return path
+        for path in self.samples['all_samples']:
+            if is_bead_sample(self.samples, path):
+                continue
+            if re.search(r'(unstained|negative)', path, re.IGNORECASE) or \
+            re.search(r'(unstained|negative)', self.samples['all_samples'][path], re.IGNORECASE):
+                return path
+        return None
+
+    def gating_signature(self, control) -> str | None:
+        """Identifies the gates a single-stain control's profile is computed
+        from, as applied to each sample they gate (per-sample overrides
+        included): the positive and internal negative gates on the control
+        sample and the "Neg Unstained" gate on its unstained negative. None
+        for other control types."""
+        if (control.get('control_type') != 'Single Stained Spectral Control'
+                or not control.get('sample_name') or not control.get('gate_label')):
+            return None
+        all_samples_rev = {v: k for k, v in self.samples['all_samples'].items()}
+        sample_path = all_samples_rev.get(control['sample_name'])
+        if sample_path is None:
+            return None
+        gating = control_gating(self.controller)
+        strategy = gating.gating
+        own_gates = [g for g in (control['gate_label'], control.get('neg_gate_label') or f'Neg {control["label"]}')
+                     if strategy.find_matching_gate_paths(g)]
+        parts = [gating.chain_signature(sample_path, own_gates)]
+        neg_name = control.get('universal_negative_name') or ''
+        if neg_name == INTERNAL_NEGATIVE_SENTINEL:
+            neg_path = None
+        elif neg_name:
+            neg_path = all_samples_rev.get(neg_name)
+        else:
+            neg_path = self._unstained_sample_path()
+        if neg_path is not None and strategy.find_matching_gate_paths('Neg Unstained'):
+            parts.append(gating.chain_signature(neg_path, ['Neg Unstained']))
+        parts.append(str(self.controller.experiment.process.get('negative_type')))
+        parts.append(str(control.get('use_cleaned')))
+        return '|'.join(parts)
+
     def get_unstained_negative(self):
         try:
-            sample_path = None
-            for path in self.samples.get('unstained_samples', []):
-                if path in self.samples['all_samples']:
-                    sample_path = path
-                    break
-            if sample_path is None:
-                for path in self.samples['all_samples']:
-                    if re.search(r'(unstained|negative)', path, re.IGNORECASE) or \
-                    re.search(r'(unstained|negative)', self.samples['all_samples'][path], re.IGNORECASE):
-                        sample_path = path
-                        break
+            sample_path = self._unstained_sample_path()
             if sample_path:
                 full_sample_path = str(self.experiment_dir / sample_path)
                 sample = sample_from_fcs(full_sample_path)
@@ -115,17 +306,7 @@ class ProfileUpdater:
                                                     range_max=(0.7 if target_gate_label == positive_gate_label else 0.9),
                                                     transformation_ref=channel_y)
                         target_gate = gates.RectangleGate(target_gate_label, dimensions=[dim_x, dim_y])
-                        base_gate_priority = self.controller.experiment.process.get('base_gate_priority_order', [])
-                        raw_gate_names = [g[0].lower() for g in self.controller.raw_gating.get_gate_ids()]
-                        base_gate_label = 'root'
-                        for gate in base_gate_priority:
-                            if gate.lower() in raw_gate_names:
-                                base_gate_label = gate
-                                break
-                        if base_gate_label != 'root' and self.raw_gating.find_matching_gate_paths(base_gate_label):
-                            base_path = tuple(list(self.raw_gating.find_matching_gate_paths(base_gate_label)[0]) + [base_gate_label])
-                        else:
-                            base_path = ('root',)
+                        base_gate_label, base_path = resolve_base_gate(self.raw_gating, self.controller.experiment.process.get('base_gate_priority_order', []))
                         self.raw_gating.add_gate(target_gate, gate_path=base_path)
 
                         target_plot = None
@@ -156,12 +337,13 @@ class ProfileUpdater:
                     _all_events = sample.get_events('raw')
                     _col_order = None
                 _pnn = _col_order if _col_order is not None else sample.pnn_labels
-                self.unstained_negative = get_profile(
-                    sample, negative_gate_label, self.raw_gating,
+                self.unstained_negative, n_neg = get_profile(
+                    sample, negative_gate_label, control_gating(self.controller),
                     self.controller.filtered_raw_fluorescence_channel_ids,
                     preloaded_events=_all_events, preloaded_pnn=_pnn,
-                    event_channels_pnn=_ecpnn,
+                    event_channels_pnn=_ecpnn, sample_key=sample_path, return_n_events=True,
                 )
+                self.low_events.note(self.samples['all_samples'][sample_path], negative_gate_label, n_neg)
                 return True
             else:
                 raise Exception(
@@ -171,8 +353,7 @@ class ProfileUpdater:
         except Exception as e:
             text = f'Failed to generate profile of unstained negative. {e}.'
             warnings.warn(text)
-            if self.bus:
-                self.bus.warningMessage.emit(text)
+            self.low_events.report(text)
             return False
 
 
@@ -196,7 +377,7 @@ class ProfileUpdater:
         # Fallback to global unstained if no per-control assignment
         if not tube_name:
             if self.controller.experiment.process.get('negative_type') == 'unstained':
-                tube_name = _find_default_unstained_tube(self.samples['all_samples']) or ''
+                tube_name = _find_default_unstained_tube(self.samples) or ''
             if not tube_name:
                 return None
 
@@ -214,8 +395,10 @@ class ProfileUpdater:
         try:
             sample = sample_from_fcs(full_path)
             gate_label = 'Neg Unstained' if self.raw_gating.find_matching_gate_paths('Neg Unstained') else None
-            events = get_raw_events(sample, self.controller.filtered_raw_fluorescence_channel_ids,
-                                    gate_label=gate_label, gating_strategy=self.raw_gating)
+            layout = raw_layout(self.controller)
+            events = get_raw_events(sample, layout['fl_ids'],
+                                    gate_label=gate_label, gating_strategy=control_gating(self.controller),
+                                    col_order=layout['col_order'], sample_key=rel_path)
             self._negative_events_cache[tube_name] = events
             return events
         except Exception as e:
@@ -224,9 +407,24 @@ class ProfileUpdater:
     
 
     def generate(self, control, search_results):
+        """Compute and store the profile of *control*; False when it cannot be made.
+        Gates with too few events are reported in one warning per call unless
+        a collecting low_events log is set for a batch."""
+        if self.low_events.entries is not None:
+            return self._generate(control, search_results)
+        self.low_events.entries = []
+        try:
+            return self._generate(control, search_results)
+        finally:
+            text = self.low_events.text()
+            self.low_events.entries = None
+            self.low_events.report(text)
+
+    def _generate(self, control, search_results):
         if control['control_type'] == 'Single Stained Spectral Control':
             try:
                 if control['sample_name'] and control['gate_label']:
+                    gating_signature = self.gating_signature(control)
                     all_samples_reverse_lookup = {v: k for k, v in self.samples['all_samples'].items()}
                     tubename = control['sample_name']
                     sample_path = all_samples_reverse_lookup[tubename]
@@ -240,7 +438,7 @@ class ProfileUpdater:
                         # use cleaned event pool when available and opted in
                         cleaned_store = self.controller.cleaned_events
                         cleaned = cleaned_store.get(control['label']) if control.get('use_cleaned') is not False else None
-                        if cleaned is not None and cleaned.get('spectrum'):
+                        if cleaned is not None and cleaned.get('spectrum') and cleaned_result_matches(control, cleaned):
                             profile = np.array(cleaned['spectrum'], dtype=float)
                             if profile.max() <= 0:
                                 raise Exception(f'Cleaned spectrum for "{control["label"]}" is zero — re-run Clean Controls.')
@@ -248,9 +446,7 @@ class ProfileUpdater:
                             if not control.get('gate_channel_locked'):
                                 control['gate_channel'] = self.fluorescence_channels_pnn[int(np.argmax(profile))]
                             self.profiles[control['label']] = profile.tolist()
-                            profile_dict = dict(zip(self.fluorescence_channels_pnn, profile.tolist()))
-                            spectral_library.deposit_control_with_profile_and_experiment_dir(
-                                control, profile_dict, str(self.experiment_dir))
+                            self.profile_gating[control['label']] = gating_signature
                             return True
 
                         # FCS load only needed for non-cleaned path
@@ -266,12 +462,13 @@ class ProfileUpdater:
                             _col_order = None
                         _pnn = _col_order if _col_order is not None else sample.pnn_labels
 
-                        positive_profile = get_profile(
-                            sample, positive_gate_label, self.raw_gating,
+                        positive_profile, n_pos = get_profile(
+                            sample, positive_gate_label, control_gating(self.controller),
                             self.controller.filtered_raw_fluorescence_channel_ids,
                             preloaded_events=_all_events, preloaded_pnn=_pnn,
-                            event_channels_pnn=_ecpnn,
+                            event_channels_pnn=_ecpnn, sample_key=sample_path, return_n_events=True,
                         )
+                        self.low_events.note(control['label'], positive_gate_label, n_pos)
 
                         universal_neg_name = control.get('universal_negative_name') or ''
                         explicit_internal = (universal_neg_name == INTERNAL_NEGATIVE_SENTINEL)
@@ -305,12 +502,14 @@ class ProfileUpdater:
                                         except (KeyError, ValueError):
                                             _neg_events = neg_sample.get_events('raw')
                                         _neg_pnn = _col_order if _col_order is not None else neg_sample.pnn_labels
-                                        resolved_unstained = get_profile(
-                                            neg_sample, neg_gate_label, self.raw_gating,
+                                        resolved_unstained, n_neg = get_profile(
+                                            neg_sample, neg_gate_label, control_gating(self.controller),
                                             self.controller.filtered_raw_fluorescence_channel_ids,
                                             preloaded_events=_neg_events, preloaded_pnn=_neg_pnn,
-                                            event_channels_pnn=_ecpnn,
+                                            event_channels_pnn=_ecpnn, sample_key=neg_rel_path,
+                                            return_n_events=True,
                                         )
+                                        self.low_events.note(universal_neg_name, neg_gate_label, n_neg)
                                     else:
                                         warnings.warn(f'{control["label"]}: unstained negative "{universal_neg_name}" has no "Neg Unstained" gate — using internal negative.')
                                 else:
@@ -326,8 +525,7 @@ class ProfileUpdater:
                             else:
                                 # No unstained available for this control — fall back gracefully
                                 warnings.warn(f'{control["label"]}: no unstained negative available — using internal negative.')
-                                if self.bus:
-                                    self.bus.warningMessage.emit(f'{control["label"]}: no unstained negative available, using internal negative.')
+                                self.low_events.report(f'{control["label"]}: no unstained negative available, using internal negative.')
                                 use_unstained = False  # drop through to internal path below
 
                         if not use_unstained:
@@ -347,12 +545,13 @@ class ProfileUpdater:
                                                 f'Please run Auto-Generate to recreate spectral gates, '
                                                 f'or select the correct Negative Gate in the Spectral Model Editor.')
 
-                            negative_profile = get_profile(
-                                sample, negative_gate_label, self.raw_gating,
+                            negative_profile, n_neg = get_profile(
+                                sample, negative_gate_label, control_gating(self.controller),
                                 self.controller.filtered_raw_fluorescence_channel_ids,
                                 preloaded_events=_all_events, preloaded_pnn=_pnn,
-                                event_channels_pnn=_ecpnn,
+                                event_channels_pnn=_ecpnn, sample_key=sample_path, return_n_events=True,
                             )
+                            self.low_events.note(control['label'], negative_gate_label, n_neg)
 
                         profile = positive_profile - negative_profile
                         if profile.sum() == 0:
@@ -368,16 +567,21 @@ class ProfileUpdater:
                                 f'Run Control Cleaning to fix this.'
                             )
                             warnings.warn(profile_warning)
-                            self.negative_profile_warnings.append(control['label'])
+                            if self.negative_profile_warnings is not None:
+                                self.negative_profile_warnings.append(control['label'])
+                            elif self.bus:
+                                self.bus.warningMessage.emit(profile_warning)
                             abs_max = np.abs(profile).max()
                             profile = np.abs(profile) / abs_max if abs_max > 0 else positive_profile
 
                         control['profile_warning'] = profile_warning
                         if not control.get('gate_channel_locked'):
-                            # Orthogonalised peak search — no col_order so indices into full channel list are valid.
+                            # Orthogonalised peak search
+                            layout = raw_layout(self.controller)
                             pos_events_raw = get_raw_events(
-                                sample, self.controller.filtered_raw_fluorescence_channel_ids,
-                                gate_label=positive_gate_label, gating_strategy=self.raw_gating,
+                                sample, layout['fl_ids'],
+                                gate_label=positive_gate_label, gating_strategy=control_gating(self.controller),
+                                col_order=layout['col_order'], sample_key=sample_path,
                             )
                             neg_events_raw = self._get_negative_events(control)
                             if (pos_events_raw is not None and len(pos_events_raw) > 1
@@ -389,24 +593,22 @@ class ProfileUpdater:
                             control['gate_channel'] = self.fluorescence_channels_pnn[peak_idx]
                         profile = profile.tolist()
                         self.profiles[control['label']] = profile
-                        profile_dict = dict(zip(self.fluorescence_channels_pnn, profile))
-                        spectral_library.deposit_control_with_profile_and_experiment_dir(control, profile_dict, str(self.experiment_dir))
+                        self.profile_gating[control['label']] = gating_signature
                         return True
 
             except Exception as e:
                 text = f'Failed to generate profile. {e}'
                 warnings.warn(text)
-                if self.bus:
-                    self.bus.warningMessage.emit(text)
+                self.low_events.report(text)
                 return False
 
         elif control['control_type'] == 'Single Stained Spectral Control from Library':
-            if control['sample_name'] and search_results:
-                for n in search_results:
-                    if control['sample_name'] == search_results[n]['current_control_list']:
-                        profile = list(json.loads(search_results[n]['profile_dict']).values())
-                        self.profiles[control['label']] = profile
-                        return True
+            # search_results maps reference library profile id -> {channel: value}
+            profile_id = profile_id_from_description(control['sample_name'])
+            by_channel = search_results.get(profile_id) if search_results else None
+            if by_channel and all(ch in by_channel for ch in self.fluorescence_channels_pnn):
+                self.profiles[control['label']] = [float(by_channel[ch]) for ch in self.fluorescence_channels_pnn]
+                return True
 
         elif control['control_type'] == 'Channel Assignment':
             if control['gate_channel']:
@@ -426,7 +628,10 @@ class ProfileUpdater:
         self.profiles.pop(label)
 
 class SpectralAutoGenerator(QObject):
-    def __init__(self, bus, controller, preferred_unstained: str | None = None):
+    generationFinished = Signal()
+
+    def __init__(self, bus, controller, preferred_unstained: str | None = None,
+                 previous_controls: list[dict] | None = None, defer_model_update: bool = False):
         super().__init__()
 
         # connect
@@ -446,28 +651,38 @@ class SpectralAutoGenerator(QObject):
         self.samples = self.controller.experiment.samples
         self.experiment_dir = self.controller.experiment_dir
         self.preferred_unstained = preferred_unstained  # tube name hint from editor
+        self.previous_controls = previous_controls or []  # model being replaced, for label restore
+        # caller cleans the controls next and emits spectralModelUpdated itself
+        self.defer_model_update = defer_model_update
 
         self.spectral_model.clear()
         self.profiles.clear()
         self.unstained_negative = None
         self.unstained_negative_events = None          # cells unstained raw events
-        self.unstained_negative_events_beads = None    # beads unstained raw events
+        self.bead_unstained_events = {}                # bead unstained raw events by path
         self.negative_profile_warnings = []            # labels; shown once at end of run()
         self.insufficient_events_warnings = []         # tubenames; shown once at end of run()
+        self.mismatched_controls = []                  # tubenames lacking the experiment's channels; shown once at end of run()
+        self.low_events = LowEventLog(controller, bus, collect=True)   # shown once at end of run()
 
         self.progress_target = len(self.samples['single_stain_controls'])
         # self.progress_target = len(self.samples['single_stain_controls'][:5]) # quick test
 
         # (sample name, label, sample path, particle_type (cells/beads), control_type (positive only, positive and negative, autofluorescence), gate channel
-        self.base_gate_label = 'root'
-        raw_gate_names = [g[0].lower() for g in self.controller.raw_gating.get_gate_ids()]
-        for gate in self.controller.experiment.process['base_gate_priority_order']:
-            if gate.lower() in raw_gate_names:
-                self.base_gate_label = gate
-                break
+        self.base_gate_label, _ = resolve_base_gate(self.controller.raw_gating, self.controller.experiment.process['base_gate_priority_order'])
 
-    @with_busy_cursor
+    @Slot()
     def run(self):
+        """Generate the spectral model; always ends with generationFinished."""
+        try:
+            self._generate()
+        except Exception as e:
+            logger.exception('SpectralAutoGenerator: auto-generation failed')
+            self._report_warning(f'Auto-generate spectral controls failed: {e}')
+        finally:
+            self.generationFinished.emit()
+
+    def _generate(self):
         self.get_unstained_negative(particle_type='Cells')
         self.get_unstained_negative(particle_type='Beads')
         if self.unstained_negative is None:
@@ -486,14 +701,21 @@ class SpectralAutoGenerator(QObject):
             if self.bus:
                 self.bus.spectralControlAdded.emit()
 
+        renamed = restore_user_labels(self.spectral_model, self.profiles, self.previous_controls)
+        if renamed:
+            logger.info(f'SpectralAutoGenerator: restored previous labels {renamed}')
+            self.negative_profile_warnings = [renamed.get(label, label) for label in self.negative_profile_warnings]
+            self.low_events.entries = [(renamed.get(name, name), gate, n) for name, gate, n in self.low_events.entries]
+
         for index, plot in enumerate(self.raw_plots):
             if self.bus:
                 self.bus.updateRois.emit('raw', index)
 
         logger.info('SpectralAutoGenerator: regenerated spectral model and raw gating hierarchy:')
-        logger.info(self.raw_gating.get_gate_hierarchy(output='json'))
+        logger.info(self.raw_gating.get_gate_hierarchy(output='ascii'))
 
-        if self.bus and self.negative_profile_warnings:
+        # with deferred update, profiles and gate counts are rechecked after cleaning
+        if self.bus and self.negative_profile_warnings and not self.defer_model_update:
             labels = ', '.join(f'"{label}"' for label in self.negative_profile_warnings)
             combined_warning = (
                 f'The following control(s) have a negative profile — the negative gate '
@@ -501,7 +723,7 @@ class SpectralAutoGenerator(QObject):
                 f'These controls have been added but will not unmix correctly. '
                 f'Run Control Cleaning to fix this.'
             )
-            self.bus.warningMessage.emit(combined_warning)
+            self._report_warning(combined_warning)
 
         if self.bus and self.insufficient_events_warnings:
             tubenames = ', '.join(f'"{name}"' for name in self.insufficient_events_warnings)
@@ -512,25 +734,50 @@ class SpectralAutoGenerator(QObject):
                 f'Adjust the "{self.base_gate_label}" gate to make sure the relevant events '
                 f'for all your single stain control samples are within it.'
             )
-            self.bus.warningMessage.emit(combined_insufficient)
+            self._report_warning(combined_insufficient)
+
+        if self.bus and self.mismatched_controls:
+            tubenames = ', '.join(f'"{name}"' for name in self.mismatched_controls)
+            self._report_warning(
+                f'The following control(s) do not contain the experiment\'s channels, so no '
+                f'spectral control was made for them: {tubenames}.\n\n'
+                f'If they were acquired on the same instrument and settings as your samples, '
+                f'run Import FCS Files (File menu) to update the experiment configuration. '
+                f'Otherwise, these controls cannot be used.'
+            )
+
+        low_event_text = self.low_events.text()
+        if self.bus and low_event_text and not self.defer_model_update:
+            self._report_warning(low_event_text)
 
         if self.bus:
             self.bus.progress.emit(self.progress_target, self.progress_target)
-            self.bus.spectralModelUpdated.emit()
-            self.bus.showSelectedProfiles.emit([])
+            if not self.defer_model_update:
+                self.bus.spectralModelUpdated.emit()
+                self.bus.showSelectedProfiles.emit([])
+
+    def _report_warning(self, text: str):
+        """Hold the warning in the controller's collector when one is active, so the
+        caller can show everything in one dialog after the run; otherwise show it at once."""
+        collector = self.controller.warning_collector
+        if collector is not None:
+            collector.append(text)
+        elif self.bus:
+            self.bus.warningMessage.emit(text)
 
     def get_unstained_negative(self, particle_type: str = 'Cells') -> bool:
         """
         Locate the unstained sample for *particle_type*, create the 'Neg Unstained'
         gate if absent, then cache the profile and raw events.
 
-        particle_type='Cells': prefer a sample whose name does NOT contain 'Beads'.
-        particle_type='Beads': prefer a sample whose name contains 'Beads'.
+        particle_type='Cells': prefer a sample that is not a bead sample.
+        particle_type='Beads': every unstained bead sample (see particle_type.is_bead_sample);
+        each bead control uses the one matching its scatter (match_bead_unstained).
 
         Stores results in:
             self.unstained_negative          (profile vector, Cells only)
             self.unstained_negative_events   (raw array, Cells)
-            self.unstained_negative_events_beads (raw array, Beads)
+            self.bead_unstained_events       (raw arrays by path, Beads)
 
         Returns True if an unstained was found and loaded, False otherwise.
         Does NOT modify negative_type on failure.
@@ -544,8 +791,7 @@ class SpectralAutoGenerator(QObject):
                         or re.search(r'(unstained|negative)', name, re.IGNORECASE))
 
             def _is_bead(path: str, name: str) -> bool:
-                return bool(re.search(r'bead', name, re.IGNORECASE)
-                            or re.search(r'bead', path, re.IGNORECASE))
+                return is_bead_sample(self.samples, path, name)
 
             sample_path = None
             # Search: manually tagged first, then regex, filtered by particle type
@@ -553,9 +799,9 @@ class SpectralAutoGenerator(QObject):
                 path for path, name in self.samples['all_samples'].items()
                 if _is_unstained(path, name)
             ]
+            bead_candidates = [p for p in candidates if _is_bead(p, self.samples['all_samples'][p])]
             if particle_type == 'Beads':
-                bead_candidates = [p for p in candidates if _is_bead(p, self.samples['all_samples'][p])]
-                sample_path = (bead_candidates or candidates or [None])[0]
+                sample_path = (bead_candidates or [None])[0]
             else:
                 # Honour editor hint for Cells unstained when available.
                 if self.preferred_unstained:
@@ -602,14 +848,29 @@ class SpectralAutoGenerator(QObject):
                 if negative_gate_label not in target_plot['child_gates']:
                     target_plot['child_gates'].append(negative_gate_label)
 
+            layout = raw_layout(self.controller)
             raw_events = get_raw_events(
-                sample, self.fluorescence_channel_ids,
+                sample, layout['fl_ids'],
                 gate_label=self.base_gate_label,
-                gating_strategy=self.raw_gating,
+                gating_strategy=control_gating(self.controller),
+                col_order=layout['col_order'],
+                sample_key=sample_path,
             )
+            self.low_events.note(self.samples['all_samples'][sample_path], self.base_gate_label, len(raw_events))
 
             if particle_type == 'Beads':
-                self.unstained_negative_events_beads = raw_events
+                self.bead_unstained_events[sample_path] = raw_events
+                for path in bead_candidates[1:]:
+                    other = sample_from_fcs(str(self.experiment_dir / path))
+                    self.bead_unstained_events[path] = get_raw_events(
+                        other, layout['fl_ids'],
+                        gate_label=self.base_gate_label,
+                        gating_strategy=control_gating(self.controller),
+                        col_order=layout['col_order'],
+                        sample_key=path,
+                    )
+                    self.low_events.note(self.samples['all_samples'][path], self.base_gate_label,
+                                         len(self.bead_unstained_events[path]))
             else:
                 _col_order = self.controller.experiment.settings['raw'].get('whitelisted_pnn')
                 _ecpnn = self.controller.experiment.settings['raw']['event_channels_pnn']
@@ -621,9 +882,9 @@ class SpectralAutoGenerator(QObject):
                 _pnn = _col_order if _col_order is not None else sample.pnn_labels
                 self.unstained_negative = get_profile(
                     sample, self.base_gate_label,
-                    self.raw_gating, self.fluorescence_channel_ids,
+                    control_gating(self.controller), self.fluorescence_channel_ids,
                     preloaded_events=_all_events, preloaded_pnn=_pnn,
-                    event_channels_pnn=_ecpnn,
+                    event_channels_pnn=_ecpnn, sample_key=sample_path,
                 )
                 self.unstained_negative_events = raw_events
 
@@ -641,6 +902,14 @@ class SpectralAutoGenerator(QObject):
     def generate_spectral_control(self, n):
         sample_path = self.samples['single_stain_controls'][n]
 
+        if (self.base_gate_label != 'root'
+                and not self.raw_gating.find_matching_gate_paths(self.base_gate_label)):
+            warnings.warn(
+                f'Autogenerate: base gate "{self.base_gate_label}" not found in the '
+                f'shared raw gating hierarchy.'
+            )
+            return False
+
         nevents = self.samples['all_sample_nevents'][sample_path]
         tubename = self.samples['all_samples'][sample_path]
         if nevents > 0:
@@ -654,15 +923,17 @@ class SpectralAutoGenerator(QObject):
                 logger.info(f'generate_spectral_control: skipping "{tubename}" (matches unstained/negative pattern or manually marked as unstained)')
                 return True
 
-            particle_type = 'Cells'
+            # bead list (name, scatter or user), else the name
             match = re.findall('([Cc]ells|[Bb]eads)', tubename)
-            if match:
-                if 'cells' in match[0].lower():
-                    particle_type = 'Cells'
-                else:
-                    particle_type = 'Beads'
+            if sample_path in self.samples.get('bead_checked_samples', []):
+                particle_type = 'Beads' if sample_path in self.samples.get('bead_samples', []) else 'Cells'
+            elif match:
+                particle_type = 'Cells' if 'cells' in match[0].lower() else 'Beads'
             else:
-                warnings.warn(f'Unknown particle type from name, assigning as {particle_type}')
+                particle_type = 'Cells'
+                warnings.warn(f'Particle type of "{tubename}" not known from the bead list or name, assigning as Cells')
+            # bead controls: the unstained bead sample matching their scatter, if any
+            bead_match = match_bead_unstained(self.samples, sample_path) if particle_type == 'Beads' else None
 
             match = re.findall(r'^(.*?)(?=\s*[\(\[]|\s+(?:cells?|beads?)\s*$)', tubename, re.IGNORECASE)
             raw_label = match[0].strip() if match else tubename
@@ -681,17 +952,22 @@ class SpectralAutoGenerator(QObject):
                 pass
             else:
                 full_sample_path = str(self.experiment_dir / sample_path)
-                if check_fcs_matches_experiment(full_sample_path, self.controller.experiment.settings['raw']['event_channels_pnn'], self.controller.experiment.settings['raw']['magnitude_ceiling']):
+                raw_settings = self.controller.experiment.settings['raw']
+                check_pnn = raw_settings.get('whitelisted_pnn') or raw_settings['event_channels_pnn']
+                if check_fcs_matches_experiment(full_sample_path, check_pnn, raw_settings['magnitude_ceiling']):
                     sample = sample_from_fcs(full_sample_path)
 
                     match = re.findall('([Uu]nstained)', label)
                     if match:
                         ...
                     else:
+                        layout = raw_layout(self.controller)
                         pos_events_all = get_raw_events(
-                            sample, self.fluorescence_channel_ids,
+                            sample, layout['fl_ids'],
                             gate_label=self.base_gate_label,
-                            gating_strategy=self.raw_gating,
+                            gating_strategy=control_gating(self.controller),
+                            col_order=layout['col_order'],
+                            sample_key=sample_path,
                         )
 
                         if len(pos_events_all) < 2:
@@ -703,7 +979,7 @@ class SpectralAutoGenerator(QObject):
                         # use particle-type-matched unstained events if available,
                         # otherwise fall back to the bottom 25 % of this sample.
                         unstained_ref = (
-                            self.unstained_negative_events_beads
+                            self.bead_unstained_events.get(bead_match)
                             if particle_type == 'Beads'
                             else self.unstained_negative_events
                         )
@@ -761,8 +1037,9 @@ class SpectralAutoGenerator(QObject):
                             self.raw_gating.remove_gate(positive_gate_label)
                         if self.raw_gating.find_matching_gate_paths(negative_gate_label):
                             self.raw_gating.remove_gate(negative_gate_label)
-                        self.raw_gating.add_gate(positive_gate, gate_path=tuple(list(self.raw_gating.find_matching_gate_paths(self.base_gate_label)[0]) + [self.base_gate_label]))
-                        self.raw_gating.add_gate(negative_gate, gate_path=tuple(list(self.raw_gating.find_matching_gate_paths(self.base_gate_label)[0]) + [self.base_gate_label]))
+                        _, base_path = resolve_base_gate(self.raw_gating, [self.base_gate_label])
+                        self.raw_gating.add_gate(positive_gate, gate_path=base_path)
+                        self.raw_gating.add_gate(negative_gate, gate_path=base_path)
                         target_plot = None
                         for n, plot in enumerate(self.raw_plots):
                             if plot['type'] == 'hist1d' and plot['channel_x'] == channel_x:
@@ -791,33 +1068,18 @@ class SpectralAutoGenerator(QObject):
 
                     default_unstained = (
                         self.preferred_unstained
-                        or _find_default_unstained_tube(self.samples['all_samples'])
+                        or _find_default_unstained_tube(self.samples)
                     )
                     assigned_negative = default_unstained or ''  # default; overridden for Beads below
                     # For bead controls, only use an unstained negative if available
                     if particle_type == 'Beads':
-                        # Mirror the combobox builder logic exactly: iterate all_samples,
-                        # accept anything unstained (manually tagged OR regex), then
-                        # filter to those whose name contains "Beads".
-                        manually_tagged = set(self.samples.get('unstained_samples', []))
-                        default_unstained_bead = None
-                        for path, name in self.samples['all_samples'].items():
-                            is_unstained = (
-                                path in manually_tagged
-                                or bool(re.search(r'unstained', name, re.IGNORECASE))
-                                or bool(re.search(r'unstained', path, re.IGNORECASE))
-                            )
-                            if not is_unstained:
-                                continue
-                            if re.search(r'bead', name, re.IGNORECASE) or re.search(r'bead', path, re.IGNORECASE):
-                                default_unstained_bead = name
-                                break
-                        # No bead-specific unstained available: explicitly opt out of the
+                        # No matching bead unstained: explicitly opt out of the
                         # global-unstained fallback (which is cell-only in ProfileUpdater)
                         # rather than leaving this blank. A blank value reads to
                         # ProfileUpdater.generate() as "no per-control override, use the
                         # global default" — silently pulling in the cell AF vector.
-                        assigned_negative = default_unstained_bead or INTERNAL_NEGATIVE_SENTINEL
+                        assigned_negative = (self.samples['all_samples'][bead_match] if bead_match
+                                             else INTERNAL_NEGATIVE_SENTINEL)
                     control = {
                         'label': label,
                         'antigen': antigen,
@@ -840,22 +1102,24 @@ class SpectralAutoGenerator(QObject):
                         _col_order = None
                     _pnn = _col_order if _col_order is not None else sample.pnn_labels
 
-                    positive_profile = get_profile(
-                        sample, control['gate_label'], self.raw_gating,
+                    positive_profile, n_pos = get_profile(
+                        sample, control['gate_label'], control_gating(self.controller),
                         self.fluorescence_channel_ids,
                         preloaded_events=_all_events, preloaded_pnn=_pnn,
-                        event_channels_pnn=_ecpnn,
+                        event_channels_pnn=_ecpnn, sample_key=sample_path, return_n_events=True,
                     )
+                    self.low_events.note(label, control['gate_label'], n_pos)
                     if (self.controller.experiment.process['negative_type'] == 'unstained'
                             and self.unstained_negative is not None):
                         negative_profile = self.unstained_negative
                     else:
-                        negative_profile = get_profile(
-                            sample, negative_gate_label, self.raw_gating,
+                        negative_profile, n_neg = get_profile(
+                            sample, negative_gate_label, control_gating(self.controller),
                             self.fluorescence_channel_ids,
                             preloaded_events=_all_events, preloaded_pnn=_pnn,
-                            event_channels_pnn=_ecpnn,
+                            event_channels_pnn=_ecpnn, sample_key=sample_path, return_n_events=True,
                         )
+                        self.low_events.note(label, negative_gate_label, n_neg)
                     profile = positive_profile - negative_profile
                     if profile.sum() == 0:
                         profile = positive_profile
@@ -882,18 +1146,10 @@ class SpectralAutoGenerator(QObject):
 
                     profile = profile.tolist()
                     self.profiles[control['label']] = profile
-
-                    profile_dict = dict(zip(self.fluorescence_channels_pnn, profile))
-                    spectral_library.deposit_control_with_profile_and_experiment_dir(control, profile_dict, str(self.experiment_dir))
                     return True
                 else:
-                    warnings.warn('Control sample file does not match experiment')
-                    # self.bus.warningMessage.emit('Failed to load control sample: sample channels (names and ranges) not consistent with experiment configuration.\n\n'
-                    #                              'Were your controls and samples acquired by the same instrument and settings? \n'
-                    #                              'If so, run Import FCS Files (from the File menu). \n'
-                    #                              'Otherwise, these controls cannot be used.')
-                    if self.bus:
-                        self.bus.openImportFCSWidget.emit(True)
+                    warnings.warn(f'Control sample "{tubename}" does not match experiment')
+                    self.mismatched_controls.append(tubename)
                     return False
 
         else:
@@ -917,9 +1173,18 @@ class SpectralCleaner(QObject):
     Runs the AutoSpectral cleaning pipeline (saturation exclusion +
     brightest-event selection) for every eligible cell control.
 
+    With refinement enabled (settings.spectral_cleaning_refine), each cleaned
+    spectrum is then re-measured on the control's whole gated population
+    (spectral_refinement.refine_row), and once every control is done the full
+    panel is checked for residual spillover from each refined control, before
+    and after refinement (spectral_refinement.crosstalk_check). The check
+    reuses events kept from the cleaning pass, so files are only re-read for
+    controls whose cleaning was already current.
+
     Instantiate, optionally move to a QThread, then call run().
     The caller is responsible for emitting bus.spectralModelUpdated after run()
-    completes (e.g. via a QThread.finished signal).
+    completes (e.g. via a QThread.finished signal), and for showing
+    self.warnings, which run() never emits itself.
     """
     cleaningFinished = Signal()
 
@@ -937,23 +1202,56 @@ class SpectralCleaner(QObject):
         self.fluor_ch_ids    = controller.filtered_raw_fluorescence_channel_ids
         self.ceiling         = controller.experiment.settings['raw']['magnitude_ceiling']
         self._cytometer_key: str | None = controller.experiment.settings['raw'].get('cytometer_db_col')
-        self._collected_warnings: list[str] = []   # gathered across run(), emitted as one dialog at the end
+        self._collected_warnings: list[str] = []   # gathered across run()
+        self.warnings: list[str] = []              # final list for the caller, read after cleaningFinished
+        self.refine = settings.spectral_cleaning_refine_retrieved
+        self.refine_settings = RefineSettings()
+        self._check_pools: dict = {}         # label -> CheckPool, for this run only
+        self._negative_refs: dict = {}       # unstained tube -> (float32 subsample, mean spectrum)
+        self._rng = np.random.default_rng(0)
+        self._refine_seconds = 0.0
+        self._low_events = LowEventLog(controller, bus, collect=True)
 
-    @with_busy_cursor
+    @Slot()
     def run(self):
+        """Clean the controls; always ends with cleaningFinished, a failure reported in self.warnings."""
+        try:
+            self._clean_all()
+        except Exception as e:
+            logger.exception('SpectralCleaner: cleaning failed')
+            self.warnings = list(self._collected_warnings) + [f'Clean Controls failed: {e}']
+            self._collected_warnings = []
+        finally:
+            self.cleaningFinished.emit()
+
+    def _clean_all(self):
         self._collected_warnings = []
+        self._low_events = LowEventLog(self.controller, self.bus, collect=True)
+        self._check_pools = {}
+        self._negative_refs = {}
+        self._refine_seconds = 0.0
+        t_start = time.perf_counter()
+
+        model_controls = []
+        seen_labels = set()
+        for c in self.spectral_model:
+            if c.get('label') and c['label'] not in seen_labels:
+                seen_labels.add(c['label'])
+                model_controls.append(c)
 
         eligible_external = [
-            c for c in self.spectral_model
+            c for c in model_controls
             if c.get('control_type') == 'Single Stained Spectral Control'
+            and c.get('sample_name')
             and c.get('particle_type') == 'Cells'
             and c.get('universal_negative_name')
             and c.get('universal_negative_name') != INTERNAL_NEGATIVE_SENTINEL
         ]
 
         eligible_internal = [
-            c for c in self.spectral_model
+            c for c in model_controls
             if c.get('control_type') == 'Single Stained Spectral Control'
+            and c.get('sample_name')
             and (
                 c.get('particle_type') == 'Beads'
                 or c.get('universal_negative_name') == INTERNAL_NEGATIVE_SENTINEL
@@ -961,7 +1259,7 @@ class SpectralCleaner(QObject):
         ]
 
         all_eligible = eligible_external + eligible_internal
-        total = len(all_eligible)
+        total = len(all_eligible) * (2 if self.refine else 1)
 
         for n, control in enumerate(eligible_external):
             if self.bus:
@@ -979,27 +1277,34 @@ class SpectralCleaner(QObject):
             else:
                 logger.info(f'SpectralCleaner: skipping "{control["label"]}" — result already current.')
 
+        t_cleaned = time.perf_counter()
+        if self.refine:
+            self._check_panel(progress_offset=len(all_eligible), progress_total=total)
+        t_checked = time.perf_counter()
+
         if self.bus:
             self.bus.progress.emit(total, total)
 
         logger.info(f'SpectralCleaner: cleaned {len(eligible_external)} cell controls '
                     f'and {len(eligible_internal)} internal/bead controls.')
+        logger.info(
+            f'SpectralCleaner: timing — cleaning {t_cleaned - t_start:.1f} s '
+            f'(of which row refinement {self._refine_seconds:.1f} s), '
+            f'residual spillover check {t_checked - t_cleaned:.1f} s.'
+        )
+        self._check_pools = {}
+        self._negative_refs = {}
 
-        # Emit all collected skip/failure messages as a single dialog, rather
-        # than one QMessageBox per control (which can crash Qt on macOS when
-        # fired repeatedly from a worker thread).
-        if self._collected_warnings and self.bus:
-            if len(self._collected_warnings) == 1:
-                combined = f'Control Cleaning: {self._collected_warnings[0]}'
-            else:
-                combined = (
-                    f'Control Cleaning: {len(self._collected_warnings)} control(s) had issues:\n\n'
-                    + '\n'.join(f'- {w}' for w in self._collected_warnings)
-                )
-            self.bus.warningMessage.emit(combined)
+        # Warnings are handed to the caller, which shows them in one dialog
+        # together with the profile QC warnings once recalculation is done.
+        background_text = background_warning_text(self.cleaned_events, [c['label'] for c in all_eligible])
+        if background_text:
+            self._collected_warnings.append(background_text)
+        low_event_text = self._low_events.text()
+        if low_event_text:
+            self._collected_warnings.append(low_event_text)
+        self.warnings = list(self._collected_warnings)
         self._collected_warnings = []
-
-        self.cleaningFinished.emit()
 
     def _cleaning_fingerprint(self, control: dict) -> dict:
         """Return a dict of all inputs that determine what _clean_one will produce.
@@ -1010,7 +1315,25 @@ class SpectralCleaner(QObject):
             'universal_negative_name': control.get('universal_negative_name'),
             'particle_type': control.get('particle_type'),
             'fluor_ch_ids': list(self.fluor_ch_ids),
+            'refine': bool(self.refine),
+            'gating': self._gating_fingerprint(control),
+            'background_check': BACKGROUND_CHECK_VERSION,
         }
+
+    def _gating_fingerprint(self, control: dict) -> str:
+        """The gates _load_events applies, as applied to the control sample and
+        to its negative (per-sample overrides included)."""
+        gating = control_gating(self.controller)
+        base_gate_label, _ = resolve_base_gate(self.raw_gating, self.controller.experiment.process.get('base_gate_priority_order', []))
+        all_samples_rev = {v: k for k, v in self.samples['all_samples'].items()}
+        parts = []
+        rel_path = all_samples_rev.get(control.get('sample_name'))
+        if rel_path is not None:
+            parts.append(gating.chain_signature(rel_path, [base_gate_label]))
+        neg_path = all_samples_rev.get(control.get('universal_negative_name') or '')
+        if neg_path is not None:
+            parts.append(gating.chain_signature(neg_path, [base_gate_label]))
+        return '|'.join(parts)
 
     def _is_cleaning_current(self, control: dict) -> bool:
         """Return True if a valid cleaned result already exists for this control
@@ -1024,143 +1347,160 @@ class SpectralCleaner(QObject):
             return False
         return stored_fp == self._cleaning_fingerprint(control)
     
+    def _load_events(self, control: dict) -> dict | None:
+        """Base-gated, saturation-excluded events of a control and its negative.
+
+        Returns None, with a collected warning, when the control cannot be
+        cleaned: no negative assigned or found, or too few events. Raises on
+        a missing sample file.
+        """
+        label = control['label']
+        # --- load base-gate fluorescence + scatter events ---
+        # Use the base gate (same pool as the autogenerator), not the narrow per-control positive gate.
+        # The cleaner selects its own positives via  cosine filter.
+        all_samples_rev = {v: k for k, v in self.samples['all_samples'].items()}
+        rel_path = all_samples_rev.get(control['sample_name'])
+        if rel_path is None:
+            raise ValueError(f'Sample "{control["sample_name"]}" not found.')
+        full_path = str(self.experiment_dir / rel_path)
+        sample = sample_from_fcs(full_path)
+
+        base_gate_label, _ = resolve_base_gate(self.raw_gating, self.controller.experiment.process.get('base_gate_priority_order', []))
+
+        layout = raw_layout(self.controller)  # column selectors for get_raw_events
+        scatter_ch_ids = layout['sc_ids']
+        scatter_ch_pnn = layout['col_order'] or self.event_channels_pnn
+
+        pos_events, pos_scatter_all = get_raw_events(
+            sample, layout['fl_ids'],
+            gate_label=base_gate_label,
+            gating_strategy=control_gating(self.controller),
+            extra_channel_ids=scatter_ch_ids,
+            col_order=layout['col_order'],
+            sample_key=rel_path,
+        )
+        self._low_events.note(label, base_gate_label, len(pos_events))
+
+        # Reduce scatter to the canonical morphology pair (scatter_param[0], scatter_param[1]).
+        scatter_param = self.controller.experiment.settings['raw'].get('scatter_param', ['FSC-A', 'SSC-A'])
+        morph_x_name, morph_y_name = scatter_param[0], scatter_param[1]
+
+        def _fsc_ssc_cols(all_scatter: np.ndarray) -> np.ndarray:
+            col_x = next((col for col, ch_id in enumerate(scatter_ch_ids)
+                        if scatter_ch_pnn[ch_id] == morph_x_name), None)
+            col_y = next((col for col, ch_id in enumerate(scatter_ch_ids)
+                        if scatter_ch_pnn[ch_id] == morph_y_name), None)
+            if col_x is None:
+                col_x = next((col for col, ch_id in enumerate(scatter_ch_ids)
+                            if 'FSC' in scatter_ch_pnn[ch_id]), 0)
+            if col_y is None:
+                col_y = next((col for col, ch_id in enumerate(scatter_ch_ids)
+                            if 'SSC' in scatter_ch_pnn[ch_id]), 1)
+            return all_scatter[:, [col_x, col_y]]
+            
+        pos_scatter = _fsc_ssc_cols(pos_scatter_all) if pos_scatter_all.shape[1] > 2 else pos_scatter_all
+
+        # --- load negative events ---
+        neg_name = control.get('universal_negative_name')
+        has_external_neg = (
+            neg_name
+            and neg_name != INTERNAL_NEGATIVE_SENTINEL
+            and self.controller.experiment.process.get('negative_type') != 'internal'
+        )
+        use_internal = not has_external_neg
+
+        logger.info(
+            f'SpectralCleaner: loading "{label}" particle_type={control.get("particle_type")!r} '
+            f'universal_negative_name={control.get("universal_negative_name")!r} '
+            f'use_internal={use_internal}'
+        )
+
+        if use_internal:
+            # internal negative: bottom 10 % of pos_events, taken in _clean_one
+            neg_events = np.empty((0, pos_events.shape[1]))
+            neg_scatter = np.empty((0, 2))     # no scatter matching for internal
+        else:
+            tube_name = control.get('universal_negative_name') or ''
+            if not tube_name:
+                msg = f'"{label}": no negative assigned — skipping cleaning.'
+                logger.warning(f'SpectralCleaner: {msg}')
+                self._collected_warnings.append(msg)
+                return None
+            all_samples_rev2 = {v: k for k, v in self.samples['all_samples'].items()}
+            neg_rel_path = all_samples_rev2.get(tube_name)
+            if not neg_rel_path:
+                msg = f'"{label}": negative tube "{tube_name}" not found — skipping cleaning.'
+                logger.warning(f'SpectralCleaner: {msg}')
+                self._collected_warnings.append(msg)
+                return None
+            neg_full_path = str(self.experiment_dir / neg_rel_path)
+            neg_sample = sample_from_fcs(neg_full_path)
+            neg_events, neg_scatter_all = get_raw_events(
+                neg_sample, layout['fl_ids'],
+                gate_label=base_gate_label,
+                gating_strategy=control_gating(self.controller),
+                extra_channel_ids=scatter_ch_ids,
+                col_order=layout['col_order'],
+                sample_key=neg_rel_path,
+            )
+            self._low_events.note(tube_name, base_gate_label, len(neg_events))
+            if len(neg_events) < MIN_EVENTS_FOR_CLEANING:
+                msg = (f'"{label}": only {len(neg_events)} negative event(s) — '
+                       f'skipping cleaning, need at least {MIN_EVENTS_FOR_CLEANING}.')
+                logger.warning(f'SpectralCleaner: {msg}')
+                self._collected_warnings.append(msg)
+                return None
+            neg_scatter = _fsc_ssc_cols(neg_scatter_all) if neg_scatter_all.shape[1] > 2 else neg_scatter_all
+
+        # Expected peak from spectral model table (fallback / QC only)
+        peak_ch_name = control.get('gate_channel', '')
+        try:
+            expected_peak_ch_idx = self.fluor_ch_ids.index(
+                self.event_channels_pnn.index(peak_ch_name)
+            )
+        except (ValueError, IndexError):
+            expected_peak_ch_idx = int(np.argmax(pos_events.mean(axis=0)))
+
+        # --- Saturation exclusion ---
+        pos_events, n_sat_pos, sat_mask_pos = exclude_saturated(pos_events, self.ceiling)
+        pos_scatter = pos_scatter[~sat_mask_pos]
+        if not use_internal:
+            neg_events, n_sat_neg, sat_mask_neg = exclude_saturated(neg_events, self.ceiling)
+            neg_scatter = neg_scatter[~sat_mask_neg]
+        else:
+            n_sat_neg = 0
+
+        if len(pos_events) < MIN_EVENTS_FOR_CLEANING:
+            msg = (f'"{label}": only {len(pos_events)} positive event(s) after saturation '
+                   f'exclusion — skipping cleaning (need at least {MIN_EVENTS_FOR_CLEANING}). '
+                   f'Existing profile, if any, is unaffected.')
+            logger.warning(f'SpectralCleaner: {msg}')
+            self._collected_warnings.append(msg)
+            return None
+
+        return {
+            'pos_events': pos_events,
+            'pos_scatter': pos_scatter,
+            'neg_events': neg_events,
+            'neg_scatter': neg_scatter,
+            'use_internal': use_internal,
+            'negative_name': None if use_internal else tube_name,
+            'n_removed_saturation': n_sat_pos + n_sat_neg,
+            'expected_peak_ch_idx': expected_peak_ch_idx,
+        }
+
     def _clean_one(self, control: dict):
         label = control['label']
         try:
-            # --- load base-gate fluorescence + scatter events ---
-            # Use the base gate (same pool as the autogenerator), not the narrow per-control positive gate.
-            # The cleaner selects its own positives via  cosine filter.
-            all_samples_rev = {v: k for k, v in self.samples['all_samples'].items()}
-            rel_path = all_samples_rev.get(control['sample_name'])
-            if rel_path is None:
-                raise ValueError(f'Sample "{control["sample_name"]}" not found.')
-            full_path = str(self.experiment_dir / rel_path)
-            sample = sample_from_fcs(full_path)
-
-            base_gate_label = 'root'
-            raw_gate_names = [g[0].lower() for g in self.raw_gating.get_gate_ids()]
-            for gate in self.controller.experiment.process.get('base_gate_priority_order', []):
-                if gate.lower() in raw_gate_names:
-                    base_gate_label = gate
-                    break
-
-            scatter_ch_ids = self.controller.experiment.settings['raw']['scatter_channel_ids']
-            scatter_ch_pnn = self.controller.experiment.settings['raw']['event_channels_pnn']
-
-            pos_events, pos_scatter_all = get_raw_events(
-                sample, self.fluor_ch_ids,
-                gate_label=base_gate_label,
-                gating_strategy=self.raw_gating,
-                extra_channel_ids=scatter_ch_ids,
-            )
-
-            # Reduce scatter to the canonical morphology pair (scatter_param[0], scatter_param[1]).
-            scatter_param = self.controller.experiment.settings['raw'].get('scatter_param', ['FSC-A', 'SSC-A'])
-            morph_x_name, morph_y_name = scatter_param[0], scatter_param[1]
-
-            def _fsc_ssc_cols(all_scatter: np.ndarray) -> np.ndarray:
-                col_x = next((col for col, ch_id in enumerate(scatter_ch_ids)
-                            if scatter_ch_pnn[ch_id] == morph_x_name), None)
-                col_y = next((col for col, ch_id in enumerate(scatter_ch_ids)
-                            if scatter_ch_pnn[ch_id] == morph_y_name), None)
-                if col_x is None:
-                    col_x = next((col for col, ch_id in enumerate(scatter_ch_ids)
-                                if 'FSC' in scatter_ch_pnn[ch_id]), 0)
-                if col_y is None:
-                    col_y = next((col for col, ch_id in enumerate(scatter_ch_ids)
-                                if 'SSC' in scatter_ch_pnn[ch_id]), 1)
-                return all_scatter[:, [col_x, col_y]]
-            
-            pos_scatter = _fsc_ssc_cols(pos_scatter_all) if pos_scatter_all.shape[1] > 2 else pos_scatter_all
-
-            # --- load negative events ---
-            neg_name = control.get('universal_negative_name')
-            has_external_neg = (
-                neg_name
-                and neg_name != INTERNAL_NEGATIVE_SENTINEL
-                and self.controller.experiment.process.get('negative_type') != 'internal'
-            )
-            use_internal = not has_external_neg
-
-            logger.info(
-                f'_clean_one: "{label}" particle_type={control.get("particle_type")!r} '
-                f'universal_negative_name={control.get("universal_negative_name")!r} '
-                f'use_internal={use_internal}'
-            )
-
-            if use_internal:
-                # Load the negative gate from the same positive sample file.
-                neg_gate_lbl = f'Neg {label}'
-                try:
-                    if (self.raw_gating and
-                            self.raw_gating.find_matching_gate_paths(neg_gate_lbl)):
-                        neg_events_internal, _ = get_raw_events(
-                            sample, self.fluor_ch_ids,
-                            gate_label=neg_gate_lbl,
-                            gating_strategy=self.raw_gating,
-                        )
-                    else:
-                        neg_events_internal = np.empty((0, pos_events.shape[1]))
-                except Exception:
-                    neg_events_internal = np.empty((0, pos_events.shape[1]))
-                neg_events = neg_events_internal
-                neg_scatter = np.empty((0, 2))     # no scatter matching for internal
-            else:
-                neg_events_internal = None
-                tube_name = control.get('universal_negative_name') or ''
-                if not tube_name:
-                    msg = f'"{label}": no negative assigned — skipping cleaning.'
-                    logger.warning(f'SpectralCleaner: {msg}')
-                    self._collected_warnings.append(msg)
-                    return
-                all_samples_rev2 = {v: k for k, v in self.samples['all_samples'].items()}
-                neg_rel_path = all_samples_rev2.get(tube_name)
-                if not neg_rel_path:
-                    msg = f'"{label}": negative tube "{tube_name}" not found — skipping cleaning.'
-                    logger.warning(f'SpectralCleaner: {msg}')
-                    self._collected_warnings.append(msg)
-                    return
-                neg_full_path = str(self.experiment_dir / neg_rel_path)
-                neg_sample = sample_from_fcs(neg_full_path)
-                neg_events, neg_scatter_all = get_raw_events(
-                    neg_sample, self.fluor_ch_ids,
-                    gate_label=base_gate_label,
-                    gating_strategy=self.raw_gating,
-                    extra_channel_ids=scatter_ch_ids,
-                )
-                if len(neg_events) < MIN_EVENTS_FOR_CLEANING:
-                    msg = (f'"{label}": only {len(neg_events)} negative event(s) — '
-                           f'skipping cleaning, need at least {MIN_EVENTS_FOR_CLEANING}.')
-                    logger.warning(f'SpectralCleaner: {msg}')
-                    self._collected_warnings.append(msg)
-                    return
-                neg_scatter = _fsc_ssc_cols(neg_scatter_all) if neg_scatter_all.shape[1] > 2 else neg_scatter_all
-
-            # Expected peak from spectral model table (fallback / QC only)
-            peak_ch_name = control.get('gate_channel', '')
-            try:
-                expected_peak_ch_idx = self.fluor_ch_ids.index(
-                    self.event_channels_pnn.index(peak_ch_name)
-                )
-            except (ValueError, IndexError):
-                expected_peak_ch_idx = int(np.argmax(pos_events.mean(axis=0)))
-
-            # --- Saturation exclusion ---
-            pos_events, n_sat_pos, sat_mask_pos = exclude_saturated(pos_events, self.ceiling)
-            pos_scatter = pos_scatter[~sat_mask_pos]
-            if not use_internal:
-                neg_events, n_sat_neg, sat_mask_neg = exclude_saturated(neg_events, self.ceiling)
-                neg_scatter = neg_scatter[~sat_mask_neg]
-            else:
-                n_sat_neg = 0
-
-            if len(pos_events) < MIN_EVENTS_FOR_CLEANING:
-                msg = (f'"{label}": only {len(pos_events)} positive event(s) after saturation '
-                       f'exclusion — skipping cleaning (need at least {MIN_EVENTS_FOR_CLEANING}). '
-                       f'Existing profile, if any, is unaffected.')
-                logger.warning(f'SpectralCleaner: {msg}')
-                self._collected_warnings.append(msg)
+            loaded = self._load_events(control)
+            if loaded is None:
                 return  # leave cleaned_events untouched; profiles[label] is the fallback
+            pos_events           = loaded['pos_events']
+            pos_scatter          = loaded['pos_scatter']
+            neg_events           = loaded['neg_events']
+            neg_scatter          = loaded['neg_scatter']
+            use_internal         = loaded['use_internal']
+            expected_peak_ch_idx = loaded['expected_peak_ch_idx']
 
             if use_internal:
                 # --- Internal-negative path: top-100 minus bottom-10% mean ---
@@ -1215,11 +1555,53 @@ class SpectralCleaner(QObject):
                 logger.warning(f'SpectralCleaner: {msg}')
                 self._collected_warnings.append(msg)
 
+            spectrum_initial = spectrum
+            refine_log = []
+            if self.refine and spectrum.max() > 0:
+                t0 = time.perf_counter()
+                try:
+                    refined = refine_row(pos_events, spectrum, settings=self.refine_settings)
+                    refined_spectrum = refined.row
+                    refine_log = refined.log
+                    pool = self._make_check_pool(loaded, refined_spectrum, control)
+                except Exception as e:
+                    logger.warning(f'SpectralCleaner: "{label}" refinement failed ({e}) — kept cleaned spectrum.')
+                    refined = None
+                else:
+                    spectrum = refined_spectrum
+                    self._check_pools[label] = pool
+                self._refine_seconds += time.perf_counter() - t0
+                if refined is not None:
+                    last = refine_log[-1] if refine_log else {}
+                    logger.info(
+                        f'SpectralCleaner: "{label}" refined on {len(pos_events)} events — '
+                        f'{"accepted" if refined.accepted else "kept cleaned spectrum"}'
+                        f'{"" if last.get("reject") is None else " (rejected: " + last["reject"] + ")"}, '
+                        f'{len(refine_log)} pass(es).'
+                    )
+
+            bg_check = None
+            # A spectrum passing the reference cosine QC is not background.
+            cosine = cosine_similarity_to_reference(
+                spectrum, [self.event_channels_pnn[i] for i in self.fluor_ch_ids],
+                label, self._cytometer_key,
+            ) if self._cytometer_key else None
+            cosine_ok = cosine is not None and cosine >= cosine_qc_warning_threshold(self._cytometer_key)
+            if not use_internal and spectrum.max() > 0 and not cosine_ok:
+                bg_check = background_check(
+                    pos_events, neg_events, neg_scatter, spectral_sub, spectrum, peak_ch_idx,
+                    n_candidates=settings.spectral_cleaning_n_candidates_retrieved,
+                    n_spectral=settings.spectral_cleaning_n_spectral_retrieved,
+                )
+                bg_check['peak_channel'] = self.event_channels_pnn[self.fluor_ch_ids[peak_ch_idx]]
+                bg_check['negative_name'] = loaded['negative_name']
+                logger.info(f'SpectralCleaner: "{label}" background check {bg_check}')
+
             result = CleanResult(
                 spectral_sub          = spectral_sub,
                 scatter_pos           = pos_scatter_sel,
                 scatter_neg_matched   = matched_neg_scatter,
-                n_removed_saturation  = n_sat_pos + n_sat_neg,
+                n_removed_saturation  = loaded['n_removed_saturation'],
                 n_surviving_positive  = n_surviving,
                 empirical_peak_ch_idx = peak_ch_idx,
                 expected_peak_ch_idx  = expected_peak_ch_idx,
@@ -1230,6 +1612,8 @@ class SpectralCleaner(QObject):
             # --- store result ---
             self.cleaned_events[label] = {
                 'spectrum':              spectrum.tolist(),
+                'spectrum_initial':      spectrum_initial.tolist(),
+                'refine_log':            refine_log,
                 'n_removed_saturation':  result.n_removed_saturation,
                 'n_surviving_positive':  result.n_surviving_positive,
                 'empirical_peak_ch_idx': result.empirical_peak_ch_idx,
@@ -1237,6 +1621,7 @@ class SpectralCleaner(QObject):
                 'fluor_ch_ids':          list(self.fluor_ch_ids),
                 'cytometer_key':         self._cytometer_key,
                 'warnings':              result.warnings,
+                'background_check':      bg_check,
                 '_fingerprint':          self._cleaning_fingerprint(control),
                 'spectral_sub':          result.spectral_sub,
                 'scatter_pos':           result.scatter_pos,
@@ -1255,3 +1640,96 @@ class SpectralCleaner(QObject):
             msg = f'"{label}": failed to clean: {e}'
             logger.error(f'SpectralCleaner: {msg}')
             self._collected_warnings.append(msg)
+
+    def _make_check_pool(self, loaded: dict, row: np.ndarray, control: dict):
+        """Events kept from a loaded control for the full-panel check. Cell
+        controls with an unstained tube carry its subsample and mean
+        spectrum, shared between controls using the same tube."""
+        negative = af_basis = None
+        tube = loaded.get('negative_name')
+        if tube and control.get('particle_type') == 'Cells' and len(loaded['neg_events']):
+            if tube not in self._negative_refs:
+                self._negative_refs[tube] = (
+                    subsample_negative(loaded['neg_events'], self.refine_settings, self._rng),
+                    loaded['neg_events'].mean(axis=0),
+                )
+            negative, af_basis = self._negative_refs[tube]
+        return make_check_pool(loaded['pos_events'], row, negative, af_basis,
+                               self.refine_settings, self._rng)
+
+    def _check_panel(self, progress_offset: int = 0, progress_total: int = 0):
+        """Residual spillover from every refined control into the rest of the
+        panel, before and after refinement, stored as
+        cleaned_events[label]['crosstalk']. Needs a profile for every control
+        in the spectral model; cleaned rows use their cleaned spectrum unless
+        the control opts out of it, exactly as the profile recalculation will."""
+        profiles = self.controller.experiment.process.get('profiles', {})
+        n_det = len(self.fluor_ch_ids)
+        labels, before, after, checked = [], [], [], []
+        for control in self.spectral_model:
+            label = control.get('label') or ''
+            cleaned = self.cleaned_events.get(label)
+            if cleaned and cleaned.get('spectrum') and control.get('use_cleaned') is not False:
+                row_after = cleaned['spectrum']
+                row_before = cleaned.get('spectrum_initial') or row_after
+                checked.append(control)
+            else:
+                row_after = row_before = profiles.get(label)
+            if row_after is None or len(row_after) != n_det or len(row_before) != n_det:
+                logger.info(f'SpectralCleaner: no profile for "{label}" yet — '
+                            f'residual spillover check skipped.')
+                return
+            labels.append(label)
+            before.append(row_before)
+            after.append(row_after)
+        if not labels:
+            logger.info('SpectralCleaner: spectral model is empty — residual spillover check skipped.')
+            return
+
+        spectra_before = np.asarray(before, dtype=float)
+        spectra_after = np.asarray(after, dtype=float)
+        spectra_before /= np.maximum(spectra_before.max(axis=1, keepdims=True), np.finfo(float).eps)
+        spectra_after /= np.maximum(spectra_after.max(axis=1, keepdims=True), np.finfo(float).eps)
+        changed = not np.allclose(spectra_before, spectra_after)
+        if np.linalg.matrix_rank(spectra_after) < len(labels):
+            logger.warning('SpectralCleaner: spectral profiles are rank-deficient — '
+                           'residual spillover check skipped.')
+            return
+
+        for n, control in enumerate(checked):
+            if self.bus:
+                self.bus.progress.emit(progress_offset + n, progress_total)
+            label = control['label']
+            try:
+                pool = self._check_pools.get(label)
+                if pool is None:
+                    loaded = self._load_events(control)
+                    if loaded is None:
+                        continue
+                    pool = self._make_check_pool(
+                        loaded, np.asarray(self.cleaned_events[label]['spectrum'], dtype=float), control)
+                rows_after = crosstalk_check(pool, spectra_after, labels, label,
+                                             self.refine_settings, self._rng)
+                rows_before = (crosstalk_check(pool, spectra_before, labels, label,
+                                               self.refine_settings, self._rng)
+                               if changed else rows_after)
+            except Exception as e:
+                logger.warning(f'SpectralCleaner: residual spillover check failed for "{label}": {e}')
+                continue
+
+            slope_before = {r['target']: r['slope'] for r in rows_before}
+            self.cleaned_events[label]['crosstalk'] = [{
+                'target': r['target'],
+                'slope_before': slope_before.get(r['target']),
+                'slope_after': r['slope'],
+                'converged': r['converged'],
+                'flagged': r['flagged'],
+            } for r in rows_after]
+
+            flagged = sorted((r for r in rows_after if r['flagged']), key=lambda r: -abs(r['slope']))
+            if flagged:
+                listing = ', '.join(f'{r["target"]} ({r["slope"]:+.3f})' for r in flagged[:4])
+                more = f' and {len(flagged) - 4} more' if len(flagged) > 4 else ''
+                msg = (f'"{label}": residual spillover after refinement into {listing}{more} '
+                       f'(robust slope above {self.refine_settings.max_crosstalk}).')
+                logger.info(f'SpectralCleaner: {msg}')
