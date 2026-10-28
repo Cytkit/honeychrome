@@ -97,19 +97,27 @@ option(HONEYCHROME_OPENMP "Enable OpenMP in the AutoSpectral kernels" ON)
 
 if(HONEYCHROME_OPENMP)
   if(APPLE)
-    # Homebrew libomp detection, same approach as build_som_kernel.py.
-    execute_process(
-      COMMAND brew --prefix libomp
-      OUTPUT_VARIABLE LIBOMP_PREFIX
-      OUTPUT_STRIP_TRAILING_WHITESPACE
-      ERROR_QUIET
-      RESULT_VARIABLE _libomp_prefix_result
-    )
+    # libomp under $HONEYCHROME_LIBOMP_PREFIX when set, otherwise Homebrew's;
+    # same approach as build_som_kernel.py.
+    if(NOT "$ENV{HONEYCHROME_LIBOMP_PREFIX}" STREQUAL "")
+      set(LIBOMP_PREFIX "$ENV{HONEYCHROME_LIBOMP_PREFIX}")
+      set(_libomp_prefix_result 0)
+    else()
+      execute_process(
+        COMMAND brew --prefix libomp
+        OUTPUT_VARIABLE LIBOMP_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE _libomp_prefix_result
+      )
+    endif()
     if(_libomp_prefix_result EQUAL 0 AND LIBOMP_PREFIX)
       foreach(kernel IN LISTS HONEYCHROME_KERNELS)
         target_compile_options(${kernel} PRIVATE -Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include)
         target_link_directories(${kernel} PRIVATE ${LIBOMP_PREFIX}/lib)
         target_link_libraries(${kernel} PRIVATE omp)
+        # Finds a libomp whose install name is @rpath/libomp.dylib (conda-forge's)
+        target_link_options(${kernel} PRIVATE "LINKER:-rpath,${LIBOMP_PREFIX}/lib")
       endforeach()
       message(STATUS "AutoSpectral kernels: macOS OpenMP via libomp at ${LIBOMP_PREFIX}")
     else()

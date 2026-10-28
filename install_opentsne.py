@@ -7,9 +7,13 @@ positive-gradient and Barnes-Hut code run on one thread whatever n_jobs is
 fit).  The Windows and Linux wheels already use OpenMP, so nothing is done
 there.
 
-This script compiles openTSNE from source against Homebrew's libomp (header
-and library), the same libomp.dylib the SOM and AutoSpectral optimisation
-kernels link, so in a source checkout all three share one OpenMP runtime.
+This script compiles openTSNE from source against libomp (header and
+library): the one under $HONEYCHROME_LIBOMP_PREFIX when that is set,
+otherwise Homebrew's.  The SOM and AutoSpectral kernels link the same
+libomp.dylib, so all of them share one OpenMP runtime.  The release build
+sets HONEYCHROME_LIBOMP_PREFIX to conda-forge's llvm-openmp, which is built
+for macOS 11 and is the copy the app ships (Homebrew's libomp is built for
+the macOS version it was installed on).
 scikit-learn's own copy (sklearn/.dylibs) cannot be used: Apple clang emits
 calls such as __kmpc_dispatch_deinit that it does not export, and openTSNE
 then fails to import ("symbol not found in flat namespace").
@@ -23,7 +27,8 @@ The build is then checked:
     wall-clock speed-up is printed but not tested: on a shared CI machine a
     single timing varies too much to be a reliable test.
 
-Run it after ``pip install -r requirements.txt`` and ``brew install libomp``.
+Run it after ``pip install -r requirements.txt`` and ``brew install libomp``
+(or with HONEYCHROME_LIBOMP_PREFIX set).
 The version is read from requirements.txt.
 
 Usage:
@@ -116,20 +121,26 @@ def main() -> int:
     if platform.system() != 'Darwin':
         print('openTSNE wheels for this platform already use OpenMP; nothing to do.')
         return 0
-    try:
-        omp_prefix = Path(run(['brew', '--prefix', 'libomp']).strip())
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print('Homebrew libomp not found: run `brew install libomp` first.')
-        return 1
+    if os.environ.get('HONEYCHROME_LIBOMP_PREFIX', '').strip():
+        omp_prefix = Path(os.environ['HONEYCHROME_LIBOMP_PREFIX'].strip())
+    else:
+        try:
+            omp_prefix = Path(run(['brew', '--prefix', 'libomp']).strip())
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print('Homebrew libomp not found: run `brew install libomp` first.')
+            return 1
     libomp = omp_prefix / 'lib' / 'libomp.dylib'
     if not (omp_prefix / 'include' / 'omp.h').exists() or not libomp.exists():
         print(f'omp.h or libomp.dylib not found under {omp_prefix}: '
               f'run `brew install libomp` first.')
         return 1
 
+    # The rpath finds a libomp whose install name is @rpath/libomp.dylib
+    # (conda-forge's); Homebrew's has an absolute install name
     env = dict(os.environ,
                CPPFLAGS=f"{os.environ.get('CPPFLAGS', '')} -I{omp_prefix / 'include'}".strip(),
-               LDFLAGS=f"{os.environ.get('LDFLAGS', '')} -L{libomp.parent}".strip(),
+               LDFLAGS=(f"{os.environ.get('LDFLAGS', '')} -L{libomp.parent} "
+                        f"-Wl,-rpath,{libomp.parent}").strip(),
                MACOSX_DEPLOYMENT_TARGET=os.environ.get('MACOSX_DEPLOYMENT_TARGET', '11.0'))
     subprocess.check_call(
         [sys.executable, '-m', 'pip', 'install', '--no-binary', 'opentsne', '--no-cache-dir',

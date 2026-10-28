@@ -53,13 +53,22 @@ jobs:
           python install_annoy.py
           pip install -r requirements.txt
 
+      # The app's one OpenMP runtime: conda-forge's llvm-openmp, built for
+      # macOS 11 (Homebrew's libomp is built for the runner's macOS).
+      # openTSNE, the kernels and build.py use it via HONEYCHROME_LIBOMP_PREFIX
+      - name: Fetch libomp (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          brew install micromamba
+          micromamba create --yes --root-prefix "$RUNNER_TEMP/mamba" --prefix "$RUNNER_TEMP/libomp" \
+            --channel conda-forge --override-channels "llvm-openmp=23.1.4"
+          ls -l "$RUNNER_TEMP/libomp/lib/libomp.dylib" "$RUNNER_TEMP/libomp/include/omp.h"
+          echo "HONEYCHROME_LIBOMP_PREFIX=$RUNNER_TEMP/libomp" >> "$GITHUB_ENV"
+
       # openTSNE's macOS wheels have no OpenMP; build it with OpenMP (checked)
       - name: Build openTSNE with OpenMP (macOS)
         if: startsWith(matrix.os, 'macos')
-        run: |
-          brew install libomp
-          python install_opentsne.py || true
-          python diag_opentsne_threads.py
+        run: python install_opentsne.py
 
       # The kernels are bundled as data by build.py; without them the app uses its numpy paths
       - name: Build AutoSpectral kernels (macOS)
@@ -175,8 +184,6 @@ jobs:
           security list-keychains -d user -s build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p "" build.keychain
-
-          brew install libomp
 
           make build
           find dist/honeychrome.app -name '_*kernel*.so' -print0 | while IFS= read -r -d '' k; do
