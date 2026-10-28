@@ -1,5 +1,6 @@
 # build_optimized.py
 import PyInstaller.__main__
+import ast
 import filecmp
 import os
 import shutil
@@ -226,6 +227,44 @@ def check_single_libomp(app, libomp):
     print(f'libomp check passed: one copy at {os.path.relpath(next(iter(copies)), app)}')
 
 
+def plugin_hidden_imports(plugin_dir):
+    """Modules the bundled plugins import.
+
+    The plugins are copied into the app as data and loaded from there at run
+    time, so PyInstaller never analyses them: packages and honeychrome modules
+    that only plugins import would be left out of the app.  Passing these as
+    hidden imports makes PyInstaller collect them (and what they import)
+    without collecting the plugins a second time.  The plugins' own modules,
+    the compiled kernels and the kernel build scripts are skipped.
+    """
+    plugin_dir = os.path.abspath(plugin_dir)
+    src_dir = os.path.dirname(os.path.dirname(plugin_dir))
+    sources = [f for f in sorted(os.listdir(plugin_dir)) if f.endswith('.py')]
+    local = {os.path.splitext(f)[0] for f in sources} | {'bundled_plugins'}
+    local |= {f.split('.')[0] for f in os.listdir(plugin_dir) if f.startswith(KERNEL_PREFIXES + ('_fmu_kernel',))}
+
+    def is_honeychrome_module(name):
+        path = os.path.join(src_dir, *name.split('.'))
+        return os.path.isfile(path + '.py') or os.path.isfile(os.path.join(path, '__init__.py'))
+
+    names = set()
+    for fname in sources:
+        if fname.startswith('build_'):
+            continue
+        with open(os.path.join(plugin_dir, fname), encoding='utf-8') as f:
+            tree = ast.parse(f.read(), filename=fname)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names.add(node.module)
+                if node.module.split('.')[0] == 'honeychrome':
+                    # `from honeychrome.x import y` may name a submodule y
+                    names.update(f'{node.module}.{alias.name}' for alias in node.names
+                                 if is_honeychrome_module(f'{node.module}.{alias.name}'))
+    return sorted(n for n in names if n.split('.')[0] not in local)
+
+
 def main():
     clean()
     icon_path = os.path.join('src', 'honeychrome', 'view_components', 'assets', 'cytkit_web_logo.ico')
@@ -249,6 +288,10 @@ def main():
     args.append('--hidden-import=honeychrome.settings')
     args.append('--hidden-import=honeychrome.plugin_loaders')
     args.append('--runtime-hook=hooks/runtime-patch-syspath.py')
+
+    # Everything the bundled plugins import; see plugin_hidden_imports()
+    for name in plugin_hidden_imports(os.path.join('src', 'honeychrome', 'bundled_plugins')):
+        args.append(f'--hidden-import={name}')
 
     # Add project files
     sep = os.pathsep
