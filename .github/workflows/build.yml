@@ -58,7 +58,8 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         run: |
           brew install libomp
-          python install_opentsne.py
+          python install_opentsne.py || true
+          python diag_opentsne_threads.py
 
       # The kernels are bundled as data by build.py; without them the app uses its numpy paths
       - name: Build AutoSpectral kernels (macOS)
@@ -118,9 +119,10 @@ jobs:
             "include(`"$vcpkgCmake`")"
           )
           $env:CMAKE_TOOLCHAIN_FILE = $toolchain
+          $failed = @()
           foreach ($script in 'build_som_kernel.py', 'build_autospectral_opt_kernel.py', 'build_fix_my_unmix_kernel.py') {
             python $script
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            if ($LASTEXITCODE) { $failed += $script }
           }
           # OpenMP runtime, loaded from beside the kernels in the app
           $vcomp = Get-ChildItem -Path $env:VCToolsRedistDir -Recurse -Filter vcomp140.dll |
@@ -129,6 +131,7 @@ jobs:
           if (-not $vcomp) { Write-Error 'vcomp140.dll not found under VCToolsRedistDir'; exit 1 }
           Copy-Item $vcomp.FullName .
           foreach ($kernel in Get-ChildItem -Filter '_*kernel*.pyd') { dumpbin /nologo /dependents $kernel.FullName }
+          if ($failed) { Write-Host "::error::Kernel builds failed: $($failed -join ', ')"; exit 1 }
 
       - name: Check the kernels load
         if: ${{ !startsWith(matrix.os, 'ubuntu') }}

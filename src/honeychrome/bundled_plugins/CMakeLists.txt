@@ -47,9 +47,9 @@ if(NOT _pybind11_dir_result EQUAL 0)
 endif()
 
 # Static OpenBLAS on Windows/Linux — single binary, nothing extra to track through the PyInstaller
-# spec or the codesign/notarization pass. macOS is unaffected either way:
-# Armadillo resolves to Apple's Accelerate framework, already on-system, so
-# this flag has no effect there.
+# spec or the codesign/notarization pass. macOS is unaffected: there the
+# Optimization kernel uses Armadillo header-only with Apple's Accelerate
+# framework (below), so this flag has no effect.
 if(NOT APPLE)
   set(BLA_STATIC ON)
 endif()
@@ -64,7 +64,22 @@ pybind11_add_module(_autospectral_opt_kernel
 )
 
 target_include_directories(_autospectral_opt_kernel PRIVATE ${ARMADILLO_INCLUDE_DIRS})
-target_link_libraries(_autospectral_opt_kernel PRIVATE ${ARMADILLO_LIBRARIES})
+if(APPLE)
+  # Header-only Armadillo calling Accelerate's BLAS and LAPACK directly. The
+  # kernel then links no libarmadillo (Homebrew's pulls in OpenBLAS, ARPACK
+  # and the gfortran runtime, none of which ship with the app), only system
+  # frameworks and libomp. The kernel uses dense solvers only, so ARPACK,
+  # SuperLU and HDF5 are switched off.
+  target_compile_definitions(_autospectral_opt_kernel PRIVATE
+    ARMA_DONT_USE_WRAPPER
+    ARMA_DONT_USE_ARPACK
+    ARMA_DONT_USE_SUPERLU
+    ARMA_DONT_USE_HDF5
+  )
+  target_link_libraries(_autospectral_opt_kernel PRIVATE "-framework Accelerate")
+else()
+  target_link_libraries(_autospectral_opt_kernel PRIVATE ${ARMADILLO_LIBRARIES})
+endif()
 
 # BLAS: Accelerate on macOS, the static OpenBLAS (BLA_STATIC above) on Windows,
 # the shared system BLAS on Linux (distribution static archives are not built
