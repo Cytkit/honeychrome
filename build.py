@@ -126,14 +126,19 @@ def link_kernels_to_bundled_libomp(kernel_dir):
         for rpath in (APP_FRAMEWORKS_RPATH, os.path.dirname(libomp)):
             if not has_rpath(kernel, rpath):
                 if rpath not in macho_rpaths(kernel):
-                    subprocess.run(['install_name_tool', '-add_rpath', rpath, kernel], check=True, capture_output=True, text=True)
-                    changed = True
+                    try:
+                        subprocess.run(['install_name_tool', '-add_rpath', rpath, kernel], check=True, capture_output=True, text=True)
+                        changed = True
+                    except subprocess.CalledProcessError as exc:
+                        # Kernel's Mach-O header has no room for another LC_RPATH
+                        # (e.g. _som_kernel: rpaths=[], no libomp refs anyway).
+                        # It already imports without this rpath — skip it.
+                        print(f'{fname}: skipping rpath {rpath} ({exc.stderr.strip().splitlines()[-1] if exc.stderr else exc})')
                 else:
                     print(f'{fname}: rpath already present ({rpath})')
         if changed:
             subprocess.run(['codesign', '--force', '--sign', '-', kernel], check=True)
         print(f'{fname}: libomp via {LIBOMP_RPATH_REF}, rpaths {macho_rpaths(kernel)}')
-
 
 def resolve_macho_ref(ref, binary, executable_dir):
     """File a load command resolves to inside the app, or None."""
