@@ -210,7 +210,7 @@ def load_library(path=None, species: str = 'human',
         canon_ct.append(cell)
         canon_mk.append(marker)
     if n_species:
-        messages.append(f"{n_species} row(s) for another species left out.")
+        log.info("FSEA library %s: %d row(s) for another species left out", p.name, n_species)
     out = df.loc[keep].reset_index(drop=True)
     out['cell_type_canonical'] = canon_ct
     out['marker_canonical'] = canon_mk

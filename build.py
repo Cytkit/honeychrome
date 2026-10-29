@@ -1,5 +1,7 @@
 # build_optimized.py
 import PyInstaller.__main__
+import ast
+import filecmp
 import os
 import shutil
 import subprocess
@@ -45,30 +47,38 @@ def get_project_files():
     return assets
 
 # --- One OpenMP runtime on macOS -------------------------------------------
-# The SOM and AutoSpectral optimisation kernels (bundled_plugins/) and openTSNE
-# (built by install_opentsne.py) all link Homebrew's libomp.dylib.  The app
-# must hold exactly one copy: two copies at different paths start two OpenMP
-# runtimes when both are used in one session, which can abort the app
-# ("OMP: Error #15").  openTSNE goes through PyInstaller's analysis, which
-# collects its libomp into Contents/Frameworks; the kernels are copied as data
-# and never analysed.  So libomp is added once at the top level, and the
-# kernels find it through @rpath (Contents/Frameworks in the app, Homebrew in
-# a source checkout).  check_single_libomp() verifies the built app.
-# scikit-learn ships its own, older libomp in sklearn/.dylibs; it cannot be
-# shared (it lacks entry points Apple clang now calls) and is left alone.
+# openTSNE (built by install_opentsne.py) and the SOM and AutoSpectral kernels
+# (bundled_plugins/) link libomp.dylib: the one under
+# $HONEYCHROME_LIBOMP_PREFIX when set (the release build uses conda-forge's
+# llvm-openmp, built for macOS 11), otherwise Homebrew's.  scikit-learn ships
+# an older copy in sklearn/.dylibs that lacks entry points the others call.
+# The app must hold one libomp: copies at different paths start separate
+# OpenMP runtimes in one process.  PyInstaller keeps a single top-level
+# libomp.dylib, and it can end up as a link to scikit-learn's copy.  So after
+# PyInstaller, use_one_libomp() puts our libomp at
+# Contents/Frameworks/libomp.dylib and makes every other libomp.dylib in the
+# app, scikit-learn's included, a link to it.  scikit-learn's extensions call
+# only long-standing OpenMP entry points, which a newer libomp provides.
+# The kernels are copied as data and never analysed by PyInstaller, so before
+# it runs they are pointed at @rpath/libomp.dylib, with rpaths to
+# Contents/Frameworks in the app and to the libomp folder in a source
+# checkout.  check_single_libomp() verifies the built app.
 
 KERNEL_PREFIXES = ('_som_kernel', '_autospectral_opt_kernel', '_gls_m2p_kernel')
 APP_FRAMEWORKS_RPATH = '@executable_path/../Frameworks'
 LIBOMP_RPATH_REF = '@rpath/libomp.dylib'
 
 
-def homebrew_libomp():
-    """Path of Homebrew's libomp.dylib, or None."""
-    try:
-        prefix = subprocess.check_output(['brew', '--prefix', 'libomp'],
-                                         stderr=subprocess.DEVNULL).decode().strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
+def app_libomp():
+    """Path of the libomp.dylib the kernels link and the app ships: under
+    $HONEYCHROME_LIBOMP_PREFIX when set, otherwise Homebrew's; None if absent."""
+    prefix = os.environ.get('HONEYCHROME_LIBOMP_PREFIX', '').strip()
+    if not prefix:
+        try:
+            prefix = subprocess.check_output(['brew', '--prefix', 'libomp'],
+                                             stderr=subprocess.DEVNULL).decode().strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None
     path = os.path.join(prefix, 'lib', 'libomp.dylib')
     return path if os.path.exists(path) else None
 
@@ -98,10 +108,10 @@ def has_rpath(binary, rpath):
 
 def link_kernels_to_bundled_libomp(kernel_dir):
     """Point the kernels' libomp load command at @rpath/libomp.dylib, with
-    rpaths to the app's Frameworks folder first and Homebrew second."""
-    libomp = homebrew_libomp()
+    rpaths to the app's Frameworks folder and the libomp folder."""
+    libomp = app_libomp()
     if libomp is None:
-        print('WARNING: Homebrew libomp not found; the SOM and optimisation kernels '
+        print('WARNING: libomp not found; the SOM and optimisation kernels '
               'will not find OpenMP in the built app.')
         return
     stale = os.path.join(kernel_dir, 'libomp.dylib')
@@ -157,9 +167,34 @@ def resolve_macho_ref(ref, binary, executable_dir):
     return candidate if os.path.exists(candidate) else None
 
 
-def check_single_libomp(app):
-    """Fail the build unless the app holds one libomp (besides scikit-learn's
-    own) and every kernel and openTSNE extension that links libomp loads it."""
+def use_one_libomp(app, libomp):
+    """Make every libomp.dylib in the app one file: a copy of `libomp` at
+    Contents/Frameworks/libomp.dylib, with every other libomp.dylib (including
+    scikit-learn's) replaced by a relative link to it."""
+    contents = os.path.join(app, 'Contents')
+    canonical = os.path.join(contents, 'Frameworks', 'libomp.dylib')
+    others = [os.path.join(root, fname)
+              for root, _dirs, files in os.walk(contents)
+              for fname in files
+              if fname == 'libomp.dylib' and os.path.join(root, fname) != canonical]
+    if os.path.lexists(canonical):
+        os.remove(canonical)
+    shutil.copy2(libomp, canonical)
+    print(f'Contents/Frameworks/libomp.dylib: copy of {libomp}')
+    for path in others:
+        os.remove(path)
+        os.symlink(os.path.relpath(canonical, os.path.dirname(path)), path)
+        print(f'{os.path.relpath(path, app)} -> Contents/Frameworks/libomp.dylib')
+    # Reseal the bundle's ad hoc signature over the replaced files; release
+    # builds are signed again with the Developer ID afterwards
+    subprocess.run(['codesign', '--force', '--sign', '-', app], check=True)
+
+
+def check_single_libomp(app, libomp):
+    """Fail the build unless every libomp.dylib in the app is one file, a copy
+    of `libomp`, and every kernel and openTSNE extension that links libomp
+    loads it.  Other packages' binaries whose libomp reference does not
+    resolve are reported as warnings."""
     contents = os.path.join(app, 'Contents')
     executable_dir = os.path.join(contents, 'MacOS')
     copies = set()
@@ -167,15 +202,17 @@ def check_single_libomp(app):
     for root, _dirs, files in os.walk(contents):
         for fname in files:
             path = os.path.join(root, fname)
-            if os.path.islink(path) or 'sklearn' in path.split(os.sep):
-                continue
             if fname == 'libomp.dylib':
                 copies.add(os.path.realpath(path))
+            elif os.path.islink(path):
+                continue
             elif fname.endswith(('.so', '.dylib')):
                 binaries.append(path)
     errors = []
     if len(copies) != 1:
         errors.append(f'{len(copies)} copies of libomp.dylib: {sorted(copies)}')
+    elif not filecmp.cmp(next(iter(copies)), libomp, shallow=False):
+        errors.append(f'the bundled libomp.dylib is not a copy of {libomp}')
     for binary in binaries:
         refs = macho_libomp_refs(binary)
         if not refs:
@@ -228,6 +265,44 @@ def collect_all_submodules(package_root, package_name):
                     modules.append(f"{package_name}.{rel.replace(os.sep, '.')}.{stem}")
     return modules
 
+def plugin_hidden_imports(plugin_dir):
+    """Modules the bundled plugins import.
+
+    The plugins are copied into the app as data and loaded from there at run
+    time, so PyInstaller never analyses them: packages and honeychrome modules
+    that only plugins import would be left out of the app.  Passing these as
+    hidden imports makes PyInstaller collect them (and what they import)
+    without collecting the plugins a second time.  The plugins' own modules,
+    the compiled kernels and the kernel build scripts are skipped.
+    """
+    plugin_dir = os.path.abspath(plugin_dir)
+    src_dir = os.path.dirname(os.path.dirname(plugin_dir))
+    sources = [f for f in sorted(os.listdir(plugin_dir)) if f.endswith('.py')]
+    local = {os.path.splitext(f)[0] for f in sources} | {'bundled_plugins'}
+    local |= {f.split('.')[0] for f in os.listdir(plugin_dir) if f.startswith(KERNEL_PREFIXES + ('_fmu_kernel',))}
+
+    def is_honeychrome_module(name):
+        path = os.path.join(src_dir, *name.split('.'))
+        return os.path.isfile(path + '.py') or os.path.isfile(os.path.join(path, '__init__.py'))
+
+    names = set()
+    for fname in sources:
+        if fname.startswith('build_'):
+            continue
+        with open(os.path.join(plugin_dir, fname), encoding='utf-8') as f:
+            tree = ast.parse(f.read(), filename=fname)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names.add(node.module)
+                if node.module.split('.')[0] == 'honeychrome':
+                    # `from honeychrome.x import y` may name a submodule y
+                    names.update(f'{node.module}.{alias.name}' for alias in node.names
+                                 if is_honeychrome_module(f'{node.module}.{alias.name}'))
+    return sorted(n for n in names if n.split('.')[0] not in local)
+
+
 def main():
     clean()
     icon_path = os.path.join('src', 'honeychrome', 'view_components', 'assets', 'cytkit_web_logo.ico')
@@ -258,14 +333,18 @@ def main():
         args.append(f'--hidden-import={mod}')
     args.append('--runtime-hook=hooks/runtime-patch-syspath.py')
 
+    # Everything the bundled plugins import; see plugin_hidden_imports()
+    for name in plugin_hidden_imports(os.path.join('src', 'honeychrome', 'bundled_plugins')):
+        args.append(f'--hidden-import={name}')
+
     # Add project files
     sep = os.pathsep
     for source, dest in get_project_files():
         args.append(f'--add-data={source}{sep}{dest}')
 
-    # One libomp for the kernels and openTSNE, at the top level of the app
-    # (Contents/Frameworks); see link_kernels_to_bundled_libomp()
-    libomp = homebrew_libomp() if platform.system() == 'Darwin' else None
+    # One libomp for the whole app, at the top level (Contents/Frameworks);
+    # see use_one_libomp()
+    libomp = app_libomp() if platform.system() == 'Darwin' else None
     if libomp is not None:
         args.append(f'--add-binary={libomp}{sep}.')
 
@@ -302,7 +381,8 @@ def main():
 
     app = os.path.join('dist', 'honeychrome.app')
     if libomp is not None and os.path.isdir(app):
-        check_single_libomp(app)
+        use_one_libomp(app, libomp)
+        check_single_libomp(app, libomp)
 
     # Show size
     exe_name = 'honeychrome.exe' if platform.system() == 'Windows' else 'honeychrome'

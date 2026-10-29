@@ -175,6 +175,13 @@ def test_bundled_library_loads_cleanly():
     assert lib.groupby('immune_state').size().min() >= 8
 
 
+def test_bundled_mouse_library_loads_cleanly():
+    lib, sha, messages = fl.load_library(species='mouse')
+    assert len(sha) == 64 and not messages
+    assert set(lib['species']) == {'mouse'}
+    assert lib.groupby('immune_state').size().min() >= 5
+
+
 def test_library_validation(tmp_path):
     path = tmp_path / 'bad.csv'
     path.write_text(

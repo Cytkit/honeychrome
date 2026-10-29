@@ -1,4 +1,5 @@
 import importlib.util
+import logging
 from pathlib import Path
 import sys
 
@@ -9,6 +10,7 @@ PLUGIN_DIR = Path.home() / experiments_folder / "plugins"
 plugins_path = Path(PLUGIN_DIR)
 
 settings = QSettings("honeychrome", "app_configuration")
+logger = logging.getLogger(__name__)
 
 meipass = getattr(sys, '_MEIPASS', None)
 
@@ -20,6 +22,27 @@ if meipass:
 else:
     BUNDLED_PLUGIN_DIR = Path(__file__).resolve().parent.parent / "bundled_plugins"
 bundled_plugins_path = Path(BUNDLED_PLUGIN_DIR)
+
+def _load_module(module_name, file_path):
+    """Import one plugin file and run its _bootstrap(); None if it fails.
+
+    A failing plugin is logged with its traceback and skipped, so it cannot
+    stop the other plugins from loading."""
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if not (spec and spec.loader):
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        if hasattr(module, '_bootstrap'):
+            module._bootstrap()
+    except Exception:
+        sys.modules.pop(module_name, None)
+        logger.exception(f'Plugin {module_name} failed to load from {file_path}')
+        return None
+    return module
+
 
 def load_plugin_modules():
     """Import and execute plugin modules only — no Qt widget creation.
@@ -38,13 +61,8 @@ def load_plugin_modules():
     for file_path in bundled_plugins_path.glob("*_tab.py"):
         if settings.value(f"EnableBundledPlugin_{file_path.stem}", False, type=bool):
             module_name = f"bundled_plugins.{file_path.stem}"
-            spec = importlib.util.spec_from_file_location(module_name, file_path)
-            if spec and spec.loader:
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = module
-                spec.loader.exec_module(module)
-                if hasattr(module, '_bootstrap'):
-                    module._bootstrap()
+            module = _load_module(module_name, file_path)
+            if module is not None:
                 print(f"Successfully loaded bundled plugin module: {module_name}")
                 loaded_modules[module_name] = module
 
@@ -56,13 +74,8 @@ def load_plugin_modules():
         for file_path in plugins_path.glob("*_tab.py"):
             if settings.value(f"EnablePlugin_{file_path}", False, type=bool):
                 module_name = f"{plugins_path.name}.{file_path.stem}"
-                spec = importlib.util.spec_from_file_location(module_name, file_path)
-                if spec and spec.loader:
-                    module = importlib.util.module_from_spec(spec)
-                    sys.modules[module_name] = module
-                    spec.loader.exec_module(module)
-                    if hasattr(module, '_bootstrap'):
-                        module._bootstrap()
+                module = _load_module(module_name, file_path)
+                if module is not None:
                     print(f"Successfully loaded plugin module: {module_name}")
                     loaded_modules[module_name] = module
 

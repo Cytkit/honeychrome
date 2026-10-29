@@ -801,6 +801,7 @@ def run_hdbscan(controller, state, params: dict, progress=None, af_state=None) -
         docstring. Must be passed when called from a background worker thread.
     """
     import hdbscan as hdbscan_lib
+    import joblib
 
     log_stage(log, "HDBSCAN")
     space = params.get('_space', 'raw')
@@ -833,13 +834,17 @@ def run_hdbscan(controller, state, params: dict, progress=None, af_state=None) -
                         f"min_samples={min_samples}, "
                         f"cluster_selection_epsilon={cluster_selection_epsilon}) …")
     start = time.perf_counter()
-    clusterer = hdbscan_lib.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        cluster_selection_epsilon=cluster_selection_epsilon,
-        core_dist_n_jobs=max(1, (os.cpu_count() or 2) - 1),   # NOT 'n_jobs' -- different name than sklearn's HDBSCAN
-        prediction_data=True,  # required for approximate_predict() below
-    ).fit(data)
+    # Threads, not joblib's default worker processes: on macOS and Linux those
+    # are started as `sys.executable -m ...`, which in the packaged app is the
+    # app itself, so each worker would open another Honeychrome window
+    with joblib.parallel_config(backend='threading'):
+        clusterer = hdbscan_lib.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            cluster_selection_epsilon=cluster_selection_epsilon,
+            core_dist_n_jobs=max(1, (os.cpu_count() or 2) - 1),   # NOT 'n_jobs' -- different name than sklearn's HDBSCAN
+            prediction_data=True,  # required for approximate_predict() below
+        ).fit(data)
     _add_time(state, 'fit', time.perf_counter() - start, len(data))
     train_labels = clusterer.labels_.astype(np.int32)
     n_noise = int(np.sum(train_labels == -1))

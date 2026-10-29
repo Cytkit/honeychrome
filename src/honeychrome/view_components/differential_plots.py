@@ -834,9 +834,10 @@ def make_comparison_heatmap_figure(results_df: pd.DataFrame, title: str, is_dark
     """
     Comparison × feature heatmap of effect sizes across every comparison
     of a results table. A cell is coloured by ``logFC`` where the feature
-    is significant in that comparison and left white (0) otherwise, so the
-    grid shows the same hits as the volcano plots. Diverging colours
-    centred on 0, limits ± the largest |logFC| shown.
+    is significant in that comparison and left in the figure's background
+    colour otherwise, so the grid shows the same hits as the volcano
+    plots. Diverging colours centred on 0, limits ± the largest |logFC|
+    shown.
 
     results_df       : stacked results with 'feature', 'comparison', 'logFC'
                        and 'significant' (``apply_significance`` output).
@@ -858,9 +859,13 @@ def make_comparison_heatmap_figure(results_df: pd.DataFrame, title: str, is_dark
         return message_figure('Run statistics to see the comparison heatmap', title, is_dark, run_label)
 
     df = results_df.copy()
-    keep = df['significant'].astype(bool) | bool(show_all)
-    df['value'] = np.where(keep & np.isfinite(df['logFC'].astype(float)), df['logFC'].astype(float), 0.0)
+    keep = (df['significant'].astype(bool) | bool(show_all)) & np.isfinite(df['logFC'].astype(float))
+    df['value'] = np.where(keep, df['logFC'].astype(float), 0.0)
     grid = df.pivot_table(index='comparison', columns='feature', values='value', aggfunc='first')
+    # Cells drawn in the theme background: features a comparison lacks, has
+    # no logFC for or, unless show_all, does not find significant.
+    blank = df.assign(blank=~keep).pivot_table(index='comparison', columns='feature', values='blank',
+                                                aggfunc='first')
     comparisons = list(comparison_order or dict.fromkeys(df['comparison'].tolist()))
     comparisons = [c for c in comparisons if c in grid.index]
     labels = feature_labels or {}
@@ -871,6 +876,7 @@ def make_comparison_heatmap_figure(results_df: pd.DataFrame, title: str, is_dark
         mean_effect = grid.mean(axis=0)
         features.sort(key=lambda f: (float(mean_effect.get(f, 0.0)), str(labels.get(f, f)).lower()))
     grid = grid.reindex(index=comparisons, columns=features).fillna(0.0)
+    blank = blank.reindex(index=comparisons, columns=features).fillna(True).astype(bool)
 
     if not (grid.values != 0).any():
         return message_figure('No significant features at current thresholds', title, is_dark, run_label)
@@ -887,12 +893,14 @@ def make_comparison_heatmap_figure(results_df: pd.DataFrame, title: str, is_dark
     panel_h = len(comparisons) * 0.32 + min(longest, 30) * 0.055 + 0.3
     fig = Figure(figsize=(fig_w, max(2.5, panel_h * n_rows + 0.8)), constrained_layout=True)
     axes = fig.subplots(n_rows, 1, squeeze=False)[:, 0]
-    cmap = matplotlib.colormaps['RdBu_r']
+    cmap = matplotlib.colormaps['RdBu_r'].copy()
+    cmap.set_bad((0.0, 0.0, 0.0, 0.0))
     norm = TwoSlopeNorm(vcenter=0.0, vmin=-vmax, vmax=vmax)
     image = None
     for ax, chunk in zip(axes, chunks):
-        values = grid[chunk].values
+        values = np.ma.masked_array(grid[chunk].values, mask=blank[chunk].values)
         image = ax.imshow(values, aspect='auto', cmap=cmap, norm=norm, interpolation='nearest')
+        ax.grid(False)
         ax.set_xticks(range(len(chunk)))
         ax.set_xticklabels([str(labels.get(f, f)) for f in chunk], rotation=90, fontsize=7)
         ax.set_yticks(range(len(comparisons)))
