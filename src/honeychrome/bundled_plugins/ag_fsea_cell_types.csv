@@ -17,7 +17,7 @@ CD4 Tconv CM,T,CD4 TCM;CD4 central memory
 CD4 Tconv EM,T,CD4 TEM;CD4 effector memory
 CD4 Tconv TEMRA,T,CD4 TEMRA
 Naïve CD8 Tconv,T,CD8 Naive;Naive CD8;CD8 naive T cells;Naive CD8 Tconv
-CD8 Tconv CM,T,CD8 TCM;CD8 central memory
+CD8 Tconv CM,T,CD8 TCM;CD8 central memory;Memory CD8
 CD8 Tconv EM,T,CD8 TEM;CD8 effector memory
 CD8 Tconv TEMRA,T,CD8 TEMRA
 CD8 SLEC,T,SLECs;SLEC;short-lived effector cells
@@ -48,9 +48,9 @@ Transitional B cell,B,Transitional B cells;Transitional
 Plasmablast,B,Plasmablasts
 Plasma cell,B,Plasma cells
 Activated memory B cell,B,Activated
-Atypical B cell,B,Atypical;tissue-like memory B cells;DN2 B cells
+Atypical B cell,B,Atypical;tissue-like memory B cells;DN2 B cells;ABC;ABCs;Age-associated B cells
 Resting naive B cell,B,Mature Naive
-Resting memory B cell,B,Memory
+Resting memory B cell,B,Memory;Memory B cells
 DN B cell,B,B cell DN;double-negative B cells
 Naïve B cell,B,B cell Naive;Naive B cells
 Unswitched memory B cell,B,B cell Non-switched;Non-switched memory B cells
@@ -65,10 +65,26 @@ activated CD14 Monocyte,myeloid,CD14 Monocytes Act
 activated CD14+CD16+ Monocyte,myeloid,CD14+CD16+ Monocytes Act
 Basophil,myeloid,Basophils
 pDC,myeloid,pDCs
-cDC,myeloid,CD11c cDCs
+cDC,myeloid,CD11c cDCs;cDCs;Dendritic cells;DCs
 cDC1,myeloid,cDC1s
 cDC2,myeloid,cDC2s
 DN DC,myeloid,DN cDCs
 ILC,ILC,ILCs
 ILC1,ILC,ILC1
 ILC2,ILC,ILC2
+Progenitor exhausted CD8,T,Tpex;Tex prog;Progenitor exhausted;Stem-like exhausted CD8;Ly108+ Tim-3- CD8
+Terminally exhausted CD8,T,Tex term;Terminally exhausted;Ly108- Tim-3+ CD8
+CD8 TRM,T,CD8 Trm;CD8 TRM cells;CD69+ CD103+ CD8
+CD4 TRM,T,CD4 Trm;CD4 TRM cells
+effector Treg,T,eTreg;eTregs;Effector Treg;Act CD4 Treg;Activated Treg
+gdT17,T,IL-17 gd T cells;CD27- gd T cells;CD27- gdT
+GC B cell,B,GC B cells;Germinal centre B cells;Germinal center B cells
+CD11b+ CD27- NK,NK,CD27- CD11b+ NK;CD11b SP NK;Mature NK
+CD11b- CD27+ NK,NK,CD27+ CD11b- NK;CD27 SP NK;Immature NK
+Neutrophil,myeloid,Neutrophils;PMN
+Immature neutrophil,myeloid,Immature neutrophils;CD101- neutrophils;Ly6Glo neutrophils
+Eosinophil,myeloid,Eosinophils;Eos
+Monocyte,myeloid,Monocytes;Mono
+Ly6Chi Monocyte,myeloid,Ly6Chi Monocytes;Ly6C-hi monocytes;Ly6Chi Mono;Inflammatory monocytes
+Macrophage,myeloid,Macrophages;Macs
+Migratory DC,myeloid,Migratory DCs;migDC;migDCs
