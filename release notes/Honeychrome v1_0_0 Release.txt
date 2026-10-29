@@ -58,4 +58,6 @@ Bug fixes
 * Numerous crash fixes from error reports
 
 Acknowledgements
-The AutoSpectral noise model builds on work by Paul Heisig (Amsterdam UMC) and David Novo. Thanks to everyone who tested pre-release builds and sent feedback.
+* Thanks to everyone who tested pre-release builds and sent feedback.
+* Per-sample Gating and the Spectral Reference Library were implemented by Angxiao Lu.
+* The AutoSpectral noise model builds on work by Paul Heisig (Amsterdam UMC) and David Novo.
