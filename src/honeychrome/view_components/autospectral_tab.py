@@ -127,11 +127,12 @@ class AfTrainingWorker(QObject):
     progress = Signal(str)
 
     def __init__(self, unstained_raw, fluor_spectra, som_dim, source_fcs_path,
-                 fluor_names=None, spread_job=None):
+                 fluor_names=None, spread_job=None, deduplicate=True):
         super().__init__()
         self.unstained_raw = unstained_raw
         self.fluor_spectra = fluor_spectra
         self.som_dim = som_dim
+        self.deduplicate = deduplicate
         self.source_fcs_path = source_fcs_path   # stored so the slot can read it
         self.fluor_names = fluor_names
         self.spread_job = spread_job
@@ -143,6 +144,7 @@ class AfTrainingWorker(QObject):
                 self.unstained_raw,
                 self.fluor_spectra,
                 som_dim=self.som_dim,
+                deduplicate=self.deduplicate,
             )
             envelope, sample, spread = None, None, None
             if self.fluor_names is not None:
@@ -922,7 +924,22 @@ class AutofluorescencePage(QWidget):
         )
         self._som_dim_spin.installEventFilter(WheelBlocker(self._som_dim_spin))
         self._som_dim_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        layout.addRow('SOM grid size:', self._som_dim_spin)
+
+        self._dedup_cb = QCheckBox('Remove near-duplicates')
+        self._dedup_cb.setChecked(True)
+        self._dedup_cb.setToolTip(
+            'Drop any base AF spectrum whose cosine similarity to one already '
+            'kept is 0.999 or more (deduplicate in R AutoSpectral). Untick to '
+            'keep every SOM node spectrum that passes the fluorophore '
+            'contamination check.'
+        )
+
+        som_row = QHBoxLayout()
+        som_row.addWidget(self._som_dim_spin)
+        som_row.addSpacing(12)
+        som_row.addWidget(self._dedup_cb)
+        som_row.addStretch(1)
+        layout.addRow('SOM grid size:', som_row)
 
         self._extract_btn = QPushButton('Extract AF Profile')
         self._extract_btn.clicked.connect(self._run_extraction)
@@ -1357,6 +1374,7 @@ class AutofluorescencePage(QWidget):
         self._train_worker = AfTrainingWorker(
             raw_fl, fluor_spectra, self._som_dim_spin.value(), sample_path,
             fluor_names=fluor_names, spread_job=spread_job,
+            deduplicate=self._dedup_cb.isChecked(),
         )
         self._train_worker.moveToThread(self._train_thread)
         self._train_thread.started.connect(self._train_worker.run)
