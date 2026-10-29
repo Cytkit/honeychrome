@@ -1973,6 +1973,13 @@ class PluginWidget(QtWidgets.QWidget):
     def _activate(self):
         unmixed = self.controller.data_for_cytometry_plots_unmixed
         unmixing_done = self.controller.experiment.process.get('unmixing_matrix') is not None
+        # The unmixed events and gate membership are normally prepared when
+        # the Unmixed Data tab is shown; if that has not happened yet for this
+        # sample, prepare them here the same way
+        if (unmixing_done and self.controller.unmixed_event_data is not None
+                and (unmixed.get('event_data') is None
+                     or 'root' not in (unmixed.get('gate_membership') or {}))):
+            self._sync_unmixed_data_for_plugin_tab()
         has_event_data = unmixed.get('event_data') is not None
 
         if not (unmixing_done and has_event_data):
