@@ -102,7 +102,7 @@ jobs:
 
       - name: Cache vcpkg packages (Windows)
         if: matrix.os == 'windows-2022'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ steps.vcpkg.outputs.cache }}
           key: vcpkg-armadillo-x64-windows-static-md-${{ steps.vcpkg.outputs.commit }}
