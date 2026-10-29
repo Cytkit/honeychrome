@@ -18,6 +18,8 @@ On macOS, requires libomp:
     brew install libomp
 then set the environment variable:
     HONEYCHROME_OPENMP=1 python build_som_kernel.py
+HONEYCHROME_LIBOMP_PREFIX, when set, is used instead of Homebrew's libomp
+(the release build points it at conda-forge's llvm-openmp).
 
 Without OpenMP the kernel still compiles and runs correctly,
 single-threaded.  The Python wrapper (som_kernel_wrapper.py)
@@ -68,18 +70,26 @@ if sys.platform == 'win32':
     extra_compile_args = ['/O2', '/fp:fast']
     extra_link_args = []
     if use_openmp:
-        extra_compile_args.append('/openmp:llvm')
+        # Plain /openmp links vcomp140.dll, the OpenMP runtime the Windows
+        # build ships beside the kernels; /openmp:llvm would need
+        # libomp140.x86_64.dll, which is not shipped
+        extra_compile_args.append('/openmp')
 else:
     libraries = ['m']
     extra_compile_args = ['-O3', '-ffast-math']
     extra_link_args = []
     if use_openmp:
         if sys.platform == 'darwin':
-            brew_prefix = os.popen('brew --prefix libomp 2>/dev/null').read().strip()
-            if brew_prefix:
-                extra_compile_args += ['-Xpreprocessor', '-fopenmp', f'-I{brew_prefix}/include']
-                extra_link_args += [f'-L{brew_prefix}/lib', '-lomp']
-                print(f'[build] macOS OpenMP via libomp at {brew_prefix}')
+            omp_prefix = (os.environ.get('HONEYCHROME_LIBOMP_PREFIX', '').strip()
+                          or os.popen('brew --prefix libomp 2>/dev/null').read().strip())
+            if omp_prefix:
+                extra_compile_args += ['-Xpreprocessor', '-fopenmp', f'-I{omp_prefix}/include']
+                # The rpath finds a libomp whose install name is
+                # @rpath/libomp.dylib (conda-forge's); the header room lets
+                # build.py re-point libomp and add rpaths
+                extra_link_args += [f'-L{omp_prefix}/lib', '-lomp', f'-Wl,-rpath,{omp_prefix}/lib',
+                                    '-Wl,-headerpad_max_install_names']
+                print(f'[build] macOS OpenMP via libomp at {omp_prefix}')
             else:
                 print('[build] WARNING: libomp not found. Building single-threaded.')
                 use_openmp = False
