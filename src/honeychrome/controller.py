@@ -1887,7 +1887,25 @@ class Controller(QObject):
 
     @Slot()
     def restart_acquisition(self):
-        pass
+        logger.info('Controller: restarting acquisition')
+
+        # stop analyser
+        self.pipe_connection_analyser.send({'command': 'stop'})
+        response = self.pipe_connection_analyser.recv()
+        logger.info(response)
+
+        # stop live update thread
+        self.stop_live_data_processing.set()
+        time.sleep(0.25)
+        if self.thread:
+            self.thread.join()
+
+        self.load_sample(self.live_sample_path) # this sets off thread for update_hists_and_stats through initialise_data_for_cytometry_plots call
+
+        # start analyser (flush cache and start analysing incoming traces and producing events)
+        self.pipe_connection_analyser.send({'command': 'start'})
+        response = self.pipe_connection_analyser.recv()
+        logger.info(response)
 
     @Slot()
     def flush_sip(self):

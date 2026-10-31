@@ -30,13 +30,13 @@ temperature_set_point = 30 # degC
 sample_pump_steps_per_microlitre = 109 # measured value: at speed 20000*0.1Hz, took 54.5s to pump 1mL = 109 steps/uL
 sample_flow_rate = 30 # microlitres per minute
 
-sample_pump_priming_speed = 20000 # steps/0.1s
-sample_pump_priming_time = 12 # s
-sample_pump_unpriming_speed = 20000 # steps/0.1s
-sample_pump_unpriming_time = 12. # s
-sample_pump_flush_speed = 20000 # steps/0.1s
+sample_pump_priming_speed = 20000 # steps/10s
+sample_pump_priming_time = 20 # s
+sample_pump_unpriming_speed = 20000 # steps/10s
+sample_pump_unpriming_time = 20. # s
+sample_pump_flush_speed = 20000 # steps/10s
 sample_pump_flush_time = 30. # s
-sample_pump_backflush_speed = 20000 # steps/0.1s
+sample_pump_backflush_speed = 20000 # steps/10s
 sample_pump_backflush_time = 30. # s
 sample_pump_settle_time = 2. # s
 sample_pump_acquisition_rate = 30 # uL/min

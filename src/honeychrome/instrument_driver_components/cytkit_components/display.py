@@ -387,6 +387,9 @@ class Display(Thread):
         self._closed = True
 
     def action_message(self, message):
+        self.message_timeout = 2
+        time.sleep(0.1) # time to finish the current info display update
+
         self.frame = deepcopy(frame_flying)
         self.draw = ImageDraw.Draw(self.frame)
 
@@ -396,7 +399,6 @@ class Display(Thread):
             draw_text_lr(self.draw, 0, 37, message[0], font6x13, 1)
             draw_text_lr(self.draw, 0, 52, message[1], font5x8, 1)
 
-        self.message_timeout = 2
 
     def info_display(self):
         self.frame = deepcopy(frame_info)
