@@ -1,0 +1,23 @@
+<header class="site-header">
+  <div class="wrap site-header__inner">
+    <a class="brand" href="{{ '/' | relative_url }}" aria-label="Honeychrome home">
+      <img class="brand__logo" src="{{ '/assets/img/brand/logo-64.png' | relative_url }}" width="32" height="32" alt="">
+      <span class="brand__name">Honeychrome</span>
+    </a>
+    <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
+      {% include icon.html name="menu" %}<span class="sr-only">Menu</span>
+    </button>
+    <nav class="site-nav" id="site-nav" aria-label="Main">
+      {% assign p = page.url %}
+      <a href="{{ '/#features' | relative_url }}">Features</a>
+      <a href="{{ '/science/' | relative_url }}"{% if p contains '/science/' %} aria-current="page"{% endif %}>Science</a>
+      <a href="{{ '/docs/' | relative_url }}"{% if p contains '/docs/' %} aria-current="page"{% endif %}>Docs</a>
+      <a href="{{ '/download/' | relative_url }}"{% if p contains '/download/' %} aria-current="page"{% endif %}>Download</a>
+      <a class="site-nav__icon" href="{{ site.github_url }}" aria-label="Honeychrome on GitHub">{% include icon.html name="github" %}<span class="site-nav__icon-label">GitHub</span></a>
+      <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch colour theme">
+        <span class="theme-toggle__dark">{% include icon.html name="moon" %}</span>
+        <span class="theme-toggle__light">{% include icon.html name="sun" %}</span>
+      </button>
+    </nav>
+  </div>
+</header>

@@ -1,0 +1,16 @@
+{%- comment -%}
+  Screenshot or figure with caption. Parameters:
+    src      path under /assets/img/
+    alt      text alternative (required)
+    caption  optional caption (Markdown allowed)
+    width / height  intrinsic size, used to reserve layout space
+    frame    "window" draws an app-window frame around a screenshot
+    zoom     "false" disables click-to-enlarge
+{%- endcomment -%}
+<figure class="figure{% if include.frame == 'window' %} figure--window{% endif %}{% if include.class %} {{ include.class }}{% endif %}">
+  {% if include.frame == 'window' %}<div class="window-bar" aria-hidden="true"><span></span><span></span><span></span></div>{% endif %}
+  <a class="figure__link" href="{{ include.src | prepend: '/assets/img/' | relative_url }}"{% if include.zoom != "false" %} data-zoom{% endif %}>
+    <img src="{{ include.src | prepend: '/assets/img/' | relative_url }}" alt="{{ include.alt }}" loading="lazy" decoding="async"{% if include.width %} width="{{ include.width }}" height="{{ include.height }}"{% endif %}>
+  </a>
+  {% if include.caption %}<figcaption>{{ include.caption | markdownify | remove: '<p>' | remove: '</p>' }}</figcaption>{% endif %}
+</figure>

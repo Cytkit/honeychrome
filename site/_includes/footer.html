@@ -1,0 +1,41 @@
+<footer class="site-footer">
+  <div class="wrap site-footer__grid">
+    <div class="site-footer__about">
+      <a class="brand" href="{{ '/' | relative_url }}">
+        <img class="brand__logo" src="{{ '/assets/img/brand/logo-64.png' | relative_url }}" width="32" height="32" alt="">
+        <span class="brand__name">Honeychrome</span>
+      </a>
+      <p>Open-source spectral cytometry with AutoSpectral built in. Part of the <a href="https://cytkit.com">Cytkit</a> project to build a complete open-source spectral cytometer.</p>
+    </div>
+    <div>
+      <h2 class="site-footer__heading">Product</h2>
+      <ul>
+        <li><a href="{{ '/download/' | relative_url }}">Download</a></li>
+        <li><a href="{{ '/releases/' | relative_url }}">Release notes</a></li>
+        <li><a href="{{ '/science/' | relative_url }}">Science</a></li>
+        <li><a href="{{ site.github_url }}">Source code</a></li>
+      </ul>
+    </div>
+    <div>
+      <h2 class="site-footer__heading">Documentation</h2>
+      <ul>
+        <li><a href="{{ '/docs/' | relative_url }}">All guides</a></li>
+        <li><a href="{{ '/docs/get-started/install/' | relative_url }}">Install</a></li>
+        <li><a href="{{ '/docs/unmixing/spectral-unmixing/' | relative_url }}">Spectral unmixing</a></li>
+        <li><a href="{{ '/docs/developers/plugins/' | relative_url }}">Plugins</a></li>
+      </ul>
+    </div>
+    <div>
+      <h2 class="site-footer__heading">Project</h2>
+      <ul>
+        <li><a href="https://cytkit.com">Cytkit</a></li>
+        <li><a href="https://www.colibri-cytometry.com">Colibri Cytometry</a></li>
+        <li><a href="{{ site.github_url }}/issues">Report an issue</a></li>
+        <li><a href="{{ '/docs/reference/privacy/' | relative_url }}">Privacy</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="wrap site-footer__legal">
+    <p>Honeychrome is free software under the <a href="{{ site.github_url }}/blob/main/LICENSE">GNU LGPL v3.0</a>. For research use only; not for use in diagnostic procedures.</p>
+  </div>
+</footer>

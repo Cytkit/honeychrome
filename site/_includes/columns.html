@@ -1,0 +1,14 @@
+{%- comment -%}
+  Lays out Markdown as side-by-side columns. In the Markdown, a line of
+  three asterisks (***) separates one column from the next.
+    content  the rendered HTML to split
+    class    optional class for each column, for example "prose"
+{%- endcomment -%}
+{%- assign cols = include.content | split: '<hr />' -%}
+<div class="split">
+  {%- for col in cols %}
+  <div{% if include.class %} class="{{ include.class }}"{% endif %}>
+{{ col }}
+  </div>
+  {%- endfor %}
+</div>

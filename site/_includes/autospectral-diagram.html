@@ -1,0 +1,70 @@
+<figure class="diagram" role="img" aria-labelledby="as-diagram-title as-diagram-desc">
+<svg viewBox="0 0 960 560" xmlns="http://www.w3.org/2000/svg">
+  <title id="as-diagram-title">The AutoSpectral pipeline</title>
+  <desc id="as-diagram-desc">Three inputs: an unstained sample, the stained sample and single-stained controls. The controls give cleaned fluorophore spectra, used for an initial unmixing of the stained sample. The unstained sample gives a library of autofluorescence signatures, and each control gives a library of spectral variants. Each cell is assigned its best autofluorescence signature, then its best variant of each fluorophore, and the result is written to the unmixed FCS file with the AF Index.</desc>
+  <defs>
+    <marker id="as-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g style="color: var(--muted)">
+    <path class="d-line" d="M160 86V246" marker-end="url(#as-arrow)"/>
+    <path class="d-line" d="M480 86V136" marker-end="url(#as-arrow)"/>
+    <path class="d-line" d="M800 86V136" marker-end="url(#as-arrow)"/>
+    <path class="d-line" d="M660 166H624" marker-end="url(#as-arrow)"/>
+    <path class="d-line" d="M800 196V246" marker-end="url(#as-arrow)"/>
+    <path class="d-line" d="M480 196V246" marker-end="url(#as-arrow)"/>
+    <path class="d-line" d="M300 276H336" marker-end="url(#as-arrow)"/>
+    <path class="d-line" d="M480 306V356" marker-end="url(#as-arrow)"/>
+    <path class="d-line" d="M800 306V386H624" marker-end="url(#as-arrow)"/>
+    <path class="d-line" d="M480 416V466" marker-end="url(#as-arrow)"/>
+  </g>
+
+  <rect class="d-box d-in" x="20" y="26" width="280" height="60" rx="10"/>
+  <text class="d-title" x="160" y="52" text-anchor="middle">Unstained sample</text>
+  <text class="d-sub" x="160" y="72" text-anchor="middle">the universal negative</text>
+
+  <rect class="d-box d-in" x="340" y="26" width="280" height="60" rx="10"/>
+  <text class="d-title" x="480" y="52" text-anchor="middle">Stained sample</text>
+  <text class="d-sub" x="480" y="72" text-anchor="middle">the cells to unmix</text>
+
+  <rect class="d-box d-in" x="660" y="26" width="280" height="60" rx="10"/>
+  <text class="d-title" x="800" y="52" text-anchor="middle">Single-stained controls</text>
+  <text class="d-sub" x="800" y="72" text-anchor="middle">one per fluorophore</text>
+
+  <rect class="d-box d-spec" x="340" y="136" width="280" height="60" rx="10"/>
+  <text class="d-title" x="480" y="162" text-anchor="middle">Initial unmixing</text>
+  <text class="d-sub" x="480" y="182" text-anchor="middle">ordinary least squares</text>
+
+  <rect class="d-box d-spec" x="660" y="136" width="280" height="60" rx="10"/>
+  <text class="d-title" x="800" y="162" text-anchor="middle">Fluorophore spectra</text>
+  <text class="d-sub" x="800" y="182" text-anchor="middle">cleaned controls, robust regression</text>
+
+  <rect class="d-box d-af" x="20" y="246" width="280" height="60" rx="10"/>
+  <text class="d-title" x="160" y="272" text-anchor="middle">AF signature library</text>
+  <text class="d-sub" x="160" y="292" text-anchor="middle">self-organising map</text>
+
+  <rect class="d-box d-af" x="340" y="246" width="280" height="60" rx="10"/>
+  <text class="d-title" x="480" y="272" text-anchor="middle">Per-cell AF assignment</text>
+  <text class="d-sub" x="480" y="292" text-anchor="middle">residual × spillover score</text>
+
+  <rect class="d-box d-var" x="660" y="246" width="280" height="60" rx="10"/>
+  <text class="d-title" x="800" y="272" text-anchor="middle">Spectral variant library</text>
+  <text class="d-sub" x="800" y="292" text-anchor="middle">one map per fluorophore</text>
+
+  <rect class="d-box d-var" x="340" y="356" width="280" height="60" rx="10"/>
+  <text class="d-title" x="480" y="382" text-anchor="middle">Per-cell fluorophore optimisation</text>
+  <text class="d-sub" x="480" y="402" text-anchor="middle">residual and leakage minimisation</text>
+
+  <rect class="d-box d-out" x="340" y="466" width="280" height="60" rx="10"/>
+  <text class="d-title" x="480" y="492" text-anchor="middle">Unmixed FCS output</text>
+  <text class="d-sub" x="480" y="512" text-anchor="middle">abundances, AF Abundance, AF Index</text>
+
+  <g class="d-legend">
+    <rect x="700" y="452" width="14" height="14" rx="3" fill="none" stroke="#8b5cf6" stroke-width="2"/><text x="722" y="464">Autofluorescence pathway</text>
+    <rect x="700" y="476" width="14" height="14" rx="3" fill="none" stroke="#10a37f" stroke-width="2"/><text x="722" y="488">Spectral pathway</text>
+    <rect x="700" y="500" width="14" height="14" rx="3" fill="none" stroke="#f08a3c" stroke-width="2"/><text x="722" y="512">Variant pathway</text>
+  </g>
+</svg>
+<figcaption>The AutoSpectral pipeline, redrawn from Figure 1 of Burton et al. 2025.</figcaption>
+</figure>

@@ -1,0 +1,73 @@
+---
+layout: default
+---
+{%- assign nav = site.data.docs_nav -%}
+{%- assign flat = "" | split: "" -%}
+{%- assign current_group = "" -%}
+{%- for g in nav -%}
+  {%- for p in g.pages -%}
+    {%- assign flat = flat | push: p -%}
+    {%- if p.url == page.url -%}{%- assign current_group = g.group -%}{%- endif -%}
+  {%- endfor -%}
+{%- endfor -%}
+{%- assign prev = nil -%}{%- assign next = nil -%}
+{%- for p in flat -%}
+  {%- if p.url == page.url -%}
+    {%- assign i_prev = forloop.index0 | minus: 1 -%}
+    {%- assign i_next = forloop.index0 | plus: 1 -%}
+    {%- if i_prev >= 0 -%}{%- assign prev = flat[i_prev] -%}{%- endif -%}
+    {%- assign next = flat[i_next] -%}
+  {%- endif -%}
+{%- endfor -%}
+<div class="docs wrap">
+  <aside class="docs__sidebar" aria-label="Documentation">
+    <button class="docs__sidebar-toggle" type="button" aria-expanded="false" aria-controls="docs-nav" data-sidebar-toggle>
+      {% include icon.html name="menu" %} Browse the docs
+    </button>
+    <div class="docs__sidebar-inner" id="docs-nav">
+      <form class="search" role="search" data-search action="{{ '/docs/' | relative_url }}">
+        <label class="sr-only" for="docs-search-input">Search the docs</label>
+        {% include icon.html name="search" %}
+        <input id="docs-search-input" type="search" placeholder="Search the docs" autocomplete="off" data-search-input>
+        <div class="search__results" data-search-results hidden></div>
+      </form>
+      <nav>
+        {% for g in nav %}
+        <p class="docs__group">{{ g.group }}</p>
+        <ul>
+          {% for p in g.pages %}
+          <li><a href="{{ p.url | relative_url }}"{% if p.url == page.url %} aria-current="page"{% endif %}>{{ p.title }}</a></li>
+          {% endfor %}
+        </ul>
+        {% endfor %}
+      </nav>
+    </div>
+  </aside>
+
+  <article class="docs__article">
+    <nav class="breadcrumbs" aria-label="Breadcrumb">
+      <a href="{{ '/docs/' | relative_url }}">Docs</a>
+      {% if current_group != "" %}<span aria-hidden="true">/</span> <span>{{ current_group }}</span>{% endif %}
+    </nav>
+    <h1>{{ page.title }}</h1>
+    {% if page.lead %}<p class="lead">{{ page.lead }}</p>{% endif %}
+    <div class="prose" data-toc-source>
+{{ content }}
+    </div>
+
+    <nav class="pager" aria-label="Previous and next">
+      {% if prev %}<a class="pager__link pager__link--prev" href="{{ prev.url | relative_url }}"><span>Previous</span>{{ prev.title }}</a>{% else %}<span></span>{% endif %}
+      {% if next %}<a class="pager__link pager__link--next" href="{{ next.url | relative_url }}"><span>Next</span>{{ next.title }}</a>{% endif %}
+    </nav>
+    <p class="edit-link">
+      <a href="{{ site.github_url }}/edit/{{ site.edit_branch }}/{{ site.site_source_dir }}/{{ page.path }}">{% include icon.html name="edit" %} Edit this page on GitHub</a>
+    </p>
+  </article>
+
+  <aside class="docs__toc" aria-label="On this page">
+    <div class="docs__toc-inner" data-toc hidden>
+      <p class="docs__toc-title">On this page</p>
+      <ul data-toc-list></ul>
+    </div>
+  </aside>
+</div>

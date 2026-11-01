@@ -1,0 +1,122 @@
+---
+layout: default
+---
+{%- comment -%}
+  Home page. The words come from index.md (hero, cards, workflow, closing
+  band) and from the Markdown files in _home/features and _home/sections.
+{%- endcomment -%}
+{% assign r = site.data.release %}
+{% assign hero = page.hero %}
+<section class="hero">
+  <div class="wrap hero__grid">
+    <div>
+      <p class="eyebrow">{{ hero.eyebrow }}</p>
+      {% capture highlighted %}<span class="spectrum">{{ hero.highlight }}</span>{% endcapture %}
+      <h1>{% if hero.highlight %}{{ hero.headline | replace: hero.highlight, highlighted }}{% else %}{{ hero.headline }}{% endif %}</h1>
+      <p class="lead">{{ hero.lead | markdownify | remove: '<p>' | remove: '</p>' | strip }}</p>
+      <div class="hero__actions">
+        <a class="btn btn--honey" data-os-download href="{{ '/download/' | relative_url }}">{% include icon.html name="download" %}<span data-os-label>Download Honeychrome</span></a>
+        <a class="btn btn--ghost" href="{{ '/docs/' | relative_url }}">Read the docs</a>
+      </div>
+      <p class="hero__meta">
+        Version {{ r.version }} · <a href="{{ '/releases/' | relative_url }}">What's new</a> ·
+        <a class="hero__video" href="{{ r.video_url }}">{% include icon.html name="play" %}Watch the 30-minute introduction</a>
+      </p>
+    </div>
+    <div>
+      {% include figure.html src=hero.screenshot alt=hero.alt width=hero.width height=hero.height frame="window" zoom="false" %}
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <div class="cards">
+      {%- for c in page.cards %}
+      <div class="card"><div class="card__mark"></div><h3>{{ c.title }}</h3><p>{{ c.text | markdownify | remove: '<p>' | remove: '</p>' | strip }}</p></div>
+      {%- endfor %}
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <div class="section__head">
+      <h2>{{ page.workflow.title }}</h2>
+      <p>{{ page.workflow.intro }}</p>
+    </div>
+    <ol class="workflow">
+      {%- for s in page.workflow.steps %}
+      {%- assign first = s.link | slice: 0 %}
+      {%- if first == '#' or s.link contains '://' %}{% assign href = s.link %}{% else %}{% assign href = s.link | relative_url %}{% endif %}
+      <li><a href="{{ href }}">{{ s.title }}</a><span>{{ s.text | markdownify | remove: '<p>' | remove: '</p>' | strip }}</span></li>
+      {%- endfor %}
+    </ol>
+  </div>
+</section>
+
+{% assign home = site.home | sort: "relative_path" %}
+{% assign features = home | where_exp: "d", "d.relative_path contains '/features/'" %}
+<section class="section" id="features">
+  <div class="wrap">
+    <div class="section__head">
+      <p class="eyebrow">{{ page.features.eyebrow }} {{ r.version }}</p>
+      <h2>{{ page.features.title }}</h2>
+    </div>
+    {% for f in features %}
+    <div class="feature{% cycle '', ' feature--flip' %}"{% if f.anchor %} id="{{ f.anchor }}"{% endif %}>
+      <div class="feature__text">
+        <p class="eyebrow">{{ f.eyebrow }}</p>
+        <h3>{{ f.title }}</h3>
+        {{ f.content }}
+        {%- if f.more %}
+        <a class="feature__more" href="{{ f.more_link | relative_url }}">{{ f.more }} {% include icon.html name="arrow" %}</a>
+        {%- endif %}
+      </div>
+      {%- if f.screenshot %}
+      {% include figure.html src=f.screenshot alt=f.alt width=f.width height=f.height caption=f.caption %}
+      {%- else %}
+      <div class="placeholder-shot">{{ f.placeholder }}</div>
+      {%- endif %}
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+{% assign sections = home | where_exp: "d", "d.relative_path contains '/sections/'" %}
+{% for s in sections %}
+<section class="section">
+  {%- if s.stats %}
+  <div class="wrap">
+    <div class="section__head">
+      {% if s.eyebrow %}<p class="eyebrow">{{ s.eyebrow }}</p>{% endif %}
+      <h2>{{ s.title }}</h2>
+      {% if s.intro %}<p>{{ s.intro }}</p>{% endif %}
+    </div>
+    <div class="stats-band">
+      {%- for st in s.stats %}
+      <div class="stat"><strong>{{ st.value }}</strong><p>{{ st.text }}</p></div>
+      {%- endfor %}
+    </div>
+    {{ s.content }}
+    {%- if s.more %}
+    <a class="feature__more" href="{{ s.more_link | relative_url }}">{{ s.more }} {% include icon.html name="arrow" %}</a>
+    {%- endif %}
+  </div>
+  {%- else %}
+  <div class="wrap">
+    {% include columns.html content=s.content %}
+  </div>
+  {%- endif %}
+</section>
+{% endfor %}
+
+<section class="wrap">
+  <div class="cta-band">
+    <div>
+      <h2>{{ page.cta.title }} {{ r.version }}</h2>
+      <p>{{ page.cta.text }}</p>
+    </div>
+    <a class="btn btn--honey" data-os-download href="{{ '/download/' | relative_url }}">{% include icon.html name="download" %}<span data-os-label>Download Honeychrome</span></a>
+  </div>
+</section>
