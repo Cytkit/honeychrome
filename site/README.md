@@ -37,6 +37,10 @@ published by GitHub Pages (`.github/workflows/jekyll-gh-pages.yml`) whenever
    ```liquid
    {% include figure.html src="docs/shot.webp" alt="What the image shows" width="1600" height="1000" caption="Optional caption." %}
    ```
+   Two images side by side, at the same height and with one caption, use
+   `figure-pair.html` with `src1`, `alt1`, `width1`, `height1`, `src2`,
+   `alt2`, `width2`, `height2` and `caption` (see the Statistics section of
+   `science.md`).
 4. Tips, notes and cautions are blockquotes followed by a class:
    ```markdown
    > Select the controls first to see only their rows.

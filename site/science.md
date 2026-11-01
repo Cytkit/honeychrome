@@ -103,6 +103,10 @@ Honeycluster and Automated Gating share one statistics engine:
 - **Differential expression** uses moderated linear models ([Smyth 2004](https://doi.org/10.2202/1544-6115.1027); [Ritchie et al. 2015](https://doi.org/10.1093/nar/gkv007)), with optional fold-change thresholds ([McCarthy and Smyth 2009](https://doi.org/10.1093/bioinformatics/btp053)).
 - **Clusters and populations are tested one by one**, as in diffcyt ([Weber et al. 2019](https://doi.org/10.1038/s42003-019-0415-5)), and the **false discovery rate** is controlled across families of tests ([Benjamini and Bogomolov 2014](https://doi.org/10.1111/rssb.12028)).
 
+So the same question can be asked of gated populations and of clusters. In the BATF chimera dataset ([PMID 38897202](https://pubmed.ncbi.nlm.nih.gov/38897202/)), Tregs are less frequent in the BATFKO group than in the WT group, whether they are defined by Automated Gating or found as a Honeycluster cluster.
+
+{% include figure-pair.html src1="science/ag_treg_wt_vs_batfko.webp" alt1="Automated Gating: CD25 against Foxp3 for the pooled BATFKO and WT samples with the Treg gate, and a violin plot of Treg as a percentage of parent in each group" width1="1600" height1="611" src2="science/honeycluster_treg_violin.webp" alt2="Honeycluster: violin plot of the Treg cluster as a percentage of events in the BATFKO and WT groups" width2="396" height2="447" class="figure--paper" caption="Treg frequency, BATFKO against WT. Automated Gating: each group's pooled events with the Treg gate, and Tregs as a percentage of their parent population in 48 samples (p = 0.0039, FDR = 0.035). Honeycluster: the Treg cluster as a percentage of clustered events in 32 samples (p = 0.0002, FDR = 0.001). Data from [PMID 38897202](https://pubmed.ncbi.nlm.nih.gov/38897202/)." %}
+
 ## How to cite
 
 <div class="cite-box" markdown="1">

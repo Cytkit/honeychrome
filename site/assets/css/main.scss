@@ -412,3 +412,9 @@ p:has(> .mascot:only-child) { margin: 0; }
 .cite-box p:last-child { margin-bottom: 0; }
 .science-figs { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
 .figure--paper img { background: #fff; }
+.figure-pair__images { display: flex; gap: 12px; align-items: flex-start; }
+.figure-pair__images > a { min-width: 0; }
+.figure-pair__images > a:first-child { flex: var(--ratio1) 1 0; }
+.figure-pair__images > a:last-child { flex: var(--ratio2) 1 0; }
+.figure-pair__images img { width: 100%; height: auto; display: block; }
+@media (max-width: 640px) { .figure-pair__images { flex-direction: column; } .figure-pair__images > a { flex: none; width: 100%; } }
