@@ -1067,6 +1067,10 @@ class PipelineState:
     # run_id of the clustering_runs entry used for the current stats
     # results — the authoritative match key for combo restore / change
     # detection, since labels are user-editable and not guaranteed unique.
+    stats_cluster_names: dict[int, str] = field(default_factory=dict)
+    # {cluster id: name} the current stats results use, so a later rename
+    # of the run's clusters can be applied to them
+    # (drc_stats.relabel_stats_results).
 
     # --- Workspace ---
     plot_configs: list[dict] = field(default_factory=list)
@@ -4332,6 +4336,7 @@ class GroupsStatsTab(QWidget):
         self._update_run_button()
         self._refresh_predictive_controls()
         self._update_stats_freshness()
+        renamed = self._apply_cluster_renames()
 
         # Redraw plots if results are present and haven't been rendered yet
         # (_last_drawn_cluster_names == {} after load_state resets it) or if
@@ -4342,7 +4347,7 @@ class GroupsStatsTab(QWidget):
                   self.state.counts_results is not None)
         if (self.state.freq_results is not None or self.state.mfi_results is not None
                 or self.state.counts_results is not None):
-            if (not self._last_drawn_cluster_names or
+            if (renamed or not self._last_drawn_cluster_names or
                     dict(self.state.cluster_names) != self._last_drawn_cluster_names):
                 _log.info("GroupsStatsTab.refresh: calling _draw_results() "
                           "(last_drawn=%r stats_comparisons=%d)",
@@ -4927,6 +4932,7 @@ class GroupsStatsTab(QWidget):
             self.state.stats_comparisons = []
             self.state.stats_run_label = ''
             self.state.stats_run_id = ''
+            self.state.stats_cluster_names = {}
             # Sample PCA is built from freq_df/counts_df/mfi_df above --
             # stale along with them; it has no run_id of its own.
             self.state.pca_scores_df = None
@@ -5218,6 +5224,9 @@ class GroupsStatsTab(QWidget):
         """
         if self._analysis_busy():
             return
+        # Renames since the results were computed are applied first, so a
+        # replot without refitting shows the current names.
+        self._apply_cluster_renames()
 
         resolved = self._resolve_stats_source()
         if resolved is None:
@@ -5459,6 +5468,7 @@ class GroupsStatsTab(QWidget):
         self.state.mfi_results = snap.mfi_results if ran_mfi else None
         self.state.mfi_df = snap.mfi_df if ran_mfi else None
         self.state.mfi_sample_df = snap.mfi_sample_df if ran_mfi else None
+        self.state.stats_cluster_names = dict(snap.stats_cluster_names)
 
     def _set_stats_busy(self, busy: bool):
         """
@@ -5610,6 +5620,48 @@ class GroupsStatsTab(QWidget):
         if drc_run_archive.sync_status(run, current) == drc_run_archive.SYNC_IN_SYNC:
             return None, None
         return run, drc_run_align.live_join_mode(run, current)
+
+    def _run_cluster_names(self, run_id: str) -> dict | None:
+        """The current names dict of clustering run *run_id* ('' is the
+        Active (unsaved) pseudo-run), or None when the run no longer exists."""
+        if not run_id:
+            return dict(self.state.cluster_names)
+        for entry in self.state.clustering_runs:
+            if entry.get('run_id') == run_id:
+                return drc_run_archive.hydrate_run(self.controller, entry).get('names', {})
+        return None
+
+    def _apply_cluster_renames(self) -> bool:
+        """
+        Give the stored results the current names of their run's clusters,
+        renamed in Cluster Annotation or Layout since the results were
+        computed, without refitting. Redraws the open Composition, Sample
+        PCA and predictive tabs and saves; the caller redraws the statistics
+        figures. Returns True when the statistics results were renamed.
+        """
+        if self._analysis_busy():
+            return False
+        s = self.state
+        renamed_stats = renamed_any = False
+        try:
+            if (s.freq_results is not None or s.counts_results is not None
+                    or s.mfi_results is not None):
+                names = self._run_cluster_names(s.stats_run_id)
+                if names is not None and drc_stats.relabel_stats_results(s, names):
+                    renamed_stats = renamed_any = True
+            if s.composition_df is not None:
+                names = self._run_cluster_names(s.composition_run_id)
+                if names is not None and drc_stats.relabel_composition(s, names):
+                    renamed_any = True
+        except ValueError as exc:
+            self.stats_status_label.setText(
+                f"⚠ {exc} The results keep the earlier cluster names until "
+                "the names are unique.")
+            self.stats_status_label.setStyleSheet("color: orange;")
+        if renamed_any:
+            self.refresh_theme_dependent_result_tabs()
+            self.results_computed.emit()
+        return renamed_stats
 
     def _update_stats_freshness(self):
         """
@@ -6214,6 +6266,9 @@ class GroupsStatsTab(QWidget):
     def _run_predictive(self):
         if self._analysis_busy():
             return
+        # Features are named from the stored tables: apply renames first.
+        if self._apply_cluster_renames():
+            self._draw_results()
         idx = self.pred_comparison_combo.currentIndex()
         if idx < 0 or idx >= len(self.state.stats_comparisons):
             return
@@ -11030,8 +11085,10 @@ class _MarkerSummaryWorker(QThread):
             else:
                 _log.info("marker summary timing: %-22s %6s  (reused, run switch)",
                           "pool_violin_data", "--")
-            names_map = self._cl_run.get('names', {})
-            colors_map = self._cl_run.get('colors', {})
+            # Copies: the cache compares them with the run's current names
+            # and colours to tell when these figures are out of date.
+            names_map = dict(self._cl_run.get('names', {}))
+            colors_map = dict(self._cl_run.get('colors', {}))
             transformed = plugin._transform_and_pool_matrix_values(
                 pooled, self._channels, self._cluster_order,
             )
@@ -12136,6 +12193,12 @@ class ClusterAnnotationTab(QWidget):
         ch = self.violin_channel_combo.currentData()
         if ch is None:
             return
+        cl_run = self._selected_cluster_run()
+        if cl_run is not None:
+            # The run's names and colours as they are now, after any rename
+            # or recolour since the violins were pooled.
+            cache['names_map'] = cl_run.get('names', {})
+            cache['colors_map'] = cl_run.get('colors', {})
         fig = self._make_single_violin_figure(
             ch, cache['pooled'].get(ch, {}), cache['names_map'], cache.get('colors_map', {}),
         )
@@ -12478,6 +12541,7 @@ class ClusterAnnotationTab(QWidget):
         if drc_scatter.rename_cluster(self.controller, cl_run, label, new_name.strip(), self):
             self._rebuild_map_legend(cl_run)
             self._populate_label_table()
+            self._redraw_cluster_figures()
 
     def _pick_colour(self, label: int):
         cl_run = self._selected_cluster_run()
@@ -12490,6 +12554,17 @@ class ClusterAnnotationTab(QWidget):
             self._rebuild_map_legend(cl_run)
             self._populate_label_table()
             self._redraw_map()
+            self._redraw_cluster_figures()
+
+    def _redraw_cluster_figures(self):
+        """Redraw the violin and, when it is shown, the Marker Summary with
+        the selected run's current cluster names and colours."""
+        run_id = self.run_combo.currentData()
+        if run_id in self._violin_cache:
+            self._draw_current_violin()
+        if self.annotation_sub_tabs.currentIndex() == getattr(self, '_marker_summary_tab_index', -1) \
+                and run_id in self._marker_summary_cache:
+            self._draw_marker_summary()
 
     # ------------------------------------------------------------------
     # Panel 3 — cluster label table
@@ -12595,6 +12670,7 @@ class ClusterAnnotationTab(QWidget):
             self._populate_label_table()
             return
         self._rebuild_map_legend(cl_run)
+        self._redraw_cluster_figures()
 
     def _on_table_cell_double_clicked(self, row: int, col: int):
         if col == 1:
@@ -12610,6 +12686,7 @@ class ClusterAnnotationTab(QWidget):
                 self._populate_label_table()
                 self._rebuild_map_legend(cl_run)
                 self._redraw_map()
+                self._redraw_cluster_figures()
         elif col == 4:
             #one-click MEM label adoption for a single cluster.
             item = self.label_table.item(row, col)
@@ -12622,6 +12699,7 @@ class ClusterAnnotationTab(QWidget):
             ):
                 self._rebuild_map_legend(cl_run)
                 self._populate_label_table()
+                self._redraw_cluster_figures()
 
     # ------------------------------------------------------------------
     # Panel 4 — Cluster ID suggestions
@@ -12860,6 +12938,7 @@ class ClusterAnnotationTab(QWidget):
         drc_run_archive.update_run_fields(self.controller, cl_run, 'names')
         self._rebuild_map_legend(cl_run)
         self._populate_label_table()
+        self._redraw_cluster_figures()
 
     def _on_annotation_sub_tab_changed(self, index: int):
         """Lazily compute the Marker Summary sub-tab only when it becomes
@@ -13015,6 +13094,14 @@ class ClusterAnnotationTab(QWidget):
                 "No clustered data to summarise for this run."
             )
             return
+
+        cl_run = self._selected_cluster_run() or {}
+        if (cache.get('names_map') != dict(cl_run.get('names', {}))
+                or cache.get('colors_map') != dict(cl_run.get('colors', {}))):
+            # Renamed or recoloured since these figures were built: rebuild
+            # them from the pooled data.
+            cache['main_fig'] = None
+            self._marker_summary_last_drawn = None
 
         is_dark = _resolve_is_dark(self.state)
         draw_key = (run_id, is_dark)
@@ -14623,6 +14710,7 @@ class PluginWidget(QWidget):
             ('stats_run_label',   self.state.stats_run_label),
             ('stats_run_id',      self.state.stats_run_id),
             ('stats_data_key',    self.state.stats_data_key),
+            ('stats_cluster_names', self.state.stats_cluster_names),
             ('composition_df',        self.state.composition_df),
             ('composition_as_pct',    self.state.composition_as_pct),
             ('composition_group_var', self.state.composition_group_var),
@@ -14803,6 +14891,8 @@ class PluginWidget(QWidget):
                 self.state.stats_run_id = payload['stats_run_id']
             if isinstance(payload.get('stats_data_key'), tuple):
                 self.state.stats_data_key = payload['stats_data_key']
+            if isinstance(payload.get('stats_cluster_names'), dict):
+                self.state.stats_cluster_names = payload['stats_cluster_names']
             print(f"[DR Plugin] Model sidecar loaded ← {path.name} "
                   f"({list(self.state.trained_reducers.keys())} trained, "
                   f"{sum(len(v) for v in self.state.embeddings.values())} embeddings, "
@@ -15167,11 +15257,14 @@ class PluginWidget(QWidget):
                 len(s.dr_runs), len(s.clustering_runs),
             )
         elif index == 2:    # ClusterAnnotationTab
+            cat = getattr(self, 'cluster_annotation_tab', None)
             return (
                 len(s.dr_runs), len(s.clustering_runs),
                 tuple(sorted(s.cluster_labels)),
                 tuple(sorted(s.cluster_names.items())),
                 tuple(sorted(s.cluster_colors.items())),
+                self._run_fields_key(cat.run_combo.currentData() if cat else None,
+                                     'names', 'colors'),
             )
         elif index == 3:    # GroupsStatsTab
             return (
@@ -15184,6 +15277,8 @@ class PluginWidget(QWidget):
                 tuple(sorted(s.cluster_labels)),
                 s.stats_run_id,
                 tuple(sorted(s.cluster_names.items())),
+                self._run_fields_key(s.stats_run_id, 'names'),
+                self._run_fields_key(s.composition_run_id, 'names'),
                 id(s.freq_results), id(s.counts_results), id(s.mfi_results),
                 id(s.composition_df),
                 s.composition_as_pct, s.composition_group_var,
@@ -15204,6 +15299,16 @@ class PluginWidget(QWidget):
         elif index == 5:    # ReportTab -- cheap to rebuild; always refresh
             return None
         return None
+
+    def _run_fields_key(self, run_id, *fields: str) -> tuple:
+        """
+        Snapshot of *fields* ('names', 'colors') of clustering run *run_id*
+        as loaded so far. Runs keep their own names and colours, so renames
+        never touch state.cluster_names; a run not loaded yet has not been
+        renamed or recoloured this session.
+        """
+        entry = next((e for e in self.state.clustering_runs if e.get('run_id') == run_id), {})
+        return tuple(tuple(sorted((entry.get(f) or {}).items())) for f in fields)
 
     def _refresh_tab_at(self, index: int):
         """
