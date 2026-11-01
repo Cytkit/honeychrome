@@ -36,7 +36,7 @@ import numpy as np
 import pandas as pd
 
 __all__ = [
-    'style_figure_theme', 'make_scatter_hover_handler', 'stamp_run_label',
+    'style_figure_theme', 'make_scatter_hover_handler', 'hide_hover_annotations', 'stamp_run_label',
     'message_figure', 'make_heatmap_figure', 'make_volcano_figure',
     'group_pair_colours', 'draw_direction_ramp',
     'make_marker_summary_figure', 'make_comparison_heatmap_figure', 'significance_column',
@@ -49,6 +49,9 @@ GROUP_COLOUR_B = '#EE6677'
 # Default colours of groups by their order, where no group colours are set.
 GROUP_COLOURS = ('#4477AA', '#EE6677', '#228833', '#CCBB44', '#66CCEE', '#AA3377', '#BBBBBB')
 MAX_STATIC_LABELS = 10
+# Shortest heatmap colour bar; a shorter heatmap lends it the height of
+# the dendrogram and group bar above.
+MIN_COLOURBAR_INCHES = 1.5
 VOLCANO_LABEL_WRAP = 24     # characters per line for volcano point labels
 
 
@@ -194,6 +197,9 @@ def make_scatter_hover_handler(fig, ax, scatter, labels: list[str], is_dark: boo
     )
     annot.set_visible(False)
     annot.set_in_layout(False)
+    if not hasattr(fig, '_hover_annotations'):
+        fig._hover_annotations = []
+    fig._hover_annotations.append(annot)
 
     def _on_hover(event):
         if event.inaxes != ax:
@@ -213,6 +219,16 @@ def make_scatter_hover_handler(fig, ax, scatter, labels: list[str], is_dark: boo
             fig.canvas.draw_idle()
 
     return _on_hover
+
+
+def hide_hover_annotations(fig) -> bool:
+    """Hide every hover label of *fig* (made by make_scatter_hover_handler),
+    for example before an export. Returns True when one was showing."""
+    shown = False
+    for annot in getattr(fig, '_hover_annotations', ()):
+        shown = shown or annot.get_visible()
+        annot.set_visible(False)
+    return shown
 
 
 def group_pair_colours(group_a: str, group_b: str,
@@ -578,7 +594,8 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
     ax_hm.grid(False)
     cell_grid_lines(ax_hm, n_cols, n_features, 'white', 0.6)
 
-    ax_cb = fig.add_subplot(gs[2, 3])
+    ax_cb = fig.add_subplot(gs[2, 3] if n_features * row_h >= MIN_COLOURBAR_INCHES
+                            else gs[0:3, 3])
     cb = fig.colorbar(im, cax=ax_cb)
     cb.ax.tick_params(labelsize=7)
     if value_label is None:
@@ -597,6 +614,38 @@ def make_heatmap_figure(results_df: pd.DataFrame, sample_df: pd.DataFrame, title
     style_figure_theme(fig, is_dark)
     stamp_run_label(fig, run_label)
     return fig
+
+
+def _separate_labels(fig, notes: list, pad_px: float = 2.0):
+    """Move overlapping point labels apart. From the highest point down, a
+    label that overlaps one already placed is pushed down until it is
+    clear, and its leader line to the point is shown. Positions are
+    measured with the figure laid out at its current size."""
+    if len(notes) < 2:
+        return
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.text import Text
+    if not hasattr(fig.canvas, 'get_renderer'):
+        FigureCanvasAgg(fig)
+    fig.draw_without_rendering()
+    renderer = fig.canvas.get_renderer()
+    pt_per_px = 72.0 / fig.dpi
+    placed = []
+    for note in sorted(notes, key=lambda n: -float(n.xy[1])):
+        note.update_positions(renderer)
+        box = Text.get_window_extent(note, renderer)
+        shift = 0.0
+        for _attempt in range(4 * len(notes)):
+            moved = box.translated(0.0, -shift)
+            hits = [b for b in placed if moved.overlaps(b)]
+            if not hits:
+                break
+            shift += max(moved.y1 - b.y0 for b in hits) + pad_px
+        placed.append(box.translated(0.0, -shift))
+        if shift > 0:
+            dx, dy = note.xyann
+            note.xyann = (dx, dy - shift * pt_per_px)
+            note.arrow_patch.set_visible(True)
 
 
 def make_volcano_figure(results_df: pd.DataFrame, title: str,
@@ -683,6 +732,7 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
         top_idx = np.argsort(sig_y)[::-1][:MAX_STATIC_LABELS]
     else:
         top_idx = np.arange(len(sig_labels))
+    notes = []
     for i in top_idx:
         # Labels on the right half extend leftwards so they stay inside the axes.
         on_right = sig_x[i] > 0
@@ -691,8 +741,13 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
                            xytext=(-4 if on_right else 4, 4),
                            textcoords='offset points',
                            ha='right' if on_right else 'left', va='bottom',
-                           fontsize=6, color=fg)
+                           fontsize=6, color=fg,
+                           arrowprops=dict(arrowstyle='-', color=fg, lw=0.5, alpha=0.6,
+                                           shrinkA=0, shrinkB=2,
+                                           relpos=(1.0, 1.0) if on_right else (0.0, 1.0)))
+        note.arrow_patch.set_visible(False)
         note.set_in_layout(False)
+        notes.append(note)
 
     if sig_scatter is not None:
         fig._hover_handler = make_scatter_hover_handler(fig, ax, sig_scatter, sig_labels, is_dark)
@@ -723,6 +778,7 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
     ax.set_title(title, fontsize=10)
     style_figure_theme(fig, is_dark)
     stamp_run_label(fig, run_label)
+    _separate_labels(fig, notes)
     return fig
 
 

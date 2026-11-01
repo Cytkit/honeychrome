@@ -660,6 +660,23 @@ def test_singlet_band_spans_the_axis():
 
 
 @pytest.mark.numpy_only
+def test_singlet_fit_ignores_saturated_pile_but_keeps_it_in_the_band():
+    rng = np.random.default_rng(7)
+    x = rng.uniform(0.2, 0.8, 9000)
+    singlets = np.column_stack([x, x + rng.normal(0, 0.01, 9000)])
+    pile = np.column_stack([np.full(600, 1.0), rng.uniform(0.3, 1.0, 600)])
+    data = np.vstack([singlets, pile])
+    g = _gate('S', 'singlets', 'A', 'H')
+    res = ag.train_boundaries([g], data, {'A': 0, 'H': 1}, axis_limits={'A': (0, 1), 'H': (0, 1)})
+    poly = np.asarray(res.boundaries['S']['in']['boundary'])
+    slope = (poly[1, 1] - poly[0, 1]) / (poly[1, 0] - poly[0, 0])
+    assert slope == pytest.approx(1.0, abs=0.02)
+    inside = res.masks['S']['in'][9000:]
+    assert inside[np.abs(pile[:, 1] - 1.0) < 0.02].all()
+    assert not inside[pile[:, 1] < 0.9].any()
+
+
+@pytest.mark.numpy_only
 def test_run_gating_stops_when_asked():
     data, idx = _three_channel_data()
     gates = [_gate('a', '1dsep', 'A', number=1), _gate('b', '1dsep', 'B', number=2)]

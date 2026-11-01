@@ -15,8 +15,8 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
-    QSlider, QVBoxLayout, QWidget,
+    QFileDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea,
+    QSizePolicy, QSlider, QVBoxLayout, QWidget,
 )
 
 import honeychrome.settings as settings
@@ -29,6 +29,7 @@ MIN_SCALE_PCT = 25
 MAX_SCALE_PCT = 400
 DEFAULT_SCALE_PCT = 100
 RESIZE_DELAY_MS = 120
+EXPORT_DPI = 300
 
 _canvas_class = None
 
@@ -85,10 +86,13 @@ class ScalableFigureWidget(QWidget):
         dpi = figure.get_dpi()
         self._natural_w = int(figure.get_figwidth() * dpi)
         self._natural_h = int(figure.get_figheight() * dpi)
+        # The slider resizes the figure itself; exports restore this size.
+        self._natural_inches = tuple(figure.get_size_inches())
 
         apply_plot_theme()
         self.canvas = scrollable_canvas_class()(figure)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.canvas.mpl_connect('figure_leave_event', self._on_leave)
 
         self._scroll = QScrollArea()
         self._scroll.setWidget(self.canvas)
@@ -161,10 +165,55 @@ class ScalableFigureWidget(QWidget):
             return
         path = Path(self.experiment_dir) / f"{self.export_stem}.{fmt}"
         try:
-            self.figure.savefig(path, bbox_inches="tight")
+            self.save_full_size(path)
         except Exception as exc:
             QMessageBox.warning(self, "Export failed", str(exc))
             return
         QMessageBox.information(
             self, "Exported",
             f"Exported {fmt} graphic file:\n{path.name}\nto {path.parent}")
+
+    def save_full_size(self, path, dpi: int = EXPORT_DPI):
+        """Save the figure at its natural size, whatever size it is shown at,
+        at *dpi* and trimmed to its contents, without hover labels."""
+        from honeychrome.view_components.differential_plots import hide_hover_annotations
+        shown = tuple(self.figure.get_size_inches())
+        hide_hover_annotations(self.figure)
+        self.figure.set_size_inches(*self._natural_inches, forward=False)
+        try:
+            self.figure.savefig(path, dpi=dpi, bbox_inches='tight')
+        finally:
+            self.figure.set_size_inches(*shown, forward=False)
+            self.canvas.draw_idle()
+
+    def save_full_size_as(self):
+        """Ask for a file name, then save as save_full_size does."""
+        fmt = settings.graphics_export_format_retrieved
+        start = str(Path(self.experiment_dir or '.') / f"{self.export_stem}.{fmt}")
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "Save figure", start, "PNG (*.png);;PDF (*.pdf);;SVG (*.svg);;All files (*)")
+        if not path:
+            return
+        if not Path(path).suffix:
+            path += f".{fmt}"
+        try:
+            self.save_full_size(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Save failed", str(exc))
+
+    def make_toolbar(self, parent=None):
+        """Matplotlib's navigation toolbar for this figure, whose Save button
+        saves the full figure as Export does."""
+        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+        widget = self
+
+        class _FullSizeSaveToolbar(NavigationToolbar2QT):
+            def save_figure(self, *_args):
+                widget.save_full_size_as()
+
+        return _FullSizeSaveToolbar(self.canvas, parent)
+
+    def _on_leave(self, _event):
+        from honeychrome.view_components.differential_plots import hide_hover_annotations
+        if hide_hover_annotations(self.figure):
+            self.canvas.draw_idle()

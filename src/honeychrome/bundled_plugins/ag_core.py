@@ -459,6 +459,31 @@ def split_population_key(key: str) -> tuple[str, str]:
     return gate, pop
 
 
+def population_display_names(populations) -> dict:
+    """Display name of each population ({key: name}): its label, or
+    "gate label" where two populations of the model share that label.
+
+    populations : iterable of (key, gate name, label); a key that repeats
+                  (for example one row per sample) counts once.
+    """
+    by_key: dict = {}
+    for key, gate, label in populations:
+        by_key.setdefault(key, (str(gate), str(label)))
+    uses: dict[str, int] = {}
+    for _gate, label in by_key.values():
+        uses[label] = uses.get(label, 0) + 1
+    return {key: label if uses[label] == 1 else f"{gate} {label}"
+            for key, (gate, label) in by_key.items()}
+
+
+def gate_population_names(gate_defs: list[dict]) -> dict:
+    """population_display_names for every population of *gate_defs*, keyed
+    by population_key."""
+    return population_display_names(
+        (population_key(g['gate_name'], pop), g['gate_name'], (info or {}).get('label') or pop)
+        for g in gate_defs for pop, info in (g.get('populations') or {}).items())
+
+
 def transform_columns(unmixed: np.ndarray, channels: list[str], transforms: dict) -> np.ndarray:
     """float32 copy of *unmixed* with each channel's display transform applied.
 

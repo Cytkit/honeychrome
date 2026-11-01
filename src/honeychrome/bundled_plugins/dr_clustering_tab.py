@@ -7227,8 +7227,8 @@ class GroupsStatsTab(QWidget):
         import matplotlib.patches as mpatches
 
         name_a, name_b = group_a, group_b
-        COLOR_A = '#4477AA'
-        COLOR_B = '#EE6677'
+        colour_a = _resolve_group_colour(self.state, name_a) if name_a else '#4477AA'
+        colour_b = _resolve_group_colour(self.state, name_b) if name_b else '#EE6677'
 
         is_dark = _resolve_is_dark(self.state)
 
@@ -7308,10 +7308,10 @@ class GroupsStatsTab(QWidget):
         ax_grp.set_ylim(0, 1)
         ax_grp.axis('off')
         for xi, grp in enumerate(grp_ord):
-            color = COLOR_A if grp == name_a else COLOR_B
+            color = colour_a if grp == name_a else colour_b
             ax_grp.add_patch(mpatches.Rectangle((xi, 0), 1, 1, color=color, transform=ax_grp.transData))
-        handles = [mpatches.Patch(color=COLOR_A, label=name_a),
-                   mpatches.Patch(color=COLOR_B, label=name_b)]
+        handles = [mpatches.Patch(color=colour_a, label=name_a),
+                   mpatches.Patch(color=colour_b, label=name_b)]
         ax_cdend.legend(handles=handles, loc='lower right', fontsize=7, frameon=True, ncol=2)
 
         ax_rdend = fig.add_subplot(gs[2, 0])
