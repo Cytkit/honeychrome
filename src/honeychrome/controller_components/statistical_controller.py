@@ -230,7 +230,7 @@ if __name__ == "__main__":
     kc.load_experiment(experiment_path) # note this loads first sample too and runs calculate all histograms and statistics
     kc.set_mode('Unmixed Data')
     kc.initialise_data_for_cytometry_plots()
-    kc.set_mode('Statistics')
+    kc.set_mode('Simple Stats')
 
     kc.experiment.statistics = [
         {

@@ -83,14 +83,14 @@ plugin_name = '3D Plots'
 # tab names whose data_for_cytometry_plots dict is real (non-None) - see the
 # core-code landmine note above. Any other tab name (including every other
 # plugin tab) leaves controller.data_for_cytometry_plots as None.
-DATA_TAB_NAMES = {'Raw Data', 'Spectral Process', 'Unmixed Data', 'Statistics'}
+DATA_TAB_NAMES = {'Raw Data', 'Spectral Process', 'Unmixed Data', 'Simple Stats'}
 
 # subset of DATA_TAB_NAMES where controller.set_mode() points
 # data_for_cytometry_plots at data_for_cytometry_plots_unmixed specifically
 # (see set_mode() in controller.py) - calc_hists_and_stats() must only be
 # flushed once one of these is the active tab, or it would recalculate the
 # wrong dict (raw/process instead of unmixed).
-UNMIXED_DATA_TAB_NAMES = {'Unmixed Data', 'Statistics'}
+UNMIXED_DATA_TAB_NAMES = {'Unmixed Data', 'Simple Stats'}
 
 
 # --------------------------------------------------------------------------

@@ -618,7 +618,7 @@ if __name__ == "__main__":
         {"sample_set": "Raw/Samples", "plot_type": "Box and Whisker Chart", "gate": "P1", "data": {"Sample": ["E1 Brain_WT_001_Samples", "E2 Brain_WT_002_Samples", "E3 Brain_GFP_003_Samples", "E4 Brain_GFP_004_Samples", "C1 Lung_WT_001_Samples", "C2 Lung_WT_002_Samples", "C3 Lung_GFP_003_Samples", "C4 Lung_GFP_004_Samples", "A1 Spleen_WT_001_Samples", "A2 Spleen_WT_002_Samples", "A3 Spleen_GFP_003_Samples", "A4 Spleen_GFP_004_Samples"], "Group": ["Brain", "Brain", "Brain", "Brain", "Lung", "Lung", "Lung", "Lung", "Spleen", "Spleen", "Spleen", "Spleen"], "% Parent": [7.925229558373414e-05, 3.1504927370640767e-06, 3.2453834420536785e-05, 8.122553080884383e-06, 0.002252513595052467, 0.003785737084492271, 0.0009384225252237184, 0.00402574728368941, 2.0293305914822232e-05, 1.5132103261472656e-05, 2.5617776563305406e-05, 3.9583548754006825e-05]}, "statistic": "% Parent", "depth": 2}
     ]
 
-    kc.set_mode('Statistics')
+    kc.set_mode('Simple Stats')
 
     widget = StatisticalComparisonWidget(
         bus=EventBus(), controller=kc

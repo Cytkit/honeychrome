@@ -1880,7 +1880,7 @@ class Controller(QObject):
             elif tab_name == 'Unmixed Data':
                 self.current_mode = 'unmixed'
                 self.data_for_cytometry_plots = self.data_for_cytometry_plots_unmixed
-            elif tab_name == 'Statistics':
+            elif tab_name == 'Simple Stats':
                 self.current_mode = 'statistics'
                 self.data_for_cytometry_plots = self.data_for_cytometry_plots_unmixed
             else:
