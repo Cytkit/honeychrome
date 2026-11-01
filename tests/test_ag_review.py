@@ -537,6 +537,12 @@ def test_1dsep_to_2dsep_turns_sides_into_halves():
     assert out['pos']['region'] == 'x-y+|x+y+' and out['neg']['region'] == 'x-y-|x+y-'
 
 
+def test_1dsep_to_2dsep_keeps_chosen_quadrants():
+    pops = {'T cells': {'region': 'x+y-'}}
+    out, problem = ag_review.convert_threshold_regions(pops, '1dsep', 'A', 'B', '2dsep', 'A', 'B')
+    assert problem == '' and out['T cells']['region'] == 'x+y-'
+
+
 def test_rename_populations_moves_every_reference():
     g = _shape_gate('Gate', regions={'neg': 'x-y-', 'pos': 'x+y+'})
     child = dict(_poly_gate('Child', 2, 'C', 'D', 'Gate', 'pos'))

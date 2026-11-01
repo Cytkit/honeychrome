@@ -443,7 +443,8 @@ def convert_threshold_regions(populations: dict, old_type: str, old_x, old_y,
     takes its side of that parameter; populations that span both sides, or
     share a side, cannot be kept (Split into 1D gates instead).
     1dsep → 2dsep with the separation parameter on one axis: each side
-    becomes that half of the plot (two quadrants).
+    becomes that half of the plot (two quadrants). Populations that all
+    carry quadrants already (chosen in the gate editor) keep them.
 
     Returns (populations, '') or (None, reason). Other type changes return
     (populations unchanged, '').
@@ -467,6 +468,8 @@ def convert_threshold_regions(populations: dict, old_type: str, old_x, old_y,
             meta['label_pos'] = 2 if sign == '+' else 1
         return out, ''
     if (old_type, new_type) == ('1dsep', '2dsep'):
+        if out and all(ag_core.region_quadrants(m.get('region')) for m in out.values()):
+            return out, ''
         axis = 'x' if old_x == new_x else ('y' if old_x == new_y else None)
         if axis is None:
             return None, "One of the 2dsep gate's parameters must be the 1dsep separation parameter."

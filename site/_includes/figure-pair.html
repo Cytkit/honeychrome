@@ -1,0 +1,22 @@
+{%- comment -%}
+  Two images side by side at the same height, with one caption below.
+  Each image's column is as wide as its aspect ratio needs; on narrow
+  screens the images stack. Parameters:
+    src1, alt1, width1, height1   left image (src under /assets/img/)
+    src2, alt2, width2, height2   right image
+    caption                       optional caption (Markdown allowed)
+    class                         optional extra class, e.g. figure--paper
+{%- endcomment -%}
+{%- assign ratio1 = include.width1 | times: 1.0 | divided_by: include.height1 -%}
+{%- assign ratio2 = include.width2 | times: 1.0 | divided_by: include.height2 -%}
+<figure class="figure figure-pair{% if include.class %} {{ include.class }}{% endif %}" style="--ratio1: {{ ratio1 | round: 3 }}; --ratio2: {{ ratio2 | round: 3 }};">
+  <div class="figure-pair__images">
+    <a class="figure__link" href="{{ include.src1 | prepend: '/assets/img/' | relative_url }}" data-zoom>
+      <img src="{{ include.src1 | prepend: '/assets/img/' | relative_url }}" alt="{{ include.alt1 }}" loading="lazy" decoding="async" width="{{ include.width1 }}" height="{{ include.height1 }}">
+    </a>
+    <a class="figure__link" href="{{ include.src2 | prepend: '/assets/img/' | relative_url }}" data-zoom>
+      <img src="{{ include.src2 | prepend: '/assets/img/' | relative_url }}" alt="{{ include.alt2 }}" loading="lazy" decoding="async" width="{{ include.width2 }}" height="{{ include.height2 }}">
+    </a>
+  </div>
+  {% if include.caption %}<figcaption>{{ include.caption | markdownify | remove: '<p>' | remove: '</p>' }}</figcaption>{% endif %}
+</figure>

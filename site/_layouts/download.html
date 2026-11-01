@@ -1,0 +1,29 @@
+---
+layout: page
+---
+{%- comment -%}
+  Download page. Platform names, file names and links come from
+  _data/release.yml; the install steps come from the page's front matter;
+  the page body is laid out as columns.
+{%- endcomment -%}
+{% assign r = site.data.release %}
+<div class="platforms">
+  {%- for pl in page.platforms %}
+  {%- assign p = r.platforms[pl.key] %}
+  <section class="platform" id="{{ pl.key }}">
+    <h2>{% include icon.html name=pl.icon %} {{ p.name }}</h2>
+    <p class="platform__detail">{{ p.detail }}</p>
+    <ol>
+      {%- for step in pl.steps %}
+      <li>{{ step | markdownify | remove: '<p>' | remove: '</p>' | strip }}</li>
+      {%- endfor %}
+    </ol>
+    <a class="btn btn--honey" href="{{ p.url }}">{% include icon.html name="download" %}{{ p.action }}</a>
+    {%- if p.file %}
+    <p class="platform__file">{{ p.file }}</p>
+    {%- endif %}
+  </section>
+  {%- endfor %}
+</div>
+
+{% include columns.html content=content class="prose" %}

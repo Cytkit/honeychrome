@@ -684,6 +684,126 @@ _TOO_FEW_CLUSTERS_HINT = (
 
 
 # ---------------------------------------------------------------------------
+# Cluster renames
+# ---------------------------------------------------------------------------
+
+def stored_cluster_names(state) -> dict[int, str]:
+    """
+    {cluster id: name} used by the stored statistics results: the names
+    recorded when they were computed (state.stats_cluster_names), else, for
+    results saved before those were recorded, read from the tables
+    themselves (column i of the frequency and counts tables is cluster i;
+    MFI results carry 'cluster_id' and 'cluster').
+    """
+    recorded = getattr(state, 'stats_cluster_names', None)
+    if recorded:
+        return dict(recorded)
+    for df in (state.freq_df, state.counts_df):
+        if df is not None and not df.empty:
+            return {cl: str(name) for cl, name in enumerate(df.columns)}
+    res = state.mfi_results
+    if res is not None and not res.empty and {'cluster_id', 'cluster'} <= set(res.columns):
+        pairs = res[['cluster_id', 'cluster']].drop_duplicates()
+        return {int(cl): str(name) for cl, name in pairs.itertuples(index=False)}
+    return {}
+
+
+def cluster_renames(state, stored: dict[int, str], names: dict) -> dict[str, str]:
+    """
+    {old name: new name} for the clusters in *stored* ({cluster id: name in
+    a stored table}) whose display name under *names* (a run's own names
+    dict) differs. Raises ValueError when the new names are not unique.
+    """
+    current = {cl: _label_for(state, cl, names) for cl in stored}
+    renames = {stored[cl]: current[cl] for cl in stored if stored[cl] != current[cl]}
+    if renames and len(set(current.values())) != len(current):
+        raise ValueError("Two clusters of this run share a name.")
+    return renames
+
+
+def _renamed_values(df: pd.DataFrame | None, column: str,
+                    renames: dict[str, str]) -> pd.DataFrame | None:
+    """A copy of *df* with the values of *column* renamed; *df* itself when
+    it is None or has no such column."""
+    if df is None or column not in df.columns:
+        return df
+    df = df.copy()
+    df[column] = df[column].map(lambda value: renames.get(value, value))
+    return df
+
+
+def _stored_mfi_channels(state) -> list[str]:
+    """Channels of the stored MFI tables, in order."""
+    channels = []
+    if state.mfi_sample_df is not None:
+        channels.extend(str(ch) for ch in state.mfi_sample_df.columns)
+    res = state.mfi_results
+    if res is not None and 'channel' in res.columns:
+        channels.extend(str(ch) for ch in res['channel'].dropna().unique())
+    return list(dict.fromkeys(channels))
+
+
+def relabel_stats_results(state, names: dict) -> dict[str, str]:
+    """
+    Give the stored statistics results the current cluster names of their
+    run (*names*, the run's own names dict) without refitting: the
+    frequency, counts and MFI tables, the differential results, the Sample
+    PCA loadings and the predictive-analysis features.
+
+    Returns {old name: new name}, empty when nothing changed. Raises
+    ValueError, changing nothing, when the new names are not unique.
+    """
+    stored = stored_cluster_names(state)
+    renames = cluster_renames(state, stored, names)
+    if not renames:
+        return {}
+    mfi_renames = {f'{old}_{ch}': f'{new}_{ch}'
+                   for old, new in renames.items() for ch in _stored_mfi_channels(state)}
+    # Features of the Sample PCA and the predictive analysis carry a source prefix.
+    prefixed = {f'{prefix}{old}': f'{prefix}{new}'
+                for prefix in ('Freq: ', 'Counts: ') for old, new in renames.items()}
+    prefixed.update({f'MFI: {old}': f'MFI: {new}' for old, new in mfi_renames.items()})
+
+    if state.freq_df is not None:
+        state.freq_df = state.freq_df.rename(columns=renames)
+    if state.counts_df is not None:
+        state.counts_df = state.counts_df.rename(columns=renames)
+    if state.mfi_df is not None:
+        state.mfi_df = state.mfi_df.rename(columns=mfi_renames)
+    state.freq_results = _renamed_values(state.freq_results, 'feature', renames)
+    state.counts_results = _renamed_values(state.counts_results, 'feature', renames)
+    state.mfi_results = _renamed_values(
+        _renamed_values(state.mfi_results, 'feature', mfi_renames), 'cluster', renames)
+    if state.pca_loadings_df is not None:
+        state.pca_loadings_df = state.pca_loadings_df.rename(index=prefixed)
+    predictive = getattr(state, 'predictive_result', None)
+    if predictive and predictive.get('importance') is not None:
+        state.predictive_result = dict(
+            predictive, importance=_renamed_values(predictive['importance'], 'feature', prefixed))
+    state.stats_cluster_names = {cl: _label_for(state, cl, names) for cl in stored}
+    log.info("statistics results relabelled: %s", renames)
+    return renames
+
+
+def relabel_composition(state, names: dict) -> dict[str, str]:
+    """
+    Give the stored Composition table the current cluster names of its run
+    (*names*); its column i is cluster i. Returns
+    {old name: new name}; raises ValueError, changing nothing, when the new
+    names are not unique.
+    """
+    df = state.composition_df
+    if df is None or df.empty:
+        return {}
+    stored = {cl: str(name) for cl, name in enumerate(df.columns)}
+    renames = cluster_renames(state, stored, names)
+    if renames:
+        state.composition_df = df.rename(columns=renames)
+        state.composition_names = dict(names)
+    return renames
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -776,6 +896,9 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
     n_clusters = n_clusters_from_labels(
         state, all_rel, cluster_labels_override=cluster_labels_override
     )
+    # The names the result tables use, so a later rename can be applied to them.
+    state.stats_cluster_names = {cl: _label_for(state, cl, names_override)
+                                 for cl in range(n_clusters)}
 
     freq_results = mfi_results = counts_results = None
 

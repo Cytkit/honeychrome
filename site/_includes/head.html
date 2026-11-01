@@ -1,0 +1,16 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem('hc-theme'); } catch (e) {}
+    if (t === 'light' || t === 'dark') { document.documentElement.setAttribute('data-theme', t); }
+  })();
+</script>
+{% seo %}
+<link rel="icon" type="image/png" sizes="64x64" href="{{ '/assets/img/brand/favicon-64.png' | relative_url }}">
+<link rel="apple-touch-icon" href="{{ '/assets/img/brand/apple-touch-icon.png' | relative_url }}">
+<link rel="stylesheet" href="{{ '/assets/css/main.css' | relative_url }}">
+<script src="{{ '/assets/js/site.js' | relative_url }}" defer></script>
+{% if page.search %}<script src="{{ '/assets/js/search-index.js' | relative_url }}" defer></script>{% endif %}
+{% if jekyll.environment == 'production' and site.google_analytics %}{% include analytics.html %}{% endif %}

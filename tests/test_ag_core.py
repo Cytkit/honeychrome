@@ -660,6 +660,23 @@ def test_singlet_band_spans_the_axis():
 
 
 @pytest.mark.numpy_only
+def test_singlet_fit_ignores_saturated_pile_but_keeps_it_in_the_band():
+    rng = np.random.default_rng(7)
+    x = rng.uniform(0.2, 0.8, 9000)
+    singlets = np.column_stack([x, x + rng.normal(0, 0.01, 9000)])
+    pile = np.column_stack([np.full(600, 1.0), rng.uniform(0.3, 1.0, 600)])
+    data = np.vstack([singlets, pile])
+    g = _gate('S', 'singlets', 'A', 'H')
+    res = ag.train_boundaries([g], data, {'A': 0, 'H': 1}, axis_limits={'A': (0, 1), 'H': (0, 1)})
+    poly = np.asarray(res.boundaries['S']['in']['boundary'])
+    slope = (poly[1, 1] - poly[0, 1]) / (poly[1, 0] - poly[0, 0])
+    assert slope == pytest.approx(1.0, abs=0.02)
+    inside = res.masks['S']['in'][9000:]
+    assert inside[np.abs(pile[:, 1] - 1.0) < 0.02].all()
+    assert not inside[pile[:, 1] < 0.9].any()
+
+
+@pytest.mark.numpy_only
 def test_run_gating_stops_when_asked():
     data, idx = _three_channel_data()
     gates = [_gate('a', '1dsep', 'A', number=1), _gate('b', '1dsep', 'B', number=2)]
@@ -884,3 +901,19 @@ def test_threshold_factor_not_applied_is_reported():
     res = ag.train_boundaries([g], data.reshape(-1, 1), {'A': 0})
     assert res.boundaries['g']['pos']['threshold_x'] < 0
     assert 'not applied' in res.status['g']['message']
+
+
+@pytest.mark.numpy_only
+def test_population_display_names_add_the_gate_only_where_labels_clash():
+    gate_defs = [
+        {'gate_name': 'Treg', 'populations': {'Treg': {'label': 'Treg'}}},
+        {'gate_name': 'CD4 & CD8', 'populations': {'CD4': {'label': 'CD4'}, 'CD8': {}}},
+        {'gate_name': 'CD69 in CD4', 'populations': {'pos': {'label': 'Positive'}}},
+        {'gate_name': 'CD69 in CD8', 'populations': {'pos': {'label': 'Positive'}}},
+    ]
+    assert ag.gate_population_names(gate_defs) == {
+        'Treg/Treg': 'Treg', 'CD4 & CD8/CD4': 'CD4', 'CD4 & CD8/CD8': 'CD8',
+        'CD69 in CD4/pos': 'CD69 in CD4 Positive', 'CD69 in CD8/pos': 'CD69 in CD8 Positive'}
+    # One row per sample: a repeated key counts once.
+    rows = [('Treg/Treg', 'Treg', 'Treg')] * 3
+    assert ag.population_display_names(rows) == {'Treg/Treg': 'Treg'}

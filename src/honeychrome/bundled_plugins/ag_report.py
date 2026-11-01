@@ -339,7 +339,8 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
                        predictive: dict | None = None, include_gates: bool = True,
                        populations: list | None = None,
                        population_figure=None,
-                       enrichment: dict | None = None) -> list[ReportItem]:
+                       enrichment: dict | None = None,
+                       group_colours: dict | None = None) -> list[ReportItem]:
     """Every available report item, in section order.
 
     pca               : ag_results.sample_pca() result, or None.
@@ -348,6 +349,8 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
     populations       : [(population key, label)] ticked for the report.
     population_figure : callable(population key) -> Figure of the
                         population's group comparison.
+    group_colours     : {group: colour} for the statistics figures and the
+                        sample PCA (default palette when None).
     enrichment        : ag_fsea.run_enrichment() result, or None.
 
     build_figures : callable(stats, base, other, pval, fc, marker, fdr_scope,
@@ -357,11 +360,7 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
                     of that comparison's figures is exported.
     """
     items: list[ReportItem] = []
-    pop_labels = {}
-    for g in gate_defs:
-        for pop, info in (g.get('populations') or {}).items():
-            pop_labels[ag_core.population_key(g['gate_name'], pop)] = \
-                f"{g['gate_name']} {(info or {}).get('label') or pop}"
+    pop_labels = ag_core.gate_population_names(gate_defs)
 
     if summaries:
         items.append(ReportItem(
@@ -405,9 +404,10 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
 
         def _figures(comp):
             if comp not in cache:
+                colours = {'group_colours': group_colours} if group_colours else {}
                 cache[comp] = build_figures(stats, comp[0], comp[1], pval_threshold,
                                             fc_threshold, marker_threshold, fdr_scope, False,
-                                            antigens, pop_labels)
+                                            antigens, pop_labels, **colours)
             return cache[comp]
 
         for base, other in stats.get('comparisons') or []:
@@ -441,7 +441,7 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
     if pca:
         items.append(ReportItem(
             key='sample_pca', tab='Statistics', label='Sample PCA',
-            get_figure=lambda: make_pca_figure(pca, False),
+            get_figure=lambda: make_pca_figure(pca, False, group_colours=group_colours),
             get_tables=lambda: {'scores': pca['scores'].assign(group=pca['groups']),
                                 'loadings': pca['loadings']}))
     if predictive:
@@ -514,10 +514,12 @@ def p_value_text(result: dict | None) -> str:
 
 def make_population_comparison_figure(gate_def: dict, pop: str, panels: list, transforms: dict,
                                       axis_labels: dict, values: dict, group_order: list[str],
-                                      title: str, p_text: str = ''):
+                                      title: str, p_text: str = '',
+                                      group_colours: dict | None = None):
     """The report figure of one population: each group's pooled parent
     events on the gate's axes with the reference boundary and the group's
-    gated frequency, then the dot and violin plot of the per-sample values.
+    gated frequency, then the dot and violin plot of the per-sample values
+    (coloured by *group_colours*, {group: colour}, when given).
 
     panels : [{'group', 'events', 'parent', 'member', 'channels',
                'boundary', 'n_samples'}], one per group.
@@ -536,7 +538,8 @@ def make_population_comparison_figure(gate_def: dict, pop: str, panels: list, tr
                          axis_labels,
                          f"{panel['group']} ({panel.get('n_samples', 0)} samples pooled)",
                          fractions={pop: frac} if frac is not None else None, ax=ax)
-    make_group_values_figure(values, group_order, f"{label}: % of parent", p_text, ax=axes[-1])
+    make_group_values_figure(values, group_order, f"{label}: % of parent", p_text, ax=axes[-1],
+                             group_colours=group_colours)
     fig.suptitle(title, fontsize=10)
     return fig
 

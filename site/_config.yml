@@ -1,0 +1,60 @@
+title: Honeychrome
+tagline: Open-source spectral cytometry with AutoSpectral built in
+description: >-
+  Free, open-source desktop software for spectral and conventional flow cytometry:
+  AutoSpectral unmixing, automated gating, clustering and statistics on macOS, Windows and Linux.
+url: https://honeychrome.cytkit.com
+baseurl: ""
+repository: Cytkit/honeychrome
+github_url: https://github.com/Cytkit/honeychrome
+edit_branch: main
+site_source_dir: site
+google_analytics: G-NLDH8KTTSG
+
+lang: en-GB
+theme: null
+encoding: utf-8
+permalink: pretty
+markdown: kramdown
+highlighter: rouge
+kramdown:
+  input: GFM
+  hard_wrap: false
+  syntax_highlighter: rouge
+  auto_ids: true
+  toc_levels: 2..3
+
+collections:
+  home:
+    output: false
+
+plugins:
+  - jekyll-redirect-from
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - tools
+  - README.md
+  - .jekyll-cache
+  - _preview
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: page
+      image: /assets/img/brand/og-image.jpg
+  - scope:
+      path: ""
+      type: home
+    values:
+      layout: none
+  - scope:
+      path: "docs"
+    values:
+      layout: docs
+      search: true

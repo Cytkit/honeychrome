@@ -1,0 +1,69 @@
+# Documentation sidebar. Groups appear in this order; pages within a group
+# appear in the order listed. Previous/next links follow the same order.
+# "summary" is shown on the Docs home page cards.
+
+- group: Get started
+  summary: Install Honeychrome and learn your way around.
+  pages:
+    - title: Install
+      url: /docs/get-started/install/
+
+- group: Unmixing
+  summary: Build a spectral model, clean controls and remove autofluorescence.
+  pages:
+    - title: Spectral unmixing
+      url: /docs/unmixing/spectral-unmixing/
+    - title: Conventional compensation
+      url: /docs/unmixing/conventional-compensation/
+    - title: AutoSpectral in Honeychrome
+      url: /docs/unmixing/autospectral/
+    - title: Control cleaning
+      url: /docs/unmixing/control-cleaning/
+    - title: Autofluorescence
+      url: /docs/unmixing/autofluorescence/
+    - title: Noise model
+      url: /docs/unmixing/noise-model/
+    - title: Spectral variants
+      url: /docs/unmixing/spectral-variants/
+    - title: Spectral correction
+      url: /docs/unmixing/spectral-correction/
+
+- group: Plots and gating
+  summary: Plots, transforms, gates and per-sample gates.
+  pages:
+    - title: Plots and gates
+      url: /docs/plots-and-gating/plots-and-gates/
+    - title: Per-sample gating
+      url: /docs/plots-and-gating/per-sample-gating/
+
+- group: Statistics
+  summary: Compare samples and groups of samples.
+  pages:
+    - title: Simple Stats
+      url: /docs/statistics/simple-stats/
+
+- group: Outputs
+  summary: Write reports and export plots and FCS files.
+  pages:
+    - title: Reports and exports
+      url: /docs/outputs/reports-and-exports/
+
+- group: Acquisition
+  summary: Run a Cytkit cytometer from Honeychrome.
+  pages:
+    - title: Acquire data
+      url: /docs/instrument/acquisition/
+
+- group: Reference
+  summary: Long jobs, privacy and other details.
+  pages:
+    - title: Long jobs
+      url: /docs/reference/long-jobs/
+    - title: Privacy and debug data
+      url: /docs/reference/privacy/
+
+- group: Developers
+  summary: Extend Honeychrome with Python plugins.
+  pages:
+    - title: Programming and plugins
+      url: /docs/developers/plugins/

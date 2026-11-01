@@ -74,7 +74,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QTreeWidget, QTreeWidgetItem,
     QAbstractItemView, QListWidget, QListWidgetItem,
-    QProgressBar, QGridLayout, QDialog,
+    QProgressBar, QGridLayout, QDialog, QColorDialog,
 )
 
 import honeychrome
@@ -202,6 +202,13 @@ MODE_LABELS = {ag_core.MODE_FIXED: 'Fixed', ag_core.MODE_RECALCULATE: 'Recalcula
 DRIFT_ACTIONS = {'flag': 'Flag only', 'reference': 'Use the stored boundary'}
 FDR_SCOPES = {'global': 'Pooled over comparisons', 'per_comparison': 'Within each comparison'}
 CONTRAST_MODES = {'reference': 'Each group against a reference', 'pairwise': 'All pairs of groups'}
+# Statistics settings put back by the Restore defaults button. The design
+# (comparisons, reference group, pairing, adjustment covariates) is kept.
+STATS_DEFAULT_KEYS = ('run_freq', 'run_counts', 'counts_method', 'run_markers', 'use_stats_parent',
+                      'exclude_gating_markers', 'min_marker_events', 'pval_threshold', 'fc_threshold',
+                      'marker_threshold', 'use_treat', 'fdr_scope', 'exclude_flagged')
+# Statistics settings applied to stored results without running them again.
+THRESHOLD_KEYS = ('pval_threshold', 'fc_threshold', 'marker_threshold', 'use_treat', 'fdr_scope')
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -277,14 +284,19 @@ def _sample_label(key: str) -> str:
     return Path(str(key)).stem
 
 
+def _group_colours(state) -> dict:
+    """{group: colour} for every group: the colour chosen on the Groups page,
+    else differential_plots.GROUP_COLOURS in group order, so a group has the
+    same colour in every figure."""
+    from honeychrome.view_components.differential_plots import GROUP_COLOURS
+    return {g: state.group_colors.get(g) or GROUP_COLOURS[i % len(GROUP_COLOURS)]
+            for i, g in enumerate(state.group_names)}
+
+
 def _population_labels(gate_defs: list[dict]) -> dict:
-    """{'gate/pop': 'gate label'} for display."""
-    out = {}
-    for g in gate_defs:
-        for pop, info in (g.get('populations') or {}).items():
-            label = (info or {}).get('label') or pop
-            out[ag_core.population_key(g['gate_name'], pop)] = f"{g['gate_name']} {label}"
-    return out
+    """{'gate/pop': display name}: the population's label, prefixed by its
+    gate only where another population shares the label."""
+    return ag_core.gate_population_names(gate_defs)
 
 
 def model_sha(model: dict) -> str:
@@ -405,6 +417,7 @@ class GatingRunState:
 
     group_names: list = field(default_factory=list)
     group_patterns: dict = field(default_factory=dict)
+    group_colors: dict = field(default_factory=dict)
     sample_groups: dict = field(default_factory=dict)
     covariates: dict = field(default_factory=dict)
     numeric_covariates: list = field(default_factory=list)
@@ -481,7 +494,7 @@ _VIEW_FIELDS = ('model_path', 'model_sha', 'results_model_sha', 'marker_channels
 
 _PERSISTED_FIELDS = (
     'modes', 'drift_limit', 'drift_action', 'run_samples', 'validation_samples', 'include_controls',
-    'display_events', 'group_names', 'group_patterns', 'sample_groups', 'covariates',
+    'display_events', 'group_names', 'group_patterns', 'group_colors', 'sample_groups', 'covariates',
     'numeric_covariates', 'pairing', 'adjust_covariates', 'contrast_mode', 'reference_group', 'pval_threshold',
     'fc_threshold', 'marker_threshold', 'use_treat', 'fdr_scope', 'run_freq', 'run_counts',
     'counts_method', 'run_markers', 'use_stats_parent', 'exclude_gating_markers', 'min_marker_events',
@@ -1713,9 +1726,11 @@ def _comparison_view(results: pd.DataFrame | None, label: str) -> pd.DataFrame |
 
 def build_result_figures(stats: dict, base: str, other: str, pval_threshold: float,
                          fc_threshold: float, marker_threshold: float, fdr_scope: str,
-                         is_dark: bool, antigens: dict, pop_labels: dict) -> dict:
+                         is_dark: bool, antigens: dict, pop_labels: dict,
+                         group_colours: dict | None = None) -> dict:
     """Every results figure for one comparison. Pure matplotlib (no canvas),
-    so it runs on a worker thread.
+    so it runs on a worker thread. *group_colours* ({group: colour}) colours
+    the group bars and direction ramps.
 
     Returns {key: {'fig', 'title', 'error', 'results'}}; 'results' is the
     table a volcano was drawn from (for click-through), in plotted order.
@@ -1755,11 +1770,13 @@ def build_result_figures(stats: dict, base: str, other: str, pval_threshold: flo
              title=f"{name}: significant populations, {label}",
              group_by_sample=group_by_sample, group_a=base, group_b=other, is_dark=is_dark,
              run_label=run_label, value_label=value_label,
-             feature_labels={f: pop_labels.get(f, f) for f in view['feature']})
+             feature_labels={f: pop_labels.get(f, f) for f in view['feature']},
+             group_colours=group_colours)
         _add(f'{key}_volcano', f"{name} volcano", dp.make_volcano_figure, results=view,
              results_df=view, title=f"{name} volcano: {label}", pval_threshold=pval_threshold,
              fc_threshold=thr, is_dark=is_dark, fdr_scope=fdr_scope, feature_labels=labels,
-             x_label=x_label, run_label=run_label, group_a=base, group_b=other)
+             x_label=x_label, run_label=run_label, group_a=base, group_b=other,
+             group_colours=group_colours)
 
     mview = _comparison_view(stats.get('markers'), label)
     if mview is not None:
@@ -1774,7 +1791,7 @@ def build_result_figures(stats: dict, base: str, other: str, pval_threshold: flo
              results_df=mview, title=f"Marker volcano: {label}", pval_threshold=pval_threshold,
              fc_threshold=marker_threshold, is_dark=is_dark, fdr_scope=fdr_scope,
              feature_labels=mlabels, x_label='Δ median (transformed units)', run_label=run_label,
-             group_a=base, group_b=other)
+             group_a=base, group_b=other, group_colours=group_colours)
     return out
 
 
@@ -1904,14 +1921,17 @@ class ResultsTab(QWidget):
 
         gbox = QGroupBox("Groups")
         gl = QVBoxLayout(gbox)
-        self.groups_table = QTableWidget(0, 2)
-        self.groups_table.setHorizontalHeaderLabels(["Group", "Sample-name pattern (regex)"])
+        self.groups_table = QTableWidget(0, 3)
+        self.groups_table.setHorizontalHeaderLabels(["Group", "Sample-name pattern (regex)", "Colour"])
         groups_header = self.groups_table.horizontalHeader()
         groups_header.setSectionResizeMode(QHeaderView.Interactive)
-        groups_header.setStretchLastSection(True)
+        groups_header.setSectionResizeMode(1, QHeaderView.Stretch)
+        groups_header.setStretchLastSection(False)
         self.groups_table.setColumnWidth(0, 180)
+        self.groups_table.setColumnWidth(2, 60)
         self.groups_table.verticalHeader().setVisible(False)
         self.groups_table.itemChanged.connect(self._on_group_item_changed)
+        self.groups_table.cellDoubleClicked.connect(self._on_group_cell_double_clicked)
         gl.addWidget(self.groups_table)
         row = QHBoxLayout()
         for text, slot in (("Add group", self._on_add_group), ("Remove group", self._on_remove_group),
@@ -1984,12 +2004,18 @@ class ResultsTab(QWidget):
         self._filling = True
         try:
             self.groups_table.setRowCount(0)
+            colours = _group_colours(self.state)
             for r, name in enumerate(self.state.group_names):
                 self.groups_table.insertRow(r)
                 item = QTableWidgetItem(name)
                 item.setData(Qt.UserRole, name)
                 self.groups_table.setItem(r, 0, item)
                 self.groups_table.setItem(r, 1, QTableWidgetItem(self.state.group_patterns.get(name, '')))
+                swatch = QTableWidgetItem('')
+                swatch.setBackground(QColor(colours[name]))
+                swatch.setFlags(swatch.flags() & ~Qt.ItemIsEditable)
+                swatch.setToolTip("Double-click to choose this group's colour in every figure.")
+                self.groups_table.setItem(r, 2, swatch)
         finally:
             self._filling = False
         self._populate_samples_table()
@@ -2080,6 +2106,8 @@ class ResultsTab(QWidget):
             st.group_names[st.group_names.index(old)] = new
             if old in st.group_patterns:
                 st.group_patterns[new] = st.group_patterns.pop(old)
+            if old in st.group_colors:
+                st.group_colors[new] = st.group_colors.pop(old)
             for k, g in list(st.sample_groups.items()):
                 if g == old:
                     st.sample_groups[k] = new
@@ -2088,8 +2116,23 @@ class ResultsTab(QWidget):
             item.setData(Qt.UserRole, new)
             self._populate_samples_table()
             self._populate_stats_choices()
-        else:
+        elif item.column() == 1:
             st.group_patterns[old] = item.text().strip()
+
+    def _on_group_cell_double_clicked(self, row: int, col: int):
+        """Choose a group's colour (the Colour column) and redraw the figures."""
+        st = self.state
+        if col != 2 or row >= len(st.group_names):
+            return
+        name = st.group_names[row]
+        colour = QColorDialog.getColor(QColor(_group_colours(st)[name]), self,
+                                       f"Colour for group '{name}'")
+        if not colour.isValid():
+            return
+        st.group_colors[name] = colour.name()
+        self._populate_groups()
+        if st.stats:
+            self._draw_figures()
 
     def _on_add_group(self):
         n = 1
@@ -2107,6 +2150,7 @@ class ResultsTab(QWidget):
         st = self.state
         st.group_names.remove(name)
         st.group_patterns.pop(name, None)
+        st.group_colors.pop(name, None)
         st.sample_groups = {k: g for k, g in st.sample_groups.items() if g != name}
         self._populate_groups()
         self._populate_stats_choices()
@@ -2308,6 +2352,17 @@ class ResultsTab(QWidget):
         left.setMaximumWidth(420)
         form = QFormLayout(left)
 
+        self.btn_stats_defaults = QPushButton("Restore defaults")
+        self.btn_stats_defaults.setToolTip(
+            "Put the tests, counts test, marker options, thresholds, TREAT, FDR correction and "
+            "'Leave out flagged samples' back to their default values. Comparisons, reference "
+            "group, pairing and adjustment covariates are kept.")
+        self.btn_stats_defaults.clicked.connect(self._restore_stats_defaults)
+        defaults_row = QHBoxLayout()
+        defaults_row.addWidget(self.btn_stats_defaults)
+        defaults_row.addStretch()
+        form.addRow(defaults_row)
+
         self.chk_freq = QCheckBox("Population frequencies (log odds within parent)")
         self.chk_counts = QCheckBox("Population counts (negative binomial, parent offset)")
         self.chk_markers = QCheckBox("Marker medians (population first)")
@@ -2413,6 +2468,36 @@ class ResultsTab(QWidget):
             w.valueChanged.connect(self._on_thresholds_changed)
         self.chk_treat.toggled.connect(self._on_thresholds_changed)
         self.cb_fdr.currentIndexChanged.connect(self._on_thresholds_changed)
+        for box in (self.chk_freq, self.chk_counts, self.chk_markers, self.chk_stats_parent,
+                    self.chk_exclude_gating, self.chk_exclude_flagged, self.chk_treat):
+            box.toggled.connect(self._update_stats_defaults_button)
+        for spin in (self.sb_min_events, self.sb_pval, self.sb_fc, self.sb_marker):
+            spin.valueChanged.connect(self._update_stats_defaults_button)
+        for combo in (self.cb_counts_method, self.cb_fdr):
+            combo.currentIndexChanged.connect(self._update_stats_defaults_button)
+
+    def _update_stats_defaults_button(self, *_args):
+        """Grey the Restore defaults button while every statistics setting
+        it puts back is at its default."""
+        defaults = GatingRunState()
+        self.btn_stats_defaults.setEnabled(
+            any(getattr(self.state, key) != getattr(defaults, key) for key in STATS_DEFAULT_KEYS))
+
+    def _restore_stats_defaults(self):
+        """Put the statistics settings back to their defaults. Stored
+        results are re-thresholded when only thresholds, TREAT or the FDR
+        correction changed; the other settings apply at the next run."""
+        st = self.state
+        defaults = GatingRunState()
+        changed = [key for key in STATS_DEFAULT_KEYS if getattr(st, key) != getattr(defaults, key)]
+        if not changed:
+            return
+        for key in changed:
+            setattr(st, key, getattr(defaults, key))
+        self._load_stats_controls()
+        if set(changed) & set(THRESHOLD_KEYS):
+            self._on_thresholds_changed()
+        _status(self.bus, "Statistics settings restored to their defaults.")
 
     def _load_stats_controls(self):
         st = self.state
@@ -2443,6 +2528,7 @@ class ResultsTab(QWidget):
         finally:
             self._filling = False
         self._populate_stats_choices()
+        self._update_stats_defaults_button()
 
     def _populate_stats_choices(self):
         st = self.state
@@ -2656,7 +2742,7 @@ class ResultsTab(QWidget):
         stats = st.stats
         args = (comp[0], comp[1], st.pval_threshold, st.fc_threshold, st.marker_threshold,
                 st.fdr_scope, _is_dark_palette(), _antigen_map(self.controller),
-                _population_labels(st.gate_defs()))
+                _population_labels(st.gate_defs()), _group_colours(st))
 
         def _build():
             return build_result_figures(stats, *args)
@@ -2742,7 +2828,6 @@ class ResultsTab(QWidget):
         worker.start()
 
     def _show_pop_out(self, worker, ok: bool, error: str, fig, title: str, results, large: bool):
-        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
         from honeychrome.view_components.scalable_figure_widget import initial_scale_for
         if worker in self._popout_workers:
             self._popout_workers.remove(worker)
@@ -2762,7 +2847,7 @@ class ResultsTab(QWidget):
                                                             self._row_figures.pop(k, None)))
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(4, 4, 4, 4)
-        layout.addWidget(NavigationToolbar2QT(widget.canvas, dialog))
+        layout.addWidget(widget.make_toolbar(dialog))
         layout.addWidget(widget, stretch=1)
         dpi = fig.get_dpi()
         scale = widget.scale_percent() / 100.0
@@ -3054,8 +3139,9 @@ class ResultsTab(QWidget):
         try:
             makers = []
             if st.pca:
-                pca = st.pca
-                makers.append(("Sample PCA", lambda: ag_report.make_pca_figure(pca, is_dark)))
+                pca, colours = st.pca, _group_colours(st)
+                makers.append(("Sample PCA", lambda: ag_report.make_pca_figure(
+                    pca, is_dark, group_colours=colours)))
             res = st.predictive
             if res:
                 summary = res['summary']
@@ -3341,7 +3427,8 @@ class ResultsTab(QWidget):
                 layout.addWidget(tile)
         fig = ag_report.make_group_values_figure(
             data['values'], data['groups'], f"{data['label']}: % of parent",
-            ag_report.p_value_text(data['result']), is_dark=_is_dark_palette())
+            ag_report.p_value_text(data['result']), is_dark=_is_dark_palette(),
+            group_colours=_group_colours(self.state))
         import honeychrome.settings as hc_settings
         canvas = scrollable_canvas_class()(fig)
         size = int(getattr(hc_settings, 'cytometry_plot_width_target_retrieved', 220) or 220)
@@ -3388,7 +3475,7 @@ class ResultsTab(QWidget):
         return ag_report.make_population_comparison_figure(
             data['gate_def'], data['pop'], data['panels'] if self.state.display else [],
             self._result_transforms(), labels, data['values'], data['groups'], data['title'],
-            ag_report.p_value_text(data['result']))
+            ag_report.p_value_text(data['result']), group_colours=_group_colours(self.state))
 
     def _save_population_image(self, pop_key: str):
         """Save one population's group biplots and dot and violin plot as a
@@ -3500,6 +3587,7 @@ class ResultsTab(QWidget):
             stats=st.stats, pval_threshold=st.pval_threshold, fc_threshold=st.fc_threshold,
             marker_threshold=st.marker_threshold, fdr_scope=st.fdr_scope,
             build_figures=build_result_figures, pca=st.pca or None,
+            group_colours=_group_colours(st),
             predictive=st.predictive or None,
             populations=[(k, _population_labels(st.gate_defs()).get(k, k))
                          for k in st.report_populations],

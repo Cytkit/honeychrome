@@ -1,0 +1,13 @@
+{% assign r = site.data.release %}
+<div class="banner" role="region" aria-label="Download">
+  <div class="wrap banner__inner">
+    <p class="banner__text">
+      <strong>{{ r.headline }}.</strong>
+      <span class="banner__summary">{{ r.summary }}</span>
+      <a class="banner__notes" href="{{ '/releases/' | relative_url }}">Release notes</a>
+    </p>
+    <a class="btn btn--honey btn--small" data-os-download href="{{ '/download/' | relative_url }}">
+      {% include icon.html name="download" %}<span data-os-label>Download {{ r.version }}</span>
+    </a>
+  </div>
+</div>

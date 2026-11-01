@@ -158,3 +158,22 @@ def test_report_items_list_gates_only_with_display_events():
     assert any('pooled display events' in t.get_text() for t in [fig.axes[0].title])
     without = ag_report.build_report_items(display={}, **common)
     assert 'gate:T' not in [item.key for item in without]
+
+
+def test_report_statistics_figures_get_the_group_colours():
+    seen = {}
+
+    def _build(*_args, **kwargs):
+        seen.update(kwargs)
+        return {}
+
+    colours = {'A': '#018700', 'B': '#00acc6'}
+    items = ag_report.build_report_items(
+        gate_defs=[], reference_boundaries={}, modes={}, summaries={}, samples=[],
+        load_info={}, display={}, groups={}, flags={}, antigens={}, transforms={},
+        axis_labels={}, stats={'comparisons': [('A', 'B')], 'freq': object()},
+        pval_threshold=0.05, fc_threshold=0.5, marker_threshold=0.0, fdr_scope='global',
+        build_figures=_build, group_colours=colours)
+    volcano = [item for item in items if item.key.startswith('freq_volcano')][0]
+    volcano.get_figure()
+    assert seen == {'group_colours': colours}

@@ -1,0 +1,21 @@
+{%- comment -%}
+  Search box and the grouped list of help pages, drawn from _data/docs_nav.yml.
+{%- endcomment -%}
+<form class="search search--large" role="search" data-search>
+  <label class="sr-only" for="docs-home-search">Search the docs</label>
+  {% include icon.html name="search" %}
+  <input id="docs-home-search" type="search" placeholder="Search the docs, for example: autofluorescence" autocomplete="off" data-search-input>
+  <div class="search__results" data-search-results hidden></div>
+</form>
+
+<div class="doc-groups">
+  {% for g in site.data.docs_nav %}
+  <section class="doc-group">
+    <h2>{{ g.group }}</h2>
+    <p>{{ g.summary }}</p>
+    <ul>
+      {% for p in g.pages %}<li><a href="{{ p.url | relative_url }}">{{ p.title }}</a></li>{% endfor %}
+    </ul>
+  </section>
+  {% endfor %}
+</div>

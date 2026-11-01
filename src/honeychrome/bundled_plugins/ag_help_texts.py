@@ -38,7 +38,9 @@ histogram.</li>
 <li><b>2dsep</b>: a threshold on each of two channels, giving four
 quadrants. A population is one quadrant or several joined.</li>
 <li><b>singlets</b>: a band around the diagonal of a scatter area against
-height plot.</li>
+height plot. Events piled at the top of either scatter axis (saturated) are
+left out of the fit; they stay in the gate when they fall inside the
+band.</li>
 <li><b>free</b>: a shape on two scatter channels. The <b>cells</b> algorithm
 cuts the debris off and trims the edges where the density falls away;
 <b>all</b> takes the convex hull of the parent population.</li>
@@ -241,9 +243,11 @@ tail fraction, number of mixture components, quantile trimming, the part of
 the axis used, the threshold factor and, for singlets gates, the band width
 in standard deviations.</li>
 <li>Changing a gate between <i>1dsep</i> and <i>2dsep</i> keeps its
-population names, so the gates below stay attached. A change that would
-leave gates below without their parent population is refused, naming
-them.</li>
+population names, so the gates below stay attached. Going to 2dsep, each
+side becomes two quadrants; tick the quadrants each population covers in
+the <b>Quadrants</b> column (e.g. X+ Y− only). Changing a gate's type
+returns its mixture components to 2. A change that would leave gates below
+without their parent population is refused, naming them.</li>
 <li>Renaming a population in the editor renames it for the gates below
 too.</li>
 <li><b>Add gate manually</b> creates a gate that is not on the main
@@ -737,6 +741,10 @@ threshold. With it off, they test for any difference and the threshold only
 filters.</li>
 <li>FDR is pooled over all comparisons or taken within each. Changing a
 threshold updates significance without refitting.</li>
+<li><b>Restore defaults</b>, at the top of the settings, puts the tests and
+their options, the thresholds, TREAT, the FDR correction and <i>Leave out
+flagged samples</i> back to their defaults. Comparisons, reference group,
+pairing and covariates are kept.</li>
 <li>The same framework has been used in systems-immunology studies of flow
 cytometry cohorts [6, 7].</li>
 </ul>

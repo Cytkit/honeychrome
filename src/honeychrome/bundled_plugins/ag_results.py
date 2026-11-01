@@ -518,8 +518,9 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
         values, meta, dropped = marker_table(
             summaries, used, gate_defs, exclude_gating_markers=exclude_gating_markers,
             min_events=min_marker_events,
-            population_labels={r['key']: f"{r['gate']} {r['label']}"
-                               for s in used for r in summaries[s].get('populations', [])})
+            population_labels=ag_core.population_display_names(
+                (r['key'], r['gate'], r['label'])
+                for s in used for r in summaries[s].get('populations', [])))
         if dropped:
             out['notes'].append(
                 f"Populations with at least {min_marker_events} events in fewer than "

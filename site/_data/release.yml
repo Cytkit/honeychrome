@@ -1,0 +1,31 @@
+# The current release. Every download link on the site (banner, home page,
+# Download page, Install guide) reads from this file, so a new release means
+# editing only the lines below.
+version: 1.0.0
+tag: v1.0.0
+headline: Honeychrome 1.0 is here
+summary: Faster AutoSpectral, Automated Gating, Honeycluster and per-sample gating.
+python: "3.12"
+
+platforms:
+  mac:
+    name: macOS
+    detail: Apple Silicon (arm64), macOS 11 or later
+    file: honeychrome-v1.0.0-macos.dmg
+    url: https://github.com/Cytkit/honeychrome/releases/download/v1.0.0/honeychrome-v1.0.0-macos.dmg
+    action: Download for macOS
+  windows:
+    name: Windows
+    detail: Windows 10 or 11, x64, from the Microsoft Store
+    url: https://apps.microsoft.com/detail/9nxl24t3t6lv
+    action: Get it from the Microsoft Store
+  linux:
+    name: Linux
+    detail: Ubuntu 24.04 or later, x64 (Wayland)
+    file: honeychrome-v1.0.0-linux-x64.tar.gz
+    url: https://github.com/Cytkit/honeychrome/releases/download/v1.0.0/honeychrome-v1.0.0-linux-x64.tar.gz
+    action: Download for Linux
+
+releases_url: https://github.com/Cytkit/honeychrome/releases
+pypi_url: https://pypi.org/project/honeychrome/
+video_url: https://youtu.be/RQ4-RQkDCm4
