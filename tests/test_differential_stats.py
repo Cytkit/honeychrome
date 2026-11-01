@@ -335,6 +335,33 @@ def test_feature_missing_in_the_first_pairing_level_is_tested():
         np.testing.assert_allclose(first['P.Value'], last['P.Value'], rtol=1e-6, atol=1e-12, equal_nan=True)
 
 
+def test_counts_tests_give_finite_results_for_a_group_with_no_events():
+    """A feature with no events in the baseline group and one event in
+    the other gets a finite logFC from the prior count, and no small p:
+    the QL test does not count its exactly fitted zeros as residual df."""
+    pytest.importorskip('statsmodels')
+    rng = np.random.default_rng(6)
+    counts, groups, pairs = _paired_null(rng, total=2000)
+    counts = counts.astype(float)
+    counts['f0'] = 0.0
+    counts.loc[counts.index[1], 'f0'] = 1.0            # one event, group B of the first mouse
+    contrasts = ds.build_contrasts(['A', 'B'], 'reference', 'A')
+    for method in ('ql', 'wald'):
+        res = ds.run_glm_counts(counts, groups, contrasts, 'reference', 0.05, 0.0, pairing_vec=pairs,
+                                use_treat=False, method=method).set_index('feature')
+        assert 0.0 < res.loc['f0', 'logFC'] < 10.0
+        assert res.loc['f0', 'P.Value'] > 0.05
+
+
+@pytest.mark.numpy_only
+def test_residual_df_leaves_out_exact_zero_fits():
+    pairs = ['m0', 'm0', 'm1', 'm1', 'm2', 'm2', 'm3', 'm3']
+    design, _names, _cols = ds.build_design(['A', 'B'] * 4, 'A', pairs, None)
+    Y, mu = np.ones((2, 8)), np.ones((2, 8))
+    Y[1, :2], mu[1, :2] = 0.0, 1e-9                    # no events in mouse m0
+    np.testing.assert_array_equal(ds._residual_df(Y, mu, design), [3.0, 2.0])
+
+
 @pytest.mark.numpy_only
 def test_library_sizes():
     rng = np.random.default_rng(2)
