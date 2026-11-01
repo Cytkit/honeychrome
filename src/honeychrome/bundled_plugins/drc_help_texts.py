@@ -458,6 +458,10 @@ for MFIs. Choose whether to <b>Test against thresholds (TREAT)</b> and use
 <b>Cluster-first MFI testing</b>, and the FDR scope.</li>
 <li>Changing the thresholds and clicking Run Statistics again recomputes the
 p-values from the stored fits without refitting.</li>
+<li><b>Restore defaults</b> puts the tests, FDR level, thresholds, FDR scope,
+TREAT, cluster-first MFI testing, counts test and library size back to their
+defaults. Groups, contrast mode, reference, pairing, covariates and marker
+roles are kept. Run Statistics applies them.</li>
 <li><b>Marker Roles — MFI Testing</b>: every channel starts as a
 <i>state</i> marker and is tested. Untick a channel to make it a
 <i>type</i> marker and leave it out of MFI testing. Do this for a channel

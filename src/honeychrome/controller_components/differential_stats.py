@@ -15,6 +15,9 @@ intensities. Used by the Honeycluster and Automated Gating plugins.
   ``'ql'`` (quasi-likelihood F test after Lund et al. 2012 and edgeR's
   glmQLFit: negative-binomial dispersion shrunk towards a common prior,
   then a per-feature quasi-dispersion moderated by empirical Bayes).
+  Observations fitted exactly as zero carry no residual degrees of freedom,
+  and the reported log fold change comes from a fit with edgeR's prior
+  count, so a group with no events gives a finite estimate.
 * ``library_sizes`` — effective library sizes for compositional data:
   the totals, a robust (trimmed) rescaling that a few dominant features
   cannot move, or the totals of chosen control features.
@@ -341,6 +344,86 @@ def covariate_frame(covariates: pd.DataFrame | None, sample_ids: list[str],
     return pd.DataFrame(columns, index=list(sample_ids))
 
 
+def _pairing_level_label(level: str) -> str:
+    """Display form of a pairing level; samples without a value carry the
+    level '__unpaired_<sample>'."""
+    if level.startswith('__unpaired_'):
+        return f"sample {Path(level[len('__unpaired_'):]).stem}"
+    return repr(level)
+
+
+def _pairing_confounded_message(group_vec: list[str], pairing_vec: list[str]) -> str:
+    """
+    Plain-language reason that pairing makes the design rank-deficient.
+
+    With an intercept, group indicators and pairing indicators, the design
+    is full rank exactly when the groups are linked to one another through
+    shared pairing levels. It fails when no two samples share a level, when
+    every level lies within a single group (pairing nested in group, e.g.
+    each mouse has one genotype), or when the groups split into sets that
+    share no levels.
+    """
+    level_groups: dict[str, list[str]] = {}
+    level_n: dict[str, int] = {}
+    for g, p in zip(group_vec, pairing_vec):
+        gs = level_groups.setdefault(p, [])
+        if g not in gs:
+            gs.append(g)
+        level_n[p] = level_n.get(p, 0) + 1
+
+    if all(n == 1 for n in level_n.values()):
+        return (
+            "Pairing can't be used for this comparison: no two samples share a "
+            "pairing value, so there is nothing to pair. Check the pairing values "
+            "for missing entries or spelling differences, or switch pairing off."
+        )
+
+    if all(len(gs) == 1 for gs in level_groups.values()):
+        named = [p for p in level_groups if not p.startswith('__unpaired_')]
+        example = sorted(named or level_groups, key=lambda p: (-level_n[p], p))[0]
+        return (
+            "Pairing can't be used for this comparison: every pairing value has "
+            "samples in only one group (for example, all samples of "
+            f"{_pairing_level_label(example)} are in {level_groups[example][0]!r}). "
+            "Pairing compares the groups within each pairing value, such as before "
+            "and after samples from one donor, or two cell populations sorted from "
+            "the same animal, so each value needs samples in more than one group. "
+            "Here the pairing value already decides the group, so pairing would "
+            "remove the very difference being tested. "
+            "Switch pairing off. Adjustment covariates, such as tissue, can stay. "
+            "Without pairing, several samples from one individual are counted as "
+            "independent, which overstates the sample size; testing each tissue "
+            "or condition separately avoids this."
+        )
+
+    groups = list(dict.fromkeys(group_vec))
+    parent = {g: g for g in groups}
+
+    def _root(g: str) -> str:
+        while parent[g] != g:
+            g = parent[g]
+        return g
+
+    for gs in level_groups.values():
+        for g in gs[1:]:
+            parent[_root(g)] = _root(gs[0])
+    sets: dict[str, list[str]] = {}
+    for g in groups:
+        sets.setdefault(_root(g), []).append(g)
+    if len(sets) > 1:
+        described = " and ".join(
+            "(" + ", ".join(repr(g) for g in members) + ")" for members in sets.values()
+        )
+        return (
+            "Pairing can't be used for this comparison: the groups fall into sets "
+            f"that share no pairing values: {described}. Pairing compares groups "
+            "within each pairing value, so groups in different sets can't be "
+            "compared. Give these groups shared pairing values, leave the separate "
+            "set out of the test, or switch pairing off."
+        )
+    return "The design is rank-deficient with the pairing variable."
+
+
 def build_design(group_vec: list[str], baseline: str,
                  pairing_vec: list[str] | None = None,
                  covariates: pd.DataFrame | None = None):
@@ -381,10 +464,7 @@ def build_design(group_vec: list[str], baseline: str,
             cols.append(np.array([1.0 if x == lvl else 0.0 for x in pairing_vec]))
             names.append(f"pair[{lvl}]")
         if not _rank_ok():
-            raise RuntimeError(
-                "The design is rank-deficient with the pairing variable — check "
-                "for missing values, or pairing levels confounded with group."
-            )
+            raise RuntimeError(_pairing_confounded_message(group_vec, pairing_vec))
 
     if covariates is not None:
         for name in covariates.columns:
@@ -885,6 +965,43 @@ def _glm_fit_features(counts: np.ndarray, design: np.ndarray, offsets: np.ndarra
 
 _LOG_ALPHA_GRID = np.linspace(np.log(1e-4), np.log(1e2), 141)
 _MIN_PRIOR_VARIANCE = 0.25          # floor of the log-dispersion prior variance
+_ZERO_FIT = 1e-4                    # count and fitted mean below this: an exact zero fit
+PRIOR_COUNT = 0.125                 # edgeR's default prior count for reported log fold changes
+
+
+def _add_prior_count(counts: np.ndarray, log_offsets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Counts and log offsets with edgeR's prior count added (addPriorCount):
+    PRIOR_COUNT × (library size / the feature's mean library size) on every
+    count, and twice that on the library size. A fit on these gives a
+    finite log fold change when a group has no events, where the
+    maximum-likelihood coefficient diverges. Used only for the reported
+    logFC; the tests use the unshrunk fit. NaN entries stay NaN.
+    """
+    with np.errstate(invalid='ignore', over='ignore'):
+        lib = np.exp(log_offsets)
+        prior = PRIOR_COUNT * lib / np.nanmean(lib, axis=1, keepdims=True)
+    return counts + prior, np.log(lib + 2.0 * prior)
+
+
+def _residual_df(Y: np.ndarray, mu: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """
+    Residual degrees of freedom per row, leaving out observations fitted
+    exactly (count and fitted mean both below _ZERO_FIT, e.g. every sample
+    of a pairing level with no events). They carry no information on the
+    dispersion, so a row's df is the number of its other observations less
+    the rank of the design on them (edgeR's glmQLFit); 0 when none remain.
+    """
+    zero = (Y < _ZERO_FIT) & (mu < _ZERO_FIT)
+    df = np.full(Y.shape[0], float(X.shape[0] - X.shape[1]))
+    by_pattern: dict[bytes, float] = {}
+    for r in np.flatnonzero(zero.any(axis=1)):
+        key = zero[r].tobytes()
+        if key not in by_pattern:
+            keep = ~zero[r]
+            by_pattern[key] = float(keep.sum() - np.linalg.matrix_rank(X[keep])) if keep.any() else 0.0
+        df[r] = by_pattern[key]
+    return df
 
 
 class _Block(NamedTuple):
@@ -997,11 +1114,16 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
     quasi-dispersion of each feature (residual deviance / residual df) is
     moderated with moderated_stats.fit_prior_variance, as limma moderates
     variances; F = (deviance without the column − deviance with it) /
-    moderated quasi-dispersion, on 1 and df + d0 degrees of freedom.
+    moderated quasi-dispersion, on 1 and df + d0 degrees of freedom. The
+    residual df of each feature leaves out its observations fitted exactly
+    as zero (_residual_df); a feature with none left takes the prior
+    quasi-dispersion.
 
-    Returns {coef: (logFC (log2), SE, t, df_total)}; SE = |logFC| / √F and
-    t = sign(logFC) √F, so a t test with df_total reproduces the F test and
-    TREAT and threshold changes work from the stored columns.
+    Returns {coef: (logFC (log2), SE, t, df_total)}. logFC comes from a fit
+    with the prior count (_add_prior_count), so it is finite when a group
+    has no events; SE = |logFC| / √F and t = sign(logFC) √F, so a t test
+    with df_total reproduces the F test and TREAT and threshold changes work
+    from the stored columns.
     """
     n_features = counts.shape[0]
     patterns: dict[bytes, list[int]] = {}
@@ -1040,8 +1162,9 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
                for fb, mu in zip(full, mus)]
 
     dev_full = [_glm_deviance(b.Y, mu, a) for b, mu, a in zip(blocks, mus, alphas)]
-    res_df = [np.full(b.Y.shape[0], float(b.X.shape[0] - b.X.shape[1])) for b in blocks]
-    phi = np.concatenate([d / df for d, df in zip(dev_full, res_df)])
+    res_df = [_residual_df(b.Y, mu, b.X) for b, mu in zip(blocks, mus)]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        phi = np.concatenate([np.where(df > 0, d / df, 0.0) for d, df in zip(dev_full, res_df)])
     df_all = np.concatenate(res_df)
     d0, s0 = ms.fit_prior_variance(phi, df_all)
     if np.isinf(d0):
@@ -1052,11 +1175,16 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
              "quasi-dispersion prior d0=%.3g s0²=%.3g", phi.size, prior['log_alpha_mean'],
              prior['log_alpha_variance'], d0, s0)
 
+    shrunk = []
+    for b, a in zip(blocks, alphas):
+        Y_prior, O_prior = _add_prior_count(b.Y, b.O)
+        shrunk.append(_fit_rows(Y_prior, b.X, O_prior, a))
+
     LN2 = np.log(2.0)
     for j in coefs:
         logfc, se, tvals, dft = (np.full(n_features, np.nan) for _ in range(4))
         start = 0
-        for b, fb, mu, a, dev, rdf in zip(blocks, full, mus, alphas, dev_full, res_df):
+        for b, fb, sh, mu, a, dev, rdf in zip(blocks, full, shrunk, mus, alphas, dev_full, res_df):
             n_rows = b.Y.shape[0]
             block_post = post[start:start + n_rows]
             start += n_rows
@@ -1070,9 +1198,9 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
             with np.errstate(divide='ignore', invalid='ignore'):
                 f_stat = np.maximum(dev_red - dev, 0.0) / block_post
             for r, i in enumerate(b.rows):
-                if fb[r] is None or reduced[r] is None or not np.isfinite(f_stat[r]):
+                if fb[r] is None or reduced[r] is None or sh[r] is None or not np.isfinite(f_stat[r]):
                     continue
-                lfc = fb[r][0][k] / LN2
+                lfc = sh[r][0][k] / LN2
                 root = np.sqrt(f_stat[r])
                 logfc[i] = lfc
                 tvals[i] = np.copysign(root, lfc)
@@ -1093,8 +1221,11 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
     ``contrasts`` (shared baseline). The offset is log(row total of
     counts_df) unless ``offset_df`` gives a per-feature denominator. The
     coefficient is a rate difference between groups, reported on the log2
-    scale. method 'wald': Wald standard errors (df.total = inf); 'ql':
-    quasi-likelihood F tests (_glm_ql_tests).
+    scale. method 'wald': Wald z tests (df.total = inf); 'ql':
+    quasi-likelihood F tests (_glm_ql_tests). With either, logFC comes from
+    a fit with the prior count (_add_prior_count) and SE is |logFC| over
+    the test statistic, so a group with no events gives a finite logFC and
+    the stored columns reproduce the test.
     NaN counts or offsets mark samples where a feature was not measured:
     each feature is fitted on the samples that have it, and is untestable
     (NaN result) when a compared group has none.
@@ -1143,6 +1274,8 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
         return pd.concat(frames, ignore_index=True)
 
     fits = _glm_fit_features(counts, design_mat, log_offsets)
+    prior_counts, prior_offsets = _add_prior_count(counts, log_offsets)
+    shrunk = _glm_fit_features(prior_counts, design_mat, prior_offsets)
 
     frames = []
     for b, other in contrasts:
@@ -1150,16 +1283,18 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
         logfc = np.full(len(features), np.nan)
         se = np.full(len(features), np.nan)
         tvals = np.full(len(features), np.nan)
-        for i, (fit, columns) in enumerate(fits):
-            if fit is None:
+        for i, ((fit, columns), (fit_prior, _columns)) in enumerate(zip(fits, shrunk)):
+            if fit is None or fit_prior is None:
                 continue
             position = np.flatnonzero(columns == j)
             if position.size == 0:
                 continue
             k = int(position[0])
-            logfc[i] = fit.params[k] / LN2
-            se[i] = fit.bse[k] / LN2
-            tvals[i] = fit.tvalues[k]
+            lfc = fit_prior.params[k] / LN2
+            z = fit.tvalues[k]
+            logfc[i] = lfc
+            se[i] = abs(lfc / z) if lfc != 0 and z != 0 else np.inf
+            tvals[i] = z
         p = ms.treat_pvalues(logfc, se, np.inf, 0.0)
         frames.append(pd.DataFrame({
             'feature':   features,

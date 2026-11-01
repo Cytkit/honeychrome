@@ -202,6 +202,13 @@ MODE_LABELS = {ag_core.MODE_FIXED: 'Fixed', ag_core.MODE_RECALCULATE: 'Recalcula
 DRIFT_ACTIONS = {'flag': 'Flag only', 'reference': 'Use the stored boundary'}
 FDR_SCOPES = {'global': 'Pooled over comparisons', 'per_comparison': 'Within each comparison'}
 CONTRAST_MODES = {'reference': 'Each group against a reference', 'pairwise': 'All pairs of groups'}
+# Statistics settings put back by the Restore defaults button. The design
+# (comparisons, reference group, pairing, adjustment covariates) is kept.
+STATS_DEFAULT_KEYS = ('run_freq', 'run_counts', 'counts_method', 'run_markers', 'use_stats_parent',
+                      'exclude_gating_markers', 'min_marker_events', 'pval_threshold', 'fc_threshold',
+                      'marker_threshold', 'use_treat', 'fdr_scope', 'exclude_flagged')
+# Statistics settings applied to stored results without running them again.
+THRESHOLD_KEYS = ('pval_threshold', 'fc_threshold', 'marker_threshold', 'use_treat', 'fdr_scope')
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -2308,6 +2315,17 @@ class ResultsTab(QWidget):
         left.setMaximumWidth(420)
         form = QFormLayout(left)
 
+        self.btn_stats_defaults = QPushButton("Restore defaults")
+        self.btn_stats_defaults.setToolTip(
+            "Put the tests, counts test, marker options, thresholds, TREAT, FDR correction and "
+            "'Leave out flagged samples' back to their default values. Comparisons, reference "
+            "group, pairing and adjustment covariates are kept.")
+        self.btn_stats_defaults.clicked.connect(self._restore_stats_defaults)
+        defaults_row = QHBoxLayout()
+        defaults_row.addWidget(self.btn_stats_defaults)
+        defaults_row.addStretch()
+        form.addRow(defaults_row)
+
         self.chk_freq = QCheckBox("Population frequencies (log odds within parent)")
         self.chk_counts = QCheckBox("Population counts (negative binomial, parent offset)")
         self.chk_markers = QCheckBox("Marker medians (population first)")
@@ -2413,6 +2431,36 @@ class ResultsTab(QWidget):
             w.valueChanged.connect(self._on_thresholds_changed)
         self.chk_treat.toggled.connect(self._on_thresholds_changed)
         self.cb_fdr.currentIndexChanged.connect(self._on_thresholds_changed)
+        for box in (self.chk_freq, self.chk_counts, self.chk_markers, self.chk_stats_parent,
+                    self.chk_exclude_gating, self.chk_exclude_flagged, self.chk_treat):
+            box.toggled.connect(self._update_stats_defaults_button)
+        for spin in (self.sb_min_events, self.sb_pval, self.sb_fc, self.sb_marker):
+            spin.valueChanged.connect(self._update_stats_defaults_button)
+        for combo in (self.cb_counts_method, self.cb_fdr):
+            combo.currentIndexChanged.connect(self._update_stats_defaults_button)
+
+    def _update_stats_defaults_button(self, *_args):
+        """Grey the Restore defaults button while every statistics setting
+        it puts back is at its default."""
+        defaults = GatingRunState()
+        self.btn_stats_defaults.setEnabled(
+            any(getattr(self.state, key) != getattr(defaults, key) for key in STATS_DEFAULT_KEYS))
+
+    def _restore_stats_defaults(self):
+        """Put the statistics settings back to their defaults. Stored
+        results are re-thresholded when only thresholds, TREAT or the FDR
+        correction changed; the other settings apply at the next run."""
+        st = self.state
+        defaults = GatingRunState()
+        changed = [key for key in STATS_DEFAULT_KEYS if getattr(st, key) != getattr(defaults, key)]
+        if not changed:
+            return
+        for key in changed:
+            setattr(st, key, getattr(defaults, key))
+        self._load_stats_controls()
+        if set(changed) & set(THRESHOLD_KEYS):
+            self._on_thresholds_changed()
+        _status(self.bus, "Statistics settings restored to their defaults.")
 
     def _load_stats_controls(self):
         st = self.state
@@ -2443,6 +2491,7 @@ class ResultsTab(QWidget):
         finally:
             self._filling = False
         self._populate_stats_choices()
+        self._update_stats_defaults_button()
 
     def _populate_stats_choices(self):
         st = self.state

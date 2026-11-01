@@ -119,7 +119,7 @@ def _suppress_third_party_warnings():
 # ---------------------------------------------------------------------------
 # Safe at module level (no Qt object creation on import)
 # ---------------------------------------------------------------------------
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from copy import copy as _shallow_copy, deepcopy
 import json
 from datetime import datetime
@@ -3019,6 +3019,11 @@ class _ResultsDrawWorker(QThread):
         self.finished.emit(payload)
 
 
+# Tests ticked on a new experiment and put back by the statistics
+# Restore defaults button.
+STATS_TEST_DEFAULTS = {'freq': True, 'counts': False, 'mfi': True}
+
+
 class GroupsStatsTab(QWidget):
     """
     Tab 2 — Groups, Factors & Statistics
@@ -3361,24 +3366,38 @@ class GroupsStatsTab(QWidget):
 
         stats_layout.addWidget(test_groups_box)
 
+        defaults_row = QHBoxLayout()
+        self.stats_defaults_btn = QPushButton("Restore defaults")
+        self.stats_defaults_btn.setToolTip(
+            "Put the tests, FDR level, effect thresholds, FDR scope, TREAT, "
+            "cluster-first MFI testing, counts test and library size back to "
+            "their default values. Groups, contrast mode, reference, pairing, "
+            "adjustment covariates and marker roles are kept. Run Statistics "
+            "to apply them."
+        )
+        self.stats_defaults_btn.clicked.connect(self._restore_stats_defaults)
+        defaults_row.addWidget(self.stats_defaults_btn)
+        defaults_row.addStretch()
+        stats_layout.addLayout(defaults_row)
+
         # Config row: what to test
         config_row = QHBoxLayout()
         config_row.addWidget(QLabel("Test:"))
         self.chk_freq = QCheckBox("Cluster Frequencies")
-        self.chk_freq.setChecked(True)
+        self.chk_freq.setChecked(STATS_TEST_DEFAULTS['freq'])
         self.chk_freq.setToolTip(
             "log2 % of events per cluster per sample → moderated linear "
             "model (empirical Bayes variance moderation)"
         )
         self.chk_counts = QCheckBox("Cluster Counts (GLM)")
-        self.chk_counts.setChecked(False)
+        self.chk_counts.setChecked(STATS_TEST_DEFAULTS['counts'])
         self.chk_counts.setToolTip(
             "Raw event counts per cluster per sample → negative-"
             "binomial GLM.\nParallel option to the Frequency test, not a "
             "replacement — run both to compare on the same data."
         )
         self.chk_mfi = QCheckBox("Cluster MFIs")
-        self.chk_mfi.setChecked(True)
+        self.chk_mfi.setChecked(STATS_TEST_DEFAULTS['mfi'])
         self.chk_mfi.setToolTip(
             "Mean transformed intensity of each marker within each cluster, "
             "per sample → moderated linear model. Clusters with no events "
@@ -3495,6 +3514,15 @@ class GroupsStatsTab(QWidget):
         method_row.addWidget(self.normalisation_combo)
         method_row.addStretch()
         stats_layout.addLayout(method_row)
+
+        for box in (self.chk_freq, self.chk_counts, self.chk_mfi, self.chk_treat,
+                    self.chk_mfi_hierarchical):
+            box.toggled.connect(self._update_stats_defaults_button)
+        for spin in (self.pval_spin, self.fc_spin, self.mfi_fc_spin):
+            spin.valueChanged.connect(self._update_stats_defaults_button)
+        for combo in (self.fdr_scope_combo, self.counts_method_combo, self.normalisation_combo):
+            combo.currentIndexChanged.connect(self._update_stats_defaults_button)
+        self._update_stats_defaults_button()
 
         # ---- Marker roles: type (clustering) vs state (tested) ----
         roles_box = QGroupBox("Marker Roles — MFI Testing")
@@ -5458,6 +5486,57 @@ class GroupsStatsTab(QWidget):
         self.fdr_scope_combo.setCurrentIndex(
             1 if self.state.stats_fdr_scope == 'per_comparison' else 0
         )
+
+    def _stats_defaults(self) -> list:
+        """
+        (widget, default) for every statistics setting the Restore defaults
+        button puts back: a check state, a spin box value or a combo box
+        index. Defaults are PipelineState's, and STATS_TEST_DEFAULTS for the
+        tests ticked. The design (groups, contrast mode, reference, pairing,
+        adjustment covariates) and marker roles are not included.
+        """
+        d = {f.name: f.default for f in dataclass_fields(PipelineState)}
+        combos = ((self.counts_method_combo, d['stats_counts_method']),
+                  (self.normalisation_combo, d['stats_normalisation']))
+        return [
+            (self.chk_freq, STATS_TEST_DEFAULTS['freq']),
+            (self.chk_counts, STATS_TEST_DEFAULTS['counts']),
+            (self.chk_mfi, STATS_TEST_DEFAULTS['mfi']),
+            (self.chk_treat, d['stats_use_treat']),
+            (self.chk_mfi_hierarchical, d['stats_mfi_hierarchical']),
+            (self.pval_spin, d['stats_pval_threshold']),
+            (self.fc_spin, d['stats_fc_threshold']),
+            (self.mfi_fc_spin, d['stats_mfi_threshold']),
+            (self.fdr_scope_combo, 1 if d['stats_fdr_scope'] == 'per_comparison' else 0),
+        ] + [(combo, max(combo.findData(value), 0)) for combo, value in combos]
+
+    def _update_stats_defaults_button(self, *_args):
+        """Grey the statistics Restore defaults button while every setting
+        it puts back is at its default."""
+        at_defaults = True
+        for widget, value in self._stats_defaults():
+            if isinstance(widget, QCheckBox):
+                at_defaults = widget.isChecked() == bool(value)
+            elif isinstance(widget, QComboBox):
+                at_defaults = widget.currentIndex() == value
+            else:
+                at_defaults = round(widget.value(), widget.decimals()) == round(value, widget.decimals())
+            if not at_defaults:
+                break
+        self.stats_defaults_btn.setEnabled(not at_defaults)
+
+    def _restore_stats_defaults(self):
+        """Put the statistics settings back to their defaults. Like an edit
+        by hand, they take effect at the next Run Statistics: a refit when
+        the tests, counts test or library size changed, otherwise a replot
+        with the new thresholds."""
+        for widget, value in self._stats_defaults():
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+            elif isinstance(widget, QComboBox):
+                widget.setCurrentIndex(value)
+            else:
+                widget.setValue(value)
 
     def _current_data_key(self, run_id: str, run_freq: bool, run_counts: bool,
                           run_mfi: bool) -> tuple:

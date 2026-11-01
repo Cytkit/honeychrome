@@ -737,6 +737,10 @@ threshold. With it off, they test for any difference and the threshold only
 filters.</li>
 <li>FDR is pooled over all comparisons or taken within each. Changing a
 threshold updates significance without refitting.</li>
+<li><b>Restore defaults</b>, at the top of the settings, puts the tests and
+their options, the thresholds, TREAT, the FDR correction and <i>Leave out
+flagged samples</i> back to their defaults. Comparisons, reference group,
+pairing and covariates are kept.</li>
 <li>The same framework has been used in systems-immunology studies of flow
 cytometry cohorts [6, 7].</li>
 </ul>
