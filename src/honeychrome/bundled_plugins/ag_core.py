@@ -1076,13 +1076,27 @@ class GateCalculator:
     def _calc_singlets(self, data, gate_def, channel_index) -> dict:
         """Line fit through the main diagonal of the two scatter channels,
         with iterative outlier removal; the gate is a parallelogram of
-        ± width_sd residual SDs around the line."""
+        ± width_sd residual SDs around the line, running the full width of
+        the x axis.
+
+        A pile of events at the top of either axis (saturation, more than
+        ``saturation_fraction`` of the events, default 0.0005; see
+        saturation_cut) is left out of the fit, so multiplets maxed out on
+        scatter do not pull the line. The band is not cut there: saturated
+        events that fall inside it stay in the population."""
         gp = gate_def.get('gate_param', {}) or {}
         q = float(gp.get('quantile_trim', 0.001))
         width_sd = float(gp.get('width_sd', 3.0))
         ix = channel_index[gate_def['gate_marker_x']]
         iy = channel_index[gate_def['gate_marker_y']]
-        xy = trim_quantiles(data[:, [ix, iy]], q)
+        xy = data[:, [ix, iy]]
+        sat_fraction = float(gp.get('saturation_fraction', 0.0005))
+        unsaturated = np.ones(len(xy), dtype=bool)
+        for k in range(2):
+            pile = saturation_cut(xy[:, k], sat_fraction)
+            if pile is not None:
+                unsaturated &= xy[:, k] < pile
+        xy = trim_quantiles(xy[unsaturated], q)
         if len(xy) < 50:
             return {}
         x, y = xy[:, 0], xy[:, 1]
@@ -1099,9 +1113,11 @@ class GateCalculator:
         sigma = float((y[keep] - (slope * x[keep] + intercept)).std()) or 1.0
         offset = width_sd * sigma
         # The band runs the full width of the axis, so the gate is open along
-        # the diagonal rather than ending at the extremes of the training data.
-        lim_lo, lim_hi = self._limits(gate_def['gate_marker_x'], x)
-        x_lo, x_hi = min(float(x.min()), lim_lo), max(float(x.max()), lim_hi)
+        # the diagonal rather than ending at the extremes of the training data
+        # (saturated events left out of the fit included).
+        full_x = data[:, ix]
+        lim_lo, lim_hi = self._limits(gate_def['gate_marker_x'], full_x)
+        x_lo, x_hi = min(float(full_x.min()), lim_lo), max(float(full_x.max()), lim_hi)
         poly = [
             [x_lo, slope * x_lo + intercept - offset],
             [x_hi, slope * x_hi + intercept - offset],

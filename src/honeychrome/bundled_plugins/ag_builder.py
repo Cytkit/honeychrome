@@ -787,6 +787,43 @@ class GateParamDialog(QDialog):
         super().accept()
 
 
+class _QuadrantPicker(QWidget):
+    """Tick boxes for the quadrants a 2dsep population covers, laid out as
+    on the plot (X+ on the right, Y+ at the top). ``touched`` is set once
+    the user ticks or unticks one."""
+
+    _LAYOUT = (('x-y+', 0, 0), ('x+y+', 0, 1), ('x-y-', 1, 0), ('x+y-', 1, 1))
+
+    def __init__(self, region: str | None = None, parent=None):
+        super().__init__(parent)
+        self.touched = False
+        grid = QGridLayout(self)
+        grid.setContentsMargins(4, 0, 4, 0)
+        grid.setSpacing(2)
+        self._boxes = {}
+        for quadrant, row, col in self._LAYOUT:
+            box = QCheckBox(quadrant.upper().replace('-', '\u2212'))
+            box.clicked.connect(self._on_clicked)
+            grid.addWidget(box, row, col)
+            self._boxes[quadrant] = box
+        self.setToolTip(
+            "Quadrants of the plot this population covers. X+ is at or above the "
+            "X threshold, Y+ at or above the Y threshold. Two quadrants on one side "
+            "make a population of that whole side.")
+        self.set_region(region)
+
+    def _on_clicked(self, _checked=False):
+        self.touched = True
+
+    def set_region(self, region: str | None):
+        chosen = set(ag_core.region_quadrants(region))
+        for quadrant, box in self._boxes.items():
+            box.setChecked(quadrant in chosen)
+
+    def region(self) -> str:
+        return ag_core.join_quadrants(q for q, box in self._boxes.items() if box.isChecked())
+
+
 class GateEditDialog(QDialog):
     """Create-or-edit dialog for a single GateDefinition.
 
@@ -826,7 +863,7 @@ class GateEditDialog(QDialog):
             f" — {gate_def.get('gate_name', '(unnamed)')}"
         )
         self.setModal(True)
-        self.resize(560, 520)
+        self.resize(640, 560)
 
         # Working copies of mutable substructures.  These get written
         # back into self.gate_def on accept().
@@ -902,6 +939,8 @@ class GateEditDialog(QDialog):
         form.addRow(self.lbl_sep_axis, self.cb_sep_axis)
         form.addRow("", self.cb_include_all_channels)
         self.cb_marker_y.currentIndexChanged.connect(self._update_axis_labels)
+        self.cb_marker_x.currentIndexChanged.connect(self._sync_quadrant_pickers)
+        self.cb_marker_y.currentIndexChanged.connect(self._sync_quadrant_pickers)
 
         # --- Parent gate and population ---
         self.cb_parent_gate = QComboBox()
@@ -952,8 +991,9 @@ class GateEditDialog(QDialog):
         pop_box = QGroupBox("Populations")
         pop_layout = QVBoxLayout(pop_box)
 
-        self.tbl_populations = QTableWidget(0, 3)
-        self.tbl_populations.setHorizontalHeaderLabels(["Name", "Label", "Position"])
+        self.tbl_populations = QTableWidget(0, 4)
+        self.tbl_populations.setHorizontalHeaderLabels(["Name", "Label", "Position",
+                                                        "Quadrants"])
         self.tbl_populations.horizontalHeader().setStretchLastSection(False)
         self.tbl_populations.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.Stretch
@@ -963,6 +1003,9 @@ class GateEditDialog(QDialog):
         )
         self.tbl_populations.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeToContents
+        )
+        self.tbl_populations.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeToContents
         )
         pop_layout.addWidget(self.tbl_populations)
 
@@ -1114,15 +1157,23 @@ class GateEditDialog(QDialog):
         is_2d_like = new_type in ('1dsep', '2dsep', 'free', 'singlets')
         self.cb_marker_y.setEnabled(is_2d_like)
         self._update_axis_labels()
+        self._sync_quadrant_pickers()
 
         if new_type == self._last_seen_type:
             return
         previous, self._last_seen_type = self._last_seen_type, new_type
 
         if {previous, new_type} <= set(ag_core.THRESHOLD_TYPES):
-            self.lbl_type_change_notice.setText(
-                "Population names are kept, so the gates below stay attached; each takes its "
-                "side of the separation parameter when you press OK.")
+            if new_type == '2dsep':
+                notice = ("Population names are kept, so the gates below stay attached. Each "
+                          "side becomes two quadrants; untick one in the Quadrants column to "
+                          "keep only part of that side.")
+            else:
+                notice = ("Population names are kept, so the gates below stay attached; each "
+                          "takes its side of the separation parameter when you press OK.")
+            if not self.is_new:
+                notice += " Mixture components return to 2."
+            self.lbl_type_change_notice.setText(notice)
             return
         default_pops = _default_populations_for_type(new_type)
         current_pops = self._read_populations_from_table()
@@ -1149,6 +1200,32 @@ class GateEditDialog(QDialog):
                                      label=meta.get('label', name),
                                      pos=meta.get('label_pos', 1),
                                      region=meta.get('region'))
+        self._sync_quadrant_pickers()
+
+    def _sync_quadrant_pickers(self, *_args):
+        """Show the Quadrants column for 2dsep gates only. A row still on a
+        side of the 1dsep separation parameter, and not ticked by hand, shows
+        that side as the two quadrants on the axis now carrying the
+        parameter (none ticked when neither axis does)."""
+        if not hasattr(self, 'tbl_populations'):
+            return
+        two_d = self.cb_type.currentText() == '2dsep'
+        self.tbl_populations.setColumnHidden(3, not two_d)
+        if not two_d:
+            return
+        sep = self.gate_def.get('gate_marker_x')
+        x, y = self.cb_marker_x.currentData(), self.cb_marker_y.currentData()
+        for row in range(self.tbl_populations.rowCount()):
+            picker = self.tbl_populations.cellWidget(row, 3)
+            item = self.tbl_populations.item(row, 0)
+            region = item.data(Qt.UserRole) if item else None
+            if not isinstance(picker, _QuadrantPicker) or picker.touched \
+                    or region not in (ag_core.REGION_ABOVE, ag_core.REGION_BELOW):
+                continue
+            pops, _reason = ag_review.convert_threshold_regions(
+                {'side': {'region': region}}, '1dsep', sep, None, '2dsep', x, y)
+            picker.set_region(pops['side']['region'] if pops else None)
+        self.tbl_populations.resizeRowsToContents()
 
     def _add_population_row(self, name: str | None = None,
                             label: str | None = None,
@@ -1181,6 +1258,7 @@ class GateEditDialog(QDialog):
         sb.setRange(1, 8)
         sb.setValue(int(pos))
         self.tbl_populations.setCellWidget(row, 2, sb)
+        self.tbl_populations.setCellWidget(row, 3, _QuadrantPicker(region))
 
     def _remove_selected_population_row(self):
         """Remove the highlighted row(s) from the populations table."""
@@ -1224,6 +1302,9 @@ class GateEditDialog(QDialog):
                 continue
             out[name] = {'label': label, 'label_pos': pos}
             region = name_item.data(Qt.UserRole) if name_item else None
+            picker = self.tbl_populations.cellWidget(row, 3)
+            if self.cb_type.currentText() == '2dsep' and isinstance(picker, _QuadrantPicker):
+                region = picker.region()
             if region:
                 out[name]['region'] = region
         return out
@@ -1307,6 +1388,15 @@ class GateEditDialog(QDialog):
                 "Define at least one population (use 'Reset to type default' if unsure)."
             )
             return
+        if gate_type == '2dsep':
+            unticked = [p for p, m in populations.items()
+                        if not ag_core.region_quadrants(m.get('region'))]
+            if unticked:
+                QMessageBox.warning(
+                    self, "Validation",
+                    "Tick at least one quadrant for "
+                    + ", ".join(f"'{p}'" for p in unticked) + ".")
+                return
         renames = {}
         if not self.is_new:
             populations, problem = ag_review.convert_threshold_regions(
@@ -1341,6 +1431,13 @@ class GateEditDialog(QDialog):
             ag_review.rename_populations(self.state.gate_definitions,
                                          self.gate_def.get('gate_name'), renames,
                                          self.state.trained_boundaries)
+        # A gate whose type changes starts from the default number of
+        # mixture components (2) on every axis.
+        if not self.is_new and gate_type != self.gate_def.get('gate_type'):
+            gp = self.gate_def.get('gate_param') or {}
+            for key in ('mixture_components', 'mixture_components_x', 'mixture_components_y'):
+                gp.pop(key, None)
+
         # Write back into the supplied dict.  Caller takes ownership.
         self.gate_def['gate_name']     = name
         self.gate_def['gate_type']     = gate_type
