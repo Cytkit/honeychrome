@@ -34,7 +34,7 @@ Most people should download the app for their platform. It needs no Python, R or
 
 For other Linux distributions, run Honeychrome with Python as below.
 
-Code signing for Windows is provided by the [SignPath Foundation](https://signpath.org). The macOS app is signed and notarised by Apple.
+The Windows app is checked and hosted by the MS Store. The macOS app is signed and notarised by Apple.
 
 ## Run Honeychrome with Python
 
