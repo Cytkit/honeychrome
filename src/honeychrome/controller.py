@@ -2173,9 +2173,13 @@ class Controller(QObject):
             # for default transformations, set limits to observed data
             if self.current_sample_path != self.live_sample_path:
                 if transformations[channel].id == 'default':
-                    index = self.data_for_cytometry_plots['pnn'].index(channel)
-                    upper_limit = max(self.data_for_cytometry_plots['event_data'][:, index]) * 1.05
-                    transformations[channel].set_transform(limits=[0, upper_limit])
+                    if self.data_for_cytometry_plots['event_data'] is not None:
+                        index = self.data_for_cytometry_plots['pnn'].index(channel)
+                        if len(self.data_for_cytometry_plots['event_data'][:, index]) > 0:
+                            upper_limit = max(self.data_for_cytometry_plots['event_data'][:, index]) * 1.05
+                        else:
+                            upper_limit = settings['default_ceiling']
+                        transformations[channel].set_transform(limits=[0, upper_limit])
 
             self.data_for_cytometry_plots['transformations'][channel] = transformations[channel]
             self.recalc_after_axis_transform(channel)
@@ -2223,6 +2227,15 @@ class Controller(QObject):
                 upper_limit = self.data_for_cytometry_plots['event_data'][-1, index]
                 if upper_limit > transformation.limits[1]:
                     transformation.set_transform(limits=[0, upper_limit * 2])
+
+                    # copy live data - this time everything, in order to be able to replot
+                    self.raw_event_data, n_new_events = self.copy_live_data(extent='all')
+                    if self.current_mode == 'raw':
+                        self.data_for_cytometry_plots['event_data'] = self.raw_event_data
+                    elif self.current_mode != 'raw' and self.experiment.process['unmixing_matrix'] is not None:
+                        self.unmixed_event_data = apply_transfer_matrix(self.transfer_matrix, self.raw_event_data)
+                        self.data_for_cytometry_plots['event_data'] = self.unmixed_event_data
+
                     self.data_for_cytometry_plots['histograms'] = initialise_hists(self.data_for_cytometry_plots['plots'], self.data_for_cytometry_plots)
 
             self.calc_hists_and_stats()
