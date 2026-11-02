@@ -1559,7 +1559,7 @@ def calc_hist2d(event_data, mask, id_channel_x, id_channel_y, transform_x, trans
     global_max_value = heatmap.max()
     inside_max_value = heatmap[1:-1,1:-1].max()
 
-    if inside_max_value < global_max_value:
+    if inside_max_value and inside_max_value < global_max_value:
         # heatmap[0,:] *= inside_max_value
         # heatmap[-1,:] *= inside_max_value
         # heatmap[1:-1,0] *= inside_max_value
@@ -1699,15 +1699,21 @@ def build_antigen_map(pnn, spectral_model):
     return {name: label_to_antigen.get(name, '') for name in (pnn or [])}
 
 
-from scipy import signal
-sos_butter = signal.butter(8, 0.5, fs=2.5, output='sos')
-def smoothing_filter(trace):
-    trace = signal.sosfiltfilt(sos_butter, trace)
-    return trace
+# from scipy import signal
+# sos_butter = signal.butter(8, 0.5, fs=2.5, output='sos')
+# def smoothing_filter(trace):
+#     trace = signal.sosfiltfilt(sos_butter, trace, axis=-1)
+#     return trace
 
 # sos_ellip = signal.ellip(8, 1, 40, 0.5, fs=2.5, output='sos')
 # w, h = signal.sosfreqz(sos_ellip, worN=[0], fs=2.5)
 # scale = 1/abs(h[0])**2
 # def smoothing_filter(trace):
-#     trace = signal.sosfiltfilt(sos_ellip, trace) * scale
+#     trace = signal.sosfiltfilt(sos_ellip, trace, axis=-1)) * scale
 #     return trace
+
+from scipy.ndimage import gaussian_filter1d
+# sigma controls the width of the Gaussian kernel
+# truncate (default 4.0) controls kernel size; lower = faster but less accurate
+def smoothing_filter(trace):
+    return gaussian_filter1d(trace, sigma=2.0, axis=-1, truncate=4.0)

@@ -286,8 +286,8 @@ class DummyDevice:
         return 'OK', 'Dummy device stopped acquisition'
 
     def set_state(self, dict_of_parameter_value):
-        print(dict_of_parameter_value)
-        message = {parameter: value for parameter, value in dict_of_parameter_value.items()}
+        # print(dict_of_parameter_value)
+        message = {parameter: value for parameter, value in dict_of_parameter_value.items() if parameter is not 'oscilloscope_trace'}
 
         for parameter, value in dict_of_parameter_value.items():
             if parameter == 'laser_enable':

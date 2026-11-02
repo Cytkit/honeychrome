@@ -281,9 +281,9 @@ class TraceAnalyser(mp.Process):
                 traces_batch_scaled[traces_batch_scaled==65535] = np.nan
                 traces_batch_scaled = traces_batch_scaled * adc_scale_uv  # scale in uV, float32
 
-                # hack to remove pickup by subtracting unused channels
-                unused_trace_averages = traces_batch_scaled[:, self.channel_input_mask_for_subtraction, :].mean(axis=1)
-                traces_batch_scaled[:,self.channel_output_mask_for_subtraction,:] -= unused_trace_averages[:,None,:]
+                # # hack to remove pickup by subtracting unused channels
+                # unused_trace_averages = traces_batch_scaled[:, self.channel_input_mask_for_subtraction, :].mean(axis=1)
+                # traces_batch_scaled[:,self.channel_output_mask_for_subtraction,:] -= unused_trace_averages[:,None,:]
 
                 # calculate area, height, width as defined in channel_dict and write to events_cache
                 baselines = np.zeros(self.n_channels_trace)
@@ -312,8 +312,7 @@ class TraceAnalyser(mp.Process):
                     widths = np.zeros(n_new_events)
                     last_event_index = 0
                     for n, traces in enumerate(traces_batch_scaled):
-                        for i in range(len(traces)):
-                            traces[i] = smoothing_filter(traces[i])
+                        traces = smoothing_filter(traces)
                         tr_peak_detection = traces[self.indices_peak_detection_channel_in_traces]
                         if not (tr_peak_detection == tr_peak_detection).any():
                             # print('all nan') # debug: why would an all nan trigger trace come through?
@@ -363,7 +362,7 @@ class TraceAnalyser(mp.Process):
                         self.events_cache[events_tail:events_tail + n_new_events, self.index_event_id_in_events] = event_ids
 
                         ### debug print latest events
-                        #self.logger.info(self.events_cache[events_tail:events_tail + n_new_events])
+                        # self.logger.info(self.events_cache[events_tail:events_tail + n_new_events])
 
                     events_tail += n_new_events
                     with self.index_tail_events_cache.get_lock():
@@ -413,10 +412,15 @@ class TraceAnalyser(mp.Process):
         return widths
 
 if __name__ == '__main__':
-    mp.set_start_method("spawn")
+    from pathlib import Path
+    import logging
+    import logging.handlers
+
+    from honeychrome.main import setup_logging
+    from honeychrome.settings import experiments_folder, traces_cache_dtype
 
     # Allocate shared memory block, plus head and tail indices
-    traces_cache_shm = shared_memory.SharedMemory(create=True, size=np.zeros(traces_cache_size, dtype=np.uint16).nbytes)
+    traces_cache_shm = shared_memory.SharedMemory(create=True, size=np.zeros(traces_cache_size, dtype=traces_cache_dtype).nbytes)
     traces_cache_lock = Lock()
     index_head_traces_cache = mp.Value('i', 0)
     index_tail_traces_cache = mp.Value('i', 0)
@@ -432,6 +436,13 @@ if __name__ == '__main__':
     pipe_experiment_instrument_e, pipe_experiment_instrument_i = mp.Pipe()
     pipe_experiment_analyser_e, pipe_experiment_analyser_a = mp.Pipe()
 
+    logger = setup_logging(Path.home() / experiments_folder / 'honeychrome.log')
+    # logging queue
+    logging_queue = mp.Queue()
+    # Set up listener in the main process
+    listener = logging.handlers.QueueListener(logging_queue, logging.StreamHandler(), respect_handler_level=True)
+    listener.start()
+
     '''
     Firstly, set up instrument
     '''
@@ -443,7 +454,8 @@ if __name__ == '__main__':
         traces_cache_lock=traces_cache_lock,
         index_head_traces_cache=index_head_traces_cache,
         index_tail_traces_cache=index_tail_traces_cache,
-        pipe_connection=pipe_experiment_instrument_i
+        pipe_connection=pipe_experiment_instrument_i,
+        logging_queue = logging_queue
     )
     instrument.start()
 
@@ -460,7 +472,8 @@ if __name__ == '__main__':
         index_head_events_cache=index_head_events_cache,
         index_tail_events_cache=index_tail_events_cache,
         oscilloscope_traces_queue=oscilloscope_traces_queue,
-        pipe_connection=pipe_experiment_analyser_a
+        pipe_connection=pipe_experiment_analyser_a,
+        logging_queue=logging_queue
     )
     trace_analyser.start()
 
@@ -480,12 +493,12 @@ if __name__ == '__main__':
     quit instrument
     '''
     # connect instrument
-    pipe_experiment_instrument_e.send({'command':'connect'})
+    pipe_experiment_instrument_e.send({'command':'find_and_connect'})
     response = pipe_experiment_instrument_e.recv()
     print(response)
 
     # start instrument
-    pipe_experiment_instrument_e.send({'command':'start'})
+    pipe_experiment_instrument_e.send({'command':'start_acquisition'})
     response = pipe_experiment_instrument_e.recv()
     print(response)
 
@@ -496,7 +509,7 @@ if __name__ == '__main__':
 
 
     #wait for a bit
-    time.sleep(1)
+    time.sleep(15)
 
     from queue import Empty
     try:
@@ -506,7 +519,7 @@ if __name__ == '__main__':
         pass
 
     #stop instrument
-    pipe_experiment_instrument_e.send({'command':'stop'})
+    pipe_experiment_instrument_e.send({'command':'stop_acquisition'})
     response = pipe_experiment_instrument_e.recv()
     print(response)
 

@@ -372,7 +372,7 @@ if __name__ == '__main__':
     print(response)
 
     #wait for a bit
-    time.sleep(120)
+    time.sleep(10)
 
     print('Stop acquisition!')
     pipe_experiment_instrument_e.send({'command':'stop_acquisition'})
