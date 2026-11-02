@@ -21,8 +21,6 @@ from honeychrome.settings import adc_channels, peak_detection_channel_retrieved,
 verbosity_divider = int(1/analyser_target_repeat_time)
 gap = 4 # gap between start of end of baseline and start of peak
 left_gap = 4 # gap before trace starts
-channel_input_mask_for_subtraction = np.array([True if ch in ['B1'] else False for ch in adc_channels])
-channel_output_mask_for_subtraction = np.array([True if ch in fluorescence_channels else False for ch in adc_channels])
 default_baselines = np.zeros(n_channels_trace)
 
 def peak_start_stop_baseline(tr, threshold):
@@ -138,6 +136,12 @@ class TraceAnalyser(mp.Process):
 
         self.stop_analyser = None
 
+        # hack to remove pickup noise by subtracting unused channels
+        self.channel_input_mask_for_subtraction = np.array([True if ch in ['B1'] else False for ch in adc_channels])
+        self.channel_input_mask_for_subtraction[self.indices_peak_detection_channel_in_traces] = False
+        self.channel_output_mask_for_subtraction = np.array([True if ch in fluorescence_channels else False for ch in adc_channels])
+        self.channel_output_mask_for_subtraction[self.indices_peak_detection_channel_in_traces] = False
+
     def run(self):
         import logging.handlers
         qh = logging.handlers.QueueHandler(self.logging_queue)
@@ -204,6 +208,12 @@ class TraceAnalyser(mp.Process):
                 if 'peak_detection_channel' in parameters:
                     self.indices_peak_detection_channel_in_traces = adc_channels.index(parameters['peak_detection_channel'])
                     # todo: this also redirects the width measurement without changing the width channel in the event data
+
+                    # hack
+                    self.channel_input_mask_for_subtraction[self.indices_peak_detection_channel_in_traces] = False
+                    self.channel_output_mask_for_subtraction = np.array([True if ch in fluorescence_channels else False for ch in adc_channels])
+                    self.channel_output_mask_for_subtraction[self.indices_peak_detection_channel_in_traces] = False
+
                 if 'threshold' in parameters:
                     self.threshold = parameters['threshold'] * 1000 # uV
 
@@ -271,7 +281,9 @@ class TraceAnalyser(mp.Process):
                 traces_batch_scaled[traces_batch_scaled==65535] = np.nan
                 traces_batch_scaled = traces_batch_scaled * adc_scale_uv  # scale in uV, float32
 
-                traces_batch_scaled[:,channel_output_mask_for_subtraction,:] -= traces_batch_scaled[:,channel_input_mask_for_subtraction, :].mean(axis=1)[:,None,:]
+                # hack to remove pickup by subtracting unused channels
+                unused_trace_averages = traces_batch_scaled[:, self.channel_input_mask_for_subtraction, :].mean(axis=1)
+                traces_batch_scaled[:,self.channel_output_mask_for_subtraction,:] -= unused_trace_averages[:,None,:]
 
                 # calculate area, height, width as defined in channel_dict and write to events_cache
                 baselines = np.zeros(self.n_channels_trace)

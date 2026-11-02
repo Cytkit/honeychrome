@@ -31,9 +31,9 @@ sample_pump_steps_per_microlitre = 109 # measured value: at speed 20000*0.1Hz, t
 sample_flow_rate = 30 # microlitres per minute
 
 sample_pump_priming_speed = 20000 # steps/10s
-sample_pump_priming_time = 20 # s
+sample_pump_priming_time = 13 # s
 sample_pump_unpriming_speed = 20000 # steps/10s
-sample_pump_unpriming_time = 20. # s
+sample_pump_unpriming_time = 13 # s
 sample_pump_flush_speed = 20000 # steps/10s
 sample_pump_flush_time = 30. # s
 sample_pump_backflush_speed = 20000 # steps/10s
@@ -65,7 +65,7 @@ dac_ref_default = 1023
 capture_enabled_default = True
 capture_pre_trigger_default = n_time_points_in_event//2
 capture_post_trigger_default = n_time_points_in_event//2
-trigger_default_hysteresis = 125
+trigger_default_hysteresis = 200
 
 ### define traces cache
 max_events_in_traces_cache = 100_000
