@@ -1896,16 +1896,21 @@ class Controller(QObject):
 
         # stop live update thread
         self.stop_live_data_processing.set()
+        logger.info('Controller: waiting until live data processing is complete')
         time.sleep(0.25)
         if self.thread:
             self.thread.join()
+        self.stop_live_data_processing.clear()
 
-        self.load_sample(self.live_sample_path) # this sets off thread for update_hists_and_stats through initialise_data_for_cytometry_plots call
-
-        # start analyser (flush cache and start analysing incoming traces and producing events)
+        # start analyser
         self.pipe_connection_analyser.send({'command': 'start'})
         response = self.pipe_connection_analyser.recv()
         logger.info(response)
+
+        # copy live data and reinitialise
+        self.raw_event_data, n_new_events = self.copy_live_data(extent='all')
+        self.clear_data_for_cytometry_plots()
+        self.initialise_data_for_cytometry_plots()
 
     @Slot()
     def flush_sip(self):

@@ -136,6 +136,8 @@ class TraceAnalyser(mp.Process):
 
         self.stop_analyser = None
 
+        self.start_time = None
+
         # hack to remove pickup noise by subtracting unused channels
         self.channel_input_mask_for_subtraction = np.array([True if ch in ['B1'] else False for ch in adc_channels])
         self.channel_input_mask_for_subtraction[self.indices_peak_detection_channel_in_traces] = False
@@ -296,7 +298,7 @@ class TraceAnalyser(mp.Process):
                     heights = traces_batch_scaled[:, self.indices_height_channels_in_traces, :].max(axis=2)
                     widths = self.calculate_width(traces_batch_scaled[:, self.indices_peak_detection_channel_in_traces, :])
                     last_event_index = n_new_events-1
-                    times = np.ones(n_new_events, dtype=np.int64) * int((time.perf_counter() - start_time) * 1000)
+                    times = np.ones(n_new_events, dtype=np.int64) * event_time
                     event_ids = np.array(range(events_tail, events_tail + n_new_events))
 
                     self.oscilloscope_traces_queue.put({'event_id': None, 'time': None,
