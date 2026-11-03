@@ -139,8 +139,48 @@ def test_summary_counts_parents_and_quartiles():
     sel = data[(data[:, 0] >= 0.45) & (data[:, 1] >= 0.45), 2]
     assert med == pytest.approx(np.median(sel))
     assert q25 <= med <= q75
+    assert isinstance(summ['markers'], ar.MarkerSummary)
     import json
-    json.dumps(summ)
+    json.dumps({k: v for k, v in summ.items() if k != 'markers'})
+
+
+@pytest.mark.numpy_only
+def test_marker_summary_reads_like_the_nested_dict(tmp_path):
+    gates = _hierarchy()
+    summ = _summarise(_sample(1), gates, _reference(gates))
+    m = summ['markers']
+    nested = {p: {ch: list(v) for ch, v in row.items()} for p, row in m.items()}
+    assert ar.MarkerSummary.from_dict(nested) == m
+    assert m == nested and 'T/pos' in m and 'C' in m['T/pos']
+    assert m.median('T/pos', 'C') == nested['T/pos']['C'][0]
+    with pytest.raises(ValueError):
+        m.values[0, 0, 0] = 1.0
+    import copy
+    assert copy.deepcopy(m) is m
+    sub = ar.select_markers(m, ['T/pos'])
+    assert list(sub) == ['T/pos'] and sub['T/pos'] == nested['T/pos']
+
+    path = tmp_path / 'markers.npz'
+    ar.save_marker_summaries(path, {'a': summ, 'b': {'markers': {}}}, 'run 1')
+    fingerprint, loaded = ar.load_marker_summaries(path)
+    assert fingerprint == 'run 1'
+    assert loaded['a'] == nested and len(loaded['b']) == 0
+
+
+@pytest.mark.numpy_only
+def test_marker_summary_keeps_uneven_channels_and_float32_exactly(tmp_path):
+    nested = {'G/pos': {'C': [0.5, 0.4, 0.6], 'D': [0.1, None, 0.3]},
+              'G/neg': {'C': [0.2, 0.1, 0.25]}}
+    m = ar.MarkerSummary.from_dict(nested)
+    assert list(m['G/neg']) == ['C'] and 'D' not in m['G/neg']
+    assert m['G/pos']['C'] == [0.5, 0.4, 0.6] and np.isnan(m['G/pos']['D'][1])
+    assert m.values.dtype == np.float64
+    exact = ar.MarkerSummary.from_dict({'G/pos': {'C': [0.5, 0.25, 0.75]}})
+    assert exact.values.dtype == np.float32
+    path = tmp_path / 'm.npz'
+    ar.save_marker_summaries(path, {'s': {'markers': m}})
+    back = ar.load_marker_summaries(path)[1]['s']
+    assert list(back['G/neg']) == ['C'] and back['G/pos']['C'] == [0.5, 0.4, 0.6]
 
 
 @pytest.mark.numpy_only
