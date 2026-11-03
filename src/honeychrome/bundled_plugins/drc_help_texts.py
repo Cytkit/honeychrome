@@ -642,6 +642,15 @@ TREAT and FDR settings as the other tests. Frequencies and Counts make
 different assumptions about the same events, so running both is a useful
 cross-check: agreement is stronger evidence than either alone, and
 disagreement often points to a cluster with very few events.</p>
+<p>The counts are tested by the quasi-likelihood F test, which suits
+homogeneous designs such as inbred mice with plenty of events: on random
+splits of BATF chimera mice, where nothing differed, it found 3–7% false
+positives at p &lt; 0.05 (5% expected). On gated populations of a human
+cohort (UCL IMMPROVE) negative-binomial tests found 7–11% for populations
+under 100 events, because donors vary more, and more unevenly, than the
+model allows for; rely on Cluster Frequencies for human or otherwise varied
+donors. The negative-binomial Wald test is not offered: it found 10–13% on
+the human cohort and 21–31% on the mice.</p>
 
 <h4>Background: paired design</h4>
 <p>Tick <b>Paired design</b> when samples are matched across the groups

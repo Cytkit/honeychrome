@@ -855,7 +855,7 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
     include_type_markers: when False, the MFI branch tests 'state'-role
         channels only. When True, tests every selected channel.
     run_counts: also run the negative-binomial GLM on raw counts, tested by
-        state.stats_counts_method ('wald' or 'ql').
+        the quasi-likelihood F test (state.stats_counts_method, 'ql').
 
     The Frequency and Counts library sizes follow state.stats_normalisation
     ('total' or 'robust', differential_stats.library_sizes).
@@ -948,7 +948,7 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
                                         pairing_vec=pairing_vec, fdr_scope=fdr_scope,
                                         covariates=covariates, use_treat=use_treat,
                                         offset_df=offset_df,
-                                        method=getattr(state, 'stats_counts_method', 'wald'))
+                                        method=getattr(state, 'stats_counts_method', 'ql'))
         state.counts_results = counts_results
         state.counts_df = counts_df      # raw (samples × clusters) counts
 
