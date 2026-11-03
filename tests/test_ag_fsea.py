@@ -232,6 +232,11 @@ def test_run_enrichment_finds_planted_state(tmp_path):
     assert st.loc['Planted', 'n_tested'] == 6
     assert st.loc['Null', 'p'] > st.loc['Planted', 'p']
     assert 'not testable' in st.loc['Small', 'note']
+    for col in ('mean_t', 'p_self', 'FDR_self', 'camera_t', 'camera_cor', 'p_camera',
+                'FDR_camera'):
+        assert col in st.columns
+    assert st.loc['Planted', 'FDR_self'] < 0.05 and st.loc['Planted', 'mean_t'] > 0
+    assert abs(st.loc['Null', 'mean_t']) < st.loc['Planted', 'mean_t']
     again = fs.run_enrichment(summaries, samples, groups, gates, lib, **kw)
     pd.testing.assert_frame_equal(res['states'], again['states'])
     back = fs.result_from_jsonable(fs.result_to_jsonable(res))
@@ -263,3 +268,30 @@ def test_default_anchor_follows_the_model_anchor():
     gates[2]['populations']['T cells']['anchor'] = True
     assert fs.default_anchor(info, gates) == 'T cells/T cells'
     assert fs.default_anchor(info) == 'root'
+
+
+def test_permutation_moves_only_the_compared_samples():
+    rng = np.random.default_rng(4)
+    movable = np.array([True, True, False, True, False, True, True, False])
+    blocks = np.array([0, 0, 0, 1, 1, 1, 1, 1])
+    for _ in range(50):
+        pi = fs._within_block_permutation(rng, blocks, 8, movable)
+        assert sorted(pi) == list(range(8))
+        assert all(pi[i] == i for i in np.flatnonzero(~movable))
+        assert all(blocks[pi[i]] == blocks[i] and movable[pi[i]] for i in np.flatnonzero(movable))
+
+
+def test_camera_inflates_the_variance_of_correlated_sets():
+    rng = np.random.default_rng(6)
+    n, G = 40, 300
+    X = np.column_stack([np.ones(n), np.repeat([0.0, 1.0], n // 2)])
+    Y = rng.normal(size=(G, n))
+    Y[:10] = 0.9 * rng.normal(size=n) + 0.45 * rng.normal(size=(10, n))
+    fit = ms.e_bayes(ms.lm_fit(Y, X))
+    sets = [(np.arange(10), np.ones(10)), (np.arange(10, 20), np.ones(10))]
+    out = fs.camera_scores(Y, X, fit.t[:, 1], fit.df_total, sets)
+    assert out['cor'][0] > 0.6 and out['cor'][1] < 0.2
+    z = fs._zscore_t(fit.t[:, 1], fit.df_total)
+    naive = (z[:10].mean() - z[10:].mean()) / np.sqrt(z.var(ddof=1) * (1 / 10 + 1 / (G - 10)))
+    assert abs(out['t'][0]) < abs(naive)
+    assert np.all((out['p'] > 0) & (out['p'] <= 1))
