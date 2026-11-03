@@ -6,7 +6,7 @@ from PySide6 import QtCore
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QThread, Slot, QObject, QEvent, QSize, Signal, QSettings
 from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QStyledItemDelegate, QComboBox, QLineEdit, QMessageBox, QHeaderView, QLabel, QWidget, QCheckBox, QMenu, QInputDialog)
 
-from honeychrome.controller_components.functions import raw_gates_list, resolve_base_gate
+from honeychrome.controller_components.functions import raw_gates_list, resolve_base_gate, build_display_label_map
 from honeychrome.controller_components.job_gate import acquire_job
 from honeychrome.controller_components.spectral_controller import (
     SpectralAutoGenerator, ProfileUpdater, SpectralCleaner, LowEventLog, control_gating,
@@ -1283,6 +1283,19 @@ class SpectralControlsEditor(QFrame):
         col = self._pending_update_col
         changed_col = COLUMNS[col]
         if index is None:
+            return
+        current_labels = {c['label'] for c in self.model._data}
+        rename_pending = any(k not in current_labels for k in self.profile_updater.profiles)
+        if changed_col == 'antigen' and not rename_pending:
+            # The antigen only changes display labels; channel names, gates, transforms
+            # and unmixed data are unchanged, so the shared label map is updated in place.
+            # A label rename still waiting in the edit timer takes the full path below.
+            pnn_labels = self.controller.data_for_cytometry_plots_unmixed.get('pnn_labels')
+            if pnn_labels:
+                pnn_labels.update(build_display_label_map(
+                    list(pnn_labels), self.controller.experiment.process.get('spectral_model')))
+                self.bus.channelLabelsChanged.emit()
+            self.bus.showSelectedProfiles.emit([self.model._data[index]['label']])
             return
         if changed_col in ('label', 'antigen'):
             control = self.model._data[index]

@@ -86,6 +86,7 @@ class EventBus(QObject):
     cleaningActivated = Signal(bool)   # True = cleaning UI active, False = hidden
     cleaningResultsReady = Signal()    # emitted after Clean Controls recalc finishes
     spectralProcessRefreshed = Signal()
+    channelLabelsChanged = Signal()    # antigen display labels changed; channel names and data unchanged
     unmixingMethodChanged = Signal()   # the experiment's unmixing method (AutoSpectral tab ticks) changed
     showAutoSpectralPage = Signal(str)  # open the AutoSpectral tab at a page: autofluorescence, noise, variants, correction
     requestUpdateProcessHists = Signal()
