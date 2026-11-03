@@ -4336,8 +4336,6 @@ class PluginWidget(QWidget):
 
     def __init__(self, bus=None, controller=None, parent=None):
         super().__init__(parent)
-        import ag_switch_timing
-        ag_switch_timing.install(globals())
         self.bus = bus
         self.controller = controller
         _ensure_qt_imports()
