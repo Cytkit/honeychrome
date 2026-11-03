@@ -464,6 +464,9 @@ class MainWindow(QMainWindow):
             action_oscilloscope.setEnabled(False)
             self.acquisition_widget.setVisible(False)
             self.gains_widget.setVisible(False)
+        else:
+            self.open_oscilloscope_widget() # todo remove this once baselines go to FPGA
+
 
         self.bus.openImportFCSWidget.connect(self.open_import_fcs_files_widget)
 

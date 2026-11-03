@@ -621,7 +621,8 @@ class CytkitDevice:
 
                 if 'threshold' in value:
                     self.threshold = value['threshold'] * 1000 / settings.adc_scale_uv  # convert mV to adc units
-                    logger.info(f'[CytkitDriver] set threshold {value['threshold']} mV, {self.threshold} (ADC units)')
+                    self.get_state(['trigger'])  # implicitly refreshes trigger merge list
+                    logger.info(f'[CytkitDriver] set threshold {value['threshold']} mV, {int(self.threshold)} (ADC units)')
 
                 if 'peak_detection_channel' in value:
                     index = settings.adc_channels.index(value['peak_detection_channel'])
@@ -629,6 +630,7 @@ class CytkitDevice:
                     self.capture.channel_set_enable(spectral_channel_index_to_adc_channel_index[index], True)
                     trigger_merge_mask = 1<<spectral_channel_index_to_adc_channel_index[index]
                     self.trigger.merge_set_merge_mask(trigger_merge_mask)
+                    self.get_state(['trigger'])  # implicitly refreshes trigger merge list
                     logger.info(f'[CytkitDriver] set peak detection channel {value['peak_detection_channel']} trigger merge mask {trigger_merge_mask}')
 
                 message['trigger'] = value
@@ -666,7 +668,8 @@ class CytkitDevice:
                                 level = int(baselines[row]/settings.adc_scale_uv  + self.threshold)
                                 level = max(min(level, 16383), 0)
                                 self.trigger.channel_set_level(spectral_channel_index_to_adc_channel_index[row], level)
-                                logger.info(f'[CytkitDriver] setting trigger {settings.adc_channels[row]}: baseline {baselines[row]} uV, baseline {int(baselines[row]*settings.adc_scale_uv/1000)} (ADC), threshold {self.threshold}, level {level}')
+                                logger.info(f'[CytkitDriver] setting trigger {settings.adc_channels[row]}: baseline {baselines[row]} uV, baseline {int(baselines[row]/settings.adc_scale_uv)} (ADC), threshold {int(self.threshold)} (ADC), trigger level {level} (ADC)')
+                                message['trigger_set'] = level
 
             if parameter == 'pressure_set_point':
                 self.pressure_set_point = value

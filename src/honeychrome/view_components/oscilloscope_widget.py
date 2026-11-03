@@ -192,7 +192,7 @@ class OscilloscopeWidget(QWidget):
             try:
                 latest = self.controller.oscilloscope_traces_queue.get_nowait()
                 self.local_trace_queue.append(latest)
-                self.send_baselines_to_instrument_driver(latest) #todo consider removing this or moving to controller / trace analyst
+                self.send_baselines_to_instrument_driver(latest) #todo stopgap here: this should be moved to an FPGA function
             except Empty:
                 break
         if len(self.local_trace_queue) > 0:
