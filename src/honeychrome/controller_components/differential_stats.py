@@ -15,9 +15,13 @@ intensities. Used by the Honeycluster and Automated Gating plugins.
   ``'ql'`` (quasi-likelihood F test after Lund et al. 2012 and edgeR's
   glmQLFit: negative-binomial dispersion shrunk towards a common prior,
   then a per-feature quasi-dispersion moderated by empirical Bayes).
-  Observations fitted exactly as zero carry no residual degrees of freedom,
-  and the reported log fold change comes from a fit with edgeR's prior
-  count, so a group with no events gives a finite estimate.
+  For small counts each unit deviance is rescaled, and its residual
+  degrees of freedom set, by how far its mean and variance depart from
+  their large-count values (after edgeR v4, Chen et al. 2024), which keeps
+  the test calibrated for features with few events per sample;
+  observations fitted exactly as zero carry no degrees of freedom. The
+  reported log fold change comes from a fit with edgeR's prior count, so a
+  group with no events gives a finite estimate.
 * ``library_sizes`` — effective library sizes for compositional data:
   the totals, a robust (trimmed) rescaling that a few dominant features
   cannot move, or the totals of chosen control features.
@@ -984,24 +988,80 @@ def _add_prior_count(counts: np.ndarray, log_offsets: np.ndarray) -> tuple[np.nd
     return counts + prior, np.log(lib + 2.0 * prior)
 
 
-def _residual_df(Y: np.ndarray, mu: np.ndarray, X: np.ndarray) -> np.ndarray:
+_DEVIANCE_GRID_MU = np.geomspace(1e-3, 1e3, 73)
+_DEVIANCE_GRID_ALPHA = np.geomspace(1e-3, 10.0, 41)
+_deviance_shape: tuple | None = None
+
+
+def _unit_deviance_shape() -> tuple:
     """
-    Residual degrees of freedom per row, leaving out observations fitted
-    exactly (count and fitted mean both below _ZERO_FIT, e.g. every sample
-    of a pairing level with no events). They carry no information on the
-    dispersion, so a row's df is the number of its other observations less
-    the rank of the design on them (edgeR's glmQLFit); 0 when none remain.
+    Degrees of freedom k and scale s of the scaled χ² that matches the mean
+    m and variance v of the negative-binomial unit deviance (k = 2m²/v,
+    s = v/2m), on a grid of means (_DEVIANCE_GRID_MU) by dispersions
+    (_DEVIANCE_GRID_ALPHA). Each is taken relative to its value at the
+    grid's largest mean for the same dispersion, so both are 1 for large
+    counts. The moments are sums over the NB distribution; the table is
+    built on first use. Returns (k, log s), dispersions × means.
     """
+    global _deviance_shape
+    if _deviance_shape is None:
+        from scipy import special
+        from scipy import stats as sstats
+        k = np.empty((_DEVIANCE_GRID_ALPHA.size, _DEVIANCE_GRID_MU.size))
+        s = np.empty_like(k)
+        for i, a in enumerate(_DEVIANCE_GRID_ALPHA):
+            for j, mu in enumerate(_DEVIANCE_GRID_MU):
+                top = int(mu + 12.0 * np.sqrt(mu + a * mu * mu) + 30)
+                y = np.arange(top + 1.0)
+                p = sstats.nbinom.pmf(y, 1.0 / a, 1.0 / (1.0 + a * mu))
+                d = 2.0 * (special.xlogy(y, y / mu) - (y + 1.0 / a) * np.log((1.0 + a * y) / (1.0 + a * mu)))
+                m = np.sum(p * d)
+                v = np.sum(p * d * d) - m * m
+                k[i, j], s[i, j] = 2.0 * m * m / v, v / (2.0 * m)
+        _deviance_shape = (k / k[:, -1:], np.log(s / s[:, -1:]))
+    return _deviance_shape
+
+
+def _low_count_shape(mu: np.ndarray, alpha: np.ndarray) -> tuple:
+    """
+    Relative df k and scale s of _unit_deviance_shape at each fitted mean
+    (rows of mu, one dispersion per row), interpolated on log scales; means
+    and dispersions outside the grid take its edge.
+    """
+    from scipy.interpolate import RegularGridInterpolator
+    k_rel, log_s_rel = _unit_deviance_shape()
+    axes = (np.log(_DEVIANCE_GRID_ALPHA), np.log(_DEVIANCE_GRID_MU))
+    log_a = np.clip(np.log(np.broadcast_to(alpha[:, None], mu.shape)), axes[0][0], axes[0][-1])
+    log_mu = np.clip(np.log(np.clip(mu, 1e-300, None)), axes[1][0], axes[1][-1])
+    points = np.column_stack([log_a.ravel(), log_mu.ravel()])
+    k = RegularGridInterpolator(axes, k_rel)(points).reshape(mu.shape)
+    s = np.exp(RegularGridInterpolator(axes, log_s_rel)(points)).reshape(mu.shape)
+    return k, s
+
+
+def _adjusted_deviance(Y: np.ndarray, mu: np.ndarray, X: np.ndarray, alpha: np.ndarray) -> tuple:
+    """
+    Residual deviance and residual df per row, adjusted for small counts.
+    Each unit deviance is divided by its relative scale s and given its
+    relative df k (_low_count_shape) times one minus its leverage under the
+    NB weights. For large counts s = k = 1, giving the residual deviance on
+    n − p df. Observations fitted exactly as zero (count and fitted mean
+    below _ZERO_FIT, e.g. every sample of a pairing level with no events)
+    carry no information on the dispersion and no df. Returns
+    (adjusted deviance, residual df) per row.
+    """
+    a = alpha[:, None]
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        unit = 2.0 * (np.where(Y > 0, Y * np.log(Y / mu), 0.0)
+                      - (Y + 1.0 / a) * np.log((1.0 + a * Y) / (1.0 + a * mu)))
+    k, scale = _low_count_shape(mu, alpha)
+    w = mu / (1.0 + a * mu)
+    xtwx = (X.T[None, :, :] * w[:, None, :]) @ X
+    leverage = w * np.einsum('np,fpq,nq->fn', X, np.linalg.pinv(xtwx), X)
     zero = (Y < _ZERO_FIT) & (mu < _ZERO_FIT)
-    df = np.full(Y.shape[0], float(X.shape[0] - X.shape[1]))
-    by_pattern: dict[bytes, float] = {}
-    for r in np.flatnonzero(zero.any(axis=1)):
-        key = zero[r].tobytes()
-        if key not in by_pattern:
-            keep = ~zero[r]
-            by_pattern[key] = float(keep.sum() - np.linalg.matrix_rank(X[keep])) if keep.any() else 0.0
-        df[r] = by_pattern[key]
-    return df
+    df = np.where(zero, 0.0, k * np.clip(1.0 - leverage, 0.0, 1.0))
+    dev = np.where(zero, 0.0, np.maximum(unit, 0.0) / scale)
+    return dev.sum(axis=1), df.sum(axis=1)
 
 
 class _Block(NamedTuple):
@@ -1115,9 +1175,9 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
     moderated with moderated_stats.fit_prior_variance, as limma moderates
     variances; F = (deviance without the column − deviance with it) /
     moderated quasi-dispersion, on 1 and df + d0 degrees of freedom. The
-    residual df of each feature leaves out its observations fitted exactly
-    as zero (_residual_df); a feature with none left takes the prior
-    quasi-dispersion.
+    quasi-dispersion is the low-count adjusted residual deviance over its
+    fractional residual df (_adjusted_deviance); a feature with no df left
+    takes the prior quasi-dispersion.
 
     Returns {coef: (logFC (log2), SE, t, df_total)}. logFC comes from a fit
     with the prior count (_add_prior_count), so it is finite when a group
@@ -1162,9 +1222,10 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
                for fb, mu in zip(full, mus)]
 
     dev_full = [_glm_deviance(b.Y, mu, a) for b, mu, a in zip(blocks, mus, alphas)]
-    res_df = [_residual_df(b.Y, mu, b.X) for b, mu in zip(blocks, mus)]
+    adjusted = [_adjusted_deviance(b.Y, mu, b.X, a) for b, mu, a in zip(blocks, mus, alphas)]
+    res_df = [df for _dev, df in adjusted]
     with np.errstate(divide='ignore', invalid='ignore'):
-        phi = np.concatenate([np.where(df > 0, d / df, 0.0) for d, df in zip(dev_full, res_df)])
+        phi = np.concatenate([np.where(df > 0, d / df, 0.0) for d, df in adjusted])
     df_all = np.concatenate(res_df)
     d0, s0 = ms.fit_prior_variance(phi, df_all)
     if np.isinf(d0):
