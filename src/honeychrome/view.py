@@ -155,6 +155,7 @@ class View(QObject):
         # change spectral model, unmix!, change fine tuning matrix
         self.bus.spectralModelUpdated.connect(self.controller.refresh_spectral_process)
         self.bus.spectralProcessRefreshed.connect(lambda : self.init_plot_grids_and_gating_trees('unmixed'))
+        self.bus.channelLabelsChanged.connect(self.refresh_channel_labels)
         self.bus.requestUpdateProcessHists.connect(self.controller.reinitialise_data_for_process_plots)
 
         self.bus.setMainWindowTitle.connect(self.set_main_window_title)
@@ -254,6 +255,19 @@ class View(QObject):
         if self.main_window:
             self.main_window.setWindowTitle(f'Honeychrome by Cytkit: {title}')
 
+    @Slot()
+    def refresh_channel_labels(self):
+        # Antigen edits change only display labels: re-label the existing plots and NxN headers.
+        if self.main_window is None or not isValid(self.main_window):
+            return
+        for plot_widget in self.main_window.cytometry_grid_unmixed.plot_widgets:
+            plot_widget.configure_axes()
+        nxn_model = self.main_window.nxn_viewer.model
+        if nxn_model.horizontal_headers:
+            nxn_model.headerDataChanged.emit(Qt.Horizontal, 0, len(nxn_model.horizontal_headers) - 1)
+        if nxn_model.vertical_headers:
+            nxn_model.headerDataChanged.emit(Qt.Vertical, 0, len(nxn_model.vertical_headers) - 1)
+
     @Slot(str)
     def init_plot_grids_and_gating_trees(self, scope=''):
         if self.main_window is None or not isValid(self.main_window):
@@ -311,13 +325,10 @@ class View(QObject):
     def new_experiment(self):
         if self._reload_refused():
             return
+        # Modal: the experiment is loaded only after the native save panel has
+        # fully closed, because loading closes the window that owns the dialog.
         new_file_dialog = NewFileDialog(self.current_window)
-        new_file_dialog.finished.connect(self.save_new_file)
-        new_file_dialog.show()
-
-    def save_new_file(self, result):
-        new_file_dialog = self.sender()   # the dialog instance
-        if result == QFileDialog.Accepted:
+        if new_file_dialog.exec() == QFileDialog.Accepted:
             file = Path(new_file_dialog.selectedFiles()[0]).with_suffix('.kit')
             add_recent_file(file)
             self.load_main_window_with_experiment_and_template(file, new=True)
