@@ -7,7 +7,9 @@ Pure computation for the Automated Gating plugin (no Qt, no controller):
   channels, antigen to antigen.
 * ``summarise_sample`` — the compact per-sample record kept after gating:
   population counts and parent counts, per-population marker medians and
-  quartiles, per-gate status and the boundaries applied.
+  quartiles (a ``MarkerSummary`` array), per-gate status and the
+  boundaries applied; ``save_marker_summaries`` / ``load_marker_summaries``
+  keep the marker summaries of a run in one .npz file.
 * ``population_tables`` / ``anchor_tables`` / ``marker_table`` — samples ×
   features tables for the differential tests in
   ``controller_components.differential_stats``: counts with their parent
@@ -41,6 +43,7 @@ from __future__ import annotations
 
 import difflib
 import re
+from collections.abc import Mapping
 
 import numpy as np
 import pandas as pd
@@ -80,7 +83,8 @@ __all__ = [
     'CONFIDENT_ALIGNMENTS', 'FEATURE_SEP', 'DEFAULT_MIN_MARKER_EVENTS', 'MIN_MEASURED_SAMPLES',
     'MIN_NONZERO_SAMPLES', 'DEFAULT_MIN_PARENT_EVENTS', 'COUNTS_REFERENCES', 'COUNTS_METHODS',
     'align_channels', 'alignment_problems', 'apply_alignment',
-    'summarise_sample', 'population_tables', 'anchor_tables', 'marker_table', 'marker_feature',
+    'summarise_sample', 'MarkerSummary', 'as_marker_summary', 'select_markers',
+    'save_marker_summaries', 'load_marker_summaries', 'MARKER_FILE_FORMAT', 'population_tables', 'anchor_tables', 'marker_table', 'marker_feature',
     'sample_flags', 'population_export', 'marker_export', 'MARKER_EXPORT_COLUMNS',
     'write_marker_export', 'MIN_SAMPLES_PER_GROUP', 'qualifying_groups', 'run_statistics', 'reapply_thresholds',
     'read_sample_table', 'sample_table_frame', 'sample_pca', 'predictive_matrix',
@@ -223,22 +227,295 @@ def apply_alignment(model: dict, alignment: dict[str, str]) -> dict:
 # Per-sample summary
 # ---------------------------------------------------------------------------
 
+def _compact_values(values: np.ndarray) -> np.ndarray:
+    """*values* as float32 when every value (NaN included) is exactly the
+    same in float32, else as float64: half the memory, never a changed
+    number."""
+    values = np.asarray(values, dtype=np.float64)
+    v32 = values.astype(np.float32)
+    if np.array_equal(v32.astype(np.float64), values, equal_nan=True):
+        return v32
+    return values
+
+
+# Name tuples shared between summaries with the same populations or
+# channels (every sample of a run has the same ones), with their
+# {name: position} lookup; cleared when it grows past the limit.
+_SHARED_NAMES: dict[tuple, tuple] = {}
+_SHARED_NAMES_LIMIT = 64
+
+
+def _shared_names(names) -> tuple[tuple, dict]:
+    names = tuple(str(n) for n in names)
+    cached = _SHARED_NAMES.get(names)
+    if cached is not None:
+        return cached
+    index = {n: i for i, n in enumerate(names)}
+    if len(index) != len(names):
+        raise ValueError("Marker summary names must be unique.")
+    if len(_SHARED_NAMES) >= _SHARED_NAMES_LIMIT:
+        _SHARED_NAMES.clear()
+    _SHARED_NAMES[names] = (names, index)
+    return names, index
+
+
+class _MarkerRow(Mapping):
+    """One population of a MarkerSummary: {channel: [median, q25, q75]}."""
+
+    __slots__ = ('_owner', '_row')
+
+    def __init__(self, owner: 'MarkerSummary', row: int):
+        self._owner = owner
+        self._row = row
+
+    def _column(self, channel) -> int:
+        owner = self._owner
+        j = owner._ch_index[channel]
+        if owner.present is not None and not owner.present[self._row, j]:
+            raise KeyError(channel)
+        return j
+
+    def __getitem__(self, channel) -> list[float]:
+        return self._owner.values[self._row, self._column(channel)].tolist()
+
+    def __contains__(self, channel) -> bool:
+        try:
+            self._column(channel)
+        except KeyError:
+            return False
+        return True
+
+    def __iter__(self):
+        owner = self._owner
+        if owner.present is None:
+            return iter(owner.channels)
+        mask = owner.present[self._row]
+        return (ch for ch, ok in zip(owner.channels, mask) if ok)
+
+    def __len__(self) -> int:
+        owner = self._owner
+        if owner.present is None:
+            return len(owner.channels)
+        return int(owner.present[self._row].sum())
+
+    def __repr__(self) -> str:
+        return repr(dict(self.items()))
+
+
+class MarkerSummary(Mapping):
+    """One sample's marker medians and quartiles in every population, in
+    transformed units.
+
+    It reads like the nested dict ``{population key: {channel: [median,
+    q25, q75]}}``, so ``summary['CD4 T/pos']['CD25'][0]`` is the median of
+    CD25 in CD4 T cells, but the numbers are held as one array of
+    populations × channels × 3 instead of one Python list per population and
+    channel. For a large panel (thousands of populations, tens of channels,
+    150 samples) that replaces tens of millions of small Python objects with
+    a few hundred arrays: less memory, faster saving and loading, and
+    nothing for Python's garbage collector to walk.
+
+    populations : population keys, in order.
+    channels    : channel names, in order.
+    values      : array (populations × channels × 3) of [median, q25, q75],
+                  float32 or float64.
+    present     : optional bool array (populations × channels), False where
+                  a population has no value for a channel; None when every
+                  population has every channel.
+
+    The summary is read-only, so copies share it.
+    """
+
+    __slots__ = ('populations', 'channels', 'values', 'present', '_pop_index', '_ch_index')
+
+    def __init__(self, populations, channels, values, present=None):
+        self.populations, self._pop_index = _shared_names(populations)
+        self.channels, self._ch_index = _shared_names(channels)
+        values = np.asarray(values)
+        if values.dtype not in (np.float32, np.float64):
+            values = values.astype(np.float64)
+        shape = (len(self.populations), len(self.channels), 3)
+        if values.size == 0:
+            values = np.zeros(shape, dtype=values.dtype)
+        if values.shape != shape:
+            raise ValueError(f"Marker values have shape {values.shape}, expected {shape}.")
+        values = values.view()
+        values.flags.writeable = False
+        if present is not None:
+            present = np.asarray(present, dtype=bool)
+            if present.shape != shape[:2]:
+                raise ValueError(f"Marker presence has shape {present.shape}, "
+                                 f"expected {shape[:2]}.")
+            if present.all():
+                present = None
+            else:
+                present = present.view()
+                present.flags.writeable = False
+        self.values = values
+        self.present = present
+
+    @classmethod
+    def empty(cls) -> 'MarkerSummary':
+        return cls((), (), np.zeros((0, 0, 3), dtype=np.float32))
+
+    @classmethod
+    def from_dict(cls, markers: dict | None) -> 'MarkerSummary':
+        """The summary of a nested {population: {channel: [median, q25, q75]}}
+        dict (missing values, saved as None, become NaN)."""
+        markers = markers or {}
+        populations = list(markers)
+        rows = [markers[p] or {} for p in populations]
+        first = list(rows[0]) if rows else []
+        if all(list(r) == first for r in rows):
+            values = np.array([[r[ch] for ch in first] for r in rows], dtype=np.float64)
+            return cls(populations, first, _compact_values(values.reshape(len(rows), len(first), 3)))
+        channels = list(dict.fromkeys(ch for r in rows for ch in r))
+        col = {ch: j for j, ch in enumerate(channels)}
+        values = np.full((len(rows), len(channels), 3), np.nan)
+        present = np.zeros((len(rows), len(channels)), dtype=bool)
+        for i, r in enumerate(rows):
+            for ch, v in r.items():
+                values[i, col[ch]] = np.array(v, dtype=np.float64)
+                present[i, col[ch]] = True
+        return cls(populations, channels, _compact_values(values), present)
+
+    def median(self, population, channel) -> float:
+        """The median of *channel* in *population* (KeyError when absent)."""
+        i = self._pop_index[population]
+        return float(self.values[i, _MarkerRow(self, i)._column(channel), 0])
+
+    def subset(self, populations) -> 'MarkerSummary':
+        """The summary of the listed populations that it has, in its order."""
+        wanted = set(populations)
+        rows = [i for i, p in enumerate(self.populations) if p in wanted]
+        present = None if self.present is None else self.present[rows]
+        return MarkerSummary([self.populations[i] for i in rows], self.channels,
+                             self.values[rows], present)
+
+    def __getitem__(self, population) -> _MarkerRow:
+        return _MarkerRow(self, self._pop_index[population])
+
+    def __contains__(self, population) -> bool:
+        return population in self._pop_index
+
+    def __iter__(self):
+        return iter(self.populations)
+
+    def __len__(self) -> int:
+        return len(self.populations)
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __repr__(self) -> str:
+        return (f"MarkerSummary({len(self.populations)} populations × "
+                f"{len(self.channels)} channels)")
+
+
+def as_marker_summary(markers) -> MarkerSummary:
+    """*markers* (a MarkerSummary, a nested dict or None) as a MarkerSummary."""
+    if isinstance(markers, MarkerSummary):
+        return markers
+    return MarkerSummary.from_dict(markers)
+
+
+def select_markers(markers, populations):
+    """The marker summary of only the listed populations, of the same kind
+    as *markers* (a MarkerSummary or a nested dict)."""
+    if isinstance(markers, MarkerSummary):
+        return markers.subset(populations)
+    wanted = set(populations)
+    return {k: v for k, v in (markers or {}).items() if k in wanted}
+
+
+def _population_median(markers, population, channel) -> float:
+    if isinstance(markers, MarkerSummary):
+        return markers.median(population, channel)
+    return float(markers[population][channel][0])
+
+
+MARKER_FILE_FORMAT = 1
+
+
+def save_marker_summaries(path, summaries: dict, fingerprint: str = '') -> None:
+    """Write every sample's marker summary (``summaries[sample]['markers']``)
+    to one .npz file, beside *path* and then moved into place.
+
+    The file holds only numeric and text arrays plus a JSON header, no
+    pickled Python objects, so it is read with ``allow_pickle=False``.
+    Population and channel names are stored once; each sample stores
+    positions into them and its values array.
+    """
+    import json
+    import os
+    from pathlib import Path
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pop_pos: dict[str, int] = {}
+    ch_pos: dict[str, int] = {}
+    samples = list(summaries)
+    arrays: dict[str, np.ndarray] = {}
+    for i, key in enumerate(samples):
+        m = as_marker_summary((summaries[key] or {}).get('markers'))
+        arrays[f'populations_{i}'] = np.array(
+            [pop_pos.setdefault(p, len(pop_pos)) for p in m.populations], dtype=np.int32)
+        arrays[f'channels_{i}'] = np.array(
+            [ch_pos.setdefault(c, len(ch_pos)) for c in m.channels], dtype=np.int32)
+        arrays[f'values_{i}'] = np.asarray(m.values)
+        if m.present is not None:
+            arrays[f'present_{i}'] = np.asarray(m.present)
+    arrays['population_names'] = np.array(list(pop_pos), dtype=str)
+    arrays['channel_names'] = np.array(list(ch_pos), dtype=str)
+    arrays['meta'] = np.array(json.dumps({'format': MARKER_FILE_FORMAT,
+                                          'fingerprint': str(fingerprint or ''),
+                                          'samples': [str(s) for s in samples]}))
+    tmp = path.with_name(path.name + '.tmp')
+    with open(tmp, 'wb') as fh:
+        np.savez(fh, **arrays)
+    os.replace(tmp, path)
+
+
+def load_marker_summaries(path) -> tuple[str, dict]:
+    """(fingerprint, {sample: MarkerSummary}) from save_marker_summaries.
+    Raises ValueError for a file of another format."""
+    import json
+    with np.load(path, allow_pickle=False) as z:
+        meta = json.loads(str(z['meta']))
+        if meta.get('format') != MARKER_FILE_FORMAT:
+            raise ValueError(f"Unsupported marker summary format {meta.get('format')!r}.")
+        pop_names = z['population_names'].tolist()
+        ch_names = z['channel_names'].tolist()
+        files = set(z.files)
+        out = {}
+        for i, key in enumerate(meta.get('samples') or []):
+            present = z[f'present_{i}'] if f'present_{i}' in files else None
+            out[key] = MarkerSummary([pop_names[k] for k in z[f'populations_{i}'].tolist()],
+                                     [ch_names[k] for k in z[f'channels_{i}'].tolist()],
+                                     z[f'values_{i}'], present)
+    return str(meta.get('fingerprint') or ''), out
+
+
 def summarise_sample(gate_defs: list[dict], result: ag_core.GatingResult, data_t: np.ndarray,
                      channel_index: dict, marker_channels: list[str], n_total: int) -> dict:
-    """Compact, JSON-safe record of one sample's gating.
+    """Compact record of one sample's gating.
 
     data_t          : the sample's transformed events (rows as gated).
     marker_channels : channels summarised within every population.
 
-    Returns {'populations': population_table rows, 'markers': {population
-    key: {channel: [median, q25, q75]}}, 'status': per-gate status,
-    'boundaries': the boundaries applied, 'n_total': events gated}.
-    Marker quartiles are in transformed units.
+    Returns {'populations': population_table rows, 'markers': MarkerSummary
+    (reads as {population key: {channel: [median, q25, q75]}}), 'status':
+    per-gate status, 'boundaries': the boundaries applied, 'n_total':
+    events gated}. Everything but 'markers' is JSON-safe; marker quartiles
+    are in transformed units.
     """
     rows = ag_core.population_table(gate_defs, result, n_total)
-    cols = [(ch, channel_index[ch]) for ch in marker_channels if ch in channel_index]
-    col_idx = [ci for _ch, ci in cols]
-    markers: dict[str, dict[str, list[float]]] = {}
+    channels = [ch for ch in dict.fromkeys(marker_channels) if ch in channel_index]
+    col_idx = [channel_index[ch] for ch in channels]
+    pop_row: dict[str, int] = {}
+    quartiles: list[np.ndarray] = []
     if col_idx:
         for gate_def in gate_defs:
             name = gate_def['gate_name']
@@ -246,10 +523,16 @@ def summarise_sample(gate_defs: list[dict], result: ag_core.GatingResult, data_t
                 if not m.any():
                     continue
                 q = np.percentile(data_t[np.ix_(m, col_idx)], [50, 25, 75], axis=0)
-                markers[ag_core.population_key(name, pop)] = {
-                    ch: [float(q[0, j]), float(q[1, j]), float(q[2, j])]
-                    for j, (ch, _ci) in enumerate(cols)
-                }
+                key = ag_core.population_key(name, pop)
+                if key in pop_row:
+                    quartiles[pop_row[key]] = q.T
+                else:
+                    pop_row[key] = len(quartiles)
+                    quartiles.append(q.T)
+    if quartiles:
+        markers = MarkerSummary(list(pop_row), channels, _compact_values(np.stack(quartiles)))
+    else:
+        markers = MarkerSummary.empty()
     return {
         'populations': ag_core.to_jsonable(rows),
         'markers': markers,
@@ -419,7 +702,7 @@ def marker_table(summaries: dict, samples: list[str], gate_defs: list[dict],
             if ch in skip:
                 continue
             feature = marker_feature(pop_key, ch)
-            values[feature] = {s: float(summaries[s]['markers'][pop_key][ch][0])
+            values[feature] = {s: _population_median(summaries[s]['markers'], pop_key, ch)
                                for s in measured}
             meta.append({'feature': feature, 'cluster': labels.get(pop_key, pop_key),
                          'cluster_id': pop_key, 'channel': ch})
@@ -474,15 +757,25 @@ def _marker_columns(summaries: dict, samples: list[str], antigens: dict | None,
         summ = summaries.get(s) or {}
         n_by_pop = {r['key']: r['n_events'] for r in summ.get('populations', [])}
         group = (groups or {}).get(s, '')
-        for pop_key, chans in (summ.get('markers') or {}).items():
-            n = n_by_pop.get(pop_key)
-            for ch, (med, q25, q75) in chans.items():
-                cols['population'].append(pop_key)
-                cols['n_events'].append(n)
-                cols['channel'].append(ch)
-                cols['median'].append(med)
-                cols['q25'].append(q25)
-                cols['q75'].append(q75)
+        markers = summ.get('markers') or {}
+        if isinstance(markers, MarkerSummary) and markers.present is None:
+            n_ch = len(markers.channels)
+            cols['population'] += [p for p in markers.populations for _ in range(n_ch)]
+            cols['n_events'] += [n_by_pop.get(p) for p in markers.populations for _ in range(n_ch)]
+            cols['channel'] += list(markers.channels) * len(markers.populations)
+            cols['median'] += markers.values[:, :, 0].ravel().tolist()
+            cols['q25'] += markers.values[:, :, 1].ravel().tolist()
+            cols['q75'] += markers.values[:, :, 2].ravel().tolist()
+        else:
+            for pop_key, chans in markers.items():
+                n = n_by_pop.get(pop_key)
+                for ch, (med, q25, q75) in chans.items():
+                    cols['population'].append(pop_key)
+                    cols['n_events'].append(n)
+                    cols['channel'].append(ch)
+                    cols['median'].append(med)
+                    cols['q25'].append(q25)
+                    cols['q75'].append(q75)
         added = len(cols['population']) - len(cols['sample'])
         cols['sample'] += [s] * added
         cols['group'] += [group] * added

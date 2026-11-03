@@ -5196,16 +5196,20 @@ class TrainTab(QWidget):
 
 class _ReviewWorker(QThread):
     """Load and unmix the review samples for the Hierarchy tab, each capped
-    at the same number of events, and pool them."""
+    at the same number of events, pool them and, given *channels* and
+    *transforms* ({channel: Transform}), transform them for display."""
 
-    finished = Signal(bool, str, object)   # ok, message, unmixed events
+    finished = Signal(bool, str, object)   # ok, message, (unmixed, transformed or None)
 
-    def __init__(self, experiment_dir, sample_keys, snapshot, max_events, parent=None):
+    def __init__(self, experiment_dir, sample_keys, snapshot, max_events, channels=None,
+                 transforms=None, parent=None):
         super().__init__(parent)
         self._experiment_dir = experiment_dir
         self._keys = list(sample_keys)
         self._snap = snapshot
         self._max_events = max_events
+        self._channels = channels
+        self._transforms = transforms
 
     def run(self):
         try:
@@ -5214,7 +5218,11 @@ class _ReviewWorker(QThread):
                 out = load_unmixed(self._experiment_dir, key, self._snap,
                                    max_events=self._max_events, seed=TRAINING_SEED, use_cache=True)
                 chunks.append(np.asarray(out['unmixed'], dtype=np.float32))
-            self.finished.emit(True, '', np.concatenate(chunks, axis=0))
+            raw = np.concatenate(chunks, axis=0)
+            data_t = None
+            if self._channels is not None and self._transforms is not None:
+                data_t = ag_core.transform_columns(raw, self._channels, self._transforms)
+            self.finished.emit(True, '', (raw, data_t))
         except Exception as exc:
             log.exception("review sample load failed")
             self.finished.emit(False, str(exc), None)
@@ -6300,19 +6308,31 @@ class ReviewTab(QWidget):
         self.lbl_status.setText(f"Loading {label} …")
         self._wanted_keys = keys
         per_sample = max(self._MAX_EVENTS // len(keys), self._MIN_EVENTS_PER_SAMPLE)
-        worker = _ReviewWorker(self.controller.experiment_dir, keys, snap, per_sample, parent=self)
-        worker.finished.connect(lambda ok, msg, data, k=keys: self._on_loaded(ok, msg, data, k))
+        signature = self._transform_signature()
+        worker = _ReviewWorker(self.controller.experiment_dir, keys, snap, per_sample,
+                               channels=_experiment_channels(self.controller),
+                               transforms=dict(self.tf.objects), parent=self)
+        worker.finished.connect(lambda ok, msg, data, k=keys, sig=signature:
+                                self._on_loaded(ok, msg, data, k, sig))
         self._worker = worker
         worker.start()
 
-    def _on_loaded(self, ok, message, data, keys):
+    def _on_loaded(self, ok, message, data, keys, signature=None):
+        """The review events arrived: keep them, with the loader's transformed
+        copy when the transforms have not changed since the load started."""
         self._worker = None
         if not ok:
             self.lbl_status.setText(f"Could not load the review sample: {message}")
             return
-        self._raw = data
+        raw, data_t = data
+        self._raw = raw
         self._loaded_keys = tuple(keys)
-        self._transform_events()
+        if data_t is not None and signature is not None \
+                and signature == self._transform_signature():
+            self._data_t = data_t
+            self._data_signature = signature
+        else:
+            self._transform_events()
         if self._wanted_keys not in (None, tuple(keys)):
             self._ensure_sample()
             return

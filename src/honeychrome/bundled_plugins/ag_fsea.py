@@ -268,8 +268,8 @@ def build_features(summaries: dict, samples: list[str], gate_defs: list[dict], *
     if 'marker' in types:
         phen = {k for k, r in info.items() if r['kind'] == 'phenotype'}
         sub = {s: {'populations': (summaries.get(s) or {}).get('populations', []),
-                   'markers': {k: v for k, v in ((summaries.get(s) or {}).get('markers') or {}).items()
-                               if k in phen}}
+                   'markers': ag_results.select_markers(
+                       (summaries.get(s) or {}).get('markers'), phen)}
                for s in samples}
         values, mmeta, _dropped = ag_results.marker_table(
             sub, samples, gate_defs, exclude_gating_markers=exclude_gating_markers,

@@ -2384,8 +2384,11 @@ def new_model(gate_defs: list[dict], boundaries: dict, *, channel_map: dict,
     })
 
 
-def normalize_model(model: dict) -> tuple[dict, list[str]]:
+def normalize_model(model: dict, copy: bool = True) -> tuple[dict, list[str]]:
     """Validate a loaded model and upgrade format 1 to format 2.
+
+    copy : work on a deep copy of *model* (the default); False completes
+        *model* itself, for a model dict nothing else refers to.
 
     Returns (model, warnings). Raises ValueError for unsupported versions or
     a malformed gate list.
@@ -2394,7 +2397,7 @@ def normalize_model(model: dict) -> tuple[dict, list[str]]:
     version = model.get('format_version')
     if version not in (1, 2):
         raise ValueError(f"Unsupported model format_version {version!r}.")
-    m = deepcopy(model)
+    m = deepcopy(model) if copy else model
     gate_defs = m.get('gate_definitions')
     if not isinstance(gate_defs, list):
         raise ValueError("Model has no gate_definitions list.")

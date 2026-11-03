@@ -184,6 +184,9 @@ plugin_name = 'Automated Gating'
 DEFAULT_DISPLAY_EVENTS = 20_000
 DISPLAY_SEED = 42
 RESULTS_FILE = Path('cache') / 'automated_gating' / 'results.json'
+# The marker medians and quartiles of RESULTS_FILE's samples, as arrays.
+MARKERS_FILE = Path('cache') / 'automated_gating' / 'results_markers.npz'
+RESULTS_FORMAT = 3
 STATS_FILE = Path('cache') / 'automated_gating' / 'stats.json'
 ENRICHMENT_FILE = Path('cache') / 'automated_gating' / 'enrichment.json'
 SAMPLE_ANALYSIS_FILE = Path('cache') / 'automated_gating' / 'sample_analysis.json'
@@ -303,12 +306,18 @@ def _population_labels(gate_defs: list[dict]) -> dict:
     return ag_core.gate_population_names(gate_defs)
 
 
-def model_sha(model: dict) -> str:
+def model_sha(model: dict, converted: bool = False) -> str:
     """Hash of a model's gates, trained boundaries and transforms (not its
-    metadata or gate modes, which run_fingerprint covers)."""
+    metadata or gate modes, which run_fingerprint covers).
+
+    converted : the model is already in JSON types (as ag_core.new_model
+        returns it), so the conversion copy is skipped; the hash is the same.
+    """
     payload = {k: (model or {}).get(k) for k in
                ('gate_definitions', 'trained_boundaries', 'transforms')}
-    return hashlib.sha256(json.dumps(ag_core.to_jsonable(payload), sort_keys=True,
+    if not converted:
+        payload = ag_core.to_jsonable(payload)
+    return hashlib.sha256(json.dumps(payload, sort_keys=True,
                                      default=str).encode('utf-8')).hexdigest()
 
 
@@ -538,6 +547,13 @@ def run_fingerprint(state: 'GatingRunState', model_sha: str) -> str:
 # Gate plot tiles (Run tab and population browser)
 # ---------------------------------------------------------------------------
 
+def _gate_tile_size() -> tuple[int, int]:
+    """(width, height) of a gate plot tile."""
+    import honeychrome.settings as hc_settings
+    tile_size = int(getattr(hc_settings, 'cytometry_plot_width_target_retrieved', 220) or 220)
+    return tile_size + 20, tile_size + 60
+
+
 def _make_gate_tile(gate_def: dict, boundary: dict, events: np.ndarray | None,
                     channels: list[str], parent_mask: np.ndarray | None,
                     transforms: dict, axis_labels: dict, title: str,
@@ -565,7 +581,7 @@ def _make_gate_tile(gate_def: dict, boundary: dict, events: np.ndarray | None,
     tile_size = int(getattr(hc_settings, 'cytometry_plot_width_target_retrieved', 220) or 220)
 
     container = QWidget()
-    container.setFixedSize(tile_size + 20, tile_size + 60)
+    container.setFixedSize(*_gate_tile_size())
     layout = QVBoxLayout(container)
     layout.setContentsMargins(2, 2, 2, 2)
     layout.setSpacing(2)
@@ -861,6 +877,14 @@ class RunTab(QWidget):
         self._tree_for = None
         self._gate_items: dict = {}
         self._gates_for = None
+        # Gated-view tiles of the shown population ({'line', 'row', 'col',
+        # 'kind', 'key', 'gate', 'holder', 'built'}), built when scrolled near.
+        self._tiles: list = []
+        self._tile_ctx: dict = {}
+        self._tile_timer = QTimer(self)
+        self._tile_timer.setSingleShot(True)
+        self._tile_timer.setInterval(30)
+        self._tile_timer.timeout.connect(self._build_visible_tiles)
         self._build_ui()
 
     def _build_ui(self):
@@ -1003,6 +1027,9 @@ class RunTab(QWidget):
         self.tile_grid.setSpacing(4)
         self.tile_grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.tile_scroll.setWidget(self.tile_canvas)
+        for bar in (self.tile_scroll.verticalScrollBar(), self.tile_scroll.horizontalScrollBar()):
+            bar.valueChanged.connect(lambda _v: self._tile_timer.start())
+            bar.rangeChanged.connect(lambda _lo, _hi: self._tile_timer.start())
 
         split = QSplitter(Qt.Horizontal)
         split.addWidget(tree_panel)
@@ -1571,6 +1598,12 @@ class RunTab(QWidget):
         return events, np.concatenate(parents), channels
 
     def _draw_tiles(self):
+        """Lay out the gated views of the selected population: a heading per
+        row (pooled, the selected sample, validation samples) and a tile per
+        gate, each a placeholder until it is scrolled near
+        (_build_visible_tiles)."""
+        self._tile_timer.stop()
+        self._tiles = []
         _clear_layout(self.tile_grid)
         st = self.state
         gates = st.gate_defs()
@@ -1604,8 +1637,11 @@ class RunTab(QWidget):
         rows = ([('pooled', None)] if self.chk_pooled.isChecked() else []) + \
             ([('selected', selected)] if selected else []) + \
             [('validation', k) for k in validation]
+        self._tile_ctx = {'transforms': transforms, 'labels': labels, 'highlight': highlight,
+                          'by_name': by_name}
+        tile_w, tile_h = _gate_tile_size()
         r = 0
-        for kind, key in rows:
+        for line, (kind, key) in enumerate(rows):
             head = QLabel("<b>All gated samples</b> <small>(stored boundaries, % of pooled "
                           "display events)</small>" if kind == 'pooled' else
                           f"<b>{_sample_label(key)}</b> <small>[{kind}"
@@ -1618,38 +1654,92 @@ class RunTab(QWidget):
                                      Qt.AlignLeft | Qt.AlignBottom)
             r += 1
             for c, g in enumerate(shown):
-                name = g['gate_name']
-                eff = ag_core.effective_gate_def(g, by_name)
-                if kind == 'pooled':
-                    events, parent, channels = self._pooled(st.gated_samples(), eff)
-                    boundary = st.reference_boundaries().get(name, {})
-                    fractions = ag_report.boundary_fractions(eff, boundary, events, channels,
-                                                             parent, transforms)
-                    mode = st.modes.get(name, ag_core.MODE_FIXED)
-                    n_flag = sum(1 for k in st.summaries
-                                 if ((st.summaries[k].get('status') or {}).get(name) or {}).get('flag'))
-                    title = f"<b>{name}</b> <small>[{MODE_LABELS[mode]}]</small>"
-                    footer = f"{n_flag} sample(s) flagged at this gate" if n_flag else ''
-                else:
-                    disp = st.display.get(key) or {}
-                    channels = disp.get('channels') or []
-                    events = disp.get('events')
-                    parent = ag_results.display_parent_mask(disp, name, eff)
-                    summ = st.summaries.get(key) or {}
-                    boundary = (summ.get('boundaries') or {}).get(name, {})
-                    fractions = {row['population']: row['fraction_of_parent']
-                                 for row in summ.get('populations', []) if row['gate'] == name}
-                    status = (summ.get('status') or {}).get(name) or {}
-                    title = f"<b>{name}</b> <small>[{status.get('source') or '—'}]</small>"
-                    footer = status.get('message') if status.get('flag') else ''
-                tile = _make_gate_tile(eff, boundary, events, channels, parent, transforms, labels,
-                                       title, fractions=fractions, highlight=highlight,
-                                       footer=footer)
-                self.tile_grid.addWidget(tile, r, c)
+                holder = QWidget()
+                holder.setFixedSize(tile_w, tile_h)
+                self.tile_grid.addWidget(holder, r, c)
+                self._tiles.append({'line': line, 'row': r, 'col': c, 'kind': kind, 'key': key,
+                                    'gate': g, 'holder': holder, 'built': False})
             r += 1
         if not rows:
             self.tile_grid.addWidget(QLabel("Tick 'Pooled', select a gated sample in the sample "
                                             "panel or tick some validation samples."), 0, 0)
+        # The tiles on screen now; the others as the views are scrolled.
+        self._build_visible_tiles()
+        self._tile_timer.start()
+
+    def _build_tile(self, tile: dict):
+        """Build one gate tile in place of its placeholder."""
+        st, ctx = self.state, self._tile_ctx
+        g, kind, key = tile['gate'], tile['kind'], tile['key']
+        name = g['gate_name']
+        eff = ag_core.effective_gate_def(g, ctx['by_name'])
+        if kind == 'pooled':
+            events, parent, channels = self._pooled(st.gated_samples(), eff)
+            boundary = st.reference_boundaries().get(name, {})
+            fractions = ag_report.boundary_fractions(eff, boundary, events, channels,
+                                                     parent, ctx['transforms'])
+            mode = st.modes.get(name, ag_core.MODE_FIXED)
+            n_flag = sum(1 for k in st.summaries
+                         if ((st.summaries[k].get('status') or {}).get(name) or {}).get('flag'))
+            title = f"<b>{name}</b> <small>[{MODE_LABELS[mode]}]</small>"
+            footer = f"{n_flag} sample(s) flagged at this gate" if n_flag else ''
+        else:
+            disp = st.display.get(key) or {}
+            channels = disp.get('channels') or []
+            events = disp.get('events')
+            parent = ag_results.display_parent_mask(disp, name, eff)
+            summ = st.summaries.get(key) or {}
+            boundary = (summ.get('boundaries') or {}).get(name, {})
+            fractions = {row['population']: row['fraction_of_parent']
+                         for row in summ.get('populations', []) if row['gate'] == name}
+            status = (summ.get('status') or {}).get(name) or {}
+            title = f"<b>{name}</b> <small>[{status.get('source') or '—'}]</small>"
+            footer = status.get('message') if status.get('flag') else ''
+        widget = _make_gate_tile(eff, boundary, events, channels, parent, ctx['transforms'],
+                                 ctx['labels'], title, fractions=fractions,
+                                 highlight=ctx['highlight'], footer=footer)
+        holder = tile['holder']
+        self.tile_grid.removeWidget(holder)
+        holder.setParent(None)
+        holder.deleteLater()
+        tile['holder'] = None
+        tile['built'] = True
+        self.tile_grid.addWidget(widget, tile['row'], tile['col'])
+
+    def _build_visible_tiles(self):
+        """Build the tiles within a screen of the visible part of the gated
+        views, in either direction; while the page is not on screen, those
+        that would fill its first screens."""
+        pending = [t for t in self._tiles if not t['built']]
+        if not pending:
+            return
+        if self.tile_scroll.isVisible():
+            self.tile_grid.activate()
+            last = pending[-1]['holder']
+            if len(pending) > 1 and last.x() <= 0 and last.y() <= 0:
+                return    # not laid out yet; the scroll ranges change once it is
+            vp = self.tile_scroll.viewport()
+            w, h = max(vp.width(), 1), max(vp.height(), 1)
+            x0 = self.tile_scroll.horizontalScrollBar().value()
+            y0 = self.tile_scroll.verticalScrollBar().value()
+            wanted = []
+            for t in pending:
+                box = t['holder'].geometry()
+                if box.right() >= x0 - w and box.left() <= x0 + 2 * w \
+                        and box.bottom() >= y0 - h and box.top() <= y0 + 2 * h:
+                    wanted.append(t)
+        else:
+            tile_w, tile_h = _gate_tile_size()
+            cols = 2 * max(1, 1400 // tile_w)
+            lines = 2 * max(1, 800 // tile_h)
+            wanted = [t for t in pending if t['col'] < cols and t['line'] < lines]
+        for t in wanted:
+            self._build_tile(t)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._tiles:
+            self._tile_timer.start()
 
     def _draw_summary_table(self):
         _clear_layout(self.summary_holder)
@@ -1955,6 +2045,11 @@ class ResultsTab(QWidget):
         self._figure_pending = False
         self._predictive_worker: _CallWorker | None = None
         self._report_worker: _ReportWorker | None = None
+        # Populations page: the background gathering of the shown
+        # population, and pooled group panels kept for the current results.
+        self._pop_worker: _CallWorker | None = None
+        self._pop_cache: dict = {}
+        self._pop_cache_lock = threading.Lock()
         self._popout_workers: list = []
         self._filling = False
         self._volcano_tables: dict = {}
@@ -3499,8 +3594,16 @@ class ResultsTab(QWidget):
         have = {st.sample_groups.get(k) for k in st.gated_samples()}
         return [g for g in st.group_names if g in have]
 
-    def _population_data(self, pop_key: str) -> dict | None:
-        """Everything the comparison of one population shows."""
+    def _population_request(self) -> tuple:
+        """(groups, comparison) the Populations page compares, read from the
+        page's widgets (main thread)."""
+        return self._comparison_groups(), self._current_comparison()
+
+    def _population_data(self, pop_key: str, request: tuple | None = None) -> dict | None:
+        """Everything the comparison of one population shows. *request* is
+        _population_request() taken on the main thread (read here when not
+        given); with it, this only reads the state, so it can run in a
+        worker thread."""
         st = self.state
         gate_name, pop = ag_core.split_population_key(pop_key)
         by_name = ag_core.gates_by_name(st.gate_defs())
@@ -3508,25 +3611,49 @@ class ResultsTab(QWidget):
         if gdef is None:
             return None
         eff = ag_core.effective_gate_def(gdef, by_name)
-        groups = self._comparison_groups()
+        groups, comp = request if request is not None else self._population_request()
         panels = []
         for g in groups:
             samples = [k for k in st.gated_samples() if st.sample_groups.get(k) == g]
-            events, parent, member, channels = ag_report.pooled_population(
-                st.display, samples, eff, pop, max_events=GROUP_PLOT_EVENTS, seed=DISPLAY_SEED)
-            panels.append({'group': g, 'events': events, 'parent': parent, 'member': member,
-                           'channels': channels, 'n_samples': sum(1 for k in samples if k in st.display),
-                           'boundary': st.reference_boundaries().get(gate_name, {})})
+            panels.append(self._pooled_group(eff, pop, g, samples))
         values = ag_results.group_population_values(st.summaries, st.gated_samples(),
                                                     st.sample_groups, pop_key, st.use_stats_parent)
         values = {g: values.get(g, []) for g in groups}
-        comp = self._current_comparison()
         result = ag_results.population_result(st.stats, pop_key, _comparison_label(*comp),
                                                st.fdr_scope) if comp else None
         label = _population_labels(st.gate_defs()).get(pop_key, pop_key)
         return {'gate_def': eff, 'pop': pop, 'panels': panels, 'values': values, 'groups': groups,
                 'result': result, 'label': label,
                 'title': f"{label}" + (f" — {_comparison_label(*comp)}" if comp else '')}
+
+    _POP_CACHE_SIZE = 32
+
+    def _pooled_group(self, gate_def: dict, pop: str, group: str, samples: list[str]) -> dict:
+        """One group's pooled panel of a population (ag_report.pooled_population),
+        its events cut to the channels the gate is plotted on, which is all
+        its figures use. Kept for the current results."""
+        st = self.state
+        gate_name = gate_def['gate_name']
+        key = (gate_name, pop, group, tuple(samples), st.results_revision)
+        with self._pop_cache_lock:
+            hit = self._pop_cache.get(key)
+        if hit is not None:
+            return hit
+        events, parent, member, channels = ag_report.pooled_population(
+            st.display, samples, gate_def, pop, max_events=GROUP_PLOT_EVENTS, seed=DISPLAY_SEED)
+        boundary = st.reference_boundaries().get(gate_name, {})
+        keep = [c for c in ag_core.boundary_plot_channels(gate_def, boundary) if c and c in channels]
+        if events is not None and keep:
+            events = np.ascontiguousarray(events[:, [channels.index(c) for c in keep]])
+            channels = keep
+        panel = {'group': group, 'events': events, 'parent': parent, 'member': member,
+                 'channels': channels, 'n_samples': sum(1 for k in samples if k in st.display),
+                 'boundary': boundary}
+        with self._pop_cache_lock:
+            self._pop_cache[key] = panel
+            while len(self._pop_cache) > self._POP_CACHE_SIZE:
+                del self._pop_cache[next(iter(self._pop_cache))]
+        return panel
 
     def _draw_population(self, item):
         _clear_layout(self.pop_view)
@@ -3540,12 +3667,44 @@ class ResultsTab(QWidget):
         if self._shown_population is None:
             self.lbl_pop_title.setText("")
             return
-        self._fill_population_view(self.pop_view, self._shown_population, self.lbl_pop_title)
+        self._request_population(self._shown_population)
 
-    def _fill_population_view(self, layout, pop_key: str, title_label: QLabel):
-        """Each compared group's pooled biplot, then the dot and violin plot."""
+    def _request_population(self, pop_key: str):
+        """Gather the shown population's data in the background, then draw it
+        (_on_population_data). While a request runs, a newer selection waits
+        for it to finish."""
+        if self._pop_worker is not None:
+            return
+        request = self._population_request()
+        self.lbl_pop_title.setText("<i>Pooling the groups' events</i>")
+        worker = _CallWorker(lambda k=pop_key, r=request: self._population_data(k, r),
+                             parent=self)
+        worker.finished.connect(lambda ok, error, data, k=pop_key:
+                                self._on_population_data(ok, error, data, k))
+        self._pop_worker = worker
+        worker.start()
+
+    def _on_population_data(self, ok: bool, error: str, data, pop_key: str):
+        self._pop_worker = None
+        if self._shown_population != pop_key:
+            # Another population was selected meanwhile.
+            _clear_layout(self.pop_view)
+            if self._shown_population is not None:
+                self._request_population(self._shown_population)
+            return
+        _clear_layout(self.pop_view)
+        if not ok:
+            self.lbl_pop_title.setText(f"The population could not be shown: {error}")
+            return
+        self._fill_population_view(self.pop_view, pop_key, self.lbl_pop_title, data=data)
+
+    def _fill_population_view(self, layout, pop_key: str, title_label: QLabel,
+                              data: dict | None = None):
+        """Each compared group's pooled biplot, then the dot and violin plot
+        (*data*: _population_data, gathered here when not given)."""
         from honeychrome.view_components.scalable_figure_widget import scrollable_canvas_class
-        data = self._population_data(pop_key)
+        if data is None:
+            data = self._population_data(pop_key)
         if data is None:
             title_label.setText("")
             return
@@ -3619,9 +3778,10 @@ class ResultsTab(QWidget):
         self._fill_population_view(row, pop_key, title)
         dialog.show()
 
-    def _population_report_figure(self, pop_key: str):
-        """The report figure of one population's group comparison."""
-        data = self._population_data(pop_key)
+    def _population_report_figure(self, pop_key: str, request: tuple | None = None):
+        """The report figure of one population's group comparison (*request*:
+        _population_request() taken on the main thread)."""
+        data = self._population_data(pop_key, request)
         if data is None:
             return None
         labels = build_display_label_map(
@@ -3750,7 +3910,8 @@ class ResultsTab(QWidget):
             predictive=st.predictive or None,
             populations=[(k, _population_labels(st.gate_defs()).get(k, k))
                          for k in st.report_populations],
-            population_figure=self._population_report_figure,
+            population_figure=lambda key, r=self._population_request():
+                self._population_report_figure(key, r),
             enrichment=st.fsea or None,
         )
 
@@ -4049,6 +4210,37 @@ class _StateLoader(QThread):
         out['model'], out['model_warnings'] = ag_core.read_model(path)
 
     @staticmethod
+    def _attach_markers(results_path: Path, payload: dict, fingerprint: str, out: dict):
+        """Give each summary of *payload* its marker summary: from the
+        marker file it names, or, in results saved before the marker file,
+        converted from the nested lists in the JSON (out['upgrade_results']
+        then asks for the results to be saved again in the current form)."""
+        summaries = payload.get('summaries') or {}
+        if int(payload.get('format_version') or 1) < RESULTS_FORMAT:
+            for summ in summaries.values():
+                summ['markers'] = ag_results.as_marker_summary(summ.get('markers'))
+            out['upgrade_results'] = bool(summaries)
+            return
+        loaded: dict = {}
+        name = Path(str(payload.get('marker_file') or MARKERS_FILE.name)).name
+        try:
+            saved_fingerprint, loaded = ag_results.load_marker_summaries(results_path.with_name(name))
+            if saved_fingerprint != fingerprint:
+                raise ValueError("it belongs to another gating run")
+            missing = [k for k in summaries if k not in loaded]
+            if missing:
+                raise ValueError(f"{len(missing)} sample(s) are missing from it")
+        except Exception as exc:
+            log.warning("could not read the saved marker summaries: %s", exc)
+            if summaries:
+                out['errors'].append(
+                    f"Could not read the saved marker medians ({exc}); run gating again to "
+                    "restore them.")
+        empty = ag_results.MarkerSummary.empty()
+        for key, summ in summaries.items():
+            summ['markers'] = loaded.get(key, empty)
+
+    @staticmethod
     def _read_results(job: dict, out: dict):
         path = job.get('results_path')
         if path is None or not Path(path).exists():
@@ -4056,6 +4248,7 @@ class _StateLoader(QThread):
         payload = json.loads(Path(path).read_text(encoding='utf-8'))
         out['results'] = payload
         fingerprint = str(payload.get('run_fingerprint') or '')
+        _StateLoader._attach_markers(Path(path), payload, fingerprint, out)
         display = {}
         folder = job.get('display_dir')
         if folder is not None:
@@ -4128,9 +4321,10 @@ class PluginWidget(QWidget):
     own settings and session file (see BuilderPages). The settings of the
     last three pages (gate modes, drift settings, sample selection, groups,
     covariates and statistics options) are kept as one JSON string in
-    cache/automated_gating/state.json. Gated results (counts, medians and per-gate status) are kept in
+    cache/automated_gating/state.json. Gated results (counts and per-gate status) are kept in
     RESULTS_FILE in the experiment folder, with the samples a paused run has
-    still to gate, and each sample's display record in DISPLAY_DIR; the last
+    still to gate, their marker medians and quartiles in MARKERS_FILE, and
+    each sample's display record in DISPLAY_DIR; the last
     statistics run is kept in STATS_FILE and the last enrichment run in
     ENRICHMENT_FILE, both restored while they still match the gated results;
     the last sample PCA and predictive analysis are kept in
@@ -4429,11 +4623,13 @@ class PluginWidget(QWidget):
         st.modes = self._application()['mode_per_gate']
         signature = signature or self.builder.signature()
         if signature != self._synced_signature or not st.applied_model:
+            # A new dict in JSON types, owned here: hashed without a converted
+            # copy and completed in place.
             model = self.builder.model()
-            sha = model_sha(model)
+            sha = model_sha(model, converted=True)
             if sha != st.model_sha or not st.applied_model:
                 try:
-                    model = ag_core.normalize_model(model)[0]
+                    model = ag_core.normalize_model(model, copy=False)[0]
                 except Exception:
                     log.exception("the model pages' gates do not form a valid hierarchy")
                 st.applied_model = model
@@ -4613,6 +4809,10 @@ class PluginWidget(QWidget):
             if int(payload.get('format_version') or 1) < 2:
                 # Hash of the model file, from before the model pages: not comparable.
                 st.results_model_sha = ''
+            if out.get('upgrade_results'):
+                # Saved before the marker file: save them again, so the next
+                # opening reads the arrays rather than the nested lists.
+                self._write_results()
         if out.get('stats'):
             st.stats = out['stats']
         if out.get('fsea'):
@@ -4677,20 +4877,31 @@ class PluginWidget(QWidget):
             return
         path = self._results_path()
         st = self.state
+        summaries = dict(st.summaries)
         payload = {
-            'format_version': 2,
+            'format_version': RESULTS_FORMAT,
             'model_path': st.model_path,
             'model_sha256': st.results_model_sha,
             'marker_channels': list(st.marker_channels),
+            'marker_file': MARKERS_FILE.name,
             'run_samples': list(st.run_samples),
-            'summaries': dict(st.summaries),
+            'summaries': {k: {f: v for f, v in (s or {}).items() if f != 'markers'}
+                          for k, s in summaries.items()},
             'load_info': dict(st.load_info),
             'pending_samples': list(st.pending_samples),
             'run_fingerprint': st.run_fingerprint,
             'run_unmixing': st.run_unmixing,
             'run_transforms': deepcopy(st.run_transforms),
         }
-        self._start_writer(lambda: _write_json_atomic(path, payload), "Saving the gating results")
+
+        def _job():
+            # The marker file is written first, so the results never name
+            # samples it does not have.
+            ag_results.save_marker_summaries(path.with_name(MARKERS_FILE.name), summaries,
+                                             payload['run_fingerprint'])
+            _write_json_atomic(path, payload)
+
+        self._start_writer(_job, "Saving the gating results")
 
     def _write_stats(self):
         """Write the last statistics run to STATS_FILE (in the background),
