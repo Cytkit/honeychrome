@@ -456,7 +456,10 @@ def convert_threshold_regions(populations: dict, old_type: str, old_x, old_y,
             return None, "The separation parameter must be one of the 2dsep gate's two parameters."
         sides: dict = {}
         for pop, meta in out.items():
-            sign = ag_core.region_sign(meta.get('region'), axis)
+            region = meta.get('region')
+            # A side already chosen in the gate editor's Side column stands.
+            sign = ({ag_core.REGION_ABOVE: '+', ag_core.REGION_BELOW: '-'}.get(region)
+                    or ag_core.region_sign(region, axis))
             if sign is None:
                 return None, (f"'{pop}' lies on both sides of {new_x}; use Split into 1D gates "
                               "instead.")
@@ -1190,6 +1193,48 @@ def split_2dsep(gate_defs: list[dict], gate_name: str, steps: list[dict],
     return out, [d['gate_name'] for d in new]
 
 
+def repoint_split_sources(gate_defs: list[dict], old_name: str,
+                          new_names: list[str]) -> tuple[dict, list[str]]:
+    """Point the replicated thresholds that came from *old_name*, now split
+    into the 1dsep gates *new_names* (split_2dsep), at the new gates, in
+    place. A threshold copied from the gate moves to the one new gate
+    separating on the same channel; one calculated on a population of the
+    gate moves to the new gate holding that population. A source without a
+    single new home is cleared, so that axis asks for a source again.
+
+    Returns ({gate: new source gate}, names of the gates whose source was
+    cleared).
+    """
+    by_name = ag_core.gates_by_name(gate_defs)
+    new = [by_name[n] for n in new_names if n in by_name]
+    moved, cleared = {}, set()
+    for g in gate_defs:
+        gp = g.get('gate_param') or {}
+        for axis in ('x', 'y'):
+            src = gp.get(f'replicate_{axis}')
+            if not isinstance(src, dict):
+                continue
+            if src.get('gate') == old_name:
+                channel = ag_core.axis_channel(g, axis)
+                homes = [d['gate_name'] for d in new if d.get('gate_marker_x') == channel]
+            elif src.get('population') \
+                    and ag_core.split_population_key(src['population'])[0] == old_name:
+                pop = ag_core.split_population_key(src['population'])[1]
+                homes = [d['gate_name'] for d in new if pop in (d.get('populations') or {})]
+            else:
+                continue
+            if len(homes) != 1:
+                gp[f'replicate_{axis}'] = None
+                cleared.add(g['gate_name'])
+            elif src.get('gate'):
+                src['gate'] = homes[0]
+                moved[g['gate_name']] = homes[0]
+            else:
+                src['population'] = ag_core.population_key(homes[0], pop)
+                moved[g['gate_name']] = homes[0]
+    return moved, sorted(cleared)
+
+
 # ---------------------------------------------------------------------------
 # Gates that share a name
 # ---------------------------------------------------------------------------
@@ -1287,6 +1332,15 @@ def _user_set(gate_def: dict) -> bool:
             and gate_def.get('sync_origin') not in (SYNC_AUTO, SYNC_DRAWN))
 
 
+def _decides_sync(gate_def: dict, member_names: set) -> bool:
+    """A user-set member whose configuration is the group's: one copying a
+    threshold from another gate of its own group is that gate's own choice,
+    so it is neither copied to the others nor counted as a disagreement."""
+    return _user_set(gate_def) and not any(
+        src and src.get('gate') in member_names
+        for src in ag_core.replicate_sources(gate_def).values())
+
+
 def _follows_sync(gate_def: dict) -> bool:
     """Updated to match its replicates: still as drawn, or set automatically."""
     if gate_def.get('sync_origin') == SYNC_DRAWN:
@@ -1303,26 +1357,32 @@ def apply_name_sync(gate_defs: list[dict], gate_name: str) -> tuple[list[str], s
     """Bring the replicates of *gate_name* in line with the configuration
     the user chose for them.
 
-    The user-set members (see _user_set) decide. When they all agree, every
+    The user-set members decide, except those copying a threshold from a
+    gate of the group (see _decides_sync). When they all agree, every
     member that is still as drawn, or was set automatically, takes their
     algorithm and parameters and is marked SYNC_AUTO; members the user set,
     or returned to their shapes as drawn, are left alone. A member is also
     left alone when the configuration would make it replicate a threshold
-    from itself or from a gate below it. When the user-set members disagree
-    nothing changes and the group's name is returned as a conflict.
+    from itself or from a gate below it. A configuration replicating an axis
+    whose source is not chosen yet is not passed on. When the deciding
+    members disagree nothing changes and the group's name is returned as a
+    conflict.
 
     Returns (names of the gates changed, conflicting group name or None).
     """
     members = sync_members(gate_defs, gate_name)
     if not members:
         return [], None
-    chosen = [m for m in members if _user_set(m)]
+    names = {m['gate_name'] for m in members}
+    chosen = [m for m in members if _decides_sync(m, names)]
     if not chosen:
         return [], None
     prints = {sync_fingerprint(m) for m in chosen}
     if len(prints) > 1:
         return [], _group_label(members)
     template = chosen[0]
+    if any(src is None for src in ag_core.replicate_sources(template).values()):
+        return [], None
     target = sync_fingerprint(template)
     tgp = template.get('gate_param') or {}
     sources = _source_gates(tgp)
@@ -1360,7 +1420,8 @@ def sync_conflicts(gate_defs: list[dict]) -> list[str]:
     different configurations, so the others are not updated."""
     out = []
     for members in _sync_groups(gate_defs):
-        prints = {sync_fingerprint(m) for m in members if _user_set(m)}
+        names = {m['gate_name'] for m in members}
+        prints = {sync_fingerprint(m) for m in members if _decides_sync(m, names)}
         if len(prints) > 1:
             out.append(_group_label(members))
     return out
@@ -1371,7 +1432,8 @@ def conflicting_gate_names(gate_defs: list[dict]) -> set:
     different configurations (see sync_conflicts)."""
     out = set()
     for members in _sync_groups(gate_defs):
-        if len({sync_fingerprint(m) for m in members if _user_set(m)}) > 1:
+        names = {m['gate_name'] for m in members}
+        if len({sync_fingerprint(m) for m in members if _decides_sync(m, names)}) > 1:
             out |= {m['gate_name'] for m in members}
     return out
 
@@ -1435,6 +1497,93 @@ def feed_forward(gate_defs: list[dict], gate_name: str,
         target['sync_origin'] = SYNC_USER
         changed.append(name)
     return changed, skipped
+
+
+def threshold_reuse_candidates(gate_defs: list[dict], source_name: str) -> list[dict]:
+    """Gates that can copy *source_name*'s threshold, in hierarchy order:
+    threshold gates other than the source with an axis on one of its
+    channels. Gates the source depends on (its ancestors and the sources of
+    its own replicated thresholds) are left out, since copying from it would
+    make them depend on themselves.
+
+    Each entry: {'gate': name, 'population': the population it is drawn on,
+    'axes': {axis: channel} it would copy, 'same_name': shares the source's
+    name, 'copies': copies the source on all those axes already,
+    'imported': still applies its shapes as drawn}.
+    """
+    by_name = ag_core.gates_by_name(gate_defs)
+    source = by_name.get(source_name)
+    if source is None or source.get('gate_type') not in ag_core.THRESHOLD_TYPES:
+        return []
+    channels = {ag_core.axis_channel(source, a) for a in ag_core.threshold_axes(source)} - {None}
+    upstream, stack = set(), [source_name]
+    while stack:
+        name = stack.pop()
+        g = by_name.get(name)
+        if g is None or name in upstream:
+            continue
+        upstream.add(name)
+        deps = ag_core.gate_dependencies(g)
+        if g.get('algorithm') == ag_core.ALGORITHM_IMPORTED:
+            deps |= ag_core.gate_dependencies(trainable_definition(g))
+        stack.extend(deps - upstream)
+    group = name_group(source)
+    out = []
+    for g in ag_core.ordered_gate_defs(gate_defs):
+        if g['gate_name'] in upstream or g.get('gate_type') not in ag_core.THRESHOLD_TYPES:
+            continue
+        axes = {a: ag_core.axis_channel(g, a) for a in ag_core.threshold_axes(g)
+                if ag_core.axis_channel(g, a) in channels}
+        if not axes:
+            continue
+        gp = g.get('gate_param') or {}
+        imported = g.get('algorithm') == ag_core.ALGORITHM_IMPORTED
+        copies = not imported and all(
+            ag_core.axis_algorithm(g, a) == ag_core.ALGORITHM_REPLICATE
+            and (gp.get(f'replicate_{a}') or {}).get('gate') == source_name for a in axes)
+        out.append({'gate': g['gate_name'], 'population': g.get('parent_popul') or 'root',
+                    'axes': axes, 'same_name': name_group(g) == group, 'copies': copies,
+                    'imported': imported})
+    return out
+
+
+def reuse_threshold(gate_defs: list[dict], source_name: str, targets: dict) -> list[str]:
+    """Make each gate of *targets* ({gate: axes}) copy *source_name*'s
+    threshold on those axes, in place: the axes replicate from the source
+    gate (see threshold_reuse_candidates for the gates that can). A 2dsep
+    target keeps the algorithm of an axis it does not copy (an imported
+    gate's proposed one). A gate still as drawn becomes trainable on its own
+    layout. The targets count as the user's choice (SYNC_USER).
+
+    Returns the names of the gates changed.
+    """
+    by_name = ag_core.gates_by_name(gate_defs)
+    changed = []
+    for name, axes in targets.items():
+        g = by_name.get(name)
+        if g is None or name == source_name or not axes \
+                or g.get('gate_type') not in ag_core.THRESHOLD_TYPES:
+            continue
+        before = deepcopy((g.get('algorithm'), g.get('gate_param')))
+        imported = g.get('algorithm') == ag_core.ALGORITHM_IMPORTED
+        gp = g.setdefault('gate_param', {})
+        two_d = g.get('gate_type') == '2dsep'
+        if two_d:
+            for a in ('x', 'y'):
+                if a not in axes and not gp.get(f'algorithm_{a}'):
+                    gp[f'algorithm_{a}'] = ((g.get('proposed_algorithm') if imported
+                                             else g.get('algorithm'))
+                                            or ag_core.default_algorithm_for_type('2dsep'))
+            for a in axes:
+                gp[f'algorithm_{a}'] = ag_core.ALGORITHM_REPLICATE
+        for a in axes:
+            gp[f'replicate_{a}'] = {'gate': source_name}
+        g['algorithm'] = gp['algorithm_x'] if two_d else ag_core.ALGORITHM_REPLICATE
+        g.pop('proposal_rule', None)
+        g['sync_origin'] = SYNC_USER
+        if (g.get('algorithm'), g.get('gate_param')) != before:
+            changed.append(name)
+    return changed
 
 
 def conversion_check(gate_def: dict, drawn: dict, proposed: dict, drawn_fractions: dict,

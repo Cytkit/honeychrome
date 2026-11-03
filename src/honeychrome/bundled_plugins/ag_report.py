@@ -9,10 +9,13 @@ widgets: every figure is built without a canvas.
 
 Sections:
   • Samples    — per-sample events, AF profiles and flags; population
-                 counts and fractions; marker medians and quartiles.
+                 fractions. The population counts and the marker medians
+                 and quartiles are the report's own CSV files
+                 (population_statistics.csv, activation_statistics.csv).
   • Gates      — one plot per gate: the parent population's events pooled
                  over the gated samples' display subsamples, with the stored
-                 boundary and pooled fractions.
+                 boundary and pooled fractions; ``gate_pages`` puts the
+                 ticked gates GATES_PER_PAGE to a page.
   • Statistics — for each comparison of the last statistics run: heatmaps,
                  volcano plots (with their results tables) and the marker
                  summary; the sample PCA and the predictive analysis (ROC
@@ -33,6 +36,9 @@ treat it as a tab.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any, Callable
+
 import numpy as np
 import pandas as pd
 
@@ -45,11 +51,33 @@ from honeychrome.view_components.differential_plots import (
 
 SECTIONS = ('Samples', 'Gates', 'Statistics', 'Populations', 'Enrichment')
 
-__all__ = ['SECTIONS', 'pooled_display', 'pooled_population', 'boundary_fractions',
+# Gate plots per PDF page (A4 landscape), as columns × rows.
+GATE_PAGE_COLUMNS = 3
+GATE_PAGE_ROWS = 2
+GATES_PER_PAGE = GATE_PAGE_COLUMNS * GATE_PAGE_ROWS
+# Above this many gates the Gates section starts unticked.
+REPORT_GATES_DEFAULT_LIMIT = 50
+# Larger tables are written to CSV only, with a note in the PDF.
+PDF_MAX_ROWS = 500
+PDF_MAX_COLUMNS = 30
+
+__all__ = ['SECTIONS', 'GATE_PAGE_COLUMNS', 'GATE_PAGE_ROWS', 'GATES_PER_PAGE',
+           'REPORT_GATES_DEFAULT_LIMIT', 'PDF_MAX_ROWS', 'PDF_MAX_COLUMNS', 'GateReportItem',
+           'pooled_display', 'pooled_population', 'boundary_fractions',
            'label_position', 'make_gate_figure', 'population_frequency_table', 'sample_table',
-           'build_report_items', 'make_pca_figure', 'make_roc_figure', 'make_importance_figure',
-           'make_panel_figure', 'predictive_subtitle', 'make_group_values_figure',
-           'make_population_comparison_figure', 'p_value_text', 'enrichment_report_items']
+           'build_report_items', 'gate_pages', 'make_pca_figure', 'make_roc_figure',
+           'make_importance_figure', 'make_panel_figure', 'predictive_subtitle',
+           'make_group_values_figure', 'make_population_comparison_figure', 'p_value_text',
+           'enrichment_report_items']
+
+
+@dataclass
+class GateReportItem(ReportItem):
+    """A Gates section item: *get_figure* draws the gate alone; *draw(ax)*
+    draws it into the given axes of a page of several gates, under the
+    page's *page_title*."""
+    draw: Callable[[Any], Any] | None = None
+    page_title: str = ''
 
 
 def pooled_display(display: dict, samples: list[str], gate_name: str,
@@ -370,34 +398,33 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
             key='frequencies', tab='Samples', label='Population frequencies',
             get_tables=lambda: {'percent_of_parent': population_frequency_table(
                 summaries, samples, pop_labels)}))
-        items.append(ReportItem(
-            key='populations', tab='Samples', label='Population counts',
-            get_tables=lambda: {'counts': ag_results.population_export(summaries, samples, groups)}))
-        items.append(ReportItem(
-            key='markers', tab='Samples', label='Marker medians',
-            get_tables=lambda: {'medians': ag_results.marker_export(summaries, samples, antigens,
-                                                                    groups)}))
 
     if display and include_gates:
         by_name = ag_core.gates_by_name(gate_defs)
+        page_title = f"Stored boundaries; % of pooled display events, {len(samples)} samples"
         for g in ag_core.ordered_gate_defs(gate_defs):
             name = g['gate_name']
             eff = ag_core.effective_gate_def(g, by_name)
             mode = modes.get(name, ag_core.MODE_FIXED)
 
-            def _gate_fig(_eff=eff, _name=name, _mode=mode):
+            def _gate_plot(title, ax=None, _eff=eff, _name=name):
                 events, parent, channels = pooled_display(display, samples, _name, _eff)
                 boundary = reference_boundaries.get(_name, {})
                 fractions = boundary_fractions(_eff, boundary, events, channels, parent,
                                                transforms)
-                return make_gate_figure(
-                    _eff, boundary, events, channels, parent, transforms, axis_labels,
-                    f"{_name} ({_mode}; stored boundary)\n"
-                    f"% of pooled display events, {len(samples)} samples",
-                    fractions=fractions)
+                return make_gate_figure(_eff, boundary, events, channels, parent, transforms,
+                                        axis_labels, title, fractions=fractions, ax=ax)
 
-            items.append(ReportItem(key=f'gate:{name}', tab='Gates', label=f"Gate {name}",
-                                    get_figure=_gate_fig))
+            def _gate_fig(_plot=_gate_plot, _name=name, _mode=mode):
+                return _plot(f"{_name} ({_mode}; stored boundary)\n"
+                             f"% of pooled display events, {len(samples)} samples")
+
+            def _gate_draw(ax, _plot=_gate_plot, _name=name, _mode=mode):
+                return _plot(f"{_name} ({_mode})", ax=ax)
+
+            items.append(GateReportItem(key=f'gate:{name}', tab='Gates', label=f"Gate {name}",
+                                        get_figure=_gate_fig, draw=_gate_draw,
+                                        page_title=page_title))
 
     if stats:
         cache: dict = {}
@@ -468,6 +495,57 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
     if enrichment:
         items.extend(enrichment_report_items(enrichment, pval_threshold))
     return items
+
+
+def gate_pages(items: list, per_page: int = GATES_PER_PAGE) -> list:
+    """*items* with the gate items (GateReportItem) put *per_page* to a
+    page: each page is one item, labelled with the range of the gates on
+    it in report order (e.g. 'Gates 007-012 of 150'), whose figure has the
+    gates in GATE_PAGE_COLUMNS columns. Other items are kept in place."""
+    gates = [it for it in items if isinstance(it, GateReportItem)]
+    if not gates:
+        return list(items)
+    width = len(str(len(gates)))
+    pages = []
+    for start in range(0, len(gates), per_page):
+        chunk = gates[start:start + per_page]
+        first, last = start + 1, start + len(chunk)
+        pages.append(ReportItem(
+            key=f"gates:{first}-{last}", tab=chunk[0].tab,
+            label=f"Gates {first:0{width}d}-{last:0{width}d} of {len(gates)}",
+            get_figure=lambda _chunk=chunk: _gate_page_figure(_chunk, per_page)))
+    out, placed = [], False
+    for it in items:
+        if isinstance(it, GateReportItem):
+            if not placed:
+                out.extend(pages)
+                placed = True
+            continue
+        out.append(it)
+    return out
+
+
+def _gate_page_figure(chunk: list, per_page: int):
+    """One A4 landscape page of gate plots; a gate that cannot be drawn
+    says so in its panel."""
+    from matplotlib.figure import Figure
+
+    rows = max(1, -(-per_page // GATE_PAGE_COLUMNS))
+    fig = Figure(figsize=(11.69, 8.27), constrained_layout=True)
+    axes = fig.subplots(rows, GATE_PAGE_COLUMNS, squeeze=False).ravel()
+    for ax, item in zip(axes, chunk):
+        try:
+            item.draw(ax)
+        except Exception as exc:
+            ax.clear()
+            ax.axis('off')
+            ax.text(0.5, 0.5, f"{item.label}: could not be drawn ({exc})", ha='center',
+                    va='center', wrap=True, transform=ax.transAxes)
+    for ax in axes[len(chunk):]:
+        ax.axis('off')
+    if chunk and chunk[0].page_title:
+        fig.suptitle(chunk[0].page_title, fontsize=10)
+    return fig
 
 
 def enrichment_report_items(result: dict, fdr_threshold: float) -> list[ReportItem]:
@@ -641,7 +719,8 @@ def make_roc_figure(performance: pd.DataFrame, roc: pd.DataFrame, summary: dict,
     ax.set_xlabel("False positive rate")
     ax.set_ylabel("True positive rate")
     ax.legend(loc='lower right', fontsize=7)
-    ax.set_title(f"Cross-validated ROC\n{predictive_subtitle(summary)}", fontsize=9)
+    ax.set_title(dp.wrap_to_width(f"Cross-validated ROC\n{predictive_subtitle(summary)}", 9, 5.0),
+                 fontsize=9)
     dp.style_figure_theme(fig, is_dark)
     return fig
 
@@ -697,6 +776,7 @@ def make_panel_figure(panel: pd.DataFrame, summary: dict, is_dark: bool):
     ax.set_xlabel("Number of top-ranked features (log scale)")
     ax.set_ylabel("Cross-validated AUC (mean ± SD)")
     ax.set_ylim(0, 1.02)
-    ax.set_title(f"How many features are needed?\n{predictive_subtitle(summary)}", fontsize=9)
+    ax.set_title(dp.wrap_to_width(f"How many features are needed?\n{predictive_subtitle(summary)}",
+                                  9, 5.0), fontsize=9)
     dp.style_figure_theme(fig, is_dark)
     return fig

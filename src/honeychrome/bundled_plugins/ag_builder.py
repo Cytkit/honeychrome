@@ -824,6 +824,31 @@ class _QuadrantPicker(QWidget):
         return ag_core.join_quadrants(q for q, box in self._boxes.items() if box.isChecked())
 
 
+class _SidePicker(QComboBox):
+    """Side of the separation threshold a 1dsep population takes.
+    ``touched`` is set once the user picks one."""
+
+    def __init__(self, region: str | None = None, parent=None):
+        super().__init__(parent)
+        self.touched = False
+        self.addItem("Below", ag_core.REGION_BELOW)
+        self.addItem("Above", ag_core.REGION_ABOVE)
+        self.setToolTip(
+            "Side of the separation parameter's threshold this population takes: "
+            "Below (events under the threshold) or Above (events at or above it).")
+        self.activated.connect(self._on_activated)
+        self.set_region(region)
+
+    def _on_activated(self, _index=0):
+        self.touched = True
+
+    def set_region(self, region: str | None):
+        self.setCurrentIndex(self.findData(region))
+
+    def region(self) -> str | None:
+        return self.currentData()
+
+
 class GateEditDialog(QDialog):
     """Create-or-edit dialog for a single GateDefinition.
 
@@ -941,6 +966,7 @@ class GateEditDialog(QDialog):
         self.cb_marker_y.currentIndexChanged.connect(self._update_axis_labels)
         self.cb_marker_x.currentIndexChanged.connect(self._sync_quadrant_pickers)
         self.cb_marker_y.currentIndexChanged.connect(self._sync_quadrant_pickers)
+        self.cb_marker_x.currentIndexChanged.connect(self._sync_side_pickers)
 
         # --- Parent gate and population ---
         self.cb_parent_gate = QComboBox()
@@ -991,9 +1017,9 @@ class GateEditDialog(QDialog):
         pop_box = QGroupBox("Populations")
         pop_layout = QVBoxLayout(pop_box)
 
-        self.tbl_populations = QTableWidget(0, 4)
+        self.tbl_populations = QTableWidget(0, 5)
         self.tbl_populations.setHorizontalHeaderLabels(["Name", "Label", "Position",
-                                                        "Quadrants"])
+                                                        "Quadrants", "Side"])
         self.tbl_populations.horizontalHeader().setStretchLastSection(False)
         self.tbl_populations.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.Stretch
@@ -1006,6 +1032,9 @@ class GateEditDialog(QDialog):
         )
         self.tbl_populations.horizontalHeader().setSectionResizeMode(
             3, QHeaderView.ResizeToContents
+        )
+        self.tbl_populations.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeToContents
         )
         pop_layout.addWidget(self.tbl_populations)
 
@@ -1158,6 +1187,7 @@ class GateEditDialog(QDialog):
         self.cb_marker_y.setEnabled(is_2d_like)
         self._update_axis_labels()
         self._sync_quadrant_pickers()
+        self._sync_side_pickers()
 
         if new_type == self._last_seen_type:
             return
@@ -1227,6 +1257,51 @@ class GateEditDialog(QDialog):
             picker.set_region(pops['side']['region'] if pops else None)
         self.tbl_populations.resizeRowsToContents()
 
+    def _sync_side_pickers(self, *_args):
+        """Show the Side column for 1dsep gates only. A row not set by hand
+        shows the side it is saved with: its own side, the side of the 2dsep
+        population it converts from, or else the side
+        ag_core.population_regions gives it beside the other rows."""
+        if not hasattr(self, 'tbl_populations'):
+            return
+        one_d = self.cb_type.currentText() == '1dsep'
+        self.tbl_populations.setColumnHidden(4, not one_d)
+        if not one_d:
+            return
+        pickers: dict = {}
+        known: dict = {}
+        for row in range(self.tbl_populations.rowCount()):
+            picker = self.tbl_populations.cellWidget(row, 4)
+            item = self.tbl_populations.item(row, 0)
+            if not isinstance(picker, _SidePicker):
+                continue
+            region = item.data(Qt.UserRole) if item else None
+            pickers[row] = picker
+            if picker.touched:
+                known[row] = picker.region()
+            elif region in (ag_core.REGION_BELOW, ag_core.REGION_ABOVE):
+                known[row] = region
+            elif ag_core.region_quadrants(region):
+                pops, _reason = ag_review.convert_threshold_regions(
+                    {'side': {'region': region}}, '2dsep', self.gate_def.get('gate_marker_x'),
+                    self.gate_def.get('gate_marker_y'), '1dsep',
+                    self.cb_marker_x.currentData(), None)
+                known[row] = pops['side']['region'] if pops else None
+            else:
+                known[row] = None
+        inferred = ag_core.population_regions(
+            {'gate_type': '1dsep',
+             'populations': {row: ({'region': side} if side else {})
+                             for row, side in known.items()}})
+        for row, picker in pickers.items():
+            if not picker.touched:
+                picker.set_region(inferred.get(row))
+
+    def _on_side_chosen(self, name_item: QTableWidgetItem, picker: _SidePicker):
+        """Keep a side picked by hand on the row and re-infer the others."""
+        name_item.setData(Qt.UserRole, picker.region())
+        self._sync_side_pickers()
+
     def _add_population_row(self, name: str | None = None,
                             label: str | None = None,
                             pos: int = 1, region: str | None = None):
@@ -1239,7 +1314,8 @@ class GateEditDialog(QDialog):
         which we deliberately ignore by accepting `name=None`.
 
         *region* (which side of the thresholds the population is on) is
-        kept on the row, so renaming a population keeps its region.
+        kept on the row, so renaming a population keeps its region. A 1dsep
+        row added without one shows the side the other rows leave free.
         """
         # Treat the bool-from-clicked case as "no name supplied".
         if isinstance(name, bool) or name is None:
@@ -1259,6 +1335,12 @@ class GateEditDialog(QDialog):
         sb.setValue(int(pos))
         self.tbl_populations.setCellWidget(row, 2, sb)
         self.tbl_populations.setCellWidget(row, 3, _QuadrantPicker(region))
+        side = _SidePicker(region if region in (ag_core.REGION_BELOW,
+                                                ag_core.REGION_ABOVE) else None)
+        side.activated.connect(
+            lambda _index, item=name_item, picker=side: self._on_side_chosen(item, picker))
+        self.tbl_populations.setCellWidget(row, 4, side)
+        self._sync_side_pickers()
 
     def _remove_selected_population_row(self):
         """Remove the highlighted row(s) from the populations table."""
@@ -1268,6 +1350,7 @@ class GateEditDialog(QDialog):
         )
         for r in rows:
             self.tbl_populations.removeRow(r)
+        self._sync_side_pickers()
 
     def _reset_populations_to_default(self):
         """Reset the table to the default populations for the current type."""
@@ -1305,6 +1388,12 @@ class GateEditDialog(QDialog):
             picker = self.tbl_populations.cellWidget(row, 3)
             if self.cb_type.currentText() == '2dsep' and isinstance(picker, _QuadrantPicker):
                 region = picker.region()
+            # 1dsep: the side shown, except for an untouched row still holding
+            # its 2dsep quadrants, which accept converts.
+            side = self.tbl_populations.cellWidget(row, 4)
+            if self.cb_type.currentText() == '1dsep' and isinstance(side, _SidePicker) \
+                    and (side.touched or self.is_new or not ag_core.region_quadrants(region)):
+                region = side.region()
             if region:
                 out[name]['region'] = region
         return out
@@ -1456,6 +1545,121 @@ class GateEditDialog(QDialog):
         self.gate_def.setdefault('stats_parent', {})
 
         super().accept()
+
+class ReuseThresholdDialog(QDialog):
+    """Choose the gates that copy a gate's threshold.
+
+    One row per candidate (ag_review.threshold_reuse_candidates): the gate,
+    the population it is drawn on, the channel it would copy and a note.
+    Gates of the same name and gates copying the threshold already start
+    ticked. ``selected()`` gives {gate: axes} of the ticked rows.
+    """
+
+    def __init__(self, gate_def: dict, candidates: list[dict], axis_label, parent=None):
+        super().__init__(parent)
+        name = gate_def['gate_name']
+        self._items = []
+        self.setWindowTitle(f"Re-use the threshold of '{name}'")
+        self.resize(720, 560)
+        outer = QVBoxLayout(self)
+        chans = ', '.join(axis_label(ag_core.axis_channel(gate_def, a))
+                          for a in ag_core.threshold_axes(gate_def))
+        intro = QLabel(
+            f"The gates ticked below copy the threshold of '{name}' on {chans} instead of "
+            "calculating their own. With Fixed application they use its trained threshold; with "
+            "Recalculate, the threshold it gets on each sample. Their training is cleared, and "
+            "gates still as drawn become trainable. Unticking a gate that copies it already "
+            "leaves that gate as it is.")
+        intro.setWordWrap(True)
+        outer.addWidget(intro)
+
+        self.le_filter = QLineEdit()
+        self.le_filter.setPlaceholderText("Filter by gate or population")
+        self.le_filter.textChanged.connect(self._apply_filter)
+        outer.addWidget(self.le_filter)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(4)
+        self.tree.setHeaderLabels(["Gate", "Drawn on", "Copies", "Note"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.setToolTip("Shift- or Ctrl-click to select several rows; ticking or unticking "
+                             "one of them does the same to all.")
+        self._spreading = False
+        for c in candidates:
+            notes = [text for flag, text in ((c['same_name'], "same name"),
+                                             (c['copies'], "copies it already"),
+                                             (c['imported'], "still as drawn")) if flag]
+            item = QTreeWidgetItem([c['gate'], c['population'],
+                                    ', '.join(axis_label(ch) for ch in c['axes'].values()),
+                                    ', '.join(notes)])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.Checked if c['same_name'] or c['copies'] else Qt.Unchecked)
+            self.tree.addTopLevelItem(item)
+            self._items.append((item, c))
+        for col in range(4):
+            self.tree.resizeColumnToContents(col)
+        outer.addWidget(self.tree, 1)
+
+        row = QHBoxLayout()
+        for text, how, tip in (("Same name", 'same', "Tick the gates of the same name only."),
+                               ("All shown", 'all', "Tick every gate the filter shows."),
+                               ("None shown", 'none', "Untick every gate the filter shows.")):
+            btn = QPushButton(text)
+            btn.setToolTip(tip)
+            btn.clicked.connect(lambda _c=False, h=how: self._tick(h))
+            row.addWidget(btn)
+        row.addStretch()
+        self.lbl_count = QLabel()
+        row.addWidget(self.lbl_count)
+        outer.addLayout(row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Copy threshold")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        outer.addWidget(buttons)
+        self.tree.itemChanged.connect(self._on_item_changed)
+        self._update_count()
+
+    def _on_item_changed(self, item, column: int):
+        """A tick on a selected row applies to every selected row shown; the
+        selection is kept so the rows can be toggled together again."""
+        if self._spreading:
+            return
+        selected = [i for i in self.tree.selectedItems() if not i.isHidden()]
+        if column == 0 and item in selected and len(selected) > 1:
+            self._spreading = True
+            try:
+                for other in selected:
+                    other.setCheckState(0, item.checkState(0))
+            finally:
+                self._spreading = False
+            QTimer.singleShot(0, lambda rows=selected: [r.setSelected(True) for r in rows])
+        self._update_count()
+
+    def _apply_filter(self, text: str):
+        needle = text.strip().lower()
+        for item, c in self._items:
+            item.setHidden(bool(needle) and needle not in c['gate'].lower()
+                           and needle not in c['population'].lower())
+
+    def _tick(self, how: str):
+        for item, c in self._items:
+            if how == 'same':
+                item.setCheckState(0, Qt.Checked if c['same_name'] else Qt.Unchecked)
+            elif not item.isHidden():
+                item.setCheckState(0, Qt.Checked if how == 'all' else Qt.Unchecked)
+
+    def _update_count(self, *_args):
+        ticked = sum(1 for item, _c in self._items if item.checkState(0) == Qt.Checked)
+        self.lbl_count.setText(f"{ticked} of {len(self._items)} ticked")
+
+    def selected(self) -> dict:
+        """{gate: axes} of the ticked rows."""
+        return {c['gate']: dict(c['axes']) for item, c in self._items
+                if item.checkState(0) == Qt.Checked}
+
 
 class SplitGateDialog(QDialog):
     """Choose how a 2dsep gate is split into sequential 1dsep gates.
@@ -2622,19 +2826,34 @@ class HierarchyTab(QWidget):
     # ------------------------------------------------------------------
 
     def _repopulate_tree(self):
-        """Rebuild every row of the tree from `state.gate_definitions`."""
+        """Rebuild every row of the tree from `state.gate_definitions`.
+
+        The tree's signals and repaints are off while it is cleared and
+        refilled: clearing a tree with a selected row otherwise moves the
+        selection through every other row, redrawing the preview each time.
+        The rows are added in one call before their buttons are attached,
+        and the gate that was selected is selected again; the preview is
+        drawn once at the end.
+        """
+        selected = self._selected_gate_name()
         self._suppress_item_changed = True
+        self.tree.setUpdatesEnabled(False)
+        self.tree.blockSignals(True)
         try:
             self.tree.clear()
             experiment_channels = set(_experiment_channels(self.controller))
-
-            for g in self._sorted_gate_defs():
-                item = self._build_tree_item(g, experiment_channels)
-                self.tree.addTopLevelItem(item)
+            gate_defs = self._sorted_gate_defs()
+            items = [self._build_tree_item(g, experiment_channels) for g in gate_defs]
+            self.tree.addTopLevelItems(items)
+            for g, item in zip(gate_defs, items):
                 actions = self._conversion_buttons(g)
                 if actions is not None:
                     self.tree.setItemWidget(item, self.COL_CONVERT, actions)
+            if selected:
+                self._select_gate_by_name(selected)
         finally:
+            self.tree.blockSignals(False)
+            self.tree.setUpdatesEnabled(True)
             self._suppress_item_changed = False
 
         self.btn_convert_all.setEnabled(any(
@@ -3399,15 +3618,22 @@ class HierarchyTab(QWidget):
             QMessageBox.warning(self, "Split gate", str(exc))
             return
         self.state.gate_definitions = new_defs
+        moved, cleared = ag_review.repoint_split_sources(new_defs, gate_name, new_names)
+        for name in set(moved) | set(cleared):
+            stale |= {name} | self._descendant_names(name)
         for name in stale:
             self.state.trained_boundaries.pop(name, None)
         self.state.algorithm_recommendations.pop(gate_name, None)
         self._repopulate_tree()
         self._select_gate_by_name(new_names[0])
         self.gatesSplit.emit()
+        note = f" {len(moved)} gate(s) copying it now copy the new gates." if moved else ''
+        if cleared:
+            note += (" Choose a new replicate source for "
+                     + ", ".join(f"'{n}'" for n in cleared) + ".")
         self.bus.statusMessage.emit(
             f"[Automated Gating] Replaced '{gate_name}' with "
-            + ", ".join(f"'{n}'" for n in new_names) + ". Train to calculate them.")
+            + ", ".join(f"'{n}'" for n in new_names) + ". Train to calculate them." + note)
 
     # ------------------------------------------------------------------
     # Importing the live GatingStrategy
@@ -5244,8 +5470,11 @@ class _ReviewPlot(QWidget):
                 action = menu.addAction(f"'{pop}' has no gates below it")
                 action.setEnabled(False)
                 continue
+            # Opening a population rebuilds the page, deleting this plot, so it
+            # waits until the click that raised the menu has been handled.
             menu.addAction(f"Open '{pop}'",
-                           lambda g=gate_name, p=pop: self.populationRequested.emit(g, p))
+                           lambda g=gate_name, p=pop: QTimer.singleShot(
+                               0, self, lambda: self.populationRequested.emit(g, p)))
         menu.exec(ev.screenPos().toPoint())
 
     def _label_position(self, entry):
@@ -5630,7 +5859,11 @@ class ReviewTab(QWidget):
     replicated thresholds.
 
     Only the gates the shown plots depend on are gated, so a large
-    hierarchy stays responsive.
+    hierarchy stays responsive. A gate's row (controls, plots, buttons and
+    reference plots) is built when it comes within a screen of the visible
+    part of the page; until then it is a placeholder of about its size, so
+    the cost of showing a population with many gates follows what is on
+    screen.
 
     The hierarchy can be searched and narrowed to unconverted gates, gates
     whose same-named partners were set to different algorithms, or flagged
@@ -5654,6 +5887,12 @@ class ReviewTab(QWidget):
     _MIN_EVENTS_PER_SAMPLE = 20_000
     _PROPOSAL_EVENTS = 50_000
     _REGATE_DELAY_MS = 400
+    # Rows are built this long after a scroll or resize settles.
+    _ROW_BUILD_DELAY_MS = 30
+    # Height of a gate's controls before one has been built.
+    _CONTROLS_HEIGHT = 60
+    # Page height assumed for the rows built while the page is not on screen.
+    _HIDDEN_VIEW_HEIGHT = 800
 
     def __init__(self, state: GatingModelState, bus, controller, tf=None, parent=None):
         super().__init__(parent)
@@ -5691,6 +5930,14 @@ class ReviewTab(QWidget):
         self._regate_timer.setSingleShot(True)
         self._regate_timer.setInterval(self._REGATE_DELAY_MS)
         self._regate_timer.timeout.connect(self._on_regate_timer)
+        # Gate rows of the shown population ({'gate', 'group', 'row', 'tile',
+        # 'built', 'placeholders'}), built when scrolled near (see _build_visible_rows).
+        self._rows: list = []
+        self._row_heights = {'controls': self._CONTROLS_HEIGHT, 'plot': None}
+        self._row_timer = QTimer(self)
+        self._row_timer.setSingleShot(True)
+        self._row_timer.setInterval(self._ROW_BUILD_DELAY_MS)
+        self._row_timer.timeout.connect(self._build_visible_rows)
         self._build_ui()
 
     def _build_ui(self):
@@ -5790,10 +6037,13 @@ class ReviewTab(QWidget):
         self._grid = QGridLayout(self._host)
         self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         # Spare column: wide controls overflow into it, not the plot column.
-        self._grid.setColumnStretch(5, 1)
+        self._grid.setColumnStretch(6, 1)
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setWidget(self._host)
+        bar = self._scroll.verticalScrollBar()
+        bar.valueChanged.connect(lambda _v: self._row_timer.start())
+        bar.rangeChanged.connect(lambda _lo, _hi: self._row_timer.start())
 
         # Gating hierarchy on the left, inspection plots on the right.
         tree_panel = QWidget()
@@ -6206,12 +6456,14 @@ class ReviewTab(QWidget):
     # -- plots --------------------------------------------------------------
 
     def _clear_plots(self):
+        self._row_timer.stop()
         for plot in self._plots:
             plot.setParent(None)
             plot.deleteLater()
         self._plots = []
         self._trainable = []
         self._references = []
+        self._rows = []
 
     def _selected(self):
         return _pop_key_tuple(self.combo_pop.currentData())
@@ -6219,8 +6471,9 @@ class ReviewTab(QWidget):
     def _rebuild_plots(self):
         """Lay out the shown population's plots: per parameter set, the gates
         as drawn on the left and each gate's controls above its trainable
-        form on the right, so the two plots of a gate sit level. The scroll
-        position is kept."""
+        form on the right, so the two plots of a gate sit level. Each gate's
+        row starts as a placeholder and is built when it is scrolled near
+        (_build_visible_rows). The scroll position is kept."""
         import honeychrome.settings as hc_settings
         from PySide6.QtWidgets import QApplication
         bar = self._scroll.verticalScrollBar()
@@ -6251,42 +6504,19 @@ class ReviewTab(QWidget):
         self._mask = mask
         tile = hc_settings.cytometry_plot_width_target_retrieved
         self._trainable = []
+        # Three grid rows per gate: controls, plots and buttons, reference
+        # plots (an empty grid row takes no space).
         r = 0
         for group in groups:
-            drawn = any(ag_review.has_drawn_shape(g) for g in group['gates'])
-            left = _ReviewPlot(group['channels'], group['gates'], self.controller, tile, self,
-                               caption="As drawn" if drawn else "Current",
-                               transforms=self.tf.objects)
-            left.gateEdited.connect(self._on_gate_edited)
-            left.axisZoomed.connect(self._on_axis_zoomed)
-            self._connect_open(left)
-            left.set_events(self._raw, mask)
             for k, g in enumerate(group['gates']):
-                controls = self._controls(g)
-                self._grid.addWidget(controls, r, 1, 1, 5, Qt.AlignLeft | Qt.AlignBottom)
-                self._plots.append(controls)
-                plot = self._trainable_plot(g, tile)
-                self._grid.addWidget(plot, r + 1, 1, Qt.AlignTop)
-                self._plots.append(plot)
-                minus = self._delete_button(g)
-                self._grid.addWidget(minus, r + 1, 2, Qt.AlignTop)
-                self._plots.append(minus)
-                forward = self._feed_forward_button(g)
-                self._grid.addWidget(forward, r + 1, 3, Qt.AlignTop)
-                self._plots.append(forward)
-                same = self._apply_named_button(g)
-                self._grid.addWidget(same, r + 1, 4, Qt.AlignTop)
-                self._plots.append(same)
-                if k == 0:
-                    self._grid.addWidget(left, r + 1, 0, Qt.AlignTop)
-                    self._plots.append(left)
-                r += 2
-                refs = self._reference_plots(g, tile)
-                if refs is not None:
-                    self._grid.addWidget(refs, r, 1, 1, 5, Qt.AlignLeft | Qt.AlignTop)
-                    self._plots.append(refs)
-                    r += 1
-        self._redraw_overlays()
+                unit = {'gate': g, 'group': group if k == 0 else None, 'row': r,
+                        'tile': tile, 'built': False, 'placeholders': []}
+                self._add_placeholders(unit)
+                self._rows.append(unit)
+                r += 3
+        # The rows on screen now; the others as the page is scrolled.
+        self._build_visible_rows()
+        self._row_timer.start()
         label = 'All events' if gate is None else f"{pop}"
         text = (f"{label}: {int(mask.sum()):,} of {len(self._raw):,} events on "
                 f"{self._samples_text()}; {len(groups)} parameter set"
@@ -6299,6 +6529,119 @@ class ReviewTab(QWidget):
             text += " " + self._edit_hint(groups)
         self.lbl_status.setText(text)
         QTimer.singleShot(0, lambda v=scroll_to: bar.setValue(v))
+
+    def _add_placeholders(self, unit: dict):
+        """Placeholders of about the size of a gate's row, in its grid cells:
+        its controls, its trainable plot and, for the first gate of a
+        parameter set, the plot of the gates as drawn."""
+        r, tile = unit['row'], unit['tile']
+        plot_h = self._row_heights['plot'] or tile + 2 * self.fontMetrics().lineSpacing() + 12
+        specs = [((r, 1, 1, 6), 1, self._row_heights['controls'], Qt.AlignLeft | Qt.AlignBottom),
+                 ((r + 1, 1, 1, 1), tile, plot_h, Qt.AlignTop)]
+        if unit['group'] is not None:
+            specs.append(((r + 1, 0, 1, 1), tile, plot_h, Qt.AlignTop))
+        for (row, col, rows, cols), width, height, align in specs:
+            holder = QWidget()
+            holder.setFixedSize(width, height)
+            self._grid.addWidget(holder, row, col, rows, cols, align)
+            self._plots.append(holder)
+            unit['placeholders'].append(holder)
+
+    def _build_row(self, unit: dict) -> list:
+        """Build a gate's row in place of its placeholders: the plot of its
+        parameter set's gates as drawn (first gate of the set), its controls,
+        trainable plot, buttons and reference plots. Returns the new plots."""
+        for holder in unit['placeholders']:
+            self._grid.removeWidget(holder)
+            self._plots.remove(holder)
+            holder.setParent(None)
+            holder.deleteLater()
+        unit['placeholders'] = []
+        unit['built'] = True
+        g, r, tile, group = unit['gate'], unit['row'], unit['tile'], unit['group']
+        new = []
+        if group is not None:
+            drawn = any(ag_review.has_drawn_shape(x) for x in group['gates'])
+            left = _ReviewPlot(group['channels'], group['gates'], self.controller, tile, self,
+                               caption="As drawn" if drawn else "Current",
+                               transforms=self.tf.objects)
+            left.gateEdited.connect(self._on_gate_edited)
+            left.axisZoomed.connect(self._on_axis_zoomed)
+            self._connect_open(left)
+            left.set_events(self._raw, self._mask)
+            new.append(left)
+        controls = self._controls(g)
+        self._grid.addWidget(controls, r, 1, 1, 6, Qt.AlignLeft | Qt.AlignBottom)
+        self._plots.append(controls)
+        plot = self._trainable_plot(g, tile)
+        self._grid.addWidget(plot, r + 1, 1, Qt.AlignTop)
+        self._plots.append(plot)
+        new.append(plot)
+        for col, button in ((2, self._delete_button(g)), (3, self._feed_forward_button(g)),
+                            (4, self._apply_named_button(g)), (5, self._reuse_threshold_button(g))):
+            self._grid.addWidget(button, r + 1, col, Qt.AlignTop)
+            self._plots.append(button)
+        if group is not None:
+            self._grid.addWidget(new[0], r + 1, 0, Qt.AlignTop)
+            self._plots.append(new[0])
+        n_refs = len(self._references)
+        refs = self._reference_plots(g, tile)
+        if refs is not None:
+            self._grid.addWidget(refs, r + 2, 1, 1, 6, Qt.AlignLeft | Qt.AlignTop)
+            self._plots.append(refs)
+        new += [p for _name, _key, p in self._references[n_refs:]]
+        self._row_heights['controls'] = controls.sizeHint().height()
+        self._row_heights['plot'] = plot.sizeHint().height()
+        return new
+
+    def _build_visible_rows(self):
+        """Build the gate rows within a screen above or below the visible
+        part of the page and draw their boundaries; the rows further away
+        stay placeholders. While the page is not on screen, the rows that
+        would fill its first screens are built, from estimated heights.
+        Runs again after building, as the rows built may be shorter than
+        their placeholders."""
+        pending = [u for u in self._rows if not u['built']]
+        if not pending or self._result is None or self._raw is None:
+            return
+        if self._scroll.isVisible():
+            self._grid.activate()
+            probe = pending[-1]
+            if probe is not self._rows[0] and probe['placeholders'][0].y() <= 0:
+                return    # not laid out yet; the scroll range changes once it is
+            bar = self._scroll.verticalScrollBar()
+            view = max(self._scroll.viewport().height(), 1)
+            top, bottom = bar.value() - view, bar.value() + 2 * view
+            wanted = [u for u in pending
+                      if u['placeholders'][1].geometry().bottom() >= top
+                      and u['placeholders'][0].y() <= bottom]
+        else:
+            view = max(self._scroll.viewport().height(), self._HIDDEN_VIEW_HEIGHT)
+            wanted, y = [], 0
+            for unit in self._rows:
+                if y > 2 * view:
+                    break
+                if not unit['built']:
+                    wanted.append(unit)
+                y += self._row_heights['controls'] + (
+                    self._row_heights['plot']
+                    or unit['tile'] + 2 * self.fontMetrics().lineSpacing() + 12)
+        new = []
+        for unit in wanted:
+            new += self._build_row(unit)
+        if not new:
+            return
+        plot_h = self._row_heights['plot']
+        for unit in self._rows:
+            for k, holder in enumerate(unit['placeholders']):
+                holder.setFixedHeight(self._row_heights['controls'] if k == 0 else plot_h)
+        self._redraw_overlays(only={id(p) for p in new})
+        self._row_timer.start()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._rows:
+            self._row_timer.start()
 
     def _connect_open(self, plot):
         """Let a plot's right-click open the population clicked."""
@@ -6776,6 +7119,59 @@ class ReviewTab(QWidget):
             lambda _c=False, n=g['gate_name']: self._feed_forward(n, everywhere=True))
         return btn
 
+    def _reuse_threshold_button(self, g: dict) -> QWidget:
+        """Let gates chosen in a popup copy this gate's threshold (see
+        _reuse_threshold)."""
+        btn = QPushButton("⇶")
+        btn.setFixedWidth(28)
+        btn.setStyleSheet("QPushButton { font-weight: bold; font-size: 14pt; }")
+        btn.setFocusPolicy(Qt.NoFocus)
+        usable = (g.get('algorithm') != ag_core.ALGORITHM_IMPORTED
+                  and g.get('gate_type') in ag_core.THRESHOLD_TYPES)
+        btn.setEnabled(usable)
+        btn.setToolTip(
+            f"Choose gates that copy '{g['gate_name']}''s threshold instead of calculating their "
+            "own: gates of the same name on other populations, or any gate on the same channel."
+            if usable else
+            "Only a converted threshold gate's threshold can be copied; convert this gate first.")
+        btn.clicked.connect(lambda _c=False, n=g['gate_name']: self._reuse_threshold(n))
+        return btn
+
+    def _reuse_threshold(self, gate_name: str):
+        """Let the gates chosen in ReuseThresholdDialog copy this gate's
+        threshold (ag_review.reuse_threshold); their training is cleared."""
+        g = self.state.gate_by_name(gate_name)
+        if g is None:
+            return
+        title = "Re-use threshold"
+        candidates = ag_review.threshold_reuse_candidates(self.state.gate_definitions, gate_name)
+        if not candidates:
+            QMessageBox.information(self, title, f"No other threshold gate separates on the "
+                                                 f"channel of '{gate_name}'.")
+            return
+        dlg = ReuseThresholdDialog(g, candidates, self._axis_label, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        targets = dlg.selected()
+        if not targets:
+            return
+        saved = deepcopy(self.state.gate_definitions)
+        changed = ag_review.reuse_threshold(self.state.gate_definitions, gate_name, targets)
+        try:
+            ag_core.ordered_gate_defs(self.state.gate_definitions)
+        except ValueError:
+            self.state.gate_definitions[:] = saved
+            QMessageBox.warning(self, title, "Copying this threshold would make the gates depend "
+                                             "on each other, so nothing was changed.")
+            return
+        self._untrain(changed)
+        self.bus.statusMessage.emit(
+            f"[Automated Gating] {len(changed)} gate(s) now copy '{gate_name}''s threshold."
+            if changed else
+            f"[Automated Gating] The ticked gates copy '{gate_name}''s threshold already.")
+        self._update_sync_banner()
+        self._after_change()
+
     def _feed_forward(self, gate_name: str, everywhere: bool = False):
         g = self.state.gate_by_name(gate_name)
         if g is None:
@@ -7057,6 +7453,15 @@ class ReviewTab(QWidget):
                                 "That source depends on this gate, so it cannot be used.")
             QTimer.singleShot(0, self._rebuild_plots)
             return
+        origin = self.state.gate_by_name((src or {}).get('gate') or '')
+        if origin is not None and origin.get('algorithm') == ag_core.ALGORITHM_IMPORTED \
+                and self._confirm("Replicate source",
+                                  f"'{origin['gate_name']}' still applies its shapes as drawn, so "
+                                  "it has no threshold to copy. Convert it to its trainable form "
+                                  "now?"):
+            self._convert(origin['gate_name'])
+            # A split replaces every gate definition with a copy.
+            g = self.state.gate_by_name(gate_name) or g
         self._after_config_change(g)
 
     def _on_source_algorithm(self, gate_name: str, axis: str, algorithm: str):
@@ -7141,9 +7546,15 @@ class ReviewTab(QWidget):
                 self.bus.statusMessage.emit(f"[Automated Gating] '{name}' was not split: {exc}")
                 continue
             self.state.gate_definitions = defs
+            moved, cleared = ag_review.repoint_split_sources(defs, name, new)
             for n in stale:
                 self.state.trained_boundaries.pop(n, None)
+            self._untrain(set(moved) | set(cleared))
             self.state.algorithm_recommendations.pop(name, None)
+            if cleared:
+                self.bus.statusMessage.emit(
+                    f"[Automated Gating] '{name}' was split; choose a new replicate source for "
+                    + ", ".join(f"'{n}'" for n in cleared) + ".")
             made += new
         return made
 
@@ -7357,15 +7768,18 @@ class ReviewTab(QWidget):
                 out[pop]['fraction'] = float(m.mean())
         return out
 
-    def _redraw_overlays(self, channel: str | None = None):
+    def _redraw_overlays(self, channel: str | None = None, only: set | None = None):
         """Draw the boundaries on the plots (only those using *channel* when
-        one is given)."""
+        one is given, and only the plots whose ids are in *only* when that
+        is given)."""
         if self._result is None:
             return
         editing = self.chk_edit.isChecked()
         by_plot = {id(plot) for _name, plot in self._trainable}
         for plot in self._plots:
             if not isinstance(plot, _ReviewPlot) or id(plot) in by_plot:
+                continue
+            if only is not None and id(plot) not in only:
                 continue
             if channel is not None and channel not in plot.channels:
                 continue
@@ -7379,6 +7793,8 @@ class ReviewTab(QWidget):
                     editable.add(name)
             plot.draw_overlays(boundaries, texts, editable)
         for name, plot in self._trainable:
+            if only is not None and id(plot) not in only:
+                continue
             if channel is not None and channel not in plot.channels:
                 continue
             g = self.state.gate_by_name(name)
@@ -7396,17 +7812,20 @@ class ReviewTab(QWidget):
             colour = _REVIEW_ALERT if fallback else self._algorithm_colours(g)
             plot.draw_overlays({name: boundary}, self._label_texts(g, boundary), editable,
                                colours={name: colour})
-        self._redraw_references(channel)
+        self._redraw_references(channel, only)
 
-    def _redraw_references(self, channel: str | None = None):
+    def _redraw_references(self, channel: str | None = None, only: set | None = None):
         """Draw each replicating gate on its reference populations, labelled
-        with their fractions there."""
+        with their fractions there (only the plots whose ids are in *only*
+        when that is given)."""
         if not self._references:
             return
         pnn = _experiment_channels(self.controller)
         index = {c: i for i, c in enumerate(pnn)}
         by_name = ag_core.gates_by_name(self.state.gate_definitions)
         for name, key, plot in self._references:
+            if only is not None and id(plot) not in only:
+                continue
             if channel is not None and channel not in plot.channels:
                 continue
             g = by_name.get(name)

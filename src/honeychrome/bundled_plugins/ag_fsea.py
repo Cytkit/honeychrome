@@ -43,7 +43,22 @@ Statistics, per comparison:
   comparison; FWER as the
   fraction of permutations whose largest same-sign null NES reaches the NES
   (GSEA's estimate; liberal in the 15-sample IMMPROVE calibration, 10% of
-  null labellings below 0.05, so FDR is the figure to read).
+  null labellings below 0.05, so FDR is the figure to read);
+* only the samples of the two groups compared exchange labels; the other
+  groups of a reference-mode design keep theirs (they share the model's
+  residual variance but are not part of the comparison);
+* the ES depends only on where members rank, so with large differences
+  between groups it saturates: it cannot exceed 1, and shuffled labellings
+  reproduce much of the real ranking. Two statistics that use effect sizes
+  are reported beside it, each with BH FDR over the states of a
+  comparison:
+  - self-contained ("did the state change?"): the mean signed moderated t
+    of the members, with its p-value from the same label permutations;
+  - competitive ("did it change more than the other features?"): CAMERA
+    (Wu & Smyth 2012), the members' signed z-scores against all other
+    features', with the variance inflated by the members' mean correlation
+    (VIF = 1 + (m − 1) ρ̄), on min(residual df, features − 2) degrees of
+    freedom.
 
 A comparison is tested only with at least ``MIN_TOTAL_SAMPLES`` samples in
 its two groups and ``MIN_GROUP_SAMPLES`` in each (``enforce_min_samples``
@@ -51,7 +66,10 @@ exists for validation on smaller data, not for the UI).
 
 v1 simplifications: random permutations without enumeration; members tied
 with non-members rank ahead of them; features not estimable under a
-permutation take r = 0.
+permutation take r = 0; CAMERA's ρ̄ is the mean pairwise correlation of the
+members' signed residuals (pairs with at least 3 shared samples, so
+features missing in some samples take part), clipped at 0, rather than
+limma's estimate from orthogonal residual effects.
 
 References
 ----------
@@ -60,6 +78,7 @@ Smyth GK (2004) Stat Appl Genet Mol Biol 3:Article 3. doi:10.2202/1544-6115.1027
 Freedman D, Lane D (1983) J Bus Econ Stat 1:292–298. doi:10.2307/1391660
 Phipson B, Smyth GK (2010) Stat Appl Genet Mol Biol 9:Article 39.
     doi:10.2202/1544-6115.1585
+Wu D, Smyth GK (2012) Nucleic Acids Res 40:e133. doi:10.1093/nar/gks461
 
 The file name does not end in ``_tab.py``, so the plugin loader does not
 treat it as a tab.
@@ -168,7 +187,7 @@ def _feature_label(ftype: str, rec: dict, pop_info: dict, marker: str = '',
 
 def build_features(summaries: dict, samples: list[str], gate_defs: list[dict], *,
                    anchor_key: str = '', feature_types=FEATURE_TYPES,
-                   use_stats_parent: bool = True,
+                   use_stats_parent: bool = True, min_parent_events: int = 0,
                    min_marker_events: int = ag_results.DEFAULT_MIN_MARKER_EVENTS,
                    exclude_gating_markers: bool = True,
                    channel_antigens: dict | None = None,
@@ -187,7 +206,8 @@ def build_features(summaries: dict, samples: list[str], gate_defs: list[dict], *
     frames: list[pd.DataFrame] = []
     metas: list[dict] = []
 
-    counts, denom, dropped = ag_results.population_tables(summaries, samples, use_stats_parent)
+    counts, denom, dropped = ag_results.population_tables(summaries, samples, use_stats_parent,
+                                                          min_parent_events)
     if dropped:
         notes.append(f"{len(dropped)} population(s) measurable or non-empty in fewer than "
                      f"{ag_results.MIN_MEASURED_SAMPLES} samples were left out.")
@@ -509,13 +529,16 @@ def _model_rank_stats(Y: np.ndarray, X: np.ndarray, cols: dict, metric: str) -> 
     return out
 
 
-def _within_block_permutation(rng, blocks: np.ndarray | None, n: int) -> np.ndarray:
-    if blocks is None:
-        return rng.permutation(n)
+def _within_block_permutation(rng, blocks: np.ndarray | None, n: int,
+                              movable: np.ndarray | None = None) -> np.ndarray:
+    """A permutation of range(n) that moves only the *movable* positions
+    (all when None), within each block of *blocks* when given."""
     idx = np.arange(n)
     out = idx.copy()
-    for b in np.unique(blocks):
-        members = idx[blocks == b]
+    movable = np.ones(n, dtype=bool) if movable is None else np.asarray(movable, dtype=bool)
+    parts = [movable] if blocks is None else [movable & (blocks == b) for b in np.unique(blocks)]
+    for part in parts:
+        members = idx[part]
         out[members] = rng.permutation(members)
     return out
 
@@ -642,6 +665,79 @@ def _null_summary(es_obs: np.ndarray, null: np.ndarray):
     return nes, p, fwer
 
 
+def _set_mean_t(T: np.ndarray, sets: list[tuple[np.ndarray, np.ndarray]]) -> np.ndarray:
+    """Mean signed moderated t of every set in every row of *T*
+    ((rows, features) or (features,)), over the members with a finite t.
+    Returns (rows, sets)."""
+    T = np.atleast_2d(np.asarray(T, dtype=float))
+    out = np.full((T.shape[0], len(sets)), np.nan)
+    for j, (idx, sgn) in enumerate(sets):
+        v = T[:, idx] * sgn
+        ok = np.isfinite(v)
+        n = ok.sum(axis=1)
+        out[:, j] = np.where(n > 0, np.where(ok, v, 0.0).sum(axis=1) / np.maximum(n, 1), np.nan)
+    return out
+
+
+def _zscore_t(t: np.ndarray, df: np.ndarray) -> np.ndarray:
+    """Normal deviates with the same tail probability as moderated t
+    statistics on *df* degrees of freedom (infinite df: t itself)."""
+    t = np.asarray(t, dtype=float)
+    df = np.broadcast_to(np.asarray(df, dtype=float), t.shape)
+    finite = np.isfinite(df)
+    with np.errstate(invalid='ignore'):
+        lsf = np.where(finite, stats.t.logsf(np.abs(t), np.where(finite, df, 1.0)),
+                       stats.norm.logsf(np.abs(t)))
+    return np.sign(t) * stats.norm.isf(np.exp(np.maximum(lsf, -700.0)))
+
+
+def camera_scores(Y: np.ndarray, X: np.ndarray, t: np.ndarray, df: np.ndarray,
+                  sets: list[tuple[np.ndarray, np.ndarray]]) -> dict:
+    """CAMERA competitive test (Wu & Smyth 2012) of every set.
+
+    The members' signed z-scores (from their moderated t) are compared with
+    those of all other features by a two-sample t statistic whose variance
+    is inflated by VIF = 1 + (m − 1) ρ̄, where ρ̄ is the mean pairwise
+    correlation of the members' residuals from the fit of *Y* on *X* (each
+    member's residuals multiplied by its sign; pairs need 3 shared
+    samples; clipped at 0). Correlated members are then not mistaken for
+    independent evidence.
+
+    Y : (features, samples), NaN where not measured; t, df : per feature.
+    Returns {'t', 'cor', 'p'} per set; p two-sided on min(residual df,
+    features − 2) degrees of freedom.
+    """
+    from honeychrome.controller_components import moderated_stats as ms
+
+    n_sets = len(sets)
+    out = {'t': np.full(n_sets, np.nan), 'cor': np.full(n_sets, np.nan),
+           'p': np.full(n_sets, np.nan)}
+    if not n_sets:
+        return out
+    fit = ms.lm_fit(Y, X)
+    resid = Y - np.nan_to_num(fit.coefficients) @ X.T
+    z = _zscore_t(t, df)
+    G = z.size
+    df_cam = max(min(X.shape[0] - int(np.linalg.matrix_rank(X)), G - 2), 1)
+    for j, (idx, sgn) in enumerate(sets):
+        m = len(idx)
+        if m < 2 or G - m < 2:
+            continue
+        member = np.zeros(G, dtype=bool)
+        member[idx] = True
+        zs, rest = z[idx] * sgn, z[~member]
+        corr = pd.DataFrame((resid[idx] * sgn[:, None]).T).corr(min_periods=3).to_numpy()
+        off = corr[~np.eye(m, dtype=bool)]
+        cor = max(float(np.nanmean(off)), 0.0) if np.isfinite(off).any() else 0.0
+        vif = 1.0 + (m - 1) * cor
+        delta = zs.mean() - rest.mean()
+        var_pooled = ((m - 1) * zs.var(ddof=1) + (G - m - 1) * rest.var(ddof=1)) / (G - 2)
+        stat = delta / np.sqrt(var_pooled * (vif / m + 1.0 / (G - m)))
+        out['t'][j], out['cor'][j] = stat, cor
+        out['p'][j] = 2.0 * stats.t.sf(abs(stat), df_cam)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -651,7 +747,8 @@ def prepare(summaries: dict, samples: list[str], gate_defs: list[dict],
             marker_readout: str = 'positivity', use_stats_parent: bool = True,
             min_marker_events: int = ag_results.DEFAULT_MIN_MARKER_EVENTS,
             exclude_gating_markers: bool = True, channel_antigens: dict | None = None,
-            cell_type_overrides: dict | None = None, min_set_size: int = MIN_SET_SIZE) -> dict:
+            cell_type_overrides: dict | None = None, min_set_size: int = MIN_SET_SIZE,
+            min_parent_events: int = 0) -> dict:
     """Features, cell types and library matching, without any test.
 
     Returns {'anchor', 'values' (kept features), 'features' (metadata of
@@ -664,9 +761,9 @@ def prepare(summaries: dict, samples: list[str], gate_defs: list[dict],
               else default_anchor(info, gate_defs))
     values, meta, notes = build_features(
         summaries, samples, gate_defs, anchor_key=anchor, feature_types=feature_types,
-        use_stats_parent=use_stats_parent, min_marker_events=min_marker_events,
-        exclude_gating_markers=exclude_gating_markers, channel_antigens=channel_antigens,
-        pop_info=info)
+        use_stats_parent=use_stats_parent, min_parent_events=min_parent_events,
+        min_marker_events=min_marker_events, exclude_gating_markers=exclude_gating_markers,
+        channel_antigens=channel_antigens, pop_info=info)
     kept_values, meta, hygiene = collapse_redundant(values, meta)
     pop_map = fl.map_populations(info, overrides=cell_type_overrides)
     meta['cell_type'] = [(pop_map.get(k) or {}).get('cell_type') or '' for k in meta['pop_key']]
@@ -688,6 +785,7 @@ def run_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs:
                    numeric_covariates=None, anchor_key: str = '',
                    feature_types=FEATURE_TYPES, marker_readout: str = 'positivity',
                    rank_metric: str = 'signed_log10p', use_stats_parent: bool = True,
+                   min_parent_events: int = 0,
                    min_marker_events: int = ag_results.DEFAULT_MIN_MARKER_EVENTS,
                    exclude_gating_markers: bool = True, channel_antigens: dict | None = None,
                    cell_type_overrides: dict | None = None, n_perm: int = DEFAULT_N_PERM,
@@ -734,7 +832,7 @@ def run_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs:
                    use_stats_parent=use_stats_parent, min_marker_events=min_marker_events,
                    exclude_gating_markers=exclude_gating_markers,
                    channel_antigens=channel_antigens, cell_type_overrides=cell_type_overrides,
-                   min_set_size=min_set_size)
+                   min_set_size=min_set_size, min_parent_events=min_parent_events)
     if prep['values'].shape[1] < 3:
         raise FseaBlocked("Fewer than three features to rank.")
     kept_values, meta, hygiene = prep['values'], prep['features'], prep['hygiene']
@@ -773,14 +871,23 @@ def run_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs:
             sets_eval = [sets_idx[i] for i in ok_sets]
             comp = f"{other} vs {base}"
             es_obs = enrichment_scores(r_obs[None, :], sets_eval)[0] if sets_eval else np.zeros(0)
+            t_obs = ob['t'][usable]
+            mt_obs = _set_mean_t(t_obs, sets_eval)[0]
             Yu = Y[usable]
             null = np.zeros((n_perm, len(sets_eval)))
+            mt_null = np.zeros((n_perm, len(sets_eval)))
+            compared = (codes == 0) | (codes == k)
             if plan['fast'] and sets_eval:
+                pos = np.flatnonzero(compared)
                 for c0 in range(0, n_perm, PERM_CHUNK):
                     b = min(PERM_CHUNK, n_perm - c0)
-                    perm_codes = np.array([rng.permutation(codes) for _ in range(b)])
-                    R = np.nan_to_num(group_rank_stats(Yu, perm_codes, rank_metric)[k]['r'])
+                    perm_codes = np.tile(codes, (b, 1))
+                    for row in perm_codes:
+                        row[pos] = rng.permutation(codes[pos])
+                    stats_k = group_rank_stats(Yu, perm_codes, rank_metric)[k]
+                    R = np.nan_to_num(stats_k['r'])
                     null[c0:c0 + b] = enrichment_scores(R, sets_eval)
+                    mt_null[c0:c0 + b] = _set_mean_t(stats_k['t'], sets_eval)
                     done += b
                     _progress(done / total_steps, f"{comp}: {c0 + b} of {n_perm} permutations")
             elif sets_eval:
@@ -792,15 +899,20 @@ def run_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs:
                           else None)
                 col = plan['columns'][other]
                 for i in range(n_perm):
-                    pi = _within_block_permutation(rng, blocks, len(sub))
+                    pi = _within_block_permutation(rng, blocks, len(sub), compared)
                     st = _model_rank_stats(fitted + resid[:, pi], plan['X'], {other: col},
                                            rank_metric)[other]
                     null[i] = enrichment_scores(np.nan_to_num(st['r'])[None, :], sets_eval)[0]
+                    mt_null[i] = _set_mean_t(st['t'], sets_eval)[0]
                     done += 1
                     if (i + 1) % 50 == 0 or i + 1 == n_perm:
                         _progress(done / total_steps, f"{comp}: {i + 1} of {n_perm} permutations")
             nes, p, fwer = _null_summary(es_obs, null)
             fdr = ms.bh_adjust(p)
+            p_self = (1 + (np.abs(mt_null) >= np.abs(mt_obs)).sum(axis=0)) / (1 + n_perm)
+            fdr_self = ms.bh_adjust(p_self)
+            cam = camera_scores(Yu, plan['X'], t_obs, ob['df'][usable], sets_eval)
+            fdr_cam = ms.bh_adjust(cam['p'])
             usable_feats = feats[usable]
             label_of = dict(zip(meta['feature'], meta['label']))
             for j_eval, j_set in enumerate(ok_sets):
@@ -813,6 +925,10 @@ def run_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs:
                     'n_matched': s['n_matched'], 'n_tested': int(len(idx)),
                     'ES': float(es_obs[j_eval]), 'NES': float(nes[j_eval]), 'p': float(p[j_eval]),
                     'FDR': float(fdr[j_eval]), 'FWER': float(fwer[j_eval]),
+                    'mean_t': float(mt_obs[j_eval]), 'p_self': float(p_self[j_eval]),
+                    'FDR_self': float(fdr_self[j_eval]), 'camera_t': float(cam['t'][j_eval]),
+                    'camera_cor': float(cam['cor'][j_eval]), 'p_camera': float(cam['p'][j_eval]),
+                    'FDR_camera': float(fdr_cam[j_eval]),
                     'direction': 'gained' if es_obs[j_eval] >= 0 else 'lost',
                     'leading_edge': '; '.join(label_of.get(f, f) for f in lead),
                     'n_leading': len(lead), 'note': s['note']})
@@ -857,6 +973,7 @@ def run_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs:
                      'n_perm': n_perm, 'seed': int(seed), 'min_set_size': int(min_set_size),
                      'contrast_mode': contrast_mode, 'use_stats_parent': bool(use_stats_parent),
                      'min_marker_events': int(min_marker_events),
+                     'min_parent_events': int(min_parent_events),
                      'exclude_gating_markers': bool(exclude_gating_markers),
                      'enforce_min_samples': bool(enforce_min_samples), 'engine': engine},
         'library': dict(library_info or {}),

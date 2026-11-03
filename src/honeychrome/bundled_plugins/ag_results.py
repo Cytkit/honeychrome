@@ -8,10 +8,13 @@ Pure computation for the Automated Gating plugin (no Qt, no controller):
 * ``summarise_sample`` — the compact per-sample record kept after gating:
   population counts and parent counts, per-population marker medians and
   quartiles, per-gate status and the boundaries applied.
-* ``population_tables`` / ``marker_table`` — samples × features tables for
-  the differential tests in ``controller_components.differential_stats``.
+* ``population_tables`` / ``anchor_tables`` / ``marker_table`` — samples ×
+  features tables for the differential tests in
+  ``controller_components.differential_stats``: counts with their parent
+  counts, counts with the anchor population's counts, marker medians.
 * ``sample_flags`` / ``population_export`` / ``marker_export`` — QC flags
-  and long-format export tables.
+  and long-format export tables; ``write_marker_export`` writes the marker
+  table to CSV one sample at a time.
 * ``read_sample_table`` / ``sample_table_frame`` — import and export of
   group assignments and covariates as a table with one row per sample.
 * ``sample_pca`` / ``predictive_matrix`` — sample-level PCA and the feature
@@ -23,7 +26,9 @@ Pure computation for the Automated Gating plugin (no Qt, no controller):
   ``save_display`` / ``load_display`` — the display subsample kept per
   gated sample for plotting: its events and every population's membership
   as packed bits, small enough to keep for every sample and to save.
-* ``statistics_tables`` — the statistics run as tables for CSV export.
+* ``statistics_tables`` — the statistics run as tables for CSV export;
+  ``counts_only_hits`` — counts hits the frequency test does not share,
+  when both asked the same question.
 * ``group_population_values`` / ``population_result`` — one population's
   per-sample values by group and its test result, for the population
   comparison plots.
@@ -58,20 +63,31 @@ MIN_MEASURED_SAMPLES = 3
 # samples; below that the comparison reflects the parent counts, not the
 # population.
 MIN_NONZERO_SAMPLES = 3
+# A frequency is measured in a sample only when its parent has at least
+# this many events; a fraction of a handful of events mostly reflects
+# gating noise.
+DEFAULT_MIN_PARENT_EVENTS = 20
+# What the counts test relates a population's events to.
+COUNTS_REFERENCES = ('anchor', 'parent')
+# How the counts test models them: the moderated linear model on log odds
+# (the frequency test's model) or a negative-binomial GLM tested by the
+# quasi-likelihood F test. The Wald test is not offered: it was far too
+# liberal on human and on mouse data.
+COUNTS_METHODS = ('moderated', 'ql')
 
 __all__ = [
     'ALIGN_EXACT', 'ALIGN_ANTIGEN', 'ALIGN_CHANNEL', 'ALIGN_FUZZY', 'ALIGN_AMBIGUOUS',
     'CONFIDENT_ALIGNMENTS', 'FEATURE_SEP', 'DEFAULT_MIN_MARKER_EVENTS', 'MIN_MEASURED_SAMPLES',
-    'MIN_NONZERO_SAMPLES',
+    'MIN_NONZERO_SAMPLES', 'DEFAULT_MIN_PARENT_EVENTS', 'COUNTS_REFERENCES', 'COUNTS_METHODS',
     'align_channels', 'alignment_problems', 'apply_alignment',
-    'summarise_sample', 'population_tables', 'marker_table', 'marker_feature',
-    'sample_flags', 'population_export', 'marker_export',
-    'MIN_SAMPLES_PER_GROUP', 'qualifying_groups', 'run_statistics', 'reapply_thresholds',
+    'summarise_sample', 'population_tables', 'anchor_tables', 'marker_table', 'marker_feature',
+    'sample_flags', 'population_export', 'marker_export', 'MARKER_EXPORT_COLUMNS',
+    'write_marker_export', 'MIN_SAMPLES_PER_GROUP', 'qualifying_groups', 'run_statistics', 'reapply_thresholds',
     'read_sample_table', 'sample_table_frame', 'sample_pca', 'predictive_matrix',
     'stats_to_jsonable', 'stats_from_jsonable',
     'pack_display', 'display_population_mask', 'display_parent_mask', 'save_display',
     'load_display', 'display_file_name', 'statistics_tables', 'group_population_values',
-    'population_result',
+    'population_result', 'counts_only_hits',
 ]
 
 
@@ -253,8 +269,9 @@ def _name_list(names: list[str], limit: int = 8) -> str:
     return shown if len(names) <= limit else f"{shown} and {len(names) - limit} more"
 
 
-def population_tables(summaries: dict, samples: list[str],
-                      use_stats_parent: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+def population_tables(summaries: dict, samples: list[str], use_stats_parent: bool = True,
+                      min_parent_events: int = 0
+                      ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """Population counts and their denominators, samples × populations.
 
     The denominator is the parent population's count, or the population's
@@ -263,11 +280,12 @@ def population_tables(summaries: dict, samples: list[str],
 
     A population with no events in a sample whose parent has events is a
     true zero and is kept as 0. Where the population cannot be measured
-    (it is absent from the sample's record, or its parent has no events)
-    both tables hold NaN, so the population is tested on the samples that
-    do have it rather than being left out. Populations measurable in fewer
-    than ``MIN_MEASURED_SAMPLES`` samples, or with events in fewer than
-    ``MIN_NONZERO_SAMPLES`` samples, are dropped.
+    (it is absent from the sample's record, or its parent has no events,
+    or fewer than *min_parent_events*) both tables hold NaN, so the
+    population is tested on the samples that do have it rather than being
+    left out. Populations measurable in fewer than ``MIN_MEASURED_SAMPLES``
+    samples, or with events in fewer than ``MIN_NONZERO_SAMPLES`` samples,
+    are dropped.
 
     Returns (counts, denominators, dropped population keys).
     """
@@ -285,7 +303,8 @@ def population_tables(summaries: dict, samples: list[str],
                                                  else row['n_parent'])
     counts_df = pd.DataFrame({k: counts[k] for k in order}, index=list(samples), dtype=float)
     denom_df = pd.DataFrame({k: denoms[k] for k in order}, index=list(samples), dtype=float)
-    unmeasurable = counts_df.isna() | denom_df.isna() | (denom_df <= 0)
+    unmeasurable = (counts_df.isna() | denom_df.isna() | (denom_df <= 0)
+                    | (denom_df < min_parent_events))
     counts_df = counts_df.mask(unmeasurable)
     denom_df = denom_df.mask(unmeasurable)
     from honeychrome.controller_components import differential_stats as ds
@@ -293,6 +312,56 @@ def population_tables(summaries: dict, samples: list[str],
     sparse = set(ds.sparse_features(counts_df, MIN_NONZERO_SAMPLES))
     dropped = [k for k in order if measured[k] < MIN_MEASURED_SAMPLES or k in sparse]
     keep = [k for k in order if k not in dropped]
+    return counts_df[keep], denom_df[keep], dropped
+
+
+def anchor_tables(summaries: dict, samples: list[str], anchor_key: str | None
+                  ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Population counts and the anchor population's counts, samples ×
+    populations, for the populations below the anchor.
+
+    *anchor_key* is a population key ('gate/pop'), or None or 'root' for
+    all events of the sample (its ``n_total``). A population absent from a
+    sample whose anchor has events is a true zero; samples whose anchor has
+    no events are NaN throughout. Populations with events in fewer than
+    ``MIN_NONZERO_SAMPLES`` samples are dropped.
+
+    Returns (counts, anchor counts, dropped population keys).
+    """
+    from honeychrome.controller_components import differential_stats as ds
+
+    anchor = anchor_key or 'root'
+    events: dict[str, dict[str, float]] = {}
+    children: dict[str, set] = {}
+    order: list[str] = []
+    for s in samples:
+        rows = (summaries.get(s) or {}).get('populations', [])
+        events[s] = {r['key']: float(r['n_events']) for r in rows}
+        for r in rows:
+            if r['key'] not in order:
+                order.append(r['key'])
+            children.setdefault(r.get('parent_key') or 'root', set()).add(r['key'])
+    under, stack = set(), list(children.get(anchor, ()))
+    while stack:
+        k = stack.pop()
+        if k not in under:
+            under.add(k)
+            stack.extend(children.get(k, ()))
+    keys = [k for k in order if k in under]
+    if anchor == 'root':
+        n_anchor = pd.Series({s: float((summaries.get(s) or {}).get('n_total') or 0)
+                              for s in samples})
+    else:
+        n_anchor = pd.Series({s: events[s].get(anchor, 0.0) for s in samples})
+    n_anchor = n_anchor.reindex(list(samples)).where(lambda v: v > 0)
+    counts_df = pd.DataFrame({k: {s: events[s].get(k, 0.0) for s in samples} for k in keys},
+                             index=list(samples), columns=keys, dtype=float)
+    counts_df.loc[n_anchor.isna().values] = np.nan
+    denom_df = pd.DataFrame(np.repeat(n_anchor.values[:, None], len(keys), axis=1),
+                            index=list(samples), columns=keys)
+    sparse = set(ds.sparse_features(counts_df, MIN_NONZERO_SAMPLES))
+    dropped = [k for k in keys if k in sparse]
+    keep = [k for k in keys if k not in sparse]
     return counts_df[keep], denom_df[keep], dropped
 
 
@@ -392,21 +461,76 @@ def population_export(summaries: dict, samples: list[str], groups: dict | None =
     return pd.DataFrame(rows)
 
 
+MARKER_EXPORT_COLUMNS = ('sample', 'group', 'population', 'n_events', 'channel', 'antigen',
+                         'median', 'q25', 'q75', 'iqr')
+
+
+def _marker_columns(summaries: dict, samples: list[str], antigens: dict | None,
+                    groups: dict | None) -> dict:
+    """{column: list of values} of the marker export rows of *samples*."""
+    cols = {c: [] for c in MARKER_EXPORT_COLUMNS}
+    antigens = antigens or {}
+    for s in samples:
+        summ = summaries.get(s) or {}
+        n_by_pop = {r['key']: r['n_events'] for r in summ.get('populations', [])}
+        group = (groups or {}).get(s, '')
+        for pop_key, chans in (summ.get('markers') or {}).items():
+            n = n_by_pop.get(pop_key)
+            for ch, (med, q25, q75) in chans.items():
+                cols['population'].append(pop_key)
+                cols['n_events'].append(n)
+                cols['channel'].append(ch)
+                cols['median'].append(med)
+                cols['q25'].append(q25)
+                cols['q75'].append(q75)
+        added = len(cols['population']) - len(cols['sample'])
+        cols['sample'] += [s] * added
+        cols['group'] += [group] * added
+    cols['antigen'] = [antigens.get(ch, ch) for ch in cols['channel']]
+    cols['iqr'] = [q75 - q25 for q25, q75 in zip(cols['q25'], cols['q75'])]
+    return cols
+
+
 def marker_export(summaries: dict, samples: list[str], antigens: dict | None = None,
                   groups: dict | None = None) -> pd.DataFrame:
     """Long table: one row per sample × population × channel, with the
     median and quartiles in transformed units."""
-    rows = []
+    cols = _marker_columns(summaries, samples, antigens, groups)
+    if not cols['sample']:
+        return pd.DataFrame()
+    return pd.DataFrame(cols)
+
+
+def write_marker_export(path, summaries: dict, samples: list[str],
+                        antigens: dict | None = None, groups: dict | None = None) -> int:
+    """Write the marker export table to *path* as CSV (no index), one
+    sample at a time so the whole table is never held in memory; the file
+    is the same as ``marker_export(summaries, samples, antigens,
+    groups).to_csv(path, index=False)``. Returns the number of rows
+    written."""
+    # Counts are written as floats in every chunk when any is missing, as
+    # in the whole table.
+    missing_counts = False
     for s in samples:
         summ = summaries.get(s) or {}
         n_by_pop = {r['key']: r['n_events'] for r in summ.get('populations', [])}
-        for pop_key, chans in (summ.get('markers') or {}).items():
-            for ch, (med, q25, q75) in chans.items():
-                rows.append({'sample': s, 'group': (groups or {}).get(s, ''),
-                             'population': pop_key, 'n_events': n_by_pop.get(pop_key),
-                             'channel': ch, 'antigen': (antigens or {}).get(ch, ch),
-                             'median': med, 'q25': q25, 'q75': q75, 'iqr': q75 - q25})
-    return pd.DataFrame(rows)
+        if any(n_by_pop.get(k) is None for k in (summ.get('markers') or {})):
+            missing_counts = True
+            break
+    n_rows = 0
+    for s in samples:
+        cols = _marker_columns(summaries, [s], antigens, groups)
+        if not cols['sample']:
+            continue
+        frame = pd.DataFrame(cols)
+        if missing_counts:
+            frame['n_events'] = frame['n_events'].astype(float)
+        frame.to_csv(path, index=False, mode='w' if n_rows == 0 else 'a',
+                     header=n_rows == 0)
+        n_rows += len(frame)
+    if n_rows == 0:
+        pd.DataFrame().to_csv(path, index=False)
+    return n_rows
 
 
 # ---------------------------------------------------------------------------
@@ -438,14 +562,25 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                    run_markers: bool = True, use_stats_parent: bool = True,
                    exclude_gating_markers: bool = True,
                    min_marker_events: int = DEFAULT_MIN_MARKER_EVENTS,
-                   counts_method: str = 'wald') -> dict:
+                   counts_method: str = 'moderated', counts_reference: str = 'anchor',
+                   min_parent_events: int = DEFAULT_MIN_PARENT_EVENTS,
+                   anchor_key: str | None = None) -> dict:
     """Compare gated populations between sample groups.
 
     * Frequencies: log2 odds of each population within its parent (or its
-      stats parent), moderated linear model.
-    * Counts: negative-binomial GLM with the log parent count as offset,
-      tested by *counts_method* ('wald' or 'ql', see
-      ``differential_stats.run_glm_counts``).
+      stats parent), moderated linear model. A sample's frequency is
+      measured only where the parent has at least *min_parent_events*
+      events.
+    * Counts: each population's events relative to *counts_reference*.
+      'anchor': the anchor population (*anchor_key*; by default
+      ``ag_core.anchor_population`` of *gate_defs*, else all events), for
+      the populations below it, asking whether a population is over- or
+      under-represented for the number of viable cells. 'parent': the
+      frequency denominators, the frequency test's question.
+      *counts_method* 'moderated' fits the moderated linear model to the
+      log2 odds within the reference; 'ql' fits a negative-binomial GLM
+      with the log reference count as offset, tested by the
+      quasi-likelihood F test (``differential_stats.run_glm_counts``).
     * Marker medians: moderated linear model on per-population medians, one
       family per population (population-first testing).
 
@@ -456,12 +591,20 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                  CRP); every other covariate is treated as categories.
 
     Returns {'samples', 'group_vec', 'comparisons', 'freq', 'freq_values'
-    (% of denominator), 'counts', 'counts_values', 'markers',
-    'marker_values', 'notes'}; a result is None when not requested. Raises
+    (% of denominator), 'counts', 'counts_values' (events), 'markers',
+    'marker_values', 'notes', and with counts 'counts_reference',
+    'counts_method' and 'counts_anchor' (population key, 'root' for all
+    events, '' against the parent)}; a result is None when not requested.
+    Raises
     RuntimeError when fewer than two groups qualify.
     """
     from honeychrome.controller_components import differential_stats as ds
 
+    if counts_method not in COUNTS_METHODS:
+        raise ValueError(f"counts_method must be one of {COUNTS_METHODS}, got {counts_method!r}")
+    if counts_reference not in COUNTS_REFERENCES:
+        raise ValueError(f"counts_reference must be one of {COUNTS_REFERENCES}, "
+                         f"got {counts_reference!r}")
     order = list(group_order or [])
     names = qualifying_groups(samples, groups, order)
     if len(names) < 2:
@@ -484,31 +627,62 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
     common = dict(pairing_vec=pairing_vec, fdr_scope=fdr_scope, covariates=cov,
                   use_treat=use_treat)
 
-    if run_freq or run_counts:
-        counts, denom, dropped = population_tables(summaries, used, use_stats_parent)
+    if run_freq or (run_counts and counts_reference == 'parent'):
+        counts, denom, dropped = population_tables(summaries, used, use_stats_parent,
+                                                   min_parent_events)
+        too_few = (f"fewer than {min_parent_events} events" if min_parent_events > 1
+                   else "no events")
         if dropped:
             out['notes'].append(
                 f"Populations measurable in fewer than {MIN_MEASURED_SAMPLES} samples (their "
-                f"parent population had no events in the others), or with events in fewer than "
+                f"parent population had {too_few} in the others), or with events in fewer than "
                 f"{MIN_NONZERO_SAMPLES} samples, were left out: "
                 + _name_list(dropped))
         partial = [k for k in counts.columns if counts[k].isna().any()]
         if partial:
             out['notes'].append(
                 f"{len(partial)} population(s) could not be measured in some samples (their "
-                "parent population had no events) and were tested on the samples that could: "
+                f"parent population had {too_few}) and were tested on the samples that could: "
                 + _name_list(partial))
         if run_freq:
             data = ds.logit_proportions(counts, denom)
             out['freq'] = ds.run_moderated(data, group_vec, contrasts, contrast_mode,
                                            pval_threshold, fc_threshold, **common)
             out['freq_values'] = 100.0 * counts / denom
-        if run_counts:
-            out['counts'] = ds.run_glm_counts(counts, group_vec, contrasts, contrast_mode,
-                                              pval_threshold, fc_threshold,
-                                              offset_df=denom, method=counts_method, **common)
-            out['counts_values'] = counts
-            empty = [k for k in counts.columns if not (counts[k].fillna(0) > 0).any()]
+    if run_counts:
+        if counts_reference == 'parent':
+            c_counts, c_denom, anchor = counts, denom, ''
+        else:
+            anchor = (anchor_key or (ag_core.anchor_population(gate_defs) if gate_defs else None)
+                      or 'root')
+            c_counts, c_denom, c_dropped = anchor_tables(summaries, used, anchor)
+            anchor_name = ('all events' if anchor == 'root'
+                           else ag_core.gate_population_names(gate_defs).get(anchor, anchor))
+            out['notes'].append(
+                f"Counts are relative to the anchor population ({anchor_name}); the "
+                f"{c_counts.shape[1]} population(s) below it were tested.")
+            if c_dropped:
+                out['notes'].append(
+                    f"Populations with events in fewer than {MIN_NONZERO_SAMPLES} samples were "
+                    "left out of the counts test: " + _name_list(c_dropped))
+        if c_counts.shape[1] < 3:
+            out['notes'].append("Fewer than three populations could be tested for counts, so "
+                                "the counts test was not run.")
+        else:
+            if counts_method == 'moderated':
+                out['counts'] = ds.run_moderated(ds.logit_proportions(c_counts, c_denom),
+                                                 group_vec, contrasts, contrast_mode,
+                                                 pval_threshold, fc_threshold, **common)
+            else:
+                out['counts'] = ds.run_glm_counts(c_counts, group_vec, contrasts, contrast_mode,
+                                                  pval_threshold, fc_threshold,
+                                                  offset_df=c_denom, method=counts_method,
+                                                  **common)
+            out['counts_values'] = c_counts
+            out['counts_reference'] = counts_reference
+            out['counts_method'] = counts_method
+            out['counts_anchor'] = anchor
+            empty = [k for k in c_counts.columns if not (c_counts[k].fillna(0) > 0).any()]
             if empty:
                 out['notes'].append(
                     f"{len(empty)} population(s) have no events in any sample and could not be "
@@ -518,9 +692,7 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
         values, meta, dropped = marker_table(
             summaries, used, gate_defs, exclude_gating_markers=exclude_gating_markers,
             min_events=min_marker_events,
-            population_labels=ag_core.population_display_names(
-                (r['key'], r['gate'], r['label'])
-                for s in used for r in summaries[s].get('populations', [])))
+            population_labels=ag_core.gate_population_names(gate_defs))
         if dropped:
             out['notes'].append(
                 f"Populations with at least {min_marker_events} events in fewer than "
@@ -656,6 +828,23 @@ def reapply_thresholds(stats: dict, pval_threshold: float, fc_threshold: float,
             out[key] = ds.apply_significance(out[key], pval_threshold, thr, fdr_scope=fdr_scope,
                                              use_treat=use_treat, hierarchical=hier)
     return out
+
+
+def counts_only_hits(stats: dict) -> set[tuple[str, str]]:
+    """(comparison, population key) of each significant counts result whose
+    frequency test is not significant, when the counts were tested against
+    the parent: both tests then ask the same question, so a counts-only hit
+    deserves a second look. Empty when the counts were tested against the
+    anchor, which asks a different question."""
+    stats = stats or {}
+    freq, counts = stats.get('freq'), stats.get('counts')
+    if freq is None or counts is None or stats.get('counts_reference', 'parent') != 'parent':
+        return set()
+
+    def hits(df):
+        sel = df[df['significant'].fillna(False).astype(bool)]
+        return set(zip(sel['comparison'], sel['feature']))
+    return hits(counts) - hits(freq)
 
 
 # ---------------------------------------------------------------------------
@@ -940,10 +1129,15 @@ def statistics_tables(stats: dict, labels: dict | None = None,
     """The statistics run as tables: {'frequencies', 'counts', 'markers'}
     for the tests that were run (every comparison, with a population label
     and, for markers, the antigen), plus 'values_frequencies' (samples ×
-    populations, % of the denominator) and 'values_markers'."""
+    populations, % of the denominator) and 'values_markers'. Counts tested
+    against the parent carry a 'counts_only_hit' column
+    (``counts_only_hits``)."""
     labels = labels or {}
     antigens = antigens or {}
     out = {}
+    only = counts_only_hits(stats)
+    flag_counts = (stats.get('counts_reference', 'parent') == 'parent'
+                   and stats.get('freq') is not None)
     for key, name in (('freq', 'frequencies'), ('counts', 'counts'), ('markers', 'markers')):
         df = stats.get(key)
         if df is None:
@@ -953,6 +1147,8 @@ def statistics_tables(stats: dict, labels: dict | None = None,
         df.insert(0, 'population', [labels.get(k, k) for k in df[pop_col]])
         if key == 'markers' and 'channel' in df.columns:
             df.insert(1, 'antigen', [antigens.get(c, c) for c in df['channel']])
+        if key == 'counts' and flag_counts:
+            df['counts_only_hit'] = [(c, f) in only for c, f in zip(df['comparison'], df['feature'])]
         out[name] = df
     values = stats.get('freq_values')
     if values is not None:
