@@ -81,25 +81,60 @@ For all other systems, please follow the Python instructions below.
 This should work on any platform for which Python is available. The simple way is to install Honeychrome from PyPi (pip). You can alternatively clone and run the source code. Either way works if you want to run plugins.
 
 #### Install Honeychrome package from PyPi
+*Requires Python 3.12 and a C/C++ compiler (some dependencies are compiled during installation):
+the Xcode command-line tools on macOS (`xcode-select --install`), the Visual Studio 2022 Build Tools
+with "Desktop development with C++" on Windows, `build-essential` on Linux.*
+
 1.  **Create a virtual environment:**
-    *Requires Python 3.12 or higher.*
     ```bash
-    python3 -m venv .venv
+    python3.12 -m venv .venv
     ```
-    
+
 2.  **Activate the virtual environment:**
     * **Linux/macOS:** `source .venv/bin/activate`
     * **Windows:** `.venv\Scripts\activate`
-    
 
-3.  **Install Honeychrome with pip:**
+3.  **Update the installation tools:**
+    ```bash
+    python -m pip install --upgrade pip setuptools wheel
+    ```
+
+4.  **macOS and Linux only: install Annoy without fast-math** (PaCMAP needs this):
+    ```bash
+    ANNOY_COMPILER_ARGS=-D_CRT_SECURE_NO_WARNINGS,-fpermissive,-O3,-fno-associative-math \
+      pip install --no-binary annoy --no-cache-dir annoy==1.17.3
+    ```
+
+5.  **Install Honeychrome with pip:**
     ```bash
     pip install honeychrome
-    ```  
-   (Optional: use pip to install any further packages on which your plugins may depend, e.g. the example plugins require umap-learn and hdbscan.)
-   
+    ```
+   (Optional: use pip to install any further packages on which your plugins may depend.)
 
-4.  **Run Honeychrome:**
+6.  **Build the compiled kernels (recommended):**
+    Honeychrome runs without them, but FlowSOM clustering in Honeycluster and Spectral Variants
+    are then unavailable, autofluorescence extraction uses k-means in place of the SOM, and the
+    noise model and Spectral Correction run more slowly. First install the build tools
+    for your platform (see [Build tools](#build-tools) below), then go to the kernels' folder
+    inside the installed package:
+    * **Linux/macOS:**
+      ```bash
+      cd "$(python -c "import honeychrome, os; print(os.path.join(os.path.dirname(honeychrome.__file__), 'bundled_plugins'))")"
+      ```
+    * **Windows (PowerShell):**
+      ```powershell
+      cd (python -c "import honeychrome, os; print(os.path.join(os.path.dirname(honeychrome.__file__), 'bundled_plugins'))")
+      ```
+
+    and build them:
+    ```bash
+    python build_som_kernel.py
+    python build_autospectral_opt_kernel.py
+    python build_fix_my_unmix_kernel.py
+    ```
+    Build them again after each upgrade of Honeychrome.
+
+7.  **Run Honeychrome:**
     ```bash
     honeychrome
     ```
@@ -114,9 +149,9 @@ Follow these steps to clone the repository and run the application from source:
     ```
 
 2.  **Create a virtual environment:**
-    *Requires Python 3.12 or higher.*
+    *Requires Python 3.12.*
     ```bash
-    python3 -m venv .venv
+    python3.12 -m venv .venv
     ```
 
 3.  **Activate the virtual environment:**
@@ -125,22 +160,66 @@ Follow these steps to clone the repository and run the application from source:
 
 4.  **Upgrade pip and install dependencies:**
     ```bash
-    pip install --upgrade pip
+    python -m pip install --upgrade pip setuptools wheel
     python install_annoy.py
     pip install -r requirements.txt
     python install_opentsne.py   # macOS only (needs `brew install libomp`); elsewhere it does nothing
     ```
 
 5.  **Install the package in editable mode:**
-    *This ensures all internal modules are correctly mapped to your path.*
+    *This ensures all internal modules are correctly mapped to your path, and that the kernels
+    built in the next step are found.*
     ```bash
     pip install -e .
     ```
 
-6.  **Run the application:**
+6.  **Build the compiled kernels** (install the [Build tools](#build-tools) for your platform first):
+    ```bash
+    cd src/honeychrome/bundled_plugins
+    python build_som_kernel.py
+    python build_autospectral_opt_kernel.py
+    python build_fix_my_unmix_kernel.py
+    cd ../../..
+    ```
+    Check that they load:
+    ```bash
+    python -c "import sys; sys.path.insert(0, 'src/honeychrome/bundled_plugins'); [__import__(n) for n in ('_som_kernel', '_autospectral_opt_kernel', '_gls_m2p_kernel', '_fmu_kernel')]; print('kernels OK')"
+    ```
+    After `git pull`, build them again if any `.c`, `.cpp`, `.hpp`, `CMakeLists.txt` or
+    `build_*kernel*.py` file in `src/honeychrome/bundled_plugins` has changed. Quit Honeychrome
+    before rebuilding.
+
+7.  **Run the application:**
     ```bash
     python3 -m honeychrome.main
     ```
+
+#### Build tools
+The compiled kernels need a C/C++ compiler, CMake, Armadillo with BLAS/LAPACK and OpenMP:
+
+* **macOS:**
+  ```bash
+  xcode-select --install
+  brew install libomp armadillo cmake
+  ```
+* **Linux (Ubuntu/Debian):**
+  ```bash
+  sudo apt install build-essential cmake libarmadillo-dev libopenblas-dev
+  ```
+* **Windows:** install the Visual Studio 2022 Build Tools with "Desktop development with C++",
+  CMake and Git, then Armadillo with OpenBLAS through vcpkg (PowerShell; the vcpkg step takes
+  about 15 minutes the first time):
+  ```powershell
+  git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+  C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+  C:\vcpkg\vcpkg.exe install armadillo:x64-windows-static-md
+  Set-Content -Path "$env:USERPROFILE\vcpkg_static_md.cmake" -Encoding ascii -Value @(
+    'set(VCPKG_TARGET_TRIPLET x64-windows-static-md CACHE STRING "")',
+    'include("C:/vcpkg/scripts/buildsystems/vcpkg.cmake")'
+  )
+  $env:CMAKE_TOOLCHAIN_FILE = "$env:USERPROFILE\vcpkg_static_md.cmake"
+  ```
+  Build the kernels in the same PowerShell window, so that `CMAKE_TOOLCHAIN_FILE` is set.
 
 ## Contributions
 We have many ideas for Honeychrome and welcome new ones. 
