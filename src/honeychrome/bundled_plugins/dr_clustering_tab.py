@@ -178,6 +178,7 @@ from honeychrome.view_components.differential_plots import (
     style_figure_theme as _style_figure_theme,
     text_width_inches,
     wrap_label,
+    wrap_to_width,
 )
 import honeychrome.settings as hc_settings
 
@@ -945,9 +946,11 @@ class PipelineState:
     stats_use_treat: bool = True
     # True: p-values test |effect| > threshold (TREAT). False: test
     #   effect != 0 and use the threshold only as a filter.
-    stats_counts_method: str = 'wald'
-    # Counts test: 'wald' (per-cluster dispersion, z) or 'ql'
-    #   (quasi-likelihood F with shrunk dispersions).
+    stats_counts_method: str = 'ql'
+    # Counts test: 'ql' (quasi-likelihood F, each comparison fitted on its
+    #   two groups with one common dispersion). The
+    #   Wald test is not offered: it was far too liberal on human and mouse
+    #   data.
     stats_normalisation: str = 'total'
     # Library size of the Counts and Frequency tests: 'total' (events over
     #   all clusters) or 'robust' (trimmed rescaling that a few expanding
@@ -3396,9 +3399,11 @@ class GroupsStatsTab(QWidget):
         self.chk_counts = QCheckBox("Cluster Counts (GLM)")
         self.chk_counts.setChecked(STATS_TEST_DEFAULTS['counts'])
         self.chk_counts.setToolTip(
-            "Raw event counts per cluster per sample → negative-"
-            "binomial GLM.\nParallel option to the Frequency test, not a "
-            "replacement — run both to compare on the same data."
+            "Raw event counts per cluster per sample → negative-binomial GLM, "
+            "quasi-likelihood F test.\nSuited to homogeneous designs such as "
+            "inbred mice with plenty of events. On human cohort data negative-"
+            "binomial tests found more false positives than their nominal rate; "
+            "rely on Cluster Frequencies there."
         )
         self.chk_mfi = QCheckBox("Cluster MFIs")
         self.chk_mfi.setChecked(STATS_TEST_DEFAULTS['mfi'])
@@ -3493,14 +3498,14 @@ class GroupsStatsTab(QWidget):
         method_row.addSpacing(20)
         method_row.addWidget(QLabel("Counts test:"))
         self.counts_method_combo = QComboBox()
-        self.counts_method_combo.addItem("Wald", 'wald')
-        self.counts_method_combo.addItem("Quasi-likelihood F", 'ql')
+        self.counts_method_combo.addItem(
+            "Quasi-likelihood F (negative binomial, homogeneous designs)", 'ql')
         self.counts_method_combo.setToolTip(
-            "Wald: each cluster's own negative-binomial dispersion and a z "
-            "test; finds too many hits with few samples per group or a "
-            "paired design. Quasi-likelihood F: dispersions shrunk towards a "
-            "common value, then a moderated quasi-dispersion per cluster; "
-            "holds its false-positive rate with few samples."
+            "Quasi-likelihood F: negative-binomial dispersions shrunk towards a "
+            "common value, then a moderated quasi-dispersion per cluster. On "
+            "inbred mice with plenty of events it gave 3–7% false positives at "
+            "the 5% level; on a human cohort 7–11% for populations under 100 "
+            "events. The Wald test is not offered (21–31% on the same mice)."
         )
         method_row.addWidget(self.counts_method_combo)
         method_row.addSpacing(10)
@@ -5308,7 +5313,7 @@ class GroupsStatsTab(QWidget):
         self.state.stats_use_treat = self.chk_treat.isChecked()
         self.state.stats_mfi_threshold = mfi_threshold
         self.state.stats_mfi_hierarchical = self.chk_mfi_hierarchical.isChecked()
-        self.state.stats_counts_method = self.counts_method_combo.currentData() or 'wald'
+        self.state.stats_counts_method = self.counts_method_combo.currentData() or 'ql'
         self.state.stats_normalisation = self.normalisation_combo.currentData() or 'total'
         use_treat = self.state.stats_use_treat
         mfi_hierarchical = self.state.stats_mfi_hierarchical
@@ -6171,7 +6176,11 @@ class GroupsStatsTab(QWidget):
             return fig
 
         n_rows = len(comp_df)
-        fig_w = max(4.0, 0.6 * n_rows + 2.5)
+        # About 22 legend rows fit beside the 5 inch plot at 8 pt; beyond
+        # that the legend gains columns and the figure widens to hold them.
+        legend_cols = max(1, int(np.ceil(len(comp_df.columns) / 22)))
+        legend_col_w = max(text_width_inches(str(c), 8) for c in comp_df.columns) + 0.45
+        fig_w = max(4.0, 0.6 * n_rows + 2.5) + (legend_cols - 1) * legend_col_w
         fig = Figure(figsize=(fig_w, 5.0), layout='constrained')
         ax = fig.add_subplot(111)
 
@@ -6193,7 +6202,7 @@ class GroupsStatsTab(QWidget):
         ax.set_ylabel('% of events' if as_pct else 'Event count')
         ax.set_title('Cluster Composition', fontsize=10)
         legend = ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), fontsize=8,
-                           title='Cluster', frameon=False)
+                           title='Cluster', frameon=False, ncol=legend_cols)
         fg = _style_figure_theme(fig, is_dark)
         # _style_figure_theme only touches tick/axis-label/title/spine
         # colours -- legend text is a separate artist it doesn't walk,
@@ -6423,7 +6432,8 @@ class GroupsStatsTab(QWidget):
         ax.set_xlabel("False positive rate")
         ax.set_ylabel("True positive rate")
         ax.legend(loc='lower right', fontsize=7)
-        ax.set_title(f"Cross-validated ROC\n{self._predictive_subtitle(summary)}", fontsize=9)
+        ax.set_title(wrap_to_width(f"Cross-validated ROC\n{self._predictive_subtitle(summary)}",
+                                   9, 5.0), fontsize=9)
         _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
         return fig
@@ -6482,8 +6492,8 @@ class GroupsStatsTab(QWidget):
         ax.set_xlabel("Number of top-ranked features (log scale)")
         ax.set_ylabel("Cross-validated AUC (mean ± SD)")
         ax.set_ylim(0, 1.02)
-        ax.set_title(f"How many features are needed?\n{self._predictive_subtitle(summary)}",
-                     fontsize=9)
+        ax.set_title(wrap_to_width(f"How many features are needed?\n"
+                                   f"{self._predictive_subtitle(summary)}", 9, 5.0), fontsize=9)
         _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
         return fig
@@ -14343,7 +14353,7 @@ class PluginWidget(QWidget):
             if fdr_scope in ('global', 'per_comparison'):
                 self.state.stats_fdr_scope = fdr_scope
             counts_method = s.value('stats_counts_method', None)
-            if counts_method in ('wald', 'ql'):
+            if counts_method == 'ql':
                 self.state.stats_counts_method = counts_method
             normalisation = s.value('stats_normalisation', None)
             if normalisation in ('total', 'robust'):

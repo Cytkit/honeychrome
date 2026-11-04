@@ -13,8 +13,12 @@ intensities. Used by the Honeycluster and Automated Gating plugins.
   a per-feature denominator (e.g. each population's parent count). Two
   tests: ``'wald'`` (per-feature Cameron–Trivedi dispersion, Wald z) and
   ``'ql'`` (quasi-likelihood F test after Lund et al. 2012 and edgeR's
-  glmQLFit: negative-binomial dispersion shrunk towards a common prior,
-  then a per-feature quasi-dispersion moderated by empirical Bayes).
+  glmQLFit: one common negative-binomial dispersion, then a per-feature
+  quasi-dispersion moderated by empirical Bayes). With ``'ql'`` each
+  comparison is fitted on the samples of its two groups only, with the
+  common dispersion estimated once on every sample, so groups that vary
+  more or less than the rest (e.g. tissues with fewer cells) do not set
+  another comparison's noise level.
   For small counts each unit deviance is rescaled, and its residual
   degrees of freedom set, by how far its mean and variance depart from
   their large-count values (after edgeR v4, Chen et al. 2024), which keeps
@@ -1137,61 +1141,34 @@ def _grid_argmax(values: np.ndarray) -> np.ndarray:
     return x
 
 
-def _shrunk_dispersions(blocks: list, mus: list) -> tuple[list, dict]:
+def _common_dispersion(blocks: list, mus: list) -> float:
     """
-    Negative-binomial dispersion per feature, shrunk towards a common value:
-    the maximum of the Cox–Reid likelihood plus a normal prior on log α
-    whose mean is the median of the features' log MLEs and whose variance
-    is their robust (MAD) variance less the sampling variance ψ′(df/2),
-    floored at 0.25 (as DESeq2). Returns one alpha array per block and the
-    prior.
+    One negative-binomial dispersion for every feature: the median of the
+    features' Cox–Reid maximum-likelihood log α (for the fitted means
+    *mus*), over the features off the Poisson boundary. Features keep their
+    own extra variation in the quasi-dispersion of the QL test, where it is
+    moderated with an estimated prior (as edgeR's glmQLFit uses a trended,
+    not a per-feature, dispersion).
     """
-    from scipy import special
-
     lls = [_nb_profile_loglik(b.Y, mu, b.X) for b, mu in zip(blocks, mus)]
-    dfs = np.concatenate([np.full(b.Y.shape[0], b.X.shape[0] - b.X.shape[1]) for b in blocks])
     mle = np.concatenate([_LOG_ALPHA_GRID[np.argmax(ll, axis=1)] for ll in lls])
     usable = mle > _LOG_ALPHA_GRID[0] + 2.0          # off the Poisson boundary
     if usable.sum() < 3:
         usable = np.ones_like(usable)
-    centre = float(np.median(mle[usable]))
-    mad = 1.4826 * float(np.median(np.abs(mle[usable] - centre)))
-    variance = max(mad ** 2 - float(special.polygamma(1, np.mean(dfs) / 2.0)), _MIN_PRIOR_VARIANCE)
-    penalty = (_LOG_ALPHA_GRID[None, :] - centre) ** 2 / (2.0 * variance)
-    alphas = [np.exp(_grid_argmax(ll - penalty)) for ll in lls]
-    return alphas, {'log_alpha_mean': centre, 'log_alpha_variance': variance}
+    return float(np.exp(np.median(mle[usable])))
 
 
-def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
-                  coefs: list[int]) -> dict:
+def _ql_blocks(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray) -> tuple[list, list]:
     """
-    Quasi-likelihood F test of each design column in ``coefs`` for every
-    feature (rows of counts and offsets; NaN = not measured).
-
-    Features sharing a pattern of measured samples are fitted together on
-    that sub-design. Negative-binomial dispersions come from
-    _shrunk_dispersions (two rounds of fit and estimate). The
-    quasi-dispersion of each feature (residual deviance / residual df) is
-    moderated with moderated_stats.fit_prior_variance, as limma moderates
-    variances; F = (deviance without the column − deviance with it) /
-    moderated quasi-dispersion, on 1 and df + d0 degrees of freedom. The
-    quasi-dispersion is the low-count adjusted residual deviance over its
-    fractional residual df (_adjusted_deviance); a feature with no df left
-    takes the prior quasi-dispersion.
-
-    Returns {coef: (logFC (log2), SE, t, df_total)}. logFC comes from a fit
-    with the prior count (_add_prior_count), so it is finite when a group
-    has no events; SE = |logFC| / √F and t = sign(logFC) √F, so a t test
-    with df_total reproduces the F test and TREAT and threshold changes work
-    from the stored columns.
+    Features (rows of counts and offsets; NaN = not measured) grouped by
+    their pattern of measured samples, each group fitted on its sub-design
+    by a Poisson GLM. Returns the _Blocks and their fitted means.
     """
-    n_features = counts.shape[0]
     patterns: dict[bytes, list[int]] = {}
-    for i in range(n_features):
+    for i in range(counts.shape[0]):
         observed = np.isfinite(counts[i]) & np.isfinite(offsets[i])
         if np.any(counts[i][observed]):
             patterns.setdefault(observed.tobytes(), []).append(i)
-
     blocks, mus = [], []
     for key, rows in patterns.items():
         observed = np.frombuffer(key, dtype=bool)
@@ -1209,17 +1186,91 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
             continue
         blocks.append(_Block(rows[ok], columns, Y[ok], O[ok], X))
         mus.append(np.array([f[1] for f in fits if f is not None]))
+    return blocks, mus
 
+
+def _ql_dispersion(blocks: list, mus: list) -> tuple[float, list]:
+    """
+    The common dispersion of *blocks* (two rounds: from the Poisson means,
+    then from the negative-binomial means at that dispersion), and the
+    fitted means at the final value.
+    """
+    alpha = np.nan
+    for _round in range(2):
+        alpha = _common_dispersion(blocks, mus)
+        full = [_fit_rows(b.Y, b.X, b.O, np.full(b.Y.shape[0], alpha)) for b in blocks]
+        mus = [np.array([f[1] if f is not None else m for f, m in zip(fb, mu)])
+               for fb, mu in zip(full, mus)]
+    return alpha, mus
+
+
+def ql_common_dispersion(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray) -> float:
+    """The QL test's common negative-binomial dispersion for every sample
+    of *design* (``_ql_dispersion``); NaN when no feature can be fitted."""
+    blocks, mus = _ql_blocks(counts, design, offsets)
+    return _ql_dispersion(blocks, mus)[0] if blocks else np.nan
+
+
+def ql_comparisons(group_vec: list[str], contrasts: list[tuple[str, str]], pairing_vec: list[str] | None,
+                   covariates: pd.DataFrame | None):
+    """
+    The QL test's fit for each contrast: the samples of its two groups only.
+    Yields (base, other, sample mask, design, group column of *other*).
+    With pairing, a pairing level that the two groups never share makes the
+    design rank-deficient only when no level is shared at all; the
+    comparison is then fitted without pairing (logged).
+    """
+    for base, other in contrasts:
+        mask = np.array([g in (base, other) for g in group_vec])
+        sub_groups = _subset_rows(group_vec, mask)
+        sub_pairing = _subset_rows(pairing_vec, mask) if pairing_vec is not None else None
+        sub_cov = covariates.loc[covariates.index[mask]] if covariates is not None else None
+        try:
+            design, _names, group_cols = build_design(sub_groups, base, sub_pairing, sub_cov)
+        except RuntimeError:
+            if sub_pairing is None:
+                raise
+            log.warning("QL counts: %s vs %s share no pairing level; fitted without pairing", other, base)
+            design, _names, group_cols = build_design(sub_groups, base, None, sub_cov)
+        yield base, other, mask, design, group_cols[other]
+
+
+def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
+                  coefs: list[int], alpha: float | None = None) -> dict:
+    """
+    Quasi-likelihood F test of each design column in ``coefs`` for every
+    feature (rows of counts and offsets; NaN = not measured).
+
+    Features sharing a pattern of measured samples are fitted together on
+    that sub-design (_ql_blocks). Every feature takes the same
+    negative-binomial dispersion: *alpha*, or the common dispersion of this
+    design (_ql_dispersion). The quasi-dispersion of each feature (residual
+    deviance / residual df) is moderated with
+    moderated_stats.fit_prior_variance, as limma moderates variances;
+    F = (deviance without the column − deviance with it) / moderated
+    quasi-dispersion, on 1 and df + d0 degrees of freedom. The
+    quasi-dispersion is the low-count adjusted residual deviance over its
+    fractional residual df (_adjusted_deviance); a feature with no df left
+    takes the prior quasi-dispersion.
+
+    Returns {coef: (logFC (log2), SE, t, df_total)}. logFC comes from a fit
+    with the prior count (_add_prior_count), so it is finite when a group
+    has no events; SE = |logFC| / √F and t = sign(logFC) √F, so a t test
+    with df_total reproduces the F test and TREAT and threshold changes work
+    from the stored columns.
+    """
+    n_features = counts.shape[0]
+    blocks, mus = _ql_blocks(counts, design, offsets)
     out = {j: tuple(np.full(n_features, np.nan) for _ in range(4)) for j in coefs}
     if not blocks:
         return out
 
-    full = None
-    for _round in range(2):
-        alphas, prior = _shrunk_dispersions(blocks, mus)
-        full = [_fit_rows(b.Y, b.X, b.O, a) for b, a in zip(blocks, alphas)]
-        mus = [np.array([f[1] if f is not None else m for f, m in zip(fb, mu)])
-               for fb, mu in zip(full, mus)]
+    if alpha is None or not np.isfinite(alpha):
+        alpha, mus = _ql_dispersion(blocks, mus)
+    alphas = [np.full(b.Y.shape[0], alpha) for b in blocks]
+    full = [_fit_rows(b.Y, b.X, b.O, a) for b, a in zip(blocks, alphas)]
+    mus = [np.array([f[1] if f is not None else m for f, m in zip(fb, mu)])
+           for fb, mu in zip(full, mus)]
 
     dev_full = [_glm_deviance(b.Y, mu, a) for b, mu, a in zip(blocks, mus, alphas)]
     adjusted = [_adjusted_deviance(b.Y, mu, b.X, a) for b, mu, a in zip(blocks, mus, alphas)]
@@ -1232,9 +1283,8 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
         post = np.full(phi.shape, s0)
     else:
         post = (d0 * s0 + df_all * phi) / (d0 + df_all)
-    log.info("QL counts test: %d features, log-dispersion prior %.3g (variance %.3g), "
-             "quasi-dispersion prior d0=%.3g s0²=%.3g", phi.size, prior['log_alpha_mean'],
-             prior['log_alpha_variance'], d0, s0)
+    log.info("QL counts test: %d features, common dispersion %.3g, quasi-dispersion prior d0=%.3g s0²=%.3g",
+             phi.size, alpha, d0, s0)
 
     shrunk = []
     for b, a in zip(blocks, alphas):
@@ -1278,12 +1328,15 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
                           offset_df: pd.DataFrame | None = None,
                           method: str = 'wald') -> pd.DataFrame:
     """
-    One design + per-feature NB/Poisson fit, read out for every contrast in
-    ``contrasts`` (shared baseline). The offset is log(row total of
-    counts_df) unless ``offset_df`` gives a per-feature denominator. The
-    coefficient is a rate difference between groups, reported on the log2
-    scale. method 'wald': Wald z tests (df.total = inf); 'ql':
-    quasi-likelihood F tests (_glm_ql_tests). With either, logFC comes from
+    Per-feature NB/Poisson fits read out for every contrast in
+    ``contrasts``. The offset is log(row total of counts_df) unless
+    ``offset_df`` gives a per-feature denominator. The coefficient is a rate
+    difference between groups, reported on the log2 scale. method 'wald':
+    one design over every sample (shared baseline), Wald z tests
+    (df.total = inf); 'ql': quasi-likelihood F tests (_glm_ql_tests), each
+    contrast fitted on the samples of its two groups (ql_comparisons) with
+    the common dispersion of every sample (ql_common_dispersion), so the
+    contrasts may have different baselines. With either, logFC comes from
     a fit with the prior count (_add_prior_count) and SE is |logFC| over
     the test statistic, so a group with no events gives a finite logFC and
     the stored columns reproduce the test.
@@ -1312,11 +1365,11 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
                    .reshape(len(features), len(counts_df)))
 
     if method == 'ql':
-        tests = _glm_ql_tests(counts, design_mat, log_offsets,
-                              [group_cols[other] for _b, other in contrasts])
+        alpha = ql_common_dispersion(counts, design_mat, log_offsets)
         frames = []
-        for b, other in contrasts:
-            logfc, se, tvals, dft = tests[group_cols[other]]
+        for b, other, mask, sub_design, coef in ql_comparisons(group_vec, contrasts, pairing_vec, covariates):
+            tests = _glm_ql_tests(counts[:, mask], sub_design, log_offsets[:, mask], [coef], alpha)
+            logfc, se, tvals, dft = tests[coef]
             p = ms.treat_pvalues(logfc, se, dft, 0.0)
             with np.errstate(invalid='ignore'):
                 q = ms._t_isf(np.full(logfc.shape, 0.025), np.where(np.isfinite(dft), dft, np.inf))
@@ -1384,9 +1437,11 @@ def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
     """
     Per-feature negative-binomial GLM differential abundance test on raw
     event counts, with the same contrasts/mode/pairing/covariate semantics
-    as run_moderated(). In 'reference' mode each feature is fitted once and
-    every contrast is read from that fit; 'pairwise' fits each pair
-    separately.
+    as run_moderated(). With 'wald', 'reference' mode fits each feature once
+    and reads every contrast from that fit, and 'pairwise' fits each pair
+    separately. With 'ql' both modes fit each contrast on its two groups'
+    samples, with the common dispersion of every sample; 'pairwise' keeps
+    its check that each group of a pair has at least three samples.
 
     offset_df: optional per-sample, per-feature denominators (same index and
         columns as counts_df), e.g. each gated population's parent count.
@@ -1394,24 +1449,25 @@ def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
     method: 'wald' — per-feature Cameron–Trivedi dispersion (Poisson where
         it is not positive) and Wald z. Liberal with few residual degrees of
         freedom (paired designs, few samples per group). 'ql' —
-        quasi-likelihood F test with shrunk dispersions (_glm_ql_tests).
+        quasi-likelihood F test (_glm_ql_tests).
 
     Returns the same schema as run_moderated() minus AveExpr.
     """
-    if mode == 'reference':
+    if mode not in ('reference', 'pairwise'):
+        raise ValueError(f"mode must be 'reference' or 'pairwise', got {mode!r}")
+    pairs = (list(_pair_subsets(counts_df, group_vec, contrasts, pairing_vec, covariates))
+             if mode == 'pairwise' else [])
+    if mode == 'reference' or method == 'ql':
         combined = _glm_counts_contrasts(counts_df, group_vec, contrasts, pairing_vec,
                                          covariates, offset_df, method)
-    elif mode == 'pairwise':
+    else:
         frames = [
             _glm_counts_contrasts(sub_df, sub_groups, [(base, other)], sub_pair, sub_cov,
                                   None if offset_df is None else offset_df.loc[sub_df.index],
                                   method)
-            for sub_df, sub_groups, sub_pair, sub_cov, base, other
-            in _pair_subsets(counts_df, group_vec, contrasts, pairing_vec, covariates)
+            for sub_df, sub_groups, sub_pair, sub_cov, base, other in pairs
         ]
         combined = pd.concat(frames, ignore_index=True)
-    else:
-        raise ValueError(f"mode must be 'reference' or 'pairwise', got {mode!r}")
 
     combined = apply_significance(combined, pval_threshold, fc_threshold,
                                   fdr_scope=fdr_scope, use_treat=use_treat)

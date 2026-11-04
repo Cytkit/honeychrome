@@ -70,6 +70,8 @@ import heapq
 import json
 import logging
 import math
+import threading
+from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass, field
 
@@ -459,28 +461,73 @@ def split_population_key(key: str) -> tuple[str, str]:
     return gate, pop
 
 
-def population_display_names(populations) -> dict:
-    """Display name of each population ({key: name}): its label, or
-    "gate label" where two populations of the model share that label.
+def _gate_place(gate_def: dict) -> str:
+    """The qualifier a gate's name adds to its name group: 'CD4 Treg' for
+    'CD38+ (CD4 Treg)' or 'CD38+ (CD4 Treg) 2' in name group 'CD38+'; ''
+    when the name has none."""
+    name = str(gate_def.get('gate_name') or '')
+    base = str(gate_def.get('name_group') or '')
+    if not base or not name.startswith(f"{base} ("):
+        return ''
+    rest = name[len(base) + 2:]
+    head, sep, number = rest.rpartition(') ')
+    if sep and number.isdigit():
+        rest = head + ')'
+    return rest[:-1] if rest.endswith(')') else ''
 
-    populations : iterable of (key, gate name, label); a key that repeats
-                  (for example one row per sample) counts once.
+
+def population_display_names(populations) -> dict:
+    """Display name of each population ({key: name}): its label where no
+    other population of the model shares it. A shared label is qualified
+    by where its gate sits, "label (place)", when the gate's name carries
+    a place; where that repeats, a gate numbered "base (place) N" adds its
+    number, "label (place) N". Otherwise, or when the name still repeats,
+    it is "gate label".
+
+    populations : iterable of (key, gate name, label) or (key, gate name,
+                  label, place); a key that repeats (for example one row
+                  per sample) counts once.
     """
     by_key: dict = {}
-    for key, gate, label in populations:
-        by_key.setdefault(key, (str(gate), str(label)))
+    for key, gate, label, *place in populations:
+        by_key.setdefault(key, (str(gate), str(label), str(place[0] or '') if place else ''))
     uses: dict[str, int] = {}
-    for _gate, label in by_key.values():
+    for _gate, label, _place in by_key.values():
         uses[label] = uses.get(label, 0) + 1
-    return {key: label if uses[label] == 1 else f"{gate} {label}"
-            for key, (gate, label) in by_key.items()}
+    names = {}
+    for key, (gate, label, place) in by_key.items():
+        if uses[label] == 1:
+            names[key] = label
+        elif place:
+            names[key] = f"{label} ({place})"
+        else:
+            names[key] = f"{gate} {label}"
+    repeats = _name_counts(names)
+    for key, (gate, label, place) in by_key.items():
+        if place and uses[label] > 1 and repeats[names[key]] > 1:
+            number = gate.rpartition(f"({place})")[2]
+            if number.strip().isdigit():
+                names[key] = f"{label} ({place}){number}"
+    repeats = _name_counts(names)
+    for key, (gate, label, place) in by_key.items():
+        if place and uses[label] > 1 and repeats[names[key]] > 1:
+            names[key] = f"{gate} {label}"
+    return names
+
+
+def _name_counts(names: dict) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for name in names.values():
+        counts[name] = counts.get(name, 0) + 1
+    return counts
 
 
 def gate_population_names(gate_defs: list[dict]) -> dict:
     """population_display_names for every population of *gate_defs*, keyed
     by population_key."""
     return population_display_names(
-        (population_key(g['gate_name'], pop), g['gate_name'], (info or {}).get('label') or pop)
+        (population_key(g['gate_name'], pop), g['gate_name'],
+         (info or {}).get('label') or pop, _gate_place(g))
         for g in gate_defs for pop, info in (g.get('populations') or {}).items())
 
 
@@ -637,6 +684,43 @@ def threshold_kde_min(x: np.ndarray) -> float:
 MIXTURE_CUTS = ('outer', 'lower', 'upper')
 
 
+# Fitted mixtures by (events, components, seed), most recently used last, so
+# that fitting the same events again (e.g. the 3-component candidates with a
+# lower and an upper cut) reuses one fit. Shared with worker threads.
+MIXTURE_CACHE_SIZE = 256
+_mixture_cache: OrderedDict = OrderedDict()
+_mixture_cache_lock = threading.Lock()
+
+
+def _fitted_mixture(x: np.ndarray, n_components: int, seed: int) -> tuple:
+    """(means, weights, standard deviations) of a 1-D Gaussian mixture
+    fitted to the float array *x*. A fit of the same events, in the same
+    memory layout (which can change a fit in its last digits), with the same
+    number of components and seed is returned from the cache; the arrays
+    are read-only."""
+    from sklearn.mixture import GaussianMixture
+
+    key = (hashlib.blake2b(x.tobytes(), digest_size=16).hexdigest(), x.shape, x.strides,
+           int(n_components), int(seed))
+    with _mixture_cache_lock:
+        fit = _mixture_cache.get(key)
+        if fit is not None:
+            _mixture_cache.move_to_end(key)
+            return fit
+    gm = GaussianMixture(n_components=int(n_components), covariance_type='full',
+                         random_state=seed, max_iter=200)
+    gm.fit(x.reshape(-1, 1))
+    fit = (gm.means_.ravel().copy(), gm.weights_.ravel().copy(),
+           np.sqrt(gm.covariances_.ravel()))
+    for arr in fit:
+        arr.setflags(write=False)
+    with _mixture_cache_lock:
+        _mixture_cache[key] = fit
+        while len(_mixture_cache) > MIXTURE_CACHE_SIZE:
+            _mixture_cache.popitem(last=False)
+    return fit
+
+
 def threshold_mixture(x: np.ndarray, n_components: int = 2, seed: int = 0,
                       cut: str = 'outer') -> float:
     """Density crossover between two components of a Gaussian mixture,
@@ -645,17 +729,11 @@ def threshold_mixture(x: np.ndarray, n_components: int = 2, seed: int = 0,
     three are the same."""
     from scipy.optimize import brentq
     from scipy.stats import norm
-    from sklearn.mixture import GaussianMixture
 
     x = np.asarray(x, dtype=float)
     if len(x) < 20:
         return float(np.median(x)) if len(x) else 0.0
-    gm = GaussianMixture(n_components=int(n_components), covariance_type='full',
-                         random_state=seed, max_iter=200)
-    gm.fit(x.reshape(-1, 1))
-    means = gm.means_.ravel()
-    weights = gm.weights_.ravel()
-    stds = np.sqrt(gm.covariances_.ravel())
+    means, weights, stds = _fitted_mixture(x, n_components, seed)
     order = np.argsort(means)
     lo, hi = {'lower': (0, 1), 'upper': (-2, -1)}.get(cut, (0, -1))
     mu1, mu2 = means[order[lo]], means[order[hi]]
@@ -973,25 +1051,34 @@ def population_regions(gate_def: dict, boundary: dict | None = None) -> dict[str
     """{population: region} for a gate.
 
     Taken from the boundary entries or population definitions when set;
-    otherwise inferred from population order (threshold gates: below/above
-    for 1D, DN/X+/Y+/DP order for 2D).
+    otherwise inferred. A 1dsep population without a region takes the side
+    the populations with one leave free (an added 'Non-B' beside 'B cells'
+    above takes the events below); when no side or both sides are taken,
+    population order decides (first below, the rest above). 2dsep
+    populations follow DN/X+/Y+/DP order.
     """
     pops = list((gate_def.get('populations') or {}).keys()) or list((boundary or {}).keys())
     gate_type = gate_def.get('gate_type')
     regions: dict[str, str] = {}
-    for i, pop in enumerate(pops):
+    for pop in pops:
         region = ((boundary or {}).get(pop) or {}).get('region') \
             or ((gate_def.get('populations') or {}).get(pop) or {}).get('region')
-        if not region:
-            if gate_type == '1dsep':
-                region = REGION_BELOW if i == 0 else REGION_ABOVE
-            elif gate_type == '2dsep':
-                region = QUADRANT_REGIONS[i] if i < 4 else None
-            else:
-                region = REGION_INSIDE
         if region:
             regions[pop] = region
-    return regions
+    sides = {r for r in regions.values() if r in (REGION_BELOW, REGION_ABOVE)}
+    free_side = ({REGION_BELOW, REGION_ABOVE} - sides).pop() if len(sides) == 1 else None
+    for i, pop in enumerate(pops):
+        if pop in regions:
+            continue
+        if gate_type == '1dsep':
+            region = free_side or (REGION_BELOW if i == 0 else REGION_ABOVE)
+        elif gate_type == '2dsep':
+            region = QUADRANT_REGIONS[i] if i < 4 else None
+        else:
+            region = REGION_INSIDE
+        if region:
+            regions[pop] = region
+    return {pop: regions[pop] for pop in pops if pop in regions}
 
 
 # ---------------------------------------------------------------------------
@@ -2297,8 +2384,11 @@ def new_model(gate_defs: list[dict], boundaries: dict, *, channel_map: dict,
     })
 
 
-def normalize_model(model: dict) -> tuple[dict, list[str]]:
+def normalize_model(model: dict, copy: bool = True) -> tuple[dict, list[str]]:
     """Validate a loaded model and upgrade format 1 to format 2.
+
+    copy : work on a deep copy of *model* (the default); False completes
+        *model* itself, for a model dict nothing else refers to.
 
     Returns (model, warnings). Raises ValueError for unsupported versions or
     a malformed gate list.
@@ -2307,7 +2397,7 @@ def normalize_model(model: dict) -> tuple[dict, list[str]]:
     version = model.get('format_version')
     if version not in (1, 2):
         raise ValueError(f"Unsupported model format_version {version!r}.")
-    m = deepcopy(model)
+    m = deepcopy(model) if copy else model
     gate_defs = m.get('gate_definitions')
     if not isinstance(gate_defs, list):
         raise ValueError("Model has no gate_definitions list.")

@@ -248,6 +248,11 @@ side becomes two quadrants; tick the quadrants each population covers in
 the <b>Quadrants</b> column (e.g. X+ Y− only). Changing a gate's type
 returns its mixture components to 2. A change that would leave gates below
 without their parent population is refused, naming them.</li>
+<li>For a <i>1dsep</i> gate, the <b>Side</b> column sets which side of the
+threshold each population takes: <b>Below</b> or <b>Above</b>. A population
+you add takes the side the others leave free, so adding <i>Non-B</i> beside
+<i>B cells</i> (Above) gives it the events below. <b>Position</b> only places
+the label.</li>
 <li>Renaming a population in the editor renames it for the gates below
 too.</li>
 <li><b>Add gate manually</b> creates a gate that is not on the main
@@ -437,6 +442,13 @@ set up <i>CD25+</i> on one T cell subset, then pass it to the subsets below
 it.</li>
 <li><b>⇉</b> does the same for every gate of that name on the same channels
 anywhere in the model.</li>
+<li><b>⇶</b> lets other gates copy a converted gate's threshold instead of
+calculating their own. Set up <i>CD28+</i> on a clean population such as
+<i>CD4 Tconv</i>, press ⇶ and tick the gates that should use its boundary:
+gates of the same name start ticked, and any gate on the same channel can be
+added; Shift- or Ctrl-click selects several rows, and ticking one ticks them
+all. With <i>Fixed</i> application they use its trained threshold; with
+<i>Recalculate</i>, the threshold it gets on each sample.</li>
 </ul>
 
 <h4>Details: editing shapes and axes</h4>
@@ -727,9 +739,40 @@ covariate. <b>Export table…</b> writes the same format.</li>
 <li><b>Population frequencies</b>: each population's share of its parent (or
 of its stats parent) as log odds, with half an event added so 0% and 100%
 stay finite. Moderated linear model [1, 2]. Effects are log2 odds
-ratios.</li>
-<li><b>Population counts</b>: negative-binomial model of event counts [5],
-with the parent count as offset. Effects are log2 fold changes.</li>
+ratios. A sample's frequency is measured only when the parent has at least
+<b>Min. parent events</b> there (20 by default), because a fraction of a
+handful of events mostly reflects gating noise; other samples are left out
+of that population's test.</li>
+<li><b>Population counts</b> (under <i>Counts (advanced)</i>), against the
+<b>anchor population</b> (normally the viable cells; see the Hierarchy
+page), ask a different question: for this many viable cells, are there
+more or fewer of this population? A population can rise as a share of its
+parent while falling per viable cell, because its parent fell. A large
+change in one abundant population (for example neutrophils) moves every
+other population per viable cell too. Against the <b>parent</b>, counts ask
+the frequency test's question, and a counts hit that is not also a
+frequency hit is marked ⚠.</li>
+<li>The counts <b>model</b>: <i>moderated log odds</i> (the default) fits the
+frequency test's model to each population's share of the reference, so its
+effects are log2 odds ratios. <i>Quasi-likelihood F</i> fits a
+negative-binomial model of the event counts [5], with log2 fold changes.
+Random splits of the samples of one group, where nothing differs, show how
+often each test finds a difference by chance (5% expected):
+<ul>
+<li>Human cohort (UCL IMMPROVE, 159 samples): moderated log odds 4–6%;
+quasi-likelihood F 7–8% against the parent and 9–11% against the anchor for
+populations under 100 events.</li>
+<li>Inbred mice (BATF chimeras, 48 samples in six tissues; six populations
+of 64 to 100,000 events): moderated log odds 4–5%; quasi-likelihood F
+3–7%.</li>
+</ul>
+The negative-binomial Wald test is not offered: it gave 10–13% on the human
+cohort and 21–31% on the mice. Use moderated log odds for human or
+otherwise varied donors.
+Quasi-likelihood F suits homogeneous designs with plenty of events; it has
+not been checked on mice with rare populations. Robust and trended versions
+of the negative-binomial test did not fix it on human data, where donors
+vary more, and more unevenly, than the model allows for.</li>
 <li><b>Marker medians</b>: each population's median of each marker (and of
 AF Abundance, the per-cell autofluorescence), in transformed units.
 Populations are screened first, and markers are tested only within the
@@ -886,8 +929,9 @@ linear model as the Results page [2], without the TREAT threshold.</li>
 <li>A state's enrichment score (ES) is the weighted running sum over that
 ranking, with the DOWN members negated. ES above zero means the state is
 <b>gained</b> in the second group, below zero <b>lost</b>.</li>
-<li>The group labels are permuted and every feature refitted to give the null
-distribution, which keeps the correlation between features. With pairing or
+<li>The group labels of the two groups compared are permuted and every
+feature refitted to give the null distribution, which keeps the correlation
+between features. Samples of other groups keep their labels. With pairing or
 covariates, the residuals of the model without the group terms are permuted
 (within pairs) [3].</li>
 <li>NES is the ES divided by the mean null ES of the same sign. p is never
@@ -896,6 +940,24 @@ FWER is the chance that the largest null NES of any state reaches the
 NES.</li>
 <li>Read the FDR. The FWER was liberal when calibrated on 15 samples (10% of
 null labellings had a state below 0.05, against 5% expected).</li>
+<li>The enrichment score only records <i>where</i> a state's features rank,
+not <i>how much</i> they changed, and it cannot exceed 1. When groups differ
+greatly, shuffled labels reproduce much of the real ranking, so a state can
+change a lot yet miss the threshold. Two statistics that use effect sizes
+are shown beside it, each with its own FDR:
+<ul>
+<li><b>Self-contained</b> (<i>Mean t</i>): did this state's features change?
+The mean of the members' moderated t, with DOWN members negated, against
+the same label permutations. When groups differ greatly, most states
+pass.</li>
+<li><b>Competitive</b> (CAMERA [5]): did they change more than the other
+features? The members' scores against all others', allowing for how
+strongly the members move together (correlated features are not counted as
+independent evidence).</li>
+</ul>
+On random splits of one group of the UCL IMMPROVE cohort, the enrichment
+score and the self-contained statistic each gave 4–7% of states below 0.05
+(5% expected).</li>
 <li>The dot plot shows every tested state in every comparison: colour NES,
 size the share of members in the leading edge, ringed when FDR is below the
 threshold. The leading edge is the set of members that drive the
@@ -909,5 +971,7 @@ score.</li>
 <li>Freedman D, Lane D (1983) J Bus Econ Stat 1:292–298.</li>
 <li>Phipson B, Smyth GK (2010) Permutation p-values should never be zero.
 Stat Appl Genet Mol Biol 9: Article 39.</li>
+<li>Wu D, Smyth GK (2012) Camera: a competitive gene set test accounting for
+inter-gene correlation. Nucleic Acids Res 40: e133.</li>
 </ol>
 ''' + _GLOSSARY

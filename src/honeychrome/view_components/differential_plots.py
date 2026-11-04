@@ -40,8 +40,8 @@ __all__ = [
     'message_figure', 'make_heatmap_figure', 'make_volcano_figure',
     'group_pair_colours', 'draw_direction_ramp',
     'make_marker_summary_figure', 'make_comparison_heatmap_figure', 'significance_column',
-    'wrap_label', 'text_width_inches', 'cell_grid_lines', 'make_group_values_figure',
-    'GROUP_COLOURS',
+    'wrap_label', 'wrap_to_width', 'text_width_inches', 'cell_grid_lines',
+    'make_group_values_figure', 'GROUP_COLOURS',
 ]
 
 GROUP_COLOUR_A = '#4477AA'
@@ -248,6 +248,27 @@ def _fit_text(text: str, fontsize: float, max_inches: float) -> str:
     while len(text) > 1 and text_width_inches(text + '\u2026', fontsize) > max_inches:
         text = text[:-1]
     return text + '\u2026'
+
+
+def wrap_to_width(text: str, fontsize: float, max_inches: float) -> str:
+    """
+    *text* with each of its lines broken at spaces so that no line is wider
+    than *max_inches* at *fontsize* points, measured as text_width_inches
+    does. A single word wider than that stays whole. Used for titles and
+    axis labels that a layout engine cannot shrink to fit.
+    """
+    lines = []
+    for line in str(text).split('\n'):
+        current = ''
+        for word in line.split(' '):
+            trial = f"{current} {word}" if current else word
+            if current and text_width_inches(trial, fontsize) > max_inches:
+                lines.append(current)
+                current = word
+            else:
+                current = trial
+        lines.append(current)
+    return '\n'.join(lines)
 
 
 def _text_colour_on(fill: str) -> str:
@@ -775,7 +796,9 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
         x_label = "Δ mean intensity (transformed units)" if 'MFI' in title else "log2 Fold Change"
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
-    ax.set_title(title, fontsize=10)
+    # Centred over the plot, about 2.3 inches from either edge of the
+    # 5 inch figure, so the title wraps to 4.4 inches.
+    ax.set_title(wrap_to_width(title, 10, 4.4), fontsize=10)
     style_figure_theme(fig, is_dark)
     stamp_run_label(fig, run_label)
     _separate_labels(fig, notes)
@@ -945,8 +968,11 @@ def make_comparison_heatmap_figure(results_df: pd.DataFrame, title: str, is_dark
 
     row_label_w = max(text_width_inches(c, 7) for c in comparisons) + 0.3
     fig_w = min(max(5.0, per_row * 0.28 + row_label_w + 1.2), 28.0)
-    longest = max(len(str(labels.get(f, f))) for f in features)
-    panel_h = len(comparisons) * 0.32 + min(longest, 30) * 0.055 + 0.3
+    # Feature labels are rotated 90 degrees, so the band below each panel
+    # is as tall as the widest label.
+    label_band = max(text_width_inches(str(labels.get(f, f)), 7) for f in features) + 0.1
+    cells_h = len(comparisons) * 0.32 + 0.3
+    panel_h = cells_h + label_band
     fig = Figure(figsize=(fig_w, max(2.5, panel_h * n_rows + 0.8)), constrained_layout=True)
     axes = fig.subplots(n_rows, 1, squeeze=False)[:, 0]
     cmap = matplotlib.colormaps['RdBu_r'].copy()
@@ -965,9 +991,13 @@ def make_comparison_heatmap_figure(results_df: pd.DataFrame, title: str, is_dark
         if len(chunk) < per_row:
             ax.set_xlim(-0.5, per_row - 0.5)
     cb = fig.colorbar(image, ax=list(axes), shrink=0.8)
-    cb.set_label(value_label if show_all else f'{value_label} (significant only)', fontsize=7)
+    # The colour bar spans every panel and the label bands between them;
+    # its label is wrapped to that length so it stays inside the figure.
+    cb_len = max(0.6, 0.8 * (n_rows * cells_h + (n_rows - 1) * label_band))
+    cb.set_label(wrap_to_width(value_label if show_all else f'{value_label} (significant only)',
+                               7, cb_len), fontsize=7)
     cb.ax.tick_params(labelsize=7)
-    axes[0].set_title(title, fontsize=10)
+    axes[0].set_title(wrap_to_width(title, 10, fig_w - 0.4), fontsize=10)
     style_figure_theme(fig, is_dark)
     stamp_run_label(fig, run_label)
     return fig
@@ -1016,7 +1046,11 @@ def make_group_values_figure(values: dict, group_order: list[str], title: str,
     ax.set_xticks(range(len(groups)), [f"{g}\n(n={len(values[g])})" for g in groups], fontsize=8)
     ax.set_xlim(-0.6, len(groups) - 0.4)
     ax.set_ylabel(value_label)
-    ax.set_title(title + (f"\n{p_text}" if p_text else ''), fontsize=9)
+    # The title is wrapped to the plot's own width (one panel of a wider
+    # report figure, or the whole 3.8 inch figure).
+    title_w = ax.get_position().width * ax.figure.get_figwidth() if fig is None else 3.4
+    ax.set_title(wrap_to_width(title + (f"\n{p_text}" if p_text else ''), 9, max(2.0, title_w)),
+                 fontsize=9)
     if fig is not None:
         if hover_xy:
             hover = np.asarray(hover_xy, dtype=float)

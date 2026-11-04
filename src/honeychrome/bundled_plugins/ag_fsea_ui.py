@@ -126,7 +126,7 @@ def input_fingerprint(state, samples: list[str], design: dict, library_sha: str)
         'numeric': design['numeric'], 'library': library_sha,
         'settings': {k: getattr(state, k) for k in (
             'contrast_mode', 'reference_group', 'use_stats_parent', 'exclude_gating_markers',
-            'min_marker_events', 'fsea_species', 'fsea_anchor', 'fsea_feature_types',
+            'min_marker_events', 'min_parent_events', 'fsea_species', 'fsea_anchor', 'fsea_feature_types',
             'fsea_marker_readout', 'fsea_rank_metric', 'fsea_n_perm', 'fsea_seed',
             'fsea_min_set_size', 'fsea_overrides')},
     }
@@ -350,10 +350,15 @@ class EnrichmentTab(QWidget):
         self.lbl_results = QLabel("")
         self.lbl_results.setWordWrap(True)
         layout.addWidget(self.lbl_results)
-        self.tbl_results = QTableWidget(0, 10)
+        self.tbl_results = QTableWidget(0, 13)
         self.tbl_results.setHorizontalHeaderLabels(
-            ["Immune state", "Direction", "NES", "p", "FDR", "FWER", "Tested",
-             "Leading edge", "Library rows", "Note"])
+            ["Immune state", "Direction", "NES", "p", "FDR", "FWER", "Mean t",
+             "Self-contained FDR", "Competitive FDR", "Tested", "Leading edge", "Library rows",
+             "Note"])
+        self.tbl_results.setToolTip(
+            "NES, p, FDR, FWER: the rank-based enrichment score. Mean t and Self-contained "
+            "FDR: did the state's features change? Competitive FDR (CAMERA): did they change "
+            "more than the other features?")
         self.tbl_results.verticalHeader().setVisible(False)
         self.tbl_results.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.tbl_results.horizontalHeader().setStretchLastSection(True)
@@ -570,6 +575,7 @@ class EnrichmentTab(QWidget):
         return dict(anchor_key=st.fsea_anchor, feature_types=list(st.fsea_feature_types),
                     marker_readout=st.fsea_marker_readout,
                     use_stats_parent=st.use_stats_parent, min_marker_events=st.min_marker_events,
+                    min_parent_events=st.min_parent_events,
                     exclude_gating_markers=st.exclude_gating_markers,
                     channel_antigens=dict(self._antigens_fn()),
                     cell_type_overrides=dict(st.fsea_overrides),
@@ -802,10 +808,17 @@ class EnrichmentTab(QWidget):
             return
         st = res['states']
         st = st[st['comparison'] == comp]
-        n_sig = int((st['FDR'] < self.state.pval_threshold).sum())
-        self.lbl_results.setText(f"{comp}: {n_sig} state(s) with FDR < "
-                                 f"{self.state.pval_threshold:g} of "
-                                 f"{int(st['NES'].notna().sum())} tested.")
+        thr = self.state.pval_threshold
+
+        def _n_below(col):
+            return int((st[col] < thr).sum()) if col in st.columns else 0
+
+        text = (f"{comp}: of {int(st['NES'].notna().sum())} states tested, FDR < {thr:g} for "
+                f"{_n_below('FDR')} by enrichment score")
+        if 'FDR_self' in st.columns:
+            text += (f", {_n_below('FDR_self')} self-contained and {_n_below('FDR_camera')} "
+                     "competitive")
+        self.lbl_results.setText(text + ".")
         self._filling = True
         try:
             for _i2, row in st.iterrows():
@@ -814,7 +827,10 @@ class EnrichmentTab(QWidget):
                 sig = row['FDR'] == row['FDR'] and row['FDR'] < self.state.pval_threshold
                 colour = ('#f8d7da' if row['direction'] == 'gained' else '#cfe2ff') if sig else None
                 vals = (row['immune_state'], row['direction'], _fmt(row['NES']), _fmt(row['p']),
-                        _fmt(row['FDR']), _fmt(row['FWER']), int(row['n_tested']),
+                        _fmt(row['FDR']), _fmt(row['FWER']), _fmt(row.get('mean_t', float('nan'))),
+                        _fmt(row.get('FDR_self', float('nan'))),
+                        _fmt(row.get('FDR_camera', float('nan'))),
+                        int(row['n_tested']),
                         row['leading_edge'], int(row['n_library']), row['note'])
                 for j, v in enumerate(vals):
                     self.tbl_results.setItem(r, j, _item(v, colour if j < 2 else None,

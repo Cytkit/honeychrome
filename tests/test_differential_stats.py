@@ -354,12 +354,19 @@ def test_counts_tests_give_finite_results_for_a_group_with_no_events():
 
 
 @pytest.mark.numpy_only
-def test_residual_df_leaves_out_exact_zero_fits():
+def test_low_count_adjustment_vanishes_at_large_counts_and_drops_exact_zeros():
+    """At large counts the adjusted residual deviance is the deviance on
+    n − p df; observations fitted exactly as zero carry no df."""
     pairs = ['m0', 'm0', 'm1', 'm1', 'm2', 'm2', 'm3', 'm3']
     design, _names, _cols = ds.build_design(['A', 'B'] * 4, 'A', pairs, None)
-    Y, mu = np.ones((2, 8)), np.ones((2, 8))
+    rng = np.random.default_rng(8)
+    alpha = np.array([0.5, 0.5])
+    mu = np.full((2, 8), 5000.0)
+    Y = rng.negative_binomial(2, 2 / (2 + mu)).astype(float)
     Y[1, :2], mu[1, :2] = 0.0, 1e-9                    # no events in mouse m0
-    np.testing.assert_array_equal(ds._residual_df(Y, mu, design), [3.0, 2.0])
+    dev, df = ds._adjusted_deviance(Y, mu, design, alpha)
+    np.testing.assert_allclose(dev[0], ds._glm_deviance(Y[:1], mu[:1], alpha[:1])[0], rtol=1e-6)
+    np.testing.assert_allclose(df, [3.0, 2.0], atol=1e-3)
 
 
 @pytest.mark.numpy_only

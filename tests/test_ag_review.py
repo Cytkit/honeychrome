@@ -357,13 +357,12 @@ def test_gates_returned_to_their_shapes_are_left_alone(cd80):
     assert changed == ['CD80+ (B)'] and by['CD80+ (DC)']['algorithm'] == 'imported'
 
 
-def test_sync_never_makes_a_gate_replicate_itself(cd80):
+def test_sync_never_passes_on_a_copy_of_a_same_named_gate(cd80):
     by = ag_core.gates_by_name(cd80)
     by['CD80+ (Mono)'].update(algorithm='replicate', sync_origin=ag_review.SYNC_USER)
     by['CD80+ (Mono)']['gate_param']['replicate_x'] = {'gate': 'CD80+ (B)'}
-    changed, _ = ag_review.apply_name_sync(cd80, 'CD80+ (Mono)')
-    assert changed == ['CD80+ (DC)']
-    assert by['CD80+ (B)']['algorithm'] == 'imported'
+    assert ag_review.apply_name_sync(cd80, 'CD80+ (Mono)') == ([], None)
+    assert by['CD80+ (B)']['algorithm'] == 'imported' and by['CD80+ (DC)']['algorithm'] == 'imported'
 
 
 def test_replicate_choices_exclude_the_gate_and_its_branch(cd80):
@@ -483,6 +482,90 @@ def test_feed_forward_never_makes_a_gate_replicate_itself(cd25_tree):
     by['CD80+ (Tconv)']['gate_param']['replicate_x'] = {'gate': 'CD80+ (Tem)'}
     changed, skipped = ag_review.feed_forward(cd25_tree, 'CD80+ (Tconv)')
     assert changed == [] and skipped == ['CD80+ (Tem)']
+
+
+def _reuse_candidates(defs, source):
+    return {c['gate']: c for c in ag_review.threshold_reuse_candidates(defs, source)}
+
+
+def test_threshold_reuse_candidates_are_the_gates_on_the_channel(cd25_tree):
+    by = ag_core.gates_by_name(cd25_tree)
+    by['CD80+ (Tconv)']['algorithm'] = 'tail'
+    out = _reuse_candidates(cd25_tree, 'CD80+ (Tconv)')
+    assert set(out) == {'CD80+ (Tem)', 'CD80+ (B)'}
+    assert all(c['axes'] == {'x': 'CD80'} and c['imported'] and not c['copies']
+               for c in out.values())
+
+
+def test_threshold_reuse_leaves_out_gates_the_source_depends_on(cd25_tree):
+    by = ag_core.gates_by_name(cd25_tree)
+    by['CD80+ (Tem)'].update(algorithm='replicate', gate_param={'replicate_x': {'gate': 'CD80+ (B)'}})
+    assert list(_reuse_candidates(cd25_tree, 'CD80+ (Tem)')) == ['CD80+ (Tconv)']
+
+
+def test_reuse_threshold_makes_the_targets_copy_the_source(cd25_tree):
+    by = ag_core.gates_by_name(cd25_tree)
+    by['CD80+ (Tconv)']['algorithm'] = 'tail'
+    changed = ag_review.reuse_threshold(cd25_tree, 'CD80+ (Tconv)', {'CD80+ (B)': {'x': 'CD80'}})
+    assert changed == ['CD80+ (B)']
+    b = by['CD80+ (B)']
+    assert b['algorithm'] == 'replicate' and b['gate_param']['replicate_x'] == {'gate': 'CD80+ (Tconv)'}
+    assert b['sync_origin'] == ag_review.SYNC_USER and by['CD80+ (Tem)']['algorithm'] == 'imported'
+    assert _reuse_candidates(cd25_tree, 'CD80+ (Tconv)')['CD80+ (B)']['copies']
+    assert ag_review.reuse_threshold(cd25_tree, 'CD80+ (Tconv)', {'CD80+ (B)': {'x': 'CD80'}}) == []
+    ag_core.ordered_gate_defs(cd25_tree)
+
+
+def test_reuse_threshold_on_one_axis_of_a_2dsep_gate(cd25_tree):
+    by = ag_core.gates_by_name(cd25_tree)
+    by['CD80+ (Tconv)']['algorithm'] = 'tail'
+    two = _thr_gate('CD86 CD80 (B)', 8, 'CD86', 'CD80', 'B', 'B')
+    two['proposed_algorithm'] = 'mixture'
+    cd25_tree.append(two)
+    assert _reuse_candidates(cd25_tree, 'CD80+ (Tconv)')['CD86 CD80 (B)']['axes'] == {'y': 'CD80'}
+    ag_review.reuse_threshold(cd25_tree, 'CD80+ (Tconv)', {'CD86 CD80 (B)': {'y': 'CD80'}})
+    gp = two['gate_param']
+    assert (two['algorithm'], gp['algorithm_x'], gp['algorithm_y']) == ('mixture', 'mixture', 'replicate')
+    assert gp['replicate_y'] == {'gate': 'CD80+ (Tconv)'} and 'replicate_x' not in gp
+
+
+def test_split_repoints_or_clears_copied_thresholds(cd25_tree):
+    two = _thr_gate('CD80 CD86 (B)', 8, 'CD80', 'CD86', 'B', 'B')
+    two['algorithm'] = 'tail'
+    cd86 = _hist_gate('CD86+ (Tem)', 9, 'Tem', 'Tem', 'CD86+', algorithm='replicate')
+    cd86['gate_marker_x'] = 'CD86'
+    cd86['gate_param']['replicate_x'] = {'gate': 'CD80 CD86 (B)'}
+    cd25_tree += [two, cd86]
+    by = ag_core.gates_by_name(cd25_tree)
+    by['CD80+ (Tconv)'].update(algorithm='replicate', gate_param={'replicate_x': {'gate': 'CD80 CD86 (B)'}})
+    steps = [{'channel': 'CD80', 'algorithm': 'tail', 'view': 'CD86', 'sep_axis': 'x'},
+             {'channel': 'CD86', 'algorithm': 'tail', 'view': 'CD80', 'sep_axis': 'x'}]
+    defs, new = ag_review.split_2dsep(cd25_tree, 'CD80 CD86 (B)', steps)
+    moved, cleared = ag_review.repoint_split_sources(defs, 'CD80 CD86 (B)', new)
+    after = ag_core.gates_by_name(defs)
+    assert moved == {'CD80+ (Tconv)': new[0]} and cleared == ['CD86+ (Tem)']
+    assert after['CD80+ (Tconv)']['gate_param']['replicate_x'] == {'gate': new[0]}
+    assert after['CD86+ (Tem)']['gate_param']['replicate_x'] is None
+
+
+def test_name_sync_waits_for_a_replicate_source(cd80):
+    by = ag_core.gates_by_name(cd80)
+    by['CD80+ (Mono)'].update(algorithm='replicate', sync_origin=ag_review.SYNC_USER,
+                              gate_param={'replicate_x': None})
+    assert ag_review.apply_name_sync(cd80, 'CD80+ (Mono)') == ([], None)
+    assert by['CD80+ (B)']['algorithm'] == 'imported'
+
+
+def test_copying_a_same_named_gate_is_not_synced_or_a_conflict(cd80):
+    by = ag_core.gates_by_name(cd80)
+    by['CD80+ (Mono)'].update(algorithm='tail', sync_origin=ag_review.SYNC_USER)
+    by['CD80+ (B)'].update(algorithm='replicate', sync_origin=ag_review.SYNC_USER,
+                           gate_param={'replicate_x': {'gate': 'CD80+ (Mono)'}})
+    assert ag_review.sync_conflicts(cd80) == []
+    changed, conflict = ag_review.apply_name_sync(cd80, 'CD80+ (B)')
+    assert changed == ['CD80+ (DC)'] and conflict is None
+    assert by['CD80+ (DC)']['algorithm'] == 'tail'
+    assert by['CD80+ (B)']['gate_param']['replicate_x'] == {'gate': 'CD80+ (Mono)'}
 
 
 def test_conflicting_gate_names_lists_the_whole_group(cd80):

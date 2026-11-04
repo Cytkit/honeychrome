@@ -14,13 +14,15 @@ Provides:
   • sanitize_filename         — safe file/folder name component
   • build_settings_document   — plain-text "how to reproduce this analysis"
                                 document, always generated
-  • add_title_page / add_section_divider / add_dataframe_pages
-                              — matplotlib PdfPages helpers (no new PDF
+  • add_title_page / add_section_divider / add_dataframe_pages /
+    add_table_note            — matplotlib PdfPages helpers (no new PDF
                                 dependency -- matplotlib is already a
                                 hard dependency of this plugin)
   • export_report_item        — write one item's PNG / CSV files and add
-                                it to the PDF (also used by the Automated
-                                Gating plugin's report)
+                                it to the PDF, optionally with tables over
+                                a size limit left out of the PDF (also
+                                used by the Automated Gating plugin's
+                                report)
   • ReportTab(QWidget)        — the tab itself: three sections (Layout,
                                 Cluster Annotation, Stats), each populated
                                 from that tab's own get_report_items().
@@ -46,6 +48,7 @@ import textwrap
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
@@ -324,6 +327,21 @@ def add_section_divider(pdf, title: str) -> None:
     ax.axis('off')
     ax.text(0.02, 0.5, title, ha='left', va='center', fontsize=18, weight='bold',
              transform=ax.transAxes)
+    pdf.savefig(fig)
+
+
+def add_table_note(pdf, title: str, lines: list[str]) -> None:
+    """A short page with a title and a few lines of text, e.g. where a
+    table was written to a CSV file only."""
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=(11.69, 1.2 + 0.3 * len(lines)))
+    ax = fig.add_subplot(111)
+    ax.axis('off')
+    ax.text(0.02, 0.95, title, ha='left', va='top', fontsize=13, weight='bold',
+            transform=ax.transAxes)
+    for k, line in enumerate(lines):
+        ax.text(0.02, 0.62 - k * 0.6 / max(len(lines), 1), line, ha='left', va='top',
+                fontsize=10, transform=ax.transAxes)
     pdf.savefig(fig)
 
 
@@ -717,10 +735,13 @@ class ReportTab(QWidget):
         export_report_item(item, subfolder, pdf)
 
 
-def export_report_item(item: ReportItem, subfolder, pdf) -> None:
+def export_report_item(item: ReportItem, subfolder, pdf, max_pdf_rows: int | None = None,
+                       max_pdf_columns: int | None = None) -> None:
     """Write one report item: its figure as PNG and its tables as CSV into
-    *subfolder*, and both into the open PdfPages *pdf*. A figure or table
-    that fails to build is logged and skipped."""
+    *subfolder*, and both into the open PdfPages *pdf*. A table with more
+    than *max_pdf_rows* rows or *max_pdf_columns* columns (when given) is
+    written to CSV only, with a note naming the file in the PDF. A figure
+    or table that fails to build is logged and skipped."""
     safe_label = sanitize_filename(item.label)
     if item.get_figure is not None:
         try:
@@ -747,4 +768,11 @@ def export_report_item(item: ReportItem, subfolder, pdf) -> None:
                 continue
             csv_name = sanitize_filename(f"{item.label}_{table_name}")
             df.to_csv(subfolder / f"{csv_name}.csv")
+            n_rows, n_cols = df.shape
+            if (max_pdf_rows is not None and n_rows > max_pdf_rows) or \
+                    (max_pdf_columns is not None and n_cols > max_pdf_columns):
+                add_table_note(pdf, table_page_title(item.label, table_name), [
+                    f"{n_rows:,} rows × {n_cols:,} columns: too large for the PDF; written to "
+                    f"{Path(subfolder).name}/{csv_name}.csv."])
+                continue
             add_dataframe_pages(pdf, df, table_page_title(item.label, table_name))
