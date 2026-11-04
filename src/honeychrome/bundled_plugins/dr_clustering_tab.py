@@ -947,7 +947,8 @@ class PipelineState:
     # True: p-values test |effect| > threshold (TREAT). False: test
     #   effect != 0 and use the threshold only as a filter.
     stats_counts_method: str = 'ql'
-    # Counts test: 'ql' (quasi-likelihood F with shrunk dispersions). The
+    # Counts test: 'ql' (quasi-likelihood F, each comparison fitted on its
+    #   two groups with one common dispersion). The
     #   Wald test is not offered: it was far too liberal on human and mouse
     #   data.
     stats_normalisation: str = 'total'
