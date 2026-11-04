@@ -240,7 +240,4 @@ Angxiao Lu contributed the per-sample gating, the spectral reference library, an
 Thanks to support and advice from many people including Catherine Vant, Lotte Carr, Scott Tasker, Philip Jones, Robyn Pritchard.
 
 ## Roadmap
-By January 2027, we hope to get to a stable release labeled v1.0.0, including the following:
-- all bugs fixed
-- documentation for users
-- documentation for developers
+We got to our milestone v1.0.0 ahead of schedule! So now we will see what the community makes of our work before we think about new milestones. Please get in touch and let us know your feedback! 
