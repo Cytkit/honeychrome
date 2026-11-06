@@ -1144,61 +1144,30 @@ def counts_only_hits(stats: dict) -> set[tuple[str, str]]:
 # Sample tables (groups and covariates)
 # ---------------------------------------------------------------------------
 
-_SAMPLE_COLUMNS = ('sample', 'file', 'filename', 'name')
-_GROUP_COLUMNS = ('group', 'condition')
-
-
-def _sample_names(key: str) -> list[str]:
-    """Ways a table may name a sample: its key, file name and stem (lower case)."""
-    path = str(key).replace('\\', '/')
-    name = path.rsplit('/', 1)[-1]
-    stem = name.rsplit('.', 1)[0] if '.' in name else name
-    return [path.lower(), name.lower(), stem.lower()]
-
-
 def read_sample_table(df: pd.DataFrame, sample_keys: list[str]) -> dict:
     """Group assignments and covariates from a table with one row per sample.
 
     The sample column is the first of 'sample', 'file', 'filename' or
-    'name' (any case); it may hold the sample key, the file name or the
-    file name without extension. A 'group' (or 'condition') column assigns
-    groups; every other column is a covariate. Empty cells are skipped.
+    'name' (any case); it may hold the sample key, the file name, the file
+    name without extension or a name found inside the file name (see
+    ``controller_components.sample_table``). A 'group' (or 'condition')
+    column assigns groups; every other column is a covariate. Empty cells
+    are skipped.
 
     Returns {'groups': {key: group}, 'covariates': {name: {key: value}},
     'unmatched': [table rows' sample names with no sample], 'columns':
     covariate names}. Raises ValueError without a sample column.
     """
-    lower = {str(c).strip().lower(): c for c in df.columns}
-    sample_col = next((lower[c] for c in _SAMPLE_COLUMNS if c in lower), None)
-    if sample_col is None:
-        raise ValueError("The table needs a 'sample' column naming each sample.")
-    group_col = next((lower[c] for c in _GROUP_COLUMNS if c in lower), None)
-    cov_cols = [c for c in df.columns if c not in (sample_col, group_col)
-                and str(c).strip().lower() != 'full_path']
-    lookup: dict[str, str] = {}
-    for key in sample_keys:
-        for n in _sample_names(key):
-            lookup.setdefault(n, key)
-    groups: dict[str, str] = {}
-    covs: dict[str, dict[str, str]] = {str(c): {} for c in cov_cols}
-    unmatched = []
-    for _i, row in df.iterrows():
-        raw = row[sample_col]
-        if pd.isna(raw) or not str(raw).strip():
-            continue
-        name = str(raw).strip()
-        key = next((lookup[n] for n in _sample_names(name) if n in lookup), None)
-        if key is None:
-            unmatched.append(name)
-            continue
-        if group_col is not None and pd.notna(row[group_col]) and str(row[group_col]).strip():
-            groups[key] = str(row[group_col]).strip()
-        for c in cov_cols:
-            v = row[c]
-            if pd.notna(v) and str(v).strip():
-                covs[str(c)][key] = str(v).strip()
-    return {'groups': groups, 'covariates': covs, 'unmatched': unmatched,
-            'columns': [str(c) for c in cov_cols]}
+    from honeychrome.controller_components import sample_table
+
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    match = sample_table.match_table(df, sample_keys)
+    group_col = sample_table.find_column(df, sample_table.GROUP_COLUMNS)
+    cov_cols = sample_table.covariate_candidates(df, match, group_col)
+    values = sample_table.table_values(df, match, group_col, cov_cols)
+    return {'groups': values['groups'], 'covariates': values['covariates'],
+            'unmatched': match.unmatched, 'columns': [str(c) for c in cov_cols]}
 
 
 def sample_table_frame(samples: list[str], groups: dict, covariates: dict) -> pd.DataFrame:

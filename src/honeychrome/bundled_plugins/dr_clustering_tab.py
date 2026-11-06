@@ -163,7 +163,9 @@ from honeychrome.view_components.ordered_multi_sample_picker import OrderedMulti
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 from honeychrome.view_components.side_tab_widget import SideTabWidget
+from honeychrome.controller_components import sample_table
 from honeychrome.view_components import suggest_groupings_dialog as sgd
+from honeychrome.view_components import sample_table_import_dialog
 from honeychrome.view_components.checkable_header import CheckableHeaderView
 from honeychrome.controller_components.differential_stats import suggest_groupings_from_names
 from honeychrome.view_components.differential_plots import (
@@ -493,8 +495,9 @@ def _cluster_id_reference_text(details: dict | None) -> str:
     if not details:
         return ''
     if details.get('mem_reference') == drc_cluster_id.MEM_REFERENCE_ANCHOR:
-        return (f" MEM against \"{details.get('anchor')}\" "
-                f"({int(details.get('n_reference_events') or 0):,} events).")
+        shared = ' '.join(details.get('shared_markers') or []) or 'none'
+        return (f" Shared against \"{details.get('anchor')}\" "
+                f"({int(details.get('n_reference_events') or 0):,} events): {shared}.")
     return " MEM against the other clusters."
 
 
@@ -942,6 +945,17 @@ class PipelineState:
     pairing_variable: str = ''
     # Column name in state.covariates used as a fixed-effect blocking term
     # when paired=True (e.g. donor ID).
+    population_split: bool = False
+    # True: compare gated populations within samples (e.g. CD45.1+ vs
+    #   CD45.1- cells of each chimera) instead of sample groups. Samples of
+    #   the checked Groups to Test are split into population_gates, the
+    #   populations are the groups and the design is paired on the sample
+    #   (drc_stats.split_by_population).
+    population_gates: list[str] = field(default_factory=list)
+    # Gates inside the analysed gate(s) to compare; also the populations
+    # the Workspace 'Population' colour mode shows.
+    population_reference: str = ''
+    # Reference population in 'reference' contrast mode ('' = the first).
     stats_fdr_scope: str = 'global'
     # 'global'         -- 'significant' uses one BH-FDR correction pooled
     #   across every comparison currently displayed (default).
@@ -1073,6 +1087,10 @@ class PipelineState:
     # sample rel-paths in test-matrix row order
     stats_group_vec: list = field(default_factory=list)
     # 'A'/'B' per row, aligned to stats_all_rel
+    stats_population_of: dict = field(default_factory=dict)
+    # {row key: [sample rel path, gate]} when the current results compare
+    # populations within samples (row keys are drc_stats.population_key);
+    # empty when they compare sample groups.
     stats_run_label: str = ''
     # display label of the clustering run used for the current stats
     # results — NOT the matching key (see stats_run_id); kept only so
@@ -1145,6 +1163,18 @@ class PipelineState:
         counts = self.n_per_group(sample_keys)
         qualifying = sum(1 for name in selection if counts.get(name, 0) >= 3)
         return qualifying >= 2
+
+    def population_stats_runnable(self, sample_keys: set[str] | None = None) -> bool:
+        """
+        Comparing populations within samples: True if at least two
+        populations are chosen and the checked 'Groups to Test' hold at
+        least 3 assigned samples between them (see n_per_group for
+        sample_keys).
+        """
+        selection = self.testing_group_selection or self.group_names
+        counts = self.n_per_group(sample_keys)
+        return (len(self.population_gates) >= 2
+                and sum(counts.get(name, 0) for name in selection) >= 3)
 
     def cluster_label(self, cluster_id: int) -> str:
         """Return display name for a cluster id, falling back to 'Cluster N'."""
@@ -3201,8 +3231,9 @@ class GroupsStatsTab(QWidget):
         csv_row = QHBoxLayout()
         self.import_csv_btn = QPushButton("Import CSV")
         self.import_csv_btn.setToolTip(
-            "Import group and covariate assignments from a CSV file.\n"
-            "Required columns: 'sample', 'group'.  Optional covariate columns follow."
+            "Import group and covariate assignments from a CSV or tab-separated file.\n"
+            "Needs a 'sample' column: the file name, or a sample ID found inside it.\n"
+            "The matches are shown for review before anything changes."
         )
         self.import_csv_btn.clicked.connect(self._import_csv)
         self.export_csv_btn = QPushButton("Export CSV")
@@ -3309,12 +3340,12 @@ class GroupsStatsTab(QWidget):
         test_groups_box = QGroupBox("Groups to Test")
         test_groups_layout = QVBoxLayout(test_groups_box)
 
-        test_groups_hint = _HintLabel(
+        self.test_groups_hint = _HintLabel(
             "Check every group to include in Frequency/Counts/MFI testing "
             "and Composition-by-group."
         )
-        test_groups_hint.setWordWrap(True)
-        test_groups_layout.addWidget(test_groups_hint)
+        self.test_groups_hint.setWordWrap(True)
+        test_groups_layout.addWidget(self.test_groups_hint)
 
         self.test_groups_list = QListWidget()
         self.test_groups_list.setFixedHeight(90)
@@ -3383,6 +3414,40 @@ class GroupsStatsTab(QWidget):
         test_groups_layout.addLayout(adjust_row)
 
         stats_layout.addWidget(test_groups_box)
+
+        # ---- Populations within samples ----
+        population_box = QGroupBox("Populations")
+        population_layout = QVBoxLayout(population_box)
+        self.chk_population_split = QCheckBox("Compare populations within samples")
+        self.chk_population_split.setToolTip(
+            "Compare gated populations of the same samples with each other instead of "
+            "groups of samples, e.g. CD45.1+ against CD45.1- cells of each mixed "
+            "bone-marrow chimera.\nSamples of the groups checked above are each split into "
+            "the populations ticked below; the populations become the groups tested and "
+            "every test is paired on the sample."
+        )
+        self.chk_population_split.toggled.connect(self._on_population_split_toggled)
+        population_layout.addWidget(self.chk_population_split)
+        self._population_panel = QWidget()
+        population_panel_layout = QVBoxLayout(self._population_panel)
+        population_panel_layout.setContentsMargins(0, 0, 0, 0)
+        population_hint = _HintLabel(
+            "Tick two or more populations inside the analysed gate that do not share "
+            "cells. Each sample's populations are compared with each other, so cluster "
+            "frequencies are shares of each population's own cells and differences "
+            "between samples (mice, donors) drop out of the comparison; sample-level "
+            "covariates are covered by that pairing. The Workspace 'Population' colour "
+            "mode shows the same populations."
+        )
+        population_hint.setWordWrap(True)
+        population_panel_layout.addWidget(population_hint)
+        self.population_gate_tree = drc_gate_tree.GateTreeWidget()
+        self.population_gate_tree.setFixedHeight(140)
+        self.population_gate_tree.selectionChanged.connect(self._on_population_gates_changed)
+        population_panel_layout.addWidget(self.population_gate_tree)
+        self._population_panel.setVisible(False)
+        population_layout.addWidget(self._population_panel)
+        stats_layout.addWidget(population_box)
 
         defaults_row = QHBoxLayout()
         self.stats_defaults_btn = QPushButton("Restore defaults")
@@ -4092,16 +4157,23 @@ class GroupsStatsTab(QWidget):
 
     def _refresh_reference_group_combo(self):
         """Populate the Reference combo from the currently checked test
-        groups only -- a reference must itself be one of the groups in play."""
-        checked = self.state.testing_group_selection or list(self.state.group_names)
+        groups only -- a reference must itself be one of the groups in play.
+        When comparing populations within samples, from the chosen
+        populations instead (state.population_reference)."""
+        split = self.state.population_split
+        checked = (list(self.state.population_gates) if split
+                   else self.state.testing_group_selection or list(self.state.group_names))
         self.reference_group_combo.blockSignals(True)
-        prev = self.state.reference_group
+        prev = self.state.population_reference if split else self.state.reference_group
         self.reference_group_combo.clear()
         self.reference_group_combo.addItems(checked)
         idx = self.reference_group_combo.findText(prev)
         self.reference_group_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.reference_group_combo.blockSignals(False)
-        self.state.reference_group = self.reference_group_combo.currentText()
+        if split:
+            self.state.population_reference = self.reference_group_combo.currentText()
+        else:
+            self.state.reference_group = self.reference_group_combo.currentText()
         self.reference_group_combo.setEnabled(self.radio_reference.isChecked())
 
     def _on_contrast_mode_changed(self, _checked: bool):
@@ -4111,8 +4183,84 @@ class GroupsStatsTab(QWidget):
         self._update_run_button()
 
     def _on_reference_group_changed(self, text: str):
-        self.state.reference_group = text
+        if self.state.population_split:
+            self.state.population_reference = text
+        else:
+            self.state.reference_group = text
         self._last_stats_data_key = None
+
+    def _population_hierarchy(self) -> list[dict]:
+        """The gates inside the analysed gate(s): the children of every
+        selected gate, or of the root when no gate is selected."""
+        try:
+            root = self.controller.unmixed_gating.get_gate_hierarchy(output='dict')
+        except Exception:
+            return []
+        if not root:
+            return []
+        targets = set(self.state.selected_gates)
+        if not targets:
+            return list(root.get('children') or [])
+        found = []
+
+        def _walk(node):
+            if node.get('name') in targets:
+                found.extend(node.get('children') or [])
+                return
+            for child in node.get('children') or []:
+                _walk(child)
+
+        _walk(root)
+        return found
+
+    def _populate_population_tree(self):
+        """Rebuild the population picker from the analysed gate(s) and tick
+        state.population_gates; chosen gates no longer inside them are
+        dropped."""
+        hierarchy = self._population_hierarchy()
+        available = set()
+
+        def _names(node):
+            available.add(node.get('name'))
+            for child in node.get('children') or []:
+                _names(child)
+
+        for node in hierarchy:
+            _names(node)
+        if hierarchy:
+            self.state.population_gates = [g for g in self.state.population_gates
+                                           if g in available]
+        self.population_gate_tree.set_hierarchy(hierarchy)
+        self.population_gate_tree.set_checked_names(self.state.population_gates)
+
+    def _on_population_split_toggled(self, checked: bool):
+        self.state.population_split = checked
+        self._last_stats_data_key = None
+        self._apply_population_mode()
+        self._refresh_reference_group_combo()
+        self._update_run_button()
+        self._refresh_predictive_controls()
+
+    def _on_population_gates_changed(self, names: list):
+        self.state.population_gates = list(names)
+        self._last_stats_data_key = None
+        self._refresh_reference_group_combo()
+        self._update_run_button()
+
+    def _apply_population_mode(self):
+        """Show the population picker, and switch the pairing and covariate
+        controls off while populations are compared within samples (the
+        design is then paired on the sample)."""
+        split = self.state.population_split
+        self._population_panel.setVisible(split)
+        self.chk_paired.setEnabled(not split)
+        self.pairing_variable_combo.setEnabled(not split and self.state.paired)
+        self.adjust_covariates_list.setEnabled(not split)
+        self.test_groups_hint.setText(
+            "Check the groups whose samples are split into the populations below."
+            if split else
+            "Check every group to include in Frequency/Counts/MFI testing "
+            "and Composition-by-group.")
 
     def _on_paired_toggled(self, checked: bool):
         self.state.paired = checked
@@ -4344,6 +4492,12 @@ class GroupsStatsTab(QWidget):
         self.radio_reference.blockSignals(False)
         self.radio_pairwise.blockSignals(False)
         self.reference_group_combo.setEnabled(self.radio_reference.isChecked())
+        self.chk_population_split.blockSignals(True)
+        self.chk_population_split.setChecked(self.state.population_split)
+        self.chk_population_split.blockSignals(False)
+        self._populate_population_tree()
+        self._apply_population_mode()
+        self._refresh_reference_group_combo()
 
         matched = self._scoped_sample_groups()
         self._populate_table(matched)
@@ -4804,11 +4958,15 @@ class GroupsStatsTab(QWidget):
         dr_only_selected = self._selected_run_kind() == 'dr'
         n_group_ok = self.state.n_group_stats_runnable(shown)
         runnable = n_group_ok and any_clustering and not dr_only_selected
+        split = self.state.population_split
+        population_ok = self.state.population_stats_runnable(shown)
+        stats_runnable = (population_ok if split else n_group_ok) \
+            and any_clustering and not dr_only_selected
         stats_running = self._stats_worker is not None and self._stats_worker.isRunning()
-        self.run_stats_btn.setEnabled(runnable and not self._analysis_busy())
+        self.run_stats_btn.setEnabled(stats_runnable and not self._analysis_busy())
         self.composition_btn.setEnabled(runnable and not stats_running)
         if hasattr(self, 'pca_btn'):
-            self.pca_btn.setEnabled(runnable and not stats_running)
+            self.pca_btn.setEnabled(stats_runnable and not stats_running)
             self._update_pca_source_availability()
         if dr_only_selected:
             self.run_stats_btn.setToolTip(
@@ -4817,6 +4975,12 @@ class GroupsStatsTab(QWidget):
             )
         elif not any_clustering:
             self.run_stats_btn.setToolTip("Run clustering first.")
+        elif split and not population_ok:
+            self.run_stats_btn.setToolTip(
+                "Comparing populations within samples requires at least two ticked "
+                "populations and ≥ 3 samples in the checked 'Groups to Test'.")
+        elif split:
+            self.run_stats_btn.setToolTip("")
         elif not n_group_ok:
             counts = self.state.n_per_group(shown)
             selection = self.state.testing_group_selection or self.state.group_names
@@ -4947,6 +5111,7 @@ class GroupsStatsTab(QWidget):
             self.state.mfi_sample_df = None
             self.state.stats_all_rel = []
             self.state.stats_group_vec = []
+            self.state.stats_population_of = {}
             self.state.stats_comparisons = []
             self.state.stats_run_label = ''
             self.state.stats_run_id = ''
@@ -5133,101 +5298,81 @@ class GroupsStatsTab(QWidget):
 
     def _import_csv(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import Group Assignments", "", "CSV files (*.csv)"
+            self, "Import Group Assignments", str(getattr(self.controller, 'experiment_dir', '')),
+            "Tables (*.csv *.tsv *.txt);;All files (*)"
         )
         if not path:
             return
+        sample_paths = self._table_sample_paths()
+        current = {sp: g for sp, g in self.state.sample_groups.items() if g != 'Unassigned'}
+        result = sample_table_import_dialog.import_sample_table(
+            self, path, sample_paths, current, title="Import CSV")
+        if result is None:
+            return
+        for group in result['groups'].values():
+            if group == 'Unassigned' or group in self.state.group_names:
+                continue
+            self.state.group_names.append(group)
+            self._group_colour(group)
+            if self.state.testing_group_selection:
+                self.state.testing_group_selection.append(group)
+        self.state.sample_groups.update(result['groups'])
+        if result['covariates']:
+            if self.state.covariates is None:
+                self.state.covariates = pd.DataFrame(index=pd.Index([], dtype=str))
+            for name, values in result['covariates'].items():
+                if name not in self.state.covariates.columns:
+                    self.state.covariates[name] = ''
+                for sp, val in values.items():
+                    rel = self._covariate_key(sp)
+                    if rel not in self.state.covariates.index:
+                        self.state.covariates.loc[rel] = ''
+                    self.state.covariates.loc[rel, name] = val
+            self.state.covariates = self.state.covariates.fillna('').astype(str)
+        self._refresh_after_groupings()
+        if self.bus:
+            self.bus.statusMessage.emit(sample_table_import_dialog.describe_import(result))
+
+    def _covariate_key(self, sample_path: str) -> str:
+        """state.covariates row for a sample: its path relative to the raw
+        samples folder."""
         try:
-            df = pd.read_csv(path)
-            if 'sample' not in df.columns or 'group' not in df.columns:
-                QMessageBox.warning(
-                    self, "Import Error",
-                    "CSV must contain 'sample' and 'group' columns."
-                )
-                return
-            valid = set(self.state.group_names) | {'Unassigned'}
-            unknown_names = set()
-            # Any column beyond sample/group/full_path is a
-            # covariate (e.g. donor ID for paired testing)
-            covariate_cols = [c for c in df.columns if c not in ('sample', 'group', 'full_path')]
+            raw_subdir = self.controller.experiment.settings['raw']['raw_samples_subdirectory']
+        except (KeyError, AttributeError):
+            raw_subdir = None
+        if raw_subdir:
             try:
-                raw_subdir = self.controller.experiment.settings['raw'][
-                    'raw_samples_subdirectory'
-                ]
-            except (KeyError, AttributeError):
-                raw_subdir = None
-            cov_rows = {}
-            for _, row in df.iterrows():
-                sample = str(row['sample'])
-                group = str(row['group']).strip()
-                match = next(
-                    (sp for sp in self.state.sample_groups
-                     if Path(sp).name == sample or sp == sample),
-                    None
-                )
-                if match is None:
-                    continue
-                if group not in valid:
-                    unknown_names.add(group)
-                else:
-                    self.state.sample_groups[match] = group
-                if covariate_cols:
-                    rel = match
-                    if raw_subdir:
-                        try:
-                            rel = str(Path(match).relative_to(raw_subdir))
-                        except ValueError:
-                            pass
-                    cov_rows[rel] = {c: str(row[c]) for c in covariate_cols}
-            if cov_rows:
-                new_cov = pd.DataFrame.from_dict(cov_rows, orient='index')
-                self.state.covariates = (
-                    new_cov if self.state.covariates is None
-                    else self.state.covariates.combine_first(new_cov).astype(str)
-                )
-                self._populate_pairing_variable_combo()
-            self._populate_table()
-            self._update_run_button()
-            if unknown_names:
-                QMessageBox.warning(
-                    self, "Unrecognised Groups",
-                    "These group names in the CSV don't match a defined "
-                    "group and were skipped (add the group first, then "
-                    "re-import): " + ", ".join(sorted(unknown_names))
-                )
-        except Exception as e:
-            QMessageBox.warning(self, "Import Error", str(e))
+                return str(Path(sample_path).relative_to(raw_subdir))
+            except ValueError:
+                pass
+        return sample_path
 
     def _export_csv(self):
+        default = sample_table.default_export_path(
+            getattr(self.controller, 'experiment_dir', ''), 'Honeycluster')
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Group Assignments", "", "CSV files (*.csv)"
+            self, "Export Group Assignments", default, "CSV files (*.csv)"
         )
         if not path:
             return
         path = _with_extension(path, '.csv')
+        samples = self._table_sample_paths()
+        cov = self.state.covariates
+        covariates = {}
+        if cov is not None:
+            for name in cov.columns:
+                covariates[name] = {
+                    sp: str(cov.loc[self._covariate_key(sp), name])
+                    for sp in samples if self._covariate_key(sp) in cov.index}
+        groups = {sp: self.state.sample_groups.get(sp, 'Unassigned') for sp in samples}
         try:
-            try:
-                raw_subdir = self.controller.experiment.settings['raw'][
-                    'raw_samples_subdirectory'
-                ]
-            except (KeyError, AttributeError):
-                raw_subdir = None
-            rows = []
-            for sp, grp in self.state.sample_groups.items():
-                rel = sp
-                if raw_subdir:
-                    try:
-                        rel = str(Path(sp).relative_to(raw_subdir))
-                    except ValueError:
-                        pass
-                row = {'sample': Path(sp).name, 'full_path': sp, 'group': grp}
-                if self.state.covariates is not None and rel in self.state.covariates.index:
-                    row.update(self.state.covariates.loc[rel].to_dict())
-                rows.append(row)
-            pd.DataFrame(rows).to_csv(path, index=False)
-            QMessageBox.information(self, "Exported", f"Saved to {path}")
+            sample_table.write_table(
+                sample_table.table_frame(samples, groups, covariates, label=lambda sp: Path(sp).name),
+                path)
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
+            return
+        QMessageBox.information(self, "Exported", f"Saved to {path}")
 
     # ------------------------------------------------------------------
     # Statistics
@@ -5259,7 +5404,13 @@ class GroupsStatsTab(QWidget):
                                 "Select at least one statistic to compute.")
             return
 
-        if self.state.paired and self.state.pairing_variable:
+        split = self.state.population_split
+        if split and len(self.state.population_gates) < 2:
+            QMessageBox.warning(self, "Populations",
+                                "Tick at least two populations to compare within samples.")
+            return
+
+        if not split and self.state.paired and self.state.pairing_variable:
             pv = self.state.pairing_variable
             try:
                 group_rel = drc_stats.resolve_test_groups(
@@ -5289,7 +5440,7 @@ class GroupsStatsTab(QWidget):
                 )
                 return
 
-        adjust_covariates = [
+        adjust_covariates = [] if split else [
             c for c in self.state.stats_adjust_covariates
             if not (self.state.paired and c == self.state.pairing_variable)
         ]
@@ -5463,7 +5614,7 @@ class GroupsStatsTab(QWidget):
         for attr in ('sample_groups', 'group_names', 'group_patterns',
                      'testing_group_selection', 'stats_adjust_covariates',
                      'numeric_covariates', 'marker_roles', 'channel_transform_params', 'selected_channels',
-                     'cluster_names'):
+                     'cluster_names', 'population_gates'):
             setattr(snap, attr, deepcopy(getattr(self.state, attr)))
         if self.state.covariates is not None:
             snap.covariates = self.state.covariates.copy()
@@ -5478,6 +5629,7 @@ class GroupsStatsTab(QWidget):
         ran_freq, ran_counts, ran_mfi = ran
         self.state.stats_all_rel = snap.stats_all_rel
         self.state.stats_group_vec = snap.stats_group_vec
+        self.state.stats_population_of = dict(snap.stats_population_of)
         self.state.stats_comparisons = snap.stats_comparisons
         self.state.freq_results = snap.freq_results if ran_freq else None
         self.state.freq_df = snap.freq_df if ran_freq else None
@@ -5601,6 +5753,10 @@ class GroupsStatsTab(QWidget):
             self.state.stats_counts_method if run_counts else None,
             self.state.stats_normalisation if (run_freq or run_counts) else None,
         )
+        if self.state.population_split:
+            test_fingerprint += (
+                'populations', tuple(self.state.population_gates),
+                self.state.population_reference, tuple(sorted(self.state.selected_gates)))
         roles_fingerprint = tuple(sorted(self.state.marker_roles.items()))
         transform_fingerprint = ()
         if run_mfi:
@@ -6278,12 +6434,17 @@ class GroupsStatsTab(QWidget):
         have_mfi = self.state.mfi_df is not None and not self.state.mfi_df.empty
         self.pred_chk_freq.setEnabled(have_freq)
         self.pred_chk_mfi.setEnabled(have_mfi)
-        runnable = bool(labels) and (have_freq or have_mfi)
+        by_population = bool(self.state.stats_population_of)
+        runnable = bool(labels) and (have_freq or have_mfi) and not by_population
         self.pred_run_btn.setEnabled(runnable and not self._analysis_busy())
-        self.pred_run_btn.setToolTip(
-            "" if runnable else
-            "Run Statistics first, with Cluster Frequencies and/or Cluster MFIs ticked."
-        )
+        if by_population:
+            tip = ("Predictive analysis needs independent samples; the current statistics "
+                   "compare populations within the same samples.")
+        elif not runnable:
+            tip = "Run Statistics first, with Cluster Frequencies and/or Cluster MFIs ticked."
+        else:
+            tip = ""
+        self.pred_run_btn.setToolTip(tip)
 
     def _run_predictive(self):
         if self._analysis_busy():
@@ -8906,6 +9067,38 @@ class _MarkerValuesWorker(QThread):
             self.finished.emit(False, str(exc), {})
 
 
+class _PopulationValuesWorker(QThread):
+    """
+    Loads, on a background thread, which of the chosen populations each
+    gated event of each sample is in (drc_pipeline.load_sample_populations)
+    for a PlotCard's Population colour mode. Shares state.gated_data_cache
+    with every other loader, like _MarkerValuesWorker.
+    """
+    finished = Signal(bool, str, dict)  # success, error, {rel_path: (membership, rows)}
+
+    def __init__(self, controller, state, samples: list[str], gates: list[str], af_state,
+                 parent=None):
+        super().__init__(parent)
+        self._controller = controller
+        self._state = state
+        self._samples = samples
+        self._gates = gates
+        self._af_state = af_state
+
+    def run(self):
+        try:
+            results: dict[str, tuple] = {}
+            for rel in self._samples:
+                loaded = drc_pipeline.load_sample_populations(
+                    self._controller, self._state, rel, self._gates, af_state=self._af_state)
+                if loaded is not None:
+                    results[rel] = loaded
+            self.finished.emit(True, '', results)
+        except Exception as exc:
+            traceback.print_exc()
+            self.finished.emit(False, str(exc), {})
+
+
 class _ClusterTreeLayoutWorker(QThread):
     """
     Computes the MST + Kamada-Kawai layout for a Cluster Tree view on a
@@ -8960,7 +9153,7 @@ class PlotCard(QFrame):
     workspace  Parent WorkspaceTab (for remove_card / magic-wand).
     """
 
-    _COLOUR_MODES = ['Clusters', 'Marker', 'Group']
+    _COLOUR_MODES = ['Clusters', 'Marker', 'Group', 'Population']
 
     figure_changed = Signal()   # the figure was redrawn or resized
     legend_changed = Signal()   # the separate legend was redrawn, shown or hidden
@@ -8976,6 +9169,9 @@ class PlotCard(QFrame):
         self._figure    = None   # current matplotlib Figure
         self._marker_worker = None            # in-flight _MarkerValuesWorker, if any
         self._marker_values_cache: dict = {}  # single-entry -- see _on_marker_values_finished
+        self._population_worker = None        # in-flight _PopulationValuesWorker, if any
+        self._population_cache: dict = {}     # single-entry, like _marker_values_cache
+        self._last_population_present: list = []  # population names drawn, 'Unassigned' last
         self._tree_layout_worker = None       # in-flight _ClusterTreeLayoutWorker, if any
         self._tree_layout_cache: dict = {}    # {run_id: layout} -- a run's tree_data is
                                                # frozen at archive time, so its MST/layout
@@ -9517,6 +9713,16 @@ class PlotCard(QFrame):
                 self._start_marker_values_worker(needed_samples, cache_key)
                 return
 
+        population_by_sample = None
+        if colour_mode == 'Population' and self.state.population_gates:
+            needed_samples = sorted({str(r) for r in np.unique(origin)})
+            cache_key = self._population_cache_key(needed_samples)
+            population_by_sample = self._population_cache.get(cache_key)
+            if population_by_sample is None:
+                self._show_placeholder("Loading populations …")
+                self._start_population_worker(needed_samples, cache_key)
+                return
+
         is_dark = _resolve_is_dark(self.state)
 
         self._figure.clear()
@@ -9584,6 +9790,9 @@ class PlotCard(QFrame):
                                       marker_values_by_sample)
         elif colour_mode == 'Group':
             self._draw_group_scatter(ax, xy_disp, origin_disp)
+        elif colour_mode == 'Population':
+            self._draw_population_scatter(ax, xy_disp, origin_disp, disp_idx,
+                                          sample_row_offsets, run, population_by_sample)
 
         # Apply label colour to colourbar (Marker), title, and axis labels
         lc = self._label_fg()
@@ -9645,6 +9854,49 @@ class PlotCard(QFrame):
         # gated arrays, so keeping stale combinations around would just be
         # wasted memory for data nothing will ask for again.
         self._marker_values_cache = {cache_key: payload}
+        self.refresh()
+
+    def _population_cache_key(self, samples: list[str]):
+        """Cache key for _population_cache: the samples, gates, chosen
+        populations and unmixing (as _marker_cache_key), plus every
+        sample's gating so an edited population gate is reloaded."""
+        from honeychrome.controller_components.per_sample_gating_functions import SampleGating
+        from honeychrome.controller_components.sample_loader import sample_key_for_path
+        keys = [sample_key_for_path(self.controller.experiment_dir,
+                                    drc_pipeline.sample_abs_path(self.controller, rel))
+                for rel in samples]
+        return (
+            self._marker_cache_key(samples),
+            tuple(self.state.population_gates),
+            SampleGating.from_controller(self.controller, copy=False).signature(keys),
+        )
+
+    def _start_population_worker(self, samples: list[str], cache_key):
+        """Load population membership on a background thread, with the
+        unmixing state snapshotted here on the main thread (see
+        _start_marker_values_worker)."""
+        if self._population_worker is not None:
+            return   # already loading; its finish will re-trigger refresh()
+        if wait_if_busy(self.controller, ('Honeycluster populations', id(self)), self.refresh,
+                        self._show_placeholder):
+            return
+        af_state = drc_pipeline.snapshot_af_state(self.controller)
+        worker = _PopulationValuesWorker(self.controller, self.state, samples,
+                                         list(self.state.population_gates), af_state)
+        worker.finished.connect(
+            lambda ok, err, payload, key=cache_key:
+                self._on_population_values_finished(ok, err, payload, key)
+        )
+        self._population_worker = worker
+        worker.start()
+
+    def _on_population_values_finished(self, success: bool, error: str,
+                                       payload: dict, cache_key):
+        self._population_worker = None
+        if not success:
+            self._show_placeholder(f"Failed to load populations: {error}")
+            return
+        self._population_cache = {cache_key: payload}
         self.refresh()
 
     def _start_tree_layout_worker(self, run_id: str, tree_data: dict):
@@ -9879,6 +10131,69 @@ class PlotCard(QFrame):
                        rasterized=True)
         ax.set_title("Group", fontsize=8)
 
+    def _draw_population_scatter(self, ax, xy, origin, disp_idx, sample_row_offsets,
+                                 run: dict, population_by_sample: dict | None):
+        """
+        Colour points by which of the populations chosen on the Stats tab
+        ('Compare populations within samples') their event is in, in the
+        populations' group colours; events in none of them are grey. An
+        event in several is shown in the first. population_by_sample is
+        {rel_path: (membership, rows)}, already loaded by refresh().
+        """
+        gates = list(self.state.population_gates)
+        self._last_population_present = []
+        if not gates or population_by_sample is None:
+            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#aaaaaa', alpha=0.4, rasterized=True)
+            ax.set_title("Population: tick populations under 'Compare populations within "
+                         "samples' on the Stats tab", fontsize=8)
+            return
+
+        # Membership comes from the CURRENT gating, matched to the run's
+        # points as the Marker mode matches marker values.
+        mode = drc_run_align.live_join_mode(run, drc_pipeline.sync_fingerprint(
+            self.controller, run.get('gates', []), run.get('training_sample_ids', [])))
+        run_gates = run.get('gates')
+        if mode != drc_run_align.JOIN_KEYS and (
+                mode == drc_run_align.JOIN_NONE or run_gates is None
+                or sorted(run_gates) != sorted(self.state.selected_gates)):
+            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.3, rasterized=True)
+            ax.set_title(f"{run.get('label', '')}: made before event keys and no longer "
+                         "matches the current gating — retrain DR", fontsize=8)
+            return
+
+        which = np.full(len(xy), -1, dtype=np.int32)
+        for rel in np.unique(origin):
+            loaded = population_by_sample.get(str(rel))
+            if loaded is None:
+                continue
+            membership, cur_rows = loaded
+            first = np.where(membership.any(axis=1), membership.argmax(axis=1), -1)
+            start, end = sample_row_offsets.get(rel, (0, int((origin == rel).sum())))
+            col, _matched = drc_run_align.pair_arrays(
+                first.astype(np.int32), end - start, mode,
+                src_rows=cur_rows, dst_rows=drc_run_align.run_rows(run, rel), fill=-1)
+            if col is None:
+                _log.warning("population: %s embedding has %d points but current gating "
+                             "yields %d events — skipped", rel, end - start, len(first))
+                continue
+            mask = origin == rel
+            which[mask] = col[disp_idx[mask] - start] if disp_idx is not None else col
+
+        outside = which < 0
+        if outside.any():
+            ax.scatter(xy[outside, 0], xy[outside, 1], s=1, c='#7f7f7f', alpha=0.4,
+                       linewidths=0, rasterized=True)
+        for j, gate in enumerate(gates):
+            mask = which == j
+            if not mask.any():
+                continue
+            self._last_population_present.append(gate)
+            ax.scatter(xy[mask, 0], xy[mask, 1], s=1, c=_resolve_group_colour(self.state, gate),
+                       alpha=0.6, linewidths=0, rasterized=True)
+        if outside.any():
+            self._last_population_present.append('Unassigned')
+        ax.set_title("Population", fontsize=8)
+
     def _show_placeholder(self, text: str):
         self._figure.clear()
         ax = self._figure.add_subplot(111)
@@ -9912,6 +10227,11 @@ class PlotCard(QFrame):
             return 'group', [
                 (g, g, _resolve_group_colour(self.state, g) if g != 'Unassigned' else '#7f7f7f')
                 for g in ordered]
+        if mode == 'Population' and not is_tree:
+            return 'group', [
+                (g, 'Other' if g == 'Unassigned' else g,
+                 '#7f7f7f' if g == 'Unassigned' else _resolve_group_colour(self.state, g))
+                for g in self._last_population_present]
         if mode != 'Clusters' and not is_tree:
             return 'cluster', []
         cl_run = self._selected_cluster_run()
@@ -11479,15 +11799,15 @@ class ClusterAnnotationTab(QWidget):
         reference_row = QHBoxLayout()
         reference_row.addWidget(QLabel("MEM reference:"))
         self.mem_reference_combo = QComboBox()
-        self.mem_reference_combo.addItem("Anchor population", drc_cluster_id.MEM_REFERENCE_ANCHOR)
         self.mem_reference_combo.addItem("Other clusters", drc_cluster_id.MEM_REFERENCE_CLUSTERS)
+        self.mem_reference_combo.addItem("Anchor population", drc_cluster_id.MEM_REFERENCE_ANCHOR)
         self.mem_reference_combo.setToolTip(
-            "What each cluster's MEM label is measured against.\n"
-            "Anchor population: the cells chosen under Anchor (normally live\n"
-            "single cells), so a marker every clustered cell carries, such as\n"
-            "CD3 in a T-cell run, still shows in the label.\n"
-            "Other clusters: the run's other clusters, which describes only\n"
-            "how the clusters differ from each other."
+            "Each cluster's MEM label describes how it differs from the run's\n"
+            "other clusters. A marker every clustered cell carries, such as CD3\n"
+            "in a T-cell run, never shows that way.\n"
+            "Anchor population also compares the clusters with the cells chosen\n"
+            "under Anchor (normally live single cells) and puts the markers they\n"
+            "all share against it in front of every label, e.g. 'CD3+ CD19-:'."
         )
         reference_row.addWidget(self.mem_reference_combo)
         reference_row.addWidget(QLabel("Anchor:"))
@@ -14168,6 +14488,9 @@ class PluginWidget(QWidget):
             s.setValue('reference_group',   self.state.reference_group)
             s.setValue('paired',            self.state.paired)
             s.setValue('pairing_variable',  self.state.pairing_variable)
+            s.setValue('population_split',  self.state.population_split)
+            s.setValue('population_gates',  list(self.state.population_gates))
+            s.setValue('population_reference', self.state.population_reference)
             s.setValue('stats_adjust_covariates', list(self.state.stats_adjust_covariates))
             s.setValue('numeric_covariates', list(self.state.numeric_covariates))
             s.setValue('stats_use_treat',   self.state.stats_use_treat)
@@ -14220,7 +14543,7 @@ class PluginWidget(QWidget):
                     if hasattr(cat, 'mem_reference_combo'):
                         s.setValue('cluster_id_mem_reference',
                                    cat.mem_reference_combo.currentData()
-                                   or drc_cluster_id.MEM_REFERENCE_ANCHOR)
+                                   or drc_cluster_id.MEM_REFERENCE_CLUSTERS)
                     if hasattr(cat, 'anchor_combo') and cat.anchor_combo.count() > 0:
                         s.setValue('cluster_id_anchor', cat.anchor_combo.currentData() or '')
             # Groups tab: include-type-markers checkbox
@@ -14433,6 +14756,9 @@ class PluginWidget(QWidget):
             paired_val = s.value('paired', False)
             self.state.paired = paired_val in (True, 'true', 'True', 1, '1')
             self.state.pairing_variable = s.value('pairing_variable', '')
+            self.state.population_split = _qs_bool(s, 'population_split', False)
+            self.state.population_gates = _qs_list(s, 'population_gates')
+            self.state.population_reference = s.value('population_reference', '') or ''
             self.state.stats_adjust_covariates = _qs_list(s, 'stats_adjust_covariates')
             self.state.numeric_covariates = _qs_list(s, 'numeric_covariates')
             use_treat = s.value('stats_use_treat', None)
@@ -14638,7 +14964,7 @@ class PluginWidget(QWidget):
                 s, 'annotation_channels_checked')
             self._pending_cluster_id_species = s.value('cluster_id_species', 'human')
             self._pending_cluster_id_mem_reference = s.value(
-                'cluster_id_mem_reference', drc_cluster_id.MEM_REFERENCE_ANCHOR)
+                'cluster_id_mem_reference', drc_cluster_id.MEM_REFERENCE_CLUSTERS)
             self._pending_cluster_id_anchor = s.value('cluster_id_anchor', '')
 
             # Config tab: restore channel and training-sample selections
@@ -14817,6 +15143,7 @@ class PluginWidget(QWidget):
             ('mfi_sample_df',     self.state.mfi_sample_df),
             ('stats_all_rel',     self.state.stats_all_rel),
             ('stats_group_vec',   self.state.stats_group_vec),
+            ('stats_population_of', self.state.stats_population_of),
             ('stats_comparisons', self.state.stats_comparisons),
             ('stats_run_label',   self.state.stats_run_label),
             ('stats_run_id',      self.state.stats_run_id),
@@ -14942,6 +15269,8 @@ class PluginWidget(QWidget):
                 self.state.stats_all_rel = payload['stats_all_rel']
             if isinstance(payload.get('stats_group_vec'), list):
                 self.state.stats_group_vec = payload['stats_group_vec']
+            if isinstance(payload.get('stats_population_of'), dict):
+                self.state.stats_population_of = payload['stats_population_of']
             if isinstance(payload.get('stats_comparisons'), list):
                 self.state.stats_comparisons = payload['stats_comparisons']
             if isinstance(payload.get('composition_df'), pd.DataFrame):
@@ -15232,7 +15561,7 @@ class PluginWidget(QWidget):
                 cat.species_combo.setCurrentIndex(idx)
         if hasattr(cat, 'mem_reference_combo'):
             idx = cat.mem_reference_combo.findData(getattr(
-                self, '_pending_cluster_id_mem_reference', drc_cluster_id.MEM_REFERENCE_ANCHOR))
+                self, '_pending_cluster_id_mem_reference', drc_cluster_id.MEM_REFERENCE_CLUSTERS))
             if idx >= 0:
                 cat.mem_reference_combo.setCurrentIndex(idx)
         if hasattr(cat, 'anchor_combo'):
@@ -15392,6 +15721,8 @@ class PluginWidget(QWidget):
                 tuple(sorted(s.group_patterns.items())),
                 tuple(s.testing_group_selection),
                 s.contrast_mode, s.reference_group, s.paired, s.pairing_variable,
+                s.population_split, tuple(s.population_gates), s.population_reference,
+                tuple(sorted(s.selected_gates)),
                 len(s.dr_runs), len(s.clustering_runs),
                 tuple(sorted(s.cluster_labels)),
                 s.stats_run_id,
@@ -15414,6 +15745,7 @@ class PluginWidget(QWidget):
                 tuple(sorted(s.cluster_names.items())),
                 tuple(sorted(s.cluster_colors.items())),
                 len(s.plot_configs), s.plot_theme,
+                tuple(s.population_gates),
             )
         elif index == 5:    # ReportTab -- cheap to rebuild; always refresh
             return None

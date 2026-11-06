@@ -729,9 +729,16 @@ name.</li>
 covariates are categories, so leave codes such as batch 1, 2, 3
 unticked.</li>
 <li><b>Import table…</b> reads groups and covariates from a CSV or
-tab-separated file with a <i>sample</i> column (the file name, with or
-without its extension), an optional <i>group</i> column and one column per
-covariate. <b>Export table…</b> writes the same format.</li>
+tab-separated file with a <i>sample</i> column and one column per covariate.
+A row matches a sample when its name is the file name (with or without its
+extension) or appears inside the file name between spaces, underscores or
+dashes, so a study key naming <i>POMS_008_FB_D</i> matches
+<i>A1 POMS_008_FB_D_Plate 1</i>. Names matched inside the file name need at
+least three characters including a digit. Before anything changes, a review
+shows which rows matched which samples, rows that matched nothing and samples
+left without a row; choose the group column there (or keep the current
+groups) and the covariates to import. <b>Export table…</b> writes the same
+format, naming samples as the table shows them.</li>
 </ul>
 
 <h4>Details: the tests</h4>

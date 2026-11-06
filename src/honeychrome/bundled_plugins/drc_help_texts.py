@@ -61,9 +61,10 @@ see. <b>Leiden</b> finds communities in a nearest-neighbour graph.
 transformed units.</li>
 <li><b>Transformed units</b>: positions on a transformed (logicle) axis,
 the same scale as the main cytometry plots.</li>
-<li><b>MEM label</b>: a description of a cluster's markers relative to a
-reference (the anchor population, or the other clusters), for example
-"CD4+6 CD8−5". It describes the data, so it is safe to adopt.</li>
+<li><b>MEM label</b>: a description of a cluster's markers relative to the
+other clusters, for example "CD4+6 CD8−5", optionally preceded by the markers
+all clusters share against the anchor population ("CD3+ CD19-: CD4+6
+CD8−5"). It describes the data, so it is safe to adopt.</li>
 <li><b>Anchor population</b>: the cells "everything" means for Cluster ID,
 normally live single cells. It must contain the clustered cells.</li>
 <li><b>Cell-type suggestion</b>: a match of a cluster's markers against a
@@ -81,6 +82,9 @@ not just different from zero.</li>
 one reference, or every pair of groups.</li>
 <li><b>Paired design</b>: samples matched across groups (for example the same
 donor before and after treatment), compared within each pair.</li>
+<li><b>Populations within samples</b>: gated populations of the same samples
+(for example CD45.1+ and CD45.1− cells of each mixed chimera) compared with
+each other instead of groups of samples.</li>
 <li><b>Covariate</b>: a per-sample value (for example age or batch) that the
 tests can <b>adjust for</b>.</li>
 <li><b>Cluster-first MFI testing</b>: asks first which clusters change, then
@@ -362,12 +366,14 @@ block MEM.</p>
 channels, every other channel with an Antigen is scored (viability dyes
 excepted). A marker you gated on but did not cluster on, such as CD3 in a
 T-cell run, still counts for T-cell types and against the others.</li>
-<li><b>MEM reference.</b> With <b>Anchor population</b>, each cluster is
-compared with the anchor's cells outside that cluster. A T-cell cluster then
-reads CD3+, because live cells include CD3− cells. With <b>Other
-clusters</b>, each cluster is compared with the run's other clusters, which
-shows only how the clusters differ from each other: a marker every clustered
-cell carries never appears.</li>
+<li><b>MEM reference.</b> Each cluster is always described against the
+run's other clusters, so a marker every clustered cell carries (CD3 in a
+T-cell run) never appears in that part. With <b>Anchor population</b>, the
+clusters are also compared with the anchor's cells, and the markers on which
+every cluster differs from the anchor in the same direction (by at least the
+MEM threshold) are put once in front of every label, for example
+"CD3+ CD19-: CD4+10 CD62L+7 CD44−3". Live cells include CD3− cells, so a
+T-cell run shares CD3+.</li>
 <li><b>Anchor.</b> <b>Auto</b> picks, among the gates that contain the
 clustered cells, the deepest one using a viability dye, else
 <i>Singlets</i>, else <i>Cells</i>, else all events. The drop-down shows the
@@ -378,16 +384,10 @@ says so.</li>
 cell sample. For a channel without one, the Otsu cut is made on the anchor's
 cells, which include a negative population even for a marker every clustered
 cell carries.</li>
-<li><b>Reading.</b> The anchor's cells, and the clustered cells' values on
-channels not stored with the run, come from a random subsample of each
-training sample (20,000 events each, the reference pooled to at most
-50,000). A cluster with fewer than 20 of its events in those subsamples
-leaves those channels out of its scores.</li>
-<li><b>Scaling.</b> MEM scores are scaled so that the largest one in the
-whole table is 10. Against the anchor, the gating marker is usually that
-largest score (CD3 in a T-cell run), so other markers' scores come out
-smaller than against the other clusters; lower the <b>MEM threshold</b> if
-labels are too short.</li>
+<li><b>Reading.</b> The other stained channels are read for the same
+cells as the stored clustering-channel values (at most 1,000 per cluster),
+and only those cells are read and unmixed. The anchor's cells come from a
+small random subsample of each training sample (20,000 cells in all).</li>
 </ul>
 
 <h4>Details: the Marker Summary sub-tab</h4>
@@ -446,6 +446,10 @@ pairwise</b>.</li>
 <li>If samples are matched (for example the same donor in each group), tick
 <b>Paired design</b> and choose the <b>Pairing variable</b>. Tick covariates
 under <b>Adjust for</b> if needed.</li>
+<li>To compare populations inside the same samples instead (for example
+CD45.1+ against CD45.1− cells of mixed chimeras), tick <b>Compare populations
+within samples</b> under <b>Populations</b> and tick the populations. See
+<i>Background: populations within samples</i> below.</li>
 <li>Tick the tests (Cluster Frequencies, Counts, MFIs), keep or change the
 thresholds, and click <b>Run Statistics</b>.</li>
 <li>Read the result tabs: volcano plots, heatmaps and tables. Right-click a
@@ -472,7 +476,12 @@ is may be a failed stain or a low event count.</li>
 <li><b>Auto-assign by pattern</b> matches each group's regular expression
 against the sample names. <b>Suggest Groupings…</b> offers groupings found
 in the sample names. <b>Import CSV</b> and <b>Export CSV</b> read and write
-the assignment table.</li>
+the assignment table. An imported row matches a sample when its
+<i>sample</i> name is the file name (with or without its extension) or
+appears inside the file name between spaces, underscores or dashes (at
+least three characters including a digit). A review shows the matches,
+and lets you choose the group column and covariates, before anything
+changes.</li>
 <li>Extra columns in the table hold covariates, such as donor, age, sex or
 batch. Tick <b>Numeric</b> under a column's title to make it a number with a
 straight-line effect (for example age or CRP); every sample then needs a
@@ -711,6 +720,37 @@ value, and each value must appear in more than one group.</li>
 <li>If your samples are independent, leave Paired design unticked.</li>
 </ul>
 
+<h4>Background: populations within samples</h4>
+<p>In a mixed bone-marrow chimera every mouse carries cells of two genotypes,
+told apart by a congenic marker such as CD45.1. The question is then not
+whether one group of mice differs from another, but whether, inside the same
+mice, one genotype's cells differ from the other's. Tick <b>Compare populations
+within samples</b> and tick two or more populations (gates inside the gate the
+clustering run analysed) that do not share cells.</p>
+<ul>
+<li><b>What it does</b>: each sample checked under <b>Groups to Test</b> is
+split into the populations, and each population of each sample becomes one
+row of the tables, named "sample · population". The populations are the
+groups tested; <b>Reference group</b> and <b>All pairwise</b> apply to them.</li>
+<li><b>Frequencies</b> are shares of each population's own cells: "cluster 5
+is 12% of this mouse's CD45.1+ cells". An uneven chimerism does not bias them.
+The clusters are the same for every population.</li>
+<li><b>Pairing</b>: every test is paired on the sample, so each mouse's
+populations are compared with each other and differences between mice drop
+out. Paired design and Adjust for are switched off: anything measured per
+sample (age, batch) is the same for both populations of a mouse and is
+already covered by that pairing.</li>
+<li><b>Overlap</b>: cells inside more than one chosen population are left out
+of all of them. If they are more than 1% of a sample's cells in the
+populations, the run stops, because the populations would then share
+cells.</li>
+<li>A population needs cells in at least 3 samples to be tested. Predictive
+analysis is not offered for these results: the rows are not independent
+samples.</li>
+<li>The Workspace <b>Population</b> colour mode shows the same populations on
+the DR map.</li>
+</ul>
+
 <h4>Background: frequentist and Bayesian statistics</h4>
 <ul>
 <li><b>Frequentist</b>: the framework behind these p-values (and t-tests,
@@ -810,8 +850,9 @@ placeholder holds its place until it can be updated.</li>
 resizing, arranging, grouping, scaling and adding or removing items; not
 changes to a plot's settings or to pages.</li>
 <li>Select a plot to edit it in the panel on the right: plot type, DR run,
-sample, colour (Clusters with a choice of <b>Clustering run</b>, Marker or
-Group) and appearance (size in mm, legend, fonts in points, grid, labels;
+sample, colour (Clusters with a choice of <b>Clustering run</b>, Marker,
+Group, or Population: the populations ticked under <b>Compare populations
+within samples</b> on the Stats tab) and appearance (size in mm, legend, fonts in points, grid, labels;
 <b>Label colour</b> Auto follows the plot theme).</li>
 <li><b>Export…</b> writes the pages as PDF (vector), SVG (one file per page,
 with editable text if you like), PNG or TIFF (300 or 600 dpi).</li>

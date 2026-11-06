@@ -83,7 +83,9 @@ from honeychrome.settings import af_abundance_channel
 from honeychrome.controller_components import differential_stats as ds
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy
 from honeychrome.controller_components import experiment_state
+from honeychrome.controller_components import sample_table
 from honeychrome.view_components import suggest_groupings_dialog as sgd
+from honeychrome.view_components import sample_table_import_dialog
 from honeychrome.view_components.checkable_header import CheckableHeaderView
 from honeychrome.controller_components.functions import (
     build_antigen_map,
@@ -2148,8 +2150,10 @@ class ResultsTab(QWidget):
         b_import = QPushButton("Import table…")
         b_import.setToolTip(
             "Read groups and covariates from a CSV or tab-separated file with one row per "
-            "sample: a 'sample' column (file name, with or without extension), an optional "
-            "'group' column, and one column per covariate (e.g. donor, age, sex).")
+            "sample: a 'sample' column (the file name, with or without extension, or a sample "
+            "ID found inside the file name), an optional group column, and one column per "
+            "covariate (e.g. donor, age, sex). The matches are shown for review before "
+            "anything changes.")
         b_import.clicked.connect(self._on_import_table)
         b_export = QPushButton("Export table…")
         b_export.setToolTip("Save the samples' groups and covariates in the same format.")
@@ -2481,41 +2485,33 @@ class ResultsTab(QWidget):
             "Tables (*.csv *.tsv *.txt);;All files (*)")
         if not path:
             return
-        try:
-            df = pd.read_csv(path, sep=None, engine='python', dtype=str)
-            table = ag_results.read_sample_table(df, self.state.gated_samples())
-        except Exception as exc:
-            QMessageBox.warning(self, "Import table", f"Could not read the table: {exc}")
-            return
         st = self.state
-        for group in table['groups'].values():
+        result = sample_table_import_dialog.import_sample_table(
+            self, path, st.gated_samples(), st.sample_groups, title="Import table")
+        if result is None:
+            return
+        for group in result['groups'].values():
             if group not in st.group_names:
                 st.group_names.append(group)
-        st.sample_groups.update(table['groups'])
-        for name, values in table['covariates'].items():
+        st.sample_groups.update(result['groups'])
+        for name, values in result['covariates'].items():
             st.covariates.setdefault(name, {}).update(values)
         self._populate_groups()
         self._populate_stats_choices()
-        msg = (f"Imported {len(table['groups'])} group assignment(s) and "
-               f"{len(table['columns'])} covariate(s) from {Path(path).name}.")
-        if table['unmatched']:
-            msg += (f" {len(table['unmatched'])} row(s) matched no gated sample: "
-                    + ", ".join(table['unmatched'][:6]) + (" …" if len(table['unmatched']) > 6 else ''))
-        _status(self.bus, msg)
-        QMessageBox.information(self, "Import table", msg)
+        _status(self.bus, sample_table_import_dialog.describe_import(result))
 
     def _on_export_table(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export sample table", str(getattr(self.controller, 'experiment_dir', '')),
-            "CSV (*.csv)")
+        default = sample_table.default_export_path(
+            getattr(self.controller, 'experiment_dir', ''), plugin_name)
+        path, _ = QFileDialog.getSaveFileName(self, "Export sample table", default, "CSV (*.csv)")
         if not path:
             return
         if not path.lower().endswith('.csv'):
             path += '.csv'
         st = self.state
         try:
-            ag_results.sample_table_frame(st.gated_samples(), st.sample_groups,
-                                          st.covariates).to_csv(path, index=False)
+            sample_table.write_table(
+                sample_table.table_frame(st.gated_samples(), st.sample_groups, st.covariates), path)
         except Exception as exc:
             QMessageBox.warning(self, "Export table", str(exc))
             return
