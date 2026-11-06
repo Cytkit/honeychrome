@@ -152,6 +152,10 @@ class Controller(QObject):
         self.autospectral_variants: dict = {}
         self.autospectral_raw_pos_thresholds = None
         self.autospectral_unmixed_pos_thresholds = None
+        # (path, content fingerprint) of the last cleaned / variants archive written,
+        # so autosave rewrites an archive only when its arrays have changed
+        self._cleaned_npz_saved = None
+        self._variants_npz_saved = None
         self.data_for_cytometry_plots = deepcopy(cytometry_data_dictionary)
         self.data_for_cytometry_plots_raw = deepcopy(self.data_for_cytometry_plots)
         self.data_for_cytometry_plots_process = deepcopy(self.data_for_cytometry_plots)
@@ -371,10 +375,16 @@ class Controller(QObject):
                     arrays[f'{safe}__{k}'] = arr
 
         self.experiment.process['cleaned_meta'] = meta
+        npz_path = self.cleaned_npz_path
         if arrays:
-            np.savez_compressed(str(self.cleaned_npz_path), **arrays)
-        elif self.cleaned_npz_path.exists():
-            self.cleaned_npz_path.unlink()
+            saved = (str(npz_path), self._arrays_fingerprint(arrays))
+            if saved != self._cleaned_npz_saved or not npz_path.exists():
+                np.savez_compressed(str(npz_path), **arrays)
+                self._cleaned_npz_saved = saved
+        else:
+            self._cleaned_npz_saved = None
+            if npz_path.exists():
+                npz_path.unlink()
 
     @property
     def cleaned_npz_path(self) -> Path:
@@ -394,6 +404,17 @@ class Controller(QObject):
         reference spectrum (see _load_autospectral_variants)."""
         arr = np.round(np.asarray(vec, dtype=np.float64), 8)
         return hashlib.sha1(arr.tobytes()).hexdigest()
+
+    @staticmethod
+    def _arrays_fingerprint(arrays: dict) -> str:
+        """Fingerprint of the names, types, shapes and contents of the arrays
+        written to an npz archive, so an unchanged archive is not rewritten."""
+        h = hashlib.sha1()
+        for key in sorted(arrays):
+            arr = np.ascontiguousarray(arrays[key])
+            h.update(f'{key}|{arr.dtype.str}|{arr.shape}'.encode())
+            h.update(arr.tobytes())
+        return h.hexdigest()
 
     def _save_autospectral_variants(self):
         """Write autospectral_variants to JSON meta (.kit) and numpy sidecar
@@ -443,10 +464,16 @@ class Controller(QObject):
             del self.experiment.process['autospectral_thresholds_meta']
 
         self.experiment.process['autospectral_variants_data'] = meta
+        npz_path = self.autospectral_variants_npz_path
         if arrays:
-            np.savez_compressed(str(self.autospectral_variants_npz_path), **arrays)
-        elif self.autospectral_variants_npz_path.exists():
-            self.autospectral_variants_npz_path.unlink()
+            saved = (str(npz_path), self._arrays_fingerprint(arrays))
+            if saved != self._variants_npz_saved or not npz_path.exists():
+                np.savez_compressed(str(npz_path), **arrays)
+                self._variants_npz_saved = saved
+        else:
+            self._variants_npz_saved = None
+            if npz_path.exists():
+                npz_path.unlink()
 
     @property
     def autospectral_variants_npz_path(self) -> Path:
@@ -2367,9 +2394,6 @@ class Controller(QObject):
                             new_plot_child_gates.append(gate)
                     new_plot['child_gates'] = new_plot_child_gates
                     self.experiment.cytometry['plots'].append(new_plot)
-
-                    if self.bus:
-                        self.bus.changedGatingHierarchy.emit('unmixed', 'root')
 
                 # keep the existing unmixed gating strategy where its channels still exist
                 if previous_unmixed is not None:
