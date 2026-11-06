@@ -13,12 +13,13 @@ intensities. Used by the Honeycluster and Automated Gating plugins.
   a per-feature denominator (e.g. each population's parent count). Two
   tests: ``'wald'`` (per-feature Cameron–Trivedi dispersion, Wald z) and
   ``'ql'`` (quasi-likelihood F test after Lund et al. 2012 and edgeR's
-  glmQLFit: one common negative-binomial dispersion, then a per-feature
-  quasi-dispersion moderated by empirical Bayes). With ``'ql'`` each
-  comparison is fitted on the samples of its two groups only, with the
-  common dispersion estimated once on every sample, so groups that vary
-  more or less than the rest (e.g. tissues with fewer cells) do not set
-  another comparison's noise level.
+  glmQLFit: a negative-binomial dispersion that trends with abundance,
+  each feature's taken from the features of similar mean count, then a
+  per-feature quasi-dispersion moderated by empirical Bayes). With
+  ``'ql'`` each comparison is fitted on the samples of its two groups
+  only, with the dispersions estimated once on every sample, so groups
+  that vary more or less than the rest (e.g. tissues with fewer cells) do
+  not set another comparison's noise level.
   For small counts each unit deviance is rescaled, and its residual
   degrees of freedom set, by how far its mean and variance depart from
   their large-count values (after edgeR v4, Chen et al. 2024), which keeps
@@ -1145,10 +1146,8 @@ def _common_dispersion(blocks: list, mus: list) -> float:
     """
     One negative-binomial dispersion for every feature: the median of the
     features' Cox–Reid maximum-likelihood log α (for the fitted means
-    *mus*), over the features off the Poisson boundary. Features keep their
-    own extra variation in the quasi-dispersion of the QL test, where it is
-    moderated with an estimated prior (as edgeR's glmQLFit uses a trended,
-    not a per-feature, dispersion).
+    *mus*), over the features off the Poisson boundary. Used by
+    _ql_dispersion when there are too few features for a trend.
     """
     lls = [_nb_profile_loglik(b.Y, mu, b.X) for b, mu in zip(blocks, mus)]
     mle = np.concatenate([_LOG_ALPHA_GRID[np.argmax(ll, axis=1)] for ll in lls])
@@ -1189,26 +1188,95 @@ def _ql_blocks(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray) -> t
     return blocks, mus
 
 
-def _ql_dispersion(blocks: list, mus: list) -> tuple[float, list]:
+_TREND_SPAN = 0.3            # fraction of features pooled for each feature's dispersion
+_TREND_MIN_FEATURES = 10     # fewer features: one common dispersion
+
+
+def _abundance(blocks: list) -> np.ndarray:
+    """log2(mean count + 0.5) of each feature over its measured samples,
+    in block order: the covariate of the dispersion trend."""
+    return np.concatenate([np.log2(b.Y.mean(axis=1) + 0.5) for b in blocks])
+
+
+def _trended_dispersion(blocks: list, mus: list) -> np.ndarray:
     """
-    The common dispersion of *blocks* (two rounds: from the Poisson means,
-    then from the negative-binomial means at that dispersion), and the
-    fitted means at the final value.
+    Negative-binomial dispersion of each feature (block order) from the
+    features of similar abundance, after edgeR's trended dispersion. The
+    features are ranked by _abundance; for each one, the Cox–Reid profile
+    log-likelihoods (_nb_profile_loglik, for the fitted means *mus*) of the
+    nearest _TREND_SPAN fraction of features are summed with tricube
+    weights on rank distance and maximised over _LOG_ALPHA_GRID, a local
+    common dispersion. Rare features, whose counts vary more relative to
+    their size, so get a larger dispersion than abundant ones. With fewer
+    than _TREND_MIN_FEATURES features every feature takes
+    _common_dispersion.
     """
-    alpha = np.nan
+    ll = np.concatenate([_nb_profile_loglik(b.Y, mu, b.X) for b, mu in zip(blocks, mus)])
+    n = ll.shape[0]
+    if n < _TREND_MIN_FEATURES:
+        return np.full(n, _common_dispersion(blocks, mus))
+    k = max(_TREND_MIN_FEATURES, int(np.ceil(_TREND_SPAN * n)))
+    rank = np.empty(n)
+    rank[np.argsort(_abundance(blocks), kind='stable')] = np.arange(n)
+    pooled = np.empty_like(ll)
+    for start in range(0, n, 512):
+        dist = np.abs(rank[start:start + 512, None] - rank[None, :])
+        h = np.partition(dist, k - 1, axis=1)[:, k - 1:k] + 1.0
+        w = np.clip(1.0 - (dist / h) ** 3, 0.0, None) ** 3
+        pooled[start:start + 512] = w @ ll
+    return np.exp(_grid_argmax(pooled))
+
+
+def _split_blocks(values: np.ndarray, blocks: list) -> list:
+    """*values* in block order, split into one array per block."""
+    return np.split(values, np.cumsum([b.Y.shape[0] for b in blocks])[:-1])
+
+
+def _ql_dispersion(blocks: list, mus: list) -> tuple[list, list]:
+    """
+    The trended dispersion of *blocks* (_trended_dispersion; two rounds:
+    from the Poisson means, then from the negative-binomial means at those
+    dispersions), one array per block, and the fitted means at the final
+    values.
+    """
+    alphas = []
     for _round in range(2):
-        alpha = _common_dispersion(blocks, mus)
-        full = [_fit_rows(b.Y, b.X, b.O, np.full(b.Y.shape[0], alpha)) for b in blocks]
+        alphas = _split_blocks(_trended_dispersion(blocks, mus), blocks)
+        full = [_fit_rows(b.Y, b.X, b.O, a) for b, a in zip(blocks, alphas)]
         mus = [np.array([f[1] if f is not None else m for f, m in zip(fb, mu)])
                for fb, mu in zip(full, mus)]
-    return alpha, mus
+    return alphas, mus
 
 
-def ql_common_dispersion(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray) -> float:
-    """The QL test's common negative-binomial dispersion for every sample
-    of *design* (``_ql_dispersion``); NaN when no feature can be fitted."""
+def ql_dispersion(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    """The QL test's negative-binomial dispersion of each row of *counts*
+    (features) over every sample of *design* (``_ql_dispersion``); NaN for
+    a feature that cannot be fitted."""
+    out = np.full(counts.shape[0], np.nan)
     blocks, mus = _ql_blocks(counts, design, offsets)
-    return _ql_dispersion(blocks, mus)[0] if blocks else np.nan
+    if blocks:
+        alphas, _mus = _ql_dispersion(blocks, mus)
+        out[np.concatenate([b.rows for b in blocks])] = np.concatenate(alphas)
+    return out
+
+
+def ql_block_dispersions(blocks: list, mus: list, alpha: np.ndarray | None = None) -> tuple[list, list]:
+    """
+    Dispersions of *blocks* (one array per block) and their fitted means
+    at those dispersions. *alpha*: per-feature dispersions indexed like the
+    rows of the counts the blocks came from (``ql_dispersion``); a feature
+    with none takes their median. Without *alpha* they are estimated on
+    the blocks' own samples (_ql_dispersion).
+    """
+    if alpha is None or not np.any(np.isfinite(alpha)):
+        return _ql_dispersion(blocks, mus)
+    alpha = np.asarray(alpha, dtype=float)
+    fill = float(np.nanmedian(alpha))
+    alphas = [np.where(np.isfinite(alpha[b.rows]), alpha[b.rows], fill) for b in blocks]
+    full = [_fit_rows(b.Y, b.X, b.O, a) for b, a in zip(blocks, alphas)]
+    mus = [np.array([f[1] if f is not None else m for f, m in zip(fb, mu)])
+           for fb, mu in zip(full, mus)]
+    return alphas, mus
 
 
 def ql_comparisons(group_vec: list[str], contrasts: list[tuple[str, str]], pairing_vec: list[str] | None,
@@ -1236,16 +1304,16 @@ def ql_comparisons(group_vec: list[str], contrasts: list[tuple[str, str]], pairi
 
 
 def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
-                  coefs: list[int], alpha: float | None = None) -> dict:
+                  coefs: list[int], alpha: np.ndarray | None = None) -> dict:
     """
     Quasi-likelihood F test of each design column in ``coefs`` for every
     feature (rows of counts and offsets; NaN = not measured).
 
     Features sharing a pattern of measured samples are fitted together on
-    that sub-design (_ql_blocks). Every feature takes the same
-    negative-binomial dispersion: *alpha*, or the common dispersion of this
-    design (_ql_dispersion). The quasi-dispersion of each feature (residual
-    deviance / residual df) is moderated with
+    that sub-design (_ql_blocks). Each feature's negative-binomial
+    dispersion is *alpha* (per row, ``ql_dispersion``), or the trended
+    dispersion of this design (_ql_dispersion). The quasi-dispersion of
+    each feature (residual deviance / residual df) is moderated with
     moderated_stats.fit_prior_variance, as limma moderates variances;
     F = (deviance without the column − deviance with it) / moderated
     quasi-dispersion, on 1 and df + d0 degrees of freedom. The
@@ -1265,9 +1333,7 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
     if not blocks:
         return out
 
-    if alpha is None or not np.isfinite(alpha):
-        alpha, mus = _ql_dispersion(blocks, mus)
-    alphas = [np.full(b.Y.shape[0], alpha) for b in blocks]
+    alphas, mus = ql_block_dispersions(blocks, mus, alpha)
     full = [_fit_rows(b.Y, b.X, b.O, a) for b, a in zip(blocks, alphas)]
     mus = [np.array([f[1] if f is not None else m for f, m in zip(fb, mu)])
            for fb, mu in zip(full, mus)]
@@ -1283,8 +1349,9 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
         post = np.full(phi.shape, s0)
     else:
         post = (d0 * s0 + df_all * phi) / (d0 + df_all)
-    log.info("QL counts test: %d features, common dispersion %.3g, quasi-dispersion prior d0=%.3g s0²=%.3g",
-             phi.size, alpha, d0, s0)
+    all_alpha = np.concatenate(alphas)
+    log.info("QL counts test: %d features, dispersion %.3g–%.3g, quasi-dispersion prior d0=%.3g s0²=%.3g",
+             phi.size, all_alpha.min(), all_alpha.max(), d0, s0)
 
     shrunk = []
     for b, a in zip(blocks, alphas):
@@ -1335,7 +1402,7 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
     one design over every sample (shared baseline), Wald z tests
     (df.total = inf); 'ql': quasi-likelihood F tests (_glm_ql_tests), each
     contrast fitted on the samples of its two groups (ql_comparisons) with
-    the common dispersion of every sample (ql_common_dispersion), so the
+    the dispersions estimated on every sample (ql_dispersion), so the
     contrasts may have different baselines. With either, logFC comes from
     a fit with the prior count (_add_prior_count) and SE is |logFC| over
     the test statistic, so a group with no events gives a finite logFC and
@@ -1365,7 +1432,7 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
                    .reshape(len(features), len(counts_df)))
 
     if method == 'ql':
-        alpha = ql_common_dispersion(counts, design_mat, log_offsets)
+        alpha = ql_dispersion(counts, design_mat, log_offsets)
         frames = []
         for b, other, mask, sub_design, coef in ql_comparisons(group_vec, contrasts, pairing_vec, covariates):
             tests = _glm_ql_tests(counts[:, mask], sub_design, log_offsets[:, mask], [coef], alpha)
@@ -1440,7 +1507,7 @@ def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
     as run_moderated(). With 'wald', 'reference' mode fits each feature once
     and reads every contrast from that fit, and 'pairwise' fits each pair
     separately. With 'ql' both modes fit each contrast on its two groups'
-    samples, with the common dispersion of every sample; 'pairwise' keeps
+    samples, with the dispersions estimated on every sample; 'pairwise' keeps
     its check that each group of a pair has at least three samples.
 
     offset_df: optional per-sample, per-feature denominators (same index and

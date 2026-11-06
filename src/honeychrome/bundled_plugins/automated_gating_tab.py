@@ -2708,10 +2708,10 @@ class ResultsTab(QWidget):
         self.cb_counts_reference.setItemText(0, f"Anchor population ({name})")
         notes = []
         if st.counts_method == 'ql':
-            notes.append("Quasi-likelihood F suits homogeneous designs with plenty of events "
-                         "(inbred mice: 3–7% false positives at the 5% level). On human cohort "
-                         "data it gave 7–11% for populations under 100 events; use moderated "
-                         "log odds there.")
+            notes.append("Quasi-likelihood F suits homogeneous designs such as inbred mice "
+                         "(3–6% false positives at the 5% level, about 5% with 100 cells per "
+                         "sample). On human cohort data it gave 7–10% for populations under 100 "
+                         "events; use moderated log odds there.")
         if st.counts_reference == 'parent' and st.counts_method == 'moderated':
             notes.append("Against the parent with this model, the counts test repeats the "
                          "frequency test.")

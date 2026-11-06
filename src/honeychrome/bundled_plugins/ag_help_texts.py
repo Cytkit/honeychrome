@@ -760,19 +760,21 @@ Random splits of the samples of one group, where nothing differs, show how
 often each test finds a difference by chance (5% expected):
 <ul>
 <li>Human cohort (UCL IMMPROVE, 159 samples): moderated log odds 4–6%;
-quasi-likelihood F 7–8% against the parent and 9–11% against the anchor for
+quasi-likelihood F 7–8% against the parent and 9–10% against the anchor for
 populations under 100 events.</li>
 <li>Inbred mice (BATF chimeras, 48 samples in six tissues; six populations
 of 64 to 100,000 events): moderated log odds 4–5%; quasi-likelihood F
-3–7%.</li>
+3–6%.</li>
 </ul>
 The negative-binomial Wald test is not offered: it gave 10–13% on the human
 cohort and 21–31% on the mice. Use moderated log odds for human or
 otherwise varied donors.
-Quasi-likelihood F suits homogeneous designs with plenty of events; it has
-not been checked on mice with rare populations. Robust and trended versions
-of the negative-binomial test did not fix it on human data, where donors
-vary more, and more unevenly, than the model allows for.</li>
+Quasi-likelihood F suits homogeneous designs. It fits each comparison on
+the samples of its two groups and takes each population's dispersion from
+the populations with similar counts, which keeps it near 5% on mouse
+samples with very few events (about 5% on samples cut down to 100 cells).
+On human data it stays above 5%, because donors vary more, and more
+unevenly, than the model allows for.</li>
 <li><b>Marker medians</b>: each population's median of each marker (and of
 AF Abundance, the per-cell autofluorescence), in transformed units.
 Populations are screened first, and markers are tested only within the
