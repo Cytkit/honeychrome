@@ -44,10 +44,25 @@ Contrasts: ``state.contrast_mode`` 'reference' fits once across every
 tested group and reads one coefficient per non-reference group;
 'pairwise' fits each pair of groups separately. Results carry a
 ``comparison`` column.
+
+Populations within samples (``state.population_split``): instead of
+comparing groups of samples, each sample is split into the gated
+populations in ``state.population_gates`` (for example CD45.1+ and
+CD45.1- cells of a mixed bone-marrow chimera) and the populations are the
+groups. Every population of a sample becomes one row of the feature tables
+(``population_key``), its frequencies are shares of that population's own
+events, and the design is paired on the sample, so each mouse's
+populations are compared with each other and mouse-to-mouse differences
+drop out. Sample groups ticked under Groups to Test choose which samples
+are split. Events inside more than one chosen population are left out of
+all of them; a sample where they are more than
+``POPULATION_OVERLAP_LIMIT`` of its events in the populations stops the
+run, since the populations would then share cells.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -75,6 +90,10 @@ log = get_logger(__name__)
 # samples' event totals, not the cluster.
 MIN_NONZERO_SAMPLES = 3
 
+# Largest share of a sample's events in the chosen populations that may lie
+# in more than one of them (those events are left out of every population).
+POPULATION_OVERLAP_LIMIT = 0.01
+
 
 # ---------------------------------------------------------------------------
 # Group resolution
@@ -100,12 +119,6 @@ def resolve_test_groups(controller, state, cluster_labels_override=None):
         else state.cluster_labels
     raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
 
-    def _to_rel(sp):
-        try:
-            return str(Path(sp).relative_to(raw_subdir))
-        except ValueError:
-            return sp
-
     selection = state.testing_group_selection or list(state.group_names)
     result = {}
     for name in selection:
@@ -113,7 +126,7 @@ def resolve_test_groups(controller, state, cluster_labels_override=None):
         for sp, g in state.sample_groups.items():
             if g != name:
                 continue
-            rel = _to_rel(sp)
+            rel = _rel_path(sp, raw_subdir)
             if rel in cluster_labels:
                 rels.append(rel)
         log.info("group %r: %d with cluster labels", name, len(rels))
@@ -130,6 +143,165 @@ def resolve_test_groups(controller, state, cluster_labels_override=None):
             + (", ".join(f"{k}={len(v)}" for k, v in result.items()) or "none")
         )
     return result
+
+
+def _rel_path(sample_path: str, raw_subdir) -> str:
+    """A sample's path relative to the raw samples folder (unchanged when
+    it is not inside it), the key of cluster labels and covariates."""
+    try:
+        return str(Path(sample_path).relative_to(raw_subdir))
+    except ValueError:
+        return sample_path
+
+
+# ---------------------------------------------------------------------------
+# Populations within samples
+# ---------------------------------------------------------------------------
+
+def population_key(rel: str, gate: str) -> str:
+    """
+    Row name of one population of one sample in the statistics tables: the
+    sample's path with ' · <gate>' added to its file name, so every plot
+    that labels samples by file name shows e.g. 'Mouse1 · CD45.1+'.
+    """
+    p = Path(rel)
+    label = str(gate).replace('/', '\u2215').replace('\\', '\u2215')
+    return str(p.with_name(f"{p.stem} \u00b7 {label}{p.suffix}"))
+
+
+def population_samples(controller, state, cluster_labels: dict) -> list[str]:
+    """
+    Samples to split into populations: labelled samples whose group is
+    ticked under Groups to Test (every defined group when none is ticked).
+    Unassigned samples are left out, as in a comparison of sample groups.
+    """
+    raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
+    selection = set(state.testing_group_selection or state.group_names)
+    out = []
+    for sp, g in state.sample_groups.items():
+        if g not in selection:
+            continue
+        rel = _rel_path(sp, raw_subdir)
+        if rel in cluster_labels and rel not in out:
+            out.append(rel)
+    return out
+
+
+@dataclass
+class PopulationSplit:
+    """Each chosen sample split into the chosen populations.
+
+    labels        : {key: cluster labels of that population's events}
+    groups        : {gate: [keys]}, in the order of state.population_gates
+    population_of : {key: (sample rel path, gate)}
+    masks         : {key: bool mask over the sample's labelled events}
+    note          : what was left out, for the status line
+    """
+    labels: dict = field(default_factory=dict)
+    groups: dict = field(default_factory=dict)
+    population_of: dict = field(default_factory=dict)
+    masks: dict = field(default_factory=dict)
+    note: str = ''
+
+
+def split_by_population(controller, state, cluster_labels: dict,
+                        af_state=None) -> PopulationSplit:
+    """
+    Split every sample of population_samples() into the gates of
+    state.population_gates. *cluster_labels* must be row for row with each
+    sample's currently gated events (an in-sync run, or one matched to the
+    current events by event key).
+
+    A population with no labelled events in a sample gives no row for that
+    sample. Raises RuntimeError when fewer than two populations are chosen,
+    no sample qualifies, or the populations overlap by more than
+    POPULATION_OVERLAP_LIMIT in any sample.
+    """
+    log_stage(log, "SPLIT SAMPLES BY POPULATION")
+    gates = list(dict.fromkeys(state.population_gates))
+    if len(gates) < 2:
+        raise RuntimeError("Choose at least two populations to compare under "
+                           "'Compare populations within samples'.")
+    rels = population_samples(controller, state, cluster_labels)
+    if not rels:
+        raise RuntimeError("No clustered samples belong to the groups ticked under "
+                           "Groups to Test.")
+
+    split = PopulationSplit(groups={g: [] for g in gates})
+    n_overlap, n_empty, unmatched = 0, 0, []
+    for rel in rels:
+        lab = np.asarray(cluster_labels[rel])
+        loaded = drc_pipeline.load_sample_populations(controller, state, rel, gates,
+                                                      af_state=af_state)
+        if loaded is None or len(loaded[0]) != len(lab):
+            log.warning("population split: %s -- membership does not match its %d labels, "
+                        "sample left out", rel, len(lab))
+            unmatched.append(rel)
+            continue
+        membership = loaded[0]
+        inside = membership.sum(axis=1)
+        overlap = inside > 1
+        n_in = int(np.count_nonzero(inside))
+        n_shared = int(np.count_nonzero(overlap))
+        if n_in and n_shared > POPULATION_OVERLAP_LIMIT * n_in:
+            raise RuntimeError(
+                f"The chosen populations share cells: {n_shared:,} of the {n_in:,} events of "
+                f"{Path(rel).stem} in them are in more than one. Choose populations that do "
+                "not overlap (for example CD45.1+ and CD45.1-).")
+        n_overlap += n_shared
+        labelled = lab != drc_run_align.UNLABELLED
+        for j, g in enumerate(gates):
+            mask = membership[:, j] & ~overlap
+            if not np.any(mask & labelled):
+                n_empty += 1
+                continue
+            key = population_key(rel, g)
+            split.labels[key] = lab[mask]
+            split.masks[key] = mask
+            split.population_of[key] = (rel, g)
+            split.groups[g].append(key)
+        log.info("population split: %s -- %s", rel,
+                 ", ".join(f"{g}={int(membership[:, j].sum())}" for j, g in enumerate(gates)))
+
+    if len(unmatched) == len(rels):
+        raise RuntimeError(
+            "No sample's clustered cells could be matched to the populations. The run "
+            "must be in step with the gates checked on the Configuration tab: select the "
+            "gates it was made with, or re-run the clustering.")
+    parts = [f"{len(rels) - len(unmatched)} sample(s) split into {len(gates)} populations."]
+    if n_overlap:
+        parts.append(f"{n_overlap:,} event(s) inside more than one population were left out.")
+    if n_empty:
+        parts.append(f"{n_empty} sample population(s) with no events were left out.")
+    if unmatched:
+        parts.append(f"{len(unmatched)} sample(s) could not be matched to their populations.")
+    split.note = " ".join(parts)
+    log.info("population split: %s", split.note)
+    return split
+
+
+def population_values(controller, state, split: PopulationSplit, channels: list[str],
+                      af_state=None) -> dict:
+    """
+    {key: (transformed values, channel names)} of each population's events
+    for *channels*, row for row with split.labels[key]; each sample is
+    loaded once.
+    """
+    by_rel: dict[str, list[str]] = {}
+    for key, (rel, _gate) in split.population_of.items():
+        by_rel.setdefault(rel, []).append(key)
+    out = {}
+    for rel, keys in by_rel.items():
+        mv = drc_pipeline.load_sample_transformed_values(controller, state, rel, channels,
+                                                         af_state=af_state)
+        if mv is None:
+            continue
+        values, names = mv
+        for key in keys:
+            mask = split.masks[key]
+            if len(mask) == len(values):
+                out[key] = (values[mask], names)
+    return out
 
 
 def missing_covariate_values(state, all_rel: list[str], names: list[str]) -> dict[str, list[str]]:
@@ -283,12 +455,20 @@ def export_tables(state, mem_labels: dict | None = None,
     if matrices:
         index = next(iter(matrices.values())).index
         group_of = dict(zip(state.stats_all_rel, state.stats_group_vec))
-        meta = pd.DataFrame({'sample': [Path(rel).name for rel in index],
-                             'sample_path': list(index),
-                             'group': [group_of.get(rel, '') for rel in index]},
+        population_of = getattr(state, 'stats_population_of', None) or {}
+        sample_of = {key: population_of[key][0] if key in population_of else key
+                     for key in index}
+        meta = pd.DataFrame({'sample': [Path(sample_of[key]).name for key in index],
+                             'sample_path': [sample_of[key] for key in index]},
                             index=index)
+        if population_of:
+            meta['population'] = [population_of[key][1] if key in population_of else ''
+                                  for key in index]
+        meta['group'] = [group_of.get(key, '') for key in index]
         if state.covariates is not None:
-            meta = meta.join(state.covariates.reindex(index), rsuffix='_covariate')
+            covariates = state.covariates.reindex([sample_of[key] for key in index])
+            covariates.index = index
+            meta = meta.join(covariates, rsuffix='_covariate')
         n_events = None
         if freq_df is not None and counts_df is not None:
             rows = np.arange(len(counts_df))
@@ -866,20 +1046,59 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
 
     values_override = None
     state.stats_alignment_note = ''
+    state.stats_population_of = {}
     if align_run is not None and align_mode is not None:
         cluster_labels_override, values_override, note = drc_run_align.statistics_inputs(
             controller, state, align_run, align_mode, af_state=af_state)
         state.stats_alignment_note = note
 
-    group_rel = resolve_test_groups(controller, state, cluster_labels_override=cluster_labels_override)
-    qualifying = [g for g in (state.testing_group_selection or state.group_names) if g in group_rel]
-    contrasts = build_contrasts(qualifying, state.contrast_mode, state.reference_group)
+    split = None
+    if getattr(state, 'population_split', False):
+        if values_override is not None:
+            raise RuntimeError(
+                "This clustering run was made before event keys and no longer matches the "
+                "current gating, so its cells cannot be assigned to populations. Re-run the "
+                "clustering to compare populations within samples.")
+        split = split_by_population(
+            controller, state,
+            cluster_labels_override if cluster_labels_override is not None
+            else state.cluster_labels,
+            af_state=af_state)
+        cluster_labels_override = split.labels
+        state.stats_population_of = {key: list(v) for key, v in split.population_of.items()}
+        state.stats_alignment_note = " ".join(
+            t for t in (state.stats_alignment_note, split.note) if t)
+        group_rel = {g: keys for g, keys in split.groups.items() if len(keys) >= 3}
+        for g, keys in split.groups.items():
+            if len(keys) < 3:
+                log.info("population %r dropped from testing (only %d samples with events)",
+                         g, len(keys))
+        if len(group_rel) < 2:
+            raise RuntimeError(
+                "Need at least 2 populations with events in 3 or more samples each. "
+                "Qualifying: " + (", ".join(f"{g}={len(k)}" for g, k in split.groups.items())
+                                  or "none"))
+        qualifying = [g for g in state.population_gates if g in group_rel]
+        reference = state.population_reference \
+            if state.population_reference in qualifying else qualifying[0]
+        contrasts = build_contrasts(qualifying, state.contrast_mode, reference)
+    else:
+        group_rel = resolve_test_groups(controller, state,
+                                        cluster_labels_override=cluster_labels_override)
+        qualifying = [g for g in (state.testing_group_selection or state.group_names)
+                      if g in group_rel]
+        contrasts = build_contrasts(qualifying, state.contrast_mode, state.reference_group)
 
     all_rel = [rel for g in qualifying for rel in group_rel[g]]
     group_vec = [g for g in qualifying for _rel in group_rel[g]]
 
     pairing_vec = None
-    if state.paired and state.pairing_variable and state.covariates is not None \
+    if split is not None:
+        # Each sample is its own block: its populations are compared with
+        # each other. Sample-level covariates are constant within a block,
+        # so the pairing already accounts for them.
+        pairing_vec = [split.population_of[key][0] for key in all_rel]
+    elif state.paired and state.pairing_variable and state.covariates is not None \
             and state.pairing_variable in state.covariates.columns:
         cov = state.covariates[state.pairing_variable]
         # Any rel missing a covariate value gets its own singleton blocking
@@ -887,8 +1106,9 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
         pairing_vec = [str(cov[rel]) if rel in cov.index else f"__unpaired_{rel}"
                        for rel in all_rel]
 
-    adjust = [c for c in (covariate_names or [])
-              if not (pairing_vec is not None and c == state.pairing_variable)]
+    adjust = [] if split is not None else [
+        c for c in (covariate_names or [])
+        if not (pairing_vec is not None and c == state.pairing_variable)]
     covariates = covariate_frame(state, all_rel, adjust)
     if covariates is not None:
         log.info("adjusting for covariates: %s", list(covariates.columns))
@@ -960,6 +1180,10 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
                 "'Include clustering (type) markers' or assign roles."
             )
         loaded = {}       # each sample read once for both MFI matrices
+        if split is not None:
+            values_override = population_values(controller, state, split, mfi_channels,
+                                                af_state=af_state)
+            loaded = dict(values_override)
         mfi_df = compute_mfis(
             controller, state, all_rel, n_clusters,
             cluster_labels_override=cluster_labels_override,

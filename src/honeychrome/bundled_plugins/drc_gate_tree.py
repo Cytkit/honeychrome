@@ -66,12 +66,15 @@ class _CheckableGateTreeModel(QAbstractItemModel):
     # Construction
     # ------------------------------------------------------------------
 
-    def set_hierarchy(self, hierarchy_dict: dict | None):
-        """Rebuild the tree from a nested {'name', 'children'} dict."""
+    def set_hierarchy(self, hierarchy_dict: dict | list | None):
+        """Rebuild the tree from a nested {'name', 'children'} dict, or a
+        list of them shown side by side at the top level."""
         self.beginResetModel()
         self.root_item = _GateTreeItem('Root')
-        if hierarchy_dict:
-            self._build(hierarchy_dict, self.root_item)
+        nodes = hierarchy_dict if isinstance(hierarchy_dict, list) else [hierarchy_dict]
+        for node in nodes:
+            if node:
+                self._build(node, self.root_item)
         self.endResetModel()
 
     def _build(self, node: dict, parent_item: _GateTreeItem):
@@ -303,8 +306,8 @@ class GateTreeWidget(QWidget):
     def _emit_selection(self):
         self.selectionChanged.emit(self.model.checked_names())
 
-    def set_hierarchy(self, hierarchy_dict: dict | None):
-        """Rebuild from a nested gating-hierarchy dict.  Does not preserve
+    def set_hierarchy(self, hierarchy_dict: dict | list | None):
+        """Rebuild from a nested gating-hierarchy dict (or a list of them).  Does not preserve
         checked state — follow with set_checked_names(state.selected_gates),
         the shared authoritative list, to restore/sync selection."""
         self.model.set_hierarchy(hierarchy_dict)
