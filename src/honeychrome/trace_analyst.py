@@ -139,7 +139,7 @@ class TraceAnalyser(mp.Process):
         self.start_time = None
 
         # hack to remove pickup noise by subtracting unused channels
-        self.channel_input_mask_for_subtraction = np.array([True if ch in ['B1'] else False for ch in adc_channels])
+        self.channel_input_mask_for_subtraction = np.array([True if ch in ['B1', 'B14'] else False for ch in adc_channels])
         self.channel_input_mask_for_subtraction[self.indices_peak_detection_channel_in_traces] = False
         self.channel_output_mask_for_subtraction = np.array([True if ch in fluorescence_channels else False for ch in adc_channels])
         self.channel_output_mask_for_subtraction[self.indices_peak_detection_channel_in_traces] = False
@@ -284,8 +284,8 @@ class TraceAnalyser(mp.Process):
                 traces_batch_scaled = traces_batch_scaled * adc_scale_uv  # scale in uV, float32
 
                 # # hack to remove pickup by subtracting unused channels
-                # unused_trace_averages = traces_batch_scaled[:, self.channel_input_mask_for_subtraction, :].mean(axis=1)
-                # traces_batch_scaled[:,self.channel_output_mask_for_subtraction,:] -= unused_trace_averages[:,None,:]
+                unused_trace_averages = traces_batch_scaled[:, self.channel_input_mask_for_subtraction, :].mean(axis=1)
+                traces_batch_scaled[:,self.channel_output_mask_for_subtraction,:] -= unused_trace_averages[:,None,:]
 
                 # calculate area, height, width as defined in channel_dict and write to events_cache
                 baselines = np.zeros(self.n_channels_trace)
