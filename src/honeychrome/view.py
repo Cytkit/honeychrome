@@ -308,9 +308,12 @@ class View(QObject):
             self.main_window.tip_unmixed.setVisible(True)
             self.main_window.statistical_comparison_widget.setVisible(False)
 
-        # Restore profile display for all controls (including library controls) whose profiles were saved in the kit file.
+        # Show the profiles of the NxN rows (all controls, including library controls,
+        # when every row is shown), so the profile display and NxN agree after a refresh.
         if self.controller.experiment.process.get('profiles'):
-            QTimer.singleShot(100, lambda: self.bus.showSelectedProfiles.emit([]))
+            nxn = self.main_window.nxn_viewer
+            selected = [] if nxn.vertical_headers == nxn.horizontal_headers else list(nxn.vertical_headers)
+            QTimer.singleShot(100, lambda: self.bus.showSelectedProfiles.emit(selected))
 
 
     @Slot(str)
@@ -318,7 +321,13 @@ class View(QObject):
         QMessageBox.information(self.main_window, "Honeychrome by Cytkit", f"{message}")
 
     @Slot(str)
-    def warning_message(self, message):
+    def warning_message(self, message, deferrals=0):
+        # A modal dialog opened inside a busy-cursor job's nested event loop loses its
+        # modality when that loop ends and can drop behind the main window, so the
+        # warning waits until the job has finished (for at most about 10 s).
+        if QApplication.overrideCursor() is not None and deferrals < 100:
+            QTimer.singleShot(100, lambda: self.warning_message(message, deferrals + 1))
+            return
         QMessageBox.warning(self.main_window, "Warning", f"{message}")
 
     @Slot()

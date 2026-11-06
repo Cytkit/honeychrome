@@ -336,6 +336,14 @@ class NxNGrid(QFrame):
         if self.controller.data_for_cytometry_plots_process['plots']:
             self.setVisible(True)
             self.set_headers_to_all_labels()
+            # the rows follow the process plots, which keep the rows shown before a refresh
+            rows = []
+            for plot in self.controller.data_for_cytometry_plots_process['plots']:
+                row = plot.get('channel_y', plot['channel_x'])
+                if row not in rows:
+                    rows.append(row)
+            if rows:
+                self.vertical_headers = rows
             self.refresh_source_combo(mode='unmixed') # populate the source combo with all unmixed gates
             self.refresh_heatmaps() #produces dummy hists
         else:

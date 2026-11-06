@@ -881,19 +881,26 @@ class Controller(QObject):
                 sync_af_index_transform(self.experiment.cytometry['transforms'], self.n_af_spectra())
                 self.unmixed_gating = from_gml(self.experiment.cytometry['gating'])
                 self.unmixed_transformations = generate_transformations(self.experiment.cytometry['transforms'])
-                # Call the plain impl, not reapply_fine_tuning(): this method
-                # (initialise_ephemeral_data) is itself called from inside the
-                # worker thread of @with_busy_cursor methods (load_experiment,
-                # refresh_spectral_process). Calling the decorated
-                # reapply_fine_tuning() here would re-enter with_busy_cursor
-                # from a background thread — QApplication.setOverrideCursor()
-                # and a nested QEventLoop off the main thread
-                self._reapply_fine_tuning_impl()
 
-
-                source_gate, _ = resolve_base_gate(self.unmixed_gating, self.experiment.process['base_gate_priority_order'])
-                logger.info(f'Controller: using {source_gate} as base gate for process NxN plots')
-                process_plots = define_process_plots(self.experiment.settings['unmixed']['fluorescence_channels'], self.experiment.settings['unmixed']['fluorescence_channels'], source_gate=source_gate)
+                # The NxN keeps the rows and source gate it showed before, where they
+                # still exist; a grid that showed every row shows every row again.
+                fluorescence_channels = self.experiment.settings['unmixed']['fluorescence_channels']
+                previous_plots = self.data_for_cytometry_plots_process.get('plots') or []
+                previous_rows, previous_columns = [], []
+                for plot in previous_plots:
+                    row = plot.get('channel_y', plot['channel_x'])
+                    if row not in previous_rows:
+                        previous_rows.append(row)
+                    if plot['channel_x'] not in previous_columns:
+                        previous_columns.append(plot['channel_x'])
+                rows = [] if set(previous_rows) == set(previous_columns) else [
+                    row for row in previous_rows if row in fluorescence_channels]
+                gate_names = {'root'} | {g[0] for g in self.unmixed_gating.get_gate_ids()}
+                source_gate = previous_plots[0]['source_gate'] if previous_plots else None
+                if source_gate not in gate_names:
+                    source_gate, _ = resolve_base_gate(self.unmixed_gating, self.experiment.process['base_gate_priority_order'])
+                logger.info(f'Controller: using {source_gate} as source gate for process NxN plots')
+                process_plots = define_process_plots(fluorescence_channels, rows or fluorescence_channels, source_gate=source_gate)
             else:
                 self.unmixed_gating = GatingStrategy()
                 self.unmixed_transformations = None
@@ -943,6 +950,16 @@ class Controller(QObject):
             logger.warning(self.raw_gating)
             logger.warning(self.data_for_cytometry_plots_raw['transformations'] is self.raw_transformations)
             logger.warning(self.data_for_cytometry_plots_raw['gating'] is self.raw_gating)
+
+        # Unmix the displayed sample again and recalculate its plots once the plots,
+        # gates and lookup tables above are current. Call the plain impl, not
+        # reapply_fine_tuning(): this method is itself called from inside the worker
+        # thread of @with_busy_cursor methods (load_experiment, refresh_spectral_process).
+        # Calling the decorated reapply_fine_tuning() here would re-enter with_busy_cursor
+        # from a background thread (QApplication.setOverrideCursor() and a nested
+        # QEventLoop off the main thread).
+        if 'unmixed' in scope and self.experiment.process['unmixing_matrix']:
+            self._reapply_fine_tuning_impl()
 
 
     def initialise_transfer_matrix(self):
@@ -1524,10 +1541,18 @@ class Controller(QObject):
     def _on_method_job_finished(self, job: dict, fl_result: dict):
         if not self._method_job_current(job):
             return
-        if QGuiApplication.overrideCursor() is not None:
-            # a busy-cursor operation (e.g. load_sample) is still filling the plots
+        if QGuiApplication.overrideCursor() is not None or QGuiApplication.modalWindow() is not None:
+            # a busy-cursor operation (e.g. load_sample) is still filling the plots, or a
+            # modal dialog is open: a busy-cursor job started inside the dialog's event
+            # loop would make it drop behind the main window
             QTimer.singleShot(100, lambda: self._on_method_job_finished(job, fl_result))
             return
+        self._show_method_result(job, fl_result)
+
+    @with_busy_cursor
+    def _show_method_result(self, job: dict, fl_result: dict):
+        """Swap a finished background unmixing into the display and recalculate the
+        plots in a worker thread, so the window keeps repainting meanwhile."""
         af = job['af']
         result = unmix_method.assemble(self.raw_event_data, self.transfer_matrix, self.experiment.settings,
                                        fl_result, self.experiment.process.get('spillover'), af)
@@ -2411,13 +2436,13 @@ class Controller(QObject):
 
         # Rebuild AF cache synchronously before reinitialising ephemeral data.
         self.cache_all_af_profiles()
-        # then reinitialise ephemeral data for process and unmixed tabs
+        # then reinitialise ephemeral data for process and unmixed tabs; with a sample
+        # loaded this unmixes it again and recalculates the current tab's plots
         self.initialise_ephemeral_data(scope=['unmixed'])
-        # Do not recalculate histograms here: the unmixing matrix has changed so
-        # any result would be immediately stale. Histograms are cleared below and
-        # will be regenerated correctly on the next sample load or tab change.
-        self.data_for_cytometry_plots_unmixed['histograms'].clear()
-        self.data_for_cytometry_plots_unmixed['statistics'].clear()
+        if self.raw_event_data is None or not self.experiment.process['unmixing_matrix']:
+            # nothing was recalculated: drop unmixed plots made with the previous unmixing
+            self.data_for_cytometry_plots_unmixed['histograms'].clear()
+            self.data_for_cytometry_plots_unmixed['statistics'].clear()
         if self.bus is not None:
             # Single consolidated dialog for both profile-QC checks — piped through
             # the bus rather than shown directly, since this method can be entered
