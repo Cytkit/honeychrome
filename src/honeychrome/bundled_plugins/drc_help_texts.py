@@ -61,9 +61,11 @@ see. <b>Leiden</b> finds communities in a nearest-neighbour graph.
 transformed units.</li>
 <li><b>Transformed units</b>: positions on a transformed (logicle) axis,
 the same scale as the main cytometry plots.</li>
-<li><b>MEM label</b>: a description of a cluster's markers relative to the
-rest of the cells, for example "CD4+6 CD8−5". It describes the data, so it is
-safe to adopt.</li>
+<li><b>MEM label</b>: a description of a cluster's markers relative to a
+reference (the anchor population, or the other clusters), for example
+"CD4+6 CD8−5". It describes the data, so it is safe to adopt.</li>
+<li><b>Anchor population</b>: the cells "everything" means for Cluster ID,
+normally live single cells. It must contain the clustered cells.</li>
 <li><b>Cell-type suggestion</b>: a match of a cluster's markers against a
 database of known cell types. A suggestion to check, not a fact.</li>
 <li><b>Frequency</b>: a cluster's share of a sample's labelled events.
@@ -348,11 +350,45 @@ suggestion cannot tell them apart either.</li>
 (several populations in one cluster) all degrade the match.</li>
 </ul></li>
 </ol>
-<p><b>Compute Cluster ID Suggestions</b> runs both. Every channel used for
-scoring needs its <i>Antigen</i> field filled in on the Spectral Process tab
-(a blank Antigen blocks the computation). An Antigen that matches nothing in
-the marker database adds nothing to cell-type scoring but does not block
-MEM.</p>
+<p><b>Compute Cluster ID Suggestions</b> runs both. Every channel the run
+was clustered on needs its <i>Antigen</i> field filled in on the Spectral
+Process tab (a blank Antigen blocks the computation). An Antigen that matches
+nothing in the marker database adds nothing to cell-type scoring but does not
+block MEM.</p>
+
+<h4>Details: which markers and which reference</h4>
+<ul>
+<li><b>Every stained marker counts.</b> Besides the run's clustering
+channels, every other channel with an Antigen is scored (viability dyes
+excepted). A marker you gated on but did not cluster on, such as CD3 in a
+T-cell run, still counts for T-cell types and against the others.</li>
+<li><b>MEM reference.</b> With <b>Anchor population</b>, each cluster is
+compared with the anchor's cells outside that cluster. A T-cell cluster then
+reads CD3+, because live cells include CD3− cells. With <b>Other
+clusters</b>, each cluster is compared with the run's other clusters, which
+shows only how the clusters differ from each other: a marker every clustered
+cell carries never appears.</li>
+<li><b>Anchor.</b> <b>Auto</b> picks, among the gates that contain the
+clustered cells, the deepest one using a viability dye, else
+<i>Singlets</i>, else <i>Cells</i>, else all events. The drop-down shows the
+gate Auto picks for the selected run. A chosen gate that does not contain the
+clustered cells is replaced by the deepest gate that does, and the status line
+says so.</li>
+<li><b>Thresholds.</b> Positivity thresholds still come from the unstained
+cell sample. For a channel without one, the Otsu cut is made on the anchor's
+cells, which include a negative population even for a marker every clustered
+cell carries.</li>
+<li><b>Reading.</b> The anchor's cells, and the clustered cells' values on
+channels not stored with the run, come from a random subsample of each
+training sample (20,000 events each, the reference pooled to at most
+50,000). A cluster with fewer than 20 of its events in those subsamples
+leaves those channels out of its scores.</li>
+<li><b>Scaling.</b> MEM scores are scaled so that the largest one in the
+whole table is 10. Against the anchor, the gating marker is usually that
+largest score (CD3 in a T-cell run), so other markers' scores come out
+smaller than against the other clusters; lower the <b>MEM threshold</b> if
+labels are too short.</li>
+</ul>
 
 <h4>Details: the Marker Summary sub-tab</h4>
 <ul>
@@ -369,8 +405,9 @@ the slider.</li>
 or the channel selection.</li>
 <li>The violins, heatmap and ridgelines use up to 20,000 events per cluster,
 spread evenly over the run's samples, taken from the marker values stored
-with the run. Cluster ID suggestions use the stored values too, so neither
-reads the sample files again for runs that have them.</li>
+with the run. Cluster ID suggestions use the stored values for the
+clustering channels too; they read a subsample of each training sample only
+for the anchor population and the other stained channels.</li>
 <li>The marker-distribution views and editable cluster names follow the
 marker-distribution and relabelling tools of the MARMOT pipeline
 [4].</li>

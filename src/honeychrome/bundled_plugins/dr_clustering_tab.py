@@ -487,6 +487,17 @@ def _is_viability_antigen(antigen: str) -> bool:
     return match_marker(antigen, get_marker_db()) == 'Viability'
 
 
+def _cluster_id_reference_text(details: dict | None) -> str:
+    """What MEM was scored against, for the Cluster ID status line, from
+    the details saved with the suggestions; '' when there are none."""
+    if not details:
+        return ''
+    if details.get('mem_reference') == drc_cluster_id.MEM_REFERENCE_ANCHOR:
+        return (f" MEM against \"{details.get('anchor')}\" "
+                f"({int(details.get('n_reference_events') or 0):,} events).")
+    return " MEM against the other clusters."
+
+
 def _antigen_dash_labels(controller) -> dict[str, str]:
     """
     Map channel name -> 'Antigen - Channel' display label — this plugin's
@@ -948,7 +959,7 @@ class PipelineState:
     #   effect != 0 and use the threshold only as a filter.
     stats_counts_method: str = 'ql'
     # Counts test: 'ql' (quasi-likelihood F, each comparison fitted on its
-    #   two groups with one common dispersion). The
+    #   two groups, dispersions trended with cluster size). The
     #   Wald test is not offered: it was far too liberal on human and mouse
     #   data.
     stats_normalisation: str = 'total'
@@ -3501,11 +3512,13 @@ class GroupsStatsTab(QWidget):
         self.counts_method_combo.addItem(
             "Quasi-likelihood F (negative binomial, homogeneous designs)", 'ql')
         self.counts_method_combo.setToolTip(
-            "Quasi-likelihood F: negative-binomial dispersions shrunk towards a "
-            "common value, then a moderated quasi-dispersion per cluster. On "
-            "inbred mice with plenty of events it gave 3–7% false positives at "
-            "the 5% level; on a human cohort 7–11% for populations under 100 "
-            "events. The Wald test is not offered (21–31% on the same mice)."
+            "Quasi-likelihood F: each comparison fitted on its two groups, "
+            "negative-binomial dispersions taken from clusters with similar "
+            "counts, then a moderated quasi-dispersion per cluster. On inbred "
+            "mice it gave 3–6% false positives at the 5% level (about 5% with "
+            "100 cells per sample); on a human cohort 7–10% for populations "
+            "under 100 events. The Wald test is not offered (21–31% on the same "
+            "mice)."
         )
         method_row.addWidget(self.counts_method_combo)
         method_row.addSpacing(10)
@@ -11444,11 +11457,11 @@ class ClusterAnnotationTab(QWidget):
 
         self.compute_suggestions_btn = QPushButton("Compute Cluster ID Suggestions")
         self.compute_suggestions_btn.setToolTip(
-            "Uses the channel set recorded for THIS clustering run at the "
-            "time it was created (its Configuration tab selection back "
-            "then) as the marker set for both the MEM label and the "
-            "cell-type score -- not whatever is currently checked above, "
-            "and not Configuration's current selection either."
+            "Scores the channels recorded for THIS clustering run when it "
+            "was created (its Configuration selection back then), plus "
+            "every other channel with an Antigen except viability dyes, "
+            "for both the MEM label and the cell-type score -- not "
+            "whatever is currently checked above."
         )
         self.compute_suggestions_btn.clicked.connect(self._compute_cluster_id_suggestions)
         suggest_row.addWidget(self.compute_suggestions_btn)
@@ -11462,6 +11475,35 @@ class ClusterAnnotationTab(QWidget):
         suggest_row.addWidget(self.adopt_all_mem_btn)
         suggest_row.addStretch()
         table_layout.addLayout(suggest_row)
+
+        reference_row = QHBoxLayout()
+        reference_row.addWidget(QLabel("MEM reference:"))
+        self.mem_reference_combo = QComboBox()
+        self.mem_reference_combo.addItem("Anchor population", drc_cluster_id.MEM_REFERENCE_ANCHOR)
+        self.mem_reference_combo.addItem("Other clusters", drc_cluster_id.MEM_REFERENCE_CLUSTERS)
+        self.mem_reference_combo.setToolTip(
+            "What each cluster's MEM label is measured against.\n"
+            "Anchor population: the cells chosen under Anchor (normally live\n"
+            "single cells), so a marker every clustered cell carries, such as\n"
+            "CD3 in a T-cell run, still shows in the label.\n"
+            "Other clusters: the run's other clusters, which describes only\n"
+            "how the clusters differ from each other."
+        )
+        reference_row.addWidget(self.mem_reference_combo)
+        reference_row.addWidget(QLabel("Anchor:"))
+        self._anchor_choice = ''
+        self.anchor_combo = QComboBox()
+        self.anchor_combo.currentIndexChanged.connect(self._on_anchor_changed)
+        self.anchor_combo.setToolTip(
+            "The reference population: it must contain the clustered cells.\n"
+            "Auto picks the deepest gate above them that uses a viability dye,\n"
+            "else Singlets, else Cells, else all events (root).\n"
+            "Also used to set positivity thresholds for channels the unstained\n"
+            "sample cannot (cut on the anchor's cells, which include negatives)."
+        )
+        reference_row.addWidget(self.anchor_combo)
+        reference_row.addStretch()
+        table_layout.addLayout(reference_row)
 
         self._suggestions_status = QLabel(
             "Cluster ID suggestions not yet computed for this run."
@@ -11761,6 +11803,7 @@ class ClusterAnnotationTab(QWidget):
         # suggestion for the still-selected run. See
         # _sync_suggestions_from_run's docstring.
         self._sync_suggestions_from_run(self._selected_cluster_run())
+        self._populate_anchor_combo()
         self._update_compat_warning()
         self._redraw_map()
         self._populate_label_table()
@@ -11875,6 +11918,35 @@ class ClusterAnnotationTab(QWidget):
                 return drc_run_archive.hydrate_run(self.controller, entry)
         return None
 
+    def _populate_anchor_combo(self):
+        """
+        Fill the Anchor drop-down: Auto, naming the gate it resolves to for
+        the selected run, then all events (root) and every gate of the
+        experiment's gating. Keeps the user's choice (self._anchor_choice;
+        '' is Auto). Reads only the run's manifest fields, so no run
+        payload is loaded here.
+        """
+        run_id = self.run_combo.currentData()
+        entry = next((e for e in self.state.clustering_runs if e.get('run_id') == run_id), None)
+        try:
+            names = [name for name, _path in self.controller.unmixed_gating.get_gate_ids()]
+            auto, _note = drc_cluster_id.resolve_run_anchor(self.controller, entry)
+        except Exception as exc:
+            _log.warning("Cluster ID anchor choices unavailable: %s", exc)
+            names, auto = [], 'root'
+        self.anchor_combo.blockSignals(True)
+        self.anchor_combo.clear()
+        self.anchor_combo.addItem(f"Auto ({auto})", '')
+        self.anchor_combo.addItem("root (all events)", 'root')
+        for name in names:
+            self.anchor_combo.addItem(name, name)
+        idx = self.anchor_combo.findData(self._anchor_choice)
+        self.anchor_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.anchor_combo.blockSignals(False)
+
+    def _on_anchor_changed(self, _index: int):
+        self._anchor_choice = self.anchor_combo.currentData() or ''
+
     def _sync_suggestions_from_run(self, cl_run):
         """
         Restore self._mem_labels / self._cell_type_df /
@@ -11898,10 +11970,13 @@ class ClusterAnnotationTab(QWidget):
         has_saved = bool(self._mem_labels) or self._cell_type_df is not None
         self._suggestions_run_id = cl_run.get('run_id') if (cl_run and has_saved) else None
         if self._suggestions_run_id:
+            details = cl_run.get('cluster_id_details') or {}
+            n_channels = len(details.get('channels') or cl_run.get('channels', []))
             self._suggestions_status.setText(
                 f"Suggestions restored for {len(self._mem_labels)} cluster(s), "
-                f"{len(cl_run.get('channels', []))} channel(s), "
+                f"{n_channels} channel(s), "
                 f"{self.species_combo.currentText()} cell types."
+                + _cluster_id_reference_text(details)
             )
         else:
             self._suggestions_status.setText(
@@ -11916,6 +11991,7 @@ class ClusterAnnotationTab(QWidget):
         # suggestion computed earlier in a previous session.
         cl_run = self._selected_cluster_run()
         self._sync_suggestions_from_run(cl_run)
+        self._populate_anchor_combo()
         self._update_compat_warning()
         self._redraw_map()
         self._populate_label_table()
@@ -12648,6 +12724,10 @@ class ClusterAnnotationTab(QWidget):
                         "evidence -- treat with caution." if low_conf
                         else f"Score: {rec.get('score')}"
                     )
+                    separated_by = rec.get('separated_by')
+                    if isinstance(separated_by, str) and separated_by:
+                        type_tip += ("\nThis panel cannot tell these cell types apart; "
+                                     f"staining for {separated_by} would.")
             type_item = QTableWidgetItem(type_text)
             type_item.setFlags(type_item.flags() & ~Qt.ItemIsEditable)
             type_item.setToolTip(type_tip)
@@ -12718,7 +12798,9 @@ class ClusterAnnotationTab(QWidget):
     def _compute_cluster_id_suggestions(self):
         """
         Runs both suggestion mechanisms for the selected run over the
-        CHANNEL SET RECORDED FOR THIS RUN -- cl_run['channels'], the
+        CHANNEL SET RECORDED FOR THIS RUN plus every other channel with an
+        Antigen, viability dyes excepted (drc_cluster_id.scoring_channels).
+        The recorded set is cl_run['channels'], the
         Configuration tab's selection at the time THIS SPECIFIC run was
         created (archived once by drc_run_archive.archive_clustering_run() /
         archive_dr_run(), never touched again). Deliberately NOT Panel 1's
@@ -12798,6 +12880,9 @@ class ClusterAnnotationTab(QWidget):
 
         mem_threshold = self.mem_threshold_spin.value()
         species = self.species_combo.currentData()
+        mem_reference = self.mem_reference_combo.currentData()
+        anchor, anchor_note = drc_cluster_id.resolve_run_anchor(
+            self.controller, cl_run, self.anchor_combo.currentData() or '')
 
         # Snapshot AF/transfer-matrix state HERE, on the main thread, before
         # the worker starts -- same reasoning as _StatsWorker/_ClWorker/
@@ -12843,6 +12928,8 @@ class ClusterAnnotationTab(QWidget):
                         af_state=self_._af_state,
                         unstained_af_states=self_._unstained_af_states,
                         live_mode=live_mode,
+                        anchor=anchor,
+                        mem_reference=mem_reference,
                     )
                     self_.finished.emit(True, '', result)
                 except Exception as exc:
@@ -12854,13 +12941,15 @@ class ClusterAnnotationTab(QWidget):
         worker.finished.connect(lambda *_: token.release())
         worker.progress.connect(self._suggestions_progress.setValue)
         worker.finished.connect(
-            lambda success, err, result, run_id=cl_run.get('run_id'), n_channels=len(channels):
-                self._on_cluster_id_finished(success, err, result, run_id, n_channels)
+            lambda success, err, result, run_id=cl_run.get('run_id'), n_channels=len(channels),
+                   note=anchor_note:
+                self._on_cluster_id_finished(success, err, result, run_id, n_channels, note)
         )
         self._cluster_id_worker = worker
         worker.start()
 
-    def _on_cluster_id_finished(self, success: bool, error_msg: str, result, run_id, n_channels):
+    def _on_cluster_id_finished(self, success: bool, error_msg: str, result, run_id, n_channels,
+                                anchor_note: str = ''):
         self._cluster_id_worker = None
         self.compute_suggestions_btn.setEnabled(True)
         self._suggestions_progress.setVisible(False)
@@ -12875,12 +12964,12 @@ class ClusterAnnotationTab(QWidget):
             )
             return
 
-        mem_labels, _mem_scores, cell_type_df, unmatched_markers = result
+        mem_labels, _mem_scores, cell_type_df, unmatched_markers, details = result
         self._mem_labels = mem_labels
         self._cell_type_df = cell_type_df
         self._suggestions_run_id = run_id
         drc_run_archive.update_cluster_id_suggestions(
-            self.controller, self.state, run_id, mem_labels, cell_type_df,
+            self.controller, self.state, run_id, mem_labels, cell_type_df, details,
         )
 
         # Antigen text
@@ -12901,10 +12990,13 @@ class ClusterAnnotationTab(QWidget):
                 "toward MEM Label as typed.\n\n  " + lines
             )
 
+        n_extra = len(details.get('extra_channels') or [])
         self._suggestions_status.setText(
             f"Suggestions ready for {len(mem_labels)} cluster(s), "
-            f"{n_channels} channel(s), {self.species_combo.currentText()} "
-            f"cell types."
+            f"{n_channels + n_extra} channel(s) ({n_extra} beyond the run's clustering channels), "
+            f"{self.species_combo.currentText()} cell types."
+            + _cluster_id_reference_text(details)
+            + (f" {anchor_note}" if anchor_note else '')
         )
         self._populate_label_table()
 
@@ -14125,6 +14217,12 @@ class PluginWidget(QWidget):
                     s.setValue('annotation_channels_checked', cat._checked_channels())
                     if hasattr(cat, 'species_combo'):
                         s.setValue('cluster_id_species', cat.species_combo.currentData() or 'human')
+                    if hasattr(cat, 'mem_reference_combo'):
+                        s.setValue('cluster_id_mem_reference',
+                                   cat.mem_reference_combo.currentData()
+                                   or drc_cluster_id.MEM_REFERENCE_ANCHOR)
+                    if hasattr(cat, 'anchor_combo') and cat.anchor_combo.count() > 0:
+                        s.setValue('cluster_id_anchor', cat.anchor_combo.currentData() or '')
             # Groups tab: include-type-markers checkbox
             if hasattr(self, 'groups_stats_tab'):
                 gst = self.groups_stats_tab
@@ -14539,6 +14637,9 @@ class PluginWidget(QWidget):
             self._pending_annotation_channels = _qs_list(
                 s, 'annotation_channels_checked')
             self._pending_cluster_id_species = s.value('cluster_id_species', 'human')
+            self._pending_cluster_id_mem_reference = s.value(
+                'cluster_id_mem_reference', drc_cluster_id.MEM_REFERENCE_ANCHOR)
+            self._pending_cluster_id_anchor = s.value('cluster_id_anchor', '')
 
             # Config tab: restore channel and training-sample selections
             # (will be applied when ConfigTab.refresh() runs).  Gate
@@ -15129,6 +15230,14 @@ class PluginWidget(QWidget):
             idx = cat.species_combo.findData(getattr(self, '_pending_cluster_id_species', 'human'))
             if idx >= 0:
                 cat.species_combo.setCurrentIndex(idx)
+        if hasattr(cat, 'mem_reference_combo'):
+            idx = cat.mem_reference_combo.findData(getattr(
+                self, '_pending_cluster_id_mem_reference', drc_cluster_id.MEM_REFERENCE_ANCHOR))
+            if idx >= 0:
+                cat.mem_reference_combo.setCurrentIndex(idx)
+        if hasattr(cat, 'anchor_combo'):
+            cat._anchor_choice = getattr(self, '_pending_cluster_id_anchor', '') or ''
+            cat._populate_anchor_combo()
         run_id = cat.run_combo.currentData()
         checked_now = cat._checked_channels()
         cached = cat._violin_cache.get(run_id)
