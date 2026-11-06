@@ -426,13 +426,17 @@ class NxNGrid(QFrame):
                         # build data arrays
                         # vertical headers are the unmixed filtered set
                         # horizontal headers are the raw fluorescence set
+                        # position of each (x, y) 2D plot, first occurrence kept
+                        plot_index = {}
+                        for n, plot in enumerate(plots):
+                            if plot['type'] == 'hist2d':
+                                plot_index.setdefault((plot['channel_x'], plot['channel_y']), n)
                         self.heatmaps = []
                         for r in self.vertical_headers:
                             row = []
                             for c in self.horizontal_headers:
                                 if c != r:
-                                    index = [plots.index(plot) for plot in plots if plot['type'] == 'hist2d' and plot['channel_x'] == c and plot['channel_y'] == r][0]
-                                    row.append(histograms[index])
+                                    row.append(histograms[plot_index[(c, r)]])
                                 else:
                                     row.append(None)
                             self.heatmaps.append(row)
