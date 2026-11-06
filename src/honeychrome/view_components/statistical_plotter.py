@@ -315,20 +315,20 @@ class StatisticalComparisonWidget(QWidget):
         token = acquire_job(self.controller, 'Statistics')
         if token is None:
             return
-        # add to statistics specification
+        # add to statistics specification; only the new comparison is calculated
         self.controller.experiment.statistics.append(statistics_comparison)
-        self._start_statistics(token)
+        self._start_statistics(token, only_new=True)
 
     def refresh_statistical_comparisons(self):
         token = acquire_job(self.controller, 'Statistics')
         if token is not None:
             self._start_statistics(token)
 
-    def _start_statistics(self, token):
+    def _start_statistics(self, token, only_new=False):
         self._job_token = token
         self.setEnabled(False)
         self.thread = QThread()
-        self.statistics_calculator = StatisticsCalculator(self.bus, self.controller)
+        self.statistics_calculator = StatisticsCalculator(self.bus, self.controller, only_new=only_new)
         self.statistics_calculator.moveToThread(self.thread)
         self.thread.started.connect(self.statistics_calculator.run)
         self.statistics_calculator.finished.connect(self.thread.quit)
