@@ -8,7 +8,10 @@ matches its rows to the plugin's samples (``sample_table.match_table``),
 and shows what matched before anything changes: how many rows and samples
 matched and how, rows that matched nothing, names that fit several samples,
 and samples left without a row. The user picks the group column (or keeps
-the current groups) and the covariate columns to import. Nothing is applied
+the current groups) and the covariate columns to import, and whether the
+imported covariates replace the current ones (the default when the table
+brings no group column, so a re-import does not pile up duplicate columns;
+groups are always kept). Nothing is applied
 when no row matches or the dialog is cancelled; each plugin writes the
 returned values into its own state.
 """
@@ -20,7 +23,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHeaderView, QLabel,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHeaderView, QLabel,
     QListWidget, QListWidgetItem, QMessageBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
@@ -71,7 +74,7 @@ def import_sample_table(parent, path, sample_keys: list[str], current_groups: di
     the user cancels.
 
     Returns {'groups': {key: group}, 'covariates': {column: {key: value}},
-    'group_column': column or None, 'file': file name}.
+    'group_column': column or None, 'replace_covariates': bool, 'file': file name}.
     """
     try:
         df = sample_table.read_table_file(path)
@@ -144,7 +147,18 @@ def import_sample_table(parent, path, sample_keys: list[str], current_groups: di
                 col, Qt.Checked if col in filled else Qt.Unchecked))
             cov_list.addItem(item)
 
-    group_combo.currentIndexChanged.connect(lambda _i: fill_covariates())
+    replace_box = QCheckBox("Replace the current covariates (groups are kept)")
+    replace_box.setToolTip("Remove every covariate column before importing, so importing the "
+                           "same key again does not add duplicate columns. Ticked when the "
+                           "table has no group column.")
+    replace_box.setChecked(group_combo.currentData() is None)
+    layout.addWidget(replace_box)
+
+    def on_group_column_changed():
+        replace_box.setChecked(group_combo.currentData() is None)
+        fill_covariates()
+
+    group_combo.currentIndexChanged.connect(lambda _i: on_group_column_changed())
     fill_covariates()
 
     pairs = [(i, key) for i in match.matched_rows for key in match.rows[i]]
@@ -187,7 +201,8 @@ def import_sample_table(parent, path, sample_keys: list[str], current_groups: di
                 "Continue?", QMessageBox.Yes | QMessageBox.No)
             if reply != QMessageBox.Yes:
                 return
-        result.update(values, group_column=group_col, file=name)
+        result.update(values, group_column=group_col, file=name,
+                      replace_covariates=replace_box.isChecked())
         dlg.accept()
 
     buttons = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Cancel)

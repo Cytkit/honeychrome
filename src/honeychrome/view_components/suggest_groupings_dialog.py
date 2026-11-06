@@ -32,9 +32,12 @@ _TITLE = "Suggest Groupings"
 
 
 def default_column_name(suggestion: dict) -> str:
-    """Default name for a suggestion: 'Group', or 'field_<position>'."""
+    """Default name for a suggestion: 'Group', 'Donor' for a pairing
+    variable, or 'field_<position>'."""
     if suggestion['role_guess'] == 'group':
         return 'Group'
+    if suggestion['role_guess'] == 'pairing':
+        return 'Donor'
     return f"field_{suggestion['position'] + 1}"
 
 
@@ -100,14 +103,19 @@ def choose_groupings(parent, result: dict, confirm_group_overwrite: bool = True)
     dlg.setMinimumWidth(720)
     layout = QVBoxLayout(dlg)
 
-    hint = QLabel("Repeated naming patterns found across the sample names. Tick the ones to "
-                  "apply, adjust the role or column name if needed, then Apply.")
+    hint_text = ("Repeated naming patterns found across the sample names. Tick the ones to "
+                 "apply, adjust the role or column name if needed, then Apply.")
+    if result.get('judged_against_groups'):
+        hint_text += (" The samples already have groups, so no group is suggested; a field is "
+                      "offered for pairing when its values recur across the current groups.")
+    hint = QLabel(hint_text)
     hint.setWordWrap(True)
     layout.addWidget(hint)
 
     if result.get('irregular_samples'):
         warn = QLabel(f"{len(result['irregular_samples'])} sample(s) have a different naming "
-                      "structure and are left out of every suggestion below.")
+                      "structure and get no value from the suggestions below (as a pairing "
+                      "variable they are left unpaired).")
         warn.setWordWrap(True)
         warn.setStyleSheet("color: grey; font-style: italic;")
         layout.addWidget(warn)
