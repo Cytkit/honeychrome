@@ -1,6 +1,6 @@
 import numpy as np
 from PySide6.QtCore import Slot, QTimer, Qt
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QCheckBox, QHBoxLayout
 from queue import Empty
 import pyqtgraph as pg
 
@@ -33,9 +33,20 @@ class OscilloscopeWidget(QWidget):
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
 
+        self.subtract_baselines_cb = QCheckBox("Subtract Baselines")
+        self.subtract_baselines_cb.setChecked(True)
+        self.subtract_baselines = True
+
         self.label = QLabel('')
         self._last_label_text = None
         self.local_trace_queue = []
+
+        top_h_layout = QHBoxLayout()
+        top_h_layout.addWidget(self.subtract_baselines_cb)
+        top_h_layout.addStretch()
+        top_h_layout.addWidget(self.label)
+
+
 
         # ---- Plot widgets ----
         self.plot_widget1 = pg.PlotWidget()
@@ -59,7 +70,7 @@ class OscilloscopeWidget(QWidget):
         self.legendLayout1 = FlowLayout(self.legendContainer1)
         self.legendLayout2 = FlowLayout(self.legendContainer2)
 
-        self.layout.addWidget(self.label)
+        self.layout.addLayout(top_h_layout)
         self.layout.addWidget(self.plot_widget1)
         self.layout.addWidget(self.legendContainer1)
         self.layout.addWidget(self.plot_widget2)
@@ -187,6 +198,11 @@ class OscilloscopeWidget(QWidget):
     # ------------------------------------------------------------------
     @Slot()
     def check_queue(self):
+        if self.subtract_baselines_cb.isChecked():
+            self.subtract_baselines = True
+        else:
+            self.subtract_baselines = False
+
         """Drain the queue completely; render only the newest traces."""
         while True:
             try:
@@ -221,12 +237,20 @@ class OscilloscopeWidget(QWidget):
             traces = self.trace['traces']
             baselines = self.trace['baselines']
 
+            thresh_span = np.array([self.threshold, self.threshold], dtype=float)
+            if not self.subtract_baselines:
+                thresh_span += baselines[self.peak_detection_channel_index]
+
             # ---------- Scatter plot ----------
             for slot, (i, curve) in enumerate(self.scatter_curves):
-                y = traces[i] - baselines[i]
+                if self.subtract_baselines:
+                    y = traces[i] - baselines[i]
+                else:
+                    y = traces[i]
+
                 curve.setData(self.x, y)
 
-                bound_height = float(traces[i][start:end].max() - baselines[i])
+                bound_height = float(y[start:end].max())
                 v0 = self.scatter_vstart[slot][1]
                 v1 = self.scatter_vend[slot][1]
                 v0.setData(np.array([x_start, x_start]),
@@ -237,12 +261,16 @@ class OscilloscopeWidget(QWidget):
             if self.scatter_thresh is not None:
                 self.scatter_thresh.setData(
                     peak_span,
-                    np.array([self.threshold, self.threshold]),
+                    thresh_span,
                 )
 
             # ---------- Fluorescence plot ----------
             for slot, (i, curve) in enumerate(self.fluorescence_curves):
-                y = traces[i] - baselines[i]
+                if self.subtract_baselines:
+                    y = traces[i] - baselines[i]
+                else:
+                    y = traces[i]
+
                 curve.setData(self.x, y)
 
                 bound_height = float(traces[i][start:end].max() - baselines[i])
@@ -256,7 +284,7 @@ class OscilloscopeWidget(QWidget):
             if self.fluorescence_thresh is not None:
                 self.fluorescence_thresh.setData(
                     peak_span,
-                    np.array([self.threshold, self.threshold]),
+                    thresh_span,
                 )
 
             # ---------- Label ----------
