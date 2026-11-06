@@ -68,7 +68,8 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     'build_contrasts', 'covariate_kind', 'missing_covariate_values',
-    'covariate_frame', 'build_design', 'log2_frequencies',
+    'covariate_frame', 'is_missing_value', 'comparison_parts', 'comparison_plan',
+    'build_design', 'log2_frequencies',
     'logit_proportions', 'sparse_features', 'run_moderated', 'run_glm_counts',
     'apply_significance', 'suggest_groupings_from_names', 'library_sizes',
     'COUNT_TESTS', 'NORMALISATIONS',
@@ -87,6 +88,7 @@ NORMALISATIONS = ('total', 'robust', 'control')
 def suggest_groupings_from_names(
     sample_rel_paths: list[str],
     display_names: dict[str, str] | None = None,
+    current_groups: dict[str, str] | None = None,
 ) -> dict:
     """
     Scan sample names for repeated, delimiter-separated tokens that could
@@ -111,6 +113,12 @@ def suggest_groupings_from_names(
     value and recurs across group values (one sample per mouse per tissue);
     other repeated fields are covariates.
 
+    With ``current_groups`` ({sample: group}, at least two groups) the
+    samples already have groups: no group is suggested from the names, and
+    pairing is judged against the current groups, so a donor number shared
+    by a mother's and a foetus's samples is offered as the pairing variable.
+    Samples without a group take no part in that judgement.
+
     Returns:
         {
             'suggestions': [
@@ -126,6 +134,7 @@ def suggest_groupings_from_names(
                 ...
             ],
             'irregular_samples': list[str],  -- rel paths excluded from all suggestions
+            'judged_against_groups': bool,   -- pairing judged against current_groups
         }
     Returns {'suggestions': [], 'irregular_samples': [...]} if no usable
     pattern is found (e.g. fewer than 2 samples, or every position is
@@ -156,6 +165,8 @@ def suggest_groupings_from_names(
 
     all_suggestions = []
     irregular_all: set[str] = set()
+    given = {sp: g for sp, g in (current_groups or {}).items() if g and sp in sample_rel_paths}
+    use_given = len(set(given.values())) >= 2
 
     for source_label, tokens_by_sample in sources:
         if len(tokens_by_sample) < 2:
@@ -193,6 +204,8 @@ def suggest_groupings_from_names(
         # sane range for a comparison group (2-8 levels).
         group_candidates = [c for c in candidates if 2 <= c[2] <= 8]
         primary = min(group_candidates, key=lambda c: c[2]) if group_candidates else None
+        if use_given:
+            primary = (None, given, len(set(given.values())))
 
         for pos, values, n_distinct in sorted(candidates, key=lambda c: c[2]):
             if primary is not None and pos == primary[0]:
@@ -204,12 +217,13 @@ def suggest_groupings_from_names(
                 # (a cohort or batch) or nested in one group value is a
                 # covariate.
                 _, group_values, _ = primary
-                pairs = Counter((v, group_values[sp]) for sp, v in values.items())
+                judged = {sp: v for sp, v in values.items() if sp in group_values}
+                pairs = Counter((v, group_values[sp]) for sp, v in judged.items())
                 co_occurrence: dict[str, set[str]] = {}
-                for sp, v in values.items():
+                for sp, v in judged.items():
                     co_occurrence.setdefault(v, set()).add(group_values[sp])
                 crosses = sum(1 for s in co_occurrence.values() if len(s) >= 2)
-                once = max(pairs.values()) == 1
+                once = bool(pairs) and max(pairs.values()) == 1
                 role = 'pairing' if once and crosses > len(co_occurrence) / 2 else 'covariate'
             else:
                 role = 'covariate'
@@ -230,7 +244,8 @@ def suggest_groupings_from_names(
     role_order = {'group': 0, 'pairing': 1, 'covariate': 2}
     all_suggestions.sort(key=lambda s: (role_order[s['role_guess']], s['n_distinct']))
 
-    return {'suggestions': all_suggestions, 'irregular_samples': sorted(irregular_all)}
+    return {'suggestions': all_suggestions, 'irregular_samples': sorted(irregular_all),
+            'judged_against_groups': use_given}
 
 
 # ---------------------------------------------------------------------------
@@ -268,13 +283,32 @@ def build_contrasts(group_names: list[str], mode: str,
 # Design matrix and covariates
 # ---------------------------------------------------------------------------
 
+#: Covariate values read as "no value" (any case), besides a blank cell.
+MISSING_WORDS = frozenset({'na', 'n/a', 'n.a.', 'nan', 'none', 'null', 'missing', '#n/a',
+                           '-', '--', '.', 'not applicable'})
+#: Fewest samples per group a comparison keeps after samples without a
+#: covariate value are left out.
+MIN_COMPARISON_SAMPLES = 3
+
+
+def is_missing_value(value) -> bool:
+    """True for a blank cell, None/NaN, or a word such as 'NA', 'n/a' or '-'
+    (MISSING_WORDS). 'Unknown' is a value: Check table offers to change it to NA."""
+    if value is None:
+        return True
+    if isinstance(value, float) and np.isnan(value):
+        return True
+    text = str(value).strip()
+    return not text or text.lower() in MISSING_WORDS
+
+
 def _is_numeric_column(values) -> bool:
-    """True when every non-blank value parses as a finite float."""
+    """True when every value that is not missing parses as a finite float."""
     seen = False
     for v in values:
-        text = str(v).strip()
-        if not text:
+        if is_missing_value(v):
             continue
+        text = str(v).strip()
         try:
             if not np.isfinite(float(text)):
                 return False
@@ -294,8 +328,9 @@ def missing_covariate_values(covariates: pd.DataFrame | None, sample_ids: list[s
                              names: list[str]) -> dict[str, list[str]]:
     """
     {covariate name: [sample ids with no value]} for each of ``names`` that
-    is missing (or blank) for at least one sample in ``sample_ids``.
-    ``covariates`` is indexed by sample id, one column per covariate.
+    is missing (blank, or NA and the like; see is_missing_value) for at least
+    one sample in ``sample_ids``. ``covariates`` is indexed by sample id, one
+    column per covariate.
     """
     missing: dict[str, list[str]] = {}
     cov = covariates
@@ -303,7 +338,7 @@ def missing_covariate_values(covariates: pd.DataFrame | None, sample_ids: list[s
         bad = [
             sid for sid in sample_ids
             if cov is None or name not in cov.columns or sid not in cov.index
-            or not str(cov.loc[sid, name]).strip()
+            or is_missing_value(cov.loc[sid, name])
         ]
         if bad:
             missing[name] = bad
@@ -312,7 +347,8 @@ def missing_covariate_values(covariates: pd.DataFrame | None, sample_ids: list[s
 
 def covariate_frame(covariates: pd.DataFrame | None, sample_ids: list[str],
                     names: list[str],
-                    numeric: Iterable[str] | None = None) -> pd.DataFrame | None:
+                    numeric: Iterable[str] | None = None,
+                    allow_missing: bool = False) -> pd.DataFrame | None:
     """
     Adjustment covariates for ``sample_ids`` (rows in that order). Columns
     named in ``numeric`` are returned as floats and enter the design as
@@ -320,37 +356,185 @@ def covariate_frame(covariates: pd.DataFrame | None, sample_ids: list[str],
     as a factor. With ``numeric=None`` a column is numeric when all of its
     values are numbers.
 
-    Returns None when ``names`` is empty. Raises RuntimeError if any sample
-    lacks a value, or a column named in ``numeric`` holds a value that is
-    not a number.
+    With ``allow_missing`` a sample without a value (see is_missing_value)
+    gets None (NaN in a numeric column); run_moderated and run_glm_counts
+    then resolve the missing values comparison by comparison
+    (comparison_parts). Otherwise a missing value raises.
+
+    Returns None when ``names`` is empty. Raises RuntimeError if a sample
+    lacks a value (without ``allow_missing``), or a column named in
+    ``numeric`` holds a value that is not a number.
     """
     names = [n for n in names if n]
     if not names:
         return None
     missing = missing_covariate_values(covariates, sample_ids, names)
-    if missing:
+    if missing and not allow_missing:
         detail = "; ".join(
             f"'{name}': " + ", ".join(Path(r).stem for r in rels[:5])
             + (" …" if len(rels) > 5 else "")
             for name, rels in missing.items()
         )
         raise RuntimeError(f"Adjustment covariates have missing values — {detail}")
-    columns = {name: [str(covariates.loc[sid, name]).strip() for sid in sample_ids]
-               for name in names}
+    def _cell(sid, name):
+        if covariates is None or name not in covariates.columns or sid not in covariates.index:
+            return None
+        value = covariates.loc[sid, name]
+        return None if is_missing_value(value) else str(value).strip()
+
+    columns = {name: [_cell(sid, name) for sid in sample_ids] for name in names}
     if numeric is None:
-        as_numeric = {n for n in names if covariate_kind(columns[n]) == 'numeric'}
+        as_numeric = {n for n in names
+                      if covariate_kind([v for v in columns[n] if v is not None]) == 'numeric'}
     else:
         as_numeric = set(names) & set(numeric)
     for name in sorted(as_numeric):
-        bad = [sid for sid, v in zip(sample_ids, columns[name]) if not _is_numeric_column([v])]
+        bad = [sid for sid, v in zip(sample_ids, columns[name])
+               if v is not None and not _is_numeric_column([v])]
         if bad:
             raise RuntimeError(
                 f"Covariate '{name}' is set to numeric but has values that are not "
                 "numbers for: " + ", ".join(Path(r).stem for r in bad[:5])
                 + (" …" if len(bad) > 5 else "")
                 + ". Untick 'Numeric' for this covariate or correct the values.")
-        columns[name] = [float(v) for v in columns[name]]
+        columns[name] = [np.nan if v is None else float(v) for v in columns[name]]
     return pd.DataFrame(columns, index=list(sample_ids))
+
+
+def comparison_parts(group_vec: list[str], contrasts: list[tuple[str, str]],
+                     covariates: pd.DataFrame | None,
+                     min_per_group: int = MIN_COMPARISON_SAMPLES,
+                     pairing_vec: list[str] | None = None) -> list[dict]:
+    """
+    How each comparison is fitted on its own samples: when covariates have
+    missing values (None/NaN, from covariate_frame(allow_missing=True)), or
+    when the pairing does not link the groups of every comparison.
+
+    For each (base, other): a covariate with no value for any sample of one
+    of the two groups is left out of that comparison's model; then samples
+    of the two groups without a value for a remaining covariate are left out
+    of that comparison. A comparison with fewer than ``min_per_group``
+    samples left in a group is not tested. With ``pairing_vec``, a
+    comparison whose two groups share no pairing value (no donor has samples
+    in both, e.g. non-pregnant donors against foetuses) is fitted without
+    pairing. Samples without a pairing value carry a level of their own
+    ('__unpaired_<sample>'): they count towards the group difference but
+    not towards the within-pair comparison.
+
+    Returns, per contrast, {'contrast', 'mask' (rows of the two groups kept),
+    'covariates' (those rows and the kept columns, or None), 'tested',
+    'paired' (fit with the pairing), 'notes' (plain-language lines for the
+    results)}.
+    """
+    groups = np.asarray(group_vec, dtype=object)
+    if covariates is None:
+        missing = np.zeros((len(group_vec), 0), dtype=bool)
+        names, index = [], []
+    else:
+        missing = covariates.isna().to_numpy()
+        names = list(covariates.columns)
+        index = list(covariates.index)
+    parts = []
+    for base, other in contrasts:
+        label = f"{other} vs {base}"
+        in_pair = (groups == base) | (groups == other)
+        notes, kept = [], []
+        for j, name in enumerate(names):
+            empty = [g for g in (base, other) if missing[groups == g, j].all()]
+            if empty:
+                notes.append(f"{label}: '{name}' was left out of the model (no value for any "
+                             f"{' or '.join(empty)} sample).")
+            else:
+                kept.append(j)
+        mask = in_pair.copy()
+        for j in kept:
+            gone = mask & missing[:, j]
+            if gone.any():
+                shown = [Path(str(index[i])).stem for i in np.flatnonzero(gone)]
+                notes.append(f"{label}: {len(shown)} sample(s) without a value for "
+                             f"'{names[j]}' were left out: " + ", ".join(shown[:5])
+                             + (" …" if len(shown) > 5 else "") + ".")
+                mask &= ~missing[:, j]
+        n_base, n_other = int((groups[mask] == base).sum()), int((groups[mask] == other).sum())
+        tested = min(n_base, n_other) >= min_per_group
+        if not tested:
+            notes.append(f"{label} was not tested: {n_other} + {n_base} samples are left after "
+                         f"leaving out missing covariate values (needs {min_per_group} per group).")
+        rows = np.flatnonzero(mask)
+        sub = covariates.iloc[rows, kept] if kept else None
+        paired = pairing_vec is not None
+        if paired and tested:
+            sub_groups = list(groups[rows])
+            sub_pairing = [pairing_vec[i] for i in rows]
+            try:
+                build_design(sub_groups, base, None, sub)
+            except RuntimeError:
+                pass  # a covariate problem; reported when the comparison is fitted
+            else:
+                try:
+                    build_design(sub_groups, base, sub_pairing, sub)
+                except RuntimeError:
+                    paired = False
+                    notes.append(f"{label} was fitted without pairing: no pairing value has "
+                                 "samples in both groups.")
+            if paired:
+                unpaired = sum(1 for p in sub_pairing if str(p).startswith('__unpaired_'))
+                if unpaired:
+                    notes.append(f"{label}: {unpaired} sample(s) without a pairing value are "
+                                 "unpaired.")
+        parts.append({'contrast': (base, other), 'mask': mask, 'covariates': sub,
+                      'tested': tested, 'paired': paired, 'notes': notes})
+    return parts
+
+
+def comparison_plan(group_vec: list[str], contrasts: list[tuple[str, str]],
+                    pairing_vec: list[str] | None, covariates: pd.DataFrame | None,
+                    mode: str) -> list[dict] | None:
+    """None when the usual fit works: no missing covariate value and, with
+    pairing, a design that links the groups (in 'reference' mode over every
+    group at once). Otherwise each comparison's own fit (comparison_parts)."""
+    missing = _has_missing(covariates)
+    if not missing and pairing_vec is None:
+        return None
+    parts = comparison_parts(group_vec, contrasts, covariates, pairing_vec=pairing_vec)
+    if missing or any(p['tested'] and not p['paired'] for p in parts):
+        return parts
+    if mode == 'reference':
+        try:
+            build_design(group_vec, contrasts[0][0], pairing_vec, covariates)
+        except RuntimeError:
+            return parts
+    return None
+
+
+def _has_missing(covariates: pd.DataFrame | None) -> bool:
+    return covariates is not None and bool(covariates.isna().to_numpy().any())
+
+
+def _fit_by_comparison(parts, fit, group_vec, pairing_vec, finish):
+    """Fit each comparison on its own samples, covariates and pairing
+    (comparison_plan), stack the results, then ``finish`` them
+    (significance). ``fit(rows, groups, contrast, pairing, covariates)``
+    returns one table. The plain-language notes are kept in the result's
+    ``attrs['notes']``."""
+    frames, notes = [], []
+    for part in parts:
+        notes.extend(part['notes'])
+        if not part['tested']:
+            continue
+        rows = np.flatnonzero(part['mask'])
+        pairing = ([pairing_vec[i] for i in rows]
+                   if pairing_vec is not None and part['paired'] else None)
+        frames.append(fit(rows, [group_vec[i] for i in rows], part['contrast'], pairing,
+                          part['covariates']))
+    for note in notes:
+        log.info("comparison fitted on its own: %s", note)
+    if not frames:
+        raise RuntimeError("No comparison could be tested after leaving out missing covariate "
+                           "values. " + " ".join(notes))
+    combined = finish(pd.concat(frames, ignore_index=True))
+    combined.attrs['notes'] = notes
+    return combined
 
 
 def _pairing_level_label(level: str) -> str:
@@ -734,11 +918,29 @@ def run_moderated(data_df: pd.DataFrame, group_vec: list[str],
     too_few_hint: appended to the error raised when fewer than three
                 features can be tested.
 
+    When covariates have missing values, or the pairing does not link the
+    groups, each comparison is fitted on its own samples (comparison_plan)
+    whatever the mode; the result's ``attrs['notes']`` says which
+    covariates and samples were left out and which comparisons were fitted
+    without pairing.
+
     Returns one row per (feature, comparison): feature, logFC, CI.L, CI.R,
     AveExpr, t, P.Value, adj.P.Val, SE, df.total, comparison,
     adj.P.Val.global, threshold, significant (plus the cluster-level
     columns when hierarchical).
     """
+    parts = comparison_plan(group_vec, contrasts, pairing_vec, covariates, mode)
+    if parts is not None:
+        return _fit_by_comparison(
+            parts,
+            lambda rows, groups, contrast, pairing, cov: run_moderated(
+                data_df.iloc[rows], groups, [contrast], 'reference', pval_threshold,
+                fc_threshold, pairing_vec=pairing, fdr_scope=fdr_scope, covariates=cov,
+                use_treat=use_treat, feature_meta=feature_meta, hierarchical=hierarchical,
+                too_few_hint=too_few_hint),
+            group_vec, pairing_vec,
+            lambda df: apply_significance(df, pval_threshold, fc_threshold, fdr_scope=fdr_scope,
+                                          use_treat=use_treat, hierarchical=hierarchical))
     if mode == 'reference':
         baseline = contrasts[0][0]
         if any(b != baseline for b, _o in contrasts):
@@ -1518,10 +1720,26 @@ def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
         freedom (paired designs, few samples per group). 'ql' —
         quasi-likelihood F test (_glm_ql_tests).
 
+    With missing covariate values, or pairing that does not link the
+    groups, each comparison is fitted on its own samples, dispersions
+    included (comparison_plan; see run_moderated).
+
     Returns the same schema as run_moderated() minus AveExpr.
     """
     if mode not in ('reference', 'pairwise'):
         raise ValueError(f"mode must be 'reference' or 'pairwise', got {mode!r}")
+    parts = comparison_plan(group_vec, contrasts, pairing_vec, covariates, mode)
+    if parts is not None:
+        return _fit_by_comparison(
+            parts,
+            lambda rows, groups, contrast, pairing, cov: run_glm_counts(
+                counts_df.iloc[rows], groups, [contrast], 'reference', pval_threshold,
+                fc_threshold, pairing_vec=pairing, fdr_scope=fdr_scope, covariates=cov,
+                use_treat=use_treat,
+                offset_df=None if offset_df is None else offset_df.iloc[rows], method=method),
+            group_vec, pairing_vec,
+            lambda df: apply_significance(df, pval_threshold, fc_threshold, fdr_scope=fdr_scope,
+                                          use_treat=use_treat))
     pairs = (list(_pair_subsets(counts_df, group_vec, contrasts, pairing_vec, covariates))
              if mode == 'pairwise' else [])
     if mode == 'reference' or method == 'ql':

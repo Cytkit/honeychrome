@@ -705,11 +705,6 @@ class EnrichmentTab(QWidget):
         if self._worker is not None or self._library is None:
             return
         samples, design = self._design()
-        if design['missing_pairing']:
-            QMessageBox.warning(self, "Pairing incomplete",
-                                f"No '{st.pairing}' value for: "
-                                + ", ".join(design['missing_pairing'][:10]))
-            return
         summaries = deepcopy({k: st.summaries[k] for k in samples})
         gate_defs = deepcopy(self._gate_defs())
         library = self._library.copy()

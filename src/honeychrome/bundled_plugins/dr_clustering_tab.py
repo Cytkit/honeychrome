@@ -163,9 +163,9 @@ from honeychrome.view_components.ordered_multi_sample_picker import OrderedMulti
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 from honeychrome.view_components.side_tab_widget import SideTabWidget
-from honeychrome.controller_components import sample_table
+from honeychrome.controller_components import covariate_check, sample_table
 from honeychrome.view_components import suggest_groupings_dialog as sgd
-from honeychrome.view_components import sample_table_import_dialog
+from honeychrome.view_components import covariate_check_dialog, sample_table_import_dialog
 from honeychrome.view_components.checkable_header import CheckableHeaderView
 from honeychrome.controller_components.differential_stats import suggest_groupings_from_names
 from honeychrome.view_components.differential_plots import (
@@ -3259,8 +3259,14 @@ class GroupsStatsTab(QWidget):
             "empty) from the table below."
         )
         self.remove_column_btn.clicked.connect(self._remove_covariate_column)
+        self.check_table_btn = QPushButton("Check table…")
+        self.check_table_btn.setToolTip(
+            "Look for blank cells, NA and Unknown spellings, similar categories, numbers "
+            "written as text and covariates confounded with the groups, and fix them.")
+        self.check_table_btn.clicked.connect(self._check_table)
         csv_row.addWidget(self.import_csv_btn)
         csv_row.addWidget(self.export_csv_btn)
+        csv_row.addWidget(self.check_table_btn)
         csv_row.addWidget(self.add_column_btn)
         csv_row.addWidget(self.remove_column_btn)
         csv_row.addWidget(self.suggest_groupings_btn)
@@ -4743,15 +4749,75 @@ class GroupsStatsTab(QWidget):
         if reply != QMessageBox.Yes:
             return
         self.state.covariates = self.state.covariates.drop(columns=[name])
+        self._forget_covariate(name)
+        self._last_stats_data_key = None
+        self._populate_table()
+        self._populate_pairing_variable_combo()
+
+    def _forget_covariate(self, name: str):
+        """Clear a removed covariate from Numeric, adjustment and pairing."""
         self.state.numeric_covariates = [c for c in self.state.numeric_covariates if c != name]
+        self.state.stats_adjust_covariates = [
+            c for c in self.state.stats_adjust_covariates if c != name]
         if self.state.pairing_variable == name:
             self.state.pairing_variable = ''
             if self.state.paired:
                 self.state.paired = False
                 self.chk_paired.setChecked(False)
-        self._last_stats_data_key = None
-        self._populate_table()
-        self._populate_pairing_variable_combo()
+
+    def _check_table(self):
+        """Check the covariates of the samples shown in the table."""
+        st = self.state
+
+        def current():
+            samples = self._table_sample_paths()
+            cov = st.covariates
+            covariates = {}
+            if cov is not None:
+                for name in cov.columns:
+                    covariates[name] = {
+                        sp: str(cov.loc[self._covariate_key(sp), name])
+                        for sp in samples if self._covariate_key(sp) in cov.index}
+            groups = {sp: g for sp, g in st.sample_groups.items() if g and g != 'Unassigned'}
+            return samples, covariates, groups
+
+        def check():
+            samples, covariates, groups = current()
+            counts = {}
+            for sp in samples:
+                if sp in groups:
+                    counts[groups[sp]] = counts.get(groups[sp], 0) + 1
+            qualifying = [g for g in (st.testing_group_selection or st.group_names)
+                          if counts.get(g, 0) >= 3]
+            comparisons = []
+            if len(qualifying) >= 2:
+                reference = st.reference_group if st.reference_group in qualifying \
+                    else qualifying[0]
+                comparisons = drc_stats.build_contrasts(qualifying, st.contrast_mode, reference)
+            return covariate_check.check_covariates(
+                covariates, samples, groups, comparisons, st.numeric_covariates)
+
+        def apply(fixes):
+            samples, covariates, _groups = current()
+            covs, numeric, removed = covariate_check.apply_fixes(
+                covariates, st.numeric_covariates, samples, fixes)
+            for name in removed:
+                st.covariates = st.covariates.drop(columns=[name])
+                self._forget_covariate(name)
+            for name, values in covs.items():
+                for sp, value in values.items():
+                    rel = self._covariate_key(sp)
+                    if rel not in st.covariates.index:
+                        st.covariates.loc[rel] = ''
+                    st.covariates.loc[rel, name] = value
+            st.numeric_covariates = numeric
+            self._refresh_after_groupings()
+            text = covariate_check.describe_fixes(fixes, removed)
+            if self.bus:
+                self.bus.statusMessage.emit(text)
+            return text
+
+        covariate_check_dialog.check_table(self, "Check table", check, apply)
 
     def _suggest_groupings(self):
         """
@@ -4769,7 +4835,9 @@ class GroupsStatsTab(QWidget):
             )
             return
         display_names = self.controller.experiment.samples.get('all_samples', {})
-        result = suggest_groupings_from_names(sample_paths, display_names)
+        current = {sp: g for sp, g in self.state.sample_groups.items()
+                   if sp in sample_paths and g in self.state.group_names}
+        result = suggest_groupings_from_names(sample_paths, display_names, current)
         if not result['suggestions']:
             QMessageBox.information(self, "Suggest Groupings", sgd.no_suggestion_message(result))
             return
@@ -5309,6 +5377,11 @@ class GroupsStatsTab(QWidget):
             self, path, sample_paths, current, title="Import CSV")
         if result is None:
             return
+        if result['replace_covariates'] and self.state.covariates is not None:
+            for name in list(self.state.covariates.columns):
+                if name not in result['covariates']:
+                    self._forget_covariate(name)
+            self.state.covariates = None
         for group in result['groups'].values():
             if group == 'Unassigned' or group in self.state.group_names:
                 continue
@@ -5410,64 +5483,10 @@ class GroupsStatsTab(QWidget):
                                 "Tick at least two populations to compare within samples.")
             return
 
-        if not split and self.state.paired and self.state.pairing_variable:
-            pv = self.state.pairing_variable
-            try:
-                group_rel = drc_stats.resolve_test_groups(
-                    self.controller, self.state, cluster_labels_override=labels_for_stats
-                )
-            except Exception:
-                group_rel = {}
-            qualifying = [g for g in (self.state.testing_group_selection or self.state.group_names)
-                         if g in group_rel]
-            all_rel = [rel for g in qualifying for rel in group_rel[g]]
-            missing = [
-                rel for rel in all_rel
-                if self.state.covariates is None
-                or pv not in self.state.covariates.columns
-                or rel not in self.state.covariates.index
-                or not str(self.state.covariates.loc[rel, pv]).strip()
-            ]
-            if missing:
-                names = "\n".join(Path(r).stem for r in missing[:15])
-                more = "\n…" if len(missing) > 15 else ""
-                QMessageBox.warning(
-                    self, "Missing Pairing Values",
-                    f"'Paired design' is checked, but {len(missing)} sample(s) "
-                    f"have no value for pairing variable '{pv}':\n\n{names}{more}\n\n"
-                    "Fill these in on the Sample Group Assignment table, or "
-                    "uncheck 'Paired design'."
-                )
-                return
-
         adjust_covariates = [] if split else [
             c for c in self.state.stats_adjust_covariates
             if not (self.state.paired and c == self.state.pairing_variable)
         ]
-        if adjust_covariates:
-            try:
-                group_rel = drc_stats.resolve_test_groups(
-                    self.controller, self.state, cluster_labels_override=labels_for_stats
-                )
-            except Exception:
-                group_rel = {}
-            qualifying = [g for g in (self.state.testing_group_selection or self.state.group_names)
-                         if g in group_rel]
-            all_rel = [rel for g in qualifying for rel in group_rel[g]]
-            missing = drc_stats.missing_covariate_values(self.state, all_rel, adjust_covariates)
-            if missing:
-                lines = []
-                for name, rels in missing.items():
-                    shown = ", ".join(Path(r).stem for r in rels[:8])
-                    more = " …" if len(rels) > 8 else ""
-                    lines.append(f"'{name}' ({len(rels)}): {shown}{more}")
-                QMessageBox.warning(
-                    self, "Missing Covariate Values",
-                    "These adjustment covariates have no value for some tested "
-                    "samples:\n\n" + "\n".join(lines) + "\n\nFill them in on the "
-                    "Sample Group Assignment table, or untick them under 'Adjust for'."
-                )
-                return
 
         pval_threshold = self.pval_spin.value()
         fc_threshold   = self.fc_spin.value()

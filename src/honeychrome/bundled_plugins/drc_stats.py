@@ -316,11 +316,14 @@ def covariate_frame(state, all_rel: list[str], names: list[str]) -> pd.DataFrame
     """
     Adjustment covariates for ``all_rel`` (rows in that order): the columns
     in ``state.numeric_covariates`` as floats, the others as strings.
-    Returns None when ``names`` is empty. Raises RuntimeError if any sample
-    lacks a value or a numeric covariate has a value that is not a number.
+    A sample without a value gets None (NaN in a numeric column); the tests
+    then leave out that covariate or those samples comparison by comparison
+    (differential_stats.comparison_parts). Returns None when ``names`` is
+    empty. Raises RuntimeError if a numeric covariate has a value that is
+    not a number.
     """
     return _ds.covariate_frame(state.covariates, all_rel, names,
-                               numeric=list(state.numeric_covariates))
+                               numeric=list(state.numeric_covariates), allow_missing=True)
 
 
 def n_clusters_from_labels(state, all_rel, cluster_labels_override=None) -> int:
@@ -1101,10 +1104,11 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
     elif state.paired and state.pairing_variable and state.covariates is not None \
             and state.pairing_variable in state.covariates.columns:
         cov = state.covariates[state.pairing_variable]
-        # Any rel missing a covariate value gets its own singleton blocking
-        # level rather than failing the whole run.
-        pairing_vec = [str(cov[rel]) if rel in cov.index else f"__unpaired_{rel}"
-                       for rel in all_rel]
+        # A sample without a pairing value (blank, NA) is unpaired: it gets
+        # a blocking level of its own rather than failing the whole run.
+        pairing_vec = [str(cov[rel]).strip()
+                       if rel in cov.index and not _ds.is_missing_value(cov[rel])
+                       else f"__unpaired_{rel}" for rel in all_rel]
 
     adjust = [] if split is not None else [
         c for c in (covariate_names or [])
@@ -1211,4 +1215,12 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
             loaded=loaded,
         )
 
+    notes = []
+    for frame in (freq_results, mfi_results, counts_results):
+        for note in (frame.attrs.get('notes', []) if frame is not None else []):
+            if note not in notes:
+                notes.append(note)
+    if notes:
+        state.stats_alignment_note = " ".join(
+            t for t in [state.stats_alignment_note] + notes if t)
     return freq_results, mfi_results, counts_results

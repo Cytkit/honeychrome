@@ -83,9 +83,9 @@ from honeychrome.settings import af_abundance_channel
 from honeychrome.controller_components import differential_stats as ds
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy
 from honeychrome.controller_components import experiment_state
-from honeychrome.controller_components import sample_table
+from honeychrome.controller_components import covariate_check, sample_table
 from honeychrome.view_components import suggest_groupings_dialog as sgd
-from honeychrome.view_components import sample_table_import_dialog
+from honeychrome.view_components import covariate_check_dialog, sample_table_import_dialog
 from honeychrome.view_components.checkable_header import CheckableHeaderView
 from honeychrome.controller_components.functions import (
     build_antigen_map,
@@ -1878,15 +1878,16 @@ def statistics_design(state: 'GatingRunState', samples: list[str]) -> dict:
     {'groups': {sample: group}, 'pairing': {sample: level} or None,
     'covariates': adjustment covariates (DataFrame) or None, 'numeric':
     covariates entered as numbers, 'missing_pairing': labels of samples
-    without a pairing value (pairing is None when any is missing)}."""
+    without a pairing value}. A sample without a pairing value is unpaired:
+    it gets a pairing level of its own."""
     st = state
     groups = {k: st.sample_groups[k] for k in samples}
     pairing, missing = None, []
     if st.pairing:
         vals = st.covariates.get(st.pairing) or {}
-        missing = [_sample_label(k) for k in samples if not str(vals.get(k, '')).strip()]
-        if not missing:
-            pairing = {k: vals[k] for k in samples}
+        missing = [_sample_label(k) for k in samples if ds.is_missing_value(vals.get(k))]
+        pairing = {k: (f"__unpaired_{k}" if ds.is_missing_value(vals.get(k))
+                       else str(vals[k]).strip()) for k in samples}
     covariates = None
     adjust = [c for c in st.adjust_covariates if c in st.covariates and c != st.pairing]
     if adjust:
@@ -2158,8 +2159,14 @@ class ResultsTab(QWidget):
         b_export = QPushButton("Export table…")
         b_export.setToolTip("Save the samples' groups and covariates in the same format.")
         b_export.clicked.connect(self._on_export_table)
+        b_check = QPushButton("Check table…")
+        b_check.setToolTip(
+            "Look for blank cells, NA and Unknown spellings, similar categories, numbers "
+            "written as text and covariates confounded with the groups, and fix them.")
+        b_check.clicked.connect(self._on_check_table)
         trow.addWidget(b_import)
         trow.addWidget(b_export)
+        trow.addWidget(b_check)
         cl.addLayout(trow)
         cl.addStretch()
         top.addWidget(cbox, stretch=1)
@@ -2369,9 +2376,9 @@ class ResultsTab(QWidget):
             msg += " Invalid pattern for: " + ", ".join(sorted(set(bad)))
         _status(self.bus, msg)
 
-    def _groupings_result(self, keys: list[str]) -> dict:
+    def _groupings_result(self, keys: list[str], current_groups: dict | None = None) -> dict:
         display = self.controller.experiment.samples.get('all_samples', {}) if self.controller else {}
-        return ds.suggest_groupings_from_names(keys, display)
+        return ds.suggest_groupings_from_names(keys, display, current_groups)
 
     def _on_suggest_groupings(self):
         """Offer groupings found in the gated samples' names (see
@@ -2381,7 +2388,10 @@ class ResultsTab(QWidget):
             QMessageBox.information(self, "Suggest Groupings",
                                     "Need at least two gated samples to detect a pattern.")
             return
-        result = self._groupings_result(keys)
+        st = self.state
+        current = {k: st.sample_groups[k] for k in keys
+                   if st.sample_groups.get(k) in st.group_names}
+        result = self._groupings_result(keys, current)
         if not result['suggestions']:
             QMessageBox.information(self, "Suggest Groupings", sgd.no_suggestion_message(result))
             return
@@ -2472,12 +2482,48 @@ class ResultsTab(QWidget):
         if not ok:
             return
         self.state.covariates.pop(name, None)
+        self._forget_covariate(name)
+        self._populate_samples_table()
+        self._populate_stats_choices()
+
+    def _forget_covariate(self, name: str):
+        """Clear a removed covariate from pairing, adjustment and Numeric."""
         if self.state.pairing == name:
             self.state.pairing = ''
         self.state.adjust_covariates = [c for c in self.state.adjust_covariates if c != name]
         self.state.numeric_covariates = [c for c in self.state.numeric_covariates if c != name]
-        self._populate_samples_table()
-        self._populate_stats_choices()
+
+    def _on_check_table(self):
+        """Check the covariates of the samples the statistics would use."""
+        st = self.state
+
+        def comparisons(samples):
+            names = ag_results.qualifying_groups(samples, st.sample_groups, list(st.group_names))
+            if len(names) < 2:
+                return []
+            reference = st.reference_group if st.reference_group in names else names[0]
+            return ds.build_contrasts(names, st.contrast_mode, reference)
+
+        def check():
+            samples = self._stats_samples()
+            return covariate_check.check_covariates(
+                st.covariates, samples, st.sample_groups, comparisons(samples),
+                st.numeric_covariates)
+
+        def apply(fixes):
+            covs, numeric, removed = covariate_check.apply_fixes(
+                st.covariates, st.numeric_covariates, self._stats_samples(), fixes)
+            st.covariates = covs
+            st.numeric_covariates = numeric
+            for name in removed:
+                self._forget_covariate(name)
+            self._populate_samples_table()
+            self._populate_stats_choices()
+            text = covariate_check.describe_fixes(fixes, removed)
+            _status(self.bus, text)
+            return text
+
+        covariate_check_dialog.check_table(self, "Check table", check, apply)
 
     def _on_import_table(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2490,6 +2536,11 @@ class ResultsTab(QWidget):
             self, path, st.gated_samples(), st.sample_groups, title="Import table")
         if result is None:
             return
+        if result['replace_covariates']:
+            for name in list(st.covariates):
+                if name not in result['covariates']:
+                    self._forget_covariate(name)
+            st.covariates = {}
         for group in result['groups'].values():
             if group not in st.group_names:
                 st.group_names.append(group)
@@ -2847,11 +2898,6 @@ class ResultsTab(QWidget):
             return
         samples = self._stats_samples()
         design = statistics_design(st, samples)
-        if design['missing_pairing']:
-            QMessageBox.warning(self, "Pairing incomplete",
-                                f"No '{st.pairing}' value for: "
-                                + ", ".join(design['missing_pairing'][:10]))
-            return
         groups = design['groups']
         kwargs = dict(
             group_order=list(st.group_names), contrast_mode=st.contrast_mode,

@@ -377,6 +377,10 @@ def comparison_plans(samples: list[str], groups: dict, *, group_order=None,
     contrasts = ds.build_contrasts(names, contrast_mode, reference)
     used = [s for s in samples if (groups.get(s) or '') in names]
     blocked, plans = [], []
+    cov_all = None
+    if covariates is not None and len(covariates.columns):
+        cov_all = ds.covariate_frame(covariates, used, list(covariates.columns),
+                                     numeric=list(numeric_covariates or []), allow_missing=True)
 
     def _gate(base, other, gvec):
         n_b, n_o = gvec.count(base), gvec.count(other)
@@ -387,11 +391,28 @@ def comparison_plans(samples: list[str], groups: dict, *, group_order=None,
                     f"{MIN_TOTAL_SAMPLES} in the two groups and {MIN_GROUP_SAMPLES} in each.")
         return None
 
-    if contrast_mode == 'reference':
-        subsets = [(used, contrasts)]
+    pvec_all = [str((pairing or {}).get(s, '')) for s in used] if pairing else None
+    parts = ds.comparison_plan([groups[s] for s in used], contrasts, pvec_all, cov_all,
+                               contrast_mode)
+    if parts is not None:
+        # Missing covariate values, or pairing that does not link the groups:
+        # each comparison on its own samples, covariates and pairing.
+        subsets = []
+        for part in parts:
+            b, o = part['contrast']
+            if not part['tested']:
+                blocked.append({'comparison': f"{o} vs {b}", 'reason': ' '.join(part['notes'])})
+                continue
+            subsets.append(([s for s, keep in zip(used, part['mask']) if keep], [(b, o)],
+                            part['covariates'], part['paired']))
+    elif contrast_mode == 'reference':
+        subsets = [(used, contrasts, cov_all, True)]
     else:
-        subsets = [([s for s in used if groups[s] in (b, o)], [(b, o)]) for b, o in contrasts]
-    for sub, comps in subsets:
+        subsets = []
+        for b, o in contrasts:
+            sub = [s for s in used if groups[s] in (b, o)]
+            subsets.append((sub, [(b, o)], None if cov_all is None else cov_all.loc[sub], True))
+    for sub, comps, cov, use_pairing in subsets:
         gvec = [groups[s] for s in sub]
         ok = []
         for b, o in comps:
@@ -403,11 +424,7 @@ def comparison_plans(samples: list[str], groups: dict, *, group_order=None,
         if not ok:
             continue
         base = comps[0][0]
-        pvec = [str((pairing or {}).get(s, '')) for s in sub] if pairing else None
-        cov = None
-        if covariates is not None and len(covariates.columns):
-            cov = ds.covariate_frame(covariates, sub, list(covariates.columns),
-                                     numeric=list(numeric_covariates or []))
+        pvec = [str((pairing or {}).get(s, '')) for s in sub] if pairing and use_pairing else None
         X, _cn, gcols = ds.build_design(gvec, base, pvec, cov)
         group_idx = sorted(gcols.values())
         reduced = np.delete(X, group_idx, axis=1)

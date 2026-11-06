@@ -912,7 +912,7 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
     cov = None
     if covariates is not None and len(covariates.columns):
         cov = ds.covariate_frame(covariates, used, list(covariates.columns),
-                                 numeric=list(numeric_covariates or []))
+                                 numeric=list(numeric_covariates or []), allow_missing=True)
 
     out = {'samples': used, 'group_vec': group_vec, 'comparisons': contrasts,
            'freq': None, 'freq_values': None, 'counts': None, 'counts_values': None,
@@ -1002,6 +1002,11 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                                           pval_threshold, marker_threshold,
                                           feature_meta=meta, hierarchical=True, **common)
         out['marker_values'] = values
+    for key in ('freq', 'counts', 'markers'):
+        frame = out.get(key)
+        for note in (frame.attrs.get('notes', []) if frame is not None else []):
+            if note not in out['notes']:
+                out['notes'].append(note)
     return out
 
 
