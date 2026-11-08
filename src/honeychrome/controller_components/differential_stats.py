@@ -69,7 +69,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     'build_contrasts', 'covariate_kind', 'missing_covariate_values',
     'covariate_frame', 'is_missing_value', 'comparison_parts', 'comparison_plan',
-    'build_design', 'log2_frequencies',
+    'pairing_absorbed', 'build_design', 'log2_frequencies',
     'logit_proportions', 'sparse_features', 'run_moderated', 'run_glm_counts',
     'apply_significance', 'suggest_groupings_from_names', 'library_sizes',
     'COUNT_TESTS', 'NORMALISATIONS',
@@ -116,7 +116,7 @@ def suggest_groupings_from_names(
     With ``current_groups`` ({sample: group}, at least two groups) the
     samples already have groups: no group is suggested from the names, and
     pairing is judged against the current groups, so a donor number shared
-    by a mother's and a foetus's samples is offered as the pairing variable.
+    by two tissues of one donor is offered as the pairing variable.
     Samples without a group take no part in that judgement.
 
     Returns:
@@ -416,7 +416,7 @@ def comparison_parts(group_vec: list[str], contrasts: list[tuple[str, str]],
     of that comparison. A comparison with fewer than ``min_per_group``
     samples left in a group is not tested. With ``pairing_vec``, a
     comparison whose two groups share no pairing value (no donor has samples
-    in both, e.g. non-pregnant donors against foetuses) is fitted without
+    in both, e.g. healthy donors against patients) is fitted without
     pairing. Samples without a pairing value carry a level of their own
     ('__unpaired_<sample>'): they count towards the group difference but
     not towards the within-pair comparison.
@@ -482,6 +482,8 @@ def comparison_parts(group_vec: list[str], contrasts: list[tuple[str, str]],
                 if unpaired:
                     notes.append(f"{label}: {unpaired} sample(s) without a pairing value are "
                                  "unpaired.")
+                notes.extend(_absorbed_note(name, label)
+                             for name in pairing_absorbed(sub, sub_pairing))
         parts.append({'contrast': (base, other), 'mask': mask, 'covariates': sub,
                       'tested': tested, 'paired': paired, 'notes': notes})
     return parts
@@ -509,6 +511,35 @@ def comparison_plan(group_vec: list[str], contrasts: list[tuple[str, str]],
 
 def _has_missing(covariates: pd.DataFrame | None) -> bool:
     return covariates is not None and bool(covariates.isna().to_numpy().any())
+
+
+def pairing_absorbed(covariates: pd.DataFrame | None,
+                     pairing_vec: list[str] | None) -> list[str]:
+    """
+    Covariates that take a single value within every pairing level
+    (missing values aside), e.g. the age shared by two tissues of one
+    donor. With pairing in the design such a covariate is already
+    accounted for — its column lies in the span of the pairing indicators —
+    so build_design leaves it out instead of reporting a rank-deficient
+    design. Rows of ``covariates`` align with ``pairing_vec``.
+    """
+    if covariates is None or pairing_vec is None or not len(covariates.columns):
+        return []
+    levels = np.array([str(p) for p in pairing_vec], dtype=object)
+    absorbed = []
+    for name in covariates.columns:
+        column = covariates[name].reset_index(drop=True)
+        if column.nunique(dropna=True) < 2:
+            continue
+        if (column.groupby(levels).nunique(dropna=True) <= 1).all():
+            absorbed.append(name)
+    return absorbed
+
+
+def _absorbed_note(name: str, label: str = '') -> str:
+    text = (f"'{name}' is the same within every pairing level, so the pairing already "
+            "accounts for it; it was left out of the model.")
+    return f"{label}: {text}" if label else text
 
 
 def _fit_by_comparison(parts, fit, group_vec, pairing_vec, finish):
@@ -629,7 +660,8 @@ def build_design(group_vec: list[str], baseline: str,
     categorical columns as indicators for every level except the first in
     sorted order. A column is numeric when it has a numeric dtype (see
     covariate_frame()); string columns are always categorical. Covariates
-    that are constant over these samples are dropped.
+    that are constant over these samples are dropped, and so, with pairing,
+    are covariates constant within every pairing level (pairing_absorbed).
 
     Returns (X, column_names, group_columns) where group_columns maps each
     non-baseline group to its column index. Raises RuntimeError naming the
@@ -660,10 +692,15 @@ def build_design(group_vec: list[str], baseline: str,
             raise RuntimeError(_pairing_confounded_message(group_vec, pairing_vec))
 
     if covariates is not None:
+        absorbed = set(pairing_absorbed(covariates, pairing_vec))
         for name in covariates.columns:
             values = covariates[name].tolist()
             if len(set(values)) < 2:
                 log.info("covariate %r is constant over these samples — dropped", name)
+                continue
+            if name in absorbed:
+                log.info("covariate %r is constant within every pairing level — accounted "
+                         "for by the pairing", name)
                 continue
             added = []
             if pd.api.types.is_numeric_dtype(covariates[name]):
@@ -964,6 +1001,9 @@ def run_moderated(data_df: pd.DataFrame, group_vec: list[str],
     combined = apply_significance(combined, pval_threshold, fc_threshold,
                                   fdr_scope=fdr_scope, use_treat=use_treat,
                                   hierarchical=hierarchical)
+    absorbed = pairing_absorbed(covariates, pairing_vec)
+    if absorbed:
+        combined.attrs['notes'] = [_absorbed_note(name) for name in absorbed]
     log.info("moderated test: %d rows across %d comparison(s), %d significant (%s FDR%s%s)",
              len(combined), combined['comparison'].nunique(),
              int(combined['significant'].sum()), fdr_scope,
@@ -1756,6 +1796,9 @@ def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
 
     combined = apply_significance(combined, pval_threshold, fc_threshold,
                                   fdr_scope=fdr_scope, use_treat=use_treat)
+    absorbed = pairing_absorbed(covariates, pairing_vec)
+    if absorbed:
+        combined.attrs['notes'] = [_absorbed_note(name) for name in absorbed]
     log.info("GLM counts (%s): %d rows across %d comparison(s), %d significant (%s FDR), "
              "%d untestable", method, len(combined), combined['comparison'].nunique(),
              int(combined['significant'].sum()), fdr_scope, int(combined['logFC'].isna().sum()))
