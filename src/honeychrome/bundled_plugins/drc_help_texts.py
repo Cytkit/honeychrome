@@ -427,6 +427,8 @@ marker-distribution and relabelling tools of the MARMOT pipeline
 ''' + _workflow('Cluster Annotation') + _GLOSSARY
 
 
+# Validation figures quoted in this help: the human cohort is UCL IMMPROVE
+# (gated populations, Automated Gating cache).
 stats_tab_help_text = '''
 <h3>Stats: compare groups of samples cluster by cluster</h3>
 <p><b>In short:</b> assign each sample to a group, then test which clusters
@@ -519,8 +521,174 @@ point: the 95% confidence interval of its effect. A wider bar means a less
 precise estimate (fewer events, more variation, or fewer samples).</li>
 </ul>
 
+<h4>Details: trends with a numeric covariate</h4>
+<ul>
+<li>Set <b>Analysis</b> to <i>Trend with a numeric covariate</i> to ask which
+clusters change with a number such as age or days after vaccination, instead of comparing groups. Tick <b>Numeric</b> under
+that covariate in the samples table first. The samples of the groups ticked
+in <b>Groups to Test</b> are used, with the groups as adjustment terms.</li>
+<li>Two tests are run on each cluster, on the moderated linear model
+[1, 2]:
+<ul>
+<li>the <b>curve</b> test asks whether the cluster changes with the
+covariate at all, whatever the shape (a rise, a fall, a rise that levels
+off, a peak): an F test of a smooth curve (a natural spline [13]), one
+p-value for the covariate as a whole, as in an ANOVA;</li>
+<li>the <b>slope</b> test fits a straight line and gives the direction and
+rate of change per unit of the covariate (log₂ % per week for
+Frequencies).</li>
+</ul></li>
+<li><b>Partial R²</b> is the share of the sample-to-sample variation the
+covariate explains once groups and adjustment covariates are accounted for
+(0 = none, 1 = all).</li>
+<li>By default a cluster is called when either test is significant, each at
+half the FDR so the combined error stays at the FDR set, and its partial
+R² is at least 0.1. In large studies very small trends become significant;
+the minimum keeps them out.</li>
+<li><b>Shape</b>: <i>Smooth curve</i> (default, 2 df: one bend), with its
+ends fixed between the 5th and 95th percentiles of the covariate so a single
+youngest or oldest sample cannot bend it; <i>Straight line</i>; or
+<i>Time points as groups</i> for designed time courses (day 0, 3, 7, 14).
+The curve gets at most one df per 10 samples. <b>Scale</b> <i>Log2</i> suits
+time courses sampled on a doubling schedule; the slope is then per
+doubling.</li>
+<li><i>Does the change differ between two groups?</i> asks whether the two
+groups ticked in Groups to Test change differently, the reference group
+first. With pairing (each donor's two tissues paired) it tests the
+within-pair difference against the covariate. A covariate shared within
+every pair cannot be tested for a common trend with pairing, so the common
+trend is then fitted without it.</li>
+<li>Cluster Counts are tested as log odds of each cluster within the
+sample's library size with the moderated model, not with the
+negative-binomial test: on a human cohort the quasi-likelihood test with a
+curve found trends in about 18% of populations when ages were shuffled (5%
+expected), the moderated models 4.5–5%.</li>
+<li>The design check under the settings warns when another covariate, or
+the events per sample, follows the covariate closely (correlation r, or η
+for categories, of 0.5 or more): a trend could then reflect it, and
+adjusting for it is advised.</li>
+<li>The results are listed in the <b>Trend tables</b> tab. Changing the FDR,
+the call or the minimum partial R² updates the calls without refitting.
+MFIs are tested as one family in a trend test (no cluster-first
+screening).</li>
+<li><b>Trend figures</b>:
+<ul>
+<li>the <b>trend volcano</b> places each cluster by its slope (left: falls,
+right: rises) and by how strongly the curve test supports a change (up:
+stronger). Called clusters are red (rise) or blue (fall); an open diamond is
+called by the curve but not the slope: a rise and fall, or a change that
+levels off, which a straight line misses. The dashed line is the FDR the
+curve test is called at;</li>
+<li>the <b>trajectories</b> heatmap shows the fitted curve of every called
+cluster, rescaled to mean 0 and SD 1 so the shape, not the size, is
+compared, ordered by where each curve is highest: early peaks at the top,
+late rises at the bottom;</li>
+<li><b>Patterns</b>: the called clusters are grouped by the shape of their
+fitted curve, whatever the size of the change (hierarchical clustering of
+the curves scaled to mean 0 and SD 1), and each group is named from its
+mean curve: <i>rises</i>, <i>falls then levels off</i>, <i>peaks at day
+7</i>. <i>Auto</i> uses the largest number of patterns that come back
+the same (adjusted Rand index of at least 0.75) when the test is repeated
+on 80% of the samples; on a human cohort we tested only the rise/fall
+split did, as finer shapes there formed a continuum. The trajectories heatmap is split
+by pattern and the <b>patterns</b> figure shows each pattern's members
+and mean curve;</li>
+<li>double-click a point or row (or right-click it) for its <b>trend
+plot</b>: each sample at its value of the variable, the fitted curve with
+its 95% confidence band (the range the true curve is likely in, given the
+spread of the samples), and the values of the variable along the bottom.
+With <i>Does the change differ between two groups?</i> and no pairing, each
+group gets its own curve and band in its group colour on the same axes:
+where the bands separate the groups differ at that value, and where the
+curves run apart the change itself differs. With pairing each pair's level
+cancels out, so only the difference can be estimated: the upper panel shows
+the samples and the lower panel the fitted difference between the groups
+with each pair's own difference;</li>
+<li><b>Composition over the variable</b> (a tab after a trend run with
+frequencies or counts): how the clusters share out the samples' events as
+the variable changes, for example whether a naive cluster shrinks with age
+while an effector cluster grows.
+<ul>
+<li>Top: the fitted share of each cluster, in the clusters' colours,
+stacked so they fill 100% at every value of the variable (the 12 largest
+clusters; the rest together as "Other clusters").</li>
+<li>Bottom: each sample's measured shares, one bar per sample, samples
+ordered by the variable, to check the fit against the data.</li>
+<li>How the curves are made: each part's counts are compared with the
+average of all the parts on a log scale (centred log-ratio, Aitchison
+1986), the trend test's curve (same shape, scale and df) is fitted to each,
+and the fitted values are turned back into shares. The result is the
+make-up of a typical sample at each value, so it never goes below 0% or
+above 100%; with skewed data it can sit a few points from the plain
+average of the samples' percentages.</li>
+<li>It is a picture of how the make-up shifts. Whether a population changes
+significantly is the trend test's answer (volcano and tables).</li>
+<li>A group × trend run gets one panel per group. The values behind the
+figure (fitted shares and each sample's shares) are offered as CSV beside
+the figure export.</li>
+</ul></li>
+<li><b>Embedding by the variable</b> (a tab after a trend run, for the DR
+run selected at the time): the samples split into four bins of the
+variable with about the same number of samples each (or the time points,
+with Time points as groups), and for each bin where its cells sit on the
+map, on one colour scale; then the last bin minus the first (red: more
+common late, blue: more common early). Every sample counts equally within
+its bin whatever its number of events. It is a picture of where the
+change happens on the map; which clusters change is the trend test's
+answer. CSV of which bin each sample fell in;</li>
+<li><b>Immune age model</b> (below Predictive Analysis, after a trend run; figures as tabs): how well does the immune profile
+predict a continuous variable, such as age, days after vaccination or any
+number used as the trend variable? A model learns to guess the variable
+from the cluster frequencies and/or MFIs of the last trend run and is always judged on samples it
+was not trained on (nested cross-validation: an outer split for judging,
+an inner one for tuning, every donor or pair kept whole, so the same donor
+is never in both). The model is an elastic net (Zou &amp;
+Hastie 2005), a penalised regression between the lasso, which keeps few
+features, and ridge, which shares weight between correlated ones such as a
+parent and its largest subset. Read the <i>mean absolute error</i> (how far
+off a typical guess is, in the variable's units) against <i>predicting the
+mean</i> (the error of guessing every sample at the average): a useful
+model is well below it. The <i>chance check</i> reruns the whole procedure
+with the variable shuffled among donors or pairs; chance p is the share of
+shuffles that did as well. The features figure shows which features the
+model kept most often and their direction (red: higher at larger values
+of the variable, e.g. in older donors). The <i>gap</i> is the guess minus
+the actual value (with age: a sample's "immune age" minus its age); any
+such model pulls guesses towards the middle (the lowest values guessed too
+high, the highest too low), so the gap is shown <i>corrected</i> for that
+(de Lange &amp; Cole 2020): positive means the sample's profile looks like
+that of a higher value than it has (with age: older than it is). Train the
+model within one group. With <i>Predict the other groups</i> ticked, the
+final model also predicts every sample of the other groups, whether or not
+they were in the trend run and whether or not they have a value of the
+variable (open markers, not cross-validated). The table lists each group's
+predicted values (mean ± SD) and, for samples that have a value, how close
+the predictions are; the <i>Predicted by group</i> panel shows them against
+the range the model was trained on. A prediction outside that range, or for
+samples of a different kind (a different tissue or time of life), says the
+profile differs from the training samples, not what their value is. Samples
+outside the trend run are predicted from frequencies only (a model that
+uses MFIs predicts only the trend run's other samples). Needs
+at least 20 samples; 40 or more is recommended;</li>
+<li>in trend mode the <b>sample PCA</b> uses the trend run's values and
+colours each sample by the variable (shape = group).</li>
+</ul></li>
+</ul>
+
 <h4>Details: composition and export</h4>
 <ul>
+<li><b>⚙ Options</b> beside a figure opens a side panel that changes how
+it is drawn, not what it shows: grid lines (off by default), the run label
+in the top left corner, the title (as drawn, hidden or your own text), the
+titles of individual panels, the font sizes of the title, the axis and
+panel labels, the tick labels, the legend and other text (each "As drawn"
+until set), and the background (the theme's: black in dark mode, white in
+light mode; or white, black or transparent). Threshold lines, such as the
+FDR and effect-size lines of a volcano plot, are part of the figure and
+always drawn. The options are kept with the experiment, per figure, and
+used for Pop Out, Export and the report and the Layout as well. <i>Use for all</i> makes
+the panel's settings (all but the title) the default of every figure of
+this plugin; <i>Reset</i> returns the figure to those defaults.</li>
 <li>The <b>Composition Barplot</b> shows how each sample's events divide
 among the clusters, as stacked counts or percentages (<b>%</b>), per sample
 or summed per group (<b>By group</b>). It needs no statistics, so it is a
@@ -695,7 +863,7 @@ treated as quieter than they are. It suits homogeneous designs such as
 inbred mice: on random splits of BATF chimera mice, where nothing differed,
 it found 3–6% false positives at p &lt; 0.05 (5% expected), and about 5% on
 mouse samples cut down to 100 cells each. On gated populations of a human
-cohort (UCL IMMPROVE) it found 7–10% for populations under 100 events,
+cohort it found 7–10% for populations under 100 events,
 because donors vary more, and more unevenly, than the model allows for;
 rely on Cluster Frequencies for human or otherwise varied donors. The
 negative-binomial Wald test is not offered: it found 10–13% on the human
@@ -780,6 +948,7 @@ gives frequentist p-values.</li>
 [10]<a href="https://doi.org/10.1002/alz.70952">Humblet-Baron et al. 2025, Alzheimer's &amp; Dementia (systems immunology of Alzheimer's disease)</a><br/>
 [11]<a href="https://doi.org/10.1038/s41467-026-70895-1">Veiga et al. 2026, Nature Communications (autoinflammation of unknown origin)</a><br/>
 [12]<a href="https://lorenzobonaguro.github.io/cyCONDOR">Bonaguro et al. 2025, R package version 0.3.1 (cyCONDOR)</a><br/>
+[13]<a href="https://doi.org/10.1007/978-0-387-84858-7">Hastie, Tibshirani and Friedman 2009, The Elements of Statistical Learning, 2nd edition (natural cubic splines)</a><br/>
 </p>
 ''' + _workflow('Stats') + _GLOSSARY
 

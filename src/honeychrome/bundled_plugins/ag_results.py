@@ -31,6 +31,13 @@ Pure computation for the Automated Gating plugin (no Qt, no controller):
 * ``statistics_tables`` — the statistics run as tables for CSV export;
   ``counts_only_hits`` — counts hits the frequency test does not share,
   when both asked the same question.
+* ``run_trend_statistics`` — trends of the same feature tables with a
+  numeric variable such as age (``controller_components.trend_stats``);
+  ``reapply_trend_thresholds``, ``trend_to_jsonable`` /
+  ``trend_from_jsonable`` and ``trend_tables`` re-threshold, save, restore
+  and export them; ``composition_gate`` / ``trend_composition`` give the
+  make-up of one gate's populations against the variable
+  (``trend_stats.fit_composition``).
 * ``group_population_values`` / ``population_result`` — one population's
   per-sample values by group and its test result, for the population
   comparison plots.
@@ -91,8 +98,12 @@ __all__ = [
     'stats_to_jsonable', 'stats_from_jsonable',
     'pack_display', 'display_population_mask', 'display_parent_mask', 'save_display',
     'load_display', 'display_file_name', 'statistics_tables', 'group_population_values',
-    'population_result', 'counts_only_hits',
+    'population_result', 'counts_only_hits', 'run_trend_statistics', 'reapply_trend_thresholds',
+    'trend_to_jsonable', 'trend_from_jsonable', 'trend_tables', 'composition_gate',
+    'trend_composition', 'COMPOSITION_OTHER', 'trend_feature_values',
 ]
+
+COMPOSITION_OTHER = 'Other'
 
 
 # ---------------------------------------------------------------------------
@@ -1143,6 +1154,306 @@ def counts_only_hits(stats: dict) -> set[tuple[str, str]]:
         sel = df[df['significant'].fillna(False).astype(bool)]
         return set(zip(sel['comparison'], sel['feature']))
     return hits(counts) - hits(freq)
+
+
+# ---------------------------------------------------------------------------
+# Trends with a numeric variable
+# ---------------------------------------------------------------------------
+
+_TREND_RESULTS = ('freq', 'counts', 'markers')
+_TREND_VALUES = ('freq_values', 'counts_values', 'marker_values', 'freq_data', 'counts_data')
+_AGE_FRAMES = ('performance', 'predictions', 'importance', 'chance')
+
+
+def run_trend_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs: list[dict],
+                         *, time: dict, variable: str, unit: str = '', scale: str = 'linear',
+                         shape: str = 'curve', k: int = 2, interaction: bool = False,
+                         baseline: str = '', pairing: dict | None = None,
+                         covariates: pd.DataFrame | None = None,
+                         numeric_covariates: list[str] | None = None,
+                         pval_threshold: float = 0.05, min_r2: float = 0.1, call: str = 'either',
+                         run_freq: bool = True, run_counts: bool = False,
+                         counts_reference: str = 'anchor',
+                         min_parent_events: int = DEFAULT_MIN_PARENT_EVENTS,
+                         run_markers: bool = True, use_stats_parent: bool = True,
+                         exclude_gating_markers: bool = True,
+                         min_marker_events: int = DEFAULT_MIN_MARKER_EVENTS,
+                         anchor_key: str | None = None, patterns: int = 0) -> dict:
+    """Trends of gated populations with a numeric variable (age, time).
+
+    The feature tables are those of ``run_statistics``: log2 odds of each
+    population within its parent, counts as log2 odds within the anchor
+    population (or the parent), and per-population marker medians. Each is
+    tested with ``trend_stats.run_trend`` (moderated linear model: a curve
+    F test and a slope test). Counts always use the moderated log-odds
+    model here; the quasi-likelihood counts test gave far too many false
+    trends. Marker medians are tested as one family (no population-first
+    screening).
+
+    time       : {sample: value of the variable} (missing: left out).
+    groups     : {sample: group}; with ``interaction`` exactly two groups,
+                 ``baseline`` the first.
+    pairing, covariates, numeric_covariates: as in run_statistics; a
+                 covariate named like ``variable`` is left out.
+    patterns   : number of shape patterns the called features of each test
+                 are grouped into (``trend_stats.add_patterns``); 0 chooses
+                 it from stability.
+
+    Returns {'kind': 'trend', 'samples', 'group_vec', 'time', 'variable',
+    'unit', 'freq' / 'counts' / 'markers' (TrendResult or None),
+    'freq_values' / 'counts_values' / 'marker_values', 'freq_data' /
+    'counts_data' (the log odds tested, samples × populations), 'counts_reference',
+    'counts_anchor', 'settings', 'notes'}.
+    """
+    from honeychrome.controller_components import differential_stats as ds
+    from honeychrome.controller_components import trend_stats as ts
+
+    used = [s for s in samples if groups.get(s)]
+    group_vec = [groups[s] for s in used]
+    tvec = [time.get(s) for s in used]
+    pairing_vec = [str((pairing or {}).get(s, '')) for s in used] if pairing else None
+    cov = None
+    if covariates is not None and len(covariates.columns):
+        names = [c for c in covariates.columns if c != variable]
+        if names:
+            cov = ds.covariate_frame(covariates[names], used, names,
+                                     numeric=list(numeric_covariates or []), allow_missing=True)
+    common = dict(variable=variable, unit=unit, scale=scale, shape=shape, k=k,
+                  group_vec=group_vec, interaction=interaction, baseline=baseline or None,
+                  pairing_vec=pairing_vec, covariates=cov, pval_threshold=pval_threshold,
+                  min_r2=min_r2, call=call)
+    out = {'kind': 'trend', 'samples': used, 'group_vec': group_vec, 'time': tvec,
+           'variable': variable, 'unit': unit, 'freq': None, 'freq_values': None,
+           'counts': None, 'counts_values': None, 'markers': None, 'marker_values': None,
+           'freq_data': None, 'counts_data': None,
+           'counts_reference': counts_reference, 'counts_anchor': '', 'settings': {},
+           'notes': []}
+    if run_freq:
+        counts, denom, _dropped = population_tables(summaries, used, use_stats_parent,
+                                                    min_parent_events)
+        out['freq_data'] = ds.logit_proportions(counts, denom)
+        out['freq'] = ts.run_trend(out['freq_data'], tvec, **common)
+        out['freq_values'] = 100.0 * counts / denom
+    if run_counts:
+        if counts_reference == 'parent':
+            c_counts, c_denom, _dropped = population_tables(summaries, used, use_stats_parent,
+                                                            min_parent_events)
+        else:
+            anchor = (anchor_key or (ag_core.anchor_population(gate_defs) if gate_defs else None)
+                      or 'root')
+            c_counts, c_denom, _dropped = anchor_tables(summaries, used, anchor)
+            out['counts_anchor'] = anchor
+            anchor_name = ('all events' if anchor == 'root'
+                           else ag_core.gate_population_names(gate_defs).get(anchor, anchor))
+            out['notes'].append(f"Counts are tested as log odds within the anchor population "
+                                f"({anchor_name}).")
+        if c_counts.shape[1] >= 3:
+            out['counts_data'] = ds.logit_proportions(c_counts, c_denom)
+            out['counts'] = ts.run_trend(out['counts_data'], tvec, **common)
+            out['counts_values'] = c_counts
+        else:
+            out['notes'].append("Fewer than three populations could be tested for counts, so "
+                                "the counts trend was not run.")
+    if run_markers:
+        values, meta, _dropped = marker_table(
+            summaries, used, gate_defs, exclude_gating_markers=exclude_gating_markers,
+            min_events=min_marker_events,
+            population_labels=ag_core.gate_population_names(gate_defs))
+        if values.shape[1] >= 3:
+            out['markers'] = ts.run_trend(values, tvec, feature_meta=meta, **common)
+            out['marker_values'] = values
+    for key, data_key in (('freq', 'freq_data'), ('counts', 'counts_data'),
+                          ('markers', 'marker_values')):
+        if out.get(key) is not None:
+            out[key] = ts.add_patterns(out[key], out[data_key], tvec, n_patterns=patterns, **common)
+    for key in _TREND_RESULTS:
+        res = out.get(key)
+        if res is None:
+            continue
+        if not out['settings']:
+            out['settings'] = dict(res.settings)
+        for note in res.notes:
+            if note not in out['notes']:
+                out['notes'].append(note)
+    if not any(out[k] is not None for k in _TREND_RESULTS):
+        raise RuntimeError("Nothing could be tested for a trend: tick at least one kind of test "
+                           "with three or more measurable populations.")
+    return out
+
+
+def reapply_trend_thresholds(trend: dict, pval_threshold: float, min_r2: float, call: str,
+                             patterns: int = 0) -> dict:
+    """*trend* with its calls redone for new thresholds and its features
+    regrouped into *patterns* shape patterns (0: the number chosen from
+    stability at the run), without refitting."""
+    from honeychrome.controller_components import trend_stats as ts
+
+    out = dict(trend)
+    for key in _TREND_RESULTS:
+        res = out.get(key)
+        if res is not None:
+            out[key] = ts.recall(res, pval_threshold, min_r2, call, n_patterns=patterns)
+    out['settings'] = dict(out.get('settings') or {}, pval_threshold=pval_threshold,
+                           min_r2=min_r2, call=call)
+    return out
+
+
+def trend_to_jsonable(trend: dict) -> dict:
+    """*trend* (a ``run_trend_statistics`` result) as JSON-safe values."""
+    from honeychrome.controller_components import trend_stats as ts
+
+    out = {k: v for k, v in trend.items()
+           if k not in _TREND_RESULTS + _TREND_VALUES + ('age_model',)}
+    out = ag_core.to_jsonable(out)
+    out['age_model'] = _result_to_jsonable(trend.get('age_model'), _AGE_FRAMES)
+    for key in _TREND_RESULTS:
+        out[key] = ts.result_to_jsonable(trend[key]) if trend.get(key) is not None else None
+    for key in _TREND_VALUES:
+        frame = trend.get(key)
+        out[key] = _frame_to_jsonable(frame) if frame is not None else None
+    return out
+
+
+def trend_from_jsonable(payload: dict) -> dict:
+    """The ``run_trend_statistics`` result that ``trend_to_jsonable`` saved."""
+    from honeychrome.controller_components import trend_stats as ts
+
+    out = {k: v for k, v in payload.items()
+           if k not in _TREND_RESULTS + _TREND_VALUES + ('age_model',)}
+    age = _result_from_jsonable(payload.get('age_model'), _AGE_FRAMES)
+    if age:
+        out['age_model'] = age
+    for key in _TREND_RESULTS:
+        obj = payload.get(key)
+        out[key] = ts.result_from_jsonable(obj) if obj else None
+    for key in _TREND_VALUES:
+        obj = payload.get(key)
+        out[key] = _frame_from_jsonable(obj) if obj else None
+    return out
+
+
+def trend_feature_values(summaries: dict, samples: list[str], gate_defs: list[dict], *,
+                         use_freq: bool = True, use_markers: bool = False,
+                         use_stats_parent: bool = True,
+                         min_parent_events: int = DEFAULT_MIN_PARENT_EVENTS,
+                         exclude_gating_markers: bool = True,
+                         min_marker_events: int = DEFAULT_MIN_MARKER_EVENTS) -> dict:
+    """
+    The per-sample values a trend run keeps ('freq_values': % of the
+    statistics parent; 'marker_values': marker medians), worked out the same
+    way for any *samples*, e.g. samples of groups outside the trend run whose
+    immune age is predicted. Returns {'samples', 'freq_values',
+    'marker_values'} for predictive_matrix.
+    """
+    out = {'samples': list(samples), 'freq_values': None, 'marker_values': None}
+    if use_freq:
+        counts, denom, _dropped = population_tables(summaries, list(samples), use_stats_parent,
+                                                    min_parent_events)
+        out['freq_values'] = 100.0 * counts / denom
+    if use_markers:
+        values, _meta, _dropped = marker_table(
+            summaries, list(samples), gate_defs, exclude_gating_markers=exclude_gating_markers,
+            min_events=min_marker_events,
+            population_labels=ag_core.gate_population_names(gate_defs))
+        out['marker_values'] = values
+    return out
+
+
+def composition_gate(summaries: dict, samples: list[str], pop_key: str) -> dict | None:
+    """
+    The gate *pop_key* belongs to, as the unit of a composition: {'gate',
+    'parent_key', 'keys' (the gate's population keys under that parent),
+    'labels'}; None when the gate has fewer than two populations or the
+    population is not in the summaries. One gate's populations never
+    overlap, whereas all the children of a parent usually do (single-marker
+    gates hang off the same parent as a subset gate).
+    """
+    for s in samples:
+        rows = (summaries.get(s) or {}).get('populations') or []
+        hit = next((r for r in rows if r.get('key') == pop_key), None)
+        if hit is None:
+            continue
+        same = [r for r in rows if r.get('gate') == hit.get('gate')
+                and (r.get('parent_key') or 'root') == (hit.get('parent_key') or 'root')]
+        if len(same) < 2:
+            return None
+        return {'gate': hit.get('gate'), 'parent_key': hit.get('parent_key') or 'root',
+                'keys': [r['key'] for r in same],
+                'labels': {r['key']: r.get('label') or r.get('population') or r['key'] for r in same}}
+    return None
+
+
+def trend_composition(summaries: dict, trend: dict, pop_key: str) -> list[dict]:
+    """
+    The make-up of the gate *pop_key* belongs to (its populations plus
+    COMPOSITION_OTHER, the parent's events outside them, when there are
+    any) against the variable of the trend run *trend*, with the run's
+    samples, scale, shape and df. One panel per group for a group × trend
+    run; otherwise one panel, with the groups as adjustment when there are
+    several. Returns [{'label', **trend_stats.fit_composition result}].
+    Raises RuntimeError when the gate has fewer than two populations.
+    """
+    from honeychrome.controller_components import trend_stats as ts
+
+    res = next((trend.get(k) for k in _TREND_RESULTS if trend.get(k) is not None), None)
+    if res is None:
+        raise RuntimeError("Run the trend test first.")
+    settings = res.settings or {}
+    used = [s for s in (settings.get('samples') or trend.get('samples') or []) if s in summaries]
+    unit = composition_gate(summaries, used, pop_key)
+    if unit is None:
+        raise RuntimeError("This population's gate has a single population, so there is no "
+                           "make-up to show.")
+    data = {}
+    for s in used:
+        rows = {r['key']: r for r in (summaries[s].get('populations') or [])}
+        if not all(k in rows for k in unit['keys']):
+            continue
+        n = {unit['labels'][k]: float(rows[k].get('n_events') or 0) for k in unit['keys']}
+        parent = float(rows[unit['keys'][0]].get('n_parent') or 0)
+        n[COMPOSITION_OTHER] = max(parent - sum(n.values()), 0.0)
+        data[s] = n
+    counts = pd.DataFrame.from_dict(data, orient='index')
+    if counts.empty:
+        raise RuntimeError("No sample of the trend run has this gate's populations.")
+    if COMPOSITION_OTHER in counts.columns and not (counts[COMPOSITION_OTHER] > 0).any():
+        counts = counts.drop(columns=[COMPOSITION_OTHER])
+    return ts.composition_panels(
+        counts, dict(zip(trend.get('samples') or [], trend.get('time') or [])),
+        dict(zip(trend.get('samples') or [], trend.get('group_vec') or [])),
+        dict(settings, samples=list(counts.index)),
+        variable=trend.get('variable') or '', unit=trend.get('unit') or '')
+
+
+def trend_tables(trend: dict, labels: dict | None = None, antigens: dict | None = None) -> dict:
+    """The trend run as tables for CSV export: {'trend_frequencies',
+    'trend_counts', 'trend_markers'} for the tests that were run, each
+    with a population label (and, for markers, the antigen), and
+    'immune_age_predictions' / 'immune_age_features' when an immune age
+    model was run on it."""
+    labels = labels or {}
+    antigens = antigens or {}
+    out = {}
+    for key, name in (('freq', 'trend_frequencies'), ('counts', 'trend_counts'),
+                      ('markers', 'trend_markers')):
+        res = (trend or {}).get(key)
+        if res is None:
+            continue
+        df = res.table.copy()
+        pop_col = 'cluster_id' if key == 'markers' and 'cluster_id' in df.columns else 'feature'
+        df.insert(0, 'population', [labels.get(k, k) for k in df[pop_col]])
+        if key == 'markers' and 'channel' in df.columns:
+            df.insert(1, 'antigen', [antigens.get(c, c) for c in df['channel']])
+        out[name] = df
+    age = (trend or {}).get('age_model')
+    if age:
+        groups = dict(zip(trend.get('samples') or [], trend.get('group_vec') or []))
+        groups.update(age.get('groups') or {})
+        pred = age['predictions'].copy()
+        pred.insert(1, 'group', [groups.get(s, '') for s in pred['sample']])
+        out['immune_age_predictions'] = pred
+        out['immune_age_features'] = age['importance']
+    return out
 
 
 # ---------------------------------------------------------------------------

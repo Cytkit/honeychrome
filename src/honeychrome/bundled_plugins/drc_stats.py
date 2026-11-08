@@ -45,6 +45,15 @@ tested group and reads one coefficient per non-reference group;
 'pairwise' fits each pair of groups separately. Results carry a
 ``comparison`` column.
 
+Trends with a numeric covariate (``run_trend_statistics``): instead of
+comparing groups, each cluster's frequency, counts (as log odds) and MFIs
+are tested for a change with a number such as age or days after
+vaccination (``controller_components.trend_stats``): a curve F test and a
+slope test, partial R², and a call by either test. The samples are those
+of Groups to Test; ``reapply_trend_thresholds``, ``relabel_trend_results``
+and ``trend_to_bundle`` / ``trend_from_bundle`` re-threshold, rename and
+store the results.
+
 Populations within samples (``state.population_split``): instead of
 comparing groups of samples, each sample is split into the gated
 populations in ``state.population_gates`` (for example CD45.1+ and
@@ -677,7 +686,8 @@ def compute_sample_mfis(controller, state, all_rel, channels=None,
 # ---------------------------------------------------------------------------
 
 def compute_sample_pca(state, use_freq: bool, use_counts: bool, use_mfi: bool,
-                       n_loadings: int = 10) -> dict | None:
+                       n_loadings: int = 10, tables: dict | None = None,
+                       group_of: dict | None = None) -> dict | None:
     """
     Sample-level PCA over any combination of the per-sample feature
     matrices Run Statistics already computed (``state.freq_df`` /
@@ -698,6 +708,10 @@ def compute_sample_pca(state, use_freq: bool, use_counts: bool, use_mfi: bool,
     variables rather than every feature in the (potentially huge)
     cluster x channel matrix.
 
+    tables / group_of: optional {'freq', 'counts', 'mfi': samples × features}
+    and {sample: group} used instead of the state's tables and groups (the
+    trend run's tested values, in trend mode).
+
     Returns None if no requested source is available/populated, or if
     fewer than 2 samples or 2 non-degenerate (non-zero-variance) features
     remain. Otherwise a dict:
@@ -712,16 +726,15 @@ def compute_sample_pca(state, use_freq: bool, use_counts: bool, use_mfi: bool,
     """
     log_stage(log, "SAMPLE PCA")
 
+    if tables is None:
+        tables = {'freq': state.freq_df, 'counts': state.counts_df, 'mfi': state.mfi_df}
     sources, frames = [], []
-    if use_freq and state.freq_df is not None and not state.freq_df.empty:
-        sources.append('Freq')
-        frames.append(state.freq_df.add_prefix('Freq: '))
-    if use_counts and state.counts_df is not None and not state.counts_df.empty:
-        sources.append('Counts')
-        frames.append(state.counts_df.add_prefix('Counts: '))
-    if use_mfi and state.mfi_df is not None and not state.mfi_df.empty:
-        sources.append('MFI')
-        frames.append(state.mfi_df.add_prefix('MFI: '))
+    for use, key, name in ((use_freq, 'freq', 'Freq'), (use_counts, 'counts', 'Counts'),
+                           (use_mfi, 'mfi', 'MFI')):
+        frame = tables.get(key)
+        if use and frame is not None and not frame.empty:
+            sources.append(name)
+            frames.append(frame.add_prefix(f'{name}: '))
 
     if not frames:
         log.warning("Sample PCA: no requested source is available -- "
@@ -771,7 +784,8 @@ def compute_sample_pca(state, use_freq: bool, use_counts: bool, use_mfi: bool,
     top_idx = magnitude.sort_values(ascending=False).head(max(1, int(n_loadings))).index
     loadings_top = loadings.loc[top_idx]
 
-    group_by_rel = dict(zip(state.stats_all_rel, state.stats_group_vec))
+    group_by_rel = (group_of if group_of is not None
+                    else dict(zip(state.stats_all_rel, state.stats_group_vec)))
     groups = [group_by_rel.get(rel, 'Unassigned') for rel in scores.index]
 
     log.info("Sample PCA: %s, %d samples, %d features (%d shown as loadings), "
@@ -1224,3 +1238,351 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
         state.stats_alignment_note = " ".join(
             t for t in [state.stats_alignment_note] + notes if t)
     return freq_results, mfi_results, counts_results
+
+
+# ---------------------------------------------------------------------------
+# Trends with a numeric covariate
+# ---------------------------------------------------------------------------
+
+_TREND_KEYS = ('freq', 'counts', 'mfi')
+
+
+def trend_samples(controller, state, cluster_labels=None) -> tuple[list[str], list[str]]:
+    """Rel paths and groups of the samples a trend test uses: the samples of
+    the groups ticked in Groups to Test (every group when none is ticked)
+    that have cluster labels, group by group."""
+    labels = cluster_labels if cluster_labels is not None else state.cluster_labels
+    raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
+    all_rel, group_vec = [], []
+    for name in (state.testing_group_selection or list(state.group_names)):
+        for sp, g in state.sample_groups.items():
+            rel = _rel_path(sp, raw_subdir)
+            if g == name and rel in labels and rel not in all_rel:
+                all_rel.append(rel)
+                group_vec.append(name)
+    return all_rel, group_vec
+
+
+def samples_outside_trend(controller, state, trend_rel: list[str],
+                          cluster_labels=None) -> tuple[list[str], list[str]]:
+    """Rel paths and groups of the labelled samples of any group that are not
+    among *trend_rel*: the samples an immune age model may predict besides
+    those of the trend run."""
+    labels = cluster_labels if cluster_labels is not None else state.cluster_labels
+    raw_subdir = controller.experiment.settings['raw']['raw_samples_subdirectory']
+    seen = set(trend_rel)
+    rels, groups = [], []
+    for sp, g in state.sample_groups.items():
+        rel = _rel_path(sp, raw_subdir)
+        if g and g in state.group_names and rel in labels and rel not in seen:
+            seen.add(rel)
+            rels.append(rel)
+            groups.append(g)
+    return rels, groups
+
+
+def trend_values(state, all_rel: list[str]) -> list[float]:
+    """The trend variable (state.trend_variable) of each sample; NaN where
+    it has no number."""
+    cov = state.covariates
+    var = state.trend_variable
+    out = []
+    for rel in all_rel:
+        value = cov[var].get(rel) if cov is not None and var in cov.columns else None
+        try:
+            out.append(float('nan') if value is None or _ds.is_missing_value(value)
+                       else float(str(value).strip()))
+        except ValueError:
+            out.append(float('nan'))
+    return out
+
+
+def _outside_frequencies(controller, state, all_rel, counts_df, tested, n_clusters, labels,
+                         names_override) -> dict:
+    """
+    The tested log2 cluster frequencies of the labelled samples outside the
+    trend run (other groups, or samples without a value of the variable),
+    for the immune age model to predict: {'other_freq_data', 'other_groups',
+    'other_time'}. Library sizes are worked out over the trend's and these
+    samples together, so they are on the same footing as the trend's.
+    """
+    rels, groups = samples_outside_trend(controller, state, all_rel, labels)
+    if not rels:
+        return {'other_freq_data': None, 'other_groups': {}, 'other_time': {}}
+    other = compute_counts(state, rels, n_clusters, cluster_labels_override=labels,
+                           names_override=names_override)
+    both = pd.concat([counts_df[tested], other[tested]])
+    totals = sample_event_totals(state, list(all_rel) + rels, labels)
+    library = np.asarray(_ds.library_sizes(both, totals, _normalisation(state)), dtype=float)
+    data = log2_frequencies(other[tested], library[len(all_rel):])
+    return {'other_freq_data': data, 'other_groups': dict(zip(rels, groups)),
+            'other_time': dict(zip(rels, trend_values(state, rels)))}
+
+
+def run_trend_statistics(controller, state, run_freq: bool, run_mfi: bool,
+                         pval_threshold: float, cluster_labels_override=None,
+                         include_type_markers: bool = False, names_override: dict | None = None,
+                         run_counts: bool = False, af_state=None,
+                         covariate_names: list[str] | None = None,
+                         align_run: dict | None = None, align_mode: str | None = None) -> dict:
+    """
+    Trends of cluster frequencies, counts and MFIs with the numeric
+    covariate state.trend_variable (``trend_stats.run_trend``: a curve F
+    test and a slope test on the moderated linear model).
+
+    The feature tables are those of run_statistics: log2 % of each
+    sample's events (library size from state.stats_normalisation),
+    counts as log2 odds within that library size (moderated; the
+    quasi-likelihood counts test gave far too many false trends), and
+    per-cluster MFIs. The samples are those of trend_samples; settings come
+    from the state's trend_* fields. With state.trend_interaction exactly
+    two groups are ticked and the reference group comes first.
+
+    Returns {'samples', 'group_vec', 'time', 'variable', 'unit', 'freq' /
+    'counts' / 'mfi' (TrendResult or None), 'freq_data' / 'counts_data' /
+    'mfi_data' (the tested values, samples × features), 'cluster_names',
+    'settings', 'notes'}.
+    """
+    from honeychrome.controller_components import trend_stats as ts
+
+    log_stage(log, "TREND STATISTICS")
+    values_override = None
+    notes = []
+    if align_run is not None and align_mode is not None:
+        cluster_labels_override, values_override, note = drc_run_align.statistics_inputs(
+            controller, state, align_run, align_mode, af_state=af_state)
+        if note:
+            notes.append(note)
+    if getattr(state, 'population_split', False):
+        raise RuntimeError("A trend test compares samples: untick 'Compare populations within "
+                           "samples' to test one.")
+    labels = cluster_labels_override if cluster_labels_override is not None \
+        else state.cluster_labels
+    variable = state.trend_variable
+    if not variable or state.covariates is None or variable not in state.covariates.columns:
+        raise RuntimeError("Choose a numeric covariate for the trend (tick Numeric under it in "
+                           "the samples table).")
+    all_rel, group_vec = trend_samples(controller, state, labels)
+    order = list(dict.fromkeys(group_vec))
+    if state.trend_interaction and len(order) != 2:
+        raise RuntimeError("Tick exactly two groups in Groups to Test to ask whether they "
+                           "change differently.")
+    baseline = state.reference_group if state.reference_group in order else (order or [''])[0]
+    time = trend_values(state, all_rel)
+
+    pairing_vec = None
+    if state.paired and state.pairing_variable and state.pairing_variable in state.covariates.columns:
+        cov = state.covariates[state.pairing_variable]
+        pairing_vec = [str(cov[rel]).strip()
+                       if rel in cov.index and not _ds.is_missing_value(cov[rel])
+                       else f"__unpaired_{rel}" for rel in all_rel]
+    adjust = [c for c in (covariate_names or []) if c != variable
+              and not (pairing_vec is not None and c == state.pairing_variable)]
+    covariates = covariate_frame(state, all_rel, adjust)
+    n_clusters = n_clusters_from_labels(state, all_rel, cluster_labels_override=labels)
+    common = dict(variable=variable, unit=state.trend_unit, scale=state.trend_scale,
+                  shape=state.trend_shape, k=state.trend_df, group_vec=group_vec,
+                  interaction=state.trend_interaction, baseline=baseline, pairing_vec=pairing_vec,
+                  covariates=covariates, pval_threshold=pval_threshold,
+                  min_r2=state.trend_min_r2, call=state.trend_call)
+    out = {'samples': all_rel, 'group_vec': group_vec, 'time': time, 'variable': variable,
+           'unit': state.trend_unit, 'freq': None, 'counts': None, 'mfi': None,
+           'freq_data': None, 'counts_data': None, 'mfi_data': None, 'cluster_counts': None,
+           'cluster_names': {cl: _label_for(state, cl, names_override) for cl in range(n_clusters)},
+           'settings': {}, 'notes': notes}
+
+    if run_freq or run_counts:
+        counts_df = compute_counts(state, all_rel, n_clusters, cluster_labels_override=labels,
+                                   names_override=names_override)
+        out['cluster_counts'] = counts_df
+        sparse = set(sparse_features(counts_df, MIN_NONZERO_SAMPLES))
+        tested = [c for c in counts_df.columns if c not in sparse]
+        if sparse:
+            notes.append(f"{len(sparse)} cluster(s) with events in fewer than "
+                         f"{MIN_NONZERO_SAMPLES} samples were left out.")
+        library = _ds.library_sizes(counts_df[tested],
+                                    sample_event_totals(state, all_rel, labels), _normalisation(state))
+        if run_freq:
+            data = log2_frequencies(counts_df[tested], library)
+            out['freq'] = ts.run_trend(data, time, **common)
+            out['freq_data'] = data
+            out.update(_outside_frequencies(controller, state, all_rel, counts_df, tested,
+                                            n_clusters, labels, names_override))
+        if run_counts:
+            denominators = pd.DataFrame({c: library for c in tested}, index=counts_df.index)
+            data = _ds.logit_proportions(counts_df[tested], denominators)
+            out['counts'] = ts.run_trend(data, time, **common)
+            out['counts_data'] = data
+            notes.append("Counts are tested as log odds within each sample's library size "
+                         "(moderated linear model).")
+    if run_mfi:
+        channels = resolve_mfi_channels(state, include_type_markers=include_type_markers)
+        mfi_df = compute_mfis(controller, state, all_rel, n_clusters,
+                              cluster_labels_override=labels, channels=channels,
+                              names_override=names_override, af_state=af_state,
+                              values_override=values_override, loaded={})
+        if mfi_df is not None and mfi_df.shape[1] >= 3:
+            meta = mfi_feature_table(state, n_clusters, channels, names_override)
+            meta = meta[meta['feature'].isin(mfi_df.columns)].drop_duplicates('feature')
+            out['mfi'] = ts.run_trend(mfi_df, time, feature_meta=meta, **common)
+            out['mfi_data'] = mfi_df
+    for key in _TREND_KEYS:
+        if out[key] is not None:
+            out[key] = ts.add_patterns(out[key], out[f'{key}_data'], time,
+                                       n_patterns=int(getattr(state, 'trend_patterns', 0)),
+                                       **common)
+    for key in _TREND_KEYS:
+        res = out[key]
+        if res is None:
+            continue
+        if not out['settings']:
+            out['settings'] = dict(res.settings)
+        for note in res.notes:
+            if note not in notes:
+                notes.append(note)
+    if not any(out[k] is not None for k in _TREND_KEYS):
+        raise RuntimeError("Nothing could be tested for a trend: tick at least one test.")
+    return out
+
+
+def trend_to_bundle(trend: dict) -> dict:
+    """*trend* (a run_trend_statistics result) with each TrendResult as a
+    plain dict of tables and arrays, for drc_persist."""
+    out = dict(trend)
+    for key in _TREND_KEYS:
+        res = trend.get(key)
+        if res is None:
+            out[key] = None
+            continue
+        out[key] = {'table': res.table, 'grid': np.asarray(res.grid),
+                    'curves': np.asarray(res.curves),
+                    'notes': list(res.notes), 'settings': dict(res.settings)}
+        for name in ('curve_se', 'group_curves', 'group_curve_se'):
+            value = getattr(res, name)
+            if value is not None:
+                out[key][name] = np.asarray(value, dtype=float)
+    return out
+
+
+def trend_from_bundle(payload: dict) -> dict:
+    """The run_trend_statistics result that trend_to_bundle stored."""
+    from honeychrome.controller_components import trend_stats as ts
+
+    out = dict(payload)
+    for key in _TREND_KEYS:
+        obj = payload.get(key)
+
+        def optional(name):
+            value = (obj or {}).get(name)
+            return None if value is None else np.asarray(value, dtype=float)
+
+        out[key] = None if not obj else ts.TrendResult(
+            table=obj['table'], grid=np.asarray(obj['grid'], dtype=float),
+            curves=np.asarray(obj['curves'], dtype=float), notes=list(obj.get('notes') or []),
+            settings=dict(obj.get('settings') or {}), curve_se=optional('curve_se'),
+            group_curves=optional('group_curves'), group_curve_se=optional('group_curve_se'))
+    out['cluster_names'] = {int(cl): str(name)
+                            for cl, name in (payload.get('cluster_names') or {}).items()}
+    return out
+
+
+COMPOSITION_TOP_CLUSTERS = 12
+
+
+def age_model_matrix(trend: dict, use_freq: bool = True, use_mfi: bool = False) -> pd.DataFrame:
+    """Samples × features of the trend run for the immune age model: the
+    tested log2 cluster frequencies ('Freq: <cluster>') and/or cluster ×
+    marker MFIs ('MFI: <cluster>_<channel>')."""
+    frames = []
+    if use_freq and trend.get('freq_data') is not None:
+        frames.append(trend['freq_data'].astype(float).add_prefix('Freq: '))
+    if use_mfi and trend.get('mfi_data') is not None:
+        frames.append(trend['mfi_data'].astype(float).add_prefix('MFI: '))
+    if not frames:
+        return pd.DataFrame(index=list(trend.get('samples') or []))
+    return pd.concat(frames, axis=1)
+
+
+def trend_composition(trend: dict, keep: int = COMPOSITION_TOP_CLUSTERS) -> list[dict]:
+    """
+    The cluster make-up of the trend run's samples against its variable
+    (``trend_stats.composition_panels``): the *keep* clusters with the
+    largest mean share, the rest added together as 'Other clusters'.
+    Raises RuntimeError when the run kept no cluster counts (frequencies
+    and counts both unticked).
+    """
+    from honeychrome.controller_components import trend_stats as ts
+
+    counts = trend.get('cluster_counts')
+    res = next((trend.get(k) for k in _TREND_KEYS if trend.get(k) is not None), None)
+    if counts is None or res is None:
+        raise RuntimeError("Run the trend test with frequencies or counts ticked first.")
+    counts = ts.merge_small_parts(counts.astype(float), keep, other='Other clusters')
+    return ts.composition_panels(counts, dict(zip(trend.get('samples') or [], trend.get('time') or [])),
+                                 dict(zip(trend.get('samples') or [], trend.get('group_vec') or [])),
+                                 res.settings or {}, variable=trend.get('variable') or '',
+                                 unit=trend.get('unit') or '')
+
+
+def reapply_trend_thresholds(trend: dict, pval_threshold: float, min_r2: float, call: str,
+                             patterns: int = 0) -> dict:
+    """*trend* with its calls redone for new thresholds and its clusters
+    regrouped into *patterns* shape patterns (0: the number chosen from
+    stability at the run), without refitting."""
+    from honeychrome.controller_components import trend_stats as ts
+
+    out = dict(trend)
+    for key in _TREND_KEYS:
+        res = out.get(key)
+        if res is not None:
+            out[key] = ts.recall(res, pval_threshold, min_r2, call, n_patterns=patterns)
+    out['settings'] = dict(out.get('settings') or {}, pval_threshold=pval_threshold,
+                           min_r2=min_r2, call=call)
+    return out
+
+
+def relabel_trend_results(state, names: dict) -> dict[str, str]:
+    """
+    Give the stored trend results (state.trend_results) the current cluster
+    names of their run (*names*) without refitting. Returns {old name: new
+    name}; raises ValueError, changing nothing, when the new names are not
+    unique.
+    """
+    from dataclasses import replace
+
+    trend = state.trend_results
+    if not trend:
+        return {}
+    stored = {int(cl): str(name) for cl, name in (trend.get('cluster_names') or {}).items()}
+    renames = cluster_renames(state, stored, names)
+    if not renames:
+        return {}
+    out = dict(trend)
+    mfi = trend.get('mfi')
+    channels = ([str(ch) for ch in mfi.table['channel'].dropna().unique()]
+                if mfi is not None and 'channel' in mfi.table.columns else [])
+    mfi_renames = {f'{old}_{ch}': f'{new}_{ch}' for old, new in renames.items() for ch in channels}
+    for key, mapping in (('freq', renames), ('counts', renames), ('mfi', mfi_renames)):
+        res = trend.get(key)
+        if res is not None:
+            table = _renamed_values(res.table, 'feature', mapping)
+            if key == 'mfi':
+                table = _renamed_values(table, 'cluster', renames)
+            out[key] = replace(res, table=table)
+        data = trend.get(f'{key}_data')
+        if data is not None:
+            out[f'{key}_data'] = data.rename(columns=mapping)
+    if trend.get('other_freq_data') is not None:
+        out['other_freq_data'] = trend['other_freq_data'].rename(columns=renames)
+    if trend.get('cluster_counts') is not None:
+        out['cluster_counts'] = trend['cluster_counts'].rename(columns=renames)
+    age = trend.get('age_model')
+    if age and age.get('importance') is not None:
+        feature_renames = {f'Freq: {old}': f'Freq: {new}' for old, new in renames.items()}
+        feature_renames.update({f'MFI: {old}': f'MFI: {new}' for old, new in mfi_renames.items()})
+        out['age_model'] = dict(age, importance=_renamed_values(age['importance'], 'feature',
+                                                                feature_renames))
+    out['cluster_names'] = {cl: _label_for(state, cl, names) for cl in stored}
+    state.trend_results = out
+    log.info("trend results relabelled: %s", renames)
+    return renames

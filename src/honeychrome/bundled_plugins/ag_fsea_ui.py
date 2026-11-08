@@ -116,9 +116,13 @@ class _FseaWorker(QThread):
         self.finished.emit(True, '', result)
 
 
-def input_fingerprint(state, samples: list[str], design: dict, library_sha: str) -> str:
-    """Hash of everything an enrichment run depends on."""
+def input_fingerprint(state, samples: list[str], design: dict, library_sha: str,
+                      trend: dict | None = None) -> str:
+    """Hash of everything an enrichment run depends on (with *trend*, the
+    trend inputs of ``EnrichmentTab``'s trend_fn)."""
     payload = {
+        'trend': ({k: v for k, v in trend.items() if k not in ('design', 'patterns')}
+                  if trend else None),
         'gating': state.run_fingerprint, 'samples': samples, 'groups': design['groups'],
         'pairing': design['pairing'],
         'covariates': (design['covariates'].to_dict() if design['covariates'] is not None
@@ -142,13 +146,25 @@ class EnrichmentTab(QWidget):
                           'missing_pairing'} for those samples.
     antigens_fn()       : {channel: antigen} of the experiment.
     experiment_dir_fn() : the experiment folder (for exports), or ''.
+    trend_fn()          : the inputs of the trend test set on the Results page
+                          ({'samples', 'time', 'variable', 'unit', 'scale',
+                          'shape', 'k', 'interaction', 'baseline', 'groups',
+                          'design', 'patterns'}), or None without a trend
+                          variable. The trend is then offered as a test beside
+                          the group comparisons: which immune states change
+                          with the variable.
+
+    Group results are kept in state.fsea and the trend result in
+    state.fsea_trend; the Test chooser at the top picks which is shown and
+    which kind Run runs.
     """
 
     enrichment_finished = Signal()
 
     def __init__(self, state, bus, controller, samples_fn, design_fn, antigens_fn,
-                 experiment_dir_fn, parent=None):
+                 experiment_dir_fn, trend_fn=None, parent=None):
         super().__init__(parent)
+        self._trend_fn = trend_fn
         self.state = state
         self.bus = bus
         self.controller = controller
@@ -177,9 +193,14 @@ class EnrichmentTab(QWidget):
         outer.setSpacing(6)
         outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_ENRICHMENT, scrolling=True))
         row = QHBoxLayout()
-        row.addWidget(QLabel("<b>Comparison:</b>"))
+        row.addWidget(QLabel("<b>Test:</b>"))
         self.cb_comparison = QComboBox()
-        self.cb_comparison.currentIndexChanged.connect(self._on_comparison_changed)
+        self.cb_comparison.setToolTip(
+            "What the enrichment tests: a comparison between groups, or the trend with a "
+            "numeric variable set on the Results page. Run runs the chosen kind (all group "
+            "comparisons together, or the trend); group and trend results are kept side by "
+            "side.")
+        self.cb_comparison.currentIndexChanged.connect(self._on_test_changed)
         row.addWidget(self.cb_comparison, stretch=1)
         outer.addLayout(row)
         self.lbl_status = QLabel("")
@@ -350,15 +371,16 @@ class EnrichmentTab(QWidget):
         self.lbl_results = QLabel("")
         self.lbl_results.setWordWrap(True)
         layout.addWidget(self.lbl_results)
-        self.tbl_results = QTableWidget(0, 13)
+        self.tbl_results = QTableWidget(0, 14)
         self.tbl_results.setHorizontalHeaderLabels(
             ["Immune state", "Direction", "NES", "p", "FDR", "FWER", "Mean t",
-             "Self-contained FDR", "Competitive FDR", "Tested", "Leading edge", "Library rows",
-             "Note"])
+             "Self-contained FDR", "Competitive FDR", "Any-direction FDR", "Tested",
+             "Leading edge", "Library rows", "Note"])
         self.tbl_results.setToolTip(
             "NES, p, FDR, FWER: the rank-based enrichment score. Mean t and Self-contained "
             "FDR: did the state's features change? Competitive FDR (CAMERA): did they change "
-            "more than the other features?")
+            "more than the other features? Any-direction FDR (trends only): did they change "
+            "with the variable in any direction, a rise and fall included?")
         self.tbl_results.verticalHeader().setVisible(False)
         self.tbl_results.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.tbl_results.horizontalHeader().setStretchLastSection(True)
@@ -406,6 +428,7 @@ class EnrichmentTab(QWidget):
         finally:
             self._filling = False
         self._load_library()
+        self._fill_tests()
         self._update_gate()
         self._show_result()
 
@@ -458,9 +481,92 @@ class EnrichmentTab(QWidget):
         samples = list(self._samples_fn())
         return samples, self._design_fn(samples)
 
-    def _update_gate(self):
-        """Group sizes against the minimum the enrichment needs."""
+    def _selected(self) -> tuple[str, str]:
+        """(kind, label) of the test chosen at the top: ('groups', 'B vs A')
+        or ('trend', 'Trend with age'); ('groups', '') when none."""
+        data = self.cb_comparison.currentData()
+        if not data:
+            return 'groups', ''
+        kind, label = json.loads(data)
+        return kind, label
+
+    def _result(self, kind: str | None = None) -> dict:
+        """The stored result of *kind* (default: the chosen test's)."""
+        kind = kind or self._selected()[0]
+        return (self.state.fsea_trend if kind == 'trend' else self.state.fsea) or {}
+
+    def _trend_inputs(self) -> dict | None:
+        return self._trend_fn() if self._trend_fn is not None else None
+
+    def _trend(self) -> dict | None:
+        """The trend inputs when the chosen test is the trend, else None."""
+        return self._trend_inputs() if self._selected()[0] == 'trend' else None
+
+    def _fill_tests(self, select: tuple[str, str] | None = None):
+        """The Test chooser: the comparisons of the current design and of the
+        last group run, then the trend set on the Results page and that of
+        the last trend run. Keeps the chosen test (or selects *select*)."""
         st = self.state
+        keep = select or (self._selected() if self.cb_comparison.count() else None)
+        labels: list[str] = []
+        samples, design = self._design()
+        try:
+            plans, _blocked, _used = ag_fsea.comparison_plans(
+                samples, design['groups'], group_order=list(st.group_names),
+                contrast_mode=st.contrast_mode, reference=st.reference_group,
+                enforce_min_samples=False)
+            labels = [f"{o} vs {b}" for p in plans for b, o in p['comparisons']]
+        except Exception:
+            labels = []
+        if (st.fsea or {}).get('settings', {}).get('kind') != 'trend':
+            labels += [c for c in ag_fsea.comparison_labels(st.fsea or {}) if c not in labels]
+        items = [('groups', c) for c in labels]
+        trend = self._trend_inputs()
+        if trend:
+            items.append(('trend', ag_fsea.trend_label(
+                trend['variable'], [trend['baseline']] + [g for g in trend['groups']
+                                                          if g != trend['baseline']],
+                trend['interaction'])))
+        items += [('trend', c) for c in ag_fsea.comparison_labels(st.fsea_trend or {})
+                  if ('trend', c) not in items]
+        self.cb_comparison.blockSignals(True)
+        self.cb_comparison.clear()
+        for kind, label in items:
+            self.cb_comparison.addItem(label, json.dumps([kind, label]))
+        index = self.cb_comparison.findData(json.dumps(list(keep))) if keep else -1
+        if index < 0 and keep:
+            # The same kind of test, renamed (e.g. a new trend variable).
+            index = next((i for i, (kind, _l) in enumerate(items) if kind == keep[0]), -1)
+        self.cb_comparison.setCurrentIndex(max(index, 0))
+        self.cb_comparison.blockSignals(False)
+
+    def _update_gate(self):
+        """Sample numbers of the chosen test against the minimum the
+        enrichment needs; the Run button names what it runs."""
+        st = self.state
+        kind, label = self._selected()
+        if kind == 'trend':
+            self.btn_run.setText(f"Run enrichment: {label}")
+            trend = self._trend()
+            n = (sum(1 for s in trend['samples'] if trend['time'].get(s) == trend['time'].get(s))
+                 if trend else 0)
+            if not trend:
+                self.lbl_gate.setText("Choose the trend variable and groups on the Results page.")
+            elif n < ag_fsea.MIN_TOTAL_SAMPLES:
+                self.lbl_gate.setText(
+                    f"<span style='color:#b00020'>{n} sample(s) have a value for "
+                    f"'{trend['variable']}'; enrichment needs at least "
+                    f"{ag_fsea.MIN_TOTAL_SAMPLES}.</span>")
+            else:
+                self.lbl_gate.setText(
+                    f"Trend with '{trend['variable']}': {n} samples ("
+                    + ", ".join(trend['groups']) + ")"
+                    + (", group × trend" if trend['interaction'] else "") + ".")
+            self.btn_run.setEnabled(bool(trend) and n >= ag_fsea.MIN_TOTAL_SAMPLES
+                                    and self._worker is None and bool(st.summaries))
+            self._update_estimate()
+            return
+        self.btn_run.setText("Run enrichment: group comparisons")
         samples, design = self._design()
         counts: dict[str, int] = {}
         for s in samples:
@@ -497,12 +603,17 @@ class EnrichmentTab(QWidget):
         samples, design = self._design()
         n_feat = self._preview['values'].shape[1]
         n_perm = int(self.sb_perm.value())
-        fast = design['pairing'] is None and design['covariates'] is None
+        trend = self._trend()
+        fast = design['pairing'] is None and design['covariates'] is None and not trend
         per = (_SECONDS_PER_PERM_FEATURE * n_feat if fast
                else _SECONDS_PER_PERM_ELEMENT * n_feat * max(len(samples), 1) + 0.002)
         n_comp = max(1, len(self.state.group_names) - 1)
+        if trend:
+            # Each permutation fits the curve, its reduced model and the line.
+            per, n_comp = 3.0 * per, 1
         secs = per * n_perm * n_comp
-        how = "group-label permutation" if fast else "residual permutation (pairing/covariates)"
+        how = ("residual permutation, trend" if trend else
+               "group-label permutation" if fast else "residual permutation (pairing/covariates)")
         self.lbl_estimate.setText(
             f"About {secs:.0f} s for {n_feat} features × {n_perm} permutations × {n_comp} "
             f"comparison(s) ({how}; estimated from a two-core machine).")
@@ -590,7 +701,9 @@ class EnrichmentTab(QWidget):
             return
         samples, _design = self._design()
         samples = samples or st.gated_samples()
-        summaries = deepcopy({k: st.summaries[k] for k in samples})
+        # Each sample's summary is replaced whole when it is gated again,
+        # never changed in place, so the worker can read this snapshot.
+        summaries = {k: st.summaries[k] for k in samples}
         gate_defs = deepcopy(self._gate_defs())
         library, kwargs = self._library.copy(), self._prepare_kwargs()
 
@@ -705,7 +818,9 @@ class EnrichmentTab(QWidget):
         if self._worker is not None or self._library is None:
             return
         samples, design = self._design()
-        summaries = deepcopy({k: st.summaries[k] for k in samples})
+        # Each sample's summary is replaced whole when it is gated again,
+        # never changed in place, so the worker can read this snapshot.
+        summaries = {k: st.summaries[k] for k in samples}
         gate_defs = deepcopy(self._gate_defs())
         library = self._library.copy()
         kwargs = self._prepare_kwargs()
@@ -717,12 +832,26 @@ class EnrichmentTab(QWidget):
             reference=st.reference_group, pairing=design['pairing'],
             covariates=design['covariates'], numeric_covariates=design['numeric'],
             rank_metric=st.fsea_rank_metric, n_perm=int(st.fsea_n_perm), seed=int(st.fsea_seed))
-        fingerprint = input_fingerprint(st, samples, design, self._library_sha)
+        trend = self._trend()
+        fingerprint = input_fingerprint(st, samples, design, self._library_sha, trend)
         groups = design['groups']
+        if trend:
+            samples, design = trend['samples'], trend['design']
+            summaries = {k: st.summaries[k] for k in samples}
+            groups = design['groups']
+            for key in ('group_order', 'contrast_mode', 'reference'):
+                kwargs.pop(key)
+            kwargs.update(pairing=design['pairing'], covariates=design['covariates'],
+                          numeric_covariates=design['numeric'])
+            kwargs.update(time=trend['time'], variable=trend['variable'], unit=trend['unit'],
+                          scale=trend['scale'], shape=trend['shape'], k=trend['k'],
+                          interaction=trend['interaction'], baseline=trend['baseline'],
+                          patterns=trend['patterns'])
 
         def _job(progress, stop):
-            res = ag_fsea.run_enrichment(summaries, samples, groups, gate_defs, library,
-                                         progress=progress, stop_check=stop, **kwargs)
+            run = ag_fsea.run_trend_enrichment if trend else ag_fsea.run_enrichment
+            res = run(summaries, samples, groups, gate_defs, library,
+                      progress=progress, stop_check=stop, **kwargs)
             res['input_fingerprint'] = fingerprint
             return res
 
@@ -755,8 +884,15 @@ class EnrichmentTab(QWidget):
                 self.lbl_run.setText(f"<span style='color:#b00020'>{error}</span>")
             return
         result['run_fingerprint'] = self.state.run_fingerprint
-        self.state.fsea = result
+        kind = 'trend' if result['settings'].get('kind') == 'trend' else 'groups'
+        if kind == 'trend':
+            self.state.fsea_trend = result
+        else:
+            self.state.fsea = result
         self.lbl_run.setText(f"Done in {result['seconds']:.0f} s ({result['settings']['engine']}).")
+        labels = ag_fsea.comparison_labels(result)
+        self._fill_tests(select=(kind, labels[0]) if labels else None)
+        self._update_gate()
         self._show_result()
         self.toolbox.setCurrentIndex(3)
         self.enrichment_finished.emit()
@@ -766,17 +902,14 @@ class EnrichmentTab(QWidget):
     # ------------------------------------------------------------------
 
     def _show_result(self):
-        res = self.state.fsea or {}
-        current = self.cb_comparison.currentData()
-        self.cb_comparison.blockSignals(True)
-        self.cb_comparison.clear()
-        for base, other in res.get('comparisons') or []:
-            self.cb_comparison.addItem(f"{other} vs {base}", f"{other} vs {base}")
-        i = self.cb_comparison.findData(current) if current else 0
-        self.cb_comparison.setCurrentIndex(max(i, 0))
-        self.cb_comparison.blockSignals(False)
-        if not res:
-            self.lbl_status.setText("No enrichment run yet.")
+        """The chosen test's stored result: its run summary, table and figures."""
+        kind, label = self._selected()
+        res = self._result(kind)
+        if not res or label not in ag_fsea.comparison_labels(res):
+            what = "the trend" if kind == 'trend' else "the group comparisons"
+            self.lbl_status.setText(f"No enrichment run yet for {label or what}: choose it and "
+                                    "press Run.")
+            self.lbl_results.setText("")
             self.tbl_results.setRowCount(0)
             self.fig_tabs.clear()
             return
@@ -785,7 +918,7 @@ class EnrichmentTab(QWidget):
                  f"({str(res['library'].get('sha256', ''))[:12]}…)."]
         samples, design = self._design()
         if res.get('input_fingerprint') != input_fingerprint(self.state, samples, design,
-                                                             self._library_sha):
+                                                             self._library_sha, self._trend()):
             lines.append("<span style='color:#856404'>Samples, groups, gating, library or "
                          "settings have changed since this run.</span>")
         for b in res.get('blocked') or []:
@@ -794,12 +927,19 @@ class EnrichmentTab(QWidget):
         self.lbl_status.setText("<br>".join(lines))
         self._on_comparison_changed(0)
 
+    def _on_test_changed(self, _i):
+        """A new test chosen at the top: its Run button and, when it has
+        been run, its results."""
+        self._update_gate()
+        self._show_result()
+
     def _on_comparison_changed(self, _i):
-        res = self.state.fsea or {}
-        comp = self.cb_comparison.currentData()
+        """The table and figures of the chosen test's result."""
+        kind, comp = self._selected()
+        res = self._result(kind)
         self.tbl_results.setRowCount(0)
         self.fig_tabs.clear()
-        if not res or comp is None:
+        if not res or not comp:
             return
         st = res['states']
         st = st[st['comparison'] == comp]
@@ -813,6 +953,8 @@ class EnrichmentTab(QWidget):
         if 'FDR_self' in st.columns:
             text += (f", {_n_below('FDR_self')} self-contained and {_n_below('FDR_camera')} "
                      "competitive")
+        if 'FDR_any' in st.columns:
+            text += f", {_n_below('FDR_any')} in any direction"
         self.lbl_results.setText(text + ".")
         self._filling = True
         try:
@@ -825,6 +967,7 @@ class EnrichmentTab(QWidget):
                         _fmt(row['FDR']), _fmt(row['FWER']), _fmt(row.get('mean_t', float('nan'))),
                         _fmt(row.get('FDR_self', float('nan'))),
                         _fmt(row.get('FDR_camera', float('nan'))),
+                        _fmt(row.get('FDR_any', float('nan'))),
                         int(row['n_tested']),
                         row['leading_edge'], int(row['n_library']), row['note'])
                 for j, v in enumerate(vals):
@@ -835,10 +978,13 @@ class EnrichmentTab(QWidget):
             self._filling = False
         self._show_dot_plot()
 
-    def _figure_widget(self, fig, title):
+    def _figure_widget(self, fig, title, options_key: str | None = None):
+        from honeychrome.view_components import figure_options as fo
         from honeychrome.view_components.scalable_figure_widget import ScalableFigureWidget
+        store = fo.store_for(self.controller) if options_key else None
+        ref = fo.FigureOptionsRef(store, 'automated_gating', options_key) if store else None
         widget = ScalableFigureWidget(fig, title=title, experiment_dir=self._experiment_dir_fn(),
-                                      parent=self)
+                                      parent=self, options=ref)
         handler = getattr(fig, '_hover_handler', None)
         if handler is not None:
             widget.canvas.mpl_connect('motion_notify_event', handler)
@@ -846,15 +992,27 @@ class EnrichmentTab(QWidget):
 
     def _show_dot_plot(self):
         import ag_fsea_plots as fp
-        res = self.state.fsea or {}
-        comps = [f"{o} vs {b}" for b, o in res.get('comparisons') or []]
+        res = self._result()
+        comps = ag_fsea.comparison_labels(res)
         try:
             fig = fp.make_dot_plot(res['states'], comps, self.state.pval_threshold,
                                    _is_dark())
-            self.fig_tabs.addTab(self._figure_widget(fig, "Enrichment dot plot"), "Dot plot")
+            self.fig_tabs.addTab(self._figure_widget(fig, "Enrichment dot plot", 'enrichment_dot'),
+                                 "Dot plot")
         except Exception as exc:
             log.exception("dot plot failed")
             self.fig_tabs.addTab(QLabel(f"Dot plot failed: {exc}"), "Dot plot")
+        pattern_states = res.get('pattern_states')
+        if pattern_states is not None and len(pattern_states):
+            try:
+                fig = fp.make_pattern_dot_plot(pattern_states, self.state.pval_threshold,
+                                               _is_dark())
+                self.fig_tabs.addTab(self._figure_widget(fig, "Patterns and immune states",
+                                                     'enrichment_patterns'),
+                                     "Patterns")
+            except Exception as exc:
+                log.exception("pattern dot plot failed")
+                self.fig_tabs.addTab(QLabel(f"Pattern plot failed: {exc}"), "Patterns")
 
     def _on_state_selected(self):
         if self._filling:
@@ -870,12 +1028,13 @@ class EnrichmentTab(QWidget):
     def show_state(self, state: str):
         """Running-sum and member figures of *state* in the current comparison."""
         import ag_fsea_plots as fp
-        res = self.state.fsea or {}
-        comp = self.cb_comparison.currentData()
-        if not res or comp is None:
+        res = self._result()
+        comp = self._selected()[1]
+        if not res or not comp:
             return
-        while self.fig_tabs.count() > 1:
-            self.fig_tabs.removeTab(1)
+        keep = 2 if self.fig_tabs.count() > 1 and self.fig_tabs.tabText(1) == "Patterns" else 1
+        while self.fig_tabs.count() > keep:
+            self.fig_tabs.removeTab(keep)
         st = res['states']
         row = st[(st['comparison'] == comp) & (st['immune_state'] == state)]
         if row.empty or row['NES'].isna().all():
@@ -885,10 +1044,12 @@ class EnrichmentTab(QWidget):
         mb = mb[(mb['comparison'] == comp) & (mb['immune_state'] == state)]
         try:
             fig = fp.make_curve_figure(curve, state, comp, row.iloc[0].to_dict(), _is_dark())
-            self.fig_tabs.addTab(self._figure_widget(fig, f"{state} enrichment"), "Running sum")
+            self.fig_tabs.addTab(self._figure_widget(fig, f"{state} enrichment",
+                                                     'enrichment_running_sum'), "Running sum")
             fig2 = fp.make_members_figure(mb, state, comp, _is_dark())
-            self.fig_tabs.addTab(self._figure_widget(fig2, f"{state} members"), "Members")
-            self.fig_tabs.setCurrentIndex(1)
+            self.fig_tabs.addTab(self._figure_widget(fig2, f"{state} members",
+                                                     'enrichment_members'), "Members")
+            self.fig_tabs.setCurrentIndex(keep)
         except Exception as exc:
             log.exception("state figures failed")
             self.fig_tabs.addTab(QLabel(f"Figures failed: {exc}"), "Error")
@@ -898,7 +1059,7 @@ class EnrichmentTab(QWidget):
     # ------------------------------------------------------------------
 
     def _on_export(self):
-        if not self.state.fsea:
+        if not (self.state.fsea or self.state.fsea_trend):
             QMessageBox.information(self, "Export", "Run the enrichment first.")
             return
         start = str(Path(self._experiment_dir_fn() or '.') / 'Automated_Gating_Results')
@@ -908,7 +1069,11 @@ class EnrichmentTab(QWidget):
         from datetime import datetime
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         try:
-            written = write_enrichment_csv(Path(folder), 'enrichment', stamp, self.state.fsea)
+            written = []
+            for stem, result in (('enrichment', self.state.fsea),
+                                 ('enrichment_trend', self.state.fsea_trend)):
+                if result:
+                    written += write_enrichment_csv(Path(folder), stem, stamp, result)
         except Exception as exc:
             log.exception("enrichment export failed")
             QMessageBox.warning(self, "Export failed", str(exc))

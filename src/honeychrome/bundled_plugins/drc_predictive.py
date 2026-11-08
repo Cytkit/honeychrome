@@ -35,6 +35,11 @@ below ``RECOMMENDED_PER_GROUP`` the estimates are noisy and the result
 carries a warning. Correlated features (e.g. a parent population and its
 largest subset) share importance: the lasso tends to keep one of them, so
 a feature it drops may still differ between groups.
+
+``run_age_model`` is the same idea for a number instead of a group: an
+"immune age" model that predicts a continuous variable (age, days after
+vaccination, any number) from the features, judged only on samples it
+was not trained on. See its docstring.
 """
 
 from __future__ import annotations
@@ -57,6 +62,12 @@ _RF_DEPTHS = [2, 4, None]
 _RF_TREES = 300
 _ROC_GRID = np.linspace(0.0, 1.0, 101)
 _FREQ_OFFSET = 0.01     # % added before log2 so empty clusters stay finite
+MIN_AGE_SAMPLES = 20
+RECOMMENDED_AGE_SAMPLES = 40
+AGE_L1_RATIOS = (0.2, 0.5, 0.8, 1.0)
+AGE_N_ALPHAS = 30
+AGE_MIN_OBSERVED = 0.8  # share of samples a feature must be measured in
+DEFAULT_AGE_PERMUTATIONS = 100
 
 
 def sample_size_status(n_per_group: dict[str, int]) -> tuple[str, str]:
@@ -300,3 +311,329 @@ def run_predictive(X: pd.DataFrame, groups: list[str], positive: str, negative: 
     _say(f"Predictive: done ({len(features)} features, minimal panel {minimal}).")
     return {'performance': pd.DataFrame(perf_rows), 'roc': pd.concat(roc_rows, ignore_index=True),
             'importance': importance, 'panel': panel, 'summary': summary}
+
+
+# ---------------------------------------------------------------------------
+# Immune age model (a numeric target)
+# ---------------------------------------------------------------------------
+
+def age_sample_size_status(n: int) -> tuple[str, str]:
+    """('block' | 'warn' | 'ok', message) for the number of samples of an
+    immune age model."""
+    if n < MIN_AGE_SAMPLES:
+        return 'block', (f"An immune age model needs at least {MIN_AGE_SAMPLES} samples with a "
+                         f"value ({n} here): with fewer, its cross-validated error is too "
+                         "unstable to interpret.")
+    if n < RECOMMENDED_AGE_SAMPLES:
+        return 'warn', (f"{n} samples: results will be noisy; {RECOMMENDED_AGE_SAMPLES} or more "
+                        "are recommended.")
+    return 'ok', f"{n} samples"
+
+
+def _grouped_splits(blocks: np.ndarray, k: int, rng) -> list[tuple[np.ndarray, np.ndarray]]:
+    """k folds keeping every block (donor, pair) whole, blocks shuffled."""
+    uniq = np.unique(blocks)
+    fold_of = {b: i % k for i, b in enumerate(rng.permutation(uniq))}
+    fold = np.array([fold_of[b] for b in blocks])
+    return [(np.flatnonzero(fold != i), np.flatnonzero(fold == i)) for i in range(k)]
+
+
+def _age_pipeline(inner_cv):
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import ElasticNetCV
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    import sklearn
+
+    major, minor = (int(v) for v in sklearn.__version__.split('.')[:2])
+    # scikit-learn 1.7 takes the number of penalty strengths as 'alphas'
+    grid = ({'alphas': AGE_N_ALPHAS} if (major, minor) >= (1, 7)
+            else {'n_alphas': AGE_N_ALPHAS})
+    return make_pipeline(SimpleImputer(strategy='median'), StandardScaler(),
+                         ElasticNetCV(l1_ratio=list(AGE_L1_RATIOS), cv=inner_cv, max_iter=5000,
+                                      tol=1e-3, **grid))
+
+
+def _age_fit(X: np.ndarray, y: np.ndarray, blocks: np.ndarray, inner_folds: int):
+    """Elastic net with penalty strength and lasso/ridge mix chosen by
+    grouped inner cross-validation, plus the linear bias of its predictions
+    on age (slope, intercept), estimated from cross-validated predictions
+    with that penalty. Returns (fitted pipeline, bias coefficients)."""
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import ElasticNet
+    from sklearn.model_selection import GroupKFold, cross_val_predict
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    import warnings
+
+    from sklearn.exceptions import ConvergenceWarning
+
+    k = int(max(2, min(inner_folds, np.unique(blocks).size)))
+    inner = list(GroupKFold(k).split(X, y, blocks))
+    with warnings.catch_warnings():
+        # weak penalties on many features stop at max_iter; the penalty
+        # chosen by cross-validation is not among them
+        warnings.simplefilter('ignore', ConvergenceWarning)
+        model = _age_pipeline(inner).fit(X, y)
+        en = model[-1]
+        fixed = make_pipeline(SimpleImputer(strategy='median'), StandardScaler(),
+                              ElasticNet(alpha=en.alpha_, l1_ratio=en.l1_ratio_, max_iter=5000,
+                                         tol=1e-3))
+        inner_pred = cross_val_predict(fixed, X, y, cv=inner)
+    bias = np.polyfit(y, inner_pred - y, 1)
+    return model, bias
+
+
+def _age_scores(y: np.ndarray, pred: np.ndarray) -> dict:
+    with np.errstate(invalid='ignore', divide='ignore'):
+        r2 = 1.0 - np.sum((pred - y) ** 2) / np.sum((y - y.mean()) ** 2)
+    return {'mae': float(np.mean(np.abs(pred - y))), 'r2': float(r2),
+            'spearman': float(pd.Series(pred).corr(pd.Series(y), method='spearman'))}
+
+
+def run_age_model(X: pd.DataFrame, y, *, blocks=None, X_other: pd.DataFrame | None = None,
+                  y_other=None, outer_folds: int = 5, repeats: int = 5, inner_folds: int = 3,
+                  n_permutations: int = DEFAULT_AGE_PERMUTATIONS, seed: int = 0,
+                  progress=None, on_step=None) -> dict:
+    """
+    Immune age model: how well the features predict a continuous variable
+    (age, days after vaccination, any number), which features carry the
+    prediction, and each sample's predicted minus actual value.
+
+    In plain terms, with age as the example: a model learns to guess each
+    sample's age from its immune profile alone, and is always judged on
+    samples it was not trained on. If it guesses well, the immune system
+    changes with age in a consistent way; samples it places older or
+    younger than they are may be ahead or behind for their age.
+
+    Model: elastic net linear regression (Zou & Hastie 2005), a penalised
+    regression mixing the lasso, which keeps few features, and ridge, which
+    shares weight among correlated features such as a parent population and
+    its largest subset. Features are median-imputed and standardised inside
+    each training split.
+
+    Nested cross-validation: the outer split (``outer_folds`` folds,
+    ``repeats`` times) gives every sample a prediction from a model that
+    never saw it; inside each training part an inner split chooses the
+    penalty strength and the lasso/ridge mix (AGE_L1_RATIOS). Folds keep
+    every *block* (donor, or pair of samples from one donor) whole,
+    otherwise the same donor is in training and testing and the model
+    looks better than it is.
+
+    Gap: the out-of-fold prediction minus the actual value. The predictions
+    of any such model are pulled towards the middle (the lowest values
+    predicted too high, the highest too low), so the raw gap follows the
+    variable. 'gap_corrected' removes that: the gap's linear trend on
+    age is estimated inside each training split from its own
+    cross-validated predictions and subtracted (de Lange & Cole 2020,
+    NeuroImage Clin 26:102229). Only the corrected gap should be compared
+    between samples or groups.
+
+    Chance check: the whole procedure (one repeat) rerun with the variable
+    shuffled among blocks ``n_permutations`` times; p = (1 + permutations
+    with a mean absolute error at least as small) / (1 + permutations).
+
+    X       : samples × features of the samples in the model (NaN allowed;
+              features measured in fewer than AGE_MIN_OBSERVED of them, or
+              constant, are dropped).
+    y       : the variable for each row of X.
+    blocks  : donor or pair of each row (None: each sample its own).
+    X_other, y_other : samples outside the model (e.g. other groups),
+              predicted by a final model fitted on all of X and marked as
+              not cross-validated; y_other may hold NaN.
+    progress: optional callable(str) for status messages.
+    on_step : optional callable(done, total), called after each model fit
+              (outer folds, chance shuffles and the final model).
+
+    Returns {'performance' (one row: mae, r2, spearman as mean and SD over
+    repeats, mae_baseline of predicting the mean, p_chance), 'predictions'
+    (sample, actual, predicted, predicted_sd, gap, gap_corrected,
+    cross_validated), 'importance' (feature, selection, coef, direction),
+    'chance' (mae of each permutation), 'summary'}.
+    Raises ValueError with too few samples or no usable feature.
+    """
+    log_stage(log, "IMMUNE AGE MODEL")
+
+    def _say(msg):
+        log.info(msg)
+        if progress is not None:
+            progress(msg)
+
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(y)
+    X = X.loc[ok]
+    y = y[ok]
+    blocks = (np.array([str(b) for b in np.asarray(blocks, dtype=object)[ok]])
+              if blocks is not None else np.array([str(i) for i in X.index]))
+    n = len(y)
+    status, message = age_sample_size_status(n)
+    if status == 'block':
+        raise ValueError(message)
+    keep = (X.notna().mean(axis=0) >= AGE_MIN_OBSERVED) & (X.std(axis=0, skipna=True).fillna(0) > 1e-12)
+    X = X.loc[:, keep]
+    if X.shape[1] == 0:
+        raise ValueError("No usable features (each must be measured in at least "
+                         f"{AGE_MIN_OBSERVED:.0%} of the samples and vary).")
+    features = list(X.columns)
+    Xv = X.to_numpy(float)
+    k_outer = int(max(2, min(outer_folds, np.unique(blocks).size)))
+    rng = np.random.default_rng(seed)
+    total_steps = (repeats * k_outer + int(n_permutations) * k_outer
+                   + (1 if X_other is not None and len(X_other) else 0))
+    done_steps = [0]
+
+    def _step():
+        done_steps[0] += 1
+        if on_step is not None:
+            on_step(done_steps[0], total_steps)
+
+    pred = np.full((repeats, n), np.nan)
+    corrected = np.full((repeats, n), np.nan)
+    coefs, chosen = [], []
+    for r in range(repeats):
+        for f, (tr, te) in enumerate(_grouped_splits(blocks, k_outer, rng)):
+            _say(f"Immune age: repeat {r + 1}/{repeats}, fold {f + 1}/{k_outer}")
+            model, bias = _age_fit(Xv[tr], y[tr], blocks[tr], inner_folds)
+            pred[r, te] = model.predict(Xv[te])
+            corrected[r, te] = (pred[r, te] - y[te]) - np.polyval(bias, y[te])
+            en = model[-1]
+            coefs.append(en.coef_)
+            chosen.append((float(en.alpha_), float(en.l1_ratio_)))
+            _step()
+    scores = pd.DataFrame([_age_scores(y, p) for p in pred])
+
+    # chance check: the variable shuffled among blocks
+    chance = []
+    shared = pd.Series(y).groupby(blocks).nunique().max() <= 1
+    for i in range(int(n_permutations)):
+        _say(f"Immune age: chance check {i + 1}/{n_permutations}")
+        if shared:
+            uniq = np.unique(blocks)
+            value_of = dict(zip(uniq, rng.permutation([y[blocks == b][0] for b in uniq])))
+            yp = np.array([value_of[b] for b in blocks])
+        else:
+            yp = rng.permutation(y)
+        pp = np.full(n, np.nan)
+        for tr, te in _grouped_splits(blocks, k_outer, rng):
+            model, _bias = _age_fit(Xv[tr], yp[tr], blocks[tr], inner_folds)
+            pp[te] = model.predict(Xv[te])
+            _step()
+        chance.append(_age_scores(yp, pp)['mae'])
+    chance = np.asarray(chance, dtype=float)
+    mae_mean = float(scores['mae'].mean())
+    p_chance = (float((1 + np.sum(chance <= mae_mean)) / (1 + chance.size))
+                if chance.size else np.nan)
+
+    C = np.vstack(coefs)
+    importance = pd.DataFrame({'feature': features, 'selection': (C != 0).mean(axis=0),
+                               'coef': C.mean(axis=0)})
+    importance['direction'] = np.sign(importance['coef'])
+    importance = importance.sort_values(['selection', 'coef'], ascending=[False, False],
+                                        key=lambda col: col.abs() if col.name == 'coef' else col,
+                                        kind='mergesort').reset_index(drop=True)
+    mean_pred = pred.mean(axis=0)
+    predictions = pd.DataFrame({
+        'sample': list(X.index), 'actual': y, 'predicted': mean_pred,
+        'predicted_sd': pred.std(axis=0, ddof=1) if repeats > 1 else 0.0,
+        'gap': mean_pred - y, 'gap_corrected': corrected.mean(axis=0), 'cross_validated': True})
+
+    if X_other is not None and len(X_other):
+        _say("Immune age: predicting the samples outside the model")
+        model, bias = _age_fit(Xv, y, blocks, inner_folds)
+        _step()
+        Xo = X_other.reindex(columns=features).to_numpy(float)
+        po = model.predict(Xo)
+        yo = (np.asarray(y_other, dtype=float) if y_other is not None
+              else np.full(len(X_other), np.nan))
+        others = pd.DataFrame({'sample': list(X_other.index), 'actual': yo, 'predicted': po,
+                               'predicted_sd': np.nan, 'gap': po - yo,
+                               'gap_corrected': (po - yo) - np.polyval(bias, yo),
+                               'cross_validated': False})
+        predictions = pd.concat([predictions, others], ignore_index=True)
+
+    pairs = pd.Series([f"{a:.3g} / {l1:g}" for a, l1 in chosen]).value_counts()
+    performance = pd.DataFrame([{
+        'mae_mean': mae_mean, 'mae_sd': float(scores['mae'].std(ddof=1)) if repeats > 1 else 0.0,
+        'r2_mean': float(scores['r2'].mean()),
+        'r2_sd': float(scores['r2'].std(ddof=1)) if repeats > 1 else 0.0,
+        'spearman_mean': float(scores['spearman'].mean()),
+        'spearman_sd': float(scores['spearman'].std(ddof=1)) if repeats > 1 else 0.0,
+        'mae_baseline': float(np.mean(np.abs(y - y.mean())) * n / max(n - 1, 1)),
+        'p_chance': p_chance}])
+    summary = {'n': n, 'n_features': len(features), 'n_blocks': int(np.unique(blocks).size),
+               'outer_folds': k_outer, 'inner_folds': int(inner_folds), 'repeats': int(repeats),
+               'n_permutations': int(chance.size), 'status': status, 'message': message,
+               'penalty': str(pairs.index[0]) if len(pairs) else ''}
+    _say(f"Immune age: done (mean absolute error {mae_mean:.3g}).")
+    return {'performance': performance, 'predictions': predictions, 'importance': importance,
+            'chance': pd.DataFrame({'mae': chance}), 'summary': summary}
+
+
+def age_predictions(result: dict, groups: dict | None = None) -> pd.DataFrame:
+    """The immune age model's per-sample predictions with each sample's group
+    (from *groups*, {sample: group}) as the second column."""
+    pred = result['predictions'].copy()
+    groups = groups or {}
+    pred.insert(1, 'group', [str(groups.get(s, '')) for s in pred['sample']])
+    return pred
+
+
+def age_model_by_group(result: dict, groups: dict | None = None) -> pd.DataFrame:
+    """
+    How the immune age model sees each group: the model's own group
+    (cross-validated predictions) and every group predicted by the final
+    model, whether or not its samples have a value of the variable.
+    Columns: group, in_model, n (samples predicted), predicted_mean,
+    predicted_sd, n_actual (samples that also have a value), mae (mean
+    absolute error), mean_gap (mean predicted − actual), mean_gap_corrected,
+    spearman (predicted against actual; NaN with fewer than 3 samples). The
+    columns that need a value are NaN for a group without one.
+    """
+    pred = age_predictions(result, groups)
+    rows = []
+    for (group, inside), part in pred.groupby(['group', 'cross_validated'], sort=False):
+        part = part[part['predicted'].notna()]
+        if part.empty:
+            continue
+        known = part[part['actual'].notna()]
+        n_known = int(len(known))
+        rho = (float(known['predicted'].corr(known['actual'], method='spearman'))
+               if n_known >= 3 else np.nan)
+        rows.append({
+            'group': group, 'in_model': bool(inside), 'n': int(len(part)),
+            'predicted_mean': float(part['predicted'].mean()),
+            'predicted_sd': float(part['predicted'].std(ddof=1)) if len(part) > 1 else np.nan,
+            'n_actual': n_known,
+            'mae': (float(np.mean(np.abs(known['predicted'] - known['actual'])))
+                    if n_known else np.nan),
+            'mean_gap': float(known['gap'].mean()) if n_known else np.nan,
+            'mean_gap_corrected': float(known['gap_corrected'].mean()) if n_known else np.nan,
+            'spearman': rho})
+    out = pd.DataFrame(rows, columns=['group', 'in_model', 'n', 'predicted_mean', 'predicted_sd',
+                                      'n_actual', 'mae', 'mean_gap', 'mean_gap_corrected',
+                                      'spearman'])
+    return out.sort_values('in_model', ascending=False, kind='stable').reset_index(drop=True)
+
+
+def age_group_rows(by_group: pd.DataFrame, unit: str = '') -> list[dict]:
+    """Rows for showing age_model_by_group: each group's predicted values and,
+    where its samples have a value of the variable, how close they are."""
+    def _num(v, fmt):
+        return format(v, fmt) + (f" {unit}" if unit else '') if np.isfinite(v) else ''
+
+    rows = []
+    for _i, r in by_group.iterrows():
+        spread = (f"{r['predicted_mean']:.3g} ± {r['predicted_sd']:.2g}"
+                  if np.isfinite(r['predicted_sd']) else f"{r['predicted_mean']:.3g}")
+        rows.append({
+            'Group': r['group'] + ('' if r['in_model'] else ' (predicted, not in the model)'),
+            'Samples': int(r['n']),
+            'Predicted (mean ± SD)': spread + (f" {unit}" if unit else ''),
+            'With a value': int(r['n_actual']),
+            'Mean absolute error': _num(r['mae'], '.3g'),
+            'Mean gap': _num(r['mean_gap'], '+.3g'),
+            'Mean gap, corrected': _num(r['mean_gap_corrected'], '+.3g'),
+            'Spearman': f"{r['spearman']:.2f}" if np.isfinite(r['spearman']) else ''})
+    return rows
