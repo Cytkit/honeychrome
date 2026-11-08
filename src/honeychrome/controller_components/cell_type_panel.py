@@ -32,10 +32,13 @@ the shared signs S = P P' + N N' and the conflicting signs
 C = P N' + N P' give the relation of every pair: group a contains group b
 when C_ab = 0 and S_ab equals a's number of signs, b having more.
 
-A root (an analysis restricted to CD3+ cells, say) keeps only the
-definitions that themselves include the root's signs, and removes those
-signs from them: a definition that says nothing about CD3 is not a T-cell
-type, and every T-cell type reads CD3+ under that root.
+A root (an analysis restricted to CD3+ cells, say) adds what is known of
+every analysed cell. Its signs are evidence, not requirements: a definition
+that contradicts one (needs CD3- under a CD3+ root, or CD44- under a CD44+
+root) cannot describe these cells and is left out, while a definition that
+says nothing about the marker is kept (plain CD4 T cells under a CD44+
+root). The root's markers count as stained, so a definition that lists
+CD3+ keeps that sign and reads differently from one silent on CD3.
 
 The definition database is ``drc_cell_type_database.csv`` in the bundled
 plugins: one row per cell type and species, positive and negative markers
@@ -61,11 +64,11 @@ class PanelGroup:
     Definitions with identical signs on the panel.
 
     names        : member names, in database order.
-    positive     : the panel markers that count for the group, in the
-                   first member's order.
-    negative     : the panel markers that count against it.
-    separated_by : markers off the panel (and outside the root) on which
-                   the members' definitions differ; empty for one member.
+    positive     : the panel and root markers that count for the group, in
+                   the first member's order.
+    negative     : the panel and root markers that count against it.
+    separated_by : markers off the panel and the root on which the
+                   members' definitions differ; empty for one member.
     """
     names: tuple
     positive: tuple
@@ -91,9 +94,9 @@ class PanelGroups:
     """
     groups       : the groups, ordered by their first member's position.
     contains     : (groups, groups) bool, [a, b] when group a contains b.
-    no_marker    : names with no sign on the panel beyond the root's (the
-                   root itself, or nothing stained).
-    outside_root : names whose definitions lack one of the root's signs.
+    no_marker    : names with no sign on the panel or the root.
+    outside_root : names whose definitions contradict one of the root's
+                   signs.
     """
     groups: list
     contains: np.ndarray
@@ -140,8 +143,8 @@ def panel_groups(definitions, panel_markers, root: dict | None = None) -> PanelG
         N[i, [col[m] for m in neg]] = 1.0
     root_pos = np.array([root.get(m) == 1 for m in markers], dtype=float)
     root_neg = np.array([root.get(m) == -1 for m in markers], dtype=float)
-    on = np.array([m in panel for m in markers], dtype=float) * (1.0 - root_pos - root_neg)
-    under_root = (P @ root_pos + N @ root_neg) == root_pos.sum() + root_neg.sum()
+    on = np.array([m in panel or m in root for m in markers], dtype=float)
+    under_root = ((N @ root_pos) == 0) & ((P @ root_neg) == 0)
     Pp, Np = P * on, N * on
     has_sign = (Pp + Np).sum(axis=1) > 0
 
@@ -150,12 +153,12 @@ def panel_groups(definitions, panel_markers, root: dict | None = None) -> PanelG
         members.setdefault((Pp[i].tobytes(), Np[i].tobytes()), []).append(int(i))
     keys = list(members)
     groups = []
-    off_panel = [j for j, m in enumerate(markers) if not on[j] and m not in root]
+    off_panel = [j for j, m in enumerate(markers) if not on[j]]
     for key in keys:
         rows = members[key]
         first = defs[rows[0]]
-        positive = tuple(m for m in first[1] if m in panel and m not in root)
-        negative = tuple(m for m in first[2] if m in panel and m not in root)
+        positive = tuple(m for m in first[1] if on[col[m]])
+        negative = tuple(m for m in first[2] if on[col[m]])
         signed = P[rows][:, off_panel] - N[rows][:, off_panel]
         differ = (signed != signed[0]).any(axis=0) if len(rows) > 1 else np.zeros(len(off_panel), dtype=bool)
         groups.append(PanelGroup(names=tuple(defs[i][0] for i in rows), positive=positive, negative=negative,
