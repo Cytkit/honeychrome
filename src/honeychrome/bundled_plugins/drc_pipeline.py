@@ -406,25 +406,31 @@ class GatedEvents:
     """
     One sample's gated events as cached: untransformed unmixed values
     (float32) of some channels, by name, and the FCS-file row of each event
-    (its event key, int32, ascending).  Indexing with rows selects events.
+    (its event key, int32, ascending).  *populations* holds, for each gate
+    asked for, whether each event is inside it (bool, one per event).
+    Indexing with rows selects events.
     """
-    __slots__ = ('values', 'names', 'rows', 'index')
+    __slots__ = ('values', 'names', 'rows', 'index', 'populations')
 
-    def __init__(self, values: np.ndarray, names: list[str], rows: np.ndarray):
+    def __init__(self, values: np.ndarray, names: list[str], rows: np.ndarray,
+                 populations: dict | None = None):
         self.values = values
         self.names = list(names)
         self.rows = rows
         self.index = {ch: i for i, ch in enumerate(self.names)}
+        self.populations = dict(populations or {})
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, idx) -> 'GatedEvents':
-        return GatedEvents(self.values[idx], self.names, self.rows[idx])
+        return GatedEvents(self.values[idx], self.names, self.rows[idx],
+                           {g: m[idx] for g, m in self.populations.items()})
 
     @property
     def nbytes(self) -> int:
-        return int(self.values.nbytes + self.rows.nbytes)
+        return int(self.values.nbytes + self.rows.nbytes
+                   + sum(m.nbytes for m in self.populations.values()))
 
 
 def default_cache_bytes() -> int:
@@ -502,7 +508,8 @@ def _cached_channels(controller, state, channels) -> list[str]:
 
 
 def load_unmixed_gated(controller, state, abs_path, af_state=None,
-                       channels: list[str] | None = None) -> GatedEvents:
+                       channels: list[str] | None = None,
+                       populations: list[str] | None = None) -> GatedEvents:
     """
     Load one FCS file, unmix it with the transfer matrix, and apply the
     selected gate(s).  Returns the gated events as a GatedEvents holding the
@@ -519,6 +526,11 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None,
     one of the channels asked for is loaded again and cached with the
     channels it had plus the new ones.
 
+    populations: gates whose membership of each gated event is wanted
+        (GatedEvents.populations). Each is evaluated on the whole file with
+        the sample's own gating, like the selected gates. A cached sample
+        lacking one is loaded again and keeps the memberships it had.
+
     af_state: optional unmixing snapshot — see apply_unmixing_af_aware()
         docstring. Pass this from any background worker thread; leave as
         None only for main-thread callers. Each sample is unmixed with its
@@ -532,12 +544,15 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None,
     cache_key = _gated_cache_key(controller, state, abs_path, af_state, sample_key)
     wanted = _cached_channels(controller, state, channels)
     cached = cache.get(cache_key)
-    if cached is not None and all(ch in cached.index for ch in wanted):
+    wanted_pops = list(dict.fromkeys(populations or []))
+    if cached is not None and all(ch in cached.index for ch in wanted) \
+            and all(g in cached.populations for g in wanted_pops):
         log.debug("load_unmixed_gated: cache hit for %s",
                    getattr(abs_path, 'name', abs_path))
         return cached
     if cached is not None:
         wanted = _cached_channels(controller, state, list(cached.names) + wanted)
+        wanted_pops = list(dict.fromkeys(list(cached.populations) + wanted_pops))
 
     _raw_settings = controller.experiment.settings['raw']
     whitelisted_pnn = _raw_settings.get('whitelisted_pnn') or None
@@ -571,9 +586,12 @@ def load_unmixed_gated(controller, state, abs_path, af_state=None,
     ch_idx = build_channel_index(controller)
     names = [ch for ch in wanted if ch_idx.get(ch, unmixed.shape[1]) < unmixed.shape[1]]
     values = unmixed[np.ix_(rows, [ch_idx[ch] for ch in names])].astype(np.float32)
-    log.debug("  gated → %d events retained (%d removed), %d channel(s) cached",
-              len(rows), unmixed.shape[0] - len(rows), len(names))
-    entry = GatedEvents(values, names, rows)
+    pops = {g: np.asarray(sample_gating.population_mask(sample_key, unmixed, pnn, [g]),
+                          dtype=bool)[rows]
+            for g in wanted_pops}
+    log.debug("  gated → %d events retained (%d removed), %d channel(s), %d population(s) cached",
+              len(rows), unmixed.shape[0] - len(rows), len(names), len(pops))
+    entry = GatedEvents(values, names, rows, pops)
     cache.put(cache_key, entry)
     return entry
 
@@ -586,6 +604,25 @@ def load_gated_rows(controller, state, abs_path, af_state=None) -> np.ndarray:
     identify the same cells whatever the gating or unmixing later becomes.
     """
     return load_unmixed_gated(controller, state, abs_path, af_state=af_state).rows
+
+
+def load_sample_populations(controller, state, rel_path, gates: list[str],
+                            af_state=None) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    For a picker-relative sample path: (membership, rows), where
+    membership[i, j] says whether gated event i is inside gates[j] and rows
+    are the events' FCS-file rows (see load_gated_rows). None on error.
+    """
+    try:
+        gated = load_unmixed_gated(controller, state, sample_abs_path(controller, rel_path),
+                                   af_state=af_state, populations=gates)
+    except Exception as exc:
+        log.exception("could not load population membership for %s: %s", rel_path, exc)
+        return None
+    membership = np.zeros((len(gated), len(gates)), dtype=bool)
+    for j, g in enumerate(gates):
+        membership[:, j] = gated.populations[g]
+    return membership, gated.rows
 
 
 def load_sample_rows(controller, state, rel_path, af_state=None) -> np.ndarray | None:

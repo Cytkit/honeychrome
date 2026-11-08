@@ -277,13 +277,22 @@ def build_settings_document(
 
     _section('Statistics Settings')
     lines.append(f"Contrast mode:     {state.contrast_mode}")
-    if state.contrast_mode == 'reference':
-        lines.append(f"Reference group:   {state.reference_group}")
+    by_population = bool(getattr(state, 'stats_population_of', None))
     selection = state.testing_group_selection or state.group_names
-    lines.append(f"Groups tested:     {', '.join(selection) if selection else '(none)'}")
-    lines.append(f"Paired:            {state.paired}")
-    if state.paired:
-        lines.append(f"Pairing variable:  {state.pairing_variable}")
+    if by_population:
+        populations = list(dict.fromkeys(g for _rel, g in state.stats_population_of.values()))
+        lines.append("Compared:          populations within samples (paired on the sample)")
+        lines.append(f"Populations:       {', '.join(populations)}")
+        if state.contrast_mode == 'reference' and state.stats_comparisons:
+            lines.append(f"Reference:         {state.stats_comparisons[0][0]}")
+        lines.append(f"Samples from:      {', '.join(selection) if selection else '(none)'}")
+    else:
+        if state.contrast_mode == 'reference':
+            lines.append(f"Reference group:   {state.reference_group}")
+        lines.append(f"Groups tested:     {', '.join(selection) if selection else '(none)'}")
+        lines.append(f"Paired:            {state.paired}")
+        if state.paired:
+            lines.append(f"Pairing variable:  {state.pairing_variable}")
     lines.append(f"P-value threshold: {pval_threshold}")
     lines.append(f"Log2FC threshold:  {fc_threshold}")
 

@@ -93,6 +93,62 @@ def make_dot_plot(states: pd.DataFrame, comparisons: list[str], fdr_threshold: f
     return fig
 
 
+def make_pattern_dot_plot(pattern_states: pd.DataFrame, fdr_threshold: float,
+                          is_dark: bool = False, run_label: str = ''):
+    """
+    Immune states × shape patterns of a trend: dot colour = fold
+    enrichment of the state's populations in the pattern (log2), size =
+    share of the state's populations in the pattern, ringed when the
+    hypergeometric FDR is below *fdr_threshold*.
+    """
+    from matplotlib.figure import Figure
+    from honeychrome.view_components import differential_plots as dp
+
+    df = pattern_states
+    if df is None or df.empty:
+        return dp.message_figure("No immune state overlaps a pattern", "Patterns", is_dark,
+                                 run_label)
+    patterns = list(dict.fromkeys(df['pattern']))
+    best = df.groupby('immune_state')['p'].min().sort_values(ascending=False)
+    order = list(best.index)
+    state_w = max(dp.text_width_inches(s, 9) for s in order)
+    fig_h = max(3.0, 0.32 * len(order) + 1.8)
+    fig_w = max(4.5, state_w + 1.2 * len(patterns) + 2.2)
+    fig = Figure(figsize=(fig_w, fig_h), layout='constrained')
+    ax = fig.add_subplot(111)
+    fold = np.log2(df['fold'].astype(float).clip(lower=1e-3))
+    lim = max(1.0, float(np.nanmax(np.abs(fold))))
+    edge = ['white' if (f < fdr_threshold and is_dark) else ('black' if f < fdr_threshold
+                                                             else 'none') for f in df['FDR']]
+    sc = ax.scatter([patterns.index(p) for p in df['pattern']],
+                    [order.index(s) for s in df['immune_state']], c=fold, cmap='RdBu_r',
+                    vmin=-lim, vmax=lim, s=30 + 270 * df['overlap'] / df['n_state'].clip(lower=1),
+                    edgecolors=edge, linewidths=1.4)
+    labels = [f"{r['immune_state']} — {r['pattern']}\n{int(r['overlap'])} of {int(r['n_state'])} "
+              f"populations, fold {r['fold']:.2f}\np {r['p']:.3g}, FDR {r['FDR']:.3g}"
+              for _i, r in df.iterrows()]
+    ax.set_xticks(range(len(patterns)))
+    ax.set_xticklabels(patterns, rotation=30, ha='right', fontsize=8)
+    ax.set_yticks(range(len(order)))
+    ax.set_yticklabels(order, fontsize=9)
+    ax.set_xlim(-0.6, len(patterns) - 0.4)
+    ax.set_ylim(-0.6, len(order) - 0.4)
+    ax.grid(True, alpha=0.25)
+    cb = fig.colorbar(sc, ax=ax, shrink=0.6)
+    cb.set_label(dp.wrap_to_width('log2 fold enrichment in the pattern', 8, 0.6 * (fig_h - 1.3)),
+                 fontsize=8)
+    cb.ax.tick_params(labelsize=8)
+    fig.suptitle(dp.wrap_to_width(f"Immune states in shape patterns (ringed: FDR < "
+                                  f"{fdr_threshold:g}; size: share of the state's populations)",
+                                  10, fig_w - 0.4), fontsize=10)
+    fg = dp.style_figure_theme(fig, is_dark)
+    cb.ax.yaxis.label.set_color(fg)
+    cb.ax.tick_params(colors=fg)
+    fig._hover_handler = dp.make_scatter_hover_handler(fig, ax, sc, labels, is_dark)
+    dp.stamp_run_label(fig, run_label)
+    return fig
+
+
 def make_curve_figure(curve: dict, state: str, comparison: str, row: dict | None = None,
                       is_dark: bool = False, run_label: str = ''):
     """GSEA-style running-sum figure for one state.

@@ -1262,7 +1262,8 @@ class SpectralControlsEditor(QFrame):
         # self.model.layoutChanged.emit() # consider refreshing at this point... but it may cause crash
         self.refresh_comboboxes()
         self.setEnabled(True)
-        QTimer.singleShot(300, lambda: self.bus.showSelectedProfiles.emit([]))
+        # show the selected controls' profiles (all of them when none is selected)
+        QTimer.singleShot(300, self._show_selected_profiles)
 
     def _show_selected_profiles(self):
         selected_rows = set()
@@ -1746,9 +1747,13 @@ class SpectralControlsEditor(QFrame):
 
     def _sort_model_by_gate_channel(self):
         """Re-order the spectral model table rows by major channel order
-        (position of gate_channel in fluorescence_channels_pnn)."""
+        (position of gate_channel in fluorescence_channels_pnn). The selected
+        controls stay selected across the model reset, without a selection-changed
+        signal, so the profile display and NxN keep their rows."""
         if not self.model._data:
             return
+        selected = {self.model._data[self.proxy.mapToSource(index).row()].get('label')
+                    for index in self.view.selectionModel().selectedRows()}
         channel_order = {ch: i for i, ch in enumerate(self.fluorescence_channels_pnn)}
         self.model.beginResetModel()
         self.model._data.sort(
@@ -1756,6 +1761,19 @@ class SpectralControlsEditor(QFrame):
         )
         self.model.endResetModel()
         self.refresh_comboboxes()
+        if selected:
+            selection = QtCore.QItemSelection()
+            for row, control in enumerate(self.model._data):
+                if control.get('label') in selected:
+                    index = self.proxy.mapFromSource(self.model.index(row, 0))
+                    if index.isValid():
+                        selection.select(index, index)
+            selection_model = self.view.selectionModel()
+            selection_model.blockSignals(True)
+            selection_model.select(selection, QtCore.QItemSelectionModel.SelectionFlag.Select
+                                   | QtCore.QItemSelectionModel.SelectionFlag.Rows)
+            selection_model.blockSignals(False)
+            self.view.viewport().update()
 
     @Slot(str, str)
     def _on_raw_gate_renamed(self, old_name: str, new_name: str):

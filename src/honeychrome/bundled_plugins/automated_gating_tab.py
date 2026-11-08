@@ -75,15 +75,18 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QTreeWidget, QTreeWidgetItem,
     QAbstractItemView, QListWidget, QListWidgetItem,
-    QProgressBar, QGridLayout, QDialog, QColorDialog,
+    QProgressBar, QGridLayout, QDialog, QColorDialog, QLineEdit,
 )
 
 import honeychrome
 from honeychrome.settings import af_abundance_channel
 from honeychrome.controller_components import differential_stats as ds
+from honeychrome.controller_components import trend_stats as ts
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy
 from honeychrome.controller_components import experiment_state
+from honeychrome.controller_components import covariate_check, sample_table
 from honeychrome.view_components import suggest_groupings_dialog as sgd
+from honeychrome.view_components import covariate_check_dialog, sample_table_import_dialog
 from honeychrome.view_components.checkable_header import CheckableHeaderView
 from honeychrome.controller_components.functions import (
     build_antigen_map,
@@ -188,6 +191,7 @@ RESULTS_FILE = Path('cache') / 'automated_gating' / 'results.json'
 MARKERS_FILE = Path('cache') / 'automated_gating' / 'results_markers.npz'
 RESULTS_FORMAT = 3
 STATS_FILE = Path('cache') / 'automated_gating' / 'stats.json'
+TREND_FILE = Path('cache') / 'automated_gating' / 'trend.json'
 ENRICHMENT_FILE = Path('cache') / 'automated_gating' / 'enrichment.json'
 SAMPLE_ANALYSIS_FILE = Path('cache') / 'automated_gating' / 'sample_analysis.json'
 DISPLAY_DIR = Path('cache') / 'automated_gating' / 'display'
@@ -208,14 +212,24 @@ FDR_SCOPES = {'global': 'Pooled over comparisons', 'per_comparison': 'Within eac
 CONTRAST_MODES = {'reference': 'Each group against a reference', 'pairwise': 'All pairs of groups'}
 COUNTS_METHOD_LABELS = {'moderated': 'moderated log odds', 'ql': 'quasi-likelihood F',
                         'wald': 'Wald'}
+STATS_TESTS = {'groups': 'Compare groups', 'trend': 'Trend with a numeric variable'}
+TREND_SHAPE_LABELS = {'curve': 'Smooth curve', 'line': 'Straight line',
+                      'points': 'Time points as groups'}
+TREND_SCALE_LABELS = {'linear': 'Linear', 'log2': 'Log2 (value + 1): slope per doubling'}
+TREND_CALL_LABELS = {'either': 'Curve or slope (each at FDR ÷ 2)', 'curve': 'Curve only',
+                     'slope': 'Slope only'}
+TREND_MAX_DF = 6
 # Statistics settings put back by the Restore defaults button. The design
 # (comparisons, reference group, pairing, adjustment covariates) is kept.
 STATS_DEFAULT_KEYS = ('run_freq', 'run_counts', 'counts_method', 'counts_reference',
                       'min_parent_events', 'run_markers', 'use_stats_parent',
                       'exclude_gating_markers', 'min_marker_events', 'pval_threshold', 'fc_threshold',
-                      'marker_threshold', 'use_treat', 'fdr_scope', 'exclude_flagged')
+                      'marker_threshold', 'use_treat', 'fdr_scope', 'exclude_flagged',
+                      'trend_shape', 'trend_df', 'trend_scale', 'trend_call', 'trend_min_r2',
+                      'trend_patterns')
 # Statistics settings applied to stored results without running them again.
-THRESHOLD_KEYS = ('pval_threshold', 'fc_threshold', 'marker_threshold', 'use_treat', 'fdr_scope')
+THRESHOLD_KEYS = ('pval_threshold', 'fc_threshold', 'marker_threshold', 'use_treat', 'fdr_scope',
+                  'trend_call', 'trend_min_r2', 'trend_patterns')
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -376,6 +390,13 @@ class GatingRunState:
     numeric_covariates: covariate names entered into the statistics as
                      continuous numbers (e.g. age); the rest are categories.
     stats          : results of the last statistics run (kept in STATS_FILE).
+    stats_test     : 'groups' (compare groups) or 'trend' (trend with a
+                     numeric covariate) — which test the Statistics page runs.
+    trend_*        : trend settings: the numeric covariate and its unit, the
+                     groups included ([] = all), group × trend interaction,
+                     shape, curve df, scale, how a trend is called and the
+                     minimum partial R² (``trend_stats``).
+    trend          : results of the last trend run (kept in TREND_FILE).
     pca, predictive: the last sample PCA and predictive analysis (from the
                      statistics run's per-sample values; kept in
                      SAMPLE_ANALYSIS_FILE with the run_id of that run).
@@ -398,7 +419,8 @@ class GatingRunState:
                      default; feature types; marker readout; ranking
                      statistic; permutations; seed; minimum set size;
                      {population key: cell type} overrides).
-    fsea           : the last enrichment run (kept in ENRICHMENT_FILE).
+    fsea           : the last enrichment run of the group comparisons, and
+    fsea_trend     : of the trend (both kept in ENRICHMENT_FILE).
 
     results_revision (not a field) counts the times one of _RESULT_FIELDS
     was given another object, so the pages can tell whether the results
@@ -454,6 +476,18 @@ class GatingRunState:
     min_marker_events: int = ag_results.DEFAULT_MIN_MARKER_EVENTS
     exclude_flagged: bool = False
     stats: dict = field(default_factory=dict)
+    stats_test: str = 'groups'
+    trend_variable: str = ''
+    trend_unit: str = ''
+    trend_groups: list = field(default_factory=list)
+    trend_interaction: bool = False
+    trend_shape: str = 'curve'
+    trend_df: int = ts.DEFAULT_CURVE_DF
+    trend_scale: str = 'linear'
+    trend_call: str = 'either'
+    trend_min_r2: float = ts.DEFAULT_MIN_R2
+    trend_patterns: int = 0          # shape patterns; 0 = chosen from stability
+    trend: dict = field(default_factory=dict)
     pca_use_freq: bool = True
     pca_use_counts: bool = False
     pca_use_markers: bool = False
@@ -463,6 +497,11 @@ class GatingRunState:
     pred_lasso: bool = True
     pred_forest: bool = True
     pred_repeats: int = 5
+    age_use_freq: bool = True
+    age_use_markers: bool = False
+    age_repeats: int = 5
+    age_permutations: int = 100
+    age_predict_others: bool = False
     pca: dict = field(default_factory=dict)
     predictive: dict = field(default_factory=dict)
     fsea_library_path: str = ''
@@ -476,6 +515,7 @@ class GatingRunState:
     fsea_min_set_size: int = ag_fsea.MIN_SET_SIZE
     fsea_overrides: dict = field(default_factory=dict)
     fsea: dict = field(default_factory=dict)
+    fsea_trend: dict = field(default_factory=dict)
 
     def __setattr__(self, name, value):
         if name in _RESULT_FIELDS and value is not self.__dict__.get(name):
@@ -500,7 +540,7 @@ class GatingRunState:
 
 # Large results, tracked by GatingRunState.results_revision.
 _RESULT_FIELDS = ('applied_model', 'summaries', 'load_info', 'display', 'stats', 'pca',
-                  'predictive', 'fsea')
+                  'predictive', 'fsea', 'fsea_trend', 'trend')
 # Further fields the Run, Results and Enrichment pages show (with
 # _PERSISTED_FIELDS), compared by content.
 _VIEW_FIELDS = ('model_path', 'model_sha', 'results_model_sha', 'marker_channels',
@@ -514,7 +554,10 @@ _PERSISTED_FIELDS = (
     'fc_threshold', 'marker_threshold', 'use_treat', 'fdr_scope', 'run_freq', 'run_counts',
     'counts_method', 'counts_reference', 'min_parent_events', 'run_markers', 'use_stats_parent',
     'exclude_gating_markers', 'min_marker_events', 'exclude_flagged', 'pca_use_freq', 'pca_use_counts', 'pca_use_markers', 'pca_n_loadings',
+    'stats_test', 'trend_variable', 'trend_unit', 'trend_groups', 'trend_interaction',
+    'trend_shape', 'trend_df', 'trend_scale', 'trend_call', 'trend_min_r2', 'trend_patterns',
     'pred_use_freq', 'pred_use_markers', 'pred_lasso', 'pred_forest', 'pred_repeats',
+    'age_use_freq', 'age_use_markers', 'age_repeats', 'age_permutations', 'age_predict_others',
     'report_populations', 'pop_filter',
     'fsea_library_path', 'fsea_species', 'fsea_anchor', 'fsea_feature_types',
     'fsea_marker_readout', 'fsea_rank_metric', 'fsea_n_perm', 'fsea_seed', 'fsea_min_set_size',
@@ -552,6 +595,23 @@ def _gate_tile_size() -> tuple[int, int]:
     import honeychrome.settings as hc_settings
     tile_size = int(getattr(hc_settings, 'cytometry_plot_width_target_retrieved', 220) or 220)
     return tile_size + 20, tile_size + 60
+
+
+# Approximate room the axes take in a gate tile, in pixels (tick labels and
+# axis titles), so the plot area's size is known before Qt lays it out.
+_TILE_AXIS_PX = (48, 40)
+
+
+def _clamp_label(value: float, lim: tuple, extent_px: float, axis_px: float) -> float:
+    """*value*, the centre of a centred label *extent_px* long, moved so the
+    label stays within *lim*, an axis *axis_px* long."""
+    span = float(lim[1]) - float(lim[0])
+    if span <= 0 or axis_px <= 0:
+        return value
+    half = 0.5 * (extent_px + 6.0) / axis_px * span
+    if 2 * half >= span:
+        return 0.5 * (lim[0] + lim[1])
+    return float(min(max(value, lim[0] + half), lim[1] - half))
 
 
 def _make_gate_tile(gate_def: dict, boundary: dict, events: np.ndarray | None,
@@ -663,6 +723,7 @@ def _make_gate_tile(gate_def: dict, boundary: dict, events: np.ndarray | None,
         y_lim = (0.0, float(np.max(counts)) if counts is not None and len(counts) else 1.0)
     regions = ag_core.population_regions(gate_def, boundary)
     fractions = fractions or {}
+    plot_w, plot_h = tile_size - _TILE_AXIS_PX[0], tile_size - _TILE_AXIS_PX[1]
     for pop, entry in (boundary or {}).items():
         width = 2.5 if pop == highlight else 1.5
         label = (gate_def.get('populations') or {}).get(pop, {}).get('label', pop)
@@ -677,7 +738,9 @@ def _make_gate_tile(gate_def: dict, boundary: dict, events: np.ndarray | None,
             if sep_y:
                 ly, lx, va_, ha_ = ag_report.label_position(gt, regions.get(pop), entry, y_lim, x_lim)
                 t = pg.TextItem(text, color=colour, fill=fill, anchor=(0.5, 0.5))
-                t.setPos(lx, ly)
+                rect = t.boundingRect()
+                t.setPos(_clamp_label(lx, x_lim, rect.width(), plot_w),
+                         _clamp_label(ly, y_lim, rect.height(), plot_h))
                 vb.addItem(t)
                 continue
         else:
@@ -692,6 +755,11 @@ def _make_gate_tile(gate_def: dict, boundary: dict, events: np.ndarray | None,
         lx, ly, ha, va = ag_report.label_position('free' if shapes else gt, regions.get(pop),
                                                   entry, x_lim, y_lim)
         t = pg.TextItem(text, color=colour, fill=fill, anchor=(anchor_x[ha], anchor_y[va]))
+        rect = t.boundingRect()
+        if ha == 'center':
+            lx = _clamp_label(lx, x_lim, rect.width(), plot_w)
+        if va == 'center':
+            ly = _clamp_label(ly, y_lim, rect.height(), plot_h)
         t.setPos(lx, ly)
         vb.addItem(t)
 
@@ -1395,7 +1463,8 @@ class RunTab(QWidget):
             return
         self._before_run = {name: (dict(getattr(st, name)) if isinstance(getattr(st, name), dict)
                                    else deepcopy(getattr(st, name))) for name in (
-            'run_samples', 'summaries', 'load_info', 'display', 'stats', 'fsea', 'marker_channels',
+            'run_samples', 'summaries', 'load_info', 'display', 'stats', 'trend', 'fsea',
+            'fsea_trend', 'marker_channels',
             'results_model_sha', 'pending_samples', 'run_fingerprint', 'run_unmixing', 'run_transforms')}
         st.run_samples = keys
         if resume:
@@ -1408,7 +1477,9 @@ class RunTab(QWidget):
             st.load_info = {}
             st.display = {}
         st.stats = {}
+        st.trend = {}
         st.fsea = {}
+        st.fsea_trend = {}
         st.pca = {}
         st.predictive = {}
         st.marker_channels = markers
@@ -1785,6 +1856,56 @@ class _CallWorker(QThread):
         self.finished.emit(True, '', result)
 
 
+FIGURE_OPTIONS_SCOPE = 'automated_gating'
+# Figure options key of each figure shown on the Figures page under a title
+# rather than a key (the sample PCA and predictive analysis).
+_EXTRA_FIGURE_KEYS = {"Sample PCA": 'sample_pca', "Predictive: ROC": 'pred_roc',
+                      "Predictive: features": 'pred_features',
+                      "Predictive: panel size": 'pred_panel'}
+
+
+def figure_options_ref(controller, key: str | None):
+    """The figure options of Automated Gating figure *key* in the experiment
+    the controller shows (figure_options), or None."""
+    from honeychrome.view_components import figure_options as fo
+    store = fo.store_for(controller) if key else None
+    return fo.FigureOptionsRef(store, FIGURE_OPTIONS_SCOPE, key) if store is not None else None
+
+
+def report_figure_key(item_key: str) -> str:
+    """The figure options key of a report item: its figure on the Figures
+    page (e.g. 'freq_volcano' for 'freq_volcano:B vs A'), or one key for
+    each kind of per-gate, per-population and enrichment figure."""
+    parts = str(item_key).split(':')
+    head = parts[0]
+    if head == 'enrichment':
+        if len(parts) == 1 or parts[1] == 'trend':
+            return 'enrichment_dot'
+        return 'enrichment_patterns' if parts[1] == 'patterns' else 'enrichment_running_sum'
+    return head
+
+
+class _ProgressCallWorker(QThread):
+    """Run fn(report) off the main thread, where report(fraction, message)
+    emits progress; emits finished(ok, error, result)."""
+
+    progress = Signal(float, str)
+    finished = Signal(bool, str, object)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self):
+        try:
+            result = self._fn(lambda fraction, message: self.progress.emit(fraction, message))
+        except Exception as exc:
+            log.exception("background task failed")
+            self.finished.emit(False, str(exc), None)
+            return
+        self.finished.emit(True, '', result)
+
+
 def write_report(*, report_dir: Path, stem: str, items: list, title_lines: list[str],
                  settings_text: str, summaries: dict, samples: list[str], groups: dict,
                  antigens: dict, progress, cancelled) -> bool:
@@ -1876,15 +1997,16 @@ def statistics_design(state: 'GatingRunState', samples: list[str]) -> dict:
     {'groups': {sample: group}, 'pairing': {sample: level} or None,
     'covariates': adjustment covariates (DataFrame) or None, 'numeric':
     covariates entered as numbers, 'missing_pairing': labels of samples
-    without a pairing value (pairing is None when any is missing)}."""
+    without a pairing value}. A sample without a pairing value is unpaired:
+    it gets a pairing level of its own."""
     st = state
     groups = {k: st.sample_groups[k] for k in samples}
     pairing, missing = None, []
     if st.pairing:
         vals = st.covariates.get(st.pairing) or {}
-        missing = [_sample_label(k) for k in samples if not str(vals.get(k, '')).strip()]
-        if not missing:
-            pairing = {k: vals[k] for k in samples}
+        missing = [_sample_label(k) for k in samples if ds.is_missing_value(vals.get(k))]
+        pairing = {k: (f"__unpaired_{k}" if ds.is_missing_value(vals.get(k))
+                       else str(vals[k]).strip()) for k in samples}
     covariates = None
     adjust = [c for c in st.adjust_covariates if c in st.covariates and c != st.pairing]
     if adjust:
@@ -1975,6 +2097,102 @@ def build_result_figures(stats: dict, base: str, other: str, pval_threshold: flo
     return out
 
 
+# Tested values behind each kind of trend result (keys of a trend run).
+_TREND_DATA_KEYS = {'freq': 'freq_data', 'counts': 'counts_data', 'markers': 'marker_values'}
+_TREND_KIND_NAMES = {'freq': 'Frequency', 'counts': 'Counts', 'markers': 'Marker'}
+
+
+def _trend_value_label(trend: dict, kind: str) -> str:
+    """Axis label of the values a trend of *kind* was tested on."""
+    if kind == 'markers':
+        return 'median (transformed units)'
+    if kind == 'counts' and trend.get('counts_reference') != 'parent':
+        return 'log2 odds within the anchor population'
+    return 'log2 odds within the parent'
+
+
+def _trend_feature_labels(table: pd.DataFrame, kind: str, pop_labels: dict,
+                          antigens: dict) -> list[str]:
+    """Display label of each row of a trend table."""
+    if kind == 'markers' and {'cluster', 'channel'}.issubset(table.columns):
+        return [f"{r['cluster']} {antigens.get(r['channel'], r['channel'])}"
+                for _i, r in table.iterrows()]
+    return [pop_labels.get(f, f) for f in table['feature'].astype(str)]
+
+
+def build_trend_figures(trend: dict, is_dark: bool, antigens: dict, pop_labels: dict,
+                        group_colours: dict | None = None) -> dict:
+    """The trend volcano and trajectory heatmap of each kind of result of
+    a trend run. Pure matplotlib (no canvas), so it runs on a worker
+    thread. Each figure carries ``_trend_kind`` (freq, counts or markers)
+    for click-through to the per-feature trend plot.
+
+    Returns {key: {'fig', 'title', 'error', 'results', 'make'}} as
+    build_result_figures does.
+    """
+    from honeychrome.view_components import trend_plots as tp
+
+    settings = trend.get('settings') or {}
+    variable = trend.get('variable') or settings.get('variable', 'time')
+    unit = trend.get('unit') or settings.get('unit', '')
+    scale = settings.get('scale', 'linear')
+    groups = list(settings.get('groups') or [])
+    what = (f" ({groups[1]} − {groups[0]})"
+            if settings.get('interaction') and len(groups) == 2 else '')
+    run_label = f"Trend with {variable}"
+    out: dict = {}
+
+    def _add(key, tab_title, kind, maker, **kwargs):
+        def make():
+            fig = maker(**kwargs)
+            fig._trend_kind = kind
+            return fig
+        try:
+            out[key] = {'fig': make(), 'title': tab_title, 'error': None, 'results': None,
+                        'make': make}
+        except Exception as exc:
+            log.exception("figure %s failed", key)
+            out[key] = {'fig': None, 'title': tab_title, 'error': str(exc), 'results': None}
+
+    for kind, name in _TREND_KIND_NAMES.items():
+        res = trend.get(kind)
+        if res is None:
+            continue
+        labels = _trend_feature_labels(res.table, kind, pop_labels, antigens)
+        per = tp.slope_label(variable, unit, scale)
+        amount = 'median' if kind == 'markers' else 'log2 odds'
+        _add(f'trend_{kind}_volcano', f"{name} trend volcano", kind,
+             tp.make_trend_volcano_figure, table=res.table,
+             title=f"{name}: trends with {variable}{what}", x_label=f"Slope ({amount} {per})",
+             feature_labels=labels, pval_threshold=settings.get('pval_threshold', 0.05),
+             call=settings.get('call', 'either'), is_dark=is_dark, run_label=run_label)
+        _add(f'trend_{kind}_heatmap', f"{name} trajectories", kind,
+             tp.make_trajectory_heatmap_figure, table=res.table, grid=res.grid,
+             curves=res.curves, title=f"{name}: fitted curves of the called features{what}",
+             variable=variable, unit=unit, scale=scale, feature_labels=labels,
+             patterns=res.settings.get('patterns'), is_dark=is_dark, run_label=run_label)
+        _add(f'trend_{kind}_patterns', f"{name} patterns", kind,
+             tp.make_pattern_panel_figure, table=res.table, grid=res.grid, curves=res.curves,
+             patterns=res.settings.get('patterns') or [],
+             title=f"{name}: shape patterns of the called features{what}", variable=variable,
+             unit=unit, scale=scale, is_dark=is_dark, run_label=run_label)
+    age = trend.get('age_model')
+    if age:
+        groups = dict(zip(trend.get('samples') or [], trend.get('group_vec') or []))
+        groups.update(age.get('groups') or {})
+        model_group = (age.get('summary') or {}).get('group', '')
+        _add('trend_age_model', "Immune age", None, tp.make_age_model_figure, result=age,
+             variable=variable, unit=unit, groups=groups, group_colours=group_colours,
+             title=f"Immune age model: {variable} from the immune profile ({model_group})",
+             is_dark=is_dark, run_label=run_label)
+        imp = age['importance']
+        keys = ({f: k for f, k in zip(imp['feature'].astype(str), imp['key'].astype(str)) if k}
+                if 'key' in imp.columns else None)
+        _add('trend_age_features', "Immune age: features", None, tp.make_age_features_figure,
+             result=age, variable=variable, is_dark=is_dark, run_label=run_label, keys=keys)
+    return out
+
+
 def _is_dark_palette() -> bool:
     from PySide6.QtGui import QPalette
     from PySide6.QtWidgets import QApplication
@@ -2008,6 +2226,20 @@ def write_results_csv(folder: Path, stem: str, timestamp: str, summaries: dict,
     return out
 
 
+def write_trend_csv(folder: Path, stem: str, timestamp: str, trend: dict, labels: dict,
+                    antigens: dict) -> list[Path]:
+    """Write the trend run's tables as ``<stem>_<timestamp>_<table>.csv``
+    (trend_frequencies, trend_counts, trend_markers); returns the paths.
+    Worker-safe (plain data only)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    out = []
+    for name, frame in ag_results.trend_tables(trend, labels, antigens).items():
+        path = folder / f"{stem}_{timestamp}_{name}.csv"
+        frame.to_csv(path, index=False)
+        out.append(path)
+    return out
+
+
 def write_statistics_csv(folder: Path, stem: str, timestamp: str, stats: dict, labels: dict,
                          antigens: dict) -> list[Path]:
     """Write the statistics run's tables as ``<stem>_<timestamp>_statistics_
@@ -2029,6 +2261,7 @@ class ResultsTab(QWidget):
     """Groups and covariates, statistics, figures, population browser, export."""
 
     stats_finished = Signal()
+    trend_finished = Signal()
     report_populations_changed = Signal()
     sample_analysis_changed = Signal()
 
@@ -2126,6 +2359,15 @@ class ResultsTab(QWidget):
             b = QPushButton(text)
             b.clicked.connect(slot)
             row.addWidget(b)
+        for text, step, tip in (("▲", -1, "Move the selected group up."),
+                                ("▼", 1, "Move the selected group down.")):
+            b = QPushButton(text)
+            b.setFixedWidth(32)
+            b.setToolTip(tip + " The group order is the order used in the Statistics "
+                         "choices, comparisons between every pair (the earlier group is "
+                         "the baseline) and every figure.")
+            b.clicked.connect(lambda _c=False, s=step: self._on_move_group(s))
+            row.addWidget(b)
         gl.addLayout(row)
         top.addWidget(gbox, stretch=1)
 
@@ -2148,14 +2390,22 @@ class ResultsTab(QWidget):
         b_import = QPushButton("Import table…")
         b_import.setToolTip(
             "Read groups and covariates from a CSV or tab-separated file with one row per "
-            "sample: a 'sample' column (file name, with or without extension), an optional "
-            "'group' column, and one column per covariate (e.g. donor, age, sex).")
+            "sample: a 'sample' column (the file name, with or without extension, or a sample "
+            "ID found inside the file name), an optional group column, and one column per "
+            "covariate (e.g. donor, age, sex). The matches are shown for review before "
+            "anything changes.")
         b_import.clicked.connect(self._on_import_table)
         b_export = QPushButton("Export table…")
         b_export.setToolTip("Save the samples' groups and covariates in the same format.")
         b_export.clicked.connect(self._on_export_table)
+        b_check = QPushButton("Check table…")
+        b_check.setToolTip(
+            "Look for blank cells, NA and Unknown spellings, similar categories, numbers "
+            "written as text and covariates confounded with the groups, and fix them.")
+        b_check.clicked.connect(self._on_check_table)
         trow.addWidget(b_import)
         trow.addWidget(b_export)
+        trow.addWidget(b_check)
         cl.addLayout(trow)
         cl.addStretch()
         top.addWidget(cbox, stretch=1)
@@ -2328,6 +2578,22 @@ class ResultsTab(QWidget):
         self._populate_groups()
         self._populate_stats_choices()
 
+    def _on_move_group(self, step: int):
+        """Move the selected group *step* rows up (-1) or down (+1). Each
+        group keeps its colour."""
+        st = self.state
+        row = self.groups_table.currentRow()
+        new = row + step
+        if row < 0 or not 0 <= new < len(st.group_names):
+            return
+        st.group_colors = _group_colours(st)
+        st.group_names.insert(new, st.group_names.pop(row))
+        self._populate_groups()
+        self._populate_stats_choices()
+        self.groups_table.setCurrentCell(new, 0)
+        if st.stats:
+            self._draw_figures()
+
     def _on_remove_group(self):
         row = self.groups_table.currentRow()
         if row < 0:
@@ -2365,9 +2631,9 @@ class ResultsTab(QWidget):
             msg += " Invalid pattern for: " + ", ".join(sorted(set(bad)))
         _status(self.bus, msg)
 
-    def _groupings_result(self, keys: list[str]) -> dict:
+    def _groupings_result(self, keys: list[str], current_groups: dict | None = None) -> dict:
         display = self.controller.experiment.samples.get('all_samples', {}) if self.controller else {}
-        return ds.suggest_groupings_from_names(keys, display)
+        return ds.suggest_groupings_from_names(keys, display, current_groups)
 
     def _on_suggest_groupings(self):
         """Offer groupings found in the gated samples' names (see
@@ -2377,7 +2643,10 @@ class ResultsTab(QWidget):
             QMessageBox.information(self, "Suggest Groupings",
                                     "Need at least two gated samples to detect a pattern.")
             return
-        result = self._groupings_result(keys)
+        st = self.state
+        current = {k: st.sample_groups[k] for k in keys
+                   if st.sample_groups.get(k) in st.group_names}
+        result = self._groupings_result(keys, current)
         if not result['suggestions']:
             QMessageBox.information(self, "Suggest Groupings", sgd.no_suggestion_message(result))
             return
@@ -2468,12 +2737,48 @@ class ResultsTab(QWidget):
         if not ok:
             return
         self.state.covariates.pop(name, None)
+        self._forget_covariate(name)
+        self._populate_samples_table()
+        self._populate_stats_choices()
+
+    def _forget_covariate(self, name: str):
+        """Clear a removed covariate from pairing, adjustment and Numeric."""
         if self.state.pairing == name:
             self.state.pairing = ''
         self.state.adjust_covariates = [c for c in self.state.adjust_covariates if c != name]
         self.state.numeric_covariates = [c for c in self.state.numeric_covariates if c != name]
-        self._populate_samples_table()
-        self._populate_stats_choices()
+
+    def _on_check_table(self):
+        """Check the covariates of the samples the statistics would use."""
+        st = self.state
+
+        def comparisons(samples):
+            names = ag_results.qualifying_groups(samples, st.sample_groups, list(st.group_names))
+            if len(names) < 2:
+                return []
+            reference = st.reference_group if st.reference_group in names else names[0]
+            return ds.build_contrasts(names, st.contrast_mode, reference)
+
+        def check():
+            samples = self._stats_samples()
+            return covariate_check.check_covariates(
+                st.covariates, samples, st.sample_groups, comparisons(samples),
+                st.numeric_covariates)
+
+        def apply(fixes):
+            covs, numeric, removed = covariate_check.apply_fixes(
+                st.covariates, st.numeric_covariates, self._stats_samples(), fixes)
+            st.covariates = covs
+            st.numeric_covariates = numeric
+            for name in removed:
+                self._forget_covariate(name)
+            self._populate_samples_table()
+            self._populate_stats_choices()
+            text = covariate_check.describe_fixes(fixes, removed)
+            _status(self.bus, text)
+            return text
+
+        covariate_check_dialog.check_table(self, "Check table", check, apply)
 
     def _on_import_table(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2481,41 +2786,38 @@ class ResultsTab(QWidget):
             "Tables (*.csv *.tsv *.txt);;All files (*)")
         if not path:
             return
-        try:
-            df = pd.read_csv(path, sep=None, engine='python', dtype=str)
-            table = ag_results.read_sample_table(df, self.state.gated_samples())
-        except Exception as exc:
-            QMessageBox.warning(self, "Import table", f"Could not read the table: {exc}")
-            return
         st = self.state
-        for group in table['groups'].values():
+        result = sample_table_import_dialog.import_sample_table(
+            self, path, st.gated_samples(), st.sample_groups, title="Import table")
+        if result is None:
+            return
+        if result['replace_covariates']:
+            for name in list(st.covariates):
+                if name not in result['covariates']:
+                    self._forget_covariate(name)
+            st.covariates = {}
+        for group in result['groups'].values():
             if group not in st.group_names:
                 st.group_names.append(group)
-        st.sample_groups.update(table['groups'])
-        for name, values in table['covariates'].items():
+        st.sample_groups.update(result['groups'])
+        for name, values in result['covariates'].items():
             st.covariates.setdefault(name, {}).update(values)
         self._populate_groups()
         self._populate_stats_choices()
-        msg = (f"Imported {len(table['groups'])} group assignment(s) and "
-               f"{len(table['columns'])} covariate(s) from {Path(path).name}.")
-        if table['unmatched']:
-            msg += (f" {len(table['unmatched'])} row(s) matched no gated sample: "
-                    + ", ".join(table['unmatched'][:6]) + (" …" if len(table['unmatched']) > 6 else ''))
-        _status(self.bus, msg)
-        QMessageBox.information(self, "Import table", msg)
+        _status(self.bus, sample_table_import_dialog.describe_import(result))
 
     def _on_export_table(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export sample table", str(getattr(self.controller, 'experiment_dir', '')),
-            "CSV (*.csv)")
+        default = sample_table.default_export_path(
+            getattr(self.controller, 'experiment_dir', ''), plugin_name)
+        path, _ = QFileDialog.getSaveFileName(self, "Export sample table", default, "CSV (*.csv)")
         if not path:
             return
         if not path.lower().endswith('.csv'):
             path += '.csv'
         st = self.state
         try:
-            ag_results.sample_table_frame(st.gated_samples(), st.sample_groups,
-                                          st.covariates).to_csv(path, index=False)
+            sample_table.write_table(
+                sample_table.table_frame(st.gated_samples(), st.sample_groups, st.covariates), path)
         except Exception as exc:
             QMessageBox.warning(self, "Export table", str(exc))
             return
@@ -2549,6 +2851,15 @@ class ResultsTab(QWidget):
         defaults_row.addWidget(self.btn_stats_defaults)
         defaults_row.addStretch()
         form.addRow(defaults_row)
+
+        self.cb_test = QComboBox()
+        for key, text in STATS_TESTS.items():
+            self.cb_test.addItem(text, key)
+        self.cb_test.setToolTip(
+            "Compare groups: which populations differ between sample groups. Trend: which "
+            "populations change with a numeric covariate such as age or days after "
+            "vaccination (mark it Numeric on the Groups page).")
+        form.addRow("Test:", self.cb_test)
 
         self.chk_freq = QCheckBox("Population frequencies (log odds within parent)")
         self.chk_counts = QCheckBox("Population counts")
@@ -2602,6 +2913,77 @@ class ResultsTab(QWidget):
         for w in (self.chk_markers, self.chk_stats_parent, self.chk_exclude_gating):
             form.addRow(w)
         form.addRow("Min. events for medians:", self.sb_min_events)
+
+        self.trend_box = QGroupBox("Trend")
+        trend_form = QFormLayout(self.trend_box)
+        self.cb_trend_var = QComboBox()
+        self.cb_trend_var.setToolTip("Covariates ticked Numeric on the Groups page.")
+        self.le_trend_unit = QLineEdit()
+        self.le_trend_unit.setPlaceholderText("e.g. weeks, days")
+        self.le_trend_unit.setToolTip("Unit of the variable, for the slope and the axes.")
+        self.list_trend_groups = QListWidget()
+        self.list_trend_groups.setMaximumHeight(80)
+        self.list_trend_groups.setToolTip(
+            "Groups whose samples are tested. Samples without a value for the variable are "
+            "left out.")
+        self.cb_trend_question = QComboBox()
+        self.cb_trend_question.addItem("Change with the variable (groups ticked together)", False)
+        self.cb_trend_question.addItem("Does the change differ between two groups?", True)
+        self.cb_trend_question.setToolTip(
+            "The second asks whether two ticked groups change differently (group × trend); "
+            "the reference group is the first. With pairing (e.g. two tissues of one donor) "
+            "it tests the within-pair difference against the variable.")
+        self.cb_trend_shape = QComboBox()
+        for key, text in TREND_SHAPE_LABELS.items():
+            self.cb_trend_shape.addItem(text, key)
+        self.cb_trend_shape.setToolTip(
+            "Smooth curve: any shape, one p-value for the variable as a whole (an ANOVA-style F "
+            "test). Straight line: a steady rise or fall. Time points as groups: each value is "
+            "its own level, for designed time courses (day 0, 3, 7, 14).")
+        self.sb_trend_df = QSpinBox()
+        self.sb_trend_df.setRange(1, TREND_MAX_DF)
+        self.sb_trend_df.setToolTip(
+            "How many bends the curve may make (1 = a straight line, 2 = one bend). Capped at "
+            "one per 10 samples.")
+        self.cb_trend_scale = QComboBox()
+        for key, text in TREND_SCALE_LABELS.items():
+            self.cb_trend_scale.addItem(text, key)
+        self.cb_trend_scale.setToolTip(
+            "Log2 suits time courses sampled on a doubling schedule (day 0, 1, 3, 7, 14, 28).")
+        self.cb_trend_call = QComboBox()
+        for key, text in TREND_CALL_LABELS.items():
+            self.cb_trend_call.addItem(text, key)
+        self.cb_trend_call.setToolTip(
+            "A population is called when the curve test or the slope test is significant, each "
+            "at half the FDR so the combined error stays at the FDR set below; or by one test "
+            "alone.")
+        self.sb_trend_r2 = QDoubleSpinBox()
+        self.sb_trend_r2.setRange(0.0, 1.0)
+        self.sb_trend_r2.setDecimals(2)
+        self.sb_trend_r2.setSingleStep(0.05)
+        self.sb_trend_r2.setToolTip(
+            "Minimum partial R²: the share of the sample-to-sample variation the variable "
+            "explains, after groups and adjustment covariates. In large studies tiny trends "
+            "become significant; this keeps them out.")
+        self.sb_trend_patterns = QSpinBox()
+        self.sb_trend_patterns.setRange(0, 10)
+        self.sb_trend_patterns.setSpecialValueText("Auto")
+        self.sb_trend_patterns.setToolTip(
+            "Shape patterns: the called populations are grouped by the shape of their fitted curve (rises, falls, peaks mid-range). Auto uses the largest number of patterns that come back the same when the test is repeated on 80% of the samples; a number groups into exactly that many.")
+        self.lbl_trend_check = QLabel("")
+        self.lbl_trend_check.setWordWrap(True)
+        trend_form.addRow("Variable:", self.cb_trend_var)
+        trend_form.addRow("Unit:", self.le_trend_unit)
+        trend_form.addRow("Groups:", self.list_trend_groups)
+        trend_form.addRow("Question:", self.cb_trend_question)
+        trend_form.addRow("Shape:", self.cb_trend_shape)
+        trend_form.addRow("Curve df:", self.sb_trend_df)
+        trend_form.addRow("Scale:", self.cb_trend_scale)
+        trend_form.addRow("Call when:", self.cb_trend_call)
+        trend_form.addRow("Min. partial R²:", self.sb_trend_r2)
+        trend_form.addRow("Patterns:", self.sb_trend_patterns)
+        trend_form.addRow(self.lbl_trend_check)
+        form.addRow(self.trend_box)
 
         self.cb_mode = QComboBox()
         for key, text in CONTRAST_MODES.items():
@@ -2690,6 +3072,194 @@ class ResultsTab(QWidget):
             spin.valueChanged.connect(self._update_stats_defaults_button)
         for combo in (self.cb_counts_method, self.cb_counts_reference, self.cb_fdr):
             combo.currentIndexChanged.connect(self._update_stats_defaults_button)
+        self.cb_test.currentIndexChanged.connect(self._on_test_changed)
+        self.cb_trend_var.currentIndexChanged.connect(self._on_trend_settings_changed)
+        self.le_trend_unit.editingFinished.connect(self._on_trend_settings_changed)
+        self.list_trend_groups.itemChanged.connect(self._on_trend_settings_changed)
+        for combo in (self.cb_trend_question, self.cb_trend_shape, self.cb_trend_scale):
+            combo.currentIndexChanged.connect(self._on_trend_settings_changed)
+        self.sb_trend_df.valueChanged.connect(self._on_trend_settings_changed)
+        self.cb_trend_call.currentIndexChanged.connect(self._on_trend_thresholds_changed)
+        self.sb_trend_r2.valueChanged.connect(self._on_trend_thresholds_changed)
+        self.sb_trend_patterns.valueChanged.connect(self._on_trend_thresholds_changed)
+        for w in (self.cb_trend_shape, self.cb_trend_scale, self.cb_trend_call):
+            w.currentIndexChanged.connect(self._update_stats_defaults_button)
+        for w in (self.sb_trend_df, self.sb_trend_r2, self.sb_trend_patterns):
+            w.valueChanged.connect(self._update_stats_defaults_button)
+
+    # ------------------------------------------------------------------
+    # Trend settings
+    # ------------------------------------------------------------------
+
+    def _trend_mode(self) -> bool:
+        return self.state.stats_test == 'trend'
+
+    def _on_test_changed(self, _i):
+        if self._filling:
+            return
+        self.state.stats_test = self.cb_test.currentData() or 'groups'
+        self._apply_test_mode()
+        self._show_run_summary()
+        self._show_results_tables()
+        self._draw_figures()
+        self._load_explore_controls()
+        self._populate_population_list()
+
+    def _show_run_summary(self):
+        """The summary line of the shown test's last run."""
+        st = self.state
+        if self._trend_mode():
+            self.lbl_stats.setText(self._trend_summary(st.trend) if st.trend else "")
+        else:
+            self.lbl_stats.setText(self._stats_summary(st.stats) if st.stats else "")
+
+    def _apply_test_mode(self):
+        """Show the trend settings in trend mode and grey out the settings
+        that only group comparisons use."""
+        st = self.state
+        trend = self._trend_mode()
+        self.trend_box.setVisible(trend)
+        for w in (self.cb_mode, self.sb_fc, self.sb_marker, self.chk_treat, self.cb_fdr):
+            w.setEnabled(not trend)
+        self.cb_reference.setEnabled(st.trend_interaction if trend
+                                     else st.contrast_mode == 'reference')
+        self.cb_comparison.setEnabled(not trend)
+        self.sb_trend_df.setEnabled(st.trend_shape == 'curve')
+        self.btn_stats.setText("Run Trend Test" if trend else "Run Statistics")
+        if trend:
+            self._update_trend_check()
+
+    def _load_trend_controls(self):
+        st = self.state
+        numeric = [c for c in st.covariates if c in st.numeric_covariates and c != st.pairing]
+        if st.trend_variable not in numeric:
+            st.trend_variable = numeric[0] if numeric else ''
+        self._filling = True
+        try:
+            self.cb_test.setCurrentIndex(max(self.cb_test.findData(st.stats_test), 0))
+            self.cb_trend_var.clear()
+            for c in numeric:
+                self.cb_trend_var.addItem(c, c)
+            self.cb_trend_var.setCurrentIndex(max(self.cb_trend_var.findData(st.trend_variable), 0))
+            self.le_trend_unit.setText(st.trend_unit)
+            self.list_trend_groups.clear()
+            chosen = [g for g in st.trend_groups if g in st.group_names]
+            for g in st.group_names:
+                it = QListWidgetItem(g)
+                it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                it.setCheckState(Qt.Checked if (not chosen or g in chosen) else Qt.Unchecked)
+                self.list_trend_groups.addItem(it)
+            for cb, v in ((self.cb_trend_question, st.trend_interaction),
+                          (self.cb_trend_shape, st.trend_shape),
+                          (self.cb_trend_scale, st.trend_scale),
+                          (self.cb_trend_call, st.trend_call)):
+                cb.setCurrentIndex(max(cb.findData(v), 0))
+            self.sb_trend_df.setValue(int(st.trend_df))
+            self.sb_trend_r2.setValue(float(st.trend_min_r2))
+            self.sb_trend_patterns.setValue(int(st.trend_patterns))
+        finally:
+            self._filling = False
+        self._apply_test_mode()
+
+    def _trend_group_names(self) -> list[str]:
+        """The groups ticked for the trend, in the Groups table's order."""
+        st = self.state
+        return [g for g in st.group_names if not st.trend_groups or g in st.trend_groups]
+
+    def _trend_samples(self) -> list[str]:
+        groups = set(self._trend_group_names())
+        return [k for k in self._stats_samples() if self.state.sample_groups.get(k) in groups]
+
+    def _trend_values(self, samples: list[str]) -> dict:
+        """{sample: value of the trend variable} (NaN where it has none)."""
+        vals = self.state.covariates.get(self.state.trend_variable) or {}
+        out = {}
+        for k in samples:
+            number = covariate_check.parse_number(vals.get(k))
+            out[k] = float('nan') if number is None else float(number)
+        return out
+
+    def _on_trend_settings_changed(self, *_args):
+        if self._filling:
+            return
+        st = self.state
+        st.trend_variable = self.cb_trend_var.currentData() or ''
+        st.trend_unit = self.le_trend_unit.text().strip()
+        ticked = [self.list_trend_groups.item(i).text() for i in range(self.list_trend_groups.count())
+                  if self.list_trend_groups.item(i).checkState() == Qt.Checked]
+        st.trend_groups = [] if len(ticked) == self.list_trend_groups.count() else ticked
+        st.trend_interaction = bool(self.cb_trend_question.currentData())
+        st.trend_shape = self.cb_trend_shape.currentData() or 'curve'
+        st.trend_df = int(self.sb_trend_df.value())
+        st.trend_scale = self.cb_trend_scale.currentData() or 'linear'
+        self._apply_test_mode()
+
+    def _on_trend_thresholds_changed(self, *_args):
+        if self._filling:
+            return
+        st = self.state
+        st.trend_call = self.cb_trend_call.currentData() or 'either'
+        st.trend_min_r2 = float(self.sb_trend_r2.value())
+        st.trend_patterns = int(self.sb_trend_patterns.value())
+        self._rethreshold_trend()
+
+    def _rethreshold_trend(self):
+        st = self.state
+        if not st.trend:
+            return
+        st.trend = ag_results.reapply_trend_thresholds(st.trend, st.pval_threshold,
+                                                       st.trend_min_r2, st.trend_call,
+                                                       st.trend_patterns)
+        if self._trend_mode():
+            self.lbl_stats.setText(self._trend_summary(st.trend))
+            self._show_results_tables()
+            self._draw_figures()
+            self._populate_population_list()
+
+    def _update_trend_check(self):
+        """The design check under the trend settings: samples with a value,
+        the curve df they allow, and any covariate (or the events per
+        sample) that follows the variable closely."""
+        st = self.state
+        var = st.trend_variable
+        if not var:
+            self.lbl_trend_check.setText(
+                "Tick <b>Numeric</b> under a covariate on the Groups page to test a trend "
+                "with it.")
+            return
+        samples = self._trend_samples()
+        values = self._trend_values(samples)
+        have = [k for k in samples if np.isfinite(values[k])]
+        lines = []
+        if st.trend_shape == 'curve':
+            df = ts.curve_df(len(have), st.trend_df)
+            lines.append(f"{len(have)} sample(s) with a value; the curve gets {df} df.")
+        else:
+            lines.append(f"{len(have)} sample(s) with a value.")
+        if st.trend_interaction and len(self._trend_group_names()) != 2:
+            lines.append("<span style='color:#b00020'>Tick exactly two groups to ask whether "
+                         "they change differently.</span>")
+        if have and st.trend_shape != 'points' and ts.suggest_shape([values[k] for k in have]) == 'points':
+            lines.append(f"'{var}' has few distinct values with several samples each: "
+                         "<i>Time points as groups</i> may suit a designed time course.")
+        others = [c for c in st.covariates if c not in (var, st.pairing)]
+        cov = pd.DataFrame({c: [(st.covariates.get(c) or {}).get(k, '') for k in have]
+                            for c in others}, index=have) if others else None
+        events = {'Events in the sample': [(st.summaries.get(k) or {}).get('n_total')
+                                           for k in have]}
+        checks = ts.design_check([values[k] for k in have], cov, events)
+        warned = [c for c in checks if c['warn']]
+        for c in warned:
+            adjusted = c['name'] in st.adjust_covariates
+            lines.append(f"<span style='color:#856404'>⚠ {c['name']} follows {var} "
+                         f"({c['measure']} = {c['value']:.2f})"
+                         + ("; adjusted for." if adjusted else
+                            ": a trend could reflect it. Consider adjusting for it.")
+                         + "</span>")
+        if checks and not warned:
+            lines.append(f"No other covariate, nor the events per sample, follows {var} "
+                         f"closely (all below {ts.DESIGN_CHECK_LIMIT}).")
+        self.lbl_trend_check.setText("<br>".join(lines))
 
     def _on_counts_settings_changed(self, *_args):
         if self._filling:
@@ -2708,10 +3278,10 @@ class ResultsTab(QWidget):
         self.cb_counts_reference.setItemText(0, f"Anchor population ({name})")
         notes = []
         if st.counts_method == 'ql':
-            notes.append("Quasi-likelihood F suits homogeneous designs with plenty of events "
-                         "(inbred mice: 3–7% false positives at the 5% level). On human cohort "
-                         "data it gave 7–11% for populations under 100 events; use moderated "
-                         "log odds there.")
+            notes.append("Quasi-likelihood F suits homogeneous designs such as inbred mice "
+                         "(3–6% false positives at the 5% level, about 5% with 100 cells per "
+                         "sample). On human cohort data it gave 7–10% for populations under 100 "
+                         "events; use moderated log odds there.")
         if st.counts_reference == 'parent' and st.counts_method == 'moderated':
             notes.append("Against the parent with this model, the counts test repeats the "
                          "frequency test.")
@@ -2774,6 +3344,7 @@ class ResultsTab(QWidget):
             self._filling = False
         self._populate_stats_choices()
         self._update_counts_note()
+        self._load_trend_controls()
         self._update_stats_defaults_button()
 
     def _populate_stats_choices(self):
@@ -2813,6 +3384,8 @@ class ResultsTab(QWidget):
         self.state.adjust_covariates = [
             self.list_adjust.item(i).text() for i in range(self.list_adjust.count())
             if self.list_adjust.item(i).checkState() == Qt.Checked]
+        if self._trend_mode():
+            self._update_trend_check()
 
     def _on_thresholds_changed(self, *_args):
         if self._filling:
@@ -2823,6 +3396,10 @@ class ResultsTab(QWidget):
         st.marker_threshold = float(self.sb_marker.value())
         st.use_treat = bool(self.chk_treat.isChecked())
         st.fdr_scope = self.cb_fdr.currentData()
+        st.trend_call = self.cb_trend_call.currentData() or 'either'
+        st.trend_min_r2 = float(self.sb_trend_r2.value())
+        st.trend_patterns = int(self.sb_trend_patterns.value())
+        self._rethreshold_trend()
         if st.stats:
             try:
                 st.stats = ag_results.reapply_thresholds(
@@ -2846,16 +3423,14 @@ class ResultsTab(QWidget):
         st = self.state
         if self._stats_worker is not None:
             return
+        if self._trend_mode():
+            self._run_trend()
+            return
         if not (st.run_freq or st.run_counts or st.run_markers):
             QMessageBox.information(self, "Nothing to test", "Tick at least one kind of test.")
             return
         samples = self._stats_samples()
         design = statistics_design(st, samples)
-        if design['missing_pairing']:
-            QMessageBox.warning(self, "Pairing incomplete",
-                                f"No '{st.pairing}' value for: "
-                                + ", ".join(design['missing_pairing'][:10]))
-            return
         groups = design['groups']
         kwargs = dict(
             group_order=list(st.group_names), contrast_mode=st.contrast_mode,
@@ -2870,7 +3445,9 @@ class ResultsTab(QWidget):
             exclude_gating_markers=st.exclude_gating_markers,
             min_marker_events=st.min_marker_events,
         )
-        summaries = deepcopy({k: st.summaries[k] for k in samples})
+        # Each sample's summary is replaced whole when it is gated again,
+        # never changed in place, so the worker can read this snapshot.
+        summaries = {k: st.summaries[k] for k in samples}
         gate_defs = deepcopy(st.gate_defs())
 
         def _run():
@@ -2905,6 +3482,115 @@ class ResultsTab(QWidget):
         self._populate_report_items()
         self.stats_finished.emit()
 
+    def trend_enrichment_inputs(self) -> dict | None:
+        """The trend settings for the Enrichment page: {'samples', 'time',
+        'variable', 'unit', 'scale', 'shape', 'k', 'interaction', 'baseline',
+        'groups', 'design', 'patterns'}; None without a trend variable or
+        groups. 'patterns' is the shape pattern of each population of the
+        last frequency trend run when it used the same variable."""
+        st = self.state
+        if not st.trend_variable or st.trend_variable not in st.covariates:
+            return None
+        group_names = self._trend_group_names()
+        if not group_names or (st.trend_interaction and len(group_names) != 2):
+            return None
+        samples = self._trend_samples()
+        patterns = None
+        res = (st.trend or {}).get('freq')
+        if res is not None and st.trend.get('variable') == st.trend_variable \
+                and 'pattern' in res.table.columns:
+            patterns = res.table.set_index('feature')['pattern']
+        return {'samples': samples, 'time': self._trend_values(samples),
+                'variable': st.trend_variable, 'unit': st.trend_unit, 'scale': st.trend_scale,
+                'shape': st.trend_shape, 'k': st.trend_df, 'interaction': st.trend_interaction,
+                'baseline': (st.reference_group if st.reference_group in group_names
+                             else group_names[0]),
+                'groups': group_names, 'design': statistics_design(st, samples),
+                'patterns': patterns}
+
+    def _run_trend(self):
+        """Test the trend of every population with the chosen numeric
+        covariate, on a worker thread."""
+        st = self.state
+        if not (st.run_freq or st.run_counts or st.run_markers):
+            QMessageBox.information(self, "Nothing to test", "Tick at least one kind of test.")
+            return
+        if not st.trend_variable or st.trend_variable not in st.covariates:
+            QMessageBox.information(
+                self, "No numeric covariate",
+                "Tick Numeric under a covariate on the Groups page (for example age) to test a "
+                "trend with it.")
+            return
+        group_names = self._trend_group_names()
+        if not group_names or (st.trend_interaction and len(group_names) != 2):
+            QMessageBox.information(self, "Choose the groups",
+                                    "Tick the groups to test (exactly two to ask whether they "
+                                    "change differently).")
+            return
+        samples = self._trend_samples()
+        design = statistics_design(st, samples)
+        baseline = st.reference_group if st.reference_group in group_names else group_names[0]
+        kwargs = dict(
+            time=self._trend_values(samples), variable=st.trend_variable, unit=st.trend_unit,
+            scale=st.trend_scale, shape=st.trend_shape, k=st.trend_df,
+            interaction=st.trend_interaction, baseline=baseline, pairing=design['pairing'],
+            covariates=design['covariates'], numeric_covariates=design['numeric'],
+            pval_threshold=st.pval_threshold, min_r2=st.trend_min_r2, call=st.trend_call,
+            patterns=st.trend_patterns, run_freq=st.run_freq, run_counts=st.run_counts,
+            counts_reference=st.counts_reference, min_parent_events=st.min_parent_events,
+            run_markers=st.run_markers, use_stats_parent=st.use_stats_parent,
+            exclude_gating_markers=st.exclude_gating_markers,
+            min_marker_events=st.min_marker_events,
+        )
+        groups = design['groups']
+        # Each sample's summary is replaced whole when it is gated again,
+        # never changed in place, so the worker can read this snapshot.
+        summaries = {k: st.summaries[k] for k in samples}
+        gate_defs = deepcopy(st.gate_defs())
+
+        def _run():
+            return ag_results.run_trend_statistics(summaries, samples, groups, gate_defs, **kwargs)
+
+        self.btn_stats.setEnabled(False)
+        self.lbl_stats.setText(f"Testing trends in {len(samples)} sample(s) …")
+        self._stats_worker = _CallWorker(_run, parent=self)
+        self._stats_worker.finished.connect(self._on_trend_finished)
+        self._stats_worker.start()
+
+    def _on_trend_finished(self, ok: bool, error: str, result: object):
+        self._stats_worker = None
+        self.btn_stats.setEnabled(True)
+        if not ok:
+            self.lbl_stats.setText(f"<span style='color:#b00020'>{error}</span>")
+            return
+        result['run_id'] = uuid.uuid4().hex
+        self.state.trend = result
+        self.lbl_stats.setText(self._trend_summary(result))
+        _status(self.bus, "Trend test complete.")
+        self._show_results_tables()
+        self._draw_figures()
+        self._load_explore_controls()
+        self._populate_population_list()
+        self._populate_report_items()
+        self.trend_finished.emit()
+
+    @staticmethod
+    def _trend_summary(trend: dict) -> str:
+        """One-line summary of a trend run, with its notes."""
+        called = []
+        for key, name in (('freq', 'frequencies'), ('counts', 'counts'), ('markers', 'markers')):
+            res = trend.get(key)
+            if res is not None:
+                called.append(f"{int(res.table['significant'].sum())} {name}")
+        settings = trend.get('settings') or {}
+        shape = TREND_SHAPE_LABELS.get(settings.get('shape'), '').lower()
+        text = (f"Trend with {trend.get('variable', '')}: {len(trend.get('samples') or [])} "
+                f"samples, {shape} ({settings.get('df', '')} df); called: "
+                + ", ".join(called) + ".")
+        if trend.get('notes'):
+            text += "<br>" + "<br>".join(trend['notes'])
+        return text
+
     @staticmethod
     def _stats_summary(result: dict) -> str:
         """One-line summary of a statistics run, with its notes."""
@@ -2935,8 +3621,55 @@ class ResultsTab(QWidget):
         self._draw_figures()
         self._populate_population_list()
 
+    def _show_trend_tables(self):
+        """The trend run's tables: slope, partial R², the two tests' FDR
+        and the call, populations ordered by the stronger of the two
+        tests."""
+        trend = self.state.trend or {}
+        labels = _population_labels(self.state.gate_defs())
+        antigens = _antigen_map(self.controller)
+        settings = trend.get('settings') or {}
+        unit = trend.get('unit') or 'unit'
+        slope_head = ("Slope (per doubling)" if settings.get('scale') == 'log2'
+                      else f"Slope (per {unit})")
+
+        def _fmt(value) -> str:
+            return f"{value:.3g}" if value is not None and pd.notna(value) else ''
+
+        for key, title in (('freq', 'Frequencies'), ('counts', 'Counts'), ('markers', 'Markers')):
+            res = trend.get(key)
+            if res is None:
+                continue
+            table_df = res.table
+            view = table_df.assign(_order=np.fmin(table_df['adj.P.Val'], table_df['slope.adj.P.Val']))
+            view = view.sort_values('_order', kind='stable')
+            rows = []
+            for _i, r in view.iterrows():
+                pop_key = r['cluster_id'] if key == 'markers' else r['feature']
+                row = {'Population': labels.get(pop_key, pop_key),
+                       slope_head: _fmt(r['slope']),
+                       'Partial R²': _fmt(r['R2']),
+                       'Curve FDR': _fmt(r['adj.P.Val']),
+                       'Slope FDR': _fmt(r['slope.adj.P.Val']),
+                       'Called by': r['called.by'],
+                       'Direction': r['direction'] if r['significant'] else '',
+                       'Pattern': r.get('pattern', '') or '',
+                       'Significant': 'yes' if r['significant'] else ''}
+                if key == 'markers':
+                    row['Marker'] = antigens.get(r['channel'], r['channel'])
+                rows.append(row)
+            headers = ['Population'] + (['Marker'] if key == 'markers' else []) + [
+                slope_head, 'Partial R²', 'Curve FDR', 'Slope FDR', 'Called by', 'Direction',
+                'Pattern', 'Significant']
+            table = CopyableTableWidget(rows, headers)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            self.results_tabs.addTab(table, title)
+
     def _show_results_tables(self):
         self.results_tabs.clear()
+        if self._trend_mode():
+            self._show_trend_tables()
+            return
         comp = self._current_comparison()
         stats = self.state.stats or {}
         if comp is None:
@@ -2981,21 +3714,31 @@ class ResultsTab(QWidget):
 
     def _draw_figures(self):
         comp = self._current_comparison()
-        if not self.state.stats or comp is None:
+        trend_mode = self._trend_mode()
+        source = self.state.trend if trend_mode else self.state.stats
+        if not source or (not trend_mode and comp is None):
             self.figures_tabs.clear()
             return
-        self._figures_for = self.state.stats
+        self._figures_for = source
         if self._figure_worker is not None:
             self._figure_pending = True
             return
         st = self.state
-        stats = st.stats
-        args = (comp[0], comp[1], st.pval_threshold, st.fc_threshold, st.marker_threshold,
-                st.fdr_scope, _is_dark_palette(), _antigen_map(self.controller),
-                _population_labels(st.gate_defs()), _group_colours(st))
+        if trend_mode:
+            trend = source
+            args = (_is_dark_palette(), _antigen_map(self.controller),
+                    _population_labels(st.gate_defs()), _group_colours(st))
 
-        def _build():
-            return build_result_figures(stats, *args)
+            def _build():
+                return build_trend_figures(trend, *args)
+        else:
+            stats = source
+            args = (comp[0], comp[1], st.pval_threshold, st.fc_threshold, st.marker_threshold,
+                    st.fdr_scope, _is_dark_palette(), _antigen_map(self.controller),
+                    _population_labels(st.gate_defs()), _group_colours(st))
+
+            def _build():
+                return build_result_figures(stats, *args)
 
         self._figure_worker = _CallWorker(_build, parent=self)
         self._figure_worker.finished.connect(self._on_figures_built)
@@ -3022,13 +3765,17 @@ class ResultsTab(QWidget):
                 self.figures_tabs.addTab(lbl, item['title'])
                 continue
             fig = item['fig']
-            large = key.endswith('heatmap') or key == 'marker_summary'
+            # Group comparison heatmaps open at half size; trend trajectories,
+            # whose labels are already sized for the screen, at full size.
+            large = ((key.endswith('heatmap') and not key.startswith('trend_'))
+                     or key == 'marker_summary')
             widget = ScalableFigureWidget(
                 fig, title=item['title'], experiment_dir=exp_dir,
                 pop_out=lambda make=item['make'], title=item['title'], results=item.get('results'),
-                large=large: self._pop_out_figure(make, title, results, large),
+                large=large, k=key: self._pop_out_figure(make, title, results, large,
+                                                         options_key=k),
                 initial_scale=initial_scale_for(fig, HEATMAP_SCALE_PCT) if large else 100,
-                parent=self)
+                parent=self, options=figure_options_ref(self.controller, key))
             self._connect_figure(widget.canvas, fig, item.get('results'))
             self.figures_tabs.addTab(widget, item['title'])
         self._add_extra_figures()
@@ -3058,26 +3805,39 @@ class ResultsTab(QWidget):
             canvas.mpl_connect('motion_notify_event', handler)
         if results is not None:
             self._volcano_tables[id(canvas)] = results
-        if getattr(fig, '_row_keys', None):
+        clickable = bool(getattr(fig, '_row_keys', None) or getattr(fig, '_point_keys', None))
+        if clickable:
             self._row_figures[id(canvas)] = fig
-        if results is not None or getattr(fig, '_row_keys', None):
+        if results is not None or clickable:
             canvas.mpl_connect('button_press_event', self._on_figure_click)
-            canvas.setToolTip("Double-click a point or row to show that population on the "
-                              "Populations page; right-click for more.")
+            if getattr(fig, '_trend_kind', None):
+                canvas.setToolTip("Double-click a point or row for its trend plot; "
+                                  "right-click for more.")
+            else:
+                canvas.setToolTip("Double-click a point or row to show that population on the "
+                                  "Populations page; right-click for more.")
 
-    def _pop_out_figure(self, make, title: str, results=None, large: bool = False):
+    def _pop_out_figure(self, make, title: str, results=None, large: bool = False,
+                        values_table=None, options_key: str | None = None):
         """Build a fresh copy of a figure in the background and show it in
         its own window (size slider, matplotlib toolbar, hover labels and
         the same click-through to the Populations page). The window stays
-        open while the Populations page is used."""
-        worker = _CallWorker(make, parent=self)
+        open while the Populations page is used. *values_table*: optional
+        function returning the values behind the figure, offered as CSV.
+        *options_key*: the figure's options (figure_options), the same as
+        where it was opened from."""
+        from honeychrome.view_components import figure_options as fo
+        ref = figure_options_ref(self.controller, options_key)
+        worker = _CallWorker(fo.with_options(make, ref), parent=self)
         worker.finished.connect(
-            lambda ok, err, fig, w=worker: self._show_pop_out(w, ok, err, fig, title, results, large))
+            lambda ok, err, fig, w=worker: self._show_pop_out(w, ok, err, fig, title, results,
+                                                              large, values_table, ref))
         self._popout_workers.append(worker)
         _status(self.bus, f"Opening {title} …")
         worker.start()
 
-    def _show_pop_out(self, worker, ok: bool, error: str, fig, title: str, results, large: bool):
+    def _show_pop_out(self, worker, ok: bool, error: str, fig, title: str, results, large: bool,
+                      values_table=None, options=None):
         from honeychrome.view_components.scalable_figure_widget import initial_scale_for
         if worker in self._popout_workers:
             self._popout_workers.remove(worker)
@@ -3090,7 +3850,7 @@ class ResultsTab(QWidget):
         widget = ScalableFigureWidget(
             fig, title=title, experiment_dir=getattr(self.controller, 'experiment_dir', ''),
             initial_scale=initial_scale_for(fig, HEATMAP_SCALE_PCT) if large else 100,
-            parent=dialog)
+            parent=dialog, options=options)
         self._connect_figure(widget.canvas, fig, results)
         canvas_key = id(widget.canvas)
         dialog.finished.connect(lambda _code, k=canvas_key: (self._volcano_tables.pop(k, None),
@@ -3099,6 +3859,15 @@ class ResultsTab(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.addWidget(widget.make_toolbar(dialog))
         layout.addWidget(widget, stretch=1)
+        if values_table is not None:
+            row = QHBoxLayout()
+            row.addStretch()
+            csv_button = QPushButton("Save values (CSV)…")
+            csv_button.setToolTip("Write the values behind this figure as a CSV file.")
+            csv_button.clicked.connect(
+                lambda _c=False: self._save_values_csv(values_table, widget.export_stem))
+            row.addWidget(csv_button)
+            layout.addLayout(row)
         dpi = fig.get_dpi()
         scale = widget.scale_percent() / 100.0
         dialog.resize(min(int(fig.get_figwidth() * dpi * scale), 1400) + 40,
@@ -3133,7 +3902,31 @@ class ResultsTab(QWidget):
         row = table[ok].iloc[i]
         return str(row.get('cluster_id') if 'cluster_id' in table.columns else row['feature'])
 
+    def _save_values_csv(self, values_table, stem: str):
+        """Ask for a file name (in the experiment folder by default) and
+        write *values_table()* there as CSV."""
+        start = str(Path(getattr(self.controller, 'experiment_dir', '') or '.') / f"{stem}.csv")
+        path, _selected = QFileDialog.getSaveFileName(self, "Save values", start, "CSV (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith('.csv'):
+            path += '.csv'
+        try:
+            values_table().to_csv(path, index=False)
+        except Exception as exc:
+            QMessageBox.warning(self, "Save values", str(exc))
+            return
+        _status(self.bus, f"Saved {Path(path).name}")
+
     def _on_figure_click(self, event):
+        hit = self._figure_trend_feature(event)
+        if hit is not None:
+            kind, feature = hit
+            if event.dblclick and event.button == 1:
+                self._trend_plot_window(kind, feature)
+            elif event.button == 3:
+                self._trend_figure_menu(kind, feature)
+            return
         pop_key = self._figure_population(event)
         if pop_key is None:
             return
@@ -3156,7 +3949,185 @@ class ResultsTab(QWidget):
         act_show.triggered.connect(lambda: self.show_population(pop_key))
         act_window.triggered.connect(lambda: self._population_window(pop_key))
         act_report.triggered.connect(lambda on: self._set_report_population(pop_key, on))
+        self._add_composition_action(menu, pop_key)
         menu.exec(QCursor.pos())
+
+    # ------------------------------------------------------------------
+    # Trend figures: per-feature trend plot
+    # ------------------------------------------------------------------
+
+    def _figure_trend_feature(self, event) -> tuple[str, str] | None:
+        """(kind, feature) under a mouse event on a trend volcano point or
+        trajectory heatmap row."""
+        from honeychrome.view_components import trend_plots as tp
+        fig = self._row_figures.get(id(event.canvas))
+        kind = getattr(fig, '_trend_kind', None) if fig is not None else None
+        if kind is None or event.inaxes is None:
+            return None
+        feature = tp.point_under(fig, event)
+        if feature is None and event.inaxes is getattr(fig, '_row_axes', None) \
+                and event.ydata is not None:
+            row = int(round(event.ydata))
+            keys = getattr(fig, '_row_keys', None) or []
+            feature = keys[row] if 0 <= row < len(keys) else None
+        return (kind, str(feature)) if feature is not None else None
+
+    def _trend_row(self, kind: str, feature: str) -> dict:
+        res = (self.state.trend or {}).get(kind)
+        if res is None:
+            return {}
+        rows = res.table[res.table['feature'].astype(str) == feature]
+        return rows.iloc[0].to_dict() if len(rows) else {}
+
+    def _trend_population(self, kind: str, feature: str) -> str:
+        """Population key of a trend feature (a marker feature's population)."""
+        if kind == 'markers':
+            return str(self._trend_row(kind, feature).get('cluster_id') or feature)
+        return feature
+
+    def _trend_feature_label(self, kind: str, feature: str) -> str:
+        labels = _population_labels(self.state.gate_defs())
+        if kind == 'markers':
+            row = self._trend_row(kind, feature)
+            if row.get('channel'):
+                channel = row['channel']
+                return f"{row.get('cluster', feature)} {_antigen_map(self.controller).get(channel, channel)}"
+        return labels.get(feature, feature)
+
+    def _trend_figure_menu(self, kind: str, feature: str):
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.addSection(self._trend_feature_label(kind, feature))
+        act_plot = menu.addAction("Show the trend plot in a window")
+        act_line = menu.addAction("Show the trend plot with the straight line")
+        res = (self.state.trend or {}).get(kind)
+        act_percent = None
+        if kind == 'freq' and res is not None and not res.settings.get('interaction'):
+            act_percent = menu.addAction("Show the trend plot as % of parent")
+            act_percent.triggered.connect(
+                lambda: self._trend_plot_window(kind, feature, percent=True))
+        act_show = menu.addAction("Show the population on the Populations page")
+        pop_key = self._trend_population(kind, feature)
+        act_report = menu.addAction("Include the population in the report")
+        act_report.setCheckable(True)
+        act_report.setChecked(pop_key in self.state.report_populations)
+        act_plot.triggered.connect(lambda: self._trend_plot_window(kind, feature))
+        act_line.triggered.connect(lambda: self._trend_plot_window(kind, feature, show_line=True))
+        act_show.triggered.connect(lambda: self.show_population(pop_key))
+        act_report.triggered.connect(lambda on: self._set_report_population(pop_key, on))
+        if kind != 'markers':
+            self._add_composition_action(menu, pop_key)
+        menu.exec(QCursor.pos())
+
+    # ------------------------------------------------------------------
+    # Composition over the trend variable
+    # ------------------------------------------------------------------
+
+    def _composition_unit(self, pop_key: str) -> dict | None:
+        """The gate *pop_key* belongs to when a trend run exists and the
+        gate has two or more populations (ag_results.composition_gate)."""
+        trend = self.state.trend or {}
+        if not pop_key or not any(trend.get(k) is not None for k in ('freq', 'counts')):
+            return None
+        return ag_results.composition_gate(self.state.summaries,
+                                           list(trend.get('samples') or []), pop_key)
+
+    def _add_composition_action(self, menu, pop_key: str):
+        unit = self._composition_unit(pop_key)
+        if unit is None:
+            return
+        variable = (self.state.trend or {}).get('variable') or 'the variable'
+        act = menu.addAction(f"Show the make-up of '{unit['gate']}' over {variable}")
+        act.triggered.connect(lambda: self._composition_window(pop_key))
+
+    def _composition_window(self, pop_key: str):
+        """The make-up of *pop_key*'s gate against the trend variable in its
+        own window, with the fitted and observed shares as CSV."""
+        from honeychrome.view_components import trend_plots as tp
+        unit = self._composition_unit(pop_key)
+        if unit is None:
+            return
+        summaries = dict(self.state.summaries)
+        trend = dict(self.state.trend or {})
+        labels = _population_labels(self.state.gate_defs())
+        parent = labels.get(unit['parent_key'], unit['parent_key'])
+        title = f"{parent}: {unit['gate']} over {trend.get('variable') or 'the variable'}"
+        is_dark = _is_dark_palette()
+        cache: dict = {}
+
+        def panels():
+            if 'panels' not in cache:
+                cache['panels'] = ag_results.trend_composition(summaries, trend, pop_key)
+            return cache['panels']
+
+        def make():
+            return tp.make_composition_figure(panels(), title=title, is_dark=is_dark)
+
+        self._pop_out_figure(make, f"Make-up of {unit['gate']}",
+                             values_table=lambda: tp.composition_table(panels()),
+                             options_key='composition')
+
+    def _trend_pairing(self, samples: list[str]) -> dict | None:
+        """{sample: pairing level} of the current pairing covariate."""
+        st = self.state
+        if not st.pairing:
+            return None
+        values = st.covariates.get(st.pairing) or {}
+        return {k: str(values[k]).strip() for k in samples
+                if not ds.is_missing_value(values.get(k))}
+
+    def _trend_plot_kwargs(self, kind: str, feature: str, show_line: bool = False,
+                           percent: bool = False) -> dict | None:
+        """Arguments of trend_plots.make_trend_plot_figure (without the
+        theme) for one feature of the trend run; None when it is not in it.
+        *percent*: the gated frequencies (% of parent) with the fit drawn
+        back on that scale (frequencies only, not for a group × trend test).
+        Reads the state only, so it can run on a worker thread."""
+        from honeychrome.view_components import trend_plots as tp
+        trend = self.state.trend or {}
+        res = trend.get(kind)
+        if percent and (kind != 'freq' or (res is not None
+                                           and res.settings.get('interaction'))):
+            return None
+        data = trend.get('freq_values' if percent else _TREND_DATA_KEYS[kind])
+        if res is None or data is None:
+            return None
+        samples = list(trend.get('samples') or [])
+        try:
+            inputs = tp.feature_plot_inputs(res, data, samples, trend.get('time') or [],
+                                            trend.get('group_vec') or [], feature,
+                                            self._trend_pairing(samples))
+        except KeyError:
+            return None
+        return dict(inputs, title=self._trend_feature_label(kind, feature),
+                    value_label='% of parent' if percent else _trend_value_label(trend, kind),
+                    group_colours=_group_colours(self.state), show_line=show_line,
+                    back_transform='percent' if percent else '')
+
+    def _trend_plot_window(self, kind: str, feature: str, show_line: bool = False,
+                           percent: bool = False):
+        """One feature's trend plot in its own window, with its values as CSV."""
+        from honeychrome.view_components import trend_plots as tp
+        kwargs = self._trend_plot_kwargs(kind, feature, show_line, percent)
+        if kwargs is None:
+            return
+        is_dark = _is_dark_palette()
+
+        def make():
+            return tp.make_trend_plot_figure(**kwargs, is_dark=is_dark)
+
+        def values():
+            df2 = kwargs['row'].get('df2', np.inf)
+            return tp.trend_plot_table(kwargs['time'], kwargs['values'], kwargs['groups'],
+                                       kwargs['samples'], grid=kwargs['grid'],
+                                       curve=kwargs['curve'], curve_se=kwargs['curve_se'],
+                                       df2=float(df2) if df2 is not None else np.inf,
+                                       variable=kwargs['variable'],
+                                       back_transform=kwargs['back_transform'],
+                                       group_curves=kwargs.get('group_curves'))
+        self._pop_out_figure(make, f"Trend {kwargs['title']}", values_table=values,
+                             options_key='trend_plot_percent' if percent else 'trend_plot')
 
     # ------------------------------------------------------------------
     # Population browser
@@ -3230,14 +4201,84 @@ class ResultsTab(QWidget):
         self.pred_table_holder = QVBoxLayout()
         dl.addLayout(self.pred_table_holder)
         layout.addWidget(dbox)
+
+        abox = QGroupBox("Immune age model")
+        al = QVBoxLayout(abox)
+        anote = QLabel(
+            "How well the immune profile predicts a continuous trend variable (for example age), "
+            "which populations carry the prediction, and whether each sample's profile looks "
+            "like a higher or lower value than its own (with age: older or younger). An elastic net (penalised regression) is trained and judged by "
+            "nested cross-validation on the values of the last trend run, keeping each donor or "
+            "pair whole; a chance check reruns it with the variable shuffled. Needs at least 20 "
+            "samples in the model's group; 40 or more is recommended. Figures open on the "
+            "Figures page in trend mode.")
+        anote.setWordWrap(True)
+        al.addWidget(anote)
+        arow = QHBoxLayout()
+        arow.addWidget(QLabel("Model on:"))
+        self.cb_age_group = QComboBox()
+        self.cb_age_group.setToolTip(
+            "The group the model is trained and judged on. Other groups of the trend run can be "
+            "predicted by the final model (not cross-validated); that is only meaningful for "
+            "samples like the model's (e.g. the same tissue from another cohort), not for a "
+            "different kind of sample (e.g. another tissue or species).")
+        arow.addWidget(self.cb_age_group, stretch=1)
+        al.addLayout(arow)
+        aorow = QHBoxLayout()
+        self.chk_age_freq = QCheckBox("Frequencies")
+        self.chk_age_markers = QCheckBox("Marker medians")
+        self.chk_age_others = QCheckBox("Predict the other groups")
+        self.chk_age_others.setToolTip(
+            "After fitting on the chosen group, predict every sample of the other groups, "
+            "including groups left out of the trend run and samples without a value of the "
+            "variable.")
+        self.sb_age_repeats = QSpinBox()
+        self.sb_age_repeats.setRange(1, 50)
+        self.sb_age_repeats.setToolTip("Repeats of the outer cross-validation.")
+        self.sb_age_perm = QSpinBox()
+        self.sb_age_perm.setRange(0, 2000)
+        self.sb_age_perm.setSingleStep(50)
+        self.sb_age_perm.setToolTip(
+            "Times the model is rerun with the variable shuffled among donors or pairs, to "
+            "check its error is better than chance (0: no check). About as long as one repeat "
+            "each.")
+        for w in (self.chk_age_freq, self.chk_age_markers, self.chk_age_others):
+            aorow.addWidget(w)
+        aorow.addWidget(QLabel("Repeats:"))
+        aorow.addWidget(self.sb_age_repeats)
+        aorow.addWidget(QLabel("Chance shuffles:"))
+        aorow.addWidget(self.sb_age_perm)
+        self.btn_age = QPushButton("Run Immune Age Model")
+        self.btn_age.clicked.connect(self._on_run_age_model)
+        aorow.addWidget(self.btn_age)
+        aorow.addStretch()
+        al.addLayout(aorow)
+        self.age_progress = QProgressBar()
+        self.age_progress.setRange(0, 1000)
+        self.age_progress.setVisible(False)
+        al.addWidget(self.age_progress)
+        self.lbl_age = QLabel("")
+        self.lbl_age.setWordWrap(True)
+        al.addWidget(self.lbl_age)
+        self.age_table_holder = QVBoxLayout()
+        al.addLayout(self.age_table_holder)
+        layout.addWidget(abox)
         layout.addStretch()
+        self._age_worker: _CallWorker | None = None
 
         for w, name in ((self.chk_pca_freq, 'pca_use_freq'), (self.chk_pca_counts, 'pca_use_counts'),
                         (self.chk_pca_markers, 'pca_use_markers'),
                         (self.chk_pred_freq, 'pred_use_freq'),
                         (self.chk_pred_markers, 'pred_use_markers'),
-                        (self.chk_pred_lasso, 'pred_lasso'), (self.chk_pred_forest, 'pred_forest')):
+                        (self.chk_pred_lasso, 'pred_lasso'), (self.chk_pred_forest, 'pred_forest'),
+                        (self.chk_age_freq, 'age_use_freq'),
+                        (self.chk_age_markers, 'age_use_markers'),
+                        (self.chk_age_others, 'age_predict_others')):
             w.toggled.connect(lambda v, n=name: self._filling or setattr(self.state, n, bool(v)))
+        self.sb_age_repeats.valueChanged.connect(
+            lambda v: self._filling or setattr(self.state, 'age_repeats', int(v)))
+        self.sb_age_perm.valueChanged.connect(
+            lambda v: self._filling or setattr(self.state, 'age_permutations', int(v)))
         self.sb_pca_loadings.valueChanged.connect(
             lambda v: self._filling or setattr(self.state, 'pca_n_loadings', int(v)))
         self.sb_pred_repeats.valueChanged.connect(
@@ -3255,6 +4296,18 @@ class ResultsTab(QWidget):
                 w.setChecked(bool(v))
             self.sb_pca_loadings.setValue(int(st.pca_n_loadings))
             self.sb_pred_repeats.setValue(int(st.pred_repeats))
+            for w, v in ((self.chk_age_freq, st.age_use_freq),
+                         (self.chk_age_markers, st.age_use_markers),
+                         (self.chk_age_others, st.age_predict_others)):
+                w.setChecked(bool(v))
+            self.sb_age_repeats.setValue(int(st.age_repeats))
+            self.sb_age_perm.setValue(int(st.age_permutations))
+            prev_group = self.cb_age_group.currentText()
+            self.cb_age_group.clear()
+            trend_groups = list(((st.trend or {}).get('settings') or {}).get('groups') or [])
+            self.cb_age_group.addItems(trend_groups)
+            if prev_group in trend_groups:
+                self.cb_age_group.setCurrentText(prev_group)
             self.cb_pred_comparison.clear()
             for base, other in (st.stats or {}).get('comparisons') or []:
                 self.cb_pred_comparison.addItem(_comparison_label(base, other),
@@ -3262,14 +4315,21 @@ class ResultsTab(QWidget):
         finally:
             self._filling = False
         stats = st.stats or {}
-        self.chk_pca_freq.setEnabled(stats.get('freq_values') is not None)
-        self.chk_pca_counts.setEnabled(stats.get('counts_values') is not None)
-        self.chk_pca_markers.setEnabled(stats.get('marker_values') is not None)
+        pca_source = (st.trend if self._trend_mode() else st.stats) or {}
+        self.chk_pca_freq.setEnabled(pca_source.get('freq_values') is not None)
+        self.chk_pca_counts.setEnabled(pca_source.get('counts_values') is not None)
+        self.chk_pca_markers.setEnabled(pca_source.get('marker_values') is not None)
         self.chk_pred_freq.setEnabled(stats.get('freq_values') is not None)
         self.chk_pred_markers.setEnabled(stats.get('marker_values') is not None)
-        self.btn_pca.setEnabled(bool(stats))
+        self.btn_pca.setEnabled(bool(pca_source))
         self.btn_pred.setEnabled(bool(stats) and self._predictive_worker is None)
         self._show_predictive_table()
+        trend = st.trend or {}
+        self.chk_age_freq.setEnabled(trend.get('freq_values') is not None)
+        self.chk_age_markers.setEnabled(trend.get('marker_values') is not None)
+        self.btn_age.setEnabled(bool(trend) and self._age_worker is None)
+        self.btn_age.setToolTip("" if trend else "Run the trend test first.")
+        self._show_age_table()
 
     def _feature_labels(self) -> dict:
         """Display names for population keys and channels in feature names."""
@@ -3279,8 +4339,12 @@ class ResultsTab(QWidget):
 
     def _on_show_pca(self):
         st = self.state
-        if not st.stats:
-            QMessageBox.information(self, "Sample PCA", "Run Statistics first.")
+        trend_mode = self._trend_mode()
+        source = st.trend if trend_mode else st.stats
+        if not source:
+            QMessageBox.information(self, "Sample PCA",
+                                    "Run the trend test first." if trend_mode
+                                    else "Run Statistics first.")
             return
         use = (self.chk_pca_freq.isChecked() and self.chk_pca_freq.isEnabled(),
                self.chk_pca_counts.isChecked() and self.chk_pca_counts.isEnabled(),
@@ -3290,7 +4354,7 @@ class ResultsTab(QWidget):
                                     "Tick at least one table that the last statistics run made.")
             return
         try:
-            pca = ag_results.sample_pca(st.stats, *use, n_loadings=st.pca_n_loadings,
+            pca = ag_results.sample_pca(source, *use, n_loadings=st.pca_n_loadings,
                                         labels=self._feature_labels())
         except Exception as exc:
             QMessageBox.warning(self, "Sample PCA", str(exc))
@@ -3299,6 +4363,12 @@ class ResultsTab(QWidget):
             QMessageBox.information(self, "Sample PCA",
                                     "At least 2 samples and 2 features that vary are needed.")
             return
+        if trend_mode:
+            from honeychrome.view_components import trend_plots as tp
+            time_of = dict(zip(source.get('samples') or [], source.get('time') or []))
+            pca['colour_values'] = [time_of.get(s) for s in pca['scores'].index]
+            pca['colour_label'] = tp.variable_label(source.get('variable') or '',
+                                                    source.get('unit') or '')
         st.pca = pca
         self._add_extra_figures()
         self._populate_report_items()
@@ -3356,6 +4426,178 @@ class ResultsTab(QWidget):
         self._populate_report_items()
         self.sample_analysis_changed.emit()
         _status(self.bus, "Predictive analysis complete.")
+
+    def _on_run_age_model(self):
+        import drc_predictive
+        st = self.state
+        trend = st.trend or {}
+        if self._age_worker is not None or not trend:
+            return
+        group = self.cb_age_group.currentText()
+        use_freq = self.chk_age_freq.isChecked() and self.chk_age_freq.isEnabled()
+        use_markers = self.chk_age_markers.isChecked() and self.chk_age_markers.isEnabled()
+        if not (use_freq or use_markers):
+            QMessageBox.information(self, "Immune age model",
+                                    "Tick at least one kind of feature that the trend run made.")
+            return
+        samples = list(trend.get('samples') or [])
+        group_of = dict(zip(samples, trend.get('group_vec') or []))
+        time_of = dict(zip(samples, trend.get('time') or []))
+        labels = self._feature_labels()
+        X = ag_results.predictive_matrix(trend, use_freq, use_markers, labels)
+        key_of = {}
+        if use_freq and trend.get('freq_values') is not None:
+            key_of.update({f"Freq: {labels.get(c, c)}": c for c in trend['freq_values'].columns})
+        if use_markers and trend.get('marker_values') is not None:
+            for c in trend['marker_values'].columns:
+                pop, _sep, ch = str(c).partition(ag_results.FEATURE_SEP)
+                key_of[f"Median: {labels.get(pop, pop)} {labels.get(ch, ch)}"] = pop
+        value = pd.to_numeric(pd.Series({s: time_of.get(s) for s in X.index}), errors='coerce')
+        in_model = [s for s in X.index if group_of.get(s) == group and pd.notna(value[s])]
+        status, message = drc_predictive.age_sample_size_status(len(in_model))
+        if status == 'block':
+            QMessageBox.warning(self, "Immune age model", message)
+            return
+        # Samples of the other groups, in the trend run or not, with or
+        # without a value of the variable: their features are worked out
+        # from the gating results the same way as the trend run's.
+        others = ([s for s in self._stats_samples()
+                   if s not in in_model and st.sample_groups.get(s) != group]
+                  if self.chk_age_others.isChecked() else [])
+        other_value = pd.Series(self._trend_values(others), dtype=float).reindex(others)
+        other_groups = {s: st.sample_groups.get(s, '') for s in others}
+        summaries = {s: st.summaries[s] for s in others}
+        gate_defs = deepcopy(st.gate_defs())
+        feature_kw = dict(use_stats_parent=st.use_stats_parent,
+                          min_parent_events=st.min_parent_events,
+                          exclude_gating_markers=st.exclude_gating_markers,
+                          min_marker_events=st.min_marker_events)
+        pairing = self._trend_pairing(in_model)
+        blocks = [pairing.get(s, s) for s in in_model] if pairing else None
+        repeats, n_perm = int(st.age_repeats), int(st.age_permutations)
+        variable = trend.get('variable') or ''
+
+        def _run(report):
+            message = {'text': ''}
+
+            def _said(text):
+                message['text'] = text
+
+            X_other = None
+            if others:
+                source = ag_results.trend_feature_values(
+                    summaries, others, gate_defs, use_freq=use_freq, use_markers=use_markers,
+                    **feature_kw)
+                X_other = ag_results.predictive_matrix(source, use_freq, use_markers, labels)
+            res = drc_predictive.run_age_model(
+                X.loc[in_model], value[in_model].to_numpy(float), blocks=blocks,
+                X_other=X_other,
+                y_other=other_value.reindex(X_other.index).to_numpy(float) if others else None,
+                repeats=repeats, n_permutations=n_perm, progress=_said,
+                on_step=lambda done, total: report(done / max(total, 1),
+                                                   f"{message['text']} ({done} of {total} fits)"))
+            res['importance']['key'] = [key_of.get(f, '') for f in res['importance']['feature']]
+            res['groups'] = dict({s: group for s in in_model}, **other_groups)
+            res['summary'].update({'group': group, 'variable': variable,
+                                   'features': ', '.join(n for n, on in (
+                                       ('frequencies', use_freq), ('marker medians', use_markers))
+                                       if on)})
+            return res
+
+        self.btn_age.setEnabled(False)
+        self.lbl_age.setText(f"Running on {X.shape[1]} features, {len(in_model)} samples "
+                             f"({n_perm} chance shuffles) …")
+        worker = _ProgressCallWorker(_run, parent=self)
+        worker.progress.connect(self._on_age_progress)
+        worker.finished.connect(lambda ok, err, res, run_id=trend.get('run_id'):
+                                self._on_age_model_finished(ok, err, res, run_id))
+        self._age_worker = worker
+        self.age_progress.setValue(0)
+        self.age_progress.setVisible(True)
+        worker.start()
+
+    def _on_age_progress(self, fraction: float, message: str):
+        self.age_progress.setValue(int(1000 * min(max(fraction, 0.0), 1.0)))
+        self.lbl_age.setText(message)
+
+    def _on_age_model_finished(self, ok: bool, error: str, result: object, run_id):
+        self._age_worker = None
+        self.age_progress.setVisible(False)
+        trend = self.state.trend or {}
+        self.btn_age.setEnabled(bool(trend))
+        if not ok:
+            self.lbl_age.setText(f"<span style='color:#b00020'>{error}</span>")
+            return
+        if trend.get('run_id') != run_id:
+            self.lbl_age.setText("The trend test was rerun meanwhile: run the model again.")
+            return
+        self.state.trend = dict(trend, age_model=result)
+        self._show_age_table()
+        self._draw_figures()
+        self._populate_report_items()
+        self.trend_finished.emit()
+        _status(self.bus, "Immune age model complete.")
+
+    def _show_age_table(self):
+        """The last immune age model: its summary line and performance."""
+        _clear_layout(self.age_table_holder)
+        res = (self.state.trend or {}).get('age_model')
+        if not res:
+            if self._age_worker is None:
+                self.lbl_age.setText("")
+            return
+        perf = res['performance'].iloc[0]
+        summary = res['summary']
+        if self._age_worker is None:
+            text = (f"{summary.get('group', '')}: {summary['n']} samples, "
+                    f"{summary['n_features']} features ({summary.get('features', '')}).")
+            if summary.get('status') == 'warn':
+                text += f" {summary.get('message', '')}"
+            self.lbl_age.setText(text)
+        unit = (self.state.trend or {}).get('unit') or ''
+        p_chance = perf.get('p_chance')
+        rows = [{'Mean absolute error': f"{perf['mae_mean']:.3g} ± {perf['mae_sd']:.2g} {unit}",
+                 'Predicting the mean': f"{perf['mae_baseline']:.3g} {unit}",
+                 'R²': f"{perf['r2_mean']:.2f} ± {perf['r2_sd']:.2f}",
+                 'Spearman': f"{perf['spearman_mean']:.2f}",
+                 'Chance p': (f"{p_chance:.3g}" if p_chance is not None and np.isfinite(p_chance)
+                              else 'not run')}]
+        table = CopyableTableWidget(rows, list(rows[0]))
+        table.setMaximumHeight(80)
+        self.age_table_holder.addWidget(table)
+        self._add_age_group_table(res, unit)
+
+    def _age_groups(self) -> dict:
+        trend = self.state.trend or {}
+        groups = dict(zip(trend.get('samples') or [], trend.get('group_vec') or []))
+        groups.update((trend.get('age_model') or {}).get('groups') or {})
+        return groups
+
+    def _add_age_group_table(self, res: dict, unit: str):
+        """How the model fits each group (its own, cross-validated, and any
+        group predicted by the final model), and a button listing every
+        sample's predicted value."""
+        import drc_predictive
+        from honeychrome.view_components.copyable_table_widget import show_frame_dialog
+        by_group = drc_predictive.age_model_by_group(res, self._age_groups())
+        rows = drc_predictive.age_group_rows(by_group, unit)
+        if rows:
+            table = CopyableTableWidget(rows, list(rows[0]))
+            table.setMaximumHeight(36 + 26 * len(rows))
+            self.age_table_holder.addWidget(table)
+        btn = QPushButton("Show every sample's prediction…")
+        btn.setToolTip("Each sample's actual and predicted value, the gap and the corrected gap, "
+                       "with its group; copy or save as CSV.")
+        variable = (self.state.trend or {}).get('variable') or 'variable'
+        btn.clicked.connect(lambda: show_frame_dialog(
+            self, f"Immune age model: predicted {variable}",
+            drc_predictive.age_predictions(res, self._age_groups()),
+            str(self._loaded_experiment_dir_or_home() / 'immune_age_predictions.csv')))
+        self.age_table_holder.addWidget(btn)
+
+    def _loaded_experiment_dir_or_home(self) -> Path:
+        exp = getattr(self.controller, 'experiment_dir', '') or ''
+        return Path(exp) if exp else Path.home()
 
     def _show_predictive_table(self):
         """The last predictive analysis: its summary line and performance
@@ -3419,10 +4661,12 @@ class ResultsTab(QWidget):
                 self.figures_tabs.removeTab(i)
         exp_dir = getattr(self.controller, 'experiment_dir', '')
         for title, fig, make in self._extra_figures():
+            key = _EXTRA_FIGURE_KEYS.get(title, title)
             widget = ScalableFigureWidget(
                 fig, title=title, experiment_dir=exp_dir,
-                pop_out=lambda make=make, title=title: self._pop_out_figure(make, title),
-                parent=self)
+                pop_out=lambda make=make, title=title, k=key: self._pop_out_figure(
+                    make, title, options_key=k),
+                parent=self, options=figure_options_ref(self.controller, key))
             handler = getattr(fig, '_hover_handler', None)
             if handler is not None:
                 widget.canvas.mpl_connect('motion_notify_event', handler)
@@ -3460,6 +4704,14 @@ class ResultsTab(QWidget):
                                        "dot and violin plot) to the report.")
         self.chk_pop_report.toggled.connect(self._on_pop_report_toggled)
         head.addWidget(self.chk_pop_report)
+        self.btn_pop_composition = QPushButton("Make-up over the variable")
+        self.btn_pop_composition.setToolTip(
+            "The share of each population of this gate (and the rest of the parent) against the "
+            "trend variable: fitted shares as a stacked area, each sample's shares below.")
+        self.btn_pop_composition.clicked.connect(
+            lambda: self._shown_population and self._composition_window(self._shown_population))
+        self.btn_pop_composition.setVisible(False)
+        head.addWidget(self.btn_pop_composition)
         self.btn_pop_window = QPushButton("⤢ Open in window")
         self.btn_pop_window.clicked.connect(
             lambda: self._shown_population and self._population_window(self._shown_population))
@@ -3482,7 +4734,13 @@ class ResultsTab(QWidget):
 
     def _significant_populations(self) -> set | None:
         """Population keys significant in the current comparison's frequency
-        test, or None without one."""
+        test (in trend mode: called as changing with the variable), or None
+        without one."""
+        if self._trend_mode():
+            res = (self.state.trend or {}).get('freq')
+            if res is None:
+                return None
+            return set(res.table.loc[res.table['significant'].astype(bool), 'feature'].astype(str))
         comp = self._current_comparison()
         df = (self.state.stats or {}).get('freq')
         if comp is None or df is None:
@@ -3526,7 +4784,12 @@ class ResultsTab(QWidget):
                     self.pop_list.setCurrentItem(it)
         self.pop_list.blockSignals(False)
         if significant is None:
-            note = "Run statistics to see which populations differ; all are listed."
+            note = ("Run the trend test to see which populations change; all are listed."
+                    if self._trend_mode() else
+                    "Run statistics to see which populations differ; all are listed.")
+        elif self._trend_mode():
+            note = (f"{self.pop_list.count()} of {n_all} populations ({len(significant)} "
+                    f"changing with {(self.state.trend or {}).get('variable', '')}).")
         else:
             note = f"{self.pop_list.count()} of {n_all} populations ({len(significant)} significant)."
         self.lbl_pop_count.setText(note)
@@ -3587,17 +4850,21 @@ class ResultsTab(QWidget):
     def _comparison_groups(self) -> list[str]:
         """Groups compared on the Populations page: the current comparison's,
         else every group with gated samples."""
+        st = self.state
+        if self._trend_mode() and st.trend:
+            order = list(dict.fromkeys(st.trend.get('group_vec') or []))
+            return [g for g in st.group_names if g in order] or order
         comp = self._current_comparison()
         if comp is not None:
             return [comp[0], comp[1]]
-        st = self.state
         have = {st.sample_groups.get(k) for k in st.gated_samples()}
         return [g for g in st.group_names if g in have]
 
     def _population_request(self) -> tuple:
         """(groups, comparison) the Populations page compares, read from the
-        page's widgets (main thread)."""
-        return self._comparison_groups(), self._current_comparison()
+        page's widgets (main thread); no comparison in trend mode."""
+        comp = None if self._trend_mode() else self._current_comparison()
+        return self._comparison_groups(), comp
 
     def _population_data(self, pop_key: str, request: tuple | None = None) -> dict | None:
         """Everything the comparison of one population shows. *request* is
@@ -3622,9 +4889,18 @@ class ResultsTab(QWidget):
         result = ag_results.population_result(st.stats, pop_key, _comparison_label(*comp),
                                                st.fdr_scope) if comp else None
         label = _population_labels(st.gate_defs()).get(pop_key, pop_key)
+        title = f"{label}" + (f" — {_comparison_label(*comp)}" if comp else '')
+        p_text = ag_report.p_value_text(result)
+        trend = trend_percent = None
+        if comp is None and self._trend_mode() and st.trend:
+            from honeychrome.view_components import trend_plots as tp
+            trend = self._trend_plot_kwargs('freq', pop_key)
+            trend_percent = self._trend_plot_kwargs('freq', pop_key, percent=True)
+            title = f"{label} — trend with {st.trend.get('variable', '')}"
+            p_text = tp.trend_p_text(self._trend_row('freq', pop_key) or None)
         return {'gate_def': eff, 'pop': pop, 'panels': panels, 'values': values, 'groups': groups,
-                'result': result, 'label': label,
-                'title': f"{label}" + (f" — {_comparison_label(*comp)}" if comp else '')}
+                'result': result, 'label': label, 'title': title, 'p_text': p_text,
+                'trend': trend, 'trend_percent': trend_percent}
 
     _POP_CACHE_SIZE = 32
 
@@ -3664,6 +4940,8 @@ class ResultsTab(QWidget):
         self.chk_pop_report.blockSignals(False)
         self.btn_pop_window.setEnabled(self._shown_population is not None)
         self.btn_pop_save.setEnabled(self._shown_population is not None)
+        self.btn_pop_composition.setVisible(
+            self._trend_mode() and self._composition_unit(self._shown_population) is not None)
         if self._shown_population is None:
             self.lbl_pop_title.setText("")
             return
@@ -3708,7 +4986,7 @@ class ResultsTab(QWidget):
         if data is None:
             title_label.setText("")
             return
-        title_label.setText(f"<b>{data['title']}</b><br>{ag_report.p_value_text(data['result'])}")
+        title_label.setText(f"<b>{data['title']}</b><br>{data['p_text']}")
         st = self.state
         if not data['groups']:
             note = QLabel("Assign samples to groups on the Groups page to compare them.")
@@ -3739,18 +5017,52 @@ class ResultsTab(QWidget):
                     fractions={data['pop']: frac} if frac is not None else None,
                     highlight=data['pop'], footer=footer)
                 layout.addWidget(tile)
-        fig = ag_report.make_group_values_figure(
-            data['values'], data['groups'], f"{data['label']}: % of parent",
-            ag_report.p_value_text(data['result']), is_dark=_is_dark_palette(),
-            group_colours=_group_colours(self.state))
         import honeychrome.settings as hc_settings
-        canvas = scrollable_canvas_class()(fig)
         size = int(getattr(hc_settings, 'cytometry_plot_width_target_retrieved', 220) or 220)
-        canvas.setFixedSize(int(size * 1.3), size + 60)
+        if data.get('trend'):
+            for kwargs, name in ((data['trend'], "Trend"),
+                                 (data.get('trend_percent'), "Trend, % of parent")):
+                if kwargs:
+                    layout.addWidget(self._trend_tile(kwargs, name))
+            return
+        else:
+            fig = ag_report.make_group_values_figure(
+                data['values'], data['groups'], f"{data['label']}: % of parent",
+                data['p_text'], is_dark=_is_dark_palette(),
+                group_colours=_group_colours(self.state))
+            canvas = scrollable_canvas_class()(fig)
+            canvas.setFixedSize(int(size * 1.3), size + 60)
         handler = getattr(fig, '_hover_handler', None)
         if handler is not None:
             canvas.mpl_connect('motion_notify_event', handler)
         layout.addWidget(canvas)
+
+    def _trend_tile(self, kwargs: dict, name: str) -> QWidget:
+        """A trend plot as a tile the size and look of the gate tiles: a
+        title above a square, transparent plot."""
+        import honeychrome.settings as hc_settings
+        from honeychrome.view_components import trend_plots as tp
+        from honeychrome.view_components.scalable_figure_widget import scrollable_canvas_class
+        size = int(getattr(hc_settings, 'cytometry_plot_width_target_retrieved', 220) or 220)
+        container = QWidget()
+        container.setFixedSize(*_gate_tile_size())
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+        lbl = QLabel(f"<b>{name}</b>")
+        lbl.setAlignment(Qt.AlignCenter)
+        layout.addWidget(lbl)
+        fig = tp.make_trend_plot_figure(**dict(kwargs, title=''), is_dark=_is_dark_palette(),
+                                        figsize=(size / 100.0, size / 100.0), compact=True,
+                                        transparent=True)
+        canvas = scrollable_canvas_class()(fig)
+        canvas.setFixedSize(size, size)
+        canvas.setStyleSheet("background: transparent;")
+        handler = getattr(fig, '_hover_handler', None)
+        if handler is not None:
+            canvas.mpl_connect('motion_notify_event', handler)
+        layout.addWidget(canvas, stretch=1)
+        return container
 
     def _population_window(self, pop_key: str):
         """The comparison of one population in its own window."""
@@ -3790,7 +5102,8 @@ class ResultsTab(QWidget):
         return ag_report.make_population_comparison_figure(
             data['gate_def'], data['pop'], data['panels'] if self.state.display else [],
             self._result_transforms(), labels, data['values'], data['groups'], data['title'],
-            ag_report.p_value_text(data['result']), group_colours=_group_colours(self.state))
+            data['p_text'], group_colours=_group_colours(self.state), trend=data.get('trend'),
+            trend_percent=data.get('trend_percent'))
 
     def _save_population_image(self, pop_key: str):
         """Save one population's group biplots and dot and violin plot as a
@@ -3804,10 +5117,12 @@ class ResultsTab(QWidget):
         fmt = str(getattr(hc_settings, 'graphics_export_format_retrieved', 'png') or 'png').lower()
         if fmt not in ('png', 'pdf', 'svg'):
             fmt = 'png'
-        comp = self._current_comparison()
+        comp = self._population_request()[1]
         name = _population_labels(self.state.gate_defs()).get(pop_key, pop_key)
         if comp:
             name += f" {_comparison_label(*comp)}"
+        elif self._trend_mode() and self.state.trend:
+            name += f" trend {self.state.trend.get('variable', '')}"
         stem = re.sub(r'[^\w.\-]+', '_', name).strip('_')
         start = str(Path(getattr(self.controller, 'experiment_dir', '') or '.') / f"{stem or 'population'}.{fmt}")
         filters = "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)"
@@ -3912,8 +5227,21 @@ class ResultsTab(QWidget):
                          for k in st.report_populations],
             population_figure=lambda key, r=self._population_request():
                 self._population_report_figure(key, r),
-            enrichment=st.fsea or None,
+            enrichment=st.fsea or None, trend_enrichment=st.fsea_trend or None,
+            trend=st.trend or None, build_trend_figures=build_trend_figures,
         )
+
+    def _report_items_with_options(self) -> list:
+        """Report items whose figures are drawn with the figure options of
+        the figures they show (figure_options)."""
+        from honeychrome.view_components import figure_options as fo
+        items = self._report_items()
+        for item in items:
+            if getattr(item, 'get_figure', None) is not None:
+                item.get_figure = fo.with_options(
+                    item.get_figure, figure_options_ref(self.controller,
+                                                        report_figure_key(item.key)))
+        return items
 
     def _export_csv(self, what: str):
         """Ask for a folder and write the gating results or the statistics
@@ -3997,7 +5325,7 @@ class ResultsTab(QWidget):
         checked = {self.report_list.item(i).data(Qt.UserRole)
                    for i in range(self.report_list.count())
                    if self.report_list.item(i).checkState() == Qt.Checked}
-        items = [it for it in self._report_items() if it.key in checked]
+        items = [it for it in self._report_items_with_options() if it.key in checked]
         samples = st.gated_samples()
         stem = drc_report.sanitize_filename(Path(st.model_path).stem or 'automated_gating')
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -4109,6 +5437,25 @@ class ResultsTab(QWidget):
                 f"  Flagged samples left out: {st.exclude_flagged}",
             ]
             lines += [f"  Note: {n}" for n in st.stats.get('notes') or []]
+        if st.trend:
+            ts_ = st.trend.get('settings') or {}
+            unit = st.trend.get('unit') or ''
+            lines += [
+                "",
+                "Trend with a numeric variable:",
+                f"  Variable: {st.trend.get('variable', '')}" + (f" ({unit})" if unit else ''),
+                f"  Samples: {ts_.get('n_samples', len(st.trend.get('samples') or []))}; "
+                f"groups: {', '.join(ts_.get('groups') or [])}",
+                f"  Shape: {ts_.get('shape', '')}, {ts_.get('df', '')} df; scale: "
+                f"{ts_.get('scale', '')}; knots: "
+                + (', '.join(f"{k:.3g}" for k in ts_.get('knots') or []) or 'none'),
+                f"  Group × trend: {bool(ts_.get('interaction'))}; paired: {bool(ts_.get('paired'))}",
+                f"  Call: {ts_.get('call', '')}; FDR <= {ts_.get('pval_threshold', '')}; "
+                f"min. partial R²: {ts_.get('min_r2', '')}",
+                f"  Counts: log odds within the {st.trend.get('counts_reference', 'anchor')} "
+                "population (moderated)",
+            ]
+            lines += [f"  Note: {n}" for n in st.trend.get('notes') or []]
         return "\n".join(lines) + "\n"
 
     # ------------------------------------------------------------------
@@ -4120,7 +5467,14 @@ class ResultsTab(QWidget):
         self._load_explore_controls()
         self._populate_comparisons()
         self._show_results_tables()
-        if not self.state.stats:
+        if self._trend_mode():
+            self._show_run_summary()
+            if not self.state.trend:
+                self.figures_tabs.clear()
+                self._figures_for = None
+            elif self._figures_for is not self.state.trend:
+                self._draw_figures()
+        elif not self.state.stats:
             self.figures_tabs.clear()
             self.lbl_stats.setText("")
             self._figures_for = None
@@ -4160,6 +5514,11 @@ class _StateLoader(QThread):
             log.exception("could not read the saved results")
             out['errors'].append(f"Could not read the saved results: {exc}")
         try:
+            self._read_trend(job, out)
+        except Exception as exc:
+            log.exception("could not read the saved trend test")
+            out['errors'].append(f"Could not read the saved trend test: {exc}")
+        try:
             self._read_enrichment(job, out)
         except Exception as exc:
             log.exception("could not read the saved enrichment")
@@ -4195,7 +5554,10 @@ class _StateLoader(QThread):
         payload = json.loads(Path(path).read_text(encoding='utf-8'))
         if payload.get('run_fingerprint') != str(results.get('run_fingerprint') or ''):
             return
-        out['fsea'] = ag_fsea.result_from_jsonable(payload['result'])
+        if payload.get('result'):
+            out['fsea'] = ag_fsea.result_from_jsonable(payload['result'])
+        if payload.get('trend_result'):
+            out['fsea_trend'] = ag_fsea.result_from_jsonable(payload['trend_result'])
 
     @staticmethod
     def _read_model(job: dict, out: dict):
@@ -4273,6 +5635,25 @@ class _StateLoader(QThread):
         t = job['thresholds']
         out['stats'] = ag_results.reapply_thresholds(stats, t['pval'], t['fc'], t['marker'],
                                                      t['fdr_scope'], t['treat'])
+
+    @staticmethod
+    def _read_trend(job: dict, out: dict):
+        """The last trend run, while it matches the gated results."""
+        path = job.get('trend_path')
+        results = out.get('results')
+        if path is None or not results or not Path(path).exists():
+            return
+        payload = json.loads(Path(path).read_text(encoding='utf-8'))
+        if payload.get('run_fingerprint') != str(results.get('run_fingerprint') or ''):
+            return
+        trend = ag_results.trend_from_jsonable(payload['trend'])
+        summaries = results.get('summaries') or {}
+        if not trend.get('samples') or any(k not in summaries for k in trend['samples']):
+            return
+        t = job['thresholds']
+        out['trend'] = ag_results.reapply_trend_thresholds(trend, t['pval'], t['trend_min_r2'],
+                                                           t['trend_call'],
+                                                           t.get('trend_patterns', 0))
 
 
 class _FileWriter(QThread):
@@ -4402,7 +5783,8 @@ class PluginWidget(QWidget):
             self.state, bus, controller, samples_fn=self.results_tab._stats_samples,
             design_fn=lambda samples: statistics_design(self.state, samples),
             antigens_fn=lambda: _antigen_map(self.controller),
-            experiment_dir_fn=lambda: str(self._loaded_experiment_dir or ''))
+            experiment_dir_fn=lambda: str(self._loaded_experiment_dir or ''),
+            trend_fn=self.results_tab.trend_enrichment_inputs)
         self.inner_tabs.addTab(self.run_tab, "Run", 'player-play')
         self.inner_tabs.addTab(self.results_tab, "Results", 'table')
         self.inner_tabs.addTab(self.enrichment_tab, "Enrichment", 'sparkles')
@@ -4416,6 +5798,7 @@ class PluginWidget(QWidget):
         self.builder.modelTrained.connect(self._on_model_trained)
         self.run_tab.gating_finished.connect(self._on_gating_finished)
         self.results_tab.stats_finished.connect(self._on_stats_finished)
+        self.results_tab.trend_finished.connect(self._on_trend_finished)
         self.results_tab.report_populations_changed.connect(self._save_run_state)
         self.results_tab.sample_analysis_changed.connect(self._write_sample_analysis)
         self.enrichment_tab.enrichment_finished.connect(self._on_enrichment_finished)
@@ -4550,6 +5933,7 @@ class PluginWidget(QWidget):
         self._result_tf = (None, None)
         self._write_results()
         self._write_stats()
+        self._write_trend()
         self._write_enrichment()
         self._write_sample_analysis()
         self._save_run_state()
@@ -4563,6 +5947,13 @@ class PluginWidget(QWidget):
         self._write_sample_analysis()
         self._save_run_state()
         self._export_statistics_csv()
+
+    def _on_trend_finished(self):
+        """Keep the trend run, and the settings it was run with, as soon as
+        it completes, and write it as CSV files."""
+        self._write_trend()
+        self._save_run_state()
+        self._export_trend_csv()
 
     def _on_enrichment_finished(self):
         """Keep the enrichment run, write it as CSV files and list it in
@@ -4752,6 +6143,10 @@ class PluginWidget(QWidget):
                 setattr(self.state, name, value)
         if self.state.counts_method not in ag_results.COUNTS_METHODS:
             self.state.counts_method = defaults.counts_method
+        for name, allowed in (('stats_test', STATS_TESTS), ('trend_shape', TREND_SHAPE_LABELS),
+                              ('trend_scale', TREND_SCALE_LABELS), ('trend_call', TREND_CALL_LABELS)):
+            if getattr(self.state, name) not in allowed:
+                setattr(self.state, name, getattr(defaults, name))
         st = self.state
         exp = self._loaded_experiment_dir
         legacy_model = ''
@@ -4763,12 +6158,14 @@ class PluginWidget(QWidget):
             'model_path': legacy_model,
             'results_path': exp / RESULTS_FILE,
             'stats_path': exp / STATS_FILE,
+            'trend_path': exp / TREND_FILE,
             'enrichment_path': exp / ENRICHMENT_FILE,
             'sample_analysis_path': exp / SAMPLE_ANALYSIS_FILE,
             'display_dir': exp / DISPLAY_DIR,
             'thresholds': {'pval': st.pval_threshold, 'fc': st.fc_threshold,
                            'marker': st.marker_threshold, 'fdr_scope': st.fdr_scope,
-                           'treat': st.use_treat},
+                           'treat': st.use_treat, 'trend_min_r2': st.trend_min_r2,
+                           'trend_call': st.trend_call, 'trend_patterns': st.trend_patterns},
         }
         self._loading = True
         self.label_loading.setVisible(True)
@@ -4813,8 +6210,12 @@ class PluginWidget(QWidget):
                 self._write_results()
         if out.get('stats'):
             st.stats = out['stats']
+        if out.get('trend'):
+            st.trend = out['trend']
         if out.get('fsea'):
             st.fsea = out['fsea']
+        if out.get('fsea_trend'):
+            st.fsea_trend = out['fsea_trend']
         if out.get('pca'):
             st.pca = out['pca']
         if out.get('predictive'):
@@ -4923,24 +6324,62 @@ class PluginWidget(QWidget):
 
         self._start_writer(_job, "Saving the statistics")
 
-    def _write_enrichment(self):
-        """Write the last enrichment run to ENRICHMENT_FILE (in the
-        background), or remove the file when there is none."""
+    def _write_trend(self):
+        """Write the last trend run to TREND_FILE (in the background), or
+        remove the file when there is none (a new gating run clears it)."""
         if not self._controller_shows_loaded_experiment():
             return
-        path = self._loaded_experiment_dir / ENRICHMENT_FILE
+        path = self._loaded_experiment_dir / TREND_FILE
         st = self.state
-        if not st.fsea:
+        if not st.trend:
             try:
                 path.unlink(missing_ok=True)
             except OSError:
                 log.exception("could not remove %s", path)
             return
-        result, fingerprint = dict(st.fsea), st.run_fingerprint
+        trend, fingerprint = dict(st.trend), st.run_fingerprint
 
         def _job():
             _write_json_atomic(path, {'format_version': 1, 'run_fingerprint': fingerprint,
-                                      'result': ag_fsea.result_to_jsonable(result)})
+                                      'trend': ag_results.trend_to_jsonable(trend)})
+
+        self._start_writer(_job, "Saving the trend test")
+
+    def _export_trend_csv(self):
+        """Write the trend tables as CSV files to EXPORT_DIR (background)."""
+        if not self._controller_shows_loaded_experiment() or not self.state.trend:
+            return
+        st = self.state
+        folder = self._loaded_experiment_dir / EXPORT_DIR
+        stem, stamp = _export_stem(st.model_path), datetime.now().strftime('%Y%m%d_%H%M%S')
+        args = (dict(st.trend), _population_labels(st.gate_defs()), _antigen_map(self.controller))
+        self._start_writer(lambda: write_trend_csv(folder, stem, stamp, *args),
+                           "Writing the trend CSV")
+        _status(self.bus, f"Trend results written to {folder}")
+
+    def _write_enrichment(self):
+        """Write the last enrichment runs (group comparisons and trend) to
+        ENRICHMENT_FILE (in the background), or remove the file when there
+        is neither."""
+        if not self._controller_shows_loaded_experiment():
+            return
+        path = self._loaded_experiment_dir / ENRICHMENT_FILE
+        st = self.state
+        if not (st.fsea or st.fsea_trend):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                log.exception("could not remove %s", path)
+            return
+        result, trend_result = dict(st.fsea), dict(st.fsea_trend)
+        fingerprint = st.run_fingerprint
+
+        def _job():
+            _write_json_atomic(path, {
+                'format_version': 1, 'run_fingerprint': fingerprint,
+                'result': ag_fsea.result_to_jsonable(result) if result else None,
+                'trend_result': (ag_fsea.result_to_jsonable(trend_result) if trend_result
+                                 else None)})
 
         self._start_writer(_job, "Saving the enrichment")
 
@@ -4971,14 +6410,18 @@ class PluginWidget(QWidget):
 
     def _export_enrichment_csv(self):
         """Write the enrichment tables as CSV files to EXPORT_DIR (background)."""
-        if not self._controller_shows_loaded_experiment() or not self.state.fsea:
-            return
         st = self.state
+        if not self._controller_shows_loaded_experiment() or not (st.fsea or st.fsea_trend):
+            return
         folder = self._loaded_experiment_dir / EXPORT_DIR
         stem, stamp = _export_stem(st.model_path), datetime.now().strftime('%Y%m%d_%H%M%S')
-        result = dict(st.fsea)
-        self._start_writer(lambda: ag_fsea_ui.write_enrichment_csv(folder, stem, stamp, result),
-                           "Writing the enrichment CSV")
+        runs = [(stem, dict(st.fsea)), (f"{stem}_trend", dict(st.fsea_trend))]
+
+        def _job():
+            for run_stem, result in runs:
+                if result:
+                    ag_fsea_ui.write_enrichment_csv(folder, run_stem, stamp, result)
+        self._start_writer(_job, "Writing the enrichment CSV")
         _status(self.bus, f"Enrichment written to {folder}")
 
     def _export_results_csv(self):

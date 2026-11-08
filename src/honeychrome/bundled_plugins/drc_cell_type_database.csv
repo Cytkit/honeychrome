@@ -23,7 +23,7 @@ CD4 Treg CM,human,CD3;CD90;TCRbeta;TCRab;CD4;FoxP3;CD25;CCR7;CD62L,CD19;CD20;CD6
 CD4 Treg TEMRA,human,CD3;CD90;TCRbeta;TCRab;CD4;FoxP3;CD25;CD45RA,CD19;CD20;CD66b;Siglec-8;CD15;CD141;CD1c;HLA-DR;CD68;CD14;CD16;CD64;TCRgd;CD8;CD127;CD62L;CCR7,
 CD4 Treg TRM,human,CD3;CD90;TCRbeta;TCRab;CD4;FoxP3;CD25;CD69,CD19;CD20;CD66b;Siglec-8;CD15;CD141;CD1c;HLA-DR;CD68;CD14;CD16;CD64;TCRgd;CD8;CD127,
 Tfh,human,CD3;CD90;TCRbeta;TCRab;CD4;Bcl-6;IL-21;CXCR5;PD-1,CD19;CD20;CD66b;Siglec-8;CD15;CD141;CD1c;HLA-DR;CD68;CD14;CD16;CD64;TCRgd;CD8;FoxP3;CD25,
-Tfr,human,CD3;CD90;TCRbeta;TCRab;CD4;FoxP3;CD25;Bcl-6;IL-21;CXCR5;PD-1,CD19;CD20;CD66b;Siglec-8;CD15;CD141;CD1c;HLA-DR;CD68;CD14;CD16;CD64;TCRgd;CD8;CD127,
+Tfr,human,CD3;CD90;TCRbeta;TCRab;CD4;FoxP3;Bcl-6;CXCR5;PD-1,CD19;CD20;CD66b;Siglec-8;CD15;CD141;CD1c;HLA-DR;CD68;CD14;CD16;CD64;TCRgd;CD8,"Tfh markers with FOXP3 as the decider (Tfh are the FOXP3- counterpart). Bcl-6 and high PD-1 and CXCR5 mark true Tfr in tissue (tonsil); blood CXCR5+ FOXP3+ cells lack Bcl-6 and PD-1 (Fonseca 2017, DOI:10.1126/sciimmunol.aan1487). IL-21 left out (not made by Tfr; Linterman 2011); CD25 left out because mature Tfr lose it (Cavaco 2025 review, Immunol Cell Biol 103:622)"
 Th1,human,CD3;CD90;TCRbeta;TCRab;CD4;T-bet;IFNg;TNF;CCR5;CXCR3,CD19;CD20;CD66b;Siglec-8;CD15;CD141;CD1c;HLA-DR;CD68;CD14;CD16;CD64;TCRgd;CD8;FoxP3;CD25,
 Tr1,human,CD3;CD90;TCRbeta;TCRab;CD4;IL-10;LAG3;CD49b;CD226,CD19;CD20;CD66b;Siglec-8;CD15;CD141;CD1c;HLA-DR;CD68;CD14;CD16;CD64;TCRgd;CD8;FoxP3;CD25,
 Th2,human,CD3;CD90;TCRbeta;TCRab;CD4;GATA-3;IL-4;IL-5;IL-13;CD294;CCR4,CD19;CD20;CD66b;Siglec-8;CD15;CD141;CD1c;HLA-DR;CD68;CD14;CD16;CD64;TCRgd;CD8;FoxP3;CD25,
@@ -42,7 +42,7 @@ exhausted CD8,human,CD3;CD90;TCRbeta;TCRab;CD8;PD-1;CD366;TIGIT;CD152;LAG3,CD19;
 LSEC,human;mouse,CD146;Stabilin2;CD31;CD32;LYVE1,CD45;Gr-1;Ly6G;PDCA-1;CD19;CD3;CD4;CD8,Liver-resident
 Langerhans cell,human,CD11c;EpCAM;CD324;HLA-DR;CD207;CD205;CD11b,XCR1;CD64;CD15;CD141;CD19;CD3;CD4;CD8;CD20;TCRab;CD68,Skin-resident
 Macrophage,human,CD68;CD64;CD11b;HLA-DR;CX3CR1;MerTK;CCR2;CD45;CD172a,Siglec-8;CD1c;CD141;CD19;CD3;CD4;CD8;CD20;TCRab;CD15,Skin-resident
-Microglia,human,CD68;Iba-1;CD64;CD11b;CX3CR1;MerTK;CCR2;P2RY12;P2XR7,CD45;FOLR2;CD206;LYVE1;CD371;CD4;CD8;CD19;CD20;CD161;CD141,Brain-resident
+Microglia,human,CD68;Iba-1;CD64;CD11b;CX3CR1;MerTK;CCR2;P2RY12;P2XR7,CD45;FOLR2;CD206;LYVE1;CD371;CD4;CD8;CD19;CD20;CD161;CD141;CD3,Brain-resident
 BAM,human,CD68;CD64;CD11b;CX3CR1;MerTK;CCR2;CD45;FOLR2;CD371;FR2;LYVE1;CD206,CD4;CD8;CD19;CD3;Siglec-8;CD141,Brain-resident
 Oligodendrocyte,human;mouse,O4,CD45;CD11b,Brain-resident
 Astrocyte,human;mouse,ACSA-2;GFAP,CD45;CD11b,Brain-resident
@@ -98,7 +98,7 @@ Act CD4 Treg,mouse,CD3;CD90.2;CD4;TCRbeta;TCRab;FoxP3;CD90.1;CD44,CD19;B220;CD11
 Naïve CD4 Treg,mouse,CD3;CD90.2;CD4;TCRbeta;TCRab;FoxP3;CD90.1;CD62L,CD19;B220;CD11b;Gr-1;F4/80;Siglec F;Ly6G;PDCA-1;CD11c;MHCII;CD64;CD8;TCRgd;CD44,
 Memory CD4 Treg,mouse,CD3;CD90.2;CD4;TCRbeta;TCRab;FoxP3;CD90.1;CD44;CD62L,CD19;B220;CD11b;Gr-1;F4/80;Siglec F;Ly6G;PDCA-1;CD11c;MHCII;CD64;CD8;TCRgd,
 Tfh,mouse,CD3;CD90.2;CD4;TCRbeta;TCRab;CD44;CXCR5;Bcl-6;IL-21,CD19;B220;CD11b;Gr-1;F4/80;Siglec F;Ly6G;PDCA-1;CD11c;MHCII;CD64;CD90.1;CD8;TCRgd;FoxP3,
-Tfr,mouse,CD3;CD90.2;CD4;TCRbeta;TCRab;CD44;CXCR5;Bcl-6;FoxP3,CD19;B220;CD11b;Gr-1;F4/80;Siglec F;Ly6G;PDCA-1;CD11c;MHCII;CD64;CD90.1;CD8;TCRgd;CD62L,
+Tfr,mouse,CD3;CD90.2;CD4;TCRbeta;TCRab;CD44;CXCR5;Bcl-6;PD-1;ICOS;FoxP3,CD19;B220;CD11b;Gr-1;F4/80;Siglec F;Ly6G;PDCA-1;CD11c;MHCII;CD64;CD90.1;CD8;TCRgd;CD62L;CD25,"Foxp3+ Treg with the follicular programme: higher ICOS and PD-1 than other effector Tregs, CXCR5 and Bcl-6, CD25 low (Maceiras 2017, DOI:10.1111/imm.12774, Table 1; Linterman 2011, PMID:21785433; Chung 2011, PMID:21785430)"
 Th1,mouse,CD3;CD90.2;CD4;TCRbeta;TCRab;CD44;T-bet;IFNg;TNF,CD19;B220;CD11b;Gr-1;F4/80;Siglec F;Ly6G;PDCA-1;CD11c;MHCII;CD64;CD90.1;CD8;TCRgd;FoxP3,
 Tr1,mouse,CD3;CD90.2;CD4;TCRbeta;TCRab;CD44;IL-10;LAG3;CD49b;CD226,CD19;B220;CD11b;Gr-1;F4/80;Siglec F;Ly6G;PDCA-1;CD11c;MHCII;CD64;CD90.1;CD8;TCRgd;FoxP3,
 Th2,mouse,CD3;CD90.2;CD4;TCRbeta;TCRab;CD44;GATA-3;IL-4;IL-5;IL-13,CD19;B220;CD11b;Gr-1;F4/80;Siglec F;Ly6G;PDCA-1;CD11c;MHCII;CD64;CD90.1;CD8;TCRgd;FoxP3,
@@ -160,3 +160,41 @@ MEP,mouse,CD117,CD11c;Gr-1;Ly6G;Siglec F;IgM;IgD;TCRgd;TCRbeta;CD19;CD4;CD3;CD8;
 CFU-Mk,mouse,CD117;CD150,CD11c;Gr-1;Ly6G;Siglec F;IgM;IgD;TCRgd;TCRbeta;CD19;CD4;CD3;CD8;PDCA-1;F4/80;B220;NK1.1;TER119;Sca-1;CD16/32;CD34,
 CFU-E,mouse,CD117;CD105,CD11c;Gr-1;Ly6G;Siglec F;IgM;IgD;TCRgd;TCRbeta;CD19;CD4;CD3;CD8;PDCA-1;F4/80;B220;NK1.1;TER119;Sca-1;CD150;CD16/32,
 CLP,mouse,CD45;CD117;Sca-1;CD135;CD127,CD11c;Gr-1;Ly6G;Siglec F;IgM;IgD;TCRgd;TCRbeta;CD19;CD4;CD3;CD8;PDCA-1;F4/80;B220;NK1.1;TER119,
+Double-positive thymocyte,mouse,CD4;CD8,,CD4+ CD8+ thymocytes
+AIM+ CD4 Tconv,human,CD3;CD4;CD134;CD137,CD8;FoxP3,"Activation-induced markers OX40 and 4-1BB after short ex vivo stimulation; other published pairs are OX40+CD25+ and CD69+CD154+. FoxP3- removes Tregs (proposed, no quoted source)"
+AIM+ CD4 Treg,human,CD3;CD4;FoxP3;CD137,CD8;CD154,Activated Tregs are 4-1BB+ CD40L- (the converse of conventional cells)
+AIM+ CD8 Tconv,human,CD3;CD8;CD69;CD137,CD4,CD69+ 4-1BB+ after short ex vivo stimulation
+AIM+ MAIT,human,CD3;TCR Va7.2;CD161;CD69,,"Va7.2+ CD161+ stands in for MR1 tetramer; CD161 bright reduced to positive, so some non-MAIT cells are included; CD4 and CD8 left free (CD4+ and double-negative MAIT exist)"
+GzmB+ Perforin+ CD8 Tconv,human,CD3;CD8;Granzyme B;Perforin,CD4,Also includes resting late effector memory cells; acute activation is better read with CD38 and HLA-DR inside it
+cytotoxic CD4 Tconv,human,CD3;CD4;Granzyme B;Perforin,CD8;FoxP3,"CX3CR1 and CD45RA are supported optional positives; FoxP3- proposed, no quoted source"
+exhausted CD4 Tconv,human,CD3;CD4;PD-1;CD39,CD8;FoxP3,"PD-1 high reduced to positive; tumour-derived evidence; overlaps recently activated cells; FoxP3- proposed, no quoted source"
+Th1 T-bet+,human,CD3;CD4;CXCR3;T-bet,CD8;CCR6;FoxP3,CXCR3+ CCR6- Th1 cells that are T-bet+; FoxP3- because Tregs can acquire T-bet and CXCR3
+Th1/17,human,CD3;CD4;CXCR3;CCR6,CD8;CD45RA,CXCR3+ CCR6+ memory CD4 T cells
+Activated memory B cell,human,CD19;CD20;CD27,CD21;CD3,CD21 low reduced to negative; CD20+ keeps out plasmablasts
+Atypical B cell,human,CD19,CD21;CD27;CD3,DN2 / tissue-like memory / ABC as CD21- CD27- B cells (Portugal 2017); CD11c and T-bet left out of the definition so the library rows inside it can change; also includes CD11c- CD21- CD27- cells
+Atypical B cell,mouse,CD19;CD11c;T-bet,CD21;CD23;CD3,"Age-associated B cells (CD21- CD23-, CD11c+ T-bet+); excludes the CD11c- naive part of CD21- CD23- cells"
+Plasmablast,human,CD19;CD27,CD20;CD3,CD27 high reduced to positive; CD38 left out of the definition so the CD38 row inside it can change; HLA-DR high (plasmablast against plasma cell) dropped
+Plasmablast,mouse,CD19;B220;CD138,CD3,"B220 retained on plasmablasts, lost on mature plasma cells; MHCII+ is an optional addition"
+Resting memory B cell,human,CD19;CD20;CD27;CD21,CD3,CD27+ CD21+ classical memory
+Resting memory B cell,mouse,CD19;CD38;CD73,IgD;GL7;CD3,CD38 high reduced to positive; GL7- excludes germinal-centre B cells; CD73 keeps out marginal-zone and B1 cells (CD80 is an alternative)
+Resting naive B cell,human,CD19;IgD;CD21,CD27;CD10;CD3,"CD10- removes transitional cells, CD21+ removes activated naive cells"
+Transitional B cell,human,CD19;CD10;CD24;CD38,CD3,"CD24 high and CD38 high reduced to positive, so CD10 carries the distinction"
+non-transitional non-plasma B cell,human,CD19;CD20,CD10;CD3,B cells less CD10+ transitional cells and CD20- plasmablasts
+CD11b+ CD27- NK,mouse,CD335;CD11b,CD3;CD27,Most mature stage; NK1.1 can replace CD335 in C57BL/6
+CD11b- CD27+ NK,mouse,CD335;CD27,CD3;CD11b,Immature stage; the CD11b+ CD27+ intermediate stage is left out
+CD56bright NK,human,CD56,CD3;CD16,CD56 bright translated as CD56+ CD16-; the bright/dim level itself is lost
+CD56dim NK,human,CD56;CD16,CD3,CD56 dim translated as CD56+ CD16+
+CD4 TRM,mouse,CD3;CD4;CD44;CD69,CD62L,Residency itself (protection from intravascular labelling) is not a marker; CD103 is an optional addition
+Progenitor exhausted CD8,mouse,CD3;CD8;PD-1;CD352,CD366,PD-1+ Ly108+ TIM-3-; TCF1+ and CD39- are optional additions
+Terminally exhausted CD8,mouse,CD3;CD8;PD-1;CD366,CD352,PD-1+ TIM-3+ Ly108-; includes CX3CR1+ transitory effector-like cells
+gdT17,mouse,CD3;TCRgd;CCR6,CD27,CD27- CCR6+ gamma-delta T cells; IL-17 itself is not used
+Immature neutrophil,mouse,CD11b;Ly6G,CD101;CD3,CD101- marks immaturity; Ly6G low not usable as a sign
+Ly6Chi Monocyte,mouse,CD11b;Ly6C;CCR2,Ly6G;NK1.1;CD3,"Ly6C high reduced to positive; CCR2 separates them from Ly6C low monocytes; NK1.1- proposed, no quoted source"
+Migratory DC,mouse,CD11c;MHCII;CCR7,CD64;CD19;CD3,"MHCII high CD11c intermediate reduced to positive, so CCR7 carries the distinction; CD19- and CD3- proposed, no quoted source"
+cDC,mouse,CD11c,CD64;Siglec H;NK1.1;Ly6C;CD19;CD3,"MHCII left out of the definition so the MHCII row inside it can change; NK1.1- and Ly6C- replace it to keep out NK cells and monocytes (proposed, no quoted source); CD64- excludes macrophages and monocyte-derived DCs; Siglec H- excludes pDCs"
+activated CD14 Monocyte,human,CD14;HLA-DR;CD86;CD80,CD16;CD3;CD19,"Classical monocytes with the antigen-presenting markers lost in deactivation (HLA-DR, CD86) and inducible CD80; CD3- and CD19- proposed, no quoted source"
+activated CD14+CD16+ Monocyte,human,CD14;CD16;HLA-DR;CD86;CD80,CD3;CD19,"Intermediate monocytes; CD14 level that separates them from non-classical monocytes is lost; CD3- and CD19- proposed, no quoted source"
+Treg Th1-like,human,CD3;CD90;TCRbeta;TCRab;CD4;FoxP3;CD25;T-bet;CXCR3,CD19;CD20;CD66b;Siglec-8;CD15;CD141;CD1c;HLA-DR;CD68;CD14;CD16;CD64;TCRgd;CD8;CD127,"Tregs that take up T-bet and CXCR3 (McClymont 2011, PMID:21368230); CD4 Treg markers plus T-bet and CXCR3"
+Treg Th1-like,mouse,CD3;CD90.2;CD4;TCRbeta;TCRab;FoxP3;T-bet;CXCR3,CD19;B220;CD11b;Gr-1;F4/80;Siglec F;Ly6G;PDCA-1;CD11c;MHCII;CD64;CD8;TCRgd,"T-bet+ CXCR3+ Tregs of type 1 inflammation (Koch 2009, PMID:19412181)"
+Treg Th17-like,human,CD3;CD90;TCRbeta;TCRab;CD4;FoxP3;CD25;RORgT;CCR6,CD19;CD20;CD66b;Siglec-8;CD15;CD141;CD1c;HLA-DR;CD68;CD14;CD16;CD64;TCRgd;CD8;CD127,"FOXP3+ CCR6+ RORgt+ cells that can produce IL-17 (Voo 2009, PMID:19273860)"
+RORgt+ CD4 Treg,mouse,CD3;CD90.2;CD4;TCRbeta;TCRab;FoxP3;RORgT,CD19;B220;CD11b;Gr-1;F4/80;Siglec F;Ly6G;PDCA-1;CD11c;MHCII;CD64;CD8;TCRgd,"Microbiota-induced colonic RORgt+ Tregs (Ohnmacht 2015, PMID:26160380; Sefik 2015, PMID:26272906); Helios and Neuropilin-1 left out of the definition so the rows inside CD4 Treg can change"

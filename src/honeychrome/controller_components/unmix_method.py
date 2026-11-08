@@ -21,9 +21,10 @@ Methods (``process['unmixing']``)
           and the noise model is not. Samples without an AF library of two or
           more spectra, or with the kernel not built, stay on R1.
 
-    ``method_state(controller)`` reads everything the method needs on the
-    main thread and returns None when every sample would be unmixed by R1
-    with the base spectra, so the R1 code path is unchanged.
+    ``method_state(controller)`` reads everything the method needs from the
+    experiment into a frozen snapshot that workers use, and returns None when
+    every sample would be unmixed by R1 with the base spectra, so the R1 code
+    path is unchanged.
 
 Spectral corrections (``process['spectral_corrections']``, written by the
 Spectral Correction page)
@@ -112,6 +113,7 @@ VARIANT_KERNEL_DEFAULTS = {
 DISPLAY_CACHE_SUBDIR = Path('cache') / 'unmixed'
 DISPLAY_CACHE_VERSION = 1
 
+_MISSING = object()
 _noise_cache: dict = {}
 
 
@@ -272,12 +274,12 @@ def transfer_with_spectra(transfer_matrix: np.ndarray, fl_ids_raw, fl_ids_unmixe
 
 
 # ---------------------------------------------------------------------------
-# Method state (main thread)
+# Method state
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True, eq=False)
 class MethodState:
-    """Everything the experiment's unmixing method needs, read on the main thread."""
+    """Everything the experiment's unmixing method needs, read once from the experiment."""
     method: str
     fluor_names: tuple
     spectra: np.ndarray
@@ -335,6 +337,7 @@ class MethodState:
 
 
 def _noise_state(controller):
+    global _noise_cache
     from honeychrome.controller_components import gls_unmix as gu
     from honeychrome.controller_components.spread_model import raw_layout
 
@@ -345,10 +348,12 @@ def _noise_state(controller):
     detectors = raw_layout(controller)['detectors']
     key = (str(controller.experiment_dir), entry.get('file'), entry.get('fingerprint'), entry.get('fitted'),
            tuple(detectors))
-    if key not in _noise_cache:
-        _noise_cache.clear()
-        _noise_cache[key] = gu.load_noise_state(process, controller.experiment_dir, detectors)
-    return _noise_cache[key]
+    cached = _noise_cache.get(key, _MISSING)
+    if cached is not _MISSING:
+        return cached
+    state = gu.load_noise_state(process, controller.experiment_dir, detectors)
+    _noise_cache = {key: state}
+    return state
 
 
 def _variants_payload(controller, names: list, spectra: np.ndarray) -> dict | None:
@@ -382,8 +387,13 @@ def method_state(controller, corrections: tuple | None = None) -> MethodState | 
     The experiment's unmixing method for every sample, or None when all of
     them are unmixed by R1 with the base spectra. ``corrections``
     (``({set: spectra}, {sample: set})``, as ``corrections_in_effect``
-    returns) replaces the stored overlay, e.g. ``({}, {})`` for none. Main
-    thread only.
+    returns) replaces the stored overlay, e.g. ``({}, {})`` for none.
+
+    It reads the experiment's settings and stored results, so call it from the
+    main thread or from a worker the main thread waits on (``with_busy_cursor``),
+    never while the spectral model or unmixing settings are being edited. The
+    returned snapshot is frozen and safe to hand to background jobs; the module
+    caches it uses are replaced in one step, so concurrent calls are safe.
     """
     experiment = getattr(controller, 'experiment', None)
     process = getattr(experiment, 'process', None)
@@ -470,7 +480,7 @@ def method_state(controller, corrections: tuple | None = None) -> MethodState | 
 
 
 # ---------------------------------------------------------------------------
-# What follows the spectra of a corrected set (main thread)
+# What follows the spectra of a corrected set
 # ---------------------------------------------------------------------------
 
 _threshold_cache: dict = {}
@@ -515,6 +525,7 @@ def threshold_shift(controller, unstained_key, names: list, base: np.ndarray, sp
     from honeychrome.controller_components.autospectral_functions import (
         AF_SUBDIR, apply_af_unmixing, build_af_precomputed,
     )
+    global _threshold_cache
     zeros = np.zeros(len(names))
     profiles = controller.experiment.process.get('af_profiles') or {}
     found = [(n, e) for n, e in profiles.items()
@@ -525,8 +536,9 @@ def threshold_shift(controller, unstained_key, names: list, base: np.ndarray, sp
     name, entry = found[0]
     path = Path(controller.experiment_dir) / AF_SUBDIR / entry['envelope']['unstained_file']
     key = digest(str(path), base, spectra)
-    if key in _threshold_cache:
-        return _threshold_cache[key]
+    cached = _threshold_cache.get(key)
+    if cached is not None:
+        return cached
     try:
         sample = np.load(path).astype(np.float64)
     except (OSError, ValueError) as exc:
@@ -541,9 +553,9 @@ def threshold_shift(controller, unstained_key, names: list, base: np.ndarray, sp
     for s in (base, spectra):
         out = apply_af_unmixing(sample, build_af_precomputed(s, lib, envelope), lib)['unmixed']
         q.append(np.percentile(out, 99.5, axis=0))
-    _threshold_cache.clear()
-    _threshold_cache[key] = q[1] - q[0]
-    return _threshold_cache[key]
+    shift = q[1] - q[0]
+    _threshold_cache = {key: shift}
+    return shift
 
 
 def set_extras(controller, process: dict, names: list, base: np.ndarray, sets: dict, noise=None,

@@ -336,6 +336,14 @@ class NxNGrid(QFrame):
         if self.controller.data_for_cytometry_plots_process['plots']:
             self.setVisible(True)
             self.set_headers_to_all_labels()
+            # the rows follow the process plots, which keep the rows shown before a refresh
+            rows = []
+            for plot in self.controller.data_for_cytometry_plots_process['plots']:
+                row = plot.get('channel_y', plot['channel_x'])
+                if row not in rows:
+                    rows.append(row)
+            if rows:
+                self.vertical_headers = rows
             self.refresh_source_combo(mode='unmixed') # populate the source combo with all unmixed gates
             self.refresh_heatmaps() #produces dummy hists
         else:
@@ -426,13 +434,17 @@ class NxNGrid(QFrame):
                         # build data arrays
                         # vertical headers are the unmixed filtered set
                         # horizontal headers are the raw fluorescence set
+                        # position of each (x, y) 2D plot, first occurrence kept
+                        plot_index = {}
+                        for n, plot in enumerate(plots):
+                            if plot['type'] == 'hist2d':
+                                plot_index.setdefault((plot['channel_x'], plot['channel_y']), n)
                         self.heatmaps = []
                         for r in self.vertical_headers:
                             row = []
                             for c in self.horizontal_headers:
                                 if c != r:
-                                    index = [plots.index(plot) for plot in plots if plot['type'] == 'hist2d' and plot['channel_x'] == c and plot['channel_y'] == r][0]
-                                    row.append(histograms[index])
+                                    row.append(histograms[plot_index[(c, r)]])
                                 else:
                                     row.append(None)
                             self.heatmaps.append(row)

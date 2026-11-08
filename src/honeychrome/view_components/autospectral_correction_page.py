@@ -582,12 +582,15 @@ class SpectralCorrectionPage(QWidget):
         self._refresh_use_check()
         self._refresh_results()
 
-    def _clear_if_stale(self):
+    def _clear_if_stale(self, unmix_again: bool = True):
+        """Drop spectral corrections made on earlier base spectra. unmix_again is False
+        after a spectral process refresh, which has just unmixed the displayed sample
+        without them (corrections on earlier spectra are never applied)."""
         names, spectra = fluor_names_and_spectra(self.controller)
         if sc.clear_if_stale(self._process(), names, spectra):
             self._fix_status.setText('The base spectra have changed since Fix Unmix was run, so the spectral '
                                      'corrections were cleared. Run Fix Unmix again.')
-            self._method_changed()
+            self._method_changed(unmix_again)
 
     def _refresh_gates(self, stored: str | None):
         c = self.controller
@@ -835,11 +838,12 @@ class SpectralCorrectionPage(QWidget):
         self._apply_list.setEnabled(bool(entry))
         self._apply_list.blockSignals(False)
 
-    def _method_changed(self):
-        """The experiment's unmixing changed: unmix the displayed sample again and tell the other pages."""
+    def _method_changed(self, unmix_again: bool = True):
+        """The experiment's unmixing changed: unmix the displayed sample again (unless
+        unmix_again is False) and tell the other pages."""
         if self.bus:
             self.bus.autoSaveRequested.emit()
-        if self.controller is not None and hasattr(self.controller, 'refresh_unmixing'):
+        if unmix_again and self.controller is not None and hasattr(self.controller, 'refresh_unmixing'):
             self.controller.refresh_unmixing()
         if self.bus:
             self.bus.unmixingMethodChanged.emit()
@@ -1380,6 +1384,6 @@ class SpectralCorrectionPage(QWidget):
     def _on_process_refreshed(self):
         if not self._available():
             return
-        self._clear_if_stale()
+        self._clear_if_stale(unmix_again=False)
         if self.is_active():
             self._refresh_ui()

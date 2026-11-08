@@ -60,6 +60,17 @@ Statistics, per comparison:
     (VIF = 1 + (m − 1) ρ̄), on min(residual df, features − 2) degrees of
     freedom.
 
+With a numeric variable (age, time; ``trend_enrichment``) the features are
+ranked by the signed slope of the trend model of the Results page and the
+same statistics are made from it; a further self-contained statistic, the
+mean normal score of the members' curve-test p-values, finds states that
+change in any direction (a rise and fall included). The null permutes the
+residuals of the model without the variable within exchangeable units
+(within groups, within donors sampled several times, or whole pairs that
+share the value). ``pattern_overrepresentation`` asks which states'
+populations gather in a shape pattern of the trend results (hypergeometric
+test).
+
 A comparison is tested only with at least ``MIN_TOTAL_SAMPLES`` samples in
 its two groups and ``MIN_GROUP_SAMPLES`` in each (``enforce_min_samples``
 exists for validation on smaller data, not for the UI).
@@ -119,7 +130,8 @@ __all__ = [
     'default_anchor', 'anchor_choices', 'build_features', 'collapse_redundant',
     'comparison_plans', 'prepare', 'group_rank_stats', 'enrichment_scores', 'running_sum',
     'run_enrichment', 'result_to_jsonable', 'result_from_jsonable', 'result_tables',
-    'state_curve',
+    'state_curve', 'trend_enrichment', 'pattern_overrepresentation', 'run_trend_enrichment',
+    'comparison_labels', 'trend_label',
 ]
 
 
@@ -377,6 +389,10 @@ def comparison_plans(samples: list[str], groups: dict, *, group_order=None,
     contrasts = ds.build_contrasts(names, contrast_mode, reference)
     used = [s for s in samples if (groups.get(s) or '') in names]
     blocked, plans = [], []
+    cov_all = None
+    if covariates is not None and len(covariates.columns):
+        cov_all = ds.covariate_frame(covariates, used, list(covariates.columns),
+                                     numeric=list(numeric_covariates or []), allow_missing=True)
 
     def _gate(base, other, gvec):
         n_b, n_o = gvec.count(base), gvec.count(other)
@@ -387,11 +403,28 @@ def comparison_plans(samples: list[str], groups: dict, *, group_order=None,
                     f"{MIN_TOTAL_SAMPLES} in the two groups and {MIN_GROUP_SAMPLES} in each.")
         return None
 
-    if contrast_mode == 'reference':
-        subsets = [(used, contrasts)]
+    pvec_all = [str((pairing or {}).get(s, '')) for s in used] if pairing else None
+    parts = ds.comparison_plan([groups[s] for s in used], contrasts, pvec_all, cov_all,
+                               contrast_mode)
+    if parts is not None:
+        # Missing covariate values, or pairing that does not link the groups:
+        # each comparison on its own samples, covariates and pairing.
+        subsets = []
+        for part in parts:
+            b, o = part['contrast']
+            if not part['tested']:
+                blocked.append({'comparison': f"{o} vs {b}", 'reason': ' '.join(part['notes'])})
+                continue
+            subsets.append(([s for s, keep in zip(used, part['mask']) if keep], [(b, o)],
+                            part['covariates'], part['paired']))
+    elif contrast_mode == 'reference':
+        subsets = [(used, contrasts, cov_all, True)]
     else:
-        subsets = [([s for s in used if groups[s] in (b, o)], [(b, o)]) for b, o in contrasts]
-    for sub, comps in subsets:
+        subsets = []
+        for b, o in contrasts:
+            sub = [s for s in used if groups[s] in (b, o)]
+            subsets.append((sub, [(b, o)], None if cov_all is None else cov_all.loc[sub], True))
+    for sub, comps, cov, use_pairing in subsets:
         gvec = [groups[s] for s in sub]
         ok = []
         for b, o in comps:
@@ -403,11 +436,7 @@ def comparison_plans(samples: list[str], groups: dict, *, group_order=None,
         if not ok:
             continue
         base = comps[0][0]
-        pvec = [str((pairing or {}).get(s, '')) for s in sub] if pairing else None
-        cov = None
-        if covariates is not None and len(covariates.columns):
-            cov = ds.covariate_frame(covariates, sub, list(covariates.columns),
-                                     numeric=list(numeric_covariates or []))
+        pvec = [str((pairing or {}).get(s, '')) for s in sub] if pairing and use_pairing else None
         X, _cn, gcols = ds.build_design(gvec, base, pvec, cov)
         group_idx = sorted(gcols.values())
         reduced = np.delete(X, group_idx, axis=1)
@@ -989,18 +1018,365 @@ def run_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs:
 
 
 # ---------------------------------------------------------------------------
+# Enrichment with a numeric variable (age, time)
+# ---------------------------------------------------------------------------
+
+def _f_scores(p) -> np.ndarray:
+    """Normal scores of curve-test p-values: large when the change is
+    strong, about 0 on average when there is none."""
+    p = np.asarray(p, dtype=float)
+    return np.where(np.isfinite(p), stats.norm.isf(np.clip(p, 1e-300, 1.0 - 1e-12)), np.nan)
+
+
+def _trend_rank_stats(Y: np.ndarray, design, metric: str) -> dict:
+    """Per feature: slope, its moderated t and df, the ranking statistic r
+    of the slope, and the curve test's p-value and normal score."""
+    from honeychrome.controller_components import moderated_stats as ms
+
+    f = ms.f_test(Y, design.X_s, design.cols_s)
+    line = ms.e_bayes(ms.lm_fit(Y, design.X_l))
+    j = design.cols_l[0]
+    b, t, df = line.coefficients[:, j], line.t[:, j], line.df_total
+    return {'slope': b, 't': t, 'df': df, 'r': _signed_stat(b, t, df, metric),
+            'p_curve': f.p_value, 'z_curve': _f_scores(f.p_value)}
+
+
+def trend_enrichment(prep: dict, samples: list[str], time, *, variable: str = 'time',
+                     group_vec: list[str] | None = None, scale: str = 'linear',
+                     shape: str = 'curve', k: int = 2, interaction: bool = False,
+                     baseline: str | None = None, pairing_vec: list[str] | None = None,
+                     covariates: pd.DataFrame | None = None,
+                     rank_metric: str = 'signed_log10p', n_perm: int = DEFAULT_N_PERM,
+                     seed: int = DEFAULT_SEED, min_set_size: int = MIN_SET_SIZE,
+                     progress=None, return_null: bool = False) -> dict:
+    """
+    Immune states that change with a numeric variable, on prepared features
+    (``prepare``). The trend model is that of the Results page
+    (``trend_stats.trend_design``: groups, pairing and covariates as
+    adjustment, a curve and a straight line in the variable).
+
+    * Directional ("gained or lost with age"): features ranked by the
+      signed slope statistic; ES/NES, the mean signed slope t (self-
+      contained) and CAMERA (competitive), as for group comparisons.
+    * Any direction ("changed with age, whatever the shape"): the mean of
+      the members' curve-test normal scores (p turned into a z-score), so
+      a state whose members rise and fall is found even when their slopes
+      are near zero.
+    * Null: residuals of the model without the variable are permuted
+      (Freedman & Lane 1983) within the exchangeable units of
+      ``TrendDesign.permutation`` (within groups; within donors sampled
+      several times; whole pairs when the pair shares the value) and every
+      feature refitted. p = (1 + exceedances) / (1 + permutations).
+
+    samples, time, group_vec, pairing_vec : per sample, in the same order.
+    return_null : also return the observed and permutation statistics
+                  ('null': {'states', 'es', 'mean_t', 'curve_score' and the
+                  same with an '_obs' suffix}), so that runs with different
+                  seeds can be pooled.
+    Returns {'label', 'states', 'members', 'ranks', 'notes', 'n_perm',
+    'seed', 'samples'}.
+    """
+    from honeychrome.controller_components import moderated_stats as ms
+    from honeychrome.controller_components import trend_stats as ts
+
+    values = prep['values'].reindex(samples)
+    design = ts.trend_design(samples, time, variable=variable, scale=scale, shape=shape, k=k,
+                             group_vec=group_vec, interaction=interaction, baseline=baseline,
+                             pairing_vec=pairing_vec, covariates=covariates)
+    Y = values.iloc[design.rows].to_numpy(dtype=float).T
+    feats = np.array(values.columns)
+    obs = _trend_rank_stats(Y, design, rank_metric)
+    n_obs = np.isfinite(Y).sum(axis=1)
+    usable = (np.isfinite(obs['r']) & np.isfinite(obs['z_curve'])
+              & (n_obs >= design.X_s.shape[1] + MIN_OBSERVED_PER_GROUP))
+    col_of = {f: i for i, f in enumerate(feats[usable])}
+    testable = [s for s in prep['sets'] if s['testable']]
+    sets_idx = []
+    for s in testable:
+        pairs = [(col_of[f], sg) for f, sg in zip(s['features'], s['signs']) if f in col_of]
+        sets_idx.append((np.array([p[0] for p in pairs], dtype=int),
+                         np.array([p[1] for p in pairs], dtype=float)))
+    ok_sets = [i for i, (idx, _s) in enumerate(sets_idx) if len(idx) >= min_set_size]
+    sets_eval = [sets_idx[i] for i in ok_sets]
+    unsigned = [(idx, np.ones(len(idx))) for idx, _sg in sets_eval]
+    Yu = Y[usable]
+    r_obs = obs['r'][usable]
+    t_obs = obs['t'][usable]
+    es_obs = enrichment_scores(r_obs[None, :], sets_eval)[0] if sets_eval else np.zeros(0)
+    mt_obs = _set_mean_t(t_obs, sets_eval)[0]
+    fz_obs = _set_mean_t(obs['z_curve'][usable], unsigned)[0]
+    n_perm = int(min(max(int(n_perm), 100), MAX_N_PERM))
+    null = np.zeros((n_perm, len(sets_eval)))
+    mt_null = np.zeros((n_perm, len(sets_eval)))
+    fz_null = np.zeros((n_perm, len(sets_eval)))
+    rng = np.random.default_rng(int(seed))
+    if sets_eval:
+        Xn = design.X_null
+        fit_n = ms.lm_fit(Yu, Xn)
+        fitted = np.nan_to_num(fit_n.coefficients) @ Xn.T
+        resid = Yu - fitted
+        for i in range(n_perm):
+            st = _trend_rank_stats(fitted + resid[:, design.permutation(rng)], design,
+                                   rank_metric)
+            null[i] = enrichment_scores(np.nan_to_num(st['r'])[None, :], sets_eval)[0]
+            mt_null[i] = _set_mean_t(st['t'], sets_eval)[0]
+            fz_null[i] = _set_mean_t(st['z_curve'], unsigned)[0]
+            if progress is not None and ((i + 1) % 50 == 0 or i + 1 == n_perm):
+                progress((i + 1) / n_perm, f"{i + 1} of {n_perm} permutations")
+    nes, p, fwer = _null_summary(es_obs, null)
+    with np.errstate(invalid='ignore'):
+        p_self = (1 + (np.abs(mt_null) >= np.abs(mt_obs)).sum(axis=0)) / (1 + n_perm)
+        p_any = (1 + (fz_null >= fz_obs).sum(axis=0)) / (1 + n_perm)
+    cam = camera_scores(Yu, design.X_l, t_obs, obs['df'][usable], sets_eval)
+    label = trend_label(variable, design.order, interaction)
+    label_of = dict(zip(prep['features']['feature'], prep['features']['label']))
+    usable_feats = feats[usable]
+    state_rows, member_rows = [], []
+    for j_eval, j_set in enumerate(ok_sets):
+        s = testable[j_set]
+        idx, sg = sets_idx[j_set]
+        rs = running_sum(r_obs, idx, sg)
+        lead = [usable_feats[i] for i, flag in zip(idx, rs['leading']) if flag]
+        state_rows.append({
+            'comparison': label, 'immune_state': s['name'], 'n_library': s['n_library'],
+            'n_matched': s['n_matched'], 'n_tested': int(len(idx)),
+            'ES': float(es_obs[j_eval]), 'NES': float(nes[j_eval]), 'p': float(p[j_eval]),
+            'FWER': float(fwer[j_eval]), 'mean_t': float(mt_obs[j_eval]),
+            'p_self': float(p_self[j_eval]), 'camera_t': float(cam['t'][j_eval]),
+            'camera_cor': float(cam['cor'][j_eval]), 'p_camera': float(cam['p'][j_eval]),
+            'curve_score': float(fz_obs[j_eval]), 'p_any': float(p_any[j_eval]),
+            'direction': 'gained' if es_obs[j_eval] >= 0 else 'lost',
+            'leading_edge': '; '.join(label_of.get(f, f) for f in lead),
+            'n_leading': len(lead), 'note': s['note']})
+        for i, sign, flag, pos in zip(idx, sg, rs['leading'], rs['positions']):
+            f = usable_feats[i]
+            member_rows.append({
+                'comparison': label, 'immune_state': s['name'], 'feature': f,
+                'label': label_of.get(f, f), 'sign': int(sign),
+                'logFC': float(obs['slope'][usable][i]), 't': float(t_obs[i]),
+                'r': float(r_obs[i]), 'p_curve': float(obs['p_curve'][usable][i]),
+                'rank': int(pos) + 1, 'leading_edge': bool(flag)})
+    states = pd.DataFrame(state_rows)
+    if len(states):
+        for col, fdr in (('p', 'FDR'), ('p_self', 'FDR_self'), ('p_camera', 'FDR_camera'),
+                         ('p_any', 'FDR_any')):
+            states[fdr] = ms.bh_adjust(states[col].to_numpy(dtype=float))
+        states = states.sort_values('p', kind='stable').reset_index(drop=True)
+    ranks = pd.DataFrame({'comparison': label, 'feature': usable_feats,
+                          'logFC': obs['slope'][usable], 't': t_obs, 'df': obs['df'][usable],
+                          'r': r_obs, 'p_curve': obs['p_curve'][usable]})
+    out = {'label': label, 'states': states, 'members': pd.DataFrame(member_rows),
+           'ranks': ranks, 'notes': list(design.notes), 'n_perm': n_perm, 'seed': int(seed),
+           'samples': [samples[i] for i in design.rows]}
+    if return_null:
+        out['null'] = {'states': [testable[j]['name'] for j in ok_sets], 'es': null,
+                       'mean_t': mt_null, 'curve_score': fz_null, 'es_obs': es_obs,
+                       'mean_t_obs': mt_obs, 'curve_score_obs': fz_obs}
+    return out
+
+
+def pattern_overrepresentation(patterns: pd.Series, prep: dict,
+                               min_overlap: int = 2) -> pd.DataFrame:
+    """
+    Over-representation of each immune state's populations among each
+    shape pattern's populations.
+
+    patterns : pattern name per tested population key ('' when not called),
+               e.g. the 'pattern' column of a frequency trend table indexed
+               by population key.
+    prep     : ``prepare`` output; a state's populations are those of its
+               matched features.
+
+    For each pattern and state: the overlap of the pattern's populations
+    with the state's tested populations, the fold enrichment against all
+    tested populations, the hypergeometric p (one-sided, more than
+    expected) and BH FDR over all pattern × state pairs with an overlap of
+    at least *min_overlap*.
+    """
+    from honeychrome.controller_components import moderated_stats as ms
+
+    pop_of = dict(zip(prep['features']['feature'], prep['features']['pop_key']))
+    universe = set(str(k) for k in patterns.index)
+    N = len(universe)
+    rows = []
+    for name in [p for p in dict.fromkeys(patterns) if p]:
+        in_pattern = set(str(k) for k, v in patterns.items() if v == name)
+        for s in prep['sets']:
+            if not s['testable']:
+                continue
+            members = {str(pop_of.get(f)) for f in s['features']} & universe
+            overlap = len(members & in_pattern)
+            if not members or overlap < min_overlap:
+                continue
+            expected = len(members) * len(in_pattern) / N if N else np.nan
+            rows.append({'pattern': name, 'immune_state': s['name'], 'n_pattern': len(in_pattern),
+                         'n_state': len(members), 'overlap': overlap,
+                         'fold': overlap / expected if expected else np.nan,
+                         'p': float(stats.hypergeom.sf(overlap - 1, N, len(members),
+                                                       len(in_pattern))),
+                         'populations': '; '.join(sorted(members & in_pattern))})
+    out = pd.DataFrame(rows, columns=['pattern', 'immune_state', 'n_pattern', 'n_state',
+                                      'overlap', 'fold', 'p', 'populations'])
+    out['FDR'] = ms.bh_adjust(out['p'].to_numpy(dtype=float)) if len(out) else []
+    return out.sort_values('p', kind='stable').reset_index(drop=True)
+
+
+
+def run_trend_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs: list[dict],
+                         library: pd.DataFrame, *, time: dict, variable: str, unit: str = '',
+                         scale: str = 'linear', shape: str = 'curve', k: int = 2,
+                         interaction: bool = False, baseline: str = '',
+                         pairing: dict | None = None, covariates: pd.DataFrame | None = None,
+                         numeric_covariates=None, patterns: pd.Series | None = None,
+                         library_info: dict | None = None, anchor_key: str = '',
+                         feature_types=FEATURE_TYPES, marker_readout: str = 'positivity',
+                         rank_metric: str = 'signed_log10p', use_stats_parent: bool = True,
+                         min_parent_events: int = 0,
+                         min_marker_events: int = ag_results.DEFAULT_MIN_MARKER_EVENTS,
+                         exclude_gating_markers: bool = True, channel_antigens: dict | None = None,
+                         cell_type_overrides: dict | None = None, n_perm: int = DEFAULT_N_PERM,
+                         seed: int = DEFAULT_SEED, min_set_size: int = MIN_SET_SIZE,
+                         progress=None, stop_check=None) -> dict:
+    """
+    Flow Set Enrichment Analysis of gated results against a numeric
+    variable (``trend_enrichment``), in the result layout of
+    ``run_enrichment`` with one labelled test instead of comparisons
+    ('labels'; see ``comparison_labels``) and 'kind' 'trend' in settings.
+
+    time       : {sample: value of the variable}; samples without one are
+                 left out.
+    groups, pairing, covariates, numeric_covariates : as for the trend test
+                 on the Results page; with *interaction* exactly two groups.
+    patterns   : optional shape pattern of each population key (the
+                 'pattern' column of a frequency trend result), for the
+                 pattern × state over-representation table
+                 ('pattern_states').
+
+    Raises FseaBlocked with fewer than MIN_TOTAL_SAMPLES samples with a
+    value, or no testable state.
+    """
+    from time import perf_counter
+
+    from honeychrome.controller_components import differential_stats as ds
+
+    t_start = perf_counter()
+    if rank_metric not in RANK_METRICS:
+        raise ValueError(f"rank_metric must be one of {RANK_METRICS}")
+
+    def _progress(frac, msg):
+        if progress is not None:
+            progress(float(frac), msg)
+        if stop_check is not None and stop_check():
+            raise FseaCancelled("Enrichment stopped.")
+
+    used = [s for s in samples if groups.get(s) and np.isfinite(_as_float(time.get(s)))]
+    if len(used) < MIN_TOTAL_SAMPLES:
+        raise FseaBlocked(f"Only {len(used)} sample(s) have a value for '{variable}'; "
+                          f"enrichment needs at least {MIN_TOTAL_SAMPLES}.")
+    _progress(0.0, "Building features …")
+    prep = prepare(summaries, used, gate_defs, library, anchor_key=anchor_key,
+                   feature_types=feature_types, marker_readout=marker_readout,
+                   use_stats_parent=use_stats_parent, min_marker_events=min_marker_events,
+                   exclude_gating_markers=exclude_gating_markers,
+                   channel_antigens=channel_antigens, cell_type_overrides=cell_type_overrides,
+                   min_set_size=min_set_size, min_parent_events=min_parent_events)
+    if prep['values'].shape[1] < 3:
+        raise FseaBlocked("Fewer than three features to rank.")
+    if not any(s['testable'] for s in prep['sets']):
+        raise FseaBlocked(f"No immune state has {min_set_size} or more matched features.")
+    cov = None
+    if covariates is not None and len(covariates.columns):
+        names = [c for c in covariates.columns if c != variable]
+        if names:
+            cov = ds.covariate_frame(covariates[names], used, names,
+                                     numeric=list(numeric_covariates or []), allow_missing=True)
+    group_vec = [groups[s] for s in used]
+    res = trend_enrichment(
+        prep, used, [_as_float(time.get(s)) for s in used], variable=variable,
+        group_vec=group_vec, scale=scale, shape=shape, k=k, interaction=interaction,
+        baseline=baseline or None,
+        pairing_vec=[str(pairing.get(s, f"__unpaired_{s}")) for s in used] if pairing else None,
+        covariates=cov, rank_metric=rank_metric, n_perm=n_perm, seed=seed,
+        min_set_size=min_set_size,
+        progress=lambda f, m: _progress(f, f"{variable}: {m}"))
+    states = res['states']
+    tested = {s['name'] for s in prep['sets'] if s['testable']}
+    extra = [{'comparison': res['label'], 'immune_state': s['name'], 'n_library': s['n_library'],
+              'n_matched': s['n_matched'], 'n_tested': 0, 'NES': np.nan, 'p': np.nan,
+              'FDR': np.nan, 'FWER': np.nan, 'direction': '', 'leading_edge': '',
+              'n_leading': 0, 'note': s['note'] if s['name'] not in tested else
+              f"not testable with this variable: fewer than {min_set_size} features measured"}
+             for s in prep['sets'] if s['name'] not in set(states.get('immune_state', []))]
+    if extra:
+        states = pd.concat([states, pd.DataFrame(extra)], ignore_index=True)
+    pattern_states = (pattern_overrepresentation(patterns, prep) if patterns is not None
+                      and (patterns.astype(str) != '').any() else pd.DataFrame())
+    _progress(1.0, "Enrichment complete.")
+    notes = list(prep['notes']) + list(res['notes'])
+    return {
+        'format_version': FORMAT_VERSION,
+        'settings': {'anchor': prep['anchor'], 'feature_types': list(feature_types),
+                     'marker_readout': marker_readout, 'rank_metric': rank_metric,
+                     'n_perm': res['n_perm'], 'seed': int(seed), 'min_set_size': int(min_set_size),
+                     'use_stats_parent': bool(use_stats_parent),
+                     'min_marker_events': int(min_marker_events),
+                     'min_parent_events': int(min_parent_events),
+                     'exclude_gating_markers': bool(exclude_gating_markers),
+                     'engine': 'residual permutation (Freedman–Lane), trend', 'kind': 'trend',
+                     'variable': variable, 'unit': unit, 'scale': scale, 'shape': shape,
+                     'interaction': bool(interaction)},
+        'library': dict(library_info or {}),
+        'samples': list(res['samples']), 'group_vec': [groups[s] for s in res['samples']],
+        'comparisons': [], 'labels': [res['label']], 'blocked': [], 'notes': notes,
+        'features': prep['features'], 'hygiene': prep['hygiene'], 'matches': prep['matches'],
+        'states': states, 'members': res['members'], 'ranks': res['ranks'],
+        'pattern_states': pattern_states,
+        'sets': [{k2: v for k2, v in s.items()} for s in prep['sets']],
+        'cell_types': {k2: v for k2, v in prep['cell_types'].items()},
+        'seconds': round(perf_counter() - t_start, 2),
+    }
+
+
+def _as_float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float('nan')
+
+
+def trend_label(variable: str, groups: list[str] | None = None,
+                interaction: bool = False) -> str:
+    """Name of a trend test: 'Trend with age', or for a group × trend test
+    'Spleen − Blood × age' (*groups* with the baseline first)."""
+    if interaction and groups and len(groups) == 2:
+        return f"{groups[1]} − {groups[0]} × {variable}"
+    return f"Trend with {variable}"
+
+
+def comparison_labels(result: dict) -> list[str]:
+    """Labels of the tests of an enrichment result: 'Other vs Base' per
+    comparison, or the trend's label."""
+    if result.get('labels'):
+        return list(result['labels'])
+    return [f"{o} vs {b}" for b, o in result.get('comparisons') or []]
+
+# ---------------------------------------------------------------------------
 # Tables, curves and saving
 # ---------------------------------------------------------------------------
 
-_FRAMES = ('features', 'hygiene', 'matches', 'states', 'members', 'ranks')
+_FRAMES = ('features', 'hygiene', 'matches', 'states', 'members', 'ranks', 'pattern_states')
 
 
 def result_tables(result: dict) -> dict[str, pd.DataFrame]:
     """The result's tables for CSV export: states, leading_edge (members),
     matches, features, hygiene."""
-    return {'states': result['states'], 'leading_edge': result['members'],
-            'matches': result['matches'], 'features': result['features'],
-            'hygiene': result['hygiene']}
+    out = {'states': result['states'], 'leading_edge': result['members'],
+           'matches': result['matches'], 'features': result['features'],
+           'hygiene': result['hygiene']}
+    pattern_states = result.get('pattern_states')
+    if pattern_states is not None and len(pattern_states):
+        out['pattern_states'] = pattern_states
+    return out
 
 
 def state_curve(result: dict, comparison: str, state: str) -> dict | None:

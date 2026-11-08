@@ -275,6 +275,9 @@ def get_profile(
         return profile, n_events
     return profile
 
+WLS_MEAN_SAMPLE_EVENTS = 20_000  # random events read per sample for the WLS detector means
+
+
 def compute_sample_means_for_wls(
     experiment_dir,
     experiment_samples: dict,
@@ -284,6 +287,12 @@ def compute_sample_means_for_wls(
     """
     Compute per-detector mean raw fluorescence across real experimental samples,
     for use as WLS (Poisson) weights.
+
+    Each sample contributes the mean of a seeded random subset of at most
+    WLS_MEAN_SAMPLE_EVENTS events, read without loading the whole file
+    (fcs_preview), weighted by the sample's full event count, so the result
+    estimates the mean over every event of every sample. A file the streamed
+    reader cannot handle is read in full.
 
     Selection priority:
       1. Samples in all_samples that are NOT in single_stain_controls and NOT
@@ -295,6 +304,9 @@ def compute_sample_means_for_wls(
     import re
     from pathlib import Path
     from honeychrome.controller_components.functions import sample_from_fcs
+    from honeychrome.controller_components.fcs_preview import (
+        read_preview_metadata, preview_indices, read_fcs_rows,
+    )
 
     all_samples = experiment_samples.get('all_samples', {})
     controls = set(experiment_samples.get('single_stain_controls', []))
@@ -329,15 +341,26 @@ def compute_sample_means_for_wls(
     channel_sums = None
     n_events_total = 0
     for path in candidates:
+        full_path = Path(experiment_dir) / path
         try:
-            sample = sample_from_fcs(Path(experiment_dir) / path)
             try:
-                all_events = sample.get_events('raw', col_order=col_order)
-            except (KeyError, ValueError):
-                all_events = sample.get_events('raw')
+                metadata = read_preview_metadata(full_path)
+                rows = preview_indices(metadata.event_count, WLS_MEAN_SAMPLE_EVENTS)
+                all_events = read_fcs_rows(full_path, rows, col_order, metadata)
+                n_file = metadata.event_count
+            except ValueError:
+                sample = sample_from_fcs(full_path)
+                try:
+                    all_events = sample.get_events('raw', col_order=col_order)
+                except (KeyError, ValueError):
+                    all_events = sample.get_events('raw')
+                n_file = len(all_events)
             fl = all_events[:, fl_ids_local].astype(np.float64)
-            channel_sums = fl.sum(axis=0) if channel_sums is None else channel_sums + fl.sum(axis=0)
-            n_events_total += fl.shape[0]
+            if not len(fl):
+                continue
+            weighted = fl.mean(axis=0) * n_file
+            channel_sums = weighted if channel_sums is None else channel_sums + weighted
+            n_events_total += n_file
         except Exception:
             continue
 
@@ -383,9 +406,10 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
     raw_length = np.shape(M)[1]
     unmixed_length = np.shape(M)[0]
 
-    Mnorm = M / np.tile(np.sqrt(np.sum(M**2, axis=0)), (unmixed_length,1))
-    Mnorm[np.isnan(Mnorm)] = 0
-    similarity_matrix = cosine_similarity(Mnorm)
+    # cosine similarity of the peak-normalised (L-infinity) spectra, as shown in the Profiles Viewer
+    peaks = np.max(np.abs(M), axis=1, keepdims=True)
+    M_peak = np.divide(M, peaks, out=np.zeros(M.shape), where=peaks > 0)
+    similarity_matrix = cosine_similarity(M_peak)
     hotspot_matrix = np.sqrt(np.abs(np.linalg.inv(similarity_matrix)))
 
     # --- Spectral profile QC: condition number + inter-profile cosine similarity ---
