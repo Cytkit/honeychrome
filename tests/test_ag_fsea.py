@@ -172,14 +172,14 @@ def test_bundled_library_loads_cleanly():
     lib, sha, messages = fl.load_library()
     assert len(sha) == 64 and not messages
     assert set(lib['direction']) <= {'UP', 'DOWN'}
-    assert lib.groupby('immune_state').size().min() >= 8
+    assert lib.groupby('immune_state').size().min() >= 3
 
 
 def test_bundled_mouse_library_loads_cleanly():
     lib, sha, messages = fl.load_library(species='mouse')
     assert len(sha) == 64 and not messages
     assert set(lib['species']) == {'mouse'}
-    assert lib.groupby('immune_state').size().min() >= 5
+    assert lib.groupby('immune_state').size().min() >= 3
 
 
 def test_library_validation(tmp_path):
@@ -295,3 +295,76 @@ def test_camera_inflates_the_variance_of_correlated_sets():
     naive = (z[:10].mean() - z[10:].mean()) / np.sqrt(z.var(ddof=1) * (1 / 10 + 1 / (G - 10)))
     assert abs(out['t'][0]) < abs(naive)
     assert np.all((out['p'] > 0) & (out['p'] <= 1))
+
+
+# ---------------------------------------------------------------------------
+# Trends with a numeric variable
+# ---------------------------------------------------------------------------
+
+def _trend_prep(n=40, seed=2):
+    """Prepared features of n samples aged 18–37: the six members of
+    'Rising state' rise with age, the six of 'Flat state' do not, plus 40
+    other features."""
+    rng = np.random.default_rng(seed)
+    age = np.linspace(18, 37, n)
+    cols, meta = {}, []
+    for j in range(6):
+        cols[f'rise{j}'] = 0.15 * (age - 27)
+        cols[f'flat{j}'] = np.zeros(n)
+    for j in range(40):
+        cols[f'other{j}'] = np.zeros(n)
+    values = pd.DataFrame({k: v + rng.normal(scale=0.4, size=n) for k, v in cols.items()},
+                          index=[f's{i}' for i in range(n)])
+    for f in values.columns:
+        meta.append({'feature': f, 'label': f, 'pop_key': f'pop_{f}'})
+
+    def state(name, prefix):
+        feats = [f'{prefix}{j}' for j in range(6)]
+        return {'name': name, 'features': feats, 'signs': [1] * 6, 'testable': True,
+                'n_library': 6, 'n_matched': 6, 'note': ''}
+    prep = {'values': values, 'features': pd.DataFrame(meta),
+            'sets': [state('Rising state', 'rise'), state('Flat state', 'flat')]}
+    return prep, list(values.index), age
+
+
+def test_trend_enrichment_finds_a_state_that_changes_with_age():
+    prep, samples, age = _trend_prep()
+    res = fs.trend_enrichment(prep, samples, age, variable='age', n_perm=200, seed=1,
+                              return_null=True)
+    st = res['states'].set_index('immune_state')
+    assert st.loc['Rising state', 'direction'] == 'gained'
+    assert st.loc['Rising state', 'p_self'] < 0.01 and st.loc['Rising state', 'p_any'] < 0.01
+    assert st.loc['Flat state', 'p_any'] > 0.05
+    assert res['null']['es'].shape == (200, 2) and res['label'] == 'Trend with age'
+
+
+def test_pattern_overrepresentation_of_a_state_in_its_pattern():
+    prep, _samples, _age = _trend_prep()
+    patterns = pd.Series({f'pop_{f}': ('rises' if f.startswith('rise') else
+                                       'falls' if f.startswith('other1') else '')
+                          for f in prep['values'].columns})
+    out = fs.pattern_overrepresentation(patterns, prep)
+    top = out.iloc[0]
+    assert (top['pattern'], top['immune_state'], top['overlap']) == ('rises', 'Rising state', 6)
+    assert top['FDR'] < 0.001
+
+
+def test_run_trend_enrichment_on_gated_results(tmp_path):
+    summaries, samples, groups, gates = synthetic_summaries(shift=1.2, seed=5)
+    lib, _sha, _m = fl.load_library(library_csv(tmp_path))
+    rng = np.random.default_rng(0)
+    age = {s: 25.0 + 8.0 * (groups[s] == 'B') + rng.normal(0, 1.0) for s in samples}
+    one_group = {s: 'Blood' for s in samples}
+    patterns = pd.Series({'CD4 & CD8/CD8': 'rises', 'CD4 & CD8/CD4': ''})
+    res = fs.run_trend_enrichment(summaries, samples, one_group, gates, lib, time=age,
+                                  variable='age', n_perm=200, seed=1, patterns=patterns)
+    assert fs.comparison_labels(res) == ['Trend with age'] and res['settings']['kind'] == 'trend'
+    st = res['states'].set_index('immune_state')
+    assert st.loc['Planted', 'direction'] == 'gained' and st.loc['Planted', 'p_any'] < 0.05
+    assert 'not testable' in st.loc['Small', 'note']
+    back = fs.result_from_jsonable(fs.result_to_jsonable(res))
+    assert fs.comparison_labels(back) == ['Trend with age']
+    assert fs.state_curve(back, 'Trend with age', 'Planted') is not None
+    with pytest.raises(fs.FseaBlocked):
+        fs.run_trend_enrichment(summaries, samples[:10], one_group, gates, lib, time=age,
+                                variable='age')

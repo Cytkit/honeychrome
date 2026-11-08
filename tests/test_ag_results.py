@@ -712,3 +712,124 @@ def test_counts_only_hits_against_the_parent():
     assert ar.counts_only_hits(stats) == {('b vs a', 'y')}
     stats['counts_reference'] = 'anchor'
     assert ar.counts_only_hits(stats) == set()
+
+
+def _aged_summaries(n=24):
+    """Samples whose T-cell fraction rises with age."""
+    gates = _hierarchy()
+    ref = _reference(gates)
+    ages = np.linspace(18, 37, n)
+    summaries, groups, time = {}, {}, {}
+    for i, age in enumerate(ages):
+        key = f'f{i}'
+        frac = 0.2 + 0.025 * (age - 18)
+        summaries[key] = _summarise(_sample(400 + i, frac_t=frac), gates, ref)
+        groups[key] = 'Blood'
+        time[key] = float(age)
+    return gates, summaries, groups, time
+
+
+@pytest.mark.numpy_only
+def test_run_trend_statistics_finds_a_population_changing_with_age():
+    import json
+    gates, summaries, groups, time = _aged_summaries()
+    samples = list(summaries)
+    cov = pd.DataFrame({'age': [str(time[k]) for k in samples]}, index=samples)
+    out = ar.run_trend_statistics(summaries, samples, groups, gates, time=time, variable='age',
+                                  unit='weeks', covariates=cov, numeric_covariates=['age'],
+                                  run_freq=True, run_markers=True, min_r2=0.0)
+    freq = out['freq'].table.set_index('feature')
+    assert freq.loc['T/pos', 'significant'] and freq.loc['T/pos', 'direction'] == 'up'
+    assert freq.loc['T/pos', 'slope'] > 0
+    assert not freq.loc['Lymph/pos', 'significant']
+    assert out['markers'] is not None and out['settings']['df'] == 2
+
+    back = ar.trend_from_jsonable(json.loads(json.dumps(ar.trend_to_jsonable(out))))
+    pd.testing.assert_frame_equal(back['freq'].table, out['freq'].table, check_dtype=False)
+    np.testing.assert_allclose(back['freq'].curves, out['freq'].curves)
+    pd.testing.assert_frame_equal(back['freq_values'], out['freq_values'], check_dtype=False)
+
+    above_all = float(out['freq'].table['R2'].max()) + 1e-6
+    strict = ar.reapply_trend_thresholds(out, 0.05, above_all, 'either')
+    assert not strict['freq'].table['significant'].any()
+    assert strict['settings']['min_r2'] == above_all
+    tables = ar.trend_tables(out, {'T/pos': 'T cells'})
+    assert set(tables) == {'trend_frequencies', 'trend_markers'}
+    assert 'T cells' in set(tables['trend_frequencies']['population'])
+
+
+@pytest.mark.numpy_only
+def test_immune_age_model_is_kept_with_the_trend_run():
+    import json
+    pytest.importorskip('sklearn')
+    import drc_predictive
+    gates, summaries, groups, time = _aged_summaries()
+    samples = list(summaries)
+    out = ar.run_trend_statistics(summaries, samples, groups, gates, time=time, variable='age',
+                                  unit='weeks', run_freq=True, min_r2=0.0)
+    X = ar.predictive_matrix(out, True, False)
+    age = drc_predictive.run_age_model(X, [time[s] for s in X.index], repeats=1,
+                                       n_permutations=0)
+    age['summary']['group'] = 'Blood'
+    out['age_model'] = age
+    back = ar.trend_from_jsonable(json.loads(json.dumps(ar.trend_to_jsonable(out))))
+    pd.testing.assert_frame_equal(back['age_model']['predictions'], age['predictions'],
+                                  check_dtype=False)
+    assert back['age_model']['summary']['group'] == 'Blood'
+    tables = ar.trend_tables(out)
+    assert {'immune_age_predictions', 'immune_age_features'} <= set(tables)
+    assert set(tables['immune_age_predictions']['group']) == {'Blood'}
+    del out['age_model']
+    plain = ar.trend_from_jsonable(json.loads(json.dumps(ar.trend_to_jsonable(out))))
+    assert 'age_model' not in plain
+
+
+@pytest.mark.numpy_only
+def test_immune_age_model_predicts_samples_outside_the_trend_run():
+    import json
+    pytest.importorskip('sklearn')
+    import drc_predictive
+    gates, summaries, groups, time = _aged_summaries()
+    trend_samples = list(summaries)[:20]
+    others = list(summaries)[20:]
+    out = ar.run_trend_statistics({s: summaries[s] for s in trend_samples}, trend_samples,
+                                  groups, gates, time=time, variable='age', unit='weeks',
+                                  run_freq=True, min_r2=0.0)
+    X = ar.predictive_matrix(out, True, False)
+    source = ar.trend_feature_values(summaries, others, gates, use_freq=True)
+    X_other = ar.predictive_matrix(source, True, False)
+    assert list(X_other.index) == others and set(X_other.columns) <= set(X.columns)
+    whole = ar.trend_feature_values(summaries, trend_samples, gates, use_freq=True)
+    pd.testing.assert_frame_equal(whole['freq_values'], out['freq_values'][
+        whole['freq_values'].columns], check_dtype=False)
+    age = drc_predictive.run_age_model(X, [time[s] for s in X.index], X_other=X_other,
+                                       y_other=[np.nan] * len(others), repeats=1,
+                                       n_permutations=0)
+    age['groups'] = dict({s: 'Blood' for s in trend_samples}, **{s: 'Cord' for s in others})
+    out['age_model'] = age
+    table = drc_predictive.age_model_by_group(age, age['groups'])
+    cord = table.set_index('group').loc['Cord']
+    assert cord['n'] == len(others) and cord['n_actual'] == 0 and np.isnan(cord['mae'])
+    assert np.isfinite(cord['predicted_mean'])
+    rows = drc_predictive.age_group_rows(table, 'weeks')
+    assert rows[1]['Mean absolute error'] == '' and rows[1]['With a value'] == 0
+    back = ar.trend_from_jsonable(json.loads(json.dumps(ar.trend_to_jsonable(out))))
+    assert back['age_model']['groups'] == age['groups']
+    assert set(ar.trend_tables(out)['immune_age_predictions']['group']) == {'Blood', 'Cord'}
+
+
+@pytest.mark.numpy_only
+def test_trend_composition_stacks_one_gates_populations():
+    gates, summaries, groups, time = _aged_summaries()
+    samples = list(summaries)
+    out = ar.run_trend_statistics(summaries, samples, groups, gates, time=time, variable='age',
+                                  unit='weeks', run_freq=True, min_r2=0.0)
+    unit = ar.composition_gate(summaries, samples, 'T/pos')
+    assert unit is not None and set(unit['keys']) >= {'T/pos'} and len(unit['keys']) >= 2
+    panels = ar.trend_composition(summaries, out, 'T/pos')
+    assert len(panels) == 1 and panels[0]['label'] == 'Blood'
+    comp = panels[0]
+    np.testing.assert_allclose(comp['shares'].sum(axis=0), 1.0)
+    pos = comp['parts'].index(unit['labels']['T/pos'])
+    assert comp['shares'][pos, -1] > comp['shares'][pos, 0]
+    assert len(comp['samples']) == len(samples)
