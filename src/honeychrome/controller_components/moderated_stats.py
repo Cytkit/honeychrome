@@ -12,7 +12,11 @@ Methods and the papers they are written from:
 * ``e_bayes`` — the hierarchical model of Smyth (2004): residual variances
   are shrunk towards a common prior whose degrees of freedom ``d0`` and
   scale ``s0²`` are estimated by the method of moments on log variances.
-  Gives moderated t-statistics and p-values.
+  Gives moderated t-statistics and p-values (the p-values are worked out
+  when first read).
+* ``f_test`` — moderated F test of several coefficients at once (limma's
+  ``topTableF``), e.g. the columns of a spline in age, with each
+  feature's partial R² (the share of variation those columns explain).
 * ``treat_pvalues`` — TREAT (McCarthy & Smyth 2009): tests whether a
   coefficient's magnitude exceeds a threshold, rather than whether it
   differs from zero.
@@ -50,12 +54,17 @@ import pandas as pd
 from scipy import special, stats
 
 __all__ = [
-    'LinearFit', 'ModeratedFit', 'lm_fit', 'e_bayes', 'top_table',
+    'LinearFit', 'ModeratedFit', 'FTest', 'lm_fit', 'e_bayes', 'top_table',
+    'f_test', 'f_pvalues',
     'treat_pvalues', 'bh_adjust', 'simes', 'stagewise_adjust',
     'fit_prior_variance', 'trigamma_inverse', 'estimable_columns',
 ]
 
 _MIN_FEATURES = 3
+
+# Smallest ratio of the diagonal of R (X = QR) to its largest entry for a
+# design to be taken as full rank without computing its singular values.
+FULL_RANK_QR_RATIO = 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +91,29 @@ class ModeratedFit(LinearFit):
     s2_post: np.ndarray = None    # (G,) posterior variance s̃²
     df_total: np.ndarray = None   # (G,) d0 + d, capped at the pooled df
     t: np.ndarray = None          # (G, p) moderated t
-    p_value: np.ndarray = None    # (G, p) two-sided
+    p_value: np.ndarray = None    # (G, p) two-sided; see _moderated_p_value
+
+
+def _moderated_p_value(self) -> np.ndarray | None:
+    """
+    Two-sided p-values of the moderated t, computed the first time they are
+    read when the fit was made without them (e_bayes). Permutation tests
+    refit the model many times and read only one coefficient's t, so the
+    t-distribution tail of every coefficient (e.g. dozens of pairing
+    columns) is not worked out unless something asks for it.
+    """
+    p = self.__dict__.get('_p_value')
+    if p is None and self.t is not None and self.df_total is not None:
+        p = 2.0 * _t_sf(np.abs(self.t), np.asarray(self.df_total, dtype=float)[:, None])
+        self.__dict__['_p_value'] = p
+    return p
+
+
+def _set_moderated_p_value(self, value) -> None:
+    self.__dict__['_p_value'] = value
+
+
+ModeratedFit.p_value = property(_moderated_p_value, _set_moderated_p_value)
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +141,13 @@ def estimable_columns(X) -> tuple[np.ndarray, np.ndarray]:
     nonzero = np.flatnonzero(np.any(X != 0.0, axis=0))
     if nonzero.size == 0:
         return nonzero, np.zeros(0, dtype=bool)
+    # Most designs are full rank: a QR decomposition (cheaper than the
+    # singular values) settles that when no column comes close to the span
+    # of the ones before it; anything else takes the exact route below.
+    if X.shape[0] >= nonzero.size:
+        diag = np.abs(np.diag(np.linalg.qr(X[:, nonzero], mode='r')))
+        if diag.min() > FULL_RANK_QR_RATIO * diag.max():
+            return nonzero, np.ones(nonzero.size, dtype=bool)
     rank = np.linalg.matrix_rank(X[:, nonzero])
     if rank == nonzero.size:
         return nonzero, np.ones(nonzero.size, dtype=bool)
@@ -319,14 +357,13 @@ def e_bayes(fit: LinearFit) -> ModeratedFit:
     se = fit.stdev_unscaled * np.sqrt(s2_post)[:, None]
     with np.errstate(divide='ignore', invalid='ignore'):
         t = fit.coefficients / se
-    p = 2.0 * _t_sf(np.abs(t), df_total[:, None])
 
     return ModeratedFit(
         coefficients=fit.coefficients, stdev_unscaled=fit.stdev_unscaled,
         sigma2=fit.sigma2, df_residual=fit.df_residual, amean=fit.amean,
         n_obs=fit.n_obs, design=fit.design,
         df_prior=float(d0), s2_prior=float(s0_2), s2_post=s2_post,
-        df_total=df_total, t=t, p_value=p,
+        df_total=df_total, t=t, p_value=None,
     )
 
 
@@ -448,3 +485,61 @@ def top_table(fit: ModeratedFit, coef: int, threshold: float = 0.0,
         'SE': se,
         'df.total': df,
     })
+
+
+# ---------------------------------------------------------------------------
+# Moderated F test of several coefficients
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FTest:
+    """Joint test of some design columns for every feature."""
+    F: np.ndarray                 # (G,) moderated F
+    df1: np.ndarray               # (G,) columns tested (estimable for that feature)
+    df2: np.ndarray               # (G,) d0 + d, as for the moderated t
+    p_value: np.ndarray           # (G,)
+    partial_r2: np.ndarray        # (G,) share of the residual variation explained
+    fit: ModeratedFit             # the full model
+
+
+def f_pvalues(F, df1, df2) -> np.ndarray:
+    """Upper tail of F(df1, df2); the chi-square limit (F·df1 on df1) where
+    df2 is infinite."""
+    F, df1, df2 = np.broadcast_arrays(*(np.asarray(v, dtype=float) for v in (F, df1, df2)))
+    finite = np.where(np.isinf(df2), 1.0, df2)
+    with np.errstate(invalid='ignore'):
+        return np.where(np.isinf(df2), stats.chi2.sf(F * df1, df1), stats.f.sf(F, df1, finite))
+
+
+def f_test(expr, design, coefs) -> FTest:
+    """
+    Moderated F test that the design columns ``coefs`` are all zero.
+
+    F = (RSS_reduced − RSS_full) / df1 / s̃², where the reduced model drops
+    ``coefs``, df1 is the drop in residual df and s̃² the moderated residual
+    variance of the full model (e_bayes). For least squares the RSS drop
+    equals β̂ᵀ V⁻¹ β̂ with V the unscaled covariance of the tested
+    coefficients, so this is limma's moderated F (topTableF); with one
+    column it is the square of the moderated t. The p-value is from
+    F(df1, d0 + d). partial_r2 = (RSS_reduced − RSS_full) / RSS_reduced on
+    the ordinary residuals: the share of the variation left after the other
+    columns that the tested columns explain (the ANOVA partial η²).
+
+    Features with no residual df, or with none of ``coefs`` estimable over
+    their observed samples, get NaN.
+    """
+    X = np.asarray(design, dtype=float)
+    coefs = sorted(int(c) for c in coefs)
+    full = e_bayes(lm_fit(expr, X))
+    reduced = lm_fit(expr, np.delete(X, coefs, axis=1))
+    rss_full = np.where(full.df_residual > 0, full.sigma2 * full.df_residual, np.nan)
+    rss_reduced = np.where(reduced.df_residual > 0, reduced.sigma2 * reduced.df_residual, np.nan)
+    df1 = (reduced.df_residual - full.df_residual).astype(float)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        drop = np.maximum(rss_reduced - rss_full, 0.0)
+        F = np.where(df1 > 0, drop / df1 / full.s2_post, np.nan)
+        r2 = np.where(rss_reduced > 0, drop / rss_reduced, np.nan)
+    F = np.where(full.df_residual > 0, F, np.nan)
+    df1 = np.where(np.isfinite(F), df1, np.nan)
+    return FTest(F=F, df1=df1, df2=full.df_total, p_value=f_pvalues(F, df1, full.df_total),
+                 partial_r2=np.where(np.isfinite(F), r2, np.nan), fit=full)
