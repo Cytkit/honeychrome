@@ -36,7 +36,7 @@ import numpy as np
 import pandas as pd
 
 __all__ = [
-    'style_figure_theme', 'make_scatter_hover_handler', 'hide_hover_annotations', 'stamp_run_label',
+    'style_figure_theme', 'figure_background', 'DARK_BACKGROUND', 'LIGHT_BACKGROUND', 'make_scatter_hover_handler', 'hide_hover_annotations', 'stamp_run_label', 'place_run_label',
     'message_figure', 'make_heatmap_figure', 'make_volcano_figure',
     'group_pair_colours', 'draw_direction_ramp',
     'make_marker_summary_figure', 'make_comparison_heatmap_figure', 'significance_column',
@@ -44,6 +44,10 @@ __all__ = [
     'make_group_values_figure', 'GROUP_COLOURS',
 ]
 
+# Figure background: black in dark mode, white in light mode (plot area and
+# the margin around it alike).
+DARK_BACKGROUND = 'black'
+LIGHT_BACKGROUND = 'white'
 GROUP_COLOUR_A = '#4477AA'
 GROUP_COLOUR_B = '#EE6677'
 # Default colours of groups by their order, where no group colours are set.
@@ -154,6 +158,11 @@ def _recolour_default_text(fig, axes, fg: str, bg: str):
                 text.set_color(fg)
 
 
+def figure_background(is_dark: bool) -> str:
+    """Background colour of figures: DARK_BACKGROUND or LIGHT_BACKGROUND."""
+    return DARK_BACKGROUND if is_dark else LIGHT_BACKGROUND
+
+
 def style_figure_theme(fig, is_dark: bool, axes=None) -> str:
     """
     Apply dark or light background styling to every axis of *fig* (or to
@@ -162,12 +171,9 @@ def style_figure_theme(fig, is_dark: bool, axes=None) -> str:
     """
     if axes is None:
         axes = fig.axes
-    if is_dark:
-        fig.patch.set_facecolor('#1e1e1e')
-        fg, bg = 'white', '#2b2b2b'
-    else:
-        fig.patch.set_facecolor('white')
-        fg, bg = 'black', 'white'
+    bg = figure_background(is_dark)
+    fg = 'white' if is_dark else 'black'
+    fig.patch.set_facecolor(bg)
     for ax in axes:
         ax.set_facecolor(bg)
         ax.tick_params(colors=fg)
@@ -310,19 +316,47 @@ RUN_LABEL_BAND_INCHES = 0.3
 def stamp_run_label(fig, run_label: str):
     """Write the source run's label in the figure's upper-left corner. A
     figure laid out by constrained layout gives the label a band of its
-    own along the top, so it never covers a title or an axis."""
+    own along the top, so it never covers a title or an axis. The label is
+    kept as ``fig._run_label`` (see place_run_label)."""
     if not run_label:
         return
-    engine = fig.get_layout_engine()
-    if engine is not None and type(engine).__name__ == 'ConstrainedLayoutEngine':
-        engine.set(rect=(0.0, 0.0, 1.0, 1.0 - RUN_LABEL_BAND_INCHES / fig.get_figheight()))
-    fig.text(
+    fig._run_label = fig.text(
         0.01, 0.99, run_label,
         ha='left', va='top', fontsize=8, color='#555555',
         transform=fig.transFigure,
         bbox=dict(boxstyle='round,pad=0.25', facecolor='white',
                   edgecolor='#cccccc', alpha=0.85),
     )
+    place_run_label(fig, True)
+
+
+def place_run_label(fig, shown: bool = True):
+    """Show or hide the run label of stamp_run_label, and (constrained
+    layout) keep a band along the top for it only while it is shown: a
+    figure title then sits just below the band, with room kept for it at
+    its current size; without the label the layout places the title as
+    usual."""
+    label = getattr(fig, '_run_label', None)
+    if label is None:
+        return
+    label.set_visible(bool(shown))
+    engine = fig.get_layout_engine()
+    if engine is None or type(engine).__name__ != 'ConstrainedLayoutEngine':
+        return
+    height = fig.get_figheight()
+    top = 1.0 - (RUN_LABEL_BAND_INCHES / height if shown else 0.0)
+    suptitle = getattr(fig, '_suptitle', None)
+    if suptitle is not None and suptitle.get_text() and suptitle.get_visible():
+        suptitle.set_va('top')
+        if shown:
+            lines = suptitle.get_text().count('\n') + 1
+            title_h = lines * suptitle.get_fontsize() * 1.25 / 72.0 + 0.1
+            suptitle._autopos = False
+            suptitle.set_y(top)
+            top -= title_h / height
+        else:
+            suptitle._autopos = True
+    engine.set(rect=(0.0, 0.0, 1.0, top))
 
 
 def message_figure(text: str, title: str, is_dark: bool, run_label: str = ''):
@@ -675,7 +709,8 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
                         feature_labels: list[str] | None = None,
                         x_label: str | None = None, run_label: str = '',
                         group_a: str = '', group_b: str = '',
-                        group_colours: dict | None = None):
+                        group_colours: dict | None = None,
+                        x_limit: float | None = None, y_limit: float | None = None):
     """
     Volcano plot: x = effect (log2 fold change, log2 odds ratio or intensity
     difference), y = -log10 of the adjusted p-value that decides
@@ -696,6 +731,15 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
                      the left. When both are given, a ramp below the plot
                      names them (see draw_direction_ramp).
     group_colours  : optional {group: colour} for the ramp.
+    x_limit        : optional largest |effect| to show; the x axis is then
+                     symmetric about zero at that value plus 5% (at least
+                     1.5 x fc_threshold) instead of sized to this table,
+                     so several volcanos can share one scale.
+    y_limit        : optional largest -log10 adjusted p-value to show; the
+                     y axis then runs from zero to that value plus 15%.
+
+    The plot area is kept as ``fig._fo_range_axes``, so the figure options
+    can set its x and y ranges (figure_options.has_axis_range).
     """
     from matplotlib.figure import Figure
     from matplotlib.gridspec import GridSpec
@@ -786,8 +830,14 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
         if drawn_ci.size:
             ci_extent = float(drawn_ci.max())
     ci_extent = min(ci_extent, 2.0 * max(max_fc, fc_threshold))
-    x_lim = max(max_fc * 1.05, fc_threshold * 1.5, ci_extent * 1.05, 1e-6)
+    if x_limit is not None and np.isfinite(x_limit):
+        x_lim = max(float(x_limit) * 1.05, fc_threshold * 1.5, 1e-6)
+    else:
+        x_lim = max(max_fc * 1.05, fc_threshold * 1.5, ci_extent * 1.05, 1e-6)
     ax.set_xlim(-x_lim, x_lim)
+    if y_limit is not None and np.isfinite(y_limit):
+        y_top = max(float(y_limit), 1e-6) * 1.15
+        ax.set_ylim(-0.02 * y_top, y_top)
     if ax_ramp is not None:
         colour_a, colour_b = group_pair_colours(group_a, group_b, group_colours)
         draw_direction_ramp(ax_ramp, x_lim, group_a, group_b, colour_a, colour_b)
@@ -802,6 +852,7 @@ def make_volcano_figure(results_df: pd.DataFrame, title: str,
     style_figure_theme(fig, is_dark)
     stamp_run_label(fig, run_label)
     _separate_labels(fig, notes)
+    fig._fo_range_axes = ax
     return fig
 
 
