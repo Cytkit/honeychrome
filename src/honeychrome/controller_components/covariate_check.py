@@ -139,8 +139,8 @@ def parse_number(text) -> float | None:
     """A number from text, or None.
 
     Reads plain numbers, ``98%`` (98), thousands separators (``768,500``),
-    powers of ten (``1.116x10^6``, ``5.4 X 10^6``, ``2e6``) and gestation as
-    weeks+days (``33+1`` → 33 + 1/7 weeks). Comments in brackets are
+    powers of ten (``1.116x10^6``, ``5.4 X 10^6``, ``2e6``) and weeks+days
+    (``33+1`` → 33 + 1/7 weeks). Comments in brackets are
     dropped first (``5.8x10^6 (bloody)``). Anything else is None.
     """
     t = _COMMENT.sub('', str(text)).strip()
