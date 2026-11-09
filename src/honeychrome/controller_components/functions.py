@@ -1539,6 +1539,8 @@ def calc_dotplot2d(event_data, source_and_child_gates, gate_membership, id_chann
     dotmap = np.zeros([len(transform_x.scale)-1, len(transform_y.scale)-1])
     gate_list_ordered = list(gate_membership.keys())
     for gate in source_and_child_gates:
+        if gate not in gate_membership:
+            continue
         mask = gate_membership[gate]
         gate_key = gate_list_ordered.index(gate)
 

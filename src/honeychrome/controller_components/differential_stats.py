@@ -27,6 +27,18 @@ intensities. Used by the Honeycluster and Automated Gating plugins.
   observations fitted exactly as zero carry no degrees of freedom. The
   reported log fold change comes from a fit with edgeR's prior count, so a
   group with no events gives a finite estimate.
+* ``run_moderated`` with ``weights='capped'`` — for counts out of library
+  sizes that differ a lot between samples (e.g. FlowCode tissues of 40 and
+  4,000 barcoded cells). Each comparison is fitted on its own two groups,
+  on log2 odds with a prior count that is the same share of every sample
+  (edgeR's scaling of the prior count), and each observation is weighted
+  by the inverse of its counting (binomial) variance plus one variance
+  between samples shared by the whole experiment. The shared variance is
+  the median, over the comparisons whose groups are deep enough for
+  counting noise not to dominate, of each comparison's residual variance
+  beyond counting; it caps the weight of a deep sample at what samples
+  actually agree to, so an expanded clone in one mouse is not taken as
+  precise.
 * ``library_sizes`` — effective library sizes for compositional data:
   the totals, a robust (trimmed) rescaling that a few dominant features
   cannot move, or the totals of chosen control features.
@@ -72,13 +84,19 @@ __all__ = [
     'pairing_absorbed', 'build_design', 'log2_frequencies',
     'logit_proportions', 'sparse_features', 'run_moderated', 'run_glm_counts',
     'apply_significance', 'suggest_groupings_from_names', 'library_sizes',
-    'COUNT_TESTS', 'NORMALISATIONS',
+    'COUNT_TESTS', 'NORMALISATIONS', 'MODERATED_WEIGHTS',
 ]
 
 #: Counts tests offered by run_glm_counts(method=).
 COUNT_TESTS = ('ql', 'wald')
 #: Library-size methods offered by library_sizes(method=).
 NORMALISATIONS = ('total', 'robust', 'control')
+#: Observation weights offered by run_moderated(weights=).
+MODERATED_WEIGHTS = (None, 'capped')
+#: Capped weights: comparisons whose two groups have at least this many
+#: events per feature in their median sample set the shared variance
+#: between samples (shallower groups inflate it with counting noise).
+CAP_MIN_EVENTS_PER_FEATURE = 9
 
 
 # ---------------------------------------------------------------------------
@@ -913,6 +931,102 @@ def _moderated_fit_contrasts(data_df: pd.DataFrame, group_vec: list[str],
     return pd.concat(frames, ignore_index=True)
 
 
+def _scaled_logits(counts: np.ndarray, library: np.ndarray) -> np.ndarray:
+    """(features x samples) log2 odds of each count within its sample's
+    library size, log2((c + p) / (L - c + p)), with a prior count p of half
+    an event scaled by L over the mean library size, so the floor is the
+    same share of every sample. NaN counts stay NaN."""
+    lib = np.asarray(library, dtype=float)
+    prior = 0.5 * lib / np.mean(lib)
+    return np.log2((counts + prior) / (np.maximum(lib - counts, 0.0) + prior))
+
+
+def _counting_variance(counts: np.ndarray, library: np.ndarray) -> np.ndarray:
+    """(features x samples) binomial variance of each observation's log2
+    odds, 1 / (ln(2)^2 (c + 1/2)(L - c + 1/2) / (L + 1))."""
+    lib = np.asarray(library, dtype=float)
+    precision = (counts + 0.5) * (np.maximum(lib - counts, 0.0) + 0.5) / (lib + 1.0)
+    return 1.0 / (precision * np.log(2.0) ** 2)
+
+
+def _variance_beyond_counting(y: np.ndarray, v: np.ndarray, X: np.ndarray) -> float:
+    """Median over features of the unweighted residual variance minus the
+    feature's mean counting variance, at least 0."""
+    fit = ms.lm_fit(y, X)
+    with np.errstate(invalid='ignore'):
+        excess = fit.sigma2 - np.nanmean(np.where(np.isfinite(y), v, np.nan), axis=1)
+    ok = np.isfinite(excess) & (fit.df_residual > 0)
+    return max(float(np.median(excess[ok])), 0.0) if ok.any() else 0.0
+
+
+def _capped_fit_contrasts(counts_df: pd.DataFrame, library, group_vec: list[str],
+                          contrasts: list[tuple[str, str]], pairing_vec: list[str] | None,
+                          covariates: pd.DataFrame | None, too_few_hint: str = '') -> pd.DataFrame:
+    """
+    The capped-weights moderated fit (module docstring): every comparison on
+    its own samples, covariates and pairing (comparison_parts), weights
+    1 / (counting variance + shared variance between samples). Returns the
+    stacked per-comparison tables with 'feature' and 'comparison' columns;
+    ``attrs['notes']`` holds the comparison notes and the shared variance.
+    """
+    counts_all = counts_df.to_numpy(dtype=float)
+    lib_all = np.asarray(library, dtype=float)
+    parts = comparison_parts(group_vec, contrasts, covariates, pairing_vec=pairing_vec)
+    prepared, variances, deep, notes = [], [], [], []
+    for part in parts:
+        notes.extend(part['notes'])
+        if not part['tested']:
+            continue
+        rows = np.flatnonzero(part['mask'])
+        base, other = part['contrast']
+        groups = [group_vec[i] for i in rows]
+        pairing = ([pairing_vec[i] for i in rows]
+                   if pairing_vec is not None and part['paired'] else None)
+        X, _names, group_cols = build_design(groups, base, pairing, part['covariates'])
+        c = counts_all[rows].T
+        lib = lib_all[rows]
+        measured = np.isfinite(c).any(axis=1)
+        if int(measured.sum()) < 3:
+            msg = _TOO_FEW_FEATURES.format(n=int(measured.sum()), other=other, base=base)
+            raise RuntimeError(f"{msg} {too_few_hint}".strip())
+        y, v = _scaled_logits(c, lib), _counting_variance(c, lib)
+        variances.append(_variance_beyond_counting(y, v, X))
+        g = np.asarray(groups, dtype=object)
+        depth = min(float(np.median(lib[g == base])), float(np.median(lib[g == other])))
+        deep.append(depth >= CAP_MIN_EVENTS_PER_FEATURE * int(measured.sum()))
+        prepared.append((base, other, y, v, X, group_cols))
+    if not prepared:
+        raise RuntimeError("No comparison could be tested. " + " ".join(notes))
+    pool = [x for x, d in zip(variances, deep) if d] or variances
+    shared = float(np.median(pool))
+    source = (f"{len(pool)} comparison(s) with at least {CAP_MIN_EVENTS_PER_FEATURE} events per feature "
+              "in each group's median sample" if any(deep) else
+              f"all {len(pool)} comparison(s), none having {CAP_MIN_EVENTS_PER_FEATURE} events per feature "
+              "in each group's median sample")
+    notes.append(f"Frequencies: each sample weighted by its counting precision, capped by a variance "
+                 f"between samples of {shared:.3g} (log2 odds), the median over {source}.")
+    log.info("capped moderated fit: shared variance %.4g from %d of %d comparison(s)",
+             shared, len(pool), len(prepared))
+
+    frames = []
+    for base, other, y, v, X, group_cols in prepared:
+        with np.errstate(invalid='ignore', divide='ignore'):
+            w = np.where(np.isfinite(y), 1.0 / (v + shared), np.nan)
+            w = w / np.nanmean(w, axis=1, keepdims=True)
+        try:
+            fit = ms.e_bayes(ms.weighted_lm_fit(y, X, w))
+        except ValueError as exc:
+            raise RuntimeError(f"{exc} ({other!r} vs {base!r}). Too few features have enough "
+                               "observed samples to fit.") from exc
+        tt = ms.top_table(fit, group_cols[other])
+        tt.insert(0, 'feature', list(counts_df.columns))
+        tt['comparison'] = f"{other} vs {base}"
+        frames.append(tt)
+    combined = pd.concat(frames, ignore_index=True)
+    combined.attrs['notes'] = notes
+    return combined
+
+
 def _pair_subsets(data_df, group_vec, contrasts, pairing_vec, covariates):
     """Yield (sub_df, sub_groups, sub_pairing, sub_covariates, base, other) per pair."""
     for base, other in contrasts:
@@ -928,7 +1042,7 @@ def _pair_subsets(data_df, group_vec, contrasts, pairing_vec, covariates):
         yield sub_df, sub_groups, _subset_rows(pairing_vec, mask), sub_cov, base, other
 
 
-def run_moderated(data_df: pd.DataFrame, group_vec: list[str],
+def run_moderated(data_df: pd.DataFrame | None, group_vec: list[str],
                   contrasts: list[tuple[str, str]], mode: str,
                   pval_threshold: float, fc_threshold: float,
                   pairing_vec: list[str] | None = None,
@@ -937,7 +1051,10 @@ def run_moderated(data_df: pd.DataFrame, group_vec: list[str],
                   use_treat: bool = True,
                   feature_meta: pd.DataFrame | None = None,
                   hierarchical: bool = False,
-                  too_few_hint: str = '') -> pd.DataFrame:
+                  too_few_hint: str = '',
+                  weights: str | None = None,
+                  counts_df: pd.DataFrame | None = None,
+                  library=None) -> pd.DataFrame:
     """
     Moderated linear model test of every feature, for N groups and
     multiple contrasts.
@@ -954,6 +1071,13 @@ def run_moderated(data_df: pd.DataFrame, group_vec: list[str],
     use_treat, hierarchical, fdr_scope: see apply_significance().
     too_few_hint: appended to the error raised when fewer than three
                 features can be tested.
+    weights   : None (every observation weighted equally), or 'capped': the
+                response is worked out from ``counts_df`` (rows = samples)
+                and ``library`` (one library size per sample) as log2 odds,
+                each comparison is fitted on its own two groups whatever the
+                mode, and observations are weighted as described in the
+                module docstring. ``data_df`` is not used then (pass None);
+                logFC is a log2 odds ratio.
 
     When covariates have missing values, or the pairing does not link the
     groups, each comparison is fitted on its own samples (comparison_plan)
@@ -966,6 +1090,20 @@ def run_moderated(data_df: pd.DataFrame, group_vec: list[str],
     adj.P.Val.global, threshold, significant (plus the cluster-level
     columns when hierarchical).
     """
+    if weights not in MODERATED_WEIGHTS:
+        raise ValueError(f"weights must be one of {MODERATED_WEIGHTS}, got {weights!r}")
+    if weights == 'capped':
+        if counts_df is None or library is None:
+            raise ValueError("weights='capped' needs counts_df and library")
+        combined = _capped_fit_contrasts(counts_df, library, group_vec, contrasts, pairing_vec,
+                                         covariates, too_few_hint)
+        notes = combined.attrs.get('notes', [])
+        if feature_meta is not None:
+            combined = combined.merge(feature_meta, on='feature', how='left', sort=False)
+        combined = apply_significance(combined, pval_threshold, fc_threshold, fdr_scope=fdr_scope,
+                                      use_treat=use_treat, hierarchical=hierarchical)
+        combined.attrs['notes'] = notes
+        return combined
     parts = comparison_plan(group_vec, contrasts, pairing_vec, covariates, mode)
     if parts is not None:
         return _fit_by_comparison(
