@@ -499,9 +499,16 @@ class Controller(QObject):
         self.experiment.cytometry['unmixed_custom_sample_gates'] = serialize_custom_sample_gates(self.custom_sample_gates.get('unmixed', {}))
 
         if not experiment_path:
-            self._save_cleaned_events()
-            self._save_autospectral_variants()
-            self.experiment.save()
+            try:
+                self._save_cleaned_events()
+                self._save_autospectral_variants()
+                self.experiment.save()
+            except OSError as e:
+                logger.warning(f'Controller: could not save experiment {self.experiment_dir} ({e})')
+                if self.bus:
+                    self.bus.statusMessage.emit(f'Autosave failed: {e.strerror or e}. '
+                                                f'Check that the drive holding this experiment is connected.')
+                return
             logger.info(f'Controller: experiment saved {self.experiment_dir}')
             if self.bus:
                 QTimer.singleShot(100, lambda: self.bus.statusMessage.emit(f'Autosaved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}'))
@@ -882,6 +889,17 @@ class Controller(QObject):
                 self.unmixed_gating = from_gml(self.experiment.cytometry['gating'])
                 self.unmixed_transformations = generate_transformations(self.experiment.cytometry['transforms'])
 
+                # A plot drawn on a channel that is no longer in the unmixed data
+                # cannot be shown, so it is removed (in place: the list is shared).
+                unmixed_plots = self.experiment.cytometry['plots']
+                kept_plots = [plot for plot in unmixed_plots
+                              if all(plot[k] in self.unmixed_transformations
+                                     for k in ('channel_x', 'channel_y') if k in plot)]
+                if len(kept_plots) != len(unmixed_plots):
+                    logger.warning(f'Controller: removed unmixed plots on channels no longer present: '
+                                   f'{[plot for plot in unmixed_plots if plot not in kept_plots]}')
+                    unmixed_plots[:] = kept_plots
+
                 # The NxN keeps the rows and source gate it showed before, where they
                 # still exist; a grid that showed every row shows every row again.
                 fluorescence_channels = self.experiment.settings['unmixed']['fluorescence_channels']
@@ -974,12 +992,12 @@ class Controller(QObject):
         # Re-express stored raw channel indices against pnn_raw (whitelisted).
         # Stored indices reference full_pnn_raw; map them to their position in pnn_raw.
         def _remap(ids):
-            return np.array([pnn_raw.index(full_pnn_raw[i]) for i in ids])
+            return np.array([pnn_raw.index(full_pnn_raw[i]) for i in ids], dtype=int)
 
         fl_channel_ids_raw = _remap(self.filtered_raw_fluorescence_channel_ids)
         sc_channel_ids_raw = _remap(_raw['scatter_channel_ids'])
-        fl_channel_ids_unmixed = np.array(self.experiment.settings['unmixed']['fluorescence_channel_ids'])
-        sc_channel_ids_unmixed = np.array(self.experiment.settings['unmixed']['scatter_channel_ids'])
+        fl_channel_ids_unmixed = np.array(self.experiment.settings['unmixed']['fluorescence_channel_ids'], dtype=int)
+        sc_channel_ids_unmixed = np.array(self.experiment.settings['unmixed']['scatter_channel_ids'], dtype=int)
         n_scatter_channels = self.experiment.settings['unmixed']['n_scatter_channels']
 
         unmixing_matrix = np.array(self.experiment.process['unmixing_matrix'])
@@ -1667,7 +1685,15 @@ class Controller(QObject):
         logger.info(f'Controller: loading sample {sample_path}')
         whitelisted_pnn = self.experiment.settings['raw'].get('whitelisted_pnn')
         check_pnn = whitelisted_pnn or self.experiment.settings['raw']['event_channels_pnn']
-        if check_fcs_matches_experiment(self.experiment_dir / sample_path, check_pnn, self.experiment.settings['raw']['magnitude_ceiling']):
+        try:
+            matches = check_fcs_matches_experiment(self.experiment_dir / sample_path, check_pnn, self.experiment.settings['raw']['magnitude_ceiling'])
+        except OSError as e:
+            logger.warning(f'Controller: could not read sample {sample_path} ({e})')
+            if self.bus:
+                self.bus.warningMessage.emit(f'Could not read {sample_path}: {e.strerror or e}. '
+                                             f'Check that the drive holding this experiment is connected.')
+            return
+        if matches:
             self.current_sample_path = sample_path
             preview = None
             if self.current_sample_path != self.live_sample_path:
@@ -2038,6 +2064,10 @@ class Controller(QObject):
     @Slot(str, int)
     def change_plot(self, mode, n_in_plot_sequence):
         if mode == self.current_mode:
+            if n_in_plot_sequence >= len(self.data_for_cytometry_plots['plots']):
+                logger.warning(f'Controller: change_plot ignored for plot {n_in_plot_sequence}; '
+                               f'{len(self.data_for_cytometry_plots["plots"])} plots in {mode}')
+                return
             plots_to_recalculate = [self.data_for_cytometry_plots['plots'][n_in_plot_sequence]]
             hist = initialise_hists(plots_to_recalculate, self.data_for_cytometry_plots)[0]
             self.data_for_cytometry_plots['statistics'] = initialise_stats(self.data_for_cytometry_plots['gating'])

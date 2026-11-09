@@ -205,6 +205,8 @@ class ListTableModel(QtCore.QAbstractTableModel):
             return True
         if role != Qt.EditRole:
             return False
+        if key == "label" and not str(value or '').strip():
+            return False
         # if key == "gate_channel":
         #     try:
         #         value = int(value)

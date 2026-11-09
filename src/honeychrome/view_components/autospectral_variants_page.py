@@ -64,6 +64,7 @@ if str(bundled_plugins_path) not in sys.path:
     sys.path.insert(0, str(bundled_plugins_path))
 
 from autospectral_optimization_functions import (   # noqa: E402
+    _resolve_unstained_cell_sample_names,
     discover_all_variants,
     calculate_optimize_necessity,
     unmix_autospectral_optimization,
@@ -586,6 +587,10 @@ class SpectralVariantsPage(QWidget):
             return
         if self._setup_thread is not None:
             self._setup_status.setText('Already computing — please wait.')
+            return
+        if not _resolve_unstained_cell_sample_names(self.controller.experiment.samples):
+            self._setup_status.setText('No unstained cell sample found. Mark a cell control as Unstained '
+                                       '(right-click in the sample panel) before running Setup.')
             return
         token = acquire_job(self.controller, 'AutoSpectral: Compute Spectral Variants')
         if token is None:
