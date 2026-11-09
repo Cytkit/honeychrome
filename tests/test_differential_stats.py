@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 
 from honeychrome.controller_components import differential_stats as ds
+from honeychrome.controller_components import moderated_stats as ms
 
 
 def _samples(n_per_group=4, n_features=8, effect=3.0, seed=3):
@@ -154,7 +155,6 @@ def test_glm_fits_are_statsmodels_fits():
 
 @pytest.mark.numpy_only
 def test_stagewise_adjust_matches_per_family_definition():
-    from honeychrome.controller_components import moderated_stats as ms
     rng = np.random.default_rng(2)
     p = rng.beta(0.3, 1.0, 600)
     p[rng.random(600) < 0.05] = np.nan
@@ -390,3 +390,92 @@ def test_library_sizes():
     np.testing.assert_allclose(control / control.sum(), ctrl / ctrl.sum(), rtol=1e-3)
     with pytest.raises(ValueError):
         ds.library_sizes(counts, totals, 'control', control=[])
+
+def _paired_composition(rng, n_mice=6, n_features=30, depth=(5000, 5000), spread=0.3, shift=None):
+    """Counts of *n_features* combinations in an 'A' and a 'B' sample of each
+    mouse. Shares vary between mice on the log scale by *spread*; *shift*
+    multiplies chosen features' shares in B."""
+    base = rng.dirichlet(np.full(n_features, 2.0))
+    rows, groups, mice, library = {}, [], [], []
+    for m in range(n_mice):
+        mouse = base * np.exp(rng.normal(0, spread, n_features))
+        for name, size in zip(('A', 'B'), depth):
+            p = mouse.copy()
+            if name == 'B' and shift:
+                for j, fold in shift.items():
+                    p[j] *= fold
+            p /= p.sum()
+            key = f'{name}_M{m}'
+            rows[key] = rng.multinomial(size, p)
+            groups.append(name)
+            mice.append(f'M{m}')
+            library.append(size)
+    counts = pd.DataFrame(rows, index=[f'f{j}' for j in range(n_features)]).T
+    return counts, groups, mice, np.asarray(library, dtype=float)
+
+
+@pytest.mark.numpy_only
+def test_weighted_lm_fit_with_unit_weights_is_lm_fit():
+    rng = np.random.default_rng(5)
+    y = rng.normal(size=(12, 8))
+    X = np.column_stack([np.ones(8), np.repeat([0.0, 1.0], 4)])
+    plain, weighted = ms.lm_fit(y, X), ms.weighted_lm_fit(y, X, np.ones_like(y))
+    assert np.allclose(plain.coefficients, weighted.coefficients)
+    assert np.allclose(plain.sigma2, weighted.sigma2)
+    assert np.allclose(plain.df_residual, weighted.df_residual)
+
+
+@pytest.mark.numpy_only
+def test_capped_weights_find_a_shift_and_keep_the_table_schema():
+    rng = np.random.default_rng(8)
+    counts, groups, mice, library = _paired_composition(rng, shift={0: 4.0})
+    contrasts = ds.build_contrasts(['A', 'B'], 'reference', 'A')
+    res = ds.run_moderated(None, groups, contrasts, 'reference', 0.05, 1.0, pairing_vec=mice,
+                           weights='capped', counts_df=counts, library=library)
+    log2_pct = np.log2((counts + 0.5).div(library, axis=0) * 100)
+    plain = ds.run_moderated(log2_pct, groups, contrasts, 'reference', 0.05, 1.0, pairing_vec=mice)
+    assert list(res.columns) == list(plain.columns)
+    top = res.sort_values('P.Value').iloc[0]
+    assert top['feature'] == 'f0' and bool(top['significant'])
+    assert 1.5 < top['logFC'] < 2.5
+    assert any(n.startswith('Frequencies:') for n in res.attrs['notes'])
+    with pytest.raises(ValueError):
+        ds.run_moderated(None, groups, contrasts, 'reference', 0.05, 1.0, weights='voom',
+                         counts_df=counts, library=library)
+
+
+@pytest.mark.numpy_only
+def test_capped_weights_hold_the_false_positive_rate():
+    rng = np.random.default_rng(21)
+    contrasts = ds.build_contrasts(['A', 'B'], 'reference', 'A')
+    rates = []
+    for _rep in range(20):
+        counts, groups, mice, library = _paired_composition(rng, depth=(5000, 2000))
+        res = ds.run_moderated(None, groups, contrasts, 'reference', 0.05, 0.0, pairing_vec=mice,
+                               weights='capped', counts_df=counts, library=library)
+        rates.append(np.mean(res['P.Value'].to_numpy() < 0.05))
+    assert np.mean(rates) < 0.09
+
+
+@pytest.mark.numpy_only
+def test_capped_weights_take_the_shared_variance_from_deep_comparisons():
+    """With one deep and one shallow comparison the cap comes from the deep
+    one only; with only shallow comparisons it falls back to all of them."""
+    rng = np.random.default_rng(4)
+    deep, groups, mice, lib_deep = _paired_composition(rng, depth=(5000, 3000))
+    shallow, _g, _m, lib_shallow = _paired_composition(rng, depth=(5000, 40))
+    shallow = shallow.loc[[k for k in shallow.index if k.startswith('B')]].rename(index=lambda k: 'C' + k[1:])
+    counts = pd.concat([deep, shallow])
+    group_vec = groups + ['C'] * len(shallow)
+    mouse_vec = mice + [k.split('_')[1] for k in shallow.index]
+    library = np.concatenate([lib_deep, np.full(len(shallow), 40.0)])
+    contrasts = ds.build_contrasts(['A', 'B', 'C'], 'reference', 'A')
+    res = ds.run_moderated(None, group_vec, contrasts, 'reference', 0.05, 1.0, pairing_vec=mouse_vec,
+                           weights='capped', counts_df=counts, library=library)
+    assert set(res['comparison']) == {'B vs A', 'C vs A'}
+    assert 'median over 1 comparison(s) with at least' in res.attrs['notes'][-1]
+    only = [i for i, g in enumerate(group_vec) if g != 'B']
+    res = ds.run_moderated(None, [group_vec[i] for i in only], ds.build_contrasts(['A', 'C'], 'reference', 'A'),
+                           'reference', 0.05, 1.0, pairing_vec=[mouse_vec[i] for i in only], weights='capped',
+                           counts_df=counts.iloc[only], library=library[only])
+    assert 'median over all 1 comparison(s), none having' in res.attrs['notes'][-1]

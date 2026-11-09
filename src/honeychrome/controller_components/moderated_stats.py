@@ -9,6 +9,8 @@ across a small number of samples.
 Methods and the papers they are written from:
 
 * ``lm_fit`` — ordinary least squares per feature, allowing missing values.
+* ``weighted_lm_fit`` — the same with a weight per observation (weighted
+  least squares; limma's ``lmFit`` with weights).
 * ``e_bayes`` — the hierarchical model of Smyth (2004): residual variances
   are shrunk towards a common prior whose degrees of freedom ``d0`` and
   scale ``s0²`` are estimated by the method of moments on log variances.
@@ -54,7 +56,7 @@ import pandas as pd
 from scipy import special, stats
 
 __all__ = [
-    'LinearFit', 'ModeratedFit', 'FTest', 'lm_fit', 'e_bayes', 'top_table',
+    'LinearFit', 'ModeratedFit', 'FTest', 'lm_fit', 'weighted_lm_fit', 'e_bayes', 'top_table',
     'f_test', 'f_pvalues',
     'treat_pvalues', 'bh_adjust', 'simes', 'stagewise_adjust',
     'fit_prior_variance', 'trigamma_inverse', 'estimable_columns',
@@ -233,6 +235,81 @@ def lm_fit(expr, design) -> LinearFit:
     return LinearFit(coefficients=coef, stdev_unscaled=stdu, sigma2=sigma2,
                      df_residual=df_res, amean=amean, n_obs=n_obs, design=X)
 
+
+def weighted_lm_fit(expr, design, weights) -> LinearFit:
+    """
+    Weighted least squares of ``expr[g] ~ design`` with per-observation
+    weights, for every feature g: ``moderated_stats.lm_fit`` with weights.
+
+    expr, weights : (features x samples); NaN in expr, or a weight that is
+                    not finite and positive, marks a missing observation.
+    design        : (samples x coefficients).
+
+    Missing observations, dropped design columns and coefficients that are
+    not estimable are handled as ``lm_fit`` handles them. Features sharing a
+    pattern of observed samples share the column choice and are solved
+    together from their normal equations. The residual variance is
+    sum(w r^2) / (observed - rank); the unscaled standard errors are the
+    square roots of the diagonal of (X^T W X)^-1.
+    """
+    Y = np.asarray(expr, dtype=float)
+    X = np.asarray(design, dtype=float)
+    W = np.asarray(weights, dtype=float)
+    if Y.ndim == 1:
+        Y = Y[None, :]
+        W = W.reshape(1, -1)
+    if X.ndim != 2 or X.shape[0] != Y.shape[1]:
+        raise ValueError(f'design has {X.shape[0] if X.ndim == 2 else "?"} rows but expr has '
+                         f'{Y.shape[1]} samples')
+    if W.shape != Y.shape:
+        raise ValueError('weights must have the shape of expr')
+    G, _n = Y.shape
+    p = X.shape[1]
+
+    coef = np.full((G, p), np.nan)
+    stdu = np.full((G, p), np.nan)
+    sigma2 = np.full(G, np.nan)
+    df_res = np.zeros(G)
+    obs_mask = np.isfinite(Y) & np.isfinite(W) & (W > 0)
+    n_obs = obs_mask.sum(axis=1)
+    with np.errstate(invalid='ignore'):
+        amean = np.where(n_obs > 0, np.where(obs_mask, Y, 0.0).sum(axis=1) / np.maximum(n_obs, 1),
+                         np.nan)
+
+    patterns: dict[bytes, list[int]] = {}
+    for g in range(G):
+        patterns.setdefault(obs_mask[g].tobytes(), []).append(g)
+
+    for key, rows in patterns.items():
+        obs = np.frombuffer(key, dtype=bool)
+        n_o = int(obs.sum())
+        if n_o == 0:
+            continue
+        cols, estimable = estimable_columns(X[obs])
+        if not estimable.any():
+            continue
+        Xc = X[obs][:, cols]
+        idx = np.asarray(rows)
+        sel = np.flatnonzero(obs)
+        Yo = Y[np.ix_(idx, sel)]
+        Wo = W[np.ix_(idx, sel)]
+        A = np.einsum('kn,nr,ns->krs', Wo, Xc, Xc)
+        rhs = np.einsum('kn,nr,kn->kr', Wo, Xc, Yo)
+        Ainv = np.linalg.inv(A)
+        B = np.einsum('krs,ks->kr', Ainv, rhs)
+        resid = Yo - B @ Xc.T
+        d = n_o - cols.size
+        coef[np.ix_(idx, cols)] = B
+        stdu[np.ix_(idx, cols)] = np.sqrt(np.diagonal(Ainv, axis1=1, axis2=2))
+        hidden = cols[~estimable]
+        coef[np.ix_(idx, hidden)] = np.nan
+        stdu[np.ix_(idx, hidden)] = np.nan
+        df_res[idx] = d
+        if d > 0:
+            sigma2[idx] = np.sum(Wo * resid ** 2, axis=1) / d
+
+    return LinearFit(coefficients=coef, stdev_unscaled=stdu, sigma2=sigma2,
+                     df_residual=df_res, amean=amean, n_obs=n_obs, design=X)
 
 # ---------------------------------------------------------------------------
 # Empirical Bayes
