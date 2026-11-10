@@ -1850,8 +1850,10 @@ def paste_gates(gate_defs: list[dict], clipboard: list[dict], target_gate, targe
         if isinstance(sp, dict):
             for k, v in list(sp.items()):
                 gate, pop = ag_core.split_population_key(str(v))
-                if gate in renamed:
+                if pop and gate in renamed:
                     sp[k] = ag_core.population_key(renamed[gate], pop)
+                elif v in renamed:
+                    sp[k] = renamed[v]
     out = [deepcopy(g) for g in gate_defs] + new
     ag_core.ordered_gate_defs(out)
     return out, [c['gate_name'] for c in new]
