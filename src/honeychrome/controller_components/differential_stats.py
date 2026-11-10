@@ -13,8 +13,13 @@ intensities. Used by the Honeycluster and Automated Gating plugins.
   a per-feature denominator (e.g. each population's parent count). Two
   tests: ``'wald'`` (per-feature Cameron–Trivedi dispersion, Wald z) and
   ``'ql'`` (quasi-likelihood F test after Lund et al. 2012 and edgeR's
-  glmQLFit: negative-binomial dispersion shrunk towards a common prior,
-  then a per-feature quasi-dispersion moderated by empirical Bayes).
+  glmQLFit: a negative-binomial dispersion that trends with abundance,
+  each feature's taken from the features of similar mean count, then a
+  per-feature quasi-dispersion moderated by empirical Bayes). With
+  ``'ql'`` each comparison is fitted on the samples of its two groups
+  only, with the dispersions estimated once on every sample, so groups
+  that vary more or less than the rest (e.g. tissues with fewer cells) do
+  not set another comparison's noise level.
   For small counts each unit deviance is rescaled, and its residual
   degrees of freedom set, by how far its mean and variance depart from
   their large-count values (after edgeR v4, Chen et al. 2024), which keeps
@@ -22,6 +27,18 @@ intensities. Used by the Honeycluster and Automated Gating plugins.
   observations fitted exactly as zero carry no degrees of freedom. The
   reported log fold change comes from a fit with edgeR's prior count, so a
   group with no events gives a finite estimate.
+* ``run_moderated`` with ``weights='capped'`` — for counts out of library
+  sizes that differ a lot between samples (e.g. FlowCode tissues of 40 and
+  4,000 barcoded cells). Each comparison is fitted on its own two groups,
+  on log2 odds with a prior count that is the same share of every sample
+  (edgeR's scaling of the prior count), and each observation is weighted
+  by the inverse of its counting (binomial) variance plus one variance
+  between samples shared by the whole experiment. The shared variance is
+  the median, over the comparisons whose groups are deep enough for
+  counting noise not to dominate, of each comparison's residual variance
+  beyond counting; it caps the weight of a deep sample at what samples
+  actually agree to, so an expanded clone in one mouse is not taken as
+  precise.
 * ``library_sizes`` — effective library sizes for compositional data:
   the totals, a robust (trimmed) rescaling that a few dominant features
   cannot move, or the totals of chosen control features.
@@ -40,8 +57,17 @@ Frequency scales:
 * ``log2_frequencies`` — log2 percentage of a total; differences are log2
   fold changes. Suited to rare clusters.
 * ``logit_proportions`` — log2 odds of a population within its parent, with
-  half an event added to both the population and its complement. Suited to
+  a prior count added to both the population and its complement. Suited to
   gated populations, whose fractions often sit near 0 or 1.
+
+Both keep empty features finite with a prior count that is the same share
+of every sample's denominator: half an event scaled by the denominator over
+the mean denominator of the samples given (edgeR's scaling of the prior
+count by library size; McCarthy, Chen & Smyth 2012). A population at 0% or
+100% of its parent then has the same value in every sample whatever the
+parent's size, so a difference in parent size between groups is not read as
+a difference in frequency. ``share_prior=False`` adds half an event to
+every sample instead.
 
 Results carry the estimate's standard error and degrees of freedom, so a
 threshold change re-derives p-values and significance without refitting.
@@ -63,16 +89,23 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     'build_contrasts', 'covariate_kind', 'missing_covariate_values',
-    'covariate_frame', 'build_design', 'log2_frequencies',
+    'covariate_frame', 'is_missing_value', 'comparison_parts', 'comparison_plan',
+    'pairing_absorbed', 'build_design', 'log2_frequencies',
     'logit_proportions', 'sparse_features', 'run_moderated', 'run_glm_counts',
     'apply_significance', 'suggest_groupings_from_names', 'library_sizes',
-    'COUNT_TESTS', 'NORMALISATIONS',
+    'COUNT_TESTS', 'NORMALISATIONS', 'MODERATED_WEIGHTS',
 ]
 
 #: Counts tests offered by run_glm_counts(method=).
 COUNT_TESTS = ('ql', 'wald')
 #: Library-size methods offered by library_sizes(method=).
 NORMALISATIONS = ('total', 'robust', 'control')
+#: Observation weights offered by run_moderated(weights=).
+MODERATED_WEIGHTS = (None, 'capped')
+#: Capped weights: comparisons whose two groups have at least this many
+#: events per feature in their median sample set the shared variance
+#: between samples (shallower groups inflate it with counting noise).
+CAP_MIN_EVENTS_PER_FEATURE = 9
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +115,7 @@ NORMALISATIONS = ('total', 'robust', 'control')
 def suggest_groupings_from_names(
     sample_rel_paths: list[str],
     display_names: dict[str, str] | None = None,
+    current_groups: dict[str, str] | None = None,
 ) -> dict:
     """
     Scan sample names for repeated, delimiter-separated tokens that could
@@ -106,6 +140,12 @@ def suggest_groupings_from_names(
     value and recurs across group values (one sample per mouse per tissue);
     other repeated fields are covariates.
 
+    With ``current_groups`` ({sample: group}, at least two groups) the
+    samples already have groups: no group is suggested from the names, and
+    pairing is judged against the current groups, so a donor number shared
+    by two tissues of one donor is offered as the pairing variable.
+    Samples without a group take no part in that judgement.
+
     Returns:
         {
             'suggestions': [
@@ -121,6 +161,7 @@ def suggest_groupings_from_names(
                 ...
             ],
             'irregular_samples': list[str],  -- rel paths excluded from all suggestions
+            'judged_against_groups': bool,   -- pairing judged against current_groups
         }
     Returns {'suggestions': [], 'irregular_samples': [...]} if no usable
     pattern is found (e.g. fewer than 2 samples, or every position is
@@ -151,6 +192,8 @@ def suggest_groupings_from_names(
 
     all_suggestions = []
     irregular_all: set[str] = set()
+    given = {sp: g for sp, g in (current_groups or {}).items() if g and sp in sample_rel_paths}
+    use_given = len(set(given.values())) >= 2
 
     for source_label, tokens_by_sample in sources:
         if len(tokens_by_sample) < 2:
@@ -188,6 +231,8 @@ def suggest_groupings_from_names(
         # sane range for a comparison group (2-8 levels).
         group_candidates = [c for c in candidates if 2 <= c[2] <= 8]
         primary = min(group_candidates, key=lambda c: c[2]) if group_candidates else None
+        if use_given:
+            primary = (None, given, len(set(given.values())))
 
         for pos, values, n_distinct in sorted(candidates, key=lambda c: c[2]):
             if primary is not None and pos == primary[0]:
@@ -199,12 +244,13 @@ def suggest_groupings_from_names(
                 # (a cohort or batch) or nested in one group value is a
                 # covariate.
                 _, group_values, _ = primary
-                pairs = Counter((v, group_values[sp]) for sp, v in values.items())
+                judged = {sp: v for sp, v in values.items() if sp in group_values}
+                pairs = Counter((v, group_values[sp]) for sp, v in judged.items())
                 co_occurrence: dict[str, set[str]] = {}
-                for sp, v in values.items():
+                for sp, v in judged.items():
                     co_occurrence.setdefault(v, set()).add(group_values[sp])
                 crosses = sum(1 for s in co_occurrence.values() if len(s) >= 2)
-                once = max(pairs.values()) == 1
+                once = bool(pairs) and max(pairs.values()) == 1
                 role = 'pairing' if once and crosses > len(co_occurrence) / 2 else 'covariate'
             else:
                 role = 'covariate'
@@ -225,7 +271,8 @@ def suggest_groupings_from_names(
     role_order = {'group': 0, 'pairing': 1, 'covariate': 2}
     all_suggestions.sort(key=lambda s: (role_order[s['role_guess']], s['n_distinct']))
 
-    return {'suggestions': all_suggestions, 'irregular_samples': sorted(irregular_all)}
+    return {'suggestions': all_suggestions, 'irregular_samples': sorted(irregular_all),
+            'judged_against_groups': use_given}
 
 
 # ---------------------------------------------------------------------------
@@ -263,13 +310,32 @@ def build_contrasts(group_names: list[str], mode: str,
 # Design matrix and covariates
 # ---------------------------------------------------------------------------
 
+#: Covariate values read as "no value" (any case), besides a blank cell.
+MISSING_WORDS = frozenset({'na', 'n/a', 'n.a.', 'nan', 'none', 'null', 'missing', '#n/a',
+                           '-', '--', '.', 'not applicable'})
+#: Fewest samples per group a comparison keeps after samples without a
+#: covariate value are left out.
+MIN_COMPARISON_SAMPLES = 3
+
+
+def is_missing_value(value) -> bool:
+    """True for a blank cell, None/NaN, or a word such as 'NA', 'n/a' or '-'
+    (MISSING_WORDS). 'Unknown' is a value: Check table offers to change it to NA."""
+    if value is None:
+        return True
+    if isinstance(value, float) and np.isnan(value):
+        return True
+    text = str(value).strip()
+    return not text or text.lower() in MISSING_WORDS
+
+
 def _is_numeric_column(values) -> bool:
-    """True when every non-blank value parses as a finite float."""
+    """True when every value that is not missing parses as a finite float."""
     seen = False
     for v in values:
-        text = str(v).strip()
-        if not text:
+        if is_missing_value(v):
             continue
+        text = str(v).strip()
         try:
             if not np.isfinite(float(text)):
                 return False
@@ -289,8 +355,9 @@ def missing_covariate_values(covariates: pd.DataFrame | None, sample_ids: list[s
                              names: list[str]) -> dict[str, list[str]]:
     """
     {covariate name: [sample ids with no value]} for each of ``names`` that
-    is missing (or blank) for at least one sample in ``sample_ids``.
-    ``covariates`` is indexed by sample id, one column per covariate.
+    is missing (blank, or NA and the like; see is_missing_value) for at least
+    one sample in ``sample_ids``. ``covariates`` is indexed by sample id, one
+    column per covariate.
     """
     missing: dict[str, list[str]] = {}
     cov = covariates
@@ -298,7 +365,7 @@ def missing_covariate_values(covariates: pd.DataFrame | None, sample_ids: list[s
         bad = [
             sid for sid in sample_ids
             if cov is None or name not in cov.columns or sid not in cov.index
-            or not str(cov.loc[sid, name]).strip()
+            or is_missing_value(cov.loc[sid, name])
         ]
         if bad:
             missing[name] = bad
@@ -307,7 +374,8 @@ def missing_covariate_values(covariates: pd.DataFrame | None, sample_ids: list[s
 
 def covariate_frame(covariates: pd.DataFrame | None, sample_ids: list[str],
                     names: list[str],
-                    numeric: Iterable[str] | None = None) -> pd.DataFrame | None:
+                    numeric: Iterable[str] | None = None,
+                    allow_missing: bool = False) -> pd.DataFrame | None:
     """
     Adjustment covariates for ``sample_ids`` (rows in that order). Columns
     named in ``numeric`` are returned as floats and enter the design as
@@ -315,37 +383,216 @@ def covariate_frame(covariates: pd.DataFrame | None, sample_ids: list[str],
     as a factor. With ``numeric=None`` a column is numeric when all of its
     values are numbers.
 
-    Returns None when ``names`` is empty. Raises RuntimeError if any sample
-    lacks a value, or a column named in ``numeric`` holds a value that is
-    not a number.
+    With ``allow_missing`` a sample without a value (see is_missing_value)
+    gets None (NaN in a numeric column); run_moderated and run_glm_counts
+    then resolve the missing values comparison by comparison
+    (comparison_parts). Otherwise a missing value raises.
+
+    Returns None when ``names`` is empty. Raises RuntimeError if a sample
+    lacks a value (without ``allow_missing``), or a column named in
+    ``numeric`` holds a value that is not a number.
     """
     names = [n for n in names if n]
     if not names:
         return None
     missing = missing_covariate_values(covariates, sample_ids, names)
-    if missing:
+    if missing and not allow_missing:
         detail = "; ".join(
             f"'{name}': " + ", ".join(Path(r).stem for r in rels[:5])
             + (" …" if len(rels) > 5 else "")
             for name, rels in missing.items()
         )
         raise RuntimeError(f"Adjustment covariates have missing values — {detail}")
-    columns = {name: [str(covariates.loc[sid, name]).strip() for sid in sample_ids]
-               for name in names}
+    def _cell(sid, name):
+        if covariates is None or name not in covariates.columns or sid not in covariates.index:
+            return None
+        value = covariates.loc[sid, name]
+        return None if is_missing_value(value) else str(value).strip()
+
+    columns = {name: [_cell(sid, name) for sid in sample_ids] for name in names}
     if numeric is None:
-        as_numeric = {n for n in names if covariate_kind(columns[n]) == 'numeric'}
+        as_numeric = {n for n in names
+                      if covariate_kind([v for v in columns[n] if v is not None]) == 'numeric'}
     else:
         as_numeric = set(names) & set(numeric)
     for name in sorted(as_numeric):
-        bad = [sid for sid, v in zip(sample_ids, columns[name]) if not _is_numeric_column([v])]
+        bad = [sid for sid, v in zip(sample_ids, columns[name])
+               if v is not None and not _is_numeric_column([v])]
         if bad:
             raise RuntimeError(
                 f"Covariate '{name}' is set to numeric but has values that are not "
                 "numbers for: " + ", ".join(Path(r).stem for r in bad[:5])
                 + (" …" if len(bad) > 5 else "")
                 + ". Untick 'Numeric' for this covariate or correct the values.")
-        columns[name] = [float(v) for v in columns[name]]
+        columns[name] = [np.nan if v is None else float(v) for v in columns[name]]
     return pd.DataFrame(columns, index=list(sample_ids))
+
+
+def comparison_parts(group_vec: list[str], contrasts: list[tuple[str, str]],
+                     covariates: pd.DataFrame | None,
+                     min_per_group: int = MIN_COMPARISON_SAMPLES,
+                     pairing_vec: list[str] | None = None) -> list[dict]:
+    """
+    How each comparison is fitted on its own samples: when covariates have
+    missing values (None/NaN, from covariate_frame(allow_missing=True)), or
+    when the pairing does not link the groups of every comparison.
+
+    For each (base, other): a covariate with no value for any sample of one
+    of the two groups is left out of that comparison's model; then samples
+    of the two groups without a value for a remaining covariate are left out
+    of that comparison. A comparison with fewer than ``min_per_group``
+    samples left in a group is not tested. With ``pairing_vec``, a
+    comparison whose two groups share no pairing value (no donor has samples
+    in both, e.g. healthy donors against patients) is fitted without
+    pairing. Samples without a pairing value carry a level of their own
+    ('__unpaired_<sample>'): they count towards the group difference but
+    not towards the within-pair comparison.
+
+    Returns, per contrast, {'contrast', 'mask' (rows of the two groups kept),
+    'covariates' (those rows and the kept columns, or None), 'tested',
+    'paired' (fit with the pairing), 'notes' (plain-language lines for the
+    results)}.
+    """
+    groups = np.asarray(group_vec, dtype=object)
+    if covariates is None:
+        missing = np.zeros((len(group_vec), 0), dtype=bool)
+        names, index = [], []
+    else:
+        missing = covariates.isna().to_numpy()
+        names = list(covariates.columns)
+        index = list(covariates.index)
+    parts = []
+    for base, other in contrasts:
+        label = f"{other} vs {base}"
+        in_pair = (groups == base) | (groups == other)
+        notes, kept = [], []
+        for j, name in enumerate(names):
+            empty = [g for g in (base, other) if missing[groups == g, j].all()]
+            if empty:
+                notes.append(f"{label}: '{name}' was left out of the model (no value for any "
+                             f"{' or '.join(empty)} sample).")
+            else:
+                kept.append(j)
+        mask = in_pair.copy()
+        for j in kept:
+            gone = mask & missing[:, j]
+            if gone.any():
+                shown = [Path(str(index[i])).stem for i in np.flatnonzero(gone)]
+                notes.append(f"{label}: {len(shown)} sample(s) without a value for "
+                             f"'{names[j]}' were left out: " + ", ".join(shown[:5])
+                             + (" …" if len(shown) > 5 else "") + ".")
+                mask &= ~missing[:, j]
+        n_base, n_other = int((groups[mask] == base).sum()), int((groups[mask] == other).sum())
+        tested = min(n_base, n_other) >= min_per_group
+        if not tested:
+            notes.append(f"{label} was not tested: {n_other} + {n_base} samples are left after "
+                         f"leaving out missing covariate values (needs {min_per_group} per group).")
+        rows = np.flatnonzero(mask)
+        sub = covariates.iloc[rows, kept] if kept else None
+        paired = pairing_vec is not None
+        if paired and tested:
+            sub_groups = list(groups[rows])
+            sub_pairing = [pairing_vec[i] for i in rows]
+            try:
+                build_design(sub_groups, base, None, sub)
+            except RuntimeError:
+                pass  # a covariate problem; reported when the comparison is fitted
+            else:
+                try:
+                    build_design(sub_groups, base, sub_pairing, sub)
+                except RuntimeError:
+                    paired = False
+                    notes.append(f"{label} was fitted without pairing: no pairing value has "
+                                 "samples in both groups.")
+            if paired:
+                unpaired = sum(1 for p in sub_pairing if str(p).startswith('__unpaired_'))
+                if unpaired:
+                    notes.append(f"{label}: {unpaired} sample(s) without a pairing value are "
+                                 "unpaired.")
+                notes.extend(_absorbed_note(name, label)
+                             for name in pairing_absorbed(sub, sub_pairing))
+        parts.append({'contrast': (base, other), 'mask': mask, 'covariates': sub,
+                      'tested': tested, 'paired': paired, 'notes': notes})
+    return parts
+
+
+def comparison_plan(group_vec: list[str], contrasts: list[tuple[str, str]],
+                    pairing_vec: list[str] | None, covariates: pd.DataFrame | None,
+                    mode: str) -> list[dict] | None:
+    """None when the usual fit works: no missing covariate value and, with
+    pairing, a design that links the groups (in 'reference' mode over every
+    group at once). Otherwise each comparison's own fit (comparison_parts)."""
+    missing = _has_missing(covariates)
+    if not missing and pairing_vec is None:
+        return None
+    parts = comparison_parts(group_vec, contrasts, covariates, pairing_vec=pairing_vec)
+    if missing or any(p['tested'] and not p['paired'] for p in parts):
+        return parts
+    if mode == 'reference':
+        try:
+            build_design(group_vec, contrasts[0][0], pairing_vec, covariates)
+        except RuntimeError:
+            return parts
+    return None
+
+
+def _has_missing(covariates: pd.DataFrame | None) -> bool:
+    return covariates is not None and bool(covariates.isna().to_numpy().any())
+
+
+def pairing_absorbed(covariates: pd.DataFrame | None,
+                     pairing_vec: list[str] | None) -> list[str]:
+    """
+    Covariates that take a single value within every pairing level
+    (missing values aside), e.g. the age shared by two tissues of one
+    donor. With pairing in the design such a covariate is already
+    accounted for — its column lies in the span of the pairing indicators —
+    so build_design leaves it out instead of reporting a rank-deficient
+    design. Rows of ``covariates`` align with ``pairing_vec``.
+    """
+    if covariates is None or pairing_vec is None or not len(covariates.columns):
+        return []
+    levels = np.array([str(p) for p in pairing_vec], dtype=object)
+    absorbed = []
+    for name in covariates.columns:
+        column = covariates[name].reset_index(drop=True)
+        if column.nunique(dropna=True) < 2:
+            continue
+        if (column.groupby(levels).nunique(dropna=True) <= 1).all():
+            absorbed.append(name)
+    return absorbed
+
+
+def _absorbed_note(name: str, label: str = '') -> str:
+    text = (f"'{name}' is the same within every pairing level, so the pairing already "
+            "accounts for it; it was left out of the model.")
+    return f"{label}: {text}" if label else text
+
+
+def _fit_by_comparison(parts, fit, group_vec, pairing_vec, finish):
+    """Fit each comparison on its own samples, covariates and pairing
+    (comparison_plan), stack the results, then ``finish`` them
+    (significance). ``fit(rows, groups, contrast, pairing, covariates)``
+    returns one table. The plain-language notes are kept in the result's
+    ``attrs['notes']``."""
+    frames, notes = [], []
+    for part in parts:
+        notes.extend(part['notes'])
+        if not part['tested']:
+            continue
+        rows = np.flatnonzero(part['mask'])
+        pairing = ([pairing_vec[i] for i in rows]
+                   if pairing_vec is not None and part['paired'] else None)
+        frames.append(fit(rows, [group_vec[i] for i in rows], part['contrast'], pairing,
+                          part['covariates']))
+    for note in notes:
+        log.info("comparison fitted on its own: %s", note)
+    if not frames:
+        raise RuntimeError("No comparison could be tested after leaving out missing covariate "
+                           "values. " + " ".join(notes))
+    combined = finish(pd.concat(frames, ignore_index=True))
+    combined.attrs['notes'] = notes
+    return combined
 
 
 def _pairing_level_label(level: str) -> str:
@@ -440,7 +687,8 @@ def build_design(group_vec: list[str], baseline: str,
     categorical columns as indicators for every level except the first in
     sorted order. A column is numeric when it has a numeric dtype (see
     covariate_frame()); string columns are always categorical. Covariates
-    that are constant over these samples are dropped.
+    that are constant over these samples are dropped, and so, with pairing,
+    are covariates constant within every pairing level (pairing_absorbed).
 
     Returns (X, column_names, group_columns) where group_columns maps each
     non-baseline group to its column index. Raises RuntimeError naming the
@@ -471,10 +719,15 @@ def build_design(group_vec: list[str], baseline: str,
             raise RuntimeError(_pairing_confounded_message(group_vec, pairing_vec))
 
     if covariates is not None:
+        absorbed = set(pairing_absorbed(covariates, pairing_vec))
         for name in covariates.columns:
             values = covariates[name].tolist()
             if len(set(values)) < 2:
                 log.info("covariate %r is constant over these samples — dropped", name)
+                continue
+            if name in absorbed:
+                log.info("covariate %r is constant within every pairing level — accounted "
+                         "for by the pairing", name)
                 continue
             added = []
             if pd.api.types.is_numeric_dtype(covariates[name]):
@@ -508,39 +761,82 @@ def _subset_rows(values, mask):
 # Frequency scales
 # ---------------------------------------------------------------------------
 
-def log2_frequencies(counts_df: pd.DataFrame, totals) -> pd.DataFrame:
+def _share_prior(denominators: np.ndarray, mean_denominator=None) -> np.ndarray:
     """
-    log2 of each feature's percentage of the sample's events, with half an
-    event added to every count (and one to every total) so empty features
-    stay finite: log2((count + 0.5) / (total + 1) · 100). Differences on
-    this scale are log2 fold changes of frequency.
+    Prior counts that are the same share of every denominator: 0.5 ·
+    denominator / mean denominator, half an event at the mean. The mean is
+    taken down each column (over the samples) of the positive, finite
+    denominators, or given as ``mean_denominator`` (one number, or one per
+    column) to put other samples on the scale of a fitted set. A
+    denominator that is not positive gives NaN.
+    """
+    d = np.asarray(denominators, dtype=float)
+    usable = np.isfinite(d) & (d > 0)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        if mean_denominator is None:
+            mean = np.where(usable, d, 0.0).sum(axis=0) / usable.sum(axis=0)
+        else:
+            mean = np.asarray(mean_denominator, dtype=float)
+        return np.where(usable, 0.5 * d / mean, np.nan)
+
+
+def log2_frequencies(counts_df: pd.DataFrame, totals, share_prior: bool = True,
+                     mean_total: float | None = None) -> pd.DataFrame:
+    """
+    log2 of each feature's percentage of the sample's events,
+    log2((count + p) / (total + 2p) · 100). Differences on this scale are
+    log2 fold changes of frequency.
+
+    The prior count p keeps empty features finite. It is the same share of
+    every sample, p = 0.5 · total / mean total over the samples given (or
+    ``mean_total``, to put other samples on the scale of a fitted set), so
+    an empty feature has the same value in every sample. With
+    ``share_prior=False`` p is half an event in every sample:
+    log2((count + 0.5) / (total + 1) · 100).
     """
     totals = np.asarray(totals, dtype=float)[:, None]
-    vals = np.log2((counts_df.values.astype(float) + 0.5) / (totals + 1.0) * 100.0)
+    counts = counts_df.values.astype(float)
+    if share_prior:
+        prior = _share_prior(totals, mean_total)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            vals = np.log2((counts + prior) / (totals + 2.0 * prior) * 100.0)
+    else:
+        vals = np.log2((counts + 0.5) / (totals + 1.0) * 100.0)
     return pd.DataFrame(vals, index=counts_df.index, columns=counts_df.columns)
 
 
-def logit_proportions(counts_df: pd.DataFrame, denominators_df: pd.DataFrame) -> pd.DataFrame:
+def logit_proportions(counts_df: pd.DataFrame, denominators_df: pd.DataFrame,
+                      share_prior: bool = True, mean_denominator=None) -> pd.DataFrame:
     """
-    Empirical log2 odds of each feature within its own denominator:
-    log2((count + 0.5) / (denominator − count + 0.5)).
+    Empirical log2 odds of each feature within its own denominator,
+    log2((count + p) / (denominator − count + p)). Differences on this
+    scale are log2 odds ratios.
 
     ``denominators_df`` has the same shape, index and columns as
-    ``counts_df`` (e.g. each population's parent count per sample). Adding
-    half an event to both the population and its complement keeps 0% and
-    100% finite. Differences on this scale are log2 odds ratios.
+    ``counts_df`` (e.g. each population's parent count per sample). The
+    prior count p, added to both the population and its complement, keeps
+    0% and 100% finite. It is the same share of every sample's denominator,
+    p = 0.5 · denominator / the feature's mean denominator over the samples
+    given (or ``mean_denominator``: one number, or one per feature), so 0%
+    and 100% are ∓log2(1 + 2 · mean) in every sample whatever the
+    denominator. A denominator of 0 gives NaN.
 
-    A zero count maps to -log2(2 · denominator + 1), a function of the
-    denominator alone. Where the groups' denominators differ, features that
-    are empty in (nearly) every sample therefore show a spurious group
-    difference; exclude them with sparse_features() before testing.
+    With ``share_prior=False`` p is half an event, and a zero count maps to
+    -log2(2 · denominator + 1), a function of the denominator alone: where
+    the groups' denominators differ, features that are empty in (nearly)
+    every sample then show a spurious group difference.
     """
     counts = counts_df.values.astype(float)
     denom = denominators_df.reindex(index=counts_df.index,
                                     columns=counts_df.columns).values.astype(float)
     if np.any(counts > denom):
         raise ValueError("A population count exceeds its denominator.")
-    vals = np.log2((counts + 0.5) / (denom - counts + 0.5))
+    if share_prior:
+        prior = _share_prior(denom, mean_denominator)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            vals = np.log2((counts + prior) / (denom - counts + prior))
+    else:
+        vals = np.log2((counts + 0.5) / (denom - counts + 0.5))
     return pd.DataFrame(vals, index=counts_df.index, columns=counts_df.columns)
 
 
@@ -687,6 +983,105 @@ def _moderated_fit_contrasts(data_df: pd.DataFrame, group_vec: list[str],
     return pd.concat(frames, ignore_index=True)
 
 
+def _scaled_logits(counts: np.ndarray, library: np.ndarray) -> np.ndarray:
+    """(features x samples) log2 odds of each count within its sample's
+    library size, log2((c + p) / (L - c + p)), with a prior count p of half
+    an event scaled by L over the mean library size, so the floor is the
+    same share of every sample. NaN counts stay NaN, and a sample with a
+    library size of 0 (no events, so no odds) is NaN throughout."""
+    lib = np.asarray(library, dtype=float)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        prior = 0.5 * lib / np.mean(lib)
+        logits = np.log2((counts + prior) / (np.maximum(lib - counts, 0.0) + prior))
+    return np.where(lib > 0, logits, np.nan)
+
+
+def _counting_variance(counts: np.ndarray, library: np.ndarray) -> np.ndarray:
+    """(features x samples) binomial variance of each observation's log2
+    odds, 1 / (ln(2)^2 (c + 1/2)(L - c + 1/2) / (L + 1))."""
+    lib = np.asarray(library, dtype=float)
+    precision = (counts + 0.5) * (np.maximum(lib - counts, 0.0) + 0.5) / (lib + 1.0)
+    return 1.0 / (precision * np.log(2.0) ** 2)
+
+
+def _variance_beyond_counting(y: np.ndarray, v: np.ndarray, X: np.ndarray) -> float:
+    """Median over features of the unweighted residual variance minus the
+    feature's mean counting variance, at least 0."""
+    fit = ms.lm_fit(y, X)
+    with np.errstate(invalid='ignore'):
+        excess = fit.sigma2 - np.nanmean(np.where(np.isfinite(y), v, np.nan), axis=1)
+    ok = np.isfinite(excess) & (fit.df_residual > 0)
+    return max(float(np.median(excess[ok])), 0.0) if ok.any() else 0.0
+
+
+def _capped_fit_contrasts(counts_df: pd.DataFrame, library, group_vec: list[str],
+                          contrasts: list[tuple[str, str]], pairing_vec: list[str] | None,
+                          covariates: pd.DataFrame | None, too_few_hint: str = '') -> pd.DataFrame:
+    """
+    The capped-weights moderated fit (module docstring): every comparison on
+    its own samples, covariates and pairing (comparison_parts), weights
+    1 / (counting variance + shared variance between samples). Returns the
+    stacked per-comparison tables with 'feature' and 'comparison' columns;
+    ``attrs['notes']`` holds the comparison notes and the shared variance.
+    """
+    counts_all = counts_df.to_numpy(dtype=float)
+    lib_all = np.asarray(library, dtype=float)
+    parts = comparison_parts(group_vec, contrasts, covariates, pairing_vec=pairing_vec)
+    prepared, variances, deep, notes = [], [], [], []
+    for part in parts:
+        notes.extend(part['notes'])
+        if not part['tested']:
+            continue
+        rows = np.flatnonzero(part['mask'])
+        base, other = part['contrast']
+        groups = [group_vec[i] for i in rows]
+        pairing = ([pairing_vec[i] for i in rows]
+                   if pairing_vec is not None and part['paired'] else None)
+        X, _names, group_cols = build_design(groups, base, pairing, part['covariates'])
+        c = counts_all[rows].T
+        lib = lib_all[rows]
+        measured = np.isfinite(c).any(axis=1)
+        if int(measured.sum()) < 3:
+            msg = _TOO_FEW_FEATURES.format(n=int(measured.sum()), other=other, base=base)
+            raise RuntimeError(f"{msg} {too_few_hint}".strip())
+        y, v = _scaled_logits(c, lib), _counting_variance(c, lib)
+        variances.append(_variance_beyond_counting(y, v, X))
+        g = np.asarray(groups, dtype=object)
+        depth = min(float(np.median(lib[g == base])), float(np.median(lib[g == other])))
+        deep.append(depth >= CAP_MIN_EVENTS_PER_FEATURE * int(measured.sum()))
+        prepared.append((base, other, y, v, X, group_cols))
+    if not prepared:
+        raise RuntimeError("No comparison could be tested. " + " ".join(notes))
+    pool = [x for x, d in zip(variances, deep) if d] or variances
+    shared = float(np.median(pool))
+    source = (f"{len(pool)} comparison(s) with at least {CAP_MIN_EVENTS_PER_FEATURE} events per feature "
+              "in each group's median sample" if any(deep) else
+              f"all {len(pool)} comparison(s), none having {CAP_MIN_EVENTS_PER_FEATURE} events per feature "
+              "in each group's median sample")
+    notes.append(f"Frequencies: each sample weighted by its counting precision, capped by a variance "
+                 f"between samples of {shared:.3g} (log2 odds), the median over {source}.")
+    log.info("capped moderated fit: shared variance %.4g from %d of %d comparison(s)",
+             shared, len(pool), len(prepared))
+
+    frames = []
+    for base, other, y, v, X, group_cols in prepared:
+        with np.errstate(invalid='ignore', divide='ignore'):
+            w = np.where(np.isfinite(y), 1.0 / (v + shared), np.nan)
+            w = w / np.nanmean(w, axis=1, keepdims=True)
+        try:
+            fit = ms.e_bayes(ms.weighted_lm_fit(y, X, w))
+        except ValueError as exc:
+            raise RuntimeError(f"{exc} ({other!r} vs {base!r}). Too few features have enough "
+                               "observed samples to fit.") from exc
+        tt = ms.top_table(fit, group_cols[other])
+        tt.insert(0, 'feature', list(counts_df.columns))
+        tt['comparison'] = f"{other} vs {base}"
+        frames.append(tt)
+    combined = pd.concat(frames, ignore_index=True)
+    combined.attrs['notes'] = notes
+    return combined
+
+
 def _pair_subsets(data_df, group_vec, contrasts, pairing_vec, covariates):
     """Yield (sub_df, sub_groups, sub_pairing, sub_covariates, base, other) per pair."""
     for base, other in contrasts:
@@ -702,7 +1097,7 @@ def _pair_subsets(data_df, group_vec, contrasts, pairing_vec, covariates):
         yield sub_df, sub_groups, _subset_rows(pairing_vec, mask), sub_cov, base, other
 
 
-def run_moderated(data_df: pd.DataFrame, group_vec: list[str],
+def run_moderated(data_df: pd.DataFrame | None, group_vec: list[str],
                   contrasts: list[tuple[str, str]], mode: str,
                   pval_threshold: float, fc_threshold: float,
                   pairing_vec: list[str] | None = None,
@@ -711,7 +1106,10 @@ def run_moderated(data_df: pd.DataFrame, group_vec: list[str],
                   use_treat: bool = True,
                   feature_meta: pd.DataFrame | None = None,
                   hierarchical: bool = False,
-                  too_few_hint: str = '') -> pd.DataFrame:
+                  too_few_hint: str = '',
+                  weights: str | None = None,
+                  counts_df: pd.DataFrame | None = None,
+                  library=None) -> pd.DataFrame:
     """
     Moderated linear model test of every feature, for N groups and
     multiple contrasts.
@@ -728,12 +1126,51 @@ def run_moderated(data_df: pd.DataFrame, group_vec: list[str],
     use_treat, hierarchical, fdr_scope: see apply_significance().
     too_few_hint: appended to the error raised when fewer than three
                 features can be tested.
+    weights   : None (every observation weighted equally), or 'capped': the
+                response is worked out from ``counts_df`` (rows = samples)
+                and ``library`` (one library size per sample) as log2 odds,
+                each comparison is fitted on its own two groups whatever the
+                mode, and observations are weighted as described in the
+                module docstring. ``data_df`` is not used then (pass None);
+                logFC is a log2 odds ratio.
+
+    When covariates have missing values, or the pairing does not link the
+    groups, each comparison is fitted on its own samples (comparison_plan)
+    whatever the mode; the result's ``attrs['notes']`` says which
+    covariates and samples were left out and which comparisons were fitted
+    without pairing.
 
     Returns one row per (feature, comparison): feature, logFC, CI.L, CI.R,
     AveExpr, t, P.Value, adj.P.Val, SE, df.total, comparison,
     adj.P.Val.global, threshold, significant (plus the cluster-level
     columns when hierarchical).
     """
+    if weights not in MODERATED_WEIGHTS:
+        raise ValueError(f"weights must be one of {MODERATED_WEIGHTS}, got {weights!r}")
+    if weights == 'capped':
+        if counts_df is None or library is None:
+            raise ValueError("weights='capped' needs counts_df and library")
+        combined = _capped_fit_contrasts(counts_df, library, group_vec, contrasts, pairing_vec,
+                                         covariates, too_few_hint)
+        notes = combined.attrs.get('notes', [])
+        if feature_meta is not None:
+            combined = combined.merge(feature_meta, on='feature', how='left', sort=False)
+        combined = apply_significance(combined, pval_threshold, fc_threshold, fdr_scope=fdr_scope,
+                                      use_treat=use_treat, hierarchical=hierarchical)
+        combined.attrs['notes'] = notes
+        return combined
+    parts = comparison_plan(group_vec, contrasts, pairing_vec, covariates, mode)
+    if parts is not None:
+        return _fit_by_comparison(
+            parts,
+            lambda rows, groups, contrast, pairing, cov: run_moderated(
+                data_df.iloc[rows], groups, [contrast], 'reference', pval_threshold,
+                fc_threshold, pairing_vec=pairing, fdr_scope=fdr_scope, covariates=cov,
+                use_treat=use_treat, feature_meta=feature_meta, hierarchical=hierarchical,
+                too_few_hint=too_few_hint),
+            group_vec, pairing_vec,
+            lambda df: apply_significance(df, pval_threshold, fc_threshold, fdr_scope=fdr_scope,
+                                          use_treat=use_treat, hierarchical=hierarchical))
     if mode == 'reference':
         baseline = contrasts[0][0]
         if any(b != baseline for b, _o in contrasts):
@@ -757,6 +1194,9 @@ def run_moderated(data_df: pd.DataFrame, group_vec: list[str],
     combined = apply_significance(combined, pval_threshold, fc_threshold,
                                   fdr_scope=fdr_scope, use_treat=use_treat,
                                   hierarchical=hierarchical)
+    absorbed = pairing_absorbed(covariates, pairing_vec)
+    if absorbed:
+        combined.attrs['notes'] = [_absorbed_note(name) for name in absorbed]
     log.info("moderated test: %d rows across %d comparison(s), %d significant (%s FDR%s%s)",
              len(combined), combined['comparison'].nunique(),
              int(combined['significant'].sum()), fdr_scope,
@@ -1137,61 +1577,32 @@ def _grid_argmax(values: np.ndarray) -> np.ndarray:
     return x
 
 
-def _shrunk_dispersions(blocks: list, mus: list) -> tuple[list, dict]:
+def _common_dispersion(blocks: list, mus: list) -> float:
     """
-    Negative-binomial dispersion per feature, shrunk towards a common value:
-    the maximum of the Cox–Reid likelihood plus a normal prior on log α
-    whose mean is the median of the features' log MLEs and whose variance
-    is their robust (MAD) variance less the sampling variance ψ′(df/2),
-    floored at 0.25 (as DESeq2). Returns one alpha array per block and the
-    prior.
+    One negative-binomial dispersion for every feature: the median of the
+    features' Cox–Reid maximum-likelihood log α (for the fitted means
+    *mus*), over the features off the Poisson boundary. Used by
+    _ql_dispersion when there are too few features for a trend.
     """
-    from scipy import special
-
     lls = [_nb_profile_loglik(b.Y, mu, b.X) for b, mu in zip(blocks, mus)]
-    dfs = np.concatenate([np.full(b.Y.shape[0], b.X.shape[0] - b.X.shape[1]) for b in blocks])
     mle = np.concatenate([_LOG_ALPHA_GRID[np.argmax(ll, axis=1)] for ll in lls])
     usable = mle > _LOG_ALPHA_GRID[0] + 2.0          # off the Poisson boundary
     if usable.sum() < 3:
         usable = np.ones_like(usable)
-    centre = float(np.median(mle[usable]))
-    mad = 1.4826 * float(np.median(np.abs(mle[usable] - centre)))
-    variance = max(mad ** 2 - float(special.polygamma(1, np.mean(dfs) / 2.0)), _MIN_PRIOR_VARIANCE)
-    penalty = (_LOG_ALPHA_GRID[None, :] - centre) ** 2 / (2.0 * variance)
-    alphas = [np.exp(_grid_argmax(ll - penalty)) for ll in lls]
-    return alphas, {'log_alpha_mean': centre, 'log_alpha_variance': variance}
+    return float(np.exp(np.median(mle[usable])))
 
 
-def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
-                  coefs: list[int]) -> dict:
+def _ql_blocks(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray) -> tuple[list, list]:
     """
-    Quasi-likelihood F test of each design column in ``coefs`` for every
-    feature (rows of counts and offsets; NaN = not measured).
-
-    Features sharing a pattern of measured samples are fitted together on
-    that sub-design. Negative-binomial dispersions come from
-    _shrunk_dispersions (two rounds of fit and estimate). The
-    quasi-dispersion of each feature (residual deviance / residual df) is
-    moderated with moderated_stats.fit_prior_variance, as limma moderates
-    variances; F = (deviance without the column − deviance with it) /
-    moderated quasi-dispersion, on 1 and df + d0 degrees of freedom. The
-    quasi-dispersion is the low-count adjusted residual deviance over its
-    fractional residual df (_adjusted_deviance); a feature with no df left
-    takes the prior quasi-dispersion.
-
-    Returns {coef: (logFC (log2), SE, t, df_total)}. logFC comes from a fit
-    with the prior count (_add_prior_count), so it is finite when a group
-    has no events; SE = |logFC| / √F and t = sign(logFC) √F, so a t test
-    with df_total reproduces the F test and TREAT and threshold changes work
-    from the stored columns.
+    Features (rows of counts and offsets; NaN = not measured) grouped by
+    their pattern of measured samples, each group fitted on its sub-design
+    by a Poisson GLM. Returns the _Blocks and their fitted means.
     """
-    n_features = counts.shape[0]
     patterns: dict[bytes, list[int]] = {}
-    for i in range(n_features):
+    for i in range(counts.shape[0]):
         observed = np.isfinite(counts[i]) & np.isfinite(offsets[i])
         if np.any(counts[i][observed]):
             patterns.setdefault(observed.tobytes(), []).append(i)
-
     blocks, mus = [], []
     for key, rows in patterns.items():
         observed = np.frombuffer(key, dtype=bool)
@@ -1209,17 +1620,158 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
             continue
         blocks.append(_Block(rows[ok], columns, Y[ok], O[ok], X))
         mus.append(np.array([f[1] for f in fits if f is not None]))
+    return blocks, mus
 
+
+_TREND_SPAN = 0.3            # fraction of features pooled for each feature's dispersion
+_TREND_MIN_FEATURES = 10     # fewer features: one common dispersion
+
+
+def _abundance(blocks: list) -> np.ndarray:
+    """log2(mean count + 0.5) of each feature over its measured samples,
+    in block order: the covariate of the dispersion trend."""
+    return np.concatenate([np.log2(b.Y.mean(axis=1) + 0.5) for b in blocks])
+
+
+def _trended_dispersion(blocks: list, mus: list) -> np.ndarray:
+    """
+    Negative-binomial dispersion of each feature (block order) from the
+    features of similar abundance, after edgeR's trended dispersion. The
+    features are ranked by _abundance; for each one, the Cox–Reid profile
+    log-likelihoods (_nb_profile_loglik, for the fitted means *mus*) of the
+    nearest _TREND_SPAN fraction of features are summed with tricube
+    weights on rank distance and maximised over _LOG_ALPHA_GRID, a local
+    common dispersion. Rare features, whose counts vary more relative to
+    their size, so get a larger dispersion than abundant ones. With fewer
+    than _TREND_MIN_FEATURES features every feature takes
+    _common_dispersion.
+    """
+    ll = np.concatenate([_nb_profile_loglik(b.Y, mu, b.X) for b, mu in zip(blocks, mus)])
+    n = ll.shape[0]
+    if n < _TREND_MIN_FEATURES:
+        return np.full(n, _common_dispersion(blocks, mus))
+    k = max(_TREND_MIN_FEATURES, int(np.ceil(_TREND_SPAN * n)))
+    rank = np.empty(n)
+    rank[np.argsort(_abundance(blocks), kind='stable')] = np.arange(n)
+    pooled = np.empty_like(ll)
+    for start in range(0, n, 512):
+        dist = np.abs(rank[start:start + 512, None] - rank[None, :])
+        h = np.partition(dist, k - 1, axis=1)[:, k - 1:k] + 1.0
+        w = np.clip(1.0 - (dist / h) ** 3, 0.0, None) ** 3
+        pooled[start:start + 512] = w @ ll
+    return np.exp(_grid_argmax(pooled))
+
+
+def _split_blocks(values: np.ndarray, blocks: list) -> list:
+    """*values* in block order, split into one array per block."""
+    return np.split(values, np.cumsum([b.Y.shape[0] for b in blocks])[:-1])
+
+
+def _ql_dispersion(blocks: list, mus: list) -> tuple[list, list]:
+    """
+    The trended dispersion of *blocks* (_trended_dispersion; two rounds:
+    from the Poisson means, then from the negative-binomial means at those
+    dispersions), one array per block, and the fitted means at the final
+    values.
+    """
+    alphas = []
+    for _round in range(2):
+        alphas = _split_blocks(_trended_dispersion(blocks, mus), blocks)
+        full = [_fit_rows(b.Y, b.X, b.O, a) for b, a in zip(blocks, alphas)]
+        mus = [np.array([f[1] if f is not None else m for f, m in zip(fb, mu)])
+               for fb, mu in zip(full, mus)]
+    return alphas, mus
+
+
+def ql_dispersion(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    """The QL test's negative-binomial dispersion of each row of *counts*
+    (features) over every sample of *design* (``_ql_dispersion``); NaN for
+    a feature that cannot be fitted."""
+    out = np.full(counts.shape[0], np.nan)
+    blocks, mus = _ql_blocks(counts, design, offsets)
+    if blocks:
+        alphas, _mus = _ql_dispersion(blocks, mus)
+        out[np.concatenate([b.rows for b in blocks])] = np.concatenate(alphas)
+    return out
+
+
+def ql_block_dispersions(blocks: list, mus: list, alpha: np.ndarray | None = None) -> tuple[list, list]:
+    """
+    Dispersions of *blocks* (one array per block) and their fitted means
+    at those dispersions. *alpha*: per-feature dispersions indexed like the
+    rows of the counts the blocks came from (``ql_dispersion``); a feature
+    with none takes their median. Without *alpha* they are estimated on
+    the blocks' own samples (_ql_dispersion).
+    """
+    if alpha is None or not np.any(np.isfinite(alpha)):
+        return _ql_dispersion(blocks, mus)
+    alpha = np.asarray(alpha, dtype=float)
+    fill = float(np.nanmedian(alpha))
+    alphas = [np.where(np.isfinite(alpha[b.rows]), alpha[b.rows], fill) for b in blocks]
+    full = [_fit_rows(b.Y, b.X, b.O, a) for b, a in zip(blocks, alphas)]
+    mus = [np.array([f[1] if f is not None else m for f, m in zip(fb, mu)])
+           for fb, mu in zip(full, mus)]
+    return alphas, mus
+
+
+def ql_comparisons(group_vec: list[str], contrasts: list[tuple[str, str]], pairing_vec: list[str] | None,
+                   covariates: pd.DataFrame | None):
+    """
+    The QL test's fit for each contrast: the samples of its two groups only.
+    Yields (base, other, sample mask, design, group column of *other*).
+    With pairing, a pairing level that the two groups never share makes the
+    design rank-deficient only when no level is shared at all; the
+    comparison is then fitted without pairing (logged).
+    """
+    for base, other in contrasts:
+        mask = np.array([g in (base, other) for g in group_vec])
+        sub_groups = _subset_rows(group_vec, mask)
+        sub_pairing = _subset_rows(pairing_vec, mask) if pairing_vec is not None else None
+        sub_cov = covariates.loc[covariates.index[mask]] if covariates is not None else None
+        try:
+            design, _names, group_cols = build_design(sub_groups, base, sub_pairing, sub_cov)
+        except RuntimeError:
+            if sub_pairing is None:
+                raise
+            log.warning("QL counts: %s vs %s share no pairing level; fitted without pairing", other, base)
+            design, _names, group_cols = build_design(sub_groups, base, None, sub_cov)
+        yield base, other, mask, design, group_cols[other]
+
+
+def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
+                  coefs: list[int], alpha: np.ndarray | None = None) -> dict:
+    """
+    Quasi-likelihood F test of each design column in ``coefs`` for every
+    feature (rows of counts and offsets; NaN = not measured).
+
+    Features sharing a pattern of measured samples are fitted together on
+    that sub-design (_ql_blocks). Each feature's negative-binomial
+    dispersion is *alpha* (per row, ``ql_dispersion``), or the trended
+    dispersion of this design (_ql_dispersion). The quasi-dispersion of
+    each feature (residual deviance / residual df) is moderated with
+    moderated_stats.fit_prior_variance, as limma moderates variances;
+    F = (deviance without the column − deviance with it) / moderated
+    quasi-dispersion, on 1 and df + d0 degrees of freedom. The
+    quasi-dispersion is the low-count adjusted residual deviance over its
+    fractional residual df (_adjusted_deviance); a feature with no df left
+    takes the prior quasi-dispersion.
+
+    Returns {coef: (logFC (log2), SE, t, df_total)}. logFC comes from a fit
+    with the prior count (_add_prior_count), so it is finite when a group
+    has no events; SE = |logFC| / √F and t = sign(logFC) √F, so a t test
+    with df_total reproduces the F test and TREAT and threshold changes work
+    from the stored columns.
+    """
+    n_features = counts.shape[0]
+    blocks, mus = _ql_blocks(counts, design, offsets)
     out = {j: tuple(np.full(n_features, np.nan) for _ in range(4)) for j in coefs}
     if not blocks:
         return out
 
-    full = None
-    for _round in range(2):
-        alphas, prior = _shrunk_dispersions(blocks, mus)
-        full = [_fit_rows(b.Y, b.X, b.O, a) for b, a in zip(blocks, alphas)]
-        mus = [np.array([f[1] if f is not None else m for f, m in zip(fb, mu)])
-               for fb, mu in zip(full, mus)]
+    alphas, mus = ql_block_dispersions(blocks, mus, alpha)
+    full = [_fit_rows(b.Y, b.X, b.O, a) for b, a in zip(blocks, alphas)]
+    mus = [np.array([f[1] if f is not None else m for f, m in zip(fb, mu)])
+           for fb, mu in zip(full, mus)]
 
     dev_full = [_glm_deviance(b.Y, mu, a) for b, mu, a in zip(blocks, mus, alphas)]
     adjusted = [_adjusted_deviance(b.Y, mu, b.X, a) for b, mu, a in zip(blocks, mus, alphas)]
@@ -1232,9 +1784,9 @@ def _glm_ql_tests(counts: np.ndarray, design: np.ndarray, offsets: np.ndarray,
         post = np.full(phi.shape, s0)
     else:
         post = (d0 * s0 + df_all * phi) / (d0 + df_all)
-    log.info("QL counts test: %d features, log-dispersion prior %.3g (variance %.3g), "
-             "quasi-dispersion prior d0=%.3g s0²=%.3g", phi.size, prior['log_alpha_mean'],
-             prior['log_alpha_variance'], d0, s0)
+    all_alpha = np.concatenate(alphas)
+    log.info("QL counts test: %d features, dispersion %.3g–%.3g, quasi-dispersion prior d0=%.3g s0²=%.3g",
+             phi.size, all_alpha.min(), all_alpha.max(), d0, s0)
 
     shrunk = []
     for b, a in zip(blocks, alphas):
@@ -1278,12 +1830,15 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
                           offset_df: pd.DataFrame | None = None,
                           method: str = 'wald') -> pd.DataFrame:
     """
-    One design + per-feature NB/Poisson fit, read out for every contrast in
-    ``contrasts`` (shared baseline). The offset is log(row total of
-    counts_df) unless ``offset_df`` gives a per-feature denominator. The
-    coefficient is a rate difference between groups, reported on the log2
-    scale. method 'wald': Wald z tests (df.total = inf); 'ql':
-    quasi-likelihood F tests (_glm_ql_tests). With either, logFC comes from
+    Per-feature NB/Poisson fits read out for every contrast in
+    ``contrasts``. The offset is log(row total of counts_df) unless
+    ``offset_df`` gives a per-feature denominator. The coefficient is a rate
+    difference between groups, reported on the log2 scale. method 'wald':
+    one design over every sample (shared baseline), Wald z tests
+    (df.total = inf); 'ql': quasi-likelihood F tests (_glm_ql_tests), each
+    contrast fitted on the samples of its two groups (ql_comparisons) with
+    the dispersions estimated on every sample (ql_dispersion), so the
+    contrasts may have different baselines. With either, logFC comes from
     a fit with the prior count (_add_prior_count) and SE is |logFC| over
     the test statistic, so a group with no events gives a finite logFC and
     the stored columns reproduce the test.
@@ -1312,11 +1867,11 @@ def _glm_counts_contrasts(counts_df: pd.DataFrame, group_vec: list[str],
                    .reshape(len(features), len(counts_df)))
 
     if method == 'ql':
-        tests = _glm_ql_tests(counts, design_mat, log_offsets,
-                              [group_cols[other] for _b, other in contrasts])
+        alpha = ql_dispersion(counts, design_mat, log_offsets)
         frames = []
-        for b, other in contrasts:
-            logfc, se, tvals, dft = tests[group_cols[other]]
+        for b, other, mask, sub_design, coef in ql_comparisons(group_vec, contrasts, pairing_vec, covariates):
+            tests = _glm_ql_tests(counts[:, mask], sub_design, log_offsets[:, mask], [coef], alpha)
+            logfc, se, tvals, dft = tests[coef]
             p = ms.treat_pvalues(logfc, se, dft, 0.0)
             with np.errstate(invalid='ignore'):
                 q = ms._t_isf(np.full(logfc.shape, 0.025), np.where(np.isfinite(dft), dft, np.inf))
@@ -1384,9 +1939,11 @@ def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
     """
     Per-feature negative-binomial GLM differential abundance test on raw
     event counts, with the same contrasts/mode/pairing/covariate semantics
-    as run_moderated(). In 'reference' mode each feature is fitted once and
-    every contrast is read from that fit; 'pairwise' fits each pair
-    separately.
+    as run_moderated(). With 'wald', 'reference' mode fits each feature once
+    and reads every contrast from that fit, and 'pairwise' fits each pair
+    separately. With 'ql' both modes fit each contrast on its two groups'
+    samples, with the dispersions estimated on every sample; 'pairwise' keeps
+    its check that each group of a pair has at least three samples.
 
     offset_df: optional per-sample, per-feature denominators (same index and
         columns as counts_df), e.g. each gated population's parent count.
@@ -1394,27 +1951,47 @@ def run_glm_counts(counts_df: pd.DataFrame, group_vec: list[str],
     method: 'wald' — per-feature Cameron–Trivedi dispersion (Poisson where
         it is not positive) and Wald z. Liberal with few residual degrees of
         freedom (paired designs, few samples per group). 'ql' —
-        quasi-likelihood F test with shrunk dispersions (_glm_ql_tests).
+        quasi-likelihood F test (_glm_ql_tests).
+
+    With missing covariate values, or pairing that does not link the
+    groups, each comparison is fitted on its own samples, dispersions
+    included (comparison_plan; see run_moderated).
 
     Returns the same schema as run_moderated() minus AveExpr.
     """
-    if mode == 'reference':
+    if mode not in ('reference', 'pairwise'):
+        raise ValueError(f"mode must be 'reference' or 'pairwise', got {mode!r}")
+    parts = comparison_plan(group_vec, contrasts, pairing_vec, covariates, mode)
+    if parts is not None:
+        return _fit_by_comparison(
+            parts,
+            lambda rows, groups, contrast, pairing, cov: run_glm_counts(
+                counts_df.iloc[rows], groups, [contrast], 'reference', pval_threshold,
+                fc_threshold, pairing_vec=pairing, fdr_scope=fdr_scope, covariates=cov,
+                use_treat=use_treat,
+                offset_df=None if offset_df is None else offset_df.iloc[rows], method=method),
+            group_vec, pairing_vec,
+            lambda df: apply_significance(df, pval_threshold, fc_threshold, fdr_scope=fdr_scope,
+                                          use_treat=use_treat))
+    pairs = (list(_pair_subsets(counts_df, group_vec, contrasts, pairing_vec, covariates))
+             if mode == 'pairwise' else [])
+    if mode == 'reference' or method == 'ql':
         combined = _glm_counts_contrasts(counts_df, group_vec, contrasts, pairing_vec,
                                          covariates, offset_df, method)
-    elif mode == 'pairwise':
+    else:
         frames = [
             _glm_counts_contrasts(sub_df, sub_groups, [(base, other)], sub_pair, sub_cov,
                                   None if offset_df is None else offset_df.loc[sub_df.index],
                                   method)
-            for sub_df, sub_groups, sub_pair, sub_cov, base, other
-            in _pair_subsets(counts_df, group_vec, contrasts, pairing_vec, covariates)
+            for sub_df, sub_groups, sub_pair, sub_cov, base, other in pairs
         ]
         combined = pd.concat(frames, ignore_index=True)
-    else:
-        raise ValueError(f"mode must be 'reference' or 'pairwise', got {mode!r}")
 
     combined = apply_significance(combined, pval_threshold, fc_threshold,
                                   fdr_scope=fdr_scope, use_treat=use_treat)
+    absorbed = pairing_absorbed(covariates, pairing_vec)
+    if absorbed:
+        combined.attrs['notes'] = [_absorbed_note(name) for name in absorbed]
     log.info("GLM counts (%s): %d rows across %d comparison(s), %d significant (%s FDR), "
              "%d untestable", method, len(combined), combined['comparison'].nunique(),
              int(combined['significant'].sum()), fdr_scope, int(combined['logFC'].isna().sum()))

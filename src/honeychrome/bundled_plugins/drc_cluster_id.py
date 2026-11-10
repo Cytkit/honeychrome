@@ -16,6 +16,22 @@ Two independent scoring mechanisms feed the Cluster Annotation tab's
      score published for ScType (Ianevski, Giri and Aittokallio 2022,
      Nat Commun 13:1246) against drc_cell_type_database.csv.
 
+Both score the run's clustering channels plus every other channel with an
+Antigen, viability dyes excepted (scoring_channels): every stained marker
+counts for or against a cell type, so a marker the cells were gated on but
+not clustered on (CD3 in a T-cell run) still has a say.
+
+Reference population (anchor). MEM compares each cluster with the run's
+other clusters, so a marker every clustered cell carries (CD3 after gating
+on T cells) reads the same in every cluster and never reaches a label. With
+the anchor population chosen as MEM reference (normally live single cells,
+resolve_anchor), the markers on which every cluster differs from the anchor
+in the same direction (shared_markers: CD3+, CD19-) are stated once, as a
+prefix to every label, and the rest of each label still describes the
+cluster against the other clusters. The anchor's events also give a channel
+without an unstained-derived threshold a negative population for its Otsu
+cut.
+
 Values are TRANSFORMED using each channel's configured transform
 (state.channel_transform_params -- the same logicle/log/linear transform
 the Transforms tab and clustering itself use), via
@@ -51,12 +67,27 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from honeychrome.controller_components import cell_type_panel
+
+import ag_core
 import drc_pipeline
 import drc_run_align
 import drc_run_archive
 from drc_logging import get_logger, log_stage
 
 log = get_logger(__name__)
+
+# What MEM compares each cluster with.
+MEM_REFERENCE_ANCHOR = 'anchor'
+MEM_REFERENCE_CLUSTERS = 'clusters'
+
+# The pooled reference population is capped at ANCHOR_MAX_EVENTS events.
+# Each training sample contributes a seeded subsample of about twice its
+# share (2 x ANCHOR_MAX_EVENTS / number of samples, at least
+# ANCHOR_MIN_EVENTS_PER_SAMPLE), since some of the events read fall outside
+# the anchor gate.
+ANCHOR_MAX_EVENTS = 20_000
+ANCHOR_MIN_EVENTS_PER_SAMPLE = 500
 
 
 # ---------------------------------------------------------------------------
@@ -291,15 +322,343 @@ def _log_pooled(result: dict):
 
 
 # ---------------------------------------------------------------------------
+# Scoring channels and the reference (anchor) population
+# ---------------------------------------------------------------------------
+
+def _viability_channels(controller, channels) -> set:
+    """Channels among *channels* carrying a viability dye: the fluorophore
+    is marked ``is.viability`` in the fluorophore database
+    (ag_core.viability_channels), or the Antigen reads as the 'Viability'
+    marker of marker_database.csv."""
+    out = set(ag_core.viability_channels(channels))
+    antigens = _channel_to_antigen_map(controller)
+    try:
+        from honeychrome.controller_components.label_matching import match_marker, get_marker_db
+        marker_db = get_marker_db()
+    except ImportError:
+        return out
+    for ch in channels:
+        antigen = (antigens.get(ch) or '').strip()
+        if antigen and match_marker(antigen, marker_db) == 'Viability':
+            out.add(ch)
+    return out
+
+
+def scoring_channels(controller, run_channels: list[str]) -> tuple[list[str], list[str]]:
+    """
+    The channels Cluster ID scores: the run's clustering channels, in their
+    order, then every other unmixed channel with an Antigen in the Spectral
+    Process tab, viability dyes excepted. Scatter, Time and AF channels
+    carry no Antigen, so they never appear.
+
+    A gating marker such as CD3 is often left out of clustering, yet it
+    still tells T cells from other cells; every stained marker counts.
+
+    Returns (channels, extra), extra being the channels added to the run's
+    own.
+    """
+    antigens = _channel_to_antigen_map(controller)
+    own = set(run_channels)
+    candidates = [ch for ch in drc_pipeline.get_unmixed_channels(controller)
+                  if ch not in own and ch not in drc_pipeline.META_CHANNELS
+                  and (antigens.get(ch) or '').strip()]
+    viability = _viability_channels(controller, candidates)
+    extra = [ch for ch in candidates if ch not in viability]
+    return list(run_channels) + extra, extra
+
+
+def resolve_anchor(gating, run_gates, chosen: str = '', viability=frozenset()) -> tuple[str, str]:
+    """
+    The reference population for a run clustered on *run_gates* (gate
+    names of *gating*, a FlowKit GatingStrategy; the clustered cells are
+    their union).
+
+    The anchor has to contain the clustered cells, so it is one of the
+    gates that are each clustered gate or above all of them ('root' always
+    is):
+
+      - *chosen*, when it is one of them;
+      - with *chosen* empty (automatic), the deepest of them that gates on
+        a channel in *viability*, else the deepest named 'Singlets', else
+        the deepest named 'Cells', else 'root' -- the order Automated
+        Gating uses (ag_core.anchor_population);
+      - a *chosen* gate that does not contain the clustered cells is
+        replaced by the deepest gate that does.
+
+    Returns (gate name, note); the note says when *chosen* was replaced.
+    """
+    from honeychrome.controller_components.per_sample_gating_functions import _gate_channels
+
+    depth = {'root': 0}
+    lineage = {'root': {'root'}}
+    for name, path in gating.get_gate_ids():
+        depth[name] = len(tuple(path))
+        lineage[name] = set(path) | {name}
+    sets = [lineage.get(g, {'root'}) for g in (run_gates or ['root'])]
+    common = set.intersection(*sets) | {'root'}
+    ordered = sorted(common, key=lambda n: depth.get(n, 0))
+
+    if chosen:
+        if chosen in common:
+            return chosen, ''
+        used = ordered[-1]
+        return used, f'"{chosen}" does not contain the clustered cells; "{used}" is used instead.'
+
+    def gate_channels(name):
+        try:
+            return set(_gate_channels(gating.get_gate(name)))
+        except Exception:
+            return set()
+
+    gates = [n for n in ordered if n != 'root']
+    for pick in ([n for n in gates if gate_channels(n) & set(viability)],
+                 [n for n in gates if n.strip().lower() == 'singlets'],
+                 [n for n in gates if n.strip().lower() == 'cells']):
+        if pick:
+            return pick[-1], ''
+    return 'root', ''
+
+
+def resolve_run_anchor(controller, cl_run: dict | None, chosen: str = '') -> tuple[str, str]:
+    """
+    MAIN-THREAD ONLY (reads the live gating). resolve_anchor for *cl_run*
+    on the experiment's unmixed gating, viability channels taken from the
+    experiment's unmixed channels. *chosen* is a gate name, or '' for
+    automatic.
+    """
+    viability = _viability_channels(controller, drc_pipeline.get_unmixed_channels(controller))
+    return resolve_anchor(controller.unmixed_gating, (cl_run or {}).get('gates') or [], chosen, viability)
+
+
+def _reference_column(reference: dict | None, channel: str) -> np.ndarray | None:
+    """The reference population's values on *channel*; None when there is
+    no reference or it lacks the channel."""
+    if reference is None or channel not in reference['names']:
+        return None
+    return reference['values'][:, reference['names'].index(channel)]
+
+
+def _stored_event_picks(cl_run: dict, stored: dict, max_events_per_cluster: int | None,
+                        seed: int) -> dict | None:
+    """
+    The run's stored marker-value events (drc_run_archive.run_marker_values:
+    the per-cluster sample taken when the run was classified), at most
+    *max_events_per_cluster* per cluster over all samples, seeded:
+    {rel_path: (FCS-file rows, ascending; their cluster labels)}. None when a
+    labelled training sample has no stored sample with rows or no event
+    keys, so the events cannot be located in the file.
+    """
+    labels_dict = cl_run.get('labels', {}) or {}
+    rels, rows, labs = [], [], []
+    for rel in cl_run.get('training_sample_ids', []):
+        labels = labels_dict.get(rel)
+        if labels is None:
+            continue
+        entry = stored.get(rel)
+        file_rows = drc_run_align.run_rows(cl_run, rel)
+        if entry is None or len(entry) != 3 or file_rows is None or len(file_rows) != len(labels):
+            return None
+        pos = np.asarray(entry[2], dtype=np.int64)
+        lab = np.asarray(labels)[pos]
+        keep = lab >= 0
+        rels.append(np.full(int(keep.sum()), len(rows)))
+        rows.append(file_rows[pos][keep])
+        labs.append(lab[keep])
+    if not rows:
+        return {}
+    sample_of, all_rows, all_labs = np.concatenate(rels), np.concatenate(rows), np.concatenate(labs)
+    chosen = np.ones(len(all_rows), dtype=bool)
+    if max_events_per_cluster is not None:
+        rng = np.random.default_rng(seed)
+        chosen[:] = False
+        for cl in np.unique(all_labs):
+            idx = np.flatnonzero(all_labs == cl)
+            if len(idx) > max_events_per_cluster:
+                idx = rng.choice(idx, size=max_events_per_cluster, replace=False)
+            chosen[idx] = True
+    names = [rel for rel in cl_run.get('training_sample_ids', []) if labels_dict.get(rel) is not None]
+    picks = {}
+    for i, rel in enumerate(names):
+        sel = chosen & (sample_of == i)
+        order = np.argsort(all_rows[sel])
+        picks[rel] = (all_rows[sel][order], all_labs[sel][order])
+    return picks
+
+
+def _read_unmixed_rows(abs_path, key: str, snap, rows: np.ndarray) -> np.ndarray:
+    """One sample's events at FCS-file *rows*, unmixed with its own AF
+    assignment (*snap*: an UnmixSnapshot). Only those rows are read when the
+    file allows it (sample_loader), else the whole file is read and indexed."""
+    from honeychrome.controller_components.fcs_preview import read_preview_metadata
+    from honeychrome.controller_components.sample_loader import (
+        _read_rows_streamed, read_raw_events, unmix_events)
+
+    raw = None
+    try:
+        raw = _read_rows_streamed(abs_path, snap, rows, read_preview_metadata(abs_path))
+    except Exception as exc:
+        log.debug("_read_unmixed_rows: %s read whole (%s)", abs_path, exc)
+    if raw is None:
+        raw = read_raw_events(abs_path, snap)[rows]
+    return unmix_events(raw, snap, snap.af_for(key), sample_key=key)['unmixed']
+
+
+def load_reference_and_extra_values(controller, state, cl_run: dict, anchor: str | None,
+                                    channels: list[str], extra_channels: list[str],
+                                    af_state=None, progress_callback=None,
+                                    max_events_per_cluster: int | None = 1000, seed: int = 42):
+    """
+    One pass over the run's training samples that reads and unmixes only
+    the events it keeps (only those rows of a file are read where the file
+    allows it; each sample is unmixed with its own AF assignment):
+
+      - the run's own events on *extra_channels*, which its stored marker
+        values do not hold. They are the stored events themselves, at most
+        *max_events_per_cluster* per cluster over all samples, chosen
+        before anything is read (_stored_event_picks), so the extra
+        channels describe the same cells as the clustering channels. A run
+        without stored events and event keys gets nothing here
+        (pooled_extra is None) and the caller reads its gated events in
+        full instead;
+      - the reference population *anchor* (a gate name or 'root'; None
+        reads none) on every channel in *channels*: a seeded subsample of
+        each sample, about twice its share of ANCHOR_MAX_EVENTS (at least
+        ANCHOR_MIN_EVENTS_PER_SAMPLE), since some events fall outside the
+        anchor gate. Each sample is gated with its own gates (per-sample
+        overrides included), and each event is tagged with its cluster in
+        the run (-1 when the run did not cluster it) so that a cluster can
+        be left out of its own reference. The pool is capped at
+        ANCHOR_MAX_EVENTS by seeded random downsampling.
+
+    af_state: unmixing snapshot (drc_pipeline.snapshot_af_state) taken on
+    the main thread; None takes one here (main-thread callers only).
+
+    progress_callback: optional callable(n_samples_done), after each
+    training sample.
+
+    Returns (pooled_extra, reference): pooled_extra is {channel: {cluster:
+    transformed values}}, or None (see above); reference is {'values': (n,
+    len(names)) float32 transformed values, 'names': channel names,
+    'labels': (n,) int cluster tags}, or None.
+    """
+    from honeychrome.controller_components.per_sample_gating_functions import SampleGating
+    from honeychrome.controller_components.sample_loader import load_unmixed, sample_key_for_path
+
+    training_samples = cl_run.get('training_sample_ids', [])
+    picks = None
+    if extra_channels:
+        picks = _stored_event_picks(cl_run, drc_run_archive.run_marker_values(controller, cl_run),
+                                    max_events_per_cluster, seed)
+    if picks is None and not anchor:
+        return None, None
+    if af_state is None:
+        af_state = drc_pipeline.snapshot_af_state(controller)
+    labels_dict = cl_run.get('labels', {}) or {}
+    gating = SampleGating.from_controller(controller) if anchor and anchor != 'root' else None
+    pnn = list(controller.data_for_cytometry_plots_unmixed['pnn'])
+    names = list(channels)
+    per_sample = max(ANCHOR_MIN_EVENTS_PER_SAMPLE,
+                     math.ceil(2 * ANCHOR_MAX_EVENTS / max(len(training_samples), 1)))
+    pooled_extra: dict[str, dict[int, list]] | None = (
+        {ch: {} for ch in extra_channels} if picks is not None else None)
+    ref_blocks: list[np.ndarray] = []
+    ref_tags: list[np.ndarray] = []
+
+    for i, rel in enumerate(training_samples):
+        try:
+            abs_path = drc_pipeline.sample_abs_path(controller, rel)
+            key = sample_key_for_path(controller.experiment_dir, abs_path)
+
+            pick = (picks or {}).get(rel)
+            if pick is not None and len(pick[0]):
+                unmixed = _read_unmixed_rows(abs_path, key, af_state, pick[0])
+                values, used = drc_pipeline.transform_channels(controller, state, unmixed, extra_channels)
+                _pool_sample(pooled_extra, extra_channels, values, used, pick[1])
+
+            if anchor:
+                got = load_unmixed(controller.experiment_dir, key, af_state, max_events=per_sample, seed=seed)
+                unmixed, event_index = got['unmixed'], np.asarray(got['event_index'])
+                if gating is not None:
+                    inside = np.asarray(gating.population_mask(key, unmixed, pnn, [anchor]), dtype=bool)
+                    unmixed, event_index = unmixed[inside], event_index[inside]
+                rows = drc_run_align.run_rows(cl_run, rel)
+                labels = labels_dict.get(rel)
+                if rows is not None and labels is not None and len(rows) == len(labels):
+                    tags, _matched = drc_run_align.align_values(np.asarray(labels), rows, event_index, -1)
+                else:
+                    tags = np.full(len(event_index), -1)
+                values, used = drc_pipeline.transform_channels(controller, state, unmixed, names)
+                block = np.full((len(values), len(names)), np.nan, dtype=np.float32)
+                for j, ch in enumerate(used):
+                    block[:, names.index(ch)] = values[:, j]
+                ref_blocks.append(block)
+                ref_tags.append(np.asarray(tags, dtype=np.int64))
+        except Exception as exc:
+            log.exception("load_reference_and_extra_values: %s could not be read: %s", rel, exc)
+        if progress_callback is not None:
+            progress_callback(i + 1)
+
+    if pooled_extra is not None:
+        pooled_extra = {ch: {cl: np.concatenate(v) for cl, v in by_cl.items() if v}
+                        for ch, by_cl in pooled_extra.items()}
+    reference = None
+    if ref_blocks:
+        values = np.concatenate(ref_blocks)
+        tags = np.concatenate(ref_tags)
+        if len(values) > ANCHOR_MAX_EVENTS:
+            keep_idx = np.sort(np.random.default_rng(seed).choice(len(values), ANCHOR_MAX_EVENTS,
+                                                                   replace=False))
+            values, tags = values[keep_idx], tags[keep_idx]
+        if len(values):
+            reference = {'values': values, 'names': names, 'labels': tags}
+    log.info("load_reference_and_extra_values: reference %r: %s event(s) (%d read per sample); "
+             "%d extra channel(s) from %s stored event(s)",
+             anchor, 0 if reference is None else len(reference['labels']), per_sample if anchor else 0,
+             len(extra_channels), 'no' if picks is None else sum(len(p[0]) for p in picks.values()))
+    return pooled_extra, reference
+
+
+def shared_markers(mem_scores: pd.DataFrame, threshold: float = 2.0) -> dict[str, int]:
+    """
+    Channels on which every cluster differs from the reference in the same
+    direction by at least *threshold* (scores from calculate_mem_scores
+    against the anchor population): {channel: +1 or -1}, strongest first.
+
+    In a run gated on T cells these are the markers all its clusters share
+    against live cells (CD3+, CD19-). They describe the gated population as
+    a whole, so the MEM label states them once, as a prefix, and describes
+    each cluster against the other clusters for everything else.
+    """
+    signs: dict[str, int] = {}
+    strength: dict[str, float] = {}
+    for ch in mem_scores.columns:
+        col = mem_scores[ch].astype(float)
+        if col.empty or col.isna().any():
+            continue
+        if (col >= threshold).all():
+            signs[ch] = 1
+        elif (col <= -threshold).all():
+            signs[ch] = -1
+        else:
+            continue
+        strength[ch] = float(col.abs().mean())
+    return {ch: signs[ch] for ch in sorted(signs, key=lambda c: -strength[c])}
+
+
+# ---------------------------------------------------------------------------
 # MEM scoring
 # ---------------------------------------------------------------------------
 
 def calculate_mem_scores(pooled: dict[str, dict[int, np.ndarray]],
-                          iqr_floor: float = 0.5) -> pd.DataFrame:
+                          iqr_floor: float = 0.5,
+                          reference: dict | None = None) -> pd.DataFrame:
     """
     Marker Enrichment Modeling score per (cluster, channel). POP = this
     cluster's pooled values for a channel; REF = every OTHER cluster's
-    pooled values for that channel (MEM's auto-reference). This is a
+    pooled values for that channel (MEM's auto-reference), or, with
+    *reference* (the anchor population, load_reference_and_extra_values),
+    the reference events on that channel outside this cluster. A channel
+    the reference lacks is left NaN. This is a
     PER-CHANNEL comparison only -- POP and REF never
     mix data from other channels; the only place channels interact at all
     is the final rescale below.
@@ -329,12 +688,20 @@ def calculate_mem_scores(pooled: dict[str, dict[int, np.ndarray]],
     mem_raw = pd.DataFrame(index=clusters, columns=channels, dtype=float)
     for ch in channels:
         by_cl = pooled[ch]
+        ref_values = _reference_column(reference, ch)
+        if reference is not None and ref_values is None:
+            log.warning("calculate_mem_scores: channel %r is not in the reference population -- left NaN", ch)
+            continue
         for cl in clusters:
             pop = by_cl.get(cl)
             if pop is None or len(pop) == 0:
                 continue
-            ref = np.concatenate([v for other, v in by_cl.items()
-                                  if other != cl and len(v)])
+            if ref_values is None:
+                others = [v for other, v in by_cl.items() if other != cl and len(v)]
+                ref = np.concatenate(others) if others else np.array([])
+            else:
+                ref = ref_values[reference['labels'] != cl]
+                ref = ref[np.isfinite(ref)]
             if len(ref) == 0:
                 continue
             mag = float(np.median(pop) - np.median(ref))
@@ -772,7 +1139,9 @@ def calculate_unstained_channel_thresholds(
 
 
 def calculate_channel_thresholds(controller, state, pooled: dict[str, dict[int, np.ndarray]],
-                                  channels: list[str], unstained_af_states: dict | None = None) -> dict[str, float]:
+                                  channels: list[str], unstained_af_states: dict | None = None,
+                                  unstained_thresholds: dict | None = None,
+                                  reference: dict | None = None) -> dict[str, float]:
     """
     Per-channel positivity threshold, PREFERRING the unstained-sample-derived
     threshold (calculate_unstained_channel_thresholds) and falling back to
@@ -791,20 +1160,39 @@ def calculate_channel_thresholds(controller, state, pooled: dict[str, dict[int, 
     unstained_af_states: forwarded to calculate_unstained_channel_thresholds
     -- see its docstring and resolve_unstained_af_states.
 
+    unstained_thresholds: calculate_unstained_channel_thresholds's result
+    when the caller already has it; None computes it here.
+
+    reference: the anchor population (load_reference_and_extra_values).
+    When it holds a channel, that channel's Otsu cut is made on the
+    reference events instead of the clustered ones: the reference contains
+    cells negative for a marker every clustered cell carries, so the cut
+    falls between negative and positive rather than inside the positives.
+
     Returns {channel: threshold}. A channel with no unstained-derived value
     AND no pooled data anywhere gets threshold 0.0 (_otsu_threshold's own
     empty-input fallback).
     """
-    unstained_thresholds = calculate_unstained_channel_thresholds(
-        controller, state, channels, unstained_af_states=unstained_af_states,
-    )
+    if unstained_thresholds is None:
+        unstained_thresholds = calculate_unstained_channel_thresholds(
+            controller, state, channels, unstained_af_states=unstained_af_states,
+        )
 
     thresholds: dict[str, float] = dict(unstained_thresholds)
     otsu_channels = [ch for ch in channels if ch not in unstained_thresholds]
+    on_reference = []
     for ch in otsu_channels:
-        by_cl = pooled.get(ch, {})
-        all_vals = np.concatenate([v for v in by_cl.values() if len(v)]) if by_cl else np.array([])
+        all_vals = _reference_column(reference, ch)
+        if all_vals is not None:
+            all_vals = all_vals[np.isfinite(all_vals)]
+        if all_vals is not None and all_vals.size:
+            on_reference.append(ch)
+        else:
+            by_cl = pooled.get(ch, {})
+            all_vals = np.concatenate([v for v in by_cl.values() if len(v)]) if by_cl else np.array([])
         thresholds[ch] = _otsu_threshold(all_vals) if all_vals.size else 0.0
+    if on_reference:
+        log.info("calculate_channel_thresholds: Otsu cut on the reference population for %s", on_reference)
 
     if otsu_channels:
         log.info(
@@ -1112,8 +1500,15 @@ def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
     pos_evidence_floor: see the absence reward guard below.
 
     Rules:
-      - A cell type with none of its markers in the panel is not scored.
-        A marker listed twice for the same side counts once.
+      - Only the panel's markers have a say; a definition's markers that
+        are not stained are left out of its sums and counts. A cell type
+        with none of its markers in the panel is not scored. A marker
+        listed twice for the same side counts once.
+      - Cell types whose signs on the panel are identical cannot be told
+        apart (cell_type_panel.panel_groups): they are scored once, as a
+        group, and a winning group is suggested under its label, its
+        single member's name or "signs: A / B / C". 'separated_by' names
+        the unstained markers on which the group's members differ.
       - Absence reward guard. The negative-marker term, -sum/sqrt(|N|), is
         split into a reward (its positive part: negative markers read
         off, as expected) and a penalty (its negative part: negative
@@ -1122,10 +1517,10 @@ def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
         cluster and the positive term exceeds pos_evidence_floor, so a
         cluster that reads low on every channel (debris, dead cells)
         cannot win on absent markers alone.
-      - Ties: an exactly equal score keeps the entry listed first in
-        cell_type_db. drc_cell_type_database.csv lists parent populations
-        before their children, so a tie resolves to the less specific
-        type.
+      - Ties between groups: an exactly equal score keeps the group whose
+        first member is listed first in cell_type_db.
+        drc_cell_type_database.csv lists parent populations before their
+        children, so a tie resolves to the less specific type.
       - low_confidence is True when the winning cell type has no positive
         evidence in this cluster (no positive marker present, or a
         positive term not above pos_evidence_floor), so the guard
@@ -1134,29 +1529,28 @@ def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
         min_score 0.3) a low-confidence suggestion never survives.
 
     Returns a DataFrame indexed like `scores` with columns
-    'suggested_type' (str), 'score' (float, rounded to 2 decimals) and
-    'low_confidence' (bool). Selection and the min_score test use the
-    unrounded score. A cluster with no scoreable cell type, or whose best
-    score is below min_score, gets suggested_type '', score NaN and
-    low_confidence False.
+    'suggested_type' (str), 'score' (float, rounded to 2 decimals),
+    'low_confidence' (bool) and 'separated_by' (str, comma-separated
+    markers). Selection and the min_score test use the unrounded score. A
+    cluster with no scoreable cell type, or whose best score is below
+    min_score, gets suggested_type '', score NaN, low_confidence False and
+    separated_by ''.
     """
-    columns = ['suggested_type', 'score', 'low_confidence']
+    columns = ['suggested_type', 'score', 'low_confidence', 'separated_by']
     n_clusters = len(scores.index)
     marker_values = _marker_value_matrix(scores, channel_marker_map)
+    grouped = cell_type_panel.panel_groups(
+        [(e.get('cell_type', ''), e.get('positive', []), e.get('negative', [])) for e in cell_type_db],
+        marker_values.keys())
 
     best_score = np.full(n_clusters, -np.inf)
     best_entry = np.full(n_clusters, -1, dtype=int)
     best_low = np.zeros(n_clusters, dtype=bool)
-    n_scoreable_types = 0
+    n_scoreable_types = sum(len(g.names) for g in grouped.groups)
 
-    for k, entry in enumerate(cell_type_db):
-        positive = entry.get('positive', [])
-        negative = entry.get('negative', [])
-        if not any(m in marker_values for m in (*positive, *negative)):
-            continue
-        n_scoreable_types += 1
-        pos_term, n_pos = _signature_term(positive, marker_values, n_clusters)
-        neg_term, _n_neg = _signature_term(negative, marker_values, n_clusters)
+    for k, group in enumerate(grouped.groups):
+        pos_term, n_pos = _signature_term(list(group.positive), marker_values, n_clusters)
+        neg_term, _n_neg = _signature_term(list(group.negative), marker_values, n_clusters)
 
         absence = -neg_term
         reward = np.maximum(absence, 0.0)
@@ -1172,16 +1566,19 @@ def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
     suggested: list[str] = []
     score_out: list[float] = []
     low_out: list[bool] = []
+    separated: list[str] = []
     for i in range(n_clusters):
         k = best_entry[i]
         if k < 0 or best_score[i] < min_score:
             suggested.append('')
             score_out.append(np.nan)
             low_out.append(False)
+            separated.append('')
         else:
-            suggested.append(cell_type_db[k]['cell_type'])
+            suggested.append(grouped.groups[k].label)
             score_out.append(round(float(best_score[i]), 2))
             low_out.append(bool(best_low[i]))
+            separated.append(', '.join(grouped.groups[k].separated_by))
 
     index = pd.Index(scores.index, name='cluster')
     result = pd.DataFrame(
@@ -1189,14 +1586,16 @@ def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
             'suggested_type': pd.Series(suggested, index=index, dtype=object),
             'score': pd.Series(score_out, index=index, dtype=float),
             'low_confidence': pd.Series(low_out, index=index, dtype=bool),
+            'separated_by': pd.Series(separated, index=index, dtype=object),
         },
         columns=columns,
     )
     n_suggested = sum(1 for s in suggested if s)
     log.info(
         "score_cell_types: %d cluster(s), %d/%d cell type(s) scoreable in this "
-        "panel, %d suggestion(s) at min_score=%.3g (%d low confidence)",
-        n_clusters, n_scoreable_types, len(cell_type_db), n_suggested,
+        "panel in %d group(s) the panel can tell apart, %d suggestion(s) at "
+        "min_score=%.3g (%d low confidence)",
+        n_clusters, n_scoreable_types, len(cell_type_db), len(grouped.groups), n_suggested,
         min_score, sum(low_out),
     )
     return result
@@ -1209,15 +1608,16 @@ def score_cell_types(scores: pd.DataFrame, channel_marker_map: dict[str, str],
 def total_progress_steps(cl_run: dict) -> int:
     """
     Total progress_callback ticks compute_cluster_id_suggestions will
-    emit for this run: one per training sample loaded (pooling), plus
-    one per remaining pipeline stage (MEM scores, cluster medians,
-    channel thresholds, MEM labels + marker mapping, cell-type scoring
-    -- 5 stages). Call this BEFORE compute_cluster_id_suggestions to
+    emit for this run: one per training sample loaded (pooling), one per
+    training sample read for the added channels and the reference
+    population, plus one per remaining pipeline stage (MEM scores, cluster
+    medians, channel thresholds, MEM labels + marker mapping, cell-type
+    scoring -- 5 stages). Call this BEFORE compute_cluster_id_suggestions to
     size a progress bar's range, so the range and the actual callback
     count can't drift apart if a stage is ever added or removed below.
     """
     n_samples = len(cl_run.get('training_sample_ids', [])) or 1
-    return n_samples + 5
+    return 2 * n_samples + 5
 
 
 def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: list[str],
@@ -1231,18 +1631,27 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
                                     unstained_af_states: dict | None = None,
                                     max_events_per_cluster: int | None = 1000,
                                     downsample_seed: int = 42,
-                                    live_mode: str = drc_run_align.JOIN_NONE):
+                                    live_mode: str = drc_run_align.JOIN_NONE,
+                                    anchor: str | None = None,
+                                    mem_reference: str = MEM_REFERENCE_CLUSTERS):
     """
     One-call pipeline for the Cluster Annotation tab's controls.
 
-    Does NOT itself check for missing Antigen -- the tab calls
-    channels_missing_antigen() BEFORE this and refuses to proceed if
-    anything comes back, so by the time this runs every channel is assumed
-    to have Antigen text (marker MATCHING against marker_database.csv is a
-    separate, non-blocking concern -- see unmatched_markers below).
+    channels: the run's clustering channels (cl_run['channels']). Every
+    other channel with an Antigen, viability dyes excepted, is scored too
+    (scoring_channels), so MEM Label and Suggested Type also see markers
+    the cells were gated on but not clustered on.
 
-    progress_callback: optional callable(n_samples_done: int), forwarded
-    straight through to pool_cluster_marker_values -- see its docstring.
+    Does NOT itself check for missing Antigen -- the tab calls
+    channels_missing_antigen() on the clustering channels BEFORE this and
+    refuses to proceed if anything comes back; the added channels have an
+    Antigen by construction (marker MATCHING against marker_database.csv is
+    a separate, non-blocking concern -- see unmatched_markers below).
+
+    progress_callback: optional callable(n_done: int), ticking
+    total_progress_steps(cl_run) times: once per training sample pooled,
+    once per training sample read for the added channels and the
+    reference population, then once per stage.
 
     species: 'human', 'mouse', or None. Restricts cell-type scoring to
     drc_cell_type_database.csv entries defined for that species (see
@@ -1253,69 +1662,131 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
     min_score, pos_evidence_floor: forwarded to score_cell_types -- see
     its docstring.
 
-    af_state: optional unmixing snapshot, forwarded straight through to
-    pool_cluster_marker_values --
-    see its docstring. Pass this when calling from a background worker
-    thread.
+    af_state: unmixing snapshot (drc_pipeline.snapshot_af_state) taken on
+    the main thread. Pass it when calling from a background worker thread.
 
     unstained_af_states: {rel_path: af_state_or_None}, as returned by
-    resolve_unstained_af_states -- forwarded to calculate_channel_thresholds
-    (and from there to calculate_unstained_channel_thresholds). NOT the
-    same thing as af_state above: the unstained sample used to derive
-    positivity thresholds has no AF profile of its own, so it needs its
-    OWN resolved stand-in, never the training samples' af_state. Must be
-    resolved on the MAIN THREAD before this function is called from a
-    background worker -- see resolve_unstained_af_states's docstring.
+    resolve_unstained_af_states -- forwarded to
+    calculate_unstained_channel_thresholds. NOT the same thing as af_state
+    above: the unstained sample used to derive positivity thresholds has
+    no AF profile of its own, so it needs its OWN resolved stand-in, never
+    the training samples' af_state. Must be resolved on the MAIN THREAD
+    before this function is called from a background worker -- see
+    resolve_unstained_af_states's docstring.
 
     max_events_per_cluster, downsample_seed: forwarded straight through
     to pool_cluster_marker_values -- see its docstring.
 
-    Returns (mem_labels, mem_scores, cell_type_df, unmatched_markers):
+    anchor: the reference population, a gate name or 'root', resolved on
+    the main thread (resolve_run_anchor); None reads no reference. It is
+    read when MEM is scored against it, or when a channel has no
+    unstained-derived threshold (that channel's Otsu cut is then made on
+    the reference events; see calculate_channel_thresholds).
+
+    mem_reference: MEM is always scored against the run's other clusters.
+    With MEM_REFERENCE_ANCHOR it is also scored against the anchor
+    population, and the markers every cluster shares against it
+    (shared_markers) become a prefix to every MEM label and are left out of
+    the per-cluster part. Without a reference there is no prefix.
+
+    Returns (mem_labels, mem_scores, cell_type_df, unmatched_markers, details):
       mem_labels        -- dict[cluster_id -> str], ready to display/adopt
       mem_scores        -- (cluster x channel) DataFrame, in case a future
                            caller wants the raw matrix (e.g. a heatmap)
       cell_type_df      -- DataFrame indexed by cluster, columns
-                           ['suggested_type', 'score', 'low_confidence']
-                           -- see score_cell_types for how ties are
-                           resolved (hierarchy order, not reported) and
-                           what low_confidence means
+                           ['suggested_type', 'score', 'low_confidence',
+                           'separated_by'] -- see score_cell_types for
+                           cell types the panel cannot tell apart (one
+                           group suggestion), how ties between groups are
+                           resolved and what low_confidence means
       unmatched_markers -- [(channel, antigen_text), ...] from
                            build_channel_marker_map -- Antigen entries that
                            didn't match marker_database.csv and so will
                            NOT contribute to cell-type scoring. The tab
                            surfaces this as a warning after computing
                            rather than failing or silently dropping them.
+      details           -- {'channels': every channel scored,
+                           'extra_channels': those beyond the run's own,
+                           'anchor': the reference population read, or
+                           None, 'mem_reference': MEM_REFERENCE_ANCHOR when
+                           the shared-marker prefix was computed,
+                           'n_reference_events': events in the pooled
+                           reference, 'shared_markers': the prefix terms,
+                           e.g. ['CD3+', 'CD19-']}
     """
     log_stage(log, "CLUSTER ID SUGGESTIONS")
     n_samples = len(cl_run.get('training_sample_ids', [])) or 1
+    run_channels = list(channels)
+    channels, extra = scoring_channels(controller, run_channels)
+    log.info("compute_cluster_id_suggestions: %d clustering channel(s) plus %d other stained "
+             "channel(s) %s", len(run_channels), len(extra), extra)
 
     pooled = pool_cluster_marker_values(
-        controller, state, cl_run, channels,
+        controller, state, cl_run, run_channels,
         progress_callback=progress_callback,
         af_state=af_state,
         max_events_per_cluster=max_events_per_cluster,
         seed=downsample_seed,
         live_mode=live_mode,
     )
+    unstained_thresholds = calculate_unstained_channel_thresholds(
+        controller, state, channels, unstained_af_states=unstained_af_states,
+    )
+    wants_reference = anchor is not None and (
+        mem_reference == MEM_REFERENCE_ANCHOR or any(ch not in unstained_thresholds for ch in channels))
 
-    mem_scores = calculate_mem_scores(pooled, iqr_floor=iqr_floor)
+    def sample_progress(n_done):
+        if progress_callback is not None:
+            progress_callback(n_samples + n_done)
+
+    pooled_extra, reference = load_reference_and_extra_values(
+        controller, state, cl_run, anchor if wants_reference else None, channels, extra,
+        af_state=af_state, progress_callback=sample_progress,
+        max_events_per_cluster=max_events_per_cluster, seed=downsample_seed,
+    )
+    if pooled_extra is not None:
+        pooled.update(pooled_extra)
+    elif extra:
+        # No stored events to read the added channels from: every gated
+        # event of each sample is read instead.
+        pooled.update(pool_cluster_marker_values(
+            controller, state, cl_run, extra, af_state=af_state,
+            max_events_per_cluster=max_events_per_cluster, seed=downsample_seed,
+            live_mode=live_mode,
+        ))
+    pooled = {ch: pooled.get(ch, {}) for ch in channels}
     if progress_callback is not None:
-        progress_callback(n_samples + 1)
+        progress_callback(2 * n_samples)
+
+    mem_against_anchor = mem_reference == MEM_REFERENCE_ANCHOR and reference is not None
+    mem_scores = calculate_mem_scores(pooled, iqr_floor=iqr_floor)
+    shared = {}
+    if mem_against_anchor:
+        shared = shared_markers(calculate_mem_scores(pooled, iqr_floor=iqr_floor, reference=reference),
+                                threshold=mem_threshold)
+    if progress_callback is not None:
+        progress_callback(2 * n_samples + 1)
 
     cluster_medians = calculate_cluster_medians(pooled)
     if progress_callback is not None:
-        progress_callback(n_samples + 2)
+        progress_callback(2 * n_samples + 2)
 
     channel_thresholds = calculate_channel_thresholds(
-        controller, state, pooled, channels, unstained_af_states=unstained_af_states,
+        controller, state, pooled, channels,
+        unstained_thresholds=unstained_thresholds, reference=reference,
     )
     thresholded = cluster_medians.subtract(pd.Series(channel_thresholds), axis=1)
     if progress_callback is not None:
-        progress_callback(n_samples + 3)
+        progress_callback(2 * n_samples + 3)
 
     antigen_map = _channel_to_antigen_map(controller)
     display_labels = {ch: (antigen_map.get(ch) or ch) for ch in channels}
-    mem_labels = generate_mem_labels(mem_scores, display_labels, threshold=mem_threshold)
+    mem_labels = generate_mem_labels(mem_scores.drop(columns=list(shared)), display_labels,
+                                     threshold=mem_threshold)
+    shared_terms = [f"{display_labels.get(ch, ch)}{'+' if sign > 0 else '-'}" for ch, sign in shared.items()]
+    if shared_terms:
+        prefix = ' '.join(shared_terms)
+        mem_labels = {cl: f'{prefix}: {label}' for cl, label in mem_labels.items()}
     n_uncharacterized = sum(1 for v in mem_labels.values() if v == 'Uncharacterized')
     log.info(
         "compute_cluster_id_suggestions: %d/%d cluster(s) Uncharacterized (threshold=%.2g)",
@@ -1325,12 +1796,20 @@ def compute_cluster_id_suggestions(controller, state, cl_run: dict, channels: li
     cell_type_db = load_cell_type_database(cell_type_db_path)
     cell_type_db = filter_cell_type_db_by_species(cell_type_db, species)
     if progress_callback is not None:
-        progress_callback(n_samples + 4)
+        progress_callback(2 * n_samples + 4)
 
     cell_type_df = score_cell_types(thresholded, channel_marker_map, cell_type_db,
                                      min_score=min_score,
                                      pos_evidence_floor=pos_evidence_floor)
     if progress_callback is not None:
-        progress_callback(n_samples + 5)
+        progress_callback(2 * n_samples + 5)
 
-    return mem_labels, mem_scores, cell_type_df, unmatched_markers
+    details = {
+        'channels': list(channels),
+        'extra_channels': list(extra),
+        'anchor': anchor if reference is not None else None,
+        'mem_reference': MEM_REFERENCE_ANCHOR if mem_against_anchor else MEM_REFERENCE_CLUSTERS,
+        'n_reference_events': 0 if reference is None else int(len(reference['labels'])),
+        'shared_markers': shared_terms,
+    }
+    return mem_labels, mem_scores, cell_type_df, unmatched_markers, details

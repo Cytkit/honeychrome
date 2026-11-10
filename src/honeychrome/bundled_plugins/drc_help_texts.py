@@ -62,8 +62,11 @@ transformed units.</li>
 <li><b>Transformed units</b>: positions on a transformed (logicle) axis,
 the same scale as the main cytometry plots.</li>
 <li><b>MEM label</b>: a description of a cluster's markers relative to the
-rest of the cells, for example "CD4+6 CD8−5". It describes the data, so it is
-safe to adopt.</li>
+other clusters, for example "CD4+6 CD8−5", optionally preceded by the markers
+all clusters share against the anchor population ("CD3+ CD19-: CD4+6
+CD8−5"). It describes the data, so it is safe to adopt.</li>
+<li><b>Anchor population</b>: the cells "everything" means for Cluster ID,
+normally live single cells. It must contain the clustered cells.</li>
 <li><b>Cell-type suggestion</b>: a match of a cluster's markers against a
 database of known cell types. A suggestion to check, not a fact.</li>
 <li><b>Frequency</b>: a cluster's share of a sample's labelled events.
@@ -79,6 +82,9 @@ not just different from zero.</li>
 one reference, or every pair of groups.</li>
 <li><b>Paired design</b>: samples matched across groups (for example the same
 donor before and after treatment), compared within each pair.</li>
+<li><b>Populations within samples</b>: gated populations of the same samples
+(for example CD45.1+ and CD45.1− cells of each mixed chimera) compared with
+each other instead of groups of samples.</li>
 <li><b>Covariate</b>: a per-sample value (for example age or batch) that the
 tests can <b>adjust for</b>.</li>
 <li><b>Cluster-first MFI testing</b>: asks first which clusters change, then
@@ -348,11 +354,41 @@ suggestion cannot tell them apart either.</li>
 (several populations in one cluster) all degrade the match.</li>
 </ul></li>
 </ol>
-<p><b>Compute Cluster ID Suggestions</b> runs both. Every channel used for
-scoring needs its <i>Antigen</i> field filled in on the Spectral Process tab
-(a blank Antigen blocks the computation). An Antigen that matches nothing in
-the marker database adds nothing to cell-type scoring but does not block
-MEM.</p>
+<p><b>Compute Cluster ID Suggestions</b> runs both. Every channel the run
+was clustered on needs its <i>Antigen</i> field filled in on the Spectral
+Process tab (a blank Antigen blocks the computation). An Antigen that matches
+nothing in the marker database adds nothing to cell-type scoring but does not
+block MEM.</p>
+
+<h4>Details: which markers and which reference</h4>
+<ul>
+<li><b>Every stained marker counts.</b> Besides the run's clustering
+channels, every other channel with an Antigen is scored (viability dyes
+excepted). A marker you gated on but did not cluster on, such as CD3 in a
+T-cell run, still counts for T-cell types and against the others.</li>
+<li><b>MEM reference.</b> Each cluster is always described against the
+run's other clusters, so a marker every clustered cell carries (CD3 in a
+T-cell run) never appears in that part. With <b>Anchor population</b>, the
+clusters are also compared with the anchor's cells, and the markers on which
+every cluster differs from the anchor in the same direction (by at least the
+MEM threshold) are put once in front of every label, for example
+"CD3+ CD19-: CD4+10 CD62L+7 CD44−3". Live cells include CD3− cells, so a
+T-cell run shares CD3+.</li>
+<li><b>Anchor.</b> <b>Auto</b> picks, among the gates that contain the
+clustered cells, the deepest one using a viability dye, else
+<i>Singlets</i>, else <i>Cells</i>, else all events. The drop-down shows the
+gate Auto picks for the selected run. A chosen gate that does not contain the
+clustered cells is replaced by the deepest gate that does, and the status line
+says so.</li>
+<li><b>Thresholds.</b> Positivity thresholds still come from the unstained
+cell sample. For a channel without one, the Otsu cut is made on the anchor's
+cells, which include a negative population even for a marker every clustered
+cell carries.</li>
+<li><b>Reading.</b> The other stained channels are read for the same
+cells as the stored clustering-channel values (at most 1,000 per cluster),
+and only those cells are read and unmixed. The anchor's cells come from a
+small random subsample of each training sample (20,000 cells in all).</li>
+</ul>
 
 <h4>Details: the Marker Summary sub-tab</h4>
 <ul>
@@ -369,8 +405,9 @@ the slider.</li>
 or the channel selection.</li>
 <li>The violins, heatmap and ridgelines use up to 20,000 events per cluster,
 spread evenly over the run's samples, taken from the marker values stored
-with the run. Cluster ID suggestions use the stored values too, so neither
-reads the sample files again for runs that have them.</li>
+with the run. Cluster ID suggestions use the stored values for the
+clustering channels too; they read a subsample of each training sample only
+for the anchor population and the other stained channels.</li>
 <li>The marker-distribution views and editable cluster names follow the
 marker-distribution and relabelling tools of the MARMOT pipeline
 [4].</li>
@@ -390,6 +427,8 @@ marker-distribution and relabelling tools of the MARMOT pipeline
 ''' + _workflow('Cluster Annotation') + _GLOSSARY
 
 
+# Validation figures quoted in this help: the human cohort is UCL IMMPROVE
+# (gated populations, Automated Gating cache).
 stats_tab_help_text = '''
 <h3>Stats: compare groups of samples cluster by cluster</h3>
 <p><b>In short:</b> assign each sample to a group, then test which clusters
@@ -409,6 +448,10 @@ pairwise</b>.</li>
 <li>If samples are matched (for example the same donor in each group), tick
 <b>Paired design</b> and choose the <b>Pairing variable</b>. Tick covariates
 under <b>Adjust for</b> if needed.</li>
+<li>To compare populations inside the same samples instead (for example
+CD45.1+ against CD45.1− cells of mixed chimeras), tick <b>Compare populations
+within samples</b> under <b>Populations</b> and tick the populations. See
+<i>Background: populations within samples</i> below.</li>
 <li>Tick the tests (Cluster Frequencies, Counts, MFIs), keep or change the
 thresholds, and click <b>Run Statistics</b>.</li>
 <li>Read the result tabs: volcano plots, heatmaps and tables. Right-click a
@@ -435,7 +478,12 @@ is may be a failed stain or a low event count.</li>
 <li><b>Auto-assign by pattern</b> matches each group's regular expression
 against the sample names. <b>Suggest Groupings…</b> offers groupings found
 in the sample names. <b>Import CSV</b> and <b>Export CSV</b> read and write
-the assignment table.</li>
+the assignment table. An imported row matches a sample when its
+<i>sample</i> name is the file name (with or without its extension) or
+appears inside the file name between spaces, underscores or dashes (at
+least three characters including a digit). A review shows the matches,
+and lets you choose the group column and covariates, before anything
+changes.</li>
 <li>Extra columns in the table hold covariates, such as donor, age, sex or
 batch. Tick <b>Numeric</b> under a column's title to make it a number with a
 straight-line effect (for example age or CRP); every sample then needs a
@@ -473,8 +521,174 @@ point: the 95% confidence interval of its effect. A wider bar means a less
 precise estimate (fewer events, more variation, or fewer samples).</li>
 </ul>
 
+<h4>Details: trends with a numeric covariate</h4>
+<ul>
+<li>Set <b>Analysis</b> to <i>Trend with a numeric covariate</i> to ask which
+clusters change with a number such as age or days after vaccination, instead of comparing groups. Tick <b>Numeric</b> under
+that covariate in the samples table first. The samples of the groups ticked
+in <b>Groups to Test</b> are used, with the groups as adjustment terms.</li>
+<li>Two tests are run on each cluster, on the moderated linear model
+[1, 2]:
+<ul>
+<li>the <b>curve</b> test asks whether the cluster changes with the
+covariate at all, whatever the shape (a rise, a fall, a rise that levels
+off, a peak): an F test of a smooth curve (a natural spline [13]), one
+p-value for the covariate as a whole, as in an ANOVA;</li>
+<li>the <b>slope</b> test fits a straight line and gives the direction and
+rate of change per unit of the covariate (log₂ % per week for
+Frequencies).</li>
+</ul></li>
+<li><b>Partial R²</b> is the share of the sample-to-sample variation the
+covariate explains once groups and adjustment covariates are accounted for
+(0 = none, 1 = all).</li>
+<li>By default a cluster is called when either test is significant, each at
+half the FDR so the combined error stays at the FDR set, and its partial
+R² is at least 0.1. In large studies very small trends become significant;
+the minimum keeps them out.</li>
+<li><b>Shape</b>: <i>Smooth curve</i> (default, 2 df: one bend), with its
+ends fixed between the 5th and 95th percentiles of the covariate so a single
+youngest or oldest sample cannot bend it; <i>Straight line</i>; or
+<i>Time points as groups</i> for designed time courses (day 0, 3, 7, 14).
+The curve gets at most one df per 10 samples. <b>Scale</b> <i>Log2</i> suits
+time courses sampled on a doubling schedule; the slope is then per
+doubling.</li>
+<li><i>Does the change differ between two groups?</i> asks whether the two
+groups ticked in Groups to Test change differently, the reference group
+first. With pairing (each donor's two tissues paired) it tests the
+within-pair difference against the covariate. A covariate shared within
+every pair cannot be tested for a common trend with pairing, so the common
+trend is then fitted without it.</li>
+<li>Cluster Counts are tested as log odds of each cluster within the
+sample's library size with the moderated model, not with the
+negative-binomial test: on a human cohort the quasi-likelihood test with a
+curve found trends in about 18% of populations when ages were shuffled (5%
+expected), the moderated models 4.5–5%.</li>
+<li>The design check under the settings warns when another covariate, or
+the events per sample, follows the covariate closely (correlation r, or η
+for categories, of 0.5 or more): a trend could then reflect it, and
+adjusting for it is advised.</li>
+<li>The results are listed in the <b>Trend tables</b> tab. Changing the FDR,
+the call or the minimum partial R² updates the calls without refitting.
+MFIs are tested as one family in a trend test (no cluster-first
+screening).</li>
+<li><b>Trend figures</b>:
+<ul>
+<li>the <b>trend volcano</b> places each cluster by its slope (left: falls,
+right: rises) and by how strongly the curve test supports a change (up:
+stronger). Called clusters are red (rise) or blue (fall); an open diamond is
+called by the curve but not the slope: a rise and fall, or a change that
+levels off, which a straight line misses. The dashed line is the FDR the
+curve test is called at;</li>
+<li>the <b>trajectories</b> heatmap shows the fitted curve of every called
+cluster, rescaled to mean 0 and SD 1 so the shape, not the size, is
+compared, ordered by where each curve is highest: early peaks at the top,
+late rises at the bottom;</li>
+<li><b>Patterns</b>: the called clusters are grouped by the shape of their
+fitted curve, whatever the size of the change (hierarchical clustering of
+the curves scaled to mean 0 and SD 1), and each group is named from its
+mean curve: <i>rises</i>, <i>falls then levels off</i>, <i>peaks at day
+7</i>. <i>Auto</i> uses the largest number of patterns that come back
+the same (adjusted Rand index of at least 0.75) when the test is repeated
+on 80% of the samples; on a human cohort we tested only the rise/fall
+split did, as finer shapes there formed a continuum. The trajectories heatmap is split
+by pattern and the <b>patterns</b> figure shows each pattern's members
+and mean curve;</li>
+<li>double-click a point or row (or right-click it) for its <b>trend
+plot</b>: each sample at its value of the variable, the fitted curve with
+its 95% confidence band (the range the true curve is likely in, given the
+spread of the samples), and the values of the variable along the bottom.
+With <i>Does the change differ between two groups?</i> and no pairing, each
+group gets its own curve and band in its group colour on the same axes:
+where the bands separate the groups differ at that value, and where the
+curves run apart the change itself differs. With pairing each pair's level
+cancels out, so only the difference can be estimated: the upper panel shows
+the samples and the lower panel the fitted difference between the groups
+with each pair's own difference;</li>
+<li><b>Composition over the variable</b> (a tab after a trend run with
+frequencies or counts): how the clusters share out the samples' events as
+the variable changes, for example whether a naive cluster shrinks with age
+while an effector cluster grows.
+<ul>
+<li>Top: the fitted share of each cluster, in the clusters' colours,
+stacked so they fill 100% at every value of the variable (the 12 largest
+clusters; the rest together as "Other clusters").</li>
+<li>Bottom: each sample's measured shares, one bar per sample, samples
+ordered by the variable, to check the fit against the data.</li>
+<li>How the curves are made: each part's counts are compared with the
+average of all the parts on a log scale (centred log-ratio, Aitchison
+1986), the trend test's curve (same shape, scale and df) is fitted to each,
+and the fitted values are turned back into shares. The result is the
+make-up of a typical sample at each value, so it never goes below 0% or
+above 100%; with skewed data it can sit a few points from the plain
+average of the samples' percentages.</li>
+<li>It is a picture of how the make-up shifts. Whether a population changes
+significantly is the trend test's answer (volcano and tables).</li>
+<li>A group × trend run gets one panel per group. The values behind the
+figure (fitted shares and each sample's shares) are offered as CSV beside
+the figure export.</li>
+</ul></li>
+<li><b>Embedding by the variable</b> (a tab after a trend run, for the DR
+run selected at the time): the samples split into four bins of the
+variable with about the same number of samples each (or the time points,
+with Time points as groups), and for each bin where its cells sit on the
+map, on one colour scale; then the last bin minus the first (red: more
+common late, blue: more common early). Every sample counts equally within
+its bin whatever its number of events. It is a picture of where the
+change happens on the map; which clusters change is the trend test's
+answer. CSV of which bin each sample fell in;</li>
+<li><b>Immune age model</b> (below Predictive Analysis, after a trend run; figures as tabs): how well does the immune profile
+predict a continuous variable, such as age, days after vaccination or any
+number used as the trend variable? A model learns to guess the variable
+from the cluster frequencies and/or MFIs of the last trend run and is always judged on samples it
+was not trained on (nested cross-validation: an outer split for judging,
+an inner one for tuning, every donor or pair kept whole, so the same donor
+is never in both). The model is an elastic net (Zou &amp;
+Hastie 2005), a penalised regression between the lasso, which keeps few
+features, and ridge, which shares weight between correlated ones such as a
+parent and its largest subset. Read the <i>mean absolute error</i> (how far
+off a typical guess is, in the variable's units) against <i>predicting the
+mean</i> (the error of guessing every sample at the average): a useful
+model is well below it. The <i>chance check</i> reruns the whole procedure
+with the variable shuffled among donors or pairs; chance p is the share of
+shuffles that did as well. The features figure shows which features the
+model kept most often and their direction (red: higher at larger values
+of the variable, e.g. in older donors). The <i>gap</i> is the guess minus
+the actual value (with age: a sample's "immune age" minus its age); any
+such model pulls guesses towards the middle (the lowest values guessed too
+high, the highest too low), so the gap is shown <i>corrected</i> for that
+(de Lange &amp; Cole 2020): positive means the sample's profile looks like
+that of a higher value than it has (with age: older than it is). Train the
+model within one group. With <i>Predict the other groups</i> ticked, the
+final model also predicts every sample of the other groups, whether or not
+they were in the trend run and whether or not they have a value of the
+variable (open markers, not cross-validated). The table lists each group's
+predicted values (mean ± SD) and, for samples that have a value, how close
+the predictions are; the <i>Predicted by group</i> panel shows them against
+the range the model was trained on. A prediction outside that range, or for
+samples of a different kind (a different tissue or time of life), says the
+profile differs from the training samples, not what their value is. Samples
+outside the trend run are predicted from frequencies only (a model that
+uses MFIs predicts only the trend run's other samples). Needs
+at least 20 samples; 40 or more is recommended;</li>
+<li>in trend mode the <b>sample PCA</b> uses the trend run's values and
+colours each sample by the variable (shape = group).</li>
+</ul></li>
+</ul>
+
 <h4>Details: composition and export</h4>
 <ul>
+<li><b>⚙ Options</b> beside a figure opens a side panel that changes how
+it is drawn, not what it shows: grid lines (off by default), the run label
+in the top left corner, the title (as drawn, hidden or your own text), the
+titles of individual panels, the font sizes of the title, the axis and
+panel labels, the tick labels, the legend and other text (each "As drawn"
+until set), and the background (the theme's: black in dark mode, white in
+light mode; or white, black or transparent). Threshold lines, such as the
+FDR and effect-size lines of a volcano plot, are part of the figure and
+always drawn. The options are kept with the experiment, per figure, and
+used for Pop Out, Export and the report and the Layout as well. <i>Use for all</i> makes
+the panel's settings (all but the title) the default of every figure of
+this plugin; <i>Reset</i> returns the figure to those defaults.</li>
 <li>The <b>Composition Barplot</b> shows how each sample's events divide
 among the clusters, as stacked counts or percentages (<b>%</b>), per sample
 or summed per group (<b>By group</b>). It needs no statistics, so it is a
@@ -560,7 +774,10 @@ but written as a design matrix so it can also express reference or pairwise
 contrasts, a pairing term and covariates. The reported effect (logFC) is
 the group coefficient: for Frequencies, the difference in log₂ percentage (a
 log₂ fold change); for MFIs, the difference in mean transformed
-intensity.</p>
+intensity. Empty clusters are kept finite by adding the same small share of
+every sample's events (half an event at the average sample size), so a
+cluster absent from a sample has the same value whatever the sample's
+size.</p>
 <p>The model uses <b>empirical Bayes moderation</b> of the variances (Smyth
 2004 [2], the method behind limma [1]). With few samples, a cluster's
 variance estimated from that cluster alone is noisy, and some clusters look
@@ -642,6 +859,18 @@ TREAT and FDR settings as the other tests. Frequencies and Counts make
 different assumptions about the same events, so running both is a useful
 cross-check: agreement is stronger evidence than either alone, and
 disagreement often points to a cluster with very few events.</p>
+<p>The counts are tested by the quasi-likelihood F test. Each comparison
+is fitted on the samples of its two groups, and each cluster's dispersion
+is taken from the clusters with similar counts, so rare clusters are not
+treated as quieter than they are. It suits homogeneous designs such as
+inbred mice: on random splits of BATF chimera mice, where nothing differed,
+it found 3–6% false positives at p &lt; 0.05 (5% expected), and about 5% on
+mouse samples cut down to 100 cells each. On gated populations of a human
+cohort it found 7–10% for populations under 100 events,
+because donors vary more, and more unevenly, than the model allows for;
+rely on Cluster Frequencies for human or otherwise varied donors. The
+negative-binomial Wald test is not offered: it found 10–13% on the human
+cohort and 21–31% on the mice.</p>
 
 <h4>Background: paired design</h4>
 <p>Tick <b>Paired design</b> when samples are matched across the groups
@@ -660,6 +889,37 @@ samples.</li>
 <li><b>Requirement</b>: every sample in every checked group needs a pairing
 value, and each value must appear in more than one group.</li>
 <li>If your samples are independent, leave Paired design unticked.</li>
+</ul>
+
+<h4>Background: populations within samples</h4>
+<p>In a mixed bone-marrow chimera every mouse carries cells of two genotypes,
+told apart by a congenic marker such as CD45.1. The question is then not
+whether one group of mice differs from another, but whether, inside the same
+mice, one genotype's cells differ from the other's. Tick <b>Compare populations
+within samples</b> and tick two or more populations (gates inside the gate the
+clustering run analysed) that do not share cells.</p>
+<ul>
+<li><b>What it does</b>: each sample checked under <b>Groups to Test</b> is
+split into the populations, and each population of each sample becomes one
+row of the tables, named "sample · population". The populations are the
+groups tested; <b>Reference group</b> and <b>All pairwise</b> apply to them.</li>
+<li><b>Frequencies</b> are shares of each population's own cells: "cluster 5
+is 12% of this mouse's CD45.1+ cells". An uneven chimerism does not bias them.
+The clusters are the same for every population.</li>
+<li><b>Pairing</b>: every test is paired on the sample, so each mouse's
+populations are compared with each other and differences between mice drop
+out. Paired design and Adjust for are switched off: anything measured per
+sample (age, batch) is the same for both populations of a mouse and is
+already covered by that pairing.</li>
+<li><b>Overlap</b>: cells inside more than one chosen population are left out
+of all of them. If they are more than 1% of a sample's cells in the
+populations, the run stops, because the populations would then share
+cells.</li>
+<li>A population needs cells in at least 3 samples to be tested. Predictive
+analysis is not offered for these results: the rows are not independent
+samples.</li>
+<li>The Workspace <b>Population</b> colour mode shows the same populations on
+the DR map.</li>
 </ul>
 
 <h4>Background: frequentist and Bayesian statistics</h4>
@@ -691,6 +951,7 @@ gives frequentist p-values.</li>
 [10]<a href="https://doi.org/10.1002/alz.70952">Humblet-Baron et al. 2025, Alzheimer's &amp; Dementia (systems immunology of Alzheimer's disease)</a><br/>
 [11]<a href="https://doi.org/10.1038/s41467-026-70895-1">Veiga et al. 2026, Nature Communications (autoinflammation of unknown origin)</a><br/>
 [12]<a href="https://lorenzobonaguro.github.io/cyCONDOR">Bonaguro et al. 2025, R package version 0.3.1 (cyCONDOR)</a><br/>
+[13]<a href="https://doi.org/10.1007/978-0-387-84858-7">Hastie, Tibshirani and Friedman 2009, The Elements of Statistical Learning, 2nd edition (natural cubic splines)</a><br/>
 </p>
 ''' + _workflow('Stats') + _GLOSSARY
 
@@ -761,8 +1022,9 @@ placeholder holds its place until it can be updated.</li>
 resizing, arranging, grouping, scaling and adding or removing items; not
 changes to a plot's settings or to pages.</li>
 <li>Select a plot to edit it in the panel on the right: plot type, DR run,
-sample, colour (Clusters with a choice of <b>Clustering run</b>, Marker or
-Group) and appearance (size in mm, legend, fonts in points, grid, labels;
+sample, colour (Clusters with a choice of <b>Clustering run</b>, Marker,
+Group, or Population: the populations ticked under <b>Compare populations
+within samples</b> on the Stats tab) and appearance (size in mm, legend, fonts in points, grid, labels;
 <b>Label colour</b> Auto follows the plot theme).</li>
 <li><b>Export…</b> writes the pages as PDF (vector), SVG (one file per page,
 with editable text if you like), PNG or TIFF (300 or 600 dpi).</li>

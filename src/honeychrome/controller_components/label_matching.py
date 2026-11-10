@@ -15,30 +15,46 @@ def _load_csv(path: Path) -> list[dict]:
 
 _DELIM = r'(?<![A-Za-z0-9\-]){}(?![A-Za-z0-9\-])'
 
-# Cache of precompiled (pattern, value, canonical) triples, keyed by
-# (id(database), canonical_col, tuple(synonym_cols)) -- see
-# _compiled_patterns(). Stable across calls because both call sites
-# (drc_cluster_id.build_channel_marker_map, spectral_controller) fetch
-# the database via get_marker_db()/get_fluorophore_db(), which each
-# cache and return the SAME list object every time -- id() doesn't
-# change between calls.
-_pattern_cache: dict[tuple, list[tuple]] = {}
+# Cache of precompiled (pattern, value, canonical) triples and of the
+# matches already found, keyed by (id(database), canonical_col,
+# tuple(synonym_cols)) -- see _compiled_patterns(). Each entry keeps the
+# database it was built from, so a list that reuses a freed list's id is
+# not served the old patterns. The databases from get_marker_db() /
+# get_fluorophore_db() are cached and returned as the SAME list every
+# time, so their entries are built once per session.
+_pattern_cache: dict[tuple, tuple] = {}
+# Matches remembered per database and column set; cleared when larger.
+_MATCH_CACHE_SIZE = 50_000
+
+
+def _cache_entry(database: list[dict], canonical_col: str, synonym_cols: list[str]) -> tuple:
+    """(database, patterns, {name: canonical or None}) for this database and
+    column set, built on first use."""
+    key = (id(database), canonical_col, tuple(synonym_cols))
+    cached = _pattern_cache.get(key)
+    if cached is not None and cached[0] is database:
+        return cached
+    entry = (database, _build_patterns(database, canonical_col, synonym_cols), {})
+    _pattern_cache[key] = entry
+    return entry
 
 
 def _compiled_patterns(database: list[dict], canonical_col: str,
                         synonym_cols: list[str]) -> list[tuple]:
     """
-    Precompile every (pattern, value, canonical) triple for this
-    database/column-set ONCE, sorted longest-value-first so _best_match
-    can return on the first hit. Building each row's regex (re.escape +
-    string-format + re.compile) here instead of inside _best_match turns
-    an O(channels x rows x cols) recompile storm into a one-time cost
-    amortised across every call for this database.
+    Every (pattern, value, canonical) triple for this database/column-set,
+    precompiled ONCE and sorted longest-value-first so _best_match can
+    return on the first hit.
     """
-    key = (id(database), canonical_col, tuple(synonym_cols))
-    cached = _pattern_cache.get(key)
-    if cached is not None:
-        return cached
+    return _cache_entry(database, canonical_col, synonym_cols)[1]
+
+
+def _build_patterns(database: list[dict], canonical_col: str,
+                    synonym_cols: list[str]) -> list[tuple]:
+    """Compile the (pattern, value, canonical) triples of a database:
+    building each row's regex (re.escape + string-format + re.compile)
+    once instead of inside _best_match turns an O(channels x rows x cols)
+    recompile storm into a one-time cost."""
 
     entries = []
     for row in database:
@@ -56,7 +72,6 @@ def _compiled_patterns(database: list[dict], canonical_col: str,
     # Python's stable sort, matching the old strict len(val) > len(best_text)
     # tie-break (first max-length match wins, not last).
     entries.sort(key=lambda e: len(e[1]), reverse=True)
-    _pattern_cache[key] = entries
     return entries
 
 
@@ -64,17 +79,28 @@ def _best_match(name: str, database: list[dict], canonical_col: str, synonym_col
     """
     Return the canonical value from `canonical_col` for the longest synonym
     that appears as a word-boundary match inside `name`.
-    Returns None if nothing matches.
+    Returns None if nothing matches. A name matched before against the
+    same database and columns is answered from the cache.
     """
-    for pattern, _val, canonical in _compiled_patterns(database, canonical_col, synonym_cols):
+    _db, patterns, matches = _cache_entry(database, canonical_col, synonym_cols)
+    if name in matches:
+        return matches[name]
+    result = None
+    for pattern, _val, canonical in patterns:
         if pattern.search(name):
-            return canonical
-    return None
+            result = canonical
+            break
+    if len(matches) >= _MATCH_CACHE_SIZE:
+        matches.clear()
+    matches[name] = result
+    return result
 
 
 def match_fluorophore(name: str, fluorophore_db: list[dict]) -> str | None:
-    """Return the canonical fluorophore name, or None."""
-    synonym_cols = [f'synonym{i}' for i in range(1, 5)]
+    """Return the canonical fluorophore name, or None. Every synonymN column
+    in the database is searched."""
+    columns = fluorophore_db[0].keys() if fluorophore_db else ()
+    synonym_cols = sorted((c for c in columns if re.fullmatch(r'synonym\d+', c)), key=lambda c: int(c[7:]))
     result = _best_match(name, fluorophore_db, 'fluorophore', synonym_cols)
     if result:
         logger.debug(f'Fluorophore match: "{name}" -> "{result}"')

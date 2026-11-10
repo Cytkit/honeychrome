@@ -34,6 +34,9 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#ifdef GLS_M2P_PROFILE
+#include <chrono>
+#endif
 
 #ifndef GLS_DGEMM
 #define GLS_DGEMM dgemm_
@@ -58,6 +61,30 @@ constexpr double kVarFloor = 1e-24;
 constexpr double kTiny = 1e-12;
 constexpr double kInvSqrt2 = 0.70710678118654752440;
 constexpr int kChunk = 128;
+
+// Stage timing, compiled in only with -DGLS_M2P_PROFILE (the release build has
+// none of it). Each stage accumulates thread-seconds; unmix_m2p returns them
+// as "profile", with the wall time of the parallel part.
+#ifdef GLS_M2P_PROFILE
+enum ProfStage { kSetup, kR1Products, kR1Score, kR1Saturated, kPriorSd, kWeights, kNormalProducts, kAfTerms,
+                 kSolve, kChi2, kProfStages };
+const char* const kProfNames[kProfStages] = {"setup",   "r1_products",     "r1_score", "r1_saturated",
+                                             "prior_sd", "weights",        "normal_products", "af_terms",
+                                             "solve",    "chi2"};
+using ProfClock = std::chrono::steady_clock;
+#define PROF_DECL(acc) double acc[kProfStages] = {}
+#define PROF_START(t) auto t = ProfClock::now()
+#define PROF_LAP(acc, stage, t)                                                \
+  do {                                                                         \
+    const auto prof_now = ProfClock::now();                                    \
+    acc[stage] += std::chrono::duration<double>(prof_now - t).count();         \
+    t = prof_now;                                                              \
+  } while (0)
+#else
+#define PROF_DECL(acc)
+#define PROF_START(t)
+#define PROF_LAP(acc, stage, t)
+#endif
 
 inline double dot(const double* a, const double* b, int n) {
   double s = 0.0;
@@ -634,6 +661,8 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
                           int batch_lanes) {
   if (batch_lanes != 0 && batch_lanes != 4 && batch_lanes != 8)
     throw std::invalid_argument("batch_lanes must be 0, 4 or 8");
+  PROF_DECL(prof_total);
+  PROF_START(prof_t);
   auto rb = raw_in.request(), sb = spectra_in.request(), ab = af_in.request();
   if (rb.ndim != 2 || sb.ndim != 2 || ab.ndim != 2) throw std::invalid_argument("raw, spectra, af must be 2-D");
   const int N = static_cast<int>(rb.shape[0]);
@@ -780,6 +809,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
   double* co = static_cast<double*>(chi2_np.request().ptr);
   std::int64_t* io = static_cast<std::int64_t*>(idx_np.request().ptr);
   const int n_chunks = (N + kChunk - 1) / kChunk;
+  PROF_LAP(prof_total, kSetup, prof_t);
 
   {
     py::gil_scoped_release release;
@@ -791,8 +821,10 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
       Chunk c;
       c.size(kChunk, F, D, J, T);
       std::vector<double> ysub(D);
+      PROF_DECL(prof_thread);
 #pragma omp for schedule(dynamic, 1)
       for (int ch = 0; ch < n_chunks; ++ch) {
+        PROF_START(pt);
         const int i0 = ch * kChunk;
         const int B = std::min(kChunk, N - i0);
         const double* Y = raw + static_cast<size_t>(i0) * D;
@@ -812,6 +844,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
           for (int q = 0; q < B * D; ++q) c.FIT[q] = Y1[q] - c.FIT[q];   // residual
           gemm_rm(B, J, D, c.FIT.data(), D, Rt.data(), J, c.RR.data(), J);
         }
+        PROF_LAP(prof_thread, kR1Products, pt);
         for (int bi = 0; bi < B; ++bi) {
           const int i = i0 + bi;
           double* x0 = x0o + static_cast<size_t>(i) * F;
@@ -821,6 +854,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
             const double* res = &c.FIT[bi * D];
             const double base_r = dot(res, res, D) + 1e-6;
             r1_score(r1lib, E, &c.U[bi * F], base_r, &c.NUM[bi * J], &c.RR[bi * J], c.sc, x0, alpha, idx);
+            PROF_LAP(prof_thread, kR1Score, pt);
             const int pat = event_pattern[i];
             if (pat >= 0 && pattern_lib[pat].ok) {
               const double* y = Y + static_cast<size_t>(bi) * D;
@@ -828,6 +862,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
               for (int d = 0; d < D; ++d) if (y[d] < E.sat_level) ysub[m++] = whiten ? y[d] * sw0[d] : y[d];
               r1_event(pattern_lib[pat], E, ysub.data(), c.sc, x0, alpha, idx);
             }
+            PROF_LAP(prof_thread, kR1Saturated, pt);
           } else {
             std::memcpy(x0, &c.U[bi * F], sizeof(double) * F);
           }
@@ -866,6 +901,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
               t2[f] = std::max(tau * tau, kTiny);
             }
           }
+          PROF_LAP(prof_thread, kPriorSd, pt);
         }
         if (start_only) {
           for (int bi = 0; bi < B; ++bi) {
@@ -907,8 +943,10 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
             }
             for (int d = 0; d < D; ++d) c.WY[bi * D + d] = w[d] * y[d];
           }
+          PROF_LAP(prof_thread, kWeights, pt);
           gemm_rm(B, T, D, c.W.data(), D, O.data(), T, c.NSS.data(), T);
           gemm_rm(B, F, D, c.WY.data(), D, St.data(), F, c.RHS.data(), F);
+          PROF_LAP(prof_thread, kNormalProducts, pt);
           if (batch_lanes == 0) {
             for (int bi = 0; bi < B; ++bi) {
               const double* y = Y + static_cast<size_t>(bi) * D;
@@ -923,6 +961,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
                 }
                 pen = c.pen.data();
               }
+              PROF_LAP(prof_thread, kSolve, pt);
               const double* nss = &c.NSS[static_cast<size_t>(bi) * T];
               const double* rhs = &c.RHS[bi * F];
               bool ok;
@@ -939,6 +978,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
   #pragma omp simd
                   for (int f = 0; f < F; ++f) c.nsa[f] += wa * sd[f];
                 }
+                PROF_LAP(prof_thread, kAfTerms, pt);
                 ok = solve_event(c, F, nss, rhs, true, c.nsa.data(), naa, rhs_a, pen);
                 if (ok) a_new = c.b[F];
                 if (ok && a_new < 0.0) {
@@ -948,6 +988,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
               } else {
                 ok = solve_event(c, F, nss, rhs, false, nullptr, 0.0, 0.0, pen);
               }
+              PROF_LAP(prof_thread, kSolve, pt);
               if (!ok) continue;   // keeps the previous estimate
               c.ALPHA[bi] = a_new;
               double* th = &c.THETA[bi * F];
@@ -972,6 +1013,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
               }
               c.EV[bi] = bi;
             }
+            PROF_LAP(prof_thread, kSolve, pt);
             if (has_af) {
               for (int bi = 0; bi < B; ++bi) {
                 const double* y = Y + static_cast<size_t>(bi) * D;
@@ -989,6 +1031,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
               }
               gemm_rm(B, F, D, c.WA.data(), D, St.data(), F, c.NSAB.data(), F);
             }
+            PROF_LAP(prof_thread, kAfTerms, pt);
             const double* PE = prior ? c.PENB.data() : nullptr;
             auto run = [&](bool with_af, int n) {
               if (batch_lanes == 8)
@@ -1020,6 +1063,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
                 x[f] = v;
               }
             }
+            PROF_LAP(prof_thread, kSolve, pt);
           }
         }
         // chi2 of the last solve: weighted residual of the unpenalised-scale coefficients
@@ -1040,10 +1084,23 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
           ao[i] = c.ALPHA[bi];
           co[i] = chi2;
         }
+        PROF_LAP(prof_thread, kChi2, pt);
       }
+#ifdef GLS_M2P_PROFILE
+#pragma omp critical
+      for (int st = 0; st < kProfStages; ++st) prof_total[st] += prof_thread[st];
+#endif
     }
   }
   py::dict out;
+#ifdef GLS_M2P_PROFILE
+  {
+    py::dict prof;
+    for (int st = 0; st < kProfStages; ++st) prof[kProfNames[st]] = prof_total[st];
+    prof["parallel_wall"] = std::chrono::duration<double>(ProfClock::now() - prof_t).count();
+    out["profile"] = prof;
+  }
+#endif
   out["unmixed"] = x_np;
   out["af_idx"] = idx_np;
   out["af_scale"] = alpha_np;

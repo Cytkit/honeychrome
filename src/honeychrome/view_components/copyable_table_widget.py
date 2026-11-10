@@ -66,3 +66,45 @@ class CopyableTableWidget(QtWidgets.QTableWidget):
                 output.append("\t".join(row_data))
 
         QtWidgets.QApplication.clipboard().setText("\n".join(output))
+
+
+def show_frame_dialog(parent, title: str, frame, default_path: str = '', digits: int = 3):
+    """
+    A non-modal window listing a pandas DataFrame in a CopyableTableWidget
+    (sortable, Ctrl+C copies the selected rows), with a button saving it as
+    CSV (full precision; *default_path* proposes the file name). Numbers
+    are shown to *digits* significant figures.
+    """
+    import numpy as np
+
+    def shown(value):
+        if isinstance(value, (float, np.floating)):
+            return '' if not np.isfinite(value) else float(f"{value:.{digits}g}")
+        if isinstance(value, (bool, np.bool_)):
+            return 'yes' if value else 'no'
+        return value
+
+    dialog = QtWidgets.QDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+    layout = QtWidgets.QVBoxLayout(dialog)
+    headers = [str(c) for c in frame.columns]
+    rows = [{h: shown(v) for h, v in zip(headers, record)}
+            for record in frame.itertuples(index=False, name=None)]
+    layout.addWidget(CopyableTableWidget(rows, headers), stretch=1)
+    footer = QtWidgets.QHBoxLayout()
+    footer.addStretch()
+    save = QtWidgets.QPushButton("Save CSV…")
+
+    def _save():
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(dialog, f"Save {title}", default_path,
+                                                        "CSV (*.csv)")
+        if path:
+            frame.to_csv(path, index=False)
+
+    save.clicked.connect(_save)
+    footer.addWidget(save)
+    layout.addLayout(footer)
+    dialog.resize(760, 480)
+    dialog.show()
+    return dialog

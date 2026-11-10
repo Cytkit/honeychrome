@@ -139,8 +139,48 @@ def test_summary_counts_parents_and_quartiles():
     sel = data[(data[:, 0] >= 0.45) & (data[:, 1] >= 0.45), 2]
     assert med == pytest.approx(np.median(sel))
     assert q25 <= med <= q75
+    assert isinstance(summ['markers'], ar.MarkerSummary)
     import json
-    json.dumps(summ)
+    json.dumps({k: v for k, v in summ.items() if k != 'markers'})
+
+
+@pytest.mark.numpy_only
+def test_marker_summary_reads_like_the_nested_dict(tmp_path):
+    gates = _hierarchy()
+    summ = _summarise(_sample(1), gates, _reference(gates))
+    m = summ['markers']
+    nested = {p: {ch: list(v) for ch, v in row.items()} for p, row in m.items()}
+    assert ar.MarkerSummary.from_dict(nested) == m
+    assert m == nested and 'T/pos' in m and 'C' in m['T/pos']
+    assert m.median('T/pos', 'C') == nested['T/pos']['C'][0]
+    with pytest.raises(ValueError):
+        m.values[0, 0, 0] = 1.0
+    import copy
+    assert copy.deepcopy(m) is m
+    sub = ar.select_markers(m, ['T/pos'])
+    assert list(sub) == ['T/pos'] and sub['T/pos'] == nested['T/pos']
+
+    path = tmp_path / 'markers.npz'
+    ar.save_marker_summaries(path, {'a': summ, 'b': {'markers': {}}}, 'run 1')
+    fingerprint, loaded = ar.load_marker_summaries(path)
+    assert fingerprint == 'run 1'
+    assert loaded['a'] == nested and len(loaded['b']) == 0
+
+
+@pytest.mark.numpy_only
+def test_marker_summary_keeps_uneven_channels_and_float32_exactly(tmp_path):
+    nested = {'G/pos': {'C': [0.5, 0.4, 0.6], 'D': [0.1, None, 0.3]},
+              'G/neg': {'C': [0.2, 0.1, 0.25]}}
+    m = ar.MarkerSummary.from_dict(nested)
+    assert list(m['G/neg']) == ['C'] and 'D' not in m['G/neg']
+    assert m['G/pos']['C'] == [0.5, 0.4, 0.6] and np.isnan(m['G/pos']['D'][1])
+    assert m.values.dtype == np.float64
+    exact = ar.MarkerSummary.from_dict({'G/pos': {'C': [0.5, 0.25, 0.75]}})
+    assert exact.values.dtype == np.float32
+    path = tmp_path / 'm.npz'
+    ar.save_marker_summaries(path, {'s': {'markers': m}})
+    back = ar.load_marker_summaries(path)[1]['s']
+    assert list(back['G/neg']) == ['C'] and back['G/pos']['C'] == [0.5, 0.4, 0.6]
 
 
 @pytest.mark.numpy_only
@@ -156,6 +196,22 @@ def test_population_tables_parent_and_stats_parent_denominators():
         assert denom.loc[s, 'T/pos'] == rows['T/pos']['n_parent']
     _c, denom_sp, _d = ar.population_tables(summaries, samples, use_stats_parent=True)
     assert all(denom_sp.loc[s, 'T/pos'] == summaries[s]['n_total'] for s in samples)
+
+
+@pytest.mark.numpy_only
+def test_missing_stats_parent_leaves_the_frequency_out_and_flags_the_sample():
+    gates = _hierarchy()
+    gates[1]['stats_parent'] = {'pos': 'gone'}
+    ref = _reference(gates)
+    summaries = {f's{i}': _summarise(_sample(i), gates, ref) for i in range(3)}
+    samples = list(summaries)
+    _c, denom_sp, dropped = ar.population_tables(summaries, samples, use_stats_parent=True)
+    assert 'T/pos' in dropped and 'T/pos' not in denom_sp.columns
+    _c, denom, _d = ar.population_tables(summaries, samples, use_stats_parent=False)
+    assert denom['T/pos'].notna().all()
+    groups = {s: 'g' for s in samples}
+    assert ar.group_population_values(summaries, samples, groups, 'T/pos') == {}
+    assert any('T/pos' in f for f in ar.sample_flags(summaries['s0']))
 
 
 @pytest.mark.numpy_only
@@ -198,7 +254,8 @@ def _summaries_with_unmeasured_population():
 def test_run_statistics_tests_populations_unmeasured_in_some_samples():
     summaries, groups = _summaries_with_unmeasured_population()
     out = ar.run_statistics(summaries, list(summaries), groups, [], run_freq=True,
-                            run_counts=True, run_markers=False, fc_threshold=0.0)
+                            run_counts=True, run_markers=False, fc_threshold=0.0,
+                            counts_reference='parent', counts_method='ql')
     assert 'D/pos' in set(out['freq']['feature'])
     assert out['freq_values']['D/pos'].isna().sum() == 2
     assert any('D/pos' in note for note in out['notes'])
@@ -216,7 +273,8 @@ def test_counts_untestable_when_a_group_has_no_measured_sample():
                 if row['key'] == 'D/pos':
                     row.update(n_events=0, n_parent=0)
     out = ar.run_statistics(summaries, list(summaries), groups, [], run_freq=True,
-                            run_counts=True, run_markers=False, fc_threshold=0.0)
+                            run_counts=True, run_markers=False, fc_threshold=0.0,
+                            counts_reference='parent', counts_method='ql')
     d_counts = out['counts'][out['counts']['feature'] == 'D/pos'].iloc[0]
     assert np.isnan(d_counts['logFC'])
     assert not bool(d_counts['significant'])
@@ -271,12 +329,13 @@ def test_empty_populations_are_not_tested_despite_different_parent_counts():
                           for c in counts.columns}, index=samples, dtype=float)
     group_vec = [groups[s] for s in samples]
     contrasts = ds.build_contrasts(['ctrl', 'treated'], 'reference', 'ctrl')
-    raw = ds.run_moderated(ds.logit_proportions(counts, denom), group_vec, contrasts,
-                           'reference', 0.05, 0.0)
+    raw = ds.run_moderated(ds.logit_proportions(counts, denom, share_prior=False), group_vec,
+                           contrasts, 'reference', 0.05, 0.0)
     assert bool(raw.loc[raw['feature'] == 'Z/pos', 'significant'].iloc[0])
 
     out = ar.run_statistics(summaries, samples, groups, [], run_freq=True, run_counts=True,
-                            run_markers=False, fc_threshold=0.0)
+                            run_markers=False, fc_threshold=0.0,
+                            counts_reference='parent', counts_method='ql')
     for table in ('freq', 'counts'):
         assert not {'Y/pos', 'Z/pos'} & set(out[table]['feature'])
     assert list(out['freq_values'].columns) == ['A/pos', 'B/pos', 'C/pos']
@@ -288,7 +347,8 @@ def test_stats_round_trip_through_json():
     import json
     summaries, groups = _summaries_with_unmeasured_population()
     out = ar.run_statistics(summaries, list(summaries), groups, [], run_freq=True,
-                            run_counts=True, run_markers=False, fc_threshold=0.0)
+                            run_counts=True, run_markers=False, fc_threshold=0.0,
+                            counts_reference='parent', counts_method='ql')
     back = ar.stats_from_jsonable(json.loads(json.dumps(ar.stats_to_jsonable(out))))
     assert back['comparisons'] == out['comparisons']
     assert back['samples'] == out['samples'] and back['notes'] == out['notes']
@@ -354,6 +414,28 @@ def test_flags_and_exports():
     assert list(pe['group']) == ['ctrl'] and list(pe['key']) == ['G/pos']
     me = ar.marker_export({'s': summ}, ['s'], {'C': 'CD4'})
     assert me.loc[0, 'antigen'] == 'CD4' and me.loc[0, 'iqr'] == pytest.approx(0.2)
+
+
+@pytest.mark.numpy_only
+def test_write_marker_export_writes_the_marker_table_one_sample_at_a_time(tmp_path):
+    def summ(n, with_neg):
+        markers = {'G/pos': {'C': [0.5, 0.4, 0.6], 'D': [0.1, 0.05, 0.3]}}
+        if with_neg:
+            markers['G/neg'] = {'C': [0.2, 0.1, 0.25]}
+        return {'populations': [{'key': 'G/pos', 'n_events': n, 'n_parent': 10}],
+                'markers': markers}
+
+    path = tmp_path / 'markers.csv'
+    for with_neg in (False, True):
+        summaries = {'a': summ(5, with_neg), 'b': summ(7, False),
+                     'c': {'populations': [], 'markers': {}}}
+        samples = ['a', 'c', 'b', 'missing']
+        expected = ar.marker_export(summaries, samples, {'C': 'CD4'}, {'a': 'ctrl'})
+        n = ar.write_marker_export(path, summaries, samples, {'C': 'CD4'}, {'a': 'ctrl'})
+        assert n == len(expected) == (5 if with_neg else 4)
+        assert path.read_text() == expected.to_csv(index=False)
+    assert ar.write_marker_export(path, {}, ['x']) == 0
+    assert path.read_text() == pd.DataFrame().to_csv(index=False)
 
 
 # ---------------------------------------------------------------------------
@@ -560,3 +642,210 @@ def test_group_values_and_population_result_match_the_statistics():
     assert set(mk.loc[mk['channel'] == 'C', 'antigen']) == {'CD25'}
     assert set(mk.loc[mk['channel'] == 'B', 'antigen']) == {'B'}
     assert list(tables['values_frequencies']['group']) == out['group_vec']
+
+
+@pytest.mark.numpy_only
+def test_population_tables_leave_out_samples_with_small_parents():
+    summaries = {f's{i}': {'populations': [{'key': 'G/pos', 'n_events': 5, 'n_parent': p}]}
+                 for i, p in enumerate((10, 30, 50, 25))}
+    counts, denom, dropped = ar.population_tables(summaries, list(summaries), min_parent_events=20)
+    assert dropped == []
+    assert np.isnan(counts.loc['s0', 'G/pos']) and np.isnan(denom.loc['s0', 'G/pos'])
+    assert counts.loc[['s1', 's2', 's3'], 'G/pos'].tolist() == [5, 5, 5]
+    every, _denom, _dropped = ar.population_tables(summaries, list(summaries))
+    assert every['G/pos'].notna().all()
+
+
+def _anchor_summaries():
+    """Twelve samples, all events > Live (anchor) > T > CD4 and Live > B.
+    Treated samples have twice the T cells per live cell, with the same CD4
+    share of T. Sample s3 has no B row: a true zero against the anchor."""
+    rng = np.random.default_rng(5)
+    summaries, groups = {}, {}
+    for i in range(12):
+        grp = 'ctrl' if i < 6 else 'treated'
+        live = int(rng.integers(40_000, 60_000))
+        t = int(rng.binomial(live, 0.4 if grp == 'treated' else 0.2))
+        cd4 = int(rng.binomial(t, 0.6))
+        b = int(rng.binomial(live, 0.1))
+        rows = [{'key': 'Live/pos', 'n_events': live, 'parent_key': 'root', 'n_parent': live + 5000},
+                {'key': 'T/pos', 'n_events': t, 'parent_key': 'Live/pos', 'n_parent': live},
+                {'key': 'CD4/pos', 'n_events': cd4, 'parent_key': 'T/pos', 'n_parent': t},
+                {'key': 'B/pos', 'n_events': b, 'parent_key': 'Live/pos', 'n_parent': live}]
+        if i == 3:
+            rows = rows[:3]
+        summaries[f's{i}'] = {'populations': rows, 'n_total': live + 5000}
+        groups[f's{i}'] = grp
+    return summaries, groups
+
+
+@pytest.mark.numpy_only
+def test_anchor_tables_count_populations_below_the_anchor():
+    summaries, _groups = _anchor_summaries()
+    samples = list(summaries)
+    counts, denom, dropped = ar.anchor_tables(summaries, samples, 'Live/pos')
+    assert dropped == [] and list(counts.columns) == ['T/pos', 'CD4/pos', 'B/pos']
+    assert counts.loc['s3', 'B/pos'] == 0
+    live = [summaries[s]['populations'][0]['n_events'] for s in samples]
+    assert denom['CD4/pos'].tolist() == live
+    every, every_denom, _ = ar.anchor_tables(summaries, samples, None)
+    assert 'Live/pos' in every.columns
+    assert every_denom.loc['s0', 'T/pos'] == summaries['s0']['n_total']
+
+
+@pytest.mark.numpy_only
+def test_counts_against_the_anchor_ask_per_viable_cell():
+    summaries, groups = _anchor_summaries()
+    samples = list(summaries)
+    out = ar.run_statistics(summaries, samples, groups, [], run_freq=True, run_counts=True,
+                            run_markers=False, anchor_key='Live/pos')
+    assert (out['counts_reference'], out['counts_method'], out['counts_anchor']) == \
+        ('anchor', 'moderated', 'Live/pos')
+    counts = out['counts'].set_index('feature')
+    freq = out['freq'].set_index('feature')
+    assert counts.loc['T/pos', 'significant'] and counts.loc['T/pos', 'logFC'] > 0
+    # CD4 cells double per live cell while their share of T cells is unchanged.
+    assert counts.loc['CD4/pos', 'significant'] and not freq.loc['CD4/pos', 'significant']
+    assert ar.counts_only_hits(out) == set()
+    assert 'counts_only_hit' not in ar.statistics_tables(out)['counts'].columns
+    parent = ar.run_statistics(summaries, samples, groups, [], run_freq=True, run_counts=True,
+                               run_markers=False, counts_reference='parent')
+    same = parent['counts'].merge(parent['freq'], on=['feature', 'comparison'])
+    np.testing.assert_allclose(same['logFC_x'], same['logFC_y'])
+    with pytest.raises(ValueError):
+        ar.run_statistics(summaries, samples, groups, [], run_counts=True, counts_method='wald')
+
+
+@pytest.mark.numpy_only
+def test_counts_only_hits_against_the_parent():
+    freq = pd.DataFrame({'comparison': ['b vs a'] * 2, 'feature': ['x', 'y'],
+                         'significant': [True, False]})
+    counts = freq.assign(significant=[True, True])
+    stats = {'freq': freq, 'counts': counts, 'counts_reference': 'parent'}
+    assert ar.counts_only_hits(stats) == {('b vs a', 'y')}
+    assert ar.statistics_tables(stats)['counts']['counts_only_hit'].tolist() == [False, True]
+    del stats['counts_reference']
+    assert ar.counts_only_hits(stats) == {('b vs a', 'y')}
+    stats['counts_reference'] = 'anchor'
+    assert ar.counts_only_hits(stats) == set()
+
+
+def _aged_summaries(n=24):
+    """Samples whose T-cell fraction rises with age."""
+    gates = _hierarchy()
+    ref = _reference(gates)
+    ages = np.linspace(18, 37, n)
+    summaries, groups, time = {}, {}, {}
+    for i, age in enumerate(ages):
+        key = f'f{i}'
+        frac = 0.2 + 0.025 * (age - 18)
+        summaries[key] = _summarise(_sample(400 + i, frac_t=frac), gates, ref)
+        groups[key] = 'Blood'
+        time[key] = float(age)
+    return gates, summaries, groups, time
+
+
+@pytest.mark.numpy_only
+def test_run_trend_statistics_finds_a_population_changing_with_age():
+    import json
+    gates, summaries, groups, time = _aged_summaries()
+    samples = list(summaries)
+    cov = pd.DataFrame({'age': [str(time[k]) for k in samples]}, index=samples)
+    out = ar.run_trend_statistics(summaries, samples, groups, gates, time=time, variable='age',
+                                  unit='weeks', covariates=cov, numeric_covariates=['age'],
+                                  run_freq=True, run_markers=True, min_r2=0.0)
+    freq = out['freq'].table.set_index('feature')
+    assert freq.loc['T/pos', 'significant'] and freq.loc['T/pos', 'direction'] == 'up'
+    assert freq.loc['T/pos', 'slope'] > 0
+    assert not freq.loc['Lymph/pos', 'significant']
+    assert out['markers'] is not None and out['settings']['df'] == 2
+
+    back = ar.trend_from_jsonable(json.loads(json.dumps(ar.trend_to_jsonable(out))))
+    pd.testing.assert_frame_equal(back['freq'].table, out['freq'].table, check_dtype=False)
+    np.testing.assert_allclose(back['freq'].curves, out['freq'].curves)
+    pd.testing.assert_frame_equal(back['freq_values'], out['freq_values'], check_dtype=False)
+
+    above_all = float(out['freq'].table['R2'].max()) + 1e-6
+    strict = ar.reapply_trend_thresholds(out, 0.05, above_all, 'either')
+    assert not strict['freq'].table['significant'].any()
+    assert strict['settings']['min_r2'] == above_all
+    tables = ar.trend_tables(out, {'T/pos': 'T cells'})
+    assert set(tables) == {'trend_frequencies', 'trend_markers'}
+    assert 'T cells' in set(tables['trend_frequencies']['population'])
+
+
+@pytest.mark.numpy_only
+def test_immune_age_model_is_kept_with_the_trend_run():
+    import json
+    pytest.importorskip('sklearn')
+    import drc_predictive
+    gates, summaries, groups, time = _aged_summaries()
+    samples = list(summaries)
+    out = ar.run_trend_statistics(summaries, samples, groups, gates, time=time, variable='age',
+                                  unit='weeks', run_freq=True, min_r2=0.0)
+    X = ar.predictive_matrix(out, True, False)
+    age = drc_predictive.run_age_model(X, [time[s] for s in X.index], repeats=1,
+                                       n_permutations=0)
+    age['summary']['group'] = 'Blood'
+    out['age_model'] = age
+    back = ar.trend_from_jsonable(json.loads(json.dumps(ar.trend_to_jsonable(out))))
+    pd.testing.assert_frame_equal(back['age_model']['predictions'], age['predictions'],
+                                  check_dtype=False)
+    assert back['age_model']['summary']['group'] == 'Blood'
+    tables = ar.trend_tables(out)
+    assert {'immune_age_predictions', 'immune_age_features'} <= set(tables)
+    assert set(tables['immune_age_predictions']['group']) == {'Blood'}
+    del out['age_model']
+    plain = ar.trend_from_jsonable(json.loads(json.dumps(ar.trend_to_jsonable(out))))
+    assert 'age_model' not in plain
+
+
+@pytest.mark.numpy_only
+def test_immune_age_model_predicts_samples_outside_the_trend_run():
+    import json
+    pytest.importorskip('sklearn')
+    import drc_predictive
+    gates, summaries, groups, time = _aged_summaries()
+    trend_samples = list(summaries)[:20]
+    others = list(summaries)[20:]
+    out = ar.run_trend_statistics({s: summaries[s] for s in trend_samples}, trend_samples,
+                                  groups, gates, time=time, variable='age', unit='weeks',
+                                  run_freq=True, min_r2=0.0)
+    X = ar.predictive_matrix(out, True, False)
+    source = ar.trend_feature_values(summaries, others, gates, use_freq=True)
+    X_other = ar.predictive_matrix(source, True, False)
+    assert list(X_other.index) == others and set(X_other.columns) <= set(X.columns)
+    whole = ar.trend_feature_values(summaries, trend_samples, gates, use_freq=True)
+    pd.testing.assert_frame_equal(whole['freq_values'], out['freq_values'][
+        whole['freq_values'].columns], check_dtype=False)
+    age = drc_predictive.run_age_model(X, [time[s] for s in X.index], X_other=X_other,
+                                       y_other=[np.nan] * len(others), repeats=1,
+                                       n_permutations=0)
+    age['groups'] = dict({s: 'Blood' for s in trend_samples}, **{s: 'Cord' for s in others})
+    out['age_model'] = age
+    table = drc_predictive.age_model_by_group(age, age['groups'])
+    cord = table.set_index('group').loc['Cord']
+    assert cord['n'] == len(others) and cord['n_actual'] == 0 and np.isnan(cord['mae'])
+    assert np.isfinite(cord['predicted_mean'])
+    rows = drc_predictive.age_group_rows(table, 'weeks')
+    assert rows[1]['Mean absolute error'] == '' and rows[1]['With a value'] == 0
+    back = ar.trend_from_jsonable(json.loads(json.dumps(ar.trend_to_jsonable(out))))
+    assert back['age_model']['groups'] == age['groups']
+    assert set(ar.trend_tables(out)['immune_age_predictions']['group']) == {'Blood', 'Cord'}
+
+
+@pytest.mark.numpy_only
+def test_trend_composition_stacks_one_gates_populations():
+    gates, summaries, groups, time = _aged_summaries()
+    samples = list(summaries)
+    out = ar.run_trend_statistics(summaries, samples, groups, gates, time=time, variable='age',
+                                  unit='weeks', run_freq=True, min_r2=0.0)
+    unit = ar.composition_gate(summaries, samples, 'T/pos')
+    assert unit is not None and set(unit['keys']) >= {'T/pos'} and len(unit['keys']) >= 2
+    panels = ar.trend_composition(summaries, out, 'T/pos')
+    assert len(panels) == 1 and panels[0]['label'] == 'Blood'
+    comp = panels[0]
+    np.testing.assert_allclose(comp['shares'].sum(axis=0), 1.0)
+    pos = comp['parts'].index(unit['labels']['T/pos'])
+    assert comp['shares'][pos, -1] > comp['shares'][pos, 0]
+    assert len(comp['samples']) == len(samples)

@@ -141,7 +141,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QSpinBox, QDoubleSpinBox, QRadioButton,
     QButtonGroup, QListWidget, QListWidgetItem,
     QAbstractItemView, QSplitter, QFrame, QGridLayout,
-    QLineEdit, QFileDialog, QMessageBox, QSizePolicy,
+    QLineEdit, QFileDialog, QMessageBox, QSizePolicy, QFormLayout,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QTabWidget, QColorDialog, QProgressBar, QSlider,
     QDialog, QTextEdit, QApplication, QToolBox, QStackedWidget,
@@ -163,9 +163,14 @@ from honeychrome.view_components.ordered_multi_sample_picker import OrderedMulti
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 from honeychrome.view_components.side_tab_widget import SideTabWidget
+from honeychrome.controller_components import covariate_check, sample_table
+from honeychrome.controller_components import trend_stats
+from honeychrome.view_components import trend_plots
 from honeychrome.view_components import suggest_groupings_dialog as sgd
+from honeychrome.view_components import covariate_check_dialog, sample_table_import_dialog
 from honeychrome.view_components.checkable_header import CheckableHeaderView
-from honeychrome.controller_components.differential_stats import suggest_groupings_from_names
+from honeychrome.controller_components.differential_stats import (
+    is_missing_value, suggest_groupings_from_names)
 from honeychrome.view_components.differential_plots import (
     make_group_values_figure,
     make_heatmap_figure,
@@ -178,6 +183,7 @@ from honeychrome.view_components.differential_plots import (
     style_figure_theme as _style_figure_theme,
     text_width_inches,
     wrap_label,
+    wrap_to_width,
 )
 import honeychrome.settings as hc_settings
 
@@ -484,6 +490,18 @@ def _is_viability_antigen(antigen: str) -> bool:
     except ImportError:
         return False
     return match_marker(antigen, get_marker_db()) == 'Viability'
+
+
+def _cluster_id_reference_text(details: dict | None) -> str:
+    """What MEM was scored against, for the Cluster ID status line, from
+    the details saved with the suggestions; '' when there are none."""
+    if not details:
+        return ''
+    if details.get('mem_reference') == drc_cluster_id.MEM_REFERENCE_ANCHOR:
+        shared = ' '.join(details.get('shared_markers') or []) or 'none'
+        return (f" Shared against \"{details.get('anchor')}\" "
+                f"({int(details.get('n_reference_events') or 0):,} events): {shared}.")
+    return " MEM against the other clusters."
 
 
 def _antigen_dash_labels(controller) -> dict[str, str]:
@@ -930,6 +948,17 @@ class PipelineState:
     pairing_variable: str = ''
     # Column name in state.covariates used as a fixed-effect blocking term
     # when paired=True (e.g. donor ID).
+    population_split: bool = False
+    # True: compare gated populations within samples (e.g. CD45.1+ vs
+    #   CD45.1- cells of each chimera) instead of sample groups. Samples of
+    #   the checked Groups to Test are split into population_gates, the
+    #   populations are the groups and the design is paired on the sample
+    #   (drc_stats.split_by_population).
+    population_gates: list[str] = field(default_factory=list)
+    # Gates inside the analysed gate(s) to compare; also the populations
+    # the Workspace 'Population' colour mode shows.
+    population_reference: str = ''
+    # Reference population in 'reference' contrast mode ('' = the first).
     stats_fdr_scope: str = 'global'
     # 'global'         -- 'significant' uses one BH-FDR correction pooled
     #   across every comparison currently displayed (default).
@@ -945,9 +974,11 @@ class PipelineState:
     stats_use_treat: bool = True
     # True: p-values test |effect| > threshold (TREAT). False: test
     #   effect != 0 and use the threshold only as a filter.
-    stats_counts_method: str = 'wald'
-    # Counts test: 'wald' (per-cluster dispersion, z) or 'ql'
-    #   (quasi-likelihood F with shrunk dispersions).
+    stats_counts_method: str = 'ql'
+    # Counts test: 'ql' (quasi-likelihood F, each comparison fitted on its
+    #   two groups, dispersions trended with cluster size). The
+    #   Wald test is not offered: it was far too liberal on human and mouse
+    #   data.
     stats_normalisation: str = 'total'
     # Library size of the Counts and Frequency tests: 'total' (events over
     #   all clusters) or 'robust' (trimmed rescaling that a few expanding
@@ -1048,6 +1079,10 @@ class PipelineState:
     pca_run_label: str = ''
     pca_groups: list = field(default_factory=list)
     pca_sources: list = field(default_factory=list)
+    # Numeric colour of each PCA sample (the trend variable), empty when the
+    # samples are coloured by group.
+    pca_colour_values: list = field(default_factory=list)
+    pca_colour_label: str = ''
     predictive_result: dict | None = None
     # drc_predictive.run_predictive() output for the last Predictive
     # Analysis run (session only), plus 'run_label'.
@@ -1059,6 +1094,10 @@ class PipelineState:
     # sample rel-paths in test-matrix row order
     stats_group_vec: list = field(default_factory=list)
     # 'A'/'B' per row, aligned to stats_all_rel
+    stats_population_of: dict = field(default_factory=dict)
+    # {row key: [sample rel path, gate]} when the current results compare
+    # populations within samples (row keys are drc_stats.population_key);
+    # empty when they compare sample groups.
     stats_run_label: str = ''
     # display label of the clustering run used for the current stats
     # results — NOT the matching key (see stats_run_id); kept only so
@@ -1071,6 +1110,23 @@ class PipelineState:
     # {cluster id: name} the current stats results use, so a later rename
     # of the run's clusters can be applied to them
     # (drc_stats.relabel_stats_results).
+
+    # --- Trends with a numeric covariate (drc_stats.run_trend_statistics) ---
+    stats_test: str = 'groups'
+    # 'groups' (compare groups) or 'trend' -- what Run Statistics runs
+    trend_variable: str = ''
+    trend_unit: str = ''
+    trend_interaction: bool = False
+    # True: do the two groups ticked in Groups to Test change differently?
+    trend_shape: str = 'curve'
+    trend_df: int = trend_stats.DEFAULT_CURVE_DF
+    trend_scale: str = 'linear'
+    trend_call: str = 'either'
+    trend_patterns: int = 0          # shape patterns; 0 = chosen from stability
+    trend_min_r2: float = trend_stats.DEFAULT_MIN_R2
+    trend_results: dict = field(default_factory=dict)
+    # the last trend run (drc_stats.run_trend_statistics), with the
+    # 'run_id' and 'run_label' of its clustering run
 
     # --- Workspace ---
     plot_configs: list[dict] = field(default_factory=list)
@@ -1131,6 +1187,30 @@ class PipelineState:
         counts = self.n_per_group(sample_keys)
         qualifying = sum(1 for name in selection if counts.get(name, 0) >= 3)
         return qualifying >= 2
+
+    def trend_stats_runnable(self, sample_keys: set[str] | None = None) -> bool:
+        """
+        True when a trend test can run on the checked 'Groups to Test': at
+        least trend_stats.MIN_TREND_SAMPLES samples in them, and with
+        trend_interaction exactly two groups of >= 3 samples each.
+        """
+        selection = self.testing_group_selection or self.group_names
+        counts = self.n_per_group(sample_keys)
+        if self.trend_interaction:
+            return len(selection) == 2 and all(counts.get(name, 0) >= 3 for name in selection)
+        return sum(counts.get(name, 0) for name in selection) >= trend_stats.MIN_TREND_SAMPLES
+
+    def population_stats_runnable(self, sample_keys: set[str] | None = None) -> bool:
+        """
+        Comparing populations within samples: True if at least two
+        populations are chosen and the checked 'Groups to Test' hold at
+        least 3 assigned samples between them (see n_per_group for
+        sample_keys).
+        """
+        selection = self.testing_group_selection or self.group_names
+        counts = self.n_per_group(sample_keys)
+        return (len(self.population_gates) >= 2
+                and sum(counts.get(name, 0) for name in selection) >= 3)
 
     def cluster_label(self, cluster_id: int) -> str:
         """Return display name for a cluster id, falling back to 'Cluster N'."""
@@ -3165,6 +3245,15 @@ class GroupsStatsTab(QWidget):
         self.remove_group_btn = QPushButton("Remove Selected Group")
         self.remove_group_btn.clicked.connect(self._remove_selected_group)
         groups_btn_row.addWidget(self.remove_group_btn)
+        for text, step, tip in (("▲", -1, "Move the selected group up."),
+                                ("▼", 1, "Move the selected group down.")):
+            btn = QPushButton(text)
+            btn.setFixedWidth(32)
+            btn.setToolTip(tip + " The group order is the order used in Groups to Test, "
+                           "the Reference list, comparisons between every pair (the "
+                           "earlier group is the baseline) and every figure.")
+            btn.clicked.connect(lambda _c=False, s=step: self._move_selected_group(s))
+            groups_btn_row.addWidget(btn)
         groups_btn_row.addStretch()
 
         self.auto_assign_btn = QPushButton("Auto-assign by pattern")
@@ -3187,8 +3276,9 @@ class GroupsStatsTab(QWidget):
         csv_row = QHBoxLayout()
         self.import_csv_btn = QPushButton("Import CSV")
         self.import_csv_btn.setToolTip(
-            "Import group and covariate assignments from a CSV file.\n"
-            "Required columns: 'sample', 'group'.  Optional covariate columns follow."
+            "Import group and covariate assignments from a CSV or tab-separated file.\n"
+            "Needs a 'sample' column: the file name, or a sample ID found inside it.\n"
+            "The matches are shown for review before anything changes."
         )
         self.import_csv_btn.clicked.connect(self._import_csv)
         self.export_csv_btn = QPushButton("Export CSV")
@@ -3214,8 +3304,14 @@ class GroupsStatsTab(QWidget):
             "empty) from the table below."
         )
         self.remove_column_btn.clicked.connect(self._remove_covariate_column)
+        self.check_table_btn = QPushButton("Check table…")
+        self.check_table_btn.setToolTip(
+            "Look for blank cells, NA and Unknown spellings, similar categories, numbers "
+            "written as text and covariates confounded with the groups, and fix them.")
+        self.check_table_btn.clicked.connect(self._check_table)
         csv_row.addWidget(self.import_csv_btn)
         csv_row.addWidget(self.export_csv_btn)
+        csv_row.addWidget(self.check_table_btn)
         csv_row.addWidget(self.add_column_btn)
         csv_row.addWidget(self.remove_column_btn)
         csv_row.addWidget(self.suggest_groupings_btn)
@@ -3295,12 +3391,12 @@ class GroupsStatsTab(QWidget):
         test_groups_box = QGroupBox("Groups to Test")
         test_groups_layout = QVBoxLayout(test_groups_box)
 
-        test_groups_hint = _HintLabel(
+        self.test_groups_hint = _HintLabel(
             "Check every group to include in Frequency/Counts/MFI testing "
             "and Composition-by-group."
         )
-        test_groups_hint.setWordWrap(True)
-        test_groups_layout.addWidget(test_groups_hint)
+        self.test_groups_hint.setWordWrap(True)
+        test_groups_layout.addWidget(self.test_groups_hint)
 
         self.test_groups_list = QListWidget()
         self.test_groups_list.setFixedHeight(90)
@@ -3370,6 +3466,40 @@ class GroupsStatsTab(QWidget):
 
         stats_layout.addWidget(test_groups_box)
 
+        # ---- Populations within samples ----
+        population_box = QGroupBox("Populations")
+        population_layout = QVBoxLayout(population_box)
+        self.chk_population_split = QCheckBox("Compare populations within samples")
+        self.chk_population_split.setToolTip(
+            "Compare gated populations of the same samples with each other instead of "
+            "groups of samples, e.g. CD45.1+ against CD45.1- cells of each mixed "
+            "bone-marrow chimera.\nSamples of the groups checked above are each split into "
+            "the populations ticked below; the populations become the groups tested and "
+            "every test is paired on the sample."
+        )
+        self.chk_population_split.toggled.connect(self._on_population_split_toggled)
+        population_layout.addWidget(self.chk_population_split)
+        self._population_panel = QWidget()
+        population_panel_layout = QVBoxLayout(self._population_panel)
+        population_panel_layout.setContentsMargins(0, 0, 0, 0)
+        population_hint = _HintLabel(
+            "Tick two or more populations inside the analysed gate that do not share "
+            "cells. Each sample's populations are compared with each other, so cluster "
+            "frequencies are shares of each population's own cells and differences "
+            "between samples (mice, donors) drop out of the comparison; sample-level "
+            "covariates are covered by that pairing. The Workspace 'Population' colour "
+            "mode shows the same populations."
+        )
+        population_hint.setWordWrap(True)
+        population_panel_layout.addWidget(population_hint)
+        self.population_gate_tree = drc_gate_tree.GateTreeWidget()
+        self.population_gate_tree.setFixedHeight(140)
+        self.population_gate_tree.selectionChanged.connect(self._on_population_gates_changed)
+        population_panel_layout.addWidget(self.population_gate_tree)
+        self._population_panel.setVisible(False)
+        population_layout.addWidget(self._population_panel)
+        stats_layout.addWidget(population_box)
+
         defaults_row = QHBoxLayout()
         self.stats_defaults_btn = QPushButton("Restore defaults")
         self.stats_defaults_btn.setToolTip(
@@ -3384,6 +3514,21 @@ class GroupsStatsTab(QWidget):
         defaults_row.addStretch()
         stats_layout.addLayout(defaults_row)
 
+        analysis_row = QHBoxLayout()
+        analysis_row.addWidget(QLabel("Analysis:"))
+        self.stats_test_combo = QComboBox()
+        self.stats_test_combo.addItem("Compare groups", 'groups')
+        self.stats_test_combo.addItem("Trend with a numeric covariate", 'trend')
+        self.stats_test_combo.setToolTip(
+            "Compare groups: which clusters differ between sample groups. Trend: which "
+            "clusters change with a numeric covariate such as age or days after vaccination "
+            "(tick Numeric under it in the samples table), in the samples of the groups ticked "
+            "in Groups to Test.")
+        self.stats_test_combo.currentIndexChanged.connect(self._on_stats_test_changed)
+        analysis_row.addWidget(self.stats_test_combo)
+        analysis_row.addStretch()
+        stats_layout.addLayout(analysis_row)
+
         # Config row: what to test
         config_row = QHBoxLayout()
         config_row.addWidget(QLabel("Test:"))
@@ -3396,9 +3541,11 @@ class GroupsStatsTab(QWidget):
         self.chk_counts = QCheckBox("Cluster Counts (GLM)")
         self.chk_counts.setChecked(STATS_TEST_DEFAULTS['counts'])
         self.chk_counts.setToolTip(
-            "Raw event counts per cluster per sample → negative-"
-            "binomial GLM.\nParallel option to the Frequency test, not a "
-            "replacement — run both to compare on the same data."
+            "Raw event counts per cluster per sample → negative-binomial GLM, "
+            "quasi-likelihood F test.\nSuited to homogeneous designs such as "
+            "inbred mice with plenty of events. On human cohort data negative-"
+            "binomial tests found more false positives than their nominal rate; "
+            "rely on Cluster Frequencies there."
         )
         self.chk_mfi = QCheckBox("Cluster MFIs")
         self.chk_mfi.setChecked(STATS_TEST_DEFAULTS['mfi'])
@@ -3493,14 +3640,16 @@ class GroupsStatsTab(QWidget):
         method_row.addSpacing(20)
         method_row.addWidget(QLabel("Counts test:"))
         self.counts_method_combo = QComboBox()
-        self.counts_method_combo.addItem("Wald", 'wald')
-        self.counts_method_combo.addItem("Quasi-likelihood F", 'ql')
+        self.counts_method_combo.addItem(
+            "Quasi-likelihood F (negative binomial, homogeneous designs)", 'ql')
         self.counts_method_combo.setToolTip(
-            "Wald: each cluster's own negative-binomial dispersion and a z "
-            "test; finds too many hits with few samples per group or a "
-            "paired design. Quasi-likelihood F: dispersions shrunk towards a "
-            "common value, then a moderated quasi-dispersion per cluster; "
-            "holds its false-positive rate with few samples."
+            "Quasi-likelihood F: each comparison fitted on its two groups, "
+            "negative-binomial dispersions taken from clusters with similar "
+            "counts, then a moderated quasi-dispersion per cluster. On inbred "
+            "mice it gave 3–6% false positives at the 5% level (about 5% with "
+            "100 cells per sample); on a human cohort 7–10% for populations "
+            "under 100 events. The Wald test is not offered (21–31% on the same "
+            "mice)."
         )
         method_row.addWidget(self.counts_method_combo)
         method_row.addSpacing(10)
@@ -3519,6 +3668,74 @@ class GroupsStatsTab(QWidget):
         method_row.addStretch()
         stats_layout.addLayout(method_row)
 
+        self.trend_box = QGroupBox("Trend")
+        trend_form = QFormLayout(self.trend_box)
+        self.trend_var_combo = QComboBox()
+        self.trend_var_combo.setToolTip("Covariates ticked Numeric in the samples table.")
+        self.trend_unit_edit = QLineEdit()
+        self.trend_unit_edit.setPlaceholderText("e.g. weeks, days")
+        self.trend_unit_edit.setToolTip("Unit of the covariate, for the slope and the axes.")
+        self.trend_question_combo = QComboBox()
+        self.trend_question_combo.addItem("Change with the covariate (groups together)", False)
+        self.trend_question_combo.addItem("Does the change differ between two groups?", True)
+        self.trend_question_combo.setToolTip(
+            "The second asks whether the two groups ticked in Groups to Test change "
+            "differently (group × trend), the reference group first. With pairing (e.g. "
+            "two tissues of one donor) it tests the within-pair difference against the covariate.")
+        self.trend_shape_combo = QComboBox()
+        for key, text in (('curve', "Smooth curve"), ('line', "Straight line"),
+                          ('points', "Time points as groups")):
+            self.trend_shape_combo.addItem(text, key)
+        self.trend_shape_combo.setToolTip(
+            "Smooth curve: any shape, one p-value for the covariate as a whole (an ANOVA-style "
+            "F test). Straight line: a steady rise or fall. Time points as groups: each value is "
+            "its own level, for designed time courses (day 0, 3, 7, 14).")
+        self.trend_df_spin = QSpinBox()
+        self.trend_df_spin.setRange(1, 6)
+        self.trend_df_spin.setToolTip(
+            "How many bends the curve may make (1 = a straight line, 2 = one bend). Capped at "
+            "one per 10 samples.")
+        self.trend_scale_combo = QComboBox()
+        self.trend_scale_combo.addItem("Linear", 'linear')
+        self.trend_scale_combo.addItem("Log2 (value + 1): slope per doubling", 'log2')
+        self.trend_scale_combo.setToolTip(
+            "Log2 suits time courses sampled on a doubling schedule (day 0, 1, 3, 7, 14, 28).")
+        self.trend_call_combo = QComboBox()
+        for key, text in (('either', "Curve or slope (each at FDR ÷ 2)"), ('curve', "Curve only"),
+                          ('slope', "Slope only")):
+            self.trend_call_combo.addItem(text, key)
+        self.trend_call_combo.setToolTip(
+            "A cluster is called when the curve test or the slope test is significant, each at "
+            "half the FDR so the combined error stays at the FDR set above; or by one test "
+            "alone.")
+        self.trend_r2_spin = QDoubleSpinBox()
+        self.trend_r2_spin.setRange(0.0, 1.0)
+        self.trend_r2_spin.setDecimals(2)
+        self.trend_r2_spin.setSingleStep(0.05)
+        self.trend_r2_spin.setToolTip(
+            "Minimum partial R²: the share of the sample-to-sample variation the covariate "
+            "explains, after groups and adjustment covariates. In large studies tiny trends "
+            "become significant; this keeps them out.")
+        self.trend_patterns_spin = QSpinBox()
+        self.trend_patterns_spin.setRange(0, 10)
+        self.trend_patterns_spin.setSpecialValueText("Auto")
+        self.trend_patterns_spin.setToolTip(
+            "Shape patterns: the called clusters are grouped by the shape of their fitted curve (rises, falls, peaks mid-range). Auto uses the largest number of patterns that come back the same when the test is repeated on 80% of the samples; a number groups into exactly that many.")
+        self.trend_check_label = QLabel("")
+        self.trend_check_label.setWordWrap(True)
+        trend_form.addRow("Covariate:", self.trend_var_combo)
+        trend_form.addRow("Unit:", self.trend_unit_edit)
+        trend_form.addRow("Question:", self.trend_question_combo)
+        trend_form.addRow("Shape:", self.trend_shape_combo)
+        trend_form.addRow("Curve df:", self.trend_df_spin)
+        trend_form.addRow("Scale:", self.trend_scale_combo)
+        trend_form.addRow("Call when:", self.trend_call_combo)
+        trend_form.addRow("Min. partial R²:", self.trend_r2_spin)
+        trend_form.addRow("Patterns:", self.trend_patterns_spin)
+        trend_form.addRow(self.trend_check_label)
+        self.trend_box.setVisible(False)
+        stats_layout.addWidget(self.trend_box)
+
         for box in (self.chk_freq, self.chk_counts, self.chk_mfi, self.chk_treat,
                     self.chk_mfi_hierarchical):
             box.toggled.connect(self._update_stats_defaults_button)
@@ -3526,6 +3743,19 @@ class GroupsStatsTab(QWidget):
             spin.valueChanged.connect(self._update_stats_defaults_button)
         for combo in (self.fdr_scope_combo, self.counts_method_combo, self.normalisation_combo):
             combo.currentIndexChanged.connect(self._update_stats_defaults_button)
+        self.trend_var_combo.currentIndexChanged.connect(self._on_trend_settings_changed)
+        self.trend_unit_edit.editingFinished.connect(self._on_trend_settings_changed)
+        for combo in (self.trend_question_combo, self.trend_shape_combo, self.trend_scale_combo):
+            combo.currentIndexChanged.connect(self._on_trend_settings_changed)
+        self.trend_df_spin.valueChanged.connect(self._on_trend_settings_changed)
+        self.trend_call_combo.currentIndexChanged.connect(self._on_trend_thresholds_changed)
+        self.trend_r2_spin.valueChanged.connect(self._on_trend_thresholds_changed)
+        self.trend_patterns_spin.valueChanged.connect(self._on_trend_thresholds_changed)
+        self.pval_spin.valueChanged.connect(self._on_trend_thresholds_changed)
+        for w in (self.trend_shape_combo, self.trend_scale_combo, self.trend_call_combo):
+            w.currentIndexChanged.connect(self._update_stats_defaults_button)
+        for w in (self.trend_df_spin, self.trend_r2_spin, self.trend_patterns_spin):
+            w.valueChanged.connect(self._update_stats_defaults_button)
         self._update_stats_defaults_button()
 
         # ---- Marker roles: type (clustering) vs state (tested) ----
@@ -3853,6 +4083,79 @@ class GroupsStatsTab(QWidget):
 
         bottom_layout.addWidget(pred_box)
 
+        # ============================================================
+        # Immune age model (trend variable)
+        # ============================================================
+        age_box = QGroupBox("Immune Age Model (trend variable)")
+        age_layout = QVBoxLayout(age_box)
+        age_hint = _HintLabel(
+            "How well the immune profile predicts a continuous trend variable (for example age), "
+            "which clusters carry the prediction, and whether each sample's profile looks like a "
+            "higher or lower value than its own (with age: older or younger). An elastic net (penalised regression) is trained and judged by nested "
+            "cross-validation on the values of the last trend run, keeping each donor or pair "
+            "whole; a chance check reruns it with the variable shuffled. Needs at least "
+            f"{drc_predictive.MIN_AGE_SAMPLES} samples in the model's group; "
+            f"{drc_predictive.RECOMMENDED_AGE_SAMPLES}+ is recommended.")
+        age_hint.setWordWrap(True)
+        age_layout.addWidget(age_hint)
+        age_row = QHBoxLayout()
+        age_row.addWidget(QLabel("Model on:"))
+        self.age_group_combo = QComboBox()
+        self.age_group_combo.setMinimumWidth(160)
+        self.age_group_combo.setToolTip(
+            "The group the model is trained and judged on. Other groups of the trend run can be "
+            "predicted by the final model (not cross-validated); that is only meaningful for "
+            "samples like the model's, not for a different kind of sample.")
+        age_row.addWidget(self.age_group_combo)
+        age_row.addSpacing(12)
+        self.age_chk_freq = QCheckBox("Frequencies")
+        self.age_chk_freq.setChecked(True)
+        self.age_chk_mfi = QCheckBox("MFIs")
+        self.age_chk_others = QCheckBox("Predict the other groups")
+        self.age_chk_others.setToolTip(
+            "After fitting on the chosen group, predict every sample of the other groups, "
+            "including groups left out of the trend run and samples without a value of the "
+            "variable.")
+        for w in (self.age_chk_freq, self.age_chk_mfi, self.age_chk_others):
+            age_row.addWidget(w)
+        age_row.addSpacing(12)
+        age_row.addWidget(QLabel("Repeats"))
+        self.age_repeats_spin = QSpinBox()
+        self.age_repeats_spin.setRange(1, 50)
+        self.age_repeats_spin.setValue(5)
+        self.age_repeats_spin.setFixedWidth(55)
+        age_row.addWidget(self.age_repeats_spin)
+        age_row.addWidget(QLabel("Chance shuffles"))
+        self.age_perm_spin = QSpinBox()
+        self.age_perm_spin.setRange(0, 2000)
+        self.age_perm_spin.setSingleStep(50)
+        self.age_perm_spin.setValue(drc_predictive.DEFAULT_AGE_PERMUTATIONS)
+        self.age_perm_spin.setFixedWidth(70)
+        self.age_perm_spin.setToolTip(
+            "Times the model is rerun with the variable shuffled among donors or pairs, to check "
+            "its error is better than chance (0: no check).")
+        age_row.addWidget(self.age_perm_spin)
+        age_row.addStretch()
+        age_layout.addLayout(age_row)
+        age_btn_row = QHBoxLayout()
+        self.age_run_btn = QPushButton("▶  Run Immune Age Model")
+        self.age_run_btn.setEnabled(False)
+        self.age_run_btn.clicked.connect(self._run_age_model)
+        age_btn_row.addWidget(self.age_run_btn)
+        self.age_status_label = QLabel("")
+        self.age_status_label.setWordWrap(True)
+        self.age_status_label.setStyleSheet("color: grey;")
+        age_btn_row.addWidget(self.age_status_label, stretch=1)
+        age_layout.addLayout(age_btn_row)
+        self.age_progress = QProgressBar()
+        self.age_progress.setRange(0, 1000)
+        self.age_progress.setVisible(False)
+        age_layout.addWidget(self.age_progress)
+        self.age_table_holder = QVBoxLayout()
+        age_layout.addLayout(self.age_table_holder)
+        self._age_worker = None
+        bottom_layout.addWidget(age_box)
+
         # Results area: one tab per plot
         self._results_tabs = QTabWidget()
         self._results_tabs.setTabsClosable(True)
@@ -3985,6 +4288,25 @@ class GroupsStatsTab(QWidget):
         self._update_group_count_label()
         self._update_run_button()
 
+    def _move_selected_group(self, step: int):
+        """Move the selected group *step* rows up (-1) or down (+1); the
+        checked Groups to Test follow the new order."""
+        st = self.state
+        row = self.groups_table.currentRow()
+        new = row + step
+        if row < 0 or not 0 <= new < len(st.group_names):
+            return
+        st.group_names.insert(new, st.group_names.pop(row))
+        checked = set(st.testing_group_selection)
+        st.testing_group_selection = [g for g in st.group_names if g in checked]
+        self._populate_groups_table()
+        self._refresh_group_combos()
+        self._populate_test_groups_list()
+        self.groups_table.setCurrentCell(new, 0)
+        self._last_stats_data_key = None
+        self._update_group_count_label()
+        self._update_run_button()
+
     def _remove_selected_group(self):
         row = self.groups_table.currentRow()
         if row < 0 or row >= len(self.state.group_names):
@@ -4071,19 +4393,28 @@ class GroupsStatsTab(QWidget):
         self._last_stats_data_key = None
         self._refresh_reference_group_combo()
         self._update_run_button()
+        if self._trend_mode():
+            self._update_trend_check()
 
     def _refresh_reference_group_combo(self):
         """Populate the Reference combo from the currently checked test
-        groups only -- a reference must itself be one of the groups in play."""
-        checked = self.state.testing_group_selection or list(self.state.group_names)
+        groups only -- a reference must itself be one of the groups in play.
+        When comparing populations within samples, from the chosen
+        populations instead (state.population_reference)."""
+        split = self.state.population_split
+        checked = (list(self.state.population_gates) if split
+                   else self.state.testing_group_selection or list(self.state.group_names))
         self.reference_group_combo.blockSignals(True)
-        prev = self.state.reference_group
+        prev = self.state.population_reference if split else self.state.reference_group
         self.reference_group_combo.clear()
         self.reference_group_combo.addItems(checked)
         idx = self.reference_group_combo.findText(prev)
         self.reference_group_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.reference_group_combo.blockSignals(False)
-        self.state.reference_group = self.reference_group_combo.currentText()
+        if split:
+            self.state.population_reference = self.reference_group_combo.currentText()
+        else:
+            self.state.reference_group = self.reference_group_combo.currentText()
         self.reference_group_combo.setEnabled(self.radio_reference.isChecked())
 
     def _on_contrast_mode_changed(self, _checked: bool):
@@ -4093,8 +4424,84 @@ class GroupsStatsTab(QWidget):
         self._update_run_button()
 
     def _on_reference_group_changed(self, text: str):
-        self.state.reference_group = text
+        if self.state.population_split:
+            self.state.population_reference = text
+        else:
+            self.state.reference_group = text
         self._last_stats_data_key = None
+
+    def _population_hierarchy(self) -> list[dict]:
+        """The gates inside the analysed gate(s): the children of every
+        selected gate, or of the root when no gate is selected."""
+        try:
+            root = self.controller.unmixed_gating.get_gate_hierarchy(output='dict')
+        except Exception:
+            return []
+        if not root:
+            return []
+        targets = set(self.state.selected_gates)
+        if not targets:
+            return list(root.get('children') or [])
+        found = []
+
+        def _walk(node):
+            if node.get('name') in targets:
+                found.extend(node.get('children') or [])
+                return
+            for child in node.get('children') or []:
+                _walk(child)
+
+        _walk(root)
+        return found
+
+    def _populate_population_tree(self):
+        """Rebuild the population picker from the analysed gate(s) and tick
+        state.population_gates; chosen gates no longer inside them are
+        dropped."""
+        hierarchy = self._population_hierarchy()
+        available = set()
+
+        def _names(node):
+            available.add(node.get('name'))
+            for child in node.get('children') or []:
+                _names(child)
+
+        for node in hierarchy:
+            _names(node)
+        if hierarchy:
+            self.state.population_gates = [g for g in self.state.population_gates
+                                           if g in available]
+        self.population_gate_tree.set_hierarchy(hierarchy)
+        self.population_gate_tree.set_checked_names(self.state.population_gates)
+
+    def _on_population_split_toggled(self, checked: bool):
+        self.state.population_split = checked
+        self._last_stats_data_key = None
+        self._apply_population_mode()
+        self._refresh_reference_group_combo()
+        self._update_run_button()
+        self._refresh_predictive_controls()
+
+    def _on_population_gates_changed(self, names: list):
+        self.state.population_gates = list(names)
+        self._last_stats_data_key = None
+        self._refresh_reference_group_combo()
+        self._update_run_button()
+
+    def _apply_population_mode(self):
+        """Show the population picker, and switch the pairing and covariate
+        controls off while populations are compared within samples (the
+        design is then paired on the sample)."""
+        split = self.state.population_split
+        self._population_panel.setVisible(split)
+        self.chk_paired.setEnabled(not split)
+        self.pairing_variable_combo.setEnabled(not split and self.state.paired)
+        self.adjust_covariates_list.setEnabled(not split)
+        self.test_groups_hint.setText(
+            "Check the groups whose samples are split into the populations below."
+            if split else
+            "Check every group to include in Frequency/Counts/MFI testing "
+            "and Composition-by-group.")
 
     def _on_paired_toggled(self, checked: bool):
         self.state.paired = checked
@@ -4146,6 +4553,8 @@ class GroupsStatsTab(QWidget):
             if self.adjust_covariates_list.item(i).checkState() == Qt.Checked
         ]
         self._last_stats_data_key = None
+        if self._trend_mode():
+            self._update_trend_check()
 
     def _refresh_viewing_comparison_combo(self):
         """Populate 'Viewing comparison:' from state.stats_comparisons,
@@ -4326,6 +4735,12 @@ class GroupsStatsTab(QWidget):
         self.radio_reference.blockSignals(False)
         self.radio_pairwise.blockSignals(False)
         self.reference_group_combo.setEnabled(self.radio_reference.isChecked())
+        self.chk_population_split.blockSignals(True)
+        self.chk_population_split.setChecked(self.state.population_split)
+        self.chk_population_split.blockSignals(False)
+        self._populate_population_tree()
+        self._apply_population_mode()
+        self._refresh_reference_group_combo()
 
         matched = self._scoped_sample_groups()
         self._populate_table(matched)
@@ -4417,6 +4832,11 @@ class GroupsStatsTab(QWidget):
                 maker_kwargs=dict(pca_result=pca_result, run_label=self.state.pca_run_label),
                 key="sample_pca",
             )
+
+        self._load_trend_controls()
+        if self.state.trend_results and not self._has_results_tab('trend_tables'):
+            self._show_trend_tables()
+            self._show_trend_figures()
 
     # ------------------------------------------------------------------
     # Table population
@@ -4571,15 +4991,75 @@ class GroupsStatsTab(QWidget):
         if reply != QMessageBox.Yes:
             return
         self.state.covariates = self.state.covariates.drop(columns=[name])
+        self._forget_covariate(name)
+        self._last_stats_data_key = None
+        self._populate_table()
+        self._populate_pairing_variable_combo()
+
+    def _forget_covariate(self, name: str):
+        """Clear a removed covariate from Numeric, adjustment and pairing."""
         self.state.numeric_covariates = [c for c in self.state.numeric_covariates if c != name]
+        self.state.stats_adjust_covariates = [
+            c for c in self.state.stats_adjust_covariates if c != name]
         if self.state.pairing_variable == name:
             self.state.pairing_variable = ''
             if self.state.paired:
                 self.state.paired = False
                 self.chk_paired.setChecked(False)
-        self._last_stats_data_key = None
-        self._populate_table()
-        self._populate_pairing_variable_combo()
+
+    def _check_table(self):
+        """Check the covariates of the samples shown in the table."""
+        st = self.state
+
+        def current():
+            samples = self._table_sample_paths()
+            cov = st.covariates
+            covariates = {}
+            if cov is not None:
+                for name in cov.columns:
+                    covariates[name] = {
+                        sp: str(cov.loc[self._covariate_key(sp), name])
+                        for sp in samples if self._covariate_key(sp) in cov.index}
+            groups = {sp: g for sp, g in st.sample_groups.items() if g and g != 'Unassigned'}
+            return samples, covariates, groups
+
+        def check():
+            samples, covariates, groups = current()
+            counts = {}
+            for sp in samples:
+                if sp in groups:
+                    counts[groups[sp]] = counts.get(groups[sp], 0) + 1
+            qualifying = [g for g in (st.testing_group_selection or st.group_names)
+                          if counts.get(g, 0) >= 3]
+            comparisons = []
+            if len(qualifying) >= 2:
+                reference = st.reference_group if st.reference_group in qualifying \
+                    else qualifying[0]
+                comparisons = drc_stats.build_contrasts(qualifying, st.contrast_mode, reference)
+            return covariate_check.check_covariates(
+                covariates, samples, groups, comparisons, st.numeric_covariates)
+
+        def apply(fixes):
+            samples, covariates, _groups = current()
+            covs, numeric, removed = covariate_check.apply_fixes(
+                covariates, st.numeric_covariates, samples, fixes)
+            for name in removed:
+                st.covariates = st.covariates.drop(columns=[name])
+                self._forget_covariate(name)
+            for name, values in covs.items():
+                for sp, value in values.items():
+                    rel = self._covariate_key(sp)
+                    if rel not in st.covariates.index:
+                        st.covariates.loc[rel] = ''
+                    st.covariates.loc[rel, name] = value
+            st.numeric_covariates = numeric
+            self._refresh_after_groupings()
+            text = covariate_check.describe_fixes(fixes, removed)
+            if self.bus:
+                self.bus.statusMessage.emit(text)
+            return text
+
+        covariate_check_dialog.check_table(self, "Check table", check, apply)
 
     def _suggest_groupings(self):
         """
@@ -4597,7 +5077,9 @@ class GroupsStatsTab(QWidget):
             )
             return
         display_names = self.controller.experiment.samples.get('all_samples', {})
-        result = suggest_groupings_from_names(sample_paths, display_names)
+        current = {sp: g for sp, g in self.state.sample_groups.items()
+                   if sp in sample_paths and g in self.state.group_names}
+        result = suggest_groupings_from_names(sample_paths, display_names, current)
         if not result['suggestions']:
             QMessageBox.information(self, "Suggest Groupings", sgd.no_suggestion_message(result))
             return
@@ -4786,11 +5268,17 @@ class GroupsStatsTab(QWidget):
         dr_only_selected = self._selected_run_kind() == 'dr'
         n_group_ok = self.state.n_group_stats_runnable(shown)
         runnable = n_group_ok and any_clustering and not dr_only_selected
+        split = self.state.population_split
+        population_ok = self.state.population_stats_runnable(shown)
+        trend = self.state.stats_test == 'trend'
+        trend_ok = self.state.trend_stats_runnable(shown)
+        stats_runnable = (population_ok if split else trend_ok if trend else n_group_ok) \
+            and any_clustering and not dr_only_selected
         stats_running = self._stats_worker is not None and self._stats_worker.isRunning()
-        self.run_stats_btn.setEnabled(runnable and not self._analysis_busy())
+        self.run_stats_btn.setEnabled(stats_runnable and not self._analysis_busy())
         self.composition_btn.setEnabled(runnable and not stats_running)
         if hasattr(self, 'pca_btn'):
-            self.pca_btn.setEnabled(runnable and not stats_running)
+            self.pca_btn.setEnabled(stats_runnable and not stats_running)
             self._update_pca_source_availability()
         if dr_only_selected:
             self.run_stats_btn.setToolTip(
@@ -4799,6 +5287,19 @@ class GroupsStatsTab(QWidget):
             )
         elif not any_clustering:
             self.run_stats_btn.setToolTip("Run clustering first.")
+        elif split and not population_ok:
+            self.run_stats_btn.setToolTip(
+                "Comparing populations within samples requires at least two ticked "
+                "populations and ≥ 3 samples in the checked 'Groups to Test'.")
+        elif split:
+            self.run_stats_btn.setToolTip("")
+        elif trend and not trend_ok:
+            self.run_stats_btn.setToolTip(
+                f"A trend test needs ≥ {trend_stats.MIN_TREND_SAMPLES} samples in the checked "
+                "'Groups to Test' (exactly two groups of ≥ 3 samples to ask whether they "
+                "change differently).")
+        elif trend:
+            self.run_stats_btn.setToolTip("")
         elif not n_group_ok:
             counts = self.state.n_per_group(shown)
             selection = self.state.testing_group_selection or self.state.group_names
@@ -4914,6 +5415,13 @@ class GroupsStatsTab(QWidget):
         """
         valid_ids = {e.get('run_id') for e in self.state.clustering_runs}
 
+        trend_run = (self.state.trend_results or {}).get('run_id', '')
+        if trend_run and trend_run not in valid_ids:
+            self.state.trend_results = {}
+            self._remove_results_tab_by_key('trend_tables')
+            for key in self._TREND_FIGURE_KEYS:
+                self._remove_results_tab_by_key(key)
+
         if self.state.stats_run_id and self.state.stats_run_id not in valid_ids:
             for key in ('freq_heatmap', 'freq_volcano', 'counts_heatmap',
                        'counts_volcano', 'mfi_heatmap', 'mfi_volcano', 'mfi_clusters',
@@ -4929,6 +5437,7 @@ class GroupsStatsTab(QWidget):
             self.state.mfi_sample_df = None
             self.state.stats_all_rel = []
             self.state.stats_group_vec = []
+            self.state.stats_population_of = {}
             self.state.stats_comparisons = []
             self.state.stats_run_label = ''
             self.state.stats_run_id = ''
@@ -4941,6 +5450,8 @@ class GroupsStatsTab(QWidget):
             self.state.pca_run_label = ''
             self.state.pca_groups = []
             self.state.pca_sources = []
+            self.state.pca_colour_values = []
+            self.state.pca_colour_label = ''
             self._last_stats_data_key = None
             self.stats_status_label.setText(
                 "Previous results' clustering run was deleted -- run "
@@ -5115,105 +5626,865 @@ class GroupsStatsTab(QWidget):
 
     def _import_csv(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import Group Assignments", "", "CSV files (*.csv)"
+            self, "Import Group Assignments", str(getattr(self.controller, 'experiment_dir', '')),
+            "Tables (*.csv *.tsv *.txt);;All files (*)"
         )
         if not path:
             return
+        sample_paths = self._table_sample_paths()
+        current = {sp: g for sp, g in self.state.sample_groups.items() if g != 'Unassigned'}
+        result = sample_table_import_dialog.import_sample_table(
+            self, path, sample_paths, current, title="Import CSV")
+        if result is None:
+            return
+        if result['replace_covariates'] and self.state.covariates is not None:
+            for name in list(self.state.covariates.columns):
+                if name not in result['covariates']:
+                    self._forget_covariate(name)
+            self.state.covariates = None
+        for group in result['groups'].values():
+            if group == 'Unassigned' or group in self.state.group_names:
+                continue
+            self.state.group_names.append(group)
+            self._group_colour(group)
+            if self.state.testing_group_selection:
+                self.state.testing_group_selection.append(group)
+        self.state.sample_groups.update(result['groups'])
+        if result['covariates']:
+            if self.state.covariates is None:
+                self.state.covariates = pd.DataFrame(index=pd.Index([], dtype=str))
+            for name, values in result['covariates'].items():
+                if name not in self.state.covariates.columns:
+                    self.state.covariates[name] = ''
+                for sp, val in values.items():
+                    rel = self._covariate_key(sp)
+                    if rel not in self.state.covariates.index:
+                        self.state.covariates.loc[rel] = ''
+                    self.state.covariates.loc[rel, name] = val
+            self.state.covariates = self.state.covariates.fillna('').astype(str)
+        self._refresh_after_groupings()
+        if self.bus:
+            self.bus.statusMessage.emit(sample_table_import_dialog.describe_import(result))
+
+    def _covariate_key(self, sample_path: str) -> str:
+        """state.covariates row for a sample: its path relative to the raw
+        samples folder."""
         try:
-            df = pd.read_csv(path)
-            if 'sample' not in df.columns or 'group' not in df.columns:
-                QMessageBox.warning(
-                    self, "Import Error",
-                    "CSV must contain 'sample' and 'group' columns."
-                )
-                return
-            valid = set(self.state.group_names) | {'Unassigned'}
-            unknown_names = set()
-            # Any column beyond sample/group/full_path is a
-            # covariate (e.g. donor ID for paired testing)
-            covariate_cols = [c for c in df.columns if c not in ('sample', 'group', 'full_path')]
+            raw_subdir = self.controller.experiment.settings['raw']['raw_samples_subdirectory']
+        except (KeyError, AttributeError):
+            raw_subdir = None
+        if raw_subdir:
             try:
-                raw_subdir = self.controller.experiment.settings['raw'][
-                    'raw_samples_subdirectory'
-                ]
-            except (KeyError, AttributeError):
-                raw_subdir = None
-            cov_rows = {}
-            for _, row in df.iterrows():
-                sample = str(row['sample'])
-                group = str(row['group']).strip()
-                match = next(
-                    (sp for sp in self.state.sample_groups
-                     if Path(sp).name == sample or sp == sample),
-                    None
-                )
-                if match is None:
-                    continue
-                if group not in valid:
-                    unknown_names.add(group)
-                else:
-                    self.state.sample_groups[match] = group
-                if covariate_cols:
-                    rel = match
-                    if raw_subdir:
-                        try:
-                            rel = str(Path(match).relative_to(raw_subdir))
-                        except ValueError:
-                            pass
-                    cov_rows[rel] = {c: str(row[c]) for c in covariate_cols}
-            if cov_rows:
-                new_cov = pd.DataFrame.from_dict(cov_rows, orient='index')
-                self.state.covariates = (
-                    new_cov if self.state.covariates is None
-                    else self.state.covariates.combine_first(new_cov).astype(str)
-                )
-                self._populate_pairing_variable_combo()
-            self._populate_table()
-            self._update_run_button()
-            if unknown_names:
-                QMessageBox.warning(
-                    self, "Unrecognised Groups",
-                    "These group names in the CSV don't match a defined "
-                    "group and were skipped (add the group first, then "
-                    "re-import): " + ", ".join(sorted(unknown_names))
-                )
-        except Exception as e:
-            QMessageBox.warning(self, "Import Error", str(e))
+                return str(Path(sample_path).relative_to(raw_subdir))
+            except ValueError:
+                pass
+        return sample_path
 
     def _export_csv(self):
+        default = sample_table.default_export_path(
+            getattr(self.controller, 'experiment_dir', ''), 'Honeycluster')
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Group Assignments", "", "CSV files (*.csv)"
+            self, "Export Group Assignments", default, "CSV files (*.csv)"
         )
         if not path:
             return
         path = _with_extension(path, '.csv')
+        samples = self._table_sample_paths()
+        cov = self.state.covariates
+        covariates = {}
+        if cov is not None:
+            for name in cov.columns:
+                covariates[name] = {
+                    sp: str(cov.loc[self._covariate_key(sp), name])
+                    for sp in samples if self._covariate_key(sp) in cov.index}
+        groups = {sp: self.state.sample_groups.get(sp, 'Unassigned') for sp in samples}
         try:
-            try:
-                raw_subdir = self.controller.experiment.settings['raw'][
-                    'raw_samples_subdirectory'
-                ]
-            except (KeyError, AttributeError):
-                raw_subdir = None
-            rows = []
-            for sp, grp in self.state.sample_groups.items():
-                rel = sp
-                if raw_subdir:
-                    try:
-                        rel = str(Path(sp).relative_to(raw_subdir))
-                    except ValueError:
-                        pass
-                row = {'sample': Path(sp).name, 'full_path': sp, 'group': grp}
-                if self.state.covariates is not None and rel in self.state.covariates.index:
-                    row.update(self.state.covariates.loc[rel].to_dict())
-                rows.append(row)
-            pd.DataFrame(rows).to_csv(path, index=False)
-            QMessageBox.information(self, "Exported", f"Saved to {path}")
+            sample_table.write_table(
+                sample_table.table_frame(samples, groups, covariates, label=lambda sp: Path(sp).name),
+                path)
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
+            return
+        QMessageBox.information(self, "Exported", f"Saved to {path}")
 
     # ------------------------------------------------------------------
     # Statistics
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Trends with a numeric covariate
+    # ------------------------------------------------------------------
+
+    def _trend_mode(self) -> bool:
+        return self.state.stats_test == 'trend'
+
+    def _on_stats_test_changed(self, _index):
+        self.state.stats_test = self.stats_test_combo.currentData() or 'groups'
+        self._apply_stats_test_mode()
+
+    def _apply_stats_test_mode(self):
+        """Show the trend settings in trend mode and grey out the settings
+        only group comparisons use."""
+        trend = self._trend_mode()
+        self.trend_box.setVisible(trend)
+        for w in (self.fc_spin, self.mfi_fc_spin, self.fdr_scope_combo, self.chk_treat,
+                  self.chk_mfi_hierarchical, self.counts_method_combo):
+            w.setEnabled(not trend)
+        self.trend_df_spin.setEnabled(self.state.trend_shape == 'curve')
+        self.run_stats_btn.setText("▶  Run Trend Test" if trend else "▶  Run Statistics")
+        self._update_run_button()
+        if trend:
+            self._update_trend_check()
+
+    def _load_trend_controls(self):
+        """Show the state's trend settings (after a load or a covariate change)."""
+        st = self.state
+        columns = list(st.covariates.columns) if st.covariates is not None else []
+        numeric = [c for c in columns if c in st.numeric_covariates
+                   and not (st.paired and c == st.pairing_variable)]
+        if st.trend_variable not in numeric:
+            st.trend_variable = numeric[0] if numeric else ''
+        widgets = (self.stats_test_combo, self.trend_var_combo, self.trend_unit_edit,
+                   self.trend_question_combo, self.trend_shape_combo, self.trend_df_spin,
+                   self.trend_scale_combo, self.trend_call_combo, self.trend_r2_spin,
+                   self.trend_patterns_spin)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self.stats_test_combo.setCurrentIndex(max(self.stats_test_combo.findData(st.stats_test), 0))
+            self.trend_var_combo.clear()
+            for c in numeric:
+                self.trend_var_combo.addItem(c, c)
+            self.trend_var_combo.setCurrentIndex(max(self.trend_var_combo.findData(st.trend_variable), 0))
+            self.trend_unit_edit.setText(st.trend_unit)
+            for combo, value in ((self.trend_question_combo, st.trend_interaction),
+                                 (self.trend_shape_combo, st.trend_shape),
+                                 (self.trend_scale_combo, st.trend_scale),
+                                 (self.trend_call_combo, st.trend_call)):
+                combo.setCurrentIndex(max(combo.findData(value), 0))
+            self.trend_df_spin.setValue(int(st.trend_df))
+            self.trend_r2_spin.setValue(float(st.trend_min_r2))
+            self.trend_patterns_spin.setValue(int(st.trend_patterns))
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        self._apply_stats_test_mode()
+        self._update_stats_defaults_button()
+
+    def _on_trend_settings_changed(self, *_args):
+        st = self.state
+        st.trend_variable = self.trend_var_combo.currentData() or ''
+        st.trend_unit = self.trend_unit_edit.text().strip()
+        st.trend_interaction = bool(self.trend_question_combo.currentData())
+        st.trend_shape = self.trend_shape_combo.currentData() or 'curve'
+        st.trend_df = int(self.trend_df_spin.value())
+        st.trend_scale = self.trend_scale_combo.currentData() or 'linear'
+        self._apply_stats_test_mode()
+
+    def _on_trend_thresholds_changed(self, *_args):
+        st = self.state
+        st.trend_call = self.trend_call_combo.currentData() or 'either'
+        st.trend_min_r2 = float(self.trend_r2_spin.value())
+        st.trend_patterns = int(self.trend_patterns_spin.value())
+        if st.trend_results:
+            st.trend_results = drc_stats.reapply_trend_thresholds(
+                st.trend_results, self.pval_spin.value(), st.trend_min_r2, st.trend_call,
+                st.trend_patterns)
+            self._show_trend_tables()
+            self._show_trend_figures()
+            if self._trend_mode():
+                self.stats_status_label.setText(self._trend_summary(st.trend_results))
+
+    def _update_trend_check(self):
+        """The design check under the trend settings: samples with a value,
+        the curve df they allow, and any covariate (or the events per
+        sample) that follows the covariate closely."""
+        st = self.state
+        var = st.trend_variable
+        if not var:
+            self.trend_check_label.setText(
+                "Tick <b>Numeric</b> under a covariate in the samples table to test a trend "
+                "with it.")
+            return
+        labels = st.cluster_labels or (
+            {rel: None for rel in st.covariates.index} if st.covariates is not None else {})
+        all_rel, group_vec = drc_stats.trend_samples(self.controller, st, labels)
+        values = drc_stats.trend_values(st, all_rel)
+        have = [i for i, v in enumerate(values) if np.isfinite(v)]
+        lines = []
+        if st.trend_shape == 'curve':
+            lines.append(f"{len(have)} sample(s) with a value; the curve gets "
+                         f"{trend_stats.curve_df(len(have), st.trend_df)} df.")
+        else:
+            lines.append(f"{len(have)} sample(s) with a value.")
+        if st.trend_interaction and len(set(group_vec)) != 2:
+            lines.append("<span style='color:#b00020'>Tick exactly two groups in Groups to "
+                         "Test to ask whether they change differently.</span>")
+        if have and st.trend_shape != 'points' and \
+                trend_stats.suggest_shape([values[i] for i in have]) == 'points':
+            lines.append(f"'{var}' has few distinct values with several samples each: "
+                         "<i>Time points as groups</i> may suit a designed time course.")
+        rels = [all_rel[i] for i in have]
+        others = [c for c in (st.covariates.columns if st.covariates is not None else [])
+                  if c not in (var, st.pairing_variable)]
+        cov = st.covariates.reindex(rels)[others] if others else None
+        extra = {}
+        if st.cluster_labels:
+            extra['Events in the sample'] = [len(st.cluster_labels[rel]) for rel in rels]
+        checks = trend_stats.design_check([values[i] for i in have], cov, extra)
+        warned = [c for c in checks if c['warn']]
+        for c in warned:
+            adjusted = c['name'] in st.stats_adjust_covariates
+            lines.append(f"<span style='color:#856404'>⚠ {c['name']} follows {var} "
+                         f"({c['measure']} = {c['value']:.2f})"
+                         + ("; adjusted for." if adjusted else
+                            ": a trend could reflect it. Consider adjusting for it.")
+                         + "</span>")
+        if checks and not warned:
+            lines.append(f"No other covariate, nor the events per sample, follows {var} closely "
+                         f"(all below {trend_stats.DESIGN_CHECK_LIMIT}).")
+        self.trend_check_label.setText("<br>".join(lines))
+
+    @staticmethod
+    def _trend_summary(trend: dict) -> str:
+        """One-line summary of a trend run, with its notes."""
+        called = []
+        for key, name in (('freq', 'frequencies'), ('counts', 'counts'), ('mfi', 'MFIs')):
+            res = trend.get(key)
+            if res is not None:
+                called.append(f"{int(res.table['significant'].sum())} {name}")
+        settings = trend.get('settings') or {}
+        text = (f"✓ Trend with {trend.get('variable', '')}: {len(trend.get('samples') or [])} "
+                f"samples, {settings.get('shape', '')} ({settings.get('df', '')} df); called: "
+                + ", ".join(called) + ".")
+        if trend.get('notes'):
+            text += "\n" + " ".join(trend['notes'])
+        return text
+
+    def _show_trend_tables(self):
+        """The 'Trend tables' results tab: per test, each cluster's slope,
+        partial R², the two tests' FDR and the call, ordered by the stronger
+        test."""
+        trend = self.state.trend_results or {}
+        self._remove_results_tab_by_key('trend_tables')
+        if not trend:
+            return
+        settings = trend.get('settings') or {}
+        slope_head = ("Slope (per doubling)" if settings.get('scale') == 'log2'
+                      else f"Slope (per {trend.get('unit') or 'unit'})")
+
+        def _fmt(value) -> str:
+            return f"{value:.3g}" if value is not None and pd.notna(value) else ''
+
+        inner = QTabWidget()
+        for key, title in (('freq', 'Frequencies'), ('counts', 'Counts'), ('mfi', 'MFIs')):
+            res = trend.get(key)
+            if res is None:
+                continue
+            table_df = res.table
+            view = table_df.assign(_order=np.fmin(table_df['adj.P.Val'], table_df['slope.adj.P.Val']))
+            rows = []
+            for _i, r in view.sort_values('_order', kind='stable').iterrows():
+                row = {'Cluster': r['cluster'] if key == 'mfi' else r['feature'],
+                       slope_head: _fmt(r['slope']), 'Partial R²': _fmt(r['R2']),
+                       'Curve FDR': _fmt(r['adj.P.Val']), 'Slope FDR': _fmt(r['slope.adj.P.Val']),
+                       'Called by': r['called.by'],
+                       'Direction': r['direction'] if r['significant'] else '',
+                       'Pattern': r.get('pattern', '') or '',
+                       'Significant': 'yes' if r['significant'] else ''}
+                if key == 'mfi':
+                    row['Marker'] = r.get('channel', '')
+                rows.append(row)
+            headers = ['Cluster'] + (['Marker'] if key == 'mfi' else []) + [
+                slope_head, 'Partial R²', 'Curve FDR', 'Slope FDR', 'Called by', 'Direction',
+                'Pattern', 'Significant']
+            table = CopyableTableWidget(rows, headers)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            inner.addTab(table, title)
+        container = QWidget()
+        QVBoxLayout(container).addWidget(inner)
+        container.setProperty('_tab_key', 'trend_tables')
+        index = self._results_tabs.addTab(container, "Trend tables")
+        self._results_tabs.setCurrentIndex(index)
+
+    # Trend results: tested values per kind, and the figure tabs' keys.
+    _TREND_DATA = {'freq': ('freq_data', 'log2 % of events'),
+                   'counts': ('counts_data', 'log2 odds of the sample\'s events'),
+                   'mfi': ('mfi_data', 'Mean intensity (Transforms-tab scale)')}
+    _TREND_NAMES = {'freq': 'Freq', 'counts': 'Counts', 'mfi': 'MFI'}
+    _TREND_FIGURE_KEYS = tuple(f"trend_{kind}_{fig}" for kind in ('freq', 'counts', 'mfi')
+                               for fig in ('volcano', 'heatmap', 'patterns')) + (
+                                   'trend_composition', 'trend_embedding', 'trend_age_model',
+                                   'trend_age_features')
+
+    def _show_trend_figures(self):
+        """Trend volcano and trajectory heatmap tabs of each kind of trend
+        result, replacing earlier ones in place; the Trend tables tab stays
+        the one shown."""
+        trend = self.state.trend_results or {}
+        for kind, name in self._TREND_NAMES.items():
+            for figure, title in (('volcano', f"{name} Trend Volcano"),
+                                  ('heatmap', f"{name} Trajectories"),
+                                  ('patterns', f"{name} Patterns")):
+                key = f"trend_{kind}_{figure}"
+                if trend.get(kind) is None:
+                    self._remove_results_tab_by_key(key)
+                    continue
+                kwargs = dict(kind=kind, figure=figure)
+                self._add_results_tab(self._make_trend_figure(**kwargs), title, key,
+                                      maker=self._make_trend_figure, maker_kwargs=kwargs, key=key)
+        if trend.get('cluster_counts') is not None:
+            variable = trend.get('variable') or 'the variable'
+            self._add_results_tab(self._make_trend_composition_figure(),
+                                  f"Composition over {variable}", 'trend_composition',
+                                  maker=self._make_trend_composition_figure, maker_kwargs={},
+                                  key='trend_composition',
+                                  values_table=self._trend_composition_values)
+        else:
+            self._remove_results_tab_by_key('trend_composition')
+        self._start_embedding_by_variable()
+        self._refresh_age_controls()
+        self._draw_age_model()
+        for i in range(self._results_tabs.count()):
+            widget = self._results_tabs.widget(i)
+            if widget is not None and widget.property('_tab_key') == 'trend_tables':
+                self._results_tabs.setCurrentIndex(i)
+                break
+
+    # ------------------------------------------------------------------
+    # Immune age model
+    # ------------------------------------------------------------------
+
+    def _refresh_age_controls(self):
+        """Groups of the last trend run; features it computed."""
+        trend = self.state.trend_results or {}
+        prev = self.age_group_combo.currentText()
+        res = next((trend.get(k) for k in ('freq', 'counts', 'mfi') if trend.get(k) is not None),
+                   None)
+        groups = list((res.settings if res is not None else {}).get('groups') or [])
+        self.age_group_combo.blockSignals(True)
+        self.age_group_combo.clear()
+        self.age_group_combo.addItems(groups)
+        if prev in groups:
+            self.age_group_combo.setCurrentText(prev)
+        self.age_group_combo.blockSignals(False)
+        self.age_chk_freq.setEnabled(trend.get('freq_data') is not None)
+        self.age_chk_mfi.setEnabled(trend.get('mfi_data') is not None)
+        runnable = bool(groups) and (trend.get('freq_data') is not None
+                                     or trend.get('mfi_data') is not None)
+        self.age_run_btn.setEnabled(runnable and not self._analysis_busy())
+        self.age_run_btn.setToolTip("" if runnable else
+                                    "Run the trend test first, with Frequencies or MFIs ticked.")
+
+    def _run_age_model(self):
+        if self._analysis_busy():
+            return
+        trend = self.state.trend_results or {}
+        group = self.age_group_combo.currentText()
+        use_freq = self.age_chk_freq.isChecked() and self.age_chk_freq.isEnabled()
+        use_mfi = self.age_chk_mfi.isChecked() and self.age_chk_mfi.isEnabled()
+        if not (use_freq or use_mfi):
+            QMessageBox.warning(self, "Immune Age Model",
+                                "Tick Frequencies and/or MFIs (computed by the trend test).")
+            return
+        samples = list(trend.get('samples') or [])
+        group_of = dict(zip(samples, trend.get('group_vec') or []))
+        time_of = dict(zip(samples, trend.get('time') or []))
+        X = drc_stats.age_model_matrix(trend, use_freq, use_mfi)
+        value = pd.to_numeric(pd.Series({s: time_of.get(s) for s in X.index}), errors='coerce')
+        in_model = [s for s in X.index if group_of.get(s) == group and pd.notna(value[s])]
+        status, message = drc_predictive.age_sample_size_status(len(in_model))
+        if status == 'block':
+            QMessageBox.warning(self, "Immune Age Model", message)
+            return
+        # Every sample outside the model is predicted: the trend run's other
+        # samples and, for frequency-only models, the labelled samples of
+        # groups the trend run left out (their values are optional).
+        X_other, y_other, other_groups = None, None, {}
+        if self.age_chk_others.isChecked():
+            inside = [s for s in X.index if s not in in_model and group_of.get(s) != group]
+            parts = [X.loc[inside]]
+            y_parts = [value[inside]]
+            other_groups = {s: group_of.get(s, '') for s in inside}
+            outside = trend.get('other_freq_data')
+            if outside is not None and len(outside) and not use_mfi:
+                keep = [s for s in outside.index
+                        if (trend.get('other_groups') or {}).get(s) != group]
+                parts.append(outside.loc[keep].astype(float).add_prefix('Freq: '))
+                y_parts.append(pd.Series({s: (trend.get('other_time') or {}).get(s, np.nan)
+                                          for s in keep}, dtype=float))
+                other_groups.update({s: trend['other_groups'][s] for s in keep})
+            X_other = pd.concat(parts)
+            y_other = pd.concat(y_parts).reindex(X_other.index).to_numpy(float)
+            if not len(X_other):
+                X_other, y_other = None, None
+        pairing = self._trend_pairing(in_model)
+        blocks = [pairing.get(s, s) for s in in_model] if pairing else None
+        repeats, n_perm = self.age_repeats_spin.value(), self.age_perm_spin.value()
+        features = ', '.join(n for n, on in (('frequencies', use_freq), ('MFIs', use_mfi)) if on)
+        token = acquire_job(self.controller, 'Honeycluster: immune age model')
+        if token is None:
+            self.age_status_label.setText(self.controller.job_gate.busy_text())
+            self.age_status_label.setStyleSheet("color: orange;")
+            return
+
+        class _AgeWorker(QThread):
+            finished = Signal(bool, str)
+            progress = Signal(str)
+            step = Signal(int, int)
+
+            def __init__(self_):
+                super().__init__()
+                self_.result = None
+
+            def run(self_):
+                try:
+                    res = drc_predictive.run_age_model(
+                        X.loc[in_model], value[in_model].to_numpy(float), blocks=blocks,
+                        X_other=X_other, y_other=y_other,
+                        repeats=repeats, n_permutations=n_perm, progress=self_.progress.emit,
+                        on_step=self_.step.emit)
+                    res['groups'] = dict({s: group for s in in_model}, **other_groups)
+                    res['summary'].update({'group': group, 'features': features})
+                    self_.result = res
+                    self_.finished.emit(True, '')
+                except Exception as exc:
+                    traceback.print_exc()
+                    self_.finished.emit(False, str(exc))
+
+        worker = _AgeWorker()
+        worker.job_token = token
+        worker.progress.connect(self.age_status_label.setText)
+        worker.step.connect(lambda done, total: self.age_progress.setValue(
+            int(1000 * done / max(total, 1))))
+        worker.finished.connect(
+            lambda ok, err, w=worker, t=trend: self._on_age_model_finished(ok, err, w, t))
+        self.age_progress.setValue(0)
+        self.age_progress.setVisible(True)
+        self._age_worker = worker
+        self._set_cursor_busy('age_model', True)
+        self.age_run_btn.setEnabled(False)
+        self.age_status_label.setStyleSheet("color: orange;")
+        self.age_status_label.setText(
+            f"⏳ Running on {X.shape[1]} features, {len(in_model)} samples …")
+        worker.start()
+
+    def _on_age_model_finished(self, success: bool, error_msg: str, worker, trend: dict):
+        worker.wait()
+        worker.job_token.release()
+        if self._age_worker is worker:
+            self._age_worker = None
+        self.age_progress.setVisible(False)
+        self._set_cursor_busy('age_model', False)
+        self._refresh_age_controls()
+        if not success:
+            self.age_status_label.setStyleSheet("color: red;")
+            self.age_status_label.setText(f"Error: {error_msg}")
+            return
+        if self.state.trend_results is not trend:
+            self.age_status_label.setStyleSheet("color: orange;")
+            self.age_status_label.setText("The trend test changed meanwhile: run the model again.")
+            return
+        res = worker.result
+        perf = res['performance'].iloc[0]
+        unit = trend.get('unit') or ''
+        text = (f"✓ Done. Mean absolute error {perf['mae_mean']:.3g} ± {perf['mae_sd']:.2g} "
+                f"{unit} (predicting the mean: {perf['mae_baseline']:.3g}); "
+                f"R² {perf['r2_mean']:.2f}")
+        if np.isfinite(perf['p_chance']):
+            text += f"; chance p = {perf['p_chance']:.3g}"
+        if res['summary'].get('status') == 'warn':
+            text += f".  ⚠ {res['summary'].get('message', '')}"
+            self.age_status_label.setStyleSheet("color: orange;")
+        else:
+            self.age_status_label.setStyleSheet("color: green;")
+        self.age_status_label.setText(text)
+        self.state.trend_results = dict(trend, age_model=res)
+        self._draw_age_model()
+        self.results_computed.emit()
+
+    def _draw_age_model(self):
+        """Immune age tabs of the stored trend results (none without a model)."""
+        trend = self.state.trend_results or {}
+        self._show_age_group_table()
+        if not trend.get('age_model'):
+            for key in ('trend_age_model', 'trend_age_features'):
+                self._remove_results_tab_by_key(key)
+            return
+        for key, title in (('trend_age_model', "Immune Age"),
+                           ('trend_age_features', "Immune Age: Features")):
+            kwargs = dict(figure=key)
+            self._add_results_tab(self._make_age_model_figure(**kwargs), title, key,
+                                  maker=self._make_age_model_figure, maker_kwargs=kwargs, key=key,
+                                  values_table=lambda k=key: self._age_model_values(k))
+
+    def _show_age_group_table(self):
+        """How the model fits each group (its own, cross-validated, and any
+        group predicted by the final model), and a button listing every
+        sample's predicted value."""
+        from honeychrome.view_components.copyable_table_widget import show_frame_dialog
+        while self.age_table_holder.count():
+            item = self.age_table_holder.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        trend = self.state.trend_results or {}
+        res = trend.get('age_model')
+        if not res:
+            return
+        unit = trend.get('unit') or ''
+        groups = dict(zip(trend.get('samples') or [], trend.get('group_vec') or []))
+        groups.update(res.get('groups') or {})
+        by_group = drc_predictive.age_model_by_group(res, groups)
+        rows = drc_predictive.age_group_rows(by_group, unit)
+        if rows:
+            table = CopyableTableWidget(rows, list(rows[0]))
+            table.setMaximumHeight(36 + 26 * len(rows))
+            self.age_table_holder.addWidget(table)
+        btn = QPushButton("Show every sample's prediction…")
+        btn.setToolTip("Each sample's actual and predicted value, the gap and the corrected gap, "
+                       "with its group; copy or save as CSV.")
+        variable = trend.get('variable') or 'variable'
+        exp = getattr(self.controller, 'experiment_dir', '') or ''
+        default = str(Path(exp) / 'immune_age_predictions.csv') if exp else 'immune_age_predictions.csv'
+        btn.clicked.connect(lambda: show_frame_dialog(
+            self, f"Immune age model: predicted {variable}",
+            drc_predictive.age_predictions(res, groups), default))
+        self.age_table_holder.addWidget(btn)
+
+    def _make_age_model_figure(self, figure: str):
+        trend = self.state.trend_results or {}
+        res = trend.get('age_model')
+        is_dark = _resolve_is_dark(self.state)
+        run_label = trend.get('run_label', '')
+        variable = trend.get('variable') or 'the variable'
+        if not res:
+            return message_figure("No immune age model.", "Immune age", is_dark, run_label)
+        if figure == 'trend_age_features':
+            keys, kinds = {}, {}
+            for name in res['importance']['feature'].astype(str):
+                prefix, _sep, feature = name.partition(': ')
+                kind = {'Freq': 'freq', 'MFI': 'mfi'}.get(prefix)
+                if kind and (trend.get(kind) is not None):
+                    keys[name], kinds[name] = feature, kind
+            fig = trend_plots.make_age_features_figure(res, variable=variable, is_dark=is_dark,
+                                                       run_label=run_label, keys=keys,
+                                                       kinds=kinds)
+            fig._trend_kind = 'freq'
+            return fig
+        groups = dict(zip(trend.get('samples') or [], trend.get('group_vec') or []))
+        groups.update(res.get('groups') or {})
+        colours = {g: self._group_colour(g) for g in dict.fromkeys(groups.values())}
+        return trend_plots.make_age_model_figure(
+            res, variable=variable, unit=trend.get('unit') or '', groups=groups,
+            group_colours=colours,
+            title=f"Immune age model: {variable} from the immune profile "
+                  f"({res['summary'].get('group', '')})",
+            is_dark=is_dark, run_label=run_label)
+
+    def _age_model_values(self, figure: str) -> 'pd.DataFrame':
+        res = (self.state.trend_results or {}).get('age_model')
+        if not res:
+            return pd.DataFrame()
+        if figure == 'trend_age_features':
+            return res['importance']
+        trend = self.state.trend_results or {}
+        groups = dict(zip(trend.get('samples') or [], trend.get('group_vec') or []))
+        groups.update(res.get('groups') or {})
+        return drc_predictive.age_predictions(res, groups)
+
+    def _trend_embedding_run(self) -> dict | None:
+        """The DR run whose embedding the trend's embedding figure uses: the
+        run selected for statistics when it is a DR run; for a clustering
+        run, the newest DR run of the algorithm it clustered on; otherwise
+        the newest DR run. Hydrated; None without any DR run."""
+        dr_runs = list(self.state.dr_runs or [])
+        if not dr_runs:
+            return None
+        entry = self._selected_run_entry()
+        chosen = None
+        if entry is not None:
+            if any(e.get('run_id') == entry.get('run_id') for e in dr_runs):
+                return entry
+            algo = (entry.get('params') or {}).get('_dr_algo')
+            same = [e for e in dr_runs if algo and e.get('algorithm') == algo]
+            chosen = max(same, key=lambda e: e.get('timestamp', ''), default=None)
+        if chosen is None:
+            chosen = max(dr_runs, key=lambda e: e.get('timestamp', ''))
+        return drc_run_archive.hydrate_run(self.controller, chosen)
+
+    def _start_embedding_by_variable(self):
+        """Work out the selected DR run's embedding density in bins of the
+        trend variable in the background, then show it as a results tab
+        (no tab without a DR run with embeddings)."""
+        trend = self.state.trend_results or {}
+        dr_run = self._trend_embedding_run()
+        embeddings = (dr_run or {}).get('embeddings') or {}
+        samples = list(trend.get('samples') or [])
+        if not samples or not embeddings:
+            self._remove_results_tab_by_key('trend_embedding')
+            return
+        if getattr(self, '_embedding_worker', None) is not None:
+            return
+        time = dict(zip(samples, trend.get('time') or []))
+        res = next((trend.get(k) for k in ('freq', 'counts', 'mfi') if trend.get(k) is not None),
+                   None)
+        settings = (res.settings if res is not None else trend.get('settings')) or {}
+        levels = None
+        if settings.get('shape') == 'points':
+            levels = [float(v) for v in pd.to_numeric(pd.Series(list(time.values())),
+                                                      errors='coerce').dropna().unique()]
+        used = {s: embeddings[s] for s in samples if s in embeddings}
+        worker = _EmbeddingByVariableWorker(used, time, levels, parent=self)
+        label = (dr_run or {}).get('label') or (dr_run or {}).get('algorithm') or 'embedding'
+        algo = (dr_run or {}).get('algorithm') or 'DR'
+        worker.finished.connect(
+            lambda ok, err, dens, w=worker: self._on_embedding_by_variable(
+                w, ok, err, dens, label, algo, time))
+        self._embedding_worker = worker
+        worker.start()
+
+    def _on_embedding_by_variable(self, worker, ok: bool, error: str, dens, label: str,
+                                  algo: str, time: dict):
+        self._embedding_worker = None
+        worker.deleteLater()
+        if not ok or dens is None:
+            _log.warning("Embedding by the trend variable not drawn: %s", error)
+            self._remove_results_tab_by_key('trend_embedding')
+            return
+        trend = self.state.trend_results or {}
+        variable = trend.get('variable') or 'the variable'
+        kwargs = dict(dens=dens, label=label, algo=algo)
+        self._add_results_tab(self._make_embedding_by_variable_figure(**kwargs),
+                              f"Embedding by {variable}", 'trend_embedding',
+                              maker=self._make_embedding_by_variable_figure, maker_kwargs=kwargs,
+                              key='trend_embedding',
+                              values_table=lambda d=dens, t=time, v=variable:
+                              trend_plots.embedding_bins_table(d, t, v))
+
+    def _make_embedding_by_variable_figure(self, dens: dict, label: str, algo: str):
+        trend = self.state.trend_results or {}
+        variable = trend.get('variable') or 'the variable'
+        return trend_plots.make_embedding_by_variable_figure(
+            dens, title=f"{label}: where cells sit by {variable}", variable=variable,
+            unit=trend.get('unit') or '', axis_labels=(f"{algo} 1", f"{algo} 2"),
+            is_dark=_resolve_is_dark(self.state), run_label=trend.get('run_label', ''))
+
+    def _trend_composition_panels(self) -> list[dict]:
+        trend = self.state.trend_results or {}
+        key = (id(trend), id(trend.get('cluster_counts')))
+        cached = getattr(self, '_composition_cache', None)
+        if cached is None or cached[0] != key:
+            self._composition_cache = (key, drc_stats.trend_composition(trend))
+        return self._composition_cache[1]
+
+    def _make_trend_composition_figure(self):
+        """The cluster make-up of the trend run against its variable: fitted
+        shares stacked, each sample's shares below (largest clusters, the
+        rest as 'Other clusters'), in the clusters' own colours."""
+        trend = self.state.trend_results or {}
+        is_dark = _resolve_is_dark(self.state)
+        run_label = trend.get('run_label', '')
+        variable = trend.get('variable') or 'the variable'
+        title = f"Cluster composition over {variable}"
+        try:
+            panels = self._trend_composition_panels()
+        except RuntimeError as exc:
+            return message_figure(str(exc), title, is_dark, run_label)
+        names = trend.get('cluster_names') or {}
+        entry = self._selected_run_entry()
+        colours = (dict(entry.get('colors', {}))
+                   if entry is not None and entry.get('kind') == 'clustering'
+                   else dict(self.state.cluster_colors))
+        by_name = {str(name): colours.get(int(cl)) for cl, name in names.items()}
+        return trend_plots.make_composition_figure(panels, title=title, colours=by_name,
+                                                   is_dark=is_dark, run_label=run_label)
+
+    def _trend_composition_values(self) -> 'pd.DataFrame':
+        try:
+            return trend_plots.composition_table(self._trend_composition_panels())
+        except RuntimeError:
+            return pd.DataFrame()
+
+    def _trend_labels(self, kind: str, table: 'pd.DataFrame') -> list[str]:
+        """Display label of each row of a trend table: the cluster, and for
+        MFIs the marker (antigen, falling back to the label)."""
+        if kind == 'mfi' and {'cluster', 'channel'}.issubset(table.columns):
+            disp = _antigen_or_label_map(self.controller)
+            return [f"{r['cluster']} {disp.get(r['channel'], r['channel'])}"
+                    for _i, r in table.iterrows()]
+        return table['feature'].astype(str).tolist()
+
+    def _make_trend_figure(self, kind: str, figure: str):
+        """The trend volcano ('volcano') or trajectory heatmap ('heatmap')
+        of one kind of trend result, from the stored results."""
+        trend = self.state.trend_results or {}
+        res = trend.get(kind)
+        is_dark = _resolve_is_dark(self.state)
+        run_label = trend.get('run_label', '')
+        name = self._TREND_NAMES[kind]
+        if res is None:
+            return message_figure("No trend results.", name, is_dark, run_label)
+        settings = res.settings or {}
+        variable = trend.get('variable') or settings.get('variable', 'time')
+        unit = trend.get('unit') or settings.get('unit', '')
+        scale = settings.get('scale', 'linear')
+        groups = list(settings.get('groups') or [])
+        what = (f" ({groups[1]} − {groups[0]})"
+                if settings.get('interaction') and len(groups) == 2 else '')
+        labels = self._trend_labels(kind, res.table)
+        if figure == 'volcano':
+            amount = {'freq': 'log2 %', 'counts': 'log2 odds', 'mfi': 'MFI'}[kind]
+            fig = trend_plots.make_trend_volcano_figure(
+                res.table, f"{name}: trends with {variable}{what}",
+                x_label=f"Slope ({amount} {trend_plots.slope_label(variable, unit, scale)})",
+                feature_labels=labels, pval_threshold=settings.get('pval_threshold', 0.05),
+                call=settings.get('call', 'either'), is_dark=is_dark, run_label=run_label)
+        elif figure == 'patterns':
+            fig = trend_plots.make_pattern_panel_figure(
+                res.table, res.grid, res.curves, settings.get('patterns') or [],
+                title=f"{name}: shape patterns of the called clusters{what}",
+                variable=variable, unit=unit, scale=scale, is_dark=is_dark, run_label=run_label)
+        else:
+            fig = trend_plots.make_trajectory_heatmap_figure(
+                res.table, res.grid, res.curves,
+                title=f"{name}: fitted curves of the called clusters{what}",
+                variable=variable, unit=unit, scale=scale, feature_labels=labels,
+                patterns=settings.get('patterns'), is_dark=is_dark, run_label=run_label)
+        fig._trend_kind = kind
+        return fig
+
+    def _trend_pairing(self, samples: list[str]) -> dict | None:
+        """{sample: pairing level} of the pairing covariate, when paired."""
+        st = self.state
+        if not (st.paired and st.pairing_variable and st.covariates is not None
+                and st.pairing_variable in st.covariates.columns):
+            return None
+        cov = st.covariates[st.pairing_variable]
+        return {rel: str(cov[rel]).strip() for rel in samples
+                if rel in cov.index and not is_missing_value(cov[rel])}
+
+    def _trend_inputs(self, kind: str, feature: str) -> dict | None:
+        """feature_plot_inputs of one feature of the stored trend results."""
+        trend = self.state.trend_results or {}
+        res = trend.get(kind)
+        data = trend.get(self._TREND_DATA[kind][0])
+        if res is None or data is None:
+            return None
+        samples = list(trend.get('samples') or [])
+        try:
+            return trend_plots.feature_plot_inputs(
+                res, data, samples, trend.get('time') or [], trend.get('group_vec') or [],
+                feature, self._trend_pairing(samples))
+        except KeyError:
+            return None
+
+    def _trend_feature_label(self, kind: str, feature: str) -> str:
+        res = (self.state.trend_results or {}).get(kind)
+        if res is None:
+            return feature
+        hit = res.table['feature'].astype(str) == feature
+        labels = self._trend_labels(kind, res.table[hit])
+        return labels[0] if labels else feature
+
+    def _make_trend_plot(self, kind: str, feature: str, show_line: bool = False):
+        """One feature's trend plot from the stored trend results."""
+        inputs = self._trend_inputs(kind, feature)
+        is_dark = _resolve_is_dark(self.state)
+        run_label = (self.state.trend_results or {}).get('run_label', '')
+        title = self._trend_feature_label(kind, feature)
+        if inputs is None:
+            return message_figure("This feature is not in the trend results.", title,
+                                  is_dark, run_label)
+        colours = {g: self._group_colour(g) for g in dict.fromkeys(inputs['groups'])}
+        return trend_plots.make_trend_plot_figure(
+            **inputs, title=title, value_label=self._TREND_DATA[kind][1],
+            group_colours=colours, show_line=show_line, is_dark=is_dark, run_label=run_label)
+
+    def _trend_plot_values(self, kind: str, feature: str) -> 'pd.DataFrame':
+        """The values behind a trend plot (samples and fitted curve)."""
+        inputs = self._trend_inputs(kind, feature)
+        if inputs is None:
+            return pd.DataFrame()
+        df2 = inputs['row'].get('df2', np.inf)
+        return trend_plots.trend_plot_table(
+            inputs['time'], inputs['values'], inputs['groups'], inputs['samples'],
+            grid=inputs['grid'], curve=inputs['curve'], curve_se=inputs['curve_se'],
+            df2=float(df2) if df2 is not None else np.inf, variable=inputs['variable'],
+            group_curves=inputs.get('group_curves'))
+
+    def _on_trend_click(self, event, fig):
+        """Double-click a trend volcano point or trajectory row for its
+        trend plot; right-click for a menu."""
+        if event.inaxes is None:
+            return
+        feature = trend_plots.point_under(fig, event)
+        if feature is None and event.inaxes is getattr(fig, '_row_axes', None) \
+                and event.ydata is not None:
+            row = int(round(event.ydata))
+            keys = getattr(fig, '_row_keys', None) or []
+            feature = keys[row] if 0 <= row < len(keys) else None
+        if feature is None:
+            return
+        kind = fig._trend_kind
+        row_kinds = getattr(fig, '_row_kinds', None)
+        if row_kinds and event.ydata is not None and 0 <= int(round(event.ydata)) < len(row_kinds):
+            kind = row_kinds[int(round(event.ydata))] or kind
+        if event.dblclick and event.button == 1:
+            self._trend_plot_window(kind, feature)
+        elif event.button == 3:
+            from PySide6.QtGui import QCursor
+            from PySide6.QtWidgets import QMenu
+            menu = QMenu(self)
+            menu.addSection(self._trend_feature_label(kind, feature))
+            act_window = menu.addAction("Show the trend plot in a window")
+            act_line = menu.addAction("Show the trend plot with the straight line")
+            act_tab = menu.addAction("Add the trend plot as a results tab (listed in the report)")
+            act_window.triggered.connect(lambda: self._trend_plot_window(kind, feature))
+            act_line.triggered.connect(lambda: self._trend_plot_window(kind, feature, True))
+            act_tab.triggered.connect(lambda: self._trend_plot_tab(kind, feature))
+            menu.exec(QCursor.pos())
+
+    def _trend_plot_window(self, kind: str, feature: str, show_line: bool = False):
+        """One feature's trend plot in its own window, with its values as CSV."""
+        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+        label = self._trend_feature_label(kind, feature)
+        fig = self._make_trend_plot(kind, feature, show_line)
+        ref = self._figure_options_ref('trend_plot')
+        if ref is not None:
+            ref.apply(fig)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Trend: {label}")
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        canvas = _new_scrollable_canvas(fig)
+        if hasattr(fig, '_hover_handler'):
+            canvas.mpl_connect('motion_notify_event', fig._hover_handler)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(NavigationToolbar2QT(canvas, dlg))
+        layout.addWidget(canvas, stretch=1)
+        stem = re.sub(r'[^\w.-]+', '_', f"trend_{label}")
+        row = QHBoxLayout()
+        row.addStretch()
+        csv_btn = QPushButton("Export Values (CSV)")
+        csv_btn.setToolTip("Write each sample's value and the fitted curve as a CSV file.")
+        csv_btn.clicked.connect(lambda _c=False: self._export_values_csv(
+            self._trend_plot_values(kind, feature), stem))
+        row.addWidget(csv_btn)
+        layout.addLayout(row)
+        dpi = fig.get_dpi()
+        dlg.resize(int(fig.get_figwidth() * dpi) + 24, int(fig.get_figheight() * dpi) + 110)
+        dlg.show()
+
+    def _trend_plot_tab(self, kind: str, feature: str):
+        """One feature's trend plot as a results tab."""
+        label = self._trend_feature_label(kind, feature)
+        kwargs = dict(kind=kind, feature=feature)
+        self._add_results_tab(
+            self._make_trend_plot(**kwargs), f"Trend: {label}",
+            re.sub(r'[^\w.-]+', '_', f"trend_{label}"),
+            maker=self._make_trend_plot, maker_kwargs=kwargs, key=f"trendplot:{kind}:{feature}",
+            values_table=lambda: self._trend_plot_values(kind, feature))
+        QTimer.singleShot(0, self._scroll_to_results_tabs)
 
     def _run_statistics(self):
         """
@@ -5240,65 +6511,20 @@ class GroupsStatsTab(QWidget):
             QMessageBox.warning(self, "Nothing Selected",
                                 "Select at least one statistic to compute.")
             return
+        if self._trend_mode():
+            self._run_trend(resolved, run_freq, run_counts, run_mfi)
+            return
 
-        if self.state.paired and self.state.pairing_variable:
-            pv = self.state.pairing_variable
-            try:
-                group_rel = drc_stats.resolve_test_groups(
-                    self.controller, self.state, cluster_labels_override=labels_for_stats
-                )
-            except Exception:
-                group_rel = {}
-            qualifying = [g for g in (self.state.testing_group_selection or self.state.group_names)
-                         if g in group_rel]
-            all_rel = [rel for g in qualifying for rel in group_rel[g]]
-            missing = [
-                rel for rel in all_rel
-                if self.state.covariates is None
-                or pv not in self.state.covariates.columns
-                or rel not in self.state.covariates.index
-                or not str(self.state.covariates.loc[rel, pv]).strip()
-            ]
-            if missing:
-                names = "\n".join(Path(r).stem for r in missing[:15])
-                more = "\n…" if len(missing) > 15 else ""
-                QMessageBox.warning(
-                    self, "Missing Pairing Values",
-                    f"'Paired design' is checked, but {len(missing)} sample(s) "
-                    f"have no value for pairing variable '{pv}':\n\n{names}{more}\n\n"
-                    "Fill these in on the Sample Group Assignment table, or "
-                    "uncheck 'Paired design'."
-                )
-                return
+        split = self.state.population_split
+        if split and len(self.state.population_gates) < 2:
+            QMessageBox.warning(self, "Populations",
+                                "Tick at least two populations to compare within samples.")
+            return
 
-        adjust_covariates = [
+        adjust_covariates = [] if split else [
             c for c in self.state.stats_adjust_covariates
             if not (self.state.paired and c == self.state.pairing_variable)
         ]
-        if adjust_covariates:
-            try:
-                group_rel = drc_stats.resolve_test_groups(
-                    self.controller, self.state, cluster_labels_override=labels_for_stats
-                )
-            except Exception:
-                group_rel = {}
-            qualifying = [g for g in (self.state.testing_group_selection or self.state.group_names)
-                         if g in group_rel]
-            all_rel = [rel for g in qualifying for rel in group_rel[g]]
-            missing = drc_stats.missing_covariate_values(self.state, all_rel, adjust_covariates)
-            if missing:
-                lines = []
-                for name, rels in missing.items():
-                    shown = ", ".join(Path(r).stem for r in rels[:8])
-                    more = " …" if len(rels) > 8 else ""
-                    lines.append(f"'{name}' ({len(rels)}): {shown}{more}")
-                QMessageBox.warning(
-                    self, "Missing Covariate Values",
-                    "These adjustment covariates have no value for some tested "
-                    "samples:\n\n" + "\n".join(lines) + "\n\nFill them in on the "
-                    "Sample Group Assignment table, or untick them under 'Adjust for'."
-                )
-                return
 
         pval_threshold = self.pval_spin.value()
         fc_threshold   = self.fc_spin.value()
@@ -5308,7 +6534,7 @@ class GroupsStatsTab(QWidget):
         self.state.stats_use_treat = self.chk_treat.isChecked()
         self.state.stats_mfi_threshold = mfi_threshold
         self.state.stats_mfi_hierarchical = self.chk_mfi_hierarchical.isChecked()
-        self.state.stats_counts_method = self.counts_method_combo.currentData() or 'wald'
+        self.state.stats_counts_method = self.counts_method_combo.currentData() or 'ql'
         self.state.stats_normalisation = self.normalisation_combo.currentData() or 'total'
         use_treat = self.state.stats_use_treat
         mfi_hierarchical = self.state.stats_mfi_hierarchical
@@ -5435,6 +6661,84 @@ class GroupsStatsTab(QWidget):
         self._stats_worker = worker
         worker.start()
 
+    def _run_trend(self, resolved: tuple, run_freq: bool, run_counts: bool, run_mfi: bool):
+        """Test the trend of every cluster with the chosen numeric
+        covariate on a worker thread, under the job gate, with the same run
+        alignment as Run Statistics."""
+        labels_for_stats, run_label, run_id, names_for_stats = resolved
+        st = self.state
+        if not st.trend_variable:
+            QMessageBox.warning(self, "No numeric covariate",
+                                "Tick Numeric under a covariate in the samples table (for "
+                                "example age) to test a trend with it.")
+            return
+        token = acquire_job(self.controller, 'Honeycluster: trend test')
+        if token is None:
+            self.stats_status_label.setText(self.controller.job_gate.busy_text())
+            self.stats_status_label.setStyleSheet("color: orange;")
+            return
+        self._set_stats_busy(True)
+        self.stats_status_label.setText("⏳ Testing trends …")
+        self.stats_status_label.setStyleSheet("color: orange;")
+        snap = self._snapshot_stats_state()
+        for attr in ('trend_variable', 'trend_unit', 'trend_interaction', 'trend_shape',
+                     'trend_df', 'trend_scale', 'trend_call', 'trend_min_r2',
+                     'trend_patterns'):
+            setattr(snap, attr, getattr(st, attr))
+        controller = self.controller
+        af_state = drc_pipeline.snapshot_af_state(self.controller)
+        align_run, align_mode = self._stats_alignment(run_id)
+        adjust = [c for c in st.stats_adjust_covariates
+                  if not (st.paired and c == st.pairing_variable)]
+        kwargs = dict(cluster_labels_override=labels_for_stats,
+                      include_type_markers=self.chk_include_type_markers.isChecked(),
+                      names_override=names_for_stats, run_counts=run_counts, af_state=af_state,
+                      covariate_names=adjust, align_run=align_run, align_mode=align_mode)
+        pval = self.pval_spin.value()
+
+        class _TrendWorker(QThread):
+            finished = Signal(bool, str)
+
+            def __init__(self_):
+                super().__init__()
+                self_.result = None
+
+            def run(self_):
+                try:
+                    self_.result = drc_stats.run_trend_statistics(
+                        controller, snap, run_freq, run_mfi, pval, **kwargs)
+                    self_.finished.emit(True, '')
+                except Exception as exc:
+                    _log.exception("trend test failed")
+                    self_.finished.emit(False, str(exc))
+
+        worker = _TrendWorker()
+        worker.job_token = token
+        worker.run_meta = (run_label, run_id)
+        worker.finished.connect(lambda ok, err, w=worker: self._on_trend_finished(ok, err, w))
+        self._stats_worker = worker
+        worker.start()
+
+    def _on_trend_finished(self, success: bool, error_msg: str, worker):
+        worker.wait()
+        worker.job_token.release()
+        if self._stats_worker is worker:
+            self._stats_worker = None
+        self._set_stats_busy(False)
+        if not success:
+            self.stats_status_label.setText(f"Error: {error_msg}")
+            self.stats_status_label.setStyleSheet("color: red;")
+            QMessageBox.critical(self, "Trend Test Error", error_msg)
+            return
+        result = dict(worker.result)
+        result['run_label'], result['run_id'] = worker.run_meta
+        self.state.trend_results = result
+        self.stats_status_label.setText(self._trend_summary(result))
+        self.stats_status_label.setStyleSheet("color: green;")
+        self._show_trend_tables()
+        self._show_trend_figures()
+        self.results_computed.emit()
+
     def _snapshot_stats_state(self) -> 'PipelineState':
         """
         Copy of the state with its own copies of every input the
@@ -5445,7 +6749,7 @@ class GroupsStatsTab(QWidget):
         for attr in ('sample_groups', 'group_names', 'group_patterns',
                      'testing_group_selection', 'stats_adjust_covariates',
                      'numeric_covariates', 'marker_roles', 'channel_transform_params', 'selected_channels',
-                     'cluster_names'):
+                     'cluster_names', 'population_gates'):
             setattr(snap, attr, deepcopy(getattr(self.state, attr)))
         if self.state.covariates is not None:
             snap.covariates = self.state.covariates.copy()
@@ -5460,6 +6764,7 @@ class GroupsStatsTab(QWidget):
         ran_freq, ran_counts, ran_mfi = ran
         self.state.stats_all_rel = snap.stats_all_rel
         self.state.stats_group_vec = snap.stats_group_vec
+        self.state.stats_population_of = dict(snap.stats_population_of)
         self.state.stats_comparisons = snap.stats_comparisons
         self.state.freq_results = snap.freq_results if ran_freq else None
         self.state.freq_df = snap.freq_df if ran_freq else None
@@ -5518,7 +6823,12 @@ class GroupsStatsTab(QWidget):
             (self.fc_spin, d['stats_fc_threshold']),
             (self.mfi_fc_spin, d['stats_mfi_threshold']),
             (self.fdr_scope_combo, 1 if d['stats_fdr_scope'] == 'per_comparison' else 0),
-        ] + [(combo, max(combo.findData(value), 0)) for combo, value in combos]
+            (self.trend_df_spin, d['trend_df']),
+            (self.trend_r2_spin, d['trend_min_r2']),
+            (self.trend_patterns_spin, d['trend_patterns']),
+        ] + [(combo, max(combo.findData(value), 0)) for combo, value in combos + (
+            (self.trend_shape_combo, d['trend_shape']), (self.trend_scale_combo, d['trend_scale']),
+            (self.trend_call_combo, d['trend_call']))]
 
     def _update_stats_defaults_button(self, *_args):
         """Grey the statistics Restore defaults button while every setting
@@ -5530,7 +6840,8 @@ class GroupsStatsTab(QWidget):
             elif isinstance(widget, QComboBox):
                 at_defaults = widget.currentIndex() == value
             else:
-                at_defaults = round(widget.value(), widget.decimals()) == round(value, widget.decimals())
+                places = widget.decimals() if isinstance(widget, QDoubleSpinBox) else 0
+                at_defaults = round(widget.value(), places) == round(value, places)
             if not at_defaults:
                 break
         self.stats_defaults_btn.setEnabled(not at_defaults)
@@ -5583,6 +6894,10 @@ class GroupsStatsTab(QWidget):
             self.state.stats_counts_method if run_counts else None,
             self.state.stats_normalisation if (run_freq or run_counts) else None,
         )
+        if self.state.population_split:
+            test_fingerprint += (
+                'populations', tuple(self.state.population_gates),
+                self.state.population_reference, tuple(sorted(self.state.selected_gates)))
         roles_fingerprint = tuple(sorted(self.state.marker_roles.items()))
         transform_fingerprint = ()
         if run_mfi:
@@ -5653,6 +6968,12 @@ class GroupsStatsTab(QWidget):
                 names = self._run_cluster_names(s.composition_run_id)
                 if names is not None and drc_stats.relabel_composition(s, names):
                     renamed_any = True
+            if s.trend_results:
+                names = self._run_cluster_names(s.trend_results.get('run_id', ''))
+                if names is not None and drc_stats.relabel_trend_results(s, names):
+                    renamed_any = True
+                    self._show_trend_tables()
+                    self._show_trend_figures()
         except ValueError as exc:
             self.stats_status_label.setText(
                 f"⚠ {exc} The results keep the earlier cluster names until "
@@ -5718,7 +7039,8 @@ class GroupsStatsTab(QWidget):
     def _analysis_busy(self) -> bool:
         """True while a statistics or predictive-analysis job is running."""
         return any(w is not None and w.isRunning()
-                   for w in (self._stats_worker, self._predictive_worker))
+                   for w in (self._stats_worker, self._predictive_worker,
+                             getattr(self, '_age_worker', None)))
 
     def _set_cursor_busy(self, owner: str, busy: bool):
         """Hold or release the busy cursor for one named job, at most once each."""
@@ -5769,7 +7091,15 @@ class GroupsStatsTab(QWidget):
             QMessageBox.warning(self, "No Clustering", "Run clustering first.")
             return None
         shown = set(self._table_sample_paths())
-        if not self.state.n_group_stats_runnable(shown):
+        if self.state.stats_test == 'trend' and not self.state.population_split:
+            if not self.state.trend_stats_runnable(shown):
+                QMessageBox.warning(
+                    self, "Too few samples",
+                    f"A trend test needs ≥ {trend_stats.MIN_TREND_SAMPLES} samples in the "
+                    "checked 'Groups to Test' (exactly two groups of ≥ 3 samples to ask "
+                    "whether they change differently).")
+                return None
+        elif not self.state.n_group_stats_runnable(shown):
             counts = self.state.n_per_group(shown)
             selection = self.state.testing_group_selection or self.state.group_names
             detail = ", ".join(f"{name}: {counts.get(name, 0)}" for name in selection)
@@ -5850,12 +7180,22 @@ class GroupsStatsTab(QWidget):
         # Statistics yet (e.g. Counts checked here but 'Cluster Counts
         # (GLM)' wasn't checked under 'Test:' the last time Run Statistics
         # ran).
+        trend = self.state.trend_results if self._trend_mode() else None
+        if trend:
+            # In trend mode the PCA uses the trend run's tested values and
+            # colours the samples by the trend variable.
+            tables = {'freq': trend.get('freq_data'), 'counts': trend.get('counts_data'),
+                      'mfi': trend.get('mfi_data')}
+            run_label = trend.get('run_label') or run_label
+        else:
+            tables = {'freq': self.state.freq_df, 'counts': self.state.counts_df,
+                      'mfi': self.state.mfi_df}
         missing = []
-        if use_freq and (self.state.freq_df is None or self.state.freq_df.empty):
+        if use_freq and (tables['freq'] is None or tables['freq'].empty):
             missing.append('Frequencies')
-        if use_counts and (self.state.counts_df is None or self.state.counts_df.empty):
+        if use_counts and (tables['counts'] is None or tables['counts'].empty):
             missing.append('Counts')
-        if use_mfi and (self.state.mfi_df is None or self.state.mfi_df.empty):
+        if use_mfi and (tables['mfi'] is None or tables['mfi'].empty):
             missing.append('MFIs')
 
         if missing:
@@ -5885,6 +7225,8 @@ class GroupsStatsTab(QWidget):
             pca_result = drc_stats.compute_sample_pca(
                 self.state, use_freq, use_counts, use_mfi,
                 n_loadings=self.state.pca_n_loadings,
+                tables=tables if trend else None,
+                group_of=dict(zip(trend['samples'], trend['group_vec'])) if trend else None,
             )
         except Exception as e:
             QMessageBox.critical(self, "Sample PCA Error", str(e))
@@ -5904,8 +7246,15 @@ class GroupsStatsTab(QWidget):
         self.state.pca_loadings_df = pca_result['loadings']
         self.state.pca_explained_variance = pca_result['explained_variance_ratio']
         self.state.pca_run_label = run_label
+        if trend and pca_result is not None:
+            time_of = dict(zip(trend['samples'], trend['time']))
+            pca_result['colour_values'] = [time_of.get(s) for s in pca_result['scores'].index]
+            pca_result['colour_label'] = trend_plots.variable_label(
+                trend.get('variable') or '', trend.get('unit') or '')
         self.state.pca_groups = pca_result['groups']
         self.state.pca_sources = pca_result['sources']
+        self.state.pca_colour_values = list(pca_result.get('colour_values') or [])
+        self.state.pca_colour_label = pca_result.get('colour_label', '')
 
         fig = self._make_pca_figure(pca_result, run_label=run_label)
         self._add_results_tab(
@@ -5932,6 +7281,8 @@ class GroupsStatsTab(QWidget):
             'explained_variance_ratio': self.state.pca_explained_variance,
             'groups': self.state.pca_groups,
             'sources': self.state.pca_sources,
+            'colour_values': self.state.pca_colour_values or None,
+            'colour_label': self.state.pca_colour_label,
         }
 
     def _make_pca_figure(self, pca_result: dict | None, run_label: str = ''):
@@ -5948,8 +7299,10 @@ class GroupsStatsTab(QWidget):
         from matplotlib.figure import Figure
 
         is_dark = _resolve_is_dark(self.state)
-        fig = Figure(figsize=(6, 6), constrained_layout=True)
+        with_bar = pca_result is not None and pca_result.get('colour_values') is not None
+        fig = Figure(figsize=(6.9 if with_bar else 6, 6), constrained_layout=True)
         ax = fig.add_subplot(111)
+        ax.set_box_aspect(1)  # the plot area itself is square, whatever surrounds it
         fg = 'white' if is_dark else 'black'
 
         if pca_result is None:
@@ -5981,15 +7334,25 @@ class GroupsStatsTab(QWidget):
         hover_xy: list[tuple[float, float]] = []
         hover_labels: list[str] = []
 
-        unique_groups = list(dict.fromkeys(groups))   # first-seen order
-        for grp in unique_groups:
-            colour = self._group_colour(grp) if grp != 'Unassigned' else '#7f7f7f'
-            mask = [g == grp for g in groups]
-            ax.scatter(
-                scores['PC1'].values[mask], scores['PC2'].values[mask],
-                s=point_size, color=colour, edgecolors=fg, linewidths=0.4,
-                label=grp, zorder=3,
-            )
+        if pca_result.get('colour_values') is not None:
+            # Trend mode: coloured by the trend variable, shaped by group.
+            trend_plots.scatter_by_value(
+                fig, ax, scores['PC1'].values, scores['PC2'].values,
+                pca_result['colour_values'], groups,
+                label=pca_result.get('colour_label') or 'value', point_size=point_size,
+                is_dark=is_dark)
+        else:
+            present = set(groups)
+            unique_groups = ([g for g in self.state.group_names if g in present]
+                             + [g for g in dict.fromkeys(groups) if g not in self.state.group_names])
+            for grp in unique_groups:
+                colour = self._group_colour(grp) if grp != 'Unassigned' else '#7f7f7f'
+                mask = [g == grp for g in groups]
+                ax.scatter(
+                    scores['PC1'].values[mask], scores['PC2'].values[mask],
+                    s=point_size, color=colour, edgecolors=fg, linewidths=0.4,
+                    label=grp, zorder=3,
+                )
 
         sample_names = [Path(s).stem for s in scores.index]
         hover_xy.extend(zip(scores['PC1'].values, scores['PC2'].values))
@@ -6171,7 +7534,11 @@ class GroupsStatsTab(QWidget):
             return fig
 
         n_rows = len(comp_df)
-        fig_w = max(4.0, 0.6 * n_rows + 2.5)
+        # About 22 legend rows fit beside the 5 inch plot at 8 pt; beyond
+        # that the legend gains columns and the figure widens to hold them.
+        legend_cols = max(1, int(np.ceil(len(comp_df.columns) / 22)))
+        legend_col_w = max(text_width_inches(str(c), 8) for c in comp_df.columns) + 0.45
+        fig_w = max(4.0, 0.6 * n_rows + 2.5) + (legend_cols - 1) * legend_col_w
         fig = Figure(figsize=(fig_w, 5.0), layout='constrained')
         ax = fig.add_subplot(111)
 
@@ -6193,7 +7560,7 @@ class GroupsStatsTab(QWidget):
         ax.set_ylabel('% of events' if as_pct else 'Event count')
         ax.set_title('Cluster Composition', fontsize=10)
         legend = ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), fontsize=8,
-                           title='Cluster', frameon=False)
+                           title='Cluster', frameon=False, ncol=legend_cols)
         fg = _style_figure_theme(fig, is_dark)
         # _style_figure_theme only touches tick/axis-label/title/spine
         # colours -- legend text is a separate artist it doesn't walk,
@@ -6256,12 +7623,17 @@ class GroupsStatsTab(QWidget):
         have_mfi = self.state.mfi_df is not None and not self.state.mfi_df.empty
         self.pred_chk_freq.setEnabled(have_freq)
         self.pred_chk_mfi.setEnabled(have_mfi)
-        runnable = bool(labels) and (have_freq or have_mfi)
+        by_population = bool(self.state.stats_population_of)
+        runnable = bool(labels) and (have_freq or have_mfi) and not by_population
         self.pred_run_btn.setEnabled(runnable and not self._analysis_busy())
-        self.pred_run_btn.setToolTip(
-            "" if runnable else
-            "Run Statistics first, with Cluster Frequencies and/or Cluster MFIs ticked."
-        )
+        if by_population:
+            tip = ("Predictive analysis needs independent samples; the current statistics "
+                   "compare populations within the same samples.")
+        elif not runnable:
+            tip = "Run Statistics first, with Cluster Frequencies and/or Cluster MFIs ticked."
+        else:
+            tip = ""
+        self.pred_run_btn.setToolTip(tip)
 
     def _run_predictive(self):
         if self._analysis_busy():
@@ -6423,7 +7795,8 @@ class GroupsStatsTab(QWidget):
         ax.set_xlabel("False positive rate")
         ax.set_ylabel("True positive rate")
         ax.legend(loc='lower right', fontsize=7)
-        ax.set_title(f"Cross-validated ROC\n{self._predictive_subtitle(summary)}", fontsize=9)
+        ax.set_title(wrap_to_width(f"Cross-validated ROC\n{self._predictive_subtitle(summary)}",
+                                   9, 5.0), fontsize=9)
         _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
         return fig
@@ -6482,8 +7855,8 @@ class GroupsStatsTab(QWidget):
         ax.set_xlabel("Number of top-ranked features (log scale)")
         ax.set_ylabel("Cross-validated AUC (mean ± SD)")
         ax.set_ylim(0, 1.02)
-        ax.set_title(f"How many features are needed?\n{self._predictive_subtitle(summary)}",
-                     fontsize=9)
+        ax.set_title(wrap_to_width(f"How many features are needed?\n"
+                                   f"{self._predictive_subtitle(summary)}", 9, 5.0), fontsize=9)
         _style_figure_theme(fig, is_dark)
         self._stamp_run_label(fig, run_label)
         return fig
@@ -6514,6 +7887,14 @@ class GroupsStatsTab(QWidget):
         """
         from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
         from PySide6.QtWidgets import QDialog
+        from honeychrome.view_components import figure_options as fo
+
+        # Figure options (figure_options): this figure, its pop-out, export,
+        # the report and the Layout all use the options kept for its key.
+        options_ref = self._figure_options_ref(key or export_stem)
+        if options_ref is not None:
+            options_ref.apply(fig)
+            maker = fo.with_options(maker, options_ref)
 
         insert_at = None
         if key is not None:
@@ -6669,6 +8050,13 @@ class GroupsStatsTab(QWidget):
         btn_row.addWidget(size_slider)
         btn_row.addWidget(size_pct_label)
         btn_row.addStretch()
+        options_panel = None
+        if options_ref is not None:
+            from honeychrome.view_components.figure_options_panel import (
+                FigureOptionsPanel, options_toggle_button,
+            )
+            options_panel = FigureOptionsPanel(options_ref)
+            btn_row.addWidget(options_toggle_button(options_panel))
 
         container = QWidget()
         if key is not None:
@@ -6682,8 +8070,21 @@ class GroupsStatsTab(QWidget):
         # Pop Out/Export/Size row above the canvas so it's always visible
         # without scrolling, whatever the canvas's current scale.
         vbox.addLayout(btn_row)
-        vbox.addWidget(scroll, stretch=1)
-        vbox.addWidget(placeholder, stretch=1)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.addWidget(scroll, stretch=1)
+        body.addWidget(placeholder, stretch=1)
+        if options_panel is not None:
+            body.addWidget(options_panel)
+
+            def _on_options_changed(scope, f=fig, c=canvas, ref=options_ref):
+                if scope == ref.scope:
+                    ref.apply(f)
+                    c.draw_idle()
+            options_ref.store.subscribe(_on_options_changed)
+            container.destroyed.connect(lambda _obj=None, store=options_ref.store,
+                                        cb=_on_options_changed: store.unsubscribe(cb))
+        vbox.addLayout(body, stretch=1)
 
         if insert_at is not None:
             self._results_tabs.insertTab(insert_at, container, tab_title)
@@ -6710,6 +8111,12 @@ class GroupsStatsTab(QWidget):
         """Right-click on a heatmap row, a volcano point or an MFI Clusters
         cell offers that feature's per-sample values as a dot and violin
         plot, in a window or as a results tab (which the report lists)."""
+        if getattr(fig, '_trend_kind', None):
+            canvas.mpl_connect('button_press_event',
+                               lambda event: self._on_trend_click(event, fig))
+            canvas.setToolTip("Double-click a point or row for its trend plot; "
+                              "right-click for more.")
+            return
         if self._VALUE_KINDS.get(key) is None:
             return
         canvas.mpl_connect('button_press_event',
@@ -6979,6 +8386,13 @@ class GroupsStatsTab(QWidget):
             )
         if self.state.predictive_result and self._has_results_tab('pred_performance'):
             self._draw_predictive_results()
+
+    def _figure_options_ref(self, key: str | None):
+        """The figure options of Honeycluster figure *key* in this
+        experiment (figure_options), or None."""
+        from honeychrome.view_components import figure_options as fo
+        store = fo.store_for(self.controller) if key else None
+        return fo.FigureOptionsRef(store, 'dr_clustering', key) if store is not None else None
 
     def _remove_results_tab_by_key(self, key: str):
         """Remove the results tab whose container carries this key, if
@@ -8883,6 +10297,59 @@ class _MarkerValuesWorker(QThread):
             self.finished.emit(False, str(exc), {})
 
 
+class _PopulationValuesWorker(QThread):
+    """
+    Loads, on a background thread, which of the chosen populations each
+    gated event of each sample is in (drc_pipeline.load_sample_populations)
+    for a PlotCard's Population colour mode. Shares state.gated_data_cache
+    with every other loader, like _MarkerValuesWorker.
+    """
+    finished = Signal(bool, str, dict)  # success, error, {rel_path: (membership, rows)}
+
+    def __init__(self, controller, state, samples: list[str], gates: list[str], af_state,
+                 parent=None):
+        super().__init__(parent)
+        self._controller = controller
+        self._state = state
+        self._samples = samples
+        self._gates = gates
+        self._af_state = af_state
+
+    def run(self):
+        try:
+            results: dict[str, tuple] = {}
+            for rel in self._samples:
+                loaded = drc_pipeline.load_sample_populations(
+                    self._controller, self._state, rel, self._gates, af_state=self._af_state)
+                if loaded is not None:
+                    results[rel] = loaded
+            self.finished.emit(True, '', results)
+        except Exception as exc:
+            traceback.print_exc()
+            self.finished.emit(False, str(exc), {})
+
+
+class _EmbeddingByVariableWorker(QThread):
+    """Densities of a DR run's embedding in bins of the trend variable
+    (trend_plots.embedding_densities) on a background thread."""
+    finished = Signal(bool, str, object)  # success, error, densities
+
+    def __init__(self, embeddings: dict, time: dict, levels, parent=None):
+        super().__init__(parent)
+        self._embeddings = embeddings
+        self._time = time
+        self._levels = levels
+
+    def run(self):
+        try:
+            dens = trend_plots.embedding_densities(self._embeddings, self._time,
+                                                   levels=self._levels)
+            self.finished.emit(True, '', dens)
+        except Exception as exc:
+            traceback.print_exc()
+            self.finished.emit(False, str(exc), None)
+
+
 class _ClusterTreeLayoutWorker(QThread):
     """
     Computes the MST + Kamada-Kawai layout for a Cluster Tree view on a
@@ -8937,7 +10404,7 @@ class PlotCard(QFrame):
     workspace  Parent WorkspaceTab (for remove_card / magic-wand).
     """
 
-    _COLOUR_MODES = ['Clusters', 'Marker', 'Group']
+    _COLOUR_MODES = ['Clusters', 'Marker', 'Group', 'Population']
 
     figure_changed = Signal()   # the figure was redrawn or resized
     legend_changed = Signal()   # the separate legend was redrawn, shown or hidden
@@ -8953,6 +10420,9 @@ class PlotCard(QFrame):
         self._figure    = None   # current matplotlib Figure
         self._marker_worker = None            # in-flight _MarkerValuesWorker, if any
         self._marker_values_cache: dict = {}  # single-entry -- see _on_marker_values_finished
+        self._population_worker = None        # in-flight _PopulationValuesWorker, if any
+        self._population_cache: dict = {}     # single-entry, like _marker_values_cache
+        self._last_population_present: list = []  # population names drawn, 'Unassigned' last
         self._tree_layout_worker = None       # in-flight _ClusterTreeLayoutWorker, if any
         self._tree_layout_cache: dict = {}    # {run_id: layout} -- a run's tree_data is
                                                # frozen at archive time, so its MST/layout
@@ -9494,6 +10964,16 @@ class PlotCard(QFrame):
                 self._start_marker_values_worker(needed_samples, cache_key)
                 return
 
+        population_by_sample = None
+        if colour_mode == 'Population' and self.state.population_gates:
+            needed_samples = sorted({str(r) for r in np.unique(origin)})
+            cache_key = self._population_cache_key(needed_samples)
+            population_by_sample = self._population_cache.get(cache_key)
+            if population_by_sample is None:
+                self._show_placeholder("Loading populations …")
+                self._start_population_worker(needed_samples, cache_key)
+                return
+
         is_dark = _resolve_is_dark(self.state)
 
         self._figure.clear()
@@ -9561,6 +11041,9 @@ class PlotCard(QFrame):
                                       marker_values_by_sample)
         elif colour_mode == 'Group':
             self._draw_group_scatter(ax, xy_disp, origin_disp)
+        elif colour_mode == 'Population':
+            self._draw_population_scatter(ax, xy_disp, origin_disp, disp_idx,
+                                          sample_row_offsets, run, population_by_sample)
 
         # Apply label colour to colourbar (Marker), title, and axis labels
         lc = self._label_fg()
@@ -9622,6 +11105,49 @@ class PlotCard(QFrame):
         # gated arrays, so keeping stale combinations around would just be
         # wasted memory for data nothing will ask for again.
         self._marker_values_cache = {cache_key: payload}
+        self.refresh()
+
+    def _population_cache_key(self, samples: list[str]):
+        """Cache key for _population_cache: the samples, gates, chosen
+        populations and unmixing (as _marker_cache_key), plus every
+        sample's gating so an edited population gate is reloaded."""
+        from honeychrome.controller_components.per_sample_gating_functions import SampleGating
+        from honeychrome.controller_components.sample_loader import sample_key_for_path
+        keys = [sample_key_for_path(self.controller.experiment_dir,
+                                    drc_pipeline.sample_abs_path(self.controller, rel))
+                for rel in samples]
+        return (
+            self._marker_cache_key(samples),
+            tuple(self.state.population_gates),
+            SampleGating.from_controller(self.controller, copy=False).signature(keys),
+        )
+
+    def _start_population_worker(self, samples: list[str], cache_key):
+        """Load population membership on a background thread, with the
+        unmixing state snapshotted here on the main thread (see
+        _start_marker_values_worker)."""
+        if self._population_worker is not None:
+            return   # already loading; its finish will re-trigger refresh()
+        if wait_if_busy(self.controller, ('Honeycluster populations', id(self)), self.refresh,
+                        self._show_placeholder):
+            return
+        af_state = drc_pipeline.snapshot_af_state(self.controller)
+        worker = _PopulationValuesWorker(self.controller, self.state, samples,
+                                         list(self.state.population_gates), af_state)
+        worker.finished.connect(
+            lambda ok, err, payload, key=cache_key:
+                self._on_population_values_finished(ok, err, payload, key)
+        )
+        self._population_worker = worker
+        worker.start()
+
+    def _on_population_values_finished(self, success: bool, error: str,
+                                       payload: dict, cache_key):
+        self._population_worker = None
+        if not success:
+            self._show_placeholder(f"Failed to load populations: {error}")
+            return
+        self._population_cache = {cache_key: payload}
         self.refresh()
 
     def _start_tree_layout_worker(self, run_id: str, tree_data: dict):
@@ -9856,6 +11382,69 @@ class PlotCard(QFrame):
                        rasterized=True)
         ax.set_title("Group", fontsize=8)
 
+    def _draw_population_scatter(self, ax, xy, origin, disp_idx, sample_row_offsets,
+                                 run: dict, population_by_sample: dict | None):
+        """
+        Colour points by which of the populations chosen on the Stats tab
+        ('Compare populations within samples') their event is in, in the
+        populations' group colours; events in none of them are grey. An
+        event in several is shown in the first. population_by_sample is
+        {rel_path: (membership, rows)}, already loaded by refresh().
+        """
+        gates = list(self.state.population_gates)
+        self._last_population_present = []
+        if not gates or population_by_sample is None:
+            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#aaaaaa', alpha=0.4, rasterized=True)
+            ax.set_title("Population: tick populations under 'Compare populations within "
+                         "samples' on the Stats tab", fontsize=8)
+            return
+
+        # Membership comes from the CURRENT gating, matched to the run's
+        # points as the Marker mode matches marker values.
+        mode = drc_run_align.live_join_mode(run, drc_pipeline.sync_fingerprint(
+            self.controller, run.get('gates', []), run.get('training_sample_ids', [])))
+        run_gates = run.get('gates')
+        if mode != drc_run_align.JOIN_KEYS and (
+                mode == drc_run_align.JOIN_NONE or run_gates is None
+                or sorted(run_gates) != sorted(self.state.selected_gates)):
+            ax.scatter(xy[:, 0], xy[:, 1], s=1, c='#cccccc', alpha=0.3, rasterized=True)
+            ax.set_title(f"{run.get('label', '')}: made before event keys and no longer "
+                         "matches the current gating — retrain DR", fontsize=8)
+            return
+
+        which = np.full(len(xy), -1, dtype=np.int32)
+        for rel in np.unique(origin):
+            loaded = population_by_sample.get(str(rel))
+            if loaded is None:
+                continue
+            membership, cur_rows = loaded
+            first = np.where(membership.any(axis=1), membership.argmax(axis=1), -1)
+            start, end = sample_row_offsets.get(rel, (0, int((origin == rel).sum())))
+            col, _matched = drc_run_align.pair_arrays(
+                first.astype(np.int32), end - start, mode,
+                src_rows=cur_rows, dst_rows=drc_run_align.run_rows(run, rel), fill=-1)
+            if col is None:
+                _log.warning("population: %s embedding has %d points but current gating "
+                             "yields %d events — skipped", rel, end - start, len(first))
+                continue
+            mask = origin == rel
+            which[mask] = col[disp_idx[mask] - start] if disp_idx is not None else col
+
+        outside = which < 0
+        if outside.any():
+            ax.scatter(xy[outside, 0], xy[outside, 1], s=1, c='#7f7f7f', alpha=0.4,
+                       linewidths=0, rasterized=True)
+        for j, gate in enumerate(gates):
+            mask = which == j
+            if not mask.any():
+                continue
+            self._last_population_present.append(gate)
+            ax.scatter(xy[mask, 0], xy[mask, 1], s=1, c=_resolve_group_colour(self.state, gate),
+                       alpha=0.6, linewidths=0, rasterized=True)
+        if outside.any():
+            self._last_population_present.append('Unassigned')
+        ax.set_title("Population", fontsize=8)
+
     def _show_placeholder(self, text: str):
         self._figure.clear()
         ax = self._figure.add_subplot(111)
@@ -9889,6 +11478,11 @@ class PlotCard(QFrame):
             return 'group', [
                 (g, g, _resolve_group_colour(self.state, g) if g != 'Unassigned' else '#7f7f7f')
                 for g in ordered]
+        if mode == 'Population' and not is_tree:
+            return 'group', [
+                (g, 'Other' if g == 'Unassigned' else g,
+                 '#7f7f7f' if g == 'Unassigned' else _resolve_group_colour(self.state, g))
+                for g in self._last_population_present]
         if mode != 'Clusters' and not is_tree:
             return 'cluster', []
         cl_run = self._selected_cluster_run()
@@ -10019,7 +11613,7 @@ class PlotCard(QFrame):
         from matplotlib.lines import Line2D
         fig = self._legend_figure
         fig.clear()
-        fig.patch.set_facecolor('#1e1e1e' if _resolve_is_dark(self.state) else 'white')
+        fig.patch.set_facecolor('black' if _resolve_is_dark(self.state) else 'white')
         font_pt = float(self._legend_font_spin.value())
         names = [name for _key, name, _colour in entries]
         ncol = self._separate_legend_ncol(names, font_pt)
@@ -11434,11 +13028,11 @@ class ClusterAnnotationTab(QWidget):
 
         self.compute_suggestions_btn = QPushButton("Compute Cluster ID Suggestions")
         self.compute_suggestions_btn.setToolTip(
-            "Uses the channel set recorded for THIS clustering run at the "
-            "time it was created (its Configuration tab selection back "
-            "then) as the marker set for both the MEM label and the "
-            "cell-type score -- not whatever is currently checked above, "
-            "and not Configuration's current selection either."
+            "Scores the channels recorded for THIS clustering run when it "
+            "was created (its Configuration selection back then), plus "
+            "every other channel with an Antigen except viability dyes, "
+            "for both the MEM label and the cell-type score -- not "
+            "whatever is currently checked above."
         )
         self.compute_suggestions_btn.clicked.connect(self._compute_cluster_id_suggestions)
         suggest_row.addWidget(self.compute_suggestions_btn)
@@ -11452,6 +13046,35 @@ class ClusterAnnotationTab(QWidget):
         suggest_row.addWidget(self.adopt_all_mem_btn)
         suggest_row.addStretch()
         table_layout.addLayout(suggest_row)
+
+        reference_row = QHBoxLayout()
+        reference_row.addWidget(QLabel("MEM reference:"))
+        self.mem_reference_combo = QComboBox()
+        self.mem_reference_combo.addItem("Other clusters", drc_cluster_id.MEM_REFERENCE_CLUSTERS)
+        self.mem_reference_combo.addItem("Anchor population", drc_cluster_id.MEM_REFERENCE_ANCHOR)
+        self.mem_reference_combo.setToolTip(
+            "Each cluster's MEM label describes how it differs from the run's\n"
+            "other clusters. A marker every clustered cell carries, such as CD3\n"
+            "in a T-cell run, never shows that way.\n"
+            "Anchor population also compares the clusters with the cells chosen\n"
+            "under Anchor (normally live single cells) and puts the markers they\n"
+            "all share against it in front of every label, e.g. 'CD3+ CD19-:'."
+        )
+        reference_row.addWidget(self.mem_reference_combo)
+        reference_row.addWidget(QLabel("Anchor:"))
+        self._anchor_choice = ''
+        self.anchor_combo = QComboBox()
+        self.anchor_combo.currentIndexChanged.connect(self._on_anchor_changed)
+        self.anchor_combo.setToolTip(
+            "The reference population: it must contain the clustered cells.\n"
+            "Auto picks the deepest gate above them that uses a viability dye,\n"
+            "else Singlets, else Cells, else all events (root).\n"
+            "Also used to set positivity thresholds for channels the unstained\n"
+            "sample cannot (cut on the anchor's cells, which include negatives)."
+        )
+        reference_row.addWidget(self.anchor_combo)
+        reference_row.addStretch()
+        table_layout.addLayout(reference_row)
 
         self._suggestions_status = QLabel(
             "Cluster ID suggestions not yet computed for this run."
@@ -11751,6 +13374,7 @@ class ClusterAnnotationTab(QWidget):
         # suggestion for the still-selected run. See
         # _sync_suggestions_from_run's docstring.
         self._sync_suggestions_from_run(self._selected_cluster_run())
+        self._populate_anchor_combo()
         self._update_compat_warning()
         self._redraw_map()
         self._populate_label_table()
@@ -11865,6 +13489,35 @@ class ClusterAnnotationTab(QWidget):
                 return drc_run_archive.hydrate_run(self.controller, entry)
         return None
 
+    def _populate_anchor_combo(self):
+        """
+        Fill the Anchor drop-down: Auto, naming the gate it resolves to for
+        the selected run, then all events (root) and every gate of the
+        experiment's gating. Keeps the user's choice (self._anchor_choice;
+        '' is Auto). Reads only the run's manifest fields, so no run
+        payload is loaded here.
+        """
+        run_id = self.run_combo.currentData()
+        entry = next((e for e in self.state.clustering_runs if e.get('run_id') == run_id), None)
+        try:
+            names = [name for name, _path in self.controller.unmixed_gating.get_gate_ids()]
+            auto, _note = drc_cluster_id.resolve_run_anchor(self.controller, entry)
+        except Exception as exc:
+            _log.warning("Cluster ID anchor choices unavailable: %s", exc)
+            names, auto = [], 'root'
+        self.anchor_combo.blockSignals(True)
+        self.anchor_combo.clear()
+        self.anchor_combo.addItem(f"Auto ({auto})", '')
+        self.anchor_combo.addItem("root (all events)", 'root')
+        for name in names:
+            self.anchor_combo.addItem(name, name)
+        idx = self.anchor_combo.findData(self._anchor_choice)
+        self.anchor_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.anchor_combo.blockSignals(False)
+
+    def _on_anchor_changed(self, _index: int):
+        self._anchor_choice = self.anchor_combo.currentData() or ''
+
     def _sync_suggestions_from_run(self, cl_run):
         """
         Restore self._mem_labels / self._cell_type_df /
@@ -11888,10 +13541,13 @@ class ClusterAnnotationTab(QWidget):
         has_saved = bool(self._mem_labels) or self._cell_type_df is not None
         self._suggestions_run_id = cl_run.get('run_id') if (cl_run and has_saved) else None
         if self._suggestions_run_id:
+            details = cl_run.get('cluster_id_details') or {}
+            n_channels = len(details.get('channels') or cl_run.get('channels', []))
             self._suggestions_status.setText(
                 f"Suggestions restored for {len(self._mem_labels)} cluster(s), "
-                f"{len(cl_run.get('channels', []))} channel(s), "
+                f"{n_channels} channel(s), "
                 f"{self.species_combo.currentText()} cell types."
+                + _cluster_id_reference_text(details)
             )
         else:
             self._suggestions_status.setText(
@@ -11906,6 +13562,7 @@ class ClusterAnnotationTab(QWidget):
         # suggestion computed earlier in a previous session.
         cl_run = self._selected_cluster_run()
         self._sync_suggestions_from_run(cl_run)
+        self._populate_anchor_combo()
         self._update_compat_warning()
         self._redraw_map()
         self._populate_label_table()
@@ -12638,6 +14295,10 @@ class ClusterAnnotationTab(QWidget):
                         "evidence -- treat with caution." if low_conf
                         else f"Score: {rec.get('score')}"
                     )
+                    separated_by = rec.get('separated_by')
+                    if isinstance(separated_by, str) and separated_by:
+                        type_tip += ("\nThis panel cannot tell these cell types apart; "
+                                     f"staining for {separated_by} would.")
             type_item = QTableWidgetItem(type_text)
             type_item.setFlags(type_item.flags() & ~Qt.ItemIsEditable)
             type_item.setToolTip(type_tip)
@@ -12708,7 +14369,9 @@ class ClusterAnnotationTab(QWidget):
     def _compute_cluster_id_suggestions(self):
         """
         Runs both suggestion mechanisms for the selected run over the
-        CHANNEL SET RECORDED FOR THIS RUN -- cl_run['channels'], the
+        CHANNEL SET RECORDED FOR THIS RUN plus every other channel with an
+        Antigen, viability dyes excepted (drc_cluster_id.scoring_channels).
+        The recorded set is cl_run['channels'], the
         Configuration tab's selection at the time THIS SPECIFIC run was
         created (archived once by drc_run_archive.archive_clustering_run() /
         archive_dr_run(), never touched again). Deliberately NOT Panel 1's
@@ -12788,6 +14451,9 @@ class ClusterAnnotationTab(QWidget):
 
         mem_threshold = self.mem_threshold_spin.value()
         species = self.species_combo.currentData()
+        mem_reference = self.mem_reference_combo.currentData()
+        anchor, anchor_note = drc_cluster_id.resolve_run_anchor(
+            self.controller, cl_run, self.anchor_combo.currentData() or '')
 
         # Snapshot AF/transfer-matrix state HERE, on the main thread, before
         # the worker starts -- same reasoning as _StatsWorker/_ClWorker/
@@ -12833,6 +14499,8 @@ class ClusterAnnotationTab(QWidget):
                         af_state=self_._af_state,
                         unstained_af_states=self_._unstained_af_states,
                         live_mode=live_mode,
+                        anchor=anchor,
+                        mem_reference=mem_reference,
                     )
                     self_.finished.emit(True, '', result)
                 except Exception as exc:
@@ -12844,13 +14512,15 @@ class ClusterAnnotationTab(QWidget):
         worker.finished.connect(lambda *_: token.release())
         worker.progress.connect(self._suggestions_progress.setValue)
         worker.finished.connect(
-            lambda success, err, result, run_id=cl_run.get('run_id'), n_channels=len(channels):
-                self._on_cluster_id_finished(success, err, result, run_id, n_channels)
+            lambda success, err, result, run_id=cl_run.get('run_id'), n_channels=len(channels),
+                   note=anchor_note:
+                self._on_cluster_id_finished(success, err, result, run_id, n_channels, note)
         )
         self._cluster_id_worker = worker
         worker.start()
 
-    def _on_cluster_id_finished(self, success: bool, error_msg: str, result, run_id, n_channels):
+    def _on_cluster_id_finished(self, success: bool, error_msg: str, result, run_id, n_channels,
+                                anchor_note: str = ''):
         self._cluster_id_worker = None
         self.compute_suggestions_btn.setEnabled(True)
         self._suggestions_progress.setVisible(False)
@@ -12865,12 +14535,12 @@ class ClusterAnnotationTab(QWidget):
             )
             return
 
-        mem_labels, _mem_scores, cell_type_df, unmatched_markers = result
+        mem_labels, _mem_scores, cell_type_df, unmatched_markers, details = result
         self._mem_labels = mem_labels
         self._cell_type_df = cell_type_df
         self._suggestions_run_id = run_id
         drc_run_archive.update_cluster_id_suggestions(
-            self.controller, self.state, run_id, mem_labels, cell_type_df,
+            self.controller, self.state, run_id, mem_labels, cell_type_df, details,
         )
 
         # Antigen text
@@ -12891,10 +14561,13 @@ class ClusterAnnotationTab(QWidget):
                 "toward MEM Label as typed.\n\n  " + lines
             )
 
+        n_extra = len(details.get('extra_channels') or [])
         self._suggestions_status.setText(
             f"Suggestions ready for {len(mem_labels)} cluster(s), "
-            f"{n_channels} channel(s), {self.species_combo.currentText()} "
-            f"cell types."
+            f"{n_channels + n_extra} channel(s) ({n_extra} beyond the run's clustering channels), "
+            f"{self.species_combo.currentText()} cell types."
+            + _cluster_id_reference_text(details)
+            + (f" {anchor_note}" if anchor_note else '')
         )
         self._populate_label_table()
 
@@ -14066,6 +15739,9 @@ class PluginWidget(QWidget):
             s.setValue('reference_group',   self.state.reference_group)
             s.setValue('paired',            self.state.paired)
             s.setValue('pairing_variable',  self.state.pairing_variable)
+            s.setValue('population_split',  self.state.population_split)
+            s.setValue('population_gates',  list(self.state.population_gates))
+            s.setValue('population_reference', self.state.population_reference)
             s.setValue('stats_adjust_covariates', list(self.state.stats_adjust_covariates))
             s.setValue('numeric_covariates', list(self.state.numeric_covariates))
             s.setValue('stats_use_treat',   self.state.stats_use_treat)
@@ -14076,6 +15752,13 @@ class PluginWidget(QWidget):
             s.setValue('stats_fdr_scope', self.state.stats_fdr_scope)
             s.setValue('stats_pval_threshold', self.state.stats_pval_threshold)
             s.setValue('stats_fc_threshold', self.state.stats_fc_threshold)
+            for key in ('stats_test', 'trend_variable', 'trend_unit', 'trend_shape',
+                        'trend_scale', 'trend_call'):
+                s.setValue(key, getattr(self.state, key))
+            s.setValue('trend_interaction', self.state.trend_interaction)
+            s.setValue('trend_df', self.state.trend_df)
+            s.setValue('trend_min_r2', self.state.trend_min_r2)
+            s.setValue('trend_patterns', self.state.trend_patterns)
             s.setValue('covariate_columns',
                       list(self.state.covariates.columns)
                       if self.state.covariates is not None else [])
@@ -14115,6 +15798,12 @@ class PluginWidget(QWidget):
                     s.setValue('annotation_channels_checked', cat._checked_channels())
                     if hasattr(cat, 'species_combo'):
                         s.setValue('cluster_id_species', cat.species_combo.currentData() or 'human')
+                    if hasattr(cat, 'mem_reference_combo'):
+                        s.setValue('cluster_id_mem_reference',
+                                   cat.mem_reference_combo.currentData()
+                                   or drc_cluster_id.MEM_REFERENCE_CLUSTERS)
+                    if hasattr(cat, 'anchor_combo') and cat.anchor_combo.count() > 0:
+                        s.setValue('cluster_id_anchor', cat.anchor_combo.currentData() or '')
             # Groups tab: include-type-markers checkbox
             if hasattr(self, 'groups_stats_tab'):
                 gst = self.groups_stats_tab
@@ -14325,6 +16014,9 @@ class PluginWidget(QWidget):
             paired_val = s.value('paired', False)
             self.state.paired = paired_val in (True, 'true', 'True', 1, '1')
             self.state.pairing_variable = s.value('pairing_variable', '')
+            self.state.population_split = _qs_bool(s, 'population_split', False)
+            self.state.population_gates = _qs_list(s, 'population_gates')
+            self.state.population_reference = s.value('population_reference', '') or ''
             self.state.stats_adjust_covariates = _qs_list(s, 'stats_adjust_covariates')
             self.state.numeric_covariates = _qs_list(s, 'numeric_covariates')
             use_treat = s.value('stats_use_treat', None)
@@ -14343,7 +16035,7 @@ class PluginWidget(QWidget):
             if fdr_scope in ('global', 'per_comparison'):
                 self.state.stats_fdr_scope = fdr_scope
             counts_method = s.value('stats_counts_method', None)
-            if counts_method in ('wald', 'ql'):
+            if counts_method == 'ql':
                 self.state.stats_counts_method = counts_method
             normalisation = s.value('stats_normalisation', None)
             if normalisation in ('total', 'robust'):
@@ -14354,6 +16046,28 @@ class PluginWidget(QWidget):
                 if stored is not None:
                     try:
                         setattr(self.state, attr, float(stored))
+                    except (ValueError, TypeError):
+                        pass
+            for key, allowed in (('stats_test', ('groups', 'trend')),
+                                 ('trend_shape', trend_stats.SHAPES),
+                                 ('trend_scale', trend_stats.SCALES),
+                                 ('trend_call', trend_stats.CALLS)):
+                value = s.value(key, None)
+                if value in allowed:
+                    setattr(self.state, key, value)
+            for key in ('trend_variable', 'trend_unit'):
+                value = s.value(key, None)
+                if isinstance(value, str):
+                    setattr(self.state, key, value)
+            interaction = s.value('trend_interaction', None)
+            if interaction is not None:
+                self.state.trend_interaction = interaction in (True, 'true', 'True', 1, '1')
+            for key, cast in (('trend_df', int), ('trend_min_r2', float),
+                              ('trend_patterns', int)):
+                value = s.value(key, None)
+                if value is not None:
+                    try:
+                        setattr(self.state, key, cast(value))
                     except (ValueError, TypeError):
                         pass
             pca_use_freq = s.value('pca_use_freq', None)
@@ -14529,6 +16243,9 @@ class PluginWidget(QWidget):
             self._pending_annotation_channels = _qs_list(
                 s, 'annotation_channels_checked')
             self._pending_cluster_id_species = s.value('cluster_id_species', 'human')
+            self._pending_cluster_id_mem_reference = s.value(
+                'cluster_id_mem_reference', drc_cluster_id.MEM_REFERENCE_CLUSTERS)
+            self._pending_cluster_id_anchor = s.value('cluster_id_anchor', '')
 
             # Config tab: restore channel and training-sample selections
             # (will be applied when ConfigTab.refresh() runs).  Gate
@@ -14706,11 +16423,14 @@ class PluginWidget(QWidget):
             ('mfi_sample_df',     self.state.mfi_sample_df),
             ('stats_all_rel',     self.state.stats_all_rel),
             ('stats_group_vec',   self.state.stats_group_vec),
+            ('stats_population_of', self.state.stats_population_of),
             ('stats_comparisons', self.state.stats_comparisons),
             ('stats_run_label',   self.state.stats_run_label),
             ('stats_run_id',      self.state.stats_run_id),
             ('stats_data_key',    self.state.stats_data_key),
             ('stats_cluster_names', self.state.stats_cluster_names),
+            ('trend_results', drc_stats.trend_to_bundle(self.state.trend_results)
+                              if self.state.trend_results else {}),
             ('composition_df',        self.state.composition_df),
             ('composition_as_pct',    self.state.composition_as_pct),
             ('composition_group_var', self.state.composition_group_var),
@@ -14724,6 +16444,8 @@ class PluginWidget(QWidget):
             ('pca_run_label',           self.state.pca_run_label),
             ('pca_groups',              self.state.pca_groups),
             ('pca_sources',             self.state.pca_sources),
+            ('pca_colour_values',       self.state.pca_colour_values),
+            ('pca_colour_label',        self.state.pca_colour_label),
         ))
         try:
             skipped = drc_persist.save_bundle(path, payload, skip_unstorable=True)
@@ -14831,8 +16553,15 @@ class PluginWidget(QWidget):
                 self.state.stats_all_rel = payload['stats_all_rel']
             if isinstance(payload.get('stats_group_vec'), list):
                 self.state.stats_group_vec = payload['stats_group_vec']
+            if isinstance(payload.get('stats_population_of'), dict):
+                self.state.stats_population_of = payload['stats_population_of']
             if isinstance(payload.get('stats_comparisons'), list):
                 self.state.stats_comparisons = payload['stats_comparisons']
+            if isinstance(payload.get('trend_results'), dict) and payload['trend_results']:
+                try:
+                    self.state.trend_results = drc_stats.trend_from_bundle(payload['trend_results'])
+                except Exception as exc:
+                    _log.warning("could not restore the saved trend test: %s", exc)
             if isinstance(payload.get('composition_df'), pd.DataFrame):
                 self.state.composition_df = payload['composition_df']
             if isinstance(payload.get('composition_as_pct'), bool):
@@ -14885,6 +16614,10 @@ class PluginWidget(QWidget):
                 self.state.pca_groups = payload['pca_groups']
             if isinstance(payload.get('pca_sources'), list):
                 self.state.pca_sources = payload['pca_sources']
+            if isinstance(payload.get('pca_colour_values'), list):
+                self.state.pca_colour_values = payload['pca_colour_values']
+            if isinstance(payload.get('pca_colour_label'), str):
+                self.state.pca_colour_label = payload['pca_colour_label']
             if isinstance(payload.get('stats_run_label'), str):
                 self.state.stats_run_label = payload['stats_run_label']
             if isinstance(payload.get('stats_run_id'), str):
@@ -15119,6 +16852,14 @@ class PluginWidget(QWidget):
             idx = cat.species_combo.findData(getattr(self, '_pending_cluster_id_species', 'human'))
             if idx >= 0:
                 cat.species_combo.setCurrentIndex(idx)
+        if hasattr(cat, 'mem_reference_combo'):
+            idx = cat.mem_reference_combo.findData(getattr(
+                self, '_pending_cluster_id_mem_reference', drc_cluster_id.MEM_REFERENCE_CLUSTERS))
+            if idx >= 0:
+                cat.mem_reference_combo.setCurrentIndex(idx)
+        if hasattr(cat, 'anchor_combo'):
+            cat._anchor_choice = getattr(self, '_pending_cluster_id_anchor', '') or ''
+            cat._populate_anchor_combo()
         run_id = cat.run_combo.currentData()
         checked_now = cat._checked_channels()
         cached = cat._violin_cache.get(run_id)
@@ -15273,6 +17014,8 @@ class PluginWidget(QWidget):
                 tuple(sorted(s.group_patterns.items())),
                 tuple(s.testing_group_selection),
                 s.contrast_mode, s.reference_group, s.paired, s.pairing_variable,
+                s.population_split, tuple(s.population_gates), s.population_reference,
+                tuple(sorted(s.selected_gates)),
                 len(s.dr_runs), len(s.clustering_runs),
                 tuple(sorted(s.cluster_labels)),
                 s.stats_run_id,
@@ -15295,6 +17038,7 @@ class PluginWidget(QWidget):
                 tuple(sorted(s.cluster_names.items())),
                 tuple(sorted(s.cluster_colors.items())),
                 len(s.plot_configs), s.plot_theme,
+                tuple(s.population_gates),
             )
         elif index == 5:    # ReportTab -- cheap to rebuild; always refresh
             return None

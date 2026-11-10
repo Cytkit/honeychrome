@@ -153,11 +153,35 @@ def test_report_items_list_gates_only_with_display_events():
                   fdr_scope='global', build_figures=lambda *a: {})
     with_display = ag_report.build_report_items(display=_display(), **common)
     keys = [item.key for item in with_display]
-    assert keys == ['samples', 'frequencies', 'populations', 'markers', 'gate:T']
+    assert keys == ['samples', 'frequencies', 'gate:T']
     fig = with_display[-1].get_figure()
     assert any('pooled display events' in t.get_text() for t in [fig.axes[0].title])
     without = ag_report.build_report_items(display={}, **common)
     assert 'gate:T' not in [item.key for item in without]
+    page = ag_report.gate_pages(with_display)[-1]
+    assert page.label == 'Gates 1-1 of 1'
+    fig = page.get_figure()
+    assert fig.axes[0].get_title() == 'T (fixed)'
+    assert 'pooled display events' in fig.get_suptitle()
+
+
+def test_gate_pages_put_gates_six_to_a_page_in_place():
+    drawn = []
+
+    def gate_item(i):
+        return ag_report.GateReportItem(
+            key=f'gate:G{i}', tab='Gates', label=f'Gate G{i}', page_title='Stored boundaries',
+            draw=lambda ax, i=i: (drawn.append(i), ax.plot([0, 1], [0, i])))
+
+    before = ag_report.ReportItem(key='samples', tab='Samples', label='Samples')
+    after = ag_report.ReportItem(key='pca', tab='Statistics', label='Sample PCA')
+    pages = ag_report.gate_pages([before] + [gate_item(i) for i in range(8)] + [after])
+    assert [p.label for p in pages] == ['Samples', 'Gates 1-6 of 8', 'Gates 7-8 of 8',
+                                        'Sample PCA']
+    fig = pages[2].get_figure()
+    assert drawn == [6, 7]
+    assert len(fig.axes) == ag_report.GATES_PER_PAGE
+    assert sum(ax.axison for ax in fig.axes) == 2
 
 
 def test_report_statistics_figures_get_the_group_colours():

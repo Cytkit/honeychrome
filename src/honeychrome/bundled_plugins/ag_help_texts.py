@@ -248,6 +248,11 @@ side becomes two quadrants; tick the quadrants each population covers in
 the <b>Quadrants</b> column (e.g. X+ Y− only). Changing a gate's type
 returns its mixture components to 2. A change that would leave gates below
 without their parent population is refused, naming them.</li>
+<li>For a <i>1dsep</i> gate, the <b>Side</b> column sets which side of the
+threshold each population takes: <b>Below</b> or <b>Above</b>. A population
+you add takes the side the others leave free, so adding <i>Non-B</i> beside
+<i>B cells</i> (Above) gives it the events below. <b>Position</b> only places
+the label.</li>
 <li>Renaming a population in the editor renames it for the gates below
 too.</li>
 <li><b>Add gate manually</b> creates a gate that is not on the main
@@ -437,6 +442,13 @@ set up <i>CD25+</i> on one T cell subset, then pass it to the subsets below
 it.</li>
 <li><b>⇉</b> does the same for every gate of that name on the same channels
 anywhere in the model.</li>
+<li><b>⇶</b> lets other gates copy a converted gate's threshold instead of
+calculating their own. Set up <i>CD28+</i> on a clean population such as
+<i>CD4 Tconv</i>, press ⇶ and tick the gates that should use its boundary:
+gates of the same name start ticked, and any gate on the same channel can be
+added; Shift- or Ctrl-click selects several rows, and ticking one ticks them
+all. With <i>Fixed</i> application they use its trained threshold; with
+<i>Recalculate</i>, the threshold it gets on each sample.</li>
 </ul>
 
 <h4>Details: editing shapes and axes</h4>
@@ -677,6 +689,9 @@ it again. Each run's counts and medians are also written as CSV files to
 ''' + _GLOSSARY
 
 
+# Validation figures quoted in the Results and Enrichment help: the human
+# cohort is UCL IMMPROVE (Automated Gating cache, 159 samples), the inbred
+# mice the BATF chimera experiment.
 AG_RESULTS = '''
 <h3>Results: compare groups of samples</h3>
 <p><b>In short:</b> this page tests which populations, and which markers
@@ -717,19 +732,63 @@ name.</li>
 covariates are categories, so leave codes such as batch 1, 2, 3
 unticked.</li>
 <li><b>Import table…</b> reads groups and covariates from a CSV or
-tab-separated file with a <i>sample</i> column (the file name, with or
-without its extension), an optional <i>group</i> column and one column per
-covariate. <b>Export table…</b> writes the same format.</li>
+tab-separated file with a <i>sample</i> column and one column per covariate.
+A row matches a sample when its name is the file name (with or without its
+extension) or appears inside the file name between spaces, underscores or
+dashes, so a study key naming <i>POMS_008_FB_D</i> matches
+<i>A1 POMS_008_FB_D_Plate 1</i>. Names matched inside the file name need at
+least three characters including a digit. Before anything changes, a review
+shows which rows matched which samples, rows that matched nothing and samples
+left without a row; choose the group column there (or keep the current
+groups) and the covariates to import. <b>Export table…</b> writes the same
+format, naming samples as the table shows them.</li>
 </ul>
 
 <h4>Details: the tests</h4>
 <ul>
 <li><b>Population frequencies</b>: each population's share of its parent (or
-of its stats parent) as log odds, with half an event added so 0% and 100%
-stay finite. Moderated linear model [1, 2]. Effects are log2 odds
-ratios.</li>
-<li><b>Population counts</b>: negative-binomial model of event counts [5],
-with the parent count as offset. Effects are log2 fold changes.</li>
+of its stats parent) as log odds, with a small prior count added so 0% and
+100% stay finite. The prior count is the same share of every sample's parent
+(half an event at the average parent size), so a population at 100% of its
+parent has the same value in every sample: a difference in parent size
+between groups is not taken for a difference in frequency. Moderated linear
+model [1, 2]. Effects are log2 odds
+ratios. A sample's frequency is measured only when the parent has at least
+<b>Min. parent events</b> there (20 by default), because a fraction of a
+handful of events mostly reflects gating noise; other samples are left out
+of that population's test.</li>
+<li><b>Population counts</b> (under <i>Counts (advanced)</i>), against the
+<b>anchor population</b> (normally the viable cells; see the Hierarchy
+page), ask a different question: for this many viable cells, are there
+more or fewer of this population? A population can rise as a share of its
+parent while falling per viable cell, because its parent fell. A large
+change in one abundant population (for example neutrophils) moves every
+other population per viable cell too. Against the <b>parent</b>, counts ask
+the frequency test's question, and a counts hit that is not also a
+frequency hit is marked ⚠.</li>
+<li>The counts <b>model</b>: <i>moderated log odds</i> (the default) fits the
+frequency test's model to each population's share of the reference, so its
+effects are log2 odds ratios. <i>Quasi-likelihood F</i> fits a
+negative-binomial model of the event counts [5], with log2 fold changes.
+Random splits of the samples of one group, where nothing differs, show how
+often each test finds a difference by chance (5% expected):
+<ul>
+<li>Human cohort (159 samples): moderated log odds 4–6%;
+quasi-likelihood F 7–8% against the parent and 9–10% against the anchor for
+populations under 100 events.</li>
+<li>Inbred mice (BATF chimeras, 48 samples in six tissues; six populations
+of 64 to 100,000 events): moderated log odds 4–5%; quasi-likelihood F
+3–6%.</li>
+</ul>
+The negative-binomial Wald test is not offered: it gave 10–13% on the human
+cohort and 21–31% on the mice. Use moderated log odds for human or
+otherwise varied donors.
+Quasi-likelihood F suits homogeneous designs. It fits each comparison on
+the samples of its two groups and takes each population's dispersion from
+the populations with similar counts, which keeps it near 5% on mouse
+samples with very few events (about 5% on samples cut down to 100 cells).
+On human data it stays above 5%, because donors vary more, and more
+unevenly, than the model allows for.</li>
 <li><b>Marker medians</b>: each population's median of each marker (and of
 AF Abundance, the per-cell autofluorescence), in transformed units.
 Populations are screened first, and markers are tested only within the
@@ -747,6 +806,163 @@ flagged samples</i> back to their defaults. Comparisons, reference group,
 pairing and covariates are kept.</li>
 <li>The same framework has been used in systems-immunology studies of flow
 cytometry cohorts [6, 7].</li>
+</ul>
+
+<h4>Details: trends with a numeric variable</h4>
+<ul>
+<li>Set <b>Test</b> to <i>Trend with a numeric variable</i> to ask which
+populations change with a number such as age or days after vaccination, instead of comparing groups. Tick <b>Numeric</b> under
+that covariate on the Groups page first.</li>
+<li>Two tests are run on each population, on the same moderated linear model
+as the group comparisons [1, 2]:
+<ul>
+<li>the <b>curve</b> test asks whether the population changes with the
+variable at all, whatever the shape (a rise, a fall, a rise that levels
+off, a peak). It is an F test of a smooth curve (a natural spline [8]):
+one p-value for the variable as a whole, as in an ANOVA;</li>
+<li>the <b>slope</b> test fits a straight line and gives the direction and
+rate of change, in log2 odds per unit of the variable (per week, per
+day).</li>
+</ul></li>
+<li><b>Partial R²</b> is the share of the sample-to-sample variation the
+variable explains once groups and adjustment covariates are accounted for
+(0 = none, 1 = all).</li>
+<li>By default a population is called when either test is significant, each
+at half the FDR so the combined error stays at the FDR set, and its partial
+R² is at least 0.1 (<b>Min. partial R²</b>). In large studies very small
+trends become significant; the minimum keeps them out.</li>
+<li><b>Shape</b>: <i>Smooth curve</i> (default, 2 df: one bend), with its
+ends fixed between the 5th and 95th percentiles of the variable so a single
+youngest or oldest sample cannot bend it; <i>Straight line</i>; or
+<i>Time points as groups</i> for designed time courses (day 0, 3, 7,
+14), where each value is its own level. The curve gets at most one df per
+10 samples. <b>Scale</b> <i>Log2</i> suits time courses sampled on a
+doubling schedule; the slope is then per doubling of time.</li>
+<li><b>Groups</b>: the samples of the ticked groups are tested together,
+with the groups as adjustment terms. <i>Does the change differ between two
+groups?</i> asks whether two groups change differently (for example two
+tissues across age). With pairing (each donor's two tissues paired) this
+tests the within-pair difference against the variable.
+A variable shared within every pair cannot be tested for a common trend
+with pairing, so the common trend is then fitted without it.</li>
+<li>Counts are tested as log odds (moderated), whichever counts model is
+chosen for group comparisons: with a curve, the quasi-likelihood test found
+trends in about 18% of populations when age was shuffled among the samples
+of one group of a human cohort (5% expected); the moderated models gave
+4.5–5%.</li>
+<li>The design check under the settings warns when another covariate, or
+the number of events per sample, follows the variable closely (correlation
+r, or η for categories, of 0.5 or more): a trend could then reflect it, and
+adjusting for it is advised.</li>
+<li>Marker medians are tested as one family (no population-first
+screening) in a trend test.</li>
+<li><b>Trend figures</b>:
+<ul>
+<li>the <b>trend volcano</b> places each population by its slope (left: falls,
+right: rises) and by how strongly the curve test supports a change (up:
+stronger). Called populations are red (rise) or blue (fall); an open diamond is
+called by the curve but not the slope: a rise and fall, or a change that
+levels off, which a straight line misses. The dashed line is the FDR the
+curve test is called at;</li>
+<li>the <b>trajectories</b> heatmap shows the fitted curve of every called
+population, rescaled to mean 0 and SD 1 so the shape, not the size, is
+compared, ordered by where each curve is highest: early peaks at the top,
+late rises at the bottom;</li>
+<li><b>Patterns</b>: the called populations are grouped by the shape of their
+fitted curve, whatever the size of the change (hierarchical clustering of
+the curves scaled to mean 0 and SD 1), and each group is named from its
+mean curve: <i>rises</i>, <i>falls then levels off</i>, <i>peaks at day
+7</i>. <i>Auto</i> uses the largest number of patterns that come back
+the same (adjusted Rand index of at least 0.75) when the test is repeated
+on 80% of the samples; on a human cohort we tested only the rise/fall
+split did, as finer shapes there formed a continuum. The trajectories heatmap is split
+by pattern and the <b>patterns</b> figure shows each pattern's members
+and mean curve;</li>
+<li>double-click a point or row (or right-click it) for its <b>trend
+plot</b>: each sample at its value of the variable, the fitted curve with
+its 95% confidence band (the range the true curve is likely in, given the
+spread of the samples), and the values of the variable along the bottom.
+With <i>Does the change differ between two groups?</i> and no pairing, each
+group gets its own curve and band in its group colour on the same axes:
+where the bands separate the groups differ at that value, and where the
+curves run apart the change itself differs. With pairing each pair's level
+cancels out, so only the difference can be estimated: the upper panel shows
+the samples and the lower panel the fitted difference between the groups
+with each pair's own difference;</li>
+<li>in trend mode the <b>Populations</b> page lists the populations called
+as changing (★) and shows each one's trend plot beside its pooled biplots,
+twice: on the tested scale (log2 odds) and as the gated frequencies (% of
+parent) with the fitted curve and band drawn back on that scale (also on
+the volcano's right-click menu);
+a population ticked for the report is reported the same way, and the
+report also holds the trend volcanoes, trajectories and the trend
+settings;</li>
+<li><b>Make-up over the variable</b>: how the populations of one gate
+share out their parent as the variable changes. For example, with a gate
+that splits CD4 T cells into naive, central memory, effector memory and
+TEMRA: does the naive share shrink with age while effector memory grows?
+Open it with the <i>Make-up over the variable</i> button on the
+Populations page (shown in trend mode for a population whose gate has two
+or more populations), or from a population's right-click menu on the
+figures.
+<ul>
+<li>Top: the fitted share of each of the gate's populations, plus "Other"
+(the parent's events in none of them), stacked so they fill 100% of the
+parent at every value of the variable.</li>
+<li>Bottom: each sample's measured shares, one bar per sample, samples
+ordered by the variable, to check the fit against the data.</li>
+<li>Why one gate: a gate's populations never overlap, so their shares add
+up to at most 100% of the parent. Populations from different gates on the
+same parent usually overlap (a cell can be both naive and Ki-67+), so
+stacking them would count cells twice.</li>
+<li>How the curves are made: each part's counts are compared with the
+average of all the parts on a log scale (centred log-ratio, Aitchison
+1986), the trend test's curve (same shape, scale and df) is fitted to each,
+and the fitted values are turned back into shares. The result is the
+make-up of a typical sample at each value, so it never goes below 0% or
+above 100%; with skewed data it can sit a few points from the plain
+average of the samples' percentages.</li>
+<li>It is a picture of how the make-up shifts. Whether a population changes
+significantly is the trend test's answer (volcano and tables).</li>
+<li>A group × trend run gets one panel per group. The values behind the
+figure (fitted shares and each sample's shares) are offered as CSV beside
+the figure export.</li>
+</ul></li>
+<li><b>Immune age model</b> (<i>Sample PCA and prediction</i> section, after a trend run; figures on the Figures page): how well does the immune profile
+predict a continuous variable, such as age, days after vaccination or any
+number used as the trend variable? A model learns to guess the variable
+from the population frequencies and/or marker medians of the last trend run and is always judged on samples it
+was not trained on (nested cross-validation: an outer split for judging,
+an inner one for tuning, every donor or pair kept whole, so the same donor
+is never in both). The model is an elastic net (Zou &amp;
+Hastie 2005), a penalised regression between the lasso, which keeps few
+features, and ridge, which shares weight between correlated ones such as a
+parent and its largest subset. Read the <i>mean absolute error</i> (how far
+off a typical guess is, in the variable's units) against <i>predicting the
+mean</i> (the error of guessing every sample at the average): a useful
+model is well below it. The <i>chance check</i> reruns the whole procedure
+with the variable shuffled among donors or pairs; chance p is the share of
+shuffles that did as well. The features figure shows which features the
+model kept most often and their direction (red: higher at larger values
+of the variable, e.g. in older donors). The <i>gap</i> is the guess minus
+the actual value (with age: a sample's "immune age" minus its age); any
+such model pulls guesses towards the middle (the lowest values guessed too
+high, the highest too low), so the gap is shown <i>corrected</i> for that
+(de Lange &amp; Cole 2020): positive means the sample's profile looks like
+that of a higher value than it has (with age: older than it is). Train the
+model within one group. With <i>Predict the other groups</i> ticked, the
+final model also predicts every sample of the other groups, whether or not
+they were in the trend run and whether or not they have a value of the
+variable (open markers, not cross-validated). The table lists each group's
+predicted values (mean ± SD) and, for samples that have a value, how close
+the predictions are; the <i>Predicted by group</i> panel shows them against
+the range the model was trained on. A prediction outside that range, or for
+samples of a different kind (a different tissue or time of life), says the
+profile differs from the training samples, not what their value is. Needs
+at least 20 samples; 40 or more is recommended;</li>
+<li>in trend mode the <b>sample PCA</b> uses the trend run's values and
+colours each sample by the variable (shape = group).</li>
+</ul></li>
 </ul>
 
 <h4>Details: sample PCA and prediction</h4>
@@ -771,6 +987,18 @@ recommended.</li>
 the comparison chosen at the top. Large heatmaps open at half size; the
 size slider enlarges them.</li>
 <li><b>Pop Out</b> opens a figure in its own window.</li>
+<li><b>⚙ Options</b> beside a figure opens a side panel that changes how
+it is drawn, not what it shows: grid lines (off by default), the run label
+in the top left corner, the title (as drawn, hidden or your own text), the
+titles of individual panels, the font sizes of the title, the axis and
+panel labels, the tick labels, the legend and other text (each "As drawn"
+until set), and the background (the theme's: black in dark mode, white in
+light mode; or white, black or transparent). Threshold lines, such as the
+FDR and effect-size lines of a volcano plot, are part of the figure and
+always drawn. The options are kept with the experiment, per figure, and
+used for Pop Out, Export and the report as well. <i>Use for all</i> makes
+the panel's settings (all but the title) the default of every figure of
+this plugin; <i>Reset</i> returns the figure to those defaults.</li>
 <li>Double-click a heatmap row or a volcano point to show that population in
 the <b>Populations</b> section and tick it for the report. Right-click it
 for more choices.</li>
@@ -802,6 +1030,7 @@ choice.</li>
 [5]<a href="https://doi.org/10.1093/bioinformatics/btp616">Robinson, McCarthy and Smyth 2009, Bioinformatics (edgeR)</a><br/>
 [6]<a href="https://doi.org/10.1002/alz.70952">Humblet-Baron et al. 2025, Alzheimer's &amp; Dementia (systems immunology of Alzheimer's disease)</a><br/>
 [7]<a href="https://doi.org/10.1038/s41467-026-70895-1">Veiga et al. 2026, Nature Communications (autoinflammation of unknown origin)</a><br/>
+[8]<a href="https://doi.org/10.1007/978-0-387-84858-7">Hastie, Tibshirani and Friedman 2009, The Elements of Statistical Learning, 2nd edition (natural cubic splines)</a><br/>
 </p>
 ''' + _GLOSSARY
 
@@ -886,8 +1115,9 @@ linear model as the Results page [2], without the TREAT threshold.</li>
 <li>A state's enrichment score (ES) is the weighted running sum over that
 ranking, with the DOWN members negated. ES above zero means the state is
 <b>gained</b> in the second group, below zero <b>lost</b>.</li>
-<li>The group labels are permuted and every feature refitted to give the null
-distribution, which keeps the correlation between features. With pairing or
+<li>The group labels of the two groups compared are permuted and every
+feature refitted to give the null distribution, which keeps the correlation
+between features. Samples of other groups keep their labels. With pairing or
 covariates, the residuals of the model without the group terms are permuted
 (within pairs) [3].</li>
 <li>NES is the ES divided by the mean null ES of the same sign. p is never
@@ -896,10 +1126,56 @@ FWER is the chance that the largest null NES of any state reaches the
 NES.</li>
 <li>Read the FDR. The FWER was liberal when calibrated on 15 samples (10% of
 null labellings had a state below 0.05, against 5% expected).</li>
+<li>The enrichment score only records <i>where</i> a state's features rank,
+not <i>how much</i> they changed, and it cannot exceed 1. When groups differ
+greatly, shuffled labels reproduce much of the real ranking, so a state can
+change a lot yet miss the threshold. Two statistics that use effect sizes
+are shown beside it, each with its own FDR:
+<ul>
+<li><b>Self-contained</b> (<i>Mean t</i>): did this state's features change?
+The mean of the members' moderated t, with DOWN members negated, against
+the same label permutations. When groups differ greatly, most states
+pass.</li>
+<li><b>Competitive</b> (CAMERA [5]): did they change more than the other
+features? The members' scores against all others', allowing for how
+strongly the members move together (correlated features are not counted as
+independent evidence).</li>
+</ul>
+On random splits of one group of a human cohort, the enrichment
+score and the self-contained statistic each gave 4–7% of states below 0.05
+(5% expected).</li>
 <li>The dot plot shows every tested state in every comparison: colour NES,
 size the share of members in the leading edge, ringed when FDR is below the
 threshold. The leading edge is the set of members that drive the
 score.</li>
+</ul>
+
+<h4>Details: enrichment with a numeric variable (age, time)</h4>
+<ul>
+<li>When a numeric variable is set for a trend on the Results page, the
+<b>Test</b> list at the top offers <i>Trend with ‹variable›</i> beside the
+group comparisons. Choose it and press Run to ask which immune states change
+with the variable, on the samples, groups and settings of the trend test.
+Group and trend results are kept side by side: switch between them with the
+Test list.</li>
+<li>Features are ranked by their slope (the straight-line trend), so the
+enrichment score, mean t and competitive test say whether a state is
+<b>gained</b> or <b>lost</b> as the variable rises.</li>
+<li><b>Any-direction FDR</b>: did the state's features change with the
+variable in any way, a rise and fall included? The mean, over the members,
+of their curve test's p-value turned into a normal score (large when the
+change is strong).</li>
+<li>The null permutes the residuals of the model without the variable
+[3]: within groups; within donors sampled at several times; or, when each
+pair shares the value (two tissues of one donor taken at the same age),
+whole pairs swap values.</li>
+<li>On a human cohort with age shuffled (40 shuffles of the samples of
+one group, 20 of the pairs), every statistic gave 4–6% of
+states below 0.05 and the permutation tests no FDR hit.</li>
+<li><b>Patterns</b> (after a frequency trend run with the same variable):
+which states' populations gather in each shape pattern (hypergeometric
+test against all tested populations, BH FDR). Dot colour: fold
+enrichment; size: share of the state's populations in the pattern.</li>
 </ul>
 
 <h4>References</h4>
@@ -909,5 +1185,7 @@ score.</li>
 <li>Freedman D, Lane D (1983) J Bus Econ Stat 1:292–298.</li>
 <li>Phipson B, Smyth GK (2010) Permutation p-values should never be zero.
 Stat Appl Genet Mol Biol 9: Article 39.</li>
+<li>Wu D, Smyth GK (2012) Camera: a competitive gene set test accounting for
+inter-gene correlation. Nucleic Acids Res 40: e133.</li>
 </ol>
 ''' + _GLOSSARY
