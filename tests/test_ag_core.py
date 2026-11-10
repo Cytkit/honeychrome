@@ -310,6 +310,22 @@ def test_population_table_uses_parent_and_stats_parent():
     assert ag.ancestor_channels(gates, 'gB') == ['B', 'A']
 
 
+@pytest.mark.numpy_only
+def test_population_table_flags_a_stats_parent_it_cannot_find():
+    data, idx = _three_channel_data()
+    gates = [
+        _gate('gA', '1dsep', 'A', number=1, algorithm='kde_min'),
+        _gate('gB', '1dsep', 'B', parent='gA', parent_pop='pos', number=2, algorithm='kde_min',
+              stats_parent={'pos': 'gA', 'neg': 'gA/'}),
+    ]
+    res = ag.train_boundaries(gates, data, idx)
+    rows = {r['key']: r for r in ag.population_table(gates, res, n_total=len(data))}
+    assert rows['gB/pos']['n_stats_parent'] == len(data)
+    assert 'stats_parent_missing' not in rows['gB/pos']
+    assert rows['gB/neg']['stats_parent_missing'] is True
+    assert rows['gB/neg']['n_stats_parent'] is None
+
+
 # ---------------------------------------------------------------------------
 # Model format
 # ---------------------------------------------------------------------------
@@ -646,6 +662,15 @@ def test_ellipse_algorithm_is_retired_on_load():
     assert area == pytest.approx(np.pi * 0.2 * 0.1, rel=0.03)
     assert any('ellipse' in w for w in warnings)
     assert 'ellipse' not in ag.ALGORITHMS_BY_GATE_TYPE['free']
+
+
+@pytest.mark.numpy_only
+def test_stats_parent_ending_in_slash_is_repaired_on_load():
+    g = _gate('gA', '1dsep', 'A', stats_parent={'pos': 'gZ (X)/', 'neg': 'gZ/pos'})
+    model = ag.new_model([g], {}, channel_map={}, transforms={}, training_summary={}, metadata={})
+    out, warnings = ag.normalize_model(model)
+    assert out['gate_definitions'][0]['stats_parent'] == {'pos': 'gZ (X)', 'neg': 'gZ/pos'}
+    assert any('gA' in w for w in warnings)
 
 
 @pytest.mark.numpy_only

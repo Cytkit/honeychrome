@@ -199,6 +199,22 @@ def test_population_tables_parent_and_stats_parent_denominators():
 
 
 @pytest.mark.numpy_only
+def test_missing_stats_parent_leaves_the_frequency_out_and_flags_the_sample():
+    gates = _hierarchy()
+    gates[1]['stats_parent'] = {'pos': 'gone'}
+    ref = _reference(gates)
+    summaries = {f's{i}': _summarise(_sample(i), gates, ref) for i in range(3)}
+    samples = list(summaries)
+    _c, denom_sp, dropped = ar.population_tables(summaries, samples, use_stats_parent=True)
+    assert 'T/pos' in dropped and 'T/pos' not in denom_sp.columns
+    _c, denom, _d = ar.population_tables(summaries, samples, use_stats_parent=False)
+    assert denom['T/pos'].notna().all()
+    groups = {s: 'g' for s in samples}
+    assert ar.group_population_values(summaries, samples, groups, 'T/pos') == {}
+    assert any('T/pos' in f for f in ar.sample_flags(summaries['s0']))
+
+
+@pytest.mark.numpy_only
 def test_population_tables_keep_populations_measured_in_some_samples():
     summaries = {}
     for i in range(5):

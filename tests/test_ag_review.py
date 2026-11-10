@@ -395,6 +395,16 @@ def test_delete_gate_removes_branch_and_clears_sources(cd80):
     assert ag_core.gates_by_name(defs)['user']['gate_param']['replicate_x'] is None
 
 
+def test_delete_gate_clears_stats_parents_naming_it(cd80):
+    by = ag_core.gates_by_name(cd80)
+    by['CD80+ (Mono)']['stats_parent'] = {'CD80+': 'CD80+ (B)'}
+    by['CD80+ (DC)']['stats_parent'] = {'CD80+': 'CD80+ (B)/CD80+'}
+    defs, _removed, _orphaned = ag_review.delete_gates(cd80, ['CD80+ (B)'])
+    after = ag_core.gates_by_name(defs)
+    assert after['CD80+ (Mono)']['stats_parent'] == {}
+    assert after['CD80+ (DC)']['stats_parent'] == {}
+
+
 def test_delete_population_keeps_the_gates_other_populations():
     q = _thr_gate('Q', 1, 'A', 'B', None, 'root')
     below = _poly_gate('below', 2, 'X', 'Y', 'Q', 'x+y-')
@@ -420,6 +430,19 @@ def test_paste_branch_renames_and_keeps_internal_links(cd80):
     assert len(ag_review.sync_members(defs, 'CD80+ (CD80+)')) == 4
     defs2, names2 = ag_review.paste_gates(defs, clip, 'CD80+ (Mono)', 'CD80+')
     assert names2[0] == 'CD80+ (CD80+) 2'
+
+
+def test_paste_branch_keeps_both_stats_parent_forms(cd80):
+    child = _hist_gate('child', 5, 'CD80+ (B)', 'CD80+')
+    child['stats_parent'] = {'CD80+': 'CD80+ (B)'}
+    grandchild = _hist_gate('grandchild', 6, 'child', 'CD80+')
+    grandchild['stats_parent'] = {'CD80+': 'CD80+ (B)/CD80+'}
+    defs = cd80 + [child, grandchild]
+    clip = ag_review.copy_gates(defs, ['CD80+ (B)'], branch=True)
+    out, _names = ag_review.paste_gates(defs, clip, 'CD80+ (Mono)', 'CD80+')
+    by = ag_core.gates_by_name(out)
+    assert by['child (CD80+)']['stats_parent'] == {'CD80+': 'CD80+ (CD80+)'}
+    assert by['grandchild (CD80+)']['stats_parent'] == {'CD80+': 'CD80+ (CD80+)/CD80+'}
 
 
 def test_rename_references_follows_sources_and_stats_parents(cd80):

@@ -1922,7 +1922,8 @@ def train_boundaries(gate_defs: list[dict], data: np.ndarray, channel_index: dic
 
 def _resolve_stats_parent(spec, result: GatingResult) -> tuple[str, np.ndarray | None]:
     """Mask of a stats-parent spec: 'root', 'gate/pop', or a gate name whose
-    applied-to events are used."""
+    applied-to events are used. The mask is None for 'root' (all events) and
+    for a spec naming no gate or population gated in this sample."""
     if spec in (None, '', 'root'):
         return 'root', None
     spec = str(spec)
@@ -1940,7 +1941,9 @@ def population_table(gate_defs: list[dict], result: GatingResult,
     parent_key, n_parent, fraction_of_parent, and — when the gate's
     ``stats_parent`` names a reference for this population — stats_parent,
     n_stats_parent and fraction_of_stats_parent. ``stats_parent`` maps a
-    population name to 'root', 'gate/pop', or a gate name.
+    population name to 'root', 'gate/pop', or a gate name. When the reference
+    is not found in this sample, n_stats_parent is None, the fraction is NaN
+    and stats_parent_missing is True.
     """
     rows = []
     for gate_def in ordered_gate_defs(gate_defs):
@@ -1969,10 +1972,15 @@ def population_table(gate_defs: list[dict], result: GatingResult,
             spec = stats_parent.get(pop) if isinstance(stats_parent, dict) else None
             if spec:
                 label, sp_mask = _resolve_stats_parent(spec, result)
-                n_sp = int(sp_mask.sum()) if sp_mask is not None else int(n_total or len(m))
                 row['stats_parent'] = label
-                row['n_stats_parent'] = n_sp
-                row['fraction_of_stats_parent'] = float(k / n_sp) if n_sp else float('nan')
+                if sp_mask is None and label != 'root':
+                    row['n_stats_parent'] = None
+                    row['fraction_of_stats_parent'] = float('nan')
+                    row['stats_parent_missing'] = True
+                else:
+                    n_sp = int(sp_mask.sum()) if sp_mask is not None else int(n_total or len(m))
+                    row['n_stats_parent'] = n_sp
+                    row['fraction_of_stats_parent'] = float(k / n_sp) if n_sp else float('nan')
             rows.append(row)
     return rows
 
@@ -2401,6 +2409,7 @@ def normalize_model(model: dict, copy: bool = True) -> tuple[dict, list[str]]:
     gate_defs = m.get('gate_definitions')
     if not isinstance(gate_defs, list):
         raise ValueError("Model has no gate_definitions list.")
+    repaired = []
     for g in gate_defs:
         if not g.get('gate_name'):
             raise ValueError("A gate definition has no gate_name.")
@@ -2411,6 +2420,20 @@ def normalize_model(model: dict, copy: bool = True) -> tuple[dict, list[str]]:
         if not g.get('parent_gate'):
             g['parent_gate'] = None
             g['parent_popul'] = 'root'
+        sp = g['stats_parent']
+        if isinstance(sp, dict):
+            for k, v in list(sp.items()):
+                if isinstance(v, str) and v.endswith('/'):
+                    sp[k] = v.rstrip('/')
+                    if g['gate_name'] not in repaired:
+                        repaired.append(g['gate_name'])
+    if repaired:
+        shown = ", ".join(repaired[:8]) + (f" and {len(repaired) - 8} more" if len(repaired) > 8 else '')
+        warnings.append(
+            f"The statistics parents of {len(repaired)} gate(s) ended in '/' and named no "
+            f"population, so their frequencies were divided by all events. They now name the "
+            f"gate itself: {shown}. Run gating again to update their frequencies."
+        )
     ordered_gate_defs(gate_defs)
     m.setdefault('trained_boundaries', {})
     m.setdefault('channel_map', {})
