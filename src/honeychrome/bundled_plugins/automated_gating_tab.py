@@ -50,6 +50,7 @@ Plugin contract (plugin_loaders.py):
   PluginWidget(QWidget)   — instantiated with (bus, controller)
 """
 
+import gc
 import hashlib
 import json
 import os as _os
@@ -57,6 +58,7 @@ import sys
 import threading
 import uuid
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime
@@ -195,6 +197,9 @@ TREND_FILE = Path('cache') / 'automated_gating' / 'trend.json'
 ENRICHMENT_FILE = Path('cache') / 'automated_gating' / 'enrichment.json'
 SAMPLE_ANALYSIS_FILE = Path('cache') / 'automated_gating' / 'sample_analysis.json'
 DISPLAY_DIR = Path('cache') / 'automated_gating' / 'display'
+# Threads that read the saved display records when an experiment opens;
+# decompressing them releases the interpreter lock, so they run in parallel.
+DISPLAY_READERS = max(1, min(8, _os.cpu_count() or 1))
 EXPORT_DIR = Path('Automated_Gating_Results')
 # Events per group in the population comparison's pooled biplots.
 GROUP_PLOT_EVENTS = 100_000
@@ -5604,18 +5609,26 @@ class _StateLoader(QThread):
 
     @staticmethod
     def _read_results(job: dict, out: dict):
+        """The gated results, their marker summaries and the display records
+        of the same run, and the statistics run while it matches them. The
+        display records are read by DISPLAY_READERS threads while the marker
+        summaries are read here."""
         path = job.get('results_path')
         if path is None or not Path(path).exists():
             return
-        payload = json.loads(Path(path).read_text(encoding='utf-8'))
+        payload = _read_json_without_gc(Path(path))
         out['results'] = payload
         fingerprint = str(payload.get('run_fingerprint') or '')
-        _StateLoader._attach_markers(Path(path), payload, fingerprint, out)
         display = {}
         folder = job.get('display_dir')
-        if folder is not None:
-            for key in (payload.get('summaries') or {}):
-                loaded = ag_results.load_display(Path(folder) / ag_results.display_file_name(key))
+        keys = list(payload.get('summaries') or {}) if folder is not None else []
+        with ThreadPoolExecutor(max_workers=DISPLAY_READERS) as pool:
+            pending = {key: pool.submit(ag_results.load_display,
+                                        Path(folder) / ag_results.display_file_name(key))
+                       for key in keys}
+            _StateLoader._attach_markers(Path(path), payload, fingerprint, out)
+            for key, future in pending.items():
+                loaded = future.result()
                 if loaded is None:
                     continue
                 disp, meta = loaded
@@ -5674,6 +5687,25 @@ class _FileWriter(QThread):
             self.done.emit(False, str(exc), None)
             return
         self.done.emit(True, '', result)
+
+
+def _read_json_without_gc(path: Path):
+    """Parse a large JSON file with Python's garbage collector paused.
+
+    Parsing creates millions of new lists and dicts, none of them garbage;
+    each burst of new objects would otherwise start a collection that walks
+    them all, which roughly doubles the time. The collector is paused for
+    the whole process while the file is parsed (under a second for the
+    largest results files).
+    """
+    text = path.read_text(encoding='utf-8')
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        return json.loads(text)
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def _write_json_atomic(path: Path, payload, jsonable: bool = False):
