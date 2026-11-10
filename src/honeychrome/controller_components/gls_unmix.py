@@ -1203,38 +1203,28 @@ def negative_sd(raw: np.ndarray, spectra: np.ndarray, af_spectra: np.ndarray | N
     return np.sqrt(var)
 
 
-def spectra_products(spectra: np.ndarray) -> np.ndarray:
-    """``S[f, d] * S[g, d]`` as (D, F*F), so ``w @ products`` gives every event's ``S diag(w) S^T``."""
-    f, d = spectra.shape
-    return np.einsum('fd,gd->dfg', spectra, spectra).reshape(d, f * f)
-
-
 def pgls_solve(y: np.ndarray, spectra: np.ndarray, af_rows: np.ndarray | None, w: np.ndarray,
-               fl_pen: np.ndarray | None = None, products: np.ndarray | None = None) -> dict:
+               fl_pen: np.ndarray | None = None) -> dict:
     """
     One penalised GLS solve per event against ``[spectra; af_rows[i]]`` with
     diagonal weights ``w`` (B, D) and the ridge ``fl_pen`` (B, F) on the
     fluorophores. Events whose AF abundance comes out negative are refitted
     without the AF row. Returns ``x`` (B, F), ``alpha`` (B,) and
     ``inv_diag`` (B, F), the fluorophore diagonal of the inverse normal
-    matrix. ``products`` is ``spectra_products(spectra)``, computed here
-    when not given.
+    matrix.
     """
-    b = y.shape[0]
+    b, d = y.shape
     f = spectra.shape[0]
-    if products is None:
-        products = spectra_products(spectra)
     has_af = af_rows is not None
     k = f + 1 if has_af else f
+    # S diag(w) S^T is linear in w, so every event's block is one product with the spectra outer products
     normal = np.empty((b, k, k))
-    normal[:, :f, :f] = (w @ products).reshape(b, f, f)
+    normal[:, :f, :f] = (w @ np.einsum('fd,gd->dfg', spectra, spectra).reshape(d, f * f)).reshape(b, f, f)
     rhs = np.empty((b, k))
     rhs[:, :f] = (w * y) @ spectra.T
     if has_af:
         wa = w * af_rows
-        cross = wa @ spectra.T
-        normal[:, :f, f] = cross
-        normal[:, f, :f] = cross
+        normal[:, :f, f] = normal[:, f, :f] = wa @ spectra.T
         normal[:, f, f] = np.einsum('bd,bd->b', wa, af_rows)
         rhs[:, f] = np.einsum('bd,bd->b', wa, y)
     if fl_pen is not None:
@@ -1248,7 +1238,7 @@ def pgls_solve(y: np.ndarray, spectra: np.ndarray, af_rows: np.ndarray | None, w
     if has_af:
         neg = out['alpha'] < 0
         if neg.any():
-            sub = pgls_solve(y[neg], spectra, None, w[neg], None if fl_pen is None else fl_pen[neg], products)
+            sub = pgls_solve(y[neg], spectra, None, w[neg], None if fl_pen is None else fl_pen[neg])
             for key in ('x', 'alpha', 'inv_diag'):
                 out[key][neg] = sub[key]
     return out
@@ -1266,7 +1256,6 @@ def _m2p_refit(raw: np.ndarray, spectra: np.ndarray, start: dict, af_spectra: np
     idx_out = np.asarray(start['af_idx']).copy()
     has_af = af_spectra is not None and np.any(idx_out >= 0)
     lam = lam if tau is not None else 0.0
-    products = spectra_products(spectra)
     chunk = int(max(64, min(2048, 4_000_000 // ((f + 1) * (f + 1)))))
     for lo in range(0, n, chunk):
         hi = min(lo + chunk, n)
@@ -1282,7 +1271,7 @@ def _m2p_refit(raw: np.ndarray, spectra: np.ndarray, start: dict, af_spectra: np
                 mu += np.maximum(alpha, 0.0)[:, np.newaxis] * rows
             w = _saturation_weights(1.0 / noise.variance(mu), y, ceiling)
             pen = None if lam <= 0 else lam * positivity_weight(x, t2) / t2
-            sol = pgls_solve(y, spectra, rows, w, pen, products)
+            sol = pgls_solve(y, spectra, rows, w, pen)
             x, alpha = sol['x'], sol['alpha']
             if pen is not None:
                 x = x / np.maximum(1.0 - pen * sol['inv_diag'], 1e-3)
