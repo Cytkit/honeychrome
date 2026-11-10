@@ -570,7 +570,8 @@ def population_tables(summaries: dict, samples: list[str], use_stats_parent: boo
 
     The denominator is the parent population's count, or the population's
     ``stats_parent`` count when one is defined and *use_stats_parent* is
-    set.
+    set. A stats parent that was not found in a sample leaves the
+    population unmeasured there.
 
     A population with no events in a sample whose parent has events is a
     true zero and is kept as 0. Where the population cannot be measured
@@ -592,9 +593,11 @@ def population_tables(summaries: dict, samples: list[str], use_stats_parent: boo
             if key not in order:
                 order.append(key)
             use_sp = use_stats_parent and row.get('n_stats_parent') is not None
+            missing = use_stats_parent and row.get('stats_parent_missing')
             counts.setdefault(key, {})[s] = float(row['n_events'])
-            denoms.setdefault(key, {})[s] = float(row['n_stats_parent'] if use_sp
-                                                 else row['n_parent'])
+            denoms.setdefault(key, {})[s] = (float('nan') if missing else
+                                             float(row['n_stats_parent'] if use_sp
+                                                   else row['n_parent']))
     counts_df = pd.DataFrame({k: counts[k] for k in order}, index=list(samples), dtype=float)
     denom_df = pd.DataFrame({k: denoms[k] for k in order}, index=list(samples), dtype=float)
     unmeasurable = (counts_df.isna() | denom_df.isna() | (denom_df <= 0)
@@ -728,8 +731,8 @@ def marker_table(summaries: dict, samples: list[str], gate_defs: list[dict],
 
 def sample_flags(summary: dict, load_info: dict | None = None) -> list[str]:
     """Reasons to treat a sample with caution: gates that could not be
-    calculated or applied, recalculated gates that drifted, and events
-    removed by time QC."""
+    calculated or applied, recalculated gates that drifted, populations whose
+    statistics parent was not found, and events removed by time QC."""
     flags = []
     for gate, st in (summary.get('status') or {}).items():
         flag = (st or {}).get('flag')
@@ -737,6 +740,9 @@ def sample_flags(summary: dict, load_info: dict | None = None) -> list[str]:
             flags.append(f"{gate}: {st.get('message') or 'drifted'}")
         elif flag in ('failed', 'skipped'):
             flags.append(f"{gate}: {st.get('message') or flag}")
+    missing = [r['key'] for r in summary.get('populations') or [] if r.get('stats_parent_missing')]
+    if missing:
+        flags.append(f"statistics parent not found for {_name_list(missing)}")
     info = load_info or {}
     n_file, n_kept = info.get('n_events_file'), info.get('n_events_kept')
     if n_file and n_kept is not None and n_kept < n_file:
@@ -1757,7 +1763,7 @@ def group_population_values(summaries: dict, samples: list[str], groups: dict, p
             continue
         row = next((r for r in (summaries.get(s) or {}).get('populations', [])
                     if r['key'] == pop_key), None)
-        if row is None:
+        if row is None or (use_stats_parent and row.get('stats_parent_missing')):
             continue
         use_sp = use_stats_parent and row.get('n_stats_parent') is not None
         denom = row['n_stats_parent'] if use_sp else row['n_parent']

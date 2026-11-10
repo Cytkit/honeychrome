@@ -1707,7 +1707,9 @@ def _clear_sources(gate_defs: list[dict], removed: set) -> list[str]:
 
 def delete_gates(gate_defs: list[dict], names) -> tuple[list[dict], list[str], list[str]]:
     """Remove gates with everything below them, and old-style replicate
-    gates copying them.
+    gates copying them. Statistics parents naming a removed gate or one of
+    its populations are cleared, so those populations are counted against
+    their own parent.
 
     Returns (remaining definitions, removed names, names of remaining gates
     whose replicate source was removed and must be chosen again).
@@ -1726,6 +1728,12 @@ def delete_gates(gate_defs: list[dict], names) -> tuple[list[dict], list[str], l
         frontier = nxt
     out = [deepcopy(g) for g in gate_defs if g['gate_name'] not in removed]
     orphaned = _clear_sources(out, removed)
+    for g in out:
+        sp = g.get('stats_parent')
+        if isinstance(sp, dict):
+            for k, v in list(sp.items()):
+                if ag_core.split_population_key(str(v))[0] in removed:
+                    sp.pop(k)
     return out, [g['gate_name'] for g in gate_defs if g['gate_name'] in removed], orphaned
 
 
