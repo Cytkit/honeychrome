@@ -1298,13 +1298,14 @@ def trend_values(state, all_rel: list[str]) -> list[float]:
 
 
 def _outside_frequencies(controller, state, all_rel, counts_df, tested, n_clusters, labels,
-                         names_override) -> dict:
+                         names_override, mean_total: float) -> dict:
     """
     The tested log2 cluster frequencies of the labelled samples outside the
     trend run (other groups, or samples without a value of the variable),
     for the immune age model to predict: {'other_freq_data', 'other_groups',
     'other_time'}. Library sizes are worked out over the trend's and these
-    samples together, so they are on the same footing as the trend's.
+    samples together, so they are on the same footing as the trend's, and
+    the prior count is set by the trend's mean library size *mean_total*.
     """
     rels, groups = samples_outside_trend(controller, state, all_rel, labels)
     if not rels:
@@ -1314,7 +1315,7 @@ def _outside_frequencies(controller, state, all_rel, counts_df, tested, n_cluste
     both = pd.concat([counts_df[tested], other[tested]])
     totals = sample_event_totals(state, list(all_rel) + rels, labels)
     library = np.asarray(_ds.library_sizes(both, totals, _normalisation(state)), dtype=float)
-    data = log2_frequencies(other[tested], library[len(all_rel):])
+    data = log2_frequencies(other[tested], library[len(all_rel):], mean_total=mean_total)
     return {'other_freq_data': data, 'other_groups': dict(zip(rels, groups)),
             'other_time': dict(zip(rels, trend_values(state, rels)))}
 
@@ -1407,7 +1408,8 @@ def run_trend_statistics(controller, state, run_freq: bool, run_mfi: bool,
             out['freq'] = ts.run_trend(data, time, **common)
             out['freq_data'] = data
             out.update(_outside_frequencies(controller, state, all_rel, counts_df, tested,
-                                            n_clusters, labels, names_override))
+                                            n_clusters, labels, names_override,
+                                            float(np.mean(library))))
         if run_counts:
             denominators = pd.DataFrame({c: library for c in tested}, index=counts_df.index)
             data = _ds.logit_proportions(counts_df[tested], denominators)

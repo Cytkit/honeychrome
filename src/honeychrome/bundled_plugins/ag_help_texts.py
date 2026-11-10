@@ -747,8 +747,12 @@ format, naming samples as the table shows them.</li>
 <h4>Details: the tests</h4>
 <ul>
 <li><b>Population frequencies</b>: each population's share of its parent (or
-of its stats parent) as log odds, with half an event added so 0% and 100%
-stay finite. Moderated linear model [1, 2]. Effects are log2 odds
+of its stats parent) as log odds, with a small prior count added so 0% and
+100% stay finite. The prior count is the same share of every sample's parent
+(half an event at the average parent size), so a population at 100% of its
+parent has the same value in every sample: a difference in parent size
+between groups is not taken for a difference in frequency. Moderated linear
+model [1, 2]. Effects are log2 odds
 ratios. A sample's frequency is measured only when the parent has at least
 <b>Min. parent events</b> there (20 by default), because a fraction of a
 handful of events mostly reflects gating noise; other samples are left out

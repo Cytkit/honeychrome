@@ -774,7 +774,10 @@ but written as a design matrix so it can also express reference or pairwise
 contrasts, a pairing term and covariates. The reported effect (logFC) is
 the group coefficient: for Frequencies, the difference in log₂ percentage (a
 log₂ fold change); for MFIs, the difference in mean transformed
-intensity.</p>
+intensity. Empty clusters are kept finite by adding the same small share of
+every sample's events (half an event at the average sample size), so a
+cluster absent from a sample has the same value whatever the sample's
+size.</p>
 <p>The model uses <b>empirical Bayes moderation</b> of the variances (Smyth
 2004 [2], the method behind limma [1]). With few samples, a cluster's
 variance estimated from that cluster alone is noisy, and some clusters look
