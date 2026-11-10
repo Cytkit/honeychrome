@@ -97,8 +97,10 @@ def _best_match(name: str, database: list[dict], canonical_col: str, synonym_col
 
 
 def match_fluorophore(name: str, fluorophore_db: list[dict]) -> str | None:
-    """Return the canonical fluorophore name, or None."""
-    synonym_cols = [f'synonym{i}' for i in range(1, 5)]
+    """Return the canonical fluorophore name, or None. Every synonymN column
+    in the database is searched."""
+    columns = fluorophore_db[0].keys() if fluorophore_db else ()
+    synonym_cols = sorted((c for c in columns if re.fullmatch(r'synonym\d+', c)), key=lambda c: int(c[7:]))
     result = _best_match(name, fluorophore_db, 'fluorophore', synonym_cols)
     if result:
         logger.debug(f'Fluorophore match: "{name}" -> "{result}"')
