@@ -60,14 +60,14 @@ Frequency scales:
   a prior count added to both the population and its complement. Suited to
   gated populations, whose fractions often sit near 0 or 1.
 
-Both keep empty features finite with a prior count: half an event by
-default. With ``share_prior=True`` the prior count is the same share of
-every sample's denominator, half an event scaled by the denominator over
+Both keep empty features finite with a prior count that is the same share
+of every sample's denominator: half an event scaled by the denominator over
 the mean denominator of the samples given (edgeR's scaling of the prior
 count by library size; McCarthy, Chen & Smyth 2012). A population at 0% or
 100% of its parent then has the same value in every sample whatever the
 parent's size, so a difference in parent size between groups is not read as
-a difference in frequency.
+a difference in frequency. ``share_prior=False`` adds half an event to
+every sample instead.
 
 Results carry the estimate's standard error and degrees of freedom, so a
 threshold change re-derives p-values and significance without refitting.
@@ -780,18 +780,19 @@ def _share_prior(denominators: np.ndarray, mean_denominator=None) -> np.ndarray:
         return np.where(usable, 0.5 * d / mean, np.nan)
 
 
-def log2_frequencies(counts_df: pd.DataFrame, totals, share_prior: bool = False,
+def log2_frequencies(counts_df: pd.DataFrame, totals, share_prior: bool = True,
                      mean_total: float | None = None) -> pd.DataFrame:
     """
-    log2 of each feature's percentage of the sample's events, with half an
-    event added to every count (and one to every total) so empty features
-    stay finite: log2((count + 0.5) / (total + 1) · 100). Differences on
-    this scale are log2 fold changes of frequency.
+    log2 of each feature's percentage of the sample's events,
+    log2((count + p) / (total + 2p) · 100). Differences on this scale are
+    log2 fold changes of frequency.
 
-    share_prior: the prior count p is the same share of every sample,
-    p = 0.5 · total / mean total over the samples given (or ``mean_total``),
-    and the value is log2((count + p) / (total + 2p) · 100). An empty
-    feature then has the same value in every sample.
+    The prior count p keeps empty features finite. It is the same share of
+    every sample, p = 0.5 · total / mean total over the samples given (or
+    ``mean_total``, to put other samples on the scale of a fitted set), so
+    an empty feature has the same value in every sample. With
+    ``share_prior=False`` p is half an event in every sample:
+    log2((count + 0.5) / (total + 1) · 100).
     """
     totals = np.asarray(totals, dtype=float)[:, None]
     counts = counts_df.values.astype(float)
@@ -805,26 +806,25 @@ def log2_frequencies(counts_df: pd.DataFrame, totals, share_prior: bool = False,
 
 
 def logit_proportions(counts_df: pd.DataFrame, denominators_df: pd.DataFrame,
-                      share_prior: bool = False, mean_denominator=None) -> pd.DataFrame:
+                      share_prior: bool = True, mean_denominator=None) -> pd.DataFrame:
     """
-    Empirical log2 odds of each feature within its own denominator:
-    log2((count + 0.5) / (denominator − count + 0.5)).
+    Empirical log2 odds of each feature within its own denominator,
+    log2((count + p) / (denominator − count + p)). Differences on this
+    scale are log2 odds ratios.
 
     ``denominators_df`` has the same shape, index and columns as
-    ``counts_df`` (e.g. each population's parent count per sample). Adding
-    half an event to both the population and its complement keeps 0% and
-    100% finite. Differences on this scale are log2 odds ratios.
+    ``counts_df`` (e.g. each population's parent count per sample). The
+    prior count p, added to both the population and its complement, keeps
+    0% and 100% finite. It is the same share of every sample's denominator,
+    p = 0.5 · denominator / the feature's mean denominator over the samples
+    given (or ``mean_denominator``: one number, or one per feature), so 0%
+    and 100% are ∓log2(1 + 2 · mean) in every sample whatever the
+    denominator. A denominator of 0 gives NaN.
 
-    A zero count maps to -log2(2 · denominator + 1), a function of the
-    denominator alone. Where the groups' denominators differ, features that
-    are empty in (nearly) every sample therefore show a spurious group
-    difference; exclude them with sparse_features() before testing.
-
-    share_prior: the prior count p added to both sides is the same share of
-    every sample's denominator, p = 0.5 · denominator / the feature's mean
-    denominator over the samples given (or ``mean_denominator``: one number,
-    or one per feature). 0% and 100% are then ∓log2(1 + 2 · mean) in every
-    sample, whatever the denominator. A denominator of 0 gives NaN.
+    With ``share_prior=False`` p is half an event, and a zero count maps to
+    -log2(2 · denominator + 1), a function of the denominator alone: where
+    the groups' denominators differ, features that are empty in (nearly)
+    every sample then show a spurious group difference.
     """
     counts = counts_df.values.astype(float)
     denom = denominators_df.reindex(index=counts_df.index,

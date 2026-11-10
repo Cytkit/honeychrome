@@ -1166,8 +1166,7 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
         totals = sample_event_totals(state, all_rel, cluster_labels_override)
         totals = _ds.library_sizes(counts_df[tested], totals, _normalisation(state))
         freq_results = run_moderated(
-            log2_frequencies(counts_df[tested], totals, share_prior=True), group_vec, contrasts,
-            state.contrast_mode,
+            log2_frequencies(counts_df[tested], totals), group_vec, contrasts, state.contrast_mode,
             pval_threshold, fc_threshold, pairing_vec=pairing_vec, fdr_scope=fdr_scope,
             covariates=covariates, use_treat=use_treat,
             too_few_hint=_TOO_FEW_CLUSTERS_HINT,
@@ -1316,8 +1315,7 @@ def _outside_frequencies(controller, state, all_rel, counts_df, tested, n_cluste
     both = pd.concat([counts_df[tested], other[tested]])
     totals = sample_event_totals(state, list(all_rel) + rels, labels)
     library = np.asarray(_ds.library_sizes(both, totals, _normalisation(state)), dtype=float)
-    data = log2_frequencies(other[tested], library[len(all_rel):], share_prior=True,
-                            mean_total=mean_total)
+    data = log2_frequencies(other[tested], library[len(all_rel):], mean_total=mean_total)
     return {'other_freq_data': data, 'other_groups': dict(zip(rels, groups)),
             'other_time': dict(zip(rels, trend_values(state, rels)))}
 
@@ -1406,7 +1404,7 @@ def run_trend_statistics(controller, state, run_freq: bool, run_mfi: bool,
         library = _ds.library_sizes(counts_df[tested],
                                     sample_event_totals(state, all_rel, labels), _normalisation(state))
         if run_freq:
-            data = log2_frequencies(counts_df[tested], library, share_prior=True)
+            data = log2_frequencies(counts_df[tested], library)
             out['freq'] = ts.run_trend(data, time, **common)
             out['freq_data'] = data
             out.update(_outside_frequencies(controller, state, all_rel, counts_df, tested,
@@ -1414,7 +1412,7 @@ def run_trend_statistics(controller, state, run_freq: bool, run_mfi: bool,
                                             float(np.mean(library))))
         if run_counts:
             denominators = pd.DataFrame({c: library for c in tested}, index=counts_df.index)
-            data = _ds.logit_proportions(counts_df[tested], denominators, share_prior=True)
+            data = _ds.logit_proportions(counts_df[tested], denominators)
             out['counts'] = ts.run_trend(data, time, **common)
             out['counts_data'] = data
             notes.append("Counts are tested as log odds within each sample's library size "

@@ -230,7 +230,7 @@ def build_features(summaries: dict, samples: list[str], gate_defs: list[dict], *
                 and info[k]['parent_key'] != 'root']
         if not keys:
             continue
-        vals = ds.logit_proportions(counts[keys], denom[keys], share_prior=True)
+        vals = ds.logit_proportions(counts[keys], denom[keys])
         vals.columns = [f"{ftype}:{k}" for k in keys]
         frames.append(vals)
         for k in keys:
@@ -260,7 +260,7 @@ def build_features(summaries: dict, samples: list[str], gate_defs: list[dict], *
         keys = [k for k in keys if k not in sparse]
         if keys:
             den = pd.DataFrame({k: anchor_n for k in keys}, index=list(samples), dtype=float)
-            vals = ds.logit_proportions(cnt[keys], den, share_prior=True)
+            vals = ds.logit_proportions(cnt[keys], den)
             vals.columns = [f"abundance:{k}" for k in keys]
             frames.append(vals)
             anchor_label = info.get(anchor, {}).get('label', 'all events')
