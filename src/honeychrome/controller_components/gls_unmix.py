@@ -1215,18 +1215,22 @@ def pgls_solve(y: np.ndarray, spectra: np.ndarray, af_rows: np.ndarray | None, w
     """
     b, d = y.shape
     f = spectra.shape[0]
-    blocks = [np.broadcast_to(spectra, (b, f, d))]
     has_af = af_rows is not None
+    k = f + 1 if has_af else f
+    # S diag(w) S^T is linear in w, so every event's block is one product with the spectra outer products
+    normal = np.empty((b, k, k))
+    normal[:, :f, :f] = (w @ np.einsum('fd,gd->dfg', spectra, spectra).reshape(d, f * f)).reshape(b, f, f)
+    rhs = np.empty((b, k))
+    rhs[:, :f] = (w * y) @ spectra.T
     if has_af:
-        blocks.append(af_rows[:, np.newaxis, :])
-    design = np.concatenate(blocks, axis=1)
-    dw = design * w[:, np.newaxis, :]
-    normal = dw @ design.transpose(0, 2, 1)
+        wa = w * af_rows
+        normal[:, :f, f] = normal[:, f, :f] = wa @ spectra.T
+        normal[:, f, f] = np.einsum('bd,bd->b', wa, af_rows)
+        rhs[:, f] = np.einsum('bd,bd->b', wa, y)
     if fl_pen is not None:
         normal[:, np.arange(f), np.arange(f)] += fl_pen
     diag_f = normal[:, np.arange(f), np.arange(f)]
     normal[:, np.arange(f), np.arange(f)] += 1e-12 * diag_f.sum(axis=1, keepdims=True) / f
-    rhs = np.einsum('bkd,bd->bk', dw, y)
     inv = np.linalg.inv(normal)
     theta = np.einsum('bkl,bl->bk', inv, rhs)
     out = {'x': theta[:, :f].copy(), 'alpha': theta[:, f].copy() if has_af else np.zeros(b),
