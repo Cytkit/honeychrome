@@ -57,8 +57,17 @@ Frequency scales:
 * ``log2_frequencies`` — log2 percentage of a total; differences are log2
   fold changes. Suited to rare clusters.
 * ``logit_proportions`` — log2 odds of a population within its parent, with
-  half an event added to both the population and its complement. Suited to
+  a prior count added to both the population and its complement. Suited to
   gated populations, whose fractions often sit near 0 or 1.
+
+Both keep empty features finite with a prior count: half an event by
+default. With ``share_prior=True`` the prior count is the same share of
+every sample's denominator, half an event scaled by the denominator over
+the mean denominator of the samples given (edgeR's scaling of the prior
+count by library size; McCarthy, Chen & Smyth 2012). A population at 0% or
+100% of its parent then has the same value in every sample whatever the
+parent's size, so a difference in parent size between groups is not read as
+a difference in frequency.
 
 Results carry the estimate's standard error and degrees of freedom, so a
 threshold change re-derives p-values and significance without refitting.
@@ -752,19 +761,51 @@ def _subset_rows(values, mask):
 # Frequency scales
 # ---------------------------------------------------------------------------
 
-def log2_frequencies(counts_df: pd.DataFrame, totals) -> pd.DataFrame:
+def _share_prior(denominators: np.ndarray, mean_denominator=None) -> np.ndarray:
+    """
+    Prior counts that are the same share of every denominator: 0.5 ·
+    denominator / mean denominator, half an event at the mean. The mean is
+    taken down each column (over the samples) of the positive, finite
+    denominators, or given as ``mean_denominator`` (one number, or one per
+    column) to put other samples on the scale of a fitted set. A
+    denominator that is not positive gives NaN.
+    """
+    d = np.asarray(denominators, dtype=float)
+    usable = np.isfinite(d) & (d > 0)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        if mean_denominator is None:
+            mean = np.where(usable, d, 0.0).sum(axis=0) / usable.sum(axis=0)
+        else:
+            mean = np.asarray(mean_denominator, dtype=float)
+        return np.where(usable, 0.5 * d / mean, np.nan)
+
+
+def log2_frequencies(counts_df: pd.DataFrame, totals, share_prior: bool = False,
+                     mean_total: float | None = None) -> pd.DataFrame:
     """
     log2 of each feature's percentage of the sample's events, with half an
     event added to every count (and one to every total) so empty features
     stay finite: log2((count + 0.5) / (total + 1) · 100). Differences on
     this scale are log2 fold changes of frequency.
+
+    share_prior: the prior count p is the same share of every sample,
+    p = 0.5 · total / mean total over the samples given (or ``mean_total``),
+    and the value is log2((count + p) / (total + 2p) · 100). An empty
+    feature then has the same value in every sample.
     """
     totals = np.asarray(totals, dtype=float)[:, None]
-    vals = np.log2((counts_df.values.astype(float) + 0.5) / (totals + 1.0) * 100.0)
+    counts = counts_df.values.astype(float)
+    if share_prior:
+        prior = _share_prior(totals, mean_total)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            vals = np.log2((counts + prior) / (totals + 2.0 * prior) * 100.0)
+    else:
+        vals = np.log2((counts + 0.5) / (totals + 1.0) * 100.0)
     return pd.DataFrame(vals, index=counts_df.index, columns=counts_df.columns)
 
 
-def logit_proportions(counts_df: pd.DataFrame, denominators_df: pd.DataFrame) -> pd.DataFrame:
+def logit_proportions(counts_df: pd.DataFrame, denominators_df: pd.DataFrame,
+                      share_prior: bool = False, mean_denominator=None) -> pd.DataFrame:
     """
     Empirical log2 odds of each feature within its own denominator:
     log2((count + 0.5) / (denominator − count + 0.5)).
@@ -778,13 +819,24 @@ def logit_proportions(counts_df: pd.DataFrame, denominators_df: pd.DataFrame) ->
     denominator alone. Where the groups' denominators differ, features that
     are empty in (nearly) every sample therefore show a spurious group
     difference; exclude them with sparse_features() before testing.
+
+    share_prior: the prior count p added to both sides is the same share of
+    every sample's denominator, p = 0.5 · denominator / the feature's mean
+    denominator over the samples given (or ``mean_denominator``: one number,
+    or one per feature). 0% and 100% are then ∓log2(1 + 2 · mean) in every
+    sample, whatever the denominator. A denominator of 0 gives NaN.
     """
     counts = counts_df.values.astype(float)
     denom = denominators_df.reindex(index=counts_df.index,
                                     columns=counts_df.columns).values.astype(float)
     if np.any(counts > denom):
         raise ValueError("A population count exceeds its denominator.")
-    vals = np.log2((counts + 0.5) / (denom - counts + 0.5))
+    if share_prior:
+        prior = _share_prior(denom, mean_denominator)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            vals = np.log2((counts + prior) / (denom - counts + prior))
+    else:
+        vals = np.log2((counts + 0.5) / (denom - counts + 0.5))
     return pd.DataFrame(vals, index=counts_df.index, columns=counts_df.columns)
 
 

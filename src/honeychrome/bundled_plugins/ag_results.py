@@ -955,7 +955,7 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                 f"parent population had {too_few}) and were tested on the samples that could: "
                 + _name_list(partial))
         if run_freq:
-            data = ds.logit_proportions(counts, denom)
+            data = ds.logit_proportions(counts, denom, share_prior=True)
             out['freq'] = ds.run_moderated(data, group_vec, contrasts, contrast_mode,
                                            pval_threshold, fc_threshold, **common)
             out['freq_values'] = 100.0 * counts / denom
@@ -980,7 +980,8 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                                 "the counts test was not run.")
         else:
             if counts_method == 'moderated':
-                out['counts'] = ds.run_moderated(ds.logit_proportions(c_counts, c_denom),
+                out['counts'] = ds.run_moderated(ds.logit_proportions(c_counts, c_denom,
+                                                                      share_prior=True),
                                                  group_vec, contrasts, contrast_mode,
                                                  pval_threshold, fc_threshold, **common)
             else:
@@ -1237,7 +1238,7 @@ def run_trend_statistics(summaries: dict, samples: list[str], groups: dict, gate
     if run_freq:
         counts, denom, _dropped = population_tables(summaries, used, use_stats_parent,
                                                     min_parent_events)
-        out['freq_data'] = ds.logit_proportions(counts, denom)
+        out['freq_data'] = ds.logit_proportions(counts, denom, share_prior=True)
         out['freq'] = ts.run_trend(out['freq_data'], tvec, **common)
         out['freq_values'] = 100.0 * counts / denom
     if run_counts:
@@ -1254,7 +1255,7 @@ def run_trend_statistics(summaries: dict, samples: list[str], groups: dict, gate
             out['notes'].append(f"Counts are tested as log odds within the anchor population "
                                 f"({anchor_name}).")
         if c_counts.shape[1] >= 3:
-            out['counts_data'] = ds.logit_proportions(c_counts, c_denom)
+            out['counts_data'] = ds.logit_proportions(c_counts, c_denom, share_prior=True)
             out['counts'] = ts.run_trend(out['counts_data'], tvec, **common)
             out['counts_values'] = c_counts
         else:
