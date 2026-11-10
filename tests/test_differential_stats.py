@@ -38,6 +38,41 @@ def test_logit_proportions_is_finite_at_bounds():
 
 
 @pytest.mark.numpy_only
+def test_share_prior_ignores_denominator_size_at_bounds():
+    idx = ['a', 'b', 'c']
+    parents = pd.DataFrame({c: [100, 10000, 1000] for c in ('full', 'empty', 'half')}, index=idx)
+    counts = pd.DataFrame({'full': [100, 10000, 1000], 'empty': [0, 0, 0],
+                           'half': [50, 5000, 500]}, index=idx)
+    out = ds.logit_proportions(counts, parents, share_prior=True)
+    mean = np.mean([100, 10000, 1000])
+    assert np.allclose(out['full'], np.log2(1 + 2 * mean))
+    assert np.allclose(out['empty'], -np.log2(1 + 2 * mean))
+    assert np.allclose(out['half'], 0.0)
+    pinned = ds.logit_proportions(counts.iloc[:1], parents.iloc[:1], share_prior=True,
+                                  mean_denominator=mean)
+    assert pinned.loc['a', 'full'] == pytest.approx(out.loc['a', 'full'])
+    same = pd.DataFrame({'p': [20.0, 20.0]})
+    few = pd.DataFrame({'p': [3.0, 7.0]})
+    assert np.allclose(ds.logit_proportions(few, same),
+                       ds.logit_proportions(few, same, share_prior=False))
+    empty_parent = ds.logit_proportions(pd.DataFrame({'p': [0.0, 5.0]}),
+                                        pd.DataFrame({'p': [0.0, 10.0]}), share_prior=True)
+    assert np.isnan(empty_parent.iloc[0, 0]) and np.isfinite(empty_parent.iloc[1, 0])
+
+
+@pytest.mark.numpy_only
+def test_log2_frequencies_share_prior():
+    counts = pd.DataFrame({'empty': [0, 0], 'tenth': [10, 1000]}, index=['a', 'b'])
+    out = ds.log2_frequencies(counts, [100, 10000], share_prior=True)
+    assert out.loc['a', 'empty'] == pytest.approx(out.loc['b', 'empty'])
+    assert out.loc['a', 'tenth'] == pytest.approx(out.loc['b', 'tenth'])
+    equal = ds.log2_frequencies(counts, [5000, 5000])
+    assert np.allclose(equal, ds.log2_frequencies(counts, [5000, 5000], share_prior=False))
+    pinned = ds.log2_frequencies(counts.iloc[:1], [100], share_prior=True, mean_total=5050)
+    assert pinned.loc['a', 'empty'] == pytest.approx(out.loc['a', 'empty'])
+
+
+@pytest.mark.numpy_only
 def test_logit_proportions_rejects_count_above_parent():
     counts = pd.DataFrame({'p': [5]}, index=['a'])
     parents = pd.DataFrame({'p': [4]}, index=['a'])
