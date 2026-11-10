@@ -238,6 +238,22 @@ def _gateable_channels(controller, include_scatter: bool = True) -> list[str]:
     return [ch for ch in pnn if ch in fluoro]
 
 
+def _plot_channel_order(controller) -> list[str]:
+    """Channels in the order the Hierarchy page lists a population's gates:
+    the scatter channels, then the fluorophores in the spectral model's
+    order, then any other channel of the experiment."""
+    pnn = _experiment_channels(controller)
+    try:
+        scatter = list(controller.experiment.settings.get('unmixed', {})
+                       .get('scatter_channels') or [])
+        model = [str(c.get('label', '')) for c in
+                 controller.experiment.process.get('spectral_model') or []
+                 if isinstance(c, dict)]
+    except Exception:
+        scatter, model = [], []
+    return list(dict.fromkeys(scatter + [ch for ch in model if ch] + pnn))
+
+
 def _axis_limits(transforms: dict) -> dict:
     """{channel: (lo, hi)} display limits from a transforms dict."""
     out = {}
@@ -5946,6 +5962,12 @@ class ReviewTab(QWidget):
         self._row_timer.setSingleShot(True)
         self._row_timer.setInterval(self._ROW_BUILD_DELAY_MS)
         self._row_timer.timeout.connect(self._build_visible_rows)
+        # Where the next rebuild of the plots scrolls to: None keeps the
+        # position, '' goes to the top, a gate name to that gate's row.
+        self._scroll_request = None
+        # Gate whose row the page is held at while the rows around it are
+        # built (their heights change as they are); cleared when the user scrolls.
+        self._scroll_target = None
         self._build_ui()
 
     def _build_ui(self):
@@ -6052,6 +6074,7 @@ class ReviewTab(QWidget):
         bar = self._scroll.verticalScrollBar()
         bar.valueChanged.connect(lambda _v: self._row_timer.start())
         bar.rangeChanged.connect(lambda _lo, _hi: self._row_timer.start())
+        bar.actionTriggered.connect(self._on_user_scroll)
 
         # Gating hierarchy on the left, inspection plots on the right.
         tree_panel = QWidget()
@@ -6138,7 +6161,8 @@ class ReviewTab(QWidget):
 
     def _fill_tree(self):
         """Rebuild the hierarchy tree and select the population shown."""
-        nodes = ag_review.population_tree(self.state.gate_definitions)
+        nodes = ag_review.population_tree(self.state.gate_definitions,
+                                          _plot_channel_order(self.controller))
         self._tree_views = {(n['gate'], n['pop']): n['view'] for n in nodes}
         self._tree_labels = {(n['gate'], n['pop']): n['label'] for n in nodes}
         self.pop_tree.set_nodes(nodes)
@@ -6200,7 +6224,9 @@ class ReviewTab(QWidget):
         self.pop_tree.select_population(gate, pop)
 
     def _on_tree_selected(self, gate: str, pop: str):
-        """A node was picked in the tree: show its plots through the combobox."""
+        """A node was picked in the tree: show its plots through the combobox,
+        from the top for a population with gates on it, or at the row of the
+        gate that defines a population without gates."""
         view = self._tree_views.get((gate, pop))
         if view is None:
             return
@@ -6212,6 +6238,7 @@ class ReviewTab(QWidget):
             self.combo_pop.setCurrentIndex(i)
         finally:
             self._building = False
+        self._scroll_request = gate if view != (gate, pop) else ''
         self._rebuild_plots()
 
     def _import_sample_key(self):
@@ -6262,6 +6289,7 @@ class ReviewTab(QWidget):
     def _on_population_changed(self, _index=None):
         if not self._building:
             self._select_in_tree()
+            self._scroll_request = ''
             self._rebuild_plots()
 
     def _samples_text(self) -> str:
@@ -6493,7 +6521,8 @@ class ReviewTab(QWidget):
         as drawn on the left and each gate's controls above its trainable
         form on the right, so the two plots of a gate sit level. Each gate's
         row starts as a placeholder and is built when it is scrolled near
-        (_build_visible_rows). The scroll position is kept."""
+        (_build_visible_rows). The scroll position is kept, unless a new
+        population or gate was picked (see _scroll_request)."""
         import honeychrome.settings as hc_settings
         from PySide6.QtWidgets import QApplication
         bar = self._scroll.verticalScrollBar()
@@ -6510,8 +6539,11 @@ class ReviewTab(QWidget):
         self._ensure_gated()
         if self._result is None:
             return
+        request, self._scroll_request = self._scroll_request, None
+        self._scroll_target = request or None
         gate, pop = self._selected()
-        groups = ag_review.daughter_groups(self.state.gate_definitions, gate, pop)
+        groups = ag_review.daughter_groups(self.state.gate_definitions, gate, pop,
+                                           _plot_channel_order(self.controller))
         if gate is None:
             mask = np.ones(len(self._raw), dtype=bool)
         else:
@@ -6548,7 +6580,10 @@ class ReviewTab(QWidget):
         if self.chk_edit.isChecked():
             text += " " + self._edit_hint(groups)
         self.lbl_status.setText(text)
-        QTimer.singleShot(0, lambda v=scroll_to: bar.setValue(v))
+        if request is None:
+            QTimer.singleShot(0, lambda v=scroll_to: bar.setValue(v))
+        elif not request:
+            QTimer.singleShot(0, lambda: bar.setValue(0))
 
     def _add_placeholders(self, unit: dict):
         """Placeholders of about the size of a gate's row, in its grid cells:
@@ -6620,7 +6655,11 @@ class ReviewTab(QWidget):
         stay placeholders. While the page is not on screen, the rows that
         would fill its first screens are built, from estimated heights.
         Runs again after building, as the rows built may be shorter than
-        their placeholders."""
+        their placeholders. While a gate is the scroll target, the page is
+        first moved to its row."""
+        if self._scroll_target is not None and self._scroll.isVisible():
+            self._grid.activate()
+            self._scroll_to_target()
         pending = [u for u in self._rows if not u['built']]
         if not pending or self._result is None or self._raw is None:
             return
@@ -6657,6 +6696,24 @@ class ReviewTab(QWidget):
                 holder.setFixedHeight(self._row_heights['controls'] if k == 0 else plot_h)
         self._redraw_overlays(only={id(p) for p in new})
         self._row_timer.start()
+
+    def _scroll_to_target(self):
+        """Scroll so the target gate's row (its name and controls) is at the
+        top of the page."""
+        unit = next((u for u in self._rows
+                     if u['gate'].get('gate_name') == self._scroll_target), None)
+        if unit is None:
+            self._scroll_target = None
+            return
+        rect = self._grid.cellRect(unit['row'], 1)
+        if not rect.isValid():
+            return
+        spacing = max(self._grid.verticalSpacing(), 0)
+        self._scroll.verticalScrollBar().setValue(max(0, rect.top() - spacing))
+
+    def _on_user_scroll(self, _action):
+        """The user moved the page: stop holding it at the target gate."""
+        self._scroll_target = None
 
     def showEvent(self, event):
         super().showEvent(event)
