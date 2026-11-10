@@ -133,6 +133,8 @@ NEGATIVES_FILE = 'noise_negatives.npz'
 NEGATIVE_SAMPLE_EVENTS = 5000
 VARIANT_FILE = 'noise_variants.npz'
 VARIANT_CACHE_VERSION = 1
+# Events used for the per-detector median of the AF-choice weights (all events below this).
+AF_WEIGHT_MEDIAN_EVENTS = 200_000
 AUTO = '__auto__'
 CLAMPED_WEIGHTS = 'clamped'
 DEFAULT_PRIOR_LAMBDA = 1.0
@@ -1125,7 +1127,15 @@ def noise_in_use(process: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def sample_af_weights(raw: np.ndarray, noise: nm.NoiseModel) -> np.ndarray:
-    """One weight per detector for a sample's AF choice: ``1 / V(median raw signal)``."""
+    """
+    One weight per detector for a sample's AF choice: ``1 / V(median raw
+    signal)``. Above ``AF_WEIGHT_MEDIAN_EVENTS`` events the median comes from
+    a fixed-seed random subsample of that size, so the weights are
+    reproducible for a given sample.
+    """
+    if len(raw) > AF_WEIGHT_MEDIAN_EVENTS:
+        rows = np.sort(np.random.default_rng(0).choice(len(raw), AF_WEIGHT_MEDIAN_EVENTS, replace=False))
+        raw = raw[rows]
     return 1.0 / noise.variance(np.maximum(np.median(raw, axis=0), 0.0))
 
 
