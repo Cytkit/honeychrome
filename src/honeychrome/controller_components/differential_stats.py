@@ -987,10 +987,13 @@ def _scaled_logits(counts: np.ndarray, library: np.ndarray) -> np.ndarray:
     """(features x samples) log2 odds of each count within its sample's
     library size, log2((c + p) / (L - c + p)), with a prior count p of half
     an event scaled by L over the mean library size, so the floor is the
-    same share of every sample. NaN counts stay NaN."""
+    same share of every sample. NaN counts stay NaN, and a sample with a
+    library size of 0 (no events, so no odds) is NaN throughout."""
     lib = np.asarray(library, dtype=float)
-    prior = 0.5 * lib / np.mean(lib)
-    return np.log2((counts + prior) / (np.maximum(lib - counts, 0.0) + prior))
+    with np.errstate(invalid='ignore', divide='ignore'):
+        prior = 0.5 * lib / np.mean(lib)
+        logits = np.log2((counts + prior) / (np.maximum(lib - counts, 0.0) + prior))
+    return np.where(lib > 0, logits, np.nan)
 
 
 def _counting_variance(counts: np.ndarray, library: np.ndarray) -> np.ndarray:
