@@ -329,8 +329,8 @@ def test_empty_populations_are_not_tested_despite_different_parent_counts():
                           for c in counts.columns}, index=samples, dtype=float)
     group_vec = [groups[s] for s in samples]
     contrasts = ds.build_contrasts(['ctrl', 'treated'], 'reference', 'ctrl')
-    raw = ds.run_moderated(ds.logit_proportions(counts, denom), group_vec, contrasts,
-                           'reference', 0.05, 0.0)
+    raw = ds.run_moderated(ds.logit_proportions(counts, denom, share_prior=False), group_vec,
+                           contrasts, 'reference', 0.05, 0.0)
     assert bool(raw.loc[raw['feature'] == 'Z/pos', 'significant'].iloc[0])
 
     out = ar.run_statistics(summaries, samples, groups, [], run_freq=True, run_counts=True,
