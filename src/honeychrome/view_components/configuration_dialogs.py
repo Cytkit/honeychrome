@@ -15,6 +15,7 @@ from honeychrome.settings import (colourmap_choice, graphics_export_formats, his
                       heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral,
                       spectral_cleaning_refine, auto_clean_controls, unmixing_cache_gb)
 import honeychrome.settings as settings
+import honeychrome.agent_control as agent_control
 from honeychrome.controller_components.job_gate import guard_while_busy
 
 
@@ -317,6 +318,33 @@ class AppConfigDialog(QDialog):
         frame_layout.addWidget(self.send_debug_data_label)
         form.addRow(frame)
 
+        agent_frame = QFrame(self)
+        agent_frame.setFrameShape(QFrame.StyledPanel)
+        agent_layout = QVBoxLayout(agent_frame)
+        agent_layout.setContentsMargins(10, 10, 10, 10)
+        self.agent_control_cb = QCheckBox('Let AI agents control Honeychrome (local MCP server)')
+        self.agent_control_cb.setToolTip(
+            'An AI agent (e.g. VS Code Copilot) can open samples, add plots, draw gates and read statistics in '
+            'this window. Only programs on this computer that have the token can connect.')
+        agent_layout.addWidget(self.agent_control_cb)
+        agent_form = QFormLayout()
+        self.agent_control_port_spin = QSpinBox()
+        self.agent_control_port_spin.setRange(1024, 65535)
+        agent_form.addRow('Port:', self.agent_control_port_spin)
+        agent_layout.addLayout(agent_form)
+        copy_button = QPushButton('Copy client settings (mcp.json)')
+        copy_button.setToolTip('Copies the MCP client settings, including the token, to the clipboard.')
+        copy_button.clicked.connect(self.copy_agent_client_settings)
+        token_button = QPushButton('New token')
+        token_button.setToolTip('Replaces the token; clients using the old one are refused.')
+        token_button.clicked.connect(self.new_agent_token)
+        agent_layout.addWidget(copy_button)
+        agent_layout.addWidget(token_button)
+        control = agent_control.AgentControl.instance()
+        self.agent_control_status = QLabel(control.status_text() if control else '')
+        agent_layout.addWidget(self.agent_control_status)
+        form.addRow(agent_frame)
+
         scroll.setWidget(container)
         main_layout.addWidget(scroll)
 
@@ -391,6 +419,8 @@ class AppConfigDialog(QDialog):
         self.report_include_process_cb.setChecked(self.settings.value("report_include_process", report_include_process, type=bool))
 
         self.send_debug_data.setChecked(self.settings.value("send_debug_data", send_debug_data, type=bool))
+        self.agent_control_cb.setChecked(agent_control.is_enabled())
+        self.agent_control_port_spin.setValue(agent_control.port())
 
         for file_path in bundled_plugins_path.glob("*_tab.py"):
             self.enable_bundled_plugin[file_path].setChecked(self.settings.value(f"EnableBundledPlugin_{file_path.stem}", False, type=bool))
@@ -421,6 +451,8 @@ class AppConfigDialog(QDialog):
         self.settings.setValue("report_include_unmixed", self.report_include_unmixed_cb.isChecked())
         self.settings.setValue("report_include_process", self.report_include_process_cb.isChecked())
         self.settings.setValue("send_debug_data", self.send_debug_data.isChecked())
+        self.settings.setValue(agent_control.SETTING_ENABLED, self.agent_control_cb.isChecked())
+        self.settings.setValue(agent_control.SETTING_PORT, self.agent_control_port_spin.value())
 
         for file_path in bundled_plugins_path.glob("*_tab.py"):
             self.settings.setValue(f"EnableBundledPlugin_{file_path.stem}", self.enable_bundled_plugin[file_path].isChecked())
@@ -429,11 +461,25 @@ class AppConfigDialog(QDialog):
             for file_path in plugins_path.glob("*_tab.py"):
                 self.settings.setValue(f"EnablePlugin_{file_path}", self.enable_plugin[file_path].isChecked())
 
+    def copy_agent_client_settings(self):
+        QApplication.clipboard().setText(agent_control.client_config(self.agent_control_port_spin.value()))
+        self.agent_control_status.setText('Client settings copied. Paste them into your MCP client (e.g. .vscode/mcp.json).')
+
+    def new_agent_token(self):
+        agent_control.new_token()
+        control = agent_control.AgentControl.instance()
+        if control is not None and control.running:
+            control.apply_settings()
+        self.agent_control_status.setText('New token created. Copy the client settings again.')
+
     def handle_accept(self):
         gate = getattr(self.controller, 'job_gate', None)
         if gate is not None and gate.is_held():
             return
         self.save_settings()
+        control = agent_control.AgentControl.instance()
+        if control is not None:
+            control.apply_settings()
         self.accept()
         importlib.reload(settings)
         self.bus.reloadExpRequested.emit()
@@ -468,6 +514,8 @@ class AppConfigDialog(QDialog):
         self.report_include_unmixed_cb.setChecked(report_include_unmixed)
         self.report_include_process_cb.setChecked(report_include_process)
         self.send_debug_data.setChecked(send_debug_data)
+        self.agent_control_cb.setChecked(False)
+        self.agent_control_port_spin.setValue(agent_control.DEFAULT_PORT)
 
         for file_path in bundled_plugins_path.glob("*_tab.py"):
             self.enable_bundled_plugin[file_path].setChecked(False)
