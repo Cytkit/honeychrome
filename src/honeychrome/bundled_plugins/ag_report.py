@@ -692,7 +692,9 @@ def make_population_comparison_figure(gate_def: dict, pop: str, panels: list, tr
                                       title: str, p_text: str = '',
                                       group_colours: dict | None = None,
                                       trend: dict | None = None,
-                                      trend_percent: dict | None = None):
+                                      trend_percent: dict | None = None,
+                                      value_label: str = '% of parent',
+                                      value_suffix: str = '%'):
     """The report figure of one population: each group's pooled parent
     events on the gate's axes with the reference boundary and the group's
     gated frequency, then the dot and violin plot of the per-sample values
@@ -704,6 +706,8 @@ def make_population_comparison_figure(gate_def: dict, pop: str, panels: list, tr
              population's trend plot then takes the place of the dot and
              violin plot (two panels for a paired group × trend test).
     trend_percent : the same trend on the % of parent scale, drawn after it.
+    value_label   : what *values* are (y-axis label and plot title), with
+                    *value_suffix* after each value in the hover labels.
     """
     from matplotlib.figure import Figure
 
@@ -730,8 +734,9 @@ def make_population_comparison_figure(gate_def: dict, pop: str, panels: list, tr
         if trend_percent:
             tp.make_trend_plot_figure(**trend_percent, axes=[axes[len(panels) + n_trend]])
     else:
-        make_group_values_figure(values, group_order, f"{label}: % of parent", p_text,
-                                 ax=axes[-1], group_colours=group_colours)
+        make_group_values_figure(values, group_order, f"{label}: {value_label}", p_text,
+                                 ax=axes[-1], group_colours=group_colours,
+                                 value_label=value_label, value_suffix=value_suffix)
     fig.suptitle(title, fontsize=10)
     return fig
 
@@ -851,9 +856,14 @@ def make_roc_figure(performance: pd.DataFrame, roc: pd.DataFrame, summary: dict,
 
 
 def make_importance_figure(importance: pd.DataFrame, summary: dict, is_dark: bool,
-                           top_n: int = 20):
+                           top_n: int = 20, keys: dict | None = None):
     """The most informative features: lasso selection frequency and/or
-    forest importance, coloured by the group with the higher value."""
+    forest importance, coloured by the group with the higher value.
+
+    keys : {feature: population key} for click-through; the figure then
+           carries ``_row_keys`` by bar position, bottom to top ('' for a
+           feature without a population), and ``_row_axes`` (every panel).
+    """
     from matplotlib.figure import Figure
     import matplotlib.patches as mpatches
     from honeychrome.view_components import differential_plots as dp
@@ -866,13 +876,18 @@ def make_importance_figure(importance: pd.DataFrame, summary: dict, is_dark: boo
     colours = ['#EE6677' if d > 0 else '#4477AA' for d in top['direction']]
     fig = Figure(figsize=(4.5 * max(1, len(metrics)) + 2.5, max(3.5, 0.28 * len(top) + 1.8)),
                  constrained_layout=True)
+    axes = []
     for i, (col, label) in enumerate(metrics):
         ax = fig.add_subplot(1, len(metrics), i + 1)
+        axes.append(ax)
         xerr = top['forest_importance_sd'] if col == 'forest_importance' else None
         ax.barh(range(len(top)), top[col], color=colours, xerr=xerr, error_kw={'elinewidth': 0.6})
         ax.set_yticks(range(len(top)))
         ax.set_yticklabels(top['feature'] if i == 0 else [''] * len(top), fontsize=7)
         ax.set_xlabel(label, fontsize=8)
+    if keys:
+        fig._row_keys = [keys.get(f, '') for f in top['feature'].astype(str)]
+        fig._row_axes = tuple(axes)
     fig.legend(handles=[
         mpatches.Patch(color='#EE6677', label=f"higher in {summary['positive']}"),
         mpatches.Patch(color='#4477AA', label=f"higher in {summary['negative']}"),

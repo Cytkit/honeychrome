@@ -824,8 +824,7 @@ def conversion_evidence(gate_def: dict, gate_defs: list[dict], data: np.ndarray,
         chans = ag_core.shape_channels(gate_def)
         if len(chans) == 2 and drawn:
             col = parent[:, index[chans[d]]]
-            cut = ag_core.debris_cut(ag_core.trim_quantiles(col, float(gp.get('quantile_trim', 0.001))),
-                                     float(gp.get('debris_density', 0.05)))
+            cut = ag_core.debris_cut(col, gp)
             inside = np.any(np.stack(list(drawn.values())), axis=0)
             if inside.any():
                 below = float((col[inside] < cut).mean())
@@ -1291,7 +1290,7 @@ SYNC_PARAM_KEYS = (
     'tail_fraction', 'tail_fraction_x', 'tail_fraction_y',
     'mixture_components', 'mixture_components_x', 'mixture_components_y',
     'axis_lo', 'axis_hi', 'axis_lo_x', 'axis_hi_x', 'axis_lo_y', 'axis_hi_y',
-    'quantile_trim', 'width_sd', 'debris_axis', 'debris_density', 'edge_density',
+    'quantile_trim', 'width_sd', 'debris_axis', 'debris_algorithm', 'edge_density',
     'edge_density_x', 'edge_density_y', 'cell_side', 'saturation_fraction',
     'mixture_cut', 'mixture_cut_x', 'mixture_cut_y',
     'threshold_factor', 'threshold_factor_x', 'threshold_factor_y',
