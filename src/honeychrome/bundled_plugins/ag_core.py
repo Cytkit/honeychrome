@@ -173,6 +173,7 @@ THRESHOLD_FACTOR_RANGE = (0.01, 100.0)
 DEFAULT_EDGE_DENSITY = 0.002        # cells: density fall-off, fraction of the peak
 CELL_SIDE_CELLS = 'cells'           # cells: keep the events above the debris cut
 CELL_SIDE_DEBRIS = 'debris'         # cells: keep the events below it
+DEFAULT_DEBRIS_ALGORITHM = 'mixture'  # cells: threshold algorithm of the debris cut
 # Tail fraction of kde_min's fallback when the density has a single peak.
 KDE_MIN_FALLBACK_TAIL = 0.01
 MODE_FIXED = 'fixed'
@@ -1191,11 +1192,17 @@ class GateCalculator:
         ± width_sd residual SDs around the line, running the full width of
         the x axis.
 
+        The residual SD is estimated from the median absolute deviation
+        (scaled to match the SD of a normal distribution), so a shoulder of
+        doublets beside the diagonal does not widen the band that is meant
+        to exclude them.
+
         A pile of events at the top of either axis (saturation, more than
         ``saturation_fraction`` of the events, default 0.0005; see
         saturation_cut) is left out of the fit, so multiplets maxed out on
         scatter do not pull the line. The band is not cut there: saturated
         events that fall inside it stay in the population."""
+        from scipy.stats import median_abs_deviation
         gp = gate_def.get('gate_param', {}) or {}
         q = float(gp.get('quantile_trim', 0.001))
         width_sd = float(gp.get('width_sd', 3.0))
@@ -1217,12 +1224,13 @@ class GateCalculator:
         for _ in range(3):
             slope, intercept = np.polyfit(x[keep], y[keep], 1)
             resid = y[keep] - (slope * x[keep] + intercept)
-            sigma = float(resid.std())
+            sigma = float(median_abs_deviation(resid, scale='normal'))
             if sigma == 0:
                 break
             keep[keep] = np.abs(resid) < width_sd * sigma
         slope, intercept = np.polyfit(x[keep], y[keep], 1)
-        sigma = float((y[keep] - (slope * x[keep] + intercept)).std()) or 1.0
+        sigma = float(median_abs_deviation(y[keep] - (slope * x[keep] + intercept),
+                                           scale='normal')) or 1.0
         offset = width_sd * sigma
         # The band runs the full width of the axis, so the gate is open along
         # the diagonal rather than ending at the extremes of the training data
@@ -1357,13 +1365,14 @@ class GateCalculator:
         debris cut on the forward-scatter axis to where the cells' density
         ends on each side.
 
-        The debris cut is the density valley left of the highest peak of the
-        forward-scatter axis (``gate_param['debris_axis']``, 'x' or 'y'),
-        or, when no peak lies left of it, the point where the density left of
-        the peak first falls below ``debris_density`` (default 0.05) of the
-        peak height. On the events above the cut, the other three sides are
-        the outermost points where each axis's density is still at least
-        its fall-off (``edge_density_x`` / ``edge_density_y``, else
+        The debris cut is the lower side on the forward-scatter axis
+        (``gate_param['debris_axis']``, 'x' or 'y'): a threshold between
+        the debris and dead cells and the cells, by the gate's
+        ``debris_algorithm`` (default DEFAULT_DEBRIS_ALGORITHM; see
+        debris_cut), multiplied by its ``threshold_factor`` in raw units.
+        On the events above the cut, the other three sides are the
+        outermost points where each axis's density is still at least its
+        fall-off (``edge_density_x`` / ``edge_density_y``, else
         ``edge_density``, default DEFAULT_EDGE_DENSITY) of its peak
         (density_edges). ``cell_side`` CELL_SIDE_DEBRIS keeps the events
         below the cut instead (a debris gate): the cut is then the upper
@@ -1379,8 +1388,7 @@ class GateCalculator:
         if len(xy) < 50:
             return {}
         d = 1 if gp.get('debris_axis') == 'y' else 0
-        col = trim_quantiles(xy[:, d], q)
-        cut = debris_cut(col, float(gp.get('debris_density', 0.05)))
+        cut = self._scaled(debris_cut(xy[:, d], gp), gp, '', chans[d])
         debris = gp.get('cell_side') == CELL_SIDE_DEBRIS
         kept = xy[xy[:, d] < cut] if debris else xy[xy[:, d] >= cut]
         if len(kept) < 50:
@@ -1405,22 +1413,39 @@ class GateCalculator:
                       'threshold_y': None, 'region': REGION_INSIDE}}
 
 
-def debris_cut(x: np.ndarray, rel_density: float = 0.05) -> float:
-    """Forward-scatter value separating debris from cells (see
-    GateCalculator._calc_cells)."""
-    from scipy.signal import find_peaks
+def debris_algorithm(gate_param: dict | None) -> str:
+    """Threshold algorithm of a cells gate's debris cut
+    (``gate_param['debris_algorithm']``, default DEFAULT_DEBRIS_ALGORITHM)."""
+    algo = (gate_param or {}).get('debris_algorithm')
+    return algo if algo in THRESHOLD_ALGORITHMS else DEFAULT_DEBRIS_ALGORITHM
+
+
+def debris_cut(x: np.ndarray, gate_param: dict | None = None) -> float:
+    """Forward-scatter value separating debris and dead cells from the
+    cells (see GateCalculator._calc_cells), before any threshold factor.
+
+    A pile of events at the top of *x* (saturation_cut) is left out, the
+    rest is quantile-trimmed (``quantile_trim``) and cropped to the
+    ``axis_lo``/``axis_hi`` window as for a 1dsep gate, and the gate's
+    debris_algorithm places the threshold with the gate's own parameters
+    (``mixture_components``, ``mixture_cut``, ``tail_fraction``). With the
+    default two-component mixture, the cut is where the debris and the
+    cells' Gaussian components are equally dense.
+    """
+    gp = gate_param or {}
     x = np.asarray(x, dtype=float)
-    if len(x) < 20 or float(x.max()) == float(x.min()):
-        return float(x.min()) if len(x) else 0.0
-    grid, density = _kde_grid(x)
-    top = int(np.argmax(density))
-    peaks, _ = find_peaks(density, prominence=0.05 * float(density[top]))
-    left = [int(p) for p in peaks if p < top]
-    if left:
-        start = max(left)
-        return float(grid[start + int(np.argmin(density[start:top + 1]))])
-    below = np.flatnonzero(density[:top] < rel_density * float(density[top]))
-    return float(grid[below[-1]]) if len(below) else float(grid[0])
+    pile = saturation_cut(x, float(gp.get('saturation_fraction', 0.0005)))
+    if pile is not None:
+        x = x[x < pile]
+    col = trim_quantiles(x, float(gp.get('quantile_trim', 0.001)))
+    if len(col) < MIN_EVENTS:
+        return float(col.min()) if len(col) else 0.0
+    algo = debris_algorithm(gp)
+    calc = crop_to_region(col, float(gp.get('axis_lo', default_axis_lo(algo))),
+                          float(gp.get('axis_hi', 0.99)))
+    if len(calc) < MIN_EVENTS:
+        calc = col
+    return compute_threshold(calc, algo, gp)
 
 
 def density_edges(x: np.ndarray, rel_density: float = DEFAULT_EDGE_DENSITY) -> tuple[float, float]:

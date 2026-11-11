@@ -514,11 +514,15 @@ class GateParamDialog(QDialog):
     threshold_factor
         Multiplies the calculated threshold in raw units (default ``1``).
     width_sd
-        Standard-deviation half-width for the singlet parallelogram.
-        Default ``3``.
+        Half-width of the singlet parallelogram in residual SDs, the SD
+        estimated from the median absolute deviation.  Default ``3``.
     edge_density_x, edge_density_y
         Density fall-off of a ``cells`` gate's sides on each scatter
         channel, as a fraction of the peak.  Default ``0.002``.
+    debris_algorithm
+        Threshold algorithm of a ``cells`` gate's debris cut (its lower
+        side on forward scatter).  Default ``mixture``; it uses the
+        tail fraction, mixture and threshold factor settings above.
     """
 
     def __init__(self, gate_def: dict, parent=None):
@@ -567,6 +571,8 @@ class GateParamDialog(QDialog):
         self.sb_axis_lo.setDecimals(3)
         self.sb_axis_lo.setSingleStep(0.01)
         algo = self.gate_def.get('algorithm')
+        if algo == 'cells':
+            algo = ag_core.debris_algorithm(params)
         self.sb_axis_lo.setValue(float(params.get('axis_lo', ag_core.default_axis_lo(algo))))
         self.sb_axis_lo.setToolTip(
             "Crops the data fed into the threshold calculation to this "
@@ -617,12 +623,24 @@ class GateParamDialog(QDialog):
         self.sb_width_sd.setSingleStep(0.1)
         self.sb_width_sd.setValue(float(params.get('width_sd', 3.0)))
         self.sb_width_sd.setToolTip(
-            "Half-width of the singlet parallelogram, in residual SDs."
+            "Half-width of the singlet parallelogram, in residual SDs. The SD is "
+            "estimated from the median absolute deviation, so doublets beside the "
+            "diagonal do not widen it."
         )
         form.addRow("Singlet width (SDs)", self.sb_width_sd)
 
         self._is_free = self.gate_def.get('gate_type') == 'free'
         if self._is_free:
+            self.cb_debris_algorithm = QComboBox()
+            self.cb_debris_algorithm.addItems(list(ag_core.THRESHOLD_ALGORITHMS))
+            self.cb_debris_algorithm.setCurrentText(ag_core.debris_algorithm(params))
+            self.cb_debris_algorithm.setToolTip(
+                "Cells gate: algorithm placing the debris cut, the lower side on forward "
+                "scatter, between the debris and dead cells and the cells. It uses the "
+                "tail fraction, mixture and threshold factor settings above.")
+            colour_algorithm_items(self.cb_debris_algorithm, ag_core.algorithm_colour)
+            block_wheel(self.cb_debris_algorithm)
+            form.addRow("Cells debris cut", self.cb_debris_algorithm)
             self.sb_edge = {}
             for axis in ('x', 'y'):
                 ch = self.gate_def.get(f'gate_marker_{axis}') or axis.upper()
@@ -798,6 +816,7 @@ class GateParamDialog(QDialog):
             params['width_sd']           = float(self.sb_width_sd.value())
             _set_threshold_factor(params, 'threshold_factor', self.sb_threshold_factor.value())
             if self._is_free:
+                params['debris_algorithm'] = self.cb_debris_algorithm.currentText()
                 for axis, sb in self.sb_edge.items():
                     params[f'edge_density_{axis}'] = float(sb.value())
         super().accept()
@@ -6887,6 +6906,10 @@ class ReviewTab(QWidget):
             if current == ag_core.ALGORITHM_REPLICATE:
                 self._add_source_controls(row, pd, axis)
             if current == 'cells':
+                self._add_debris_controls(row, pd)
+                row.addStretch()
+                row = QHBoxLayout()
+                column.addLayout(row)
                 self._add_edge_density(row, pd)
             if current in ag_core.THRESHOLD_ALGORITHMS:
                 self._add_threshold_factor(row, pd, axis)
@@ -6993,6 +7016,40 @@ class ReviewTab(QWidget):
             src = (pd.get('gate_param') or {}).get(f'replicate_{axis}')
             if isinstance(src, dict) and not isinstance(gp.get(f'replicate_{axis}'), dict):
                 gp[f'replicate_{axis}'] = deepcopy(src)
+
+    def _add_debris_controls(self, row, g: dict):
+        """Debris cut of a 'cells' gate: its lower side on the forward-scatter
+        axis, placed by a threshold algorithm with that algorithm's own
+        settings and a threshold factor."""
+        gp = g.get('gate_param') or {}
+        axis = 'y' if gp.get('debris_axis') == 'y' else 'x'
+        ch = g.get(f'gate_marker_{axis}')
+        algo = ag_core.debris_algorithm(gp)
+        combo = algorithm_combo(list(ag_core.THRESHOLD_ALGORITHMS), algo, ag_core.algorithm_colour)
+        combo.setToolTip(
+            f"Algorithm placing the lower side of the gate on {self._axis_label(ch)}, between the "
+            "debris and dead cells and the cells. mixture (default): one Gaussian for the debris "
+            "and one for the cells, cut where they are equally dense. kde_min / bimodal: the "
+            "density valley between the two highest peaks. otsu: the split that best separates "
+            "two classes. tail: the upper edge of the highest peak, so only when the debris peak "
+            "is the tallest.")
+        combo.currentTextChanged.connect(
+            lambda a, n=g['gate_name']: self._on_debris_algorithm(n, a))
+        row.addWidget(QLabel(f"Debris cut {self._axis_label(ch)}:"))
+        row.addWidget(combo)
+        if algo == 'tail':
+            self._add_tail_fraction(row, g, axis)
+        if algo == 'mixture':
+            self._add_mixture_controls(row, g, axis)
+        self._add_threshold_factor(row, g, axis)
+
+    def _on_debris_algorithm(self, gate_name: str, algorithm: str):
+        g = self.state.gate_by_name(gate_name)
+        if g is None or not algorithm:
+            return
+        self._adopt_layout(g)
+        g.setdefault('gate_param', {})['debris_algorithm'] = algorithm
+        self._after_config_change(g)
 
     def _add_edge_density(self, row, g: dict):
         """Density fall-off of a 'cells' gate on each axis: a side is placed

@@ -38,12 +38,17 @@ histogram.</li>
 <li><b>2dsep</b>: a threshold on each of two channels, giving four
 quadrants. A population is one quadrant or several joined.</li>
 <li><b>singlets</b>: a band around the diagonal of a scatter area against
-height plot. Events piled at the top of either scatter axis (saturated) are
-left out of the fit; they stay in the gate when they fall inside the
-band.</li>
+height plot. Its width is measured with a median-based spread, so doublets
+beside the diagonal do not widen it. Events piled at the top of either
+scatter axis (saturated) are left out of the fit; they stay in the gate when
+they fall inside the band.</li>
 <li><b>free</b>: a shape on two scatter channels. The <b>cells</b> algorithm
-cuts the debris off and trims the edges where the density falls away;
-<b>all</b> takes the convex hull of the parent population.</li>
+draws a rectangle. Its lower side on forward scatter is the <i>debris
+cut</i>, placed by a threshold algorithm (default <i>mixture</i>: one
+Gaussian for the debris and dead cells, one for the cells, cut where they
+are equally dense; any threshold algorithm can be chosen). Its other sides
+are where the cells' density falls below the <i>fall-off</i> fraction of
+its peak. <b>all</b> takes the convex hull of the parent population.</li>
 <li><b>replicate</b> (gate type): reuses another gate's boundary on a
 different parent.</li>
 <li><b>tail</b>: threshold just above the negative population, which is
@@ -791,15 +796,24 @@ On human data it stays above 5%, because donors vary more, and more
 unevenly, than the model allows for.</li>
 <li><b>Marker medians</b>: each population's median of each marker (and of
 AF Abundance, the per-cell autofluorescence), in transformed units.
-Populations are screened first, and markers are tested only within the
-populations that pass (stage-wise FDR [4]). By default a population is not
+With <b>Test marker medians population first</b> on (the default), each
+population is first tested on all its markers together, and markers are
+tested only within the populations that pass (stage-wise FDR [4]). The
+population screen is on the marker medians themselves, not on whether the
+population's frequency changed. With it off, every population × marker is
+corrected as one list, which finds an isolated marker change in a
+population whose other markers are steady, at the cost of more tests to
+correct for. Switching it updates significance without refitting. By
+default a population is not
 tested on the markers of its own and its ancestors' gates, which differ by
 construction.</li>
 <li>With <b>TREAT</b> [3] on, p-values test whether the effect exceeds the
 threshold. With it off, they test for any difference and the threshold only
 filters.</li>
-<li>FDR is pooled over all comparisons or taken within each. Changing a
-threshold updates significance without refitting.</li>
+<li>Frequencies, counts and marker medians are each corrected for multiple
+testing as their own family. FDR is pooled over all comparisons or taken
+within each. Changing a threshold updates significance without
+refitting.</li>
 <li><b>Restore defaults</b>, at the top of the settings, puts the tests and
 their options, the thresholds, TREAT, the FDR correction and <i>Leave out
 flagged samples</i> back to their defaults. Comparisons, reference group,
