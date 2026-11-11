@@ -623,7 +623,14 @@ class SampleWidget(QWidget):
             self.bus.sampleTreeUpdated.emit()
 
     def refresh_sample_tree(self):
-        self.controller.experiment.scan_sample_tree()
+        try:
+            self.controller.experiment.scan_sample_tree()
+        except OSError as e:
+            logger.warning(f'SampleWidget: could not scan the sample folders ({e})')
+            if self.bus:
+                self.bus.statusMessage.emit(f'Could not read the sample folders: {e.strerror or e}. '
+                                            f'Check that the drive holding this experiment is connected.')
+            return
         self.model.refresh_tree()
         self.tree_view.expandAll()
 
