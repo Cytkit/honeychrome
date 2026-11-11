@@ -1,6 +1,6 @@
 """
 Agent control: lets an AI agent drive the open Honeychrome window through a
-local MCP server (design/agent_control.md). Off by default; turned on in
+local MCP server. Off by default; turned on in
 Edit > App Configuration. Only this package's own modules are imported, so
 the feature adds no dependency.
 """

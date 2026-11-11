@@ -2,8 +2,7 @@
 bridge.py
 ---------
 Runs the agent's tool calls on the Qt main thread, one at a time, and
-collects the messages Honeychrome shows while a call runs
-(design/agent_control.md §5.2 and §5.6).
+collects the messages Honeychrome shows while a call runs.
 
 The MCP server thread calls ``call``, which queues the call to the main
 thread and waits for its result. Controller methods with

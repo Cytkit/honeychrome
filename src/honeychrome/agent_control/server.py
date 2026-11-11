@@ -2,7 +2,7 @@
 server.py
 ---------
 A minimal Model Context Protocol server over Streamable HTTP, for the
-agent tools (design/agent_control.md §5.1). It serves tools only:
+agent tools. It serves tools only:
 ``initialize``, ``ping``, ``tools/list`` and ``tools/call`` on POST, answered
 with a single JSON response (no SSE stream, no sessions), so it needs only the
 standard library.

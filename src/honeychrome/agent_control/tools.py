@@ -1,7 +1,7 @@
 """
 tools.py
 --------
-The tools an AI agent calls to drive Honeychrome (design/agent_control.md).
+The tools an AI agent calls to drive Honeychrome.
 
 Every tool runs on the Qt main thread (``bridge.AgentBridge``) and changes
 the experiment the way the matching click does, so the open window follows:
