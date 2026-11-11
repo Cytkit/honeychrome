@@ -940,3 +940,409 @@ def refresh_unmixing(ctx: ToolContext) -> dict:
         raise ToolError('The spectral model is empty. Define the spectral controls in the Spectral Process tab first.')
     ctx.bus.spectralModelUpdated.emit()
     return get_spectral_model(ctx)
+
+
+@tool('Get spectral profiles',
+      'The reference spectrum of each control in the spectral model: one value per raw fluorescence detector '
+      '(normalised to a peak of 1), and its peak detector.',
+      properties={'labels': {'type': 'array', 'items': {'type': 'string'},
+                             'description': 'Control labels to return (default: all).'}})
+def get_spectral_profiles(ctx: ToolContext, labels: list | None = None) -> dict:
+    c = ctx.controller
+    profiles = c.experiment.process.get('profiles') or {}
+    if not profiles:
+        raise ToolError('No spectra yet: build the spectral model in the Spectral Process tab first.')
+    raw = c.experiment.settings['raw']
+    detectors = [raw['event_channels_pnn'][i] for i in (c.filtered_raw_fluorescence_channel_ids or [])]
+    wanted = [str(label) for label in labels] if labels else list(profiles)
+    unknown = [label for label in wanted if label not in profiles]
+    if unknown:
+        raise ToolError(f'No spectrum for: {", ".join(unknown)}. Labels: {", ".join(profiles)}.')
+    out = {}
+    for label in wanted:
+        values = np.asarray(profiles[label], dtype=np.float64)
+        matches = len(values) == len(detectors)
+        out[label] = {'peak_detector': detectors[int(np.argmax(values))] if matches and len(values) else None,
+                      'values': [round(float(v), 4) for v in values]}
+    return {'detectors': detectors, 'profiles': out}
+
+
+_MATRIX_VIEWERS = {'similarity': 'similarity_viewer', 'hotspot': 'hotspot_viewer',
+                   'unmixing': 'unmixing_viewer', 'spillover': 'compensation_editor'}
+
+
+@tool('Get spectral matrix',
+      'One matrix from the Spectral Process tab, with its row and column names: similarity, hotspot, unmixing, '
+      'or spillover (the fine-tuning matrix).',
+      properties={'matrix': {'type': 'string', 'enum': list(_MATRIX_VIEWERS)}}, required=('matrix',))
+def get_spectral_matrix(ctx: ToolContext, matrix: str) -> dict:
+    viewer = getattr(ctx.main_window(), _MATRIX_VIEWERS[matrix])
+    model = viewer.model
+    if model._data is None or not model.vertical_headers:
+        raise ToolError(f'There is no {matrix} matrix yet: build the spectral model first.')
+    return {'matrix': matrix, 'rows': list(model.vertical_headers), 'columns': list(model.horizontal_headers),
+            'values': np.round(np.asarray(model._data, dtype=np.float64), 4).tolist(),
+            'condition_number': ctx.controller.experiment.process.get('condition_number')}
+
+
+def _match_name(names: list, wanted: str, what: str) -> int:
+    for i, name in enumerate(names):
+        if name == wanted:
+            return i
+    lowered = wanted.strip().lower()
+    for i, name in enumerate(names):
+        if str(name).lower() == lowered:
+            return i
+    raise ToolError(f'No {what} "{wanted}". Choices: {", ".join(map(str, names))}.')
+
+
+@tool('Set spillover value',
+      'Change one cell of the spillover (fine-tuning) matrix, as editing it in the Spectral Process tab does: how '
+      'much of the column fluorophore is subtracted from the row fluorophore. Unmixed data is recalculated.',
+      properties={'row': {'type': 'string', 'description': 'Row fluorophore, from get_spectral_matrix.'},
+                  'column': {'type': 'string', 'description': 'Column fluorophore.'},
+                  'value': {'type': 'number'}},
+      required=('row', 'column', 'value'), writes=True, timeout=600.0)
+def set_spillover_value(ctx: ToolContext, row: str, column: str, value: float) -> dict:
+    from PySide6.QtCore import Qt
+
+    editor = ctx.main_window().compensation_editor
+    model = editor.model
+    if model._data is None or not model.vertical_headers:
+        raise ToolError('There is no spillover matrix yet: build the spectral model first.')
+    if not np.isfinite(value):
+        raise ToolError('The value must be a finite number.')
+    r = _match_name(model.vertical_headers, row, 'row')
+    c = _match_name(model.horizontal_headers, column, 'column')
+    if r == c:
+        raise ToolError('The diagonal of the spillover matrix cannot be edited.')
+    old = float(model._data[r, c])
+    if not model.setData(model.index(r, c), float(value), Qt.EditRole):
+        raise ToolError('Honeychrome did not accept the value.')
+    # apply now rather than after the editor's debounce, so the next call sees the result
+    editor._timer.stop()
+    editor._emit_now()
+    return {'row': model.vertical_headers[r], 'column': model.horizontal_headers[c],
+            'old_value': old, 'new_value': float(model._data[r, c])}
+
+
+# ---------------------------------------------------------------------------
+# Gate intensities
+# ---------------------------------------------------------------------------
+
+MAX_INTENSITY_CELLS = 600
+
+
+def _intensity(values: np.ndarray) -> dict | None:
+    v = values[np.isfinite(values)]
+    if len(v) == 0:
+        return None
+    median, mean = float(np.median(v)), float(np.mean(v))
+    sd = float(np.std(v, ddof=1)) if len(v) > 1 else 0.0
+    p16, p84 = np.percentile(v, (15.87, 84.13))
+    return {'median': round(median, 3), 'mean': round(mean, 3), 'sd': round(sd, 3),
+            'cv_percent': round(100 * sd / abs(mean), 2) if abs(mean) > 1e-12 else None,
+            'robust_cv_percent': round(100 * 0.5 * (p84 - p16) / abs(median), 2) if abs(median) > 1e-12 else None}
+
+
+@tool('Get gate intensities',
+      'Median, mean, SD, CV and robust CV of channel values for the events in each gate on the loaded sample '
+      '(MFI). Default: every gate and every fluorescence channel of the scope. Computed on the displayed events. '
+      'Shows the scope\'s tab.',
+      properties={'scope': SCOPE,
+                  'gates': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Gate names; "root" for all events.'},
+                  'channels': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Channel names or labels.'}},
+      required=('scope',))
+def get_gate_intensities(ctx: ToolContext, scope: str, gates: list | None = None, channels: list | None = None) -> dict:
+    data = ctx.ensure_scope(scope)
+    path = ctx.require_sample()
+    events = data.get('event_data')
+    membership = data.get('gate_membership') or {}
+    if events is None or 'root' not in membership:
+        raise ToolError('The gate memberships are not computed yet; try again.')
+    gating = data['gating']
+    if gates:
+        names = list(dict.fromkeys(str(g) for g in gates))
+        for name in names:
+            if name != 'root':
+                ctx.require_gate(gating, name)
+    else:
+        names = ['root'] + [n for n, p in gating.get_gate_ids()
+                            if gating._get_gate_node(n, p).gate_type != 'QuadrantGate']
+    pnn = data['pnn']
+    if channels:
+        chans = list(dict.fromkeys(ctx.resolve_channel(data, str(ch)) for ch in channels))
+    else:
+        chans = [pnn[i] for i in (data.get('fluoro_indices') or [])]
+    if not chans:
+        raise ToolError('No channels to summarise; give channels.')
+    if len(names) * len(chans) > MAX_INTENSITY_CELLS:
+        raise ToolError(f'{len(names)} gates x {len(chans)} channels is too many; give fewer gates or channels.')
+    labels = data.get('pnn_labels') or {}
+    rows = []
+    for name in names:
+        mask = membership.get(name)
+        if mask is None:
+            rows.append({'gate': name, 'error': 'not computed for this sample'})
+            continue
+        n = int(mask.sum())
+        entry = {'gate': name, 'events': n, 'channels': {}}
+        if n:
+            subset = events[mask]
+            for channel in chans:
+                label = labels.get(channel)
+                key = f'{channel} ({label})' if label and label != channel else channel
+                entry['channels'][key] = _intensity(np.asarray(subset[:, pnn.index(channel)], dtype=np.float64))
+        rows.append(entry)
+    c = ctx.controller
+    return {'scope': scope, 'sample': path, 'events_in_file': int(c.current_sample.event_count),
+            'events_displayed': None if c.raw_event_data is None else int(len(c.raw_event_data)),
+            'units': 'channel values as on the axes (raw signal, or unmixed abundance in the unmixed scope)',
+            'gates': rows}
+
+
+# ---------------------------------------------------------------------------
+# More gate and plot editing
+# ---------------------------------------------------------------------------
+
+@tool('Rename gate',
+      'Rename a gate everywhere it is used (plots, child gates, spectral model positive/negative gates), as '
+      'renaming its label on the plot does.',
+      properties={'scope': SCOPE, 'gate_name': {'type': 'string'}, 'new_name': {'type': 'string'}},
+      required=('scope', 'gate_name', 'new_name'), writes=True)
+def rename_gate(ctx: ToolContext, scope: str, gate_name: str, new_name: str) -> dict:
+    from honeychrome.controller_components.functions import rename_label_offset
+
+    data = ctx.ensure_scope(scope)
+    gating = data['gating']
+    path = ctx.require_gate(gating, gate_name)
+    new_name = new_name.strip()
+    if not new_name or new_name == 'root' or '/' in new_name:
+        raise ToolError('Gate names must be non-empty, not "root", and contain no "/".')
+    if gating.find_matching_gate_paths(new_name):
+        raise ToolError(f'A gate named "{new_name}" already exists in {scope}.')
+    if gating._get_gate_node(gate_name, path).gate_type == 'Quadrant':
+        raise ToolError('Quadrants are named after their channels and cannot be renamed.')
+    customised = [s for s, sample_gates in ctx.controller.custom_sample_gates.get(scope, {}).items()
+                  if gate_name in sample_gates]
+    if customised:
+        raise ToolError(f'{len(customised)} sample(s) have a custom version of "{gate_name}". Revert them to the '
+                        'template first (revert_gate), then rename.')
+    gating.rename_gate(gate_name, new_name)
+    indices = []
+    for i, plot in enumerate(data['plots']):
+        if gate_name in plot['child_gates']:
+            plot['child_gates'][plot['child_gates'].index(gate_name)] = new_name
+            rename_label_offset(plot, gate_name, new_name)
+            indices.append(i)
+    if scope == 'raw':
+        ctx.bus.rawGateRenamed.emit(gate_name, new_name)
+    ctx.bus.updateSourceChildGates.emit(scope, new_name)
+    for i in indices:
+        ctx.bus.updateRois.emit(scope, i)
+    ctx.bus.changedGatingHierarchy.emit(scope, new_name)
+    return _gate_result(ctx, data, new_name, indices[0] if indices else None, [])
+
+
+@tool('Adopt custom gate as template',
+      'Make the loaded sample\'s custom version of a gate the shared gate for all samples (samples without their '
+      'own version follow it); the sample\'s custom copy is then removed.',
+      properties={'scope': SCOPE, 'gate_name': {'type': 'string'}}, required=('scope', 'gate_name'), writes=True)
+def adopt_gate_as_template(ctx: ToolContext, scope: str, gate_name: str) -> dict:
+    data = ctx.ensure_scope(scope)
+    path = ctx.require_sample()
+    gating = data['gating']
+    ctx.require_gate(gating, gate_name)
+    if not gating.is_custom_gate(path, gate_name):
+        raise ToolError(f'The loaded sample has no custom version of "{gate_name}".')
+    ctx.bus.adoptGateRequested.emit(scope, gate_name)
+    out = _gate_result(ctx, data, gate_name, ctx.plot_with_gate(data, gate_name), [])
+    out['custom_for_loaded_sample'] = bool(gating.is_custom_gate(path, gate_name))
+    return out
+
+
+@tool('Add ribbon plot',
+      'Add a ribbon plot (every fluorescence channel side by side) showing the events of source_gate. Shows the '
+      'scope\'s tab.',
+      properties={'scope': SCOPE, 'source_gate': {'type': 'string', 'default': 'root'}},
+      required=('scope',), writes=True)
+def add_ribbon_plot(ctx: ToolContext, scope: str, source_gate: str = 'root') -> dict:
+    data = ctx.ensure_scope(scope)
+    if source_gate != 'root':
+        ctx.require_gate(data['gating'], source_gate)
+    ctx.bus.newPlotRequested.emit('All Fluorescence', '')
+    index = len(data['plots']) - 1
+    if data['plots'][index]['type'] != 'ribbon':
+        raise ToolError('Honeychrome did not add a ribbon plot.')
+    if source_gate != 'root':
+        data['plots'][index]['source_gate'] = source_gate
+        ctx.bus.plotChangeRequested.emit(scope, index)
+    ctx.grid(scope).init_grid()
+    return _describe_plot(data, index)
+
+
+@tool('Move plot',
+      'Move a plot in its tab, as the toolbar arrows do: to the start, one place left, one place right, or to the '
+      'end. Plot indices change accordingly.',
+      properties={'scope': SCOPE, 'plot_index': PLOT_INDEX,
+                  'destination': {'type': 'string', 'enum': ['start', 'left', 'right', 'end']}},
+      required=('scope', 'plot_index', 'destination'), writes=True)
+def move_plot(ctx: ToolContext, scope: str, plot_index: int, destination: str) -> dict:
+    data = ctx.ensure_scope(scope)
+    ctx.plot(data, plot_index)
+    grid = ctx.grid(scope)
+    grid.select_plot(ctx.plot_widget(scope, plot_index))
+    grid.permute_plot_widgets(destination)
+    grid.init_grid()
+    return {'scope': scope, 'plots': [_describe_plot(data, i) for i in range(len(data['plots']))]}
+
+
+_AXIS_PARAMETERS = {'top': 'scale_t', 'logicle_width': 'logicle_w', 'logicle_decades': 'logicle_m',
+                    'logicle_negative_decades': 'logicle_a', 'linear_negative_range': 'linear_a',
+                    'log_decades': 'log_m'}
+
+
+def _check_axis(t, changed: set) -> None:
+    """The Logicle, linear and log constraints on the transform's parameters, and a usable bin scale."""
+    if t.scale_t <= 0:
+        raise ToolError('top must be positive.')
+    if changed & {'logicle_w', 'logicle_m', 'logicle_a'}:
+        w, m, a = t.logicle_w, t.logicle_m, t.logicle_a
+        if m <= 0 or not 0 <= w <= m / 2:
+            raise ToolError(f'logicle_width must be between 0 and logicle_decades / 2 ({m / 2:g}).')
+        if not -w <= a <= m - 2 * w:
+            raise ToolError(f'logicle_negative_decades must be between {-w:g} and {m - 2 * w:g}.')
+    if 'linear_a' in changed and t.linear_a < 0:
+        raise ToolError('linear_negative_range must not be negative.')
+    if 'log_m' in changed and t.log_m <= 0:
+        raise ToolError('log_decades must be positive.')
+    scale = np.asarray(t.scale[1:-1], dtype=np.float64)
+    if not (np.all(np.isfinite(scale)) and np.all(np.diff(scale) > 0)):
+        raise ToolError('These parameters give an unusable axis.')
+
+
+@tool('Set axis parameters',
+      'Fine-tune a channel\'s axis in a scope (every plot using it changes): top of the scale (T, data units), '
+      'logicle width (W), decades (M) and extra negative decades (A), linear negative range, log decades, and the '
+      'visible range in data units. Gates keep their position on the axis.',
+      properties={'scope': SCOPE, 'channel': {'type': 'string'},
+                  'top': {'type': 'number'}, 'logicle_width': {'type': 'number'},
+                  'logicle_decades': {'type': 'number'}, 'logicle_negative_decades': {'type': 'number'},
+                  'linear_negative_range': {'type': 'number'}, 'log_decades': {'type': 'number'},
+                  'visible_min': {'type': 'number'}, 'visible_max': {'type': 'number'}},
+      required=('scope', 'channel'), writes=True)
+def set_axis_parameters(ctx: ToolContext, scope: str, channel: str, visible_min: float | None = None,
+                        visible_max: float | None = None, **params) -> dict:
+    data = ctx.ensure_scope(scope)
+    channel = ctx.resolve_channel(data, channel)
+    t = _transform(data, channel)
+    changes = {_AXIS_PARAMETERS[k]: float(v) for k, v in params.items() if v is not None}
+    if not changes and visible_min is None and visible_max is None:
+        raise ToolError('Nothing to change: give at least one parameter or visible_min/visible_max.')
+    if changes and t.id == 'default':
+        raise ToolError(f'"{channel}" has a fixed linear axis (e.g. Time); only its visible range can change.')
+    old = {attr: getattr(t, attr) for attr in _AXIS_PARAMETERS.values()}
+    old_limits = list(t.limits)
+    try:
+        for attr, value in changes.items():
+            setattr(t, attr, value)
+        t.set_transform()
+        _check_axis(t, set(changes))
+        if visible_min is not None or visible_max is not None:
+            lo, hi = geo.axis_range(t)
+            lo = lo if visible_min is None else visible_min
+            hi = hi if visible_max is None else visible_max
+            limits = [float(v) for v in geo.to_plot(t, [lo, hi])]
+            if not (np.all(np.isfinite(limits)) and limits[1] > limits[0]):
+                raise ToolError('The visible range must have visible_min below visible_max, within the transform.')
+            t.set_transform(limits=limits)
+            _check_axis(t, set())
+    except Exception as exc:
+        for attr, value in old.items():
+            setattr(t, attr, value)
+        t.set_transform(limits=old_limits)
+        if isinstance(exc, ToolError):
+            raise
+        raise ToolError(f'Invalid axis parameters ({exc}); the axis is unchanged.') from None
+    ctx.bus.axisTransformed.emit(channel)
+    out = _axis(data, channel)
+    out['parameters'] = {k: getattr(t, attr) for k, attr in _AXIS_PARAMETERS.items()}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Samples, reports, new experiments
+# ---------------------------------------------------------------------------
+
+@tool('Set sample flags',
+      'Mark or unmark a sample as unstained and/or as beads, as the sample panel\'s right-click menu does.',
+      properties={'sample': {'type': 'string', 'description': 'Sample path or name, from list_samples.'},
+                  'unstained': {'type': 'boolean'}, 'beads': {'type': 'boolean'}},
+      required=('sample',), writes=True)
+def set_sample_flags(ctx: ToolContext, sample: str, unstained: bool | None = None, beads: bool | None = None) -> dict:
+    from honeychrome.controller_components.particle_type import is_bead_sample
+
+    if unstained is None and beads is None:
+        raise ToolError('Give unstained and/or beads.')
+    path = _resolve_sample(ctx, sample)
+    tree = ctx.main_window().sample_tree
+    samples = ctx.controller.experiment.samples
+    if unstained is not None and (path in samples.get('unstained_samples', [])) != unstained:
+        tree.toggle_unstained(path)
+    if beads is not None and bool(is_bead_sample(samples, path)) != beads:
+        tree.toggle_beads(path)
+    return {'sample': path, 'unstained': path in samples.get('unstained_samples', []),
+            'beads': bool(is_bead_sample(samples, path))}
+
+
+@tool('Generate sample report',
+      'Write the Word report (plots, statistics, spectral process) of the loaded sample to the experiment\'s '
+      'Reports folder, as the sample panel\'s "Generate Sample Report" does. Returns the file path.',
+      writes=True, timeout=900.0)
+def generate_sample_report(ctx: ToolContext) -> dict:
+    import time
+
+    c = ctx.controller
+    path = ctx.require_sample()
+    try:
+        relative = Path(path).relative_to(c.experiment.settings['raw']['raw_samples_subdirectory'])
+    except ValueError:
+        raise ToolError('Reports can be generated only for samples in the raw samples folder.') from None
+    report = (Path(c.experiment_dir) / 'Reports' / relative).with_suffix('.docx')
+    started = time.time()
+    ctx.main_window().sample_tree.generate_report()
+    if not report.exists() or report.stat().st_mtime < started - 1:
+        raise ToolError('The report was not written (is the file open in Word?).')
+    return {'report': str(report)}
+
+
+@tool('New experiment',
+      'Create a new experiment in the Experiments folder and open it, optionally copying the settings and spectral '
+      'model of a template experiment (from list_experiments). Replaces the open experiment.',
+      properties={'name': {'type': 'string', 'description': 'File name without .kit.'},
+                  'template': {'type': 'string', 'description': 'Path of a template .kit (optional).'}},
+      required=('name',), writes=True, needs_experiment=False, timeout=300.0)
+def new_experiment(ctx: ToolContext, name: str, template: str | None = None) -> dict:
+    import re
+
+    from honeychrome.controller_components.functions import add_recent_file
+
+    name = name.strip()
+    if name.lower().endswith('.kit'):
+        name = name[:-4]
+    if not re.fullmatch(r'[\w\-. ()]+', name) or name.startswith('.'):
+        raise ToolError('Use letters, digits, spaces, "-", "_", "." and brackets only for the experiment name.')
+    kit = _experiments_folder() / f'{name}.kit'
+    if kit.exists() or kit.with_suffix('').exists():
+        raise ToolError(f'An experiment called "{name}" already exists. Choose another name or open it.')
+    template_path = None
+    if template:
+        template_path = Path(template).expanduser()
+        if template_path.suffix != '.kit' or not template_path.is_file() or not _allowed_experiment(template_path):
+            raise ToolError('The template must be an experiment from list_experiments.')
+    add_recent_file(kit)
+    ctx.view.load_main_window_with_experiment_and_template(
+        str(kit), new=True, template_path=None if template_path is None else str(template_path))
+    if not ctx.experiment_open() or Path(ctx.controller.experiment.experiment_path).resolve() != kit.resolve():
+        raise ToolError(f'Honeychrome did not create "{name}".')
+    return get_state(ctx)

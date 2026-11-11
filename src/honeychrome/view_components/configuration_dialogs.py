@@ -482,7 +482,9 @@ class AppConfigDialog(QDialog):
             control.apply_settings()
         self.accept()
         importlib.reload(settings)
-        self.bus.reloadExpRequested.emit()
+        # from the start screen there is no experiment to reload yet
+        if getattr(self.controller, 'experiment_dir', None) is not None:
+            self.bus.reloadExpRequested.emit()
 
     def reset_to_defaults(self):
         index = self.hist2dtype_combo.findText(hist2dtype)

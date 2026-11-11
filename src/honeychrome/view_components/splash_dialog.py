@@ -147,6 +147,11 @@ class SplashScreen(QDialog):
         self.btn_template.clicked.connect(self.view.new_from_template)
         layout.addWidget(self.btn_template)
 
+        self.btn_config = QPushButton("App Configuration")
+        self.btn_config.setToolTip('Application settings, including letting AI agents control Honeychrome')
+        self.btn_config.clicked.connect(self.open_app_config)
+        layout.addWidget(self.btn_config)
+
         # recent files
         self.recent_model = QStringListModel()
         full_recent_files = q_settings.value("recent_files", [])
@@ -196,6 +201,11 @@ class SplashScreen(QDialog):
 
 
         self.setLayout(layout)
+
+    def open_app_config(self):
+        from honeychrome.view_components.configuration_dialogs import AppConfigDialog
+        dialog = AppConfigDialog(self, getattr(self.view, 'bus', None), getattr(self.view, 'controller', None))
+        dialog.exec()
 
     def handle_recent_clicked(self, index):
         self.btn_new.setEnabled(False)
