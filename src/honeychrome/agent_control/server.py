@@ -42,6 +42,8 @@ These tools drive the Honeychrome window the user has open (flow cytometry analy
 in the user's window as if they had clicked it.
 - Call get_state first. Tools that take a scope work on the Raw Data ('raw') or Unmixed Data ('unmixed') tab and
   switch to it.
+- Call these tools one at a time and wait for each result: they act in turn on the same window, so a call made in
+  parallel can run before the one it depends on (e.g. load_sample before open_experiment).
 - Plots and statistics show the loaded sample (load_sample). Gates are shared by all samples unless customised.
 - Before drawing a gate, look at the plot with get_plot_image and summarise_plot. Coordinates are in data units
   (axis values) unless units is 'plot'. After drawing, check the statistics the tool returns and tell the user
