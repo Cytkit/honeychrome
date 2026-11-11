@@ -165,6 +165,7 @@ from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 from honeychrome.view_components.side_tab_widget import SideTabWidget
 from honeychrome.controller_components import covariate_check, sample_table
 from honeychrome.controller_components import trend_stats
+from honeychrome.controller_components import anova_stats
 from honeychrome.view_components import trend_plots
 from honeychrome.view_components import suggest_groupings_dialog as sgd
 from honeychrome.view_components import covariate_check_dialog, sample_table_import_dialog
@@ -946,8 +947,13 @@ class PipelineState:
     # Baseline group for 'reference' mode.
     paired: bool = False
     pairing_variable: str = ''
-    # Column name in state.covariates used as a fixed-effect blocking term
-    # when paired=True (e.g. donor ID).
+    # Column name in state.covariates used as a blocking term when
+    # paired=True (e.g. donor ID).
+    pairing_mode: str = 'auto'
+    # How the pairing variable enters the model
+    # (differential_stats.resolve_pairing): 'fixed' (within-individual
+    # comparisons), 'random' (repeated samples of individuals nested in the
+    # groups) or 'auto' (random when every individual is in one group).
     population_split: bool = False
     # True: compare gated populations within samples (e.g. CD45.1+ vs
     #   CD45.1- cells of each chimera) instead of sample groups. Samples of
@@ -1016,6 +1022,9 @@ class PipelineState:
     # raw (samples x clusters) count matrix
     mfi_results: pd.DataFrame | None = None
     # moderated linear model output for per-cluster marker MFIs
+    anova_results: dict = field(default_factory=dict)
+    # variance tables of the last Run Statistics (drc_stats.run_statistics):
+    # 'freq' and 'mfi' (anova_stats.run_anova, either may be None) and 'notes'
     mfi_df: pd.DataFrame | None = None
     # raw (samples x cluster·channel) MFI matrix, each channel on its
     # configured Transforms-tab scale (Logicle/biexponential/linear)
@@ -3443,6 +3452,26 @@ class GroupsStatsTab(QWidget):
         )
         self.pairing_variable_combo.currentTextChanged.connect(self._on_pairing_variable_changed)
         paired_row.addWidget(self.pairing_variable_combo)
+        paired_row.addWidget(QLabel("Individual effect:"))
+        self.pairing_mode_combo = QComboBox()
+        for text, key in (("Auto", 'auto'), ("Fixed (paired)", 'fixed'),
+                          ("Random (repeated samples)", 'random')):
+            self.pairing_mode_combo.addItem(text, key)
+        self.pairing_mode_combo.setEnabled(False)
+        self.pairing_mode_combo.setToolTip(
+            "How the pairing variable enters the model.\n"
+            "Fixed: groups are compared within each individual (before and after "
+            "samples of one donor, two populations of one animal). Each individual "
+            "needs samples in more than one group.\n"
+            "Random: each individual gives several samples (e.g. four tissues per "
+            "mouse) but belongs to one group (knockout or wild type). The samples "
+            "of one individual are treated as correlated, so the group difference "
+            "is judged against the variation between individuals rather than "
+            "between samples. The counts test is not run in this mode.\n"
+            "Auto: Random when every individual belongs to one group, Fixed "
+            "otherwise.")
+        self.pairing_mode_combo.currentIndexChanged.connect(self._on_pairing_mode_changed)
+        paired_row.addWidget(self.pairing_mode_combo)
         paired_row.addStretch()
         test_groups_layout.addLayout(paired_row)
 
@@ -4496,6 +4525,7 @@ class GroupsStatsTab(QWidget):
         self._population_panel.setVisible(split)
         self.chk_paired.setEnabled(not split)
         self.pairing_variable_combo.setEnabled(not split and self.state.paired)
+        self.pairing_mode_combo.setEnabled(not split and self.state.paired)
         self.adjust_covariates_list.setEnabled(not split)
         self.test_groups_hint.setText(
             "Check the groups whose samples are split into the populations below."
@@ -4506,8 +4536,20 @@ class GroupsStatsTab(QWidget):
     def _on_paired_toggled(self, checked: bool):
         self.state.paired = checked
         self.pairing_variable_combo.setEnabled(checked)
+        self.pairing_mode_combo.setEnabled(checked)
         self._last_stats_data_key = None
         self._update_run_button()
+
+    def _on_pairing_mode_changed(self, _index: int):
+        self.state.pairing_mode = self.pairing_mode_combo.currentData() or 'auto'
+        self._last_stats_data_key = None
+
+    def _load_pairing_mode_combo(self):
+        self.pairing_mode_combo.blockSignals(True)
+        self.pairing_mode_combo.setCurrentIndex(
+            max(self.pairing_mode_combo.findData(self.state.pairing_mode), 0))
+        self.pairing_mode_combo.blockSignals(False)
+        self.pairing_mode_combo.setEnabled(self.state.paired and not self.state.population_split)
 
     def _populate_pairing_variable_combo(self):
         cols = list(self.state.covariates.columns) if self.state.covariates is not None else []
@@ -4719,6 +4761,7 @@ class GroupsStatsTab(QWidget):
         self.chk_paired.setChecked(self.state.paired)
         self.chk_paired.blockSignals(False)
         self.pairing_variable_combo.setEnabled(self.state.paired)
+        self._load_pairing_mode_combo()
         self.chk_treat.setChecked(self.state.stats_use_treat)
         self.chk_mfi_hierarchical.setChecked(self.state.stats_mfi_hierarchical)
         self.counts_method_combo.setCurrentIndex(
@@ -4837,6 +4880,8 @@ class GroupsStatsTab(QWidget):
         if self.state.trend_results and not self._has_results_tab('trend_tables'):
             self._show_trend_tables()
             self._show_trend_figures()
+        if self.state.anova_results and not self._has_results_tab('anova_tables'):
+            self._show_anova_tables()
 
     # ------------------------------------------------------------------
     # Table population
@@ -5431,6 +5476,8 @@ class GroupsStatsTab(QWidget):
             self.state.freq_results = None
             self.state.counts_results = None
             self.state.mfi_results = None
+            self.state.anova_results = {}
+            self._remove_results_tab_by_key('anova_tables')
             self.state.freq_df = None
             self.state.counts_df = None
             self.state.mfi_df = None
@@ -5906,6 +5953,41 @@ class GroupsStatsTab(QWidget):
         container.setProperty('_tab_key', 'trend_tables')
         index = self._results_tabs.addTab(container, "Trend tables")
         self._results_tabs.setCurrentIndex(index)
+
+    def _show_anova_tables(self):
+        """The 'Variance' results tab: for every cluster (and marker), each
+        term's FDR and the share of variation it explains
+        (anova_stats.run_anova), with the notes of the run above."""
+        anova = self.state.anova_results or {}
+        self._remove_results_tab_by_key('anova_tables')
+        if anova.get('freq') is None and anova.get('mfi') is None:
+            return
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        if anova.get('notes'):
+            note = QLabel(" ".join(anova['notes']))
+            note.setWordWrap(True)
+            layout.addWidget(note)
+        inner = QTabWidget()
+        for key, title in (('freq', 'Frequencies'), ('mfi', 'MFIs')):
+            table_df = anova.get(key)
+            if table_df is None:
+                continue
+            ids = ['feature', 'cluster', 'channel'] if key == 'mfi' else ['feature']
+            headers, rows = anova_stats.display_rows(table_df, ids)
+            if key == 'mfi':
+                headers = ['Cluster', 'Marker'] + headers[3:]
+                rows = [dict({'Cluster': r.pop('cluster', ''), 'Marker': r.pop('channel', '')},
+                             **{k: v for k, v in r.items() if k != 'feature'}) for r in rows]
+            else:
+                headers = ['Cluster'] + headers[1:]
+                rows = [dict({'Cluster': r.pop('feature', '')}, **r) for r in rows]
+            table = CopyableTableWidget(rows, headers)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            inner.addTab(table, title)
+        layout.addWidget(inner)
+        container.setProperty('_tab_key', 'anova_tables')
+        self._results_tabs.addTab(container, "Variance")
 
     # Trend results: tested values per kind, and the figure tabs' keys.
     _TREND_DATA = {'freq': ('freq_data', 'log2 % of events'),
@@ -6773,6 +6855,7 @@ class GroupsStatsTab(QWidget):
         self.state.mfi_results = snap.mfi_results if ran_mfi else None
         self.state.mfi_df = snap.mfi_df if ran_mfi else None
         self.state.mfi_sample_df = snap.mfi_sample_df if ran_mfi else None
+        self.state.anova_results = dict(snap.anova_results or {})
         self.state.stats_cluster_names = dict(snap.stats_cluster_names)
 
     def _set_stats_busy(self, busy: bool):
@@ -6889,6 +6972,7 @@ class GroupsStatsTab(QWidget):
         test_fingerprint = (
             tuple(self.state.testing_group_selection), self.state.contrast_mode,
             self.state.reference_group, self.state.paired, self.state.pairing_variable,
+            self.state.pairing_mode if paired else None,
             tuple(adjust_covariates), covariate_values,
             tuple(c for c in adjust_covariates if c in self.state.numeric_covariates),
             self.state.stats_counts_method if run_counts else None,
@@ -7601,6 +7685,7 @@ class GroupsStatsTab(QWidget):
         self._update_pca_source_availability()
         self._refresh_predictive_controls()
         self._draw_results()
+        self._show_anova_tables()
         self.results_computed.emit()
 
     # ------------------------------------------------------------------
@@ -8868,6 +8953,11 @@ class GroupsStatsTab(QWidget):
                 frames['Counts (GLM)'] = self.state.counts_results
             if self.state.mfi_results is not None:
                 frames['MFIs'] = self.state.mfi_results
+            anova = self.state.anova_results or {}
+            for key, title in (('freq', 'Variance table: Frequencies'),
+                               ('mfi', 'Variance table: MFIs')):
+                if anova.get(key) is not None:
+                    frames[title] = anova[key]
 
             if not frames:
                 QMessageBox.warning(self, "No Results", "No statistics results to export.")
@@ -15739,6 +15829,7 @@ class PluginWidget(QWidget):
             s.setValue('reference_group',   self.state.reference_group)
             s.setValue('paired',            self.state.paired)
             s.setValue('pairing_variable',  self.state.pairing_variable)
+            s.setValue('pairing_mode',      self.state.pairing_mode)
             s.setValue('population_split',  self.state.population_split)
             s.setValue('population_gates',  list(self.state.population_gates))
             s.setValue('population_reference', self.state.population_reference)
@@ -16014,6 +16105,8 @@ class PluginWidget(QWidget):
             paired_val = s.value('paired', False)
             self.state.paired = paired_val in (True, 'true', 'True', 1, '1')
             self.state.pairing_variable = s.value('pairing_variable', '')
+            mode = s.value('pairing_mode', 'auto') or 'auto'
+            self.state.pairing_mode = mode if mode in ('auto', 'fixed', 'random') else 'auto'
             self.state.population_split = _qs_bool(s, 'population_split', False)
             self.state.population_gates = _qs_list(s, 'population_gates')
             self.state.population_reference = s.value('population_reference', '') or ''
@@ -16417,6 +16510,7 @@ class PluginWidget(QWidget):
             ('freq_results',      self.state.freq_results),
             ('counts_results',    self.state.counts_results),
             ('mfi_results',       self.state.mfi_results),
+            ('anova_results',     self.state.anova_results),
             ('freq_df',           self.state.freq_df),
             ('counts_df',         self.state.counts_df),
             ('mfi_df',            self.state.mfi_df),
@@ -16541,6 +16635,8 @@ class PluginWidget(QWidget):
                 self.state.counts_results = payload['counts_results']
             if isinstance(payload.get('mfi_results'), pd.DataFrame):
                 self.state.mfi_results = payload['mfi_results']
+            if isinstance(payload.get('anova_results'), dict):
+                self.state.anova_results = payload['anova_results']
             if isinstance(payload.get('freq_df'), pd.DataFrame):
                 self.state.freq_df = payload['freq_df']
             if isinstance(payload.get('counts_df'), pd.DataFrame):
@@ -17014,7 +17110,7 @@ class PluginWidget(QWidget):
                 tuple(sorted(s.group_patterns.items())),
                 tuple(s.testing_group_selection),
                 s.contrast_mode, s.reference_group, s.paired, s.pairing_variable,
-                s.population_split, tuple(s.population_gates), s.population_reference,
+                s.pairing_mode, s.population_split, tuple(s.population_gates), s.population_reference,
                 tuple(sorted(s.selected_gates)),
                 len(s.dr_runs), len(s.clustering_runs),
                 tuple(sorted(s.cluster_labels)),

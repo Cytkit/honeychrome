@@ -81,6 +81,7 @@ from sklearn.decomposition import PCA
 import drc_pipeline
 import drc_run_align
 from drc_logging import get_logger, log_stage
+from honeychrome.controller_components import anova_stats
 from honeychrome.controller_components import differential_stats as _ds
 from honeychrome.controller_components.differential_stats import (
     apply_significance,
@@ -971,6 +972,13 @@ def relabel_stats_results(state, names: dict) -> dict[str, str]:
     state.counts_results = _renamed_values(state.counts_results, 'feature', renames)
     state.mfi_results = _renamed_values(
         _renamed_values(state.mfi_results, 'feature', mfi_renames), 'cluster', renames)
+    anova = getattr(state, 'anova_results', None) or {}
+    if anova:
+        state.anova_results = dict(
+            anova,
+            freq=_renamed_values(anova.get('freq'), 'feature', renames),
+            mfi=_renamed_values(_renamed_values(anova.get('mfi'), 'feature', mfi_renames),
+                                'cluster', renames))
     if state.pca_loadings_df is not None:
         state.pca_loadings_df = state.pca_loadings_df.rename(index=prefixed)
     predictive = getattr(state, 'predictive_result', None)
@@ -1041,7 +1049,14 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
     reference_group, the pairing vector (if state.paired and
     state.pairing_variable names a covariates column) and the adjustment
     covariates, all shared across freq/counts/mfi so the three tests
-    report the same comparisons from the same design.
+    report the same comparisons from the same design. The pairing enters
+    as a fixed term or as a random effect by state.pairing_mode
+    (differential_stats.resolve_pairing); with a random effect the counts
+    GLM is not run.
+
+    Also writes state.anova_results: {'freq', 'mfi'} variance tables
+    (anova_stats.run_anova) of the tested frequencies and MFIs, and
+    'notes'.
 
     fc_threshold  : |log2 fold change| threshold for Frequencies and Counts.
     mfi_threshold : |difference| threshold for MFIs, in transformed units
@@ -1130,6 +1145,13 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
     covariates = covariate_frame(state, all_rel, adjust)
     if covariates is not None:
         log.info("adjusting for covariates: %s", list(covariates.columns))
+    individual = 'Sample' if split is not None else (state.pairing_variable or 'Individual')
+    block_vec = None
+    if split is None:
+        pairing_vec, block_vec, mode = _ds.resolve_pairing(
+            group_vec, pairing_vec, getattr(state, 'pairing_mode', 'auto'))
+        if mode:
+            log.info("pairing variable %r entered as a %s effect", individual, mode)
 
     n_clusters = n_clusters_from_labels(
         state, all_rel, cluster_labels_override=cluster_labels_override
@@ -1139,6 +1161,9 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
                                  for cl in range(n_clusters)}
 
     freq_results = mfi_results = counts_results = None
+    anova = {'notes': []}
+    stats_notes: list[str] = []
+    state.anova_results = {}
 
     # Group metadata for the heatmap and the 'Viewing comparison' selector.
     state.stats_all_rel = all_rel
@@ -1165,15 +1190,23 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
         )
         totals = sample_event_totals(state, all_rel, cluster_labels_override)
         totals = _ds.library_sizes(counts_df[tested], totals, _normalisation(state))
+        freq_values = log2_frequencies(counts_df[tested], totals)
         freq_results = run_moderated(
-            log2_frequencies(counts_df[tested], totals), group_vec, contrasts, state.contrast_mode,
+            freq_values, group_vec, contrasts, state.contrast_mode,
             pval_threshold, fc_threshold, pairing_vec=pairing_vec, fdr_scope=fdr_scope,
             covariates=covariates, use_treat=use_treat,
-            too_few_hint=_TOO_FEW_CLUSTERS_HINT,
+            too_few_hint=_TOO_FEW_CLUSTERS_HINT, block_vec=block_vec, block_name=individual,
         )
         state.freq_results = freq_results
         state.freq_df = freq_df          # % per cluster (display)
+        anova['freq'] = _variance_table(freq_values, group_vec, pairing_vec, block_vec,
+                                        individual, covariates, None, anova['notes'])
 
+    if run_counts and block_vec is not None:
+        run_counts = False
+        stats_notes.append(f"Counts were not tested: the negative-binomial counts test has no "
+                           f"random {individual} effect. Frequencies and MFIs were tested with "
+                           "it.")
     if run_counts:
         # The library-size offset is each sample's total over all clusters,
         # including those left out of the test (robustly rescaled on request).
@@ -1219,25 +1252,50 @@ def run_statistics(controller, state, run_freq: bool, run_mfi: bool,
                 pval_threshold, mfi_threshold, pairing_vec=pairing_vec, fdr_scope=fdr_scope,
                 covariates=covariates, use_treat=use_treat,
                 feature_meta=meta, hierarchical=mfi_hierarchical,
-                too_few_hint=_TOO_FEW_CLUSTERS_HINT,
+                too_few_hint=_TOO_FEW_CLUSTERS_HINT, block_vec=block_vec, block_name=individual,
             )
             state.mfi_results = mfi_results
             state.mfi_df = mfi_df        # raw (samples × cluster·channel) MFIs
+            anova['mfi'] = _variance_table(mfi_df, group_vec, pairing_vec, block_vec, individual,
+                                           covariates, meta, anova['notes'])
 
         state.mfi_sample_df = compute_sample_mfis(
             controller, state, all_rel, channels=mfi_channels, af_state=af_state,
             loaded=loaded,
         )
 
-    notes = []
+    notes = list(stats_notes)
     for frame in (freq_results, mfi_results, counts_results):
         for note in (frame.attrs.get('notes', []) if frame is not None else []):
             if note not in notes:
                 notes.append(note)
+    for title, frame in (('Frequencies', freq_results), ('MFIs', mfi_results)):
+        for note in (frame.attrs.get('block_notes', []) if frame is not None else []):
+            notes.append(f"{title}: {note}")
     if notes:
         state.stats_alignment_note = " ".join(
             t for t in [state.stats_alignment_note] + notes if t)
+    if anova.get('freq') is not None or anova.get('mfi') is not None or anova['notes']:
+        state.anova_results = anova
     return freq_results, mfi_results, counts_results
+
+
+def _variance_table(values: pd.DataFrame, group_vec: list[str], pairing_vec, block_vec,
+                    individual: str, covariates, feature_meta, notes: list[str]):
+    """The variance table (anova_stats.run_anova) of one kind of feature,
+    or None with the reason added to *notes* when it cannot be made."""
+    try:
+        table = anova_stats.run_anova(
+            values, group_vec, pairing_vec=pairing_vec, block_vec=block_vec,
+            individual=individual, covariates=covariates, feature_meta=feature_meta)
+    except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+        log.warning("variance table not made: %s", exc)
+        notes.append(f"Variance table not made: {exc}")
+        return None
+    for note in table.attrs.get('notes', []):
+        if note not in notes:
+            notes.append(note)
+    return table
 
 
 # ---------------------------------------------------------------------------
