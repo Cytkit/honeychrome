@@ -139,7 +139,7 @@ class TraceAnalyser(mp.Process):
         self.start_time = None
 
         # hack to remove pickup noise by subtracting unused channels
-        self.channel_input_mask_for_subtraction = np.array([True if ch in ['B1', 'B14'] else False for ch in adc_channels])
+        self.channel_input_mask_for_subtraction = np.array([True if ch in ['B11', 'B12', 'B13', 'B14'] else False for ch in adc_channels])
         self.channel_input_mask_for_subtraction[self.indices_peak_detection_channel_in_traces] = False
         self.channel_output_mask_for_subtraction = np.array([True if ch in fluorescence_channels else False for ch in adc_channels])
         self.channel_output_mask_for_subtraction[self.indices_peak_detection_channel_in_traces] = False

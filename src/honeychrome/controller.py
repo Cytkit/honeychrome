@@ -1663,7 +1663,7 @@ class Controller(QObject):
                 logger.debug('load_sample: raw_event_data shape %s', self.raw_event_data.shape)
 
             # apply spectral unmixing and compensation if defined
-            if self.experiment.process['unmixing_matrix'] is not None:
+            if self.experiment.process['unmixing_matrix'] is not None and self.raw_event_data is not None and self.raw_event_data.size > 0:
                 profiles_assigned = bool(
                     self.experiment.samples
                     .get('sample_af_profiles', {})
