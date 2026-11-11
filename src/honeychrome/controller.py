@@ -2170,14 +2170,16 @@ class Controller(QObject):
 
             # copy live data
             self.raw_event_data, n_new_events = self.copy_live_data(extent='update')
-            self.data_for_cytometry_plots['event_data'] = self.raw_event_data
 
             # apply spectral unmixing and compensation if defined
-            if self.current_mode == 'raw' and self.experiment.process['unmixing_matrix'] is not None:
+            if self.experiment.process['unmixing_matrix'] is not None:
                 self.unmixed_event_data = apply_transfer_matrix(self.transfer_matrix, self.raw_event_data)
-                self.data_for_cytometry_plots['event_data'] = self.unmixed_event_data
 
-            self.calc_hists_and_stats()
+            # one reference: a tab switch on the main thread can rebind it (None on a plugin tab)
+            data = self.data_for_cytometry_plots
+            if data is not None:
+                data['event_data'] = self.raw_event_data if data is self.data_for_cytometry_plots_raw else self.unmixed_event_data
+                self.calc_hists_and_stats()
 
             # Calculate elapsed time and sleep precisely
             new_update_time = time.perf_counter()
@@ -2347,7 +2349,7 @@ class Controller(QObject):
     @with_busy_cursor
     @Slot()
     def refresh_spectral_process(self):
-        from honeychrome.controller_components.spectral_functions import calculate_spectral_process
+        from honeychrome.controller_components.spectral_functions import calculate_spectral_process, UnmixableProfilesError
 
         # first build unmixed part of experiment: settings, process and cytometry
         raw_settings = self.experiment.settings['raw']
@@ -2371,19 +2373,28 @@ class Controller(QObject):
                 and len(profiles.keys()) == len(spectral_model)
                 and all(profiles.keys())
         )
+        # profiles that cannot be unmixed leave the experiment as it was; the reason is
+        # reported with the other profile-QC warnings below
+        spectral_process = None
         if spectral_model and spectral_model_valid:
             if self.bus:
                 self.bus.statusMessage.emit(f'Refreshing spectral process...')
             existing_spillover = self.experiment.process.get('spillover')
             unmixing_method = self.experiment.settings.get('unmixing_method', 'OLS')
-            unmixed_settings, spectral_process, conditioning_warnings = calculate_spectral_process(
-                raw_settings, spectral_model, profiles,
-                existing_spillover=existing_spillover,
-                unmixing_method=unmixing_method,
-                experiment_dir=self.experiment_dir,
-                experiment_samples=self.experiment.samples,
-                filtered_fluorescence_channel_ids=self.filtered_raw_fluorescence_channel_ids,
-            )
+            try:
+                unmixed_settings, spectral_process, conditioning_warnings = calculate_spectral_process(
+                    raw_settings, spectral_model, profiles,
+                    existing_spillover=existing_spillover,
+                    unmixing_method=unmixing_method,
+                    experiment_dir=self.experiment_dir,
+                    experiment_samples=self.experiment.samples,
+                    filtered_fluorescence_channel_ids=self.filtered_raw_fluorescence_channel_ids,
+                )
+            except UnmixableProfilesError as e:
+                logger.warning(f'Controller: spectral process not refreshed ({len(spectral_model)} profiles): {e}')
+                conditioning_warnings = [str(e)]
+
+        if spectral_process is not None:
             self.experiment.process.update(spectral_process)
 
             # An experiment whose channel list predates the AF channels gains
@@ -2453,7 +2464,7 @@ class Controller(QObject):
                 # keep the existing unmixed gating strategy where its channels still exist
                 if previous_unmixed is not None:
                     self._carry_over_unmixed_cytometry(previous_unmixed)
-        else:
+        elif not (spectral_model and spectral_model_valid):
             unmixed_settings = settings_default['unmixed'].copy()
             self.experiment.settings['unmixed'].update(unmixed_settings)
 
@@ -2488,7 +2499,10 @@ class Controller(QObject):
                     self.bus.warningMessage.emit(qc_text)
             self.bus.spectralProcessRefreshed.emit()
             # self.bus.changedGatingHierarchy.emit('unmixed', 'root')
-            self.bus.statusMessage.emit(f'Spectral process refreshed.')
+            if spectral_process is None and spectral_model and spectral_model_valid:
+                self.bus.statusMessage.emit(f'Spectral process not refreshed.')
+            else:
+                self.bus.statusMessage.emit(f'Spectral process refreshed.')
 
         logger.info(f'Controller: refreshed spectral process, unmixed settings, unmixed cytometry')
 
