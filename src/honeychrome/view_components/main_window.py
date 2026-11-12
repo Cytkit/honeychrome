@@ -319,6 +319,11 @@ class MainWindow(QMainWindow):
         zoom_row.addWidget(zoom_label)
         zoom_row.addWidget(self._heatmap_zoom_minus)
         zoom_row.addWidget(self._heatmap_zoom_plus)
+        zoom_row.addSpacing(20)
+        export_csv_button = QPushButton("Export CSV")
+        export_csv_button.setToolTip("Save the spectral profiles and the unmixing, spillover and hotspot matrices as CSV files")
+        export_csv_button.clicked.connect(self._export_process_csv)
+        zoom_row.addWidget(export_csv_button)
         zoom_row.addStretch()
         self.process_layout.addLayout(zoom_row)
         # --- end zoom control ---
@@ -706,6 +711,43 @@ class MainWindow(QMainWindow):
         for viewer in (self.similarity_viewer, self.hotspot_viewer,
                        self.unmixing_viewer, self.compensation_editor):
             viewer.view.set_cell_size(self._heatmap_cell_size)
+
+    def _export_process_csv(self):
+        """Write the spectral profiles and the unmixing, spillover and hotspot matrices to CSV files.
+
+        Each file has channel labels in the first row and column and full numeric
+        precision, named <experiment>_<table>.csv in the chosen folder.
+        """
+        tables = {
+            'spectral_profiles': self.profiles_viewer.profiles_dataframe(),
+            'unmixing_matrix': self.unmixing_viewer.to_dataframe(),
+            'spillover_matrix': self.compensation_editor.to_dataframe(),
+            'hotspot_matrix': self.hotspot_viewer.to_dataframe(),
+        }
+        tables = {key: frame for key, frame in tables.items() if frame is not None}
+        if not tables:
+            QMessageBox.information(self, "Export CSV", "There are no profiles or matrices to export yet.")
+            return
+
+        experiment_dir = self.controller.experiment_dir
+        folder = QFileDialog.getExistingDirectory(self, "Export profiles and matrices to folder", str(experiment_dir))
+        if not folder:
+            return
+
+        paths = {key: Path(folder) / f"{experiment_dir.name}_{key}.csv" for key in tables}
+        existing = [path.name for path in paths.values() if path.exists()]
+        if existing:
+            answer = QMessageBox.question(self, "Export CSV", "Overwrite existing files?\n\n" + "\n".join(existing))
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        try:
+            for key, frame in tables.items():
+                frame.to_csv(paths[key], index_label='')
+        except OSError as e:
+            QMessageBox.warning(self, "Export CSV", f"Could not write the CSV files:\n{e}")
+            return
+        self.bus.statusMessage.emit(f"Exported {', '.join(path.name for path in paths.values())} to {folder}")
 
     def _save_visibility_state(self):
         for name, widget in {"gains": self.gains_widget, "acquisition": self.acquisition_widget}.items():

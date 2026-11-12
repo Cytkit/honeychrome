@@ -2,7 +2,7 @@ import sys
 import numpy as np
 
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QObject, QEvent, Slot, QSize, QTimer, QItemSelectionModel, QSignalBlocker, QSettings
-from PySide6.QtWidgets import QApplication, QTableView, QStyledItemDelegate, QLineEdit, QFrame, QVBoxLayout, QLabel, QHeaderView, QStyle, QAbstractItemView
+from PySide6.QtWidgets import QApplication, QTableView, QStyledItemDelegate, QLineEdit, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QHeaderView, QStyle, QAbstractItemView, QWidget, QPushButton, QCheckBox, QSpinBox
 from PySide6.QtGui import QColor, QPen
 
 import pyqtgraph as pg
@@ -66,6 +66,10 @@ class HeatmapModel(QAbstractTableModel):
         if role == Qt.BackgroundRole:
             return self.value_to_cet_color(value)
 
+        if role == Qt.ToolTipRole:
+            return (f"{self.vertical_headers[index.row()]} / "
+                    f"{self.horizontal_headers[index.column()]}: {value:.4f}")
+
         return None
 
     def setData(self, index, value, role):
@@ -89,8 +93,10 @@ class HeatmapModel(QAbstractTableModel):
         return Qt.ItemIsSelectable | Qt.ItemIsEditable | Qt.ItemIsEnabled
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if orientation == Qt.Horizontal and role == Qt.ToolTipRole:
-            return self.horizontal_headers[section]
+        if role == Qt.ToolTipRole:
+            if orientation == Qt.Horizontal:
+                return self.horizontal_headers[section]
+            return self.vertical_headers[section]
 
         if role == Qt.DisplayRole:
             if orientation == Qt.Horizontal:
@@ -124,6 +130,13 @@ class HeatmapDelegate(QStyledItemDelegate):
             editor.selectAll()
         else:
             super().setEditorData(editor, index)
+
+    def initStyleOption(self, option, index):
+        # Show colour only when the number would not fit in the cell; the value
+        # remains available as the cell tooltip.
+        super().initStyleOption(option, index)
+        if option.text and option.fontMetrics.horizontalAdvance(option.text) > option.rect.width() - 4:
+            option.text = ''
 
     def paint(self, painter, option, index):
         if self.disable_diagonal:
@@ -261,6 +274,108 @@ class ResizingTable(QTableView):
 
         return QSize(width + frame_width, height + frame_width)
 
+class HeatmapPopoutWindow(QWidget):
+    """Separate, resizable window showing one Spectral Process heatmap.
+
+    The table shares the model and the selection with the docked heatmap, so
+    values, spillover edits and the selected cell stay in sync between the two.
+    With "Fit to window" ticked the cells are resized to fill the window, so the
+    whole matrix can be seen at once (for example maximised on a second screen);
+    unticked, the cell size is set manually and the table scrolls with its
+    channel labels kept in view. Numbers are hidden when a cell is too small to
+    show them, and every cell's value is available as a tooltip.
+    """
+    MIN_CELL = 16
+    MAX_CELL = 160
+
+    def __init__(self, editor, title):
+        super().__init__(editor, Qt.Window)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setWindowTitle(title)
+        self.editor = editor
+
+        layout = QVBoxLayout(self)
+        controls = QHBoxLayout()
+        self.fit_check = QCheckBox('Fit to window')
+        self.fit_check.setChecked(True)
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(self.MIN_CELL, self.MAX_CELL)
+        self.size_spin.setSingleStep(4)
+        self.size_spin.setSuffix(' px')
+        self.size_spin.setValue(editor.view.horizontalHeader().defaultSectionSize())
+        self.size_spin.setEnabled(False)
+        controls.addWidget(self.fit_check)
+        controls.addWidget(QLabel('Cell size:'))
+        controls.addWidget(self.size_spin)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        self.view = QTableView()
+        self.view.setModel(editor.model)
+        self.view.setSelectionModel(editor.view.selectionModel())
+        self.view.setItemDelegate(HeatmapDelegate(self.view, **editor.delegate_kwargs))
+        self.view.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.view.setSelectionBehavior(QAbstractItemView.SelectItems)
+        self.view.setEditTriggers(editor.view.editTriggers())
+        self.view.setWordWrap(True)
+        for header in (self.view.horizontalHeader(), self.view.verticalHeader()):
+            header.setMinimumSectionSize(self.MIN_CELL)
+        layout.addWidget(self.view)
+
+        if editor.process_key == 'spillover':
+            self.wheel_handler = WheelEditor(self.view, editor.model)
+            self.view.viewport().installEventFilter(self.wheel_handler)
+
+        self.sync_hidden_rows()
+        self._set_cell_size(self.size_spin.value())
+
+        self.fit_check.toggled.connect(self._on_fit_toggled)
+        self.size_spin.valueChanged.connect(self._set_cell_size)
+        editor.model.modelReset.connect(self._refit)
+        self.view.installEventFilter(self)
+
+        screen = editor.screen().availableGeometry()
+        self.resize(int(screen.width() * 0.8), int(screen.height() * 0.8))
+
+    def sync_hidden_rows(self):
+        """Show the same rows as the docked heatmap (profiles selected above)."""
+        for row in range(self.editor.model.rowCount()):
+            self.view.setRowHidden(row, self.editor.view.isRowHidden(row))
+        self._refit()
+
+    def eventFilter(self, obj, event):
+        if obj is self.view and event.type() == QEvent.Resize:
+            self._refit()
+        return False
+
+    def _on_fit_toggled(self, checked):
+        self.size_spin.setEnabled(not checked)
+        self._refit()
+
+    def _refit(self):
+        if self.fit_check.isChecked():
+            self.fit_to_window()
+
+    def fit_to_window(self):
+        model = self.view.model()
+        n_cols = model.columnCount()
+        n_rows = sum(not self.view.isRowHidden(row) for row in range(model.rowCount()))
+        if n_cols == 0 or n_rows == 0:
+            return
+        frame = 2 * self.view.frameWidth()
+        avail_w = self.view.width() - self.view.verticalHeader().width() - frame
+        avail_h = self.view.height() - self.view.horizontalHeader().height() - frame
+        size = int(min(avail_w / n_cols, avail_h / n_rows))
+        size = max(self.MIN_CELL, min(self.MAX_CELL, size))
+        with QSignalBlocker(self.size_spin):
+            self.size_spin.setValue(size)
+        self._set_cell_size(size)
+
+    def _set_cell_size(self, size):
+        self.view.horizontalHeader().setDefaultSectionSize(size)
+        self.view.verticalHeader().setDefaultSectionSize(size)
+
+
 # -----------------------------------------------------
 # Main Application
 # -----------------------------------------------------
@@ -287,25 +402,40 @@ class HeatmapViewEditor(QFrame):
 
         self.view = ResizingTable()
         self.title = None
-        delegate = None
+        self._popout = None
+        self.delegate_kwargs = {}
         if process_key == 'similarity_matrix':
-            self.title = QLabel('Similarity Matrix')
-            delegate = HeatmapDelegate(disable_diagonal=True)
+            self.short_title = 'Similarity Matrix'
+            self.title = QLabel(self.short_title)
+            self.delegate_kwargs = dict(disable_diagonal=True)
             heatmap_range = (-1,1)
         elif process_key == 'hotspot_matrix':
-            self.title = QLabel('Hotspot Matrix')
-            delegate = HeatmapDelegate(disable_diagonal=True)
+            self.short_title = 'Hotspot Matrix'
+            self.title = QLabel(self.short_title)
+            self.delegate_kwargs = dict(disable_diagonal=True)
             heatmap_range = (-10,10)
         elif process_key == 'unmixing_matrix':
-            self.title = QLabel('Unmixing Matrix')
-            delegate = HeatmapDelegate()
+            self.short_title = 'Unmixing Matrix'
+            self.title = QLabel(self.short_title)
             heatmap_range = (-1,1)
         elif self.process_key == 'spillover':
+            self.short_title = 'Spillover (Fine Tuning) Matrix'
             self.title = QLabel('Spillover (Fine Tuning) Matrix: double click to edit, or click to select then roll scroll wheel')
-            delegate = HeatmapDelegate(enable_editor=True, disable_diagonal=True)
+            self.delegate_kwargs = dict(enable_editor=True, disable_diagonal=True)
             heatmap_range = (-0.5,0.5)
+        delegate = HeatmapDelegate(**self.delegate_kwargs)
 
-        self.layout.addWidget(self.title)
+        if self.bus:
+            title_row = QHBoxLayout()
+            title_row.addWidget(self.title)
+            title_row.addStretch()
+            popout_button = QPushButton('Pop out')
+            popout_button.setToolTip('Open this matrix in a separate, resizable window')
+            popout_button.clicked.connect(self.open_popout)
+            title_row.addWidget(popout_button)
+            self.layout.addLayout(title_row)
+        else:
+            self.layout.addWidget(self.title)
         self.title.setStyleSheet(heading_style)
         self.model = HeatmapModel(is_dark, heatmap_range)
         self.view.setModel(self.model)
@@ -338,6 +468,28 @@ class HeatmapViewEditor(QFrame):
                 visible = label in selected_label_list
                 self.view.setRowHidden(row, not visible)
             self.view.updateGeometry()
+            if self._popout is not None:
+                self._popout.sync_hidden_rows()
+
+    def open_popout(self):
+        """Show this matrix in its own window, or raise the window if already open."""
+        if self._popout is None:
+            self._popout = HeatmapPopoutWindow(self, self.short_title)
+            self._popout.destroyed.connect(self._on_popout_destroyed)
+        self._popout.show()
+        self._popout.raise_()
+        self._popout.activateWindow()
+
+    def _on_popout_destroyed(self):
+        self._popout = None
+
+    def to_dataframe(self):
+        """The full matrix (including rows hidden by profile selection) with channel labels, or None if not calculated."""
+        if not self.controller.experiment.process.get(self.process_key) or self.model._data is None:
+            return None
+        import pandas as pd
+        return pd.DataFrame(self.model._data, index=self.model.vertical_headers,
+                            columns=self.model.horizontal_headers)
 
     def _emit_now(self):
         self.controller.reapply_fine_tuning()
