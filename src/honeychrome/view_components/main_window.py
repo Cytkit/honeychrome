@@ -16,7 +16,7 @@ from honeychrome.view_components.statistical_plotter import StatisticalCompariso
 os.environ["QT_LOGGING_RULES"] = "qt.core.qobject.connect=false" #suppress pyqtgraph graphicslayoutwidget warning
 
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QMainWindow, QFileDialog, QWidget, QHBoxLayout, QSplitter, QTabWidget, QStatusBar, QVBoxLayout, QLabel, QProgressBar, QScrollArea, QPushButton, QMenu, QGroupBox, QSpinBox, QMessageBox
+from PySide6.QtWidgets import QMainWindow, QFileDialog, QWidget, QHBoxLayout, QSplitter, QTabWidget, QStatusBar, QVBoxLayout, QLabel, QProgressBar, QScrollArea, QPushButton, QMenu, QGroupBox, QSpinBox, QMessageBox, QCheckBox
 from PySide6.QtCore import Qt, QSettings, QByteArray, QPoint, Slot, QTimer, QThread, Signal as QtSignal
 
 from honeychrome.view_components.gating_hierarchy_widget import GatingHierarchyWidget
@@ -316,9 +316,14 @@ class MainWindow(QMainWindow):
         self._heatmap_zoom_plus.setToolTip("Increase heatmap cell size")
         self._heatmap_zoom_minus.clicked.connect(self._heatmap_zoom_out)
         self._heatmap_zoom_plus.clicked.connect(self._heatmap_zoom_in)
+        self._heatmap_fit_check = QCheckBox("Fit to width")
+        self._heatmap_fit_check.setToolTip("Shrink or enlarge the heatmap cells so every column fits the panel width")
+        self._heatmap_fit_check.setChecked(self.settings.value("heatmap_fit_width", False, type=bool))
+        self._heatmap_fit_check.toggled.connect(self._on_heatmap_fit_toggled)
         zoom_row.addWidget(zoom_label)
         zoom_row.addWidget(self._heatmap_zoom_minus)
         zoom_row.addWidget(self._heatmap_zoom_plus)
+        zoom_row.addWidget(self._heatmap_fit_check)
         zoom_row.addSpacing(20)
         export_csv_button = QPushButton("Export CSV")
         export_csv_button.setToolTip("Save the spectral profiles and the unmixing, spillover and hotspot matrices as CSV files")
@@ -327,6 +332,9 @@ class MainWindow(QMainWindow):
         zoom_row.addStretch()
         self.process_layout.addLayout(zoom_row)
         # --- end zoom control ---
+
+        if self._heatmap_fit_check.isChecked():
+            self._on_heatmap_fit_toggled(True)
 
         self.process_layout.addWidget(self.similarity_viewer)
         self.process_layout.addWidget(self.hotspot_viewer)
@@ -711,6 +719,17 @@ class MainWindow(QMainWindow):
         for viewer in (self.similarity_viewer, self.hotspot_viewer,
                        self.unmixing_viewer, self.compensation_editor):
             viewer.view.set_cell_size(self._heatmap_cell_size)
+
+    def _on_heatmap_fit_toggled(self, checked):
+        """Fit heatmap cells to the panel width, or return to the +/- cell size."""
+        self.settings.setValue("heatmap_fit_width", checked)
+        self._heatmap_zoom_minus.setEnabled(not checked)
+        self._heatmap_zoom_plus.setEnabled(not checked)
+        for viewer in (self.similarity_viewer, self.hotspot_viewer,
+                       self.unmixing_viewer, self.compensation_editor):
+            viewer.set_fit_width(checked)
+        if not checked:
+            self._apply_heatmap_cell_size()
 
     def _export_process_csv(self):
         """Write the spectral profiles and the unmixing, spillover and hotspot matrices to CSV files.

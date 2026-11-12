@@ -1,9 +1,9 @@
 import sys
 import numpy as np
 
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QObject, QEvent, Slot, QSize, QTimer, QItemSelectionModel, QSignalBlocker, QSettings
-from PySide6.QtWidgets import QApplication, QTableView, QStyledItemDelegate, QLineEdit, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QHeaderView, QStyle, QAbstractItemView, QWidget, QPushButton, QCheckBox, QSpinBox
-from PySide6.QtGui import QColor, QPen
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QObject, QEvent, Slot, QSize, QTimer, QItemSelectionModel, QSignalBlocker, QSettings, QRect
+from PySide6.QtWidgets import QApplication, QTableView, QStyledItemDelegate, QLineEdit, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QHeaderView, QStyle, QAbstractItemView, QWidget, QPushButton, QCheckBox, QSpinBox, QStyleOptionHeader
+from PySide6.QtGui import QColor, QPen, QPalette
 
 import pyqtgraph as pg
 import colorcet as cc
@@ -114,6 +114,9 @@ class HeatmapDelegate(QStyledItemDelegate):
         super().__init__(parent)
         self.enable_editor = enable_editor
         self.disable_diagonal = disable_diagonal
+        # row and column under the mouse, outlined as a crosshair (-1 = none)
+        self.hover_row = -1
+        self.hover_col = -1
 
     def createEditor(self, parent, option, index):
         if not self.enable_editor:
@@ -145,6 +148,7 @@ class HeatmapDelegate(QStyledItemDelegate):
             # Hide diagonal: paint background color of table with no text
             if r == c:
                 painter.fillRect(option.rect, option.palette.window())  # blank area
+                self._paint_crosshair(painter, option, index)
                 return  # skip default painting
 
         # 1. Clear the "Selected" state so the default renderer
@@ -170,6 +174,138 @@ class HeatmapDelegate(QStyledItemDelegate):
             painter.drawRect(rect)
 
             painter.restore()
+
+        self._paint_crosshair(painter, option, index)
+
+    def _paint_crosshair(self, painter, option, index):
+        """Outline the cells in the hovered row and column so a value can be traced back to both labels."""
+        in_row = index.row() == self.hover_row
+        in_col = index.column() == self.hover_col
+        if not (in_row or in_col):
+            return
+        painter.save()
+        painter.setPen(QPen(option.palette.color(QPalette.Text), 1))
+        rect = option.rect.adjusted(0, 0, -1, -1)
+        if in_row:
+            painter.drawLine(rect.topLeft(), rect.topRight())
+            painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+        if in_col:
+            painter.drawLine(rect.topLeft(), rect.bottomLeft())
+            painter.drawLine(rect.topRight(), rect.bottomRight())
+        painter.restore()
+
+
+# ---------------------------
+# Headers: hover highlight and rotated column labels
+# ---------------------------
+class HighlightHeaderView(QHeaderView):
+    """Header that shades the section matching the hovered row or column."""
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.setSectionsClickable(True)
+        self.setHighlightSections(True)
+        self._highlight = -1
+
+    def set_highlight(self, logical_index):
+        if logical_index != self._highlight:
+            self._highlight = logical_index
+            self.viewport().update()
+
+    def paintSection(self, painter, rect, logical_index):
+        painter.save()
+        super().paintSection(painter, rect, logical_index)
+        painter.restore()
+        self._paint_highlight(painter, rect, logical_index)
+
+    def _paint_highlight(self, painter, rect, logical_index):
+        if logical_index == self._highlight:
+            color = QColor(self.palette().color(QPalette.Highlight))
+            color.setAlpha(90)
+            painter.fillRect(rect, color)
+
+
+class RotatedHeaderView(HighlightHeaderView):
+    """Column header with labels written bottom-to-top, so columns can be as narrow as the
+    text height instead of the label length. Height follows the longest label, capped."""
+    PADDING = 4
+    MAX_HEIGHT = 220
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+
+    def _label(self, logical_index):
+        model = self.model()
+        text = model.headerData(logical_index, Qt.Horizontal, Qt.DisplayRole) if model else None
+        return '' if text is None else str(text)
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        metrics = self.fontMetrics()
+        longest = max((metrics.horizontalAdvance(self._label(i)) for i in range(self.count())), default=0)
+        hint.setHeight(min(self.MAX_HEIGHT, longest + 3 * self.PADDING))
+        return hint
+
+    def paintSection(self, painter, rect, logical_index):
+        if not rect.isValid():
+            return
+        painter.save()
+        option = QStyleOptionHeader()
+        self.initStyleOption(option)
+        option.rect = rect
+        option.section = logical_index
+        option.text = ''
+        self.style().drawControl(QStyle.CE_Header, option, painter, self)
+
+        length = rect.height() - 2 * self.PADDING
+        text = self.fontMetrics().elidedText(self._label(logical_index), Qt.ElideRight, length)
+        painter.setPen(self.palette().color(QPalette.ButtonText))
+        painter.translate(rect.left(), rect.bottom() - self.PADDING)
+        painter.rotate(-90)
+        painter.drawText(QRect(0, 0, length, rect.width()), Qt.AlignLeft | Qt.AlignVCenter, text)
+        painter.restore()
+        self._paint_highlight(painter, rect, logical_index)
+
+
+def install_readable_headers(view):
+    """Give a heatmap table rotated column labels and hover-highlighting row labels,
+    keeping the current cell size."""
+    size = view.horizontalHeader().defaultSectionSize()
+    view.setHorizontalHeader(RotatedHeaderView(view))
+    view.setVerticalHeader(HighlightHeaderView(Qt.Vertical, view))
+    for header in (view.horizontalHeader(), view.verticalHeader()):
+        header.setDefaultSectionSize(size)
+
+
+class CrosshairTracker(QObject):
+    """Follow the mouse over a heatmap table and highlight the row and column under it,
+    in the cells (via the delegate) and in both headers."""
+    def __init__(self, view):
+        super().__init__(view)
+        self.view = view
+        view.setMouseTracking(True)
+        view.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.MouseMove:
+            index = self.view.indexAt(event.position().toPoint())
+            if index.isValid():
+                self._set(index.row(), index.column())
+            else:
+                self._set(-1, -1)
+        elif event.type() == QEvent.Leave:
+            self._set(-1, -1)
+        return False
+
+    def _set(self, row, col):
+        delegate = self.view.itemDelegate()
+        if (delegate.hover_row, delegate.hover_col) == (row, col):
+            return
+        delegate.hover_row, delegate.hover_col = row, col
+        self.view.viewport().update()
+        if isinstance(self.view.horizontalHeader(), HighlightHeaderView):
+            self.view.horizontalHeader().set_highlight(col)
+        if isinstance(self.view.verticalHeader(), HighlightHeaderView):
+            self.view.verticalHeader().set_highlight(row)
 
 # ---------------------------
 # Wheel handler (event filter)
@@ -318,8 +454,10 @@ class HeatmapPopoutWindow(QWidget):
         self.view.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.view.setEditTriggers(editor.view.editTriggers())
         self.view.setWordWrap(True)
+        install_readable_headers(self.view)
         for header in (self.view.horizontalHeader(), self.view.verticalHeader()):
             header.setMinimumSectionSize(self.MIN_CELL)
+        self.crosshair = CrosshairTracker(self.view)
         layout.addWidget(self.view)
 
         if editor.process_key == 'spillover':
@@ -454,7 +592,38 @@ class HeatmapViewEditor(QFrame):
 
         self.layout.addWidget(self.view)
 
+        # fit-to-width state, switched on from the Spectral Process tab
+        self.fit_width = False
+        self.fit_min_cell = 16
+        self.fit_max_cell = 120
+        self.model.modelReset.connect(lambda: QTimer.singleShot(0, self._refit_width))
+        if self.bus:
+            install_readable_headers(self.view)
+            for header in (self.view.horizontalHeader(), self.view.verticalHeader()):
+                header.setMinimumSectionSize(self.fit_min_cell)
+            self.crosshair = CrosshairTracker(self.view)
+
         self.refresh_heatmap()
+
+    def set_fit_width(self, enabled):
+        """Size cells so all columns fit the width of the panel, within fit_min_cell to fit_max_cell pixels."""
+        self.fit_width = enabled
+        self._refit_width()
+
+    def _refit_width(self):
+        if not self.fit_width:
+            return
+        n_cols = self.model.columnCount()
+        if n_cols == 0:
+            return
+        available = self.width() - self.view.verticalHeader().width() - 2 * self.view.frameWidth()
+        size = max(self.fit_min_cell, min(self.fit_max_cell, available // n_cols))
+        if size != self.view.horizontalHeader().defaultSectionSize():
+            self.view.set_cell_size(size)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refit_width()
 
     @Slot(list)
     def show_selected_rows(self, selected_label_list):
