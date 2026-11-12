@@ -82,6 +82,12 @@ M2pg (``unmix_m2pg``)
     compiled kernel (bundled_plugins/gls_m2p_kernel.cpp) runs it when built;
     otherwise the NumPy path here, with the same result.
 
+    With the noise-aware AF abundance the caller passes ``fixed_af``, each
+    event's AF row and abundance from R1 (``af_posterior``): there is then
+    no AF start or AF column, the AF signal is subtracted from the event and
+    counted in its signal for the weights, and only the fluorophores are
+    solved, so M2pg reports the same AF as R1.
+
 Storage
     ``process['noise_model']`` holds the fit's description (unstained
     sample, gate, bead sources, calibration summary, the no-AF negative
@@ -1252,8 +1258,12 @@ def pgls_solve(y: np.ndarray, spectra: np.ndarray, af_rows: np.ndarray | None, w
 
 def _m2p_refit(raw: np.ndarray, spectra: np.ndarray, start: dict, af_spectra: np.ndarray | None,
                noise: nm.NoiseModel, tau: np.ndarray | None, lam: float, n_iter: int,
-               ceiling: float | None) -> dict:
-    """The plug-in penalised GLS iterations of M2pg from ``start`` (see the module docstring)."""
+               ceiling: float | None, fixed_af: bool = False) -> dict:
+    """
+    The plug-in penalised GLS iterations of M2pg from ``start`` (see the
+    module docstring). With ``fixed_af`` the start's AF row and abundance
+    are kept and only the fluorophores are solved.
+    """
     from honeychrome.controller_components.autospectral_functions import positivity_weight
 
     n, f = len(raw), spectra.shape[0]
@@ -1277,8 +1287,12 @@ def _m2p_refit(raw: np.ndarray, spectra: np.ndarray, start: dict, af_spectra: np
                 mu += np.maximum(alpha, 0.0)[:, np.newaxis] * rows
             w = _saturation_weights(1.0 / noise.variance(mu), y, ceiling)
             pen = None if lam <= 0 else lam * positivity_weight(x, t2) / t2
-            sol = pgls_solve(y, spectra, rows, w, pen)
-            x, alpha = sol['x'], sol['alpha']
+            if fixed_af and rows is not None:
+                sol = pgls_solve(y - alpha[:, np.newaxis] * rows, spectra, None, w, pen)
+                x = sol['x']
+            else:
+                sol = pgls_solve(y, spectra, rows, w, pen)
+                x, alpha = sol['x'], sol['alpha']
             if pen is not None:
                 x = x / np.maximum(1.0 - pen * sol['inv_diag'], 1e-3)
         x_out[lo:hi] = x
@@ -1298,15 +1312,18 @@ def kernel_available() -> bool:
 def unmix_m2pg(raw_fl: np.ndarray, spectra: np.ndarray, noise: nm.NoiseModel, af_spectra: np.ndarray | None = None,
                envelope: dict | None = None, null_var_no_af: np.ndarray | None = None,
                spread: np.ndarray | None = None, prior_lambda: float = DEFAULT_PRIOR_LAMBDA,
-               ceiling: float | None = None, n_threads: int = 0, use_kernel: bool = True) -> dict:
+               ceiling: float | None = None, n_threads: int = 0, use_kernel: bool = True,
+               fixed_af: tuple | None = None) -> dict:
     """
     M2pg on raw fluorescence events (see the module docstring). With
     ``af_spectra`` (two or more rows) each event takes one AF row, scored
     with ``envelope`` (the runtime envelope; joint L2 without one, and then
     no prior); without, ``null_var_no_af`` sets the prior's negative
     variance and ``spread`` the spillover spread at the OLS position.
-    Returns ``unmixed`` (n, F, uncompensated), ``af_idx`` (0-based, -1
-    without AF) and ``af_scale``.
+    ``fixed_af`` = (AF row, 0-based, and abundance per event) fixes each
+    event's AF (the noise-aware abundance); only the fluorophores are then
+    solved. Returns ``unmixed`` (n, F, uncompensated), ``af_idx`` (0-based,
+    -1 without AF) and ``af_scale``.
     """
     raw_fl = np.ascontiguousarray(raw_fl, dtype=np.float64)
     spectra = np.ascontiguousarray(spectra, dtype=np.float64)
@@ -1316,23 +1333,41 @@ def unmix_m2pg(raw_fl: np.ndarray, spectra: np.ndarray, noise: nm.NoiseModel, af
         tau_spread = None if envelope is None else envelope.get('spread')
     else:
         af_spectra, envelope, tau_spread = None, None, spread
+    if not has_af:
+        fixed_af = None
+    if fixed_af is not None:
+        fixed_idx = np.ascontiguousarray(fixed_af[0], dtype=np.int64)
+        fixed_scale = np.ascontiguousarray(fixed_af[1], dtype=np.float64)
     if use_kernel and kernel_available():
         from gls_m2p_kernel_wrapper import unmix_m2p_kernel
-        out = unmix_m2p_kernel(
-            raw_fl, spectra, af_spectra, envelope, noise.sigma0_sq, noise.g, noise.c,
-            bead_var=None if has_af else null_var_no_af, tau_spread=tau_spread, prior_lambda=prior_lambda,
-            n_iter=N_ITER, ceiling=ceiling or 0.0, n_threads=n_threads,
-            af_choice_weights=sample_af_weights(raw_fl, noise) if has_af else None)
-        return {'unmixed': out['unmixed'], 'af_idx': out['af_idx'] if has_af else np.full(len(raw_fl), -1),
-                'af_scale': out['af_scale']}
-    if has_af:
+        try:
+            out = unmix_m2p_kernel(
+                raw_fl, spectra, af_spectra, envelope, noise.sigma0_sq, noise.g, noise.c,
+                bead_var=None if has_af else null_var_no_af, tau_spread=tau_spread, prior_lambda=prior_lambda,
+                n_iter=N_ITER, ceiling=ceiling or 0.0, n_threads=n_threads,
+                af_choice_weights=sample_af_weights(raw_fl, noise) if has_af and fixed_af is None else None,
+                fixed_af_idx=None if fixed_af is None else fixed_idx,
+                fixed_af_scale=None if fixed_af is None else fixed_scale)
+        except TypeError as exc:
+            if fixed_af is None:
+                raise
+            logger.warning('M2pg: the compiled kernel predates the noise-aware AF abundance (%s); the NumPy path '
+                           'is used. Build the kernels again.', exc)
+        else:
+            return {'unmixed': out['unmixed'], 'af_idx': out['af_idx'] if has_af else np.full(len(raw_fl), -1),
+                    'af_scale': out['af_scale']}
+    if fixed_af is not None:
+        x0 = _ols(raw_fl - fixed_scale[:, np.newaxis] * af_spectra[fixed_idx], spectra)
+        start = {'unmixed': x0, 'af_idx': fixed_idx, 'af_scale': fixed_scale}
+    elif has_af:
         start = per_cell_af_whitened(raw_fl, spectra, af_spectra, envelope, sample_af_weights(raw_fl, noise))
     else:
         start = {'unmixed': _ols(raw_fl, spectra), 'af_idx': np.full(len(raw_fl), -1),
                  'af_scale': np.zeros(len(raw_fl))}
     spread_m = None if tau_spread is None else np.asarray(tau_spread, dtype=np.float64)
     tau = negative_sd(raw_fl, spectra, af_spectra, envelope, None if has_af else null_var_no_af, spread_m)
-    return _m2p_refit(raw_fl, spectra, start, af_spectra, noise, tau, float(prior_lambda), N_ITER, ceiling)
+    return _m2p_refit(raw_fl, spectra, start, af_spectra, noise, tau, float(prior_lambda), N_ITER, ceiling,
+                      fixed_af=fixed_af is not None)
 
 
 def assemble_unmixed(raw_event_data: np.ndarray, transfer_matrix: np.ndarray, settings: dict, result: dict,

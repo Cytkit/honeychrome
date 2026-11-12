@@ -66,7 +66,8 @@ from honeychrome.controller_components.spread_model import (
 )
 from honeychrome.controller_components.transform import Transform
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
-from honeychrome.controller_components.sample_loader import resolve_af_for_profiles
+from honeychrome.controller_components.sample_loader import AFState, resolve_af_for_profiles
+from honeychrome.controller_components import af_posterior
 from honeychrome.controller_components.particle_type import (
     is_bead_sample, scatter_channel_pair, scatter_ceilings,
 )
@@ -195,8 +196,9 @@ class ComparisonWorker(QObject):
 
     def __init__(self, raw_event_data, transfer_matrix,
                  af_precomputed, af_spectra, exp_settings,
-                 filtered_fl_ids_raw, spillover=None, af_index_map=None):
+                 filtered_fl_ids_raw, spillover=None, af_index_map=None, af_posterior=None):
         super().__init__()
+        self.af_posterior = af_posterior
         self.raw_event_data = raw_event_data
         self.transfer_matrix = transfer_matrix
         self.af_precomputed = af_precomputed
@@ -220,6 +222,7 @@ class ComparisonWorker(QObject):
                 filtered_fl_ids_raw=self.filtered_fl_ids_raw,
                 spillover=self.spillover,
                 af_index_map=self.af_index_map,
+                af_posterior=self.af_posterior,
             )
             self.finished.emit(ols_data, af_result['unmixed'])
         except Exception as e:
@@ -898,6 +901,7 @@ class AutofluorescencePage(QWidget):
             self.bus.loadSampleRequested.connect(self._on_sample_loaded)
             self.bus.spectralProcessRefreshed.connect(self._on_process_refreshed)
             self.bus.sampleTreeUpdated.connect(self._populate_sample_combo)
+            self.bus.unmixingMethodChanged.connect(self._refresh_af_abundance_control)
 
     # ======================================================================
     # Section builders
@@ -940,6 +944,27 @@ class AutofluorescencePage(QWidget):
         som_row.addWidget(self._dedup_cb)
         som_row.addStretch(1)
         layout.addRow('SOM grid size:', som_row)
+
+        self._noise_aware_cb = QCheckBox('Noise-aware')
+        self._noise_aware_cb.setToolTip(
+            'How much AF each cell is given. Noise-aware (the default for new '
+            'experiments): each cell\'s own AF reading is weighed against the '
+            'typical AF of cells of the same size (SSC) in the sample, by how much '
+            'of the reading is noise, so cells bright for a dye are not given a '
+            'noisy AF amount; the AF Abundance has no pile-up at 0. Unticked: the '
+            'cell\'s own reading, clamped at 0 (the method before this option). '
+            'Needs a noise model (Noise page); applies to every unmixing method '
+            'except spectral variants.'
+        )
+        self._noise_aware_cb.toggled.connect(self._on_noise_aware_toggled)
+        guard_while_busy(self.controller, self._noise_aware_cb)
+        self._noise_aware_note = QLabel('')
+        self._noise_aware_note.setWordWrap(True)
+        af_row = QHBoxLayout()
+        af_row.addWidget(self._noise_aware_cb)
+        af_row.addSpacing(12)
+        af_row.addWidget(self._noise_aware_note, 1)
+        layout.addRow('AF abundance:', af_row)
 
         self._extract_btn = QPushButton('Extract AF Profile')
         self._extract_btn.clicked.connect(self._run_extraction)
@@ -1254,6 +1279,31 @@ class AutofluorescencePage(QWidget):
         self._assign_unstained_own_profiles()
         self._rebuild_assignment_grid()
         self._refresh_comparison_controls()
+        self._refresh_af_abundance_control()
+
+    def _refresh_af_abundance_control(self):
+        """The AF abundance tick box from the experiment's setting, with a note when it cannot apply."""
+        process = self.controller.experiment.process
+        noise_aware = af_posterior.af_abundance_mode(process) == af_posterior.NOISE_AWARE
+        self._noise_aware_cb.blockSignals(True)
+        self._noise_aware_cb.setChecked(noise_aware)
+        self._noise_aware_cb.blockSignals(False)
+        missing = noise_aware and af_posterior.noise_context(self.controller) is None
+        self._noise_aware_note.setText(
+            'Needs a noise model (Noise page, Model Noise); clamped at 0 until then.' if missing else '')
+
+    def _on_noise_aware_toggled(self, checked: bool):
+        af_posterior.set_af_abundance_mode(self.controller.experiment.process,
+                                           af_posterior.NOISE_AWARE if checked else af_posterior.CLAMPED)
+        self._refresh_af_abundance_control()
+        if self.bus:
+            self.bus.autoSaveRequested.emit()
+        self.controller.refresh_unmixing()
+        if self.bus:
+            self.bus.unmixingMethodChanged.emit()
+        if self.is_active() and self.controller.raw_event_data is not None:
+            self._clear_comparison_plots()
+            QTimer.singleShot(0, self._run_comparison)
 
     # ======================================================================
     # Section 1 — extraction
@@ -2377,6 +2427,17 @@ class AutofluorescencePage(QWidget):
             )
             return
 
+        # The noise-aware AF posterior of the current sample under the library compared.
+        posterior = None
+        context = af_posterior.noise_context(self.controller)
+        sample_key = self.controller.current_sample_path
+        if context is not None and sample_key is not None:
+            names = tuple(af.profile_names) if profile_key == '__assigned__' else (profile_key,)
+            live = self.controller.live_sample_path is not None and sample_key == self.controller.live_sample_path
+            posterior = context.posterior_for(
+                AFState(profile_names=names, precomputed=af_precomputed, spectra=np.asarray(af_spectra)),
+                sample_key, live=live)
+
         self._plot_ols.set_status('Computing...')
         self._plot_af.set_status('Computing...')
         self._cmp_status.setText('Running unmixing on current sample...')
@@ -2400,6 +2461,7 @@ class AutofluorescencePage(QWidget):
             profile_key,
             af_key,
             spillover_key,
+            None if posterior is None else posterior.fingerprint,
         )
         if state_key == self._last_cmp_state and self._ols_data is not None:
             self._plot_ols.set_status('')
@@ -2428,6 +2490,7 @@ class AutofluorescencePage(QWidget):
             _fl_ids_remapped,
             spillover=self.controller.experiment.process.get('spillover'),
             af_index_map=af_index_map,
+            af_posterior=posterior,
         )
         self._cmp_worker.moveToThread(self._cmp_thread)
         self._cmp_thread.started.connect(self._cmp_worker.run)

@@ -32,7 +32,7 @@ class MethodUnmixWorker(QObject):
         try:
             raw_fl = job['raw'][:, list(job['fl_ids'])]
             result = unmix_method.unmix_fluorescence(raw_fl, job['state'], job['af'], job['sample_key'],
-                                                     job['method'])
+                                                     job['method'], log_ssc=job.get('log_ssc'))
             if job.get('cache_key'):
                 unmix_method.store_display_cache(job['experiment_dir'], job['cache_key'], result)
             self.finished.emit(job, result)

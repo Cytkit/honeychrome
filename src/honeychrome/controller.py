@@ -62,7 +62,7 @@ from honeychrome.controller_components.autospectral_functions import (
         refresh_envelope_entry,
      )
 from honeychrome.settings import af_index_channel
-from honeychrome.controller_components import unmix_method
+from honeychrome.controller_components import af_posterior, unmix_method
 from honeychrome.controller_components.job_gate import JobGate
 from honeychrome.controller_components.sample_loader import AFState
 
@@ -1422,7 +1422,9 @@ class Controller(QObject):
         With the noise model or spectral variants as the method, the displayed
         sample is returned unmixed by per-cell AF (or from the display cache)
         and the method's result is swapped in from a background job
-        (_start_method_job). Live data stays on per-cell AF.
+        (_start_method_job). Live data stays on per-cell AF; with the
+        noise-aware AF abundance it takes the prior of the sample's AF
+        reference until it has been recorded.
         """
         self._unmix_generation += 1
         live = self.live_sample_path is not None and self.current_sample_path == self.live_sample_path
@@ -1438,6 +1440,7 @@ class Controller(QObject):
             full_pnn_raw = _raw['event_channels_pnn']
             fl_ids_remapped = [pnn_raw.index(full_pnn_raw[i])
                                for i in self.filtered_raw_fluorescence_channel_ids]
+            af = self._current_af_state(live=live)
             result = apply_af_transfer(
                 raw_event_data,
                 self.transfer_matrix,
@@ -1447,6 +1450,8 @@ class Controller(QObject):
                 filtered_fl_ids_raw=fl_ids_remapped,
                 spillover=self.experiment.process.get('spillover'),
                 af_index_map=self.af_index_map,
+                af_posterior=None if af is None else af.posterior,
+                pnn_raw=pnn_raw,
             )
             # result is now a dict; store the sidecar columns
             self.af_sidecar_data = np.column_stack(
@@ -1457,13 +1462,28 @@ class Controller(QObject):
             self.af_sidecar_data = None
             return apply_transfer_matrix(self.transfer_matrix, raw_event_data)
 
-    def _current_af_state(self) -> AFState | None:
-        """The displayed sample's AF library as set by initialise_af_matrices."""
+    def _current_af_state(self, live: bool = False) -> AFState | None:
+        """
+        The displayed sample's AF library as set by initialise_af_matrices,
+        with its noise-aware AF posterior when that setting is in effect
+        (``live``: the sample is being acquired, see af_posterior).
+        """
         if self.af_precomputed is None or self.af_spectra is None:
             return None
         names = self.experiment.samples.get('sample_af_profiles', {}).get(self.current_sample_path, []) or []
-        return AFState(profile_names=tuple(names), precomputed=self.af_precomputed,
-                       spectra=self.af_spectra, index_map=self.af_index_map)
+        af = AFState(profile_names=tuple(names), precomputed=self.af_precomputed,
+                     spectra=self.af_spectra, index_map=self.af_index_map)
+        context = af_posterior.noise_context(self)
+        if context is not None and self.current_sample_path is not None:
+            af = context.attach(af, self.current_sample_path, live=live)
+        return af
+
+    def _log_ssc(self, raw_event_data, af) -> np.ndarray | None:
+        """log SSC of the displayed events for a noise-aware AF posterior (None without one)."""
+        if af is None or af.posterior is None:
+            return None
+        _raw = self.experiment.settings['raw']
+        return af.posterior.log_ssc(raw_event_data, _raw.get('whitelisted_pnn') or _raw['event_channels_pnn'])
 
     def _raw_fl_ids(self) -> list:
         """Fluorescence channel positions in the (whitelisted) raw event columns."""
@@ -1502,11 +1522,12 @@ class Controller(QObject):
                 logger.info('Controller: %s from the unmixing cache for %s', method, key)
                 return result['unmixed']
 
+        log_ssc = self._log_ssc(raw_event_data, af)
         job = {'generation': self._unmix_generation, 'raw': raw_event_data, 'state': state, 'af': af,
                'sample_key': key, 'fl_ids': fl_ids, 'method': method, 'cache_key': cache_key,
-               'experiment_dir': self.experiment_dir}
+               'experiment_dir': self.experiment_dir, 'log_ssc': log_ssc}
         if not self.progressive_unmixing or QCoreApplication.instance() is None:
-            fl = unmix_method.unmix_fluorescence(raw_event_data[:, fl_ids], state, af, key, method)
+            fl = unmix_method.unmix_fluorescence(raw_event_data[:, fl_ids], state, af, key, method, log_ssc=log_ssc)
             if cache_key:
                 unmix_method.store_display_cache(self.experiment_dir, cache_key, fl)
             result = unmix_method.assemble(raw_event_data, self.transfer_matrix, settings_, fl, spillover, af)

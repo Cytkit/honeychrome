@@ -26,6 +26,14 @@ Methods (``process['unmixing']``)
     every sample would be unmixed by R1 with the base spectra, so the R1 code
     path is unchanged.
 
+AF abundance
+    With the noise-aware AF abundance (``af_posterior``) the sample's
+    posterior travels on its ``AFState`` (``posterior``). R1 reports it in
+    place of the clamped abundance; M2pg and the clamped-data weights take
+    R1's noise-aware AF row and abundance as fixed and solve only the
+    fluorophores by penalised GLS, so every method reports the same AF. R2
+    is unchanged.
+
 Spectral corrections (``process['spectral_corrections']``, written by the
 Spectral Correction page)
     ::
@@ -332,6 +340,9 @@ class MethodState:
             af_part = [list(af.profile_names), af.spectra,
                        None if env is None else [env.get('null_var'), env.get('spread'),
                                                  env.get('mean_rows'), env.get('ceiling')]]
+            posterior = getattr(af, 'posterior', None)
+            if posterior is not None and method != R2:
+                af_part.append(posterior.fingerprint)
         return digest(self.fingerprint, method, set_id, self.spectra_for(set_id) if set_id else None,
                       self.is_bead(sample_key) if af is None else None, af_part)
 
@@ -648,25 +659,31 @@ def _set_envelope(state: MethodState, set_id: str, af, spectra: np.ndarray):
 
 
 def _set_af(state: MethodState, set_id: str, af):
-    """The sample's AF library precomputed with a corrected spectra set and its rebuilt envelope."""
+    """
+    The sample's AF library precomputed with a corrected spectra set and its
+    rebuilt envelope (the precomputed matrices are cached per library; the
+    sample's own posterior is kept).
+    """
     if not set_id or af is None:
         return af
-    key = ('af', set_id, tuple(af.profile_names))
+    key = ('af_precomputed', set_id, tuple(af.profile_names))
     if key not in state._derived:
         from honeychrome.controller_components.autospectral_functions import build_af_precomputed
         spectra = state.spectra_for(set_id)
-        pre = build_af_precomputed(spectra, np.asarray(af.spectra, dtype=np.float64),
-                                   _set_envelope(state, set_id, af, spectra))
-        state._derived[key] = replace(af, precomputed=pre)
-    return state._derived[key]
+        state._derived[key] = build_af_precomputed(spectra, np.asarray(af.spectra, dtype=np.float64),
+                                                   _set_envelope(state, set_id, af, spectra))
+    return replace(af, precomputed=state._derived[key])
 
 
-def unmix_fluorescence(raw_fl: np.ndarray, state: MethodState, af, sample_key=None, method: str | None = None) -> dict:
+def unmix_fluorescence(raw_fl: np.ndarray, state: MethodState, af, sample_key=None, method: str | None = None,
+                       log_ssc: np.ndarray | None = None) -> dict:
     """
     The sample's method on raw fluorescence events, with its spectra set:
     R1 (per-cell AF, or the weighted OLS unmixing matrix without AF), M2pg,
     the clamped-data weights or R2. Returns ``unmixed`` (n, F,
     uncompensated), ``af_scale`` and ``af_idx`` (0-based, -1 without AF).
+    With a noise-aware posterior on ``af``, ``log_ssc`` (n,) gives each
+    event's log SSC for the prior mean (None: the sample's median).
     """
     from honeychrome.controller_components import gls_unmix as gu
 
@@ -682,12 +699,19 @@ def unmix_fluorescence(raw_fl: np.ndarray, state: MethodState, af, sample_key=No
             return {'unmixed': raw_fl @ unmixing_matrix_for(spectra, state.unmixing_weights).T,
                     'af_scale': np.zeros(n), 'af_idx': np.full(n, -1, dtype=np.int64)}
         from honeychrome.controller_components.autospectral_functions import apply_af_unmixing
-        res = apply_af_unmixing(raw_fl, af.precomputed, np.asarray(af.spectra, dtype=np.float64))
+        res = apply_af_unmixing(raw_fl, af.precomputed, np.asarray(af.spectra, dtype=np.float64),
+                                af_posterior=getattr(af, 'posterior', None), log_ssc=log_ssc)
         idx = np.asarray(res['af_idx'], dtype=np.int64)
         return {'unmixed': res['unmixed'], 'af_scale': np.asarray(res['af_scale'], dtype=np.float64),
                 'af_idx': np.where(idx > 0, idx - 1, -1)}
     envelope = None if af is None or not af.precomputed else af.precomputed.get('envelope')
     if method in NOISE_METHODS:
+        fixed_af = None
+        if af is not None and getattr(af, 'posterior', None) is not None:
+            from honeychrome.controller_components.autospectral_functions import apply_af_unmixing
+            r1 = apply_af_unmixing(raw_fl, af.precomputed, np.asarray(af.spectra, dtype=np.float64),
+                                   af_posterior=af.posterior, log_ssc=log_ssc)
+            fixed_af = (np.asarray(r1['af_idx'], dtype=np.int64) - 1, np.asarray(r1['af_scale'], dtype=np.float64))
         noise = state.noise
         model = noise.clamped_model if method == CLAMPED else noise.model_for(state.is_bead(sample_key))
         null_var = spread_no_af = None
@@ -701,7 +725,8 @@ def unmix_fluorescence(raw_fl: np.ndarray, state: MethodState, af, sample_key=No
                     spread_no_af = np.asarray(extra['spread']['spread'], dtype=np.float64)
         return gu.unmix_m2pg(raw_fl, spectra, model, None if af is None else af.spectra, envelope,
                              null_var_no_af=null_var, spread=spread_no_af,
-                             prior_lambda=state.prior_lambda, ceiling=state.ceiling, n_threads=state.n_threads)
+                             prior_lambda=state.prior_lambda, ceiling=state.ceiling, n_threads=state.n_threads,
+                             fixed_af=fixed_af)
     if method == R2:
         _bundled()
         from autospectral_optimization_functions import unmix_autospectral_optimization
@@ -726,7 +751,7 @@ def assemble(raw_event_data, transfer_matrix, settings, fl_result: dict, spillov
 
 
 def unmix(raw_event_data, transfer_matrix, settings, fl_ids_raw, spillover, af, state: MethodState | None,
-          sample_key=None, force_r1: bool = False, cache_file=None) -> dict:
+          sample_key=None, force_r1: bool = False, cache_file=None, pnn_raw=None) -> dict:
     """
     Unmix raw events with the experiment's method for ``sample_key``.
 
@@ -738,7 +763,9 @@ def unmix(raw_event_data, transfer_matrix, settings, fl_ids_raw, spillover, af, 
     progressive display's first pass). ``cache_file`` (the sample's FCS file)
     reads an M2pg or R2 result from the display cache, or computes and
     stores it; the result is then always the cache's float32 values, so a
-    first and a later load agree exactly.
+    first and a later load agree exactly. ``pnn_raw`` names the columns of
+    ``raw_event_data`` (default: the channel whitelist when set, else every
+    raw channel); the noise-aware AF abundance reads SSC from it.
     """
     from honeychrome.controller_components.autospectral_functions import apply_af_transfer
     from honeychrome.controller_components.functions import apply_transfer_matrix
@@ -749,11 +776,14 @@ def unmix(raw_event_data, transfer_matrix, settings, fl_ids_raw, spillover, af, 
     if set_id:
         transfer_matrix = _set_matrices(state, set_id, transfer_matrix, fl_ids_raw, settings, spillover)
         af = _set_af(state, set_id, af)
+    posterior = None if af is None else getattr(af, 'posterior', None)
+    if posterior is not None and pnn_raw is None:
+        pnn_raw = settings['raw'].get('whitelisted_pnn') or settings['raw']['event_channels_pnn']
     if method == R1:
         if af is not None:
             result = apply_af_transfer(raw_event_data, transfer_matrix, af.precomputed, af.spectra, settings,
                                        filtered_fl_ids_raw=list(fl_ids_raw), spillover=spillover,
-                                       af_index_map=af.index_map)
+                                       af_index_map=af.index_map, af_posterior=posterior, pnn_raw=pnn_raw)
             return {'unmixed': result['unmixed'], 'af_scale': np.asarray(result['af_scale'], dtype=np.float64),
                     'af_idx': np.asarray(result['af_idx'], dtype=np.int64), 'method': R1}
         return {'unmixed': apply_transfer_matrix(transfer_matrix, raw_event_data),
@@ -765,7 +795,9 @@ def unmix(raw_event_data, transfer_matrix, settings, fl_ids_raw, spillover, af, 
         if fl is not None:
             logger.debug('unmix: %s of %s from the unmixing cache', method, sample_key)
     if fl is None:
-        fl = unmix_fluorescence(np.asarray(raw_event_data)[:, list(fl_ids_raw)], state, af, sample_key, method)
+        log_ssc = None if posterior is None else posterior.log_ssc(np.asarray(raw_event_data), pnn_raw)
+        fl = unmix_fluorescence(np.asarray(raw_event_data)[:, list(fl_ids_raw)], state, af, sample_key, method,
+                                log_ssc=log_ssc)
         if cache_key is not None:
             store_display_cache(state.experiment_dir, cache_key, fl)
             fl = {'unmixed': np.asarray(fl['unmixed'], dtype=np.float32).astype(np.float64),

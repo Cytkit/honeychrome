@@ -249,6 +249,7 @@ process_default = {
     'spillover': None,
     'af_profiles': {},
     'cleaned_meta': {},
+    'af_abundance': 'noise_aware',   # experiments saved without it keep the clamped AF abundance
 }
 
 cytometry_default = {
