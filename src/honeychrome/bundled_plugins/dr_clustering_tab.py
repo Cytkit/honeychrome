@@ -217,6 +217,7 @@ import drc_workspace_export
 import drc_time_estimate
 import drc_run_align
 import drc_umap_index
+import drc_gating_confirmation
 from transforms_panel import (
     TransformInspector, pool_population_events, transform_from_params,
     transform_params as _transform_params,
@@ -3139,6 +3140,8 @@ class GroupsStatsTab(QWidget):
     results_computed = Signal()
     # Emitted once the result figures have been built and shown as tabs.
     results_drawn = Signal()
+    # (run id, cluster name): "Confirm by gating…" on a result figure.
+    gatingConfirmationRequested = Signal(str, str)
 
     def __init__(self, state: PipelineState, bus, controller, parent=None):
         super().__init__(parent)
@@ -8225,6 +8228,10 @@ class GroupsStatsTab(QWidget):
         act_tab = menu.addAction("Add per-sample values as a results tab (listed in the report)")
         act_window.triggered.connect(lambda: self._values_window(kwargs))
         act_tab.triggered.connect(lambda: self._values_tab(kwargs))
+        if kind in ('freq', 'counts') and self.state.stats_run_id:
+            act_gates = menu.addAction("Confirm by gating…")
+            act_gates.triggered.connect(lambda: self.gatingConfirmationRequested.emit(
+                self.state.stats_run_id, str(feature)))
         menu.exec(QCursor.pos())
 
     def _clicked_feature(self, event, fig, key: str, maker_kwargs: dict) -> str | None:
@@ -12863,6 +12870,9 @@ class ClusterAnnotationTab(QWidget):
          one means retyping it into Name yourself).
     """
 
+    # (run id, cluster id): "Confirm by gating…" on the cluster table.
+    gatingConfirmationRequested = Signal(str, object)
+
     def __init__(self, state: PipelineState, bus, controller, parent=None):
         super().__init__(parent)
         self.state = state
@@ -13200,6 +13210,8 @@ class ClusterAnnotationTab(QWidget):
         )
         self.label_table.itemChanged.connect(self._on_table_item_changed)
         self.label_table.cellDoubleClicked.connect(self._on_table_cell_double_clicked)
+        self.label_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.label_table.customContextMenuRequested.connect(self._on_label_table_menu)
         table_layout.addWidget(self.label_table)
         splitter.addWidget(table_box)
 
@@ -14452,6 +14464,21 @@ class ClusterAnnotationTab(QWidget):
                 self._populate_label_table()
                 self._redraw_cluster_figures()
 
+    def _on_label_table_menu(self, pos):
+        """Right-click on a cluster row: confirm the cluster by gating."""
+        item = self.label_table.itemAt(pos)
+        run_id = self.run_combo.currentData()
+        if item is None or run_id is None:
+            return
+        cl_id = self.label_table.item(item.row(), 0).data(Qt.UserRole)
+        if cl_id is None:
+            return
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        act = menu.addAction("Confirm by gating…")
+        act.triggered.connect(lambda: self.gatingConfirmationRequested.emit(run_id, int(cl_id)))
+        menu.exec(self.label_table.viewport().mapToGlobal(pos))
+
     # ------------------------------------------------------------------
     # Panel 4 — Cluster ID suggestions
     # ------------------------------------------------------------------
@@ -15381,8 +15408,9 @@ class PluginWidget(QWidget):
     Top-level plugin widget.
 
     Inserted as a tab in the Honeychrome main window by plugin_loaders.py.
-    Owns the PipelineState and all six inner tabs (Transforms,
-    Configuration, Cluster Annotation, Stats, Workspace, Report).
+    Owns the PipelineState and all seven inner tabs (Transforms,
+    Configuration, Cluster Annotation, Stats, Gating confirmation, Layout,
+    Report).
 
     The outer layer follows the exact pattern of the Honeychrome example
     plugin: a disabled-label shown when unmixing is not yet available,
@@ -15494,6 +15522,14 @@ class PluginWidget(QWidget):
         self.groups_stats_tab.results_computed.connect(self.save_state)
         self.workspace_tab = WorkspaceTab(self.state, bus, controller)
         self.cluster_annotation_tab = ClusterAnnotationTab(self.state, bus, controller)
+        self.gating_confirmation_tab = drc_gating_confirmation.GatingConfirmationTab(
+            self.state, bus, controller,
+            channel_labels=lambda: _antigen_dash_labels(controller),
+            fdr_threshold=lambda: self.groups_stats_tab.pval_spin.value(),
+        )
+        self.groups_stats_tab.gatingConfirmationRequested.connect(self._open_gating_confirmation)
+        self.cluster_annotation_tab.gatingConfirmationRequested.connect(
+            self._open_gating_confirmation)
         # Built last -- holds references to the four tabs above so it can
         # enumerate their currently-rendered plots/tables (see
         # drc_report.ReportTab.get_report_items callers).
@@ -15518,7 +15554,9 @@ class PluginWidget(QWidget):
         guard_while_busy(controller, self.config_tab.dr_run_btn, self.config_tab.dr_apply_btn,
                          self.config_tab.cl_run_btn, self.groups_stats_tab.run_stats_btn,
                          self.groups_stats_tab.pred_run_btn,
-                         self.cluster_annotation_tab.compute_suggestions_btn)
+                         self.cluster_annotation_tab.compute_suggestions_btn,
+                         self.gating_confirmation_tab.find_btn,
+                         self.gating_confirmation_tab.find_all_btn)
         if getattr(controller, 'job_gate', None) is not None:
             controller.job_gate.changed.connect(self.groups_stats_tab.on_job_gate_changed)
 
@@ -15526,6 +15564,7 @@ class PluginWidget(QWidget):
         self.inner_tabs.addTab(self.config_tab,       "Configuration", 'settings')
         self.inner_tabs.addTab(self.cluster_annotation_tab, "Cluster Annotation", 'shape')
         self.inner_tabs.addTab(self.groups_stats_tab, "Stats",         'table')
+        self.inner_tabs.addTab(self.gating_confirmation_tab, "Gating confirmation", 'rectangle')
         self.inner_tabs.addTab(self.workspace_tab,    "Layout",        'border-all')
         self.inner_tabs.addTab(self.report_tab,       "Report",        'file-description')
 
@@ -15596,6 +15635,11 @@ class PluginWidget(QWidget):
                 self.cluster_annotation_tab.refresh()
             else:
                 self._last_tab_refresh_key.pop(2, None)
+        if hasattr(self, 'gating_confirmation_tab'):
+            if self.inner_tabs.currentWidget() is self.gating_confirmation_tab:
+                self.gating_confirmation_tab.refresh()
+            else:
+                self._last_tab_refresh_key.pop(4, None)
         if hasattr(self, 'report_tab'):
             self.report_tab.refresh()
 
@@ -17026,6 +17070,12 @@ class PluginWidget(QWidget):
         self._update_sample_browser_visibility()
         self._refresh_tab_at(index)
 
+    def _open_gating_confirmation(self, run_id: str, cluster):
+        """Show the Gating confirmation tab with *cluster* of run *run_id*."""
+        self.inner_tabs.setCurrentWidget(self.gating_confirmation_tab)
+        self.gating_confirmation_tab.refresh()
+        self.gating_confirmation_tab.select_cluster(run_id, cluster)
+
     def _update_sample_browser_visibility(self):
         """
         Show the main window's sample browser only on the Transforms tab,
@@ -17128,7 +17178,13 @@ class PluginWidget(QWidget):
                     for ch, v in sorted(s.channel_transform_params.items())
                 ),
             )
-        elif index == 4:    # WorkspaceTab
+        elif index == 4:    # GatingConfirmationTab
+            return (
+                tuple(e.get('run_id') for e in s.clustering_runs),
+                s.stats_run_id,
+                id(s.freq_results), id(s.counts_results),
+            )
+        elif index == 5:    # WorkspaceTab
             return (
                 len(s.dr_runs), len(s.clustering_runs),
                 tuple(sorted(s.cluster_names.items())),
@@ -17136,7 +17192,7 @@ class PluginWidget(QWidget):
                 len(s.plot_configs), s.plot_theme,
                 tuple(s.population_gates),
             )
-        elif index == 5:    # ReportTab -- cheap to rebuild; always refresh
+        elif index == 6:    # ReportTab -- cheap to rebuild; always refresh
             return None
         return None
 
@@ -17160,7 +17216,7 @@ class PluginWidget(QWidget):
         (e.g. GroupsStatsTab's _last_drawn_cluster_names / _has_results_tab
         checks), which still apply whenever refresh() does run.
         """
-        if index == 5:
+        if index == 6:
             # The report lists what these tabs hold, and they build it
             # from the restored state on refresh.
             for source_index in (2, 3):
@@ -17175,6 +17231,7 @@ class PluginWidget(QWidget):
             self.config_tab,
             self.cluster_annotation_tab,
             self.groups_stats_tab,
+            self.gating_confirmation_tab,
             self.workspace_tab,
             self.report_tab,
         ]

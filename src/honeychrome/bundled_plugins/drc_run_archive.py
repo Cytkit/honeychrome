@@ -102,6 +102,12 @@ def marker_values_path(controller, run_id: str) -> Path:
     return runs_dir(controller) / f'{run_id}.marker_values'
 
 
+def gating_confirmation_path(controller, run_id: str) -> Path:
+    """Bundle directory holding a clustering run's gating confirmation
+    results (drc_gating_confirmation)."""
+    return runs_dir(controller) / f'{run_id}.gating_confirmation'
+
+
 def purge_legacy_pickles(controller) -> tuple[int, int]:
     """
     Remove everything left over from the pickle-based format.
@@ -290,6 +296,7 @@ def load_run_payload(controller, run_id: str) -> dict | None:
 def delete_run_payload(controller, run_id: str) -> None:
     drc_persist.delete_bundle(run_payload_path(controller, run_id))
     drc_persist.delete_bundle(marker_values_path(controller, run_id))
+    drc_persist.delete_bundle(gating_confirmation_path(controller, run_id))
 
 
 def run_marker_values(controller, entry: dict) -> dict:

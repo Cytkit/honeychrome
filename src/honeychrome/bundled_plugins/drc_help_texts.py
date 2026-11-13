@@ -20,6 +20,7 @@ _TABS = (
                       'clusters.'),
     ('Cluster Annotation', 'see what each cluster expresses and name it'),
     ('Stats', 'compare groups of samples cluster by cluster'),
+    ('Gating confirmation', 'check whether a cluster can be found with ordinary gates'),
     ('Layout', 'lay out figures on pages for export'),
     ('Report', 'write a folder of figures, tables and settings'),
 )
@@ -76,6 +77,11 @@ fold change for frequencies and counts, a difference in transformed units
 for MFIs.</li>
 <li><b>FDR</b>: the false discovery rate, the expected share of false
 positives among the results called significant.</li>
+<li><b>Recall</b>: the share of a cluster's cells that a gate keeps.
+<b>Purity</b>: the share of the cells in a gate that belong to the
+cluster.</li>
+<li><b>Gating strategy</b>: a sequence of ordinary gates (a low and/or high
+threshold on each marker used) that recovers a cluster.</li>
 <li><b>TREAT</b>: tests whether an effect is larger than a set threshold,
 not just different from zero.</li>
 <li><b>Reference group</b> and <b>All pairwise</b>: compare every group with
@@ -1072,3 +1078,89 @@ back to the settings that produced it.</li>
 <b>Refresh Items</b> after changing anything on the Layout, Cluster
 Annotation or Stats tabs.</p>
 ''' + _workflow('Report') + _GLOSSARY
+
+
+gating_confirmation_tab_help_text = '''
+<h3>Gating confirmation: can a cluster be found with ordinary gates?</h3>
+<p><b>In short:</b> for the clusters you care about (usually the ones Stats
+finds different between groups), find the fewest ordinary gates that recover
+each one, and see whether the cluster is a population a reviewer could gate
+by hand.</p>
+
+<h4>What to do here</h4>
+<ol>
+<li>Run statistics on the Stats tab first, then pick the same clustering
+run here (it is selected for you).</li>
+<li>Set <b>Show</b> to <b>Significant in Stats</b>, select the clusters and
+click <b>Find gating strategy</b>, or click <b>Run for all shown</b>. From
+Stats or Cluster Annotation, right-click a cluster and choose <b>Confirm by
+gating…</b> to come straight here.</li>
+<li>Click a cluster to see its gates as biaxial plots, step by step, with
+its verdict.</li>
+</ol>
+
+<h4>What good looks like</h4>
+<ul>
+<li><b>Confirmed</b>: a few gates keep at least 90% of the cluster's cells,
+and at least 50% of the cells in the last gate belong to it (the targets
+can be changed). Regulatory T cells, for example, are often confirmed by one
+gate on Foxp3.</li>
+<li>The <b>Per sample</b> table shows the gates working in every sample,
+not only on average.</li>
+</ul>
+
+<h4>The verdicts</h4>
+<ul>
+<li><b>Confirmed</b>: the gating strategy meets both targets.</li>
+<li><b>Not gateable</b>: no gates do, but a weighted combination of all
+markers separates the cluster. It is a real population whose border with its
+neighbours runs through many markers at once, which a few biaxial gates
+cannot follow.</li>
+<li><b>Continuum</b>: not even that combination separates it. The cluster is
+a slice of a continuous population; the <b>Impurity</b> table names the
+clusters it grades into.</li>
+</ul>
+<p>A verdict other than Confirmed is a finding, not a failure: it says how
+the cluster relates to populations defined by gating. <b>Best
+compromise</b> shows the gates that best balance recall and purity.</p>
+<p><b>Tip:</b> clusters from <b>Leiden</b> follow the gaps in the data and
+are more often confirmed than FlowSOM metaclusters, which divide cells by
+the nearest cluster centre and so cut through continuous populations. On
+one test experiment, a Leiden run gave 19 confirmed clusters of 24 where a
+FlowSOM run with 25 clusters gave 14. If many clusters are not confirmed,
+try a Leiden run.</p>
+
+<h4>Details</h4>
+<ul>
+<li><b>Events</b>: each run keeps a sample of up to 5,000 cells per cluster
+(also used by Cluster Annotation), on the run's own transforms. Each cell is
+weighted by how many of its cluster's cells it stands for, so recall and
+purity are those of all the clustered cells.</li>
+<li><b>Validation</b>: the gates are found on half of the cells and every
+number shown is measured on the other half, so gates that only fit the
+cells they were tuned on are caught. <b>Half of the samples</b> is stricter:
+do the gates work on samples they have not seen?</li>
+<li><b>Search</b>: with each marker's values sorted, the recall and purity
+of every possible threshold are counted in one pass. The best single
+threshold change over all markers is applied, again and again, keeping the
+recall above a floor that is lowered step by step to the target. Markers are
+then removed, least useful first, keeping the fewest that still meet the
+targets (at most the <b>markers</b> limit). The gates are aimed 2 points
+above each target so that they still meet it on the validation half.</li>
+<li><b>Hierarchy</b>: the markers are ordered by how much purity is lost
+without them and paired into biaxial plots.</li>
+<li><b>Markers…</b> limits the markers the gates may use (for example to
+those a sorter has). <b>Move thresholds to density valleys</b> moves each
+threshold to the nearest dip in the cell density when the targets still
+hold.</li>
+<li>Results are saved with the run when each cluster finishes and marked
+<i>other settings</i> when the settings have changed since.</li>
+</ul>
+<p>The search follows Hypergate [1]; FlowJo's HyperFinder and GateFinder [2]
+answer the same question.</p>
+<p>
+[1]<a href="https://doi.org/10.1101/278796">Becht et al. 2018, bioRxiv (Hypergate)</a><br/>
+[2]<a href="https://bioconductor.org/packages/release/bioc/html/GateFinder.html">Aghaeepour et al., GateFinder (Bioconductor)</a><br/>
+</p>
+''' + _workflow('Gating confirmation') + _GLOSSARY
+
