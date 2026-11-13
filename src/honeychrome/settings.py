@@ -234,6 +234,7 @@ samples_default = {
     'unstained_samples': [],
     'bead_samples': [],
     'bead_checked_samples': [],
+    'collapsed_folders': [],
 }
 
 process_default = {

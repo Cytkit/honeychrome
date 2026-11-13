@@ -193,6 +193,7 @@ class ExperimentModel:
         self.samples = file_data['samples']
         self.process = file_data['process']
         self.samples.setdefault('unstained_samples', [])  # not present in older .kit files
+        self.samples.setdefault('collapsed_folders', [])  # not present in older .kit files
         self.cytometry = file_data['cytometry']
         self.statistics = file_data['statistics']
 
