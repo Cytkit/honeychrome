@@ -33,11 +33,7 @@ The maths
       variance of k_hat on the chosen variants over that on the library's
       mean spectrum, within [0.05, 1]. Choosing among many variants fits
       part of each event's noise, so its AF reading varies less than a fixed
-      spectrum's would; c says how much. ``fit_af_prior(shrinkage='noise')``
-      takes the cell-to-cell AF variance tau2 out of both variances first
-      (tau2 and c fitted in turn), so that real AF differences between
-      cells, which the choice does not shrink, do not pull c towards 1;
-      the default ``'total'`` does not.
+      spectrum's would; c says how much.
     * Prior, fitted on the sample's own events: a core Normal(m, tau2) with
       m = intercept + slope log SSC (median regression on residuals
       standardised by sqrt(tau2 + c s2)) and tau2 set so the median
@@ -110,8 +106,6 @@ IRLS_EPS = 1e-3
 CORE_ITERATIONS = 30
 MIXTURE_ITERATIONS = 60
 SHRINKAGE_RANGE = (0.05, 1.0)
-SHRINKAGE_ITERATIONS = 20
-SHRINKAGE_TOLERANCE = 1e-3
 _TINY = 1e-300
 
 
@@ -388,29 +382,15 @@ def fit_mixture(k_hat: np.ndarray, s2: np.ndarray, log_ssc: np.ndarray, core: di
 
 def fit_af_prior(raw_fl: np.ndarray, log_ssc: np.ndarray, precomputed: dict, af_spectra: np.ndarray,
                  sigma0_sq: np.ndarray, g: np.ndarray, c: np.ndarray, fingerprint: str = '',
-                 source: str = '', shrinkage: str = 'total') -> AFPrior:
-    """
-    A sample's AF prior from its (unsaturated) raw fluorescence events and
-    log SSC. ``shrinkage``: ``'total'`` (choice shrinkage from the whole
-    spread of the AF estimates) or ``'noise'`` (from their spread beyond the
-    cell-to-cell AF variance; see the module docstring).
-    """
+                 source: str = '') -> AFPrior:
+    """A sample's AF prior from its (unsaturated) raw fluorescence events and log SSC."""
     est = af_estimates(raw_fl, precomputed, af_spectra)
     k_hat = est['k_hat']
     k_typical = max(float(np.median(k_hat)), 0.0)
     s2 = af_variance(np.maximum(est['u'], 0.0), est['best'], precomputed, af_spectra, est['k_denom'],
                      sigma0_sq, g, c, k_typical)
-    var_chosen = _robust_sd(k_hat) ** 2
-    var_mean = _robust_sd(est['k_mean']) ** 2
-    shrink = float(np.clip(var_chosen / max(var_mean, 1e-12), *SHRINKAGE_RANGE))
-    if shrinkage == 'noise':
-        for _ in range(SHRINKAGE_ITERATIONS):
-            tau2 = fit_core(k_hat, shrink * s2, log_ssc)['tau2']
-            new = float(np.clip(max(var_chosen - tau2, 1e-12) / max(var_mean - tau2, 1e-12), *SHRINKAGE_RANGE))
-            done = abs(new - shrink) < SHRINKAGE_TOLERANCE
-            shrink = new
-            if done:
-                break
+    shrink = _robust_sd(k_hat) ** 2 / max(_robust_sd(est['k_mean']) ** 2, 1e-12)
+    shrink = float(np.clip(shrink, *SHRINKAGE_RANGE))
     s2c = shrink * s2
     core = fit_core(k_hat, s2c, log_ssc)
     mix = fit_mixture(k_hat, s2c, log_ssc, core)
