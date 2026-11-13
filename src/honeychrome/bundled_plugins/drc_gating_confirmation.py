@@ -24,7 +24,12 @@ v1 simplifications:
 
 Results are saved as each cluster finishes, one top-level field per target
 in the bundle runs/<run_id>.gating_confirmation (drc_run_archive), with the
-settings they were found with.
+settings they were found with, plus the last settings and the clusters
+ticked for the report.
+
+Thresholds are shown on the run's transform scale (the plots' axes) and in
+raw intensity (the unmixed value before the transform), so the gates can be
+redrawn elsewhere.
 """
 
 from __future__ import annotations
@@ -35,11 +40,12 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
+import pandas as pd
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel, QListWidget,
+    QDoubleSpinBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
     QVBoxLayout, QWidget,
@@ -52,6 +58,8 @@ from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 import drc_gate_finder as gf
 import drc_help_texts
 import drc_persist
+import drc_pipeline
+import drc_report
 import drc_run_align
 import drc_run_archive
 from drc_logging import get_logger
@@ -61,6 +69,9 @@ log = get_logger(__name__)
 JOB_LABEL = 'Honeycluster: gating confirmation'
 DISPLAY_EVENTS = 20_000
 SETTINGS_FIELD = 'settings'
+REPORT_FIELD = 'report'
+REPORT_SECTION = 'Gating confirmation'
+IMAGE_DPI = 300
 
 FILTER_ALL = 'all'
 FILTER_SIGNIFICANT = 'significant'
@@ -209,6 +220,135 @@ def cluster_name(names: dict, c: int) -> str:
     if str(c) in names:
         return str(names[str(c)])
     return 'Noise' if c < 0 else f'Cluster {c}'
+
+
+# ---------------------------------------------------------------------------
+# Figures and tables
+# ---------------------------------------------------------------------------
+
+def raw_value(cl_run: dict, channel: str, value):
+    """A threshold on the run's transform scale as raw intensity (the
+    unmixed value before the run's transform); None stays None."""
+    if value is None:
+        return None
+    params = (cl_run.get('transform_params') or {}).get(channel) or {}
+    xform = drc_pipeline._build_flowkit_transform(int(params.get('id', 1)) if params else 1,
+                                                   params)
+    if xform is None:
+        return float(value)
+    return float(np.asarray(xform.inverse(np.array([float(value)])))[0])
+
+
+def finding_tables(cl_run: dict, f: dict, compromise: bool, labels: dict, names: dict,
+                   samples: list) -> dict:
+    """The tables behind a result: gates (one row per marker, thresholds on
+    the plot scale and in raw intensity, metrics after its step), per sample,
+    impurity, fewer markers and trade-off. Per sample and impurity describe
+    the gating strategy."""
+    cuts = f['compromise'] if compromise else f['strategy']
+    if compromise:
+        m = f.get('compromise_metrics') or {}
+        groups = [(None, list(cuts), m.get('recall'), m.get('purity'))]
+    else:
+        groups = [(k, [s['x']] + ([s['y']] if s['y'] else []), s['recall'], s['purity'])
+                  for k, s in enumerate(f['steps'], 1)]
+    gates = []
+    for step, chans, r, p in groups:
+        for ch in chans:
+            lo, hi = cuts.get(ch, [None, None])
+            gates.append({'step': step, 'marker': labels.get(ch, ch), 'channel': ch,
+                          'low': lo, 'high': hi,
+                          'low_raw': raw_value(cl_run, ch, lo),
+                          'high_raw': raw_value(cl_run, ch, hi),
+                          'recall_after_step': r, 'purity_after_step': p})
+    per_sample = [{'sample': samples[r['sample']] if r['sample'] < len(samples)
+                   else str(r['sample']), 'cluster_events': r['n_target'],
+                   'recall': r['recall'], 'purity': r['purity']} for r in f['per_sample']]
+    impurity = [{'other_cluster': cluster_name(names, c), 'share_of_gate': v}
+                for c, v in f['impurity']]
+    return {
+        'gates': pd.DataFrame(gates),
+        'per_sample': pd.DataFrame(per_sample),
+        'impurity': pd.DataFrame(impurity),
+        'fewer_markers': pd.DataFrame(f['path']).rename(columns={'n_markers': 'markers'}),
+        'tradeoff': pd.DataFrame(f['tradeoff']),
+    }
+
+
+def make_hierarchy_figure(events: 'RunEvents', f: dict, clusters: list, colour: str,
+                          labels: dict, compromise: bool, title: str = ''):
+    """One biaxial plot per step (or the compromise's markers in pairs):
+    the events passing the earlier steps, the cluster's in its colour, the
+    gate as a rectangle; a single-marker step as a histogram. Events are a
+    weighted draw of the stored sample, so cluster sizes look as in the
+    data. Returns a canvas-less matplotlib Figure."""
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Rectangle
+
+    cuts = f['compromise'] if compromise else f['strategy']
+    chans = list(cuts)
+    if not compromise and f['steps']:
+        pairs = [(s['x'], s['y']) for s in f['steps']]
+    else:
+        pairs = [(chans[i], chans[i + 1] if i + 1 < len(chans) else None)
+                 for i in range(0, len(chans), 2)]
+    rng = np.random.default_rng(0)
+    n = len(events.labels)
+    pick = rng.choice(n, size=min(DISPLAY_EVENTS, n), replace=False,
+                      p=events.weights / events.weights.sum())
+    X = events.X[pick]
+    in_target = np.isin(events.labels[pick], clusters)
+    col = {ch: i for i, ch in enumerate(events.channels)}
+    alive = np.ones(len(pick), dtype=bool)
+    ncol = min(3, len(pairs))
+    nrow = int(np.ceil(len(pairs) / ncol))
+    fig = Figure(figsize=(3.4 * ncol, 3.3 * nrow + (0.4 if title else 0)), dpi=100)
+    for k, (cx, cy) in enumerate(pairs, 1):
+        ax = fig.add_subplot(nrow, ncol, k)
+        x = X[:, col[cx]]
+        lo_x, hi_x = cuts[cx]
+        if cy is None:
+            bins = np.linspace(np.quantile(x[alive], 0.002), np.quantile(x[alive], 0.998), 80)
+            ax.hist(x[alive & ~in_target], bins=bins, color='#bbbbbb')
+            ax.hist(x[alive & in_target], bins=bins, color=colour, alpha=0.8)
+            for v in (lo_x, hi_x):
+                if v is not None:
+                    ax.axvline(v, color='black', lw=1.2)
+            ax.set_xlabel(labels.get(cx, cx))
+            ax.set_ylabel('Cells')
+            inside = (x >= (lo_x if lo_x is not None else -np.inf)) & \
+                     (x <= (hi_x if hi_x is not None else np.inf))
+        else:
+            y = X[:, col[cy]]
+            ax.scatter(x[alive & ~in_target], y[alive & ~in_target], s=1, c='#bbbbbb',
+                       linewidths=0, rasterized=True)
+            ax.scatter(x[alive & in_target], y[alive & in_target], s=1, c=colour,
+                       linewidths=0, rasterized=True)
+            xl = np.quantile(x[alive], [0.002, 0.998])
+            yl = np.quantile(y[alive], [0.002, 0.998])
+            lo_y, hi_y = cuts[cy]
+            x0 = lo_x if lo_x is not None else min(xl[0], x[alive].min())
+            x1 = hi_x if hi_x is not None else max(xl[1], x[alive].max())
+            y0 = lo_y if lo_y is not None else min(yl[0], y[alive].min())
+            y1 = hi_y if hi_y is not None else max(yl[1], y[alive].max())
+            ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
+                                   edgecolor='black', lw=1.2))
+            ax.set_xlim(min(xl[0], x0) - 0.02, max(xl[1], x1) + 0.02)
+            ax.set_ylim(min(yl[0], y0) - 0.02, max(yl[1], y1) + 0.02)
+            ax.set_xlabel(labels.get(cx, cx))
+            ax.set_ylabel(labels.get(cy, cy))
+            inside = (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
+        name = f'Step {k}' if len(pairs) > 1 else 'Gate'
+        step = f['steps'][k - 1] if not compromise and k <= len(f['steps']) else None
+        if step is not None:
+            name += f': {_pct(step["recall"])} kept, {_pct(step["purity"])} pure'
+        ax.set_title(name, fontsize=9)
+        ax.tick_params(labelsize=7)
+        alive &= inside
+    if title:
+        fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +624,27 @@ class GatingConfirmationTab(QWidget):
         self.view_combo.currentIndexChanged.connect(lambda _i: self._show_current())
         head.addWidget(self.view_combo)
         rl.addLayout(head)
+        actions = QHBoxLayout()
+        self.chk_report = QCheckBox('Include in report')
+        self.chk_report.setToolTip('List this cluster\'s gating hierarchy and tables on the '
+                                   'Report tab.')
+        self.chk_report.toggled.connect(self._on_report_toggled)
+        actions.addWidget(self.chk_report)
+        actions.addStretch(1)
+        self.window_btn = QPushButton('⤢ Open in window')
+        self.window_btn.clicked.connect(self._open_window)
+        actions.addWidget(self.window_btn)
+        self.image_btn = QPushButton('Save image…')
+        self.image_btn.setToolTip('Save the gating hierarchy as PNG, PDF or SVG.')
+        self.image_btn.clicked.connect(self._save_image_dialog)
+        actions.addWidget(self.image_btn)
+        self.csv_btn = QPushButton('Export CSV…')
+        self.csv_btn.setToolTip('Write the summary of every cluster of this run and the '
+                                'gates, per-sample, impurity, fewer-markers and trade-off '
+                                'tables of every cluster with a result, to a new folder.')
+        self.csv_btn.clicked.connect(self._export_csv_dialog)
+        actions.addWidget(self.csv_btn)
+        rl.addLayout(actions)
         self.lbl_verdict = QLabel('')
         self.lbl_verdict.setWordWrap(True)
         self.lbl_verdict.setTextFormat(Qt.RichText)
@@ -493,7 +654,8 @@ class GatingConfirmationTab(QWidget):
         self.figure_scroll.setMinimumHeight(360)
         rl.addWidget(self.figure_scroll, stretch=3)
         self.detail_tabs = QTabWidget()
-        self.steps_table = _table(['Step', 'X', 'Y', 'Gate', 'Recall', 'Purity'])
+        self.steps_table = _table(['Step', 'Marker', 'Gate (plot scale)', 'Gate (raw intensity)',
+                                   'Recall', 'Purity'])
         self.samples_table = _table(['Sample', 'Cluster events', 'Recall', 'Purity'])
         self.samples_table.setSortingEnabled(True)
         self.impurity_table = _table(['Cluster', 'Share of the gate'])
@@ -602,9 +764,13 @@ class GatingConfirmationTab(QWidget):
         self._clear_detail()
 
     def _ensure_events(self) -> RunEvents | None:
-        run_id = self._run['run_id']
+        return self._events_for(self._run)
+
+    def _events_for(self, run: dict) -> RunEvents | None:
+        """The stored events of *run*, loaded once."""
+        run_id = run['run_id']
         if run_id not in self._events:
-            events, reason = run_events(self.controller, self._run)
+            events, reason = run_events(self.controller, run)
             if events is None:
                 self.lbl_status.setText(reason)
                 return None
@@ -857,6 +1023,12 @@ class GatingConfirmationTab(QWidget):
         self._clear_detail()
         self.lbl_title.setText('<b>' + ' + '.join(cluster_name(names, c) for c in self._shown)
                                + '</b>')
+        self._loading = True
+        self.chk_report.setChecked(target_key(self._shown) in self._report_keys(self._run['run_id']))
+        self._loading = False
+        has_result = entry is not None and 'finding' in entry
+        for w in (self.chk_report, self.window_btn, self.image_btn):
+            w.setEnabled(has_result)
         if entry is None:
             self.lbl_verdict.setText('Not run yet: click <b>Find gating strategy</b>.')
             return
@@ -872,12 +1044,13 @@ class GatingConfirmationTab(QWidget):
         self.view_combo.setEnabled(has_compromise)
         use_compromise = has_compromise and self.view_combo.currentData() == 'compromise'
         cuts = f['compromise'] if use_compromise else f['strategy']
-        self._fill_tables(f, cuts, use_compromise)
+        self._ensure_events()
+        self._fill_tables(f, use_compromise)
         self._draw(f, cuts, self._shown, use_compromise)
 
-    def _fill_tables(self, f: dict, cuts: dict, compromise: bool):
-        labels = self._channel_labels()
-        names = self._names()
+    def _fill_tables(self, f: dict, compromise: bool):
+        tables = finding_tables(self._run, f, compromise, self._channel_labels(), self._names(),
+                                self._samples())
 
         def set_rows(table, rows):
             sorting = table.isSortingEnabled()
@@ -890,120 +1063,269 @@ class GatingConfirmationTab(QWidget):
                     table.setItem(r, col, _NumberItem(value, text))
             table.setSortingEnabled(sorting)
 
-        def gate_text(ch):
-            lo, hi = cuts.get(ch, [None, None])
+        def cut(lo, hi, fmt):
             parts = []
-            if lo is not None:
-                parts.append(f'> {lo:.3g}')
-            if hi is not None:
-                parts.append(f'< {hi:.3g}')
-            return f'{labels.get(ch, ch)} {" and ".join(parts)}'
+            if lo is not None and not pd.isna(lo):
+                parts.append(f'> {fmt(lo)}')
+            if hi is not None and not pd.isna(hi):
+                parts.append(f'< {fmt(hi)}')
+            return ' and '.join(parts)
 
-        steps = [] if compromise else f['steps']
-        rows = []
-        for k, s in enumerate(steps, 1):
-            gate = gate_text(s['x']) + ('' if s['y'] is None else '; ' + gate_text(s['y']))
-            rows.append([(k, str(k)), (None, labels.get(s['x'], s['x'])),
-                         (None, '' if s['y'] is None else labels.get(s['y'], s['y'])),
-                         (None, gate), (s['recall'], _pct(s['recall'])),
-                         (s['purity'], _pct(s['purity']))])
-        if compromise:
-            m = f.get('compromise_metrics') or {}
-            rows.append([(None, ''), (None, ''), (None, ''),
-                         (None, '; '.join(gate_text(ch) for ch in cuts)),
-                         (m.get('recall'), _pct(m.get('recall'))),
-                         (m.get('purity'), _pct(m.get('purity')))])
-        set_rows(self.steps_table, rows)
-        events = self._events.get(self._run['run_id'])
-        samples = events.samples if events is not None else []
+        set_rows(self.steps_table, [
+            [(None if pd.isna(g['step']) else int(g['step']),
+              '' if pd.isna(g['step']) else str(int(g['step']))),
+             (None, g['marker']),
+             (None, cut(g['low'], g['high'], lambda v: f'{v:.3g}')),
+             (None, cut(g['low_raw'], g['high_raw'], lambda v: f'{v:,.0f}')),
+             (g['recall_after_step'], _pct(g['recall_after_step'])),
+             (g['purity_after_step'], _pct(g['purity_after_step']))]
+            for g in tables['gates'].to_dict('records')])
         set_rows(self.samples_table, [
-            [(None, samples[r['sample']] if r['sample'] < len(samples) else str(r['sample'])),
-             (r['n_target'], str(r['n_target'])), (r['recall'], _pct(r['recall'])),
-             (r['purity'], _pct(r['purity']))] for r in f['per_sample']])
-        set_rows(self.impurity_table, [[(None, cluster_name(names, c)), (s, _pct(s))]
-                                       for c, s in f['impurity']])
-        set_rows(self.path_table, [[(p['n_markers'], str(p['n_markers'])),
+            [(None, r['sample']), (r['cluster_events'], str(r['cluster_events'])),
+             (r['recall'], _pct(r['recall'])), (r['purity'], _pct(r['purity']))]
+            for r in tables['per_sample'].to_dict('records')])
+        set_rows(self.impurity_table, [[(None, r['other_cluster']), (r['share_of_gate'],
+                                                               _pct(r['share_of_gate']))]
+                                       for r in tables['impurity'].to_dict('records')])
+        set_rows(self.path_table, [[(p['markers'], str(p['markers'])),
                                     (p['recall'], _pct(p['recall'])),
-                                    (p['purity'], _pct(p['purity']))] for p in f['path']])
+                                    (p['purity'], _pct(p['purity']))]
+                                   for p in tables['fewer_markers'].to_dict('records')])
         set_rows(self.tradeoff_table, [[(t['beta'], f'{t["beta"]:g}'),
                                         (t['n_markers'], str(t['n_markers'])),
                                         (t['recall'], _pct(t['recall'])),
-                                        (t['purity'], _pct(t['purity']))] for t in f['tradeoff']])
+                                        (t['purity'], _pct(t['purity']))]
+                                       for t in tables['tradeoff'].to_dict('records')])
+
+    def _samples(self, run: dict | None = None) -> list:
+        events = self._events.get((run or self._run)['run_id'])
+        return events.samples if events is not None else []
+
+    def _colour(self, run: dict, clusters: list) -> str:
+        colours = run.get('colors') or {}
+        return colours.get(clusters[0], colours.get(str(clusters[0]), '#d62728'))
+
+    def _figure(self, run: dict, entry: dict, compromise: bool = False, title: str = ''):
+        """The hierarchy figure of a saved result, or None."""
+        events = self._events_for(run)
+        f = entry.get('finding')
+        if events is None or f is None:
+            return None
+        cuts = f['compromise'] if compromise else f['strategy']
+        if not cuts:
+            return None
+        return make_hierarchy_figure(events, f, entry['clusters'],
+                                     self._colour(run, entry['clusters']),
+                                     self._channel_labels(), compromise, title)
 
     def _draw(self, f: dict, cuts: dict, clusters: list[int], compromise: bool):
-        """One biaxial plot per step (or one for the compromise): the events
-        passing the earlier steps, the cluster's in its colour, the gate as a
-        rectangle."""
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-        from matplotlib.figure import Figure
-        from matplotlib.patches import Rectangle
 
-        events = self._ensure_events()
-        if events is None or not cuts:
+        entry = self._entry(clusters)
+        fig = None if entry is None else self._figure(self._run, entry, compromise)
+        if fig is None:
             self.figure_scroll.takeWidget()
             return
-        chans = list(cuts)
-        if not compromise and f['steps']:
-            pairs = [(s['x'], s['y']) for s in f['steps']]
-        else:
-            pairs = [(chans[i], chans[i + 1] if i + 1 < len(chans) else None)
-                     for i in range(0, len(chans), 2)]
-        labels = self._channel_labels()
-        colours = self._run.get('colors') or {}
-        colour = colours.get(clusters[0], colours.get(str(clusters[0]), '#d62728'))
-        rng = np.random.default_rng(0)
-        n = len(events.labels)
-        pick = rng.choice(n, size=min(DISPLAY_EVENTS, n), replace=False,
-                          p=events.weights / events.weights.sum())
-        X = events.X[pick]
-        in_target = np.isin(events.labels[pick], clusters)
-        col = {ch: events.channels.index(ch) for ch in events.channels}
-        alive = np.ones(len(pick), dtype=bool)
-        ncol = min(3, len(pairs))
-        nrow = int(np.ceil(len(pairs) / ncol))
-        fig = Figure(figsize=(3.4 * ncol, 3.3 * nrow), dpi=100)
-        for k, (cx, cy) in enumerate(pairs, 1):
-            ax = fig.add_subplot(nrow, ncol, k)
-            x = X[:, col[cx]]
-            lo_x, hi_x = cuts[cx]
-            if cy is None:
-                bins = np.linspace(np.quantile(x[alive], 0.002), np.quantile(x[alive], 0.998), 80)
-                ax.hist(x[alive & ~in_target], bins=bins, color='#bbbbbb', label='Other cells')
-                ax.hist(x[alive & in_target], bins=bins, color=colour, alpha=0.8, label='Cluster')
-                for v in (lo_x, hi_x):
-                    if v is not None:
-                        ax.axvline(v, color='black', lw=1.2)
-                ax.set_xlabel(labels.get(cx, cx))
-                inside = (x >= (lo_x if lo_x is not None else -np.inf)) & \
-                         (x <= (hi_x if hi_x is not None else np.inf))
-            else:
-                y = X[:, col[cy]]
-                ax.scatter(x[alive & ~in_target], y[alive & ~in_target], s=1, c='#bbbbbb',
-                           linewidths=0, rasterized=True)
-                ax.scatter(x[alive & in_target], y[alive & in_target], s=1, c=colour,
-                           linewidths=0, rasterized=True)
-                xl = np.quantile(x[alive], [0.002, 0.998])
-                yl = np.quantile(y[alive], [0.002, 0.998])
-                lo_y, hi_y = cuts[cy]
-                x0 = lo_x if lo_x is not None else min(xl[0], x[alive].min())
-                x1 = hi_x if hi_x is not None else max(xl[1], x[alive].max())
-                y0 = lo_y if lo_y is not None else min(yl[0], y[alive].min())
-                y1 = hi_y if hi_y is not None else max(yl[1], y[alive].max())
-                ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
-                                       edgecolor='black', lw=1.2))
-                ax.set_xlim(min(xl[0], x0) - 0.02, max(xl[1], x1) + 0.02)
-                ax.set_ylim(min(yl[0], y0) - 0.02, max(yl[1], y1) + 0.02)
-                ax.set_xlabel(labels.get(cx, cx))
-                ax.set_ylabel(labels.get(cy, cy))
-                inside = (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
-            title = f'Step {k}' if len(pairs) > 1 else 'Gate'
-            step = f['steps'][k - 1] if not compromise and k <= len(f['steps']) else None
-            if step is not None:
-                title += f': {_pct(step["recall"])} kept, {_pct(step["purity"])} pure'
-            ax.set_title(title, fontsize=9)
-            ax.tick_params(labelsize=7)
-            alive &= inside
-        fig.tight_layout()
         canvas = FigureCanvasQTAgg(fig)
-        canvas.setMinimumHeight(int(330 * nrow))
+        canvas.setMinimumHeight(int(fig.get_figheight() * 100))
         self.figure_scroll.setWidget(canvas)
+
+    # ------------------------------------------------------------------
+    # Report, image and CSV export
+    # ------------------------------------------------------------------
+
+    def _report_keys(self, run_id: str) -> list:
+        return list((self._results.get(run_id) or {}).get(REPORT_FIELD) or [])
+
+    def _on_report_toggled(self, checked: bool):
+        if self._run is None or not self._shown or self._loading:
+            return
+        run_id = self._run['run_id']
+        key = target_key(self._shown)
+        keys = [k for k in self._report_keys(run_id) if k != key] + ([key] if checked else [])
+        self._results.setdefault(run_id, {})[REPORT_FIELD] = keys
+        save_fields(self.controller, run_id, {REPORT_FIELD: keys})
+
+    def _title(self, run: dict, clusters: list) -> str:
+        names = run.get('names') or {}
+        return (f'{" + ".join(cluster_name(names, c) for c in clusters)} '
+                f'({run.get("label") or run["run_id"]})')
+
+    def _current_figure(self):
+        if self._run is None or not self._shown:
+            return None
+        entry = self._entry(self._shown)
+        if entry is None:
+            return None
+        compromise = self.view_combo.isEnabled() and self.view_combo.currentData() == 'compromise'
+        return self._figure(self._run, entry, compromise, self._title(self._run, self._shown))
+
+    def _open_window(self):
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+
+        fig = self._current_figure()
+        if fig is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(self._title(self._run, self._shown))
+        lay = QVBoxLayout(dialog)
+        canvas = FigureCanvasQTAgg(fig)
+        lay.addWidget(NavigationToolbar2QT(canvas, dialog))
+        lay.addWidget(canvas)
+        dialog.resize(int(fig.get_figwidth() * 110), int(fig.get_figheight() * 110) + 60)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.show()
+
+    def save_image(self, path) -> bool:
+        """Write the shown cluster's hierarchy to *path* (format from its
+        suffix) at IMAGE_DPI."""
+        fig = self._current_figure()
+        if fig is None:
+            return False
+        fig.savefig(str(path), dpi=IMAGE_DPI, bbox_inches='tight')
+        return True
+
+    def _save_image_dialog(self):
+        if self._current_figure() is None:
+            return
+        names = self._names()
+        stem = drc_report.sanitize_filename(
+            'gating_' + '_'.join(cluster_name(names, c) for c in self._shown))
+        start = str(self.controller.experiment_dir / f'{stem}.png') \
+            if getattr(self.controller, 'experiment_dir', None) else f'{stem}.png'
+        path, _selected = QFileDialog.getSaveFileName(
+            self, 'Save gating hierarchy', start, 'PNG (*.png);;PDF (*.pdf);;SVG (*.svg)')
+        if path:
+            self.save_image(path)
+            self.lbl_status.setText(f'Saved {path}')
+
+    def summary_table(self, run: dict | None = None) -> pd.DataFrame:
+        """One row per cluster of *run* (default: the selected run): size,
+        FDR, verdict, metrics, gates and the settings the result was found
+        with."""
+        run = run or self._run
+        if run is None:
+            return pd.DataFrame()
+        names = run.get('names') or {}
+        labels = self._channel_labels()
+        results = self._results.get(run['run_id']) or {}
+        fdr = cluster_fdr(self.state, run['run_id'], names)
+        totals = {}
+        for lab in (run.get('labels') or {}).values():
+            ids, counts = np.unique(np.asarray(lab), return_counts=True)
+            for c, n in zip(ids.tolist(), counts.tolist()):
+                if c >= 0:
+                    totals[c] = totals.get(c, 0) + n
+        all_cells = sum(totals.values()) or 1
+        current = settings_key(self.settings())
+        rows = []
+        for c in sorted(totals):
+            entry = results.get(target_key([c])) or {}
+            f = entry.get('finding') or {}
+            st = entry.get('settings') or {}
+            val = f.get('validation') or {}
+            comp = f.get('compromise_metrics') or {}
+            gates = '; '.join(
+                f'{labels.get(ch, ch)}'
+                + (f' > {lo:.3g}' if lo is not None else '')
+                + (f' < {hi:.3g}' if hi is not None else '')
+                for ch, (lo, hi) in (f.get('strategy') or {}).items())
+            rows.append({
+                'cluster': cluster_name(names, c), 'cluster_id': c,
+                'percent_of_cells': 100.0 * totals[c] / all_cells,
+                'fdr': fdr.get(c),
+                'verdict': VERDICT_TEXT.get(f.get('status'), entry.get('error', 'not run')),
+                'recall': val.get('recall'), 'purity': val.get('purity'),
+                'markers': len(f.get('strategy') or {}) if f else None,
+                'gates': gates,
+                'separability_purity': (f.get('separability') or {}).get('purity'),
+                'compromise_recall': comp.get('recall'), 'compromise_purity': comp.get('purity'),
+                'recall_target': st.get('recall'), 'purity_target': st.get('purity'),
+                'max_markers': st.get('max_markers'), 'validation': st.get('holdout'),
+                'other_settings': bool(entry) and settings_key(st) != current,
+                'found': entry.get('saved'),
+            })
+        return pd.DataFrame(rows)
+
+    def _detail_tables(self, run: dict, entry: dict) -> dict:
+        f = entry.get('finding')
+        if f is None:
+            return {}
+        self._events_for(run)
+        return finding_tables(run, f, False, self._channel_labels(), run.get('names') or {},
+                              self._samples(run))
+
+    def export_csv(self, folder) -> list:
+        """Write summary.csv and, over every cluster with a result, gates,
+        per_sample, impurity, fewer_markers and tradeoff CSVs (a cluster
+        column first) into *folder*. Returns the files written."""
+        from pathlib import Path
+        if self._run is None:
+            return []
+        folder = Path(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        written = []
+        summary = self.summary_table()
+        summary.to_csv(folder / 'summary.csv', index=False)
+        written.append(folder / 'summary.csv')
+        names = self._names()
+        parts: dict = {}
+        for key, entry in (self._results.get(self._run['run_id']) or {}).items():
+            if not key.startswith('cluster:') or 'finding' not in (entry or {}):
+                continue
+            name = ' + '.join(cluster_name(names, c) for c in entry['clusters'])
+            for table_name, df in self._detail_tables(self._run, entry).items():
+                if df.empty:
+                    continue
+                df = df.copy()
+                df.insert(0, 'cluster', name)
+                parts.setdefault(table_name, []).append(df)
+        for table_name, dfs in parts.items():
+            path = folder / f'{table_name}.csv'
+            pd.concat(dfs, ignore_index=True).to_csv(path, index=False)
+            written.append(path)
+        return written
+
+    def _export_csv_dialog(self):
+        if self._run is None:
+            return
+        start = str(self.controller.experiment_dir) \
+            if getattr(self.controller, 'experiment_dir', None) else ''
+        base = QFileDialog.getExistingDirectory(self, 'Folder for the gating confirmation CSVs',
+                                                start)
+        if not base:
+            return
+        from pathlib import Path
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        name = drc_report.sanitize_filename(
+            f'gating_confirmation_{self._run.get("label") or self._run["run_id"]}_{stamp}')
+        written = self.export_csv(Path(base) / name)
+        self.lbl_status.setText(f'Wrote {len(written)} CSV file(s) to {Path(base) / name}')
+
+    def get_report_items(self) -> list:
+        """For the selected run: the summary table, and each cluster ticked
+        'Include in report' (hierarchy figure and its tables)."""
+        run = self._run
+        if run is None:
+            return []
+        results = self._results.get(run['run_id']) or {}
+        if not any(k.startswith('cluster:') for k in results):
+            return []
+        label = run.get('label') or run['run_id']
+        items = [drc_report.ReportItem(
+            key=f'gating_confirmation:{run["run_id"]}:summary', tab=REPORT_SECTION,
+            label=f'{label} gating confirmation',
+            get_tables=lambda run=run: {'summary': self.summary_table(run)})]
+        names = run.get('names') or {}
+        for key in self._report_keys(run['run_id']):
+            entry = results.get(key)
+            if not entry or 'finding' not in entry:
+                continue
+            name = ' + '.join(cluster_name(names, c) for c in entry['clusters'])
+            items.append(drc_report.ReportItem(
+                key=f'gating_confirmation:{run["run_id"]}:{key}', tab=REPORT_SECTION,
+                label=f'{label} {name}',
+                get_figure=lambda run=run, entry=entry: self._figure(
+                    run, entry, False, self._title(run, entry['clusters'])),
+                get_tables=lambda run=run, entry=entry: self._detail_tables(run, entry)))
+        return items

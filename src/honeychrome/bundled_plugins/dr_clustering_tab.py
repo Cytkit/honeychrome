@@ -15538,6 +15538,7 @@ class PluginWidget(QWidget):
             workspace_tab=self.workspace_tab,
             groups_stats_tab=self.groups_stats_tab,
             cluster_annotation_tab=self.cluster_annotation_tab,
+            gating_confirmation_tab=self.gating_confirmation_tab,
         )
 
         # Figures the Workspace can copy onto its pages
@@ -17219,7 +17220,7 @@ class PluginWidget(QWidget):
         if index == 6:
             # The report lists what these tabs hold, and they build it
             # from the restored state on refresh.
-            for source_index in (2, 3):
+            for source_index in (2, 3, 4):
                 self._refresh_tab_at(source_index)
         key = self._tab_refresh_key(index)
         if key is not None and self._last_tab_refresh_key.get(index) == key:

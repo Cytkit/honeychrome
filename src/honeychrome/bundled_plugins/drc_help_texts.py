@@ -1155,6 +1155,14 @@ threshold to the nearest dip in the cell density when the targets still
 hold.</li>
 <li>Results are saved with the run when each cluster finishes and marked
 <i>other settings</i> when the settings have changed since.</li>
+<li><b>Include in report</b> lists the cluster's hierarchy and tables on the
+Report tab, beside a summary of every cluster of the run. <b>Save
+image…</b> writes the hierarchy as PNG, PDF or SVG; <b>Export CSV…</b>
+writes the summary and the tables of every cluster with a result to a new
+folder.</li>
+<li>Gates are given on the plot scale and in <b>raw intensity</b> (the
+unmixed value before the transform), so they can be drawn again in other
+software.</li>
 </ul>
 <p>The search follows Hypergate [1]; FlowJo's HyperFinder and GateFinder [2]
 answer the same question.</p>
