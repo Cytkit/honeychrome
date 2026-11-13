@@ -670,6 +670,38 @@ def enrichment_report_items(result: dict, fdr_threshold: float) -> list[ReportIt
             key='enrichment:patterns', tab='Enrichment', label='Immune states in shape patterns',
             get_figure=lambda: fp.make_pattern_dot_plot(pattern_states, fdr_threshold, False),
             get_tables=lambda: {'pattern_states': pattern_states}))
+    items += coherence_report_items(result.get('coherence') or {}, fdr_threshold)
+    return items
+
+
+def coherence_report_items(block: dict, fdr_threshold: float) -> list[ReportItem]:
+    """Report items of a coherence result: per comparison, the coherence
+    figure with its tables, and the state network when at least one
+    correlation differs between the groups (FDR below *fdr_threshold*)."""
+    import ag_coherence
+    import ag_fsea_plots as fp
+
+    coh = block.get('coherence')
+    if coh is None or not len(coh):
+        return []
+    items = []
+    for comp in ag_coherence.comparison_labels(block):
+        if comp not in set(coh['comparison']):
+            continue
+        rows = coh[coh['comparison'] == comp]
+        edges = block['edges'][block['edges']['comparison'] == comp]
+        members = block['members'][block['members']['comparison'] == comp]
+        items.append(ReportItem(
+            key=f'coherence:{comp}', tab='Enrichment', label=f"Coherence: {comp}",
+            get_figure=lambda _c=comp: fp.make_coherence_figure(block, _c, fdr_threshold, False),
+            get_tables=lambda _r=rows, _e=edges, _m=members: {
+                'coherence': _r, 'state_network': _e, 'coherence_members': _m}))
+        if (edges['FDR'].astype(float) < fdr_threshold).any():
+            items.append(ReportItem(
+                key=f'coherence_network:{comp}', tab='Enrichment', label=f"State network: {comp}",
+                get_figure=lambda _c=comp: fp.make_state_network_figure(block, _c, fdr_threshold,
+                                                                        False),
+                get_tables=lambda _e=edges: {'state_network': _e}))
     return items
 
 
@@ -692,7 +724,9 @@ def make_population_comparison_figure(gate_def: dict, pop: str, panels: list, tr
                                       title: str, p_text: str = '',
                                       group_colours: dict | None = None,
                                       trend: dict | None = None,
-                                      trend_percent: dict | None = None):
+                                      trend_percent: dict | None = None,
+                                      value_label: str = '% of parent',
+                                      value_suffix: str = '%'):
     """The report figure of one population: each group's pooled parent
     events on the gate's axes with the reference boundary and the group's
     gated frequency, then the dot and violin plot of the per-sample values
@@ -704,6 +738,8 @@ def make_population_comparison_figure(gate_def: dict, pop: str, panels: list, tr
              population's trend plot then takes the place of the dot and
              violin plot (two panels for a paired group × trend test).
     trend_percent : the same trend on the % of parent scale, drawn after it.
+    value_label   : what *values* are (y-axis label and plot title), with
+                    *value_suffix* after each value in the hover labels.
     """
     from matplotlib.figure import Figure
 
@@ -730,8 +766,9 @@ def make_population_comparison_figure(gate_def: dict, pop: str, panels: list, tr
         if trend_percent:
             tp.make_trend_plot_figure(**trend_percent, axes=[axes[len(panels) + n_trend]])
     else:
-        make_group_values_figure(values, group_order, f"{label}: % of parent", p_text,
-                                 ax=axes[-1], group_colours=group_colours)
+        make_group_values_figure(values, group_order, f"{label}: {value_label}", p_text,
+                                 ax=axes[-1], group_colours=group_colours,
+                                 value_label=value_label, value_suffix=value_suffix)
     fig.suptitle(title, fontsize=10)
     return fig
 
@@ -851,9 +888,14 @@ def make_roc_figure(performance: pd.DataFrame, roc: pd.DataFrame, summary: dict,
 
 
 def make_importance_figure(importance: pd.DataFrame, summary: dict, is_dark: bool,
-                           top_n: int = 20):
+                           top_n: int = 20, keys: dict | None = None):
     """The most informative features: lasso selection frequency and/or
-    forest importance, coloured by the group with the higher value."""
+    forest importance, coloured by the group with the higher value.
+
+    keys : {feature: population key} for click-through; the figure then
+           carries ``_row_keys`` by bar position, bottom to top ('' for a
+           feature without a population), and ``_row_axes`` (every panel).
+    """
     from matplotlib.figure import Figure
     import matplotlib.patches as mpatches
     from honeychrome.view_components import differential_plots as dp
@@ -866,13 +908,18 @@ def make_importance_figure(importance: pd.DataFrame, summary: dict, is_dark: boo
     colours = ['#EE6677' if d > 0 else '#4477AA' for d in top['direction']]
     fig = Figure(figsize=(4.5 * max(1, len(metrics)) + 2.5, max(3.5, 0.28 * len(top) + 1.8)),
                  constrained_layout=True)
+    axes = []
     for i, (col, label) in enumerate(metrics):
         ax = fig.add_subplot(1, len(metrics), i + 1)
+        axes.append(ax)
         xerr = top['forest_importance_sd'] if col == 'forest_importance' else None
         ax.barh(range(len(top)), top[col], color=colours, xerr=xerr, error_kw={'elinewidth': 0.6})
         ax.set_yticks(range(len(top)))
         ax.set_yticklabels(top['feature'] if i == 0 else [''] * len(top), fontsize=7)
         ax.set_xlabel(label, fontsize=8)
+    if keys:
+        fig._row_keys = [keys.get(f, '') for f in top['feature'].astype(str)]
+        fig._row_axes = tuple(axes)
     fig.legend(handles=[
         mpatches.Patch(color='#EE6677', label=f"higher in {summary['positive']}"),
         mpatches.Patch(color='#4477AA', label=f"higher in {summary['negative']}"),

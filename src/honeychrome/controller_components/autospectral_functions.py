@@ -606,7 +606,8 @@ def af_index_lookup(af_profiles: dict, profile_names) -> np.ndarray | None:
 
 
 def apply_af_transfer(raw_event_data, transfer_matrix, af_precomputed, af_spectra, settings,
-                      filtered_fl_ids_raw=None, spillover=None, af_index_map=None):
+                      filtered_fl_ids_raw=None, spillover=None, af_index_map=None, af_posterior=None,
+                      pnn_raw=None):
     """
     Assemble a full unmixed event array with AF-corrected fluorescence columns.
     Scatter, time, and event_id columns come from the standard transfer_matrix path;
@@ -620,6 +621,12 @@ def apply_af_transfer(raw_event_data, transfer_matrix, af_precomputed, af_spectr
     to those fluorescence columns so the result matches the compensated transfer_matrix
     path. The transpose matches spillover's row-spills-into-column convention to the
     column-vector multiplication used below (see controller.py::initialise_transfer_matrix).
+
+    With ``af_posterior`` (af_posterior.AFPosterior) the AF abundance is the
+    noise-aware one; the prior mean then reads each event's SSC from the
+    column of ``raw_event_data`` named in ``pnn_raw`` (default: the channel
+    whitelist when set, else every raw channel, the order raw events are
+    loaded in).
     """
     from honeychrome.controller_components.functions import apply_transfer_matrix
 
@@ -636,7 +643,12 @@ def apply_af_transfer(raw_event_data, transfer_matrix, af_precomputed, af_spectr
     unmixed = raw_event_data @ transfer_matrix
 
     raw_fl = raw_event_data[:, fl_ids_raw]
-    result = apply_af_unmixing(raw_fl, af_precomputed, af_spectra)
+    log_ssc = None
+    if af_posterior is not None:
+        if pnn_raw is None:
+            pnn_raw = raw_settings.get('whitelisted_pnn') or raw_settings['event_channels_pnn']
+        log_ssc = af_posterior.log_ssc(raw_event_data, pnn_raw)
+    result = apply_af_unmixing(raw_fl, af_precomputed, af_spectra, af_posterior=af_posterior, log_ssc=log_ssc)
     af_unmixed_fl = result['unmixed']  # (n_cells, n_fluors) — plain OLS space
 
     if spillover is not None:
@@ -788,11 +800,14 @@ def fluorophores_identifiable(fluor_spectra: np.ndarray, keep: np.ndarray, min_r
     return bool(sv[-1] > min_ratio * sv[0])
 
 
-def _refit_saturated(raw_data, precomputed, af_spectra, envelope, unmixed_out, af_scale_out, af_idx_out):
+def _refit_saturated(raw_data, precomputed, af_spectra, envelope, unmixed_out, af_scale_out, af_idx_out,
+                     af_posterior=None, log_ssc=None):
     """
     Re-fit events with saturated detectors on the unsaturated detectors only.
     Events are grouped by their pattern of saturated detectors; a pattern
     that leaves a fluorophore unidentifiable keeps its first-pass result.
+    A noise-aware posterior is applied with the noise of the unsaturated
+    detectors.
     """
     saturated = raw_data >= envelope['saturated_frac'] * envelope['ceiling']
     rows_any = np.flatnonzero(saturated.any(axis=1))
@@ -810,7 +825,9 @@ def _refit_saturated(raw_data, precomputed, af_spectra, envelope, unmixed_out, a
         sub_af = np.ascontiguousarray(af_spectra[:, keep])
         sub = build_af_precomputed(sub_fluor, sub_af, envelope)
         out = apply_af_unmixing(np.ascontiguousarray(raw_data[rows][:, keep]), sub, sub_af,
-                                handle_saturation=False)
+                                handle_saturation=False,
+                                af_posterior=None if af_posterior is None else af_posterior.subset(keep),
+                                log_ssc=None if log_ssc is None else log_ssc[rows])
         unmixed_out[rows] = out['unmixed']
         af_scale_out[rows] = out['af_scale']
         af_idx_out[rows] = out['af_idx']
@@ -917,6 +934,8 @@ def apply_af_unmixing(
     af_spectra: np.ndarray,
     chunk_size: int = 50_000,
     handle_saturation: bool = True,
+    af_posterior=None,
+    log_ssc: np.ndarray | None = None,
 ) -> dict:
     """
     Per-cell AF extraction and OLS unmixing (fluorescence channels only).
@@ -942,6 +961,13 @@ def apply_af_unmixing(
     unsaturated detectors. The abundance estimate and the residual term are
     unchanged.
 
+    With ``af_posterior`` (af_posterior.AFPosterior) the clamp is replaced by
+    the noise-aware abundance: the unclamped estimate on the chosen variant
+    weighed against the sample's prior by its noise (see af_posterior), so
+    it is always positive and is pulled towards the typical AF of cells of
+    the same SSC when the event's spectrum says little about its AF. The
+    variant choice is unchanged.
+
     Parameters
     ----------
     raw_data    : (n_cells, n_channels) raw fluorescence only
@@ -952,6 +978,10 @@ def apply_af_unmixing(
     chunk_size  : cells per processing batch
     handle_saturation : with an envelope, re-fit events that have saturated
                   detectors (False when called for such a re-fit)
+    af_posterior : noise-aware posterior of the sample, None for the clamped
+                  abundance
+    log_ssc     : (n_cells,) log SSC of each event for the posterior's prior
+                  mean; None gives every event the sample's median
 
     Returns
     -------
@@ -978,14 +1008,19 @@ def apply_af_unmixing(
             chunk, precomputed, w, k_denom, c_fluor, envelope
         )
 
-        best_k = np.maximum(numerator[np.arange(end - start), best_j], 0.0) / k_denom[best_j]
+        if af_posterior is None:
+            best_k = np.maximum(numerator[np.arange(end - start), best_j], 0.0) / k_denom[best_j]
+        else:
+            k_hat = numerator[np.arange(end - start), best_j] / k_denom[best_j]
+            best_k = af_posterior.abundance(k_hat, unmixed, best_j, precomputed, af_spectra, k_denom,
+                                            None if log_ssc is None else log_ssc[start:end])
         unmixed_out[start:end]  = unmixed - best_k[:, np.newaxis] * v_library_t[best_j]
         af_scale_out[start:end] = best_k
         af_idx_out[start:end]   = best_j + 1
 
     if envelope is not None and handle_saturation:
         _refit_saturated(raw_data, precomputed, af_spectra, envelope,
-                         unmixed_out, af_scale_out, af_idx_out)
+                         unmixed_out, af_scale_out, af_idx_out, af_posterior, log_ssc)
 
     return {'unmixed': unmixed_out, 'af_scale': af_scale_out, 'af_idx': af_idx_out}
 

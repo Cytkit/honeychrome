@@ -62,7 +62,7 @@ from honeychrome.controller_components.autospectral_functions import (
         refresh_envelope_entry,
      )
 from honeychrome.settings import af_index_channel
-from honeychrome.controller_components import unmix_method
+from honeychrome.controller_components import af_posterior, unmix_method
 from honeychrome.controller_components.job_gate import JobGate
 from honeychrome.controller_components.sample_loader import AFState
 
@@ -1422,7 +1422,9 @@ class Controller(QObject):
         With the noise model or spectral variants as the method, the displayed
         sample is returned unmixed by per-cell AF (or from the display cache)
         and the method's result is swapped in from a background job
-        (_start_method_job). Live data stays on per-cell AF.
+        (_start_method_job). Live data stays on per-cell AF; with the
+        noise-aware AF abundance it takes the prior of the sample's AF
+        reference until it has been recorded.
         """
         self._unmix_generation += 1
         live = self.live_sample_path is not None and self.current_sample_path == self.live_sample_path
@@ -1438,6 +1440,7 @@ class Controller(QObject):
             full_pnn_raw = _raw['event_channels_pnn']
             fl_ids_remapped = [pnn_raw.index(full_pnn_raw[i])
                                for i in self.filtered_raw_fluorescence_channel_ids]
+            af = self._current_af_state(live=live)
             result = apply_af_transfer(
                 raw_event_data,
                 self.transfer_matrix,
@@ -1447,6 +1450,8 @@ class Controller(QObject):
                 filtered_fl_ids_raw=fl_ids_remapped,
                 spillover=self.experiment.process.get('spillover'),
                 af_index_map=self.af_index_map,
+                af_posterior=None if af is None else af.posterior,
+                pnn_raw=pnn_raw,
             )
             # result is now a dict; store the sidecar columns
             self.af_sidecar_data = np.column_stack(
@@ -1457,13 +1462,28 @@ class Controller(QObject):
             self.af_sidecar_data = None
             return apply_transfer_matrix(self.transfer_matrix, raw_event_data)
 
-    def _current_af_state(self) -> AFState | None:
-        """The displayed sample's AF library as set by initialise_af_matrices."""
+    def _current_af_state(self, live: bool = False) -> AFState | None:
+        """
+        The displayed sample's AF library as set by initialise_af_matrices,
+        with its noise-aware AF posterior when that setting is in effect
+        (``live``: the sample is being acquired, see af_posterior).
+        """
         if self.af_precomputed is None or self.af_spectra is None:
             return None
         names = self.experiment.samples.get('sample_af_profiles', {}).get(self.current_sample_path, []) or []
-        return AFState(profile_names=tuple(names), precomputed=self.af_precomputed,
-                       spectra=self.af_spectra, index_map=self.af_index_map)
+        af = AFState(profile_names=tuple(names), precomputed=self.af_precomputed,
+                     spectra=self.af_spectra, index_map=self.af_index_map)
+        context = af_posterior.noise_context(self)
+        if context is not None and self.current_sample_path is not None:
+            af = context.attach(af, self.current_sample_path, live=live)
+        return af
+
+    def _log_ssc(self, raw_event_data, af) -> np.ndarray | None:
+        """log SSC of the displayed events for a noise-aware AF posterior (None without one)."""
+        if af is None or af.posterior is None:
+            return None
+        _raw = self.experiment.settings['raw']
+        return af.posterior.log_ssc(raw_event_data, _raw.get('whitelisted_pnn') or _raw['event_channels_pnn'])
 
     def _raw_fl_ids(self) -> list:
         """Fluorescence channel positions in the (whitelisted) raw event columns."""
@@ -1502,11 +1522,12 @@ class Controller(QObject):
                 logger.info('Controller: %s from the unmixing cache for %s', method, key)
                 return result['unmixed']
 
+        log_ssc = self._log_ssc(raw_event_data, af)
         job = {'generation': self._unmix_generation, 'raw': raw_event_data, 'state': state, 'af': af,
                'sample_key': key, 'fl_ids': fl_ids, 'method': method, 'cache_key': cache_key,
-               'experiment_dir': self.experiment_dir}
+               'experiment_dir': self.experiment_dir, 'log_ssc': log_ssc}
         if not self.progressive_unmixing or QCoreApplication.instance() is None:
-            fl = unmix_method.unmix_fluorescence(raw_event_data[:, fl_ids], state, af, key, method)
+            fl = unmix_method.unmix_fluorescence(raw_event_data[:, fl_ids], state, af, key, method, log_ssc=log_ssc)
             if cache_key:
                 unmix_method.store_display_cache(self.experiment_dir, cache_key, fl)
             result = unmix_method.assemble(raw_event_data, self.transfer_matrix, settings_, fl, spillover, af)
@@ -2170,14 +2191,16 @@ class Controller(QObject):
 
             # copy live data
             self.raw_event_data, n_new_events = self.copy_live_data(extent='update')
-            self.data_for_cytometry_plots['event_data'] = self.raw_event_data
 
             # apply spectral unmixing and compensation if defined
-            if self.current_mode == 'raw' and self.experiment.process['unmixing_matrix'] is not None:
+            if self.experiment.process['unmixing_matrix'] is not None:
                 self.unmixed_event_data = apply_transfer_matrix(self.transfer_matrix, self.raw_event_data)
-                self.data_for_cytometry_plots['event_data'] = self.unmixed_event_data
 
-            self.calc_hists_and_stats()
+            # one reference: a tab switch on the main thread can rebind it (None on a plugin tab)
+            data = self.data_for_cytometry_plots
+            if data is not None:
+                data['event_data'] = self.raw_event_data if data is self.data_for_cytometry_plots_raw else self.unmixed_event_data
+                self.calc_hists_and_stats()
 
             # Calculate elapsed time and sleep precisely
             new_update_time = time.perf_counter()
@@ -2347,7 +2370,7 @@ class Controller(QObject):
     @with_busy_cursor
     @Slot()
     def refresh_spectral_process(self):
-        from honeychrome.controller_components.spectral_functions import calculate_spectral_process
+        from honeychrome.controller_components.spectral_functions import calculate_spectral_process, UnmixableProfilesError
 
         # first build unmixed part of experiment: settings, process and cytometry
         raw_settings = self.experiment.settings['raw']
@@ -2371,19 +2394,28 @@ class Controller(QObject):
                 and len(profiles.keys()) == len(spectral_model)
                 and all(profiles.keys())
         )
+        # profiles that cannot be unmixed leave the experiment as it was; the reason is
+        # reported with the other profile-QC warnings below
+        spectral_process = None
         if spectral_model and spectral_model_valid:
             if self.bus:
                 self.bus.statusMessage.emit(f'Refreshing spectral process...')
             existing_spillover = self.experiment.process.get('spillover')
             unmixing_method = self.experiment.settings.get('unmixing_method', 'OLS')
-            unmixed_settings, spectral_process, conditioning_warnings = calculate_spectral_process(
-                raw_settings, spectral_model, profiles,
-                existing_spillover=existing_spillover,
-                unmixing_method=unmixing_method,
-                experiment_dir=self.experiment_dir,
-                experiment_samples=self.experiment.samples,
-                filtered_fluorescence_channel_ids=self.filtered_raw_fluorescence_channel_ids,
-            )
+            try:
+                unmixed_settings, spectral_process, conditioning_warnings = calculate_spectral_process(
+                    raw_settings, spectral_model, profiles,
+                    existing_spillover=existing_spillover,
+                    unmixing_method=unmixing_method,
+                    experiment_dir=self.experiment_dir,
+                    experiment_samples=self.experiment.samples,
+                    filtered_fluorescence_channel_ids=self.filtered_raw_fluorescence_channel_ids,
+                )
+            except UnmixableProfilesError as e:
+                logger.warning(f'Controller: spectral process not refreshed ({len(spectral_model)} profiles): {e}')
+                conditioning_warnings = [str(e)]
+
+        if spectral_process is not None:
             self.experiment.process.update(spectral_process)
 
             # An experiment whose channel list predates the AF channels gains
@@ -2453,7 +2485,7 @@ class Controller(QObject):
                 # keep the existing unmixed gating strategy where its channels still exist
                 if previous_unmixed is not None:
                     self._carry_over_unmixed_cytometry(previous_unmixed)
-        else:
+        elif not (spectral_model and spectral_model_valid):
             unmixed_settings = settings_default['unmixed'].copy()
             self.experiment.settings['unmixed'].update(unmixed_settings)
 
@@ -2488,7 +2520,10 @@ class Controller(QObject):
                     self.bus.warningMessage.emit(qc_text)
             self.bus.spectralProcessRefreshed.emit()
             # self.bus.changedGatingHierarchy.emit('unmixed', 'root')
-            self.bus.statusMessage.emit(f'Spectral process refreshed.')
+            if spectral_process is None and spectral_model and spectral_model_valid:
+                self.bus.statusMessage.emit(f'Spectral process not refreshed.')
+            else:
+                self.bus.statusMessage.emit(f'Spectral process refreshed.')
 
         logger.info(f'Controller: refreshed spectral process, unmixed settings, unmixed cytometry')
 
@@ -2670,14 +2705,13 @@ if __name__ == '__main__':
     '''
 
     # Allocate shared memory block, plus head and tail indices
-    traces_cache_shm = shared_memory.SharedMemory(create=True, size=np.zeros(traces_cache_size, dtype=traces_cache_dtype).nbytes)
+    traces_cache_shm = shared_memory.SharedMemory(create=True, size=traces_cache_size * np.dtype(traces_cache_dtype).itemsize)
     traces_cache_lock = Lock()
     index_head_traces_cache = mp.Value('i', 0)
     index_tail_traces_cache = mp.Value('i', 0)
 
     events_cache_shm = shared_memory.SharedMemory(create=True,
-                                                  size=np.zeros((max_events_in_cache, n_channels_per_event),
-                                                                dtype=np.int64).nbytes)
+                                                  size=max_events_in_cache * n_channels_per_event * np.dtype(np.int64).itemsize)
     events_cache_lock = Lock()
     index_head_events_cache = mp.Value('i', 0)
     index_tail_events_cache = mp.Value('i', 0)

@@ -98,7 +98,7 @@ __all__ = [
     'stats_to_jsonable', 'stats_from_jsonable',
     'pack_display', 'display_population_mask', 'display_parent_mask', 'save_display',
     'load_display', 'display_file_name', 'statistics_tables', 'group_population_values',
-    'population_result', 'counts_only_hits', 'run_trend_statistics', 'reapply_trend_thresholds',
+    'population_result', 'predictive_feature_keys', 'counts_only_hits', 'run_trend_statistics', 'reapply_trend_thresholds',
     'trend_to_jsonable', 'trend_from_jsonable', 'trend_tables', 'composition_gate',
     'trend_composition', 'COMPOSITION_OTHER', 'trend_feature_values',
 ]
@@ -870,11 +870,13 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                    marker_threshold: float = 0.03, use_treat: bool = True,
                    fdr_scope: str = 'global', run_freq: bool = True, run_counts: bool = False,
                    run_markers: bool = True, use_stats_parent: bool = True,
+                   markers_population_first: bool = True,
                    exclude_gating_markers: bool = True,
                    min_marker_events: int = DEFAULT_MIN_MARKER_EVENTS,
                    counts_method: str = 'moderated', counts_reference: str = 'anchor',
                    min_parent_events: int = DEFAULT_MIN_PARENT_EVENTS,
-                   anchor_key: str | None = None) -> dict:
+                   anchor_key: str | None = None, pairing_mode: str = 'auto',
+                   individual: str = 'Individual') -> dict:
     """Compare gated populations between sample groups.
 
     * Frequencies: log2 odds of each population within its parent (or its
@@ -891,23 +893,33 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
       log2 odds within the reference; 'ql' fits a negative-binomial GLM
       with the log reference count as offset, tested by the
       quasi-likelihood F test (``differential_stats.run_glm_counts``).
-    * Marker medians: moderated linear model on per-population medians, one
-      family per population (population-first testing).
+    * Marker medians: moderated linear model on per-population medians.
+      With *markers_population_first*, one family per population: each
+      population is screened on all its markers together, and markers are
+      tested only within the populations that pass (stage-wise FDR);
+      otherwise every population × marker is one Benjamini–Hochberg list.
 
     groups     : {sample: group name}; samples without a group are left out.
     pairing    : {sample: pairing level} (e.g. donor), or None.
+    pairing_mode: how the pairing enters the model, 'auto', 'fixed' or
+                 'random' (``differential_stats.resolve_pairing``); with a
+                 random effect the quasi-likelihood counts test is not run.
+    individual : name of the pairing variable, for the variance tables.
     covariates : adjustment covariates, indexed by sample, or None.
     numeric_covariates : the covariates entered as continuous terms (age,
                  CRP); every other covariate is treated as categories.
 
     Returns {'samples', 'group_vec', 'comparisons', 'freq', 'freq_values'
     (% of denominator), 'counts', 'counts_values' (events), 'markers',
-    'marker_values', 'notes', and with counts 'counts_reference',
-    'counts_method' and 'counts_anchor' (population key, 'root' for all
-    events, '' against the parent)}; a result is None when not requested.
+    'marker_values', 'anova_freq' and 'anova_markers' (variance tables,
+    ``anova_stats.run_anova``), 'pairing_mode' ('fixed', 'random' or ''),
+    'notes', and with counts 'counts_reference', 'counts_method' and
+    'counts_anchor' (population key, 'root' for all events, '' against the
+    parent)}; a result is None when not requested.
     Raises
     RuntimeError when fewer than two groups qualify.
     """
+    from honeychrome.controller_components import anova_stats
     from honeychrome.controller_components import differential_stats as ds
 
     if counts_method not in COUNTS_METHODS:
@@ -926,6 +938,7 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
     used = [s for s in samples if (groups.get(s) or '') in names]
     group_vec = [groups[s] for s in used]
     pairing_vec = [str((pairing or {}).get(s, '')) for s in used] if pairing else None
+    pairing_vec, block_vec, resolved = ds.resolve_pairing(group_vec, pairing_vec, pairing_mode)
     cov = None
     if covariates is not None and len(covariates.columns):
         cov = ds.covariate_frame(covariates, used, list(covariates.columns),
@@ -933,9 +946,24 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
 
     out = {'samples': used, 'group_vec': group_vec, 'comparisons': contrasts,
            'freq': None, 'freq_values': None, 'counts': None, 'counts_values': None,
-           'markers': None, 'marker_values': None, 'notes': []}
+           'markers': None, 'marker_values': None, 'anova_freq': None, 'anova_markers': None,
+           'pairing_mode': resolved, 'notes': []}
     common = dict(pairing_vec=pairing_vec, fdr_scope=fdr_scope, covariates=cov,
                   use_treat=use_treat)
+    moderated = dict(common, block_vec=block_vec, block_name=individual)
+
+    def _variance(values, meta=None):
+        try:
+            table = anova_stats.run_anova(values, group_vec, pairing_vec=pairing_vec,
+                                          block_vec=block_vec, individual=individual,
+                                          covariates=cov, feature_meta=meta)
+        except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+            out['notes'].append(f"Variance table not made: {exc}")
+            return None
+        for note in table.attrs.get('notes', []):
+            if note not in out['notes']:
+                out['notes'].append(note)
+        return table
 
     if run_freq or (run_counts and counts_reference == 'parent'):
         counts, denom, dropped = population_tables(summaries, used, use_stats_parent,
@@ -957,8 +985,9 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
         if run_freq:
             data = ds.logit_proportions(counts, denom)
             out['freq'] = ds.run_moderated(data, group_vec, contrasts, contrast_mode,
-                                           pval_threshold, fc_threshold, **common)
+                                           pval_threshold, fc_threshold, **moderated)
             out['freq_values'] = 100.0 * counts / denom
+            out['anova_freq'] = _variance(data)
     if run_counts:
         if counts_reference == 'parent':
             c_counts, c_denom, anchor = counts, denom, ''
@@ -978,11 +1007,15 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
         if c_counts.shape[1] < 3:
             out['notes'].append("Fewer than three populations could be tested for counts, so "
                                 "the counts test was not run.")
+        elif counts_method != 'moderated' and block_vec is not None:
+            out['notes'].append(f"Counts were not tested: the quasi-likelihood counts test has "
+                                f"no random {individual} effect. Choose the moderated counts "
+                                "test to test counts with it.")
         else:
             if counts_method == 'moderated':
                 out['counts'] = ds.run_moderated(ds.logit_proportions(c_counts, c_denom),
                                                  group_vec, contrasts, contrast_mode,
-                                                 pval_threshold, fc_threshold, **common)
+                                                 pval_threshold, fc_threshold, **moderated)
             else:
                 out['counts'] = ds.run_glm_counts(c_counts, group_vec, contrasts, contrast_mode,
                                                   pval_threshold, fc_threshold,
@@ -1017,17 +1050,24 @@ def run_statistics(summaries: dict, samples: list[str], groups: dict, gate_defs:
                 "enough: " + _name_list(partial))
         out['markers'] = ds.run_moderated(values, group_vec, contrasts, contrast_mode,
                                           pval_threshold, marker_threshold,
-                                          feature_meta=meta, hierarchical=True, **common)
+                                          feature_meta=meta,
+                                          hierarchical=markers_population_first, **moderated)
         out['marker_values'] = values
+        out['anova_markers'] = _variance(values, meta)
     for key in ('freq', 'counts', 'markers'):
         frame = out.get(key)
         for note in (frame.attrs.get('notes', []) if frame is not None else []):
             if note not in out['notes']:
                 out['notes'].append(note)
+    for key, title in (('freq', 'Frequencies'), ('counts', 'Counts'), ('markers', 'Markers')):
+        frame = out.get(key)
+        for note in (frame.attrs.get('block_notes', []) if frame is not None else []):
+            out['notes'].append(f"{title}: {note}")
     return out
 
 
-_STATS_FRAMES = ('freq', 'freq_values', 'counts', 'counts_values', 'markers', 'marker_values')
+_STATS_FRAMES = ('freq', 'freq_values', 'counts', 'counts_values', 'markers', 'marker_values',
+                 'anova_freq', 'anova_markers')
 
 
 def _frame_to_jsonable(df: pd.DataFrame) -> dict:
@@ -1131,14 +1171,16 @@ def sample_analysis_from_jsonable(payload: dict) -> tuple[dict, dict]:
 
 
 def reapply_thresholds(stats: dict, pval_threshold: float, fc_threshold: float,
-                       marker_threshold: float, fdr_scope: str, use_treat: bool) -> dict:
+                       marker_threshold: float, fdr_scope: str, use_treat: bool,
+                       markers_population_first: bool = True) -> dict:
     """*stats* with p-values, FDR and significance recomputed for new
-    thresholds, without refitting."""
+    thresholds, and with or without population-first testing of the
+    marker medians, without refitting."""
     from honeychrome.controller_components import differential_stats as ds
 
     out = dict(stats)
     for key, thr, hier in (('freq', fc_threshold, False), ('counts', fc_threshold, False),
-                           ('markers', marker_threshold, True)):
+                           ('markers', marker_threshold, markers_population_first)):
         if out.get(key) is not None:
             out[key] = ds.apply_significance(out[key], pval_threshold, thr, fdr_scope=fdr_scope,
                                              use_treat=use_treat, hierarchical=hier)
@@ -1599,6 +1641,23 @@ def predictive_matrix(stats: dict, use_freq: bool = True, use_markers: bool = Fa
     return X.rename(columns=lambda c: c.replace('MFI: ', 'Median: '))
 
 
+def predictive_feature_keys(stats: dict, labels: dict | None = None) -> dict:
+    """{feature name: population key} for the features predictive_matrix
+    names from *stats* with the same *labels* ('Freq: <population>' and
+    'Median: <population> <marker>')."""
+    labels = labels or {}
+    keys = {}
+    freq = stats.get('freq_values')
+    if freq is not None:
+        keys.update({f"Freq: {labels.get(c, c)}": c for c in freq.columns})
+    med = stats.get('marker_values')
+    if med is not None:
+        for c in med.columns:
+            pop, _sep, ch = str(c).partition(FEATURE_SEP)
+            keys[f"Median: {labels.get(pop, pop)} {labels.get(ch, ch)}"] = pop
+    return keys
+
+
 # ---------------------------------------------------------------------------
 # Display subsamples
 # ---------------------------------------------------------------------------
@@ -1749,13 +1808,26 @@ def statistics_tables(stats: dict, labels: dict | None = None,
         vm.insert(0, 'group', list(stats.get('group_vec') or [''] * len(vm)))
         vm.index.name = 'sample'
         out['values_markers'] = vm
+    for key, name in (('anova_freq', 'variance_frequencies'),
+                      ('anova_markers', 'variance_markers')):
+        df = stats.get(key)
+        if df is None:
+            continue
+        df = df.copy()
+        pop_col = 'cluster_id' if key == 'anova_markers' and 'cluster_id' in df.columns else 'feature'
+        df.insert(0, 'population', [labels.get(k, k) for k in df[pop_col]])
+        if key == 'anova_markers' and 'channel' in df.columns:
+            df.insert(1, 'antigen', [antigens.get(c, c) for c in df['channel']])
+        out[name] = df
     return out
 
 
 def group_population_values(summaries: dict, samples: list[str], groups: dict, pop_key: str,
-                            use_stats_parent: bool = True) -> dict:
-    """{group: [(sample, % of parent)]} for one population, from the gated
-    summaries; samples where the population cannot be measured are left out."""
+                            use_stats_parent: bool = True, measure: str = 'freq') -> dict:
+    """{group: [(sample, value)]} for one population, from the gated
+    summaries: % of parent (*measure* 'freq') or the population's event
+    count ('counts'). Samples where the population cannot be measured are
+    left out."""
     out: dict[str, list] = {}
     for s in samples:
         g = groups.get(s)
@@ -1763,7 +1835,12 @@ def group_population_values(summaries: dict, samples: list[str], groups: dict, p
             continue
         row = next((r for r in (summaries.get(s) or {}).get('populations', [])
                     if r['key'] == pop_key), None)
-        if row is None or (use_stats_parent and row.get('stats_parent_missing')):
+        if row is None:
+            continue
+        if measure == 'counts':
+            out.setdefault(g, []).append((s, float(row['n_events'])))
+            continue
+        if use_stats_parent and row.get('stats_parent_missing'):
             continue
         use_sp = use_stats_parent and row.get('n_stats_parent') is not None
         denom = row['n_stats_parent'] if use_sp else row['n_parent']
@@ -1774,10 +1851,11 @@ def group_population_values(summaries: dict, samples: list[str], groups: dict, p
 
 
 def population_result(stats: dict, pop_key: str, comparison: str,
-                      fdr_scope: str = 'global') -> dict | None:
-    """The frequency test of one population in one comparison: {'logFC',
-    'P', 'FDR', 'significant'}, or None when it was not tested."""
-    df = (stats or {}).get('freq')
+                      fdr_scope: str = 'global', kind: str = 'freq') -> dict | None:
+    """The frequency (*kind* 'freq') or counts ('counts') test of one
+    population in one comparison: {'logFC', 'P', 'FDR', 'significant'}, or
+    None when it was not tested."""
+    df = (stats or {}).get(kind)
     if df is None or df.empty:
         return None
     sel = df[df['feature'] == pop_key]

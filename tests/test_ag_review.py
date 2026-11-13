@@ -957,3 +957,20 @@ def test_threshold_sides_of_a_joined_region():
         'L': {'region': 'x-y-|x-y+'}, 'P': {'region': 'x+y-'}, 'Q': {'region': 'x+y+'}}}
     assert ag_core.threshold_sides(g, 'x') == {'-', '+'}
     assert ag_core.threshold_sides(g, 'y') == {'+'}
+
+
+def test_daughter_groups_follow_the_channel_order(gates):
+    order = ['FSC-A', 'SSC-A', 'CD56', 'CD16', 'CD3', 'CD4']
+    groups = ag_review.daughter_groups(gates, 'Cells', 'Cells', order)
+    assert [g['channels'] for g in groups] == [('CD56', 'CD16'), ('CD3', 'CD4')]
+    # gates on the same plot keep their hierarchy order
+    assert [x['gate_name'] for x in groups[1]['gates']] == ['T', 'B']
+
+
+def test_population_tree_orders_daughters_by_channel(gates):
+    order = ['FSC-A', 'SSC-A', 'CD56', 'CD16', 'CD3', 'CD4']
+    labels = [n['label'] for n in ag_review.population_tree(gates, order)]
+    assert labels == ['All events (root)', 'Cells  [anchor]', 'NK', 'T', 'B']
+    # channels missing from the order follow the ones in it
+    labels = [n['label'] for n in ag_review.population_tree(gates, ['CD3'])]
+    assert labels == ['All events (root)', 'Cells  [anchor]', 'T', 'B', 'NK']

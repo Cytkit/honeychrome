@@ -11,7 +11,7 @@ from flowkit import gates as Gates
 from flowkit.exceptions import GateReferenceError
 from networkx import NetworkXError
 
-from honeychrome.controller_components.functions import define_quad_gates, define_range_gate, define_ellipse_gate, define_rectangle_gate, define_polygon_gate, get_set_or_initialise_label_offset, rename_label_offset
+from honeychrome.controller_components.functions import define_quad_gates, define_range_gate, define_ellipse_gate, define_rectangle_gate, define_polygon_gate, get_set_or_initialise_label_offset, rename_label_offset, gate_channels
 from honeychrome.controller_components.transform import transforms_menu_items
 import honeychrome.settings as settings
 from honeychrome.controller_components.cytometer_whitelist import get_detector_laser_map, LASER_LABEL_COLORS
@@ -447,13 +447,18 @@ class CytometryPlotWidget(QFrame):
             if new_gate_name != '' and self.plot['source_gate'] != 'root' and len(self.gating.find_matching_gate_paths(self.plot['source_gate'])) == 0:
                 self.plot['source_gate'] = new_gate_name
 
-            # if any previous child gate has disappeared, set to the new name
+            # if any previous child gate has disappeared, drop it; the new gate takes its
+            # place (a renamed gate) only if it is drawn on this plot's channels
+            new_gate_paths = self.gating.find_matching_gate_paths(new_gate_name) if new_gate_name not in ('', 'root') else []
+            plot_channels = {self.plot.get('channel_x'), self.plot.get('channel_y')} - {None}
+            new_gate_fits = bool(new_gate_paths) and set(
+                gate_channels(self.gating._get_gate_node(new_gate_name, new_gate_paths[0]).gate)) <= plot_channels
             for old_child_gate in deepcopy(self.plot['child_gates']):
                 if len(self.gating.find_matching_gate_paths(old_child_gate)) == 0:
                     self.plot['child_gates'].remove(old_child_gate)
-                    self.plot['child_gates'].append(new_gate_name)
-
-                    rename_label_offset(self.plot, old_child_gate, new_gate_name)
+                    if new_gate_fits and new_gate_name not in self.plot['child_gates']:
+                        self.plot['child_gates'].append(new_gate_name)
+                        rename_label_offset(self.plot, old_child_gate, new_gate_name)
 
             self.configure_title()
 
@@ -637,7 +642,8 @@ class CytometryPlotWidget(QFrame):
             # regenerate rois
             for gate_name in gates_to_refresh:
                 index_roi = self.plot['child_gates'].index(gate_name)
-                self.rois[index_roi].request_remove(delete_gate=False)
+                if self.rois[index_roi] is not None:
+                    self.rois[index_roi].request_remove(delete_gate=False)
                 roi = self._generate_roi(gate_name)
                 self.rois[index_roi] = roi
 
@@ -648,7 +654,8 @@ class CytometryPlotWidget(QFrame):
             # first wipe out all rois but *not* their associated gates
             rois = self.rois.copy()
             for roi in rois:
-                roi.request_remove(delete_gate=False)
+                if roi is not None:
+                    roi.request_remove(delete_gate=False)
             self.rois.clear()
 
             for gate_name in self.plot['child_gates']:
@@ -975,11 +982,11 @@ class CytometryPlotWidget(QFrame):
     def remove_gate_and_roi(self):
         """Remove ROI and associated gate"""
         if self.sender() is None: # i.e. called directly
-            rois = self.rois.copy()  # copy list to make sure elements are not skipped
+            rois = [roi for roi in self.rois if roi is not None]  # copy list to make sure elements are not skipped
         else:
             if hasattr(self.sender(), 'text'):
                 if self.sender().text() == 'Delete Child Gates':
-                    rois = self.rois.copy() # copy list to make sure elements are not skipped
+                    rois = [roi for roi in self.rois if roi is not None] # copy list to make sure elements are not skipped
                 else:
                     rois = []
             else:

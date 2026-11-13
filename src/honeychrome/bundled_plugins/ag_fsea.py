@@ -1376,6 +1376,9 @@ def result_tables(result: dict) -> dict[str, pd.DataFrame]:
     pattern_states = result.get('pattern_states')
     if pattern_states is not None and len(pattern_states):
         out['pattern_states'] = pattern_states
+    if (result.get('coherence') or {}).get('coherence') is not None:
+        import ag_coherence
+        out.update(ag_coherence.result_tables(result['coherence']))
     return out
 
 
@@ -1398,18 +1401,24 @@ def state_curve(result: dict, comparison: str, state: str) -> dict | None:
 
 def result_to_jsonable(result: dict) -> dict:
     """*result* as JSON-safe values (tables in split orientation)."""
-    out = {k: v for k, v in result.items() if k not in _FRAMES}
+    out = {k: v for k, v in result.items() if k not in _FRAMES and k != 'coherence'}
     out = ag_core.to_jsonable(out)
     for key in _FRAMES:
         frame = result.get(key)
         out[key] = ag_results._frame_to_jsonable(frame) if frame is not None else None
+    if result.get('coherence'):
+        import ag_coherence
+        out['coherence'] = ag_coherence.to_jsonable(result['coherence'])
     return out
 
 
 def result_from_jsonable(payload: dict) -> dict:
     """The result ``result_to_jsonable`` saved."""
-    out = {k: v for k, v in payload.items() if k not in _FRAMES}
+    out = {k: v for k, v in payload.items() if k not in _FRAMES and k != 'coherence'}
     for key in _FRAMES:
         obj = payload.get(key)
         out[key] = ag_results._frame_from_jsonable(obj) if obj else pd.DataFrame()
+    if payload.get('coherence'):
+        import ag_coherence
+        out['coherence'] = ag_coherence.from_jsonable(payload['coherence'])
     return out

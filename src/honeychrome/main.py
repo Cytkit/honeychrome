@@ -122,6 +122,20 @@ def setup_logging(log_file):
     return logger
 
 
+def redirect_missing_std_streams(log_file):
+    """In the packaged Windows app there is no console, so sys.stdout and sys.stderr are None.
+    Child processes then fail while reporting an error and the real error is lost. Send
+    stderr to the log file and stdout to the null device so errors are recorded."""
+    if sys.stderr is None:
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            sys.stderr = open(log_file, 'a', encoding='utf-8', buffering=1)
+        except OSError:
+            sys.stderr = open(os.devnull, 'w')
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, 'w')
+
+
 def configure_multiprocessing():
     if getattr(sys, 'frozen', False):
         # Running as PyInstaller executable
@@ -175,6 +189,7 @@ def init_sentry():
 
 
 def main():
+    redirect_missing_std_streams(Path.home() / experiments_folder / 'honeychrome.log')
     configure_multiprocessing()
 
     # create experiments directory and plugins directory
@@ -219,14 +234,13 @@ def main():
     import honeychrome.settings as settings
 
     # Allocate shared memory block, plus head and tail indices
-    traces_cache_shm = shared_memory.SharedMemory(create=True, size=np.zeros(traces_cache_size, dtype=traces_cache_dtype).nbytes)
+    traces_cache_shm = shared_memory.SharedMemory(create=True, size=traces_cache_size * np.dtype(traces_cache_dtype).itemsize)
     traces_cache_lock = Lock()
     index_head_traces_cache = mp.Value('i', 0)
     index_tail_traces_cache = mp.Value('i', 0)
 
     events_cache_shm = shared_memory.SharedMemory(create=True,
-                                                  size=np.zeros((max_events_in_cache, n_channels_per_event),
-                                                                dtype=np.int_).nbytes)
+                                                  size=max_events_in_cache * n_channels_per_event * np.dtype(np.int64).itemsize)
     events_cache_lock = Lock()
     index_head_events_cache = mp.Value('i', 0)
     index_tail_events_cache = mp.Value('i', 0)

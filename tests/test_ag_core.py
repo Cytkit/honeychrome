@@ -616,6 +616,23 @@ def test_cells_fall_off_defaults_to_0_002_and_is_set_per_axis():
 
 
 @pytest.mark.numpy_only
+def test_cells_debris_cut_is_a_mixture_by_default_and_ignores_a_saturated_pile():
+    rng = np.random.default_rng(5)
+    debris = np.column_stack([rng.normal(0.15, 0.05, 4000), rng.normal(0.15, 0.05, 4000)])
+    cells = np.column_stack([rng.normal(0.55, 0.06, 6000), rng.normal(0.4, 0.08, 6000)])
+    pile = np.column_stack([np.ones(800), rng.uniform(0.2, 0.9, 800)])
+    clean = np.vstack([debris, cells])
+    data = np.vstack([clean, pile])
+    assert ag.debris_algorithm({}) == 'mixture'
+    lower = _cells_box(data)[:, 0].min()
+    assert 0.25 < lower < 0.42
+    assert np.isclose(lower, _cells_box(clean)[:, 0].min(), atol=0.01)
+    assert np.isclose(lower, ag.debris_cut(data[:, 0], {}))
+    kde = _cells_box(data, debris_algorithm='kde_min')[:, 0].min()
+    assert np.isclose(kde, ag.debris_cut(data[:, 0], {'debris_algorithm': 'kde_min'}))
+
+
+@pytest.mark.numpy_only
 def test_cells_debris_side_keeps_the_events_below_the_cut():
     rng = np.random.default_rng(4)
     debris = np.column_stack([rng.normal(0.1, 0.03, 3000), rng.normal(0.1, 0.05, 3000)])
@@ -699,6 +716,24 @@ def test_singlet_fit_ignores_saturated_pile_but_keeps_it_in_the_band():
     inside = res.masks['S']['in'][9000:]
     assert inside[np.abs(pile[:, 1] - 1.0) < 0.02].all()
     assert not inside[pile[:, 1] < 0.9].any()
+
+
+@pytest.mark.numpy_only
+def test_singlet_band_width_is_not_widened_by_a_doublet_shoulder():
+    rng = np.random.default_rng(8)
+    x = rng.uniform(0.2, 0.8, 8500)
+    singlets = np.column_stack([x, x + rng.normal(0, 0.01, 8500)])
+    xd = rng.uniform(0.3, 0.9, 1500)
+    doublets = np.column_stack([xd, xd - 0.045 + rng.normal(0, 0.01, 1500)])
+    g = _gate('S', 'singlets', 'A', 'H')
+    res = ag.train_boundaries([g], np.vstack([singlets, doublets]), {'A': 0, 'H': 1},
+                              axis_limits={'A': (0, 1), 'H': (0, 1)})
+    poly = np.asarray(res.boundaries['S']['in']['boundary'])
+    half_width = (poly[3, 1] - poly[0, 1]) / 2.0
+    assert half_width == pytest.approx(0.03, abs=0.006)
+    inside = res.masks['S']['in']
+    assert inside[:8500].mean() > 0.98
+    assert inside[8500:].mean() < 0.2
 
 
 @pytest.mark.numpy_only

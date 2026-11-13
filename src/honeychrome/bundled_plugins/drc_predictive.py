@@ -132,7 +132,7 @@ def _lasso_search(inner_cv, seed):
     from sklearn.preprocessing import StandardScaler
 
     pipe = Pipeline([
-        ('impute', SimpleImputer(strategy='median')),
+        ('impute', SimpleImputer(strategy='median', keep_empty_features=True)),
         ('scale', StandardScaler()),
         ('model', LogisticRegression(l1_ratio=1.0, solver='liblinear',
                                      class_weight='balanced', max_iter=5000,
@@ -152,7 +152,7 @@ def _fit_forest(X, y, seed):
     from sklearn.impute import SimpleImputer
     from sklearn.metrics import roc_auc_score
 
-    imputer = SimpleImputer(strategy='median').fit(X)
+    imputer = SimpleImputer(strategy='median', keep_empty_features=True).fit(X)
     Xi = imputer.transform(X)
     best, best_auc = None, -np.inf
     for depth in _RF_DEPTHS:
@@ -223,6 +223,8 @@ def run_predictive(X: pd.DataFrame, groups: list[str], positive: str, negative: 
     status, message = sample_size_status(n_per_group)
     if status == 'block':
         raise ValueError(message)
+    observed = Xs.notna().any(axis=0) & (Xs.std(axis=0, skipna=True).fillna(0.0) > 1e-12)
+    Xs = Xs.loc[:, observed]
     if Xs.shape[1] == 0:
         raise ValueError("No usable features (all missing or constant).")
 
@@ -262,7 +264,7 @@ def run_predictive(X: pd.DataFrame, groups: list[str], positive: str, negative: 
             for si, n in enumerate(sizes):
                 cols = ranking[:n]
                 panel = Pipeline([
-                    ('impute', SimpleImputer(strategy='median')),
+                    ('impute', SimpleImputer(strategy='median', keep_empty_features=True)),
                     ('scale', StandardScaler()),
                     ('model', LogisticRegression(C=1.0, class_weight='balanced', max_iter=5000)),
                 ]).fit(Xv[np.ix_(tr, cols)], y[tr])
@@ -350,7 +352,7 @@ def _age_pipeline(inner_cv):
     # scikit-learn 1.7 takes the number of penalty strengths as 'alphas'
     grid = ({'alphas': AGE_N_ALPHAS} if (major, minor) >= (1, 7)
             else {'n_alphas': AGE_N_ALPHAS})
-    return make_pipeline(SimpleImputer(strategy='median'), StandardScaler(),
+    return make_pipeline(SimpleImputer(strategy='median', keep_empty_features=True), StandardScaler(),
                          ElasticNetCV(l1_ratio=list(AGE_L1_RATIOS), cv=inner_cv, max_iter=5000,
                                       tol=1e-3, **grid))
 
@@ -378,7 +380,7 @@ def _age_fit(X: np.ndarray, y: np.ndarray, blocks: np.ndarray, inner_folds: int)
         warnings.simplefilter('ignore', ConvergenceWarning)
         model = _age_pipeline(inner).fit(X, y)
         en = model[-1]
-        fixed = make_pipeline(SimpleImputer(strategy='median'), StandardScaler(),
+        fixed = make_pipeline(SimpleImputer(strategy='median', keep_empty_features=True), StandardScaler(),
                               ElasticNet(alpha=en.alpha_, l1_ratio=en.l1_ratio_, max_iter=5000,
                                          tol=1e-3))
         inner_pred = cross_val_predict(fixed, X, y, cv=inner)

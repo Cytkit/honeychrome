@@ -86,6 +86,23 @@ def _channels(gate_def: dict, by_name: dict) -> tuple:
     return drawn_channels(ag_core.effective_gate_def(gate_def, by_name))
 
 
+def _plot_order_key(channel_order):
+    """Sort key for a plot's channels: the position of its x channel in
+    *channel_order*, then of its y channel. Channels not in the order follow
+    the ones that are, by name; a gate without channels comes last. With no
+    order every key is equal, so a stable sort keeps the hierarchy order."""
+    if channel_order is None:
+        return lambda chans: ()
+    rank = {ch: i for i, ch in enumerate(channel_order)}
+    n = len(rank)
+
+    def key(chans):
+        if not chans:
+            return ((n + 1, ''),)
+        return tuple((rank[ch], '') if ch in rank else (n, str(ch)) for ch in chans)
+    return key
+
+
 def has_drawn_shape(gate_def: dict) -> bool:
     """True when the gate's template holds its shapes as drawn."""
     return ag_core.is_shape_boundary(gate_def.get('template'))
@@ -157,7 +174,7 @@ def population_choices(gate_defs: list[dict]) -> list[dict]:
     return choices
 
 
-def population_tree(gate_defs: list[dict]) -> list[dict]:
+def population_tree(gate_defs: list[dict], channel_order=None) -> list[dict]:
     """Every population of the hierarchy as tree nodes, parents before children.
 
     Each node is ``{'gate', 'pop', 'label', 'parent', 'n_gates', 'view'}``.
@@ -168,6 +185,11 @@ def population_tree(gate_defs: list[dict]) -> list[dict]:
     node itself when gates are drawn on it, else its parent (the plot it is
     gated on). Labels follow ``population_choices``; reference populations
     and the anchor population (ag_core.anchor_population) are marked.
+
+    With *channel_order* (channel names), the populations below each
+    population are ordered by the channels of the gates that define them,
+    as ``daughter_groups`` orders its plots; populations of the same gate,
+    or of gates on the same plot, keep their hierarchy order.
     """
     ordered = ag_core.ordered_gate_defs(gate_defs)
     by_name = ag_core.gates_by_name(gate_defs)
@@ -209,14 +231,32 @@ def population_tree(gate_defs: list[dict]) -> list[dict]:
             nodes.append({'gate': gate_def['gate_name'], 'pop': pop, 'label': label,
                           'parent': parent, 'n_gates': n, 'view': key if n else parent})
             known.add(key)
-    return nodes
+    if channel_order is None:
+        return nodes
+
+    plot_key = _plot_order_key(channel_order)
+    children: dict = {}
+    for node in nodes[1:]:
+        children.setdefault(node['parent'], []).append(node)
+    out, stack = [], [nodes[0]]
+    while stack:
+        node = stack.pop()
+        out.append(node)
+        below = sorted(children.get(key_of(node['gate'], node['pop']), []),
+                       key=lambda n: plot_key(_channels(by_name[n['gate']], by_name)))
+        stack.extend(reversed(below))
+    return out
 
 
-def daughter_groups(gate_defs: list[dict], parent_gate, parent_pop) -> list[dict]:
+def daughter_groups(gate_defs: list[dict], parent_gate, parent_pop,
+                    channel_order=None) -> list[dict]:
     """Daughter gates of one population grouped by parameter set.
 
     Returns ``[{'channels': (x,) or (x, y), 'gates': [gate_def, ...]}]`` in
-    hierarchy order; each group is drawn as one biplot (or histogram).
+    hierarchy order, or, with *channel_order* (channel names), ordered by
+    the position of each set's x channel and then its y channel in it; the
+    gates of a set keep their hierarchy order. Each group is drawn as one
+    biplot (or histogram).
     """
     by_name = ag_core.gates_by_name(gate_defs)
     parent_gate = parent_gate or None
@@ -231,7 +271,9 @@ def daughter_groups(gate_defs: list[dict], parent_gate, parent_pop) -> list[dict
         if not chans:
             continue
         groups.setdefault(chans, []).append(by_name[g['gate_name']])
-    return [{'channels': chans, 'gates': gates} for chans, gates in groups.items()]
+    plot_key = _plot_order_key(channel_order)
+    return [{'channels': chans, 'gates': groups[chans]}
+            for chans in sorted(groups, key=plot_key)]
 
 
 def imported_fraction(gate_def: dict, pop: str):
@@ -782,8 +824,7 @@ def conversion_evidence(gate_def: dict, gate_defs: list[dict], data: np.ndarray,
         chans = ag_core.shape_channels(gate_def)
         if len(chans) == 2 and drawn:
             col = parent[:, index[chans[d]]]
-            cut = ag_core.debris_cut(ag_core.trim_quantiles(col, float(gp.get('quantile_trim', 0.001))),
-                                     float(gp.get('debris_density', 0.05)))
+            cut = ag_core.debris_cut(col, gp)
             inside = np.any(np.stack(list(drawn.values())), axis=0)
             if inside.any():
                 below = float((col[inside] < cut).mean())
@@ -1249,7 +1290,7 @@ SYNC_PARAM_KEYS = (
     'tail_fraction', 'tail_fraction_x', 'tail_fraction_y',
     'mixture_components', 'mixture_components_x', 'mixture_components_y',
     'axis_lo', 'axis_hi', 'axis_lo_x', 'axis_hi_x', 'axis_lo_y', 'axis_hi_y',
-    'quantile_trim', 'width_sd', 'debris_axis', 'debris_density', 'edge_density',
+    'quantile_trim', 'width_sd', 'debris_axis', 'debris_algorithm', 'edge_density',
     'edge_density_x', 'edge_density_y', 'cell_side', 'saturation_fraction',
     'mixture_cut', 'mixture_cut_x', 'mixture_cut_y',
     'threshold_factor', 'threshold_factor_x', 'threshold_factor_y',

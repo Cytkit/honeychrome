@@ -32,6 +32,7 @@ methods:
 '''
 
 import time
+import errno
 import json
 import sys
 from copy import deepcopy
@@ -192,6 +193,7 @@ class ExperimentModel:
         self.samples = file_data['samples']
         self.process = file_data['process']
         self.samples.setdefault('unstained_samples', [])  # not present in older .kit files
+        self.samples.setdefault('collapsed_folders', [])  # not present in older .kit files
         self.cytometry = file_data['cytometry']
         self.statistics = file_data['statistics']
 
@@ -227,6 +229,9 @@ class ExperimentModel:
     def generate_subdirs(self):
         experiment_pl = Path(self.experiment_path)
         experiment_dir = experiment_pl.parent / experiment_pl.stem
+        if not experiment_pl.parent.is_dir():
+            # never recreate the path of a disconnected drive
+            raise FileNotFoundError(errno.ENOENT, 'Experiment folder is not available', str(experiment_pl.parent))
 
         for subdir in (self.settings['raw']['single_stain_controls_subdirectory'], self.settings['raw']['raw_samples_subdirectory'], self.settings['unmixed']['unmixed_samples_subdirectory']):
             subdir_path = experiment_dir / subdir

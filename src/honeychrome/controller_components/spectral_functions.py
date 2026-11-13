@@ -10,6 +10,11 @@ import honeychrome.settings as settings
 logger = logging.getLogger(__name__)
 
 PROFILE_COSINE_WARNING_THRESHOLD = 0.95  # cross-profile cosine similarity QC threshold
+PROFILE_IDENTICAL_THRESHOLD = 0.999  # cosine similarity at which two profiles count as the same spectrum
+
+
+class UnmixableProfilesError(ValueError):
+    """The spectral profiles cannot be unmixed; the message explains why to the user."""
 CONDITION_NUMBER_WARNING_MIN = 10  # never warn about the condition number below this, however few fluorophores
 
 # otb: get_best_channel can now be removed entirely
@@ -410,7 +415,37 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
     peaks = np.max(np.abs(M), axis=1, keepdims=True)
     M_peak = np.divide(M, peaks, out=np.zeros(M.shape), where=peaks > 0)
     similarity_matrix = cosine_similarity(M_peak)
-    hotspot_matrix = np.sqrt(np.abs(np.linalg.inv(similarity_matrix)))
+
+    # Unmixing works only if every fluorophore has its own distinct spectrum, i.e. no
+    # profile is empty, duplicated or a combination of the others (M has full row rank).
+    unmixable_reasons = [
+        f'"{name}" has no signal (empty spectrum). Check its control file and gates.'
+        for name, peak in zip(fluorescence_channels, peaks[:, 0]) if peak == 0
+    ]
+    unmixable_reasons += [
+        f'"{fluorescence_channels[i]}" and "{fluorescence_channels[j]}" have the same spectrum. '
+        f'Check that the same control file is not assigned to both.'
+        for i in range(unmixed_length)
+        for j in range(i + 1, unmixed_length)
+        if peaks[i, 0] > 0 and peaks[j, 0] > 0 and similarity_matrix[i, j] >= PROFILE_IDENTICAL_THRESHOLD
+    ]
+    if unmixed_length > raw_length:
+        unmixable_reasons.append(
+            f'There are {unmixed_length} fluorophores but only {raw_length} detectors. '
+            f'Remove fluorophores from the spectral model.')
+    unmixable_text = (
+        'Unmixing was not updated: some fluorophores cannot be told apart. Unmixing works only '
+        'if every fluorophore has its own distinct spectrum.\n\n'
+        + ('\n'.join(f'\u2022 {reason}' for reason in unmixable_reasons) if unmixable_reasons else
+           'One spectrum is a blend of others, for example a control containing two fluorophores. '
+           'Check the spectra in the Profiles Viewer, then remove or re-record that control.')
+    )
+    if np.linalg.matrix_rank(M) < unmixed_length:
+        raise UnmixableProfilesError(unmixable_text)
+    try:
+        hotspot_matrix = np.sqrt(np.abs(np.linalg.inv(similarity_matrix)))
+    except np.linalg.LinAlgError as e:
+        raise UnmixableProfilesError(unmixable_text) from e
 
     # --- Spectral profile QC: condition number + inter-profile cosine similarity ---
     # M is (n_fluorophores, n_channels); a high condition number here means the
@@ -461,7 +496,10 @@ def calculate_spectral_process(raw_settings, spectral_model, profiles,
             fl_ids = raw_settings.get('fluorescence_channel_ids', [])
         sample_means = compute_sample_means_for_wls(experiment_dir, experiment_samples, fl_ids, raw_settings)
     Omega_inv = _build_omega_inv(M, method=unmixing_method, sample_means=sample_means)
-    unmixing_matrix = np.linalg.inv(M @ Omega_inv @ M.T) @ M @ Omega_inv  # "W" matrix in Novo paper
+    try:
+        unmixing_matrix = np.linalg.inv(M @ Omega_inv @ M.T) @ M @ Omega_inv  # "W" matrix in Novo paper
+    except np.linalg.LinAlgError as e:
+        raise UnmixableProfilesError(unmixable_text) from e
 
     # define unmixed channels
     pnn_raw = raw_settings['event_channels_pnn']

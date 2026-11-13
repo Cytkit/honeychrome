@@ -522,6 +522,22 @@ def test_reapply_thresholds_without_refit():
 
 
 @pytest.mark.numpy_only
+def test_markers_population_first_toggle():
+    gates, summaries, groups = _grouped_summaries()
+    flat = ar.run_statistics(summaries, list(summaries), groups, gates, reference='ctrl',
+                             marker_threshold=0.0, markers_population_first=False)
+    assert 'stagewise.adj.P.Val' not in flat['markers'].columns
+    staged = ar.reapply_thresholds(flat, 0.05, 0.5, 0.0, 'global', True,
+                                   markers_population_first=True)
+    assert 'stagewise.adj.P.Val' in staged['markers'].columns
+    back = ar.reapply_thresholds(staged, 0.05, 0.5, 0.0, 'global', True,
+                                 markers_population_first=False)
+    assert 'stagewise.adj.P.Val' not in back['markers'].columns
+    np.testing.assert_array_equal(back['markers']['significant'].values,
+                                  flat['markers']['significant'].values)
+
+
+@pytest.mark.numpy_only
 def test_run_statistics_counts_glm_uses_parent_offset():
     pytest.importorskip('statsmodels')
     gates, summaries, groups = _grouped_summaries()

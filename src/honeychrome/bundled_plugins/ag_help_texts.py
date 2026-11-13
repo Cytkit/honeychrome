@@ -38,12 +38,17 @@ histogram.</li>
 <li><b>2dsep</b>: a threshold on each of two channels, giving four
 quadrants. A population is one quadrant or several joined.</li>
 <li><b>singlets</b>: a band around the diagonal of a scatter area against
-height plot. Events piled at the top of either scatter axis (saturated) are
-left out of the fit; they stay in the gate when they fall inside the
-band.</li>
+height plot. Its width is measured with a median-based spread, so doublets
+beside the diagonal do not widen it. Events piled at the top of either
+scatter axis (saturated) are left out of the fit; they stay in the gate when
+they fall inside the band.</li>
 <li><b>free</b>: a shape on two scatter channels. The <b>cells</b> algorithm
-cuts the debris off and trims the edges where the density falls away;
-<b>all</b> takes the convex hull of the parent population.</li>
+draws a rectangle. Its lower side on forward scatter is the <i>debris
+cut</i>, placed by a threshold algorithm (default <i>mixture</i>: one
+Gaussian for the debris and dead cells, one for the cells, cut where they
+are equally dense; any threshold algorithm can be chosen). Its other sides
+are where the cells' density falls below the <i>fall-off</i> fraction of
+its peak. <b>all</b> takes the convex hull of the parent population.</li>
 <li><b>replicate</b> (gate type): reuses another gate's boundary on a
 different parent.</li>
 <li><b>tail</b>: threshold just above the negative population, which is
@@ -791,15 +796,24 @@ On human data it stays above 5%, because donors vary more, and more
 unevenly, than the model allows for.</li>
 <li><b>Marker medians</b>: each population's median of each marker (and of
 AF Abundance, the per-cell autofluorescence), in transformed units.
-Populations are screened first, and markers are tested only within the
-populations that pass (stage-wise FDR [4]). By default a population is not
+With <b>Test marker medians population first</b> on (the default), each
+population is first tested on all its markers together, and markers are
+tested only within the populations that pass (stage-wise FDR [4]). The
+population screen is on the marker medians themselves, not on whether the
+population's frequency changed. With it off, every population × marker is
+corrected as one list, which finds an isolated marker change in a
+population whose other markers are steady, at the cost of more tests to
+correct for. Switching it updates significance without refitting. By
+default a population is not
 tested on the markers of its own and its ancestors' gates, which differ by
 construction.</li>
 <li>With <b>TREAT</b> [3] on, p-values test whether the effect exceeds the
 threshold. With it off, they test for any difference and the threshold only
 filters.</li>
-<li>FDR is pooled over all comparisons or taken within each. Changing a
-threshold updates significance without refitting.</li>
+<li>Frequencies, counts and marker medians are each corrected for multiple
+testing as their own family. FDR is pooled over all comparisons or taken
+within each. Changing a threshold updates significance without
+refitting.</li>
 <li><b>Restore defaults</b>, at the top of the settings, puts the tests and
 their options, the thresholds, TREAT, the FDR correction and <i>Leave out
 flagged samples</i> back to their defaults. Comparisons, reference group,
@@ -1020,6 +1034,11 @@ removes its half-written folder.</li>
 as CSV files, and kept with the experiment. <b>Export Gating Results…</b>
 and <b>Export Statistics…</b> write the same files to a folder of your
 choice.</li>
+<li><b>Export Graphic</b> on a figure, and the save button of a popped-out
+figure, write the figure at 300 dpi to <i>Automated_Gating_Reports</i>; the
+status bar at the bottom of the window shows the file written. CSV exports
+(values, sample table, gating results, statistics) start in the same
+folder.</li>
 </ul>
 
 <p>References:<br/>
@@ -1178,6 +1197,63 @@ test against all tested populations, BH FDR). Dot colour: fold
 enrichment; size: share of the state's populations in the pattern.</li>
 </ul>
 
+<h4>Coherence and the state network</h4>
+<p><b>In short:</b> enrichment asks whether a state <i>shifted</i> between
+two groups. Coherence asks something different: within one group, do the
+state's features rise and fall <b>together</b> from donor to donor, in the
+directions the library expects? If a programme is more active in some
+donors than others, a donor with more Granzyme B⁺ CD4 cells should also have
+more perforin⁺ and fewer CD27⁺ CD4 cells. Tick <b>Coherence and state
+network</b> on the Run section (group comparisons only; each group needs at
+least 20 samples, and below 40 only large differences can be found).</p>
+<ul>
+<li><b>Coherence C</b> of a state in a group: the mean correlation of its
+members across the group's donors, each pair counted positive when the two
+move as the library expects (both up, or one up and one down when the
+library says so). 1 would mean they move exactly together, 0 independently.
+Pairs the gating tree ties together are left out (a population and its
+ancestor, sibling populations of one gate, the same marker on nested
+parents). The table gives each group's C with a 95% interval (from
+resampling donors), and <b>ΔC</b>, p and FDR for the difference between
+the groups.</li>
+<li><b>Before correlating</b>, each feature has the group's mean removed,
+and the Results page's covariates (e.g. plate) and the trend variable when
+one is set; otherwise plate or age would make unrelated features move
+together. The model used is shown above the table.</li>
+<li><b>Marker background</b> (option, on by default): when a sample's whole
+distribution for a marker sits brighter (stain, background, fix/perm,
+unmixing spread), more cells cross a fixed gate in every population, and
+the marker's positivity features move together for a technical reason. The
+background is the marker's median in the sample's populations that are
+negative for it (median share positive below 5%, at least three such
+populations); each positivity feature is adjusted for its own marker's
+background.</li>
+<li><b>Minimum reliability</b>: a population of a few events per sample
+gives a noisy percentage, and noise weakens every correlation the feature
+enters, making a group look less coherent than it is. Reliability is the
+share of a feature's donor-to-donor variation that is not counting noise
+(binomial noise from its counts). Features below the minimum in either
+group are left out of that comparison, and the table says which and
+why.</li>
+<li><b>State network</b>: each donor gets a score per state (the mean of
+its members, signed by the library direction). A line joins two states
+whose scores correlate across the group's donors (FDR below your
+threshold): faint lines. A <b>solid line</b> marks a correlation that
+differs between the two groups. Solid lines are exploratory: how many
+appear depends on the adjustment, so treat them as leads.</li>
+<li><b>State pair</b>: for two states of the network, each donor's two
+scores (one dot per donor), and their member features around a circle in
+gating-tree order, with correlated pairs drawn along the tree [6].</li>
+<li>The p-values come from relabelling: the two groups' samples swap
+labels (within pairs when the design is paired), and everything is
+recomputed. So that a network line can reach FDR 0.05 among all pairs of
+states, the number of relabellings is raised when needed (about 5,000 for
+23 states, about 2 minutes per comparison). On a human cohort split at
+random into two halves of one group
+(40 splits), about 5% of states fell below p 0.05 and none below FDR
+0.05.</li>
+</ul>
+
 <h4>References</h4>
 <ol>
 <li>Subramanian A et al. (2005) Gene set enrichment analysis. PNAS 102:15545–15550.</li>
@@ -1187,5 +1263,7 @@ enrichment; size: share of the state's populations in the pattern.</li>
 Stat Appl Genet Mol Biol 9: Article 39.</li>
 <li>Wu D, Smyth GK (2012) Camera: a competitive gene set test accounting for
 inter-gene correlation. Nucleic Acids Res 40: e133.</li>
+<li>Holten D (2006) Hierarchical edge bundles: visualization of adjacency
+relations in hierarchical data. IEEE Trans Vis Comput Graph 12:741–748.</li>
 </ol>
 ''' + _GLOSSARY

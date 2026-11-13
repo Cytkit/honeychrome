@@ -349,6 +349,10 @@ class SampleWidget(QWidget):
 
         # Connect selection changed signal
         self.tree_view.selectionModel().selectionChanged.connect(self.open_item)
+        # Record folders the user collapses so the layout survives saving and reopening
+        self._restoring_expansion = False
+        self.tree_view.collapsed.connect(self._on_folder_collapsed)
+        self.tree_view.expanded.connect(self._on_folder_expanded)
         # Enable context menu
         self.tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.show_context_menu)
@@ -608,7 +612,7 @@ class SampleWidget(QWidget):
             unstained.append(path)
         self.bus.autoSaveRequested.emit()
         self.model.refresh_tree()
-        self.tree_view.expandAll()
+        self._restore_expansion()
         if self.bus:
             self.bus.sampleTreeUpdated.emit()
 
@@ -618,14 +622,75 @@ class SampleWidget(QWidget):
         self.bus.beadSampleToggled.emit(path)
         self.bus.autoSaveRequested.emit()
         self.model.refresh_tree()
-        self.tree_view.expandAll()
+        self._restore_expansion()
         if self.bus:
             self.bus.sampleTreeUpdated.emit()
 
     def refresh_sample_tree(self):
-        self.controller.experiment.scan_sample_tree()
+        try:
+            self.controller.experiment.scan_sample_tree()
+        except OSError as e:
+            logger.warning(f'SampleWidget: could not scan the sample folders ({e})')
+            if self.bus:
+                self.bus.statusMessage.emit(f'Could not read the sample folders: {e.strerror or e}. '
+                                            f'Check that the drive holding this experiment is connected.')
+            return
         self.model.refresh_tree()
-        self.tree_view.expandAll()
+        self._restore_expansion()
+
+    @staticmethod
+    def _folder_key(index):
+        """Identify a folder by its chain of names from the top of the tree,
+        e.g. 'All Samples/Day 1/Group A'. Folder items carry no file path."""
+        names = []
+        while index.isValid():
+            names.append(index.internalPointer().name)
+            index = index.parent()
+        return '/'.join(reversed(names))
+
+    def _collapsed_folders(self):
+        return self.controller.experiment.samples.setdefault('collapsed_folders', [])
+
+    def _on_folder_collapsed(self, index):
+        if self._restoring_expansion:
+            return
+        key = self._folder_key(index)
+        collapsed = self._collapsed_folders()
+        if key not in collapsed:
+            collapsed.append(key)
+
+    def _on_folder_expanded(self, index):
+        if self._restoring_expansion:
+            return
+        key = self._folder_key(index)
+        collapsed = self._collapsed_folders()
+        if key in collapsed:
+            collapsed.remove(key)
+
+    def _restore_expansion(self):
+        """Expand every folder, then collapse those the user had collapsed.
+
+        The collapsed list is stored with the experiment's samples and written
+        at the next save; it does not itself mark the experiment as changed.
+        Folders not in the list (including newly added ones) start expanded."""
+        collapsed = set(self._collapsed_folders())
+        self._restoring_expansion = True
+        try:
+            self.tree_view.expandAll()
+            if not collapsed:
+                return
+            stack = [QModelIndex()]
+            while stack:
+                parent = stack.pop()
+                for row in range(self.model.rowCount(parent)):
+                    index = self.model.index(row, 0, parent)
+                    if self.model.rowCount(index) == 0:
+                        continue
+                    if self._folder_key(index) in collapsed:
+                        self.tree_view.collapse(index)
+                    stack.append(index)
+        finally:
+            self._restoring_expansion = False
 
     def open_samples_folder(self):
         QDesktopServices.openUrl(QUrl.fromLocalFile(self.controller.experiment_dir))

@@ -602,7 +602,8 @@ class FolderSelectorLineEdit(QLineEdit):
                     QMessageBox.warning(
                         self, 'Cannot link folder',
                         f'Honeychrome could not create a link to {folder_path} ({e.strerror or e}).\n\n'
-                        f'Some drives, such as exFAT or FAT32 USB drives, do not support folder links. '
+                        f'Some locations, such as exFAT or FAT32 USB drives and cloud-synced folders '
+                        f'like OneDrive, do not support folder links. '
                         f'Move the folder inside the experiment folder, or keep the experiment on a drive '
                         f'that supports links.')
                     relative_path = None

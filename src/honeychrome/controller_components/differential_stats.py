@@ -52,6 +52,20 @@ non-baseline group, optional pairing (blocking) levels, and optional
 adjustment covariates — columns the caller marks numeric (age, CRP) enter
 as centred continuous terms, all others as treatment-coded factors.
 
+Several samples from one individual enter in one of two ways
+(``resolve_pairing``):
+
+* fixed pairing — one design column per individual, so groups are
+  compared within individuals (before/after, two populations sorted from
+  one animal). Needs individuals with samples in more than one group.
+* a random effect — ``run_moderated(block_vec=)``: the individual's
+  samples are correlated rather than given their own columns, after
+  limma's duplicateCorrelation (``moderated_stats.block_correlation``).
+  Used when each individual belongs to one group (e.g. four tissues of
+  each knockout or wild-type mouse): the group difference is then judged
+  against the variation between individuals, not between samples. The
+  counts GLM has no random-effect form and is not run in this mode.
+
 Frequency scales:
 
 * ``log2_frequencies`` — log2 percentage of a total; differences are log2
@@ -93,7 +107,8 @@ __all__ = [
     'pairing_absorbed', 'build_design', 'log2_frequencies',
     'logit_proportions', 'sparse_features', 'run_moderated', 'run_glm_counts',
     'apply_significance', 'suggest_groupings_from_names', 'library_sizes',
-    'COUNT_TESTS', 'NORMALISATIONS', 'MODERATED_WEIGHTS',
+    'pairing_nested', 'resolve_pairing',
+    'COUNT_TESTS', 'NORMALISATIONS', 'MODERATED_WEIGHTS', 'PAIRING_MODES',
 ]
 
 #: Counts tests offered by run_glm_counts(method=).
@@ -102,6 +117,9 @@ COUNT_TESTS = ('ql', 'wald')
 NORMALISATIONS = ('total', 'robust', 'control')
 #: Observation weights offered by run_moderated(weights=).
 MODERATED_WEIGHTS = (None, 'capped')
+#: How the pairing variable enters the model (resolve_pairing): 'auto'
+#: picks 'random' when every individual belongs to one group, else 'fixed'.
+PAIRING_MODES = ('auto', 'fixed', 'random')
 #: Capped weights: comparisons whose two groups have at least this many
 #: events per feature in their median sample set the shared variance
 #: between samples (shallower groups inflate it with counting noise).
@@ -503,7 +521,8 @@ def comparison_parts(group_vec: list[str], contrasts: list[tuple[str, str]],
                 except RuntimeError:
                     paired = False
                     notes.append(f"{label} was fitted without pairing: no pairing value has "
-                                 "samples in both groups.")
+                                 "samples in both groups. A random individual effect keeps "
+                                 "the individual in the model in this case.")
             if paired:
                 unpaired = sum(1 for p in sub_pairing if str(p).startswith('__unpaired_'))
                 if unpaired:
@@ -574,8 +593,9 @@ def _fit_by_comparison(parts, fit, group_vec, pairing_vec, finish):
     (comparison_plan), stack the results, then ``finish`` them
     (significance). ``fit(rows, groups, contrast, pairing, covariates)``
     returns one table. The plain-language notes are kept in the result's
-    ``attrs['notes']``."""
-    frames, notes = [], []
+    ``attrs['notes']``, and the fits' notes on a random individual effect in
+    ``attrs['block_notes']``."""
+    frames, notes, block_notes = [], [], []
     for part in parts:
         notes.extend(part['notes'])
         if not part['tested']:
@@ -583,8 +603,10 @@ def _fit_by_comparison(parts, fit, group_vec, pairing_vec, finish):
         rows = np.flatnonzero(part['mask'])
         pairing = ([pairing_vec[i] for i in rows]
                    if pairing_vec is not None and part['paired'] else None)
-        frames.append(fit(rows, [group_vec[i] for i in rows], part['contrast'], pairing,
-                          part['covariates']))
+        frame = fit(rows, [group_vec[i] for i in rows], part['contrast'], pairing,
+                    part['covariates'])
+        block_notes.extend(frame.attrs.get('block_notes', []))
+        frames.append(frame)
     for note in notes:
         log.info("comparison fitted on its own: %s", note)
     if not frames:
@@ -592,6 +614,8 @@ def _fit_by_comparison(parts, fit, group_vec, pairing_vec, finish):
                            "values. " + " ".join(notes))
     combined = finish(pd.concat(frames, ignore_index=True))
     combined.attrs['notes'] = notes
+    if block_notes:
+        combined.attrs['block_notes'] = block_notes
     return combined
 
 
@@ -641,10 +665,10 @@ def _pairing_confounded_message(group_vec: list[str], pairing_vec: list[str]) ->
             "the same animal, so each value needs samples in more than one group. "
             "Here the pairing value already decides the group, so pairing would "
             "remove the very difference being tested. "
-            "Switch pairing off. Adjustment covariates, such as tissue, can stay. "
-            "Without pairing, several samples from one individual are counted as "
-            "independent, which overstates the sample size; testing each tissue "
-            "or condition separately avoids this."
+            "Enter the individual as a random effect instead, or switch pairing off. "
+            "Adjustment covariates, such as tissue, can stay. Without pairing, several "
+            "samples from one individual are counted as independent, which overstates "
+            "the sample size; a random individual effect avoids this."
         )
 
     groups = list(dict.fromkeys(group_vec))
@@ -673,6 +697,40 @@ def _pairing_confounded_message(group_vec: list[str], pairing_vec: list[str]) ->
             "set out of the test, or switch pairing off."
         )
     return "The design is rank-deficient with the pairing variable."
+
+
+def pairing_nested(group_vec: list[str], pairing_vec: list[str]) -> bool:
+    """True when every pairing value with more than one sample lies within
+    one group (each mouse has one genotype) and at least one value has
+    several samples: the individuals carry repeated samples but no
+    within-individual group comparison."""
+    level_groups: dict[str, set] = {}
+    level_n: dict[str, int] = {}
+    for g, p in zip(group_vec, pairing_vec):
+        level_groups.setdefault(p, set()).add(g)
+        level_n[p] = level_n.get(p, 0) + 1
+    repeated = [p for p, n in level_n.items() if n > 1]
+    return bool(repeated) and all(len(level_groups[p]) == 1 for p in repeated)
+
+
+def resolve_pairing(group_vec: list[str], pairing_vec: list[str] | None,
+                    mode: str = 'auto') -> tuple[list[str] | None, list[str] | None, str]:
+    """
+    How the pairing variable enters the model: returns (pairing_vec for a
+    fixed pairing term, block_vec for a random effect, 'fixed' | 'random' |
+    ''). Exactly one of the two vectors is set, or neither without pairing.
+
+    'auto': a random effect when the individuals are nested in the groups
+    (pairing_nested), so the fixed term would remove the group difference;
+    fixed pairing otherwise. 'fixed' and 'random' force the choice.
+    """
+    if pairing_vec is None:
+        return None, None, ''
+    if mode not in PAIRING_MODES:
+        raise ValueError(f"pairing mode must be one of {PAIRING_MODES}, got {mode!r}")
+    if mode == 'random' or (mode == 'auto' and pairing_nested(group_vec, pairing_vec)):
+        return None, list(pairing_vec), 'random'
+    return list(pairing_vec), None, 'fixed'
 
 
 def build_design(group_vec: list[str], baseline: str,
@@ -947,15 +1005,49 @@ _TOO_FEW_FEATURES = (
 )
 
 
+def block_note(correlation: float, n_estimated: int, label: str = '',
+               name: str = 'individual') -> str:
+    """Plain-language note on the random individual effect of a fit; *name*
+    is the pairing variable (e.g. 'Mouse')."""
+    if not np.isfinite(correlation):
+        text = (f"{name} as a random effect: no feature had enough samples to estimate the "
+                f"correlation within each {name}, so the samples were treated as independent.")
+    else:
+        text = (f"{name} as a random effect: samples of one {name} correlate by "
+                f"{correlation:.2f} (consensus over {n_estimated} features).")
+        if correlation <= 0:
+            text += (" There is no shared individual effect, so this is the same as treating "
+                     "the samples as independent.")
+        elif correlation > 0.9:
+            text += (" The samples of an individual are nearly identical; the individual, not "
+                     "the sample, carries almost all of the information.")
+    return f"{label}: {text}" if label else text
+
+
+def _block_fit(expr: np.ndarray, X: np.ndarray, block_vec: list[str]):
+    """lm_fit by generalised least squares with the consensus correlation
+    within individuals (block_correlation), and that correlation's note."""
+    bc = ms.block_correlation(expr, X, block_vec)
+    rho = bc.consensus if np.isfinite(bc.consensus) else 0.0
+    log.info("random individual effect: consensus correlation %.4g over %d features",
+             bc.consensus, bc.n_estimated)
+    return ms.gls_lm_fit(expr, X, block_vec, rho), bc
+
+
 def _moderated_fit_contrasts(data_df: pd.DataFrame, group_vec: list[str],
                              contrasts: list[tuple[str, str]],
                              pairing_vec: list[str] | None,
                              covariates: pd.DataFrame | None,
-                             too_few_hint: str = '') -> pd.DataFrame:
+                             too_few_hint: str = '',
+                             block_vec: list[str] | None = None,
+                             block_name: str = 'individual') -> pd.DataFrame:
     """
     One moderated fit over data_df's samples, read out for every contrast
     in ``contrasts`` (all sharing one baseline). Returns the stacked
-    per-contrast tables with 'feature' and 'comparison' columns.
+    per-contrast tables with 'feature' and 'comparison' columns. With
+    ``block_vec`` the individual is a random effect (generalised least
+    squares, block_correlation); the note on its correlation is in
+    ``attrs['block_notes']``.
     """
     base = contrasts[0][0]
     X, _names, group_cols = build_design(group_vec, base, pairing_vec, covariates)
@@ -964,8 +1056,15 @@ def _moderated_fit_contrasts(data_df: pd.DataFrame, group_vec: list[str],
     if n_features < 3:
         msg = _TOO_FEW_FEATURES.format(n=n_features, other=contrasts[0][1], base=base)
         raise RuntimeError(f"{msg} {too_few_hint}".strip())
+    notes = []
     try:
-        fit = ms.e_bayes(ms.lm_fit(expr, X))
+        if block_vec is None:
+            fit = ms.e_bayes(ms.lm_fit(expr, X))
+        else:
+            gls, bc = _block_fit(expr, X, block_vec)
+            fit = ms.e_bayes(gls)
+            label = f"{contrasts[0][1]} vs {base}" if len(contrasts) == 1 else ''
+            notes.append(block_note(bc.consensus, bc.n_estimated, label, block_name))
     except ValueError as exc:
         raise RuntimeError(
             f"{exc} ({contrasts[0][1]!r} vs {base!r}). Too few features "
@@ -980,7 +1079,9 @@ def _moderated_fit_contrasts(data_df: pd.DataFrame, group_vec: list[str],
         tt.insert(0, 'feature', list(data_df.columns))
         tt['comparison'] = f"{other} vs {b}"
         frames.append(tt)
-    return pd.concat(frames, ignore_index=True)
+    combined = pd.concat(frames, ignore_index=True)
+    combined.attrs['block_notes'] = notes
+    return combined
 
 
 def _scaled_logits(counts: np.ndarray, library: np.ndarray) -> np.ndarray:
@@ -1109,7 +1210,9 @@ def run_moderated(data_df: pd.DataFrame | None, group_vec: list[str],
                   too_few_hint: str = '',
                   weights: str | None = None,
                   counts_df: pd.DataFrame | None = None,
-                  library=None) -> pd.DataFrame:
+                  library=None,
+                  block_vec: list[str] | None = None,
+                  block_name: str = 'individual') -> pd.DataFrame:
     """
     Moderated linear model test of every feature, for N groups and
     multiple contrasts.
@@ -1133,6 +1236,12 @@ def run_moderated(data_df: pd.DataFrame | None, group_vec: list[str],
                 mode, and observations are weighted as described in the
                 module docstring. ``data_df`` is not used then (pass None);
                 logFC is a log2 odds ratio.
+    block_vec : the individual of each sample, entered as a random effect
+                (resolve_pairing); mutually exclusive with ``pairing_vec``
+                and with ``weights``. Each fit estimates the consensus
+                correlation within individuals on its own samples; the
+                result's ``attrs['block_notes']`` reports it, naming the
+                pairing variable ``block_name``.
 
     When covariates have missing values, or the pairing does not link the
     groups, each comparison is fitted on its own samples (comparison_plan)
@@ -1147,6 +1256,8 @@ def run_moderated(data_df: pd.DataFrame | None, group_vec: list[str],
     """
     if weights not in MODERATED_WEIGHTS:
         raise ValueError(f"weights must be one of {MODERATED_WEIGHTS}, got {weights!r}")
+    if block_vec is not None and (pairing_vec is not None or weights is not None):
+        raise ValueError("block_vec cannot be combined with pairing_vec or weights")
     if weights == 'capped':
         if counts_df is None or library is None:
             raise ValueError("weights='capped' needs counts_df and library")
@@ -1167,7 +1278,9 @@ def run_moderated(data_df: pd.DataFrame | None, group_vec: list[str],
                 data_df.iloc[rows], groups, [contrast], 'reference', pval_threshold,
                 fc_threshold, pairing_vec=pairing, fdr_scope=fdr_scope, covariates=cov,
                 use_treat=use_treat, feature_meta=feature_meta, hierarchical=hierarchical,
-                too_few_hint=too_few_hint),
+                too_few_hint=too_few_hint,
+                block_vec=None if block_vec is None else [block_vec[i] for i in rows],
+                block_name=block_name),
             group_vec, pairing_vec,
             lambda df: apply_significance(df, pval_threshold, fc_threshold, fdr_scope=fdr_scope,
                                           use_treat=use_treat, hierarchical=hierarchical))
@@ -1176,14 +1289,21 @@ def run_moderated(data_df: pd.DataFrame | None, group_vec: list[str],
         if any(b != baseline for b, _o in contrasts):
             raise ValueError("reference mode expects a shared baseline")
         combined = _moderated_fit_contrasts(data_df, group_vec, contrasts, pairing_vec,
-                                            covariates, too_few_hint)
+                                            covariates, too_few_hint, block_vec=block_vec,
+                                            block_name=block_name)
+        fit_notes = list(combined.attrs.get('block_notes', []))
     elif mode == 'pairwise':
-        frames = [
-            _moderated_fit_contrasts(sub_df, sub_groups, [(base, other)], sub_pair, sub_cov,
-                                     too_few_hint)
-            for sub_df, sub_groups, sub_pair, sub_cov, base, other
-            in _pair_subsets(data_df, group_vec, contrasts, pairing_vec, covariates)
-        ]
+        frames, fit_notes = [], []
+        for base, other in contrasts:
+            mask = [g in (base, other) for g in group_vec]
+            sub_df, sub_groups, sub_pair, sub_cov, _b, _o = next(_pair_subsets(
+                data_df, group_vec, [(base, other)], pairing_vec, covariates))
+            frame = _moderated_fit_contrasts(sub_df, sub_groups, [(base, other)], sub_pair,
+                                             sub_cov, too_few_hint,
+                                             block_vec=_subset_rows(block_vec, mask),
+                                             block_name=block_name)
+            fit_notes.extend(frame.attrs.get('block_notes', []))
+            frames.append(frame)
         combined = pd.concat(frames, ignore_index=True)
     else:
         raise ValueError(f"mode must be 'reference' or 'pairwise', got {mode!r}")
@@ -1197,6 +1317,8 @@ def run_moderated(data_df: pd.DataFrame | None, group_vec: list[str],
     absorbed = pairing_absorbed(covariates, pairing_vec)
     if absorbed:
         combined.attrs['notes'] = [_absorbed_note(name) for name in absorbed]
+    if fit_notes:
+        combined.attrs['block_notes'] = fit_notes
     log.info("moderated test: %d rows across %d comparison(s), %d significant (%s FDR%s%s)",
              len(combined), combined['comparison'].nunique(),
              int(combined['significant'].sum()), fdr_scope,
