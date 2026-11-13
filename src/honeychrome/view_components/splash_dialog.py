@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel, QListView, QMenu, QDialog, QDialogButtonBox, QVBoxLayout as QVLayout, QStyledItemDelegate, QCheckBox, QFrame)
-from PySide6.QtCore import Qt, QSettings, QStringListModel, QPoint, QObject, QModelIndex
+from PySide6.QtCore import Qt, QSettings, QStringListModel, QPoint, QObject, QModelIndex, Signal
 from PySide6.QtGui import QPixmap, QPainter, QIcon
 
 from honeychrome.controller_components.functions import q_settings, add_recent_file
@@ -20,11 +20,21 @@ n_recent = 10
 import logging
 logger = logging.getLogger(__name__)
 
+import threading
 import requests
+
+UPDATE_CHECK_TIMEOUT_S = 5
+
+
+class UpdateNotifier(QObject):
+    """Carries the update-check result from the background thread to the GUI thread."""
+    update_available = Signal(str)
+
 
 def check_for_updates():
     try:
-        response = requests.get("https://api.github.com/repos/salmansamson/honeychrome/releases/latest")
+        response = requests.get("https://api.github.com/repos/salmansamson/honeychrome/releases/latest",
+                                timeout=UPDATE_CHECK_TIMEOUT_S)
         latest_tag = response.json()["tag_name"]
 
         if latest_tag != f"v{__version__}":
@@ -115,22 +125,11 @@ class SplashScreen(QDialog):
         image_label.setPixmap(scaled_pixmap)
         layout.addWidget(image_label)
 
-        # update link and version check
-        update = check_for_updates()
-        if update:
-            frame = QFrame(self)
-            frame_layout = QVBoxLayout()
-            frame.setLayout(frame_layout)
-            frame_layout.setContentsMargins(10, 10, 10, 10)
-            frame.setFrameShape(QFrame.StyledPanel)
-            frame.setLineWidth(1)
-
-            update_label = QLabel(update)
-            update_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
-            update_label.setOpenExternalLinks(True)
-
-            frame_layout.addWidget(update_label)
-            layout.addWidget(frame)
+        # update link and version check, run in the background so a slow network cannot delay start-up
+        self.main_layout = layout
+        self.update_notifier = UpdateNotifier(self)
+        self.update_notifier.update_available.connect(self.show_update_notice)
+        threading.Thread(target=self.check_for_updates_in_background, daemon=True).start()
 
         layout.addWidget(QLabel("Select an option to start:"))
 
@@ -196,6 +195,29 @@ class SplashScreen(QDialog):
 
 
         self.setLayout(layout)
+
+    def check_for_updates_in_background(self):
+        update = check_for_updates()
+        if update:
+            try:
+                self.update_notifier.update_available.emit(update)
+            except RuntimeError:
+                pass  # splash screen closed before the check finished
+
+    def show_update_notice(self, update):
+        frame = QFrame(self)
+        frame_layout = QVBoxLayout()
+        frame.setLayout(frame_layout)
+        frame_layout.setContentsMargins(10, 10, 10, 10)
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame.setLineWidth(1)
+
+        update_label = QLabel(update)
+        update_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        update_label.setOpenExternalLinks(True)
+
+        frame_layout.addWidget(update_label)
+        self.main_layout.insertWidget(1, frame)
 
     def handle_recent_clicked(self, index):
         self.btn_new.setEnabled(False)
