@@ -113,6 +113,7 @@ if _PLUGIN_DIR not in sys.path:
 
 import ag_builder  # noqa: E402
 import ag_core  # noqa: E402
+import ag_coherence  # noqa: E402
 import ag_fsea  # noqa: E402
 import ag_fsea_ui  # noqa: E402
 import ag_help_texts  # noqa: E402
@@ -425,7 +426,10 @@ class GatingRunState:
                      default; feature types; marker readout; ranking
                      statistic; permutations; seed; minimum set size;
                      {population key: cell type} overrides).
-    fsea           : the last enrichment run of the group comparisons, and
+    coherence_*    : the Enrichment page's coherence options (on, marker
+                     background adjustment, minimum reliability).
+    fsea           : the last enrichment run of the group comparisons (with
+                     its coherence result under 'coherence'), and
     fsea_trend     : of the trend (both kept in ENRICHMENT_FILE).
 
     results_revision (not a field) counts the times one of _RESULT_FIELDS
@@ -523,6 +527,9 @@ class GatingRunState:
     fsea_seed: int = ag_fsea.DEFAULT_SEED
     fsea_min_set_size: int = ag_fsea.MIN_SET_SIZE
     fsea_overrides: dict = field(default_factory=dict)
+    coherence_on: bool = True
+    coherence_background: bool = True
+    coherence_min_reliability: float = ag_coherence.DEFAULT_MIN_RELIABILITY
     fsea: dict = field(default_factory=dict)
     fsea_trend: dict = field(default_factory=dict)
 
@@ -571,7 +578,7 @@ _PERSISTED_FIELDS = (
     'report_populations', 'pop_filter', 'pop_values',
     'fsea_library_path', 'fsea_species', 'fsea_anchor', 'fsea_feature_types',
     'fsea_marker_readout', 'fsea_rank_metric', 'fsea_n_perm', 'fsea_seed', 'fsea_min_set_size',
-    'fsea_overrides',
+    'fsea_overrides', 'coherence_on', 'coherence_background', 'coherence_min_reliability',
 )
 
 

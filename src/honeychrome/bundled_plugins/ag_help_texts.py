@@ -1192,6 +1192,63 @@ test against all tested populations, BH FDR). Dot colour: fold
 enrichment; size: share of the state's populations in the pattern.</li>
 </ul>
 
+<h4>Coherence and the state network</h4>
+<p><b>In short:</b> enrichment asks whether a state <i>shifted</i> between
+two groups. Coherence asks something different: within one group, do the
+state's features rise and fall <b>together</b> from donor to donor, in the
+directions the library expects? If a programme is more active in some
+donors than others, a donor with more Granzyme B⁺ CD4 cells should also have
+more perforin⁺ and fewer CD27⁺ CD4 cells. Tick <b>Coherence and state
+network</b> on the Run section (group comparisons only; each group needs at
+least 20 samples, and below 40 only large differences can be found).</p>
+<ul>
+<li><b>Coherence C</b> of a state in a group: the mean correlation of its
+members across the group's donors, each pair counted positive when the two
+move as the library expects (both up, or one up and one down when the
+library says so). 1 would mean they move exactly together, 0 independently.
+Pairs the gating tree ties together are left out (a population and its
+ancestor, sibling populations of one gate, the same marker on nested
+parents). The table gives each group's C with a 95% interval (from
+resampling donors), and <b>ΔC</b>, p and FDR for the difference between
+the groups.</li>
+<li><b>Before correlating</b>, each feature has the group's mean removed,
+and the Results page's covariates (e.g. plate) and the trend variable when
+one is set; otherwise plate or age would make unrelated features move
+together. The model used is shown above the table.</li>
+<li><b>Marker background</b> (option, on by default): when a sample's whole
+distribution for a marker sits brighter (stain, background, fix/perm,
+unmixing spread), more cells cross a fixed gate in every population, and
+the marker's positivity features move together for a technical reason. The
+background is the marker's median in the sample's populations that are
+negative for it (median share positive below 5%, at least three such
+populations); each positivity feature is adjusted for its own marker's
+background.</li>
+<li><b>Minimum reliability</b>: a population of a few events per sample
+gives a noisy percentage, and noise weakens every correlation the feature
+enters, making a group look less coherent than it is. Reliability is the
+share of a feature's donor-to-donor variation that is not counting noise
+(binomial noise from its counts). Features below the minimum in either
+group are left out of that comparison, and the table says which and
+why.</li>
+<li><b>State network</b>: each donor gets a score per state (the mean of
+its members, signed by the library direction). A line joins two states
+whose scores correlate across the group's donors (FDR below your
+threshold): faint lines. A <b>solid line</b> marks a correlation that
+differs between the two groups. Solid lines are exploratory: how many
+appear depends on the adjustment, so treat them as leads.</li>
+<li><b>State pair</b>: for two states of the network, each donor's two
+scores (one dot per donor), and their member features around a circle in
+gating-tree order, with correlated pairs drawn along the tree [6].</li>
+<li>The p-values come from relabelling: the two groups' samples swap
+labels (within pairs when the design is paired), and everything is
+recomputed. So that a network line can reach FDR 0.05 among all pairs of
+states, the number of relabellings is raised when needed (about 5,000 for
+23 states, about 2 minutes per comparison). On a human cohort split at
+random into two halves of one group
+(40 splits), about 5% of states fell below p 0.05 and none below FDR
+0.05.</li>
+</ul>
+
 <h4>References</h4>
 <ol>
 <li>Subramanian A et al. (2005) Gene set enrichment analysis. PNAS 102:15545–15550.</li>
@@ -1201,5 +1258,7 @@ enrichment; size: share of the state's populations in the pattern.</li>
 Stat Appl Genet Mol Biol 9: Article 39.</li>
 <li>Wu D, Smyth GK (2012) Camera: a competitive gene set test accounting for
 inter-gene correlation. Nucleic Acids Res 40: e133.</li>
+<li>Holten D (2006) Hierarchical edge bundles: visualization of adjacency
+relations in hierarchical data. IEEE Trans Vis Comput Graph 12:741–748.</li>
 </ol>
 ''' + _GLOSSARY

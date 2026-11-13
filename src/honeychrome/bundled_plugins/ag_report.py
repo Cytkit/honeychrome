@@ -670,6 +670,38 @@ def enrichment_report_items(result: dict, fdr_threshold: float) -> list[ReportIt
             key='enrichment:patterns', tab='Enrichment', label='Immune states in shape patterns',
             get_figure=lambda: fp.make_pattern_dot_plot(pattern_states, fdr_threshold, False),
             get_tables=lambda: {'pattern_states': pattern_states}))
+    items += coherence_report_items(result.get('coherence') or {}, fdr_threshold)
+    return items
+
+
+def coherence_report_items(block: dict, fdr_threshold: float) -> list[ReportItem]:
+    """Report items of a coherence result: per comparison, the coherence
+    figure with its tables, and the state network when at least one
+    correlation differs between the groups (FDR below *fdr_threshold*)."""
+    import ag_coherence
+    import ag_fsea_plots as fp
+
+    coh = block.get('coherence')
+    if coh is None or not len(coh):
+        return []
+    items = []
+    for comp in ag_coherence.comparison_labels(block):
+        if comp not in set(coh['comparison']):
+            continue
+        rows = coh[coh['comparison'] == comp]
+        edges = block['edges'][block['edges']['comparison'] == comp]
+        members = block['members'][block['members']['comparison'] == comp]
+        items.append(ReportItem(
+            key=f'coherence:{comp}', tab='Enrichment', label=f"Coherence: {comp}",
+            get_figure=lambda _c=comp: fp.make_coherence_figure(block, _c, fdr_threshold, False),
+            get_tables=lambda _r=rows, _e=edges, _m=members: {
+                'coherence': _r, 'state_network': _e, 'coherence_members': _m}))
+        if (edges['FDR'].astype(float) < fdr_threshold).any():
+            items.append(ReportItem(
+                key=f'coherence_network:{comp}', tab='Enrichment', label=f"State network: {comp}",
+                get_figure=lambda _c=comp: fp.make_state_network_figure(block, _c, fdr_threshold,
+                                                                        False),
+                get_tables=lambda _e=edges: {'state_network': _e}))
     return items
 
 
