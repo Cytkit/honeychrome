@@ -48,7 +48,8 @@ Noise model fit (``fit_experiment_noise_model``, worker thread)
       cytometer database (``detector_lasers``), else $PnL, else the name.
     * ``noise.per_control_quadratic``, ``noise.sigma0_by_class`` (classes
       from the particle type: bead controls and bead negatives 'beads',
-      the rest 'cells') and ``noise.sigma0_fallback``: see noise_model.py.
+      the rest 'cells'; on by default for Model Noise, a single class when
+      only one is present) and ``noise.sigma0_fallback``: see noise_model.py.
 
     Clamped data (``clamp_mode = 'auto'``): when the unstained cells and
     bead negatives have no detector with 1% of values at or below zero
@@ -196,7 +197,7 @@ class NoiseSetupSettings:
     clamp_weights: str = 'poisson'
     clamp_floor_pe: float = 10.0
     variant: VariantSettings = field(default_factory=VariantSettings)
-    noise: nm.NoiseSettings = field(default_factory=nm.NoiseSettings)
+    noise: nm.NoiseSettings = field(default_factory=lambda: nm.NoiseSettings(sigma0_by_class=True))
 
 
 # ---------------------------------------------------------------------------

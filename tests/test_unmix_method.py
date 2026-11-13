@@ -124,7 +124,7 @@ def test_m2pg_through_snapshot_is_the_noise_page(fitted, tmp_path):
     raw = _raw(fitted, A)
     af = snap.af_for(A)
     page = gu.assemble_unmixed(raw, tm, settings, gu.unmix_m2pg(
-        raw[:, :d], spectra, state.noise.model, af.spectra, env, ceiling=ceiling, n_threads=nthreads),
+        raw[:, :d], spectra, state.noise.model_for(False), af.spectra, env, ceiling=ceiling, n_threads=nthreads),
         spillover=spill, af_index_map=af.index_map)
     out = sl.unmix_events(raw, snap, af, return_af=True, sample_key=A)
     np.testing.assert_array_equal(out['unmixed'], page)
@@ -134,8 +134,8 @@ def test_m2pg_through_snapshot_is_the_noise_page(fitted, tmp_path):
     for key, null_var in ((B, state.noise.cell_null_var), (BEADS, state.noise.bead_null_var)):
         raw = _raw(fitted, key)
         page = gu.assemble_unmixed(raw, tm, settings, gu.unmix_m2pg(
-            raw[:, :d], spectra, state.noise.model, None, None, null_var_no_af=null_var, ceiling=ceiling,
-            n_threads=nthreads), spillover=spill)
+            raw[:, :d], spectra, state.noise.model_for(key == BEADS), None, None, null_var_no_af=null_var,
+            ceiling=ceiling, n_threads=nthreads), spillover=spill)
         out = sl.unmix_events(raw, snap, None, return_af=True, sample_key=key)
         np.testing.assert_array_equal(out['unmixed'], page)
         assert np.all(out['af_idx'] == 0)

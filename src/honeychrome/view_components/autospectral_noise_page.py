@@ -292,6 +292,7 @@ class NoisePage(QWidget):
             self._option_checks[key] = check
             options_layout.addWidget(check)
         self._option_checks['clamp_mode'].setChecked(True)
+        self._option_checks['sigma0_by_class'].setChecked(True)
         self._options.setVisible(False)
         self._options_toggle.toggled.connect(self._options.setVisible)
         layout.addWidget(self._options)
