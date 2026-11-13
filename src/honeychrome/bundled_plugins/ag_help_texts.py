@@ -1034,6 +1034,11 @@ removes its half-written folder.</li>
 as CSV files, and kept with the experiment. <b>Export Gating Results…</b>
 and <b>Export Statistics…</b> write the same files to a folder of your
 choice.</li>
+<li><b>Export Graphic</b> on a figure, and the save button of a popped-out
+figure, write the figure at 300 dpi to <i>Automated_Gating_Reports</i>; the
+status bar at the bottom of the window shows the file written. CSV exports
+(values, sample table, gating results, statistics) start in the same
+folder.</li>
 </ul>
 
 <p>References:<br/>

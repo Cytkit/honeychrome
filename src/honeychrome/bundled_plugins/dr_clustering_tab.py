@@ -163,6 +163,9 @@ from honeychrome.view_components.ordered_multi_sample_picker import OrderedMulti
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 from honeychrome.view_components.side_tab_widget import SideTabWidget
+from honeychrome.view_components.scalable_figure_widget import (
+    figure_toolbar, report_saved, results_folder, save_figure, start_path,
+)
 from honeychrome.controller_components import covariate_check, sample_table
 from honeychrome.controller_components import trend_stats
 from honeychrome.controller_components import anova_stats
@@ -423,6 +426,12 @@ def _qs_int(settings, key: str, default=None):
         return int(raw)
     except (TypeError, ValueError):
         return default
+
+
+def _reports_folder(controller):
+    """The experiment's Honeycluster_Reports folder, where figures are
+    exported ('' when no experiment is open)."""
+    return results_folder(getattr(controller, 'experiment_dir', ''), drc_report.REPORTS_SUBDIR)
 
 
 def _with_extension(path: str, ext: str) -> str:
@@ -1371,7 +1380,8 @@ class RunDetailDialog(QDialog):
         e = self.entry
         default_name = f"{e.get('label', 'run')}_config.csv".replace(' ', '_')
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Run Config CSV", default_name, "CSV files (*.csv)"
+            self, "Save Run Config CSV", start_path(_reports_folder(self.controller), default_name),
+            "CSV files (*.csv)"
         )
         if not path:
             return
@@ -5734,7 +5744,8 @@ class GroupsStatsTab(QWidget):
         default = sample_table.default_export_path(
             getattr(self.controller, 'experiment_dir', ''), 'Honeycluster')
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Group Assignments", default, "CSV files (*.csv)"
+            self, "Export Group Assignments",
+            start_path(_reports_folder(self.controller), Path(default).name), "CSV files (*.csv)"
         )
         if not path:
             return
@@ -6531,7 +6542,6 @@ class GroupsStatsTab(QWidget):
 
     def _trend_plot_window(self, kind: str, feature: str, show_line: bool = False):
         """One feature's trend plot in its own window, with its values as CSV."""
-        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
         label = self._trend_feature_label(kind, feature)
         fig = self._make_trend_plot(kind, feature, show_line)
         ref = self._figure_options_ref('trend_plot')
@@ -6545,9 +6555,9 @@ class GroupsStatsTab(QWidget):
             canvas.mpl_connect('motion_notify_event', fig._hover_handler)
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(4, 4, 4, 4)
-        layout.addWidget(NavigationToolbar2QT(canvas, dlg))
-        layout.addWidget(canvas, stretch=1)
         stem = re.sub(r'[^\w.-]+', '_', f"trend_{label}")
+        layout.addWidget(figure_toolbar(canvas, dlg, _reports_folder(self.controller), stem))
+        layout.addWidget(canvas, stretch=1)
         row = QHBoxLayout()
         row.addStretch()
         csv_btn = QPushButton("Export Values (CSV)")
@@ -7973,7 +7983,6 @@ class GroupsStatsTab(QWidget):
         Sample PCA) outside of _draw_results, using the same pop-out/
         export machinery as the heatmap/volcano tabs.
         """
-        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
         from PySide6.QtWidgets import QDialog
         from honeychrome.view_components import figure_options as fo
 
@@ -7995,6 +8004,7 @@ class GroupsStatsTab(QWidget):
         dpi  = fig.get_dpi()
         w_px = int(fig.get_figwidth()  * dpi)
         h_px = int(fig.get_figheight() * dpi)
+        natural_inches = tuple(fig.get_size_inches())
 
         # these plots routinely overflowed the viewport at full
         # size. The inline canvas now starts at roughly a third of the
@@ -8065,7 +8075,8 @@ class GroupsStatsTab(QWidget):
             if hasattr(dlg_fig, '_hover_handler'):
                 dlg_canvas.mpl_connect('motion_notify_event', dlg_fig._hover_handler)
             self._connect_value_menu(dlg_canvas, dlg_fig, key, maker_kwargs)
-            dlg_toolbar = NavigationToolbar2QT(dlg_canvas, None)
+            dlg_toolbar = figure_toolbar(dlg_canvas, None, _reports_folder(self.controller),
+                                         export_stem)
 
             class _PlotDialog(QDialog):
                 def closeEvent(self_, event):
@@ -8107,7 +8118,7 @@ class GroupsStatsTab(QWidget):
         export_btn = QPushButton("Export Figure" if values_table is not None
                                  else f"Export {tab_title}")
         export_btn.clicked.connect(lambda checked=False, f=fig, s=export_stem:
-                                   self._export_figure(f, s))
+                                   self._export_figure(f, s, natural_inches))
         btn_row.addWidget(popout_btn)
         btn_row.addWidget(export_btn)
         if values_table is not None:
@@ -8325,8 +8336,8 @@ class GroupsStatsTab(QWidget):
         return pd.DataFrame(rows, columns=['sample', 'group', 'feature', value_label])
 
     def _export_values_csv(self, table: pd.DataFrame, stem: str):
-        """Save a values table as CSV, by default in the experiment folder."""
-        start = str(Path(self.controller.experiment_dir) / f"{stem}.csv")
+        """Save a values table as CSV, by default in Honeycluster_Reports."""
+        start = start_path(_reports_folder(self.controller), f"{stem}.csv")
         path, _ = QFileDialog.getSaveFileName(self, "Export Values", start, "CSV files (*.csv)")
         if not path:
             return
@@ -8356,7 +8367,6 @@ class GroupsStatsTab(QWidget):
 
     def _values_window(self, kwargs: dict):
         """The per-sample values of one feature in their own window."""
-        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
         fig = self._make_values_figure(**kwargs)
         dlg = QDialog(self)
         dlg.setWindowTitle(self._feature_display_label(kwargs['kind'], kwargs['feature']))
@@ -8366,7 +8376,8 @@ class GroupsStatsTab(QWidget):
             canvas.mpl_connect('motion_notify_event', fig._hover_handler)
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(4, 4, 4, 4)
-        layout.addWidget(NavigationToolbar2QT(canvas, dlg))
+        stem = re.sub(r'[^\w.-]+', '_', f"values_{self._feature_display_label(kwargs['kind'], kwargs['feature'])}")
+        layout.addWidget(figure_toolbar(canvas, dlg, _reports_folder(self.controller), stem))
         layout.addWidget(canvas, stretch=1)
         dpi = fig.get_dpi()
         dlg.resize(int(fig.get_figwidth() * dpi) + 24, int(fig.get_figheight() * dpi) + 80)
@@ -8933,21 +8944,34 @@ class GroupsStatsTab(QWidget):
             family_label='cluster',
         )
 
-    def _export_figure(self, fig, stem: str):
-        """Save a matplotlib Figure to disk."""
+    def _export_figure(self, fig, stem: str, size_inches=None):
+        """Save a results-tab figure to the Honeycluster_Reports folder, at
+        its natural size (*size_inches*) whatever size the tab shows it at."""
         fmt = getattr(hc_settings, 'graphics_export_format_retrieved', 'png')
-        exp_dir = self.controller.experiment_dir
-        out_path = exp_dir / f"{stem}.{fmt}"
+        folder = _reports_folder(self.controller)
+        if not folder:
+            QMessageBox.warning(self, "Export", "There is no experiment folder to export to.")
+            return
+        out_path = folder / f"{stem}.{fmt}"
+        shown = tuple(fig.get_size_inches())
+        if size_inches is not None:
+            fig.set_size_inches(*size_inches, forward=False)
         try:
-            fig.savefig(out_path, bbox_inches='tight')
-            QMessageBox.information(self, "Exported", f"Saved to {out_path}")
+            save_figure(fig, out_path)
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
+            return
+        finally:
+            fig.set_size_inches(*shown, forward=False)
+            if fig.canvas is not None:
+                fig.canvas.draw_idle()
+        report_saved(self, out_path)
 
     def _export_results_csv(self):
         """Export all statistics results to a combined CSV."""
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Statistics Results", "", "CSV files (*.csv)"
+            self, "Export Statistics Results",
+            start_path(_reports_folder(self.controller), 'statistics_results.csv'), "CSV files (*.csv)"
         )
         if not path:
             return
@@ -8993,7 +9017,7 @@ class GroupsStatsTab(QWidget):
             QMessageBox.warning(self, "No Results", "No statistics results to export.")
             return
         folder = QFileDialog.getExistingDirectory(
-            self, "Export Tables to Folder", str(self.controller.experiment_dir))
+            self, "Export Tables to Folder", start_path(_reports_folder(self.controller), ''))
         if not folder:
             return
         stem = drc_report.sanitize_filename(self.state.stats_run_label or 'honeycluster')
@@ -10066,8 +10090,11 @@ class WorkspaceTab(QWidget):
         pages = (list(range(len(self.scene.pages))) if pages_combo.currentIndex() == 0
                  else [self.scene.current_page])
         ext = {'PDF': '.pdf', 'SVG': '.svg', 'PNG': '.png', 'TIFF': '.tif'}[fmt]
+        folder = _reports_folder(self.controller)
+        if folder:
+            folder.mkdir(parents=True, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
-            self, f"Export {fmt}", f"Layout{ext}", f"{fmt} files (*{ext})")
+            self, f"Export {fmt}", str(Path(folder or '.') / f"Layout{ext}"), f"{fmt} files (*{ext})")
         if not path:
             return
         self.export_pages(path, fmt, pages, int(dpi_combo.currentData()),
@@ -10091,8 +10118,10 @@ class WorkspaceTab(QWidget):
             traceback.print_exc()
             QMessageBox.warning(self, "Export Error", str(e))
             return []
-        names = "\n".join(p.name for p in written)
-        QMessageBox.information(self, "Exported", f"Saved to {target.parent}:\n{names}")
+        if len(written) == 1:
+            report_saved(self, written[0])
+        elif written:
+            report_saved(self, f"{len(written)} files to {target.parent}")
         return written
 
     def export_plot_png(self, card: 'PlotCard'):
@@ -10103,8 +10132,11 @@ class WorkspaceTab(QWidget):
 
     def export_item_png(self, item):
         """Export one item (a plot with its separate legend) as a 300 dpi PNG."""
+        folder = _reports_folder(self.controller)
+        if folder:
+            folder.mkdir(parents=True, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export PNG", f"{item.uid}.png", "PNG files (*.png)")
+            self, "Export PNG", str(Path(folder or '.') / f"{item.uid}.png"), "PNG files (*.png)")
         if not path:
             return
         path = _with_extension(path, '.png')
@@ -10116,7 +10148,7 @@ class WorkspaceTab(QWidget):
                 entries, w, h, drc_workspace_export.DEFAULT_EXPORT_DPI)
             drc_workspace_export.save_raster(array, Path(path), 'PNG',
                                              drc_workspace_export.DEFAULT_EXPORT_DPI)
-            QMessageBox.information(self, "Exported", f"Saved to {path}")
+            report_saved(self, path)
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
 
@@ -14149,7 +14181,6 @@ class ClusterAnnotationTab(QWidget):
         with the same pan/zoom toolbar the Stats results tabs already
         have, and its own copy of the swatch legend."""
         from matplotlib.figure import Figure
-        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 
         cl_run = self._selected_cluster_run()
         dr_run = self._selected_dr_run()
@@ -14161,7 +14192,8 @@ class ClusterAnnotationTab(QWidget):
 
         dlg_canvas = _new_scrollable_canvas(dlg_fig)
         dlg_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        dlg_toolbar = NavigationToolbar2QT(dlg_canvas, None)
+        dlg_toolbar = figure_toolbar(dlg_canvas, None, _reports_folder(self.controller),
+                                     'cluster_map')
 
         dlg_legend_scroll = QScrollArea()
         dlg_legend_scroll.setWidgetResizable(True)

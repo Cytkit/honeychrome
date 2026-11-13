@@ -1085,11 +1085,15 @@ class EnrichmentTab(QWidget):
 
     def _figure_widget(self, fig, title, options_key: str | None = None):
         from honeychrome.view_components import figure_options as fo
-        from honeychrome.view_components.scalable_figure_widget import ScalableFigureWidget
+        from honeychrome.view_components.scalable_figure_widget import (
+            ScalableFigureWidget, results_folder,
+        )
         store = fo.store_for(self.controller) if options_key else None
         ref = fo.FigureOptionsRef(store, 'automated_gating', options_key) if store else None
-        widget = ScalableFigureWidget(fig, title=title, experiment_dir=self._experiment_dir_fn(),
-                                      parent=self, options=ref)
+        widget = ScalableFigureWidget(
+            fig, title=title,
+            experiment_dir=results_folder(self._experiment_dir_fn(), 'Automated_Gating_Reports'),
+            parent=self, options=ref)
         handler = getattr(fig, '_hover_handler', None)
         if handler is not None:
             widget.canvas.mpl_connect('motion_notify_event', handler)
@@ -1323,7 +1327,8 @@ class EnrichmentTab(QWidget):
         if not (self.state.fsea or self.state.fsea_trend):
             QMessageBox.information(self, "Export", "Run the enrichment first.")
             return
-        start = str(Path(self._experiment_dir_fn() or '.') / 'Automated_Gating_Results')
+        from honeychrome.view_components.scalable_figure_widget import results_folder, start_path
+        start = start_path(results_folder(self._experiment_dir_fn(), 'Automated_Gating_Reports'), '')
         folder = QFileDialog.getExistingDirectory(self, "Export to folder", start)
         if not folder:
             return

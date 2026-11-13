@@ -203,6 +203,8 @@ DISPLAY_DIR = Path('cache') / 'automated_gating' / 'display'
 # decompressing them releases the interpreter lock, so they run in parallel.
 DISPLAY_READERS = max(1, min(8, _os.cpu_count() or 1))
 EXPORT_DIR = Path('Automated_Gating_Results')
+# Reports, and figures and tables exported by hand, go here.
+REPORTS_DIR = Path('Automated_Gating_Reports')
 # Events per group in the population comparison's pooled biplots.
 GROUP_PLOT_EVENTS = 100_000
 # Heatmaps and marker summaries open at this size (percent of natural size).
@@ -2831,8 +2833,10 @@ class ResultsTab(QWidget):
         _status(self.bus, sample_table_import_dialog.describe_import(result))
 
     def _on_export_table(self):
-        default = sample_table.default_export_path(
-            getattr(self.controller, 'experiment_dir', ''), plugin_name)
+        from honeychrome.view_components.scalable_figure_widget import results_folder, start_path
+        exp_dir = getattr(self.controller, 'experiment_dir', '')
+        default = start_path(results_folder(exp_dir, REPORTS_DIR),
+                             Path(sample_table.default_export_path(exp_dir, plugin_name)).name)
         path, _ = QFileDialog.getSaveFileName(self, "Export sample table", default, "CSV (*.csv)")
         if not path:
             return
@@ -3852,8 +3856,10 @@ class ResultsTab(QWidget):
         if not ok:
             self.figures_tabs.addTab(QLabel(f"Figures failed: {error}"), "Error")
             return
-        exp_dir = getattr(self.controller, 'experiment_dir', '')
-        from honeychrome.view_components.scalable_figure_widget import initial_scale_for
+        from honeychrome.view_components.scalable_figure_widget import (
+            initial_scale_for, results_folder,
+        )
+        exp_dir = results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR)
         for key, item in payload.items():
             if item['fig'] is None:
                 lbl = QLabel(f"{item['title']}: {item['error']}")
@@ -3934,7 +3940,9 @@ class ResultsTab(QWidget):
 
     def _show_pop_out(self, worker, ok: bool, error: str, fig, title: str, results, large: bool,
                       values_table=None, options=None):
-        from honeychrome.view_components.scalable_figure_widget import initial_scale_for
+        from honeychrome.view_components.scalable_figure_widget import (
+            initial_scale_for, results_folder,
+        )
         if worker in self._popout_workers:
             self._popout_workers.remove(worker)
         if not ok or fig is None:
@@ -3944,7 +3952,8 @@ class ResultsTab(QWidget):
         dialog.setWindowTitle(title)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         widget = ScalableFigureWidget(
-            fig, title=title, experiment_dir=getattr(self.controller, 'experiment_dir', ''),
+            fig, title=title,
+            experiment_dir=results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR),
             initial_scale=initial_scale_for(fig, HEATMAP_SCALE_PCT) if large else 100,
             parent=dialog, options=options)
         self._connect_figure(widget.canvas, fig, results)
@@ -4002,9 +4011,11 @@ class ResultsTab(QWidget):
         return str(row.get('cluster_id') if 'cluster_id' in table.columns else row['feature'])
 
     def _save_values_csv(self, values_table, stem: str):
-        """Ask for a file name (in the experiment folder by default) and
+        """Ask for a file name (in Automated_Gating_Reports by default) and
         write *values_table()* there as CSV."""
-        start = str(Path(getattr(self.controller, 'experiment_dir', '') or '.') / f"{stem}.csv")
+        from honeychrome.view_components.scalable_figure_widget import results_folder, start_path
+        start = start_path(results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR),
+                           f"{stem}.csv")
         path, _selected = QFileDialog.getSaveFileName(self, "Save values", start, "CSV (*.csv)")
         if not path:
             return
@@ -4766,7 +4777,8 @@ class ResultsTab(QWidget):
                 if canvas is not None:
                     self._row_figures.pop(id(canvas), None)
                 self.figures_tabs.removeTab(i)
-        exp_dir = getattr(self.controller, 'experiment_dir', '')
+        from honeychrome.view_components.scalable_figure_widget import results_folder
+        exp_dir = results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR)
         for title, fig, make in self._extra_figures():
             key = _EXTRA_FIGURE_KEYS.get(title, title)
             widget = ScalableFigureWidget(
@@ -5310,9 +5322,9 @@ class ResultsTab(QWidget):
         if fig is None:
             QMessageBox.warning(self, "Save image", "This population has no figure to save.")
             return
-        fmt = str(getattr(hc_settings, 'graphics_export_format_retrieved', 'png') or 'png').lower()
-        if fmt not in ('png', 'pdf', 'svg'):
-            fmt = 'png'
+        from honeychrome.view_components.scalable_figure_widget import (
+            ask_figure_path, results_folder,
+        )
         comp = self._population_request()[1]
         name = _population_labels(self.state.gate_defs()).get(pop_key, pop_key)
         if comp:
@@ -5320,15 +5332,11 @@ class ResultsTab(QWidget):
         elif self._trend_mode() and self.state.trend:
             name += f" trend {self.state.trend.get('variable', '')}"
         stem = re.sub(r'[^\w.\-]+', '_', name).strip('_')
-        start = str(Path(getattr(self.controller, 'experiment_dir', '') or '.') / f"{stem or 'population'}.{fmt}")
-        filters = "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)"
-        path, selected = QFileDialog.getSaveFileName(
-            self, "Save population image", start, filters,
-            {'png': "PNG (*.png)", 'pdf': "PDF (*.pdf)", 'svg': "SVG (*.svg)"}[fmt])
-        if not path:
+        path = ask_figure_path(
+            self, results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR),
+            stem or 'population', title="Save population image")
+        if path is None:
             return
-        if Path(path).suffix.lower() not in ('.png', '.pdf', '.svg'):
-            path += '.' + selected.split('*.')[-1].rstrip(')')
         try:
             fig.savefig(path, dpi=300, facecolor='white', bbox_inches='tight')
         except Exception as exc:
@@ -5449,7 +5457,8 @@ class ResultsTab(QWidget):
         if what == 'results' and not st.summaries:
             QMessageBox.information(self, "Export Gating Results", "Gate some samples first.")
             return
-        start = str(Path(getattr(self.controller, 'experiment_dir', '')) / EXPORT_DIR)
+        from honeychrome.view_components.scalable_figure_widget import results_folder, start_path
+        start = start_path(results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR), '')
         folder = QFileDialog.getExistingDirectory(self, "Export to folder", start)
         if not folder:
             return
@@ -5525,7 +5534,7 @@ class ResultsTab(QWidget):
         samples = st.gated_samples()
         stem = drc_report.sanitize_filename(Path(st.model_path).stem or 'automated_gating')
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        report_dir = Path(self.controller.experiment_dir) / 'Automated_Gating_Reports' / f"{stem}_{timestamp}"
+        report_dir = Path(self.controller.experiment_dir) / REPORTS_DIR / f"{stem}_{timestamp}"
         token = acquire_job(self.controller, 'Automated Gating: report')
         if token is None:
             self.lbl_export.setText(self.controller.job_gate.busy_text())

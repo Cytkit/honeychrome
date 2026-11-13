@@ -9,13 +9,19 @@ matplotlib.
 
 The figure's canvas is available as ``widget.canvas`` for connecting
 matplotlib events (hover, click).
+
+The module also holds the figure-saving functions shared by the analysis
+plugins, so that every Export button and every pop-out window's Save button
+behaves the same way: figures are written at EXPORT_DPI, trimmed to their
+contents, into the plugin's results folder (``results_folder``) by default,
+and the file written is reported in the main window's status bar.
 """
 
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QFileDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea,
+    QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea,
     QSizePolicy, QSlider, QVBoxLayout, QWidget,
 )
 
@@ -23,7 +29,8 @@ import honeychrome.settings as settings
 from honeychrome.view_components.exportable_plot_widget import apply_plot_theme
 
 __all__ = ['ScalableFigureWidget', 'MIN_SCALE_PCT', 'MAX_SCALE_PCT', 'DEFAULT_SCALE_PCT',
-           'initial_scale_for']
+           'EXPORT_DPI', 'initial_scale_for', 'results_folder', 'start_path', 'save_figure',
+           'report_saved', 'ask_figure_path', 'figure_toolbar']
 
 MIN_SCALE_PCT = 25
 MAX_SCALE_PCT = 400
@@ -32,6 +39,97 @@ RESIZE_DELAY_MS = 120
 EXPORT_DPI = 300
 
 _canvas_class = None
+_FIGURE_FILTERS = {'png': "PNG (*.png)", 'pdf': "PDF (*.pdf)", 'svg': "SVG (*.svg)"}
+
+
+def results_folder(experiment_dir, subfolder) -> Path | str:
+    """The plugin's results folder *subfolder* inside *experiment_dir*, or
+    '' when no experiment is open."""
+    return Path(experiment_dir) / subfolder if experiment_dir else ''
+
+
+def start_path(folder, filename: str) -> str:
+    """*folder*/*filename* as the starting path of a save dialog, creating
+    *folder* first so the dialog opens in it ('.' when there is no folder)."""
+    if folder:
+        try:
+            Path(folder).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    return str(Path(folder or '.') / filename)
+
+
+def save_figure(figure, path, dpi: int = EXPORT_DPI):
+    """Write *figure* to *path* (format from its suffix) at *dpi*, trimmed
+    to its contents and without hover labels, creating the folder when
+    missing."""
+    from honeychrome.view_components.differential_plots import hide_hover_annotations
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hide_hover_annotations(figure)
+    figure.savefig(path, dpi=dpi, bbox_inches='tight')
+
+
+def report_saved(widget, what):
+    """Show "Saved <what>" in the status bar of the main window that
+    *widget* (or the window it sits in) belongs to."""
+    window = widget
+    while window is not None and not isinstance(window, QMainWindow):
+        window = window.parentWidget()
+    if window is not None:
+        window.statusBar().showMessage(f"Saved {what}")
+
+
+def ask_figure_path(parent, folder, stem: str, title: str = "Save figure") -> Path | None:
+    """Ask where to save a figure, starting at *folder*/*stem* in the
+    application's graphics export format; the folder is created first so
+    the dialog opens in it. Returns the chosen path, with a suffix, or None
+    when cancelled."""
+    fmt = str(settings.graphics_export_format_retrieved or 'png').lower()
+    if fmt not in _FIGURE_FILTERS:
+        fmt = 'png'
+    start = start_path(folder, f"{stem}.{fmt}")
+    path, selected = QFileDialog.getSaveFileName(
+        parent, title, start, ";;".join(_FIGURE_FILTERS.values()), _FIGURE_FILTERS[fmt])
+    if not path:
+        return None
+    if Path(path).suffix.lower().lstrip('.') not in _FIGURE_FILTERS:
+        path += '.' + (selected.split('*.')[-1].rstrip(')') if '*.' in selected else fmt)
+    return Path(path)
+
+
+def figure_toolbar(canvas, parent, folder, stem: str, save=None):
+    """
+    Matplotlib's navigation toolbar for *canvas*, whose Save button asks for
+    a file name (starting in *folder*, named *stem*), saves at EXPORT_DPI
+    and reports the file in the status bar.
+
+    save : optional callable taking the chosen path, used in place of
+           saving the canvas's figure as it is (e.g. to save it at its
+           natural size).
+    """
+    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+
+    class _ExportToolbar(NavigationToolbar2QT):
+        def save_figure(self, *_args):
+            widget = self.canvas
+            if widget is None:
+                return
+            path = ask_figure_path(widget, folder, stem)
+            if path is None:
+                return
+            try:
+                if save is not None:
+                    save(path)
+                else:
+                    save_figure(widget.figure, path)
+                    widget.draw_idle()
+            except Exception as exc:
+                QMessageBox.warning(widget, "Save failed", str(exc))
+                return
+            report_saved(widget, path)
+
+    return _ExportToolbar(canvas, parent)
 
 
 def initial_scale_for(figure, preferred: int = DEFAULT_SCALE_PCT, max_height_px: int = 8000) -> int:
@@ -67,7 +165,9 @@ class ScalableFigureWidget(QWidget):
 
     figure         : the matplotlib Figure to show.
     title          : used for the export file name.
-    experiment_dir : folder the exported graphic is written to.
+    experiment_dir : folder the exported graphic is written to (the
+                     plugin's results folder, see results_folder); also
+                     where the pop-out toolbar's Save dialog starts.
     pop_out        : optional callable with no arguments that opens the
                      figure in its own window.
     initial_scale  : starting size in percent of the natural size (large
@@ -185,7 +285,8 @@ class ScalableFigureWidget(QWidget):
                                  max(80, int(self._natural_h * pct / 100)))
 
     def export_graphic(self):
-        """Save the figure in the application's graphics export format."""
+        """Save the figure in the application's graphics export format to
+        the export folder, and report the file in the status bar."""
         fmt = settings.graphics_export_format_retrieved
         if not self.experiment_dir:
             QMessageBox.warning(self, "Export", "There is no experiment folder to export to.")
@@ -196,49 +297,24 @@ class ScalableFigureWidget(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Export failed", str(exc))
             return
-        QMessageBox.information(
-            self, "Exported",
-            f"Exported {fmt} graphic file:\n{path.name}\nto {path.parent}")
+        report_saved(self, path)
 
     def save_full_size(self, path, dpi: int = EXPORT_DPI):
         """Save the figure at its natural size, whatever size it is shown at,
-        at *dpi* and trimmed to its contents, without hover labels."""
-        from honeychrome.view_components.differential_plots import hide_hover_annotations
+        as save_figure does."""
         shown = tuple(self.figure.get_size_inches())
-        hide_hover_annotations(self.figure)
         self.figure.set_size_inches(*self._natural_inches, forward=False)
         try:
-            self.figure.savefig(path, dpi=dpi, bbox_inches='tight')
+            save_figure(self.figure, path, dpi)
         finally:
             self.figure.set_size_inches(*shown, forward=False)
             self.canvas.draw_idle()
 
-    def save_full_size_as(self):
-        """Ask for a file name, then save as save_full_size does."""
-        fmt = settings.graphics_export_format_retrieved
-        start = str(Path(self.experiment_dir or '.') / f"{self.export_stem}.{fmt}")
-        path, _selected = QFileDialog.getSaveFileName(
-            self, "Save figure", start, "PNG (*.png);;PDF (*.pdf);;SVG (*.svg);;All files (*)")
-        if not path:
-            return
-        if not Path(path).suffix:
-            path += f".{fmt}"
-        try:
-            self.save_full_size(path)
-        except Exception as exc:
-            QMessageBox.warning(self, "Save failed", str(exc))
-
     def make_toolbar(self, parent=None):
         """Matplotlib's navigation toolbar for this figure, whose Save button
-        saves the full figure as Export does."""
-        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
-        widget = self
-
-        class _FullSizeSaveToolbar(NavigationToolbar2QT):
-            def save_figure(self, *_args):
-                widget.save_full_size_as()
-
-        return _FullSizeSaveToolbar(self.canvas, parent)
+        saves the full figure as Export does, starting in the export folder."""
+        return figure_toolbar(self.canvas, parent, self.experiment_dir, self.export_stem,
+                              save=self.save_full_size)
 
     def _on_leave(self, _event):
         from honeychrome.view_components.differential_plots import hide_hover_annotations

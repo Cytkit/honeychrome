@@ -1077,6 +1077,11 @@ back to the settings that produced it.</li>
 <p>The items reflect what is currently shown elsewhere, so click
 <b>Refresh Items</b> after changing anything on the Layout, Cluster
 Annotation or Stats tabs.</p>
+<p>Single figures exported from the tabs (<b>Export Figure</b>, the save
+button of a popped-out figure, Layout exports) go to
+<tt>Honeycluster_Reports</tt> by default, at 300 dpi (Layout exports at the
+resolution chosen in their dialog); the status bar at the bottom of the
+window shows the file written.</p>
 ''' + _workflow('Report') + _GLOSSARY
 
 

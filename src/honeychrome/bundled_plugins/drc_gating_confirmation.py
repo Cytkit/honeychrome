@@ -54,6 +54,9 @@ from PySide6.QtWidgets import (
 from honeychrome.controller_components.job_gate import acquire_job
 from honeychrome.view_components.differential_plots import significance_column
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
+from honeychrome.view_components.scalable_figure_widget import (
+    ask_figure_path, figure_toolbar, report_saved, results_folder, start_path,
+)
 
 import drc_gate_finder as gf
 import drc_help_texts
@@ -1161,7 +1164,7 @@ class GatingConfirmationTab(QWidget):
         return self._figure(self._run, entry, compromise, self._title(self._run, self._shown))
 
     def _open_window(self):
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
         fig = self._current_figure()
         if fig is None:
@@ -1170,7 +1173,8 @@ class GatingConfirmationTab(QWidget):
         dialog.setWindowTitle(self._title(self._run, self._shown))
         lay = QVBoxLayout(dialog)
         canvas = FigureCanvasQTAgg(fig)
-        lay.addWidget(NavigationToolbar2QT(canvas, dialog))
+        lay.addWidget(figure_toolbar(canvas, dialog, self._export_folder(), self._image_stem(),
+                                     save=self.save_image))
         lay.addWidget(canvas)
         dialog.resize(int(fig.get_figwidth() * 110), int(fig.get_figheight() * 110) + 60)
         dialog.setAttribute(Qt.WA_DeleteOnClose)
@@ -1185,19 +1189,25 @@ class GatingConfirmationTab(QWidget):
         fig.savefig(str(path), dpi=IMAGE_DPI, bbox_inches='tight')
         return True
 
+    def _export_folder(self):
+        """Where gating hierarchy images are saved by default."""
+        return results_folder(getattr(self.controller, 'experiment_dir', ''),
+                              drc_report.REPORTS_SUBDIR)
+
+    def _image_stem(self) -> str:
+        names = self._names()
+        return drc_report.sanitize_filename(
+            'gating_' + '_'.join(cluster_name(names, c) for c in self._shown))
+
     def _save_image_dialog(self):
         if self._current_figure() is None:
             return
-        names = self._names()
-        stem = drc_report.sanitize_filename(
-            'gating_' + '_'.join(cluster_name(names, c) for c in self._shown))
-        start = str(self.controller.experiment_dir / f'{stem}.png') \
-            if getattr(self.controller, 'experiment_dir', None) else f'{stem}.png'
-        path, _selected = QFileDialog.getSaveFileName(
-            self, 'Save gating hierarchy', start, 'PNG (*.png);;PDF (*.pdf);;SVG (*.svg)')
+        path = ask_figure_path(self, self._export_folder(), self._image_stem(),
+                               title='Save gating hierarchy')
         if path:
             self.save_image(path)
             self.lbl_status.setText(f'Saved {path}')
+            report_saved(self, path)
 
     def summary_table(self, run: dict | None = None) -> pd.DataFrame:
         """One row per cluster of *run* (default: the selected run): size,
@@ -1289,10 +1299,8 @@ class GatingConfirmationTab(QWidget):
     def _export_csv_dialog(self):
         if self._run is None:
             return
-        start = str(self.controller.experiment_dir) \
-            if getattr(self.controller, 'experiment_dir', None) else ''
         base = QFileDialog.getExistingDirectory(self, 'Folder for the gating confirmation CSVs',
-                                                start)
+                                                start_path(self._export_folder(), ''))
         if not base:
             return
         from pathlib import Path
