@@ -27,9 +27,11 @@ in the bundle runs/<run_id>.gating_confirmation (drc_run_archive), with the
 settings they were found with, plus the last settings and the clusters
 ticked for the report.
 
-Thresholds are shown on the run's transform scale (the plots' axes) and in
-raw intensity (the unmixed value before the transform), so the gates can be
-redrawn elsewhere.
+Thresholds are shown on the run's transform scale (where the gates were
+found) and in raw intensity (the unmixed value before the transform), so the
+gates can be redrawn elsewhere. The plots (drc_gating_plots) are drawn as in
+Unmixed Data, on display axes that start from Honeycluster's transforms and
+can be adjusted on the page; adjustments are saved with the run's results.
 """
 
 from __future__ import annotations
@@ -41,11 +43,11 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDoubleSpinBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QListWidget,
+    QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
     QVBoxLayout, QWidget,
@@ -54,27 +56,32 @@ from PySide6.QtWidgets import (
 from honeychrome.controller_components.job_gate import acquire_job
 from honeychrome.view_components.differential_plots import significance_column
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
-from honeychrome.view_components.scalable_figure_widget import (
-    ask_figure_path, figure_toolbar, report_saved, results_folder, start_path,
-)
 
 import drc_gate_finder as gf
+import drc_gating_plots as gp
 import drc_help_texts
 import drc_persist
 import drc_pipeline
 import drc_report
 import drc_run_align
 import drc_run_archive
+import drc_stats
 from drc_logging import get_logger
 
 log = get_logger(__name__)
 
 JOB_LABEL = 'Honeycluster: gating confirmation'
-DISPLAY_EVENTS = 20_000
 SETTINGS_FIELD = 'settings'
+AXES_FIELD = 'axes'
+LABELS_FIELD = 'labels'
 REPORT_FIELD = 'report'
 REPORT_SECTION = 'Gating confirmation'
 IMAGE_DPI = 300
+TABLE_MIN_HEIGHT = 240
+TRADEOFF_HELP = ('Shown for clusters whose targets are not met: the gates that best balance '
+                 'keeping the cluster (recall) and excluding other cells (purity), at three '
+                 'weightings. Balance 0.5 favours purity, 1 weighs both equally, 2 favours '
+                 'keeping cells.')
 
 FILTER_ALL = 'all'
 FILTER_SIGNIFICANT = 'significant'
@@ -109,10 +116,11 @@ DEFAULT_SETTINGS = {
 
 @dataclass
 class RunEvents:
-    """A run's stored events on its own transforms: values (columns =
-    channels), cluster labels, sample index, and the number of clustered
-    cells each event stands for."""
+    """A run's stored events on its own transforms (X) and untransformed
+    (raw), columns = channels, with cluster labels, sample index, and the
+    number of clustered cells each event stands for."""
     X: np.ndarray
+    raw: np.ndarray
     labels: np.ndarray
     sample: np.ndarray
     weights: np.ndarray
@@ -138,7 +146,7 @@ def run_events(controller, cl_run: dict) -> tuple[RunEvents | None, str]:
         for c, n in zip(ids.tolist(), counts.tolist()):
             if c >= 0:
                 totals[c] = totals.get(c, 0) + n
-    xs, labs, samp, names = [], [], [], []
+    xs, raws, labs, samp, names = [], [], [], [], []
     for rel in sorted(stored):
         labels = labels_of.get(rel)
         if labels is None:
@@ -156,6 +164,8 @@ def run_events(controller, cl_run: dict) -> tuple[RunEvents | None, str]:
             missing = sorted(set(channels) - set(kept))
             return None, f'The stored events lack channel(s) {", ".join(missing)}.'
         xs.append(X)
+        raws.append(np.column_stack([np.asarray(values[keep][:, value_names.index(ch)],
+                                                dtype=np.float32) for ch in channels]))
         labs.append(lab[keep].astype(np.int32))
         samp.append(np.full(int(keep.sum()), len(names), dtype=np.int32))
         names.append(rel)
@@ -165,7 +175,8 @@ def run_events(controller, cl_run: dict) -> tuple[RunEvents | None, str]:
     ids, stored_counts = np.unique(labels, return_counts=True)
     per_event = {int(c): totals.get(int(c), n) / n for c, n in zip(ids, stored_counts)}
     weights = np.array([per_event[int(c)] for c in labels], dtype=np.float64)
-    return RunEvents(np.concatenate(xs), labels, np.concatenate(samp), weights,
+    return RunEvents(np.concatenate(xs), np.concatenate(raws), labels, np.concatenate(samp),
+                     weights,
                      channels, names, totals), ''
 
 
@@ -197,23 +208,24 @@ def save_fields(controller, run_id: str, fields: dict) -> None:
         drc_persist.save_bundle(path, fields)
 
 
-def cluster_fdr(state, run_id: str, names: dict) -> dict:
+def cluster_fdr(state, run_id: str) -> dict:
     """{cluster id: smallest adjusted p over the frequency and counts tests}
-    for the run whose statistics are loaded; {} for any other run."""
+    for the run whose statistics are loaded; {} for any other run. Table
+    features are matched to clusters through the names Stats recorded with
+    its results (drc_stats.stored_cluster_names), so clusters without a
+    name of their own are found too."""
     if getattr(state, 'stats_run_id', None) != run_id:
         return {}
-    by_name = {}
+    id_of = {str(name): int(c) for c, name in drc_stats.stored_cluster_names(state).items()}
+    out: dict = {}
     for table in (getattr(state, 'freq_results', None), getattr(state, 'counts_results', None)):
         if table is None or table.empty or 'feature' not in table.columns:
             continue
         col, _label = significance_column(table, getattr(state, 'stats_fdr_scope', 'global'))
         for feature, p in table.groupby('feature')[col].min().items():
-            by_name[str(feature)] = min(float(p), by_name.get(str(feature), 1.0))
-    out = {}
-    for c in names:
-        p = by_name.get(cluster_name(names, int(c)))
-        if p is not None:
-            out[int(c)] = p
+            c = id_of.get(str(feature))
+            if c is not None:
+                out[c] = min(float(p), out.get(c, 1.0))
     return out
 
 
@@ -245,7 +257,7 @@ def raw_value(cl_run: dict, channel: str, value):
 def finding_tables(cl_run: dict, f: dict, compromise: bool, labels: dict, names: dict,
                    samples: list) -> dict:
     """The tables behind a result: gates (one row per marker, thresholds on
-    the plot scale and in raw intensity, metrics after its step), per sample,
+    the run's transform scale and in raw intensity, metrics after its step), per sample,
     impurity, fewer markers and trade-off. Per sample and impurity describe
     the gating strategy."""
     cuts = f['compromise'] if compromise else f['strategy']
@@ -276,82 +288,6 @@ def finding_tables(cl_run: dict, f: dict, compromise: bool, labels: dict, names:
         'fewer_markers': pd.DataFrame(f['path']).rename(columns={'n_markers': 'markers'}),
         'tradeoff': pd.DataFrame(f['tradeoff']),
     }
-
-
-def make_hierarchy_figure(events: 'RunEvents', f: dict, clusters: list, colour: str,
-                          labels: dict, compromise: bool, title: str = ''):
-    """One biaxial plot per step (or the compromise's markers in pairs):
-    the events passing the earlier steps, the cluster's in its colour, the
-    gate as a rectangle; a single-marker step as a histogram. Events are a
-    weighted draw of the stored sample, so cluster sizes look as in the
-    data. Returns a canvas-less matplotlib Figure."""
-    from matplotlib.figure import Figure
-    from matplotlib.patches import Rectangle
-
-    cuts = f['compromise'] if compromise else f['strategy']
-    chans = list(cuts)
-    if not compromise and f['steps']:
-        pairs = [(s['x'], s['y']) for s in f['steps']]
-    else:
-        pairs = [(chans[i], chans[i + 1] if i + 1 < len(chans) else None)
-                 for i in range(0, len(chans), 2)]
-    rng = np.random.default_rng(0)
-    n = len(events.labels)
-    pick = rng.choice(n, size=min(DISPLAY_EVENTS, n), replace=False,
-                      p=events.weights / events.weights.sum())
-    X = events.X[pick]
-    in_target = np.isin(events.labels[pick], clusters)
-    col = {ch: i for i, ch in enumerate(events.channels)}
-    alive = np.ones(len(pick), dtype=bool)
-    ncol = min(3, len(pairs))
-    nrow = int(np.ceil(len(pairs) / ncol))
-    fig = Figure(figsize=(3.4 * ncol, 3.3 * nrow + (0.4 if title else 0)), dpi=100)
-    for k, (cx, cy) in enumerate(pairs, 1):
-        ax = fig.add_subplot(nrow, ncol, k)
-        x = X[:, col[cx]]
-        lo_x, hi_x = cuts[cx]
-        if cy is None:
-            bins = np.linspace(np.quantile(x[alive], 0.002), np.quantile(x[alive], 0.998), 80)
-            ax.hist(x[alive & ~in_target], bins=bins, color='#bbbbbb')
-            ax.hist(x[alive & in_target], bins=bins, color=colour, alpha=0.8)
-            for v in (lo_x, hi_x):
-                if v is not None:
-                    ax.axvline(v, color='black', lw=1.2)
-            ax.set_xlabel(labels.get(cx, cx))
-            ax.set_ylabel('Cells')
-            inside = (x >= (lo_x if lo_x is not None else -np.inf)) & \
-                     (x <= (hi_x if hi_x is not None else np.inf))
-        else:
-            y = X[:, col[cy]]
-            ax.scatter(x[alive & ~in_target], y[alive & ~in_target], s=1, c='#bbbbbb',
-                       linewidths=0, rasterized=True)
-            ax.scatter(x[alive & in_target], y[alive & in_target], s=1, c=colour,
-                       linewidths=0, rasterized=True)
-            xl = np.quantile(x[alive], [0.002, 0.998])
-            yl = np.quantile(y[alive], [0.002, 0.998])
-            lo_y, hi_y = cuts[cy]
-            x0 = lo_x if lo_x is not None else min(xl[0], x[alive].min())
-            x1 = hi_x if hi_x is not None else max(xl[1], x[alive].max())
-            y0 = lo_y if lo_y is not None else min(yl[0], y[alive].min())
-            y1 = hi_y if hi_y is not None else max(yl[1], y[alive].max())
-            ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
-                                   edgecolor='black', lw=1.2))
-            ax.set_xlim(min(xl[0], x0) - 0.02, max(xl[1], x1) + 0.02)
-            ax.set_ylim(min(yl[0], y0) - 0.02, max(yl[1], y1) + 0.02)
-            ax.set_xlabel(labels.get(cx, cx))
-            ax.set_ylabel(labels.get(cy, cy))
-            inside = (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
-        name = f'Step {k}' if len(pairs) > 1 else 'Gate'
-        step = f['steps'][k - 1] if not compromise and k <= len(f['steps']) else None
-        if step is not None:
-            name += f': {_pct(step["recall"])} kept, {_pct(step["purity"])} pure'
-        ax.set_title(name, fontsize=9)
-        ax.tick_params(labelsize=7)
-        alive &= inside
-    if title:
-        fig.suptitle(title, fontsize=10)
-    fig.tight_layout()
-    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +425,14 @@ class GatingConfirmationTab(QWidget):
         self._token = None
         self._shown = None
         self._loading = False
+        self._axes: dict = {}
+        self._plot_set: gp.GatingPlotSet | None = None
+        self._shown_compromise = False
+        self._windows: list = []
+        self._axes_timer = QTimer(self)
+        self._axes_timer.setSingleShot(True)
+        self._axes_timer.setInterval(800)
+        self._axes_timer.timeout.connect(self._save_axes)
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -614,7 +558,7 @@ class GatingConfirmationTab(QWidget):
 
         right = QWidget()
         rl = QVBoxLayout(right)
-        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setContentsMargins(0, 0, 6, 0)
         head = QHBoxLayout()
         self.lbl_title = QLabel('')
         self.lbl_title.setWordWrap(True)
@@ -634,7 +578,13 @@ class GatingConfirmationTab(QWidget):
         self.chk_report.toggled.connect(self._on_report_toggled)
         actions.addWidget(self.chk_report)
         actions.addStretch(1)
+        self.axes_btn = QPushButton('Reset axes')
+        self.axes_btn.setToolTip('Set every axis back to the transforms of Honeycluster\'s '
+                                 'Transforms tab.')
+        self.axes_btn.clicked.connect(self._reset_all_axes)
+        actions.addWidget(self.axes_btn)
         self.window_btn = QPushButton('⤢ Open in window')
+        self.window_btn.setToolTip('Show every plot of the hierarchy at once, in rows.')
         self.window_btn.clicked.connect(self._open_window)
         actions.addWidget(self.window_btn)
         self.image_btn = QPushButton('Save image…')
@@ -652,24 +602,51 @@ class GatingConfirmationTab(QWidget):
         self.lbl_verdict.setWordWrap(True)
         self.lbl_verdict.setTextFormat(Qt.RichText)
         rl.addWidget(self.lbl_verdict)
+
+        # The plots in one row, scrolling sideways when they do not fit.
+        self.plot_row = gp.GatingPlotRow()
+        self.plot_row.transformsEdited.connect(self._on_axes_edited)
+        self.plot_row.labelsMoved.connect(self._on_labels_moved)
         self.figure_scroll = QScrollArea()
         self.figure_scroll.setWidgetResizable(True)
-        self.figure_scroll.setMinimumHeight(360)
-        rl.addWidget(self.figure_scroll, stretch=3)
+        self.figure_scroll.setFrameShape(QFrame.NoFrame)
+        self.figure_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.figure_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.figure_scroll.setWidget(self.plot_row)
+        bar = self.figure_scroll.horizontalScrollBar().sizeHint().height()
+        self.figure_scroll.setFixedHeight(gp.GatingPlotRow.plot_size() + bar + 6)
+        rl.addWidget(self.figure_scroll)
+        self.lbl_plots = QLabel('')
+        self.lbl_plots.setWordWrap(True)
+        self.lbl_plots.setStyleSheet('color: grey;')
+        rl.addWidget(self.lbl_plots)
+
         self.detail_tabs = QTabWidget()
-        self.steps_table = _table(['Step', 'Marker', 'Gate (plot scale)', 'Gate (raw intensity)',
+        self.steps_table = _table(['Step', 'Marker', 'Gate (run scale)', 'Gate (raw intensity)',
                                    'Recall', 'Purity'])
         self.samples_table = _table(['Sample', 'Cluster events', 'Recall', 'Purity'])
         self.samples_table.setSortingEnabled(True)
         self.impurity_table = _table(['Cluster', 'Share of the gate'])
         self.path_table = _table(['Markers', 'Recall', 'Purity'])
         self.tradeoff_table = _table(['Balance (beta)', 'Markers', 'Recall', 'Purity'])
+        self.tradeoff_table.horizontalHeaderItem(0).setToolTip(TRADEOFF_HELP)
+        for t in (self.steps_table, self.samples_table, self.impurity_table,
+                  self.path_table, self.tradeoff_table):
+            t.setMinimumHeight(TABLE_MIN_HEIGHT)
         self.detail_tabs.addTab(self.steps_table, 'Steps')
         self.detail_tabs.addTab(self.samples_table, 'Per sample')
         self.detail_tabs.addTab(self.impurity_table, 'Impurity')
         self.detail_tabs.addTab(self.path_table, 'Fewer markers')
-        self.detail_tabs.addTab(self.tradeoff_table, 'Trade-off')
-        rl.addWidget(self.detail_tabs, stretch=2)
+        self.tradeoff_index = self.detail_tabs.addTab(self.tradeoff_table, 'Trade-off')
+        rl.addWidget(self.detail_tabs, stretch=1)
+
+        # The whole right-hand side scrolls up and down.
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        right_scroll.setWidget(right)
+        right = right_scroll
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 5)
@@ -752,6 +729,9 @@ class GatingConfirmationTab(QWidget):
         self._on_run_changed()
 
     def _on_run_changed(self):
+        if self._axes_timer.isActive():
+            self._axes_timer.stop()
+            self._save_axes()
         run_id = self.run_combo.currentData()
         entry = next((e for e in self.state.clustering_runs if e.get('run_id') == run_id), None)
         self._run = None if entry is None else drc_run_archive.hydrate_run(self.controller, entry)
@@ -814,7 +794,7 @@ class GatingConfirmationTab(QWidget):
             return
         names = self._names()
         colours = self._run.get('colors') or {}
-        fdr = cluster_fdr(self.state, self._run['run_id'], names)
+        fdr = cluster_fdr(self.state, self._run['run_id'])
         threshold = float(self._fdr_threshold())
         totals = {}
         for labels in (self._run.get('labels') or {}).values():
@@ -881,8 +861,12 @@ class GatingConfirmationTab(QWidget):
         if self.run_combo.currentIndex() != i:
             self.run_combo.setCurrentIndex(i)
         if isinstance(cluster, str):
-            names = self._names()
-            match = [c for c in self._clusters() if cluster_name(names, c) == cluster]
+            stats_names = drc_stats.stored_cluster_names(self.state) \
+                if getattr(self.state, 'stats_run_id', None) == run_id else {}
+            match = [int(c) for c, name in stats_names.items() if str(name) == cluster]
+            if not match:
+                names = self._names()
+                match = [c for c in self._clusters() if cluster_name(names, c) == cluster]
             if not match:
                 return
             cluster = match[0]
@@ -977,7 +961,10 @@ class GatingConfirmationTab(QWidget):
     def _clear_detail(self):
         self.lbl_title.setText('')
         self.lbl_verdict.setText('')
-        self.figure_scroll.takeWidget()
+        self.lbl_plots.setText('')
+        self.plot_row.clear()
+        self._plot_set = None
+        self.detail_tabs.setTabEnabled(self.tradeoff_index, True)
         for t in (self.steps_table, self.samples_table, self.impurity_table,
                   self.path_table, self.tradeoff_table):
             t.setRowCount(0)
@@ -1030,7 +1017,7 @@ class GatingConfirmationTab(QWidget):
         self.chk_report.setChecked(target_key(self._shown) in self._report_keys(self._run['run_id']))
         self._loading = False
         has_result = entry is not None and 'finding' in entry
-        for w in (self.chk_report, self.window_btn, self.image_btn):
+        for w in (self.chk_report, self.window_btn, self.image_btn, self.axes_btn):
             w.setEnabled(has_result)
         if entry is None:
             self.lbl_verdict.setText('Not run yet: click <b>Find gating strategy</b>.')
@@ -1099,6 +1086,14 @@ class GatingConfirmationTab(QWidget):
                                         (t['recall'], _pct(t['recall'])),
                                         (t['purity'], _pct(t['purity']))]
                                        for t in tables['tradeoff'].to_dict('records')])
+        has_tradeoff = not tables['tradeoff'].empty
+        self.detail_tabs.setTabEnabled(self.tradeoff_index, has_tradeoff)
+        self.detail_tabs.setTabToolTip(
+            self.tradeoff_index,
+            TRADEOFF_HELP if has_tradeoff else 'Not needed: this cluster\'s targets are met. '
+            + TRADEOFF_HELP)
+        if not has_tradeoff and self.detail_tabs.currentIndex() == self.tradeoff_index:
+            self.detail_tabs.setCurrentIndex(0)
 
     def _samples(self, run: dict | None = None) -> list:
         events = self._events.get((run or self._run)['run_id'])
@@ -1108,8 +1103,16 @@ class GatingConfirmationTab(QWidget):
         colours = run.get('colors') or {}
         return colours.get(clusters[0], colours.get(str(clusters[0]), '#d62728'))
 
-    def _figure(self, run: dict, entry: dict, compromise: bool = False, title: str = ''):
-        """The hierarchy figure of a saved result, or None."""
+    def _transform_set(self, run: dict):
+        """The display axes of *run*'s plots, loaded once."""
+        run_id = run['run_id']
+        if run_id not in self._axes:
+            saved = (self._results.get(run_id) or {}).get(AXES_FIELD)
+            self._axes[run_id] = gp.display_transforms(self.controller, self.state, run, saved)
+        return self._axes[run_id]
+
+    def _make_plot_set(self, run: dict, entry: dict, compromise: bool = False):
+        """The plot data of a saved result, or None."""
         events = self._events_for(run)
         f = entry.get('finding')
         if events is None or f is None:
@@ -1117,21 +1120,102 @@ class GatingConfirmationTab(QWidget):
         cuts = f['compromise'] if compromise else f['strategy']
         if not cuts:
             return None
-        return make_hierarchy_figure(events, f, entry['clusters'],
-                                     self._colour(run, entry['clusters']),
-                                     self._channel_labels(), compromise, title)
+        tset = self._transform_set(run)
+        missing = [ch for ch in cuts if ch not in tset.objects]
+        if missing:
+            log.warning(f'Gating confirmation: no transform for {missing}')
+            return None
+        plot_set = gp.GatingPlotSet(events, f, entry['clusters'], compromise, tset.objects,
+                                    lambda ch, v: raw_value(run, ch, v), self._channel_labels())
+        saved = ((self._results.get(run['run_id']) or {}).get(LABELS_FIELD) or {}).get(
+            self._labels_key(entry['clusters'], compromise)) or {}
+        plot_set.label_positions = {g: (float(p[0]), float(p[1])) for g, p in saved.items()
+                                    if g in plot_set.names}
+        return plot_set
+
+    @staticmethod
+    def _labels_key(clusters, compromise: bool) -> str:
+        return f'{target_key(clusters)}|{"compromise" if compromise else "strategy"}'
+
+    def _on_labels_moved(self):
+        """A gate label of the shown plots was dragged or put back: redraw
+        open windows and save where the labels are."""
+        for row in list(self._windows):
+            try:
+                row.redraw()
+            except RuntimeError:
+                self._windows.remove(row)
+        self._save_labels()
+
+    def _on_window_labels_moved(self):
+        self.plot_row.redraw()
+        self._save_labels()
+
+    def _save_labels(self):
+        if self._run is None or self._plot_set is None or not self._shown:
+            return
+        run_id = self._run['run_id']
+        labels = dict(self._results.setdefault(run_id, {}).get(LABELS_FIELD) or {})
+        key = self._labels_key(self._shown, self._shown_compromise)
+        positions = {g: list(p) for g, p in self._plot_set.label_positions.items()}
+        if positions:
+            labels[key] = positions
+        else:
+            labels.pop(key, None)
+        self._results[run_id][LABELS_FIELD] = labels
+        save_fields(self.controller, run_id, {LABELS_FIELD: labels})
+
+    def _figure(self, run: dict, entry: dict, compromise: bool = False, title: str = ''):
+        """The hierarchy figure of a saved result (matplotlib), or None."""
+        plot_set = self._make_plot_set(run, entry, compromise)
+        if plot_set is None:
+            return None
+        return gp.make_hierarchy_figure(plot_set, self._colour(run, entry['clusters']), title)
 
     def _draw(self, f: dict, cuts: dict, clusters: list[int], compromise: bool):
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-
         entry = self._entry(clusters)
-        fig = None if entry is None else self._figure(self._run, entry, compromise)
-        if fig is None:
-            self.figure_scroll.takeWidget()
+        self._shown_compromise = compromise
+        self._plot_set = None if entry is None else self._make_plot_set(self._run, entry,
+                                                                         compromise)
+        if self._plot_set is None:
+            self.plot_row.clear()
+            self.lbl_plots.setText('')
             return
-        canvas = FigureCanvasQTAgg(fig)
-        canvas.setMinimumHeight(int(fig.get_figheight() * 100))
-        self.figure_scroll.setWidget(canvas)
+        self.plot_row.show_set(self._plot_set, self._colour(self._run, clusters),
+                               self._transform_set(self._run))
+        self.lbl_plots.setText(
+            f'{len(self._plot_set.data["plots"])} plot(s), each of the cells left by the one '
+            'before it; the cluster\'s cells in its colour over the density of all cells. '
+            'Drag an axis or right-click its label to change its scale, as in Unmixed Data.')
+
+    def _on_axes_edited(self):
+        """An axis of the shown plots changed: redraw open windows, save soon."""
+        for row in list(self._windows):
+            try:
+                row.redraw()
+            except RuntimeError:
+                self._windows.remove(row)
+        self._axes_timer.start()
+
+    def _on_window_axes_edited(self):
+        self.plot_row.redraw()
+        self._on_axes_edited()
+
+    def _save_axes(self):
+        if self._run is None or self._run['run_id'] not in self._axes:
+            return
+        run_id = self._run['run_id']
+        params = self._axes[run_id].params()
+        self._results.setdefault(run_id, {})[AXES_FIELD] = params
+        save_fields(self.controller, run_id, {AXES_FIELD: params})
+
+    def _reset_all_axes(self):
+        if self._run is None or self._run['run_id'] not in self._axes:
+            return
+        tset = self._axes[self._run['run_id']]
+        gp.reset_channels(tset, list(tset.objects))
+        self.plot_row.redraw()
+        self._on_axes_edited()
 
     # ------------------------------------------------------------------
     # Report, image and CSV export
@@ -1164,19 +1248,29 @@ class GatingConfirmationTab(QWidget):
         return self._figure(self._run, entry, compromise, self._title(self._run, self._shown))
 
     def _open_window(self):
-        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-
-        fig = self._current_figure()
-        if fig is None:
+        if self._run is None or not self._shown or self._plot_set is None:
             return
         dialog = QDialog(self)
         dialog.setWindowTitle(self._title(self._run, self._shown))
         lay = QVBoxLayout(dialog)
-        canvas = FigureCanvasQTAgg(fig)
-        lay.addWidget(figure_toolbar(canvas, dialog, self._export_folder(), self._image_stem(),
-                                     save=self.save_image))
-        lay.addWidget(canvas)
-        dialog.resize(int(fig.get_figwidth() * 110), int(fig.get_figheight() * 110) + 60)
+        row = gp.GatingPlotRow(columns=gp.FIGURE_COLUMNS)
+        row.show_set(self._plot_set, self._colour(self._run, self._shown),
+                     self._transform_set(self._run))
+        row.transformsEdited.connect(self._on_window_axes_edited)
+        row.labelsMoved.connect(self._on_window_labels_moved)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        area.setWidget(row)
+        lay.addWidget(area)
+        self._windows.append(row)
+        dialog.destroyed.connect(lambda *_a, r=row: self._windows.remove(r)
+                                 if r in self._windows else None)
+        size = gp.GatingPlotRow.plot_size()
+        n = len(self._plot_set.data['plots'])
+        ncol = min(n, gp.FIGURE_COLUMNS)
+        nrow = (n + gp.FIGURE_COLUMNS - 1) // gp.FIGURE_COLUMNS
+        dialog.resize(ncol * (size + 6) + 60, min(nrow * (size + 6) + 60, 900))
         dialog.setAttribute(Qt.WA_DeleteOnClose)
         dialog.show()
 
@@ -1189,25 +1283,19 @@ class GatingConfirmationTab(QWidget):
         fig.savefig(str(path), dpi=IMAGE_DPI, bbox_inches='tight')
         return True
 
-    def _export_folder(self):
-        """Where gating hierarchy images are saved by default."""
-        return results_folder(getattr(self.controller, 'experiment_dir', ''),
-                              drc_report.REPORTS_SUBDIR)
-
-    def _image_stem(self) -> str:
-        names = self._names()
-        return drc_report.sanitize_filename(
-            'gating_' + '_'.join(cluster_name(names, c) for c in self._shown))
-
     def _save_image_dialog(self):
         if self._current_figure() is None:
             return
-        path = ask_figure_path(self, self._export_folder(), self._image_stem(),
-                               title='Save gating hierarchy')
+        names = self._names()
+        stem = drc_report.sanitize_filename(
+            'gating_' + '_'.join(cluster_name(names, c) for c in self._shown))
+        start = str(self.controller.experiment_dir / f'{stem}.png') \
+            if getattr(self.controller, 'experiment_dir', None) else f'{stem}.png'
+        path, _selected = QFileDialog.getSaveFileName(
+            self, 'Save gating hierarchy', start, 'PNG (*.png);;PDF (*.pdf);;SVG (*.svg)')
         if path:
             self.save_image(path)
             self.lbl_status.setText(f'Saved {path}')
-            report_saved(self, path)
 
     def summary_table(self, run: dict | None = None) -> pd.DataFrame:
         """One row per cluster of *run* (default: the selected run): size,
@@ -1219,7 +1307,7 @@ class GatingConfirmationTab(QWidget):
         names = run.get('names') or {}
         labels = self._channel_labels()
         results = self._results.get(run['run_id']) or {}
-        fdr = cluster_fdr(self.state, run['run_id'], names)
+        fdr = cluster_fdr(self.state, run['run_id'])
         totals = {}
         for lab in (run.get('labels') or {}).values():
             ids, counts = np.unique(np.asarray(lab), return_counts=True)
@@ -1299,8 +1387,10 @@ class GatingConfirmationTab(QWidget):
     def _export_csv_dialog(self):
         if self._run is None:
             return
+        start = str(self.controller.experiment_dir) \
+            if getattr(self.controller, 'experiment_dir', None) else ''
         base = QFileDialog.getExistingDirectory(self, 'Folder for the gating confirmation CSVs',
-                                                start_path(self._export_folder(), ''))
+                                                start)
         if not base:
             return
         from pathlib import Path

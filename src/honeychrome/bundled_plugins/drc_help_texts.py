@@ -1165,9 +1165,27 @@ Report tab, beside a summary of every cluster of the run. <b>Save
 image…</b> writes the hierarchy as PNG, PDF or SVG; <b>Export CSV…</b>
 writes the summary and the tables of every cluster with a result to a new
 folder.</li>
-<li>Gates are given on the plot scale and in <b>raw intensity</b> (the
-unmixed value before the transform), so they can be drawn again in other
-software.</li>
+<li><b>Plots</b> are drawn as in Unmixed Data: one plot per step, each
+showing the cells left by the step before it, with the gate labelled with
+its % of that parent population and the cluster's own cells drawn in the
+cluster's colour over the density of all cells. The axes start from the
+Transforms tab's settings; drag an axis, or right-click its label to switch
+between linear, logicle and log, exactly as in Unmixed Data. This changes
+only how the plots look, never which cells a gate holds. <b>Reset axes</b>
+returns to the Transforms tab's settings. Each gate's label sits in its
+upper-right corner; drag a label out of the way if it hides cells
+(double-click it to put it back). Right-click a plot to export or copy
+it. With many steps the row of plots scrolls sideways; <b>Open in
+window</b> shows them all at once.</li>
+<li>The plots use a draw of up to 100,000 cells, each cluster in
+proportion to its size, so the gates' percentages are those of all the
+clustered cells to within sampling noise.</li>
+<li><b>Trade-off</b> is filled for clusters whose targets are not met: the
+gates that best balance recall and purity at three weightings (balance 0.5
+favours purity, 1 weighs both equally, 2 favours keeping cells).</li>
+<li>Gates are given on the run's transform scale (where they were found)
+and in <b>raw intensity</b> (the unmixed value before the transform), so
+they can be drawn again in other software.</li>
 </ul>
 <p>The search follows Hypergate [1]; FlowJo's HyperFinder and GateFinder [2]
 answer the same question.</p>
