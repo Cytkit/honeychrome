@@ -31,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 import colorcet as cc
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QRectF, QSettings, QTimer, QEvent
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QRectF, QTimer, QEvent
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel,
@@ -95,7 +95,6 @@ from honeychrome.view_components.help_texts import autospectral_af_help_text
 logger = logging.getLogger(__name__)
 
 TAB_NAME = 'AutoSpectral'
-PAGE_SETTING = 'autospectral_page'
 
 # Comparison plots open on the first of these gates that exists (any case).
 COMPARISON_GATE_PREFERENCE = ('Singlets', 'Cells')
@@ -2658,7 +2657,8 @@ class AutoSpectralTab(QWidget):
     The AutoSpectral tab: Autofluorescence, Noise, Spectral Variants and
     Spectral Correction pages beside a side navigation list. A page with
     ``on_activated`` is told when it comes on screen; ``page_is_active``
-    tells a page whether it is on screen.
+    tells a page whether it is on screen. The tab always opens on the
+    Autofluorescence page, the first step of the workflow.
     """
 
     def __init__(self, bus=None, controller=None, parent=None):
@@ -2683,10 +2683,7 @@ class AutoSpectralTab(QWidget):
                 (self.correction_page, 'Spectral Correction', 'adjustments')):
             self._pages.addTab(page, label, icon_name)
 
-        self._qsettings = QSettings('honeychrome', 'app_configuration')
-        saved = self._qsettings.value(PAGE_SETTING, 0, type=int)
-        if 0 <= saved < self._pages.count():
-            self._pages.setCurrentIndex(saved)
+        self._pages.setCurrentWidget(self.af_page)
         self._pages.currentChanged.connect(self._on_page_changed)
 
         layout = QVBoxLayout(self)
@@ -2710,7 +2707,6 @@ class AutoSpectralTab(QWidget):
                 and self._pages.currentWidget() is page)
 
     def _on_page_changed(self, index: int):
-        self._qsettings.setValue(PAGE_SETTING, index)
         page = self._pages.widget(index)
         if hasattr(page, 'on_activated') and self.page_is_active(page):
             page.on_activated()
