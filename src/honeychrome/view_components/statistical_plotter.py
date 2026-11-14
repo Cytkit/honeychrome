@@ -540,7 +540,8 @@ class StatisticsPlotWidget(QWidget):
                         data=self.statistics_comparison['data'],
                         x=x,
                         y=y,
-                        hue=hue,
+                        hue=hue if hue is not None else x,   # use x for colouring when no hue grouping
+                        legend=False if hue is None else True,
                         width=0.6,
                         palette=palette,
                         ax=ax,
