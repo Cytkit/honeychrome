@@ -344,18 +344,35 @@ def negatives_clamped(negatives: list, min_share: float = CLAMP_MIN_SHARE,
     return bool(np.all(share < min_share)), share
 
 
-def _weighted_nnls(a: np.ndarray, b: np.ndarray, w: np.ndarray) -> np.ndarray:
-    """``argmin_{x >= 0} sum w (a x - b)^2`` through a QR reduction to the column count."""
+def _weighted_nnls(a, b: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """
+    ``argmin_{x >= 0} sum w (a x - b)^2`` through a QR reduction to the column
+    count. The reduction is accumulated over blocks of ``_QR_BLOCK_ROWS`` rows:
+    the triangular factor of the rows so far is stacked on the next block and
+    factored again, so memory grows with the column count squared rather than
+    with rows x columns, and the reduced problem has the same minimiser as the
+    QR of all rows at once. Columns are scaled to unit weighted norm first.
+    ``a`` is an array or a ``_DesignRows`` (anything with ``shape`` and row
+    slices).
+    """
     from scipy.optimize import nnls
 
     sw = np.sqrt(np.maximum(w, 0.0))
-    aw = a * sw[:, np.newaxis]
-    bw = b * sw
-    scale = np.linalg.norm(aw, axis=0)
+    n_rows, n_cols = a.shape
+    blocks = [(start, min(start + _QR_BLOCK_ROWS, n_rows)) for start in range(0, n_rows, _QR_BLOCK_ROWS)]
+    sq = np.zeros(n_cols)
+    for start, stop in blocks:
+        part = a[start:stop] * sw[start:stop, np.newaxis]
+        sq += np.einsum('ij,ij->j', part, part)
+    scale = np.sqrt(sq)
     scale = np.where(scale > 0, scale, 1.0)
-    aw /= scale
-    q, r = np.linalg.qr(aw, mode='reduced')
-    sol = nnls(r, q.T @ bw, maxiter=50 * a.shape[1])[0]
+    r = np.zeros((0, n_cols))
+    z = np.zeros(0)
+    for start, stop in blocks:
+        part = a[start:stop] * (sw[start:stop, np.newaxis] / scale)
+        q, r = np.linalg.qr(np.vstack([r, part]), mode='reduced')
+        z = q.T @ np.concatenate([z, b[start:stop] * sw[start:stop]])
+    sol = nnls(r, z, maxiter=50 * n_cols)[0]
     return sol / scale
 
 
@@ -421,6 +438,7 @@ class NoiseSettings:
 
 
 _MAD_VAR_REL = 2.72       # n x relative variance of a squared normalised MAD (Gaussian)
+_QR_BLOCK_ROWS = 20_000    # rows per block of the weighted least-squares QR (_weighted_nnls)
 
 
 @dataclass
@@ -436,26 +454,38 @@ class _Layout:
     def n_cols(self) -> int:
         return (self.k + 1 + int(self.quadratic)) * self.d + len(self.controls)
 
-    def design(self, rows: _Rows, with_s: bool = True) -> np.ndarray:
+    def design(self, rows: _Rows, with_s: bool = True, index: np.ndarray | None = None,
+               s_only: bool = False) -> np.ndarray:
+        """
+        The design of the rows in ``index`` (all rows when None): the sigma0
+        blocks (``with_s``) and, unless ``s_only``, the remaining columns.
+        """
+        def take(x):
+            return x if index is None else x[index]
+
         blocks = []
         if with_s:
-            blocks.extend(self.s_blocks(rows))
-        blocks.append(rows.a_g)
-        if self.quadratic:
-            blocks.append(rows.a_c)
-        if len(self.controls):
-            a_cg = np.zeros((len(rows.b), len(self.controls)))
-            for j, gi in enumerate(self.controls):
-                on = rows.group == gi
-                a_cg[on, j] = rows.c_sum[on]
-            blocks.append(a_cg)
+            blocks.extend(self.s_blocks(rows, index))
+        if not s_only:
+            blocks.append(take(rows.a_g))
+            if self.quadratic:
+                blocks.append(take(rows.a_c))
+            if len(self.controls):
+                group, c_sum = take(rows.group), take(rows.c_sum)
+                a_cg = np.zeros((len(group), len(self.controls)))
+                for j, gi in enumerate(self.controls):
+                    on = group == gi
+                    a_cg[on, j] = c_sum[on]
+                blocks.append(a_cg)
         return np.hstack(blocks)
 
-    def s_blocks(self, rows: _Rows) -> list:
+    def s_blocks(self, rows: _Rows, index: np.ndarray | None = None) -> list:
+        a_s = rows.a_s if index is None else rows.a_s[index]
         if self.k == 1:
-            return [rows.a_s]
-        cls = self.cls_of_group[rows.group]
-        return [rows.a_s * (cls == k)[:, np.newaxis] for k in range(self.k)]
+            return [a_s]
+        group = rows.group if index is None else rows.group[index]
+        cls = self.cls_of_group[group]
+        return [a_s * (cls == k)[:, np.newaxis] for k in range(self.k)]
 
     def split(self, sol: np.ndarray, n_groups: int) -> tuple:
         """``(s (K, D), g, c, c_g (n_groups,))``."""
@@ -474,7 +504,35 @@ class _Layout:
         return np.concatenate([g] + ([c] if self.quadratic else []) + [cg[self.controls]])
 
 
-def _solve_rows(a: np.ndarray, b: np.ndarray, n: np.ndarray, n_irls: int) -> np.ndarray:
+class _DesignRows:
+    """
+    The joint fit's design restricted to the rows in ``index``, built one block
+    of rows at a time when sliced, so the whole array (rows x columns) is never
+    held at once; ``@`` a vector is computed block by block. It offers what
+    ``_weighted_nnls`` and ``_solve_rows`` use: ``shape``, row slices and ``@``.
+    ``with_s`` and ``s_only`` select the columns as ``_Layout.design`` does.
+    """
+
+    def __init__(self, layout: _Layout, rows: _Rows, index: np.ndarray, with_s: bool = True,
+                 s_only: bool = False):
+        self.layout, self.rows, self.index = layout, rows, np.asarray(index)
+        self.with_s, self.s_only = with_s, s_only
+        n_s = layout.k * layout.d if with_s else 0
+        n_rest = 0 if s_only else layout.n_cols - layout.k * layout.d
+        self.shape = (len(self.index), n_s + n_rest)
+
+    def __getitem__(self, rows_slice: slice) -> np.ndarray:
+        return self.layout.design(self.rows, self.with_s, self.index[rows_slice], self.s_only)
+
+    def __matmul__(self, x: np.ndarray) -> np.ndarray:
+        n = self.shape[0]
+        out = np.empty(n)
+        for start in range(0, n, _QR_BLOCK_ROWS):
+            out[start:start + _QR_BLOCK_ROWS] = self[start:start + _QR_BLOCK_ROWS] @ x
+        return out
+
+
+def _solve_rows(a, b: np.ndarray, n: np.ndarray, n_irls: int) -> np.ndarray:
     sol = _weighted_nnls(a, b, n / np.maximum(b, _TINY) ** 2)
     for _ in range(max(0, int(n_irls))):
         sol = _weighted_nnls(a, b, n / np.maximum(a @ sol, _TINY) ** 2)
@@ -568,9 +626,7 @@ def fit_noise_model(groups: list, detectors: list, settings: NoiseSettings | Non
         ok = np.isfinite(rows.b) & (rows.b > 0)
         if not ok.any():
             raise ValueError('Every binned residual variance is zero or not finite.')
-        a = lay.design(rows)
-        sol = _solve_rows(a if ok.all() else a[ok], rows.b[ok], rows.n[ok], s.n_irls)
-        del a
+        sol = _solve_rows(_DesignRows(lay, rows, np.flatnonzero(ok)), rows.b[ok], rows.n[ok], s.n_irls)
         return (rows, ok) + lay.split(sol, n_groups)
 
     def floored(s_mat):
@@ -610,8 +666,9 @@ def fit_noise_model(groups: list, detectors: list, settings: NoiseSettings | Non
         flags[applied] |= FLAG_SIGMA0_FALLBACK
 
     if clamped.any():
-        fixed = np.hstack(lay.s_blocks(rows))[ok] @ s_mat.ravel()
-        rest = lay.design(rows, with_s=False)[ok]
+        index = np.flatnonzero(ok)
+        fixed = _DesignRows(lay, rows, index, s_only=True) @ s_mat.ravel()
+        rest = _DesignRows(lay, rows, index, with_s=False)
         current = fixed + rest @ lay.rest(g, c, cg)
         sub = _weighted_nnls(rest, rows.b[ok] - fixed, rows.n[ok] / np.maximum(current, _TINY) ** 2)
         _s, g, c, cg = lay.split(np.concatenate([np.zeros(k_n * d), sub]), n_groups)
@@ -641,7 +698,8 @@ def fit_noise_model(groups: list, detectors: list, settings: NoiseSettings | Non
     coef = np.concatenate([s_mat.ravel(), lay.rest(g, model.c, cg)])
     model.fit_table = {
         'group': rows.group, 'bin': rows.bin, 'detector': rows.det, 'mu': rows.mu_own,
-        'observed': rows.b, 'predicted': lay.design(rows) @ coef, 'n': rows.n.astype(np.int64),
+        'observed': rows.b, 'predicted': _DesignRows(lay, rows, np.arange(len(rows.b))) @ coef,
+        'n': rows.n.astype(np.int64),
         'centre': np.concatenate([np.repeat(bi.centre, d) for bi in bins]),
         'group_c': cg.copy(),
     }
