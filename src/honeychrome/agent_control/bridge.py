@@ -5,10 +5,12 @@ Runs the agent's tool calls on the Qt main thread, one at a time, and
 collects the messages Honeychrome shows while a call runs.
 
 The MCP server thread calls ``call``, which queues the call to the main
-thread and waits for its result. Controller methods with
-``with_busy_cursor`` spin a nested event loop, which can deliver the next
-queued call in the middle of the current one; ``_run`` queues it instead,
-so calls never interleave.
+thread and waits for its result. A call made while another is running is
+refused, and a call that times out before it starts is cancelled, so no call
+runs after the agent has been told it failed. Controller methods with
+``with_busy_cursor`` spin a nested event loop, which could deliver a queued
+call in the middle of the current one; ``_run`` queues it instead, so calls
+never interleave.
 """
 
 from __future__ import annotations
@@ -17,8 +19,10 @@ import concurrent.futures
 import logging
 import re
 import shutil
+import threading
+import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
@@ -29,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGES = 20
 MAX_STATUS = 5
+# a tool that waits stops this long before its timeout, so it can report why
+DEADLINE_MARGIN = 5.0
 # status-bar progress that says nothing to the agent
 PROGRESS = re.compile(r'^(Agent:|Ready\.?$|Calculating \d+/\d+ |Calculating \d+ histograms|Initialising plots|Processing \d+/\d+)')
 
@@ -38,6 +44,8 @@ class _Call:
     spec: ToolSpec
     args: dict
     future: concurrent.futures.Future
+    started: float = field(default_factory=time.monotonic)
+    abandoned: threading.Event = field(default_factory=threading.Event)
 
 
 class AgentBridge(QObject):
@@ -48,6 +56,8 @@ class AgentBridge(QObject):
         self.context = ToolContext(view)
         self._queue: deque = deque()
         self._running = False
+        self._lock = threading.Lock()
+        self._active: _Call | None = None   # from acceptance until the main thread is done with it
         self._messages: dict | None = None
         self._backed_up: set = set()
         self._requested.connect(self._run, Qt.QueuedConnection)
@@ -64,13 +74,33 @@ class AgentBridge(QObject):
     def call(self, name: str, args: dict) -> tuple:
         """``(result, messages)`` of the tool, run on the main thread; raises ``ToolError``."""
         spec = TOOLS[name]
-        job = _Call(spec, args, concurrent.futures.Future())
+        with self._lock:
+            busy = self._active
+            if busy is None:
+                job = self._active = _Call(spec, args, concurrent.futures.Future())
+        if busy is not None:
+            raise ToolError(f'Honeychrome is still running {busy.spec.name} (for '
+                            f'{time.monotonic() - busy.started:.0f} s), so {name} was not run. Tools run one at '
+                            'a time: wait for each result before the next call.')
         self._requested.emit(job)
         try:
             return job.future.result(timeout=spec.timeout)
         except concurrent.futures.TimeoutError:
-            raise ToolError(f'{name} did not finish within {spec.timeout:.0f} s. It may still be running in '
-                            'Honeychrome: call get_state before trying again.') from None
+            job.abandoned.set()
+            if job.future.cancel():
+                self._release(job)
+                raise ToolError(f'{name} could not start within {spec.timeout:.0f} s and was cancelled; '
+                                'nothing was changed.') from None
+            if not job.future.done():
+                raise ToolError(f'{name} did not finish within {spec.timeout:.0f} s. It is still running in '
+                                'Honeychrome and other calls are refused until it ends; then call get_state to '
+                                'see what it did before trying again.') from None
+            return job.future.result()
+
+    def _release(self, job: _Call) -> None:
+        with self._lock:
+            if self._active is job:
+                self._active = None
 
     # main thread
     @Slot(object)
@@ -87,26 +117,34 @@ class AgentBridge(QObject):
 
     def _execute(self, job: _Call) -> None:
         if not job.future.set_running_or_notify_cancel():
-            return
+            return   # timed out before it started
         spec, ctx = job.spec, self.context
-        self._messages = {'popups': [], 'warnings': [], 'status': []}
+        messages = self._messages = {'popups': [], 'warnings': [], 'status': []}
+        ctx.deadline = job.started + spec.timeout - DEADLINE_MARGIN
+        ctx.abandoned = job.abandoned.is_set
+        result = error = None
         try:
             self._check(spec)
             logger.info('Agent tool %s %s', spec.name, job.args)
             ctx.bus.statusMessage.emit(f'Agent: {spec.title}')
             result = spec.fn(ctx, **job.args)
-            job.future.set_result((result, self._messages))
         except ToolError as exc:
             logger.info('Agent tool %s refused: %s', spec.name, exc)
-            exc.messages = self._messages
-            job.future.set_exception(exc)
+            error = exc
         except Exception as exc:
             logger.exception('Agent tool %s failed', spec.name)
             error = ToolError(f'{type(exc).__name__}: {exc}')
-            error.messages = self._messages
-            job.future.set_exception(error)
         finally:
             self._messages = None
+            # free the bridge before the result reaches the agent, so its next call is accepted
+            self._release(job)
+        if job.abandoned.is_set():
+            logger.info('Agent tool %s finished after its call timed out', spec.name)
+        if error is not None:
+            error.messages = messages
+            job.future.set_exception(error)
+        else:
+            job.future.set_result((result, messages))
 
     def _check(self, spec: ToolSpec) -> None:
         ctx = self.context

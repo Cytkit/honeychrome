@@ -16,12 +16,13 @@ failure, reported to the agent as a tool error it can act on.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
-from PySide6.QtCore import QBuffer, QIODevice
+from PySide6.QtCore import QBuffer, QCoreApplication, QEventLoop, QIODevice, QTimer
 from PySide6.QtWidgets import QMessageBox
 from shiboken6 import isValid
 
@@ -36,6 +37,7 @@ MODE_FOR_TAB = {'Raw Data': 'raw', 'Spectral Process': 'process', 'Unmixed Data'
                 'Simple Stats': 'statistics'}
 TRANSFORM_IDS = {'linear': 0, 'logicle': 1, 'log': 2}
 MAX_PEAKS = 6
+WAIT_STEP_MS = 50
 
 
 class ToolError(Exception):
@@ -101,6 +103,9 @@ class ToolContext:
     def __init__(self, view):
         self.view = view
         self.confirm_hook = None   # replaces the confirmation dialog (headless runs)
+        # set by the bridge for each call
+        self.deadline = float('inf')
+        self.abandoned = lambda: False
 
     @property
     def controller(self):
@@ -136,7 +141,29 @@ class ToolContext:
         self.check_scope(scope)
         if self.controller.current_mode != scope:
             self.switch_tab(TAB_FOR_SCOPE[scope])
+        if scope == 'unmixed' and not self.wait_for_unmixing():
+            holder = self.controller.job_gate.busy_text()
+            raise ToolError('Honeychrome is still unmixing the loaded sample in the background'
+                            + (f' (it waits for {holder})' if holder else '')
+                            + '; until then the unmixed data is provisional. Try again in a while.')
         return self.data(scope)
+
+    def wait_for_unmixing(self) -> bool:
+        """Let the loaded sample's background unmixing finish, keeping the window responsive, so unmixed
+        data is final rather than per-cell AF. False if it is still running at the call's deadline."""
+        c = self.controller
+        if not c.background_unmixing_running():
+            return True
+        loop = QEventLoop()
+        while c.background_unmixing_running():
+            if self.abandoned():
+                raise ToolError('The call timed out while Honeychrome was unmixing in the background.')
+            if time.monotonic() > self.deadline:
+                return False
+            QTimer.singleShot(WAIT_STEP_MS, loop.quit)
+            loop.exec()
+        QCoreApplication.processEvents()   # let the plots redraw with the final data
+        return True
 
     def tab_names(self) -> list:
         tabs = self.main_window().tabs
@@ -286,6 +313,7 @@ def get_state(ctx: ToolContext) -> dict:
         'current_sample': sample,
         'n_samples': len(samples['all_samples']),
         'unmixed_data_available': c.experiment.process.get('unmixing_matrix') is not None,
+        'background_unmixing': c.background_unmixing_running(),
         'busy': c.job_gate.busy_text() or None,
         'live_acquisition': not c.stop_live_data_processing.is_set(),
     }
@@ -400,7 +428,8 @@ def load_sample(ctx: ToolContext, sample: str) -> dict:
         raise ToolError(f'Honeychrome could not load "{path}".')
     return {'loaded': path, 'name': c.experiment.samples['all_samples'].get(path),
             'events_in_file': int(c.current_sample.event_count),
-            'events_displayed': None if c.raw_event_data is None else int(len(c.raw_event_data))}
+            'events_displayed': None if c.raw_event_data is None else int(len(c.raw_event_data)),
+            'background_unmixing': not ctx.wait_for_unmixing()}
 
 
 @tool('Switch tab',
@@ -939,7 +968,7 @@ def refresh_unmixing(ctx: ToolContext) -> dict:
     if not ctx.controller.experiment.process.get('spectral_model'):
         raise ToolError('The spectral model is empty. Define the spectral controls in the Spectral Process tab first.')
     ctx.bus.spectralModelUpdated.emit()
-    return get_spectral_model(ctx)
+    return {**get_spectral_model(ctx), 'background_unmixing': not ctx.wait_for_unmixing()}
 
 
 @tool('Get spectral profiles',
@@ -1023,7 +1052,8 @@ def set_spillover_value(ctx: ToolContext, row: str, column: str, value: float) -
     editor._timer.stop()
     editor._emit_now()
     return {'row': model.vertical_headers[r], 'column': model.horizontal_headers[c],
-            'old_value': old, 'new_value': float(model._data[r, c])}
+            'old_value': old, 'new_value': float(model._data[r, c]),
+            'background_unmixing': not ctx.wait_for_unmixing()}
 
 
 # ---------------------------------------------------------------------------
