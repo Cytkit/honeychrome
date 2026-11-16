@@ -4,6 +4,7 @@ Honeychrome - open source cytometry data acquisition and analysis software
 
 # from honeychrome.tools import DepthFinder # debug module imports here
 
+import faulthandler
 import os
 import sys
 import threading
@@ -190,6 +191,15 @@ def init_sentry():
 
 def main():
     redirect_missing_std_streams(Path.home() / experiments_folder / 'honeychrome.log')
+
+    # A crash in compiled code (Qt, numpy or a compiled kernel) ends the process without a
+    # Python traceback. faulthandler writes the stack of every thread to the log instead.
+    try:
+        crash_log = open(Path.home() / experiments_folder / 'honeychrome.log', 'a', encoding='utf-8', buffering=1)
+        faulthandler.enable(file=crash_log, all_threads=True)
+    except OSError:
+        pass
+
     configure_multiprocessing()
 
     # create experiments directory and plugins directory
