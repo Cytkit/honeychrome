@@ -123,6 +123,7 @@ class Controller(QObject):
         self._method_thread = None
         self._method_worker = None
         self._method_job_pending = None
+        self._display_job = None   # background unmixing of the displayed sample, until its result is shown
         self.methodUnmixRequested.connect(self._start_method_job, Qt.QueuedConnection)
         # AF profiles whose envelope is built from their source sample (envelope_builder)
         self._envelope_thread = None
@@ -1516,6 +1517,7 @@ class Controller(QObject):
         result = unmix_method.unmix(raw_event_data, self.transfer_matrix, settings_, fl_ids, spillover, af,
                                     state, key, force_r1=True)
         self._set_unmixed_sidecar(result, af)
+        self._display_job = job
         self.methodUnmixRequested.emit(job)
         return result['unmixed']
 
@@ -1555,9 +1557,20 @@ class Controller(QObject):
         return (job['generation'] == self._unmix_generation and self.raw_event_data is job['raw']
                 and self.experiment_dir == job['experiment_dir'] and self.transfer_matrix is not None)
 
+    def background_unmixing_running(self) -> bool:
+        """True while the displayed unmixed data is still provisional: the sample shows per-cell AF
+        until its background method unmixing is shown, or AF envelopes are being built."""
+        job = self._display_job
+        return (job is not None and self._method_job_current(job)) or self._envelope_thread is not None
+
+    def _display_job_done(self, job: dict) -> None:
+        if self._display_job is job:
+            self._display_job = None
+
     @Slot(object, object)
     def _on_method_job_finished(self, job: dict, fl_result: dict):
         if not self._method_job_current(job):
+            self._display_job_done(job)
             return
         if QGuiApplication.overrideCursor() is not None or QGuiApplication.modalWindow() is not None:
             # a busy-cursor operation (e.g. load_sample) is still filling the plots, or a
@@ -1565,7 +1578,10 @@ class Controller(QObject):
             # loop would make it drop behind the main window
             QTimer.singleShot(100, lambda: self._on_method_job_finished(job, fl_result))
             return
-        self._show_method_result(job, fl_result)
+        try:
+            self._show_method_result(job, fl_result)
+        finally:
+            self._display_job_done(job)
 
     @with_busy_cursor
     def _show_method_result(self, job: dict, fl_result: dict):
@@ -1584,6 +1600,7 @@ class Controller(QObject):
 
     @Slot(object, str)
     def _on_method_job_error(self, job: dict, msg: str):
+        self._display_job_done(job)
         if self.bus and self._method_job_current(job):
             self.bus.statusMessage.emit(f'Background unmixing failed ({msg}); showing per-cell AF.')
 

@@ -56,6 +56,7 @@ from honeychrome.view_components.main_window import MainWindow
 from honeychrome.controller_components.functions import add_recent_file
 from honeychrome.settings import experiments_folder, file_extension
 from honeychrome.view_components.new_file_dialog import NewFileDialog
+from honeychrome.agent_control import AgentControl
 from honeychrome import __version__
 
 import pyqtgraph as pg
@@ -106,6 +107,9 @@ class View(QObject):
 
         if self.controller is not None:
             self._connect_signals()
+
+        # started by main() when enabled in App Configuration
+        self.agent_control = AgentControl(self)
 
     def _connect_signals(self):
         # file actions
@@ -237,6 +241,7 @@ class View(QObject):
             self.current_window = self.main_window
 
             self.bus.setMainWindowTitle.emit(str(self.controller.experiment_dir))
+            self.agent_control.update_indicator()
             if self.controller.experiment.samples['all_samples']:
                 status = 'Experiment loaded. Select a sample to view plots.'
             else:
@@ -318,10 +323,14 @@ class View(QObject):
 
     @Slot(str)
     def popup_message(self, message):
+        if self.agent_control.capturing_messages:
+            return   # returned to the agent with its tool result
         QMessageBox.information(self.main_window, "Honeychrome by Cytkit", f"{message}")
 
     @Slot(str)
     def warning_message(self, message, deferrals=0):
+        if deferrals == 0 and self.agent_control.capturing_messages:
+            return   # returned to the agent with its tool result
         # A modal dialog opened inside a busy-cursor job's nested event loop loses its
         # modality when that loop ends and can drop behind the main window, so the
         # warning waits until the job has finished (for at most about 10 s).

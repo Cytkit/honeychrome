@@ -324,6 +324,7 @@ def main():
         controller=controller
     )
     controller.bus = view.bus # connect signals coming from controller
+    view.agent_control.apply_settings()  # local MCP server for AI agents, if enabled
 
     '''
     start QT application
@@ -333,6 +334,7 @@ def main():
 
     # end processes, free memory
     logger.info('***** Quitting Honeychrome *****')
+    view.agent_control.stop()
     controller.quit_instrument_quit_analyser()
     trace_analyser.join()
     instrument.join()
