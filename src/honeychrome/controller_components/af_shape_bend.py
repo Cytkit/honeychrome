@@ -32,14 +32,16 @@ The maths
       LIBRARY_SV_FLOOR of the largest), then the principal directions of the
       noise-scaled leftover of the top 10% AF events, each event's own
       variant direction removed (an amount error is not a shape). Each is
-      orthogonalised against the library's mean AF spectrum and those kept,
-      and kept only if it spreads over at least MIN_PARTICIPATION detectors
-      (1 / sum e^4), up to N_SHAPES from each source. A bend along the AF
-      spectrum itself would be a change in AF amount, which per-cell AF
-      already sets; without the mean removed, a library whose variants
-      differ in only one or two directions puts every variant inside the
-      shapes' span and the bend is not identifiable. A shape confined to one
-      or two detectors is a detector effect, not an AF shape.
+      orthogonalised against those kept and kept only if it spreads over at
+      least MIN_PARTICIPATION detectors (1 / sum e^4), up to N_SHAPES from
+      each source; a shape confined to one or two detectors is a detector
+      effect, not an AF shape. A candidate is also skipped if, with it, a
+      library variant (unit length) would lie less than MIN_VARIANT_OUTSIDE
+      outside the shapes' span: then a bend could not be told from a change
+      in that variant's AF amount (a library whose variants differ in only
+      one or two directions can do this). Shapes that merely lie close to
+      the AF spectrum are kept; their component along it is part of what
+      the bend corrects.
     * Bend size by AF: each event's unpenalised bend c_hat is the
       least-squares fit of d on [a_j; E] (its own variant included), and
       n its noise variance under V(mu). In each AF percentile bin
@@ -109,6 +111,7 @@ N_SHAPES = 3
 SHAPE_QUANTILE = 0.90
 MIN_PARTICIPATION = 4.0
 LIBRARY_SV_FLOOR = 1e-6
+MIN_VARIANT_OUTSIDE = 1e-3
 BIN_EDGES = (0, 50, 80, 90, 95, 99, 100)
 MIN_BIN_EVENTS = 20
 FROM_QUANTILE = 0.80
@@ -222,23 +225,27 @@ def learn_shapes(d: np.ndarray, k: np.ndarray, j: np.ndarray, mu: np.ndarray, af
     left = d[top] - np.einsum('nd,nd->n', d[top], a)[:, np.newaxis] * a
     sd = np.sqrt(noise_variance(np.median(mu[top], axis=0), noise))
     res_dirs = _unit_rows(np.linalg.svd(left / sd, full_matrices=False)[2] * sd)
-    mean = af_spectra.mean(axis=0)
-    anchor = [mean / max(float(np.linalg.norm(mean)), _TINY)]
+    variants_outside = _unit_rows(af_spectra)
     kept = []
     for candidates in (_unit_rows(lib_dirs), res_dirs):
         taken = 0
         for v in candidates:
             if taken == N_SHAPES:
                 break
-            for q in anchor + kept:
+            for q in kept:
                 v = v - (v @ q) * q
             norm = np.linalg.norm(v)
             if norm < 1e-6:
                 continue
             v = v / norm
-            if _participation(v) >= MIN_PARTICIPATION:
-                kept.append(v)
-                taken += 1
+            if _participation(v) < MIN_PARTICIPATION:
+                continue
+            outside = variants_outside - np.outer(variants_outside @ v, v)
+            if np.linalg.norm(outside, axis=1).min() < MIN_VARIANT_OUTSIDE:
+                continue
+            variants_outside = outside
+            kept.append(v)
+            taken += 1
     return np.array(kept).reshape(len(kept), n_det)
 
 
@@ -310,33 +317,27 @@ def learn_bend(raw_fl: np.ndarray, log_ssc: np.ndarray | None, precomputed: dict
 # Applying
 # ---------------------------------------------------------------------------
 
-def _weighted_outside(d: np.ndarray, s: np.ndarray, e: np.ndarray, w: np.ndarray) -> tuple:
-    """Outside term with detector weights w (n, D): E Q_W E' and E Q_W d per event (see the module docstring)."""
-    n, n_l = len(d), len(e)
+def _weighted_terms(d: np.ndarray, s: np.ndarray, e: np.ndarray, w: np.ndarray) -> tuple:
+    """
+    Outside term with detector weights w (n, D): E Q_W E' and E Q_W d per event (see the module docstring),
+    with M^-1 X and M^-1 z (M = S W S', X = S W E', z = S W d) from one solve per event, the right-hand sides
+    stacked. The fluorophore refit of d - c E is then M^-1 z - M^-1 X c, so the leftover after a bend needs no
+    further solve.
+    """
+    n, n_l, n_f = len(d), len(e), len(s)
     a, b = np.empty((n, n_l, n_l)), np.empty((n, n_l))
+    mx, mz = np.empty((n, n_f, n_l)), np.empty((n, n_f))
     for start in range(0, n, CHUNK):
         sl = slice(start, min(n, start + CHUNK))
         sw = s[np.newaxis] * w[sl, np.newaxis, :]
         x = sw @ e.T
-        m = sw @ s.T
-        mx = np.linalg.solve(m, x)
-        mz = np.linalg.solve(m, np.einsum('cfd,cd->cf', sw, d[sl])[:, :, np.newaxis])[:, :, 0]
+        z = np.einsum('cfd,cd->cf', sw, d[sl])
+        sol = np.linalg.solve(sw @ s.T, np.concatenate([x, z[:, :, np.newaxis]], axis=2))
+        mx[sl], mz[sl] = sol[:, :, :n_l], sol[:, :, n_l]
         ew = e[np.newaxis] * w[sl, np.newaxis, :]
-        a[sl] = ew @ e.T - np.transpose(x, (0, 2, 1)) @ mx
-        b[sl] = np.einsum('cld,cd->cl', ew, d[sl]) - np.einsum('cfl,cf->cl', x, mz)
-    return a, b
-
-
-def _weighted_residual(d: np.ndarray, s: np.ndarray, e: np.ndarray, w: np.ndarray, c: np.ndarray) -> np.ndarray:
-    """d - c E minus its fluorophore fit with detector weights w: what each detector has left."""
-    r = d - c @ e
-    out = np.empty_like(r)
-    for start in range(0, len(r), CHUNK):
-        sl = slice(start, min(len(r), start + CHUNK))
-        sw = s[np.newaxis] * w[sl, np.newaxis, :]
-        z = np.einsum('cfd,cd->cf', sw, r[sl])
-        out[sl] = r[sl] - np.linalg.solve(sw @ s.T, z[:, :, np.newaxis])[:, :, 0] @ s
-    return out
+        a[sl] = ew @ e.T - np.transpose(x, (0, 2, 1)) @ mx[sl]
+        b[sl] = np.einsum('cld,cd->cl', ew, d[sl]) - np.einsum('cfl,cf->cl', x, mz[sl])
+    return a, b, mx, mz
 
 
 def _solve(a: np.ndarray, b: np.ndarray, t2: np.ndarray) -> np.ndarray:
@@ -348,11 +349,11 @@ def _robust_outside(d: np.ndarray, s: np.ndarray, e: np.ndarray, w0: np.ndarray,
     """Noise-weighted outside term with Huber down-weighting of detectors far from 0 after the bend."""
     w = w0
     for _ in range(ROBUST_PASSES):
-        a, b = _weighted_outside(d, s, e, w)
+        a, b, mx, mz = _weighted_terms(d, s, e, w)
         c = _solve(a, b, t2)
-        z = np.abs(_weighted_residual(d, s, e, w, c)) * np.sqrt(w0)
-        w = w0 * np.minimum(1.0, ROBUST_Z / np.maximum(z, _TINY))
-    return _weighted_outside(d, s, e, w)
+        left = d - c @ e - (mz - np.einsum('nfl,nl->nf', mx, c)) @ s
+        w = w0 * np.minimum(1.0, ROBUST_Z / np.maximum(np.abs(left) * np.sqrt(w0), _TINY))
+    return _weighted_terms(d, s, e, w)[:2]
 
 
 def _leave_own_out(a_full: np.ndarray, c: np.ndarray, g: np.ndarray, omega: np.ndarray,
