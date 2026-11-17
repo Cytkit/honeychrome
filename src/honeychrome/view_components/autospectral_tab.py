@@ -961,7 +961,7 @@ class AutofluorescencePage(QWidget):
         self._shape_bend_cb = QCheckBox('Shape bend')
         self._shape_bend_cb.setToolTip(
             'Lets the AF spectrum of high-AF cells (above the unstained '
-            'sample\'s 80th AF percentile) bend a little along shapes learnt from '
+            'sample\'s 70th AF percentile, fully from its 90th) bend a little along shapes learnt from '
             'the unstained sample its AF profile was extracted from, by about as '
             'much as AF of that brightness varies there. This narrows the spread '
             'of AF-like fluorophores (BUV395, BUV496, BV421, BV510 and similar) in '

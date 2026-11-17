@@ -107,7 +107,8 @@ def test_learnt_bend(learnt):
     assert np.all(np.diff(bend.log_k) > 0.0)
     again = asb.AFBend.from_dict(bend.to_dict())
     assert np.array_equal(again.shapes, bend.shapes) and np.array_equal(again.sigma2, bend.sigma2)
-    assert again.from_k == bend.from_k
+    assert again.from_k == bend.from_k and again.full_k == bend.full_k
+    assert bend.full_k > bend.from_k
 
 
 @pytest.mark.numpy_only
@@ -130,7 +131,7 @@ def test_bend_changes_only_high_af_fluorophores(library, learnt):
     assert not np.allclose(bent['unmixed'][~low], plain['unmixed'][~low])
     assert np.allclose(chunked['unmixed'], bent['unmixed'], rtol=1e-9, atol=1e-6)
 
-    zero = (abund == 0.0) & ~low[:, None]
+    zero = (abund == 0.0) & (plain['af_scale'] >= bend.full_k)[:, None]
     rms_plain = np.sqrt(np.mean(plain['unmixed'][zero] ** 2))
     rms_bent = np.sqrt(np.mean(bent['unmixed'][zero] ** 2))
     assert rms_bent < 0.9 * rms_plain

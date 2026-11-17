@@ -17,8 +17,11 @@ In plain terms
     detectors the panel cannot explain and from the fluorophores that should
     be close to 0; each fluorophore's correction is worked out without that
     fluorophore's own value, so a real dim signal for a dye cannot be taken
-    for AF. Cells below the unstained sample's 80th AF percentile keep their
-    per-cell AF result exactly; the AF Abundance and AF Index never change.
+    for AF. Cells below the unstained sample's 70th AF percentile keep their
+    per-cell AF result exactly; from there to its 90th percentile the bend
+    allowed grows gradually from none to its full size, so cells just above
+    the threshold move only a little. The AF Abundance and AF Index never
+    change.
 
 The maths
     Learning, on the AF profile's unstained sample (LEARN_EVENTS events,
@@ -50,12 +53,15 @@ The maths
       of AF beyond what noise alone would give (0.4549 is the median of a
       chi-square with one degree of freedom, so a median of squares reads
       as a variance).
-    * Threshold k0: the 80th percentile of k.
+    * Threshold k0 and full-bend AF k1: the FROM_QUANTILE and FULL_QUANTILE
+      percentiles of k.
 
     Applying, to events with k >= k0:
 
     * Prior on the bend c (one value per shape): Normal(0, T), T =
-      diag(k^2 sigma_l^2(k)), sigma^2 interpolated in log k between bins.
+      diag(r(k)^2 k^2 sigma_l^2(k)), sigma^2 interpolated in log k between
+      bins, and the ramp r(k) = (log k - log k0) / (log k1 - log k0),
+      clipped to [0, 1]: 0 at the threshold, 1 from k1 up.
     * Outside term: the fit of c E to d with the fluorophores refitted
       around it, with detector weights W = 1 / V(mu): A = E W E' -
       E W S' (S W S')^-1 S W E', and b likewise with d. ROBUST_PASSES times,
@@ -83,8 +89,8 @@ v1 simplifications
       first profile was extracted from, used for every sample unmixed with
       that library (stained samples, controls and the unstained sample
       itself).
-    * The bend size is the learnt one (scale 1) and the threshold the 80th
-      percentile; neither is chosen per sample.
+    * The bend size is the learnt one (scale 1) and the ramp runs from the
+      70th to the 90th percentile; neither is chosen per sample.
     * Events with a saturated detector are not bent (their re-fit on the
       unsaturated detectors keeps the per-cell AF result).
     * Only per-cell AF (R1) reports bent fluorophores; M2pg and the
@@ -103,7 +109,7 @@ from scipy.special import erfc
 logger = logging.getLogger(__name__)
 
 SHAPE_BEND_KEY = 'af_shape_bend'
-BEND_VERSION = 1
+BEND_VERSION = 2
 BENDS_FILE = 'af_bends.json'
 LEARN_EVENTS = 50_000
 LEARN_SEED = 11
@@ -114,7 +120,8 @@ LIBRARY_SV_FLOOR = 1e-6
 MIN_VARIANT_OUTSIDE = 1e-3
 BIN_EDGES = (0, 50, 80, 90, 95, 99, 100)
 MIN_BIN_EVENTS = 20
-FROM_QUANTILE = 0.80
+FROM_QUANTILE = 0.70
+FULL_QUANTILE = 0.90
 POSITIVE_OFFSET_SD = 2.0
 ROBUST_Z = 4.0
 ROBUST_PASSES = 2
@@ -151,6 +158,7 @@ class AFBend:
     n_events: int
     fingerprint: str
     source: str
+    full_k: float | None = None   # AF from which the full bend is allowed (None: from from_k)
 
     @property
     def active(self) -> bool:
@@ -160,6 +168,7 @@ class AFBend:
         return {'shapes': np.asarray(self.shapes).tolist(), 'n_detectors': int(np.asarray(self.shapes).shape[1]),
                 'log_k': np.asarray(self.log_k).tolist(), 'sigma2': np.asarray(self.sigma2).tolist(),
                 'from_k': float(self.from_k) if np.isfinite(self.from_k) else None,
+                'full_k': None if self.full_k is None else float(self.full_k),
                 'n_events': int(self.n_events), 'fingerprint': self.fingerprint, 'source': self.source}
 
     @classmethod
@@ -169,7 +178,8 @@ class AFBend:
         return cls(shapes=shapes, log_k=log_k,
                    sigma2=np.asarray(d['sigma2'], dtype=np.float64).reshape(len(log_k), len(shapes)),
                    from_k=float('inf') if d.get('from_k') is None else float(d['from_k']),
-                   n_events=int(d['n_events']), fingerprint=str(d['fingerprint']), source=str(d['source']))
+                   n_events=int(d['n_events']), fingerprint=str(d['fingerprint']), source=str(d['source']),
+                   full_k=None if d.get('full_k') is None else float(d['full_k']))
 
 
 def empty_bend(n_detectors: int, n_events: int = 0, fingerprint: str = '', source: str = '') -> AFBend:
@@ -201,11 +211,23 @@ def _precision(t2: np.ndarray) -> np.ndarray:
     return np.where(t2 > 0.0, 1.0 / np.maximum(t2, _TINY), _FIXED)
 
 
+def ramp_factor(k: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """0 at AF lo, 1 at AF hi and above, linear in log AF between."""
+    span = max(np.log(max(hi, _TINY)) - np.log(max(lo, _TINY)), 1e-12)
+    return np.clip((np.log(np.maximum(k, _TINY)) - np.log(max(lo, _TINY))) / span, 0.0, 1.0)
+
+
 def prior_variance(k: np.ndarray, bend: AFBend) -> np.ndarray:
-    """(k sigma_l(k))^2 per event and shape, sigma^2 interpolated in log k between the bins."""
+    """
+    (r(k) k sigma_l(k))^2 per event and shape, sigma^2 interpolated in log k
+    between the bins and r(k) the ramp from ``from_k`` to ``full_k``.
+    """
     log_k = np.log(np.maximum(k, _TINY))
     s2 = np.column_stack([np.interp(log_k, bend.log_k, bend.sigma2[:, l]) for l in range(len(bend.shapes))])
-    return s2 * (k ** 2)[:, np.newaxis]
+    t2 = s2 * (k ** 2)[:, np.newaxis]
+    if bend.full_k is not None:
+        t2 = t2 * ramp_factor(k, bend.from_k, bend.full_k)[:, np.newaxis] ** 2
+    return t2
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +332,8 @@ def learn_bend(raw_fl: np.ndarray, log_ssc: np.ndarray | None, precomputed: dict
     if not len(log_k):
         return empty
     return AFBend(shapes=shapes, log_k=log_k, sigma2=sigma2, from_k=float(np.quantile(k[pos], FROM_QUANTILE)),
-                  n_events=n, fingerprint=fingerprint, source=source)
+                  n_events=n, fingerprint=fingerprint, source=source,
+                  full_k=float(np.quantile(k[pos], FULL_QUANTILE)))
 
 
 # ---------------------------------------------------------------------------
