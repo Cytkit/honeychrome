@@ -856,6 +856,8 @@ def predictive_subtitle(summary: dict) -> str:
     n = ", ".join(f"{g} n={k}" for g, k in summary['n_per_group'].items())
     text = (f"{summary['positive']} vs {summary['negative']} ({n}); "
             f"{summary['repeats']}× repeated {summary['outer_folds']}-fold CV")
+    if summary.get('n_donors'):
+        text += f", {summary['n_donors']} donors kept together"
     if summary.get('status') == 'warn':
         text += (f"\nfewer than {drc_predictive.RECOMMENDED_PER_GROUP} per group: "
                  "estimates are noisy")

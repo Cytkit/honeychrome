@@ -4107,6 +4107,17 @@ class GroupsStatsTab(QWidget):
             "a different split. More repeats give steadier estimates."
         )
         pred_row.addWidget(self.pred_repeats_spin)
+        pred_row.addSpacing(12)
+        self.pred_chk_donors = QCheckBox("Keep donors together")
+        self.pred_chk_donors.setChecked(True)
+        self.pred_chk_donors.setToolTip(
+            "With a paired design (Pairing variable), every cross-validation split keeps "
+            "all samples of a donor on the same side, so the model is never tested on a "
+            "donor it was trained on. Needs at least "
+            f"{drc_predictive.MIN_DONORS_PER_GROUP} donors per group. Untick to split "
+            "samples alone. No effect without a paired design."
+        )
+        pred_row.addWidget(self.pred_chk_donors)
         pred_row.addStretch()
         pred_layout.addLayout(pred_row)
 
@@ -7773,6 +7784,8 @@ class GroupsStatsTab(QWidget):
             rel_list,
         )
         repeats = self.pred_repeats_spin.value()
+        pairing = self._trend_pairing(rel_list) if self.pred_chk_donors.isChecked() else None
+        blocks = [pairing.get(rel, rel) for rel in rel_list] if pairing else None
         run_label = self.state.stats_run_label or 'Active (unsaved)'
         token = acquire_job(self.controller, 'Honeycluster: predictive analysis')
         if token is None:
@@ -7792,7 +7805,7 @@ class GroupsStatsTab(QWidget):
                 try:
                     self_.result = drc_predictive.run_predictive(
                         X, groups, positive, negative, models=tuple(models),
-                        repeats=repeats, progress=self_.progress.emit,
+                        repeats=repeats, blocks=blocks, progress=self_.progress.emit,
                     )
                     self_.result['run_label'] = run_label
                     self_.finished.emit(True, '')
@@ -7870,6 +7883,8 @@ class GroupsStatsTab(QWidget):
         n = ", ".join(f"{g} n={k}" for g, k in summary['n_per_group'].items())
         text = (f"{summary['positive']} vs {summary['negative']} ({n}); "
                 f"{summary['repeats']}× repeated {summary['outer_folds']}-fold CV")
+        if summary.get('n_donors'):
+            text += f", {summary['n_donors']} donors kept together"
         if summary.get('status') == 'warn':
             text += (f"\nfewer than {drc_predictive.RECOMMENDED_PER_GROUP} per group: "
                      "estimates are noisy")
