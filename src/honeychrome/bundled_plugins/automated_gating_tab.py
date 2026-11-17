@@ -1584,6 +1584,7 @@ class RunTab(QWidget):
         self._worker = None
         self._job_token.release()
         self._set_running(False)
+        self._update_warnings()
         self.progress_bar.setVisible(False)
         st = self.state
         if outcome == 'cancelled' and self._before_run is not None:
