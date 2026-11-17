@@ -696,7 +696,7 @@ def design_check(time, covariates: pd.DataFrame | None = None,
                 continue
             value, measure = float(np.corrcoef(t[ok], numeric[ok])[0, 1]), 'r'
         else:
-            ok = np.isfinite(t) & np.array([v is not None for v in texts])
+            ok = np.isfinite(t) & np.array([v is not None for v in texts], dtype=bool)
             if ok.sum() < 3:
                 continue
             tt = t[ok]
