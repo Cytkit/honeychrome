@@ -71,10 +71,11 @@ class EventBus(QObject):
     refreshCustomRois = Signal(str)
 
     ### per-sample custom gates (one shared template, per-sample gate overrides)
-    # UI -> controller: customise / revert / adopt a gate for the current sample (scope, gate_name)
+    # UI -> controller: customise / revert / adopt / apply to the sample's group a gate for the current sample (scope, gate_name)
     customiseGateRequested = Signal(str, str)
     revertGateRequested = Signal(str, str)
     adoptGateRequested = Signal(str, str)
+    applyGateToGroupRequested = Signal(str, str)
     # controller -> UI: the current sample's customised gate names for a scope (scope, [gate_names])
     customGatesChanged = Signal(str, list) # the list of custom gates changes for a scope
 

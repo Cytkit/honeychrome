@@ -238,6 +238,9 @@ def _build_custom_gate_actions(menu, label):
         added.append(menu.addAction(
             f"Adopt '{gate_name}' custom gate as template",
             lambda: bus.adoptGateRequested.emit(mode, label.gate_name)))
+        added.append(menu.addAction(
+            f"Apply '{gate_name}' custom gate to this sample's group",
+            lambda: bus.applyGateToGroupRequested.emit(mode, label.gate_name)))
     else:
         action = menu.addAction(
             f"Customise '{gate_name}' for this sample",

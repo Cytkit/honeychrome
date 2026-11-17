@@ -367,7 +367,8 @@ class GatingHierarchyWidget(QWidget):
             copy_action.triggered.connect(lambda : self.model.copy_hierarchy(index))
 
             # Per-sample custom gates: customise this gate for the current sample,
-            # or (if already customised) revert to / adopt as the shared template.
+            # or (if already customised) revert to / adopt as the shared template /
+            # apply to every sample in the same folder.
             # A QuadrantGate's four quadrants are not gates in their own right —
             # FlowKit refuses to return them ("specify the owning QuadrantGate"),
             # and their geometry comes entirely from the parent's dividers — so
@@ -383,6 +384,9 @@ class GatingHierarchyWidget(QWidget):
                     adopt_action = menu.addAction(f"Adopt '{item_name}' custom gate as template")
                     adopt_action.triggered.connect(
                         lambda: self.bus.adoptGateRequested.emit(self.mode, item_name))
+                    group_action = menu.addAction(f"Apply '{item_name}' custom gate to this sample's group")
+                    group_action.triggered.connect(
+                        lambda: self.bus.applyGateToGroupRequested.emit(self.mode, item_name))
                 else:
                     customise_action = menu.addAction(f"Customise '{item_name}' for this sample")
                     customise_action.triggered.connect(
@@ -431,6 +435,8 @@ class GatingHierarchyWidget(QWidget):
     @Slot(str, str)
     def update_hierarchy(self, mode=None, top_gate_id=None):
         if mode == self.mode:
+            if self.data_for_cytometry_plots is None or self.data_for_cytometry_plots['gating'] is None:
+                return
             self.gating_hierarchy = self.data_for_cytometry_plots['gating'].get_gate_hierarchy(output='dict')
             self.model.set_dict(self.gating_hierarchy, self.data_for_cytometry_plots['statistics'])
             self.tree_view.expandAll()
