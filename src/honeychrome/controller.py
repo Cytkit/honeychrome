@@ -32,7 +32,7 @@ import warnings
 import hashlib
 from datetime import datetime
 import numpy as np
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from PySide6.QtCore import QCoreApplication, QObject, QThread, Qt, Signal, Slot, QTimer
 from PySide6.QtGui import QGuiApplication
 from flowkit import GatingStrategy, Sample, gates
@@ -300,6 +300,10 @@ class Controller(QObject):
                 key = f'{safe}__{k}'
                 if key in arrays:
                     entry[k] = arrays[key]
+            if 'v_mats' not in entry:
+                # the sidecar holding this fluorophore's variants is missing
+                n_skipped_stale += 1
+                continue
             self.autospectral_variants[label] = entry
         if self.autospectral_variants:
             logger.info(f'Controller: loaded autospectral_variants for {len(self.autospectral_variants)} fluorophore(s).')
@@ -338,7 +342,12 @@ class Controller(QObject):
         self.initialise_ephemeral_data()
         self._load_cleaned_events()
         self._load_autospectral_variants()
-        self.cache_all_af_profiles()
+        af_warning = self.cache_all_af_profiles()
+        if af_warning:
+            if self.warning_collector is not None:
+                self.warning_collector.append(af_warning)
+            elif self.bus is not None:
+                self.bus.warningMessage.emit(af_warning)
         self.initialise_af_matrices()
 
         logger.info(f'Controller: experiment loaded {self.experiment_dir}')
@@ -745,6 +754,35 @@ class Controller(QObject):
             self.bus.changedGatingHierarchy.emit(scope, gate_name)
         self.refresh_custom_gates_on_current_tab_for_current_sample(scope)
         logger.info(f'Controller: adopted custom {scope} gate {gate_name!r} as template')
+
+    def apply_custom_gate_to_group(self, scope, gate_name):
+        """Copy the current sample's custom ``gate_name`` to every other sample
+        in the same sample group (the folder the sample sits in), as each
+        sample's own custom gate. Samples outside the folder, and the
+        template, are unchanged; a sample's earlier customisation of this gate
+        is replaced."""
+        if not self.current_sample_path:
+            return
+        gating = self.raw_gating if scope == 'raw' else self.unmixed_gating
+        sample_id = self.current_sample_path
+        if gating is None or not gating.is_custom_gate(sample_id, gate_name):
+            return
+        custom_gate = gating.get_gate(gate_name, sample_id=sample_id)
+        folder = PurePosixPath(str(sample_id).replace('\\', '/')).parent
+        members = [p for p in self.experiment.samples.get('all_samples', {})
+                   if p != sample_id and PurePosixPath(str(p).replace('\\', '/')).parent == folder]
+        scope_overrides = self.custom_sample_gates.setdefault(scope, {})
+        scope_overrides.setdefault(sample_id, {})[gate_name] = deepcopy(custom_gate)
+        for path in members:
+            scope_overrides.setdefault(path, {})[gate_name] = deepcopy(custom_gate)
+        if self.bus is not None:
+            self.bus.changedGatingHierarchy.emit(scope, gate_name)
+            self.bus.statusMessage.emit(
+                f"Custom gate '{gate_name}' applied to {len(members)} other sample"
+                f"{'' if len(members) == 1 else 's'} in group '{folder.name or folder}'")
+        self.refresh_custom_gates_on_current_tab_for_current_sample(scope)
+        logger.info(f'Controller: applied custom {scope} gate {gate_name!r} from {sample_id} '
+                    f'to {len(members)} samples in {folder}')
 
     def refresh_custom_gates_on_current_tab_for_current_sample(self, scope=None):
         """Tell the UI which gates are customised for the current sample in ``scope``."""
@@ -1179,21 +1217,28 @@ class Controller(QObject):
         (Re)compute precomputed matrices for every stored AF profile and replace
         the entire cache.  Called by initialise_transfer_matrix() after a spectral
         process refresh, because P depends on fluor_spectra which may have changed.
+        Returns a warning for the user when stored AF profiles were extracted
+        with a different set of detectors from the current spectra, else None.
         """
         self.af_precomputed_cache = {}
         af_profiles = self.experiment.process.get('af_profiles', {})
         if not af_profiles:
             logger.debug(f'cache_all_af_profiles: experiment.process has no af_profiles — keys present: {list(self.experiment.process.keys())}')
-            return
+            return None
 
         fluor_spectra = self._build_fluor_spectra()
         if fluor_spectra is None:
             logger.warning(
                 'cache_all_af_profiles: fluor_spectra unavailable — cache empty.'
             )
-            return
+            return None
 
+        mismatched = []
         for name, entry in af_profiles.items():
+            af_spectra = np.asarray(entry.get('spectra'), dtype=float)
+            if af_spectra.ndim != 2 or af_spectra.shape[1] != fluor_spectra.shape[1]:
+                mismatched.append(name)
+                continue
             try:
                 self.af_precomputed_cache[name] = self._precompute_profile(entry, fluor_spectra)
             except Exception as e:
@@ -1204,6 +1249,14 @@ class Controller(QObject):
             f'{len(self.af_precomputed_cache)}/{len(af_profiles)} profiles cached.'
         )
         self._request_missing_envelopes()
+        if not mismatched:
+            return None
+        logger.warning(f'cache_all_af_profiles: {mismatched} do not match the {fluor_spectra.shape[1]} detectors of the current spectra')
+        names = ', '.join(f'"{name}"' for name in mismatched)
+        return (f'These autofluorescence (AF) profiles were extracted with a different set of detectors '
+                f'from the current spectral profiles ({fluor_spectra.shape[1]} detectors), so they are not '
+                f'being used: {names}.\n\nThis happens when the fluorescence channels in use change after '
+                f'the AF profiles were extracted. Extract them again in the AutoSpectral tab.')
 
     def _request_missing_envelopes(self):
         """
@@ -2497,7 +2550,9 @@ class Controller(QObject):
             self.af_sidecar_data = None
 
         # Rebuild AF cache synchronously before reinitialising ephemeral data.
-        self.cache_all_af_profiles()
+        af_warning = self.cache_all_af_profiles()
+        if af_warning:
+            conditioning_warnings.append(af_warning)
         # then reinitialise ephemeral data for process and unmixed tabs; with a sample
         # loaded this unmixes it again and recalculates the current tab's plots
         self.initialise_ephemeral_data(scope=['unmixed'])
