@@ -8,7 +8,6 @@ A single-stained control is never only one colour. The brightest events of a cel
 - **Saturation exclusion** removes events that saturate a detector.
 - **Brightest-event selection** keeps the events with the most fluorophore signal.
 - **Scatter matching** picks unstained cells with the same forward and side scatter as those positives, so positives and negatives share an autofluorescence background.
-- **Noise exclusion** (optional) removes intrusive autofluorescent events, such as macrophages and dead cells, from the control.
 
 Cleaning is designed for single-stained **cell** controls on a spectral cytometer. It does less for bead controls, and has not been tested on conventional cytometry.
 
@@ -25,16 +24,14 @@ Cleaning is designed for single-stained **cell** controls on a spectral cytomete
 
 ## Clean the controls
 
-1. In the Spectral Process tab, tick **Show AutoSpectral Cleaning**. The cleaning box and its workflow guide appear, and the spectral model table gains the **Use cleaned** and **Exclude Noise** columns.
+1. In the Spectral Process tab, tick **Show AutoSpectral Cleaning**. The cleaning box and its workflow guide appear, and the spectral model table gains the **Use cleaned** column.
 2. Choose **Using unstained negative** instead of **Using internal negatives**, and check that each cell control has an unstained sample in its **Unstained Negative** column. **Set negative for all** fills the column in one step.
 3. Press **Auto generate spectral controls** (see [Spectral unmixing](/docs/unmixing/spectral-unmixing/)). With **Automatically Clean** ticked, the default, cleaning follows straight on and the spectral model is recalculated once.
 4. To clean again after changing gates, negatives or particle types, press **Clean Controls**. Only the controls whose settings changed are cleaned again.
 
-{% include figure.html src="docs/show_autospectral_cleaning2.webp" alt="Spectral Process with the AutoSpectral cleaning box, Use cleaned and Exclude Noise columns" width="1600" height="1091" %}
+{% include figure.html src="docs/show_autospectral_cleaning2.webp" alt="Spectral Process with the AutoSpectral cleaning box and the Use cleaned column" width="1600" height="1091" %}
 
 **Automatically Clean** is saved with each experiment. Its default for new experiments is set in App Configuration.
-
-**Exclude Noise** is off by default, because controls with little autofluorescence do not need it. Clean once, look at the results, then tick it for the controls with high autofluorescence and clean again.
 
 ## Check the result
 

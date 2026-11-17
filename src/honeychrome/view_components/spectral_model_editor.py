@@ -486,8 +486,8 @@ class SpectralControlsEditor(QFrame):
         """)
         self.activate_cleaning_checkbox.setToolTip(
             'Show AutoSpectral Control Cleaning options: "Clean Controls" button, '
-            '"Use Cleaned" and "Exclude noise" table columns, peak-channel histograms, '
-            'scatter-matching and noise exclusion diagnostic plots.'
+            '"Use Cleaned" table column, peak-channel histograms, '
+            'scatter-matching and spectral QC diagnostic plots.'
         )
 
         self.auto_clean_checkbox = QCheckBox("Automatically Clean")

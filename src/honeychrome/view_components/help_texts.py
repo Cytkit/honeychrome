@@ -170,7 +170,6 @@ autospectral_cleaning_help_text = '''
   <ul>
     <li>Saturation exclusion — removes detector-saturated events.</li>
     <li>Scatter matching — selects negative events whose scatter profile matches the positive control, reducing background due to cell size/granularity differences.</li>
-    <li>Noise exclusion (if ticked) — identifies and removes intrusive autofluorescent events from the positive control using PCA on the matched unstained.</li>
   </ul>
 </li>
 <li><b>Inspect diagnostic plots:</b> After cleaning, use the scatter-matching and spectral QC diagnostic plots (visible below when cleaning is active and relevant box ticked) to verify that the cleaning has worked as expected.</li>
