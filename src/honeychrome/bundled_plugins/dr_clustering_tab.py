@@ -1292,7 +1292,9 @@ class _SortableItem(QTableWidgetItem):
                     return a < b
                 except TypeError:
                     pass
-        return super().__lt__(other)
+        # Not QTableWidgetItem.__lt__: called from this override, it calls
+        # the override again.
+        return self.text() < other.text()
 
 
 class RunDetailDialog(QDialog):
@@ -1516,7 +1518,8 @@ class RunManagementTable(CopyableTableWidget):
         self.setItem(row, 5, events_item)
 
         channels = entry.get('channels', [])
-        ch_item = QTableWidgetItem(str(len(channels)))
+        ch_item = _SortableItem(str(len(channels)))
+        ch_item.set_sort_key(len(channels))
         ch_item.setToolTip(', '.join(channels))
         self.setItem(row, 6, ch_item)
 

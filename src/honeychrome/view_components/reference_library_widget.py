@@ -112,7 +112,9 @@ class _SortableItem(QTableWidgetItem):
         mine = self.data(_SORT_ROLE)
         theirs = other.data(_SORT_ROLE) if isinstance(other, QTableWidgetItem) else None
         if mine is None or theirs is None:
-            return super().__lt__(other)
+            # Not QTableWidgetItem.__lt__: called from this override, it
+            # calls the override again.
+            return self.text() < other.text()
         try:
             return mine < theirs
         except TypeError:
