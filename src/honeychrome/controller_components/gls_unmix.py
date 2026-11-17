@@ -17,7 +17,11 @@ Noise model fit (``fit_experiment_noise_model``, worker thread)
        projection basis comes from the training events. "Auto" picks, among
        the unstained cell samples with a stored AF profile, the one with the
        lowest mean raw signal (from the profile's stored unstained
-       subsample when it has one).
+       subsample when it has one). When no unstained cell sample has a
+       stored AF profile, Auto fits from the bead controls alone: the bead
+       negatives take the unstained sample's place, cell controls are left
+       out and the model has one class ('beads'), which cells use too, with
+       the bead negatives' variance for their positivity prior.
     2. Bead negatives anchor sigma0: unstained bead samples (or the one the
        user chose), else the bead controls' universal negatives, else
        internal negatives found inside the bead controls (``bead_mode``).
@@ -112,6 +116,8 @@ v1 simplifications
       negatives are internal ones, is processed after the others.
     * A model fitted with earlier spectra stays usable (it describes the
       detectors); ``spectra_changed`` reports it.
+    * A fit from bead controls alone scales the clamped-data weights and the
+      flat weights to the held-out events of its largest bead negative.
 """
 
 from __future__ import annotations
@@ -198,6 +204,10 @@ class NoiseSetupSettings:
     clamp_floor_pe: float = 10.0
     variant: VariantSettings = field(default_factory=VariantSettings)
     noise: nm.NoiseSettings = field(default_factory=lambda: nm.NoiseSettings(sigma0_by_class=True))
+
+
+BEADS_ONLY_NOTE = ('Fitted from bead controls only: no unstained cell sample has an AF profile. '
+                   'Cells are unmixed with the bead model.')
 
 
 # ---------------------------------------------------------------------------
@@ -546,11 +556,16 @@ def noise_setup_snapshot(controller, settings: NoiseSetupSettings, unstained_pat
     for path in candidates + [r['neg_path'] for r in controls if r['is_cell'] and r['neg_path']]:
         if path not in stored:
             stored[path], sidecars[path] = stored_af_for(controller, path, layout['detectors'])
+    beads_only = False
     if unstained_path == AUTO:
         candidates = [p for p in candidates if stored.get(p) is not None]
         if not candidates:
-            raise ValueError('No unstained cell sample has a stored AF profile: extract one on the '
-                             'Autofluorescence page, or choose the unstained sample.')
+            controls = [r for r in controls if not r['is_cell']]
+            if not controls:
+                raise ValueError('No unstained cell sample has a stored AF profile and the spectral model has '
+                                 'no bead control: extract an AF profile on the Autofluorescence page, or '
+                                 'choose the unstained sample.')
+            beads_only = True
     folder = Path(controller.experiment_dir) / AF_SUBDIR
     raw_settings = controller.experiment.settings['raw']
     lasers = detector_lasers(raw_settings, layout['detectors'], Path(controller.experiment_dir) / controls[0]['path'])
@@ -561,7 +576,7 @@ def noise_setup_snapshot(controller, settings: NoiseSetupSettings, unstained_pat
         'fluor_names': names, 'spectra': spectra, 'settings': settings, 'controls': controls,
         'bead_unstained': [p for p, _n in unstained_bead_samples(samples)],
         'stored_af': stored, 'stored_sidecar': sidecars, 'variant_cache': str(folder / VARIANT_FILE),
-        'scatter_columns': scatter_columns_for(controller, layout), 'lasers': lasers,
+        'scatter_columns': scatter_columns_for(controller, layout), 'lasers': lasers, 'beads_only': beads_only,
     }
 
 
@@ -584,11 +599,11 @@ class NoiseFit:
     """A fitted noise model with what it was fitted from."""
     model: nm.NoiseModel
     calibration: dict
-    unstained_path: str
+    unstained_path: str | None   # None for a fit from bead controls alone
     gate: str
     af_source: str
     bead_sources: list        # [{'name', 'source'}]: a sample key or an internal negative's name
-    cell_null_var: np.ndarray
+    cell_null_var: np.ndarray    # the beads' for a fit from bead controls alone
     bead_null_var: np.ndarray | None
     n_controls: int
     notes: list
@@ -600,6 +615,7 @@ class NoiseFit:
     clamped_weights: dict = field(default_factory=dict)  # {'kind', 'floor', 'scale'}: the weights for clamped data
     selection: dict = field(default_factory=dict)     # {'mode', 'counts': {path: counts}, 'sources': {group: path}}
     options: dict = field(default_factory=dict)       # the design and estimator settings used
+    beads_only: bool = False                          # fitted from bead controls alone
 
 
 def _load(snap: dict, loader, path: str, gate: str) -> tuple:
@@ -704,16 +720,23 @@ def fit_experiment_noise_model(snap: dict, progress, loader=None) -> NoiseFit:
         tr, _te = holdout_split(len(neg_fl), s.control_train_frac, s.seed + 7)
         return af_basis(neg_fl[tr], s.bead_af_rows, seed=s.seed)
 
-    unstained_path, fl, sc = _choose_unstained(snap, loader, progress)
-    keep = subsample(len(fl), s.max_unstained, s.seed)
-    fl, sc = fl[keep], sc[keep]
-    train, test = holdout_split(len(fl), s.unstained_train_frac, s.seed, s.max_test_unstained)
-    u_train, u_test = fl[train], fl[test]
-    setup_af = snap['stored_af'].get(unstained_path)
-    af_source = 'stored AF profile' if setup_af is not None else 'AF extracted for the thresholds'
-    setup_basis = af_basis(u_train, s.n_af_rows, seed=s.seed)
-    bases_af = {unstained_path: setup_basis}
-    neg_cache = {unstained_path: (u_train, sc[train])}
+    beads_only = bool(snap.get('beads_only'))
+    if beads_only:
+        notes.append(BEADS_ONLY_NOTE)
+        unstained_path = fl = u_train = u_test = setup_af = setup_basis = None
+        af_source = 'none (bead controls only)'
+        bases_af, neg_cache = {}, {}
+    else:
+        unstained_path, fl, sc = _choose_unstained(snap, loader, progress)
+        keep = subsample(len(fl), s.max_unstained, s.seed)
+        fl, sc = fl[keep], sc[keep]
+        train, test = holdout_split(len(fl), s.unstained_train_frac, s.seed, s.max_test_unstained)
+        u_train, u_test = fl[train], fl[test]
+        setup_af = snap['stored_af'].get(unstained_path)
+        af_source = 'stored AF profile' if setup_af is not None else 'AF extracted for the thresholds'
+        setup_basis = af_basis(u_train, s.n_af_rows, seed=s.seed)
+        bases_af = {unstained_path: setup_basis}
+        neg_cache = {unstained_path: (u_train, sc[train])}
     thr_cache = {}
 
     def threshold(key, is_cell, af_spectra):
@@ -865,6 +888,9 @@ def fit_experiment_noise_model(snap: dict, progress, loader=None) -> NoiseFit:
 
     if s.bead_mode == 'auto' and not anchors:
         anchors = internal
+    if beads_only and not anchors:
+        raise ValueError('A noise model from bead controls alone needs bead negatives (unstained beads, a '
+                         'universal negative, or unstained beads inside the controls with bead negatives Auto).')
     for n, rec, cfl, csc in deferred:
         if anchors:
             neg_fl = np.vstack([a[2] for a in anchors])
@@ -907,11 +933,12 @@ def fit_experiment_noise_model(snap: dict, progress, loader=None) -> NoiseFit:
         cls = 'cells' if is_cell else 'beads'
         fit_groups.append(nm.Group(label, 'control', fit_ev, design, offset, cls=cls))
         cal_groups.append(nm.Group(label, 'control', cal_ev, design, offset, cls=cls))
-    fit_groups.append(nm.Group('Unstained', 'unstained',
-                               u_train[subsample(len(u_train), 4 * s.max_fit_events, s.seed)], setup_basis))
-    cal_groups.append(nm.Group('Unstained', 'unstained',
-                               u_test[subsample(len(u_test), 2 * s.max_cal_events, s.seed)], setup_basis))
-    group_paths['Unstained'] = unstained_path
+    if not beads_only:
+        fit_groups.append(nm.Group('Unstained', 'unstained',
+                                   u_train[subsample(len(u_train), 4 * s.max_fit_events, s.seed)], setup_basis))
+        cal_groups.append(nm.Group('Unstained', 'unstained',
+                                   u_test[subsample(len(u_test), 2 * s.max_cal_events, s.seed)], setup_basis))
+        group_paths['Unstained'] = unstained_path
     bead_test = []
     for name, _source, bfl, _bsc in anchors:
         tr, te = holdout_split(len(bfl), s.control_train_frac, s.seed + 7)
@@ -925,13 +952,17 @@ def fit_experiment_noise_model(snap: dict, progress, loader=None) -> NoiseFit:
 
     clamped = False
     if s.clamp_mode == 'auto':
-        clamped, _share = nm.negatives_clamped([fl] + [a[2] for a in anchors])
+        clamped, _share = nm.negatives_clamped(([] if beads_only else [fl]) + [a[2] for a in anchors])
         if clamped:
             notes.append('Clamped data: the negatives have no values at or below zero on any detector, so their '
                          'noise is truncated at zero. The experiment is unmixed with '
                          f'{clamped_weights_text(s.clamp_weights)} and the positivity prior unless the noise model '
                          'is ticked.')
-    u_proj = nm.project(nm.Group('Unstained', 'unstained', u_test, setup_basis))
+    if beads_only:
+        k = int(np.argmax([len(t) for t in bead_test]))
+        u_proj = nm.project(nm.Group(anchors[k][0], 'beads', bead_test[k], bead_rows(anchors[k][2]), cls='beads'))
+    else:
+        u_proj = nm.project(nm.Group('Unstained', 'unstained', u_test, setup_basis))
     flat_phi = float(np.median(nm.robust_var(u_proj.resid)))
 
     progress('Fitting the noise model')
@@ -953,17 +984,19 @@ def fit_experiment_noise_model(snap: dict, progress, loader=None) -> NoiseFit:
                                               'options': options})
     bead_var = robust_sd(_ols(np.vstack(bead_test), spectra)) ** 2 if bead_test else None
     bead_all = np.vstack(bead_test) if bead_test else None
+    cell_neg = bead_all if beads_only else u_test
     return NoiseFit(
         model=model, calibration=calibration, unstained_path=unstained_path,
         gate=snap['gate'] if s.selection == 'gates' else None,
         af_source=af_source, bead_sources=[{'name': a[0], 'source': a[1]} for a in anchors],
-        cell_null_var=robust_sd(_ols(u_test, spectra)) ** 2, bead_null_var=bead_var,
+        cell_null_var=bead_var if beads_only else robust_sd(_ols(u_test, spectra)) ** 2, bead_null_var=bead_var,
         n_controls=len(kept), notes=notes, spectra_fingerprint=spectra_fingerprint(names, spectra),
-        cell_negatives=u_test[subsample(len(u_test), NEGATIVE_SAMPLE_EVENTS, s.seed)].astype(np.float32),
+        cell_negatives=cell_neg[subsample(len(cell_neg), NEGATIVE_SAMPLE_EVENTS, s.seed)].astype(np.float32),
         bead_negatives=None if bead_all is None else
         bead_all[subsample(len(bead_all), NEGATIVE_SAMPLE_EVENTS, s.seed)].astype(np.float32),
         clamped=bool(clamped), flat_phi=flat_phi, clamped_weights=clamped_weights,
-        selection={'mode': s.selection, 'counts': counts, 'sources': group_paths}, options=options)
+        selection={'mode': s.selection, 'counts': counts, 'sources': group_paths}, options=options,
+        beads_only=beads_only)
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1040,7 @@ def store_noise_fit(process: dict, experiment_dir, fit: NoiseFit, prior_lambda: 
         'spectra_fingerprint': fit.spectra_fingerprint, 'unstained': fit.unstained_path, 'gate': fit.gate,
         'af_source': fit.af_source, 'beads': list(fit.bead_sources), 'n_controls': int(fit.n_controls),
         'cell_null_var': [float(v) for v in fit.cell_null_var],
+        'beads_only': bool(fit.beads_only),
         'bead_null_var': None if fit.bead_null_var is None else [float(v) for v in fit.bead_null_var],
         'calibration': calibration_summary(fit.calibration), 'notes': list(fit.notes),
         'flagged_detectors': int(np.count_nonzero(fit.model.flags)),

@@ -7,6 +7,7 @@ assembly), the estimator options, clamped data and flat weights, the
 automatic event selection and version 1 files.
 """
 
+import dataclasses
 import json
 
 import numpy as np
@@ -149,6 +150,39 @@ def test_store_and_load(experiment, tmp_path):
     assert gu.load_noise_state(process, tmp_path, panel['detectors'][:-1]) is None
     assert not gu.spectra_changed(entry, snap['fluor_names'], snap['spectra'])
     assert gu.spectra_changed(entry, snap['fluor_names'], snap['spectra'] * 1.01)
+
+
+def _beads_only(snap, **settings):
+    return dict(snap, unstained_candidates=[], beads_only=True,
+                controls=[r for r in snap['controls'] if not r['is_cell']],
+                settings=dataclasses.replace(snap['settings'], **settings))
+
+
+def test_fit_from_bead_controls_alone(experiment, tmp_path):
+    panel, samples, snap, full = experiment
+    fit = gu.fit_experiment_noise_model(_beads_only(snap), lambda _t: None, syn.loader_for(samples))
+    assert fit.beads_only and fit.unstained_path is None
+    assert fit.n_controls == 4 and fit.model.sigma0_sq_by_class is None
+    assert gu.BEADS_ONLY_NOTE in fit.notes
+    assert fit.bead_null_var.shape == (12,)
+    np.testing.assert_array_equal(fit.cell_null_var, fit.bead_null_var)
+    ratio = fit.model.sigma0_sq / full.model.for_class('beads').sigma0_sq
+    assert 0.67 <= float(np.median(ratio)) <= 1.5
+
+    process = {}
+    gu.store_noise_fit(process, tmp_path, fit, prior_lambda=1.0)
+    entry = process[gu.PROCESS_KEY]
+    assert entry['beads_only'] and entry['unstained'] is None
+    state = gu.load_noise_state(process, tmp_path, panel['detectors'])
+    np.testing.assert_allclose(state.cell_null_var, fit.bead_null_var)
+    assert state.cell_negatives is not None and state.bead_negatives is not None
+    np.testing.assert_array_equal(state.model_for(False).sigma0_sq, state.model_for(True).sigma0_sq)
+
+
+def test_fit_from_bead_controls_alone_needs_bead_negatives(experiment):
+    _panel, samples, snap, _full = experiment
+    with pytest.raises(ValueError, match='bead negatives'):
+        gu.fit_experiment_noise_model(_beads_only(snap, bead_mode='none'), lambda _t: None, syn.loader_for(samples))
 
 
 # ---------------------------------------------------------------------------
