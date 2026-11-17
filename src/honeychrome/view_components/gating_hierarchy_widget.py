@@ -4,8 +4,10 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence, QClipboard
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTreeView, QWidget, QVBoxLayout, QHeaderView, QMenu,
-                               QMessageBox)
+                               QMessageBox, QDialog)
 from PySide6.QtCore import Qt, QAbstractItemModel, QModelIndex, Slot, QMimeData
+
+from honeychrome.view_components.regions_of_interest import LabelEditDialog, rename_gate_in_experiment
 
 import logging
 logger = logging.getLogger(__name__)
@@ -285,6 +287,7 @@ class GatingHierarchyWidget(QWidget):
         # self.tree_view.setSelectionBehavior(QTreeView.SelectItems)
         self.tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.show_context_menu)
+        self.tree_view.doubleClicked.connect(self.on_double_clicked)
 
         # gate names customised for the current sample (per-sample custom gates)
         self._custom_gates = set()
@@ -377,6 +380,8 @@ class GatingHierarchyWidget(QWidget):
             is_quadrant = getattr(item, 'gate_type', None) == 'Quadrant'
             if self.bus is not None and item_name and item_name != 'root' and not is_quadrant:
                 menu.addSeparator()
+                rename_action = menu.addAction(f"Rename '{item_name}'")
+                rename_action.triggered.connect(lambda: self.rename_item(item_name))
                 if item_name in self._custom_gates:
                     revert_action = menu.addAction(f"Revert '{item_name}' to template")
                     revert_action.triggered.connect(
@@ -392,7 +397,7 @@ class GatingHierarchyWidget(QWidget):
                     customise_action.triggered.connect(
                         lambda: self.bus.customiseGateRequested.emit(self.mode, item_name))
 
-        # todo add delete/rename, should be integrated with delete/rename menus on plots
+        # todo add delete, should be integrated with delete menus on plots
         #
         # if index.isValid():
         #     # Item was clicked - get item data
@@ -403,10 +408,6 @@ class GatingHierarchyWidget(QWidget):
         #     title_action.setEnabled(False)  # Make it non-clickable
         #     menu.addAction(title_action)
         #
-        #     rename_action = QAction(f"Rename", self)
-        #     rename_action.triggered.connect(lambda: self.rename_item(index))
-        #     menu.addAction(rename_action)
-        #
         #     delete_action = QAction(f"Delete", self)
         #     delete_action.triggered.connect(lambda: self.delete_item(index))
         #     menu.addAction(delete_action)
@@ -416,9 +417,28 @@ class GatingHierarchyWidget(QWidget):
 
         menu.exec(self.tree_view.viewport().mapToGlobal(position))
 
-    def rename_item(self, index):
-        item_name = self.model.data(index.siblingAtColumn(0), Qt.DisplayRole)
-        QMessageBox.information(self, "Rename", f"Renaming: {item_name}")
+    def on_double_clicked(self, index):
+        """Double-click a gate's name to rename it, as on the plots. Root and
+        the four quadrants of a QuadrantGate (not gates in their own right)
+        are not renamable."""
+        if self.bus is None or index.column() != 0:
+            return
+        item = index.internalPointer()
+        if item is None or item.name == 'root' or getattr(item, 'gate_type', None) == 'Quadrant':
+            return
+        self.rename_item(item.name)
+
+    def rename_item(self, item_name):
+        """Rename a gate through the same path as the plot gate labels, so the
+        plots, the spectral model and other views follow the new name."""
+        gating = self.data_for_cytometry_plots['gating']
+        gate_names = ['root'] + [g[0] for g in gating.get_gate_ids()]
+        dlg = LabelEditDialog(item_name, existing_names=gate_names, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_name = dlg.getText()
+            if new_name.strip():
+                rename_gate_in_experiment(gating, self.data_for_cytometry_plots, self.bus,
+                                          self.mode, item_name, new_name)
 
     def delete_item(self, index):
         item_name = self.model.data(index.siblingAtColumn(0), Qt.DisplayRole)

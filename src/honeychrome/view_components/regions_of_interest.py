@@ -191,28 +191,36 @@ class DraggableRoiLabel(pg.TextItem):
         self.setPos(*new_label_pos)
 
     def rename_gate(self, new_name):
-        if self.gating.find_matching_gate_paths(new_name):
-            raise Exception(f"gate name {new_name} already exists")
-        else:
-            old_name = self.gate_name
-            self.gating.rename_gate(old_name, new_name)
-            self.gate_name = new_name
-            # Update child_gates references in all plots
-            for plot in self.data_for_cytometry_plots['plots']:
-                if old_name in plot['child_gates']:
-                    idx = plot['child_gates'].index(old_name)
-                    plot['child_gates'][idx] = new_name
-                    rename_label_offset(plot, old_name, new_name)
-            # If this is a raw-mode rename, propagate to the spectral model's gate_label
-            # so that generate() and Recalculate can still find the gate.
-            mode = self.parent_roi.vb.parent().mode
-            if mode == 'raw' and self.bus is not None:
-                self.bus.rawGateRenamed.emit(old_name, new_name)
-            if self.bus is not None:
-                self.bus.updateSourceChildGates.emit(mode, new_name)
-                self.bus.changedGatingHierarchy.emit(mode, new_name)
+        mode = self.parent_roi.vb.parent().mode
+        rename_gate_in_experiment(self.gating, self.data_for_cytometry_plots, self.bus,
+                                  mode, self.gate_name, new_name)
+        self.gate_name = new_name
 
-        # print(self.gating.get_gate_ids())
+
+def rename_gate_in_experiment(gating, data_for_cytometry_plots, bus, mode, old_name, new_name):
+    """Rename a gate and every reference the plots and other views hold to it.
+
+    Shared by the gate labels on the plots and the gating hierarchy tree, so a
+    gate renamed in either place stays consistent everywhere: the gating
+    strategy, each plot's child gates and label offsets, the plot labels
+    themselves (via ``gateRenamed``) and, for raw-mode gates, the spectral
+    model's gate labels (via ``rawGateRenamed``) so that generate() and
+    Recalculate can still find the gate.
+    """
+    if gating.find_matching_gate_paths(new_name):
+        raise Exception(f"gate name {new_name} already exists")
+    gating.rename_gate(old_name, new_name)
+    for plot in data_for_cytometry_plots['plots']:
+        if old_name in plot['child_gates']:
+            idx = plot['child_gates'].index(old_name)
+            plot['child_gates'][idx] = new_name
+            rename_label_offset(plot, old_name, new_name)
+    if bus is not None:
+        bus.gateRenamed.emit(mode, old_name, new_name)
+        if mode == 'raw':
+            bus.rawGateRenamed.emit(old_name, new_name)
+        bus.updateSourceChildGates.emit(mode, new_name)
+        bus.changedGatingHierarchy.emit(mode, new_name)
 
 def _build_custom_gate_actions(menu, label):
     """Append the per-sample custom gate actions to ``menu``, mirroring the

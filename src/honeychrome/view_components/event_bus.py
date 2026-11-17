@@ -93,3 +93,4 @@ class EventBus(QObject):
     requestUpdateProcessHists = Signal()
     spilloverSelectedCellChanged = Signal(str, str)
     rawGateRenamed = Signal(str, str)   # (old_name, new_name) — propagate raw gate rename to spectral model
+    gateRenamed = Signal(str, str, str)   # (mode, old_name, new_name) — any gate rename, from a plot label or the hierarchy tree
