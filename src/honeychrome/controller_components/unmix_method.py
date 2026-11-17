@@ -29,7 +29,8 @@ Methods (``process['unmixing']``)
 AF abundance
     With the noise-aware AF abundance (``af_posterior``) the sample's
     posterior travels on its ``AFState`` (``posterior``). R1 reports it in
-    place of the clamped abundance; M2pg and the clamped-data weights take
+    place of the clamped abundance, with the AF shape bend (af_shape_bend)
+    on high-AF events when the posterior carries one; M2pg and the clamped-data weights take
     R1's noise-aware AF row and abundance as fixed and solve only the
     fluorophores by penalised GLS, so every method reports the same AF. R2
     is unchanged.
@@ -710,7 +711,7 @@ def unmix_fluorescence(raw_fl: np.ndarray, state: MethodState, af, sample_key=No
         if af is not None and getattr(af, 'posterior', None) is not None:
             from honeychrome.controller_components.autospectral_functions import apply_af_unmixing
             r1 = apply_af_unmixing(raw_fl, af.precomputed, np.asarray(af.spectra, dtype=np.float64),
-                                   af_posterior=af.posterior, log_ssc=log_ssc)
+                                   af_posterior=af.posterior, log_ssc=log_ssc, shape_bend=False)
             fixed_af = (np.asarray(r1['af_idx'], dtype=np.int64) - 1, np.asarray(r1['af_scale'], dtype=np.float64))
         noise = state.noise
         model = noise.clamped_model if method == CLAMPED else noise.model_for(state.is_bead(sample_key))

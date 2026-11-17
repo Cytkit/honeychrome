@@ -936,6 +936,7 @@ def apply_af_unmixing(
     handle_saturation: bool = True,
     af_posterior=None,
     log_ssc: np.ndarray | None = None,
+    shape_bend: bool = True,
 ) -> dict:
     """
     Per-cell AF extraction and OLS unmixing (fluorescence channels only).
@@ -966,7 +967,10 @@ def apply_af_unmixing(
     weighed against the sample's prior by its noise (see af_posterior), so
     it is always positive and is pulled towards the typical AF of cells of
     the same SSC when the event's spectrum says little about its AF. The
-    variant choice is unchanged.
+    variant choice is unchanged. When the posterior carries an AF shape bend
+    (af_shape_bend), the fluorophores of high-AF events are reported with
+    their AF bent along the learnt shapes; the AF abundance and index are
+    unchanged.
 
     Parameters
     ----------
@@ -982,6 +986,8 @@ def apply_af_unmixing(
                   abundance
     log_ssc     : (n_cells,) log SSC of each event for the posterior's prior
                   mean; None gives every event the sample's median
+    shape_bend  : apply the posterior's AF shape bend when it has one (False
+                  when only the AF abundance and index are wanted)
 
     Returns
     -------
@@ -1000,6 +1006,10 @@ def apply_af_unmixing(
     af_scale_out = np.empty(n_cells,             dtype=np.float64)
     af_idx_out   = np.empty(n_cells,             dtype=np.int32)
 
+    bend = getattr(af_posterior, 'bend', None) if shape_bend and af_posterior is not None else None
+    if bend is not None:
+        from honeychrome.controller_components.af_shape_bend import apply_bend
+
     for start in range(0, n_cells, chunk_size):
         end   = min(start + chunk_size, n_cells)
         chunk = np.ascontiguousarray(raw_data[start:end], dtype=np.float64)
@@ -1015,6 +1025,9 @@ def apply_af_unmixing(
             best_k = af_posterior.abundance(k_hat, unmixed, best_j, precomputed, af_spectra, k_denom,
                                             None if log_ssc is None else log_ssc[start:end])
         unmixed_out[start:end]  = unmixed - best_k[:, np.newaxis] * v_library_t[best_j]
+        if bend is not None:
+            unmixed_out[start:end] = apply_bend(chunk, unmixed_out[start:end], best_k, best_j, precomputed,
+                                                af_spectra, af_posterior.noise, bend)
         af_scale_out[start:end] = best_k
         af_idx_out[start:end]   = best_j + 1
 

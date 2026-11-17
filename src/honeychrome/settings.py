@@ -251,6 +251,7 @@ process_default = {
     'af_profiles': {},
     'cleaned_meta': {},
     'af_abundance': 'noise_aware',   # experiments saved without it keep the clamped AF abundance
+    'af_shape_bend': True,           # AF shape bend on high-AF cells (af_shape_bend); on when unset
 }
 
 cytometry_default = {
