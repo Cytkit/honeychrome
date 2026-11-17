@@ -213,9 +213,9 @@ def test_missing_gate_raises_and_no_gates_keeps_everything():
 def _statistics(controller, monkeypatch):
     """Run the Statistics tab's calculator over the three samples; returns
     {(gate, statistic): {sample name: value}}."""
-    from honeychrome.controller_components import statistical_controller as sc
+    from honeychrome.controller_components import functions, statistical_controller as sc
 
-    monkeypatch.setattr(sc, 'sample_from_fcs', lambda path: _FakeSample(SAMPLES[f'Raw/{Path(path).name}']))
+    monkeypatch.setattr(functions, 'sample_from_fcs', lambda path: _FakeSample(SAMPLES[f'Raw/{Path(path).name}']))
     controller.experiment.settings['raw'].update({'event_channels_pnn': list(PNN), 'whitelisted_pnn': None})
     controller.filtered_raw_fluorescence_channel_ids = [0]
     controller.transfer_matrix = np.eye(len(PNN))

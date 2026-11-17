@@ -50,11 +50,11 @@ def test_automatic_choice_takes_the_group_and_the_pairing():
     keys = _flowcode_style_names()
     chosen = sgd.automatic_groupings(suggest_groupings_from_names(keys))
     assert [c['role'] for c in chosen] == ['group', 'pairing']
-    assert chosen[0]['name'] == 'Group' and chosen[1]['name'] == 'field_7'
+    assert chosen[0]['name'] == 'Group' and chosen[1]['name'] == 'Donor'
     assert set(chosen[0]['values'].values()) == set(TISSUES)
     text = sgd.describe_groupings(chosen)
     assert text.startswith('Groups suggested from sample names: Group = name field 2 of 9')
-    assert "paired by 'field_7'" in text and '6 levels' in text
+    assert "paired by 'Donor'" in text and '6 levels' in text
 
 
 def test_automatic_choice_is_empty_without_a_group():
