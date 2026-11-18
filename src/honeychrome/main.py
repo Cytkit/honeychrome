@@ -75,6 +75,7 @@ import logging
 import logging.handlers
 import re
 import warnings
+import uuid
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
 
@@ -166,11 +167,13 @@ def configure_multiprocessing():
             mp.set_start_method('spawn', force=True)
 
 _HOME_PATH_PATTERN = re.compile(r'(?i)([A-Z]:\\{1,2}Users\\{1,2}|/Users/|/home/)[^\\/\'"\s]+')
+_DATA_FILE_PATTERN = re.compile(r'(?i)[^\\/\'"\s:]+\.(fcs|kc|csv|tsv|xlsx|xls|wsp|xml|json|h5|hdf5|parquet)\b')
 
 def _scrub_paths(value):
-    # replace the user-name part of home-folder paths anywhere in the event
+    # replace the user-name part of home-folder paths and the names of data files anywhere in the event
     if isinstance(value, str):
-        return _HOME_PATH_PATTERN.sub(r'\1~', value)
+        value = _HOME_PATH_PATTERN.sub(r'\1~', value)
+        return _DATA_FILE_PATTERN.sub(r'<file>.\1', value)
     if isinstance(value, dict):
         return {k: _scrub_paths(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -181,30 +184,45 @@ def _sentry_before_send(event, hint):
     exc_info = hint.get('exc_info')
     if exc_info and issubclass(exc_info[0], KeyboardInterrupt):
         return None
+    event.pop('server_name', None)
     return _scrub_paths(event)
 
-def init_sentry():
+def get_install_id():
+    """Return a random identifier for this installation, created on first launch and stored in the app settings.
+
+    It contains no information about the user or the computer and is used only to count launches per installation.
+    """
+    install_id = q_settings_app_config.value("install_id", "", type=str)
+    if not install_id:
+        install_id = uuid.uuid4().hex
+        q_settings_app_config.setValue("install_id", install_id)
+    return install_id
+
+def init_sentry(install_id):
     try:
 
         sentry_logging = LoggingIntegration(
-            level=logging.INFO,  # Send INFO and above as breadcrumbs (context)
+            level=logging.WARNING,  # Send WARNING and above as breadcrumbs (context)
             event_level=logging.ERROR  # Actually send ERROR and above as alerts
         )
-        # Keep it anonymous with send_default_pii=False (i.e. all personal data are scrubbed, e.g. usernames, file names and locations, etc)
+        # Anonymous reporting: no default personal data, no machine name, and no local variable values in stack frames
         sentry_sdk.init(dsn="https://c99858ad29b86e3c551978e9b72c7724@o4511334133334016.ingest.de.sentry.io/4511334139887696",
                         shutdown_timeout=1,
                         integrations=[sentry_logging],
                         release=f"honeychrome@{__version__}",
                         environment='production' if getattr(sys, 'frozen', False) else 'development',
                         before_send=_sentry_before_send,
-                        send_default_pii=False)
+                        send_default_pii=False,
+                        include_local_variables=False,
+                        server_name='')
+        sentry_sdk.set_user({"id": install_id})
         sentry_sdk.set_tag("os_name", platform.system())
         sentry_sdk.set_tag("os_release", platform.release())
         sentry_sdk.set_tag("os_version", platform.version())
 
 
         sentry_sdk.metrics.count("honeychrome.launch", 1,
-            attributes={"version": __version__, "platform": sys.platform})
+            attributes={"version": __version__, "platform": sys.platform, "install_id": install_id})
     except Exception:
         pass  # Sentry must never crash or stall the app
 
@@ -249,7 +267,7 @@ def main():
 
     # send debug data if setting is on
     if q_settings_app_config.value("send_debug_data", send_debug_data, type=bool):
-        threading.Thread(target=init_sentry, daemon=True).start()
+        threading.Thread(target=init_sentry, args=(get_install_id(),), daemon=True).start()
 
         # # Test sentry
         # try:
