@@ -155,10 +155,9 @@ class Instrument(mp.Process):
             try:
                 device_name = self.device.name
                 self.logger.info(f'[Instrument driver] {device_name} already connected')
-                if device_name == 'Cytkit':
-                    status, message = self.device.get_state('check_connection')
-                    if not message['check_connection']:
-                        raise ConnectionError
+                status, message = self.device.get_state('check_connection')
+                if not message['check_connection']:
+                    raise ConnectionError
 
                 return {'source': '[Instrument driver]', 'status': status, 'message': message}
 

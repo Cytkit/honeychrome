@@ -18,6 +18,7 @@ os.environ["QT_LOGGING_RULES"] = "qt.core.qobject.connect=false" #suppress pyqtg
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QMainWindow, QFileDialog, QWidget, QHBoxLayout, QSplitter, QTabWidget, QStatusBar, QVBoxLayout, QLabel, QProgressBar, QScrollArea, QPushButton, QMenu, QGroupBox, QSpinBox, QMessageBox
 from PySide6.QtCore import Qt, QSettings, QByteArray, QPoint, Slot, QTimer, QThread, Signal as QtSignal
+from PySide6.QtWidgets import QApplication
 
 from honeychrome.view_components.gating_hierarchy_widget import GatingHierarchyWidget
 from honeychrome.view_components.heatmap_viewedit import HeatmapViewEditor
@@ -601,6 +602,11 @@ class MainWindow(QMainWindow):
         for child in self.findChildren(QWidget):
             child.deleteLater()
 
+        # Close all other top-level widgets (non-child widgets)
+        for widget in QApplication.topLevelWidgets():
+            if widget is not self:  # Skip the main window itself
+                widget.close()
+
         # Disconnect all signals
         try:
             self.blockSignals(True)
@@ -732,7 +738,6 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     import sys
-    from PySide6.QtWidgets import QApplication
     from honeychrome.controller import Controller
     from pathlib import Path
     from honeychrome.view_components.event_bus import EventBus

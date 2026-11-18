@@ -1,6 +1,6 @@
 import sys
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap, QTransform, QHideEvent, QShowEvent
+from PySide6.QtGui import QPixmap, QTransform, QHideEvent, QShowEvent, QImage
 from PySide6.QtMultimedia import QCamera, QMediaCaptureSession, QMediaDevices, QVideoSink
 from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QVBoxLayout, QWidget, QPushButton, QHBoxLayout, QSlider, QFormLayout
 import numpy as np
@@ -33,11 +33,23 @@ class AlignmentCameraWidget(QWidget):
         self.slider.setRange(0, 1000)  # 1000 discrete log steps
         self.value_label = QLabel("0.0000 s")
         self.control_layout.addRow("Exposure:", self.slider)
-        self.control_layout.addRow("Value:", self.value_label)
+        self.control_layout.addRow("Exposure value:", self.value_label)
         self.slider.valueChanged.connect(self.on_exposure_changed)
         default_val = 0.005
         default_step = int(1000 * (np.log10(default_val) - log_min) / (log_max - log_min))
         self.slider.setValue(default_step)
+
+        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.brightness_slider.setRange(-100, 100)
+        self.brightness_value_label = QLabel("0")
+        self.control_layout.addRow("Brightness:", self.brightness_slider)
+        self.control_layout.addRow("Brightness value:", self.brightness_value_label)
+        self.brightness_slider.valueChanged.connect(self.on_brightness_changed)
+        default_val = 0
+        default_step = 1
+        self.brightness_slider.setValue(default_val)
+        self.brightness_slider.setSingleStep(default_step)
+        self.brightness = 1
 
         self.status_label = QLabel("Camera not connected")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -94,10 +106,27 @@ class AlignmentCameraWidget(QWidget):
             return
 
         image = frame.toImage()
+
+        # Convert QImage to numpy array (ensure it's in a known format)
+        image = image.convertToFormat(QImage.Format.Format_RGB888)
+        width, height = image.width(), image.height()
+        bytes_per_line = image.bytesPerLine()
+
+        # Get raw bytes as numpy array, accounting for padding
+        ptr = image.bits()
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((height, bytes_per_line))
+        arr = arr[:, :width * 3].reshape((height, width, 3)).copy()
+
+        # Multiply by brightness and cast to int (clamp to 0-255 to avoid overflow/wraparound)
+        arr = np.clip(arr.astype(np.int32) * self.brightness, 0, 255).astype(np.uint8)
+
+        # Rebuild QImage from the modified array
+        image = QImage(arr.data, width, height, width * 3, QImage.Format.Format_RGB888).copy()
+
         pixmap = QPixmap.fromImage(image)
 
-        # rotated_pixmap = pixmap.transformed(QTransform().rotate(90).scale(0.5, 0.5))
-        rotated_pixmap = pixmap.transformed(QTransform().rotate(90))
+        rotated_pixmap = pixmap.transformed(QTransform().rotate(-90).scale(0.6, 0.6))
+        # rotated_pixmap = pixmap.transformed(QTransform().rotate(90))
         self.image_label.setPixmap(rotated_pixmap)
 
     # def autoexposure(self):
@@ -107,25 +136,25 @@ class AlignmentCameraWidget(QWidget):
     #         print("Switched camera to Auto Exposure mode.")
     #     else:
     #         print("Auto exposure mode is not supported on this device.")
-
-    def min_exposure(self):
-        # Switch camera to Manual Exposure Mode
-        if self.camera and self.camera.isExposureModeSupported(QCamera.ExposureMode.ExposureManual):
-            self.camera.setExposureMode(QCamera.ExposureMode.ExposureManual)
-
-            # Set Exposure Time (in seconds, e.g., 0.01 = 10ms / 1/100s)
-            self.camera.setManualExposureTime(0.005)
-            print(f"Current Exposure Time: {self.camera.exposureTime()}s")
-
-            ### The items below are not supported by camera
-            # # Set Gain via ISO Sensitivity (e.g., 100, 200, 400, 800)
-            # self.camera.setManualIsoSensitivity(0)
-            # self.camera.setExposureCompensation(-2.0)
-            # print(f"Current ISO (Gain): {self.camera.isoSensitivity()}")
-
-        else:
-            print("Manual exposure mode not supported by driver. Using EV offset instead.")
-            self.camera.setExposureCompensation(-2.0)
+    #
+    # def min_exposure(self):
+    #     # Switch camera to Manual Exposure Mode
+    #     if self.camera and self.camera.isExposureModeSupported(QCamera.ExposureMode.ExposureManual):
+    #         self.camera.setExposureMode(QCamera.ExposureMode.ExposureManual)
+    #
+    #         # Set Exposure Time (in seconds, e.g., 0.01 = 10ms / 1/100s)
+    #         self.camera.setManualExposureTime(0.005)
+    #         print(f"Current Exposure Time: {self.camera.exposureTime()}s")
+    #
+    #         ### The items below are not supported by camera
+    #         # # Set Gain via ISO Sensitivity (e.g., 100, 200, 400, 800)
+    #         # self.camera.setManualIsoSensitivity(0)
+    #         # self.camera.setExposureCompensation(-2.0)
+    #         # print(f"Current ISO (Gain): {self.camera.isoSensitivity()}")
+    #
+    #     else:
+    #         print("Manual exposure mode not supported by driver. Using EV offset instead.")
+    #         self.camera.setExposureCompensation(-2.0)
 
     def on_exposure_changed(self, value: int):
         # 1. Calculate normalized position (0.0 to 1.0)
@@ -148,6 +177,10 @@ class AlignmentCameraWidget(QWidget):
             self.value_label.setText(f"{exposure_seconds * 1000:.1f} ms")
         else:
             self.value_label.setText(f"{exposure_seconds:.2f} s")
+
+    def on_brightness_changed(self, value: int):
+        self.brightness = 10**(value/10)
+        self.brightness_value_label.setText(f'{self.brightness:0.3f}')
 
     def showEvent(self, event: QShowEvent):
         super().showEvent(event)

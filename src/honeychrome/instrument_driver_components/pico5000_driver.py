@@ -251,7 +251,12 @@ class Pico5000_Device:
         return 'OK', 'Picoscope 5000-series parameters are set elsewhere'
 
     def get_state(self, list_of_parameters):
-        return 'OK', {parameter:None for parameter in list_of_parameters}
+        message = {}
+        if 'check_connection' in list_of_parameters:
+            message['check_connection'] = 'connected'
+
+        # return 'OK', {parameter:None for parameter in list_of_parameters}
+        return 'OK', message
 
     def flush_sip(self):
         return 'OK', 'Picoscope 5000-series doesn''t provide flush'

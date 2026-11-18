@@ -1728,6 +1728,10 @@ class PluginWidget(QWidget):
             self.device_name = self.controller.get_connected_device_name()
         if self.device_name == 'Cytkit':
             self.get_instrument_state([])
+        elif self.device_name == 'Pico5000':
+            self.connection_status_connected.setText('<span style="font-weight:bold; color:green">Pico5000 (Cytkit 1S1F) connected</span>')
+            self.connection_status_connected.setVisible(True)
+            self.connection_status_not_connected.setVisible(False)
         else:
             self.connection_status_connected.setVisible(False)
             self.connection_status_not_connected.setVisible(True)
