@@ -11,7 +11,7 @@ transparent) and, on figures that offer it (volcano plots), the range of
 the x and y axes.
 
 Options belong to the experiment: they are kept in the experiment's folder
-(``cache/figure_options/state.json``, see ``experiment_state``), never in
+(``state/figure_options/state.json``, see ``experiment_state``), never in
 QSettings. Each plugin has its own *scope* (e.g. ``'automated_gating'``)
 with defaults for all its figures and, per figure (a stable *key* such as
 ``'trend_freq_volcano'``), the options that figure overrides. The title
