@@ -62,7 +62,7 @@ from honeychrome.controller_components.autospectral_functions import (
         refresh_envelope_entry,
      )
 from honeychrome.settings import af_index_channel
-from honeychrome.controller_components import af_posterior, unmix_method
+from honeychrome.controller_components import af_posterior, experiment_paths, unmix_method
 from honeychrome.controller_components.job_gate import JobGate
 from honeychrome.controller_components.sample_loader import AFState
 
@@ -340,6 +340,8 @@ class Controller(QObject):
             self.experiment.save()
         self.experiment_dir = self.experiment.generate_subdirs()
         add_recent_file(experiment_path)
+        experiment_paths.migrate(self.experiment_dir)
+        experiment_paths.prune_cache(self.experiment_dir)
 
         self.current_mode = 'raw'
         self.initialise_ephemeral_data()
@@ -400,9 +402,9 @@ class Controller(QObject):
 
     @property
     def cleaned_npz_path(self) -> Path:
-        cache_dir = self.experiment_dir / 'cache'
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return cache_dir / 'cleaned.npz'
+        state_dir = experiment_paths.state_dir(self.experiment_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir / 'cleaned.npz'
 
     @property
     def _legacy_cleaned_npz_path(self) -> Path:
@@ -489,9 +491,9 @@ class Controller(QObject):
 
     @property
     def autospectral_variants_npz_path(self) -> Path:
-        cache_dir = self.experiment_dir / 'cache'
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return cache_dir / 'autospectral_variants.npz'
+        state_dir = experiment_paths.state_dir(self.experiment_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir / 'autospectral_variants.npz'
 
     @Slot(str)
     def save_experiment(self, experiment_path=None):

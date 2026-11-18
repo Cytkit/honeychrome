@@ -20,7 +20,7 @@ from multiprocessing import shared_memory, Lock
 import numpy as np
 
 from honeychrome import __version__
-from honeychrome.settings import experiments_folder, send_debug_data
+from honeychrome.settings import experiments_folder, send_debug_data, detailed_log
 from honeychrome.settings import q_settings as q_settings_app_config
 
 current_file_path = Path(__file__).resolve()
@@ -72,13 +72,23 @@ View:
 from honeychrome.view import View, logo_icon
 
 import logging
+import logging.handlers
 import re
 import warnings
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
 
-def setup_logging(log_file):
-    """Set up logging to both console and file, and capture all output."""
+LOG_MAX_BYTES = 10 * 1024 ** 2   # honeychrome.log is rotated at this size
+LOG_BACKUPS = 3                   # honeychrome.log.1 to .3 are kept
+CRASH_LOG_MAX_BYTES = 1024 ** 2   # crash.log is started afresh beyond this size
+
+
+def setup_logging(log_file, detailed=False):
+    """Set up logging to the console and to *log_file*, and capture all output.
+
+    The file is rotated at LOG_MAX_BYTES with LOG_BACKUPS older copies, so
+    the log never takes more than about 40 MB. It records INFO and above, and
+    DEBUG as well when *detailed* (App Configuration, "Detailed log")."""
 
     # Create logger
     logger = logging.getLogger()
@@ -95,8 +105,9 @@ def setup_logging(log_file):
     console_handler.setFormatter(formatter)
 
     # File handler
-    file_handler = logging.FileHandler(log_file, mode='a')
-    file_handler.setLevel(logging.DEBUG)
+    file_handler = logging.handlers.RotatingFileHandler(log_file, maxBytes=LOG_MAX_BYTES,
+                                                        backupCount=LOG_BACKUPS, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG if detailed else logging.INFO)
     file_handler.setFormatter(formatter)
 
     # Add handlers
@@ -123,16 +134,25 @@ def setup_logging(log_file):
     return logger
 
 
-def redirect_missing_std_streams(log_file):
+def open_crash_log(path):
+    """crash.log for appending (started afresh beyond CRASH_LOG_MAX_BYTES), or None.
+
+    It is kept apart from honeychrome.log, which is rotated: on Windows a file
+    held open by a second handle cannot be renamed."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = 'w' if path.exists() and path.stat().st_size > CRASH_LOG_MAX_BYTES else 'a'
+        return open(path, mode, encoding='utf-8', buffering=1)
+    except OSError:
+        return None
+
+
+def redirect_missing_std_streams(crash_log):
     """In the packaged Windows app there is no console, so sys.stdout and sys.stderr are None.
     Child processes then fail while reporting an error and the real error is lost. Send
-    stderr to the log file and stdout to the null device so errors are recorded."""
+    stderr to *crash_log* and stdout to the null device so errors are recorded."""
     if sys.stderr is None:
-        try:
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            sys.stderr = open(log_file, 'a', encoding='utf-8', buffering=1)
-        except OSError:
-            sys.stderr = open(os.devnull, 'w')
+        sys.stderr = crash_log if crash_log is not None else open(os.devnull, 'w')
     if sys.stdout is None:
         sys.stdout = open(os.devnull, 'w')
 
@@ -190,14 +210,15 @@ def init_sentry():
 
 
 def main():
-    redirect_missing_std_streams(Path.home() / experiments_folder / 'honeychrome.log')
+    crash_log = open_crash_log(Path.home() / experiments_folder / 'crash.log')
+    redirect_missing_std_streams(crash_log)
 
     # A crash in compiled code (Qt, numpy or a compiled kernel) ends the process without a
-    # Python traceback. faulthandler writes the stack of every thread to the log instead.
+    # Python traceback. faulthandler writes the stack of every thread to crash.log instead.
     try:
-        crash_log = open(Path.home() / experiments_folder / 'honeychrome.log', 'a', encoding='utf-8', buffering=1)
-        faulthandler.enable(file=crash_log, all_threads=True)
-    except OSError:
+        if crash_log is not None:
+            faulthandler.enable(file=crash_log, all_threads=True)
+    except (OSError, ValueError):
         pass
 
     configure_multiprocessing()
@@ -217,7 +238,8 @@ def main():
             if not destination.exists():
                 shutil.copy2(template, destination)
 
-    logger = setup_logging(Path.home() / experiments_folder / 'honeychrome.log')
+    logger = setup_logging(Path.home() / experiments_folder / 'honeychrome.log',
+                           q_settings_app_config.value("detailed_log", detailed_log, type=bool))
 
     # # Log messages at different levels
     # logger.debug("Debug message")  # Only to file

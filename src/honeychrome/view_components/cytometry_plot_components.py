@@ -303,7 +303,7 @@ class InteractiveLabel(pg.LabelItem):
             self.leftItemSelected = actions[chosen_action]
             func = self.leftClickMenuFunction
             func(self.leftItemSelected, self.parent())
-            logger.info(f"{func} called with option {self.leftItemSelected} parent {self.parent()}")
+            logger.debug(f"{func} called with option {self.leftItemSelected} parent {self.parent()}")
 
 
     def show_right_context_menu(self, pos):
@@ -322,4 +322,4 @@ class InteractiveLabel(pg.LabelItem):
             self.rightItemSelected = actions[chosen_action]
             func = self.rightClickMenuFunction
             func(self.rightItemSelected, self.parent())
-            logger.info(f"{func} called with option {self.rightItemSelected} parent {self.parent()}")
+            logger.debug(f"{func} called with option {self.rightItemSelected} parent {self.parent()}")

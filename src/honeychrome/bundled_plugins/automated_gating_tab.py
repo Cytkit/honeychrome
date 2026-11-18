@@ -36,7 +36,7 @@ Run applies the model as it stands on the model pages, in their transforms,
 once every gate has a trained boundary. Gated results record a hash of the
 model they were made with (gates, boundaries, transforms and gate modes).
 Gated results, display subsamples and statistics are saved in the
-experiment's cache folder and restored when the experiment is opened again;
+experiment's state folder and restored when the experiment is opened again;
 each gating and statistics run is also written as CSV files to
 ``Automated_Gating_Results`` (named after the model, with a timestamp).
 
@@ -86,7 +86,7 @@ from honeychrome.controller_components import anova_stats
 from honeychrome.controller_components import differential_stats as ds
 from honeychrome.controller_components import trend_stats as ts
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy
-from honeychrome.controller_components import experiment_state
+from honeychrome.controller_components import experiment_paths, experiment_state
 from honeychrome.controller_components import covariate_check, sample_table
 from honeychrome.view_components import suggest_groupings_dialog as sgd
 from honeychrome.view_components import covariate_check_dialog, sample_table_import_dialog
@@ -190,15 +190,15 @@ plugin_name = 'Automated Gating'
 
 DEFAULT_DISPLAY_EVENTS = 20_000
 DISPLAY_SEED = 42
-RESULTS_FILE = Path('cache') / 'automated_gating' / 'results.json'
+RESULTS_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'results.json'
 # The marker medians and quartiles of RESULTS_FILE's samples, as arrays.
-MARKERS_FILE = Path('cache') / 'automated_gating' / 'results_markers.npz'
+MARKERS_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'results_markers.npz'
 RESULTS_FORMAT = 3
-STATS_FILE = Path('cache') / 'automated_gating' / 'stats.json'
-TREND_FILE = Path('cache') / 'automated_gating' / 'trend.json'
-ENRICHMENT_FILE = Path('cache') / 'automated_gating' / 'enrichment.json'
-SAMPLE_ANALYSIS_FILE = Path('cache') / 'automated_gating' / 'sample_analysis.json'
-DISPLAY_DIR = Path('cache') / 'automated_gating' / 'display'
+STATS_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'stats.json'
+TREND_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'trend.json'
+ENRICHMENT_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'enrichment.json'
+SAMPLE_ANALYSIS_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'sample_analysis.json'
+DISPLAY_DIR = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'display'
 # Threads that read the saved display records when an experiment opens;
 # decompressing them releases the interpreter lock, so they run in parallel.
 DISPLAY_READERS = max(1, min(8, _os.cpu_count() or 1))
@@ -5952,7 +5952,7 @@ class PluginWidget(QWidget):
     own settings and session file (see BuilderPages). The settings of the
     last three pages (gate modes, drift settings, sample selection, groups,
     covariates and statistics options) are kept as one JSON string in
-    cache/automated_gating/state.json. Gated results (counts and per-gate status) are kept in
+    state/automated_gating/state.json. Gated results (counts and per-gate status) are kept in
     RESULTS_FILE in the experiment folder, with the samples a paused run has
     still to gate, their marker medians and quartiles in MARKERS_FILE, and
     each sample's display record in DISPLAY_DIR; the last

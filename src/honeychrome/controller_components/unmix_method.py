@@ -72,7 +72,7 @@ Display cache
     under ``<experiment>/cache/unmixed/`` (fluorophore abundances before
     compensation, AF abundance and row), keyed by everything that decides
     them (``display_cache_key``), least recently used files removed beyond
-    the App Settings' unmixing cache size (``unmixing_cache_gb``).
+    the App Settings' temporary files limit (``experiment_paths.prune_cache``).
 
 v1 simplifications
     * Live acquisition stays on the transfer matrix (the controller does not
@@ -100,6 +100,8 @@ from pathlib import Path
 
 import numpy as np
 
+from honeychrome.controller_components import experiment_paths
+
 logger = logging.getLogger(__name__)
 
 UNMIXING_KEY = 'unmixing'
@@ -121,7 +123,7 @@ VARIANT_KERNEL_DEFAULTS = {
     'noise_floor': 125.0, 'alpha': 0.5, 'collinear_thresh': 0.5, 'joint_pair_resolution': True,
 }
 
-DISPLAY_CACHE_SUBDIR = Path('cache') / 'unmixed'
+DISPLAY_CACHE_SUBDIR = Path(experiment_paths.CACHE_FOLDER) / 'unmixed'
 DISPLAY_CACHE_VERSION = 1
 
 _MISSING = object()
@@ -876,31 +878,7 @@ def store_display_cache(experiment_dir, key: str, fl_result: dict, max_bytes: in
     except OSError as exc:
         logger.warning('Unmixing cache: could not write %s (%s)', path.name, exc)
         return
-    prune_display_cache(path.parent, max_bytes)
-
-
-def prune_display_cache(folder, max_bytes: int | None = None) -> None:
-    """Remove the least recently used files beyond ``max_bytes`` (default:
-    the App Settings' unmixing cache size)."""
-    if max_bytes is None:
-        from honeychrome import settings as app_settings
-        max_bytes = int(app_settings.unmixing_cache_gb_retrieved) * 1024 ** 3
-    files = []
-    for p in Path(folder).glob('*.npz'):
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        files.append((st.st_mtime, st.st_size, p))
-    total = sum(f[1] for f in files)
-    for _mtime, size, p in sorted(files):
-        if total <= max_bytes:
-            break
-        try:
-            p.unlink()
-            total -= size
-        except OSError:
-            pass
+    experiment_paths.prune_cache(experiment_dir, max_bytes)
 
 
 # ---------------------------------------------------------------------------

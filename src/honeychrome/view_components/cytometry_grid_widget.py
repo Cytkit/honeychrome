@@ -261,7 +261,7 @@ class CytometryGridWidget(QScrollArea):
                 elif self.n_columns > 10:
                     self.n_columns = 10
 
-                logger.info(f'Cytometry Grid Widget: setting width to {self.n_columns} columns')
+                logger.debug(f'Cytometry Grid Widget: setting width to {self.n_columns} columns')
 
                 # # Create container widget
                 # if self.container is not None:

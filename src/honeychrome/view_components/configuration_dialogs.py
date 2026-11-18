@@ -5,17 +5,19 @@ from pathlib import Path
 import subprocess
 import re
 
-from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QWidget, QVBoxLayout, QDialog, QScrollArea, QFormLayout, QLineEdit, QCheckBox, QSpinBox, QDoubleSpinBox, QDialogButtonBox, QComboBox, QLabel, QButtonGroup, QFileDialog, QFrame, QMessageBox)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QPushButton, QWidget, QVBoxLayout, QHBoxLayout, QDialog, QScrollArea, QFormLayout, QLineEdit, QCheckBox, QSpinBox, QDoubleSpinBox, QDialogButtonBox, QComboBox, QLabel, QButtonGroup, QFileDialog, QFrame, QMessageBox)
 from PySide6.QtCore import Qt, QSettings
 
 from honeychrome.settings import (colourmap_choice, graphics_export_formats, hist2dtype, colormap_name, graphics_export_format, cytometry_plot_width_target,
                       tile_size_nxn_grid, subsample, max_display_events, hist_bins, density_cutoff, trigger_channel, adc_channels, width_channels, height_channels,
                       use_dummy_instrument, magnitude_ceilings, magnitude_ceiling, raw_settings, unmixed_settings, experiments_folder,
-                      magnitude_ceilings_int, spectral_positive_gate_percent, spectral_negative_gate_percent, report_include_raw, report_include_unmixed, report_include_process, send_debug_data,
+                      magnitude_ceilings_int, spectral_positive_gate_percent, spectral_negative_gate_percent, report_include_raw, report_include_unmixed, report_include_process, send_debug_data, detailed_log,
                       heatmap_colourmap_name, heatmap_colourmap_choice, spectral_cleaning_n_candidates, spectral_cleaning_n_spectral,
                       spectral_cleaning_refine, auto_clean_controls, unmixing_cache_gb)
 import honeychrome.settings as settings
+from honeychrome.controller_components import experiment_paths
 from honeychrome.controller_components.job_gate import guard_while_busy
+from honeychrome.view_components.busy_cursor import with_busy_cursor
 
 
 import numpy as np
@@ -131,6 +133,22 @@ def create_folder_link(experiment_path, link_name, target_path):
         print(f"Failed to create junction: {e.stderr.decode().strip()}")
         raise
 
+def format_bytes(n: int) -> str:
+    """Size for display: MB below one GB, otherwise GB."""
+    if n < 1024 ** 3:
+        return f'{n / 1024 ** 2:.0f} MB'
+    return f'{n / 1024 ** 3:.1f} GB'
+
+
+def set_log_file_level(detailed: bool) -> None:
+    """Record DEBUG messages in honeychrome.log when *detailed*, otherwise INFO and above."""
+    import logging
+    import logging.handlers
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.handlers.RotatingFileHandler):
+            handler.setLevel(logging.DEBUG if detailed else logging.INFO)
+
+
 def colormap_to_qimage(cmap_name, width=256, height=20):
     """
     Convert a colorcet colormap to a horizontal swatch QImage.
@@ -224,9 +242,30 @@ class AppConfigDialog(QDialog):
         self.unmixing_cache_gb_spin = QSpinBox()
         self.unmixing_cache_gb_spin.setRange(1, 500)
         self.unmixing_cache_gb_spin.setSuffix(" GB")
-        self.unmixing_cache_gb_spin.setToolTip('Disk space per experiment (cache/unmixed) for samples unmixed with the noise model or '
-                                               'spectral variants, so they are not unmixed again. Least recently used files are removed first.')
-        form.addRow("Unmixing cache size:", self.unmixing_cache_gb_spin)
+        self.unmixing_cache_gb_spin.setToolTip('Disk space per experiment for temporary files Honeychrome can make again: unmixed '
+                                               'events kept so samples are not unmixed again, and compact event sets for FlowCode '
+                                               'counting and phenotype shift. Least recently used files are removed first. Settings '
+                                               'and saved results are kept separately and never removed.')
+        form.addRow("Temporary files per experiment:", self.unmixing_cache_gb_spin)
+
+        self.cache_size_label = QLabel()
+        self.clear_cache_button = QPushButton("Clear for this experiment")
+        self.clear_cache_button.setToolTip('Remove the temporary files of the open experiment. They are made again when needed.')
+        self.clear_cache_button.clicked.connect(self.clear_experiment_cache)
+        self.clear_all_caches_button = QPushButton("Clear for all experiments")
+        self.clear_all_caches_button.setToolTip('Remove the temporary files of every experiment in the Experiments folder '
+                                                'and the recent-files list. They are made again when needed.')
+        self.clear_all_caches_button.clicked.connect(self.clear_all_caches)
+        guard_while_busy(controller, self.clear_cache_button, self.clear_all_caches_button)
+        cache_row = QWidget()
+        cache_layout = QHBoxLayout(cache_row)
+        cache_layout.setContentsMargins(0, 0, 0, 0)
+        cache_layout.addWidget(self.cache_size_label)
+        cache_layout.addWidget(self.clear_cache_button)
+        cache_layout.addWidget(self.clear_all_caches_button)
+        cache_layout.addStretch()
+        form.addRow("", cache_row)
+        self._show_cache_size()
 
         self.histogram_resolution_spin = QSpinBox()
         self.histogram_resolution_spin.setRange(50, 400)
@@ -315,6 +354,8 @@ class AppConfigDialog(QDialog):
 
         frame_layout.addWidget(self.send_debug_data)
         frame_layout.addWidget(self.send_debug_data_label)
+        self.detailed_log = QCheckBox("Detailed log (also record debug messages in honeychrome.log)")
+        frame_layout.addWidget(self.detailed_log)
         form.addRow(frame)
 
         scroll.setWidget(container)
@@ -391,6 +432,7 @@ class AppConfigDialog(QDialog):
         self.report_include_process_cb.setChecked(self.settings.value("report_include_process", report_include_process, type=bool))
 
         self.send_debug_data.setChecked(self.settings.value("send_debug_data", send_debug_data, type=bool))
+        self.detailed_log.setChecked(self.settings.value("detailed_log", detailed_log, type=bool))
 
         for file_path in bundled_plugins_path.glob("*_tab.py"):
             self.enable_bundled_plugin[file_path].setChecked(self.settings.value(f"EnableBundledPlugin_{file_path.stem}", False, type=bool))
@@ -421,6 +463,8 @@ class AppConfigDialog(QDialog):
         self.settings.setValue("report_include_unmixed", self.report_include_unmixed_cb.isChecked())
         self.settings.setValue("report_include_process", self.report_include_process_cb.isChecked())
         self.settings.setValue("send_debug_data", self.send_debug_data.isChecked())
+        self.settings.setValue("detailed_log", self.detailed_log.isChecked())
+        set_log_file_level(self.detailed_log.isChecked())
 
         for file_path in bundled_plugins_path.glob("*_tab.py"):
             self.settings.setValue(f"EnableBundledPlugin_{file_path.stem}", self.enable_bundled_plugin[file_path].isChecked())
@@ -437,6 +481,57 @@ class AppConfigDialog(QDialog):
         self.accept()
         importlib.reload(settings)
         self.bus.reloadExpRequested.emit()
+
+    def _show_cache_size(self):
+        experiment_dir = getattr(self.controller, 'experiment_dir', None)
+        if experiment_dir is None:
+            self.cache_size_label.setText('No experiment open')
+            self.clear_cache_button.setEnabled(False)
+            return
+        self.cache_size_label.setText(f'This experiment: {format_bytes(experiment_paths.cache_size(experiment_dir))}')
+
+    def clear_experiment_cache(self):
+        experiment_dir = getattr(self.controller, 'experiment_dir', None)
+        if experiment_dir is None:
+            return
+        size = experiment_paths.cache_size(experiment_dir)
+        answer = QMessageBox.question(
+            self, 'Clear temporary files',
+            f'Remove {format_bytes(size)} of temporary files from this experiment? They are made again when needed; '
+            'settings and saved results are not affected.')
+        if answer != QMessageBox.Yes:
+            return
+        experiment_paths.migrate(experiment_dir)
+        experiment_paths.clear_cache(experiment_dir)
+        self._show_cache_size()
+
+    @with_busy_cursor
+    def _all_cache_sizes(self):
+        dirs = experiment_paths.known_experiment_dirs()
+        current = getattr(self.controller, 'experiment_dir', None)
+        if current is not None and Path(current) not in dirs:
+            dirs.append(Path(current))
+        return dirs, sum(experiment_paths.cache_size(d) for d in dirs)
+
+    @with_busy_cursor
+    def _clear_caches(self, dirs):
+        freed = 0
+        for experiment_dir in dirs:
+            experiment_paths.migrate(experiment_dir)
+            freed += experiment_paths.clear_cache(experiment_dir)
+        return freed
+
+    def clear_all_caches(self):
+        dirs, size = self._all_cache_sizes()
+        answer = QMessageBox.question(
+            self, 'Clear temporary files',
+            f'Remove {format_bytes(size)} of temporary files from {len(dirs)} experiment(s)? They are made again when '
+            'needed; settings and saved results are not affected.')
+        if answer != QMessageBox.Yes:
+            return
+        freed = self._clear_caches(dirs)
+        self._show_cache_size()
+        QMessageBox.information(self, 'Clear temporary files', f'Removed {format_bytes(freed)}.')
 
     def reset_to_defaults(self):
         index = self.hist2dtype_combo.findText(hist2dtype)
@@ -468,6 +563,7 @@ class AppConfigDialog(QDialog):
         self.report_include_unmixed_cb.setChecked(report_include_unmixed)
         self.report_include_process_cb.setChecked(report_include_process)
         self.send_debug_data.setChecked(send_debug_data)
+        self.detailed_log.setChecked(detailed_log)
 
         for file_path in bundled_plugins_path.glob("*_tab.py"):
             self.enable_bundled_plugin[file_path].setChecked(False)

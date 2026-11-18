@@ -15769,7 +15769,7 @@ class PluginWidget(QWidget):
             _log.info("started UMAP JIT warm-up (%s path)", 'parallel' if parallel else 'serial')
 
     # ------------------------------------------------------------------
-    # State persistence (the experiment folder's cache/dr_clustering)
+    # State persistence (the experiment folder's state/dr_clustering)
     # ------------------------------------------------------------------
 
     def _experiment_key(self) -> tuple:
@@ -15844,9 +15844,9 @@ class PluginWidget(QWidget):
         opened.
 
         Lightweight scalar/list values go to the settings store
-        (cache/dr_clustering/state.json, see experiment_state).
+        (state/dr_clustering/state.json, see experiment_state).
         Embeddings, cluster labels and stats results are written to a
-        sidecar bundle in the experiment's cache folder; see
+        sidecar bundle in the experiment's state folder; see
         _save_model_sidecar.
 
         self.controller.experiment can already point at a DIFFERENT
@@ -16680,9 +16680,9 @@ class PluginWidget(QWidget):
         path = self._sidecar_path()
 
         # temporary diagnostic
-        _log.info("_load_model_sidecar: path=%s exists=%s cache_root=%s",
+        _log.info("_load_model_sidecar: path=%s exists=%s archive_root=%s",
                 path, path.exists() if path else None,
-                drc_run_archive.cache_root(self.controller))
+                drc_run_archive.archive_root(self.controller))
                 
 
         # Rebuild the run archive regardless of whether the current-state
