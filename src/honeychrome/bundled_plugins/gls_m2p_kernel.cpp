@@ -25,6 +25,8 @@
 // through the Woodbury identity, S W S' - (S W E') M^-1 (E W S') and
 // S W r - (S W E') M^-1 E W r with M = E W E' + T^-1 (a rank-L change per
 // event; events with every variance 0 are solved without it).
+// The extension also holds the AF shape bend of per-cell AF (bend_r1,
+// af_bend_kernel.cpp); the dense helpers both use are in kernel_linalg.hpp.
 // Build with -DGLS_DGEMM=<symbol> -DGLS_BLAS_INT=<int type> for a BLAS whose
 // dgemm is not plain dgemm_ with 32-bit integers.
 // ---------------------------------------------------------------------------
@@ -48,22 +50,19 @@
 #include <chrono>
 #endif
 
-#ifndef GLS_DGEMM
-#define GLS_DGEMM dgemm_
-#endif
-#ifndef GLS_BLAS_INT
-#define GLS_BLAS_INT int
-#endif
-
-extern "C" void GLS_DGEMM(const char* ta, const char* tb, const GLS_BLAS_INT* m, const GLS_BLAS_INT* n,
-                          const GLS_BLAS_INT* k, const double* alpha, const double* a, const GLS_BLAS_INT* lda,
-                          const double* b, const GLS_BLAS_INT* ldb, const double* beta, double* c,
-                          const GLS_BLAS_INT* ldc);
+#include "kernel_linalg.hpp"
 
 namespace py = pybind11;
 using Arr = py::array_t<double, py::array::c_style | py::array::forcecast>;
 
+void register_af_bend(py::module_& m);   // af_bend_kernel.cpp
+
 namespace {
+
+using kernel_linalg::chol_solve;
+using kernel_linalg::cholesky;
+using kernel_linalg::dot;
+using kernel_linalg::gemm_rm;
 
 constexpr double kScoreEps = 1e-12;
 constexpr double kTieTol = 1e-9;
@@ -96,47 +95,6 @@ using ProfClock = std::chrono::steady_clock;
 #define PROF_START(t)
 #define PROF_LAP(acc, stage, t)
 #endif
-
-inline double dot(const double* a, const double* b, int n) {
-  double s = 0.0;
-#pragma omp simd reduction(+ : s)
-  for (int i = 0; i < n; ++i) s += a[i] * b[i];
-  return s;
-}
-
-// Row-major C (m x n) = A (m x k) B (k x n) + beta C.
-void gemm_rm(int m, int n, int k, const double* A, int lda, const double* B, int ldb, double* C, int ldc,
-             double beta = 0.0) {
-  if (m == 0 || n == 0) return;
-  const char t = 'N';
-  const GLS_BLAS_INT M = n, N = m, K = k, LA = ldb, LB = lda, LC = ldc;
-  const double one = 1.0;
-  GLS_DGEMM(&t, &t, &M, &N, &K, &one, B, &LA, A, &LB, &beta, C, &LC);
-}
-
-// Cholesky of a p x p SPD matrix in place (lower triangle, row-major). False if not SPD.
-bool cholesky(double* a, int p) {
-  for (int j = 0; j < p; ++j) {
-    const double* aj = &a[j * p];
-    const double d2 = a[j * p + j] - dot(aj, aj, j);
-    if (!(d2 > 0.0)) return false;
-    const double d = std::sqrt(d2);
-    a[j * p + j] = d;
-    const double inv = 1.0 / d;
-    for (int i = j + 1; i < p; ++i) a[i * p + j] = (a[i * p + j] - dot(&a[i * p], aj, j)) * inv;
-  }
-  return true;
-}
-
-// Solve L L' x = b in place.
-void chol_solve(const double* l, int p, double* b) {
-  for (int i = 0; i < p; ++i) b[i] = (b[i] - dot(&l[i * p], b, i)) / l[i * p + i];
-  for (int i = p - 1; i >= 0; --i) {
-    double s = b[i];
-    for (int k = i + 1; k < p; ++k) s -= l[k * p + i] * b[k];
-    b[i] = s / l[i * p + i];
-  }
-}
 
 // diag((L L')^-1)[0:m]: column norms of L^-1, with L^-1 built column by column (work p).
 void chol_inv_diag(const double* l, int p, int m, double* out, double* work) {
@@ -1234,4 +1192,5 @@ PYBIND11_MODULE(_gls_m2p_kernel, m) {
         py::arg("batch_lanes") = 0, py::arg("fixed_af_idx") = py::none(), py::arg("fixed_af_scale") = py::none(),
         py::arg("bend_shapes") = py::none(), py::arg("bend_var") = py::none());
   m.def("max_threads", &max_threads);
+  register_af_bend(m);
 }

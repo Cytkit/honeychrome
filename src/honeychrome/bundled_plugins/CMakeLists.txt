@@ -1,6 +1,7 @@
 # CMakeLists.txt — AutoSpectral kernels: the Optimization kernel
 # (_autospectral_opt_kernel, pybind11 + Armadillo) and the M2p noise-model
-# GLS kernel (_gls_m2p_kernel, pybind11 + BLAS dgemm, no Armadillo).
+# GLS kernel with the per-cell AF shape bend (_gls_m2p_kernel, pybind11 +
+# BLAS dgemm, no Armadillo).
 #
 # Prerequisites (macOS, local + CI):
 #   brew install armadillo libomp cmake
@@ -88,7 +89,7 @@ if(UNIX AND NOT APPLE)
   set(BLA_STATIC OFF)
 endif()
 find_package(BLAS REQUIRED)
-pybind11_add_module(_gls_m2p_kernel gls_m2p_kernel.cpp)
+pybind11_add_module(_gls_m2p_kernel gls_m2p_kernel.cpp af_bend_kernel.cpp)
 target_link_libraries(_gls_m2p_kernel PRIVATE ${BLAS_LIBRARIES})
 
 set(HONEYCHROME_KERNELS _autospectral_opt_kernel _gls_m2p_kernel)

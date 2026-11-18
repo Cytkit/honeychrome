@@ -313,3 +313,29 @@ def test_m2pg_bend_kernel_matches_numpy(library, learnt, m2pg_inputs, monkeypatc
     scale = gu.robust_sd(py['unmixed'])
     assert np.max(np.abs(k['unmixed'] - py['unmixed']) / scale) < 1e-6
     assert not np.allclose(k['unmixed'], plain['unmixed'])
+
+
+@pytest.mark.parametrize('spread', [False, True])
+def test_r1_bend_kernel_matches_numpy(library, learnt, monkeypatch, spread):
+    if not gu.kernel_available():
+        pytest.skip('M2pg kernel not built')
+    import gls_m2p_kernel_wrapper as wrapper
+    if not wrapper.BEND_R1_AVAILABLE:
+        pytest.skip('kernel built without the per-cell AF shape bend')
+    _fl, af, pre = library
+    posterior, bend = learnt
+    raw, _abund = bent_events(6000, seed=9)
+    raw_fl, log_ssc = _split(raw)
+    plain = apply_af_unmixing(raw_fl, pre, af, af_posterior=posterior, log_ssc=log_ssc)
+    k, j = plain['af_scale'], np.asarray(plain['af_idx'], dtype=np.int64) - 1
+    if spread:
+        n_fluors = plain['unmixed'].shape[1]
+        pre = dict(pre, envelope={'spread': np.full((n_fluors, n_fluors), 0.02) + 0.1 * np.eye(n_fluors)})
+    monkeypatch.setattr(asb, 'USE_KERNEL', False)
+    reference = asb.apply_bend(raw_fl, plain['unmixed'], k, j, pre, af, NOISE, bend)
+    monkeypatch.setattr(asb, 'USE_KERNEL', True)
+    compiled = asb.apply_bend(raw_fl, plain['unmixed'], k, j, pre, af, NOISE, bend)
+    bent = k >= bend.from_k
+    assert bent.any() and not np.allclose(reference[bent], plain['unmixed'][bent])
+    assert np.max(np.abs(compiled - reference) / gu.robust_sd(reference)) < 1e-7
+    assert np.array_equal(compiled[~bent], reference[~bent])

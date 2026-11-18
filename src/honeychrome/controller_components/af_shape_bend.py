@@ -79,6 +79,10 @@ The maths
       corrected by the bend estimated without its own term, exactly by a
       rank-one downdate: (g_f' c - omega_f u_f q_f) / (1 - omega_f q_f),
       q_f = g_f' (A + g Omega g' + T^-1)^-1 g_f. Reported: u minus that.
+    * With USE_KERNEL the compiled extension (bundled_plugins/
+      af_bend_kernel.cpp) does this arithmetic when it is built; the NumPy
+      code here is the reference and the fallback. The two agree to
+      rounding (different solvers and summation order).
 
 Setting (``process['af_shape_bend']``): on unless set to False. It acts only
 with the noise-aware AF abundance; the bend travels on the sample's
@@ -127,6 +131,7 @@ FULL_QUANTILE = 0.90
 POSITIVE_OFFSET_SD = 2.0
 ROBUST_Z = 4.0
 ROBUST_PASSES = 2
+USE_KERNEL = True
 CHUNK = 2000
 CHI2_1_MEDIAN = 0.45493642311957283
 _TINY = 1e-300
@@ -394,20 +399,39 @@ def _leave_own_out(a_full: np.ndarray, c: np.ndarray, g: np.ndarray, omega: np.n
     return delta
 
 
+def _kernel():
+    """The compiled bend (gls_m2p_kernel_wrapper.bend_r1_kernel), or None when it is switched off or not built."""
+    if not USE_KERNEL:
+        return None
+    from honeychrome.controller_components import gls_unmix
+    gls_unmix._bundled()
+    try:
+        import gls_m2p_kernel_wrapper as wrapper
+    except ImportError:
+        return None
+    return wrapper.bend_r1_kernel if wrapper.BEND_R1_AVAILABLE else None
+
+
 def bend_fluorophores(d: np.ndarray, u: np.ndarray, k: np.ndarray, mu: np.ndarray, precomputed: dict,
                       noise: tuple, bend: AFBend, return_bend: bool = False):
     """
     Bent fluorophores of events with leftover d, per-cell AF fluorophores u,
     AF k and fitted signal mu; with *return_bend* also each event's bend c
-    (one value per shape: its AF is k a_j + c E).
+    (one value per shape: its AF is k a_j + c E), always by the NumPy code.
     """
     from honeychrome.controller_components.autospectral_functions import _spread_variance
 
     e = bend.shapes
     p = np.asarray(precomputed['P'], dtype=np.float64)
     s = np.asarray(precomputed['S_t'], dtype=np.float64).T
-    g = e @ p.T
     t2 = prior_variance(k, bend)
+    kernel = None if return_bend else _kernel()
+    if kernel is not None:
+        from honeychrome.controller_components.unmix_method import n_threads_default
+        spread = (precomputed.get('envelope') or {}).get('spread')
+        return kernel(d, u, mu, t2, s, p, e, noise, spread if spread is not None and np.any(spread) else None,
+                      ROBUST_Z, ROBUST_PASSES, POSITIVE_OFFSET_SD, n_threads_default())
+    g = e @ p.T
     var_d = noise_variance(mu, noise)
     a, b = _robust_outside(d, s, e, 1.0 / np.maximum(var_d, _TINY), t2)
     var_f = var_d @ (p ** 2).T
