@@ -607,7 +607,7 @@ def af_index_lookup(af_profiles: dict, profile_names) -> np.ndarray | None:
 
 def apply_af_transfer(raw_event_data, transfer_matrix, af_precomputed, af_spectra, settings,
                       filtered_fl_ids_raw=None, spillover=None, af_index_map=None, af_posterior=None,
-                      pnn_raw=None):
+                      pnn_raw=None, shape_bend=True):
     """
     Assemble a full unmixed event array with AF-corrected fluorescence columns.
     Scatter, time, and event_id columns come from the standard transfer_matrix path;
@@ -626,7 +626,8 @@ def apply_af_transfer(raw_event_data, transfer_matrix, af_precomputed, af_spectr
     noise-aware one; the prior mean then reads each event's SSC from the
     column of ``raw_event_data`` named in ``pnn_raw`` (default: the channel
     whitelist when set, else every raw channel, the order raw events are
-    loaded in).
+    loaded in). ``shape_bend`` False leaves out the posterior's AF shape
+    bend (see apply_af_unmixing).
     """
     from honeychrome.controller_components.functions import apply_transfer_matrix
 
@@ -648,7 +649,8 @@ def apply_af_transfer(raw_event_data, transfer_matrix, af_precomputed, af_spectr
         if pnn_raw is None:
             pnn_raw = raw_settings.get('whitelisted_pnn') or raw_settings['event_channels_pnn']
         log_ssc = af_posterior.log_ssc(raw_event_data, pnn_raw)
-    result = apply_af_unmixing(raw_fl, af_precomputed, af_spectra, af_posterior=af_posterior, log_ssc=log_ssc)
+    result = apply_af_unmixing(raw_fl, af_precomputed, af_spectra, af_posterior=af_posterior, log_ssc=log_ssc,
+                               shape_bend=shape_bend)
     af_unmixed_fl = result['unmixed']  # (n_cells, n_fluors) — plain OLS space
 
     if spillover is not None:
