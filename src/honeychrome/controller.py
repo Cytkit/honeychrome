@@ -114,6 +114,9 @@ class Controller(QObject):
         self.live_sample_path = None
         # one heavy job at a time across the application
         self.job_gate = JobGate(self)
+        # one sample load at a time; a request made during a load waits here
+        self._sample_load_lock = threading.Lock()
+        self._pending_sample_path = None
         self.raw_event_data = None
         self.unmixed_event_data = None
         self.af_sidecar_data = None   # (n_cells, 2) float64: col 0 = af_scale, col 1 = af_idx; None when OLS
@@ -1754,8 +1757,26 @@ class Controller(QObject):
             logger.info('load_sample: streaming preview unavailable (%s); reading full file', e)
             return None
 
-    @with_busy_cursor
     def load_sample(self, sample_path):
+        """Load a sample for display. The busy cursor keeps the window responsive
+        during a load, so another sample can be selected meanwhile (for example by
+        arrowing through the sample list). Such a request waits, and only the most
+        recent one is loaded once the running load finishes, so two loads never
+        write to the plot data at the same time."""
+        while True:
+            if not self._sample_load_lock.acquire(blocking=False):
+                self._pending_sample_path = sample_path
+                return
+            try:
+                self._load_sample(sample_path)
+            finally:
+                self._sample_load_lock.release()
+            sample_path, self._pending_sample_path = self._pending_sample_path, None
+            if sample_path is None:
+                return
+
+    @with_busy_cursor
+    def _load_sample(self, sample_path):
         logger.info(f'Controller: loading sample {sample_path}')
         whitelisted_pnn = self.experiment.settings['raw'].get('whitelisted_pnn')
         check_pnn = whitelisted_pnn or self.experiment.settings['raw']['event_channels_pnn']
