@@ -138,14 +138,23 @@ def max_cache_bytes() -> int:
     return int(app_settings.unmixing_cache_gb_retrieved) * 1024 ** 3
 
 
-def prune_cache(experiment_dir, max_bytes: int | None = None) -> int:
+def prune_cache(experiment_dir, max_bytes: int | None = None, folder: str | None = None) -> int:
     """Remove the least recently used REBUILDABLE files until the experiment
     is within ``max_bytes`` (default: the App Configuration limit). Returns
-    the bytes removed."""
+    the bytes removed.
+
+    Every REBUILDABLE folder counts towards the limit. With *folder* (one of
+    REBUILDABLE), only files in that folder are removed: a job writing there
+    then never removes files another job of the same run has just written
+    elsewhere and is about to read. Without it (when an experiment is
+    opened, before any job runs), files in any of them are removed."""
     if max_bytes is None:
         max_bytes = max_cache_bytes()
     files = _cache_files(experiment_dir)
     total = sum(f[1] for f in files)
+    if folder is not None:
+        own = cache_dir(experiment_dir, folder)
+        files = [f for f in files if own in f[2].parents]
     freed = 0
     for _mtime, size, p in sorted(files):
         if total <= max_bytes:

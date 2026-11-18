@@ -774,7 +774,9 @@ def unmix(raw_event_data, transfer_matrix, settings, fl_ids_raw, spillover, af, 
     uncompensated one with ``spillover=None``. Returns ``unmixed``,
     ``af_scale``, ``af_idx`` (1-based into the sample's AF library, 0 = no
     AF) and ``method``. ``force_r1`` gives R1 with the sample's spectra (the
-    progressive display's first pass). ``cache_file`` (the sample's FCS file)
+    progressive display's first pass); when the sample's method is M2pg that
+    pass leaves out R1's AF shape bend, which M2pg does not use and which
+    costs more than M2pg itself. ``cache_file`` (the sample's FCS file)
     reads an M2pg or R2 result from the display cache, or computes and
     stores it; the result is then always the cache's float32 values, so a
     first and a later load agree exactly. ``pnn_raw`` names the columns of
@@ -795,9 +797,11 @@ def unmix(raw_event_data, transfer_matrix, settings, fl_ids_raw, spillover, af, 
         pnn_raw = settings['raw'].get('whitelisted_pnn') or settings['raw']['event_channels_pnn']
     if method == R1:
         if af is not None:
+            first_pass_of_m2pg = force_r1 and state is not None and state.effective_method(af, sample_key) == M2PG
             result = apply_af_transfer(raw_event_data, transfer_matrix, af.precomputed, af.spectra, settings,
                                        filtered_fl_ids_raw=list(fl_ids_raw), spillover=spillover,
-                                       af_index_map=af.index_map, af_posterior=posterior, pnn_raw=pnn_raw)
+                                       af_index_map=af.index_map, af_posterior=posterior, pnn_raw=pnn_raw,
+                                       shape_bend=not first_pass_of_m2pg)
             return {'unmixed': result['unmixed'], 'af_scale': np.asarray(result['af_scale'], dtype=np.float64),
                     'af_idx': np.asarray(result['af_idx'], dtype=np.int64), 'method': R1}
         return {'unmixed': apply_transfer_matrix(transfer_matrix, raw_event_data),
@@ -878,7 +882,7 @@ def store_display_cache(experiment_dir, key: str, fl_result: dict, max_bytes: in
     except OSError as exc:
         logger.warning('Unmixing cache: could not write %s (%s)', path.name, exc)
         return
-    experiment_paths.prune_cache(experiment_dir, max_bytes)
+    experiment_paths.prune_cache(experiment_dir, max_bytes, folder='unmixed')
 
 
 # ---------------------------------------------------------------------------
