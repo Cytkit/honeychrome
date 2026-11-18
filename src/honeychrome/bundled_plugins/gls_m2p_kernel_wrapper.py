@@ -53,15 +53,19 @@ def _arr(a):
 
 def unmix_m2p_kernel(raw, spectra, af_spectra, envelope, sigma0_sq, g, c, bead_var=None, tau_spread=None,
                      prior_lambda=1.0, n_iter=2, ceiling=0.0, n_threads=0, af_choice_weights=None,
-                     batch_lanes=BATCH_LANES, fixed_af_idx=None, fixed_af_scale=None) -> dict:
+                     batch_lanes=BATCH_LANES, fixed_af_idx=None, fixed_af_scale=None, bend_shapes=None,
+                     bend_var=None) -> dict:
     """
     ``af_spectra`` None or empty for no AF; ``bead_var`` (F,) is the prior's
     negative variance without AF; ``tau_spread`` (F x F) the spillover
     spread added to it; ``af_choice_weights`` (D,) whitens the per-cell AF
     choice (M2pg). ``fixed_af_idx`` (n, 0-based) and ``fixed_af_scale`` (n,)
     fix each event's AF row and abundance (only the fluorophores are
-    solved); a kernel built before this option raises TypeError. Returns
-    ``unmixed`` (n, F), ``af_idx`` (0-based), ``af_scale``, ``chi2``.
+    solved); a kernel built before this option raises TypeError. With the
+    AF fixed, ``bend_shapes`` (L, D) and ``bend_var`` (n, L) integrate out
+    each event's AF shape bend (prior variance 0: not bent); a kernel built
+    before this option raises TypeError. Returns ``unmixed`` (n, F),
+    ``af_idx`` (0-based), ``af_scale``, ``chi2``.
     """
     if _lib is None:
         raise ImportError('the _gls_m2p_kernel extension is not built (build_autospectral_opt_kernel.py)')
@@ -71,6 +75,8 @@ def unmix_m2p_kernel(raw, spectra, af_spectra, envelope, sigma0_sq, g, c, bead_v
     if fixed_af_idx is not None:
         fixed = {'fixed_af_idx': np.ascontiguousarray(fixed_af_idx, dtype=np.int64),
                  'fixed_af_scale': _arr(fixed_af_scale)}
+        if bend_shapes is not None:
+            fixed.update(bend_shapes=_arr(bend_shapes), bend_var=_arr(bend_var))
     out = _lib.unmix_m2p(
         np.ascontiguousarray(raw, dtype=np.float64), np.ascontiguousarray(spectra, dtype=np.float64), af,
         _envelope_arg(envelope), _arr(sigma0_sq), _arr(g), _arr(c), 1.0, _arr(bead_var), _arr(tau_spread),

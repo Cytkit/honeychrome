@@ -93,6 +93,29 @@ M2pg (``unmix_m2pg``)
     counted in its signal for the weights, and only the fluorophores are
     solved, so M2pg reports the same AF as R1.
 
+    AF shape bend (``af_bend``, the posterior's ``af_shape_bend.AFBend``).
+    In plain terms: in high-AF cells the real AF spectrum differs a little
+    from the library spectrum the cell was given, along a few shapes learnt
+    from the unstained sample, by an amount that grows with the cell's AF.
+    M2pg is told that the AF spectrum is uncertain along those shapes, so
+    it gives less weight to whatever part of the cell's detector pattern a
+    change of AF shape could explain, instead of reporting it as signal in
+    the fluorophores that resemble AF. No corrected AF spectrum is
+    estimated, and the AF abundance and row are unchanged. Cells below the
+    bend's threshold (``from_k``, the unstained sample's 70th AF percentile)
+    are solved exactly as without it.
+    The maths: the bend c (one value per shape, rows of E) has the prior
+    Normal(0, T), T = ``af_shape_bend.prior_variance`` (r(k)^2 k^2
+    sigma_l^2(k), with the ramp r from ``from_k`` to ``full_k``).
+    Integrated out, y - k a_j = x S + c E + noise has the detector
+    covariance V + E' T E, whose inverse is W - W E' (T^-1 + E W E')^-1 E W
+    (W = 1 / V, Woodbury identity): a rank-L change to each bent event's
+    normal equations, S W S' - (S W E') M^-1 (E W S') and S W r -
+    (S W E') M^-1 E W r with M = E W E' + T^-1. Penalised GLS under that
+    covariance is the joint MAP of the fluorophores and the bend with the
+    positivity ridge as the near-0 term, and each fluorophore is reported
+    with its own ridge removed, as without the bend.
+
 Storage
     ``process['noise_model']`` holds the fit's description (unstained
     sample, gate, bead sources, calibration summary, the no-AF negative
@@ -118,6 +141,9 @@ v1 simplifications
       detectors); ``spectra_changed`` reports it.
     * A fit from bead controls alone scales the clamped-data weights and the
       flat weights to the held-out events of its largest bead negative.
+    * The AF shape bend acts only with the AF fixed (the noise-aware
+      abundance); events with a detector at the ceiling are not bent, as in
+      per-cell AF.
 """
 
 from __future__ import annotations
@@ -152,6 +178,10 @@ AUTO = '__auto__'
 CLAMPED_WEIGHTS = 'clamped'
 DEFAULT_PRIOR_LAMBDA = 1.0
 N_ITER = 2
+# Changes whenever the AF shape bend changes what M2pg reports (part of the unmixing signature).
+SHAPE_BEND_VERSION = 1
+# Precision of a bend shape that may not move (prior variance 0).
+_BEND_FIXED = 1e30
 _EPS = 1e-12
 
 
@@ -1254,15 +1284,46 @@ def negative_sd(raw: np.ndarray, spectra: np.ndarray, af_spectra: np.ndarray | N
     return np.sqrt(var)
 
 
+def bend_precision(t2: np.ndarray) -> np.ndarray:
+    """Prior precision 1 / T of each event's bend per shape; a shape with variance 0 is held fixed."""
+    return np.where(t2 > 0.0, 1.0 / np.maximum(t2, 1e-300), _BEND_FIXED)
+
+
+def shape_bend_variance(bend, k: np.ndarray, raw: np.ndarray, ceiling: float | None) -> np.ndarray | None:
+    """
+    Prior variance T (n, L) of each event's AF shape bend for M2pg:
+    ``af_shape_bend.prior_variance`` at the event's AF abundance k, 0 below
+    the bend's threshold and for events with a detector at the ceiling.
+    None when the bend is absent, inactive, learnt on other detectors, or
+    bends no event.
+    """
+    if bend is None or not bend.active or bend.shapes.shape[1] != raw.shape[1]:
+        return None
+    from honeychrome.controller_components.af_shape_bend import prior_variance
+
+    k = np.asarray(k, dtype=np.float64)
+    t2 = prior_variance(np.maximum(k, 0.0), bend)
+    t2[k < bend.from_k] = 0.0
+    if ceiling:
+        t2[np.any(raw >= 0.999 * ceiling, axis=1)] = 0.0
+    if not np.any(t2 > 0.0):
+        return None
+    return np.ascontiguousarray(t2, dtype=np.float64)
+
+
 def pgls_solve(y: np.ndarray, spectra: np.ndarray, af_rows: np.ndarray | None, w: np.ndarray,
-               fl_pen: np.ndarray | None = None) -> dict:
+               fl_pen: np.ndarray | None = None, bend_shapes: np.ndarray | None = None,
+               bend_prec: np.ndarray | None = None) -> dict:
     """
     One penalised GLS solve per event against ``[spectra; af_rows[i]]`` with
     diagonal weights ``w`` (B, D) and the ridge ``fl_pen`` (B, F) on the
     fluorophores. Events whose AF abundance comes out negative are refitted
-    without the AF row. Returns ``x`` (B, F), ``alpha`` (B,) and
-    ``inv_diag`` (B, F), the fluorophore diagonal of the inverse normal
-    matrix.
+    without the AF row. Without AF rows, ``bend_shapes`` (L, D) and
+    ``bend_prec`` (B, L) integrate out each event's AF shape bend (the
+    Woodbury change to the normal equations in the module docstring);
+    events whose every shape is held fixed are solved without it. Returns
+    ``x`` (B, F), ``alpha`` (B,) and ``inv_diag`` (B, F), the fluorophore
+    diagonal of the inverse normal matrix.
     """
     b, d = y.shape
     f = spectra.shape[0]
@@ -1273,11 +1334,22 @@ def pgls_solve(y: np.ndarray, spectra: np.ndarray, af_rows: np.ndarray | None, w
     design = np.concatenate(blocks, axis=1)
     dw = design * w[:, np.newaxis, :]
     normal = dw @ design.transpose(0, 2, 1)
+    rhs = np.einsum('bkd,bd->bk', dw, y)
+    if bend_shapes is not None and not has_af:
+        bent = np.flatnonzero(np.any(bend_prec < _BEND_FIXED, axis=1))
+        if len(bent):
+            n_l = len(bend_shapes)
+            wb = w[bent]
+            swe = dw[bent] @ bend_shapes.T
+            m = (bend_shapes[np.newaxis] * wb[:, np.newaxis, :]) @ bend_shapes.T
+            m[:, np.arange(n_l), np.arange(n_l)] += bend_prec[bent]
+            ewr = (wb * y[bent]) @ bend_shapes.T
+            normal[bent] -= swe @ np.linalg.solve(m, swe.transpose(0, 2, 1))
+            rhs[bent] -= np.einsum('bfl,bl->bf', swe, np.linalg.solve(m, ewr[:, :, np.newaxis])[:, :, 0])
     if fl_pen is not None:
         normal[:, np.arange(f), np.arange(f)] += fl_pen
     diag_f = normal[:, np.arange(f), np.arange(f)]
     normal[:, np.arange(f), np.arange(f)] += 1e-12 * diag_f.sum(axis=1, keepdims=True) / f
-    rhs = np.einsum('bkd,bd->bk', dw, y)
     inv = np.linalg.inv(normal)
     theta = np.einsum('bkl,bl->bk', inv, rhs)
     out = {'x': theta[:, :f].copy(), 'alpha': theta[:, f].copy() if has_af else np.zeros(b),
@@ -1293,11 +1365,13 @@ def pgls_solve(y: np.ndarray, spectra: np.ndarray, af_rows: np.ndarray | None, w
 
 def _m2p_refit(raw: np.ndarray, spectra: np.ndarray, start: dict, af_spectra: np.ndarray | None,
                noise: nm.NoiseModel, tau: np.ndarray | None, lam: float, n_iter: int,
-               ceiling: float | None, fixed_af: bool = False) -> dict:
+               ceiling: float | None, fixed_af: bool = False,
+               bend: tuple | None = None) -> dict:
     """
     The plug-in penalised GLS iterations of M2pg from ``start`` (see the
     module docstring). With ``fixed_af`` the start's AF row and abundance
-    are kept and only the fluorophores are solved.
+    are kept and only the fluorophores are solved; ``bend`` = (shapes (L,
+    D), prior variance (n, L)) then integrates out the AF shape bend.
     """
     from honeychrome.controller_components.autospectral_functions import positivity_weight
 
@@ -1316,6 +1390,7 @@ def _m2p_refit(raw: np.ndarray, spectra: np.ndarray, start: dict, af_spectra: np
         idx = idx_out[lo:hi]
         rows = af_spectra[np.clip(idx, 0, None)] if has_af else None
         t2 = None if tau is None else np.maximum(tau[lo:hi] ** 2, _EPS)
+        prec = None if bend is None else bend_precision(bend[1][lo:hi])
         for _ in range(max(1, int(n_iter))):
             mu = np.maximum(x, 0.0) @ spectra
             if rows is not None:
@@ -1323,7 +1398,8 @@ def _m2p_refit(raw: np.ndarray, spectra: np.ndarray, start: dict, af_spectra: np
             w = _saturation_weights(1.0 / noise.variance(mu), y, ceiling)
             pen = None if lam <= 0 else lam * positivity_weight(x, t2) / t2
             if fixed_af and rows is not None:
-                sol = pgls_solve(y - alpha[:, np.newaxis] * rows, spectra, None, w, pen)
+                sol = pgls_solve(y - alpha[:, np.newaxis] * rows, spectra, None, w, pen,
+                                 None if bend is None else bend[0], prec)
                 x = sol['x']
             else:
                 sol = pgls_solve(y, spectra, rows, w, pen)
@@ -1348,7 +1424,7 @@ def unmix_m2pg(raw_fl: np.ndarray, spectra: np.ndarray, noise: nm.NoiseModel, af
                envelope: dict | None = None, null_var_no_af: np.ndarray | None = None,
                spread: np.ndarray | None = None, prior_lambda: float = DEFAULT_PRIOR_LAMBDA,
                ceiling: float | None = None, n_threads: int = 0, use_kernel: bool = True,
-               fixed_af: tuple | None = None) -> dict:
+               fixed_af: tuple | None = None, af_bend=None) -> dict:
     """
     M2pg on raw fluorescence events (see the module docstring). With
     ``af_spectra`` (two or more rows) each event takes one AF row, scored
@@ -1357,8 +1433,10 @@ def unmix_m2pg(raw_fl: np.ndarray, spectra: np.ndarray, noise: nm.NoiseModel, af
     variance and ``spread`` the spillover spread at the OLS position.
     ``fixed_af`` = (AF row, 0-based, and abundance per event) fixes each
     event's AF (the noise-aware abundance); only the fluorophores are then
-    solved. Returns ``unmixed`` (n, F, uncompensated), ``af_idx`` (0-based,
-    -1 without AF) and ``af_scale``.
+    solved. With ``fixed_af``, ``af_bend`` (an ``af_shape_bend.AFBend``)
+    integrates out the AF shape bend of high-AF events (module docstring).
+    Returns ``unmixed`` (n, F, uncompensated), ``af_idx`` (0-based, -1
+    without AF) and ``af_scale``.
     """
     raw_fl = np.ascontiguousarray(raw_fl, dtype=np.float64)
     spectra = np.ascontiguousarray(spectra, dtype=np.float64)
@@ -1370,9 +1448,13 @@ def unmix_m2pg(raw_fl: np.ndarray, spectra: np.ndarray, noise: nm.NoiseModel, af
         af_spectra, envelope, tau_spread = None, None, spread
     if not has_af:
         fixed_af = None
+    bend = None
     if fixed_af is not None:
         fixed_idx = np.ascontiguousarray(fixed_af[0], dtype=np.int64)
         fixed_scale = np.ascontiguousarray(fixed_af[1], dtype=np.float64)
+        t2_bend = shape_bend_variance(af_bend, fixed_scale, raw_fl, ceiling)
+        if t2_bend is not None:
+            bend = (np.ascontiguousarray(af_bend.shapes, dtype=np.float64), t2_bend)
     if use_kernel and kernel_available():
         from gls_m2p_kernel_wrapper import unmix_m2p_kernel
         try:
@@ -1382,12 +1464,13 @@ def unmix_m2pg(raw_fl: np.ndarray, spectra: np.ndarray, noise: nm.NoiseModel, af
                 n_iter=N_ITER, ceiling=ceiling or 0.0, n_threads=n_threads,
                 af_choice_weights=sample_af_weights(raw_fl, noise) if has_af and fixed_af is None else None,
                 fixed_af_idx=None if fixed_af is None else fixed_idx,
-                fixed_af_scale=None if fixed_af is None else fixed_scale)
+                fixed_af_scale=None if fixed_af is None else fixed_scale,
+                bend_shapes=None if bend is None else bend[0], bend_var=None if bend is None else bend[1])
         except TypeError as exc:
             if fixed_af is None:
                 raise
-            logger.warning('M2pg: the compiled kernel predates the noise-aware AF abundance (%s); the NumPy path '
-                           'is used. Build the kernels again.', exc)
+            logger.warning('M2pg: the compiled kernel predates the noise-aware AF abundance or the AF shape bend '
+                           '(%s); the NumPy path is used. Build the kernels again.', exc)
         else:
             return {'unmixed': out['unmixed'], 'af_idx': out['af_idx'] if has_af else np.full(len(raw_fl), -1),
                     'af_scale': out['af_scale']}
@@ -1402,7 +1485,7 @@ def unmix_m2pg(raw_fl: np.ndarray, spectra: np.ndarray, noise: nm.NoiseModel, af
     spread_m = None if tau_spread is None else np.asarray(tau_spread, dtype=np.float64)
     tau = negative_sd(raw_fl, spectra, af_spectra, envelope, None if has_af else null_var_no_af, spread_m)
     return _m2p_refit(raw_fl, spectra, start, af_spectra, noise, tau, float(prior_lambda), N_ITER, ceiling,
-                      fixed_af=fixed_af is not None)
+                      fixed_af=fixed_af is not None, bend=bend)
 
 
 def assemble_unmixed(raw_event_data: np.ndarray, transfer_matrix: np.ndarray, settings: dict, result: dict,

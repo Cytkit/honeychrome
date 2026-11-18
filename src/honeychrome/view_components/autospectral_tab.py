@@ -967,7 +967,7 @@ class AutofluorescencePage(QWidget):
             'of AF-like fluorophores (BUV395, BUV496, BV421, BV510 and similar) in '
             'high-AF cells without taking dim dye signal. The AF Abundance and AF '
             'Index are unchanged. Needs the noise-aware AF abundance; applies to '
-            'per-cell AF unmixing.'
+            'per-cell AF and to the noise model (M2pg) unmixing.'
         )
         self._shape_bend_cb.toggled.connect(self._on_shape_bend_toggled)
         guard_while_busy(self.controller, self._shape_bend_cb)

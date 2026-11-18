@@ -31,9 +31,11 @@ AF abundance
     posterior travels on its ``AFState`` (``posterior``). R1 reports it in
     place of the clamped abundance, with the AF shape bend (af_shape_bend)
     on high-AF events when the posterior carries one; M2pg and the clamped-data weights take
-    R1's noise-aware AF row and abundance as fixed and solve only the
-    fluorophores by penalised GLS, so every method reports the same AF. R2
-    is unchanged.
+    R1's noise-aware AF row and abundance (unbent) as fixed and solve only the
+    fluorophores by penalised GLS, so every method reports the same AF. M2pg
+    integrates the posterior's AF shape bend out of its noise covariance
+    (``gls_unmix``, ``af_bend``); the clamped-data weights do not. R2 is
+    unchanged.
 
 Spectral corrections (``process['spectral_corrections']``, written by the
 Spectral Correction page)
@@ -344,6 +346,9 @@ class MethodState:
             posterior = getattr(af, 'posterior', None)
             if posterior is not None and method != R2:
                 af_part.append(posterior.fingerprint)
+                bend = getattr(posterior, 'bend', None)
+                if method == M2PG and bend is not None and bend.active:
+                    af_part.append(bend.fingerprint)
         return digest(self.fingerprint, method, set_id, self.spectra_for(set_id) if set_id else None,
                       self.is_bead(sample_key) if af is None else None, af_part)
 
@@ -466,10 +471,14 @@ def method_state(controller, corrections: tuple | None = None) -> MethodState | 
     if corrections is None and corrected:
         parts['corrections_apply_to'] = unmixing_settings(process)['corrections_apply_to']
     if method in NOISE_METHODS:
+        from honeychrome.controller_components.af_shape_bend import shape_bend_on
+
         parts.update(noise=[noise.entry.get('fingerprint'), noise.entry.get('fitted'), noise.cell_null_var,
                             noise.bead_null_var, noise.entry.get('flat_phi'), noise.entry.get('clamped_weights')],
                      prior_lambda=lam, spread=spread,
                      kernel=m2p_kernel)
+        if method == M2PG and shape_bend_on(process):
+            parts['shape_bend'] = gu.SHAPE_BEND_VERSION
     if method == R2:
         meta = variants['meta']
         parts.update(active=variants['active'], thresholds=variants['thresholds'], kernel=variants['kernel'],
@@ -707,12 +716,14 @@ def unmix_fluorescence(raw_fl: np.ndarray, state: MethodState, af, sample_key=No
                 'af_idx': np.where(idx > 0, idx - 1, -1)}
     envelope = None if af is None or not af.precomputed else af.precomputed.get('envelope')
     if method in NOISE_METHODS:
-        fixed_af = None
+        fixed_af = af_bend = None
         if af is not None and getattr(af, 'posterior', None) is not None:
             from honeychrome.controller_components.autospectral_functions import apply_af_unmixing
             r1 = apply_af_unmixing(raw_fl, af.precomputed, np.asarray(af.spectra, dtype=np.float64),
                                    af_posterior=af.posterior, log_ssc=log_ssc, shape_bend=False)
             fixed_af = (np.asarray(r1['af_idx'], dtype=np.int64) - 1, np.asarray(r1['af_scale'], dtype=np.float64))
+            if method == M2PG:
+                af_bend = getattr(af.posterior, 'bend', None)
         noise = state.noise
         model = noise.clamped_model if method == CLAMPED else noise.model_for(state.is_bead(sample_key))
         null_var = spread_no_af = None
@@ -727,7 +738,7 @@ def unmix_fluorescence(raw_fl: np.ndarray, state: MethodState, af, sample_key=No
         return gu.unmix_m2pg(raw_fl, spectra, model, None if af is None else af.spectra, envelope,
                              null_var_no_af=null_var, spread=spread_no_af,
                              prior_lambda=state.prior_lambda, ceiling=state.ceiling, n_threads=state.n_threads,
-                             fixed_af=fixed_af)
+                             fixed_af=fixed_af, af_bend=af_bend)
     if method == R2:
         _bundled()
         from autospectral_optimization_functions import unmix_autospectral_optimization

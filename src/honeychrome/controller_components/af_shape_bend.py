@@ -21,7 +21,9 @@ In plain terms
     per-cell AF result exactly; from there to its 90th percentile the bend
     allowed grows gradually from none to its full size, so cells just above
     the threshold move only a little. The AF Abundance and AF Index never
-    change.
+    change. With the noise model (M2pg) no bent spectrum is worked out:
+    M2pg is told how far each cell's AF may bend along the shapes and gives
+    less weight to what such a bend could explain (gls_unmix, ``af_bend``).
 
 The maths
     Learning, on the AF profile's unstained sample (LEARN_EVENTS events,
@@ -93,9 +95,9 @@ v1 simplifications
       70th to the 90th percentile; neither is chosen per sample.
     * Events with a saturated detector are not bent (their re-fit on the
       unsaturated detectors keeps the per-cell AF result).
-    * Only per-cell AF (R1) reports bent fluorophores; M2pg and the
-      clamped-data weights take the per-cell AF amount and row unbent, and
-      spectral variants (R2) are unchanged.
+    * Per-cell AF (R1) and M2pg use the bend; the clamped-data weights take
+      the per-cell AF amount and row unbent, and spectral variants (R2) are
+      unchanged.
 """
 
 from __future__ import annotations
@@ -393,8 +395,12 @@ def _leave_own_out(a_full: np.ndarray, c: np.ndarray, g: np.ndarray, omega: np.n
 
 
 def bend_fluorophores(d: np.ndarray, u: np.ndarray, k: np.ndarray, mu: np.ndarray, precomputed: dict,
-                      noise: tuple, bend: AFBend) -> np.ndarray:
-    """Bent fluorophores of events with leftover d, per-cell AF fluorophores u, AF k and fitted signal mu."""
+                      noise: tuple, bend: AFBend, return_bend: bool = False):
+    """
+    Bent fluorophores of events with leftover d, per-cell AF fluorophores u,
+    AF k and fitted signal mu; with *return_bend* also each event's bend c
+    (one value per shape: its AF is k a_j + c E).
+    """
     from honeychrome.controller_components.autospectral_functions import _spread_variance
 
     e = bend.shapes
@@ -417,24 +423,33 @@ def bend_fluorophores(d: np.ndarray, u: np.ndarray, k: np.ndarray, mu: np.ndarra
     a_full = a_full + _precision(t2)[:, :, np.newaxis] * np.eye(len(e))[np.newaxis]
     rhs = b + (omega * u) @ g.T
     c = np.linalg.solve(a_full, rhs[:, :, np.newaxis])[:, :, 0]
-    return u - _leave_own_out(a_full, c, g, omega, u)
+    out = u - _leave_own_out(a_full, c, g, omega, u)
+    return (out, c) if return_bend else out
 
 
 def apply_bend(raw_fl: np.ndarray, unmixed: np.ndarray, k: np.ndarray, j: np.ndarray, precomputed: dict,
-               af_spectra: np.ndarray, noise: tuple, bend: AFBend) -> np.ndarray:
+               af_spectra: np.ndarray, noise: tuple, bend: AFBend, return_bend: bool = False):
     """
     Per-cell AF fluorophores ``unmixed`` (AF k on variant j, 0-based) with the
     events at or above the bend's threshold bent; the rest returned unchanged.
+    With *return_bend* also each event's bend c (events x shapes, 0 where not
+    bent), so that its AF in detector space is k a_j + c ``bend.shapes``.
     """
+    n_shapes = 0 if bend is None else len(bend.shapes)
+    none = np.zeros((len(unmixed), n_shapes))
     if bend is None or not bend.active or bend.shapes.shape[1] != raw_fl.shape[1]:
-        return unmixed
+        return (unmixed, none) if return_bend else unmixed
     sel = k >= bend.from_k
     if not sel.any():
-        return unmixed
+        return (unmixed, none) if return_bend else unmixed
     lib = np.asarray(af_spectra, dtype=np.float64)
     a = k[sel, np.newaxis] * lib[j[sel]]
     u = unmixed[sel]
     mu = a + np.maximum(u, 0.0) @ np.asarray(precomputed['S_t'], dtype=np.float64).T
     out = np.array(unmixed)
-    out[sel] = bend_fluorophores(raw_fl[sel] - a, u, k[sel], mu, precomputed, noise, bend)
-    return out
+    if not return_bend:
+        out[sel] = bend_fluorophores(raw_fl[sel] - a, u, k[sel], mu, precomputed, noise, bend)
+        return out
+    out[sel], none[sel] = bend_fluorophores(raw_fl[sel] - a, u, k[sel], mu, precomputed, noise, bend,
+                                            return_bend=True)
+    return out, none
