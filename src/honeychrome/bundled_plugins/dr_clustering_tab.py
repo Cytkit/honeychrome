@@ -1292,7 +1292,9 @@ class _SortableItem(QTableWidgetItem):
                     return a < b
                 except TypeError:
                     pass
-        return super().__lt__(other)
+        # Not QTableWidgetItem.__lt__: called from this override, it calls
+        # the override again.
+        return self.text() < other.text()
 
 
 class RunDetailDialog(QDialog):
@@ -1516,7 +1518,8 @@ class RunManagementTable(CopyableTableWidget):
         self.setItem(row, 5, events_item)
 
         channels = entry.get('channels', [])
-        ch_item = QTableWidgetItem(str(len(channels)))
+        ch_item = _SortableItem(str(len(channels)))
+        ch_item.set_sort_key(len(channels))
         ch_item.setToolTip(', '.join(channels))
         self.setItem(row, 6, ch_item)
 
@@ -4107,6 +4110,17 @@ class GroupsStatsTab(QWidget):
             "a different split. More repeats give steadier estimates."
         )
         pred_row.addWidget(self.pred_repeats_spin)
+        pred_row.addSpacing(12)
+        self.pred_chk_donors = QCheckBox("Keep donors together")
+        self.pred_chk_donors.setChecked(True)
+        self.pred_chk_donors.setToolTip(
+            "With a paired design (Pairing variable), every cross-validation split keeps "
+            "all samples of a donor on the same side, so the model is never tested on a "
+            "donor it was trained on. Needs at least "
+            f"{drc_predictive.MIN_DONORS_PER_GROUP} donors per group. Untick to split "
+            "samples alone. No effect without a paired design."
+        )
+        pred_row.addWidget(self.pred_chk_donors)
         pred_row.addStretch()
         pred_layout.addLayout(pred_row)
 
@@ -7773,6 +7787,8 @@ class GroupsStatsTab(QWidget):
             rel_list,
         )
         repeats = self.pred_repeats_spin.value()
+        pairing = self._trend_pairing(rel_list) if self.pred_chk_donors.isChecked() else None
+        blocks = [pairing.get(rel, rel) for rel in rel_list] if pairing else None
         run_label = self.state.stats_run_label or 'Active (unsaved)'
         token = acquire_job(self.controller, 'Honeycluster: predictive analysis')
         if token is None:
@@ -7792,7 +7808,7 @@ class GroupsStatsTab(QWidget):
                 try:
                     self_.result = drc_predictive.run_predictive(
                         X, groups, positive, negative, models=tuple(models),
-                        repeats=repeats, progress=self_.progress.emit,
+                        repeats=repeats, blocks=blocks, progress=self_.progress.emit,
                     )
                     self_.result['run_label'] = run_label
                     self_.finished.emit(True, '')
@@ -7870,6 +7886,8 @@ class GroupsStatsTab(QWidget):
         n = ", ".join(f"{g} n={k}" for g, k in summary['n_per_group'].items())
         text = (f"{summary['positive']} vs {summary['negative']} ({n}); "
                 f"{summary['repeats']}× repeated {summary['outer_folds']}-fold CV")
+        if summary.get('n_donors'):
+            text += f", {summary['n_donors']} donors kept together"
         if summary.get('status') == 'warn':
             text += (f"\nfewer than {drc_predictive.RECOMMENDED_PER_GROUP} per group: "
                      "estimates are noisy")
@@ -15751,7 +15769,7 @@ class PluginWidget(QWidget):
             _log.info("started UMAP JIT warm-up (%s path)", 'parallel' if parallel else 'serial')
 
     # ------------------------------------------------------------------
-    # State persistence (the experiment folder's cache/dr_clustering)
+    # State persistence (the experiment folder's state/dr_clustering)
     # ------------------------------------------------------------------
 
     def _experiment_key(self) -> tuple:
@@ -15826,9 +15844,9 @@ class PluginWidget(QWidget):
         opened.
 
         Lightweight scalar/list values go to the settings store
-        (cache/dr_clustering/state.json, see experiment_state).
+        (state/dr_clustering/state.json, see experiment_state).
         Embeddings, cluster labels and stats results are written to a
-        sidecar bundle in the experiment's cache folder; see
+        sidecar bundle in the experiment's state folder; see
         _save_model_sidecar.
 
         self.controller.experiment can already point at a DIFFERENT
@@ -16662,9 +16680,9 @@ class PluginWidget(QWidget):
         path = self._sidecar_path()
 
         # temporary diagnostic
-        _log.info("_load_model_sidecar: path=%s exists=%s cache_root=%s",
+        _log.info("_load_model_sidecar: path=%s exists=%s archive_root=%s",
                 path, path.exists() if path else None,
-                drc_run_archive.cache_root(self.controller))
+                drc_run_archive.archive_root(self.controller))
                 
 
         # Rebuild the run archive regardless of whether the current-state

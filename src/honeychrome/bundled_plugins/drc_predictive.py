@@ -18,7 +18,12 @@ Vaccines 10:140; Veiga et al. 2026, Nat Commun 17:4670):
 * Performance: repeated stratified K-fold outer cross-validation. Each
   sample is predicted once per repeat by a model that never saw it; ROC
   AUC and balanced accuracy are computed on these out-of-fold predictions
-  and summarised as mean ± SD over repeats.
+  and summarised as mean ± SD over repeats. When the samples come from
+  donors with several samples each (a paired design), the outer and inner
+  splits can keep every donor's samples on one side of the split
+  (stratified group K-fold), so a model is never tested on a donor it was
+  trained on. The forest's out-of-bag depth choice does not see donors;
+  it only tunes the model, and the outer splits still keep donors apart.
 * Importance: how often the lasso keeps each feature across outer fits
   (selection frequency, with its mean standardised coefficient), and the
   forest's mean impurity importance.
@@ -55,6 +60,7 @@ log = get_logger(__name__)
 
 MIN_PER_GROUP = 10
 RECOMMENDED_PER_GROUP = 30
+MIN_DONORS_PER_GROUP = 4    # keeping donors together: fewest donors per group
 MODEL_LABELS = {'l1_logistic': 'Lasso logistic regression',
                 'random_forest': 'Random forest'}
 _C_GRID = np.logspace(-2, 2, 15)
@@ -180,13 +186,18 @@ def _panel_sizes(n_features: int, max_panel: int) -> list[int]:
 def run_predictive(X: pd.DataFrame, groups: list[str], positive: str, negative: str,
                    models=('l1_logistic', 'random_forest'), outer_folds: int = 5,
                    repeats: int = 5, inner_folds: int = 3, max_panel: int = 50,
-                   seed: int = 0, progress=None) -> dict:
+                   seed: int = 0, blocks=None, progress=None) -> dict:
     """
     Nested cross-validated classification of ``positive`` vs ``negative``.
 
     X      : samples × features (rows aligned to ``groups``); NaN allowed.
     groups : group name per row; rows in other groups are ignored.
     models : any of 'l1_logistic', 'random_forest'.
+    blocks : donor (pairing level) of each row, or None. Given, every outer
+             and inner split keeps a donor's samples together, and the
+             number of folds is limited by the donors in the smaller
+             group; at least MIN_DONORS_PER_GROUP donors per group are
+             needed. None, or one sample per donor, splits samples alone.
     progress: optional callable(str) for status messages.
 
     Returns a dict:
@@ -199,13 +210,15 @@ def run_predictive(X: pd.DataFrame, groups: list[str], positive: str, negative: 
       'panel':       DataFrame — n_features, auc_mean, auc_sd
       'summary':     dict — positive, negative, n_per_group, n_features,
                      minimal_panel, best_panel_auc, status, message,
-                     outer_folds, repeats
-    Raises ValueError when a group has fewer than MIN_PER_GROUP samples.
+                     outer_folds, repeats, n_donors (None when samples
+                     were split alone)
+    Raises ValueError when a group has fewer than MIN_PER_GROUP samples,
+    or, with blocks, fewer than MIN_DONORS_PER_GROUP donors.
     """
     from sklearn.linear_model import LogisticRegression
     from sklearn.impute import SimpleImputer
     from sklearn.metrics import balanced_accuracy_score, roc_auc_score, roc_curve
-    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
 
@@ -230,7 +243,20 @@ def run_predictive(X: pd.DataFrame, groups: list[str], positive: str, negative: 
 
     features = list(Xs.columns)
     Xv = Xs.values.astype(float)
-    n_min = int(min(n_per_group.values()))
+    donors = None
+    if blocks is not None:
+        donors = np.array([str(b) for b, m in zip(np.asarray(blocks, dtype=object), mask) if m])
+        if np.unique(donors).size == donors.size:
+            donors = None
+    if donors is None:
+        n_min = int(min(n_per_group.values()))
+    else:
+        n_min = int(min(np.unique(donors[y == 1]).size, np.unique(donors[y == 0]).size))
+        if n_min < MIN_DONORS_PER_GROUP:
+            raise ValueError(
+                f"Keeping donors together needs at least {MIN_DONORS_PER_GROUP} donors in each "
+                f"group; the smaller group has {n_min}. Untick 'Keep donors together' to split "
+                "samples alone.")
     k_outer = int(min(outer_folds, n_min))
     k_inner = int(min(inner_folds, n_min - (n_min // k_outer) - 1)) if n_min > 3 else 2
     k_inner = max(2, k_inner)
@@ -244,10 +270,21 @@ def run_predictive(X: pd.DataFrame, groups: list[str], positive: str, negative: 
     panel_oof = np.full((repeats, len(sizes), len(y)), np.nan)
 
     for r in range(repeats):
-        outer = StratifiedKFold(n_splits=k_outer, shuffle=True, random_state=seed + r)
-        for f, (tr, te) in enumerate(outer.split(Xv, y)):
+        if donors is None:
+            outer = StratifiedKFold(n_splits=k_outer, shuffle=True,
+                                    random_state=seed + r).split(Xv, y)
+        else:
+            outer = StratifiedGroupKFold(n_splits=k_outer, shuffle=True,
+                                         random_state=seed + r).split(Xv, y, donors)
+        for f, (tr, te) in enumerate(outer):
             _say(f"Predictive: repeat {r + 1}/{repeats}, fold {f + 1}/{k_outer}")
-            inner = StratifiedKFold(n_splits=k_inner, shuffle=True, random_state=seed + 1000 + r)
+            if donors is None:
+                inner = StratifiedKFold(n_splits=k_inner, shuffle=True,
+                                        random_state=seed + 1000 + r)
+            else:
+                inner = list(StratifiedGroupKFold(n_splits=k_inner, shuffle=True,
+                                                  random_state=seed + 1000 + r)
+                             .split(Xv[tr], y[tr], donors[tr]))
             if 'l1_logistic' in models:
                 search = _lasso_search(inner, seed).fit(Xv[tr], y[tr])
                 oof['l1_logistic'][r, te] = search.predict_proba(Xv[te])[:, 1]
@@ -309,7 +346,8 @@ def run_predictive(X: pd.DataFrame, groups: list[str], positive: str, negative: 
 
     summary = {'positive': positive, 'negative': negative, 'n_per_group': n_per_group,
                'n_features': len(features), 'minimal_panel': minimal, 'best_panel_auc': best,
-               'status': status, 'message': message, 'outer_folds': k_outer, 'repeats': repeats}
+               'status': status, 'message': message, 'outer_folds': k_outer, 'repeats': repeats,
+               'n_donors': None if donors is None else int(np.unique(donors).size)}
     _say(f"Predictive: done ({len(features)} features, minimal panel {minimal}).")
     return {'performance': pd.DataFrame(perf_rows), 'roc': pd.concat(roc_rows, ignore_index=True),
             'importance': importance, 'panel': panel, 'summary': summary}

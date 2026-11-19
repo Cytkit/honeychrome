@@ -29,10 +29,13 @@ Methods (``process['unmixing']``)
 AF abundance
     With the noise-aware AF abundance (``af_posterior``) the sample's
     posterior travels on its ``AFState`` (``posterior``). R1 reports it in
-    place of the clamped abundance; M2pg and the clamped-data weights take
-    R1's noise-aware AF row and abundance as fixed and solve only the
-    fluorophores by penalised GLS, so every method reports the same AF. R2
-    is unchanged.
+    place of the clamped abundance, with the AF shape bend (af_shape_bend)
+    on high-AF events when the posterior carries one; M2pg and the clamped-data weights take
+    R1's noise-aware AF row and abundance (unbent) as fixed and solve only the
+    fluorophores by penalised GLS, so every method reports the same AF. M2pg
+    integrates the posterior's AF shape bend out of its noise covariance
+    (``gls_unmix``, ``af_bend``); the clamped-data weights do not. R2 is
+    unchanged.
 
 Spectral corrections (``process['spectral_corrections']``, written by the
 Spectral Correction page)
@@ -69,7 +72,7 @@ Display cache
     under ``<experiment>/cache/unmixed/`` (fluorophore abundances before
     compensation, AF abundance and row), keyed by everything that decides
     them (``display_cache_key``), least recently used files removed beyond
-    the App Settings' unmixing cache size (``unmixing_cache_gb``).
+    the App Settings' temporary files limit (``experiment_paths.prune_cache``).
 
 v1 simplifications
     * Live acquisition stays on the transfer matrix (the controller does not
@@ -97,6 +100,8 @@ from pathlib import Path
 
 import numpy as np
 
+from honeychrome.controller_components import experiment_paths
+
 logger = logging.getLogger(__name__)
 
 UNMIXING_KEY = 'unmixing'
@@ -118,7 +123,7 @@ VARIANT_KERNEL_DEFAULTS = {
     'noise_floor': 125.0, 'alpha': 0.5, 'collinear_thresh': 0.5, 'joint_pair_resolution': True,
 }
 
-DISPLAY_CACHE_SUBDIR = Path('cache') / 'unmixed'
+DISPLAY_CACHE_SUBDIR = Path(experiment_paths.CACHE_FOLDER) / 'unmixed'
 DISPLAY_CACHE_VERSION = 1
 
 _MISSING = object()
@@ -343,6 +348,9 @@ class MethodState:
             posterior = getattr(af, 'posterior', None)
             if posterior is not None and method != R2:
                 af_part.append(posterior.fingerprint)
+                bend = getattr(posterior, 'bend', None)
+                if method == M2PG and bend is not None and bend.active:
+                    af_part.append(bend.fingerprint)
         return digest(self.fingerprint, method, set_id, self.spectra_for(set_id) if set_id else None,
                       self.is_bead(sample_key) if af is None else None, af_part)
 
@@ -465,10 +473,14 @@ def method_state(controller, corrections: tuple | None = None) -> MethodState | 
     if corrections is None and corrected:
         parts['corrections_apply_to'] = unmixing_settings(process)['corrections_apply_to']
     if method in NOISE_METHODS:
+        from honeychrome.controller_components.af_shape_bend import shape_bend_on
+
         parts.update(noise=[noise.entry.get('fingerprint'), noise.entry.get('fitted'), noise.cell_null_var,
                             noise.bead_null_var, noise.entry.get('flat_phi'), noise.entry.get('clamped_weights')],
                      prior_lambda=lam, spread=spread,
                      kernel=m2p_kernel)
+        if method == M2PG and shape_bend_on(process):
+            parts['shape_bend'] = gu.SHAPE_BEND_VERSION
     if method == R2:
         meta = variants['meta']
         parts.update(active=variants['active'], thresholds=variants['thresholds'], kernel=variants['kernel'],
@@ -706,12 +718,14 @@ def unmix_fluorescence(raw_fl: np.ndarray, state: MethodState, af, sample_key=No
                 'af_idx': np.where(idx > 0, idx - 1, -1)}
     envelope = None if af is None or not af.precomputed else af.precomputed.get('envelope')
     if method in NOISE_METHODS:
-        fixed_af = None
+        fixed_af = af_bend = None
         if af is not None and getattr(af, 'posterior', None) is not None:
             from honeychrome.controller_components.autospectral_functions import apply_af_unmixing
             r1 = apply_af_unmixing(raw_fl, af.precomputed, np.asarray(af.spectra, dtype=np.float64),
-                                   af_posterior=af.posterior, log_ssc=log_ssc)
+                                   af_posterior=af.posterior, log_ssc=log_ssc, shape_bend=False)
             fixed_af = (np.asarray(r1['af_idx'], dtype=np.int64) - 1, np.asarray(r1['af_scale'], dtype=np.float64))
+            if method == M2PG:
+                af_bend = getattr(af.posterior, 'bend', None)
         noise = state.noise
         model = noise.clamped_model if method == CLAMPED else noise.model_for(state.is_bead(sample_key))
         null_var = spread_no_af = None
@@ -726,7 +740,7 @@ def unmix_fluorescence(raw_fl: np.ndarray, state: MethodState, af, sample_key=No
         return gu.unmix_m2pg(raw_fl, spectra, model, None if af is None else af.spectra, envelope,
                              null_var_no_af=null_var, spread=spread_no_af,
                              prior_lambda=state.prior_lambda, ceiling=state.ceiling, n_threads=state.n_threads,
-                             fixed_af=fixed_af)
+                             fixed_af=fixed_af, af_bend=af_bend)
     if method == R2:
         _bundled()
         from autospectral_optimization_functions import unmix_autospectral_optimization
@@ -760,7 +774,9 @@ def unmix(raw_event_data, transfer_matrix, settings, fl_ids_raw, spillover, af, 
     uncompensated one with ``spillover=None``. Returns ``unmixed``,
     ``af_scale``, ``af_idx`` (1-based into the sample's AF library, 0 = no
     AF) and ``method``. ``force_r1`` gives R1 with the sample's spectra (the
-    progressive display's first pass). ``cache_file`` (the sample's FCS file)
+    progressive display's first pass); when the sample's method is M2pg that
+    pass leaves out R1's AF shape bend, which M2pg does not use and which
+    costs more than M2pg itself. ``cache_file`` (the sample's FCS file)
     reads an M2pg or R2 result from the display cache, or computes and
     stores it; the result is then always the cache's float32 values, so a
     first and a later load agree exactly. ``pnn_raw`` names the columns of
@@ -781,9 +797,11 @@ def unmix(raw_event_data, transfer_matrix, settings, fl_ids_raw, spillover, af, 
         pnn_raw = settings['raw'].get('whitelisted_pnn') or settings['raw']['event_channels_pnn']
     if method == R1:
         if af is not None:
+            first_pass_of_m2pg = force_r1 and state is not None and state.effective_method(af, sample_key) == M2PG
             result = apply_af_transfer(raw_event_data, transfer_matrix, af.precomputed, af.spectra, settings,
                                        filtered_fl_ids_raw=list(fl_ids_raw), spillover=spillover,
-                                       af_index_map=af.index_map, af_posterior=posterior, pnn_raw=pnn_raw)
+                                       af_index_map=af.index_map, af_posterior=posterior, pnn_raw=pnn_raw,
+                                       shape_bend=not first_pass_of_m2pg)
             return {'unmixed': result['unmixed'], 'af_scale': np.asarray(result['af_scale'], dtype=np.float64),
                     'af_idx': np.asarray(result['af_idx'], dtype=np.int64), 'method': R1}
         return {'unmixed': apply_transfer_matrix(transfer_matrix, raw_event_data),
@@ -864,31 +882,7 @@ def store_display_cache(experiment_dir, key: str, fl_result: dict, max_bytes: in
     except OSError as exc:
         logger.warning('Unmixing cache: could not write %s (%s)', path.name, exc)
         return
-    prune_display_cache(path.parent, max_bytes)
-
-
-def prune_display_cache(folder, max_bytes: int | None = None) -> None:
-    """Remove the least recently used files beyond ``max_bytes`` (default:
-    the App Settings' unmixing cache size)."""
-    if max_bytes is None:
-        from honeychrome import settings as app_settings
-        max_bytes = int(app_settings.unmixing_cache_gb_retrieved) * 1024 ** 3
-    files = []
-    for p in Path(folder).glob('*.npz'):
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        files.append((st.st_mtime, st.st_size, p))
-    total = sum(f[1] for f in files)
-    for _mtime, size, p in sorted(files):
-        if total <= max_bytes:
-            break
-        try:
-            p.unlink()
-            total -= size
-        except OSError:
-            pass
+    experiment_paths.prune_cache(experiment_dir, max_bytes, folder='unmixed')
 
 
 # ---------------------------------------------------------------------------

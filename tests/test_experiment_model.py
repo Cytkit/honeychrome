@@ -1,10 +1,13 @@
 import os
+import pytest
 from deepdiff import DeepDiff
 from pathlib import Path
 from honeychrome.controller_components.import_fcs_controller import ImportFCSController
 from honeychrome.experiment_model import ExperimentModel
 
 base_directory = Path.home() / 'spectral_cytometry'
+pytestmark = pytest.mark.skipif(not base_directory.is_dir(),
+                                reason=f'Example data folder not found at {base_directory}')
 '''
 Test two examples:
 1. set up new experiment

@@ -7,6 +7,7 @@ assembly), the estimator options, clamped data and flat weights, the
 automatic event selection and version 1 files.
 """
 
+import dataclasses
 import json
 
 import numpy as np
@@ -46,6 +47,57 @@ def test_noise_model_save_load_and_fingerprint(tmp_path):
     assert back is not None and back.detectors == model.detectors
     assert np.allclose(back.g, model.g) and np.allclose(back.sigma0_sq, model.sigma0_sq)
     assert nm.load_noise_model(path, 'other') is None
+
+
+def _weighted_nnls_full_qr(a, b, w):
+    """The weighted NNLS through one QR of all rows (the reference for the blocked solve)."""
+    from scipy.optimize import nnls
+    sw = np.sqrt(np.maximum(w, 0.0))
+    aw = a * sw[:, np.newaxis]
+    scale = np.linalg.norm(aw, axis=0)
+    scale = np.where(scale > 0, scale, 1.0)
+    q, r = np.linalg.qr(aw / scale, mode='reduced')
+    return nnls(r, q.T @ (b * sw), maxiter=50 * a.shape[1])[0] / scale
+
+
+@pytest.mark.parametrize('n_rows,n_cols,block', [(5_003, 40, 700), (5_003, 40, 5_003), (10, 30, 4), (300, 12, 1_000)])
+def test_blocked_weighted_nnls_matches_full_qr(monkeypatch, n_rows, n_cols, block):
+    rng = np.random.default_rng(n_rows + n_cols + block)
+    a = np.abs(rng.normal(size=(n_rows, n_cols))) * rng.uniform(0.1, 1e4, size=n_cols)
+    x = np.where(rng.random(n_cols) < 0.3, 0.0, rng.uniform(0.0, 2.0, size=n_cols))
+    b = a @ x + rng.normal(scale=0.05 * np.abs(a @ x).mean(), size=n_rows)
+    w = rng.uniform(0.0, 3.0, size=n_rows)
+    w[rng.random(n_rows) < 0.1] = 0.0
+    monkeypatch.setattr(nm, '_QR_BLOCK_ROWS', block)
+    got = nm._weighted_nnls(a, b, w)
+    want = _weighted_nnls_full_qr(a, b, w)
+    assert np.all(got >= 0.0)
+    np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-10 * np.abs(want).max())
+
+
+def test_design_rows_match_the_full_design(monkeypatch):
+    rng = np.random.default_rng(3)
+    d, n_rows, n_groups = 7, 1_003, 9
+    group = rng.integers(0, n_groups, size=n_rows)
+    rows = nm._Rows(rng.normal(size=(n_rows, d)), rng.normal(size=(n_rows, d)), rng.normal(size=(n_rows, d)),
+                    rng.normal(size=n_rows), rng.uniform(1, 2, size=n_rows), rng.uniform(1, 2, size=n_rows),
+                    group, rng.integers(0, 20, size=n_rows), rng.integers(0, d, size=n_rows), rng.normal(size=n_rows))
+    lay = nm._Layout(d, 2, rng.integers(0, 2, size=n_groups), True, np.array([1, 4, 6]))
+    index = np.flatnonzero(rng.random(n_rows) < 0.8)
+    monkeypatch.setattr(nm, '_QR_BLOCK_ROWS', 97)
+    x = rng.normal(size=lay.n_cols)
+    for with_s, s_only, cols in ((True, False, slice(None)), (False, False, slice(2 * d, None)),
+                                 (True, True, slice(0, 2 * d))):
+        full = lay.design(rows, with_s=True)[index][:, cols]
+        view = nm._DesignRows(lay, rows, index, with_s=with_s, s_only=s_only)
+        assert view.shape == full.shape
+        np.testing.assert_array_equal(view[100:350], full[100:350])
+        np.testing.assert_allclose(view @ x[cols], full @ x[cols], rtol=1e-12)
+    w = rng.uniform(0.5, 2.0, size=len(index))
+    b = rng.normal(size=len(index))
+    view = nm._DesignRows(lay, rows, index)
+    np.testing.assert_allclose(nm._weighted_nnls(view, b, w), nm._weighted_nnls(lay.design(rows)[index], b, w),
+                               rtol=1e-10, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +150,39 @@ def test_store_and_load(experiment, tmp_path):
     assert gu.load_noise_state(process, tmp_path, panel['detectors'][:-1]) is None
     assert not gu.spectra_changed(entry, snap['fluor_names'], snap['spectra'])
     assert gu.spectra_changed(entry, snap['fluor_names'], snap['spectra'] * 1.01)
+
+
+def _beads_only(snap, **settings):
+    return dict(snap, unstained_candidates=[], beads_only=True,
+                controls=[r for r in snap['controls'] if not r['is_cell']],
+                settings=dataclasses.replace(snap['settings'], **settings))
+
+
+def test_fit_from_bead_controls_alone(experiment, tmp_path):
+    panel, samples, snap, full = experiment
+    fit = gu.fit_experiment_noise_model(_beads_only(snap), lambda _t: None, syn.loader_for(samples))
+    assert fit.beads_only and fit.unstained_path is None
+    assert fit.n_controls == 4 and fit.model.sigma0_sq_by_class is None
+    assert gu.BEADS_ONLY_NOTE in fit.notes
+    assert fit.bead_null_var.shape == (12,)
+    np.testing.assert_array_equal(fit.cell_null_var, fit.bead_null_var)
+    ratio = fit.model.sigma0_sq / full.model.for_class('beads').sigma0_sq
+    assert 0.67 <= float(np.median(ratio)) <= 1.5
+
+    process = {}
+    gu.store_noise_fit(process, tmp_path, fit, prior_lambda=1.0)
+    entry = process[gu.PROCESS_KEY]
+    assert entry['beads_only'] and entry['unstained'] is None
+    state = gu.load_noise_state(process, tmp_path, panel['detectors'])
+    np.testing.assert_allclose(state.cell_null_var, fit.bead_null_var)
+    assert state.cell_negatives is not None and state.bead_negatives is not None
+    np.testing.assert_array_equal(state.model_for(False).sigma0_sq, state.model_for(True).sigma0_sq)
+
+
+def test_fit_from_bead_controls_alone_needs_bead_negatives(experiment):
+    _panel, samples, snap, _full = experiment
+    with pytest.raises(ValueError, match='bead negatives'):
+        gu.fit_experiment_noise_model(_beads_only(snap, bead_mode='none'), lambda _t: None, syn.loader_for(samples))
 
 
 # ---------------------------------------------------------------------------

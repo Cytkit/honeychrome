@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
 
 import honeychrome
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
-from honeychrome.controller_components import experiment_state
+from honeychrome.controller_components import experiment_paths, experiment_state
 from honeychrome.controller_components.functions import (
     build_antigen_map,
     build_display_label_map,
@@ -160,7 +160,7 @@ def _ensure_qt_imports():
 # ---------------------------------------------------------------------------
 DEFAULT_EVENTS_PER_SAMPLE = 50_000
 TRAINING_SEED = 42
-SESSION_FILE = Path('cache') / 'gating_model_builder' / 'session.agmodel'
+SESSION_FILE = Path(experiment_paths.STATE_FOLDER) / 'gating_model_builder' / 'session.agmodel'
 
 
 # ---------------------------------------------------------------------------
@@ -8865,14 +8865,14 @@ class BuilderPages(QObject):
     # ----------------------------------------------------------------------
     # State persistence
     #
-    # The experiment's cache/gating_model_builder/state.json (see
+    # The experiment's state/gating_model_builder/state.json (see
     # experiment_state) holds the training-sample selection, events per
     # sample, the controls toggle, the last model path, the gate hierarchy,
     # the conversion flags, a paused run's progress, the population shown on
     # the Transforms page and a loaded model's own transforms, as JSON
     # strings or scalars (as they were kept in QSettings, from which older
     # experiments are moved once). The trained boundaries are kept in a session model
-    # in the experiment's cache folder (SESSION_FILE), in the same .agmodel
+    # in the experiment's state folder (SESSION_FILE), in the same .agmodel
     # format as an export, together with the transforms they are in, so
     # training and the transforms survive a restart.
     # ----------------------------------------------------------------------

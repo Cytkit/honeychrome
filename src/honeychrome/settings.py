@@ -78,6 +78,7 @@ heatmap_colourmap_name = 'bkr'  # default diverging palette for heatmaps
 heatmap_colourmap_choice = ['coolwarm', 'bkr', 'CET_D1', 'CET_D8', 'bjy', 'gwv', 'bwy']
 hist2dtype = '2D Histogram'
 send_debug_data = True # on by default
+detailed_log = False  # write DEBUG messages to honeychrome.log
 hist2dtypes = ['2D Histogram', 'Dot plot coloured by gate']
 report_include_raw = False
 report_include_unmixed = True
@@ -96,7 +97,7 @@ hist_bins = 200 # for displaying histograms
 label_offset_default = (0, -0.03) # for gate labels
 subsample = 10_000 # for exporting FCS files
 max_display_events = 500_000  # cap on events shown in cytometry display plots (None = no cap)
-unmixing_cache_gb = 8  # per experiment: on-disk noise-model / variants unmixing results (cache/unmixed)
+unmixing_cache_gb = 8  # per experiment: limit on the rebuildable files in the experiment's cache folder
 density_cutoff = 1 # bin count to set to first level of colourmap in 2d histograms (below this level is transparent)
 
 line_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
@@ -251,6 +252,7 @@ process_default = {
     'af_profiles': {},
     'cleaned_meta': {},
     'af_abundance': 'noise_aware',   # experiments saved without it keep the clamped AF abundance
+    'af_shape_bend': True,           # AF shape bend on high-AF cells (af_shape_bend); on when unset
 }
 
 cytometry_default = {

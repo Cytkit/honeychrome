@@ -57,6 +57,12 @@ sample's particle class). Workers fit and store them; the file is written
 under a lock and replaced atomically, and a lost write only means a refit
 (the fit is deterministic).
 
+AF shape bend: with ``process['af_shape_bend']`` on (the default), the
+posterior also carries the bend of the sample's AF library (af_shape_bend),
+learnt on the unstained sample the library's first profile was extracted
+from and stored in ``<experiment>/AutoSpectral/af_bends.json`` keyed by that
+sample and a fingerprint of its prior.
+
 Setting (``process['af_abundance']``): ``'noise_aware'`` or ``'clamped'``;
 missing means clamped (experiments made before the setting existed). New
 experiments start noise-aware (``settings.process_default``). Noise-aware
@@ -85,6 +91,8 @@ from pathlib import Path
 
 import numpy as np
 from scipy.special import erfcx, log_ndtr
+
+from honeychrome.controller_components import af_shape_bend as asb
 
 logger = logging.getLogger(__name__)
 
@@ -156,21 +164,31 @@ class AFPosterior:
     """
     Everything the noise-aware abundance needs for one sample: its prior and
     the per-detector noise model of its particle class (sigma0_sq, g, c),
-    plus the name of the SSC channel the prior mean depends on.
+    plus the name of the SSC channel the prior mean depends on and, when the
+    AF shape bend is on, the bend of the sample's AF library
+    (af_shape_bend.AFBend).
     """
     prior: AFPrior
     sigma0_sq: np.ndarray
     g: np.ndarray
     c: np.ndarray
     ssc_name: str | None = None
+    bend: asb.AFBend | None = None
 
     @property
     def fingerprint(self) -> str:
         return self.prior.fingerprint
 
+    @property
+    def noise(self) -> tuple:
+        return self.sigma0_sq, self.g, self.c
+
     def subset(self, keep: np.ndarray) -> 'AFPosterior':
-        """The same posterior on a subset of detectors (events with saturated detectors)."""
-        return replace(self, sigma0_sq=self.sigma0_sq[keep], g=self.g[keep], c=self.c[keep])
+        """
+        The same posterior on a subset of detectors (events with saturated
+        detectors), without the bend, which is learnt on every detector.
+        """
+        return replace(self, sigma0_sq=self.sigma0_sq[keep], g=self.g[keep], c=self.c[keep], bend=None)
 
     def log_ssc(self, raw_event_data: np.ndarray, pnn_raw) -> np.ndarray | None:
         """log SSC of each event (SSC below 1 read as 1); None when the channel is not in ``pnn_raw``."""
@@ -415,28 +433,36 @@ def _priors_path(experiment_dir) -> Path:
     return Path(experiment_dir) / AF_SUBDIR / PRIORS_FILE
 
 
-def _read_store(path: Path) -> dict:
+def _bends_path(experiment_dir) -> Path:
+    from honeychrome.controller_components.autospectral_functions import AF_SUBDIR
+    return Path(experiment_dir) / AF_SUBDIR / asb.BENDS_FILE
+
+
+def _read_store(path: Path, version: int = PRIOR_VERSION) -> dict:
     if str(path) in _memory:
         return _memory[str(path)]
     data = {}
     try:
         with open(path) as f:
             raw = json.load(f)
-        if raw.get('version') == PRIOR_VERSION:
+        if raw.get('version') == version:
             data = raw.get('samples') or {}
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as exc:
-        logger.warning('AF priors: %s not read (%s); priors will be fitted again.', path.name, exc)
+        logger.warning('AF priors: %s not read (%s); its entries will be fitted again.', path.name, exc)
     _memory[str(path)] = data
     return data
 
 
+def _load_entry(path: Path, version: int, sample_key: str, fingerprint: str) -> dict | None:
+    with _store_lock:
+        return (_read_store(path, version).get(str(sample_key)) or {}).get(fingerprint)
+
+
 def load_prior(experiment_dir, sample_key: str, fingerprint: str) -> AFPrior | None:
     """The stored prior of ``sample_key`` with this fingerprint, or None."""
-    path = _priors_path(experiment_dir)
-    with _store_lock:
-        entry = (_read_store(path).get(str(sample_key)) or {}).get(fingerprint)
+    entry = _load_entry(_priors_path(experiment_dir), PRIOR_VERSION, sample_key, fingerprint)
     if entry is None:
         return None
     try:
@@ -445,15 +471,35 @@ def load_prior(experiment_dir, sample_key: str, fingerprint: str) -> AFPrior | N
         return None
 
 
+def load_bend(experiment_dir, sample_key: str, fingerprint: str) -> asb.AFBend | None:
+    """The stored AF shape bend learnt on ``sample_key`` with this fingerprint, or None."""
+    entry = _load_entry(_bends_path(experiment_dir), asb.BEND_VERSION, sample_key, fingerprint)
+    if entry is None:
+        return None
+    try:
+        return asb.AFBend.from_dict(entry)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def store_prior(experiment_dir, sample_key: str, prior: AFPrior) -> None:
     """Store a fitted prior, keeping the newest MAX_ENTRIES_PER_SAMPLE fingerprints of each sample."""
-    path = _priors_path(experiment_dir)
+    _store_entry(_priors_path(experiment_dir), PRIOR_VERSION, sample_key, prior.fingerprint, prior.to_dict())
+
+
+def store_bend(experiment_dir, sample_key: str, bend: asb.AFBend) -> None:
+    """Store a learnt AF shape bend, as ``store_prior``."""
+    _store_entry(_bends_path(experiment_dir), asb.BEND_VERSION, sample_key, bend.fingerprint, bend.to_dict())
+
+
+def _store_entry(path: Path, version: int, sample_key: str, fingerprint: str, entry: dict) -> None:
+    """Write one entry under a lock, merged with what is on disk, keeping the newest entries of each sample."""
     with _store_lock:
-        data = _read_store(path)
+        data = _read_store(path, version)
         try:
             with open(path) as f:
                 on_disk = json.load(f)
-            if on_disk.get('version') == PRIOR_VERSION:
+            if on_disk.get('version') == version:
                 for key, entries in (on_disk.get('samples') or {}).items():
                     merged = dict(entries)
                     merged.update(data.get(key) or {})
@@ -461,8 +507,8 @@ def store_prior(experiment_dir, sample_key: str, prior: AFPrior) -> None:
         except (OSError, ValueError):
             pass
         entries = dict(data.get(str(sample_key)) or {})
-        entries.pop(prior.fingerprint, None)
-        entries[prior.fingerprint] = prior.to_dict()
+        entries.pop(fingerprint, None)
+        entries[fingerprint] = entry
         while len(entries) > MAX_ENTRIES_PER_SAMPLE:
             entries.pop(next(iter(entries)))
         data[str(sample_key)] = entries
@@ -470,7 +516,7 @@ def store_prior(experiment_dir, sample_key: str, prior: AFPrior) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(f'{path.stem}.{os.getpid()}.{threading.get_ident()}.tmp')
             with open(tmp, 'w') as f:
-                json.dump({'version': PRIOR_VERSION, 'samples': data}, f)
+                json.dump({'version': version, 'samples': data}, f)
             os.replace(tmp, path)
         except OSError as exc:
             logger.warning('AF priors: could not write %s (%s)', path.name, exc)
@@ -520,6 +566,7 @@ class AFNoiseContext:
     whitelisted: bool
     fl_ids_raw: tuple
     ssc_name: str | None
+    shape_bend: bool = False
 
     def _noise_for(self, sample_key) -> tuple:
         return self.bead_noise if str(sample_key) in self.bead_samples else self.cell_noise
@@ -544,12 +591,13 @@ class AFNoiseContext:
                        np.asarray(af.precomputed['S_t'], dtype=np.float64), env_part, list(noise),
                        self.noise_fingerprint, self.ssc_name)
 
-    def _fit(self, sample_key: str, af, noise: tuple, fingerprint: str) -> AFPrior | None:
+    def _read_unsaturated(self, sample_key: str, af, n_events: int, seed: int) -> tuple | None:
+        """A seeded subsample's unsaturated raw fluorescence and log SSC; None with fewer than MIN_EVENTS."""
         from honeychrome.controller_components.sample_loader import read_raw_subsample
 
         try:
             raw, _index, _n_file, _n_kept = read_raw_subsample(Path(self.experiment_dir) / sample_key, self,
-                                                               sample_key, FIT_EVENTS, seed=FIT_SEED)
+                                                               sample_key, n_events, seed=seed)
         except Exception as exc:
             logger.warning('AF priors: %s not read (%s)', sample_key, exc)
             return None
@@ -567,7 +615,14 @@ class AFNoiseContext:
             log_ssc = np.log(np.maximum(raw[keep, pnn.index(self.ssc_name)], 1.0))
         else:
             log_ssc = np.zeros(int(keep.sum()))
-        prior = fit_af_prior(raw_fl[keep], log_ssc, af.precomputed, np.asarray(af.spectra, dtype=np.float64),
+        return raw_fl[keep], log_ssc
+
+    def _fit(self, sample_key: str, af, noise: tuple, fingerprint: str) -> AFPrior | None:
+        events = self._read_unsaturated(sample_key, af, FIT_EVENTS, FIT_SEED)
+        if events is None:
+            return None
+        raw_fl, log_ssc = events
+        prior = fit_af_prior(raw_fl, log_ssc, af.precomputed, np.asarray(af.spectra, dtype=np.float64),
                              *noise, fingerprint=fingerprint, source=str(sample_key))
         logger.info('AF priors: fitted %s (%d events; typical AF %.1f, choice shrinkage %.2f)',
                     sample_key, prior.n_events, prior.k_typical, prior.choice_shrinkage)
@@ -593,12 +648,48 @@ class AFNoiseContext:
                     _unfittable.add(key)
         return prior
 
+    def _bend_for(self, sample_key: str, af) -> asb.AFBend | None:
+        """
+        The AF shape bend of library ``af`` learnt on ``sample_key`` (its
+        reference unstained sample), stored or learnt now; None when the
+        sample has no prior or too few usable events.
+        """
+        noise = self._noise_for(sample_key)
+        prior = self._prior_for(sample_key, af, noise)
+        if prior is None:
+            return None
+        fingerprint = _digest(asb.BEND_VERSION, asb.LEARN_EVENTS, asb.LEARN_SEED, prior.fingerprint)
+        bend = load_bend(self.experiment_dir, sample_key, fingerprint)
+        if bend is not None:
+            return bend
+        key = ('bend', self.experiment_dir, sample_key, fingerprint)
+        if key in _unfittable:
+            return None
+        with _fit_lock(key):
+            bend = load_bend(self.experiment_dir, sample_key, fingerprint)
+            if bend is None and key not in _unfittable:
+                events = self._read_unsaturated(sample_key, af, asb.LEARN_EVENTS, asb.LEARN_SEED)
+                if events is not None:
+                    posterior = AFPosterior(prior=prior, sigma0_sq=noise[0], g=noise[1], c=noise[2],
+                                            ssc_name=self.ssc_name)
+                    bend = asb.learn_bend(events[0], events[1], af.precomputed,
+                                          np.asarray(af.spectra, dtype=np.float64), posterior,
+                                          fingerprint=fingerprint, source=str(sample_key))
+                    logger.info('AF shape bend: learnt on %s (%d events; %d shapes; from AF %.1f)',
+                                sample_key, bend.n_events, len(bend.shapes), bend.from_k)
+                    store_bend(self.experiment_dir, sample_key, bend)
+                else:
+                    _unfittable.add(key)
+        return bend
+
     def posterior_for(self, af, sample_key, live: bool = False) -> AFPosterior | None:
         """
         The noise-aware posterior for ``sample_key`` unmixed with the AF
         library ``af``: its own prior, or while it is being acquired (``live``)
         or when it has too few usable events, its AF reference's prior under
-        the same library. None (clamped) when neither can be had.
+        the same library. None (clamped) when neither can be had. With the
+        AF shape bend on, the posterior carries the library's bend learnt on
+        that reference sample (none without a reference).
         """
         if af is None or not af.precomputed or sample_key is None:
             return None
@@ -617,8 +708,11 @@ class AFNoiseContext:
             if prior is not None:
                 if candidate != key:
                     logger.info('AF priors: %s uses the prior of %s', key, candidate)
+                bend = None
+                if self.shape_bend and reference is not None:
+                    bend = self._bend_for(reference, af)
                 return AFPosterior(prior=prior, sigma0_sq=noise[0], g=noise[1], c=noise[2],
-                                   ssc_name=self.ssc_name)
+                                   ssc_name=self.ssc_name, bend=bend)
         return None
 
     def attach(self, af, sample_key, live: bool = False):
@@ -671,7 +765,7 @@ def noise_context(controller, pnn_raw=None, whitelisted=None, fl_ids_raw=None) -
         bead_noise=_noise_arrays(noise.model_for(True)),
         noise_fingerprint=str(noise.entry.get('fingerprint')), bead_samples=beads, references=references,
         pnn_raw=tuple(pnn_raw), whitelisted=bool(whitelisted), fl_ids_raw=tuple(fl_ids_raw),
-        ssc_name=ssc_channel(raw, pnn_raw))
+        ssc_name=ssc_channel(raw, pnn_raw), shape_bend=asb.shape_bend_on(process))
 
 
 def signature(context: AFNoiseContext | None) -> str | None:
@@ -679,4 +773,4 @@ def signature(context: AFNoiseContext | None) -> str | None:
     if context is None:
         return None
     return _digest(PRIOR_VERSION, context.noise_fingerprint, context.cell_noise, context.bead_noise,
-                   context.ssc_name)
+                   context.ssc_name, asb.BEND_VERSION if context.shape_bend else None)

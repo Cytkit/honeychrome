@@ -383,7 +383,8 @@ def test_envelope_rebuilt_for_a_corrected_set(run, data):
     expected = positivity_null_variance(sample, corrected, syn.af_library())
     np.testing.assert_allclose(set_af.precomputed['envelope']['null_var'][0], expected)
     assert not np.allclose(set_af.precomputed['envelope']['null_var'], af.precomputed['envelope']['null_var'])
-    assert um._set_af(state, '', af) is af and um._set_af(state, 'Raw/G1', af) is set_af
+    assert um._set_af(state, '', af) is af
+    assert um._set_af(state, 'Raw/G1', af).precomputed is set_af.precomputed
     assert set(state.set_extras) == {'Raw/G1', 'Raw/G2'}
     assert state.set_extras['Raw/G1']['spread'] is None       # no controls, no base spread here
 

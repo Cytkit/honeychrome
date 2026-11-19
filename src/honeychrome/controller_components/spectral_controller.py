@@ -663,6 +663,7 @@ class SpectralAutoGenerator(QObject):
         self.negative_profile_warnings = []            # labels; shown once at end of run()
         self.insufficient_events_warnings = []         # tubenames; shown once at end of run()
         self.mismatched_controls = []                  # tubenames lacking the experiment's channels; shown once at end of run()
+        self.missing_controls = []                     # control files no longer on disk; shown once at end of run()
         self.low_events = LowEventLog(controller, bus, collect=True)   # shown once at end of run()
 
         self.progress_target = len(self.samples['single_stain_controls'])
@@ -692,7 +693,11 @@ class SpectralAutoGenerator(QObject):
         for n in range(self.progress_target):
             if self.bus:
                 self.bus.progress.emit(n, self.progress_target)
-            success = self.generate_spectral_control(n)
+            try:
+                success = self.generate_spectral_control(n)
+            except FileNotFoundError:
+                self.missing_controls.append(self.samples['single_stain_controls'][n])
+                success = False
             if not success:
                 if self.bus:
                     QTimer.singleShot(100, lambda: self.bus.statusMessage.emit(
@@ -744,6 +749,14 @@ class SpectralAutoGenerator(QObject):
                 f'If they were acquired on the same instrument and settings as your samples, '
                 f'run Import FCS Files (File menu) to update the experiment configuration. '
                 f'Otherwise, these controls cannot be used.'
+            )
+
+        if self.bus and self.missing_controls:
+            paths = ', '.join(f'"{path}"' for path in self.missing_controls)
+            self._report_warning(
+                f'The following control file(s) are no longer in the experiment folder, so no '
+                f'spectral control was made for them: {paths}.\n\n'
+                f'Refresh the sample list, or put the files back.'
             )
 
         low_event_text = self.low_events.text()
@@ -1361,7 +1374,7 @@ class SpectralCleaner(QObject):
         all_samples_rev = {v: k for k, v in self.samples['all_samples'].items()}
         rel_path = all_samples_rev.get(control['sample_name'])
         if rel_path is None:
-            raise ValueError(f'Sample "{control["sample_name"]}" not found.')
+            raise FileNotFoundError(f'Sample "{control["sample_name"]}" not found in the experiment.')
         full_path = str(self.experiment_dir / rel_path)
         sample = sample_from_fcs(full_path)
 

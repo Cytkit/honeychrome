@@ -1,8 +1,52 @@
+import functools
+import math
+import re
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QTableWidgetItem
 
 from PySide6 import QtWidgets, QtGui
+
+_NUMBER, _TEXT, _EMPTY = 0, 1, 2
+# A number as tables show it: an optional comparison sign, thousands
+# separators, a decimal part, an exponent, and a trailing % or degree sign.
+_NUMBER_TEXT = re.compile(r'^[<>≤≥~]?\s*([+\-−]?(?:\d{1,3}(?:,\d{3})+|\d+)?(?:\.\d+)?(?:[eE][+\-]?\d+)?)\s*[%°]?$')
+
+
+@functools.lru_cache(maxsize=65536)
+def _text_sort_key(text: str) -> tuple:
+    text = text.strip()
+    if not text or text.lower() == 'nan':
+        return (_EMPTY, 0.0)
+    if text.lower().lstrip('+-−') == 'inf':
+        return (_NUMBER, -math.inf if text[0] in '-−' else math.inf)
+    match = _NUMBER_TEXT.match(text)
+    if match and any(ch.isdigit() for ch in match.group(1)):
+        return (_NUMBER, float(match.group(1).replace(',', '').replace('−', '-')))
+    return (_TEXT, text)
+
+
+class SortableTableItem(QTableWidgetItem):
+    """
+    A table cell that sorts as a number when it shows one, so that 10 comes
+    after 2. A cell holds a number when its value is one, or when its text
+    reads as one: '1,234', '+0.52', '3.1e-05', '12.5%', '45°', '<0.001'.
+    In ascending order numbers come first, then text, then empty cells and
+    'nan'. Use it wherever a sortable table is filled with formatted text.
+    The comparison never falls back on ``QTableWidgetItem.__lt__``: called
+    from this override, it calls the override again.
+    """
+
+    def _sort_key(self) -> tuple:
+        value = self.data(Qt.EditRole)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return (_EMPTY, 0.0) if math.isnan(value) else (_NUMBER, float(value))
+        return _text_sort_key(self.text())
+
+    def __lt__(self, other):
+        theirs = other._sort_key() if isinstance(other, SortableTableItem) else _text_sort_key(other.text())
+        return self._sort_key() < theirs
 
 
 class CopyableTableWidget(QtWidgets.QTableWidget):
@@ -25,7 +69,7 @@ class CopyableTableWidget(QtWidgets.QTableWidget):
         for i, row_data in enumerate(list_of_dicts):
             for j, column_name in enumerate(headers):
                 value = row_data.get(column_name, "")
-                item = QTableWidgetItem()
+                item = SortableTableItem()
 
                 # Check if the value is a Hex Color string
                 if isinstance(value, str) and value.startswith("#") and len(value) == 7:

@@ -988,6 +988,10 @@ class SpectralCorrectionPage(QWidget):
             self._release_job()
             self._fix_status.setText(f'Error: {e}')
             return
+        if len(snap['fl']) < 2:
+            self._release_job()
+            self._fix_status.setText('Fix My Unmix needs at least two fluorophores in the spectral model.')
+            return
         self._set_running(True)
         self._fix_status.setText('Running Fix My Unmix...')
         self._fix_worker = FixUnmixWorker(snap)

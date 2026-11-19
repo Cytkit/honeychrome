@@ -5,7 +5,9 @@ Embedded matplotlib figure with a size slider, pop-out and export buttons.
 natural size (25% to 400%) inside a scroll area, so a large heatmap can be
 enlarged to read its labels and a small plot shrunk to fit beside others.
 The mouse wheel is left to the scroll area rather than being used by
-matplotlib.
+matplotlib. With ``fit_width`` the widget also offers a Fit to width box,
+which sizes the figure so its full width fits the panel and follows the
+panel as it is resized.
 
 The figure's canvas is available as ``widget.canvas`` for connecting
 matplotlib events (hover, click).
@@ -19,10 +21,10 @@ and the file written is reported in the main window's status bar.
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea,
-    QSizePolicy, QSlider, QVBoxLayout, QWidget,
+    QCheckBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
+    QScrollArea, QSizePolicy, QSlider, QVBoxLayout, QWidget,
 )
 
 import honeychrome.settings as settings
@@ -175,11 +177,18 @@ class ScalableFigureWidget(QWidget):
     options        : optional figure_options.FigureOptionsRef: the figure is
                      drawn with its options, and an Options button opens a
                      side panel that changes them (see figure_options_panel).
+    fit_width      : None for no Fit to width box; True or False to show the
+                     box, checked or not. While checked, the Size slider is
+                     set (within its range) so the figure fills the width of
+                     the panel. ``fitWidthToggled`` reports the user's
+                     changes so the caller can remember them.
     """
+
+    fitWidthToggled = Signal(bool)
 
     def __init__(self, figure, title: str = 'figure', experiment_dir='',
                  pop_out=None, parent=None, initial_scale: int = DEFAULT_SCALE_PCT,
-                 options=None):
+                 options=None, fit_width: bool | None = None):
         super().__init__(parent)
         self.figure = figure
         self.options = options
@@ -232,6 +241,14 @@ class ScalableFigureWidget(QWidget):
         self._pct_label = QLabel()
         self._pct_label.setFixedWidth(44)
         controls.addWidget(self._pct_label)
+        self.fit_check = None
+        if fit_width is not None:
+            self.fit_check = QCheckBox("Fit to width")
+            self.fit_check.setToolTip("Shrink or enlarge the plot so its full width fits the panel. "
+                                      "Pop Out and Export always use the full figure.")
+            self.fit_check.setChecked(bool(fit_width))
+            self.size_slider.setEnabled(not fit_width)
+            controls.addWidget(self.fit_check)
         controls.addStretch()
 
         body = QHBoxLayout()
@@ -262,6 +279,9 @@ class ScalableFigureWidget(QWidget):
         self._resize_timer.setInterval(RESIZE_DELAY_MS)
         self._resize_timer.timeout.connect(self._apply_scale)
         self.size_slider.valueChanged.connect(self._on_slider_changed)
+        if self.fit_check is not None:
+            self.fit_check.toggled.connect(self._on_fit_toggled)
+            self._scroll.installEventFilter(self)
 
         self._pct_label.setText(f"{initial_scale}%")
         self._apply_scale()
@@ -279,7 +299,38 @@ class ScalableFigureWidget(QWidget):
         self._pct_label.setText(f"{pct}%")
         self._resize_timer.start()
 
+    def _on_fit_toggled(self, checked: bool):
+        self.size_slider.setEnabled(not checked)
+        self._apply_scale()
+        self.fitWidthToggled.emit(checked)
+
+    def fits_width(self) -> bool:
+        """Whether Fit to width is offered and checked."""
+        return self.fit_check is not None and self.fit_check.isChecked()
+
+    def eventFilter(self, obj, event):
+        if (obj is self._scroll and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)
+                and self.fits_width()):
+            self._resize_timer.start()
+        return False
+
+    def _fit_percent(self) -> int:
+        """The size (percent) at which the figure fills the scroll area's
+        width, leaving room for a vertical scroll bar so that its appearing
+        does not change the fit."""
+        available = (self._scroll.width() - 2 * self._scroll.frameWidth()
+                     - self._scroll.verticalScrollBar().sizeHint().width())
+        pct = int(100 * available / max(self._natural_w, 1))
+        return max(MIN_SCALE_PCT, min(MAX_SCALE_PCT, pct))
+
     def _apply_scale(self):
+        if self.fits_width() and self._scroll.isVisible():
+            pct = self._fit_percent()
+            if pct != self.size_slider.value():
+                self.size_slider.blockSignals(True)
+                self.size_slider.setValue(pct)
+                self.size_slider.blockSignals(False)
+                self._pct_label.setText(f"{pct}%")
         pct = self.size_slider.value()
         self.canvas.setFixedSize(max(80, int(self._natural_w * pct / 100)),
                                  max(80, int(self._natural_h * pct / 100)))

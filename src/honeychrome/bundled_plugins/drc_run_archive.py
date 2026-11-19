@@ -1,12 +1,12 @@
 """
-drc_run_archive.py — Per-run cache/archive for the Honeycluster plugin
+drc_run_archive.py — Per-run archive for the Honeycluster plugin
 ========================================================================
 Companion module to ``dr_clustering_tab.py`` (filename intentionally does
 NOT end in ``_tab.py``, so it is not picked up as a separate plugin tab).
 
 Layout under the experiment folder:
 
-  cache/dr_clustering/
+  state/dr_clustering/
       current_state/     — "live" in-progress state (tree data for
                            FlowSOM/Leiden/HDBSCAN, embeddings,
                            cluster_labels, stats results, …).
@@ -51,6 +51,8 @@ from pathlib import Path
 
 import numpy as np
 
+from honeychrome.controller_components import experiment_paths
+
 import drc_persist
 from drc_logging import get_logger, log_stage
 
@@ -65,21 +67,21 @@ STORAGE_FORMAT = 'bundle'
 # Paths
 # ---------------------------------------------------------------------------
 
-def cache_root(controller) -> Path:
-    """``experiment_dir / 'cache' / 'dr_clustering'`` — created if absent."""
-    root = Path(controller.experiment_dir) / 'cache' / 'dr_clustering'
+def archive_root(controller) -> Path:
+    """``experiment_dir / 'state' / 'dr_clustering'`` — created if absent."""
+    root = experiment_paths.state_dir(controller.experiment_dir, 'dr_clustering')
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def runs_dir(controller) -> Path:
-    d = cache_root(controller) / 'runs'
+    d = archive_root(controller) / 'runs'
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def manifest_path(controller) -> Path:
-    return cache_root(controller) / 'manifest.json'
+    return archive_root(controller) / 'manifest.json'
 
 
 def current_state_path(controller) -> Path:
@@ -89,7 +91,7 @@ def current_state_path(controller) -> Path:
 
 def current_state_path_for(experiment_dir: Path) -> Path:
     """current_state_path() for an explicit experiment folder."""
-    return Path(experiment_dir) / 'cache' / 'dr_clustering' / 'current_state'
+    return experiment_paths.state_dir(experiment_dir, 'dr_clustering', 'current_state')
 
 
 def run_payload_path(controller, run_id: str) -> Path:
@@ -112,7 +114,7 @@ def purge_legacy_pickles(controller) -> tuple[int, int]:
     """
     Remove everything left over from the pickle-based format.
 
-    Deletes the pickled live state (both its cache/ location and the older
+    Deletes the pickled live state (both its state/ location and the older
     loose file beside the experiment), every runs/*.pkl payload, and every
     manifest entry not marked with the current 'storage' format, so the
     run pickers start from a clean slate. Pickles are never read. Once
@@ -121,7 +123,7 @@ def purge_legacy_pickles(controller) -> tuple[int, int]:
 
     Returns (files_removed, runs_removed).
     """
-    root = cache_root(controller)
+    root = archive_root(controller)
     candidates = [
         root / 'current_state.pkl',
         Path(controller.experiment_dir) / 'dr_clustering_state.pkl',
@@ -332,7 +334,7 @@ def archive_dr_run(controller, state, *, algorithm, embeddings,
                     split_fingerprints=None, transform_params=None) -> dict:
     """
     Archive a completed DR training run: write the embeddings to
-    ``cache/dr_clustering/runs/<run_id>/``, append a lightweight entry to
+    ``state/dr_clustering/runs/<run_id>/``, append a lightweight entry to
     ``manifest.json``, and append the full (manifest fields + heavy payload)
     entry to ``state.dr_runs``.  Returns the in-memory entry.
 

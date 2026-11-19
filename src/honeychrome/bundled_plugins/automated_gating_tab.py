@@ -36,7 +36,7 @@ Run applies the model as it stands on the model pages, in their transforms,
 once every gate has a trained boundary. Gated results record a hash of the
 model they were made with (gates, boundaries, transforms and gate modes).
 Gated results, display subsamples and statistics are saved in the
-experiment's cache folder and restored when the experiment is opened again;
+experiment's state folder and restored when the experiment is opened again;
 each gating and statistics run is also written as CSV files to
 ``Automated_Gating_Results`` (named after the model, with a timestamp).
 
@@ -86,7 +86,7 @@ from honeychrome.controller_components import anova_stats
 from honeychrome.controller_components import differential_stats as ds
 from honeychrome.controller_components import trend_stats as ts
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy
-from honeychrome.controller_components import experiment_state
+from honeychrome.controller_components import experiment_paths, experiment_state
 from honeychrome.controller_components import covariate_check, sample_table
 from honeychrome.view_components import suggest_groupings_dialog as sgd
 from honeychrome.view_components import covariate_check_dialog, sample_table_import_dialog
@@ -190,15 +190,15 @@ plugin_name = 'Automated Gating'
 
 DEFAULT_DISPLAY_EVENTS = 20_000
 DISPLAY_SEED = 42
-RESULTS_FILE = Path('cache') / 'automated_gating' / 'results.json'
+RESULTS_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'results.json'
 # The marker medians and quartiles of RESULTS_FILE's samples, as arrays.
-MARKERS_FILE = Path('cache') / 'automated_gating' / 'results_markers.npz'
+MARKERS_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'results_markers.npz'
 RESULTS_FORMAT = 3
-STATS_FILE = Path('cache') / 'automated_gating' / 'stats.json'
-TREND_FILE = Path('cache') / 'automated_gating' / 'trend.json'
-ENRICHMENT_FILE = Path('cache') / 'automated_gating' / 'enrichment.json'
-SAMPLE_ANALYSIS_FILE = Path('cache') / 'automated_gating' / 'sample_analysis.json'
-DISPLAY_DIR = Path('cache') / 'automated_gating' / 'display'
+STATS_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'stats.json'
+TREND_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'trend.json'
+ENRICHMENT_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'enrichment.json'
+SAMPLE_ANALYSIS_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'sample_analysis.json'
+DISPLAY_DIR = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'display'
 # Threads that read the saved display records when an experiment opens;
 # decompressing them releases the interpreter lock, so they run in parallel.
 DISPLAY_READERS = max(1, min(8, _os.cpu_count() or 1))
@@ -512,6 +512,7 @@ class GatingRunState:
     pred_lasso: bool = True
     pred_forest: bool = True
     pred_repeats: int = 5
+    pred_keep_donors: bool = True
     age_use_freq: bool = True
     age_use_markers: bool = False
     age_repeats: int = 5
@@ -576,6 +577,7 @@ _PERSISTED_FIELDS = (
     'stats_test', 'trend_variable', 'trend_unit', 'trend_groups', 'trend_interaction',
     'trend_shape', 'trend_df', 'trend_scale', 'trend_call', 'trend_min_r2', 'trend_patterns',
     'pred_use_freq', 'pred_use_markers', 'pred_lasso', 'pred_forest', 'pred_repeats',
+    'pred_keep_donors',
     'age_use_freq', 'age_use_markers', 'age_repeats', 'age_permutations', 'age_predict_others',
     'report_populations', 'pop_filter', 'pop_values',
     'fsea_library_path', 'fsea_species', 'fsea_anchor', 'fsea_feature_types',
@@ -1584,6 +1586,7 @@ class RunTab(QWidget):
         self._worker = None
         self._job_token.release()
         self._set_running(False)
+        self._update_warnings()
         self.progress_bar.setVisible(False)
         st = self.state
         if outcome == 'cancelled' and self._before_run is not None:
@@ -4252,6 +4255,7 @@ class ResultsTab(QWidget):
     # ------------------------------------------------------------------
 
     def _build_explore_page(self):
+        import drc_predictive
         layout = QVBoxLayout(self.explore_page)
         note = QLabel("Both use the per-sample values of the last statistics run (population "
                       "% of parent, counts and marker medians), so run Statistics first with "
@@ -4304,6 +4308,14 @@ class ResultsTab(QWidget):
             orow.addWidget(w)
         orow.addWidget(QLabel("Repeats:"))
         orow.addWidget(self.sb_pred_repeats)
+        self.chk_pred_donors = QCheckBox("Keep donors together")
+        self.chk_pred_donors.setToolTip(
+            "With a pairing variable (Pair samples by), every cross-validation split keeps "
+            "all samples of a donor on the same side, so the model is never tested on a "
+            "donor it was trained on. Needs at least "
+            f"{drc_predictive.MIN_DONORS_PER_GROUP} donors per group. Untick to split "
+            "samples alone. No effect without a pairing variable.")
+        orow.addWidget(self.chk_pred_donors)
         self.btn_pred = QPushButton("Run Predictive Analysis")
         self.btn_pred.clicked.connect(self._on_run_predictive)
         orow.addWidget(self.btn_pred)
@@ -4385,6 +4397,7 @@ class ResultsTab(QWidget):
                         (self.chk_pred_freq, 'pred_use_freq'),
                         (self.chk_pred_markers, 'pred_use_markers'),
                         (self.chk_pred_lasso, 'pred_lasso'), (self.chk_pred_forest, 'pred_forest'),
+                        (self.chk_pred_donors, 'pred_keep_donors'),
                         (self.chk_age_freq, 'age_use_freq'),
                         (self.chk_age_markers, 'age_use_markers'),
                         (self.chk_age_others, 'age_predict_others')):
@@ -4406,7 +4419,8 @@ class ResultsTab(QWidget):
                          (self.chk_pca_markers, st.pca_use_markers),
                          (self.chk_pred_freq, st.pred_use_freq),
                          (self.chk_pred_markers, st.pred_use_markers),
-                         (self.chk_pred_lasso, st.pred_lasso), (self.chk_pred_forest, st.pred_forest)):
+                         (self.chk_pred_lasso, st.pred_lasso), (self.chk_pred_forest, st.pred_forest),
+                         (self.chk_pred_donors, st.pred_keep_donors)):
                 w.setChecked(bool(v))
             self.sb_pca_loadings.setValue(int(st.pca_n_loadings))
             self.sb_pred_repeats.setValue(int(st.pred_repeats))
@@ -4515,10 +4529,12 @@ class ResultsTab(QWidget):
             return
         X = ag_results.predictive_matrix(st.stats, use_freq, use_markers, self._feature_labels())
         repeats = int(st.pred_repeats)
+        pairing = self._trend_pairing(list(X.index)) if st.pred_keep_donors else None
+        blocks = [pairing.get(s, s) for s in X.index] if pairing else None
 
         def _run():
             return drc_predictive.run_predictive(X, groups, other, base, models=tuple(models),
-                                                 repeats=repeats)
+                                                 repeats=repeats, blocks=blocks)
 
         self.btn_pred.setEnabled(False)
         self.lbl_pred.setText(f"Running on {X.shape[1]} features, "
@@ -5936,7 +5952,7 @@ class PluginWidget(QWidget):
     own settings and session file (see BuilderPages). The settings of the
     last three pages (gate modes, drift settings, sample selection, groups,
     covariates and statistics options) are kept as one JSON string in
-    cache/automated_gating/state.json. Gated results (counts and per-gate status) are kept in
+    state/automated_gating/state.json. Gated results (counts and per-gate status) are kept in
     RESULTS_FILE in the experiment folder, with the samples a paused run has
     still to gate, their marker medians and quartiles in MARKERS_FILE, and
     each sample's display record in DISPLAY_DIR; the last

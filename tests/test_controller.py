@@ -1,5 +1,6 @@
 import multiprocessing as mp
 from pathlib import Path
+import pytest
 from deepdiff import DeepDiff
 
 from honeychrome.experiment_model import ExperimentModel
@@ -24,10 +25,12 @@ save statistics
 '''
 
 def test_open_experiment_view_sample_add_gates_add_plots():
-    kc = Controller()
     base_directory = Path.home() / 'spectral_cytometry'
     experiment_name = base_directory / '20240620 Spectral Symposium-poor cell unmixed'
     experiment_path = experiment_name.with_suffix('.kit')
+    if not experiment_path.is_file():
+        pytest.skip(f'Example experiment not found at {experiment_path}')
+    kc = Controller()
     kc.load_experiment(experiment_path)
 
     # # Auto generate spectral model on loaded experiment, unmix, add plots

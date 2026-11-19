@@ -1103,7 +1103,7 @@ def make_age_model_figure(result: dict, *, variable: str, unit: str = '',
         ax_grp.set_xticks(range(len(order)),
                           [dp.wrap_to_width(g + ('' if cv[[x == g for x in labels]].all()
                                                  else ' (predicted)'), 8, 1.4) for g in order],
-                          fontsize=8)
+                          fontsize=8, rotation=30, ha='right', rotation_mode='anchor')
         ax_grp.set_ylabel(predicted_label)
         ax_grp.set_title("Predicted by group (bar: mean)", fontsize=9)
         if trained.size:
@@ -1144,7 +1144,7 @@ def make_age_features_figure(result: dict, *, variable: str, top: int = AGE_FEAT
     label_w = max(dp.text_width_inches(line, 7) for n in names for line in n.split('\n')) + 0.3
     lines = sum(n.count('\n') + 1 for n in names)
     width = max(6.0, 4.2 + label_w)
-    title_text = dp.wrap_to_width(f"{title} ({variable})", 9, width - 0.6)
+    title_text = dp.wrap_to_width(f"{title} ({variable})", 9, width - label_w - 0.6)
     xlabel = dp.wrap_to_width(
         "Mean standardised coefficient (per SD of the feature). +: higher at larger values "
         "of the variable; % = kept in the outer fits", 8, width - label_w - 0.6)

@@ -545,9 +545,10 @@ class NoisePage(QWidget):
                      f'({n_sel / max(n_root, 1):.0%}) over {len(counts)} samples')
         else:
             where = f'in {entry.get("gate")}'
+        cells = ('no unstained cells (bead controls only)' if entry.get('beads_only') else
+                 f'unstained cells <i>{names.get(entry.get("unstained"), entry.get("unstained"))}</i>')
         lines = [
-            f'<b>Fitted</b> {entry.get("fitted", "")} from {entry.get("n_controls", 0)} controls, '
-            f'unstained cells <i>{names.get(entry.get("unstained"), entry.get("unstained"))}</i>, '
+            f'<b>Fitted</b> {entry.get("fitted", "")} from {entry.get("n_controls", 0)} controls, {cells}, '
             f'bead negatives: {beads or "none"}; {where}.',
         ]
         options = entry.get('options') or {}
@@ -676,14 +677,16 @@ class NoisePage(QWidget):
         if self.bus:
             self.bus.autoSaveRequested.emit()
         name = c.experiment.samples.get('all_samples', {}).get(fit.unstained_path, fit.unstained_path)
+        source = 'from bead controls alone' if fit.beads_only else f'with unstained cells {name}'
+        cells = ' Cells are unmixed with the bead model.' if fit.beads_only else ''
         if fit.clamped:
-            self._fit_status.setText(f'Done. Noise model fitted with unstained cells {name}. The data are clamped '
+            self._fit_status.setText(f'Done. Noise model fitted {source}. The data are clamped '
                                      'at zero, so the experiment is now unmixed with '
                                      f'{gu.clamped_weights_text(fit.clamped_weights.get("kind"))} and the '
                                      'positivity prior, not the noise model.')
         else:
-            self._fit_status.setText(f'Done. Noise model fitted with unstained cells {name}; the experiment is '
-                                     'now unmixed with it.')
+            self._fit_status.setText(f'Done. Noise model fitted {source}; the experiment is '
+                                     f'now unmixed with it.{cells}')
         self._refresh_summary()
         self._refresh_use_check()
         self._method_changed()

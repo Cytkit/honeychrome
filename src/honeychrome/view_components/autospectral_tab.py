@@ -68,6 +68,7 @@ from honeychrome.controller_components.transform import Transform
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
 from honeychrome.controller_components.sample_loader import AFState, resolve_af_for_profiles
 from honeychrome.controller_components import af_posterior
+from honeychrome.controller_components import af_shape_bend
 from honeychrome.controller_components.particle_type import (
     is_bead_sample, scatter_channel_pair, scatter_ceilings,
 )
@@ -957,10 +958,25 @@ class AutofluorescencePage(QWidget):
         )
         self._noise_aware_cb.toggled.connect(self._on_noise_aware_toggled)
         guard_while_busy(self.controller, self._noise_aware_cb)
+        self._shape_bend_cb = QCheckBox('Shape bend')
+        self._shape_bend_cb.setToolTip(
+            'Lets the AF spectrum of high-AF cells (above the unstained '
+            'sample\'s 70th AF percentile, fully from its 90th) bend a little along shapes learnt from '
+            'the unstained sample its AF profile was extracted from, by about as '
+            'much as AF of that brightness varies there. This narrows the spread '
+            'of AF-like fluorophores (BUV395, BUV496, BV421, BV510 and similar) in '
+            'high-AF cells without taking dim dye signal. The AF Abundance and AF '
+            'Index are unchanged. Needs the noise-aware AF abundance; applies to '
+            'per-cell AF and to the noise model (M2pg) unmixing.'
+        )
+        self._shape_bend_cb.toggled.connect(self._on_shape_bend_toggled)
+        guard_while_busy(self.controller, self._shape_bend_cb)
         self._noise_aware_note = QLabel('')
         self._noise_aware_note.setWordWrap(True)
         af_row = QHBoxLayout()
         af_row.addWidget(self._noise_aware_cb)
+        af_row.addSpacing(12)
+        af_row.addWidget(self._shape_bend_cb)
         af_row.addSpacing(12)
         af_row.addWidget(self._noise_aware_note, 1)
         layout.addRow('AF abundance:', af_row)
@@ -1287,6 +1303,10 @@ class AutofluorescencePage(QWidget):
         self._noise_aware_cb.blockSignals(True)
         self._noise_aware_cb.setChecked(noise_aware)
         self._noise_aware_cb.blockSignals(False)
+        self._shape_bend_cb.blockSignals(True)
+        self._shape_bend_cb.setChecked(af_shape_bend.shape_bend_on(process))
+        self._shape_bend_cb.blockSignals(False)
+        self._shape_bend_cb.setEnabled(noise_aware)
         missing = noise_aware and af_posterior.noise_context(self.controller) is None
         self._noise_aware_note.setText(
             'Needs a noise model (Noise page, Model Noise); clamped at 0 until then.' if missing else '')
@@ -1294,6 +1314,14 @@ class AutofluorescencePage(QWidget):
     def _on_noise_aware_toggled(self, checked: bool):
         af_posterior.set_af_abundance_mode(self.controller.experiment.process,
                                            af_posterior.NOISE_AWARE if checked else af_posterior.CLAMPED)
+        self._af_abundance_changed()
+
+    def _on_shape_bend_toggled(self, checked: bool):
+        af_shape_bend.set_shape_bend(self.controller.experiment.process, checked)
+        self._af_abundance_changed()
+
+    def _af_abundance_changed(self):
+        """Save, re-unmix and redraw the comparison after an AF abundance setting changes."""
         self._refresh_af_abundance_control()
         if self.bus:
             self.bus.autoSaveRequested.emit()
@@ -2461,6 +2489,7 @@ class AutofluorescencePage(QWidget):
             af_key,
             spillover_key,
             None if posterior is None else posterior.fingerprint,
+            None if posterior is None or posterior.bend is None else posterior.bend.fingerprint,
         )
         if state_key == self._last_cmp_state and self._ols_data is not None:
             self._plot_ols.set_status('')

@@ -117,6 +117,7 @@ class CytometryPlotWidget(QFrame):
             self.bus.histsStatsRecalculated.connect(self.update_axes_stats_hist)
             self.bus.updateRois.connect(self.configure_rois)
             self.bus.refreshCustomRois.connect(self.refresh_custom_rois)
+            self.bus.gateRenamed.connect(self.on_gate_renamed)
 
         # Create main layout
         main_layout = QVBoxLayout(self)
@@ -646,6 +647,23 @@ class CytometryPlotWidget(QFrame):
                     self.rois[index_roi].request_remove(delete_gate=False)
                 roi = self._generate_roi(gate_name)
                 self.rois[index_roi] = roi
+
+    @Slot(str, str, str)
+    def on_gate_renamed(self, mode, old_name, new_name):
+        """Keep this plot's gate labels in step with a gate rename, including
+        one made from the gating hierarchy tree rather than on this plot."""
+        if mode != self.mode:
+            return
+        if old_name in self.customised_gates:
+            self.customised_gates = (self.customised_gates - {old_name}) | {new_name}
+        for roi in self.rois:
+            if roi is None or roi.label.gate_name != old_name:
+                continue
+            roi.label.gate_name = new_name
+            if hasattr(roi, 'gate_name'):
+                roi.gate_name = new_name
+            roi.label.setText(new_name)
+            roi.label.update_label_statistic_and_gate()
 
     @Slot(str, int)
     def configure_rois(self, mode, index):

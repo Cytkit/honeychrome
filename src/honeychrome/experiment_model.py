@@ -90,6 +90,10 @@ def check_fcs_matches_experiment(sample_full_path, experiment_pnn_raw, magnitude
     channels_match = set(experiment_pnn_raw).issubset(set(sample_pnn))
     return channels_match
 
+class ExperimentFileError(ValueError):
+    """An experiment file that cannot be read as an experiment; the message is for the user."""
+
+
 class ExperimentModel:
     def __init__(self):
         ### experiment_path is file path and data directory (minus extension) ###
@@ -185,9 +189,15 @@ class ExperimentModel:
     def load(self, experiment_path) -> bool:
         """Read a .kit. Returns True when the file had no experiment id and
         one was given to it, so the caller can save to keep it."""
+        try:
+            with open(experiment_path, "rb") as f:
+                file_data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise ExperimentFileError(
+                f'{experiment_path} cannot be opened: the file is empty or damaged. '
+                f'If the experiment is in a cloud-synced folder, check that the file has finished '
+                f'downloading.') from e
         self.experiment_path = str(experiment_path)
-        with open(self.experiment_path, "rb") as f:
-            file_data = json.load(f)
 
         self.settings = file_data['settings']
         self.samples = file_data['samples']

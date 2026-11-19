@@ -17,7 +17,11 @@ Noise model fit (``fit_experiment_noise_model``, worker thread)
        projection basis comes from the training events. "Auto" picks, among
        the unstained cell samples with a stored AF profile, the one with the
        lowest mean raw signal (from the profile's stored unstained
-       subsample when it has one).
+       subsample when it has one). When no unstained cell sample has a
+       stored AF profile, Auto fits from the bead controls alone: the bead
+       negatives take the unstained sample's place, cell controls are left
+       out and the model has one class ('beads'), which cells use too, with
+       the bead negatives' variance for their positivity prior.
     2. Bead negatives anchor sigma0: unstained bead samples (or the one the
        user chose), else the bead controls' universal negatives, else
        internal negatives found inside the bead controls (``bead_mode``).
@@ -89,6 +93,29 @@ M2pg (``unmix_m2pg``)
     counted in its signal for the weights, and only the fluorophores are
     solved, so M2pg reports the same AF as R1.
 
+    AF shape bend (``af_bend``, the posterior's ``af_shape_bend.AFBend``).
+    In plain terms: in high-AF cells the real AF spectrum differs a little
+    from the library spectrum the cell was given, along a few shapes learnt
+    from the unstained sample, by an amount that grows with the cell's AF.
+    M2pg is told that the AF spectrum is uncertain along those shapes, so
+    it gives less weight to whatever part of the cell's detector pattern a
+    change of AF shape could explain, instead of reporting it as signal in
+    the fluorophores that resemble AF. No corrected AF spectrum is
+    estimated, and the AF abundance and row are unchanged. Cells below the
+    bend's threshold (``from_k``, the unstained sample's 70th AF percentile)
+    are solved exactly as without it.
+    The maths: the bend c (one value per shape, rows of E) has the prior
+    Normal(0, T), T = ``af_shape_bend.prior_variance`` (r(k)^2 k^2
+    sigma_l^2(k), with the ramp r from ``from_k`` to ``full_k``).
+    Integrated out, y - k a_j = x S + c E + noise has the detector
+    covariance V + E' T E, whose inverse is W - W E' (T^-1 + E W E')^-1 E W
+    (W = 1 / V, Woodbury identity): a rank-L change to each bent event's
+    normal equations, S W S' - (S W E') M^-1 (E W S') and S W r -
+    (S W E') M^-1 E W r with M = E W E' + T^-1. Penalised GLS under that
+    covariance is the joint MAP of the fluorophores and the bend with the
+    positivity ridge as the near-0 term, and each fluorophore is reported
+    with its own ridge removed, as without the bend.
+
 Storage
     ``process['noise_model']`` holds the fit's description (unstained
     sample, gate, bead sources, calibration summary, the no-AF negative
@@ -112,6 +139,11 @@ v1 simplifications
       negatives are internal ones, is processed after the others.
     * A model fitted with earlier spectra stays usable (it describes the
       detectors); ``spectra_changed`` reports it.
+    * A fit from bead controls alone scales the clamped-data weights and the
+      flat weights to the held-out events of its largest bead negative.
+    * The AF shape bend acts only with the AF fixed (the noise-aware
+      abundance); events with a detector at the ceiling are not bent, as in
+      per-cell AF.
 """
 
 from __future__ import annotations
@@ -146,6 +178,10 @@ AUTO = '__auto__'
 CLAMPED_WEIGHTS = 'clamped'
 DEFAULT_PRIOR_LAMBDA = 1.0
 N_ITER = 2
+# Changes whenever the AF shape bend changes what M2pg reports (part of the unmixing signature).
+SHAPE_BEND_VERSION = 1
+# Precision of a bend shape that may not move (prior variance 0).
+_BEND_FIXED = 1e30
 _EPS = 1e-12
 
 
@@ -198,6 +234,10 @@ class NoiseSetupSettings:
     clamp_floor_pe: float = 10.0
     variant: VariantSettings = field(default_factory=VariantSettings)
     noise: nm.NoiseSettings = field(default_factory=lambda: nm.NoiseSettings(sigma0_by_class=True))
+
+
+BEADS_ONLY_NOTE = ('Fitted from bead controls only: no unstained cell sample has an AF profile. '
+                   'Cells are unmixed with the bead model.')
 
 
 # ---------------------------------------------------------------------------
@@ -546,11 +586,16 @@ def noise_setup_snapshot(controller, settings: NoiseSetupSettings, unstained_pat
     for path in candidates + [r['neg_path'] for r in controls if r['is_cell'] and r['neg_path']]:
         if path not in stored:
             stored[path], sidecars[path] = stored_af_for(controller, path, layout['detectors'])
+    beads_only = False
     if unstained_path == AUTO:
         candidates = [p for p in candidates if stored.get(p) is not None]
         if not candidates:
-            raise ValueError('No unstained cell sample has a stored AF profile: extract one on the '
-                             'Autofluorescence page, or choose the unstained sample.')
+            controls = [r for r in controls if not r['is_cell']]
+            if not controls:
+                raise ValueError('No unstained cell sample has a stored AF profile and the spectral model has '
+                                 'no bead control: extract an AF profile on the Autofluorescence page, or '
+                                 'choose the unstained sample.')
+            beads_only = True
     folder = Path(controller.experiment_dir) / AF_SUBDIR
     raw_settings = controller.experiment.settings['raw']
     lasers = detector_lasers(raw_settings, layout['detectors'], Path(controller.experiment_dir) / controls[0]['path'])
@@ -561,7 +606,7 @@ def noise_setup_snapshot(controller, settings: NoiseSetupSettings, unstained_pat
         'fluor_names': names, 'spectra': spectra, 'settings': settings, 'controls': controls,
         'bead_unstained': [p for p, _n in unstained_bead_samples(samples)],
         'stored_af': stored, 'stored_sidecar': sidecars, 'variant_cache': str(folder / VARIANT_FILE),
-        'scatter_columns': scatter_columns_for(controller, layout), 'lasers': lasers,
+        'scatter_columns': scatter_columns_for(controller, layout), 'lasers': lasers, 'beads_only': beads_only,
     }
 
 
@@ -584,11 +629,11 @@ class NoiseFit:
     """A fitted noise model with what it was fitted from."""
     model: nm.NoiseModel
     calibration: dict
-    unstained_path: str
+    unstained_path: str | None   # None for a fit from bead controls alone
     gate: str
     af_source: str
     bead_sources: list        # [{'name', 'source'}]: a sample key or an internal negative's name
-    cell_null_var: np.ndarray
+    cell_null_var: np.ndarray    # the beads' for a fit from bead controls alone
     bead_null_var: np.ndarray | None
     n_controls: int
     notes: list
@@ -600,6 +645,7 @@ class NoiseFit:
     clamped_weights: dict = field(default_factory=dict)  # {'kind', 'floor', 'scale'}: the weights for clamped data
     selection: dict = field(default_factory=dict)     # {'mode', 'counts': {path: counts}, 'sources': {group: path}}
     options: dict = field(default_factory=dict)       # the design and estimator settings used
+    beads_only: bool = False                          # fitted from bead controls alone
 
 
 def _load(snap: dict, loader, path: str, gate: str) -> tuple:
@@ -704,16 +750,23 @@ def fit_experiment_noise_model(snap: dict, progress, loader=None) -> NoiseFit:
         tr, _te = holdout_split(len(neg_fl), s.control_train_frac, s.seed + 7)
         return af_basis(neg_fl[tr], s.bead_af_rows, seed=s.seed)
 
-    unstained_path, fl, sc = _choose_unstained(snap, loader, progress)
-    keep = subsample(len(fl), s.max_unstained, s.seed)
-    fl, sc = fl[keep], sc[keep]
-    train, test = holdout_split(len(fl), s.unstained_train_frac, s.seed, s.max_test_unstained)
-    u_train, u_test = fl[train], fl[test]
-    setup_af = snap['stored_af'].get(unstained_path)
-    af_source = 'stored AF profile' if setup_af is not None else 'AF extracted for the thresholds'
-    setup_basis = af_basis(u_train, s.n_af_rows, seed=s.seed)
-    bases_af = {unstained_path: setup_basis}
-    neg_cache = {unstained_path: (u_train, sc[train])}
+    beads_only = bool(snap.get('beads_only'))
+    if beads_only:
+        notes.append(BEADS_ONLY_NOTE)
+        unstained_path = fl = u_train = u_test = setup_af = setup_basis = None
+        af_source = 'none (bead controls only)'
+        bases_af, neg_cache = {}, {}
+    else:
+        unstained_path, fl, sc = _choose_unstained(snap, loader, progress)
+        keep = subsample(len(fl), s.max_unstained, s.seed)
+        fl, sc = fl[keep], sc[keep]
+        train, test = holdout_split(len(fl), s.unstained_train_frac, s.seed, s.max_test_unstained)
+        u_train, u_test = fl[train], fl[test]
+        setup_af = snap['stored_af'].get(unstained_path)
+        af_source = 'stored AF profile' if setup_af is not None else 'AF extracted for the thresholds'
+        setup_basis = af_basis(u_train, s.n_af_rows, seed=s.seed)
+        bases_af = {unstained_path: setup_basis}
+        neg_cache = {unstained_path: (u_train, sc[train])}
     thr_cache = {}
 
     def threshold(key, is_cell, af_spectra):
@@ -865,6 +918,9 @@ def fit_experiment_noise_model(snap: dict, progress, loader=None) -> NoiseFit:
 
     if s.bead_mode == 'auto' and not anchors:
         anchors = internal
+    if beads_only and not anchors:
+        raise ValueError('A noise model from bead controls alone needs bead negatives (unstained beads, a '
+                         'universal negative, or unstained beads inside the controls with bead negatives Auto).')
     for n, rec, cfl, csc in deferred:
         if anchors:
             neg_fl = np.vstack([a[2] for a in anchors])
@@ -907,11 +963,12 @@ def fit_experiment_noise_model(snap: dict, progress, loader=None) -> NoiseFit:
         cls = 'cells' if is_cell else 'beads'
         fit_groups.append(nm.Group(label, 'control', fit_ev, design, offset, cls=cls))
         cal_groups.append(nm.Group(label, 'control', cal_ev, design, offset, cls=cls))
-    fit_groups.append(nm.Group('Unstained', 'unstained',
-                               u_train[subsample(len(u_train), 4 * s.max_fit_events, s.seed)], setup_basis))
-    cal_groups.append(nm.Group('Unstained', 'unstained',
-                               u_test[subsample(len(u_test), 2 * s.max_cal_events, s.seed)], setup_basis))
-    group_paths['Unstained'] = unstained_path
+    if not beads_only:
+        fit_groups.append(nm.Group('Unstained', 'unstained',
+                                   u_train[subsample(len(u_train), 4 * s.max_fit_events, s.seed)], setup_basis))
+        cal_groups.append(nm.Group('Unstained', 'unstained',
+                                   u_test[subsample(len(u_test), 2 * s.max_cal_events, s.seed)], setup_basis))
+        group_paths['Unstained'] = unstained_path
     bead_test = []
     for name, _source, bfl, _bsc in anchors:
         tr, te = holdout_split(len(bfl), s.control_train_frac, s.seed + 7)
@@ -925,13 +982,17 @@ def fit_experiment_noise_model(snap: dict, progress, loader=None) -> NoiseFit:
 
     clamped = False
     if s.clamp_mode == 'auto':
-        clamped, _share = nm.negatives_clamped([fl] + [a[2] for a in anchors])
+        clamped, _share = nm.negatives_clamped(([] if beads_only else [fl]) + [a[2] for a in anchors])
         if clamped:
             notes.append('Clamped data: the negatives have no values at or below zero on any detector, so their '
                          'noise is truncated at zero. The experiment is unmixed with '
                          f'{clamped_weights_text(s.clamp_weights)} and the positivity prior unless the noise model '
                          'is ticked.')
-    u_proj = nm.project(nm.Group('Unstained', 'unstained', u_test, setup_basis))
+    if beads_only:
+        k = int(np.argmax([len(t) for t in bead_test]))
+        u_proj = nm.project(nm.Group(anchors[k][0], 'beads', bead_test[k], bead_rows(anchors[k][2]), cls='beads'))
+    else:
+        u_proj = nm.project(nm.Group('Unstained', 'unstained', u_test, setup_basis))
     flat_phi = float(np.median(nm.robust_var(u_proj.resid)))
 
     progress('Fitting the noise model')
@@ -953,17 +1014,19 @@ def fit_experiment_noise_model(snap: dict, progress, loader=None) -> NoiseFit:
                                               'options': options})
     bead_var = robust_sd(_ols(np.vstack(bead_test), spectra)) ** 2 if bead_test else None
     bead_all = np.vstack(bead_test) if bead_test else None
+    cell_neg = bead_all if beads_only else u_test
     return NoiseFit(
         model=model, calibration=calibration, unstained_path=unstained_path,
         gate=snap['gate'] if s.selection == 'gates' else None,
         af_source=af_source, bead_sources=[{'name': a[0], 'source': a[1]} for a in anchors],
-        cell_null_var=robust_sd(_ols(u_test, spectra)) ** 2, bead_null_var=bead_var,
+        cell_null_var=bead_var if beads_only else robust_sd(_ols(u_test, spectra)) ** 2, bead_null_var=bead_var,
         n_controls=len(kept), notes=notes, spectra_fingerprint=spectra_fingerprint(names, spectra),
-        cell_negatives=u_test[subsample(len(u_test), NEGATIVE_SAMPLE_EVENTS, s.seed)].astype(np.float32),
+        cell_negatives=cell_neg[subsample(len(cell_neg), NEGATIVE_SAMPLE_EVENTS, s.seed)].astype(np.float32),
         bead_negatives=None if bead_all is None else
         bead_all[subsample(len(bead_all), NEGATIVE_SAMPLE_EVENTS, s.seed)].astype(np.float32),
         clamped=bool(clamped), flat_phi=flat_phi, clamped_weights=clamped_weights,
-        selection={'mode': s.selection, 'counts': counts, 'sources': group_paths}, options=options)
+        selection={'mode': s.selection, 'counts': counts, 'sources': group_paths}, options=options,
+        beads_only=beads_only)
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1070,7 @@ def store_noise_fit(process: dict, experiment_dir, fit: NoiseFit, prior_lambda: 
         'spectra_fingerprint': fit.spectra_fingerprint, 'unstained': fit.unstained_path, 'gate': fit.gate,
         'af_source': fit.af_source, 'beads': list(fit.bead_sources), 'n_controls': int(fit.n_controls),
         'cell_null_var': [float(v) for v in fit.cell_null_var],
+        'beads_only': bool(fit.beads_only),
         'bead_null_var': None if fit.bead_null_var is None else [float(v) for v in fit.bead_null_var],
         'calibration': calibration_summary(fit.calibration), 'notes': list(fit.notes),
         'flagged_detectors': int(np.count_nonzero(fit.model.flags)),
@@ -1220,15 +1284,46 @@ def negative_sd(raw: np.ndarray, spectra: np.ndarray, af_spectra: np.ndarray | N
     return np.sqrt(var)
 
 
+def bend_precision(t2: np.ndarray) -> np.ndarray:
+    """Prior precision 1 / T of each event's bend per shape; a shape with variance 0 is held fixed."""
+    return np.where(t2 > 0.0, 1.0 / np.maximum(t2, 1e-300), _BEND_FIXED)
+
+
+def shape_bend_variance(bend, k: np.ndarray, raw: np.ndarray, ceiling: float | None) -> np.ndarray | None:
+    """
+    Prior variance T (n, L) of each event's AF shape bend for M2pg:
+    ``af_shape_bend.prior_variance`` at the event's AF abundance k, 0 below
+    the bend's threshold and for events with a detector at the ceiling.
+    None when the bend is absent, inactive, learnt on other detectors, or
+    bends no event.
+    """
+    if bend is None or not bend.active or bend.shapes.shape[1] != raw.shape[1]:
+        return None
+    from honeychrome.controller_components.af_shape_bend import prior_variance
+
+    k = np.asarray(k, dtype=np.float64)
+    t2 = prior_variance(np.maximum(k, 0.0), bend)
+    t2[k < bend.from_k] = 0.0
+    if ceiling:
+        t2[np.any(raw >= 0.999 * ceiling, axis=1)] = 0.0
+    if not np.any(t2 > 0.0):
+        return None
+    return np.ascontiguousarray(t2, dtype=np.float64)
+
+
 def pgls_solve(y: np.ndarray, spectra: np.ndarray, af_rows: np.ndarray | None, w: np.ndarray,
-               fl_pen: np.ndarray | None = None) -> dict:
+               fl_pen: np.ndarray | None = None, bend_shapes: np.ndarray | None = None,
+               bend_prec: np.ndarray | None = None) -> dict:
     """
     One penalised GLS solve per event against ``[spectra; af_rows[i]]`` with
     diagonal weights ``w`` (B, D) and the ridge ``fl_pen`` (B, F) on the
     fluorophores. Events whose AF abundance comes out negative are refitted
-    without the AF row. Returns ``x`` (B, F), ``alpha`` (B,) and
-    ``inv_diag`` (B, F), the fluorophore diagonal of the inverse normal
-    matrix.
+    without the AF row. Without AF rows, ``bend_shapes`` (L, D) and
+    ``bend_prec`` (B, L) integrate out each event's AF shape bend (the
+    Woodbury change to the normal equations in the module docstring);
+    events whose every shape is held fixed are solved without it. Returns
+    ``x`` (B, F), ``alpha`` (B,) and ``inv_diag`` (B, F), the fluorophore
+    diagonal of the inverse normal matrix.
     """
     b, d = y.shape
     f = spectra.shape[0]
@@ -1244,6 +1339,17 @@ def pgls_solve(y: np.ndarray, spectra: np.ndarray, af_rows: np.ndarray | None, w
         normal[:, :f, f] = normal[:, f, :f] = wa @ spectra.T
         normal[:, f, f] = np.einsum('bd,bd->b', wa, af_rows)
         rhs[:, f] = np.einsum('bd,bd->b', wa, y)
+    if bend_shapes is not None and not has_af:
+        bent = np.flatnonzero(np.any(bend_prec < _BEND_FIXED, axis=1))
+        if len(bent):
+            n_l = len(bend_shapes)
+            wb = w[bent]
+            swe = (spectra[np.newaxis] * wb[:, np.newaxis, :]) @ bend_shapes.T
+            m = (bend_shapes[np.newaxis] * wb[:, np.newaxis, :]) @ bend_shapes.T
+            m[:, np.arange(n_l), np.arange(n_l)] += bend_prec[bent]
+            ewr = (wb * y[bent]) @ bend_shapes.T
+            normal[bent] -= swe @ np.linalg.solve(m, swe.transpose(0, 2, 1))
+            rhs[bent] -= np.einsum('bfl,bl->bf', swe, np.linalg.solve(m, ewr[:, :, np.newaxis])[:, :, 0])
     if fl_pen is not None:
         normal[:, np.arange(f), np.arange(f)] += fl_pen
     diag_f = normal[:, np.arange(f), np.arange(f)]
@@ -1263,11 +1369,13 @@ def pgls_solve(y: np.ndarray, spectra: np.ndarray, af_rows: np.ndarray | None, w
 
 def _m2p_refit(raw: np.ndarray, spectra: np.ndarray, start: dict, af_spectra: np.ndarray | None,
                noise: nm.NoiseModel, tau: np.ndarray | None, lam: float, n_iter: int,
-               ceiling: float | None, fixed_af: bool = False) -> dict:
+               ceiling: float | None, fixed_af: bool = False,
+               bend: tuple | None = None) -> dict:
     """
     The plug-in penalised GLS iterations of M2pg from ``start`` (see the
     module docstring). With ``fixed_af`` the start's AF row and abundance
-    are kept and only the fluorophores are solved.
+    are kept and only the fluorophores are solved; ``bend`` = (shapes (L,
+    D), prior variance (n, L)) then integrates out the AF shape bend.
     """
     from honeychrome.controller_components.autospectral_functions import positivity_weight
 
@@ -1286,6 +1394,7 @@ def _m2p_refit(raw: np.ndarray, spectra: np.ndarray, start: dict, af_spectra: np
         idx = idx_out[lo:hi]
         rows = af_spectra[np.clip(idx, 0, None)] if has_af else None
         t2 = None if tau is None else np.maximum(tau[lo:hi] ** 2, _EPS)
+        prec = None if bend is None else bend_precision(bend[1][lo:hi])
         for _ in range(max(1, int(n_iter))):
             mu = np.maximum(x, 0.0) @ spectra
             if rows is not None:
@@ -1293,7 +1402,8 @@ def _m2p_refit(raw: np.ndarray, spectra: np.ndarray, start: dict, af_spectra: np
             w = _saturation_weights(1.0 / noise.variance(mu), y, ceiling)
             pen = None if lam <= 0 else lam * positivity_weight(x, t2) / t2
             if fixed_af and rows is not None:
-                sol = pgls_solve(y - alpha[:, np.newaxis] * rows, spectra, None, w, pen)
+                sol = pgls_solve(y - alpha[:, np.newaxis] * rows, spectra, None, w, pen,
+                                 None if bend is None else bend[0], prec)
                 x = sol['x']
             else:
                 sol = pgls_solve(y, spectra, rows, w, pen)
@@ -1318,7 +1428,7 @@ def unmix_m2pg(raw_fl: np.ndarray, spectra: np.ndarray, noise: nm.NoiseModel, af
                envelope: dict | None = None, null_var_no_af: np.ndarray | None = None,
                spread: np.ndarray | None = None, prior_lambda: float = DEFAULT_PRIOR_LAMBDA,
                ceiling: float | None = None, n_threads: int = 0, use_kernel: bool = True,
-               fixed_af: tuple | None = None) -> dict:
+               fixed_af: tuple | None = None, af_bend=None) -> dict:
     """
     M2pg on raw fluorescence events (see the module docstring). With
     ``af_spectra`` (two or more rows) each event takes one AF row, scored
@@ -1327,8 +1437,10 @@ def unmix_m2pg(raw_fl: np.ndarray, spectra: np.ndarray, noise: nm.NoiseModel, af
     variance and ``spread`` the spillover spread at the OLS position.
     ``fixed_af`` = (AF row, 0-based, and abundance per event) fixes each
     event's AF (the noise-aware abundance); only the fluorophores are then
-    solved. Returns ``unmixed`` (n, F, uncompensated), ``af_idx`` (0-based,
-    -1 without AF) and ``af_scale``.
+    solved. With ``fixed_af``, ``af_bend`` (an ``af_shape_bend.AFBend``)
+    integrates out the AF shape bend of high-AF events (module docstring).
+    Returns ``unmixed`` (n, F, uncompensated), ``af_idx`` (0-based, -1
+    without AF) and ``af_scale``.
     """
     raw_fl = np.ascontiguousarray(raw_fl, dtype=np.float64)
     spectra = np.ascontiguousarray(spectra, dtype=np.float64)
@@ -1340,9 +1452,13 @@ def unmix_m2pg(raw_fl: np.ndarray, spectra: np.ndarray, noise: nm.NoiseModel, af
         af_spectra, envelope, tau_spread = None, None, spread
     if not has_af:
         fixed_af = None
+    bend = None
     if fixed_af is not None:
         fixed_idx = np.ascontiguousarray(fixed_af[0], dtype=np.int64)
         fixed_scale = np.ascontiguousarray(fixed_af[1], dtype=np.float64)
+        t2_bend = shape_bend_variance(af_bend, fixed_scale, raw_fl, ceiling)
+        if t2_bend is not None:
+            bend = (np.ascontiguousarray(af_bend.shapes, dtype=np.float64), t2_bend)
     if use_kernel and kernel_available():
         from gls_m2p_kernel_wrapper import unmix_m2p_kernel
         try:
@@ -1352,12 +1468,13 @@ def unmix_m2pg(raw_fl: np.ndarray, spectra: np.ndarray, noise: nm.NoiseModel, af
                 n_iter=N_ITER, ceiling=ceiling or 0.0, n_threads=n_threads,
                 af_choice_weights=sample_af_weights(raw_fl, noise) if has_af and fixed_af is None else None,
                 fixed_af_idx=None if fixed_af is None else fixed_idx,
-                fixed_af_scale=None if fixed_af is None else fixed_scale)
+                fixed_af_scale=None if fixed_af is None else fixed_scale,
+                bend_shapes=None if bend is None else bend[0], bend_var=None if bend is None else bend[1])
         except TypeError as exc:
             if fixed_af is None:
                 raise
-            logger.warning('M2pg: the compiled kernel predates the noise-aware AF abundance (%s); the NumPy path '
-                           'is used. Build the kernels again.', exc)
+            logger.warning('M2pg: the compiled kernel predates the noise-aware AF abundance or the AF shape bend '
+                           '(%s); the NumPy path is used. Build the kernels again.', exc)
         else:
             return {'unmixed': out['unmixed'], 'af_idx': out['af_idx'] if has_af else np.full(len(raw_fl), -1),
                     'af_scale': out['af_scale']}
@@ -1372,7 +1489,7 @@ def unmix_m2pg(raw_fl: np.ndarray, spectra: np.ndarray, noise: nm.NoiseModel, af
     spread_m = None if tau_spread is None else np.asarray(tau_spread, dtype=np.float64)
     tau = negative_sd(raw_fl, spectra, af_spectra, envelope, None if has_af else null_var_no_af, spread_m)
     return _m2p_refit(raw_fl, spectra, start, af_spectra, noise, tau, float(prior_lambda), N_ITER, ceiling,
-                      fixed_af=fixed_af is not None)
+                      fixed_af=fixed_af is not None, bend=bend)
 
 
 def assemble_unmixed(raw_event_data: np.ndarray, transfer_matrix: np.ndarray, settings: dict, result: dict,
