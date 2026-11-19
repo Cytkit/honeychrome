@@ -131,9 +131,9 @@ class _FakeSample:
 
 
 def _run_statistics(controller, monkeypatch):
-    from honeychrome.controller_components import statistical_controller as sc
+    from honeychrome.controller_components import functions, statistical_controller as sc
 
-    monkeypatch.setattr(sc, 'sample_from_fcs', lambda path: _FakeSample(RAW[f'Raw/{Path(path).name}']))
+    monkeypatch.setattr(functions, 'sample_from_fcs', lambda path: _FakeSample(RAW[f'Raw/{Path(path).name}']))
     calculator = sc.StatisticsCalculator(None, controller)
     sc.StatisticsCalculator.run.__wrapped__(calculator)
     c = controller.experiment.statistics[0]
@@ -178,7 +178,8 @@ def _cluster_id_controller(unstained_assignment):
                           'fluorescence_channel_ids': [0, 1, 2]}},
     )
     return SimpleNamespace(
-        experiment=experiment, transfer_matrix=np.eye(3), filtered_raw_fluorescence_channel_ids=[0, 1, 2],
+        experiment=experiment, experiment_dir=Path('experiment'), transfer_matrix=np.eye(3),
+        filtered_raw_fluorescence_channel_ids=[0, 1, 2],
         af_precomputed_cache={'P': build_af_precomputed(FLUOR, AF), 'Q': build_af_precomputed(FLUOR, af_b)},
     ), af_b
 

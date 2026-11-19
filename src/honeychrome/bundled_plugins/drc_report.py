@@ -80,7 +80,8 @@ class ReportItem:
                 item back up after a refresh; the checkbox state itself
                 is tracked by label -- see ReportTab._populate_section).
     tab         Source tab name -- 'Layout' | 'Cluster Annotation' |
-                'Stats' -- also the sub-folder these get exported into.
+                'Stats' | 'Gating confirmation' -- also the sub-folder these
+                get exported into.
     label       Display text for the checkbox, and the exported file stem.
     get_figure  Optional zero-arg callable returning a fresh, canvas-less
                 matplotlib Figure (or None on failure). Called once, at
@@ -148,6 +149,9 @@ def qtable_to_dataframe(table_widget) -> pd.DataFrame:
 
 
 _INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*]')
+# Honeycluster's results folder inside the experiment folder: reports, and
+# figures exported from the tabs.
+REPORTS_SUBDIR = 'Honeycluster_Reports'
 
 
 def sanitize_filename(text: str, fallback: str = 'item') -> str:
@@ -473,7 +477,7 @@ def add_dataframe_pages(pdf, df, title: str, max_rows_per_page: int = 35) -> Non
 # Report tab
 # ---------------------------------------------------------------------------
 
-_SECTIONS = ('Layout', 'Cluster Annotation', 'Stats')
+_SECTIONS = ('Layout', 'Cluster Annotation', 'Stats', 'Gating confirmation')
 
 
 class ReportTab(QWidget):
@@ -497,7 +501,7 @@ class ReportTab(QWidget):
     """
 
     def __init__(self, state, bus, controller, *, workspace_tab, groups_stats_tab,
-                 cluster_annotation_tab, parent=None):
+                 cluster_annotation_tab, gating_confirmation_tab=None, parent=None):
         super().__init__(parent)
         self.state = state
         self.bus = bus
@@ -505,6 +509,7 @@ class ReportTab(QWidget):
         self.workspace_tab = workspace_tab
         self.groups_stats_tab = groups_stats_tab
         self.cluster_annotation_tab = cluster_annotation_tab
+        self.gating_confirmation_tab = gating_confirmation_tab
         self._section_lists: dict[str, QListWidget] = {}
         self._build_ui()
 
@@ -595,7 +600,7 @@ class ReportTab(QWidget):
             self.context_label.setText(f"Reporting on clustering run: {run_label}")
             safe_label = sanitize_filename(run_label)
             self.output_label.setText(
-                f"Report folder: {self.controller.experiment_dir / 'Honeycluster_Reports' / (safe_label + '_<timestamp>')}"
+                f"Report folder: {self.controller.experiment_dir / REPORTS_SUBDIR / (safe_label + '_<timestamp>')}"
             )
         else:
             self.context_label.setText(
@@ -607,6 +612,9 @@ class ReportTab(QWidget):
         self._populate_section('Layout', self.workspace_tab.get_report_items())
         self._populate_section('Cluster Annotation', self.cluster_annotation_tab.get_report_items())
         self._populate_section('Stats', self.groups_stats_tab.get_report_items())
+        self._populate_section('Gating confirmation',
+                               self.gating_confirmation_tab.get_report_items()
+                               if self.gating_confirmation_tab is not None else [])
 
     def _populate_section(self, section_name: str, items: list):
         list_widget = self._section_lists[section_name]
@@ -668,7 +676,7 @@ class ReportTab(QWidget):
         run_label = cl_run.get('label') or 'clustering_run'
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         folder_name = f"{sanitize_filename(run_label)}_{timestamp}"
-        report_dir = self.controller.experiment_dir / 'Honeycluster_Reports' / folder_name
+        report_dir = self.controller.experiment_dir / REPORTS_SUBDIR / folder_name
 
         log.info("generate_report: writing %d item(s) to %s", len(items), report_dir)
 
@@ -759,7 +767,7 @@ def export_report_item(item: ReportItem, subfolder, pdf, max_pdf_rows: int | Non
             fig = None
             log.warning("figure build failed for %r: %s", item.label, e)
         if fig is not None:
-            fig.savefig(subfolder / f"{safe_label}.png", dpi=200, bbox_inches='tight')
+            fig.savefig(subfolder / f"{safe_label}.png", dpi=300, bbox_inches='tight')
             pdf.savefig(fig, bbox_inches='tight', dpi=300)
     if item.write_files is not None:
         try:

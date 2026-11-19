@@ -10,10 +10,13 @@ Sections (one open at a time):
                marker readout; Check matching builds the features and shows
                the population → cell type table (editable) and how each
                library row matched.
-  • Run      — ranking statistic, permutations, seed, minimum set size;
-               runs in a background worker with progress and Cancel.
+  • Run      — ranking statistic, permutations, seed, minimum set size,
+               and the coherence options; runs in a background worker with
+               progress and Cancel.
   • Results  — states table, dot plot, and the running-sum and member
-               figures of one state.
+               figures of one state; with coherence on, the coherence
+               table and the Coherence, State network and State pair
+               figures (``ag_coherence``).
   • Export   — CSV files of the last run.
 
 The page takes its samples, groups, pairing and covariates from the
@@ -35,11 +38,13 @@ import pandas as pd
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
+    QLabel,
     QMessageBox, QProgressBar, QPushButton, QSpinBox, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+import ag_coherence
 import ag_core
 import ag_fsea
 import ag_fsea_library as fl
@@ -340,7 +345,36 @@ class EnrichmentTab(QWidget):
         form.addRow("Permutations:", self.sb_perm)
         form.addRow("Random seed:", self.sb_seed)
         form.addRow("Minimum matched features:", self.sb_min_set)
+        self.chk_coherence = QCheckBox("Coherence and state network")
+        self.chk_coherence.setToolTip(
+            "Also ask, within each group, whether each state's features rise and fall together "
+            "from donor to donor, and which states move together. Group comparisons only; each "
+            f"group needs at least {ag_coherence.MIN_GROUP_SAMPLES} samples.")
+        self.chk_coherence.toggled.connect(self._on_run_settings_changed)
+        self.chk_background = QCheckBox("Adjust positivity features for marker background")
+        self.chk_background.setToolTip(
+            "When a sample's whole distribution for a marker sits brighter (stain, background, "
+            "fix/perm), more cells cross a fixed gate in every population. This removes each "
+            "marker's own background, measured in the sample's populations that are negative "
+            "for it, before correlating.")
+        self.chk_background.toggled.connect(self._on_run_settings_changed)
+        self.sb_reliability = QDoubleSpinBox()
+        self.sb_reliability.setRange(0.0, 0.9)
+        self.sb_reliability.setSingleStep(0.05)
+        self.sb_reliability.setDecimals(2)
+        self.sb_reliability.setToolTip(
+            "Share of a feature's donor-to-donor variation that must be real rather than "
+            "counting noise. Features of rare populations (a few events per sample) fall below "
+            "it and are left out of coherence, because their noise weakens every correlation.")
+        self.sb_reliability.valueChanged.connect(self._on_run_settings_changed)
+        form.addRow("", self.chk_coherence)
+        form.addRow("", self.chk_background)
+        form.addRow("Minimum reliability:", self.sb_reliability)
         layout.addLayout(form)
+        self.lbl_coherence_model = QLabel("")
+        self.lbl_coherence_model.setWordWrap(True)
+        self.lbl_coherence_model.setStyleSheet("color: grey;")
+        layout.addWidget(self.lbl_coherence_model)
         self.lbl_gate = QLabel("")
         self.lbl_gate.setWordWrap(True)
         layout.addWidget(self.lbl_gate)
@@ -388,9 +422,33 @@ class EnrichmentTab(QWidget):
         self.tbl_results.setMinimumHeight(240)
         self.tbl_results.itemSelectionChanged.connect(self._on_state_selected)
         layout.addWidget(self.tbl_results)
+        self.lbl_coherence = QLabel("")
+        self.lbl_coherence.setWordWrap(True)
+        layout.addWidget(self.lbl_coherence)
+        self.tbl_coherence = QTableWidget(0, 9)
+        self.tbl_coherence.setToolTip(
+            "Coherence: the signed mean correlation of a state's members across the donors of "
+            "a group (1: they move exactly as the library expects; 0: independently), with its "
+            "95% interval. ΔC, p, FDR: does it differ between the two groups?")
+        self.tbl_coherence.verticalHeader().setVisible(False)
+        self.tbl_coherence.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.tbl_coherence.horizontalHeader().setStretchLastSection(True)
+        self.tbl_coherence.setMinimumHeight(160)
+        layout.addWidget(self.tbl_coherence)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("State pair:"))
+        self.cb_pair = QComboBox()
+        self.cb_pair.setToolTip("Two states of the network: each donor's two scores, and their "
+                                "member features' correlations drawn along the gate tree.")
+        self.cb_pair.currentIndexChanged.connect(self._on_pair_changed)
+        row.addWidget(self.cb_pair, stretch=1)
+        self.pair_row = QWidget()
+        self.pair_row.setLayout(row)
+        layout.addWidget(self.pair_row)
         self.fig_tabs = QTabWidget()
         self.fig_tabs.setMinimumHeight(420)
         layout.addWidget(self.fig_tabs, stretch=1)
+        self._n_fixed_tabs = 0
 
     def _build_export_page(self, page):
         layout = QVBoxLayout(page)
@@ -424,6 +482,11 @@ class EnrichmentTab(QWidget):
             self.sb_perm.setValue(int(st.fsea_n_perm))
             self.sb_seed.setValue(int(st.fsea_seed))
             self.sb_min_set.setValue(int(st.fsea_min_set_size))
+            self.chk_coherence.setChecked(bool(st.coherence_on))
+            self.chk_background.setChecked(bool(st.coherence_background))
+            self.sb_reliability.setValue(float(st.coherence_min_reliability))
+            self.chk_background.setEnabled(bool(st.coherence_on))
+            self.sb_reliability.setEnabled(bool(st.coherence_on))
             self._fill_anchor()
         finally:
             self._filling = False
@@ -595,6 +658,7 @@ class EnrichmentTab(QWidget):
                 "the permutation null is too coarse and set results are not reliable.</span>")
         self.btn_run.setEnabled(bool(plans) and self._worker is None and bool(st.summaries))
         self._update_estimate()
+        self._update_coherence_model()
 
     def _update_estimate(self):
         if self._preview is None:
@@ -614,9 +678,18 @@ class EnrichmentTab(QWidget):
         secs = per * n_perm * n_comp
         how = ("residual permutation, trend" if trend else
                "group-label permutation" if fast else "residual permutation (pairing/covariates)")
-        self.lbl_estimate.setText(
-            f"About {secs:.0f} s for {n_feat} features × {n_perm} permutations × {n_comp} "
-            f"comparison(s) ({how}; estimated from a two-core machine).")
+        text = (f"About {secs:.0f} s for {n_feat} features × {n_perm} permutations × {n_comp} "
+                f"comparison(s) ({how}; estimated from a two-core machine).")
+        if self.state.coherence_on and not trend:
+            # 23 ms per relabelling for 206 members and 143 samples, plus the intervals.
+            testable = [s for s in self._preview['sets'] if s['testable']]
+            n_mem = sum(len(s['features']) for s in testable)
+            scale = (max(n_mem, 1) / 206) ** 2 * max(len(samples), 1) / 143
+            n_rel = ag_coherence.relabellings_needed(n_perm, len(testable))
+            coh = (0.023 * scale * (n_rel + 2 * ag_coherence.DEFAULT_N_BOOT)) * n_comp
+            text += f" Coherence adds about {coh:.0f} s."
+        self.lbl_estimate.setText(text)
+        self._update_coherence_model()
 
     # ------------------------------------------------------------------
     # Settings
@@ -670,6 +743,11 @@ class EnrichmentTab(QWidget):
         st.fsea_n_perm = int(self.sb_perm.value())
         st.fsea_seed = int(self.sb_seed.value())
         st.fsea_min_set_size = int(self.sb_min_set.value())
+        st.coherence_on = self.chk_coherence.isChecked()
+        st.coherence_background = self.chk_background.isChecked()
+        st.coherence_min_reliability = float(self.sb_reliability.value())
+        self.chk_background.setEnabled(st.coherence_on)
+        self.sb_reliability.setEnabled(st.coherence_on)
         self._update_estimate()
 
     def _invalidate_preview(self):
@@ -848,10 +926,35 @@ class EnrichmentTab(QWidget):
                           interaction=trend['interaction'], baseline=trend['baseline'],
                           patterns=trend['patterns'])
 
+        coherence = None
+        if not trend and st.coherence_on:
+            trend_in = self._trend_inputs()
+            coherence = dict(
+                group_order=list(st.group_names), contrast_mode=st.contrast_mode,
+                reference=st.reference_group, pairing=design['pairing'],
+                covariates=design['covariates'], numeric_covariates=design['numeric'],
+                trend_time=dict(trend_in['time']) if trend_in else None,
+                trend_variable=trend_in['variable'] if trend_in else '',
+                channel_antigens=dict(self._antigens_fn()),
+                background=bool(st.coherence_background),
+                min_reliability=float(st.coherence_min_reliability),
+                n_perm=int(st.fsea_n_perm), seed=int(st.fsea_seed))
+
         def _job(progress, stop):
             run = ag_fsea.run_trend_enrichment if trend else ag_fsea.run_enrichment
+            share = 0.5 if coherence is not None else 1.0
             res = run(summaries, samples, groups, gate_defs, library,
-                      progress=progress, stop_check=stop, **kwargs)
+                      progress=lambda f, m: progress(share * f, m), stop_check=stop, **kwargs)
+            if coherence is not None:
+                try:
+                    res['coherence'] = ag_coherence.run_coherence(
+                        summaries, samples, groups, gate_defs, res,
+                        progress=lambda f, m: progress(share + (1 - share) * f, m),
+                        stop_check=stop, **coherence)
+                except ag_coherence.CoherenceCancelled as exc:
+                    raise ag_fsea.FseaCancelled(str(exc)) from exc
+                except ag_coherence.CoherenceBlocked as exc:
+                    res['coherence'] = {'blocked_message': str(exc)}
             res['input_fingerprint'] = fingerprint
             return res
 
@@ -912,6 +1015,7 @@ class EnrichmentTab(QWidget):
             self.lbl_results.setText("")
             self.tbl_results.setRowCount(0)
             self.fig_tabs.clear()
+            self._show_coherence_table('')
             return
         lines = [f"Last run: {len(res['samples'])} samples, {res['settings']['n_perm']} "
                  f"permutations, library {res['library'].get('version') or ''} "
@@ -939,6 +1043,7 @@ class EnrichmentTab(QWidget):
         res = self._result(kind)
         self.tbl_results.setRowCount(0)
         self.fig_tabs.clear()
+        self._show_coherence_table(comp if res else '')
         if not res or not comp:
             return
         st = res['states']
@@ -1013,6 +1118,8 @@ class EnrichmentTab(QWidget):
             except Exception as exc:
                 log.exception("pattern dot plot failed")
                 self.fig_tabs.addTab(QLabel(f"Pattern plot failed: {exc}"), "Patterns")
+        self._show_coherence_figures()
+        self._n_fixed_tabs = self.fig_tabs.count()
 
     def _on_state_selected(self):
         if self._filling:
@@ -1032,7 +1139,7 @@ class EnrichmentTab(QWidget):
         comp = self._selected()[1]
         if not res or not comp:
             return
-        keep = 2 if self.fig_tabs.count() > 1 and self.fig_tabs.tabText(1) == "Patterns" else 1
+        keep = self._n_fixed_tabs
         while self.fig_tabs.count() > keep:
             self.fig_tabs.removeTab(keep)
         st = res['states']
@@ -1053,6 +1160,160 @@ class EnrichmentTab(QWidget):
         except Exception as exc:
             log.exception("state figures failed")
             self.fig_tabs.addTab(QLabel(f"Figures failed: {exc}"), "Error")
+
+    # ------------------------------------------------------------------
+    # Coherence
+    # ------------------------------------------------------------------
+
+    def _coherence(self) -> dict:
+        """The coherence block of the group result, or {}."""
+        if self._selected()[0] == 'trend':
+            return {}
+        return (self.state.fsea or {}).get('coherence') or {}
+
+    def _update_coherence_model(self):
+        """The residual model coherence will use, in words."""
+        if not self.state.coherence_on:
+            self.lbl_coherence_model.setText("")
+            return
+        _samples, design = self._design()
+        terms = ['group']
+        cov = design.get('covariates')
+        if cov is not None and len(cov.columns):
+            terms += [str(c) for c in cov.columns]
+        trend = self._trend_inputs()
+        if trend:
+            terms.append(f"{trend['variable']} (trend variable)")
+        self.lbl_coherence_model.setText(
+            "Coherence: features compared after removing " + ", ".join(terms)
+            + f"; groups with fewer than {ag_coherence.MIN_GROUP_SAMPLES} samples are left out "
+              f"(warning below {ag_coherence.WARN_GROUP_SAMPLES}).")
+
+    def _show_coherence_table(self, comp: str):
+        """The coherence table of *comp*, and the state pairs to choose from."""
+        block = self._coherence()
+        self.tbl_coherence.setRowCount(0)
+        self.cb_pair.blockSignals(True)
+        self.cb_pair.clear()
+        self.cb_pair.blockSignals(False)
+        coh = block.get('coherence') if block else None
+        has = coh is not None and len(coh) and comp in set(coh['comparison'])
+        self.tbl_coherence.setVisible(bool(has))
+        self.pair_row.setVisible(bool(has))
+        if block.get('blocked_message'):
+            self.lbl_coherence.setText(f"Coherence not run: {block['blocked_message']}")
+            return
+        if not has:
+            blocked = [b['reason'] for b in (block.get('blocked') or [])
+                       if b.get('comparison') == comp]
+            self.lbl_coherence.setText(("Coherence not tested — " + blocked[0]) if blocked else "")
+            return
+        thr = self.state.pval_threshold
+        rows = coh[coh['comparison'] == comp]
+        a, b = str(rows['group_a'].iloc[0]), str(rows['group_b'].iloc[0])
+        sett = block.get('settings') or {}
+        lines = [f"Coherence, {comp}: {int((rows['FDR'] < thr).sum())} of "
+                 f"{int(rows['dC'].notna().sum())} states differ (FDR < {thr:g}); "
+                 f"{int(rows['n_a'].iloc[0])} {a} and {int(rows['n_b'].iloc[0])} {b} samples"
+                 + (", swapped within pairs" if bool(rows['paired'].iloc[0]) else "")
+                 + ". Model: group" + "".join(f", {t}" for t in sett.get('model') or [])
+                 + (f"; background removed for {sett.get('members_adjusted', 0)} features "
+                    f"({sett.get('markers_with_background', 0)} markers)" if sett.get('background')
+                    else "; no background adjustment")
+                 + f"; minimum reliability {sett.get('min_reliability', 0):g}."]
+        lines += block.get('notes') or []
+        self.lbl_coherence.setText("<br>".join(lines))
+        headers = ["Immune state", "Lineage", f"C {a}", f"C {b}", "ΔC", "p", "FDR",
+                   "Members used", "Left out"]
+        self.tbl_coherence.setHorizontalHeaderLabels(headers)
+        mem = block['members']
+        mem = mem[mem['comparison'] == comp]
+        for _i, r in rows.iterrows():
+            k = self.tbl_coherence.rowCount()
+            self.tbl_coherence.insertRow(k)
+            sig = r['FDR'] == r['FDR'] and r['FDR'] < thr
+            colour = ('#f8d7da' if r['dC'] > 0 else '#cfe2ff') if sig else None
+            out = mem[(mem['immune_state'] == r['immune_state']) & ~mem['used'].astype(bool)]
+            vals = (r['immune_state'], r['lineage'] or '—',
+                    f"{_fmt(r['C_a'])} ({_fmt(r['C_a_lo'])} to {_fmt(r['C_a_hi'])})",
+                    f"{_fmt(r['C_b'])} ({_fmt(r['C_b_lo'])} to {_fmt(r['C_b_hi'])})",
+                    _fmt(r['dC']), _fmt(r['p']), _fmt(r['FDR']),
+                    f"{int(r['members_used'])} of {int(r['members_total'])}",
+                    '; '.join(f"{lab}: {why}" for lab, why in zip(out['label'], out['reason'])))
+            for j, v in enumerate(vals):
+                self.tbl_coherence.setItem(k, j, _item(v, colour if j < 1 else None))
+        self.tbl_coherence.resizeColumnToContents(0)
+        edges = block['edges']
+        edges = edges[edges['comparison'] == comp].copy()
+        within = (edges['FDR_a'] < thr) | (edges['FDR_b'] < thr) | (edges['FDR'] < thr)
+        edges = edges[within].sort_values(['FDR', 'p'], na_position='last')
+        self.cb_pair.blockSignals(True)
+        for _i, e in edges.iterrows():
+            tag = " (differs)" if e['FDR'] < thr else ""
+            self.cb_pair.addItem(f"{e['state_1']} — {e['state_2']}{tag}",
+                                 json.dumps([e['state_1'], e['state_2']]))
+        self.cb_pair.blockSignals(False)
+        self.pair_row.setVisible(self.cb_pair.count() > 0)
+
+    def _show_coherence_figures(self):
+        import ag_fsea_plots as fp
+        block = self._coherence()
+        comp = self._selected()[1]
+        coh = block.get('coherence') if block else None
+        if coh is None or not len(coh) or comp not in set(coh['comparison']):
+            return
+        from honeychrome.view_components.differential_plots import GROUP_COLOURS
+        st = self.state
+        colours = {g: st.group_colors.get(g) or GROUP_COLOURS[i % len(GROUP_COLOURS)]
+                   for i, g in enumerate(st.group_names)}
+        for title, tab, key, make in (
+                ("Coherence", "Coherence", 'enrichment_coherence',
+                 lambda: fp.make_coherence_figure(block, comp, st.pval_threshold, _is_dark(),
+                                                  colours)),
+                ("State network", "State network", 'enrichment_state_network',
+                 lambda: fp.make_state_network_figure(block, comp, st.pval_threshold,
+                                                      _is_dark()))):
+            try:
+                self.fig_tabs.addTab(self._figure_widget(make(), f"{title} — {comp}", key), tab)
+            except Exception as exc:
+                log.exception("%s figure failed", title)
+                self.fig_tabs.addTab(QLabel(f"{title} failed: {exc}"), tab)
+        self._add_pair_tab()
+
+    def _add_pair_tab(self):
+        import ag_fsea_plots as fp
+        block = self._coherence()
+        comp = self._selected()[1]
+        data = self.cb_pair.currentData()
+        if not block or not data:
+            return
+        s1, s2 = json.loads(data)
+        coh = block['coherence']
+        row = coh[coh['comparison'] == comp].iloc[0]
+        groups = (str(row['group_b']), str(row['group_a']))
+        from honeychrome.view_components.differential_plots import GROUP_COLOURS
+        st = self.state
+        colours = {g: st.group_colors.get(g) or GROUP_COLOURS[i % len(GROUP_COLOURS)]
+                   for i, g in enumerate(st.group_names)}
+        try:
+            view = ag_coherence.pair_view(block, comp, s1, s2)
+            fig = fp.make_state_pair_figure(view, s1, s2, comp, groups, _is_dark(), colours)
+            widget = self._figure_widget(fig, f"{s1} and {s2} — {comp}", 'enrichment_state_pair')
+        except Exception as exc:
+            log.exception("state pair figure failed")
+            widget = QLabel(f"State pair failed: {exc}")
+        self.fig_tabs.addTab(widget, "State pair")
+
+    def _on_pair_changed(self, _i):
+        if self._filling:
+            return
+        for k in range(self.fig_tabs.count()):
+            if self.fig_tabs.tabText(k) == "State pair":
+                self.fig_tabs.removeTab(k)
+                self._add_pair_tab()
+                self.fig_tabs.tabBar().moveTab(self.fig_tabs.count() - 1, k)
+                self.fig_tabs.setCurrentIndex(k)
+                return
 
     # ------------------------------------------------------------------
     # Export

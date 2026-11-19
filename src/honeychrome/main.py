@@ -4,6 +4,7 @@ Honeychrome - open source cytometry data acquisition and analysis software
 
 # from honeychrome.tools import DepthFinder # debug module imports here
 
+import faulthandler
 import os
 import sys
 import threading
@@ -19,7 +20,7 @@ from multiprocessing import shared_memory, Lock
 import numpy as np
 
 from honeychrome import __version__
-from honeychrome.settings import experiments_folder, send_debug_data
+from honeychrome.settings import experiments_folder, send_debug_data, detailed_log
 from honeychrome.settings import q_settings as q_settings_app_config
 
 current_file_path = Path(__file__).resolve()
@@ -71,13 +72,24 @@ View:
 from honeychrome.view import View, logo_icon
 
 import logging
+import logging.handlers
 import re
 import warnings
+import uuid
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
 
-def setup_logging(log_file):
-    """Set up logging to both console and file, and capture all output."""
+LOG_MAX_BYTES = 10 * 1024 ** 2   # honeychrome.log is rotated at this size
+LOG_BACKUPS = 3                   # honeychrome.log.1 to .3 are kept
+CRASH_LOG_MAX_BYTES = 1024 ** 2   # crash.log is started afresh beyond this size
+
+
+def setup_logging(log_file, detailed=False):
+    """Set up logging to the console and to *log_file*, and capture all output.
+
+    The file is rotated at LOG_MAX_BYTES with LOG_BACKUPS older copies, so
+    the log never takes more than about 40 MB. It records INFO and above, and
+    DEBUG as well when *detailed* (App Configuration, "Detailed log")."""
 
     # Create logger
     logger = logging.getLogger()
@@ -94,8 +106,9 @@ def setup_logging(log_file):
     console_handler.setFormatter(formatter)
 
     # File handler
-    file_handler = logging.FileHandler(log_file, mode='a')
-    file_handler.setLevel(logging.DEBUG)
+    file_handler = logging.handlers.RotatingFileHandler(log_file, maxBytes=LOG_MAX_BYTES,
+                                                        backupCount=LOG_BACKUPS, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG if detailed else logging.INFO)
     file_handler.setFormatter(formatter)
 
     # Add handlers
@@ -122,6 +135,29 @@ def setup_logging(log_file):
     return logger
 
 
+def open_crash_log(path):
+    """crash.log for appending (started afresh beyond CRASH_LOG_MAX_BYTES), or None.
+
+    It is kept apart from honeychrome.log, which is rotated: on Windows a file
+    held open by a second handle cannot be renamed."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = 'w' if path.exists() and path.stat().st_size > CRASH_LOG_MAX_BYTES else 'a'
+        return open(path, mode, encoding='utf-8', buffering=1)
+    except OSError:
+        return None
+
+
+def redirect_missing_std_streams(crash_log):
+    """In the packaged Windows app there is no console, so sys.stdout and sys.stderr are None.
+    Child processes then fail while reporting an error and the real error is lost. Send
+    stderr to *crash_log* and stdout to the null device so errors are recorded."""
+    if sys.stderr is None:
+        sys.stderr = crash_log if crash_log is not None else open(os.devnull, 'w')
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, 'w')
+
+
 def configure_multiprocessing():
     if getattr(sys, 'frozen', False):
         # Running as PyInstaller executable
@@ -131,11 +167,13 @@ def configure_multiprocessing():
             mp.set_start_method('spawn', force=True)
 
 _HOME_PATH_PATTERN = re.compile(r'(?i)([A-Z]:\\{1,2}Users\\{1,2}|/Users/|/home/)[^\\/\'"\s]+')
+_DATA_FILE_PATTERN = re.compile(r'(?i)[^\\/\'"\s:]+\.(fcs|kc|csv|tsv|xlsx|xls|wsp|xml|json|h5|hdf5|parquet)\b')
 
 def _scrub_paths(value):
-    # replace the user-name part of home-folder paths anywhere in the event
+    # replace the user-name part of home-folder paths and the names of data files anywhere in the event
     if isinstance(value, str):
-        return _HOME_PATH_PATTERN.sub(r'\1~', value)
+        value = _HOME_PATH_PATTERN.sub(r'\1~', value)
+        return _DATA_FILE_PATTERN.sub(r'<file>.\1', value)
     if isinstance(value, dict):
         return {k: _scrub_paths(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -146,35 +184,61 @@ def _sentry_before_send(event, hint):
     exc_info = hint.get('exc_info')
     if exc_info and issubclass(exc_info[0], KeyboardInterrupt):
         return None
+    event.pop('server_name', None)
     return _scrub_paths(event)
 
-def init_sentry():
+def get_install_id():
+    """Return a random identifier for this installation, created on first launch and stored in the app settings.
+
+    It contains no information about the user or the computer and is used only to count launches per installation.
+    """
+    install_id = q_settings_app_config.value("install_id", "", type=str)
+    if not install_id:
+        install_id = uuid.uuid4().hex
+        q_settings_app_config.setValue("install_id", install_id)
+    return install_id
+
+def init_sentry(install_id):
     try:
 
         sentry_logging = LoggingIntegration(
-            level=logging.INFO,  # Send INFO and above as breadcrumbs (context)
+            level=logging.WARNING,  # Send WARNING and above as breadcrumbs (context)
             event_level=logging.ERROR  # Actually send ERROR and above as alerts
         )
-        # Keep it anonymous with send_default_pii=False (i.e. all personal data are scrubbed, e.g. usernames, file names and locations, etc)
+        # Anonymous reporting: no default personal data, no machine name, and no local variable values in stack frames
         sentry_sdk.init(dsn="https://c99858ad29b86e3c551978e9b72c7724@o4511334133334016.ingest.de.sentry.io/4511334139887696",
                         shutdown_timeout=1,
                         integrations=[sentry_logging],
                         release=f"honeychrome@{__version__}",
                         environment='production' if getattr(sys, 'frozen', False) else 'development',
                         before_send=_sentry_before_send,
-                        send_default_pii=False)
+                        send_default_pii=False,
+                        include_local_variables=False,
+                        server_name='')
+        sentry_sdk.set_user({"id": install_id})
         sentry_sdk.set_tag("os_name", platform.system())
         sentry_sdk.set_tag("os_release", platform.release())
         sentry_sdk.set_tag("os_version", platform.version())
 
 
         sentry_sdk.metrics.count("honeychrome.launch", 1,
-            attributes={"version": __version__, "platform": sys.platform})
+            attributes={"version": __version__, "platform": sys.platform, "install_id": install_id})
     except Exception:
         pass  # Sentry must never crash or stall the app
 
 
 def main():
+    crash_log = open_crash_log(Path.home() / experiments_folder / 'crash.log')
+    redirect_missing_std_streams(crash_log)
+
+    # A crash in compiled code (Qt, numpy or a compiled kernel) ends the process without a
+    # Python traceback. faulthandler writes the stack of every thread to crash.log instead.
+    try:
+        if crash_log is not None:
+            faulthandler.enable(file=crash_log, all_threads=True)
+    except (OSError, ValueError):
+        pass
+
     configure_multiprocessing()
 
     # create experiments directory and plugins directory
@@ -192,7 +256,8 @@ def main():
             if not destination.exists():
                 shutil.copy2(template, destination)
 
-    logger = setup_logging(Path.home() / experiments_folder / 'honeychrome.log')
+    logger = setup_logging(Path.home() / experiments_folder / 'honeychrome.log',
+                           q_settings_app_config.value("detailed_log", detailed_log, type=bool))
 
     # # Log messages at different levels
     # logger.debug("Debug message")  # Only to file
@@ -202,7 +267,7 @@ def main():
 
     # send debug data if setting is on
     if q_settings_app_config.value("send_debug_data", send_debug_data, type=bool):
-        threading.Thread(target=init_sentry, daemon=True).start()
+        threading.Thread(target=init_sentry, args=(get_install_id(),), daemon=True).start()
 
         # # Test sentry
         # try:
@@ -219,14 +284,13 @@ def main():
     import honeychrome.settings as settings
 
     # Allocate shared memory block, plus head and tail indices
-    traces_cache_shm = shared_memory.SharedMemory(create=True, size=np.zeros(traces_cache_size, dtype=traces_cache_dtype).nbytes)
+    traces_cache_shm = shared_memory.SharedMemory(create=True, size=traces_cache_size * np.dtype(traces_cache_dtype).itemsize)
     traces_cache_lock = Lock()
     index_head_traces_cache = mp.Value('i', 0)
     index_tail_traces_cache = mp.Value('i', 0)
 
     events_cache_shm = shared_memory.SharedMemory(create=True,
-                                                  size=np.zeros((max_events_in_cache, n_channels_per_event),
-                                                                dtype=np.int_).nbytes)
+                                                  size=max_events_in_cache * n_channels_per_event * np.dtype(np.int64).itemsize)
     events_cache_lock = Lock()
     index_head_events_cache = mp.Value('i', 0)
     index_tail_events_cache = mp.Value('i', 0)

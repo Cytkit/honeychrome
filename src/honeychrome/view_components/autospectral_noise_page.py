@@ -36,7 +36,8 @@ from PySide6.QtWidgets import (
 from honeychrome.controller_components import gls_unmix as gu
 from honeychrome.controller_components import noise_model as nm
 from honeychrome.controller_components import unmix_method
-from honeychrome.controller_components.autospectral_functions import apply_af_transfer
+from honeychrome.controller_components.autospectral_functions import apply_af_transfer, apply_af_unmixing
+from honeychrome.controller_components import af_posterior
 from honeychrome.controller_components.functions import apply_transfer_matrix, resolve_base_gate
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
 from honeychrome.controller_components.particle_type import is_bead_sample
@@ -116,15 +117,24 @@ class NoiseComparisonWorker(QObject):
             raw = j['raw']
             fl = np.ascontiguousarray(raw[:, j['fl_ids']], dtype=np.float64)
             af = j['af']
+            posterior = None if af is None else af.posterior
+            fixed_af = None
             if af is not None:
                 left = apply_af_transfer(raw, j['transfer'], af.precomputed, af.spectra, j['settings'],
                                          filtered_fl_ids_raw=j['fl_ids'], spillover=j['spillover'],
-                                         af_index_map=af.index_map)['unmixed']
+                                         af_index_map=af.index_map, af_posterior=posterior)['unmixed']
+                if posterior is not None:
+                    raw_settings = j['settings']['raw']
+                    log_ssc = posterior.log_ssc(raw, raw_settings.get('whitelisted_pnn')
+                                                or raw_settings['event_channels_pnn'])
+                    r1 = apply_af_unmixing(fl, af.precomputed, np.asarray(af.spectra, dtype=np.float64),
+                                           af_posterior=posterior, log_ssc=log_ssc)
+                    fixed_af = (np.asarray(r1['af_idx'], dtype=np.int64) - 1, r1['af_scale'])
             else:
                 left = apply_transfer_matrix(j['transfer'], raw)
             res = gu.unmix_m2pg(fl, j['spectra'], j['noise'], None if af is None else af.spectra, j['envelope'],
                                 null_var_no_af=j['null_var'], spread=j['spread'], prior_lambda=j['prior_lambda'],
-                                ceiling=j['ceiling'], n_threads=j['n_threads'])
+                                ceiling=j['ceiling'], n_threads=j['n_threads'], fixed_af=fixed_af)
             right = gu.assemble_unmixed(raw, j['transfer'], j['settings'], res, spillover=j['spillover'],
                                         af_index_map=None if af is None else af.index_map)
             self.finished.emit(left, right)
@@ -282,6 +292,7 @@ class NoisePage(QWidget):
             self._option_checks[key] = check
             options_layout.addWidget(check)
         self._option_checks['clamp_mode'].setChecked(True)
+        self._option_checks['sigma0_by_class'].setChecked(True)
         self._options.setVisible(False)
         self._options_toggle.toggled.connect(self._options.setVisible)
         layout.addWidget(self._options)
@@ -534,9 +545,10 @@ class NoisePage(QWidget):
                      f'({n_sel / max(n_root, 1):.0%}) over {len(counts)} samples')
         else:
             where = f'in {entry.get("gate")}'
+        cells = ('no unstained cells (bead controls only)' if entry.get('beads_only') else
+                 f'unstained cells <i>{names.get(entry.get("unstained"), entry.get("unstained"))}</i>')
         lines = [
-            f'<b>Fitted</b> {entry.get("fitted", "")} from {entry.get("n_controls", 0)} controls, '
-            f'unstained cells <i>{names.get(entry.get("unstained"), entry.get("unstained"))}</i>, '
+            f'<b>Fitted</b> {entry.get("fitted", "")} from {entry.get("n_controls", 0)} controls, {cells}, '
             f'bead negatives: {beads or "none"}; {where}.',
         ]
         options = entry.get('options') or {}
@@ -665,14 +677,16 @@ class NoisePage(QWidget):
         if self.bus:
             self.bus.autoSaveRequested.emit()
         name = c.experiment.samples.get('all_samples', {}).get(fit.unstained_path, fit.unstained_path)
+        source = 'from bead controls alone' if fit.beads_only else f'with unstained cells {name}'
+        cells = ' Cells are unmixed with the bead model.' if fit.beads_only else ''
         if fit.clamped:
-            self._fit_status.setText(f'Done. Noise model fitted with unstained cells {name}. The data are clamped '
+            self._fit_status.setText(f'Done. Noise model fitted {source}. The data are clamped '
                                      'at zero, so the experiment is now unmixed with '
                                      f'{gu.clamped_weights_text(fit.clamped_weights.get("kind"))} and the '
                                      'positivity prior, not the noise model.')
         else:
-            self._fit_status.setText(f'Done. Noise model fitted with unstained cells {name}; the experiment is '
-                                     'now unmixed with it.')
+            self._fit_status.setText(f'Done. Noise model fitted {source}; the experiment is '
+                                     f'now unmixed with it.{cells}')
         self._refresh_summary()
         self._refresh_use_check()
         self._method_changed()
@@ -761,6 +775,10 @@ class NoisePage(QWidget):
             self._cmp_status.setText('AF matrices are not available yet for this sample. Wait for the spectral '
                                      'process to finish, then run the comparison again.')
             return
+        context = af_posterior.noise_context(c)
+        if context is not None and af is not None and c.current_sample_path is not None:
+            live = c.live_sample_path is not None and c.current_sample_path == c.live_sample_path
+            af = context.attach(af, c.current_sample_path, live=live)
         note = ''
         envelope = null_var = spread = None
         bead = is_bead_sample(c.experiment.samples, c.current_sample_path)
@@ -788,6 +806,7 @@ class NoisePage(QWidget):
             None if af is None else bytes(np.ascontiguousarray(af.spectra).data),
             self._state_key, lam, cap,
             None if envelope is None else np.asarray(envelope['null_var']).tobytes(), bead, clamped,
+            None if af is None or af.posterior is None else af.posterior.fingerprint,
         )
         if state_key == self._last_cmp_state and self._left_data is not None:
             self._cmp_status.setText(

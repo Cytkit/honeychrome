@@ -199,6 +199,27 @@ def test_signature_does_not_follow_the_displayed_sample():
     assert _signatures(controller)[1] != after_all
 
 
+def test_apply_custom_gate_to_group_copies_to_same_folder_only():
+    controller = _controller(shown='Raw/B.fcs')
+    controller.experiment.samples['all_samples'] = {
+        'Raw/A.fcs': 'A', 'Raw/B.fcs': 'B', 'Raw/C.fcs': 'C', 'Raw/Other/D.fcs': 'D'}
+    _override(controller, 'Raw/B.fcs', 'Cells', 20, 80)
+    controller.apply_custom_gate_to_group('unmixed', 'Cells')
+
+    overrides = controller.custom_sample_gates['unmixed']
+    for key in ('Raw/A.fcs', 'Raw/C.fcs'):
+        dim = overrides[key]['Cells'].dimensions[0]
+        assert (dim.min, dim.max) == (20, 80)
+    assert 'Raw/Other/D.fcs' not in overrides
+    template = controller.unmixed_gating.get_gate('Cells').dimensions[0]
+    assert (template.min, template.max) == (10, 90)
+
+    gating = SampleGating.from_controller(controller)
+    events = SAMPLES['Raw/C.fcs']
+    got = gating.memberships('Raw/C.fcs', events, list(PNN), gate_names=['Cells'])
+    assert np.array_equal(got['Cells'], _expected(events, cells=(20, 80))['Cells'])
+
+
 def test_missing_gate_raises_and_no_gates_keeps_everything():
     controller = _controller()
     sample_gating = SampleGating.from_controller(controller)
@@ -213,9 +234,9 @@ def test_missing_gate_raises_and_no_gates_keeps_everything():
 def _statistics(controller, monkeypatch):
     """Run the Statistics tab's calculator over the three samples; returns
     {(gate, statistic): {sample name: value}}."""
-    from honeychrome.controller_components import statistical_controller as sc
+    from honeychrome.controller_components import functions, statistical_controller as sc
 
-    monkeypatch.setattr(sc, 'sample_from_fcs', lambda path: _FakeSample(SAMPLES[f'Raw/{Path(path).name}']))
+    monkeypatch.setattr(functions, 'sample_from_fcs', lambda path: _FakeSample(SAMPLES[f'Raw/{Path(path).name}']))
     controller.experiment.settings['raw'].update({'event_channels_pnn': list(PNN), 'whitelisted_pnn': None})
     controller.filtered_raw_fluorescence_channel_ids = [0]
     controller.transfer_matrix = np.eye(len(PNN))

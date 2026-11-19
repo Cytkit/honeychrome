@@ -25,7 +25,7 @@ Honeychrome provides these parts of AutoSpectral natively:
   - **Spectral Correction** (Fix My Unmix): attempts to corrects the fluorophore spectra from residual spillover in fully stained samples. This is new. Use it
   with caution.
 
-AutoSpectral Cleaning clears up artifacts due to poor single stain control profiles, for example hypernegative events, skewed data and diagonal correlations, by carrying out saturation exclusion, brightest-event selection, scatter matching and noise removal on the control profiles.
+AutoSpectral Cleaning clears up artifacts due to poor single stain control profiles, for example hypernegative events, skewed data and diagonal correlations, by carrying out saturation exclusion, brightest-event selection and scatter matching on the control profiles.
 
 AutoSpectral AF clears up artifacts due to variable autofluorescence, for example negative spreading, by pairing every event with its best matched autofluorescence spectrum. The noise model, the spectral variants and the spectral corrections then reduce the remaining spread and spillover further.
 
@@ -51,13 +51,12 @@ Click "Show AutoSpectral Cleaning", which brings up the AutoSpectral control cle
 
 Beside it, "Automatically Clean" makes "Auto generate spectral controls" continue straight into Clean Controls, so the cleaning below runs without a second click and the spectral model is only recalculated once. It is ticked by default in new experiments (the default can be changed in App Settings) and is saved with each experiment. Untick it to generate and clean separately.
 
-Two new columns are shown in the spectral controls table: "Use cleaned" and "Exclude Noise". The cleaned profiles are applied when you run Clean Controls. The noise removal is not checked by default, as it is not necessary for controls with low autofluorescence: run it first and see the results. Then consider applying noise removal to controls with high autofluorescence and re-running.
+A new column is shown in the spectral controls table: "Use cleaned". The cleaned profiles are applied when you run Clean Controls; untick "Use cleaned" to go back to the original profile for a control.
 
 You may now click "Clean Controls". The AutoSpectal cleaning pipeline will automatically proceed. Each control will be processed for:
 - Saturation exclusion
 - Brightest-event selection
 - Scatter matching (selection of the best-matching negative cells)
-- Noise removal (subtraction of matching autofluorescence per control event)
 
 ![show_autospectral_cleaning2.png](/assets/show_autospectral_cleaning2.png)
 

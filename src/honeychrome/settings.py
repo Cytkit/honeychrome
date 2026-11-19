@@ -54,6 +54,7 @@ library_file = 'spectral_controls_library.db'
 
 ### define default channels for trace analyser and experiment model - these should match the channels in the instrument
 max_events_in_cache = 10_000_000
+max_events_in_cache_dummy_instrument = 1_000_000
 adc_channels = ['FSC', 'SSC', 'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14']
 area_channels = ['FSC', 'SSC', 'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B13', 'B14'] # make sure there is equal number to n_channels_trace in instrument config
 height_channels = ['FSC']
@@ -77,6 +78,7 @@ heatmap_colourmap_name = 'bkr'  # default diverging palette for heatmaps
 heatmap_colourmap_choice = ['coolwarm', 'bkr', 'CET_D1', 'CET_D8', 'bjy', 'gwv', 'bwy']
 hist2dtype = '2D Histogram'
 send_debug_data = True # on by default
+detailed_log = False  # write DEBUG messages to honeychrome.log
 hist2dtypes = ['2D Histogram', 'Dot plot coloured by gate']
 report_include_raw = False
 report_include_unmixed = True
@@ -95,7 +97,7 @@ hist_bins = 200 # for displaying histograms
 label_offset_default = (0, -0.03) # for gate labels
 subsample = 10_000 # for exporting FCS files
 max_display_events = 500_000  # cap on events shown in cytometry display plots (None = no cap)
-unmixing_cache_gb = 8  # per experiment: on-disk noise-model / variants unmixing results (cache/unmixed)
+unmixing_cache_gb = 8  # per experiment: limit on the rebuildable files in the experiment's cache folder
 density_cutoff = 1 # bin count to set to first level of colourmap in 2d histograms (below this level is transparent)
 
 line_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
@@ -233,6 +235,7 @@ samples_default = {
     'unstained_samples': [],
     'bead_samples': [],
     'bead_checked_samples': [],
+    'collapsed_folders': [],
 }
 
 process_default = {
@@ -248,6 +251,8 @@ process_default = {
     'spillover': None,
     'af_profiles': {},
     'cleaned_meta': {},
+    'af_abundance': 'noise_aware',   # experiments saved without it keep the clamped AF abundance
+    'af_shape_bend': True,           # AF shape bend on high-AF cells (af_shape_bend); on when unset
 }
 
 cytometry_default = {
@@ -276,6 +281,14 @@ trigger_channel_retrieved = str(q_settings.value("trigger_channel", trigger_chan
 width_channel_retrieved = str(q_settings.value("width_channel", width_channels[0]))  # there can be more than one width channel, but currently only allowing one
 height_channel_retrieved = str(q_settings.value("height_channel", height_channels))  # there can be more than one height channel, but currently only allowing one
 use_dummy_instrument_retrieved = q_settings.value("use_dummy_instrument", use_dummy_instrument, type=bool)
+
+# The events cache is shared memory allocated at startup, and on Windows its full size is
+# reserved against RAM plus page file whether or not it is used. The dummy instrument only
+# demonstrates acquisition, so it gets a cache of 1 million events (160 MB) instead of
+# 10 million (1.6 GB). The instrument setting takes effect at the next start, and every
+# process reads the same value, so they all agree on the cache size.
+if use_dummy_instrument_retrieved:
+    max_events_in_cache = max_events_in_cache_dummy_instrument
 
 spectral_positive_gate_percent_retrieved = q_settings.value("spectral_positive_gate_percent", spectral_positive_gate_percent, type=int)
 spectral_negative_gate_percent_retrieved = q_settings.value("spectral_negative_gate_percent", spectral_negative_gate_percent, type=int)

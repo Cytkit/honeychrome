@@ -32,6 +32,7 @@ methods:
 '''
 
 import time
+import errno
 import json
 import sys
 from copy import deepcopy
@@ -88,6 +89,10 @@ def check_fcs_matches_experiment(sample_full_path, experiment_pnn_raw, magnitude
     # This permits FACSDiscover files with different derived-parameter sets to coexist.
     channels_match = set(experiment_pnn_raw).issubset(set(sample_pnn))
     return channels_match
+
+class ExperimentFileError(ValueError):
+    """An experiment file that cannot be read as an experiment; the message is for the user."""
+
 
 class ExperimentModel:
     def __init__(self):
@@ -184,14 +189,21 @@ class ExperimentModel:
     def load(self, experiment_path) -> bool:
         """Read a .kit. Returns True when the file had no experiment id and
         one was given to it, so the caller can save to keep it."""
+        try:
+            with open(experiment_path, "rb") as f:
+                file_data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise ExperimentFileError(
+                f'{experiment_path} cannot be opened: the file is empty or damaged. '
+                f'If the experiment is in a cloud-synced folder, check that the file has finished '
+                f'downloading.') from e
         self.experiment_path = str(experiment_path)
-        with open(self.experiment_path, "rb") as f:
-            file_data = json.load(f)
 
         self.settings = file_data['settings']
         self.samples = file_data['samples']
         self.process = file_data['process']
         self.samples.setdefault('unstained_samples', [])  # not present in older .kit files
+        self.samples.setdefault('collapsed_folders', [])  # not present in older .kit files
         self.cytometry = file_data['cytometry']
         self.statistics = file_data['statistics']
 
@@ -227,6 +239,9 @@ class ExperimentModel:
     def generate_subdirs(self):
         experiment_pl = Path(self.experiment_path)
         experiment_dir = experiment_pl.parent / experiment_pl.stem
+        if not experiment_pl.parent.is_dir():
+            # never recreate the path of a disconnected drive
+            raise FileNotFoundError(errno.ENOENT, 'Experiment folder is not available', str(experiment_pl.parent))
 
         for subdir in (self.settings['raw']['single_stain_controls_subdirectory'], self.settings['raw']['raw_samples_subdirectory'], self.settings['unmixed']['unmixed_samples_subdirectory']):
             subdir_path = experiment_dir / subdir

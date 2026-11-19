@@ -60,6 +60,7 @@ from honeychrome import __version__
 
 import pyqtgraph as pg
 from shiboken6 import isValid
+from honeychrome.experiment_model import ExperimentFileError
 
 base_directory = str(Path.home() / experiments_folder)
 
@@ -151,6 +152,7 @@ class View(QObject):
         self.bus.customiseGateRequested.connect(self.controller.customise_gate)
         self.bus.revertGateRequested.connect(self.controller.revert_gate_to_template)
         self.bus.adoptGateRequested.connect(self.controller.adopt_custom_gate_as_template)
+        self.bus.applyGateToGroupRequested.connect(self.controller.apply_custom_gate_to_group)
 
         # change spectral model, unmix!, change fine tuning matrix
         self.bus.spectralModelUpdated.connect(self.controller.refresh_spectral_process)
@@ -244,15 +246,16 @@ class View(QObject):
             self.bus.statusMessage.emit(status)
             # QTimer.singleShot(0, lambda: self.bus.statusMessage.emit(f'Failed to load sample.'))
 
-        except FileNotFoundError as e:
+        except (FileNotFoundError, ExperimentFileError) as e:
             warnings.warn(f'{e}')
+            self.current_window.blockSignals(False)
             if self.bus:
                 self.bus.warningMessage.emit(f'{e}')
 
 
     @Slot(str)
     def set_main_window_title(self, title):
-        if self.main_window:
+        if self.main_window is not None and isValid(self.main_window):
             self.main_window.setWindowTitle(f'Honeychrome by Cytkit: {title}')
 
     @Slot()

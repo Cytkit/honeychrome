@@ -163,8 +163,12 @@ from honeychrome.view_components.ordered_multi_sample_picker import OrderedMulti
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 from honeychrome.view_components.side_tab_widget import SideTabWidget
+from honeychrome.view_components.scalable_figure_widget import (
+    figure_toolbar, report_saved, results_folder, save_figure, start_path,
+)
 from honeychrome.controller_components import covariate_check, sample_table
 from honeychrome.controller_components import trend_stats
+from honeychrome.controller_components import anova_stats
 from honeychrome.view_components import trend_plots
 from honeychrome.view_components import suggest_groupings_dialog as sgd
 from honeychrome.view_components import covariate_check_dialog, sample_table_import_dialog
@@ -216,6 +220,7 @@ import drc_workspace_export
 import drc_time_estimate
 import drc_run_align
 import drc_umap_index
+import drc_gating_confirmation
 from transforms_panel import (
     TransformInspector, pool_population_events, transform_from_params,
     transform_params as _transform_params,
@@ -421,6 +426,12 @@ def _qs_int(settings, key: str, default=None):
         return int(raw)
     except (TypeError, ValueError):
         return default
+
+
+def _reports_folder(controller):
+    """The experiment's Honeycluster_Reports folder, where figures are
+    exported ('' when no experiment is open)."""
+    return results_folder(getattr(controller, 'experiment_dir', ''), drc_report.REPORTS_SUBDIR)
 
 
 def _with_extension(path: str, ext: str) -> str:
@@ -946,8 +957,13 @@ class PipelineState:
     # Baseline group for 'reference' mode.
     paired: bool = False
     pairing_variable: str = ''
-    # Column name in state.covariates used as a fixed-effect blocking term
-    # when paired=True (e.g. donor ID).
+    # Column name in state.covariates used as a blocking term when
+    # paired=True (e.g. donor ID).
+    pairing_mode: str = 'auto'
+    # How the pairing variable enters the model
+    # (differential_stats.resolve_pairing): 'fixed' (within-individual
+    # comparisons), 'random' (repeated samples of individuals nested in the
+    # groups) or 'auto' (random when every individual is in one group).
     population_split: bool = False
     # True: compare gated populations within samples (e.g. CD45.1+ vs
     #   CD45.1- cells of each chimera) instead of sample groups. Samples of
@@ -1016,6 +1032,9 @@ class PipelineState:
     # raw (samples x clusters) count matrix
     mfi_results: pd.DataFrame | None = None
     # moderated linear model output for per-cluster marker MFIs
+    anova_results: dict = field(default_factory=dict)
+    # variance tables of the last Run Statistics (drc_stats.run_statistics):
+    # 'freq' and 'mfi' (anova_stats.run_anova, either may be None) and 'notes'
     mfi_df: pd.DataFrame | None = None
     # raw (samples x cluster·channel) MFI matrix, each channel on its
     # configured Transforms-tab scale (Logicle/biexponential/linear)
@@ -1273,7 +1292,9 @@ class _SortableItem(QTableWidgetItem):
                     return a < b
                 except TypeError:
                     pass
-        return super().__lt__(other)
+        # Not QTableWidgetItem.__lt__: called from this override, it calls
+        # the override again.
+        return self.text() < other.text()
 
 
 class RunDetailDialog(QDialog):
@@ -1361,7 +1382,8 @@ class RunDetailDialog(QDialog):
         e = self.entry
         default_name = f"{e.get('label', 'run')}_config.csv".replace(' ', '_')
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Run Config CSV", default_name, "CSV files (*.csv)"
+            self, "Save Run Config CSV", start_path(_reports_folder(self.controller), default_name),
+            "CSV files (*.csv)"
         )
         if not path:
             return
@@ -1496,7 +1518,8 @@ class RunManagementTable(CopyableTableWidget):
         self.setItem(row, 5, events_item)
 
         channels = entry.get('channels', [])
-        ch_item = QTableWidgetItem(str(len(channels)))
+        ch_item = _SortableItem(str(len(channels)))
+        ch_item.set_sort_key(len(channels))
         ch_item.setToolTip(', '.join(channels))
         self.setItem(row, 6, ch_item)
 
@@ -3130,6 +3153,8 @@ class GroupsStatsTab(QWidget):
     results_computed = Signal()
     # Emitted once the result figures have been built and shown as tabs.
     results_drawn = Signal()
+    # (run id, cluster name): "Confirm by gating…" on a result figure.
+    gatingConfirmationRequested = Signal(str, str)
 
     def __init__(self, state: PipelineState, bus, controller, parent=None):
         super().__init__(parent)
@@ -3443,6 +3468,26 @@ class GroupsStatsTab(QWidget):
         )
         self.pairing_variable_combo.currentTextChanged.connect(self._on_pairing_variable_changed)
         paired_row.addWidget(self.pairing_variable_combo)
+        paired_row.addWidget(QLabel("Individual effect:"))
+        self.pairing_mode_combo = QComboBox()
+        for text, key in (("Auto", 'auto'), ("Fixed (paired)", 'fixed'),
+                          ("Random (repeated samples)", 'random')):
+            self.pairing_mode_combo.addItem(text, key)
+        self.pairing_mode_combo.setEnabled(False)
+        self.pairing_mode_combo.setToolTip(
+            "How the pairing variable enters the model.\n"
+            "Fixed: groups are compared within each individual (before and after "
+            "samples of one donor, two populations of one animal). Each individual "
+            "needs samples in more than one group.\n"
+            "Random: each individual gives several samples (e.g. four tissues per "
+            "mouse) but belongs to one group (knockout or wild type). The samples "
+            "of one individual are treated as correlated, so the group difference "
+            "is judged against the variation between individuals rather than "
+            "between samples. The counts test is not run in this mode.\n"
+            "Auto: Random when every individual belongs to one group, Fixed "
+            "otherwise.")
+        self.pairing_mode_combo.currentIndexChanged.connect(self._on_pairing_mode_changed)
+        paired_row.addWidget(self.pairing_mode_combo)
         paired_row.addStretch()
         test_groups_layout.addLayout(paired_row)
 
@@ -4065,6 +4110,17 @@ class GroupsStatsTab(QWidget):
             "a different split. More repeats give steadier estimates."
         )
         pred_row.addWidget(self.pred_repeats_spin)
+        pred_row.addSpacing(12)
+        self.pred_chk_donors = QCheckBox("Keep donors together")
+        self.pred_chk_donors.setChecked(True)
+        self.pred_chk_donors.setToolTip(
+            "With a paired design (Pairing variable), every cross-validation split keeps "
+            "all samples of a donor on the same side, so the model is never tested on a "
+            "donor it was trained on. Needs at least "
+            f"{drc_predictive.MIN_DONORS_PER_GROUP} donors per group. Untick to split "
+            "samples alone. No effect without a paired design."
+        )
+        pred_row.addWidget(self.pred_chk_donors)
         pred_row.addStretch()
         pred_layout.addLayout(pred_row)
 
@@ -4496,6 +4552,7 @@ class GroupsStatsTab(QWidget):
         self._population_panel.setVisible(split)
         self.chk_paired.setEnabled(not split)
         self.pairing_variable_combo.setEnabled(not split and self.state.paired)
+        self.pairing_mode_combo.setEnabled(not split and self.state.paired)
         self.adjust_covariates_list.setEnabled(not split)
         self.test_groups_hint.setText(
             "Check the groups whose samples are split into the populations below."
@@ -4506,8 +4563,20 @@ class GroupsStatsTab(QWidget):
     def _on_paired_toggled(self, checked: bool):
         self.state.paired = checked
         self.pairing_variable_combo.setEnabled(checked)
+        self.pairing_mode_combo.setEnabled(checked)
         self._last_stats_data_key = None
         self._update_run_button()
+
+    def _on_pairing_mode_changed(self, _index: int):
+        self.state.pairing_mode = self.pairing_mode_combo.currentData() or 'auto'
+        self._last_stats_data_key = None
+
+    def _load_pairing_mode_combo(self):
+        self.pairing_mode_combo.blockSignals(True)
+        self.pairing_mode_combo.setCurrentIndex(
+            max(self.pairing_mode_combo.findData(self.state.pairing_mode), 0))
+        self.pairing_mode_combo.blockSignals(False)
+        self.pairing_mode_combo.setEnabled(self.state.paired and not self.state.population_split)
 
     def _populate_pairing_variable_combo(self):
         cols = list(self.state.covariates.columns) if self.state.covariates is not None else []
@@ -4719,6 +4788,7 @@ class GroupsStatsTab(QWidget):
         self.chk_paired.setChecked(self.state.paired)
         self.chk_paired.blockSignals(False)
         self.pairing_variable_combo.setEnabled(self.state.paired)
+        self._load_pairing_mode_combo()
         self.chk_treat.setChecked(self.state.stats_use_treat)
         self.chk_mfi_hierarchical.setChecked(self.state.stats_mfi_hierarchical)
         self.counts_method_combo.setCurrentIndex(
@@ -4837,6 +4907,8 @@ class GroupsStatsTab(QWidget):
         if self.state.trend_results and not self._has_results_tab('trend_tables'):
             self._show_trend_tables()
             self._show_trend_figures()
+        if self.state.anova_results and not self._has_results_tab('anova_tables'):
+            self._show_anova_tables()
 
     # ------------------------------------------------------------------
     # Table population
@@ -5431,6 +5503,8 @@ class GroupsStatsTab(QWidget):
             self.state.freq_results = None
             self.state.counts_results = None
             self.state.mfi_results = None
+            self.state.anova_results = {}
+            self._remove_results_tab_by_key('anova_tables')
             self.state.freq_df = None
             self.state.counts_df = None
             self.state.mfi_df = None
@@ -5684,7 +5758,8 @@ class GroupsStatsTab(QWidget):
         default = sample_table.default_export_path(
             getattr(self.controller, 'experiment_dir', ''), 'Honeycluster')
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Group Assignments", default, "CSV files (*.csv)"
+            self, "Export Group Assignments",
+            start_path(_reports_folder(self.controller), Path(default).name), "CSV files (*.csv)"
         )
         if not path:
             return
@@ -5906,6 +5981,41 @@ class GroupsStatsTab(QWidget):
         container.setProperty('_tab_key', 'trend_tables')
         index = self._results_tabs.addTab(container, "Trend tables")
         self._results_tabs.setCurrentIndex(index)
+
+    def _show_anova_tables(self):
+        """The 'Variance' results tab: for every cluster (and marker), each
+        term's FDR and the share of variation it explains
+        (anova_stats.run_anova), with the notes of the run above."""
+        anova = self.state.anova_results or {}
+        self._remove_results_tab_by_key('anova_tables')
+        if anova.get('freq') is None and anova.get('mfi') is None:
+            return
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        if anova.get('notes'):
+            note = QLabel(" ".join(anova['notes']))
+            note.setWordWrap(True)
+            layout.addWidget(note)
+        inner = QTabWidget()
+        for key, title in (('freq', 'Frequencies'), ('mfi', 'MFIs')):
+            table_df = anova.get(key)
+            if table_df is None:
+                continue
+            ids = ['feature', 'cluster', 'channel'] if key == 'mfi' else ['feature']
+            headers, rows = anova_stats.display_rows(table_df, ids)
+            if key == 'mfi':
+                headers = ['Cluster', 'Marker'] + headers[3:]
+                rows = [dict({'Cluster': r.pop('cluster', ''), 'Marker': r.pop('channel', '')},
+                             **{k: v for k, v in r.items() if k != 'feature'}) for r in rows]
+            else:
+                headers = ['Cluster'] + headers[1:]
+                rows = [dict({'Cluster': r.pop('feature', '')}, **r) for r in rows]
+            table = CopyableTableWidget(rows, headers)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            inner.addTab(table, title)
+        layout.addWidget(inner)
+        container.setProperty('_tab_key', 'anova_tables')
+        self._results_tabs.addTab(container, "Variance")
 
     # Trend results: tested values per kind, and the figure tabs' keys.
     _TREND_DATA = {'freq': ('freq_data', 'log2 % of events'),
@@ -6446,7 +6556,6 @@ class GroupsStatsTab(QWidget):
 
     def _trend_plot_window(self, kind: str, feature: str, show_line: bool = False):
         """One feature's trend plot in its own window, with its values as CSV."""
-        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
         label = self._trend_feature_label(kind, feature)
         fig = self._make_trend_plot(kind, feature, show_line)
         ref = self._figure_options_ref('trend_plot')
@@ -6460,9 +6569,9 @@ class GroupsStatsTab(QWidget):
             canvas.mpl_connect('motion_notify_event', fig._hover_handler)
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(4, 4, 4, 4)
-        layout.addWidget(NavigationToolbar2QT(canvas, dlg))
-        layout.addWidget(canvas, stretch=1)
         stem = re.sub(r'[^\w.-]+', '_', f"trend_{label}")
+        layout.addWidget(figure_toolbar(canvas, dlg, _reports_folder(self.controller), stem))
+        layout.addWidget(canvas, stretch=1)
         row = QHBoxLayout()
         row.addStretch()
         csv_btn = QPushButton("Export Values (CSV)")
@@ -6773,6 +6882,7 @@ class GroupsStatsTab(QWidget):
         self.state.mfi_results = snap.mfi_results if ran_mfi else None
         self.state.mfi_df = snap.mfi_df if ran_mfi else None
         self.state.mfi_sample_df = snap.mfi_sample_df if ran_mfi else None
+        self.state.anova_results = dict(snap.anova_results or {})
         self.state.stats_cluster_names = dict(snap.stats_cluster_names)
 
     def _set_stats_busy(self, busy: bool):
@@ -6889,6 +6999,7 @@ class GroupsStatsTab(QWidget):
         test_fingerprint = (
             tuple(self.state.testing_group_selection), self.state.contrast_mode,
             self.state.reference_group, self.state.paired, self.state.pairing_variable,
+            self.state.pairing_mode if paired else None,
             tuple(adjust_covariates), covariate_values,
             tuple(c for c in adjust_covariates if c in self.state.numeric_covariates),
             self.state.stats_counts_method if run_counts else None,
@@ -7601,6 +7712,7 @@ class GroupsStatsTab(QWidget):
         self._update_pca_source_availability()
         self._refresh_predictive_controls()
         self._draw_results()
+        self._show_anova_tables()
         self.results_computed.emit()
 
     # ------------------------------------------------------------------
@@ -7675,6 +7787,8 @@ class GroupsStatsTab(QWidget):
             rel_list,
         )
         repeats = self.pred_repeats_spin.value()
+        pairing = self._trend_pairing(rel_list) if self.pred_chk_donors.isChecked() else None
+        blocks = [pairing.get(rel, rel) for rel in rel_list] if pairing else None
         run_label = self.state.stats_run_label or 'Active (unsaved)'
         token = acquire_job(self.controller, 'Honeycluster: predictive analysis')
         if token is None:
@@ -7694,7 +7808,7 @@ class GroupsStatsTab(QWidget):
                 try:
                     self_.result = drc_predictive.run_predictive(
                         X, groups, positive, negative, models=tuple(models),
-                        repeats=repeats, progress=self_.progress.emit,
+                        repeats=repeats, blocks=blocks, progress=self_.progress.emit,
                     )
                     self_.result['run_label'] = run_label
                     self_.finished.emit(True, '')
@@ -7772,6 +7886,8 @@ class GroupsStatsTab(QWidget):
         n = ", ".join(f"{g} n={k}" for g, k in summary['n_per_group'].items())
         text = (f"{summary['positive']} vs {summary['negative']} ({n}); "
                 f"{summary['repeats']}× repeated {summary['outer_folds']}-fold CV")
+        if summary.get('n_donors'):
+            text += f", {summary['n_donors']} donors kept together"
         if summary.get('status') == 'warn':
             text += (f"\nfewer than {drc_predictive.RECOMMENDED_PER_GROUP} per group: "
                      "estimates are noisy")
@@ -7885,7 +8001,6 @@ class GroupsStatsTab(QWidget):
         Sample PCA) outside of _draw_results, using the same pop-out/
         export machinery as the heatmap/volcano tabs.
         """
-        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
         from PySide6.QtWidgets import QDialog
         from honeychrome.view_components import figure_options as fo
 
@@ -7907,6 +8022,7 @@ class GroupsStatsTab(QWidget):
         dpi  = fig.get_dpi()
         w_px = int(fig.get_figwidth()  * dpi)
         h_px = int(fig.get_figheight() * dpi)
+        natural_inches = tuple(fig.get_size_inches())
 
         # these plots routinely overflowed the viewport at full
         # size. The inline canvas now starts at roughly a third of the
@@ -7977,7 +8093,8 @@ class GroupsStatsTab(QWidget):
             if hasattr(dlg_fig, '_hover_handler'):
                 dlg_canvas.mpl_connect('motion_notify_event', dlg_fig._hover_handler)
             self._connect_value_menu(dlg_canvas, dlg_fig, key, maker_kwargs)
-            dlg_toolbar = NavigationToolbar2QT(dlg_canvas, None)
+            dlg_toolbar = figure_toolbar(dlg_canvas, None, _reports_folder(self.controller),
+                                         export_stem)
 
             class _PlotDialog(QDialog):
                 def closeEvent(self_, event):
@@ -8019,7 +8136,7 @@ class GroupsStatsTab(QWidget):
         export_btn = QPushButton("Export Figure" if values_table is not None
                                  else f"Export {tab_title}")
         export_btn.clicked.connect(lambda checked=False, f=fig, s=export_stem:
-                                   self._export_figure(f, s))
+                                   self._export_figure(f, s, natural_inches))
         btn_row.addWidget(popout_btn)
         btn_row.addWidget(export_btn)
         if values_table is not None:
@@ -8140,6 +8257,10 @@ class GroupsStatsTab(QWidget):
         act_tab = menu.addAction("Add per-sample values as a results tab (listed in the report)")
         act_window.triggered.connect(lambda: self._values_window(kwargs))
         act_tab.triggered.connect(lambda: self._values_tab(kwargs))
+        if kind in ('freq', 'counts') and self.state.stats_run_id:
+            act_gates = menu.addAction("Confirm by gating…")
+            act_gates.triggered.connect(lambda: self.gatingConfirmationRequested.emit(
+                self.state.stats_run_id, str(feature)))
         menu.exec(QCursor.pos())
 
     def _clicked_feature(self, event, fig, key: str, maker_kwargs: dict) -> str | None:
@@ -8233,8 +8354,8 @@ class GroupsStatsTab(QWidget):
         return pd.DataFrame(rows, columns=['sample', 'group', 'feature', value_label])
 
     def _export_values_csv(self, table: pd.DataFrame, stem: str):
-        """Save a values table as CSV, by default in the experiment folder."""
-        start = str(Path(self.controller.experiment_dir) / f"{stem}.csv")
+        """Save a values table as CSV, by default in Honeycluster_Reports."""
+        start = start_path(_reports_folder(self.controller), f"{stem}.csv")
         path, _ = QFileDialog.getSaveFileName(self, "Export Values", start, "CSV files (*.csv)")
         if not path:
             return
@@ -8264,7 +8385,6 @@ class GroupsStatsTab(QWidget):
 
     def _values_window(self, kwargs: dict):
         """The per-sample values of one feature in their own window."""
-        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
         fig = self._make_values_figure(**kwargs)
         dlg = QDialog(self)
         dlg.setWindowTitle(self._feature_display_label(kwargs['kind'], kwargs['feature']))
@@ -8274,7 +8394,8 @@ class GroupsStatsTab(QWidget):
             canvas.mpl_connect('motion_notify_event', fig._hover_handler)
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(4, 4, 4, 4)
-        layout.addWidget(NavigationToolbar2QT(canvas, dlg))
+        stem = re.sub(r'[^\w.-]+', '_', f"values_{self._feature_display_label(kwargs['kind'], kwargs['feature'])}")
+        layout.addWidget(figure_toolbar(canvas, dlg, _reports_folder(self.controller), stem))
         layout.addWidget(canvas, stretch=1)
         dpi = fig.get_dpi()
         dlg.resize(int(fig.get_figwidth() * dpi) + 24, int(fig.get_figheight() * dpi) + 80)
@@ -8841,21 +8962,34 @@ class GroupsStatsTab(QWidget):
             family_label='cluster',
         )
 
-    def _export_figure(self, fig, stem: str):
-        """Save a matplotlib Figure to disk."""
+    def _export_figure(self, fig, stem: str, size_inches=None):
+        """Save a results-tab figure to the Honeycluster_Reports folder, at
+        its natural size (*size_inches*) whatever size the tab shows it at."""
         fmt = getattr(hc_settings, 'graphics_export_format_retrieved', 'png')
-        exp_dir = self.controller.experiment_dir
-        out_path = exp_dir / f"{stem}.{fmt}"
+        folder = _reports_folder(self.controller)
+        if not folder:
+            QMessageBox.warning(self, "Export", "There is no experiment folder to export to.")
+            return
+        out_path = folder / f"{stem}.{fmt}"
+        shown = tuple(fig.get_size_inches())
+        if size_inches is not None:
+            fig.set_size_inches(*size_inches, forward=False)
         try:
-            fig.savefig(out_path, bbox_inches='tight')
-            QMessageBox.information(self, "Exported", f"Saved to {out_path}")
+            save_figure(fig, out_path)
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
+            return
+        finally:
+            fig.set_size_inches(*shown, forward=False)
+            if fig.canvas is not None:
+                fig.canvas.draw_idle()
+        report_saved(self, out_path)
 
     def _export_results_csv(self):
         """Export all statistics results to a combined CSV."""
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Statistics Results", "", "CSV files (*.csv)"
+            self, "Export Statistics Results",
+            start_path(_reports_folder(self.controller), 'statistics_results.csv'), "CSV files (*.csv)"
         )
         if not path:
             return
@@ -8868,6 +9002,11 @@ class GroupsStatsTab(QWidget):
                 frames['Counts (GLM)'] = self.state.counts_results
             if self.state.mfi_results is not None:
                 frames['MFIs'] = self.state.mfi_results
+            anova = self.state.anova_results or {}
+            for key, title in (('freq', 'Variance table: Frequencies'),
+                               ('mfi', 'Variance table: MFIs')):
+                if anova.get(key) is not None:
+                    frames[title] = anova[key]
 
             if not frames:
                 QMessageBox.warning(self, "No Results", "No statistics results to export.")
@@ -8896,7 +9035,7 @@ class GroupsStatsTab(QWidget):
             QMessageBox.warning(self, "No Results", "No statistics results to export.")
             return
         folder = QFileDialog.getExistingDirectory(
-            self, "Export Tables to Folder", str(self.controller.experiment_dir))
+            self, "Export Tables to Folder", start_path(_reports_folder(self.controller), ''))
         if not folder:
             return
         stem = drc_report.sanitize_filename(self.state.stats_run_label or 'honeycluster')
@@ -9969,8 +10108,11 @@ class WorkspaceTab(QWidget):
         pages = (list(range(len(self.scene.pages))) if pages_combo.currentIndex() == 0
                  else [self.scene.current_page])
         ext = {'PDF': '.pdf', 'SVG': '.svg', 'PNG': '.png', 'TIFF': '.tif'}[fmt]
+        folder = _reports_folder(self.controller)
+        if folder:
+            folder.mkdir(parents=True, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
-            self, f"Export {fmt}", f"Layout{ext}", f"{fmt} files (*{ext})")
+            self, f"Export {fmt}", str(Path(folder or '.') / f"Layout{ext}"), f"{fmt} files (*{ext})")
         if not path:
             return
         self.export_pages(path, fmt, pages, int(dpi_combo.currentData()),
@@ -9994,8 +10136,10 @@ class WorkspaceTab(QWidget):
             traceback.print_exc()
             QMessageBox.warning(self, "Export Error", str(e))
             return []
-        names = "\n".join(p.name for p in written)
-        QMessageBox.information(self, "Exported", f"Saved to {target.parent}:\n{names}")
+        if len(written) == 1:
+            report_saved(self, written[0])
+        elif written:
+            report_saved(self, f"{len(written)} files to {target.parent}")
         return written
 
     def export_plot_png(self, card: 'PlotCard'):
@@ -10006,8 +10150,11 @@ class WorkspaceTab(QWidget):
 
     def export_item_png(self, item):
         """Export one item (a plot with its separate legend) as a 300 dpi PNG."""
+        folder = _reports_folder(self.controller)
+        if folder:
+            folder.mkdir(parents=True, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export PNG", f"{item.uid}.png", "PNG files (*.png)")
+            self, "Export PNG", str(Path(folder or '.') / f"{item.uid}.png"), "PNG files (*.png)")
         if not path:
             return
         path = _with_extension(path, '.png')
@@ -10019,7 +10166,7 @@ class WorkspaceTab(QWidget):
                 entries, w, h, drc_workspace_export.DEFAULT_EXPORT_DPI)
             drc_workspace_export.save_raster(array, Path(path), 'PNG',
                                              drc_workspace_export.DEFAULT_EXPORT_DPI)
-            QMessageBox.information(self, "Exported", f"Saved to {path}")
+            report_saved(self, path)
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
 
@@ -12773,6 +12920,9 @@ class ClusterAnnotationTab(QWidget):
          one means retyping it into Name yourself).
     """
 
+    # (run id, cluster id): "Confirm by gating…" on the cluster table.
+    gatingConfirmationRequested = Signal(str, object)
+
     def __init__(self, state: PipelineState, bus, controller, parent=None):
         super().__init__(parent)
         self.state = state
@@ -13110,6 +13260,8 @@ class ClusterAnnotationTab(QWidget):
         )
         self.label_table.itemChanged.connect(self._on_table_item_changed)
         self.label_table.cellDoubleClicked.connect(self._on_table_cell_double_clicked)
+        self.label_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.label_table.customContextMenuRequested.connect(self._on_label_table_menu)
         table_layout.addWidget(self.label_table)
         splitter.addWidget(table_box)
 
@@ -14047,7 +14199,6 @@ class ClusterAnnotationTab(QWidget):
         with the same pan/zoom toolbar the Stats results tabs already
         have, and its own copy of the swatch legend."""
         from matplotlib.figure import Figure
-        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 
         cl_run = self._selected_cluster_run()
         dr_run = self._selected_dr_run()
@@ -14059,7 +14210,8 @@ class ClusterAnnotationTab(QWidget):
 
         dlg_canvas = _new_scrollable_canvas(dlg_fig)
         dlg_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        dlg_toolbar = NavigationToolbar2QT(dlg_canvas, None)
+        dlg_toolbar = figure_toolbar(dlg_canvas, None, _reports_folder(self.controller),
+                                     'cluster_map')
 
         dlg_legend_scroll = QScrollArea()
         dlg_legend_scroll.setWidgetResizable(True)
@@ -14361,6 +14513,21 @@ class ClusterAnnotationTab(QWidget):
                 self._rebuild_map_legend(cl_run)
                 self._populate_label_table()
                 self._redraw_cluster_figures()
+
+    def _on_label_table_menu(self, pos):
+        """Right-click on a cluster row: confirm the cluster by gating."""
+        item = self.label_table.itemAt(pos)
+        run_id = self.run_combo.currentData()
+        if item is None or run_id is None:
+            return
+        cl_id = self.label_table.item(item.row(), 0).data(Qt.UserRole)
+        if cl_id is None:
+            return
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        act = menu.addAction("Confirm by gating…")
+        act.triggered.connect(lambda: self.gatingConfirmationRequested.emit(run_id, int(cl_id)))
+        menu.exec(self.label_table.viewport().mapToGlobal(pos))
 
     # ------------------------------------------------------------------
     # Panel 4 — Cluster ID suggestions
@@ -15291,8 +15458,9 @@ class PluginWidget(QWidget):
     Top-level plugin widget.
 
     Inserted as a tab in the Honeychrome main window by plugin_loaders.py.
-    Owns the PipelineState and all six inner tabs (Transforms,
-    Configuration, Cluster Annotation, Stats, Workspace, Report).
+    Owns the PipelineState and all seven inner tabs (Transforms,
+    Configuration, Cluster Annotation, Stats, Gating confirmation, Layout,
+    Report).
 
     The outer layer follows the exact pattern of the Honeychrome example
     plugin: a disabled-label shown when unmixing is not yet available,
@@ -15404,6 +15572,14 @@ class PluginWidget(QWidget):
         self.groups_stats_tab.results_computed.connect(self.save_state)
         self.workspace_tab = WorkspaceTab(self.state, bus, controller)
         self.cluster_annotation_tab = ClusterAnnotationTab(self.state, bus, controller)
+        self.gating_confirmation_tab = drc_gating_confirmation.GatingConfirmationTab(
+            self.state, bus, controller,
+            channel_labels=lambda: _antigen_dash_labels(controller),
+            fdr_threshold=lambda: self.groups_stats_tab.pval_spin.value(),
+        )
+        self.groups_stats_tab.gatingConfirmationRequested.connect(self._open_gating_confirmation)
+        self.cluster_annotation_tab.gatingConfirmationRequested.connect(
+            self._open_gating_confirmation)
         # Built last -- holds references to the four tabs above so it can
         # enumerate their currently-rendered plots/tables (see
         # drc_report.ReportTab.get_report_items callers).
@@ -15412,6 +15588,7 @@ class PluginWidget(QWidget):
             workspace_tab=self.workspace_tab,
             groups_stats_tab=self.groups_stats_tab,
             cluster_annotation_tab=self.cluster_annotation_tab,
+            gating_confirmation_tab=self.gating_confirmation_tab,
         )
 
         # Figures the Workspace can copy onto its pages
@@ -15428,7 +15605,9 @@ class PluginWidget(QWidget):
         guard_while_busy(controller, self.config_tab.dr_run_btn, self.config_tab.dr_apply_btn,
                          self.config_tab.cl_run_btn, self.groups_stats_tab.run_stats_btn,
                          self.groups_stats_tab.pred_run_btn,
-                         self.cluster_annotation_tab.compute_suggestions_btn)
+                         self.cluster_annotation_tab.compute_suggestions_btn,
+                         self.gating_confirmation_tab.find_btn,
+                         self.gating_confirmation_tab.find_all_btn)
         if getattr(controller, 'job_gate', None) is not None:
             controller.job_gate.changed.connect(self.groups_stats_tab.on_job_gate_changed)
 
@@ -15436,6 +15615,7 @@ class PluginWidget(QWidget):
         self.inner_tabs.addTab(self.config_tab,       "Configuration", 'settings')
         self.inner_tabs.addTab(self.cluster_annotation_tab, "Cluster Annotation", 'shape')
         self.inner_tabs.addTab(self.groups_stats_tab, "Stats",         'table')
+        self.inner_tabs.addTab(self.gating_confirmation_tab, "Gating confirmation", 'rectangle')
         self.inner_tabs.addTab(self.workspace_tab,    "Layout",        'border-all')
         self.inner_tabs.addTab(self.report_tab,       "Report",        'file-description')
 
@@ -15506,6 +15686,11 @@ class PluginWidget(QWidget):
                 self.cluster_annotation_tab.refresh()
             else:
                 self._last_tab_refresh_key.pop(2, None)
+        if hasattr(self, 'gating_confirmation_tab'):
+            if self.inner_tabs.currentWidget() is self.gating_confirmation_tab:
+                self.gating_confirmation_tab.refresh()
+            else:
+                self._last_tab_refresh_key.pop(4, None)
         if hasattr(self, 'report_tab'):
             self.report_tab.refresh()
 
@@ -15584,7 +15769,7 @@ class PluginWidget(QWidget):
             _log.info("started UMAP JIT warm-up (%s path)", 'parallel' if parallel else 'serial')
 
     # ------------------------------------------------------------------
-    # State persistence (the experiment folder's cache/dr_clustering)
+    # State persistence (the experiment folder's state/dr_clustering)
     # ------------------------------------------------------------------
 
     def _experiment_key(self) -> tuple:
@@ -15659,9 +15844,9 @@ class PluginWidget(QWidget):
         opened.
 
         Lightweight scalar/list values go to the settings store
-        (cache/dr_clustering/state.json, see experiment_state).
+        (state/dr_clustering/state.json, see experiment_state).
         Embeddings, cluster labels and stats results are written to a
-        sidecar bundle in the experiment's cache folder; see
+        sidecar bundle in the experiment's state folder; see
         _save_model_sidecar.
 
         self.controller.experiment can already point at a DIFFERENT
@@ -15739,6 +15924,7 @@ class PluginWidget(QWidget):
             s.setValue('reference_group',   self.state.reference_group)
             s.setValue('paired',            self.state.paired)
             s.setValue('pairing_variable',  self.state.pairing_variable)
+            s.setValue('pairing_mode',      self.state.pairing_mode)
             s.setValue('population_split',  self.state.population_split)
             s.setValue('population_gates',  list(self.state.population_gates))
             s.setValue('population_reference', self.state.population_reference)
@@ -16014,6 +16200,8 @@ class PluginWidget(QWidget):
             paired_val = s.value('paired', False)
             self.state.paired = paired_val in (True, 'true', 'True', 1, '1')
             self.state.pairing_variable = s.value('pairing_variable', '')
+            mode = s.value('pairing_mode', 'auto') or 'auto'
+            self.state.pairing_mode = mode if mode in ('auto', 'fixed', 'random') else 'auto'
             self.state.population_split = _qs_bool(s, 'population_split', False)
             self.state.population_gates = _qs_list(s, 'population_gates')
             self.state.population_reference = s.value('population_reference', '') or ''
@@ -16417,6 +16605,7 @@ class PluginWidget(QWidget):
             ('freq_results',      self.state.freq_results),
             ('counts_results',    self.state.counts_results),
             ('mfi_results',       self.state.mfi_results),
+            ('anova_results',     self.state.anova_results),
             ('freq_df',           self.state.freq_df),
             ('counts_df',         self.state.counts_df),
             ('mfi_df',            self.state.mfi_df),
@@ -16491,9 +16680,9 @@ class PluginWidget(QWidget):
         path = self._sidecar_path()
 
         # temporary diagnostic
-        _log.info("_load_model_sidecar: path=%s exists=%s cache_root=%s",
+        _log.info("_load_model_sidecar: path=%s exists=%s archive_root=%s",
                 path, path.exists() if path else None,
-                drc_run_archive.cache_root(self.controller))
+                drc_run_archive.archive_root(self.controller))
                 
 
         # Rebuild the run archive regardless of whether the current-state
@@ -16541,6 +16730,8 @@ class PluginWidget(QWidget):
                 self.state.counts_results = payload['counts_results']
             if isinstance(payload.get('mfi_results'), pd.DataFrame):
                 self.state.mfi_results = payload['mfi_results']
+            if isinstance(payload.get('anova_results'), dict):
+                self.state.anova_results = payload['anova_results']
             if isinstance(payload.get('freq_df'), pd.DataFrame):
                 self.state.freq_df = payload['freq_df']
             if isinstance(payload.get('counts_df'), pd.DataFrame):
@@ -16930,6 +17121,12 @@ class PluginWidget(QWidget):
         self._update_sample_browser_visibility()
         self._refresh_tab_at(index)
 
+    def _open_gating_confirmation(self, run_id: str, cluster):
+        """Show the Gating confirmation tab with *cluster* of run *run_id*."""
+        self.inner_tabs.setCurrentWidget(self.gating_confirmation_tab)
+        self.gating_confirmation_tab.refresh()
+        self.gating_confirmation_tab.select_cluster(run_id, cluster)
+
     def _update_sample_browser_visibility(self):
         """
         Show the main window's sample browser only on the Transforms tab,
@@ -17014,7 +17211,7 @@ class PluginWidget(QWidget):
                 tuple(sorted(s.group_patterns.items())),
                 tuple(s.testing_group_selection),
                 s.contrast_mode, s.reference_group, s.paired, s.pairing_variable,
-                s.population_split, tuple(s.population_gates), s.population_reference,
+                s.pairing_mode, s.population_split, tuple(s.population_gates), s.population_reference,
                 tuple(sorted(s.selected_gates)),
                 len(s.dr_runs), len(s.clustering_runs),
                 tuple(sorted(s.cluster_labels)),
@@ -17032,7 +17229,13 @@ class PluginWidget(QWidget):
                     for ch, v in sorted(s.channel_transform_params.items())
                 ),
             )
-        elif index == 4:    # WorkspaceTab
+        elif index == 4:    # GatingConfirmationTab
+            return (
+                tuple(e.get('run_id') for e in s.clustering_runs),
+                s.stats_run_id,
+                id(s.freq_results), id(s.counts_results),
+            )
+        elif index == 5:    # WorkspaceTab
             return (
                 len(s.dr_runs), len(s.clustering_runs),
                 tuple(sorted(s.cluster_names.items())),
@@ -17040,7 +17243,7 @@ class PluginWidget(QWidget):
                 len(s.plot_configs), s.plot_theme,
                 tuple(s.population_gates),
             )
-        elif index == 5:    # ReportTab -- cheap to rebuild; always refresh
+        elif index == 6:    # ReportTab -- cheap to rebuild; always refresh
             return None
         return None
 
@@ -17064,10 +17267,10 @@ class PluginWidget(QWidget):
         (e.g. GroupsStatsTab's _last_drawn_cluster_names / _has_results_tab
         checks), which still apply whenever refresh() does run.
         """
-        if index == 5:
+        if index == 6:
             # The report lists what these tabs hold, and they build it
             # from the restored state on refresh.
-            for source_index in (2, 3):
+            for source_index in (2, 3, 4):
                 self._refresh_tab_at(source_index)
         key = self._tab_refresh_key(index)
         if key is not None and self._last_tab_refresh_key.get(index) == key:
@@ -17079,6 +17282,7 @@ class PluginWidget(QWidget):
             self.config_tab,
             self.cluster_annotation_tab,
             self.groups_stats_tab,
+            self.gating_confirmation_tab,
             self.workspace_tab,
             self.report_tab,
         ]

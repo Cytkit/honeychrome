@@ -2,12 +2,12 @@
 Experiment-specific plugin state, kept in the experiment's folder.
 
 A plugin keeps its settings for one experiment in
-``<experiment folder>/cache/<folder>/state.json``, stamped with the id of
+``<experiment folder>/state/<folder>/state.json``, stamped with the id of
 the ``.kit`` they belong to (``ExperimentModel.experiment_id``). The plugin's
-results live in the same cache folder. When a new ``.kit`` takes over a folder
+results live in the same folder. When a new ``.kit`` takes over a folder
 (an experiment deleted and created again at the same path), the folder's
 contents carry another experiment's id: they are moved to
-``cache/<folder>.previous`` and the new experiment starts clean. QSettings
+``state/<folder>.previous`` and the new experiment starts clean. QSettings
 keeps only window layout and application-wide preferences.
 
 Experiments saved before ids existed keep their plugin state: on first use
@@ -26,6 +26,7 @@ import logging
 import shutil
 from pathlib import Path
 
+from honeychrome.controller_components import experiment_paths
 from honeychrome.experiment_model import safe_save
 
 log = logging.getLogger(__name__)
@@ -149,7 +150,7 @@ def _from_qsettings(app_key: str, experiment_dir) -> dict:
 def open_store(controller, folder: str, legacy_app_key: str | None = None,
                experiment_dir=None) -> ExperimentStateStore:
     """Open *folder*'s state for the experiment the controller shows (or
-    the folder *experiment_dir* of it), claiming the cache folder for this
+    the folder *experiment_dir* of it), claiming the state folder for this
     ``.kit``: another experiment's contents are moved aside, and for an
     experiment saved before ids existed the old QSettings group
     *legacy_app_key* is read once. The file is written at once, so the
@@ -158,8 +159,9 @@ def open_store(controller, folder: str, legacy_app_key: str | None = None,
     exp_dir = Path(experiment_dir or controller.experiment_dir)
     exp_id = str(getattr(experiment, 'experiment_id', '') or '')
     legacy = bool(getattr(experiment, 'legacy_plugin_state', False))
-    cache = exp_dir / 'cache' / folder
-    path = cache / STATE_FILE
+    experiment_paths.migrate(exp_dir)
+    folder_path = experiment_paths.state_dir(exp_dir, folder)
+    path = folder_path / STATE_FILE
     data = _read(path)
     if data is not None and data.get('experiment_id') == exp_id:
         values = dict(data.get('values') or {})
@@ -171,8 +173,8 @@ def open_store(controller, folder: str, legacy_app_key: str | None = None,
             if values:
                 log.info("moved %d %s settings from QSettings to %s", len(values), folder, path)
     else:
-        if cache.exists() and any(cache.iterdir()):
-            _set_aside(cache)
+        if folder_path.exists() and any(folder_path.iterdir()):
+            _set_aside(folder_path)
         values = {}
     store = ExperimentStateStore(path, exp_id, values)
     store.sync(force=True)

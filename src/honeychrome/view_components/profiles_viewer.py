@@ -662,6 +662,26 @@ class ProfilesViewer(QFrame):
                 if control in self.controller.experiment.process['profiles']:
                     self.plot_profiles([control], show_legend=False)
 
+    def _ordered_profile_labels(self, profiles):
+        """Profile labels in spectral model order, falling back to dict order if the model is empty."""
+        spectral_model = self.controller.experiment.process.get('spectral_model', [])
+        labels = [
+            c['label'] for c in spectral_model
+            if c.get('label') and c['label'] in profiles
+        ]
+        return labels or list(profiles.keys())
+
+    def profiles_dataframe(self):
+        """Spectral profiles as a table: one row per control, one column per raw fluorescence detector."""
+        profiles = self.controller.experiment.process.get('profiles')
+        if not profiles:
+            return None
+        import pandas as pd
+        pnn = self.controller.experiment.settings['raw']['event_channels_pnn']
+        detectors = [pnn[n] for n in self.controller.filtered_raw_fluorescence_channel_ids]
+        labels = self._ordered_profile_labels(profiles)
+        return pd.DataFrame([profiles[label] for label in labels], index=labels, columns=detectors)
+
     @Slot(list)
     def plot_profiles(self, profile_list, show_legend=True):
 
@@ -704,15 +724,7 @@ class ProfilesViewer(QFrame):
 
         # Plot each profile
         if not profile_list:
-            # Derive order from spectral model, not profiles dict insertion order
-            spectral_model = self.controller.experiment.process.get('spectral_model', [])
-            profile_list = [
-                c['label'] for c in spectral_model
-                if c.get('label') and c['label'] in profiles
-            ]
-            # Fall back to dict order if spectral model is empty or unpopulated
-            if not profile_list:
-                profile_list = list(profiles.keys())
+            profile_list = self._ordered_profile_labels(profiles)
 
         profile_list = [p for p in profile_list if p]
         for i, profile_name in enumerate(profile_list):

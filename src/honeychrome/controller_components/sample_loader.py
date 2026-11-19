@@ -16,9 +16,10 @@ The work is split in two:
     each requested sample (resolved from ``samples['sample_af_profiles']``
     and the controller's precomputed AF cache), and the experiment's
     unmixing method (``unmix_method.method_state``: noise model, spectral
-    variants, per-sample corrected spectra; None for per-cell AF). Also
-    collects per-sample time-QC keep-masks when the ``time_qc`` module is
-    present.
+    variants, per-sample corrected spectra; None for per-cell AF), and the
+    noise-aware AF context (``af_posterior.noise_context``; None for the
+    clamped AF abundance). Also collects per-sample time-QC keep-masks when
+    the ``time_qc`` module is present.
 
 ``load_unmixed(experiment_dir, sample_key, snapshot)``
     Worker-safe. Reads one FCS file, applies an optional keep-mask and a
@@ -47,7 +48,7 @@ from pathlib import Path
 
 import numpy as np
 
-from honeychrome.controller_components import unmix_method
+from honeychrome.controller_components import af_posterior, unmix_method
 from honeychrome.controller_components.autospectral_functions import (
     af_index_lookup,
     apply_af_transfer,
@@ -74,11 +75,16 @@ class AFState:
     """Combined AF library for one profile assignment.
 
     ``index_map`` holds the experiment-wide AF Index of each library row.
+    ``posterior`` is the sample's noise-aware AF posterior
+    (``af_posterior.AFPosterior``), None for the clamped AF abundance; it
+    belongs to one sample, so it is attached to a per-sample copy
+    (``AFNoiseContext.attach``).
     """
     profile_names: tuple
     precomputed: dict
     spectra: np.ndarray
     index_map: np.ndarray | None = None
+    posterior: object = None
 
     @property
     def n_spectra(self) -> int:
@@ -94,6 +100,8 @@ class UnmixSnapshot:
     worker holding this snapshot is unaffected by later reassignments.
     ``method`` is the experiment's unmixing method
     (``unmix_method.MethodState``), None for per-cell AF with the base spectra.
+    ``af_noise`` (``af_posterior.AFNoiseContext``) resolves each sample's
+    noise-aware AF posterior, None for the clamped AF abundance.
     """
     transfer_matrix: np.ndarray
     pnn_raw: tuple
@@ -104,6 +112,7 @@ class UnmixSnapshot:
     af_by_sample: dict = field(default_factory=dict)
     qc_by_sample: dict = field(default_factory=dict)
     method: object = None
+    af_noise: object = None
 
     def af_for(self, sample_key: str | None) -> AFState | None:
         """AF library assigned to *sample_key*, or None for plain unmixing."""
@@ -256,6 +265,9 @@ def unmixing_signature(controller, sample_keys) -> dict:
     method = unmix_method.method_state(controller)
     if method is not None:
         out['method'] = {k: [method.fingerprint, method.set_for(k)] for k in keys}
+    noise_aware = af_posterior.signature(af_posterior.noise_context(controller))
+    if noise_aware is not None:
+        out['af_abundance'] = noise_aware
     return out
 
 
@@ -331,6 +343,7 @@ def snapshot_unmix_state(controller, sample_keys=None,
         af_by_sample=af_by_sample,
         qc_by_sample=qc,
         method=unmix_method.method_state(controller),
+        af_noise=af_posterior.noise_context(controller, pnn_raw, whitelist is not None, fl_ids_raw),
     )
 
 
@@ -373,9 +386,12 @@ def unmix_events(raw_event_data: np.ndarray, snap: UnmixSnapshot,
     Without *sample_key* a sample is unmixed with the base spectra and, for
     the noise model without AF, as cells. *cache_file* (the sample's FCS
     file, for whole-sample loads) caches the method's result on disk (see
-    ``unmix_method.unmix``).
+    ``unmix_method.unmix``). With the noise-aware AF abundance the sample's
+    posterior is attached to *af* here (fitted and stored the first time).
     """
     n = len(raw_event_data)
+    if af is not None and sample_key is not None and getattr(snap, 'af_noise', None) is not None:
+        af = snap.af_noise.attach(af, sample_key)
     if getattr(snap, 'method', None) is not None:
         result = unmix_method.unmix(raw_event_data, snap.transfer_matrix, snap.settings, snap.fl_ids_raw,
                                     snap.spillover, af, snap.method, sample_key, cache_file=cache_file)
@@ -394,6 +410,8 @@ def unmix_events(raw_event_data: np.ndarray, snap: UnmixSnapshot,
             filtered_fl_ids_raw=list(snap.fl_ids_raw),
             spillover=snap.spillover,
             af_index_map=af.index_map,
+            af_posterior=af.posterior,
+            pnn_raw=snap.pnn_raw,
         )
         out = {'unmixed': result['unmixed'], 'af_scale': None, 'af_idx': None}
         if return_af:

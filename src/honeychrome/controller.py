@@ -32,7 +32,7 @@ import warnings
 import hashlib
 from datetime import datetime
 import numpy as np
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from PySide6.QtCore import QCoreApplication, QObject, QThread, Qt, Signal, Slot, QTimer
 from PySide6.QtGui import QGuiApplication
 from flowkit import GatingStrategy, Sample, gates
@@ -62,7 +62,7 @@ from honeychrome.controller_components.autospectral_functions import (
         refresh_envelope_entry,
      )
 from honeychrome.settings import af_index_channel
-from honeychrome.controller_components import unmix_method
+from honeychrome.controller_components import af_posterior, experiment_paths, unmix_method
 from honeychrome.controller_components.job_gate import JobGate
 from honeychrome.controller_components.sample_loader import AFState
 
@@ -114,6 +114,9 @@ class Controller(QObject):
         self.live_sample_path = None
         # one heavy job at a time across the application
         self.job_gate = JobGate(self)
+        # one sample load at a time; a request made during a load waits here
+        self._sample_load_lock = threading.Lock()
+        self._pending_sample_path = None
         self.raw_event_data = None
         self.unmixed_event_data = None
         self.af_sidecar_data = None   # (n_cells, 2) float64: col 0 = af_scale, col 1 = af_idx; None when OLS
@@ -300,6 +303,10 @@ class Controller(QObject):
                 key = f'{safe}__{k}'
                 if key in arrays:
                     entry[k] = arrays[key]
+            if 'v_mats' not in entry:
+                # the sidecar holding this fluorophore's variants is missing
+                n_skipped_stale += 1
+                continue
             self.autospectral_variants[label] = entry
         if self.autospectral_variants:
             logger.info(f'Controller: loaded autospectral_variants for {len(self.autospectral_variants)} fluorophore(s).')
@@ -333,12 +340,19 @@ class Controller(QObject):
             self.experiment.save()
         self.experiment_dir = self.experiment.generate_subdirs()
         add_recent_file(experiment_path)
+        experiment_paths.migrate(self.experiment_dir)
+        experiment_paths.prune_cache(self.experiment_dir)
 
         self.current_mode = 'raw'
         self.initialise_ephemeral_data()
         self._load_cleaned_events()
         self._load_autospectral_variants()
-        self.cache_all_af_profiles()
+        af_warning = self.cache_all_af_profiles()
+        if af_warning:
+            if self.warning_collector is not None:
+                self.warning_collector.append(af_warning)
+            elif self.bus is not None:
+                self.bus.warningMessage.emit(af_warning)
         self.initialise_af_matrices()
 
         logger.info(f'Controller: experiment loaded {self.experiment_dir}')
@@ -388,9 +402,9 @@ class Controller(QObject):
 
     @property
     def cleaned_npz_path(self) -> Path:
-        cache_dir = self.experiment_dir / 'cache'
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return cache_dir / 'cleaned.npz'
+        state_dir = experiment_paths.state_dir(self.experiment_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir / 'cleaned.npz'
 
     @property
     def _legacy_cleaned_npz_path(self) -> Path:
@@ -477,9 +491,9 @@ class Controller(QObject):
 
     @property
     def autospectral_variants_npz_path(self) -> Path:
-        cache_dir = self.experiment_dir / 'cache'
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return cache_dir / 'autospectral_variants.npz'
+        state_dir = experiment_paths.state_dir(self.experiment_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir / 'autospectral_variants.npz'
 
     @Slot(str)
     def save_experiment(self, experiment_path=None):
@@ -745,6 +759,35 @@ class Controller(QObject):
             self.bus.changedGatingHierarchy.emit(scope, gate_name)
         self.refresh_custom_gates_on_current_tab_for_current_sample(scope)
         logger.info(f'Controller: adopted custom {scope} gate {gate_name!r} as template')
+
+    def apply_custom_gate_to_group(self, scope, gate_name):
+        """Copy the current sample's custom ``gate_name`` to every other sample
+        in the same sample group (the folder the sample sits in), as each
+        sample's own custom gate. Samples outside the folder, and the
+        template, are unchanged; a sample's earlier customisation of this gate
+        is replaced."""
+        if not self.current_sample_path:
+            return
+        gating = self.raw_gating if scope == 'raw' else self.unmixed_gating
+        sample_id = self.current_sample_path
+        if gating is None or not gating.is_custom_gate(sample_id, gate_name):
+            return
+        custom_gate = gating.get_gate(gate_name, sample_id=sample_id)
+        folder = PurePosixPath(str(sample_id).replace('\\', '/')).parent
+        members = [p for p in self.experiment.samples.get('all_samples', {})
+                   if p != sample_id and PurePosixPath(str(p).replace('\\', '/')).parent == folder]
+        scope_overrides = self.custom_sample_gates.setdefault(scope, {})
+        scope_overrides.setdefault(sample_id, {})[gate_name] = deepcopy(custom_gate)
+        for path in members:
+            scope_overrides.setdefault(path, {})[gate_name] = deepcopy(custom_gate)
+        if self.bus is not None:
+            self.bus.changedGatingHierarchy.emit(scope, gate_name)
+            self.bus.statusMessage.emit(
+                f"Custom gate '{gate_name}' applied to {len(members)} other sample"
+                f"{'' if len(members) == 1 else 's'} in group '{folder.name or folder}'")
+        self.refresh_custom_gates_on_current_tab_for_current_sample(scope)
+        logger.info(f'Controller: applied custom {scope} gate {gate_name!r} from {sample_id} '
+                    f'to {len(members)} samples in {folder}')
 
     def refresh_custom_gates_on_current_tab_for_current_sample(self, scope=None):
         """Tell the UI which gates are customised for the current sample in ``scope``."""
@@ -1179,21 +1222,28 @@ class Controller(QObject):
         (Re)compute precomputed matrices for every stored AF profile and replace
         the entire cache.  Called by initialise_transfer_matrix() after a spectral
         process refresh, because P depends on fluor_spectra which may have changed.
+        Returns a warning for the user when stored AF profiles were extracted
+        with a different set of detectors from the current spectra, else None.
         """
         self.af_precomputed_cache = {}
         af_profiles = self.experiment.process.get('af_profiles', {})
         if not af_profiles:
             logger.debug(f'cache_all_af_profiles: experiment.process has no af_profiles — keys present: {list(self.experiment.process.keys())}')
-            return
+            return None
 
         fluor_spectra = self._build_fluor_spectra()
         if fluor_spectra is None:
             logger.warning(
                 'cache_all_af_profiles: fluor_spectra unavailable — cache empty.'
             )
-            return
+            return None
 
+        mismatched = []
         for name, entry in af_profiles.items():
+            af_spectra = np.asarray(entry.get('spectra'), dtype=float)
+            if af_spectra.ndim != 2 or af_spectra.shape[1] != fluor_spectra.shape[1]:
+                mismatched.append(name)
+                continue
             try:
                 self.af_precomputed_cache[name] = self._precompute_profile(entry, fluor_spectra)
             except Exception as e:
@@ -1204,6 +1254,14 @@ class Controller(QObject):
             f'{len(self.af_precomputed_cache)}/{len(af_profiles)} profiles cached.'
         )
         self._request_missing_envelopes()
+        if not mismatched:
+            return None
+        logger.warning(f'cache_all_af_profiles: {mismatched} do not match the {fluor_spectra.shape[1]} detectors of the current spectra')
+        names = ', '.join(f'"{name}"' for name in mismatched)
+        return (f'These autofluorescence (AF) profiles were extracted with a different set of detectors '
+                f'from the current spectral profiles ({fluor_spectra.shape[1]} detectors), so they are not '
+                f'being used: {names}.\n\nThis happens when the fluorescence channels in use change after '
+                f'the AF profiles were extracted. Extract them again in the AutoSpectral tab.')
 
     def _request_missing_envelopes(self):
         """
@@ -1422,7 +1480,9 @@ class Controller(QObject):
         With the noise model or spectral variants as the method, the displayed
         sample is returned unmixed by per-cell AF (or from the display cache)
         and the method's result is swapped in from a background job
-        (_start_method_job). Live data stays on per-cell AF.
+        (_start_method_job). Live data stays on per-cell AF; with the
+        noise-aware AF abundance it takes the prior of the sample's AF
+        reference until it has been recorded.
         """
         self._unmix_generation += 1
         live = self.live_sample_path is not None and self.current_sample_path == self.live_sample_path
@@ -1438,6 +1498,7 @@ class Controller(QObject):
             full_pnn_raw = _raw['event_channels_pnn']
             fl_ids_remapped = [pnn_raw.index(full_pnn_raw[i])
                                for i in self.filtered_raw_fluorescence_channel_ids]
+            af = self._current_af_state(live=live)
             result = apply_af_transfer(
                 raw_event_data,
                 self.transfer_matrix,
@@ -1447,6 +1508,8 @@ class Controller(QObject):
                 filtered_fl_ids_raw=fl_ids_remapped,
                 spillover=self.experiment.process.get('spillover'),
                 af_index_map=self.af_index_map,
+                af_posterior=None if af is None else af.posterior,
+                pnn_raw=pnn_raw,
             )
             # result is now a dict; store the sidecar columns
             self.af_sidecar_data = np.column_stack(
@@ -1457,13 +1520,28 @@ class Controller(QObject):
             self.af_sidecar_data = None
             return apply_transfer_matrix(self.transfer_matrix, raw_event_data)
 
-    def _current_af_state(self) -> AFState | None:
-        """The displayed sample's AF library as set by initialise_af_matrices."""
+    def _current_af_state(self, live: bool = False) -> AFState | None:
+        """
+        The displayed sample's AF library as set by initialise_af_matrices,
+        with its noise-aware AF posterior when that setting is in effect
+        (``live``: the sample is being acquired, see af_posterior).
+        """
         if self.af_precomputed is None or self.af_spectra is None:
             return None
         names = self.experiment.samples.get('sample_af_profiles', {}).get(self.current_sample_path, []) or []
-        return AFState(profile_names=tuple(names), precomputed=self.af_precomputed,
-                       spectra=self.af_spectra, index_map=self.af_index_map)
+        af = AFState(profile_names=tuple(names), precomputed=self.af_precomputed,
+                     spectra=self.af_spectra, index_map=self.af_index_map)
+        context = af_posterior.noise_context(self)
+        if context is not None and self.current_sample_path is not None:
+            af = context.attach(af, self.current_sample_path, live=live)
+        return af
+
+    def _log_ssc(self, raw_event_data, af) -> np.ndarray | None:
+        """log SSC of the displayed events for a noise-aware AF posterior (None without one)."""
+        if af is None or af.posterior is None:
+            return None
+        _raw = self.experiment.settings['raw']
+        return af.posterior.log_ssc(raw_event_data, _raw.get('whitelisted_pnn') or _raw['event_channels_pnn'])
 
     def _raw_fl_ids(self) -> list:
         """Fluorescence channel positions in the (whitelisted) raw event columns."""
@@ -1502,11 +1580,12 @@ class Controller(QObject):
                 logger.info('Controller: %s from the unmixing cache for %s', method, key)
                 return result['unmixed']
 
+        log_ssc = self._log_ssc(raw_event_data, af)
         job = {'generation': self._unmix_generation, 'raw': raw_event_data, 'state': state, 'af': af,
                'sample_key': key, 'fl_ids': fl_ids, 'method': method, 'cache_key': cache_key,
-               'experiment_dir': self.experiment_dir}
+               'experiment_dir': self.experiment_dir, 'log_ssc': log_ssc}
         if not self.progressive_unmixing or QCoreApplication.instance() is None:
-            fl = unmix_method.unmix_fluorescence(raw_event_data[:, fl_ids], state, af, key, method)
+            fl = unmix_method.unmix_fluorescence(raw_event_data[:, fl_ids], state, af, key, method, log_ssc=log_ssc)
             if cache_key:
                 unmix_method.store_display_cache(self.experiment_dir, cache_key, fl)
             result = unmix_method.assemble(raw_event_data, self.transfer_matrix, settings_, fl, spillover, af)
@@ -1680,8 +1759,26 @@ class Controller(QObject):
             logger.info('load_sample: streaming preview unavailable (%s); reading full file', e)
             return None
 
-    @with_busy_cursor
     def load_sample(self, sample_path):
+        """Load a sample for display. The busy cursor keeps the window responsive
+        during a load, so another sample can be selected meanwhile (for example by
+        arrowing through the sample list). Such a request waits, and only the most
+        recent one is loaded once the running load finishes, so two loads never
+        write to the plot data at the same time."""
+        while True:
+            if not self._sample_load_lock.acquire(blocking=False):
+                self._pending_sample_path = sample_path
+                return
+            try:
+                self._load_sample(sample_path)
+            finally:
+                self._sample_load_lock.release()
+            sample_path, self._pending_sample_path = self._pending_sample_path, None
+            if sample_path is None:
+                return
+
+    @with_busy_cursor
+    def _load_sample(self, sample_path):
         logger.info(f'Controller: loading sample {sample_path}')
         whitelisted_pnn = self.experiment.settings['raw'].get('whitelisted_pnn')
         check_pnn = whitelisted_pnn or self.experiment.settings['raw']['event_channels_pnn']
@@ -2170,14 +2267,16 @@ class Controller(QObject):
 
             # copy live data
             self.raw_event_data, n_new_events = self.copy_live_data(extent='update')
-            self.data_for_cytometry_plots['event_data'] = self.raw_event_data
 
             # apply spectral unmixing and compensation if defined
-            if self.current_mode == 'raw' and self.experiment.process['unmixing_matrix'] is not None:
+            if self.experiment.process['unmixing_matrix'] is not None:
                 self.unmixed_event_data = apply_transfer_matrix(self.transfer_matrix, self.raw_event_data)
-                self.data_for_cytometry_plots['event_data'] = self.unmixed_event_data
 
-            self.calc_hists_and_stats()
+            # one reference: a tab switch on the main thread can rebind it (None on a plugin tab)
+            data = self.data_for_cytometry_plots
+            if data is not None:
+                data['event_data'] = self.raw_event_data if data is self.data_for_cytometry_plots_raw else self.unmixed_event_data
+                self.calc_hists_and_stats()
 
             # Calculate elapsed time and sleep precisely
             new_update_time = time.perf_counter()
@@ -2347,7 +2446,7 @@ class Controller(QObject):
     @with_busy_cursor
     @Slot()
     def refresh_spectral_process(self):
-        from honeychrome.controller_components.spectral_functions import calculate_spectral_process
+        from honeychrome.controller_components.spectral_functions import calculate_spectral_process, UnmixableProfilesError
 
         # first build unmixed part of experiment: settings, process and cytometry
         raw_settings = self.experiment.settings['raw']
@@ -2371,19 +2470,28 @@ class Controller(QObject):
                 and len(profiles.keys()) == len(spectral_model)
                 and all(profiles.keys())
         )
+        # profiles that cannot be unmixed leave the experiment as it was; the reason is
+        # reported with the other profile-QC warnings below
+        spectral_process = None
         if spectral_model and spectral_model_valid:
             if self.bus:
                 self.bus.statusMessage.emit(f'Refreshing spectral process...')
             existing_spillover = self.experiment.process.get('spillover')
             unmixing_method = self.experiment.settings.get('unmixing_method', 'OLS')
-            unmixed_settings, spectral_process, conditioning_warnings = calculate_spectral_process(
-                raw_settings, spectral_model, profiles,
-                existing_spillover=existing_spillover,
-                unmixing_method=unmixing_method,
-                experiment_dir=self.experiment_dir,
-                experiment_samples=self.experiment.samples,
-                filtered_fluorescence_channel_ids=self.filtered_raw_fluorescence_channel_ids,
-            )
+            try:
+                unmixed_settings, spectral_process, conditioning_warnings = calculate_spectral_process(
+                    raw_settings, spectral_model, profiles,
+                    existing_spillover=existing_spillover,
+                    unmixing_method=unmixing_method,
+                    experiment_dir=self.experiment_dir,
+                    experiment_samples=self.experiment.samples,
+                    filtered_fluorescence_channel_ids=self.filtered_raw_fluorescence_channel_ids,
+                )
+            except UnmixableProfilesError as e:
+                logger.warning(f'Controller: spectral process not refreshed ({len(spectral_model)} profiles): {e}')
+                conditioning_warnings = [str(e)]
+
+        if spectral_process is not None:
             self.experiment.process.update(spectral_process)
 
             # An experiment whose channel list predates the AF channels gains
@@ -2453,7 +2561,7 @@ class Controller(QObject):
                 # keep the existing unmixed gating strategy where its channels still exist
                 if previous_unmixed is not None:
                     self._carry_over_unmixed_cytometry(previous_unmixed)
-        else:
+        elif not (spectral_model and spectral_model_valid):
             unmixed_settings = settings_default['unmixed'].copy()
             self.experiment.settings['unmixed'].update(unmixed_settings)
 
@@ -2465,7 +2573,9 @@ class Controller(QObject):
             self.af_sidecar_data = None
 
         # Rebuild AF cache synchronously before reinitialising ephemeral data.
-        self.cache_all_af_profiles()
+        af_warning = self.cache_all_af_profiles()
+        if af_warning:
+            conditioning_warnings.append(af_warning)
         # then reinitialise ephemeral data for process and unmixed tabs; with a sample
         # loaded this unmixes it again and recalculates the current tab's plots
         self.initialise_ephemeral_data(scope=['unmixed'])
@@ -2488,7 +2598,10 @@ class Controller(QObject):
                     self.bus.warningMessage.emit(qc_text)
             self.bus.spectralProcessRefreshed.emit()
             # self.bus.changedGatingHierarchy.emit('unmixed', 'root')
-            self.bus.statusMessage.emit(f'Spectral process refreshed.')
+            if spectral_process is None and spectral_model and spectral_model_valid:
+                self.bus.statusMessage.emit(f'Spectral process not refreshed.')
+            else:
+                self.bus.statusMessage.emit(f'Spectral process refreshed.')
 
         logger.info(f'Controller: refreshed spectral process, unmixed settings, unmixed cytometry')
 
@@ -2670,14 +2783,13 @@ if __name__ == '__main__':
     '''
 
     # Allocate shared memory block, plus head and tail indices
-    traces_cache_shm = shared_memory.SharedMemory(create=True, size=np.zeros(traces_cache_size, dtype=traces_cache_dtype).nbytes)
+    traces_cache_shm = shared_memory.SharedMemory(create=True, size=traces_cache_size * np.dtype(traces_cache_dtype).itemsize)
     traces_cache_lock = Lock()
     index_head_traces_cache = mp.Value('i', 0)
     index_tail_traces_cache = mp.Value('i', 0)
 
     events_cache_shm = shared_memory.SharedMemory(create=True,
-                                                  size=np.zeros((max_events_in_cache, n_channels_per_event),
-                                                                dtype=np.int64).nbytes)
+                                                  size=max_events_in_cache * n_channels_per_event * np.dtype(np.int64).itemsize)
     events_cache_lock = Lock()
     index_head_events_cache = mp.Value('i', 0)
     index_tail_events_cache = mp.Value('i', 0)

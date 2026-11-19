@@ -15,6 +15,18 @@
 // thread per call (OPENBLAS_NUM_THREADS=1; Accelerate needs nothing).
 // batch_lanes = 4 or 8 solves that many events at once (structure of arrays,
 // batch_solve); 0, the default, solves one event at a time (solve_event).
+// fixed_af_idx / fixed_af_scale (one AF row, 0-based, and abundance per event)
+// fix each event's AF, as the noise-aware AF abundance does: no AF choice and
+// no AF column; the AF signal counts in the event's signal for the weights and
+// is subtracted from the event, and only the fluorophores are solved.
+// bend_shapes (L x D) and bend_var (N x L), with the AF fixed, integrate out
+// each event's AF shape bend c ~ Normal(0, diag(bend_var)) along the shapes:
+// the detector covariance becomes V + E' T E, applied to the normal equations
+// through the Woodbury identity, S W S' - (S W E') M^-1 (E W S') and
+// S W r - (S W E') M^-1 E W r with M = E W E' + T^-1 (a rank-L change per
+// event; events with every variance 0 are solved without it).
+// The extension also holds the AF shape bend of per-cell AF (bend_r1,
+// af_bend_kernel.cpp); the dense helpers both use are in kernel_linalg.hpp.
 // Build with -DGLS_DGEMM=<symbol> -DGLS_BLAS_INT=<int type> for a BLAS whose
 // dgemm is not plain dgemm_ with 32-bit integers.
 // ---------------------------------------------------------------------------
@@ -38,22 +50,19 @@
 #include <chrono>
 #endif
 
-#ifndef GLS_DGEMM
-#define GLS_DGEMM dgemm_
-#endif
-#ifndef GLS_BLAS_INT
-#define GLS_BLAS_INT int
-#endif
-
-extern "C" void GLS_DGEMM(const char* ta, const char* tb, const GLS_BLAS_INT* m, const GLS_BLAS_INT* n,
-                          const GLS_BLAS_INT* k, const double* alpha, const double* a, const GLS_BLAS_INT* lda,
-                          const double* b, const GLS_BLAS_INT* ldb, const double* beta, double* c,
-                          const GLS_BLAS_INT* ldc);
+#include "kernel_linalg.hpp"
 
 namespace py = pybind11;
 using Arr = py::array_t<double, py::array::c_style | py::array::forcecast>;
 
+void register_af_bend(py::module_& m);   // af_bend_kernel.cpp
+
 namespace {
+
+using kernel_linalg::chol_solve;
+using kernel_linalg::cholesky;
+using kernel_linalg::dot;
+using kernel_linalg::gemm_rm;
 
 constexpr double kScoreEps = 1e-12;
 constexpr double kTieTol = 1e-9;
@@ -61,6 +70,7 @@ constexpr double kVarFloor = 1e-24;
 constexpr double kTiny = 1e-12;
 constexpr double kInvSqrt2 = 0.70710678118654752440;
 constexpr int kChunk = 128;
+constexpr double kBendFixed = 1e30;   // precision of a bend shape with prior variance 0
 
 // Stage timing, compiled in only with -DGLS_M2P_PROFILE (the release build has
 // none of it). Each stage accumulates thread-seconds; unmix_m2p returns them
@@ -85,47 +95,6 @@ using ProfClock = std::chrono::steady_clock;
 #define PROF_START(t)
 #define PROF_LAP(acc, stage, t)
 #endif
-
-inline double dot(const double* a, const double* b, int n) {
-  double s = 0.0;
-#pragma omp simd reduction(+ : s)
-  for (int i = 0; i < n; ++i) s += a[i] * b[i];
-  return s;
-}
-
-// Row-major C (m x n) = A (m x k) B (k x n) + beta C.
-void gemm_rm(int m, int n, int k, const double* A, int lda, const double* B, int ldb, double* C, int ldc,
-             double beta = 0.0) {
-  if (m == 0 || n == 0) return;
-  const char t = 'N';
-  const GLS_BLAS_INT M = n, N = m, K = k, LA = ldb, LB = lda, LC = ldc;
-  const double one = 1.0;
-  GLS_DGEMM(&t, &t, &M, &N, &K, &one, B, &LA, A, &LB, &beta, C, &LC);
-}
-
-// Cholesky of a p x p SPD matrix in place (lower triangle, row-major). False if not SPD.
-bool cholesky(double* a, int p) {
-  for (int j = 0; j < p; ++j) {
-    const double* aj = &a[j * p];
-    const double d2 = a[j * p + j] - dot(aj, aj, j);
-    if (!(d2 > 0.0)) return false;
-    const double d = std::sqrt(d2);
-    a[j * p + j] = d;
-    const double inv = 1.0 / d;
-    for (int i = j + 1; i < p; ++i) a[i * p + j] = (a[i * p + j] - dot(&a[i * p], aj, j)) * inv;
-  }
-  return true;
-}
-
-// Solve L L' x = b in place.
-void chol_solve(const double* l, int p, double* b) {
-  for (int i = 0; i < p; ++i) b[i] = (b[i] - dot(&l[i * p], b, i)) / l[i * p + i];
-  for (int i = p - 1; i >= 0; --i) {
-    double s = b[i];
-    for (int k = i + 1; k < p; ++k) s -= l[k * p + i] * b[k];
-    b[i] = s / l[i * p + i];
-  }
-}
 
 // diag((L L')^-1)[0:m]: column norms of L^-1, with L^-1 built column by column (work p).
 void chol_inv_diag(const double* l, int p, int m, double* out, double* work) {
@@ -658,7 +627,8 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
                           Arr g_in, Arr c_in, double sigma0_mult, py::object bead_var_obj,
                           py::object tau_spread_obj, double prior_lambda, int n_iter, double weight_ceiling,
                           int n_threads, bool start_only, py::object af_choice_weights_obj,
-                          int batch_lanes) {
+                          int batch_lanes, py::object fixed_idx_obj, py::object fixed_scale_obj,
+                          py::object bend_shapes_obj, py::object bend_var_obj) {
   if (batch_lanes != 0 && batch_lanes != 4 && batch_lanes != 8)
     throw std::invalid_argument("batch_lanes must be 0, 4 or 8");
   PROF_DECL(prof_total);
@@ -674,6 +644,50 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
   const double* S = static_cast<const double*>(sb.ptr);
   const double* A = static_cast<const double*>(ab.ptr);
   const bool has_af = J > 0;
+  // optional fixed AF row and abundance per event: no AF choice and no AF column
+  const bool fixed = has_af && !fixed_idx_obj.is_none();
+  std::vector<std::int64_t> fixed_idx;
+  std::vector<double> fixed_scale;
+  if (fixed) {
+    if (fixed_scale_obj.is_none()) throw std::invalid_argument("fixed_af_scale is needed with fixed_af_idx");
+    fixed_idx = fixed_idx_obj.cast<std::vector<std::int64_t>>();
+    Arr fs = fixed_scale_obj.cast<Arr>();
+    auto fsb = fs.request();
+    if (static_cast<int>(fixed_idx.size()) != N || static_cast<int>(fsb.size) != N)
+      throw std::invalid_argument("fixed_af_idx and fixed_af_scale must have one value per event");
+    for (auto v : fixed_idx)
+      if (v < 0 || v >= J) throw std::invalid_argument("fixed_af_idx out of range");
+    fixed_scale.assign(static_cast<const double*>(fsb.ptr), static_cast<const double*>(fsb.ptr) + fsb.size);
+  }
+  const bool solve_af = has_af && !fixed;
+  // optional AF shape bend (fixed AF only): shapes Eb (Lb x D), prior precision per event and shape
+  int Lb = 0;
+  std::vector<double> Eb, bend_prec;
+  std::vector<unsigned char> bent;
+  bool any_bent = false;
+  if (!bend_shapes_obj.is_none()) {
+    if (!fixed) throw std::invalid_argument("bend_shapes needs fixed_af_idx and fixed_af_scale");
+    if (bend_var_obj.is_none()) throw std::invalid_argument("bend_var is needed with bend_shapes");
+    Arr es = bend_shapes_obj.cast<Arr>();
+    Arr ev = bend_var_obj.cast<Arr>();
+    auto esb = es.request(), evb = ev.request();
+    if (esb.ndim != 2 || esb.shape[1] != D) throw std::invalid_argument("bend_shapes must be L x D");
+    Lb = static_cast<int>(esb.shape[0]);
+    if (evb.ndim != 2 || evb.shape[0] != N || evb.shape[1] != Lb)
+      throw std::invalid_argument("bend_var must be N x L");
+    Eb.assign(static_cast<const double*>(esb.ptr), static_cast<const double*>(esb.ptr) + esb.size);
+    const double* vp = static_cast<const double*>(evb.ptr);
+    bend_prec.resize(static_cast<size_t>(N) * Lb);
+    bent.assign(N, 0);
+    for (int i = 0; i < N; ++i)
+      for (int l = 0; l < Lb; ++l) {
+        const double v = vp[static_cast<size_t>(i) * Lb + l];
+        const bool movable = v > 0.0 && std::isfinite(v);
+        bend_prec[static_cast<size_t>(i) * Lb + l] = movable ? 1.0 / v : kBendFixed;
+        if (movable) bent[i] = 1;
+      }
+    for (int i = 0; i < N; ++i) any_bent |= bent[i] != 0;
+  }
 
   std::vector<int> all(D);
   for (int d = 0; d < D; ++d) all[d] = d;
@@ -681,7 +695,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
   if (!full.ok) throw std::runtime_error("the fluorophore spectra are not identifiable");
   // optional AF choice in coordinates whitened by one weight vector (sqrt w0 per detector)
   std::vector<double> sw0, Sw, Aw;
-  const bool whiten = has_af && !af_choice_weights_obj.is_none();
+  const bool whiten = has_af && !fixed && !af_choice_weights_obj.is_none();
   if (whiten) {
     Arr w0 = af_choice_weights_obj.cast<Arr>();
     auto wb = w0.request();
@@ -781,7 +795,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
   std::map<std::string, int> pattern_id;
   std::vector<Lib> pattern_lib;
   std::vector<int> event_pattern(N, -1);
-  if (E.present && E.sat_level > 0.0) {
+  if (!fixed && E.present && E.sat_level > 0.0) {
     for (int i = 0; i < N; ++i) {
       const double* y = raw + static_cast<size_t>(i) * D;
       bool any = false;
@@ -821,6 +835,8 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
       Chunk c;
       c.size(kChunk, F, D, J, T);
       std::vector<double> ysub(D);
+      std::vector<double> bw(D), bswe(static_cast<size_t>(F) * Lb), bz(static_cast<size_t>(F) * Lb),
+          bm(static_cast<size_t>(Lb) * Lb), bew(Lb);
       PROF_DECL(prof_thread);
 #pragma omp for schedule(dynamic, 1)
       for (int ch = 0; ch < n_chunks; ++ch) {
@@ -850,7 +866,13 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
           double* x0 = x0o + static_cast<size_t>(i) * F;
           double alpha = 0.0;
           int idx = -1;
-          if (has_af) {
+          if (fixed) {
+            idx = static_cast<int>(fixed_idx[i]);
+            alpha = fixed_scale[i];
+            const double* u = &c.U[bi * F];
+            const double* vj = &full.vT[static_cast<size_t>(idx) * F];
+            for (int f = 0; f < F; ++f) x0[f] = u[f] - alpha * vj[f];
+          } else if (has_af) {
             const double* res = &c.FIT[bi * D];
             const double base_r = dot(res, res, D) + 1e-6;
             r1_score(r1lib, E, &c.U[bi * F], base_r, &c.NUM[bi * J], &c.RR[bi * J], c.sc, x0, alpha, idx);
@@ -921,10 +943,16 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
             const double* y = Y + static_cast<size_t>(bi) * D;
             double* mu = &c.MU[bi * D];
             double* w = &c.W[bi * D];
+            const double* arow_fixed = nullptr;
+            double al_fixed = 0.0;
             if (has_af) {
               const double al = std::max(c.ALPHA[bi], 0.0);
               const double* arow = A + static_cast<size_t>(c.IDX[bi]) * D;
               for (int d = 0; d < D; ++d) mu[d] += al * arow[d];
+              if (fixed) {
+                arow_fixed = arow;
+                al_fixed = c.ALPHA[bi];
+              }
             }
             for (int d = 0; d < D; ++d) {
               const double mp = std::max(mu[d], 0.0);
@@ -941,11 +969,46 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
                 for (int d = 0; d < D; ++d) if (y[d] >= 0.999 * weight_ceiling) w[d] = small;
               }
             }
-            for (int d = 0; d < D; ++d) c.WY[bi * D + d] = w[d] * y[d];
+            for (int d = 0; d < D; ++d)
+              c.WY[bi * D + d] = w[d] * (arow_fixed ? y[d] - al_fixed * arow_fixed[d] : y[d]);
           }
           PROF_LAP(prof_thread, kWeights, pt);
           gemm_rm(B, T, D, c.W.data(), D, O.data(), T, c.NSS.data(), T);
           gemm_rm(B, F, D, c.WY.data(), D, St.data(), F, c.RHS.data(), F);
+          if (any_bent) {
+            // AF shape bend integrated out: the Woodbury change to S W S' and S W r of each bent event
+            for (int bi = 0; bi < B; ++bi) {
+              const int i = i0 + bi;
+              if (!bent[i]) continue;
+              const double* w = &c.W[bi * D];
+              const double* wr = &c.WY[bi * D];
+              const double* prec = &bend_prec[static_cast<size_t>(i) * Lb];
+              for (int l = 0; l < Lb; ++l) {
+                const double* el = &Eb[static_cast<size_t>(l) * D];
+                for (int d = 0; d < D; ++d) bw[d] = w[d] * el[d];
+                for (int m = 0; m <= l; ++m) {
+                  const double v = dot(bw.data(), &Eb[static_cast<size_t>(m) * D], D);
+                  bm[l * Lb + m] = v;
+                  bm[m * Lb + l] = v;
+                }
+                bm[l * Lb + l] += prec[l];
+                bew[l] = dot(wr, el, D);
+                for (int f = 0; f < F; ++f) bswe[f * Lb + l] = dot(bw.data(), &S[static_cast<size_t>(f) * D], D);
+              }
+              if (!cholesky(bm.data(), Lb)) continue;   // keeps the unbent normal equations
+              for (int f = 0; f < F; ++f) {
+                for (int l = 0; l < Lb; ++l) bz[f * Lb + l] = bswe[f * Lb + l];
+                chol_solve(bm.data(), Lb, &bz[f * Lb]);
+              }
+              chol_solve(bm.data(), Lb, bew.data());
+              double* nss = &c.NSS[static_cast<size_t>(bi) * T];
+              double* rhs = &c.RHS[bi * F];
+              int t = 0;
+              for (int a = 0; a < F; ++a)
+                for (int bb = 0; bb <= a; ++bb, ++t) nss[t] -= dot(&bswe[a * Lb], &bz[bb * Lb], Lb);
+              for (int f = 0; f < F; ++f) rhs[f] -= dot(&bswe[f * Lb], bew.data(), Lb);
+            }
+          }
           PROF_LAP(prof_thread, kNormalProducts, pt);
           if (batch_lanes == 0) {
             for (int bi = 0; bi < B; ++bi) {
@@ -966,7 +1029,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
               const double* rhs = &c.RHS[bi * F];
               bool ok;
               double a_new = 0.0;
-              if (has_af) {
+              if (solve_af) {
                 const double* arow = A + static_cast<size_t>(c.IDX[bi]) * D;
                 std::fill(c.nsa.begin(), c.nsa.end(), 0.0);
                 double naa = 0.0, rhs_a = 0.0;
@@ -990,7 +1053,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
               }
               PROF_LAP(prof_thread, kSolve, pt);
               if (!ok) continue;   // keeps the previous estimate
-              c.ALPHA[bi] = a_new;
+              if (!fixed) c.ALPHA[bi] = a_new;
               double* th = &c.THETA[bi * F];
               for (int f = 0; f < F; ++f) {
                 th[f] = c.b[f];
@@ -1014,7 +1077,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
               c.EV[bi] = bi;
             }
             PROF_LAP(prof_thread, kSolve, pt);
-            if (has_af) {
+            if (solve_af) {
               for (int bi = 0; bi < B; ++bi) {
                 const double* y = Y + static_cast<size_t>(bi) * D;
                 const double* w = &c.W[bi * D];
@@ -1041,8 +1104,8 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
                 batch_solve<4>(F, with_af, T, c.EV.data(), n, c.NSS.data(), c.RHS.data(), c.NSAB.data(),
                                c.NAAB.data(), c.RHSAB.data(), PE, c.BOUT.data(), c.INVD.data(), c.OKV.data(), c.sbuf);
             };
-            run(has_af, B);
-            if (has_af) {   // a negative AF abundance: re-solve those events without the AF column
+            run(solve_af, B);
+            if (solve_af) {   // a negative AF abundance: re-solve those events without the AF column
               int n2 = 0;
               for (int bi = 0; bi < B; ++bi)
                 if (c.OKV[bi] && c.BOUT[static_cast<size_t>(bi) * (F + 1) + F] < 0.0) c.EV[n2++] = bi;
@@ -1053,7 +1116,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
               const double* bo = &c.BOUT[static_cast<size_t>(bi) * (F + 1)];
               const double* inv = &c.INVD[static_cast<size_t>(bi) * F];
               const double* pen = prior ? &c.PENB[bi * F] : nullptr;
-              c.ALPHA[bi] = has_af ? bo[F] : 0.0;
+              if (!fixed) c.ALPHA[bi] = solve_af ? bo[F] : 0.0;
               double* th = &c.THETA[bi * F];
               double* x = &c.X[bi * F];
               for (int f = 0; f < F; ++f) {
@@ -1126,6 +1189,8 @@ PYBIND11_MODULE(_gls_m2p_kernel, m) {
         py::arg("bead_var") = py::none(), py::arg("tau_spread") = py::none(), py::arg("prior_lambda") = 1.0,
         py::arg("n_iter") = 2, py::arg("weight_ceiling") = 0.0, py::arg("n_threads") = 0,
         py::arg("start_only") = false, py::arg("af_choice_weights") = py::none(),
-        py::arg("batch_lanes") = 0);
+        py::arg("batch_lanes") = 0, py::arg("fixed_af_idx") = py::none(), py::arg("fixed_af_scale") = py::none(),
+        py::arg("bend_shapes") = py::none(), py::arg("bend_var") = py::none());
   m.def("max_threads", &max_threads);
+  register_af_bend(m);
 }

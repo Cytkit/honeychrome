@@ -24,8 +24,8 @@ and three apply it, after Train:
               over every sample and for each validation sample.
   • Results — sample groups and covariates, moderated tests of population
               frequencies (log-odds within the parent population), optional
-              negative-binomial tests of counts, population-first tests of
-              marker medians, heatmaps and volcano plots, a population
+              negative-binomial tests of counts, tests of marker medians
+              (population first by default), heatmaps and volcano plots, a population
               comparison (each group's pooled biplot and the per-sample
               values with the test's p-value), and CSV export.
   • Enrichment — Flow Set Enrichment Analysis: curated immune states
@@ -36,7 +36,7 @@ Run applies the model as it stands on the model pages, in their transforms,
 once every gate has a trained boundary. Gated results record a hash of the
 model they were made with (gates, boundaries, transforms and gate modes).
 Gated results, display subsamples and statistics are saved in the
-experiment's cache folder and restored when the experiment is opened again;
+experiment's state folder and restored when the experiment is opened again;
 each gating and statistics run is also written as CSV files to
 ``Automated_Gating_Results`` (named after the model, with a timestamp).
 
@@ -50,6 +50,7 @@ Plugin contract (plugin_loaders.py):
   PluginWidget(QWidget)   — instantiated with (bus, controller)
 """
 
+import gc
 import hashlib
 import json
 import os as _os
@@ -57,6 +58,7 @@ import sys
 import threading
 import uuid
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime
@@ -80,10 +82,11 @@ from PySide6.QtWidgets import (
 
 import honeychrome
 from honeychrome.settings import af_abundance_channel
+from honeychrome.controller_components import anova_stats
 from honeychrome.controller_components import differential_stats as ds
 from honeychrome.controller_components import trend_stats as ts
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy
-from honeychrome.controller_components import experiment_state
+from honeychrome.controller_components import experiment_paths, experiment_state
 from honeychrome.controller_components import covariate_check, sample_table
 from honeychrome.view_components import suggest_groupings_dialog as sgd
 from honeychrome.view_components import covariate_check_dialog, sample_table_import_dialog
@@ -110,6 +113,7 @@ if _PLUGIN_DIR not in sys.path:
 
 import ag_builder  # noqa: E402
 import ag_core  # noqa: E402
+import ag_coherence  # noqa: E402
 import ag_fsea  # noqa: E402
 import ag_fsea_ui  # noqa: E402
 import ag_help_texts  # noqa: E402
@@ -186,16 +190,21 @@ plugin_name = 'Automated Gating'
 
 DEFAULT_DISPLAY_EVENTS = 20_000
 DISPLAY_SEED = 42
-RESULTS_FILE = Path('cache') / 'automated_gating' / 'results.json'
+RESULTS_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'results.json'
 # The marker medians and quartiles of RESULTS_FILE's samples, as arrays.
-MARKERS_FILE = Path('cache') / 'automated_gating' / 'results_markers.npz'
+MARKERS_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'results_markers.npz'
 RESULTS_FORMAT = 3
-STATS_FILE = Path('cache') / 'automated_gating' / 'stats.json'
-TREND_FILE = Path('cache') / 'automated_gating' / 'trend.json'
-ENRICHMENT_FILE = Path('cache') / 'automated_gating' / 'enrichment.json'
-SAMPLE_ANALYSIS_FILE = Path('cache') / 'automated_gating' / 'sample_analysis.json'
-DISPLAY_DIR = Path('cache') / 'automated_gating' / 'display'
+STATS_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'stats.json'
+TREND_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'trend.json'
+ENRICHMENT_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'enrichment.json'
+SAMPLE_ANALYSIS_FILE = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'sample_analysis.json'
+DISPLAY_DIR = Path(experiment_paths.STATE_FOLDER) / 'automated_gating' / 'display'
+# Threads that read the saved display records when an experiment opens;
+# decompressing them releases the interpreter lock, so they run in parallel.
+DISPLAY_READERS = max(1, min(8, _os.cpu_count() or 1))
 EXPORT_DIR = Path('Automated_Gating_Results')
+# Reports, and figures and tables exported by hand, go here.
+REPORTS_DIR = Path('Automated_Gating_Reports')
 # Events per group in the population comparison's pooled biplots.
 GROUP_PLOT_EVENTS = 100_000
 # Heatmaps and marker summaries open at this size (percent of natural size).
@@ -204,7 +213,7 @@ HEATMAP_SCALE_PCT = 50
 # name cannot push the other columns out of view; covariates get room to type.
 SAMPLE_COLUMN_MAX_WIDTH = 280
 COVARIATE_COLUMN_MIN_WIDTH = 110
-POP_FILTERS = (('significant', 'Significant populations'), ('all', 'All populations'))
+POP_FILTERS = (('all', 'All populations'), ('significant', 'Significant populations'))
 
 MODE_LABELS = {ag_core.MODE_FIXED: 'Fixed', ag_core.MODE_RECALCULATE: 'Recalculate'}
 DRIFT_ACTIONS = {'flag': 'Flag only', 'reference': 'Use the stored boundary'}
@@ -222,14 +231,14 @@ TREND_MAX_DF = 6
 # Statistics settings put back by the Restore defaults button. The design
 # (comparisons, reference group, pairing, adjustment covariates) is kept.
 STATS_DEFAULT_KEYS = ('run_freq', 'run_counts', 'counts_method', 'counts_reference',
-                      'min_parent_events', 'run_markers', 'use_stats_parent',
-                      'exclude_gating_markers', 'min_marker_events', 'pval_threshold', 'fc_threshold',
+                      'min_parent_events', 'run_markers', 'markers_population_first',
+                      'use_stats_parent', 'exclude_gating_markers', 'min_marker_events', 'pval_threshold', 'fc_threshold',
                       'marker_threshold', 'use_treat', 'fdr_scope', 'exclude_flagged',
                       'trend_shape', 'trend_df', 'trend_scale', 'trend_call', 'trend_min_r2',
                       'trend_patterns')
 # Statistics settings applied to stored results without running them again.
 THRESHOLD_KEYS = ('pval_threshold', 'fc_threshold', 'marker_threshold', 'use_treat', 'fdr_scope',
-                  'trend_call', 'trend_min_r2', 'trend_patterns')
+                  'markers_population_first', 'trend_call', 'trend_min_r2', 'trend_patterns')
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -419,7 +428,10 @@ class GatingRunState:
                      default; feature types; marker readout; ranking
                      statistic; permutations; seed; minimum set size;
                      {population key: cell type} overrides).
-    fsea           : the last enrichment run of the group comparisons, and
+    coherence_*    : the Enrichment page's coherence options (on, marker
+                     background adjustment, minimum reliability).
+    fsea           : the last enrichment run of the group comparisons (with
+                     its coherence result under 'coherence'), and
     fsea_trend     : of the trend (both kept in ENRICHMENT_FILE).
 
     results_revision (not a field) counts the times one of _RESULT_FIELDS
@@ -449,6 +461,7 @@ class GatingRunState:
     run_transforms: dict = field(default_factory=dict)
     report_populations: list = field(default_factory=list)
     pop_filter: str = 'significant'
+    pop_values: str = 'freq'
 
     group_names: list = field(default_factory=list)
     group_patterns: dict = field(default_factory=dict)
@@ -457,6 +470,7 @@ class GatingRunState:
     covariates: dict = field(default_factory=dict)
     numeric_covariates: list = field(default_factory=list)
     pairing: str = ''
+    pairing_mode: str = 'auto'
     adjust_covariates: list = field(default_factory=list)
     contrast_mode: str = 'reference'
     reference_group: str = ''
@@ -471,6 +485,7 @@ class GatingRunState:
     counts_reference: str = 'anchor'
     min_parent_events: int = ag_results.DEFAULT_MIN_PARENT_EVENTS
     run_markers: bool = True
+    markers_population_first: bool = True
     use_stats_parent: bool = True
     exclude_gating_markers: bool = True
     min_marker_events: int = ag_results.DEFAULT_MIN_MARKER_EVENTS
@@ -497,6 +512,7 @@ class GatingRunState:
     pred_lasso: bool = True
     pred_forest: bool = True
     pred_repeats: int = 5
+    pred_keep_donors: bool = True
     age_use_freq: bool = True
     age_use_markers: bool = False
     age_repeats: int = 5
@@ -514,6 +530,9 @@ class GatingRunState:
     fsea_seed: int = ag_fsea.DEFAULT_SEED
     fsea_min_set_size: int = ag_fsea.MIN_SET_SIZE
     fsea_overrides: dict = field(default_factory=dict)
+    coherence_on: bool = True
+    coherence_background: bool = True
+    coherence_min_reliability: float = ag_coherence.DEFAULT_MIN_RELIABILITY
     fsea: dict = field(default_factory=dict)
     fsea_trend: dict = field(default_factory=dict)
 
@@ -550,18 +569,20 @@ _VIEW_FIELDS = ('model_path', 'model_sha', 'results_model_sha', 'marker_channels
 _PERSISTED_FIELDS = (
     'modes', 'drift_limit', 'drift_action', 'run_samples', 'validation_samples', 'include_controls',
     'display_events', 'group_names', 'group_patterns', 'group_colors', 'sample_groups', 'covariates',
-    'numeric_covariates', 'pairing', 'adjust_covariates', 'contrast_mode', 'reference_group', 'pval_threshold',
+    'numeric_covariates', 'pairing', 'pairing_mode', 'adjust_covariates', 'contrast_mode', 'reference_group', 'pval_threshold',
     'fc_threshold', 'marker_threshold', 'use_treat', 'fdr_scope', 'run_freq', 'run_counts',
-    'counts_method', 'counts_reference', 'min_parent_events', 'run_markers', 'use_stats_parent',
+    'counts_method', 'counts_reference', 'min_parent_events', 'run_markers',
+    'markers_population_first', 'use_stats_parent',
     'exclude_gating_markers', 'min_marker_events', 'exclude_flagged', 'pca_use_freq', 'pca_use_counts', 'pca_use_markers', 'pca_n_loadings',
     'stats_test', 'trend_variable', 'trend_unit', 'trend_groups', 'trend_interaction',
     'trend_shape', 'trend_df', 'trend_scale', 'trend_call', 'trend_min_r2', 'trend_patterns',
     'pred_use_freq', 'pred_use_markers', 'pred_lasso', 'pred_forest', 'pred_repeats',
+    'pred_keep_donors',
     'age_use_freq', 'age_use_markers', 'age_repeats', 'age_permutations', 'age_predict_others',
-    'report_populations', 'pop_filter',
+    'report_populations', 'pop_filter', 'pop_values',
     'fsea_library_path', 'fsea_species', 'fsea_anchor', 'fsea_feature_types',
     'fsea_marker_readout', 'fsea_rank_metric', 'fsea_n_perm', 'fsea_seed', 'fsea_min_set_size',
-    'fsea_overrides',
+    'fsea_overrides', 'coherence_on', 'coherence_background', 'coherence_min_reliability',
 )
 
 
@@ -1565,6 +1586,7 @@ class RunTab(QWidget):
         self._worker = None
         self._job_token.release()
         self._set_running(False)
+        self._update_warnings()
         self.progress_bar.setVisible(False)
         st = self.state
         if outcome == 'cancelled' and self._before_run is not None:
@@ -2043,10 +2065,17 @@ def build_result_figures(stats: dict, base: str, other: str, pval_threshold: flo
     run_label = f"{label}"
     out: dict = {}
 
-    def _add(key, tab_title, maker, results=None, **kwargs):
+    def _add(key, tab_title, maker, results=None, values_kind=None, **kwargs):
+        # values_kind ('freq' or 'counts'): the population values a click
+        # through to the Populations page shows in its dot and violin plot.
+        def make():
+            fig = maker(**kwargs)
+            if values_kind:
+                fig._pop_values = values_kind
+            return fig
         try:
-            out[key] = {'fig': maker(**kwargs), 'title': tab_title, 'error': None,
-                        'results': results, 'make': lambda: maker(**kwargs)}
+            out[key] = {'fig': make(), 'title': tab_title, 'error': None,
+                        'results': results, 'make': make}
         except Exception as exc:
             log.exception("figure %s failed", key)
             out[key] = {'fig': None, 'title': tab_title, 'error': str(exc), 'results': None}
@@ -2067,7 +2096,7 @@ def build_result_figures(stats: dict, base: str, other: str, pval_threshold: flo
         if view is None:
             continue
         labels = [pop_labels.get(f, f) for f in view['feature']]
-        _add(f'{key}_heatmap', f"{name} heatmap", dp.make_heatmap_figure,
+        _add(f'{key}_heatmap', f"{name} heatmap", dp.make_heatmap_figure, values_kind=key,
              results_df=view, sample_df=_rows(values),
              title=f"{name}: significant populations, {label}",
              group_by_sample=group_by_sample, group_a=base, group_b=other, is_dark=is_dark,
@@ -2075,7 +2104,7 @@ def build_result_figures(stats: dict, base: str, other: str, pval_threshold: flo
              feature_labels={f: pop_labels.get(f, f) for f in view['feature']},
              group_colours=group_colours)
         _add(f'{key}_volcano', f"{name} volcano", dp.make_volcano_figure, results=view,
-             results_df=view, title=f"{name} volcano: {label}", pval_threshold=pval_threshold,
+             values_kind=key, results_df=view, title=f"{name} volcano: {label}", pval_threshold=pval_threshold,
              fc_threshold=thr, is_dark=is_dark, fdr_scope=fdr_scope, feature_labels=labels,
              x_label=x_label, run_label=run_label, group_a=base, group_b=other,
              group_colours=group_colours)
@@ -2807,8 +2836,10 @@ class ResultsTab(QWidget):
         _status(self.bus, sample_table_import_dialog.describe_import(result))
 
     def _on_export_table(self):
-        default = sample_table.default_export_path(
-            getattr(self.controller, 'experiment_dir', ''), plugin_name)
+        from honeychrome.view_components.scalable_figure_widget import results_folder, start_path
+        exp_dir = getattr(self.controller, 'experiment_dir', '')
+        default = start_path(results_folder(exp_dir, REPORTS_DIR),
+                             Path(sample_table.default_export_path(exp_dir, plugin_name)).name)
         path, _ = QFileDialog.getSaveFileName(self, "Export sample table", default, "CSV (*.csv)")
         if not path:
             return
@@ -2863,7 +2894,15 @@ class ResultsTab(QWidget):
 
         self.chk_freq = QCheckBox("Population frequencies (log odds within parent)")
         self.chk_counts = QCheckBox("Population counts")
-        self.chk_markers = QCheckBox("Marker medians (population first)")
+        self.chk_markers = QCheckBox("Marker medians")
+        self.chk_marker_pop_first = QCheckBox("Test marker medians population first")
+        self.chk_marker_pop_first.setToolTip(
+            "On: each population is first tested on all its markers together, and markers are "
+            "tested only within the populations that pass, with the FDR adjusted for how many "
+            "populations were selected (Benjamini & Bogomolov 2014). Off: every population × "
+            "marker is corrected as one list, so a marker can be called in a population whose "
+            "markers otherwise do not change. Applied to the current results without running "
+            "them again.")
         self.chk_stats_parent = QCheckBox("Use a population's stats parent where defined")
         self.chk_exclude_gating = QCheckBox("Leave out each population's gating markers")
         self.chk_exclude_gating.setToolTip(
@@ -2910,7 +2949,8 @@ class ResultsTab(QWidget):
         counts_form.addRow("Model:", self.cb_counts_method)
         counts_form.addRow(self.lbl_counts_note)
         form.addRow(counts_box)
-        for w in (self.chk_markers, self.chk_stats_parent, self.chk_exclude_gating):
+        for w in (self.chk_markers, self.chk_marker_pop_first, self.chk_stats_parent,
+                  self.chk_exclude_gating):
             form.addRow(w)
         form.addRow("Min. events for medians:", self.sb_min_events)
 
@@ -2990,11 +3030,29 @@ class ResultsTab(QWidget):
             self.cb_mode.addItem(text, key)
         self.cb_reference = QComboBox()
         self.cb_pairing = QComboBox()
+        self.cb_pairing_mode = QComboBox()
+        for text, key in (("Auto", 'auto'), ("Fixed (paired)", 'fixed'),
+                          ("Random (repeated samples)", 'random')):
+            self.cb_pairing_mode.addItem(text, key)
+        self.cb_pairing_mode.setToolTip(
+            "How the pairing variable enters the model.\n"
+            "Fixed: groups are compared within each individual (before and after "
+            "samples of one donor, two populations of one animal). Each individual "
+            "needs samples in more than one group.\n"
+            "Random: each individual gives several samples (e.g. four tissues per "
+            "mouse) but belongs to one group (knockout or wild type). The samples "
+            "of one individual are treated as correlated, so the group difference "
+            "is judged against the variation between individuals rather than "
+            "between samples. The quasi-likelihood counts test is not run in this "
+            "mode.\n"
+            "Auto: Random when every individual belongs to one group, Fixed "
+            "otherwise.")
         self.list_adjust = QListWidget()
         self.list_adjust.setMaximumHeight(80)
         form.addRow("Comparisons:", self.cb_mode)
         form.addRow("Reference group:", self.cb_reference)
         form.addRow("Pair samples by:", self.cb_pairing)
+        form.addRow("Individual effect:", self.cb_pairing_mode)
         form.addRow("Adjust for:", self.list_adjust)
 
         self.sb_pval = QDoubleSpinBox()
@@ -3056,16 +3114,19 @@ class ResultsTab(QWidget):
         self.cb_reference.currentIndexChanged.connect(
             lambda _i: self._filling or setattr(self.state, 'reference_group',
                                                 self.cb_reference.currentData() or ''))
-        self.cb_pairing.currentIndexChanged.connect(
-            lambda _i: self._filling or setattr(self.state, 'pairing',
-                                                self.cb_pairing.currentData() or ''))
+        self.cb_pairing.currentIndexChanged.connect(self._on_pairing_changed)
+        self.cb_pairing_mode.currentIndexChanged.connect(
+            lambda _i: self._filling or setattr(self.state, 'pairing_mode',
+                                                self.cb_pairing_mode.currentData() or 'auto'))
         self.list_adjust.itemChanged.connect(self._on_adjust_changed)
         for w in (self.sb_pval, self.sb_fc, self.sb_marker):
             w.valueChanged.connect(self._on_thresholds_changed)
         self.chk_treat.toggled.connect(self._on_thresholds_changed)
+        self.chk_marker_pop_first.toggled.connect(self._on_thresholds_changed)
         self.cb_fdr.currentIndexChanged.connect(self._on_thresholds_changed)
-        for box in (self.chk_freq, self.chk_counts, self.chk_markers, self.chk_stats_parent,
-                    self.chk_exclude_gating, self.chk_exclude_flagged, self.chk_treat):
+        for box in (self.chk_freq, self.chk_counts, self.chk_markers, self.chk_marker_pop_first,
+                    self.chk_stats_parent, self.chk_exclude_gating, self.chk_exclude_flagged,
+                    self.chk_treat):
             box.toggled.connect(self._update_stats_defaults_button)
         for spin in (self.sb_min_events, self.sb_min_parent, self.sb_pval, self.sb_fc,
                      self.sb_marker):
@@ -3119,7 +3180,8 @@ class ResultsTab(QWidget):
         st = self.state
         trend = self._trend_mode()
         self.trend_box.setVisible(trend)
-        for w in (self.cb_mode, self.sb_fc, self.sb_marker, self.chk_treat, self.cb_fdr):
+        for w in (self.cb_mode, self.sb_fc, self.sb_marker, self.chk_treat, self.cb_fdr,
+                  self.chk_marker_pop_first):
             w.setEnabled(not trend)
         self.cb_reference.setEnabled(st.trend_interaction if trend
                                      else st.contrast_mode == 'reference')
@@ -3317,6 +3379,7 @@ class ResultsTab(QWidget):
         try:
             for w, v in ((self.chk_freq, st.run_freq), (self.chk_counts, st.run_counts),
                          (self.chk_markers, st.run_markers),
+                         (self.chk_marker_pop_first, st.markers_population_first),
                          (self.chk_stats_parent, st.use_stats_parent),
                          (self.chk_exclude_gating, st.exclude_gating_markers),
                          (self.chk_treat, st.use_treat),
@@ -3363,6 +3426,9 @@ class ResultsTab(QWidget):
             for c in st.covariates:
                 self.cb_pairing.addItem(c, c)
             self.cb_pairing.setCurrentIndex(max(self.cb_pairing.findData(st.pairing), 0))
+            self.cb_pairing_mode.setCurrentIndex(
+                max(self.cb_pairing_mode.findData(st.pairing_mode), 0))
+            self.cb_pairing_mode.setEnabled(bool(st.pairing))
             self.list_adjust.clear()
             for c in st.covariates:
                 it = QListWidgetItem(c)
@@ -3371,6 +3437,12 @@ class ResultsTab(QWidget):
                 self.list_adjust.addItem(it)
         finally:
             self._filling = False
+
+    def _on_pairing_changed(self, _i):
+        if self._filling:
+            return
+        self.state.pairing = self.cb_pairing.currentData() or ''
+        self.cb_pairing_mode.setEnabled(bool(self.state.pairing))
 
     def _on_mode_changed(self, _i):
         if self._filling:
@@ -3396,6 +3468,7 @@ class ResultsTab(QWidget):
         st.marker_threshold = float(self.sb_marker.value())
         st.use_treat = bool(self.chk_treat.isChecked())
         st.fdr_scope = self.cb_fdr.currentData()
+        st.markers_population_first = bool(self.chk_marker_pop_first.isChecked())
         st.trend_call = self.cb_trend_call.currentData() or 'either'
         st.trend_min_r2 = float(self.sb_trend_r2.value())
         st.trend_patterns = int(self.sb_trend_patterns.value())
@@ -3404,7 +3477,8 @@ class ResultsTab(QWidget):
             try:
                 st.stats = ag_results.reapply_thresholds(
                     st.stats, st.pval_threshold, st.fc_threshold, st.marker_threshold,
-                    st.fdr_scope, st.use_treat)
+                    st.fdr_scope, st.use_treat,
+                    markers_population_first=st.markers_population_first)
             except Exception as exc:
                 self.lbl_stats.setText(f"Could not apply thresholds: {exc}")
                 return
@@ -3442,8 +3516,10 @@ class ResultsTab(QWidget):
             counts_method=st.counts_method, counts_reference=st.counts_reference,
             min_parent_events=st.min_parent_events,
             run_markers=st.run_markers, use_stats_parent=st.use_stats_parent,
+            markers_population_first=st.markers_population_first,
             exclude_gating_markers=st.exclude_gating_markers,
             min_marker_events=st.min_marker_events,
+            pairing_mode=st.pairing_mode, individual=st.pairing or 'Individual',
         )
         # Each sample's summary is replaced whole when it is gated again,
         # never changed in place, so the worker can read this snapshot.
@@ -3707,6 +3783,33 @@ class ResultsTab(QWidget):
             table = CopyableTableWidget(rows, headers)
             table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
             self.results_tabs.addTab(table, title)
+        self._show_variance_tables(stats, labels, antigens)
+
+    def _show_variance_tables(self, stats: dict, labels: dict, antigens: dict):
+        """'Variance' tabs: per population (and marker), each term's FDR and
+        the share of variation it explains (anova_stats.run_anova). They
+        cover every group at once, so they do not change with the
+        comparison shown."""
+        for key, title in (('anova_freq', 'Variance: Frequencies'),
+                           ('anova_markers', 'Variance: Markers')):
+            table_df = stats.get(key)
+            if table_df is None:
+                continue
+            markers = key == 'anova_markers'
+            ids = ['feature', 'cluster_id', 'channel'] if markers else ['feature']
+            headers, rows = anova_stats.display_rows(table_df, ids)
+            shown = []
+            for r in rows:
+                pop_key = r.pop('cluster_id') if markers else r['feature']
+                row = {'Population': labels.get(pop_key, pop_key)}
+                if markers:
+                    row['Marker'] = antigens.get(r['channel'], r['channel'])
+                row.update({k: v for k, v in r.items() if k not in ('feature', 'channel')})
+                shown.append(row)
+            head = ['Population'] + (['Marker'] if markers else []) + headers[len(ids):]
+            table = CopyableTableWidget(shown, head)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            self.results_tabs.addTab(table, title)
 
     # ------------------------------------------------------------------
     # Figures
@@ -3756,8 +3859,10 @@ class ResultsTab(QWidget):
         if not ok:
             self.figures_tabs.addTab(QLabel(f"Figures failed: {error}"), "Error")
             return
-        exp_dir = getattr(self.controller, 'experiment_dir', '')
-        from honeychrome.view_components.scalable_figure_widget import initial_scale_for
+        from honeychrome.view_components.scalable_figure_widget import (
+            initial_scale_for, results_folder,
+        )
+        exp_dir = results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR)
         for key, item in payload.items():
             if item['fig'] is None:
                 lbl = QLabel(f"{item['title']}: {item['error']}")
@@ -3838,7 +3943,9 @@ class ResultsTab(QWidget):
 
     def _show_pop_out(self, worker, ok: bool, error: str, fig, title: str, results, large: bool,
                       values_table=None, options=None):
-        from honeychrome.view_components.scalable_figure_widget import initial_scale_for
+        from honeychrome.view_components.scalable_figure_widget import (
+            initial_scale_for, results_folder,
+        )
         if worker in self._popout_workers:
             self._popout_workers.remove(worker)
         if not ok or fig is None:
@@ -3848,7 +3955,8 @@ class ResultsTab(QWidget):
         dialog.setWindowTitle(title)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         widget = ScalableFigureWidget(
-            fig, title=title, experiment_dir=getattr(self.controller, 'experiment_dir', ''),
+            fig, title=title,
+            experiment_dir=results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR),
             initial_scale=initial_scale_for(fig, HEATMAP_SCALE_PCT) if large else 100,
             parent=dialog, options=options)
         self._connect_figure(widget.canvas, fig, results)
@@ -3881,10 +3989,13 @@ class ResultsTab(QWidget):
         if ax is None or event.x is None:
             return None
         fig = self._row_figures.get(id(event.canvas))
-        if fig is not None and ax is getattr(fig, '_row_axes', None) and event.ydata is not None:
+        row_axes = getattr(fig, '_row_axes', None)
+        if not isinstance(row_axes, tuple):
+            row_axes = (row_axes,)
+        if fig is not None and ax in row_axes and event.ydata is not None:
             row = int(round(event.ydata))
             keys = fig._row_keys
-            return str(keys[row]) if 0 <= row < len(keys) else None
+            return (str(keys[row]) or None) if 0 <= row < len(keys) else None
         table = self._volcano_tables.get(id(event.canvas))
         if table is None or table.empty:
             return None
@@ -3903,9 +4014,11 @@ class ResultsTab(QWidget):
         return str(row.get('cluster_id') if 'cluster_id' in table.columns else row['feature'])
 
     def _save_values_csv(self, values_table, stem: str):
-        """Ask for a file name (in the experiment folder by default) and
+        """Ask for a file name (in Automated_Gating_Reports by default) and
         write *values_table()* there as CSV."""
-        start = str(Path(getattr(self.controller, 'experiment_dir', '') or '.') / f"{stem}.csv")
+        from honeychrome.view_components.scalable_figure_widget import results_folder, start_path
+        start = start_path(results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR),
+                           f"{stem}.csv")
         path, _selected = QFileDialog.getSaveFileName(self, "Save values", start, "CSV (*.csv)")
         if not path:
             return
@@ -3930,12 +4043,16 @@ class ResultsTab(QWidget):
         pop_key = self._figure_population(event)
         if pop_key is None:
             return
+        measure = getattr(event.canvas.figure, '_pop_values', None)
         if event.dblclick and event.button == 1:
-            self.show_population(pop_key, include=True)
+            self.show_population(pop_key, include=True, measure=measure)
         elif event.button == 3:
-            self._figure_menu(pop_key)
+            self._figure_menu(pop_key, measure)
 
-    def _figure_menu(self, pop_key: str):
+    def _figure_menu(self, pop_key: str, measure: str | None = None):
+        """Right-click menu of a population on a figure; *measure* ('freq'
+        or 'counts') is the values the figure shows, which the Populations
+        page and the comparison window then plot."""
         from PySide6.QtGui import QCursor
         from PySide6.QtWidgets import QMenu
         label = _population_labels(self.state.gate_defs()).get(pop_key, pop_key)
@@ -3946,8 +4063,8 @@ class ResultsTab(QWidget):
         act_report = menu.addAction("Include in the report")
         act_report.setCheckable(True)
         act_report.setChecked(pop_key in self.state.report_populations)
-        act_show.triggered.connect(lambda: self.show_population(pop_key))
-        act_window.triggered.connect(lambda: self._population_window(pop_key))
+        act_show.triggered.connect(lambda: self.show_population(pop_key, measure=measure))
+        act_window.triggered.connect(lambda: self._population_window(pop_key, measure))
         act_report.triggered.connect(lambda on: self._set_report_population(pop_key, on))
         self._add_composition_action(menu, pop_key)
         menu.exec(QCursor.pos())
@@ -4138,6 +4255,7 @@ class ResultsTab(QWidget):
     # ------------------------------------------------------------------
 
     def _build_explore_page(self):
+        import drc_predictive
         layout = QVBoxLayout(self.explore_page)
         note = QLabel("Both use the per-sample values of the last statistics run (population "
                       "% of parent, counts and marker medians), so run Statistics first with "
@@ -4190,6 +4308,14 @@ class ResultsTab(QWidget):
             orow.addWidget(w)
         orow.addWidget(QLabel("Repeats:"))
         orow.addWidget(self.sb_pred_repeats)
+        self.chk_pred_donors = QCheckBox("Keep donors together")
+        self.chk_pred_donors.setToolTip(
+            "With a pairing variable (Pair samples by), every cross-validation split keeps "
+            "all samples of a donor on the same side, so the model is never tested on a "
+            "donor it was trained on. Needs at least "
+            f"{drc_predictive.MIN_DONORS_PER_GROUP} donors per group. Untick to split "
+            "samples alone. No effect without a pairing variable.")
+        orow.addWidget(self.chk_pred_donors)
         self.btn_pred = QPushButton("Run Predictive Analysis")
         self.btn_pred.clicked.connect(self._on_run_predictive)
         orow.addWidget(self.btn_pred)
@@ -4271,6 +4397,7 @@ class ResultsTab(QWidget):
                         (self.chk_pred_freq, 'pred_use_freq'),
                         (self.chk_pred_markers, 'pred_use_markers'),
                         (self.chk_pred_lasso, 'pred_lasso'), (self.chk_pred_forest, 'pred_forest'),
+                        (self.chk_pred_donors, 'pred_keep_donors'),
                         (self.chk_age_freq, 'age_use_freq'),
                         (self.chk_age_markers, 'age_use_markers'),
                         (self.chk_age_others, 'age_predict_others')):
@@ -4292,7 +4419,8 @@ class ResultsTab(QWidget):
                          (self.chk_pca_markers, st.pca_use_markers),
                          (self.chk_pred_freq, st.pred_use_freq),
                          (self.chk_pred_markers, st.pred_use_markers),
-                         (self.chk_pred_lasso, st.pred_lasso), (self.chk_pred_forest, st.pred_forest)):
+                         (self.chk_pred_lasso, st.pred_lasso), (self.chk_pred_forest, st.pred_forest),
+                         (self.chk_pred_donors, st.pred_keep_donors)):
                 w.setChecked(bool(v))
             self.sb_pca_loadings.setValue(int(st.pca_n_loadings))
             self.sb_pred_repeats.setValue(int(st.pred_repeats))
@@ -4401,10 +4529,12 @@ class ResultsTab(QWidget):
             return
         X = ag_results.predictive_matrix(st.stats, use_freq, use_markers, self._feature_labels())
         repeats = int(st.pred_repeats)
+        pairing = self._trend_pairing(list(X.index)) if st.pred_keep_donors else None
+        blocks = [pairing.get(s, s) for s in X.index] if pairing else None
 
         def _run():
             return drc_predictive.run_predictive(X, groups, other, base, models=tuple(models),
-                                                 repeats=repeats)
+                                                 repeats=repeats, blocks=blocks)
 
         self.btn_pred.setEnabled(False)
         self.lbl_pred.setText(f"Running on {X.shape[1]} features, "
@@ -4637,11 +4767,12 @@ class ResultsTab(QWidget):
             res = st.predictive
             if res:
                 summary = res['summary']
+                keys = ag_results.predictive_feature_keys(st.stats or {}, self._feature_labels())
                 makers += [
                     ("Predictive: ROC", lambda: ag_report.make_roc_figure(
                         res['performance'], res['roc'], summary, is_dark)),
                     ("Predictive: features", lambda: ag_report.make_importance_figure(
-                        res['importance'], summary, is_dark)),
+                        res['importance'], summary, is_dark, keys=keys)),
                     ("Predictive: panel size", lambda: ag_report.make_panel_figure(
                         res['panel'], summary, is_dark)),
                 ]
@@ -4658,8 +4789,12 @@ class ResultsTab(QWidget):
         titles = {"Sample PCA", "Predictive: ROC", "Predictive: features", "Predictive: panel size"}
         for i in reversed(range(self.figures_tabs.count())):
             if self.figures_tabs.tabText(i) in titles:
+                canvas = getattr(self.figures_tabs.widget(i), 'canvas', None)
+                if canvas is not None:
+                    self._row_figures.pop(id(canvas), None)
                 self.figures_tabs.removeTab(i)
-        exp_dir = getattr(self.controller, 'experiment_dir', '')
+        from honeychrome.view_components.scalable_figure_widget import results_folder
+        exp_dir = results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR)
         for title, fig, make in self._extra_figures():
             key = _EXTRA_FIGURE_KEYS.get(title, title)
             widget = ScalableFigureWidget(
@@ -4667,9 +4802,7 @@ class ResultsTab(QWidget):
                 pop_out=lambda make=make, title=title, k=key: self._pop_out_figure(
                     make, title, options_key=k),
                 parent=self, options=figure_options_ref(self.controller, key))
-            handler = getattr(fig, '_hover_handler', None)
-            if handler is not None:
-                widget.canvas.mpl_connect('motion_notify_event', handler)
+            self._connect_figure(widget.canvas, fig)
             self.figures_tabs.addTab(widget, title)
 
     def _build_browser_page(self):
@@ -4680,8 +4813,9 @@ class ResultsTab(QWidget):
         ll.setContentsMargins(0, 0, 0, 0)
         ll.addWidget(QLabel("<b>Populations</b>"))
         self.pop_filter = FilterBar(POP_FILTERS, placeholder="Search populations…", vertical=True)
-        self.pop_filter.setToolTip("Significant: populations whose frequency differs between the "
-                                   "comparison's groups at the FDR threshold.")
+        self.pop_filter.setToolTip("Significant: populations that differ between the comparison's "
+                                   "groups at the FDR threshold in any test of the run (frequency, "
+                                   "counts or marker medians). Hover a population to see which.")
         self.pop_filter.changed.connect(self._on_pop_filter_changed)
         ll.addWidget(self.pop_filter)
         self.pop_list = QListWidget()
@@ -4699,6 +4833,20 @@ class ResultsTab(QWidget):
         self.lbl_pop_title = QLabel("")
         self.lbl_pop_title.setWordWrap(True)
         head.addWidget(self.lbl_pop_title, stretch=1)
+        self.pop_values_box = QWidget()
+        values_row = QHBoxLayout(self.pop_values_box)
+        values_row.setContentsMargins(0, 0, 0, 0)
+        values_row.addWidget(QLabel("Values:"))
+        self.cb_pop_values = block_wheel(QComboBox())
+        self.cb_pop_values.addItem("% of parent", 'freq')
+        self.cb_pop_values.addItem("Event counts", 'counts')
+        self.cb_pop_values.setToolTip(
+            "What the dot and violin plot shows for each sample: its % of parent, with the "
+            "frequency test, or its event count, with the counts test. Event counts need the "
+            "counts test in the statistics run.")
+        self.cb_pop_values.currentIndexChanged.connect(self._on_pop_values_changed)
+        values_row.addWidget(self.cb_pop_values)
+        head.addWidget(self.pop_values_box)
         self.chk_pop_report = QCheckBox("Include in report")
         self.chk_pop_report.setToolTip("Add this population's group comparison (biplots and the "
                                        "dot and violin plot) to the report.")
@@ -4732,23 +4880,41 @@ class ResultsTab(QWidget):
         rl.addWidget(self.pop_scroll, stretch=1)
         layout.addWidget(right, stretch=1)
 
-    def _significant_populations(self) -> set | None:
-        """Population keys significant in the current comparison's frequency
-        test (in trend mode: called as changing with the variable), or None
-        without one."""
+    def _significant_populations(self) -> dict | None:
+        """{population key: [tests]} of the populations significant in any
+        test of the run for the current comparison (in trend mode: called as
+        changing with the variable). The tests are 'frequency', 'counts' and
+        'marker medians (<markers>)'. None when no test has results."""
+        kinds = ('freq', 'counts', 'markers')
         if self._trend_mode():
-            res = (self.state.trend or {}).get('freq')
-            if res is None:
+            trend = self.state.trend or {}
+            tables = {k: (trend[k].table if trend.get(k) is not None else None) for k in kinds}
+        else:
+            comp = self._current_comparison()
+            if comp is None:
                 return None
-            return set(res.table.loc[res.table['significant'].astype(bool), 'feature'].astype(str))
-        comp = self._current_comparison()
-        df = (self.state.stats or {}).get('freq')
-        if comp is None or df is None:
+            label = _comparison_label(*comp)
+            tables = {k: _comparison_view((self.state.stats or {}).get(k), label) for k in kinds}
+        tables = {k: t for k, t in tables.items() if t is not None and 'significant' in t.columns}
+        if not tables:
             return None
-        view = _comparison_view(df, _comparison_label(*comp))
-        if view is None or 'significant' not in view.columns:
-            return None
-        return set(view.loc[view['significant'].astype(bool), 'feature'])
+        hits: dict[str, list] = {}
+        for kind, name in (('freq', 'frequency'), ('counts', 'counts')):
+            t = tables.get(kind)
+            if t is not None:
+                for key in t.loc[t['significant'].fillna(False).astype(bool), 'feature']:
+                    hits.setdefault(str(key), []).append(name)
+        t = tables.get('markers')
+        if t is not None:
+            antigens = _antigen_map(self.controller)
+            sig = t[t['significant'].fillna(False).astype(bool)]
+            markers: dict[str, list] = {}
+            for key, ch in zip(sig['cluster_id'].astype(str), sig['channel']):
+                markers.setdefault(key, []).append(antigens.get(ch, ch))
+            for key, names in markers.items():
+                hits.setdefault(key, []).append(
+                    f"marker medians ({', '.join(dict.fromkeys(names))})")
+        return hits
 
     def _populate_population_list(self):
         current = self.pop_list.currentItem().data(Qt.UserRole) if self.pop_list.currentItem() else None
@@ -4759,6 +4925,13 @@ class ResultsTab(QWidget):
         significant = self._significant_populations()
         only_sig = self.pop_filter.mode() == 'significant' and significant is not None
         text = self.pop_filter.text()
+        self.cb_pop_values.blockSignals(True)
+        self.cb_pop_values.setCurrentIndex(max(0, self.cb_pop_values.findData(self._pop_measure())))
+        self.cb_pop_values.blockSignals(False)
+        self.cb_pop_values.setEnabled(self._counts_available())
+        self.pop_values_box.setVisible(not self._trend_mode())
+        sig_prefix = (f"Changing with {(self.state.trend or {}).get('variable', '')}: "
+                      if self._trend_mode() else "Significant: ")
         self.pop_list.blockSignals(True)
         self.pop_list.clear()
         labels = _population_labels(self.state.gate_defs())
@@ -4774,11 +4947,16 @@ class ResultsTab(QWidget):
                     continue
                 it = QListWidgetItem(("★ " if significant and key in significant else '') + label)
                 it.setData(Qt.UserRole, key)
+                tips = []
+                if significant and key in significant:
+                    tips.append(sig_prefix + ", ".join(significant[key]))
                 if key in self.state.report_populations:
-                    it.setToolTip("Included in the report")
+                    tips.append("Included in the report")
                     font = it.font()
                     font.setBold(True)
                     it.setFont(font)
+                if tips:
+                    it.setToolTip("\n".join(tips))
                 self.pop_list.addItem(it)
                 if key == current:
                     self.pop_list.setCurrentItem(it)
@@ -4799,20 +4977,50 @@ class ResultsTab(QWidget):
         self.state.pop_filter = mode or 'significant'
         self._populate_population_list()
 
-    def show_population(self, pop_key: str, include: bool = False):
+    def show_population(self, pop_key: str, include: bool = False, measure: str | None = None):
         """Show a population on the Populations page (clearing the filter
-        when it hides it); with *include*, tick it for the report."""
+        when it hides it); with *include*, tick it for the report. *measure*
+        ('freq' or 'counts') switches the dot and violin plot to those
+        values."""
         if include:
             self._set_report_population(pop_key, True)
+        changed = self._set_pop_measure(measure)
+        shown = self._shown_population
         found = self._select_population(pop_key)
         if not found:
             self.pop_filter.clear()
             self._select_population(pop_key)
+        if changed and shown == pop_key:
+            self._draw_population(self.pop_list.currentItem())
         self.toolbox.setCurrentIndex(self._page_browser)
         win = self.window()
         if win is not None:
             win.raise_()
             win.activateWindow()
+
+    def _counts_available(self) -> bool:
+        """Whether the group comparison has a counts test to plot."""
+        return not self._trend_mode() and (self.state.stats or {}).get('counts') is not None
+
+    def _pop_measure(self) -> str:
+        """The values of the Populations page's dot and violin plot: 'counts'
+        when chosen and the run has a counts test, else 'freq'."""
+        return 'counts' if self.state.pop_values == 'counts' and self._counts_available() else 'freq'
+
+    def _set_pop_measure(self, measure: str | None) -> bool:
+        """Choose the dot and violin plot's values ('freq' or 'counts'; None
+        keeps the choice) without redrawing. True when the choice changed."""
+        if not measure or measure == self.state.pop_values:
+            return False
+        self.state.pop_values = measure
+        self.cb_pop_values.blockSignals(True)
+        self.cb_pop_values.setCurrentIndex(max(0, self.cb_pop_values.findData(measure)))
+        self.cb_pop_values.blockSignals(False)
+        return True
+
+    def _on_pop_values_changed(self, _index: int):
+        self.state.pop_values = self.cb_pop_values.currentData() or 'freq'
+        self._draw_population(self.pop_list.currentItem())
 
     def _select_population(self, pop_key: str) -> bool:
         for i in range(self.pop_list.count()):
@@ -4860,11 +5068,13 @@ class ResultsTab(QWidget):
         have = {st.sample_groups.get(k) for k in st.gated_samples()}
         return [g for g in st.group_names if g in have]
 
-    def _population_request(self) -> tuple:
-        """(groups, comparison) the Populations page compares, read from the
-        page's widgets (main thread); no comparison in trend mode."""
+    def _population_request(self, measure: str | None = None) -> tuple:
+        """(groups, comparison, measure) the Populations page compares, read
+        from the page's widgets (main thread); no comparison in trend mode.
+        *measure*: the dot and violin plot's values ('freq' or 'counts'),
+        the page's choice when not given."""
         comp = None if self._trend_mode() else self._current_comparison()
-        return self._comparison_groups(), comp
+        return self._comparison_groups(), comp, measure or self._pop_measure()
 
     def _population_data(self, pop_key: str, request: tuple | None = None) -> dict | None:
         """Everything the comparison of one population shows. *request* is
@@ -4878,7 +5088,7 @@ class ResultsTab(QWidget):
         if gdef is None:
             return None
         eff = ag_core.effective_gate_def(gdef, by_name)
-        groups, comp = request if request is not None else self._population_request()
+        groups, comp, measure = request if request is not None else self._population_request()
         panels = []
         for g in groups:
             samples = [k for k in st.gated_samples() if st.sample_groups.get(k) == g]
@@ -4886,8 +5096,15 @@ class ResultsTab(QWidget):
         values = ag_results.group_population_values(st.summaries, st.gated_samples(),
                                                     st.sample_groups, pop_key, st.use_stats_parent)
         values = {g: values.get(g, []) for g in groups}
+        if measure == 'counts':
+            plot_values = ag_results.group_population_values(
+                st.summaries, st.gated_samples(), st.sample_groups, pop_key, measure='counts')
+            plot_values = {g: plot_values.get(g, []) for g in groups}
+            value_label, value_suffix = 'Events', ''
+        else:
+            plot_values, value_label, value_suffix = values, '% of parent', '%'
         result = ag_results.population_result(st.stats, pop_key, _comparison_label(*comp),
-                                               st.fdr_scope) if comp else None
+                                               st.fdr_scope, kind=measure) if comp else None
         label = _population_labels(st.gate_defs()).get(pop_key, pop_key)
         title = f"{label}" + (f" — {_comparison_label(*comp)}" if comp else '')
         p_text = ag_report.p_value_text(result)
@@ -4899,7 +5116,8 @@ class ResultsTab(QWidget):
             title = f"{label} — trend with {st.trend.get('variable', '')}"
             p_text = tp.trend_p_text(self._trend_row('freq', pop_key) or None)
         return {'gate_def': eff, 'pop': pop, 'panels': panels, 'values': values, 'groups': groups,
-                'result': result, 'label': label, 'title': title, 'p_text': p_text,
+                'plot_values': plot_values, 'value_label': value_label,
+                'value_suffix': value_suffix, 'result': result, 'label': label, 'title': title, 'p_text': p_text,
                 'trend': trend, 'trend_percent': trend_percent}
 
     _POP_CACHE_SIZE = 32
@@ -5027,9 +5245,10 @@ class ResultsTab(QWidget):
             return
         else:
             fig = ag_report.make_group_values_figure(
-                data['values'], data['groups'], f"{data['label']}: % of parent",
+                data['plot_values'], data['groups'], f"{data['label']}: {data['value_label']}",
                 data['p_text'], is_dark=_is_dark_palette(),
-                group_colours=_group_colours(self.state))
+                group_colours=_group_colours(self.state), value_label=data['value_label'],
+                value_suffix=data['value_suffix'])
             canvas = scrollable_canvas_class()(fig)
             canvas.setFixedSize(int(size * 1.3), size + 60)
         handler = getattr(fig, '_hover_handler', None)
@@ -5064,8 +5283,12 @@ class ResultsTab(QWidget):
         layout.addWidget(canvas, stretch=1)
         return container
 
-    def _population_window(self, pop_key: str):
-        """The comparison of one population in its own window."""
+    def _population_window(self, pop_key: str, measure: str | None = None):
+        """The comparison of one population in its own window. *measure*
+        ('freq' or 'counts') switches the dot and violin plot, here and on
+        the Populations page, to those values."""
+        if self._set_pop_measure(measure):
+            self._draw_population(self.pop_list.currentItem())
         dialog = QDialog(self)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.setWindowTitle(_population_labels(self.state.gate_defs()).get(pop_key, pop_key))
@@ -5101,9 +5324,10 @@ class ResultsTab(QWidget):
             self.controller.experiment.process.get('spectral_model') or [])
         return ag_report.make_population_comparison_figure(
             data['gate_def'], data['pop'], data['panels'] if self.state.display else [],
-            self._result_transforms(), labels, data['values'], data['groups'], data['title'],
+            self._result_transforms(), labels, data['plot_values'], data['groups'], data['title'],
             data['p_text'], group_colours=_group_colours(self.state), trend=data.get('trend'),
-            trend_percent=data.get('trend_percent'))
+            trend_percent=data.get('trend_percent'), value_label=data['value_label'],
+            value_suffix=data['value_suffix'])
 
     def _save_population_image(self, pop_key: str):
         """Save one population's group biplots and dot and violin plot as a
@@ -5114,9 +5338,9 @@ class ResultsTab(QWidget):
         if fig is None:
             QMessageBox.warning(self, "Save image", "This population has no figure to save.")
             return
-        fmt = str(getattr(hc_settings, 'graphics_export_format_retrieved', 'png') or 'png').lower()
-        if fmt not in ('png', 'pdf', 'svg'):
-            fmt = 'png'
+        from honeychrome.view_components.scalable_figure_widget import (
+            ask_figure_path, results_folder,
+        )
         comp = self._population_request()[1]
         name = _population_labels(self.state.gate_defs()).get(pop_key, pop_key)
         if comp:
@@ -5124,15 +5348,11 @@ class ResultsTab(QWidget):
         elif self._trend_mode() and self.state.trend:
             name += f" trend {self.state.trend.get('variable', '')}"
         stem = re.sub(r'[^\w.\-]+', '_', name).strip('_')
-        start = str(Path(getattr(self.controller, 'experiment_dir', '') or '.') / f"{stem or 'population'}.{fmt}")
-        filters = "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)"
-        path, selected = QFileDialog.getSaveFileName(
-            self, "Save population image", start, filters,
-            {'png': "PNG (*.png)", 'pdf': "PDF (*.pdf)", 'svg': "SVG (*.svg)"}[fmt])
-        if not path:
+        path = ask_figure_path(
+            self, results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR),
+            stem or 'population', title="Save population image")
+        if path is None:
             return
-        if Path(path).suffix.lower() not in ('.png', '.pdf', '.svg'):
-            path += '.' + selected.split('*.')[-1].rstrip(')')
         try:
             fig.savefig(path, dpi=300, facecolor='white', bbox_inches='tight')
         except Exception as exc:
@@ -5225,7 +5445,7 @@ class ResultsTab(QWidget):
             predictive=st.predictive or None,
             populations=[(k, _population_labels(st.gate_defs()).get(k, k))
                          for k in st.report_populations],
-            population_figure=lambda key, r=self._population_request():
+            population_figure=lambda key, r=self._population_request('freq'):
                 self._population_report_figure(key, r),
             enrichment=st.fsea or None, trend_enrichment=st.fsea_trend or None,
             trend=st.trend or None, build_trend_figures=build_trend_figures,
@@ -5253,7 +5473,8 @@ class ResultsTab(QWidget):
         if what == 'results' and not st.summaries:
             QMessageBox.information(self, "Export Gating Results", "Gate some samples first.")
             return
-        start = str(Path(getattr(self.controller, 'experiment_dir', '')) / EXPORT_DIR)
+        from honeychrome.view_components.scalable_figure_widget import results_folder, start_path
+        start = start_path(results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR), '')
         folder = QFileDialog.getExistingDirectory(self, "Export to folder", start)
         if not folder:
             return
@@ -5329,7 +5550,7 @@ class ResultsTab(QWidget):
         samples = st.gated_samples()
         stem = drc_report.sanitize_filename(Path(st.model_path).stem or 'automated_gating')
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        report_dir = Path(self.controller.experiment_dir) / 'Automated_Gating_Reports' / f"{stem}_{timestamp}"
+        report_dir = Path(self.controller.experiment_dir) / REPORTS_DIR / f"{stem}_{timestamp}"
         token = acquire_job(self.controller, 'Automated Gating: report')
         if token is None:
             self.lbl_export.setText(self.controller.job_gate.busy_text())
@@ -5434,6 +5655,7 @@ class ResultsTab(QWidget):
                 f"  Frequencies relative to stats parent where defined: {st.use_stats_parent}",
                 f"  Gating markers left out of marker tests: {st.exclude_gating_markers}; "
                 f"min. events: {st.min_marker_events}",
+                f"  Marker medians tested population first: {st.markers_population_first}",
                 f"  Flagged samples left out: {st.exclude_flagged}",
             ]
             lines += [f"  Note: {n}" for n in st.stats.get('notes') or []]
@@ -5604,18 +5826,26 @@ class _StateLoader(QThread):
 
     @staticmethod
     def _read_results(job: dict, out: dict):
+        """The gated results, their marker summaries and the display records
+        of the same run, and the statistics run while it matches them. The
+        display records are read by DISPLAY_READERS threads while the marker
+        summaries are read here."""
         path = job.get('results_path')
         if path is None or not Path(path).exists():
             return
-        payload = json.loads(Path(path).read_text(encoding='utf-8'))
+        payload = _read_json_without_gc(Path(path))
         out['results'] = payload
         fingerprint = str(payload.get('run_fingerprint') or '')
-        _StateLoader._attach_markers(Path(path), payload, fingerprint, out)
         display = {}
         folder = job.get('display_dir')
-        if folder is not None:
-            for key in (payload.get('summaries') or {}):
-                loaded = ag_results.load_display(Path(folder) / ag_results.display_file_name(key))
+        keys = list(payload.get('summaries') or {}) if folder is not None else []
+        with ThreadPoolExecutor(max_workers=DISPLAY_READERS) as pool:
+            pending = {key: pool.submit(ag_results.load_display,
+                                        Path(folder) / ag_results.display_file_name(key))
+                       for key in keys}
+            _StateLoader._attach_markers(Path(path), payload, fingerprint, out)
+            for key, future in pending.items():
+                loaded = future.result()
                 if loaded is None:
                     continue
                 disp, meta = loaded
@@ -5633,8 +5863,9 @@ class _StateLoader(QThread):
         if not stats.get('samples') or any(k not in summaries for k in stats['samples']):
             return
         t = job['thresholds']
-        out['stats'] = ag_results.reapply_thresholds(stats, t['pval'], t['fc'], t['marker'],
-                                                     t['fdr_scope'], t['treat'])
+        out['stats'] = ag_results.reapply_thresholds(
+            stats, t['pval'], t['fc'], t['marker'], t['fdr_scope'], t['treat'],
+            markers_population_first=t['pop_first'])
 
     @staticmethod
     def _read_trend(job: dict, out: dict):
@@ -5676,6 +5907,25 @@ class _FileWriter(QThread):
         self.done.emit(True, '', result)
 
 
+def _read_json_without_gc(path: Path):
+    """Parse a large JSON file with Python's garbage collector paused.
+
+    Parsing creates millions of new lists and dicts, none of them garbage;
+    each burst of new objects would otherwise start a collection that walks
+    them all, which roughly doubles the time. The collector is paused for
+    the whole process while the file is parsed (under a second for the
+    largest results files).
+    """
+    text = path.read_text(encoding='utf-8')
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        return json.loads(text)
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
 def _write_json_atomic(path: Path, payload, jsonable: bool = False):
     """Write *payload* as JSON beside *path*, then move it into place."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -5702,7 +5952,7 @@ class PluginWidget(QWidget):
     own settings and session file (see BuilderPages). The settings of the
     last three pages (gate modes, drift settings, sample selection, groups,
     covariates and statistics options) are kept as one JSON string in
-    cache/automated_gating/state.json. Gated results (counts and per-gate status) are kept in
+    state/automated_gating/state.json. Gated results (counts and per-gate status) are kept in
     RESULTS_FILE in the experiment folder, with the samples a paused run has
     still to gate, their marker medians and quartiles in MARKERS_FILE, and
     each sample's display record in DISPLAY_DIR; the last
@@ -6164,7 +6414,8 @@ class PluginWidget(QWidget):
             'display_dir': exp / DISPLAY_DIR,
             'thresholds': {'pval': st.pval_threshold, 'fc': st.fc_threshold,
                            'marker': st.marker_threshold, 'fdr_scope': st.fdr_scope,
-                           'treat': st.use_treat, 'trend_min_r2': st.trend_min_r2,
+                           'treat': st.use_treat, 'pop_first': st.markers_population_first,
+                           'trend_min_r2': st.trend_min_r2,
                            'trend_call': st.trend_call, 'trend_patterns': st.trend_patterns},
         }
         self._loading = True
