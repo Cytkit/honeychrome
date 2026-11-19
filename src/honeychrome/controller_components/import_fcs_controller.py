@@ -61,6 +61,32 @@ def _extract_pnv_values(text_dict, n_channels):
     return pnv
 
 
+def summarise_channels_not_in_all_files(channels_by_file, n_files):
+    """Short end-of-import note for channels left out because some files lack them.
+
+    *channels_by_file* maps each file that has extra channels to those channels.
+    Channels are grouped by -A/-H/-W suffix; a group is named in full only when
+    it has at most five channels, otherwise it is counted. The full per-file
+    listing goes to the debug log, so the dialog stays readable however many
+    files and channels are involved.
+    """
+    logger.debug('Channels not present in every imported file: %s', channels_by_file)
+    dropped = sorted({ch for chs in channels_by_file.values() for ch in chs})
+    kinds = {'-A': 'area', '-H': 'height', '-W': 'width'}
+    groups = {}
+    for ch in dropped:
+        groups.setdefault(kinds.get(ch[-2:], 'other'), []).append(ch)
+    parts = [
+        f'{len(chs)} {kind} ({", ".join(chs)})' if len(chs) <= 5 else f'{len(chs)} {kind}'
+        for kind, chs in groups.items()
+    ]
+    return (
+        f'{len(dropped)} channel(s) present in only {len(channels_by_file)} of {n_files} '
+        f'files were left out of the experiment: {"; ".join(parts)}. '
+        f'Only channels found in every file are used.'
+    )
+
+
 class ImportFCSController(QObject):
     finished = Signal()
 
@@ -139,8 +165,24 @@ class ImportFCSController(QObject):
                 voltage_mismatch_note = None  # set below if PnV/PnG differs across files; folded into the same dialog
                 voltage_unavailable_note = None  # set below for ID7000, which reports no PnV/PnG at all
 
+                # Only channels present in every file (not just the first one
+                # scanned) are whitelisted, so files with extra parameters (e.g.
+                # single stain controls exported with -H and -W channels that the
+                # samples lack) can all be loaded with one channel layout.
+                _common_pnn = set(representative_pnn)
+                for sp in raw_samples:
+                    _common_pnn &= set(all_sample_pnn[sp])
+                _per_file_drops = {
+                    sp: sorted(set(all_sample_pnn[sp]) - _common_pnn)
+                    for sp in raw_samples
+                    if set(all_sample_pnn[sp]) - _common_pnn
+                }
+
                 if cyt_info is not None:
-                    _fl_ids = cyt_info.fluorescence_channel_ids
+                    _fl_ids = [
+                        i for i in cyt_info.fluorescence_channel_ids
+                        if representative_pnn[i] in _common_pnn
+                    ]
                     _sc_base = [ch.rsplit('-', 1)[0] for ch in cyt_info.scatter_param]
                     _sc_extra_pat = (
                         re.compile('|'.join(cyt_info.scatter_extra_pat))
@@ -148,8 +190,9 @@ class ImportFCSController(QObject):
                     )
                     _sc_ids = [
                         i for i, ch in enumerate(representative_pnn)
-                        if ch.rsplit('-', 1)[0] in _sc_base
-                        or (_sc_extra_pat and re.search(_sc_extra_pat, ch))
+                        if ch in _common_pnn
+                        and (ch.rsplit('-', 1)[0] in _sc_base
+                             or (_sc_extra_pat and re.search(_sc_extra_pat, ch)))
                     ]
                     _time_id = next(
                         (i for i, ch in enumerate(representative_pnn) if ch.lower() == 'time'), None
@@ -160,34 +203,17 @@ class ImportFCSController(QObject):
                         + [representative_pnn[i] for i in _fl_ids]
                     )
                 else:
-                    # Unrecognised cytometer: restrict to channels common to every
-                    # file (not just the first one scanned), so files with extra or
-                    # missing derived parameters (e.g. a post-processing tool adding
-                    # parameters to only some files) can all be loaded afterwards
-                    # without re-triggering the "channels don't match" check.
-                    _common_pnn = set(representative_pnn)
-                    for sp in raw_samples:
-                        _common_pnn &= set(all_sample_pnn[sp])
                     whitelisted_pnn = [ch for ch in representative_pnn if ch in _common_pnn]
 
-                    _dropped_pnn = [ch for ch in representative_pnn if ch not in _common_pnn]
-                    if _dropped_pnn:
-                        _per_file_drops = {
-                            sp: sorted(set(all_sample_pnn[sp]) - _common_pnn)
-                            for sp in raw_samples
-                            if set(all_sample_pnn[sp]) - _common_pnn
-                        }
-                        # Stash rather than emit immediately — combined into the single
-                        # end-of-import dialog below so only one QMessageBox is shown.
-                        channel_mismatch_note = (
-                            'Cytometer not recognised — channels were not identical across '
-                            'all imported files.\n'
-                            f'Retained {len(whitelisted_pnn)} channel(s) common to every file:\n'
-                            f'  {whitelisted_pnn}\n'
-                            'Channels present in only some files (ignored):\n'
-                            + '\n'.join(f'  {sp}: {chs}' for sp, chs in _per_file_drops.items())
-                        )
-                        warnings.warn(channel_mismatch_note)
+                if _per_file_drops:
+                    # Stash rather than emit immediately — combined into the single
+                    # end-of-import dialog below so only one QMessageBox is shown.
+                    channel_mismatch_note = summarise_channels_not_in_all_files(
+                        _per_file_drops, len(raw_samples),
+                    )
+                    if cyt_info is None:
+                        channel_mismatch_note = 'Cytometer not recognised. ' + channel_mismatch_note
+                    warnings.warn(channel_mismatch_note)
 
                 logger.debug('Whitelisted PNN (%d channels): %s', len(whitelisted_pnn), whitelisted_pnn)
 
