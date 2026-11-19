@@ -3,7 +3,10 @@ import numpy as np
 from picosdk.ps5000a import ps5000a as ps
 from picosdk.functions import assert_pico_ok, PICO_STATUS_LOOKUP
 
-from honeychrome.settings import adc_channels, magnitude_ceiling, traces_cache_dtype, n_channels_trace, n_time_points_in_event, transfer_target_repeat_time, threshold, FSC_sense
+from honeychrome.settings import adc_channels, magnitude_ceiling, traces_cache_dtype, n_channels_trace, n_time_points_in_event, transfer_target_repeat_time, threshold_retrieved, peak_detection_channel_retrieved, adc_scale_uv
+
+import logging
+logger = logging.getLogger(__name__)
 
 index_channel_a = adc_channels.index('FSC')
 index_channel_b = adc_channels.index('B1')
@@ -11,6 +14,7 @@ inject_signal = True
 nearly_floor_uint16 = 65536*0.01
 nearly_ceiling_uint16 = 65536*0.99
 half_uint16 = 65536*0.5
+FSC_sense = -1
 
 # note timebases for ps5000aRunBlock command
 # 3→8 ns
@@ -40,11 +44,10 @@ TIMEBASE = 3  # 8ns at 14-bit
 MAX_SEGMENTS = int(1000 * transfer_target_repeat_time)  # Number of pulses to capture per "Burst"
 resolution = ps.PS5000A_DEVICE_RESOLUTION["PS5000A_DR_14BIT"]
 auto_trig_timeout = 10 #ms
-A_range = 1000
+A_range = 10000
 B_range = 1000
-A_range_text = '1V'
+A_range_text = '10V'
 B_range_text = '1V'
-trigger_channel = 0 # 0=A, 1=B
 deltaT = SAMPLE_INTERVAL_NS * 1e-9
 analysis_decimation = 64 # e.g. 1024 x 8ns --> 8 us, 64 --> 0.5 us
 deltaT_analysis = deltaT * analysis_decimation
@@ -151,6 +154,9 @@ class Pico5000_Device:
         self.buffer_list_a = []
         self.buffer_list_b = []
         self.name = 'Pico5000'
+        self.threshold = threshold_retrieved # mV
+        self.peak_detection_channel = peak_detection_channel_retrieved # should be FSC or B1
+        self.baseline = 0
 
     def find_and_connect_to_device(self):
         # 1. Open and Power
@@ -180,7 +186,7 @@ class Pico5000_Device:
 
         range_A = ps.PS5000A_RANGE[f"PS5000A_{A_range_text}"]
         range_B = ps.PS5000A_RANGE[f"PS5000A_{B_range_text}"]
-        ps.ps5000aSetChannel(chandle, 0, 1, 0, range_A, 0.0)
+        ps.ps5000aSetChannel(chandle, 0, 1, 1, range_A, 0.0)
         ps.ps5000aSetChannel(chandle, 1, 1, 1, range_B, 0.0)
 
         # 0 = Channel A, 1 = Channel B
@@ -192,12 +198,7 @@ class Pico5000_Device:
 
         self.max_adc = ctypes.c_int16()
         ps.ps5000aMaximumValue(chandle, ctypes.byref(self.max_adc))
-
-        # AUTO TRIGGER: Ch A (0), 100mV Threshold, Rising (0), Auto-trigger (400ms)
-        threshold_adc = int((threshold / A_range) * self.max_adc.value)
-        if trigger_channel == 0:
-            threshold_adc *= FSC_sense
-        ps.ps5000aSetSimpleTrigger(chandle, 1, trigger_channel, threshold_adc, 1, 0, auto_trig_timeout)
+        self.set_simple_trigger()
 
         # Rapid Transfer Buffers
         # We create a list of buffers (one for each segment)
@@ -218,10 +219,20 @@ class Pico5000_Device:
         self.initialised = False
         return 'OK', 'Picoscope 5000-series instrument connected'
 
-
     def disconnect(self):
         ps.ps5000aStop(chandle)
         ps.ps5000aCloseUnit(chandle)
+
+    def set_simple_trigger(self):
+        # AUTO TRIGGER: Ch A (0), 100mV Threshold, Rising (0), Auto-trigger (400ms)
+        if self.peak_detection_channel == 'FSC':
+            threshold_adc = int(((self.baseline + FSC_sense*self.threshold) / A_range) * self.max_adc.value)
+            trigger_channel = 0
+        else:
+            threshold_adc = int(((self.baseline + self.threshold) / B_range) * self.max_adc.value)
+            trigger_channel = 1
+        ps.ps5000aSetSimpleTrigger(chandle, 1, trigger_channel, threshold_adc, 1, 0, auto_trig_timeout)
+        logger.info(f'[Pico5000Driver] setting trigger {self.peak_detection_channel}: baseline {self.baseline} mV, threshold {self.threshold} (mV)')
 
     def initialise(self):
         # start arb sig generator
@@ -247,8 +258,42 @@ class Pico5000_Device:
     def stop_acquisition(self):
         return 'OK', 'Picoscope 5000-series stopped acquisition'
 
-    def set_state(self, dict_of_parameters):
-        return 'OK', 'Picoscope 5000-series parameters are set elsewhere'
+    def set_state(self, dict_of_parameter_value):
+        message = {}
+        for parameter, value in dict_of_parameter_value.items():
+
+            if parameter == 'trigger':
+                if 'threshold' in value:
+                    self.threshold = value['threshold'] # mV
+                    logger.info(f'[Pico5000Driver] set threshold {self.threshold} mV')
+
+                if 'peak_detection_channel' in value:
+                    self.peak_detection_channel = value['peak_detection_channel']  # should be FSC or B1
+                    if self.peak_detection_channel in ['FSC', 'B1']:
+                        logger.info(f'[Pico5000Driver] set peak detection channel {self.peak_detection_channel}')
+                    else:
+                        logger.info(f'[Pico5000Driver] incorrect peak detection channel {self.peak_detection_channel}, should by FSC or B1')
+
+                self.set_simple_trigger()
+                message['trigger'] = value
+
+            if parameter == 'oscilloscope_trace':
+                trace = value
+                baselines = trace['baselines']
+                if baselines is not None:
+                    baseline = baselines[adc_channels.index(self.peak_detection_channel)]
+                    baseline = baseline/adc_scale_uv
+                    if not np.isnan(baseline):
+                        if self.peak_detection_channel == 'FSC':
+                            self.baseline = (nearly_ceiling_uint16 + FSC_sense * baseline) * adc_scale_uv/1000
+                        else:
+                            self.baseline = (baseline - nearly_floor_uint16) * adc_scale_uv/1000
+
+                        self.set_simple_trigger()
+                        message['trigger_set'] = self.baseline
+
+
+        return 'OK', message
 
     def get_state(self, list_of_parameters):
         message = {}
@@ -258,11 +303,14 @@ class Pico5000_Device:
         # return 'OK', {parameter:None for parameter in list_of_parameters}
         return 'OK', message
 
+    def set_sample_flow_rate(self, data):
+        return 'OK', 'Picoscope 5000-series doesn''t control sample pump'
+
     def flush_sip(self):
-        return 'OK', 'Picoscope 5000-series doesn''t provide flush'
+        return 'OK', 'Picoscope 5000-series doesn''t control flush'
 
     def backflush_sip(self):
-        return 'OK', 'Picoscope 5000-series doesn''t provide backflush'
+        return 'OK', 'Picoscope 5000-series doesn''t control backflush'
 
     def read_out_traces(self):
         # Start capturing MAX_SEGMENTS
@@ -279,13 +327,16 @@ class Pico5000_Device:
         # Get traces
         # Convert to Numpy Arrays (float32)
         # Using np.frombuffer is the fastest way to cast ctypes to numpy
-        traces_a = np.array([np.frombuffer(b, dtype=np.int16) for b in self.buffer_list_a], dtype=np.float32)
-        traces_b = np.array([np.frombuffer(b, dtype=np.int16) for b in self.buffer_list_b], dtype=np.float32)
+        traces_a = np.array([np.frombuffer(b, dtype=np.int16) for b in self.buffer_list_a], dtype=np.float32)/self.max_adc*A_range*1000/adc_scale_uv
+        traces_b = np.array([np.frombuffer(b, dtype=np.int16) for b in self.buffer_list_b], dtype=np.float32)/self.max_adc*B_range*1000/adc_scale_uv
 
         N = len(traces_a)
         traces = np.zeros((N, n_channels_trace, n_time_points_in_event), dtype=np.uint16)
         for n in range(N):
-            traces[n, index_channel_a, :] = FSC_sense * filter_and_decimate(traces_a[n]) + nearly_floor_uint16
+            if FSC_sense == -1:
+                traces[n, index_channel_a, :] = FSC_sense * filter_and_decimate(traces_a[n]) + nearly_ceiling_uint16
+            else:
+                traces[n, index_channel_a, :] = filter_and_decimate(traces_a[n]) + nearly_floor_uint16
             traces[n, index_channel_b, :] = filter_and_decimate(traces_b[n]) + nearly_floor_uint16
 
         blob_of_traces_as_array = traces.reshape(-1)
@@ -295,7 +346,8 @@ if __name__ == '__main__':
     awg_buffer, delta_phase = generate_test_signal()
 
     pico_device = Pico5000_Device()
-    pico_device.connect_to_device()
+    pico_device.find_and_connect_to_device()
+    pico_device.initialise()
     pico_device.start_acquisition()
     blob = pico_device.read_out_traces()
     traces = blob.reshape((-1, n_channels_trace, n_time_points_in_event))
@@ -305,7 +357,10 @@ if __name__ == '__main__':
     from matplotlib import pyplot as plt
     fig, ax = plt.subplots(3)
     ax[0].plot(awg_buffer)
+    ax[0].set_title('AWG buffer')
     ax[1].plot(traces[:,index_channel_a,:].T)
+    ax[1].set_title('FSC')
     ax[2].plot(traces[:,index_channel_b,:].T)
+    ax[2].set_title('B1')
     plt.show()
 

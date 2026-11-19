@@ -17,7 +17,7 @@ devices_boot_order = [
 transfer_target_repeat_time = 0.005 #s
 n_channels_trace = 16
 adc_rate = 2.5  # [MHz]
-max_event_time = 80  # [us]
+max_event_time = 120  # [us]
 n_time_points_in_event = int(adc_rate * max_event_time)
 deltaT = 1/adc_rate # [us]
 adc_scale_uv = 183.11 # microvolts per unit adc scale (default for Cytkit)
@@ -46,7 +46,6 @@ sample_pump_clocks_per_cycle = 2000
 ### peak detection settings
 peak_detection_channel = 'FSC'
 peak_detection_channel_retrieved = str(instrument_settings.value("peak_detection_channel", peak_detection_channel))  # there can only be one peak detection channel
-FSC_sense = -1
 threshold = 100 # mV
 baseline_time = 10e-6  # time in s, sets decay rate of exponentially moving average
 window_extension_time_pre = 10e-6  # time in s, sets time before threshold crossing to start integration and stop averaging signal
