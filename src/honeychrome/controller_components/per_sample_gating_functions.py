@@ -78,8 +78,15 @@ def _digest(value) -> str:
 
 
 def _transform_params(tr) -> list:
-    return [getattr(tr, k, None) for k in ('id', 'limits', 'scale_t', 'linear_a', 'logicle_w', 'logicle_m',
-                                           'logicle_a', 'log_m', 'scale_bins')]
+    """A transform's parameters as they decide gating. A per-sample
+    ('default') axis has no limits or bin count here: the main window sets
+    them from the displayed sample's range, and every sample is gated on
+    its own range."""
+    params = [getattr(tr, k, None) for k in ('id', 'limits', 'scale_t', 'linear_a', 'logicle_w', 'logicle_m',
+                                             'logicle_a', 'log_m', 'scale_bins')]
+    if params[0] == 'default':
+        params[1] = params[8] = None
+    return params
 
 
 def _gate_channels(gate) -> list:
@@ -202,8 +209,10 @@ class SampleGating:
 
     def signature(self, sample_keys=None) -> str:
         """Identifies the gating of *sample_keys* (every sample when None):
-        the template gates, those samples' overrides and the axis transforms.
-        Use it to tell when results computed from this gating are stale."""
+        the template gates, those samples' overrides and the axis transforms
+        (without the limits of per-sample axes, so it does not depend on the
+        displayed sample). Use it to tell when results computed from this
+        gating are stale."""
         keys = sorted(self.overrides) if sample_keys is None else sorted(str(k) for k in sample_keys)
         return _digest({
             'gates': [[gid, list(gpath), _gml(self.gating.get_gate(gid))]

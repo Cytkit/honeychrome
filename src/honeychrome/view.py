@@ -155,6 +155,7 @@ class View(QObject):
         # change spectral model, unmix!, change fine tuning matrix
         self.bus.spectralModelUpdated.connect(self.controller.refresh_spectral_process)
         self.bus.spectralProcessRefreshed.connect(lambda : self.init_plot_grids_and_gating_trees('unmixed'))
+        self.bus.channelLabelsChanged.connect(self.refresh_channel_labels)
         self.bus.requestUpdateProcessHists.connect(self.controller.reinitialise_data_for_process_plots)
 
         self.bus.setMainWindowTitle.connect(self.set_main_window_title)
@@ -254,6 +255,19 @@ class View(QObject):
         if self.main_window:
             self.main_window.setWindowTitle(f'Honeychrome by Cytkit: {title}')
 
+    @Slot()
+    def refresh_channel_labels(self):
+        # Antigen edits change only display labels: re-label the existing plots and NxN headers.
+        if self.main_window is None or not isValid(self.main_window):
+            return
+        for plot_widget in self.main_window.cytometry_grid_unmixed.plot_widgets:
+            plot_widget.configure_axes()
+        nxn_model = self.main_window.nxn_viewer.model
+        if nxn_model.horizontal_headers:
+            nxn_model.headerDataChanged.emit(Qt.Horizontal, 0, len(nxn_model.horizontal_headers) - 1)
+        if nxn_model.vertical_headers:
+            nxn_model.headerDataChanged.emit(Qt.Vertical, 0, len(nxn_model.vertical_headers) - 1)
+
     @Slot(str)
     def init_plot_grids_and_gating_trees(self, scope=''):
         if self.main_window is None or not isValid(self.main_window):
@@ -294,9 +308,12 @@ class View(QObject):
             self.main_window.tip_unmixed.setVisible(True)
             self.main_window.statistical_comparison_widget.setVisible(False)
 
-        # Restore profile display for all controls (including library controls) whose profiles were saved in the kit file.
+        # Show the profiles of the NxN rows (all controls, including library controls,
+        # when every row is shown), so the profile display and NxN agree after a refresh.
         if self.controller.experiment.process.get('profiles'):
-            QTimer.singleShot(100, lambda: self.bus.showSelectedProfiles.emit([]))
+            nxn = self.main_window.nxn_viewer
+            selected = [] if nxn.vertical_headers == nxn.horizontal_headers else list(nxn.vertical_headers)
+            QTimer.singleShot(100, lambda: self.bus.showSelectedProfiles.emit(selected))
 
 
     @Slot(str)
@@ -304,20 +321,23 @@ class View(QObject):
         QMessageBox.information(self.main_window, "Honeychrome by Cytkit", f"{message}")
 
     @Slot(str)
-    def warning_message(self, message):
+    def warning_message(self, message, deferrals=0):
+        # A modal dialog opened inside a busy-cursor job's nested event loop loses its
+        # modality when that loop ends and can drop behind the main window, so the
+        # warning waits until the job has finished (for at most about 10 s).
+        if QApplication.overrideCursor() is not None and deferrals < 100:
+            QTimer.singleShot(100, lambda: self.warning_message(message, deferrals + 1))
+            return
         QMessageBox.warning(self.main_window, "Warning", f"{message}")
 
     @Slot()
     def new_experiment(self):
         if self._reload_refused():
             return
+        # Modal: the experiment is loaded only after the native save panel has
+        # fully closed, because loading closes the window that owns the dialog.
         new_file_dialog = NewFileDialog(self.current_window)
-        new_file_dialog.finished.connect(self.save_new_file)
-        new_file_dialog.show()
-
-    def save_new_file(self, result):
-        new_file_dialog = self.sender()   # the dialog instance
-        if result == QFileDialog.Accepted:
+        if new_file_dialog.exec() == QFileDialog.Accepted:
             file = Path(new_file_dialog.selectedFiles()[0]).with_suffix('.kit')
             add_recent_file(file)
             self.load_main_window_with_experiment_and_template(file, new=True)

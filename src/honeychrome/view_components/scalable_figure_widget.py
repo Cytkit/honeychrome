@@ -72,12 +72,19 @@ class ScalableFigureWidget(QWidget):
                      figure in its own window.
     initial_scale  : starting size in percent of the natural size (large
                      heatmaps start smaller so they draw quickly).
+    options        : optional figure_options.FigureOptionsRef: the figure is
+                     drawn with its options, and an Options button opens a
+                     side panel that changes them (see figure_options_panel).
     """
 
     def __init__(self, figure, title: str = 'figure', experiment_dir='',
-                 pop_out=None, parent=None, initial_scale: int = DEFAULT_SCALE_PCT):
+                 pop_out=None, parent=None, initial_scale: int = DEFAULT_SCALE_PCT,
+                 options=None):
         super().__init__(parent)
         self.figure = figure
+        self.options = options
+        if options is not None:
+            options.apply(figure)
         self.export_stem = title.replace(' ', '_').replace(':', '')
         self.experiment_dir = experiment_dir
 
@@ -127,11 +134,26 @@ class ScalableFigureWidget(QWidget):
         controls.addWidget(self._pct_label)
         controls.addStretch()
 
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.addWidget(self._scroll, stretch=1)
+        if options is not None:
+            from honeychrome.view_components.figure_options_panel import (
+                FigureOptionsPanel, options_toggle_button,
+            )
+            from honeychrome.view_components.figure_options import has_axis_range
+            self.options_panel = FigureOptionsPanel(options, self, axis_range=has_axis_range(figure))
+            controls.addWidget(options_toggle_button(self.options_panel))
+            body.addWidget(self.options_panel)
+            options.store.subscribe(self._on_options_changed)
+            self.destroyed.connect(lambda _obj=None, store=options.store,
+                                   cb=self._on_options_changed: store.unsubscribe(cb))
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
         layout.addLayout(controls)
-        layout.addWidget(self._scroll, stretch=1)
+        layout.addLayout(body, stretch=1)
 
         # The canvas is resized once the slider has paused, so dragging it
         # does not redraw a large figure at every step.
@@ -143,6 +165,11 @@ class ScalableFigureWidget(QWidget):
 
         self._pct_label.setText(f"{initial_scale}%")
         self._apply_scale()
+
+    def _on_options_changed(self, scope: str):
+        if self.options is not None and scope == self.options.scope:
+            self.options.apply(self.figure)
+            self.canvas.draw_idle()
 
     def scale_percent(self) -> int:
         """The percentage of natural size currently selected."""

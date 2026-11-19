@@ -439,7 +439,6 @@ class FigureItem(QGraphicsObject):
         return path
 
     def geometry_scale_changed(self):
-        self.prepareGeometryChange()
         self.schedule_render()
 
     # -- rendering -----------------------------------------------------
@@ -1468,13 +1467,18 @@ class WorkspaceView(QGraphicsView):
 
     def _apply_zoom(self):
         scale = self._zoom * self.physical_px_per_mm()
-        self.setTransform(QTransform.fromScale(scale, scale))
         scene = self.scene()
+        # Item handle margins (boundingRect) depend on px_per_mm, so the scene
+        # index must be told before it changes, not after.
+        items = scene.figure_items()
+        for it in items:
+            it.prepareGeometryChange()
+        scene.group_frame.prepareGeometryChange()
+        self.setTransform(QTransform.fromScale(scale, scale))
         scene.px_per_mm = scale
         scene.device_pixel_ratio = float(self.devicePixelRatioF())
-        for it in scene.figure_items():
+        for it in items:
             it.geometry_scale_changed()
-        scene.group_frame.prepareGeometryChange()
         self.zoom_changed.emit(self._zoom)
 
     def fit_page(self, index: int):

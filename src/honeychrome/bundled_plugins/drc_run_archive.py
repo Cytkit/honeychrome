@@ -398,7 +398,8 @@ def update_dr_run_embeddings(controller, state, run_id: str, embeddings: dict,
 
 
 def update_cluster_id_suggestions(controller, state, run_id: str,
-                                   mem_labels: dict, cell_type_df) -> None:
+                                   mem_labels: dict, cell_type_df,
+                                   details: dict | None = None) -> None:
     """
     Persist the Cluster ID Suggestions (MEM Label + Suggested Type)
     for an already-archived clustering run -- same "update after the
@@ -414,6 +415,9 @@ def update_cluster_id_suggestions(controller, state, run_id: str,
     cell_type_df: the DataFrame returned by compute_cluster_id_suggestions
         (score_cell_types's output) -- stored as a CSV table in the
         run's bundle.
+    details: compute_cluster_id_suggestions's details (channels scored,
+        reference population, what MEM was scored against), stored as
+        'cluster_id_details'.
 
     Only data.json and this table are rewritten
     (drc_persist.update_bundle_fields), not the labels or event rows.
@@ -424,10 +428,12 @@ def update_cluster_id_suggestions(controller, state, run_id: str,
     manifest fields (same reasoning as 'names'/'colors' living only in
     the payload, never in the lightweight JSON manifest).
     """
+    details = dict(details or {})
     path = run_payload_path(controller, run_id)
     if drc_persist.bundle_exists(path):
         drc_persist.update_bundle_fields(path, {'mem_labels': mem_labels,
-                                                'cell_type_suggestions': cell_type_df})
+                                                'cell_type_suggestions': cell_type_df,
+                                                'cluster_id_details': details})
     else:
         log.warning("run %s has no payload on disk; Cluster ID suggestions not saved",
                     run_id)
@@ -435,6 +441,7 @@ def update_cluster_id_suggestions(controller, state, run_id: str,
         if entry.get('run_id') == run_id:
             entry['mem_labels'] = mem_labels
             entry['cell_type_suggestions'] = cell_type_df
+            entry['cluster_id_details'] = details
             break
 
 
@@ -622,6 +629,7 @@ def hydrate_run(controller, entry: dict) -> dict:
         entry['dr_positions'] = payload.get('dr_positions', {})
         entry['mem_labels'] = payload.get('mem_labels', {})
         entry['cell_type_suggestions'] = payload.get('cell_type_suggestions')
+        entry['cluster_id_details'] = payload.get('cluster_id_details') or {}
         entry['tree_data'] = payload.get('tree_data')
         entry['event_rows'] = payload.get('event_rows', {})
     return entry

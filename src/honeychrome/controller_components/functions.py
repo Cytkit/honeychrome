@@ -1379,6 +1379,18 @@ def calc_hists(data_for_cytometry_plots, indices_plots_to_calculate=None, status
     event_data = data_for_cytometry_plots['event_data']
     fluoro_indices = data_for_cytometry_plots['fluoro_indices']
 
+    # Each channel's events in a source gate are binned once, and a 2D plot whose
+    # mirror image (x and y swapped, same source gate) is already done is that
+    # histogram transposed: the counts and the scaling in scale_hist2d are symmetric.
+    bin_positions = {}
+    done_2d = {}
+
+    def channel_bins(source_gate, mask, channel, id_channel, edges):
+        key = (source_gate, channel)
+        if key not in bin_positions:
+            bin_positions[key] = hist_bin_positions(event_data[mask, id_channel], edges)
+        return bin_positions[key]
+
     hists = []
     for n, plot in enumerate(plots):
         if status_message_signal:
@@ -1406,7 +1418,18 @@ def calc_hists(data_for_cytometry_plots, indices_plots_to_calculate=None, status
                 source_and_child_gates = [source_gate] + [g[0] for g in gate_ids if source_gate in g[1]]
                 histogram = calc_dotplot2d(event_data, source_and_child_gates, gate_membership, id_channel_x, id_channel_y, transform_x, transform_y, density_cutoff)
             else:
-                histogram = calc_hist2d(event_data, mask, id_channel_x, id_channel_y, transform_x, transform_y, density_cutoff)
+                mirror = done_2d.get((source_gate, plot['channel_y'], plot['channel_x']))
+                if mirror is not None:
+                    histogram = mirror.T.copy()
+                else:
+                    edges_x = np.asarray(transform_x.scale)
+                    edges_y = np.asarray(transform_y.scale)
+                    counts = hist2d_from_bins(
+                        channel_bins(source_gate, mask, plot['channel_x'], id_channel_x, edges_x),
+                        channel_bins(source_gate, mask, plot['channel_y'], id_channel_y, edges_y),
+                        len(edges_x), len(edges_y))
+                    histogram = scale_hist2d(counts, density_cutoff)
+                done_2d[(source_gate, plot['channel_x'], plot['channel_y'])] = histogram
         else: # 'ribbon'
             histogram = calc_ribbon_plot(event_data, mask, fluoro_indices, transformations['ribbon'], density_cutoff)
 
@@ -1516,6 +1539,8 @@ def calc_dotplot2d(event_data, source_and_child_gates, gate_membership, id_chann
     dotmap = np.zeros([len(transform_x.scale)-1, len(transform_y.scale)-1])
     gate_list_ordered = list(gate_membership.keys())
     for gate in source_and_child_gates:
+        if gate not in gate_membership:
+            continue
         mask = gate_membership[gate]
         gate_key = gate_list_ordered.index(gate)
 
@@ -1537,7 +1562,31 @@ def calc_hist2d(event_data, mask, id_channel_x, id_channel_y, transform_x, trans
 
     # Calculate 2D histogram (density)
     heatmap, xedges, yedges = np.histogram2d(x, y, bins=[transform_x.scale, transform_y.scale])
+    return scale_hist2d(heatmap, density_cutoff)
 
+
+def hist_bin_positions(values, edges):
+    """Bin of each value as np.histogramdd numbers them: 0 below the first edge,
+    len(edges) above the last edge or NaN, and a value equal to the last edge in
+    the last bin."""
+    positions = np.searchsorted(edges, values, side='right')
+    positions[values == edges[-1]] -= 1
+    return positions.astype(np.int32)
+
+
+def hist2d_from_bins(bins_x, bins_y, n_edges_x, n_edges_y):
+    """The 2D histogram (float counts, x along rows) of events already binned by
+    hist_bin_positions; identical to np.histogram2d on the same values and edges."""
+    n_x, n_y = n_edges_x + 1, n_edges_y + 1
+    flat = bins_x.astype(np.intp) * n_y + bins_y
+    counts = np.bincount(flat, minlength=n_x * n_y).reshape(n_x, n_y)
+    return counts[1:-1, 1:-1].astype(float)
+
+
+def scale_hist2d(heatmap, density_cutoff):
+    """Display scaling of 2D histogram counts, in place: edge bins brought down to
+    the interior maximum, and with a density cutoff every bin at or above it lifted
+    to the first colour and the top clipped at the 99.9th percentile."""
     # make sure all unit bins get lowest LUT
     global_max_value = heatmap.max()
     inside_max_value = heatmap[1:-1,1:-1].max()

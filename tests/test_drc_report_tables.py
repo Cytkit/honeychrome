@@ -55,3 +55,19 @@ def test_empty_table_writes_no_pages():
     pages = _Pages()
     drc_report.add_dataframe_pages(pages, pd.DataFrame(), 'empty')
     assert pages.figures == []
+
+
+def test_export_report_item_leaves_large_tables_out_of_the_pdf(tmp_path):
+    tables = {'long': pd.DataFrame({'a': range(12)}), 'wide': pd.DataFrame([list(range(5))]),
+              'small': pd.DataFrame({'a': [1, 2]})}
+    item = drc_report.ReportItem(key='k', tab='Samples', label='Item',
+                                 get_tables=lambda: tables)
+    pages = _Pages()
+    drc_report.export_report_item(item, tmp_path, pages, max_pdf_rows=10, max_pdf_columns=4)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ['Item_long.csv', 'Item_small.csv',
+                                                          'Item_wide.csv']
+    notes = [t.get_text() for fig in pages.figures for ax in fig.axes for t in ax.texts]
+    assert any('12 rows' in t and 'Item_long.csv' in t for t in notes)
+    assert any('5 columns' in t and 'Item_wide.csv' in t for t in notes)
+    assert any(fig.texts and fig.texts[0].get_text().startswith('Item small')
+               for fig in pages.figures)

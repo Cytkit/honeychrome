@@ -14,6 +14,11 @@ thread, styled like the Results page's figures
 * ``make_members_figure`` — the members' ranking statistics (times their
   library sign), leading edge highlighted.
 
+Every figure sets its own font sizes (the app's plot theme would
+otherwise enlarge them) and is sized from its longest labels, with titles
+and long axis labels wrapped to the space they have, so no text runs past
+the figure's edge on screen or in an export.
+
 The file name does not end in ``_tab.py``, so the plugin loader does not
 treat it as a tab.
 """
@@ -40,8 +45,12 @@ def make_dot_plot(states: pd.DataFrame, comparisons: list[str], fdr_threshold: f
     best = tested.groupby('immune_state')['NES'].apply(lambda v: float(np.nanmax(np.abs(v))))
     order = list(best.sort_values().index)
     comps = [c for c in comparisons if c in set(tested['comparison'])]
-    fig_h = max(3.0, 0.32 * len(order) + 1.6)
-    fig_w = max(4.5, 1.5 * len(comps) + 4.0)
+    state_w = max(dp.text_width_inches(s, 9) for s in order)
+    comp_w = max((dp.text_width_inches(c, 8) for c in comps), default=0.0)
+    base_h = max(3.0, 0.32 * len(order) + 1.6)
+    # Comparison labels are rotated 30 degrees: half their width is height.
+    fig_h = base_h + 0.5 * comp_w
+    fig_w = max(4.5, state_w + 1.5 * len(comps) + 2.0)
     fig = Figure(figsize=(fig_w, fig_h), layout='constrained')
     ax = fig.add_subplot(111)
     lim = max(2.0, float(np.nanmax(np.abs(tested['NES']))))
@@ -62,16 +71,76 @@ def make_dot_plot(states: pd.DataFrame, comparisons: list[str], fdr_threshold: f
     sc = ax.scatter(xs, ys, c=cs, s=ss, cmap='RdBu_r', vmin=-lim, vmax=lim,
                     edgecolors=edge, linewidths=1.4)
     ax.set_xticks(range(len(comps)))
-    ax.set_xticklabels(comps, rotation=30, ha='right')
+    ax.set_xticklabels(comps, rotation=30, ha='right', fontsize=8)
     ax.set_yticks(range(len(order)))
-    ax.set_yticklabels(order)
+    ax.set_yticklabels(order, fontsize=9)
     ax.set_xlim(-0.6, len(comps) - 0.4)
     ax.set_ylim(-0.6, len(order) - 0.4)
     ax.grid(True, alpha=0.25)
     cb = fig.colorbar(sc, ax=ax, shrink=0.6)
-    cb.set_label('NES (red gained, blue lost)')
-    ax.set_title(f"Immune state enrichment (ringed: FDR < {fdr_threshold:g}; "
-                 "size: leading-edge share)", fontsize=10)
+    cb.set_label(dp.wrap_to_width('NES (red gained, blue lost)', 8, 0.6 * (base_h - 1.3)),
+                 fontsize=8)
+    cb.ax.tick_params(labelsize=8)
+    # A figure-level title: the plot sits right of the state names, so a
+    # title centred over the plot alone would run off the right edge.
+    fig.suptitle(dp.wrap_to_width(f"Immune state enrichment (ringed: FDR < {fdr_threshold:g}; "
+                                  "size: leading-edge share)", 10, fig_w - 0.4), fontsize=10)
+    fg = dp.style_figure_theme(fig, is_dark)
+    cb.ax.yaxis.label.set_color(fg)
+    cb.ax.tick_params(colors=fg)
+    fig._hover_handler = dp.make_scatter_hover_handler(fig, ax, sc, labels, is_dark)
+    dp.stamp_run_label(fig, run_label)
+    return fig
+
+
+def make_pattern_dot_plot(pattern_states: pd.DataFrame, fdr_threshold: float,
+                          is_dark: bool = False, run_label: str = ''):
+    """
+    Immune states × shape patterns of a trend: dot colour = fold
+    enrichment of the state's populations in the pattern (log2), size =
+    share of the state's populations in the pattern, ringed when the
+    hypergeometric FDR is below *fdr_threshold*.
+    """
+    from matplotlib.figure import Figure
+    from honeychrome.view_components import differential_plots as dp
+
+    df = pattern_states
+    if df is None or df.empty:
+        return dp.message_figure("No immune state overlaps a pattern", "Patterns", is_dark,
+                                 run_label)
+    patterns = list(dict.fromkeys(df['pattern']))
+    best = df.groupby('immune_state')['p'].min().sort_values(ascending=False)
+    order = list(best.index)
+    state_w = max(dp.text_width_inches(s, 9) for s in order)
+    fig_h = max(3.0, 0.32 * len(order) + 1.8)
+    fig_w = max(4.5, state_w + 1.2 * len(patterns) + 2.2)
+    fig = Figure(figsize=(fig_w, fig_h), layout='constrained')
+    ax = fig.add_subplot(111)
+    fold = np.log2(df['fold'].astype(float).clip(lower=1e-3))
+    lim = max(1.0, float(np.nanmax(np.abs(fold))))
+    edge = ['white' if (f < fdr_threshold and is_dark) else ('black' if f < fdr_threshold
+                                                             else 'none') for f in df['FDR']]
+    sc = ax.scatter([patterns.index(p) for p in df['pattern']],
+                    [order.index(s) for s in df['immune_state']], c=fold, cmap='RdBu_r',
+                    vmin=-lim, vmax=lim, s=30 + 270 * df['overlap'] / df['n_state'].clip(lower=1),
+                    edgecolors=edge, linewidths=1.4)
+    labels = [f"{r['immune_state']} — {r['pattern']}\n{int(r['overlap'])} of {int(r['n_state'])} "
+              f"populations, fold {r['fold']:.2f}\np {r['p']:.3g}, FDR {r['FDR']:.3g}"
+              for _i, r in df.iterrows()]
+    ax.set_xticks(range(len(patterns)))
+    ax.set_xticklabels(patterns, rotation=30, ha='right', fontsize=8)
+    ax.set_yticks(range(len(order)))
+    ax.set_yticklabels(order, fontsize=9)
+    ax.set_xlim(-0.6, len(patterns) - 0.4)
+    ax.set_ylim(-0.6, len(order) - 0.4)
+    ax.grid(True, alpha=0.25)
+    cb = fig.colorbar(sc, ax=ax, shrink=0.6)
+    cb.set_label(dp.wrap_to_width('log2 fold enrichment in the pattern', 8, 0.6 * (fig_h - 1.3)),
+                 fontsize=8)
+    cb.ax.tick_params(labelsize=8)
+    fig.suptitle(dp.wrap_to_width(f"Immune states in shape patterns (ringed: FDR < "
+                                  f"{fdr_threshold:g}; size: share of the state's populations)",
+                                  10, fig_w - 0.4), fontsize=10)
     fg = dp.style_figure_theme(fig, is_dark)
     cb.ax.yaxis.label.set_color(fg)
     cb.ax.tick_params(colors=fg)
@@ -105,11 +174,11 @@ def make_curve_figure(curve: dict, state: str, comparison: str, row: dict | None
     ax1.axhline(0, color=fg, lw=0.6)
     peak = int(np.argmax(np.abs(curve['curve'])))
     ax1.axvline(peak, color='#888888', ls='--', lw=0.8)
-    ax1.set_ylabel('Running ES')
+    ax1.set_ylabel('Running ES', fontsize=9)
     txt = f"ES {curve['es']:.2f}"
     if row:
         txt += f", NES {row['NES']:.2f}, p {row['p']:.3g}, FDR {row['FDR']:.3g}"
-    ax1.set_title(f"{state} — {comparison}\n{txt}", fontsize=10)
+    ax1.set_title(dp.wrap_to_width(f"{state} — {comparison}\n{txt}", 10, 6.6), fontsize=10)
     pos = np.asarray(curve['positions'])
     signs = np.asarray(curve.get('signs', np.ones(pos.size)))
     lead = np.asarray(curve['leading'])
@@ -117,12 +186,15 @@ def make_curve_figure(curve: dict, state: str, comparison: str, row: dict | None
         ax2.axvline(p_ + 0.5, color=_UP if s_ > 0 else _DOWN, lw=2.0 if l_ else 0.8,
                     alpha=1.0 if l_ else 0.5)
     ax2.set_yticks([])
-    ax2.set_ylabel('Members', rotation=0, ha='right', va='center')
+    ax2.set_ylabel('Members', rotation=0, ha='right', va='center', fontsize=9)
     ax3.fill_between(np.arange(G), ordered, 0, color='#888888', step='mid')
     ax3.axhline(0, color=fg, lw=0.6)
-    ax3.set_ylabel('Rank statistic')
-    ax3.set_xlabel('Features ranked (DOWN members negated); red UP, blue DOWN members')
+    ax3.set_ylabel('Rank statistic', fontsize=9)
+    ax3.set_xlabel(dp.wrap_to_width('Features ranked (DOWN members negated); '
+                                    'red UP, blue DOWN members', 9, 5.8), fontsize=9)
     ax3.set_xlim(0, G)
+    for ax in (ax1, ax2, ax3):
+        ax.tick_params(labelsize=8)
     for ax in (ax1, ax2):
         ax.tick_params(labelbottom=False)
     dp.style_figure_theme(fig, is_dark)
@@ -139,17 +211,26 @@ def make_members_figure(members: pd.DataFrame, state: str, comparison: str,
     if members is None or members.empty:
         return dp.message_figure("No members", state, is_dark, run_label)
     m = members.assign(signed=members['r'] * members['sign']).sort_values('signed')
-    fig = Figure(figsize=(7, max(2.5, 0.28 * len(m) + 1.2)), layout='constrained')
+    tick_labels = [f"{lab} ({'UP' if s > 0 else 'DOWN'})" for lab, s in zip(m['label'], m['sign'])]
+    # The figure widens with the member names so the bars keep at least
+    # four inches; the axis label and title wrap to the space they have.
+    label_w = max(dp.text_width_inches(t, 8) for t in tick_labels)
+    fig_w = max(7.0, label_w + 4.6)
+    bars_w = fig_w - label_w - 0.6
+    fig = Figure(figsize=(fig_w, max(2.5, 0.28 * len(m) + 1.2)), layout='constrained')
     ax = fig.add_subplot(111)
     colours = [(_UP if s > 0 else _DOWN) if lead else '#BBBBBB'
                for s, lead in zip(m['sign'], m['leading_edge'])]
     ax.barh(range(len(m)), m['signed'], color=colours)
     ax.set_yticks(range(len(m)))
-    ax.set_yticklabels([f"{lab} ({'UP' if s > 0 else 'DOWN'})"
-                        for lab, s in zip(m['label'], m['sign'])], fontsize=8)
+    ax.set_yticklabels(tick_labels, fontsize=8)
+    ax.tick_params(axis='x', labelsize=8)
     ax.axvline(0, color='white' if is_dark else 'black', lw=0.6)
-    ax.set_xlabel('sign(logFC)·−log10 p × library direction (coloured: leading edge)')
-    ax.set_title(f"{state} — {comparison}: members", fontsize=10)
+    ax.set_xlabel(dp.wrap_to_width('sign(logFC)·−log10 p × library direction '
+                                   '(coloured: leading edge)', 9, bars_w), fontsize=9)
+    # A figure-level title, centred over the member names and bars together.
+    fig.suptitle(dp.wrap_to_width(f"{state} — {comparison}: members", 10, fig_w - 0.4),
+                 fontsize=10)
     dp.style_figure_theme(fig, is_dark)
     dp.stamp_run_label(fig, run_label)
     return fig

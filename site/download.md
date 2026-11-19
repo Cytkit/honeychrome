@@ -52,6 +52,6 @@ On Windows, activate the environment with `.venv\Scripts\activate`. The [Install
 - [Source code](https://github.com/Cytkit/honeychrome) (GNU LGPL v3.0)
 - [honeychrome on PyPI]({{ site.data.release.pypi_url }})
 
-The macOS app is signed and notarised by Apple. Code signing for Windows is provided by the [SignPath Foundation](https://signpath.org).
+The macOS app is signed and notarised by Apple. The Windows app is checked and hosted by the MS Store.
 
 Honeychrome collects no personal data. Crash reports are optional and can be switched off; see [Privacy and debug data](/docs/reference/privacy/).

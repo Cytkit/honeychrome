@@ -310,6 +310,22 @@ def test_population_table_uses_parent_and_stats_parent():
     assert ag.ancestor_channels(gates, 'gB') == ['B', 'A']
 
 
+@pytest.mark.numpy_only
+def test_population_table_flags_a_stats_parent_it_cannot_find():
+    data, idx = _three_channel_data()
+    gates = [
+        _gate('gA', '1dsep', 'A', number=1, algorithm='kde_min'),
+        _gate('gB', '1dsep', 'B', parent='gA', parent_pop='pos', number=2, algorithm='kde_min',
+              stats_parent={'pos': 'gA', 'neg': 'gA/'}),
+    ]
+    res = ag.train_boundaries(gates, data, idx)
+    rows = {r['key']: r for r in ag.population_table(gates, res, n_total=len(data))}
+    assert rows['gB/pos']['n_stats_parent'] == len(data)
+    assert 'stats_parent_missing' not in rows['gB/pos']
+    assert rows['gB/neg']['stats_parent_missing'] is True
+    assert rows['gB/neg']['n_stats_parent'] is None
+
+
 # ---------------------------------------------------------------------------
 # Model format
 # ---------------------------------------------------------------------------
@@ -649,6 +665,15 @@ def test_ellipse_algorithm_is_retired_on_load():
 
 
 @pytest.mark.numpy_only
+def test_stats_parent_ending_in_slash_is_repaired_on_load():
+    g = _gate('gA', '1dsep', 'A', stats_parent={'pos': 'gZ (X)/', 'neg': 'gZ/pos'})
+    model = ag.new_model([g], {}, channel_map={}, transforms={}, training_summary={}, metadata={})
+    out, warnings = ag.normalize_model(model)
+    assert out['gate_definitions'][0]['stats_parent'] == {'pos': 'gZ (X)', 'neg': 'gZ/pos'}
+    assert any('gA' in w for w in warnings)
+
+
+@pytest.mark.numpy_only
 def test_singlet_band_spans_the_axis():
     rng = np.random.default_rng(6)
     x = rng.uniform(0.3, 0.6, 5000)
@@ -917,3 +942,38 @@ def test_population_display_names_add_the_gate_only_where_labels_clash():
     # One row per sample: a repeated key counts once.
     rows = [('Treg/Treg', 'Treg', 'Treg')] * 3
     assert ag.population_display_names(rows) == {'Treg/Treg': 'Treg'}
+
+
+def test_population_display_names_qualify_shared_labels_by_the_gate_place():
+    gate_defs = [
+        {'gate_name': 'CD38+ (CD4 Treg)', 'name_group': 'CD38+',
+         'populations': {'CD38+': {'label': 'CD38+'}, 'CD38-': {'label': 'CD38-'}}},
+        {'gate_name': 'CD38+ (CD4 Tconv)', 'name_group': 'CD38+',
+         'populations': {'CD38+': {'label': 'CD38+'}, 'CD38-': {'label': 'CD38-'}}},
+        {'gate_name': 'Ki67 (Tem)', 'name_group': 'Ki67', 'populations': {'pos': {'label': 'Ki67+'}}},
+        {'gate_name': 'Ki67 (CD8 › Tem)', 'name_group': 'Ki67',
+         'populations': {'pos': {'label': 'Ki67+'}}},
+        {'gate_name': 'Ki67 copy', 'name_group': 'Ki67', 'populations': {'pos': {'label': 'Ki67+'}}},
+    ]
+    assert ag.gate_population_names(gate_defs) == {
+        'CD38+ (CD4 Treg)/CD38+': 'CD38+ (CD4 Treg)', 'CD38+ (CD4 Treg)/CD38-': 'CD38- (CD4 Treg)',
+        'CD38+ (CD4 Tconv)/CD38+': 'CD38+ (CD4 Tconv)',
+        'CD38+ (CD4 Tconv)/CD38-': 'CD38- (CD4 Tconv)',
+        'Ki67 (Tem)/pos': 'Ki67+ (Tem)', 'Ki67 (CD8 › Tem)/pos': 'Ki67+ (CD8 › Tem)',
+        'Ki67 copy/pos': 'Ki67 copy Ki67+'}
+    # A numbered gate drops its number unless the name is taken.
+    numbered = [
+        {'gate_name': 'BAFFR+ (Plasmablasts) 2', 'name_group': 'BAFFR+',
+         'populations': {'BAFFR+': {'label': 'BAFFR+'}}},
+        {'gate_name': 'BAFFR+ (B cells)', 'name_group': 'BAFFR+',
+         'populations': {'BAFFR+': {'label': 'BAFFR+'}}},
+        {'gate_name': 'CD27+ (Tem)', 'name_group': 'CD27+', 'populations': {'p': {'label': 'CD27+'}}},
+        {'gate_name': 'CD27+ (Tem) 2', 'name_group': 'CD27+', 'populations': {'p': {'label': 'CD27+'}}},
+    ]
+    assert ag.gate_population_names(numbered) == {
+        'BAFFR+ (Plasmablasts) 2/BAFFR+': 'BAFFR+ (Plasmablasts)',
+        'BAFFR+ (B cells)/BAFFR+': 'BAFFR+ (B cells)',
+        'CD27+ (Tem)/p': 'CD27+ (Tem)', 'CD27+ (Tem) 2/p': 'CD27+ (Tem) 2'}
+    # A qualified name that still repeats falls back to "gate label".
+    rows = [('a/p', 'X (Tem)', 'P', 'Tem'), ('b/p', 'Y (Tem)', 'P', 'Tem')]
+    assert ag.population_display_names(rows) == {'a/p': 'X (Tem) P', 'b/p': 'Y (Tem) P'}

@@ -188,6 +188,17 @@ def test_signature_changes_only_for_the_edited_sample():
     assert _signatures(controller)[0]['Raw/B.fcs'] != after['Raw/B.fcs']
 
 
+def test_signature_does_not_follow_the_displayed_sample():
+    controller = _controller(shown='Raw/A.fcs')
+    before, before_all = _signatures(controller)
+    _shown_memberships(controller, 'Raw/B.fcs')
+    after, after_all = _signatures(controller)
+    assert after == before and after_all == before_all
+
+    controller.unmixed_transformations['X'].set_transform(limits=[0, 0.5])
+    assert _signatures(controller)[1] != after_all
+
+
 def test_missing_gate_raises_and_no_gates_keeps_everything():
     controller = _controller()
     sample_gating = SampleGating.from_controller(controller)

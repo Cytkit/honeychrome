@@ -152,6 +152,10 @@ class Controller(QObject):
         self.autospectral_variants: dict = {}
         self.autospectral_raw_pos_thresholds = None
         self.autospectral_unmixed_pos_thresholds = None
+        # (path, content fingerprint) of the last cleaned / variants archive written,
+        # so autosave rewrites an archive only when its arrays have changed
+        self._cleaned_npz_saved = None
+        self._variants_npz_saved = None
         self.data_for_cytometry_plots = deepcopy(cytometry_data_dictionary)
         self.data_for_cytometry_plots_raw = deepcopy(self.data_for_cytometry_plots)
         self.data_for_cytometry_plots_process = deepcopy(self.data_for_cytometry_plots)
@@ -371,10 +375,16 @@ class Controller(QObject):
                     arrays[f'{safe}__{k}'] = arr
 
         self.experiment.process['cleaned_meta'] = meta
+        npz_path = self.cleaned_npz_path
         if arrays:
-            np.savez_compressed(str(self.cleaned_npz_path), **arrays)
-        elif self.cleaned_npz_path.exists():
-            self.cleaned_npz_path.unlink()
+            saved = (str(npz_path), self._arrays_fingerprint(arrays))
+            if saved != self._cleaned_npz_saved or not npz_path.exists():
+                np.savez_compressed(str(npz_path), **arrays)
+                self._cleaned_npz_saved = saved
+        else:
+            self._cleaned_npz_saved = None
+            if npz_path.exists():
+                npz_path.unlink()
 
     @property
     def cleaned_npz_path(self) -> Path:
@@ -394,6 +404,17 @@ class Controller(QObject):
         reference spectrum (see _load_autospectral_variants)."""
         arr = np.round(np.asarray(vec, dtype=np.float64), 8)
         return hashlib.sha1(arr.tobytes()).hexdigest()
+
+    @staticmethod
+    def _arrays_fingerprint(arrays: dict) -> str:
+        """Fingerprint of the names, types, shapes and contents of the arrays
+        written to an npz archive, so an unchanged archive is not rewritten."""
+        h = hashlib.sha1()
+        for key in sorted(arrays):
+            arr = np.ascontiguousarray(arrays[key])
+            h.update(f'{key}|{arr.dtype.str}|{arr.shape}'.encode())
+            h.update(arr.tobytes())
+        return h.hexdigest()
 
     def _save_autospectral_variants(self):
         """Write autospectral_variants to JSON meta (.kit) and numpy sidecar
@@ -443,10 +464,16 @@ class Controller(QObject):
             del self.experiment.process['autospectral_thresholds_meta']
 
         self.experiment.process['autospectral_variants_data'] = meta
+        npz_path = self.autospectral_variants_npz_path
         if arrays:
-            np.savez_compressed(str(self.autospectral_variants_npz_path), **arrays)
-        elif self.autospectral_variants_npz_path.exists():
-            self.autospectral_variants_npz_path.unlink()
+            saved = (str(npz_path), self._arrays_fingerprint(arrays))
+            if saved != self._variants_npz_saved or not npz_path.exists():
+                np.savez_compressed(str(npz_path), **arrays)
+                self._variants_npz_saved = saved
+        else:
+            self._variants_npz_saved = None
+            if npz_path.exists():
+                npz_path.unlink()
 
     @property
     def autospectral_variants_npz_path(self) -> Path:
@@ -472,9 +499,16 @@ class Controller(QObject):
         self.experiment.cytometry['unmixed_custom_sample_gates'] = serialize_custom_sample_gates(self.custom_sample_gates.get('unmixed', {}))
 
         if not experiment_path:
-            self._save_cleaned_events()
-            self._save_autospectral_variants()
-            self.experiment.save()
+            try:
+                self._save_cleaned_events()
+                self._save_autospectral_variants()
+                self.experiment.save()
+            except OSError as e:
+                logger.warning(f'Controller: could not save experiment {self.experiment_dir} ({e})')
+                if self.bus:
+                    self.bus.statusMessage.emit(f'Autosave failed: {e.strerror or e}. '
+                                                f'Check that the drive holding this experiment is connected.')
+                return
             logger.info(f'Controller: experiment saved {self.experiment_dir}')
             if self.bus:
                 QTimer.singleShot(100, lambda: self.bus.statusMessage.emit(f'Autosaved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}'))
@@ -854,19 +888,37 @@ class Controller(QObject):
                 sync_af_index_transform(self.experiment.cytometry['transforms'], self.n_af_spectra())
                 self.unmixed_gating = from_gml(self.experiment.cytometry['gating'])
                 self.unmixed_transformations = generate_transformations(self.experiment.cytometry['transforms'])
-                # Call the plain impl, not reapply_fine_tuning(): this method
-                # (initialise_ephemeral_data) is itself called from inside the
-                # worker thread of @with_busy_cursor methods (load_experiment,
-                # refresh_spectral_process). Calling the decorated
-                # reapply_fine_tuning() here would re-enter with_busy_cursor
-                # from a background thread — QApplication.setOverrideCursor()
-                # and a nested QEventLoop off the main thread
-                self._reapply_fine_tuning_impl()
 
+                # A plot drawn on a channel that is no longer in the unmixed data
+                # cannot be shown, so it is removed (in place: the list is shared).
+                unmixed_plots = self.experiment.cytometry['plots']
+                kept_plots = [plot for plot in unmixed_plots
+                              if all(plot[k] in self.unmixed_transformations
+                                     for k in ('channel_x', 'channel_y') if k in plot)]
+                if len(kept_plots) != len(unmixed_plots):
+                    logger.warning(f'Controller: removed unmixed plots on channels no longer present: '
+                                   f'{[plot for plot in unmixed_plots if plot not in kept_plots]}')
+                    unmixed_plots[:] = kept_plots
 
-                source_gate, _ = resolve_base_gate(self.unmixed_gating, self.experiment.process['base_gate_priority_order'])
-                logger.info(f'Controller: using {source_gate} as base gate for process NxN plots')
-                process_plots = define_process_plots(self.experiment.settings['unmixed']['fluorescence_channels'], self.experiment.settings['unmixed']['fluorescence_channels'], source_gate=source_gate)
+                # The NxN keeps the rows and source gate it showed before, where they
+                # still exist; a grid that showed every row shows every row again.
+                fluorescence_channels = self.experiment.settings['unmixed']['fluorescence_channels']
+                previous_plots = self.data_for_cytometry_plots_process.get('plots') or []
+                previous_rows, previous_columns = [], []
+                for plot in previous_plots:
+                    row = plot.get('channel_y', plot['channel_x'])
+                    if row not in previous_rows:
+                        previous_rows.append(row)
+                    if plot['channel_x'] not in previous_columns:
+                        previous_columns.append(plot['channel_x'])
+                rows = [] if set(previous_rows) == set(previous_columns) else [
+                    row for row in previous_rows if row in fluorescence_channels]
+                gate_names = {'root'} | {g[0] for g in self.unmixed_gating.get_gate_ids()}
+                source_gate = previous_plots[0]['source_gate'] if previous_plots else None
+                if source_gate not in gate_names:
+                    source_gate, _ = resolve_base_gate(self.unmixed_gating, self.experiment.process['base_gate_priority_order'])
+                logger.info(f'Controller: using {source_gate} as source gate for process NxN plots')
+                process_plots = define_process_plots(fluorescence_channels, rows or fluorescence_channels, source_gate=source_gate)
             else:
                 self.unmixed_gating = GatingStrategy()
                 self.unmixed_transformations = None
@@ -917,6 +969,16 @@ class Controller(QObject):
             logger.warning(self.data_for_cytometry_plots_raw['transformations'] is self.raw_transformations)
             logger.warning(self.data_for_cytometry_plots_raw['gating'] is self.raw_gating)
 
+        # Unmix the displayed sample again and recalculate its plots once the plots,
+        # gates and lookup tables above are current. Call the plain impl, not
+        # reapply_fine_tuning(): this method is itself called from inside the worker
+        # thread of @with_busy_cursor methods (load_experiment, refresh_spectral_process).
+        # Calling the decorated reapply_fine_tuning() here would re-enter with_busy_cursor
+        # from a background thread (QApplication.setOverrideCursor() and a nested
+        # QEventLoop off the main thread).
+        if 'unmixed' in scope and self.experiment.process['unmixing_matrix']:
+            self._reapply_fine_tuning_impl()
+
 
     def initialise_transfer_matrix(self):
         # run in intitialisation of ephemeral data or if spillover changed
@@ -930,12 +992,12 @@ class Controller(QObject):
         # Re-express stored raw channel indices against pnn_raw (whitelisted).
         # Stored indices reference full_pnn_raw; map them to their position in pnn_raw.
         def _remap(ids):
-            return np.array([pnn_raw.index(full_pnn_raw[i]) for i in ids])
+            return np.array([pnn_raw.index(full_pnn_raw[i]) for i in ids], dtype=int)
 
         fl_channel_ids_raw = _remap(self.filtered_raw_fluorescence_channel_ids)
         sc_channel_ids_raw = _remap(_raw['scatter_channel_ids'])
-        fl_channel_ids_unmixed = np.array(self.experiment.settings['unmixed']['fluorescence_channel_ids'])
-        sc_channel_ids_unmixed = np.array(self.experiment.settings['unmixed']['scatter_channel_ids'])
+        fl_channel_ids_unmixed = np.array(self.experiment.settings['unmixed']['fluorescence_channel_ids'], dtype=int)
+        sc_channel_ids_unmixed = np.array(self.experiment.settings['unmixed']['scatter_channel_ids'], dtype=int)
         n_scatter_channels = self.experiment.settings['unmixed']['n_scatter_channels']
 
         unmixing_matrix = np.array(self.experiment.process['unmixing_matrix'])
@@ -1497,10 +1559,18 @@ class Controller(QObject):
     def _on_method_job_finished(self, job: dict, fl_result: dict):
         if not self._method_job_current(job):
             return
-        if QGuiApplication.overrideCursor() is not None:
-            # a busy-cursor operation (e.g. load_sample) is still filling the plots
+        if QGuiApplication.overrideCursor() is not None or QGuiApplication.modalWindow() is not None:
+            # a busy-cursor operation (e.g. load_sample) is still filling the plots, or a
+            # modal dialog is open: a busy-cursor job started inside the dialog's event
+            # loop would make it drop behind the main window
             QTimer.singleShot(100, lambda: self._on_method_job_finished(job, fl_result))
             return
+        self._show_method_result(job, fl_result)
+
+    @with_busy_cursor
+    def _show_method_result(self, job: dict, fl_result: dict):
+        """Swap a finished background unmixing into the display and recalculate the
+        plots in a worker thread, so the window keeps repainting meanwhile."""
         af = job['af']
         result = unmix_method.assemble(self.raw_event_data, self.transfer_matrix, self.experiment.settings,
                                        fl_result, self.experiment.process.get('spillover'), af)
@@ -1615,7 +1685,15 @@ class Controller(QObject):
         logger.info(f'Controller: loading sample {sample_path}')
         whitelisted_pnn = self.experiment.settings['raw'].get('whitelisted_pnn')
         check_pnn = whitelisted_pnn or self.experiment.settings['raw']['event_channels_pnn']
-        if check_fcs_matches_experiment(self.experiment_dir / sample_path, check_pnn, self.experiment.settings['raw']['magnitude_ceiling']):
+        try:
+            matches = check_fcs_matches_experiment(self.experiment_dir / sample_path, check_pnn, self.experiment.settings['raw']['magnitude_ceiling'])
+        except OSError as e:
+            logger.warning(f'Controller: could not read sample {sample_path} ({e})')
+            if self.bus:
+                self.bus.warningMessage.emit(f'Could not read {sample_path}: {e.strerror or e}. '
+                                             f'Check that the drive holding this experiment is connected.')
+            return
+        if matches:
             self.current_sample_path = sample_path
             preview = None
             if self.current_sample_path != self.live_sample_path:
@@ -1986,6 +2064,10 @@ class Controller(QObject):
     @Slot(str, int)
     def change_plot(self, mode, n_in_plot_sequence):
         if mode == self.current_mode:
+            if n_in_plot_sequence >= len(self.data_for_cytometry_plots['plots']):
+                logger.warning(f'Controller: change_plot ignored for plot {n_in_plot_sequence}; '
+                               f'{len(self.data_for_cytometry_plots["plots"])} plots in {mode}')
+                return
             plots_to_recalculate = [self.data_for_cytometry_plots['plots'][n_in_plot_sequence]]
             hist = initialise_hists(plots_to_recalculate, self.data_for_cytometry_plots)[0]
             self.data_for_cytometry_plots['statistics'] = initialise_stats(self.data_for_cytometry_plots['gating'])
@@ -2368,9 +2450,6 @@ class Controller(QObject):
                     new_plot['child_gates'] = new_plot_child_gates
                     self.experiment.cytometry['plots'].append(new_plot)
 
-                    if self.bus:
-                        self.bus.changedGatingHierarchy.emit('unmixed', 'root')
-
                 # keep the existing unmixed gating strategy where its channels still exist
                 if previous_unmixed is not None:
                     self._carry_over_unmixed_cytometry(previous_unmixed)
@@ -2387,13 +2466,13 @@ class Controller(QObject):
 
         # Rebuild AF cache synchronously before reinitialising ephemeral data.
         self.cache_all_af_profiles()
-        # then reinitialise ephemeral data for process and unmixed tabs
+        # then reinitialise ephemeral data for process and unmixed tabs; with a sample
+        # loaded this unmixes it again and recalculates the current tab's plots
         self.initialise_ephemeral_data(scope=['unmixed'])
-        # Do not recalculate histograms here: the unmixing matrix has changed so
-        # any result would be immediately stale. Histograms are cleared below and
-        # will be regenerated correctly on the next sample load or tab change.
-        self.data_for_cytometry_plots_unmixed['histograms'].clear()
-        self.data_for_cytometry_plots_unmixed['statistics'].clear()
+        if self.raw_event_data is None or not self.experiment.process['unmixing_matrix']:
+            # nothing was recalculated: drop unmixed plots made with the previous unmixing
+            self.data_for_cytometry_plots_unmixed['histograms'].clear()
+            self.data_for_cytometry_plots_unmixed['statistics'].clear()
         if self.bus is not None:
             # Single consolidated dialog for both profile-QC checks — piped through
             # the bus rather than shown directly, since this method can be entered

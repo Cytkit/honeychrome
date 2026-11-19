@@ -6,7 +6,7 @@ from PySide6 import QtCore
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QThread, Slot, QObject, QEvent, QSize, Signal, QSettings
 from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QStyledItemDelegate, QComboBox, QLineEdit, QMessageBox, QHeaderView, QLabel, QWidget, QCheckBox, QMenu, QInputDialog)
 
-from honeychrome.controller_components.functions import raw_gates_list, resolve_base_gate
+from honeychrome.controller_components.functions import raw_gates_list, resolve_base_gate, build_display_label_map
 from honeychrome.controller_components.job_gate import acquire_job
 from honeychrome.controller_components.spectral_controller import (
     SpectralAutoGenerator, ProfileUpdater, SpectralCleaner, LowEventLog, control_gating,
@@ -204,6 +204,8 @@ class ListTableModel(QtCore.QAbstractTableModel):
             self.dataEditedSignal.emit(row, col)
             return True
         if role != Qt.EditRole:
+            return False
+        if key == "label" and not str(value or '').strip():
             return False
         # if key == "gate_channel":
         #     try:
@@ -1262,7 +1264,8 @@ class SpectralControlsEditor(QFrame):
         # self.model.layoutChanged.emit() # consider refreshing at this point... but it may cause crash
         self.refresh_comboboxes()
         self.setEnabled(True)
-        QTimer.singleShot(300, lambda: self.bus.showSelectedProfiles.emit([]))
+        # show the selected controls' profiles (all of them when none is selected)
+        QTimer.singleShot(300, self._show_selected_profiles)
 
     def _show_selected_profiles(self):
         selected_rows = set()
@@ -1283,6 +1286,19 @@ class SpectralControlsEditor(QFrame):
         col = self._pending_update_col
         changed_col = COLUMNS[col]
         if index is None:
+            return
+        current_labels = {c['label'] for c in self.model._data}
+        rename_pending = any(k not in current_labels for k in self.profile_updater.profiles)
+        if changed_col == 'antigen' and not rename_pending:
+            # The antigen only changes display labels; channel names, gates, transforms
+            # and unmixed data are unchanged, so the shared label map is updated in place.
+            # A label rename still waiting in the edit timer takes the full path below.
+            pnn_labels = self.controller.data_for_cytometry_plots_unmixed.get('pnn_labels')
+            if pnn_labels:
+                pnn_labels.update(build_display_label_map(
+                    list(pnn_labels), self.controller.experiment.process.get('spectral_model')))
+                self.bus.channelLabelsChanged.emit()
+            self.bus.showSelectedProfiles.emit([self.model._data[index]['label']])
             return
         if changed_col in ('label', 'antigen'):
             control = self.model._data[index]
@@ -1733,9 +1749,13 @@ class SpectralControlsEditor(QFrame):
 
     def _sort_model_by_gate_channel(self):
         """Re-order the spectral model table rows by major channel order
-        (position of gate_channel in fluorescence_channels_pnn)."""
+        (position of gate_channel in fluorescence_channels_pnn). The selected
+        controls stay selected across the model reset, without a selection-changed
+        signal, so the profile display and NxN keep their rows."""
         if not self.model._data:
             return
+        selected = {self.model._data[self.proxy.mapToSource(index).row()].get('label')
+                    for index in self.view.selectionModel().selectedRows()}
         channel_order = {ch: i for i, ch in enumerate(self.fluorescence_channels_pnn)}
         self.model.beginResetModel()
         self.model._data.sort(
@@ -1743,6 +1763,19 @@ class SpectralControlsEditor(QFrame):
         )
         self.model.endResetModel()
         self.refresh_comboboxes()
+        if selected:
+            selection = QtCore.QItemSelection()
+            for row, control in enumerate(self.model._data):
+                if control.get('label') in selected:
+                    index = self.proxy.mapFromSource(self.model.index(row, 0))
+                    if index.isValid():
+                        selection.select(index, index)
+            selection_model = self.view.selectionModel()
+            selection_model.blockSignals(True)
+            selection_model.select(selection, QtCore.QItemSelectionModel.SelectionFlag.Select
+                                   | QtCore.QItemSelectionModel.SelectionFlag.Rows)
+            selection_model.blockSignals(False)
+            self.view.viewport().update()
 
     @Slot(str, str)
     def _on_raw_gate_renamed(self, old_name: str, new_name: str):

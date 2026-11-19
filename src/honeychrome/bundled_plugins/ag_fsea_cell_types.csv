@@ -88,3 +88,4 @@ Monocyte,myeloid,Monocytes;Mono
 Ly6Chi Monocyte,myeloid,Ly6Chi Monocytes;Ly6C-hi monocytes;Ly6Chi Mono;Inflammatory monocytes
 Macrophage,myeloid,Macrophages;Macs
 Migratory DC,myeloid,Migratory DCs;migDC;migDCs
+RORgt+ CD4 Treg,T,RORgt+ Treg;RORgt+ Tregs;Treg RORgt

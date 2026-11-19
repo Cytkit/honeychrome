@@ -1638,7 +1638,7 @@ class SpectralCleaner(QObject):
 
         except Exception as e:
             msg = f'"{label}": failed to clean: {e}'
-            logger.error(f'SpectralCleaner: {msg}')
+            logger.error(f'SpectralCleaner: {msg}', exc_info=True)
             self._collected_warnings.append(msg)
 
     def _make_check_pool(self, loaded: dict, row: np.ndarray, control: dict):

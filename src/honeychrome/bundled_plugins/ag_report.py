@@ -9,10 +9,13 @@ widgets: every figure is built without a canvas.
 
 Sections:
   • Samples    — per-sample events, AF profiles and flags; population
-                 counts and fractions; marker medians and quartiles.
+                 fractions. The population counts and the marker medians
+                 and quartiles are the report's own CSV files
+                 (population_statistics.csv, activation_statistics.csv).
   • Gates      — one plot per gate: the parent population's events pooled
                  over the gated samples' display subsamples, with the stored
-                 boundary and pooled fractions.
+                 boundary and pooled fractions; ``gate_pages`` puts the
+                 ticked gates GATES_PER_PAGE to a page.
   • Statistics — for each comparison of the last statistics run: heatmaps,
                  volcano plots (with their results tables) and the marker
                  summary; the sample PCA and the predictive analysis (ROC
@@ -33,6 +36,9 @@ treat it as a tab.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any, Callable
+
 import numpy as np
 import pandas as pd
 
@@ -45,11 +51,33 @@ from honeychrome.view_components.differential_plots import (
 
 SECTIONS = ('Samples', 'Gates', 'Statistics', 'Populations', 'Enrichment')
 
-__all__ = ['SECTIONS', 'pooled_display', 'pooled_population', 'boundary_fractions',
+# Gate plots per PDF page (A4 landscape), as columns × rows.
+GATE_PAGE_COLUMNS = 3
+GATE_PAGE_ROWS = 2
+GATES_PER_PAGE = GATE_PAGE_COLUMNS * GATE_PAGE_ROWS
+# Above this many gates the Gates section starts unticked.
+REPORT_GATES_DEFAULT_LIMIT = 50
+# Larger tables are written to CSV only, with a note in the PDF.
+PDF_MAX_ROWS = 500
+PDF_MAX_COLUMNS = 30
+
+__all__ = ['SECTIONS', 'GATE_PAGE_COLUMNS', 'GATE_PAGE_ROWS', 'GATES_PER_PAGE',
+           'REPORT_GATES_DEFAULT_LIMIT', 'PDF_MAX_ROWS', 'PDF_MAX_COLUMNS', 'GateReportItem',
+           'pooled_display', 'pooled_population', 'boundary_fractions',
            'label_position', 'make_gate_figure', 'population_frequency_table', 'sample_table',
-           'build_report_items', 'make_pca_figure', 'make_roc_figure', 'make_importance_figure',
-           'make_panel_figure', 'predictive_subtitle', 'make_group_values_figure',
-           'make_population_comparison_figure', 'p_value_text', 'enrichment_report_items']
+           'build_report_items', 'gate_pages', 'make_pca_figure', 'make_roc_figure',
+           'make_importance_figure', 'make_panel_figure', 'predictive_subtitle',
+           'make_group_values_figure', 'make_population_comparison_figure', 'p_value_text',
+           'enrichment_report_items']
+
+
+@dataclass
+class GateReportItem(ReportItem):
+    """A Gates section item: *get_figure* draws the gate alone; *draw(ax)*
+    draws it into the given axes of a page of several gates, under the
+    page's *page_title*."""
+    draw: Callable[[Any], Any] | None = None
+    page_title: str = ''
 
 
 def pooled_display(display: dict, samples: list[str], gate_name: str,
@@ -177,6 +205,26 @@ def label_position(gate_type: str, region: str | None, entry: dict,
     return 0.5 * (x_lim[0] + x_lim[1]), 0.5 * (y_lim[0] + y_lim[1]), 'center', 'center'
 
 
+GATE_LABEL_FONT = 8
+
+
+def _inside(value: float, lim: tuple, text: str, axis_inches: float, horizontal: bool) -> float:
+    """*value* (the centre of a centred label) moved so the label's text
+    stays within *lim*, the axis it sits on, which is *axis_inches* long."""
+    from honeychrome.view_components import differential_plots as dp
+
+    lines = str(text).split('\n')
+    if horizontal:
+        extent = max(dp.text_width_inches(line, GATE_LABEL_FONT) for line in lines) + 0.1
+    else:
+        extent = len(lines) * GATE_LABEL_FONT * 1.3 / 72.0 + 0.1
+    span = float(lim[1]) - float(lim[0])
+    half = 0.5 * extent / max(axis_inches, 0.5) * span
+    if 2 * half >= span:
+        return 0.5 * (lim[0] + lim[1])
+    return float(min(max(value, lim[0] + half), lim[1] - half))
+
+
 def _apply(tr, values: np.ndarray) -> np.ndarray:
     xform = getattr(tr, 'xform', None)
     values = np.asarray(values, dtype=float)
@@ -266,6 +314,10 @@ def make_gate_figure(gate_def: dict, boundary: dict, events: np.ndarray | None,
     pops = gate_def.get('populations') or {}
     regions = ag_core.population_regions(gate_def, boundary)
     bbox = dict(boxstyle='round,pad=0.25', facecolor='white', edgecolor='none', alpha=0.8)
+    # Size of the plot area, so centred labels can be kept inside it.
+    pos = ax.get_position()
+    ax_w = fig.get_figwidth() * pos.width
+    ax_h = fig.get_figheight() * pos.height
     for pop, entry in (boundary or {}).items():
         label = (pops.get(pop) or {}).get('label', pop)
         frac = fractions.get(pop)
@@ -277,13 +329,15 @@ def make_gate_figure(gate_def: dict, boundary: dict, events: np.ndarray | None,
             if sep_y:
                 ax.axhline(float(tx), color=colour, linewidth=1.5)
                 ly, lx, va, ha = label_position(gt, regions.get(pop), entry, y_lim, (0.0, 1.0))
-                ax.text(lx, ly, text, color=colour, ha=ha, va=va, fontsize=8, bbox=bbox,
-                        transform=ax.get_yaxis_transform())
+                ly = _inside(ly, y_lim, text, ax_h, horizontal=False)
+                ax.text(lx, ly, text, color=colour, ha=ha, va=va, fontsize=GATE_LABEL_FONT,
+                        bbox=bbox, transform=ax.get_yaxis_transform())
                 continue
             ax.axvline(float(tx), color=colour, linewidth=1.5)
             lx, ly, ha, va = label_position(gt, regions.get(pop), entry, x_lim, (0.0, 1.0))
-            ax.text(lx, ly, text, color=colour, ha=ha, va=va, fontsize=8, bbox=bbox,
-                    transform=ax.get_xaxis_transform())
+            lx = _inside(lx, x_lim, text, ax_w, horizontal=True)
+            ax.text(lx, ly, text, color=colour, ha=ha, va=va, fontsize=GATE_LABEL_FONT,
+                    bbox=bbox, transform=ax.get_xaxis_transform())
             continue
         coords = np.asarray(entry.get('boundary') or [], dtype=float)
         if coords.ndim != 2 or coords.shape[1] != 2 or not len(coords):
@@ -292,7 +346,11 @@ def make_gate_figure(gate_def: dict, boundary: dict, events: np.ndarray | None,
         ax.plot(closed[:, 0], closed[:, 1], color=colour, linewidth=1.5)
         lx, ly, ha, va = label_position('free' if shapes else gt, regions.get(pop), entry,
                                         x_lim, y_lim)
-        ax.text(lx, ly, text, color=colour, ha=ha, va=va, fontsize=8, bbox=bbox)
+        if ha == 'center':
+            lx = _inside(lx, x_lim, text, ax_w, horizontal=True)
+        if va == 'center':
+            ly = _inside(ly, y_lim, text, ax_h, horizontal=False)
+        ax.text(lx, ly, text, color=colour, ha=ha, va=va, fontsize=GATE_LABEL_FONT, bbox=bbox)
 
     ax.set_xlabel(axis_labels.get(ch_x, ch_x))
     ax.set_ylabel(axis_labels.get(ch_y, ch_y) if ch_y else 'Count')
@@ -340,7 +398,10 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
                        populations: list | None = None,
                        population_figure=None,
                        enrichment: dict | None = None,
-                       group_colours: dict | None = None) -> list[ReportItem]:
+                       group_colours: dict | None = None,
+                       trend: dict | None = None,
+                       build_trend_figures=None,
+                       trend_enrichment: dict | None = None) -> list[ReportItem]:
     """Every available report item, in section order.
 
     pca               : ag_results.sample_pca() result, or None.
@@ -352,6 +413,11 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
     group_colours     : {group: colour} for the statistics figures and the
                         sample PCA (default palette when None).
     enrichment        : ag_fsea.run_enrichment() result, or None.
+    trend_enrichment  : ag_fsea.run_trend_enrichment() result, or None.
+    trend             : ag_results.run_trend_statistics() result, or None.
+    build_trend_figures : callable(trend, is_dark, antigens, pop_labels) ->
+                        {key: {'fig', …}}, e.g. the tab's build_trend_figures;
+                        called once, when the first trend figure is exported.
 
     build_figures : callable(stats, base, other, pval, fc, marker, fdr_scope,
                     is_dark, antigens, pop_labels) -> {key: {'fig', 'title',
@@ -370,34 +436,33 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
             key='frequencies', tab='Samples', label='Population frequencies',
             get_tables=lambda: {'percent_of_parent': population_frequency_table(
                 summaries, samples, pop_labels)}))
-        items.append(ReportItem(
-            key='populations', tab='Samples', label='Population counts',
-            get_tables=lambda: {'counts': ag_results.population_export(summaries, samples, groups)}))
-        items.append(ReportItem(
-            key='markers', tab='Samples', label='Marker medians',
-            get_tables=lambda: {'medians': ag_results.marker_export(summaries, samples, antigens,
-                                                                    groups)}))
 
     if display and include_gates:
         by_name = ag_core.gates_by_name(gate_defs)
+        page_title = f"Stored boundaries; % of pooled display events, {len(samples)} samples"
         for g in ag_core.ordered_gate_defs(gate_defs):
             name = g['gate_name']
             eff = ag_core.effective_gate_def(g, by_name)
             mode = modes.get(name, ag_core.MODE_FIXED)
 
-            def _gate_fig(_eff=eff, _name=name, _mode=mode):
+            def _gate_plot(title, ax=None, _eff=eff, _name=name):
                 events, parent, channels = pooled_display(display, samples, _name, _eff)
                 boundary = reference_boundaries.get(_name, {})
                 fractions = boundary_fractions(_eff, boundary, events, channels, parent,
                                                transforms)
-                return make_gate_figure(
-                    _eff, boundary, events, channels, parent, transforms, axis_labels,
-                    f"{_name} ({_mode}; stored boundary)\n"
-                    f"% of pooled display events, {len(samples)} samples",
-                    fractions=fractions)
+                return make_gate_figure(_eff, boundary, events, channels, parent, transforms,
+                                        axis_labels, title, fractions=fractions, ax=ax)
 
-            items.append(ReportItem(key=f'gate:{name}', tab='Gates', label=f"Gate {name}",
-                                    get_figure=_gate_fig))
+            def _gate_fig(_plot=_gate_plot, _name=name, _mode=mode):
+                return _plot(f"{_name} ({_mode}; stored boundary)\n"
+                             f"% of pooled display events, {len(samples)} samples")
+
+            def _gate_draw(ax, _plot=_gate_plot, _name=name, _mode=mode):
+                return _plot(f"{_name} ({_mode})", ax=ax)
+
+            items.append(GateReportItem(key=f'gate:{name}', tab='Gates', label=f"Gate {name}",
+                                        get_figure=_gate_fig, draw=_gate_draw,
+                                        page_title=page_title))
 
     if stats:
         cache: dict = {}
@@ -438,12 +503,60 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
                 items.append(ReportItem(key=f'{key}:{label}', tab='Statistics',
                                         label=f"{title}: {label}", get_figure=_fig,
                                         get_tables=get_tables))
+    if trend and build_trend_figures is not None:
+        trend_cache: dict = {}
+
+        def _trend_figures():
+            if 'figures' not in trend_cache:
+                trend_cache['figures'] = build_trend_figures(trend, False, antigens, pop_labels)
+            return trend_cache['figures']
+
+        variable = trend.get('variable') or ''
+        for kind, name, table_name in (('freq', 'Frequency', 'trend_frequencies'),
+                                       ('counts', 'Counts', 'trend_counts'),
+                                       ('markers', 'Marker', 'trend_markers')):
+            if trend.get(kind) is None:
+                continue
+            for figure, title in (('volcano', 'trend volcano'), ('heatmap', 'trajectories'),
+                                  ('patterns', 'shape patterns')):
+                key = f'trend_{kind}_{figure}'
+
+                def _fig(_key=key):
+                    return (_trend_figures().get(_key) or {}).get('fig')
+
+                def _table(_name=table_name):
+                    tables = ag_results.trend_tables(trend, pop_labels, antigens)
+                    return {_name: tables[_name]} if _name in tables else {}
+
+                items.append(ReportItem(key=f'{key}:{variable}', tab='Statistics',
+                                        label=f"{name} {title}: {variable}", get_figure=_fig,
+                                        get_tables=_table if figure == 'volcano' else None))
+        if trend.get('age_model'):
+            for key, title, table_name in (
+                    ('trend_age_model', 'Immune age model', 'immune_age_predictions'),
+                    ('trend_age_features', 'Immune age features', 'immune_age_features')):
+
+                def _age_fig(_key=key):
+                    return (_trend_figures().get(_key) or {}).get('fig')
+
+                def _age_table(_name=table_name):
+                    tables = ag_results.trend_tables(trend, pop_labels, antigens)
+                    return {_name: tables[_name]} if _name in tables else {}
+
+                items.append(ReportItem(key=f'{key}:{variable}', tab='Statistics',
+                                        label=f"{title}: {variable}", get_figure=_age_fig,
+                                        get_tables=_age_table))
     if pca:
+        def _pca_scores():
+            scores = pca['scores'].assign(group=pca['groups'])
+            if pca.get('colour_values') is not None:
+                scores[pca.get('colour_label') or 'value'] = pca['colour_values']
+            return scores
+
         items.append(ReportItem(
             key='sample_pca', tab='Statistics', label='Sample PCA',
             get_figure=lambda: make_pca_figure(pca, False, group_colours=group_colours),
-            get_tables=lambda: {'scores': pca['scores'].assign(group=pca['groups']),
-                                'loadings': pca['loadings']}))
+            get_tables=lambda: {'scores': _pca_scores(), 'loadings': pca['loadings']}))
     if predictive:
         summary = predictive['summary']
         what = f"{summary['positive']} vs {summary['negative']}"
@@ -467,7 +580,60 @@ def build_report_items(*, gate_defs: list[dict], reference_boundaries: dict, mod
                 get_figure=lambda _k=pop_key: population_figure(_k)))
     if enrichment:
         items.extend(enrichment_report_items(enrichment, pval_threshold))
+    if trend_enrichment:
+        items.extend(enrichment_report_items(trend_enrichment, pval_threshold))
     return items
+
+
+def gate_pages(items: list, per_page: int = GATES_PER_PAGE) -> list:
+    """*items* with the gate items (GateReportItem) put *per_page* to a
+    page: each page is one item, labelled with the range of the gates on
+    it in report order (e.g. 'Gates 007-012 of 150'), whose figure has the
+    gates in GATE_PAGE_COLUMNS columns. Other items are kept in place."""
+    gates = [it for it in items if isinstance(it, GateReportItem)]
+    if not gates:
+        return list(items)
+    width = len(str(len(gates)))
+    pages = []
+    for start in range(0, len(gates), per_page):
+        chunk = gates[start:start + per_page]
+        first, last = start + 1, start + len(chunk)
+        pages.append(ReportItem(
+            key=f"gates:{first}-{last}", tab=chunk[0].tab,
+            label=f"Gates {first:0{width}d}-{last:0{width}d} of {len(gates)}",
+            get_figure=lambda _chunk=chunk: _gate_page_figure(_chunk, per_page)))
+    out, placed = [], False
+    for it in items:
+        if isinstance(it, GateReportItem):
+            if not placed:
+                out.extend(pages)
+                placed = True
+            continue
+        out.append(it)
+    return out
+
+
+def _gate_page_figure(chunk: list, per_page: int):
+    """One A4 landscape page of gate plots; a gate that cannot be drawn
+    says so in its panel."""
+    from matplotlib.figure import Figure
+
+    rows = max(1, -(-per_page // GATE_PAGE_COLUMNS))
+    fig = Figure(figsize=(11.69, 8.27), constrained_layout=True)
+    axes = fig.subplots(rows, GATE_PAGE_COLUMNS, squeeze=False).ravel()
+    for ax, item in zip(axes, chunk):
+        try:
+            item.draw(ax)
+        except Exception as exc:
+            ax.clear()
+            ax.axis('off')
+            ax.text(0.5, 0.5, f"{item.label}: could not be drawn ({exc})", ha='center',
+                    va='center', wrap=True, transform=ax.transAxes)
+    for ax in axes[len(chunk):]:
+        ax.axis('off')
+    if chunk and chunk[0].page_title:
+        fig.suptitle(chunk[0].page_title, fontsize=10)
+    return fig
 
 
 def enrichment_report_items(result: dict, fdr_threshold: float) -> list[ReportItem]:
@@ -477,9 +643,12 @@ def enrichment_report_items(result: dict, fdr_threshold: float) -> list[ReportIt
     import ag_fsea
     import ag_fsea_plots as fp
 
-    comps = [f"{o} vs {b}" for b, o in result.get('comparisons') or []]
+    comps = ag_fsea.comparison_labels(result)
+    trend = (result.get('settings') or {}).get('kind') == 'trend'
     items = [ReportItem(
-        key='enrichment', tab='Enrichment', label='Immune state enrichment',
+        key='enrichment:trend' if trend else 'enrichment', tab='Enrichment',
+        label=f"Immune state enrichment: {comps[0]}" if trend and comps
+        else 'Immune state enrichment',
         get_figure=lambda: fp.make_dot_plot(result['states'], comps, fdr_threshold, False),
         get_tables=lambda: ag_fsea.result_tables(result))]
     states = result['states']
@@ -495,6 +664,12 @@ def enrichment_report_items(result: dict, fdr_threshold: float) -> list[ReportIt
         items.append(ReportItem(
             key=f'enrichment:{comp}:{name}', tab='Enrichment', label=f"{name}: {comp}",
             get_figure=_curve, get_tables=lambda _m=mb: {'members': _m}))
+    pattern_states = result.get('pattern_states')
+    if pattern_states is not None and len(pattern_states):
+        items.append(ReportItem(
+            key='enrichment:patterns', tab='Enrichment', label='Immune states in shape patterns',
+            get_figure=lambda: fp.make_pattern_dot_plot(pattern_states, fdr_threshold, False),
+            get_tables=lambda: {'pattern_states': pattern_states}))
     return items
 
 
@@ -515,7 +690,9 @@ def p_value_text(result: dict | None) -> str:
 def make_population_comparison_figure(gate_def: dict, pop: str, panels: list, transforms: dict,
                                       axis_labels: dict, values: dict, group_order: list[str],
                                       title: str, p_text: str = '',
-                                      group_colours: dict | None = None):
+                                      group_colours: dict | None = None,
+                                      trend: dict | None = None,
+                                      trend_percent: dict | None = None):
     """The report figure of one population: each group's pooled parent
     events on the gate's axes with the reference boundary and the group's
     gated frequency, then the dot and violin plot of the per-sample values
@@ -523,12 +700,20 @@ def make_population_comparison_figure(gate_def: dict, pop: str, panels: list, tr
 
     panels : [{'group', 'events', 'parent', 'member', 'channels',
                'boundary', 'n_samples'}], one per group.
+    trend  : keyword arguments of trend_plots.make_trend_plot_figure; the
+             population's trend plot then takes the place of the dot and
+             violin plot (two panels for a paired group × trend test).
+    trend_percent : the same trend on the % of parent scale, drawn after it.
     """
     from matplotlib.figure import Figure
 
-    n = len(panels) + 1
-    fig = Figure(figsize=(3.9 * n, 4.4), constrained_layout=True)
-    axes = fig.subplots(1, n, squeeze=False)[0]
+    two_panels = bool(trend and trend.get('interaction') and not trend.get('group_curves'))
+    n_last = (2 if two_panels else 1) + (1 if trend_percent else 0) if trend else 1
+    n = len(panels) + n_last
+    last_w = 4.6 if trend else 3.9
+    fig = Figure(figsize=(3.9 * len(panels) + last_w * n_last, 4.4), constrained_layout=True)
+    axes = fig.subplots(1, n, squeeze=False,
+                        width_ratios=[3.9] * len(panels) + [last_w] * n_last)[0]
     label = ((gate_def.get('populations') or {}).get(pop) or {}).get('label', pop)
     for ax, panel in zip(axes, panels):
         member = panel.get('member')
@@ -538,8 +723,15 @@ def make_population_comparison_figure(gate_def: dict, pop: str, panels: list, tr
                          axis_labels,
                          f"{panel['group']} ({panel.get('n_samples', 0)} samples pooled)",
                          fractions={pop: frac} if frac is not None else None, ax=ax)
-    make_group_values_figure(values, group_order, f"{label}: % of parent", p_text, ax=axes[-1],
-                             group_colours=group_colours)
+    if trend:
+        from honeychrome.view_components import trend_plots as tp
+        n_trend = 2 if two_panels else 1
+        tp.make_trend_plot_figure(**trend, axes=list(axes[len(panels):len(panels) + n_trend]))
+        if trend_percent:
+            tp.make_trend_plot_figure(**trend_percent, axes=[axes[len(panels) + n_trend]])
+    else:
+        make_group_values_figure(values, group_order, f"{label}: % of parent", p_text,
+                                 ax=axes[-1], group_colours=group_colours)
     fig.suptitle(title, fontsize=10)
     return fig
 
@@ -558,21 +750,32 @@ def make_pca_figure(pca: dict, is_dark: bool, sample_labels: dict | None = None,
                     group_colours: dict | None = None):
     """Samples on PC1 × PC2 coloured by group, with the top loadings as
     arrows; hovering names a sample or loading (fig._hover_handler).
-    *group_colours* ({group: colour}) overrides the default palette."""
+    *group_colours* ({group: colour}) overrides the default palette. When
+    *pca* has 'colour_values' (one number per sample, e.g. age), samples
+    are coloured by that value instead, with a colour bar named
+    'colour_label', and shaped by group."""
     from matplotlib.figure import Figure
     from honeychrome.view_components import differential_plots as dp
 
-    fig = Figure(figsize=(6, 6), constrained_layout=True)
+    with_bar = pca.get('colour_values') is not None
+    fig = Figure(figsize=(6.9 if with_bar else 6, 6), constrained_layout=True)
     ax = fig.add_subplot(111)
+    ax.set_box_aspect(1)  # the plot area itself is square, whatever surrounds it
     fg = 'white' if is_dark else 'black'
     scores, loadings, groups = pca['scores'], pca['loadings'], pca['groups']
     colours = {g: (group_colours or {}).get(g) or c for g, c in _group_colours(groups).items()}
     names = [(sample_labels or {}).get(s, str(s).replace('\\', '/').rsplit('/', 1)[-1])
              for s in scores.index]
-    for grp, colour in colours.items():
-        mask = np.array([g == grp for g in groups])
-        ax.scatter(scores['PC1'].values[mask], scores['PC2'].values[mask], s=60, color=colour,
-                   edgecolors=fg, linewidths=0.4, label=grp or 'no group', zorder=3)
+    if pca.get('colour_values') is not None:
+        from honeychrome.view_components import trend_plots as tp
+        tp.scatter_by_value(fig, ax, scores['PC1'].values, scores['PC2'].values,
+                            pca['colour_values'], groups, label=pca.get('colour_label') or 'value',
+                            is_dark=is_dark)
+    else:
+        for grp, colour in colours.items():
+            mask = np.array([g == grp for g in groups])
+            ax.scatter(scores['PC1'].values[mask], scores['PC2'].values[mask], s=60, color=colour,
+                       edgecolors=fg, linewidths=0.4, label=grp or 'no group', zorder=3)
     hover_xy = list(zip(scores['PC1'].values, scores['PC2'].values))
     hover_labels = list(names)
     if label_points:
@@ -641,7 +844,8 @@ def make_roc_figure(performance: pd.DataFrame, roc: pd.DataFrame, summary: dict,
     ax.set_xlabel("False positive rate")
     ax.set_ylabel("True positive rate")
     ax.legend(loc='lower right', fontsize=7)
-    ax.set_title(f"Cross-validated ROC\n{predictive_subtitle(summary)}", fontsize=9)
+    ax.set_title(dp.wrap_to_width(f"Cross-validated ROC\n{predictive_subtitle(summary)}", 9, 5.0),
+                 fontsize=9)
     dp.style_figure_theme(fig, is_dark)
     return fig
 
@@ -697,6 +901,7 @@ def make_panel_figure(panel: pd.DataFrame, summary: dict, is_dark: bool):
     ax.set_xlabel("Number of top-ranked features (log scale)")
     ax.set_ylabel("Cross-validated AUC (mean ± SD)")
     ax.set_ylim(0, 1.02)
-    ax.set_title(f"How many features are needed?\n{predictive_subtitle(summary)}", fontsize=9)
+    ax.set_title(dp.wrap_to_width(f"How many features are needed?\n{predictive_subtitle(summary)}",
+                                  9, 5.0), fontsize=9)
     dp.style_figure_theme(fig, is_dark)
     return fig
