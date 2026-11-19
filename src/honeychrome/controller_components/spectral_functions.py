@@ -622,6 +622,7 @@ def get_raw_events(
     extra_channel_ids: list | None = None,
     col_order: list | None = None,
     sample_key: str | None = None,
+    event_keep: np.ndarray | None = None,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Return a (n_events, n_channels) float64 array of raw fluorescence values.
@@ -639,6 +640,9 @@ def get_raw_events(
 
     gating_strategy may be a SampleGating, with sample_key the sample's
     experiment key, to gate the sample with its own gates (see gate_event_mask).
+
+    event_keep: boolean mask over the file's events; events outside it are
+    left out as well (e.g. events an AF contaminant screen removed).
     """
     try:
         all_events = sample.get_events('raw', col_order=col_order)
@@ -664,6 +668,11 @@ def get_raw_events(
             event_mask = np.ones(len(all_events), dtype=np.bool_)
     else:
         event_mask = np.ones(len(all_events), dtype=np.bool_)
+
+    if event_keep is not None:
+        if len(event_keep) != len(all_events):
+            raise ValueError(f'event_keep has {len(event_keep)} entries for {len(all_events)} events')
+        event_mask = event_mask & np.asarray(event_keep, dtype=np.bool_)
 
     gated = all_events[event_mask]
     fluor = gated[:, fluorescence_channel_ids].astype(np.float64)

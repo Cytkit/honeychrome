@@ -5,7 +5,8 @@ Negative envelopes for stored AF profiles that have none they can keep
 current (``autospectral_functions.envelope_needs_source``): profiles
 extracted before envelopes existed, or whose unstained subsample is missing.
 The envelope is built from the profile's source sample exactly as AF
-extraction builds it (all events of the sample, ``make_envelope_entry``),
+extraction builds it (all events of the sample less those its contaminant
+screen removed, ``make_envelope_entry``),
 so the AF spectra, and with them the experiment's AF Index numbering, are
 unchanged. The controller runs ``EnvelopeBuildWorker`` in a QThread after
 the AF cache is rebuilt and stores the results on the main thread.
@@ -19,6 +20,7 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
+from honeychrome.controller_components.af_contaminants import load_excluded
 from honeychrome.controller_components.autospectral_functions import envelope_sample_name, make_envelope_entry
 
 logger = logging.getLogger(__name__)
@@ -28,7 +30,8 @@ def build_envelope(experiment_dir, profile_name: str, profile: dict, layout: dic
                    fluor_spectra: np.ndarray, loader=None) -> tuple:
     """
     ``(envelope entry, unstained subsample)`` of one profile from all events
-    of its source sample (``profile['source_fcs']``). Raises when the sample
+    of its source sample (``profile['source_fcs']``) except those its
+    contaminant screen removed. Raises when the sample
     cannot be read or its detectors do not match the profile.
     """
     from honeychrome.controller_components.spread_model import load_events
@@ -37,7 +40,12 @@ def build_envelope(experiment_dir, profile_name: str, profile: dict, layout: dic
     source = profile.get('source_fcs')
     if not source or not (Path(experiment_dir) / source).is_file():
         raise FileNotFoundError(f'source sample {source!r} not found')
-    raw_fl, _sc = loader(experiment_dir, source, None, layout, None)
+    screen = profile.get('contaminant_screen') or {}
+    excluded = load_excluded(experiment_dir, screen['excluded_file']) if screen.get('excluded_file') else None
+    if excluded is None:
+        raw_fl, _sc = loader(experiment_dir, source, None, layout, None)
+    else:
+        raw_fl, _sc = loader(experiment_dir, source, None, layout, None, excluded=excluded)
     af_spectra = np.asarray(profile['spectra'], dtype=np.float64)
     if raw_fl.shape[1] != af_spectra.shape[1]:
         raise ValueError(f'{raw_fl.shape[1]} detectors in {source}, {af_spectra.shape[1]} in the profile')

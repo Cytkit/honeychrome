@@ -60,9 +60,18 @@ from honeychrome.controller_components.autospectral_functions import (
     save_envelope_sample,
 )
 from honeychrome.controller_components.spread_model import (
+    raw_layout,
     spread_is_current,
     spread_snapshot,
     compute_spread_entry,
+)
+from honeychrome.controller_components.af_contaminants import (
+    excluded_file_name,
+    save_excluded,
+    screen_job,
+    screen_on,
+    screen_unstained,
+    set_screen,
 )
 from honeychrome.controller_components.transform import Transform
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
@@ -119,18 +128,22 @@ AF_PROFILE_SUFFIX = ' AutoSpectral AF'
 
 class AfTrainingWorker(QObject):
     """
-    Runs get_af_spectra in a QThread, then builds the negative envelope and,
-    when spread_job is given, estimates the spillover spread. Emits a dict
-    with af_spectra, envelope, envelope_sample and spread.
+    Screens the unstained sample for contaminating events (when screen is
+    given), runs get_af_spectra on the events kept in a QThread, then builds
+    the negative envelope from them and, when spread_job is given, estimates
+    the spillover spread. Emits a dict with af_spectra, envelope,
+    envelope_sample, spread and screen (af_contaminants.ScreenResult or None).
     """
     finished = Signal(object)
     error = Signal(str)
     progress = Signal(str)
 
     def __init__(self, unstained_raw, fluor_spectra, som_dim, source_fcs_path,
-                 fluor_names=None, spread_job=None, deduplicate=True):
+                 fluor_names=None, spread_job=None, deduplicate=True, screen=None, unstained_scatter=None):
         super().__init__()
         self.unstained_raw = unstained_raw
+        self.screen = screen
+        self.unstained_scatter = unstained_scatter
         self.fluor_spectra = fluor_spectra
         self.som_dim = som_dim
         self.deduplicate = deduplicate
@@ -140,25 +153,32 @@ class AfTrainingWorker(QObject):
 
     def run(self):
         try:
+            screen, raw, guard, excluded = None, self.unstained_raw, None, None
+            if self.screen is not None:
+                screen = screen_unstained(self.screen, self.unstained_raw, self.unstained_scatter,
+                                          progress=self.progress.emit)
+                raw, guard = self.unstained_raw[screen.keep], screen.guard
+                excluded = np.flatnonzero(~screen.keep)
             self.progress.emit('Clustering unstained sample and refining AF spectra...')
             af_spectra = get_af_spectra(
-                self.unstained_raw,
+                raw,
                 self.fluor_spectra,
                 som_dim=self.som_dim,
                 deduplicate=self.deduplicate,
+                refine_guard=guard,
             )
             envelope, sample, spread = None, None, None
             if self.fluor_names is not None:
                 self.progress.emit('Building the negative envelope')
                 envelope, sample = make_envelope_entry(
-                    self.unstained_raw, self.fluor_names, self.fluor_spectra, af_spectra)
+                    raw, self.fluor_names, self.fluor_spectra, af_spectra)
                 if self.spread_job is not None:
                     try:
-                        spread = self.spread_job(self.progress.emit)
+                        spread = self.spread_job(self.progress.emit, excluded)
                     except Exception as e:
                         logger.warning(f'AutoSpectral: spillover spread not estimated: {e}')
             self.finished.emit({'af_spectra': af_spectra, 'envelope': envelope,
-                                'envelope_sample': sample, 'spread': spread})
+                                'envelope_sample': sample, 'spread': spread, 'screen': screen})
         except Exception as e:
             self.error.emit(str(e))
 
@@ -938,10 +958,25 @@ class AutofluorescencePage(QWidget):
             'contamination check.'
         )
 
+        self._screen_cb = QCheckBox('Screen for contaminants')
+        self._screen_cb.setToolTip(
+            'Before extraction, remove events carrying a dye from a neighbouring '
+            'single-stain control well (the 8 wells around the unstained well, or '
+            'the well acquired just before it), judged against how often clean '
+            'unstained samples of the experiment reach that level by chance. '
+            'The first extraction in an experiment takes longer while the clean '
+            'samples are summarised; later ones reuse the summaries. Unticked: '
+            'no events are removed (AF spectra that are a fluorophore are still dropped).'
+        )
+        self._screen_cb.toggled.connect(self._on_screen_toggled)
+        guard_while_busy(self.controller, self._screen_cb)
+
         som_row = QHBoxLayout()
         som_row.addWidget(self._som_dim_spin)
         som_row.addSpacing(12)
         som_row.addWidget(self._dedup_cb)
+        som_row.addSpacing(12)
+        som_row.addWidget(self._screen_cb)
         som_row.addStretch(1)
         layout.addRow('SOM grid size:', som_row)
 
@@ -987,6 +1022,7 @@ class AutofluorescencePage(QWidget):
         guard_while_busy(self.controller, self._extract_btn)
 
         self._extract_status = QLabel('')
+        self._extract_status.setWordWrap(True)
         layout.addRow(self._extract_status)
 
         parent_layout.addWidget(grp)
@@ -1299,6 +1335,9 @@ class AutofluorescencePage(QWidget):
     def _refresh_af_abundance_control(self):
         """The AF abundance tick box from the experiment's setting, with a note when it cannot apply."""
         process = self.controller.experiment.process
+        self._screen_cb.blockSignals(True)
+        self._screen_cb.setChecked(screen_on(process))
+        self._screen_cb.blockSignals(False)
         noise_aware = af_posterior.af_abundance_mode(process) == af_posterior.NOISE_AWARE
         self._noise_aware_cb.blockSignals(True)
         self._noise_aware_cb.setChecked(noise_aware)
@@ -1315,6 +1354,11 @@ class AutofluorescencePage(QWidget):
         af_posterior.set_af_abundance_mode(self.controller.experiment.process,
                                            af_posterior.NOISE_AWARE if checked else af_posterior.CLAMPED)
         self._af_abundance_changed()
+
+    def _on_screen_toggled(self, checked: bool):
+        set_screen(self.controller.experiment.process, checked)
+        if self.bus:
+            self.bus.autoSaveRequested.emit()
 
     def _on_shape_bend_toggled(self, checked: bool):
         af_shape_bend.set_shape_bend(self.controller.experiment.process, checked)
@@ -1408,10 +1452,13 @@ class AutofluorescencePage(QWidget):
             self._extract_status.setText(self.controller.job_gate.busy_text())
             return
         self._train_token = token
+        # Columns in the experiment's whitelisted order, so the channel indices
+        # below hold whatever extra channels this file has.
+        layout = raw_layout(self.controller)
         try:
             full_path = str(self.controller.experiment_dir / sample_path)
             sample = sample_from_fcs(full_path, self.bus)
-            raw_event_data = sample.get_events(source='raw')
+            raw_event_data = sample.get_events(source='raw', col_order=layout['col_order'])
         except Exception as e:
             token.release()
             self._extract_status.setText(f'Failed to load sample: {e}')
@@ -1422,10 +1469,11 @@ class AutofluorescencePage(QWidget):
             self._extract_status.setText('Sample has no events.')
             return
 
-        fl_ids = np.array(
-            self.controller.filtered_raw_fluorescence_channel_ids
-        )
-        raw_fl = raw_event_data[:, fl_ids]
+        raw_fl = raw_event_data[:, np.array(layout['fl_ids'])]
+        raw_settings = self.controller.experiment.settings['raw']
+        sc_ids = [col for i, col in zip(raw_settings['scatter_channel_ids'], layout['sc_ids'])
+                  if not str(raw_settings['event_channels_pnn'][i]).upper().endswith('-T')]
+        raw_sc = raw_event_data[:, sc_ids]
 
         fluor_spectra = self._build_fluor_spectra()
         if fluor_spectra is None:
@@ -1441,8 +1489,12 @@ class AutofluorescencePage(QWidget):
                 self.controller.experiment.process.get('af_spread'), fluor_names, fluor_spectra):
             snapshot = spread_snapshot(self.controller, fluor_names, fluor_spectra, sample_path)
 
-            def spread_job(progress):
+            def spread_job(progress, unstained_excluded=None):
+                snapshot['unstained_excluded'] = unstained_excluded
                 return compute_spread_entry(snapshot, progress)
+        screen = None
+        if fluor_names is not None and screen_on(self.controller.experiment.process):
+            screen = screen_job(self.controller, sample_path, fluor_names, fluor_spectra)
 
         self._extract_btn.setEnabled(False)
         self._extract_status.setText('Extracting AF spectra...')
@@ -1452,6 +1504,7 @@ class AutofluorescencePage(QWidget):
             raw_fl, fluor_spectra, self._som_dim_spin.value(), sample_path,
             fluor_names=fluor_names, spread_job=spread_job,
             deduplicate=self._dedup_cb.isChecked(),
+            screen=screen, unstained_scatter=raw_sc,
         )
         self._train_worker.moveToThread(self._train_thread)
         self._train_thread.started.connect(self._train_worker.run)
@@ -1501,6 +1554,24 @@ class AutofluorescencePage(QWidget):
             except OSError as e:
                 logger.warning(f'AutoSpectral: failed to save the unstained subsample: {e}')
             af_profiles[profile_name]['envelope'] = envelope
+        screen = result.get('screen')
+        screen_note = ''
+        if screen is not None:
+            summary = dict(screen.summary)
+            if summary['removed'] > 0:
+                summary['excluded_file'] = excluded_file_name(profile_name)
+                try:
+                    save_excluded(screen.keep, self.controller.experiment_dir, summary['excluded_file'])
+                except OSError as e:
+                    logger.warning(f'AutoSpectral: failed to save the excluded events: {e}')
+                    summary.pop('excluded_file')
+            af_profiles[profile_name]['contaminant_screen'] = summary
+            if summary['removed'] > 0:
+                removed = ', '.join(f'{d} {n}' for d, n in summary['removed_by_dye'].items())
+                screen_note = (f' {summary["removed"]:,} contaminated event(s) left out '
+                               f'({100 * summary["removed"] / max(summary["events"], 1):.2f}%: {removed}).')
+            if screen.warnings:
+                screen_note += ' ' + ' '.join(screen.warnings)
         if result['spread'] is not None:
             self.controller.experiment.process['af_spread'] = result['spread']
         self.controller.experiment.process['af_profiles'] = af_profiles
@@ -1525,7 +1596,7 @@ class AutofluorescencePage(QWidget):
             spread_note = (f' Spillover spread estimated from {result["spread"]["n_estimated"]} controls.'
                            if result['spread'] is not None else '')
             self._extract_status.setText(
-                f'Done. Profile "{profile_name}" stored ({n_af} AF spectra).{spread_note}'
+                f'Done. Profile "{profile_name}" stored ({n_af} AF spectra).{spread_note}{screen_note}'
             )
         self._refresh_profile_list(select_name=profile_name)
         self._rebuild_assignment_grid()
