@@ -149,6 +149,46 @@ def _find_default_unstained_tube(samples: dict) -> str | None:
             return name
     return None
 
+_UNSTAINED_TUBE = re.compile(r'(unstained|negative)', re.IGNORECASE)
+
+
+def control_label_from_tubename(tubename: str) -> tuple[str, str]:
+    """Control label and antigen auto-generate reads from a tube name: the text
+    before any bracket or trailing "cells"/"beads", without a plate-position
+    prefix such as "A1 ", as the canonical fluorophore when one is recognised
+    (else that text) and the canonical marker (else '')."""
+    match = re.findall(r'^(.*?)(?=\s*[\(\[]|\s+(?:cells?|beads?)\s*$)', tubename, re.IGNORECASE)
+    raw_label = match[0].strip() if match else tubename
+    raw_label = re.sub(r'^[A-H]\d{1,2}\s+', '', raw_label).strip()
+    label = match_fluorophore(raw_label, get_fluorophore_db()) or raw_label
+    antigen = match_marker(raw_label, get_marker_db()) or ''
+    return label, antigen
+
+
+def alternate_control_paths(samples: dict, control: dict, exclude_names) -> list[str]:
+    """Other single-stain control tubes for the fluorophore of *control*, in
+    sample order: tubes whose name gives the same label as the control's own
+    tube, with the same particle type, that are not unstained and not named in
+    *exclude_names* (tubes already used by a row of the spectral model)."""
+    own_name = control.get('sample_name') or ''
+    if not own_name:
+        return []
+    label = control_label_from_tubename(own_name)[0]
+    want_beads = control.get('particle_type') == 'Beads'
+    unstained = set(samples.get('unstained_samples', []))
+    paths = []
+    for path in samples.get('single_stain_controls', []):
+        name = samples['all_samples'].get(path)
+        if (not name or name == own_name or name in exclude_names or path in unstained
+                or _UNSTAINED_TUBE.search(name) or _UNSTAINED_TUBE.search(path)):
+            continue
+        if is_bead_sample(samples, path, name) != want_beads:
+            continue
+        if control_label_from_tubename(name)[0] == label:
+            paths.append(path)
+    return paths
+
+
 def restore_user_labels(spectral_model, profiles, previous_controls):
     """Give each regenerated control the label and antigen it had in the previous
     model, matched by control tube (sample path, else a unique sample name), so
@@ -948,17 +988,7 @@ class SpectralAutoGenerator(QObject):
             # bead controls: the unstained bead sample matching their scatter, if any
             bead_match = match_bead_unstained(self.samples, sample_path) if particle_type == 'Beads' else None
 
-            match = re.findall(r'^(.*?)(?=\s*[\(\[]|\s+(?:cells?|beads?)\s*$)', tubename, re.IGNORECASE)
-            raw_label = match[0].strip() if match else tubename
-
-            # Strip leading plate-position prefixes like "A1 ", "B12 " before label matching
-            raw_label = re.sub(r'^[A-H]\d{1,2}\s+', '', raw_label).strip()
-
-            canonical_fluor = match_fluorophore(raw_label, get_fluorophore_db())
-            label = canonical_fluor if canonical_fluor else raw_label
-
-            canonical_marker = match_marker(raw_label, get_marker_db())
-            antigen = canonical_marker or ''
+            label, antigen = control_label_from_tubename(tubename)
 
             # discard if label is already in spectral model
             if label in [control['label'] for control in self.spectral_model]:
@@ -1224,6 +1254,11 @@ class SpectralCleaner(QObject):
         self._rng = np.random.default_rng(0)
         self._refine_seconds = 0.0
         self._low_events = LowEventLog(controller, bus, collect=True)
+        # Read by the caller after cleaningFinished. substitutions: one dict per
+        # control switched to another tube of its fluorophore (the fields to set
+        # on the control); unresolved: labels still showing no clear stain.
+        self.substitutions: list[dict] = []
+        self.unresolved: list[str] = []
 
     @Slot()
     def run(self):
@@ -1243,6 +1278,8 @@ class SpectralCleaner(QObject):
         self._check_pools = {}
         self._negative_refs = {}
         self._refine_seconds = 0.0
+        self.substitutions = []
+        self.unresolved = []
         t_start = time.perf_counter()
 
         model_controls = []
@@ -1289,6 +1326,8 @@ class SpectralCleaner(QObject):
                 self._clean_one(control)
             else:
                 logger.info(f'SpectralCleaner: skipping "{control["label"]}" — result already current.')
+
+        self._replace_unclear_controls(all_eligible)
 
         t_cleaned = time.perf_counter()
         if self.refine:
@@ -1360,8 +1399,13 @@ class SpectralCleaner(QObject):
             return False
         return stored_fp == self._cleaning_fingerprint(control)
     
-    def _load_events(self, control: dict) -> dict | None:
+    def _load_events(self, control: dict, find_peak: bool = False) -> dict | None:
         """Base-gated, saturation-excluded events of a control and its negative.
+
+        The expected peak is the control's major channel, or with *find_peak*
+        the empirical peak of its events after removing the negative's mean
+        (the dimmest quarter of the control without one), as auto-generate
+        finds it.
 
         Returns None, with a collected warning, when the control cannot be
         cleaned: no negative assigned or found, or too few events. Raises on
@@ -1467,12 +1511,20 @@ class SpectralCleaner(QObject):
 
         # Expected peak from spectral model table (fallback / QC only)
         peak_ch_name = control.get('gate_channel', '')
-        try:
-            expected_peak_ch_idx = self.fluor_ch_ids.index(
-                self.event_channels_pnn.index(peak_ch_name)
-            )
-        except (ValueError, IndexError):
-            expected_peak_ch_idx = int(np.argmax(pos_events.mean(axis=0)))
+        if find_peak and len(pos_events) > 1:
+            if not use_internal and len(neg_events) > 1:
+                af_mean = neg_events.mean(axis=0)
+            else:
+                order = np.argsort(pos_events.max(axis=1))
+                af_mean = pos_events[order[:max(2, len(pos_events) // 4)]].mean(axis=0)
+            expected_peak_ch_idx = int(find_empirical_peak(pos_events, af_mean))
+        else:
+            try:
+                expected_peak_ch_idx = self.fluor_ch_ids.index(
+                    self.event_channels_pnn.index(peak_ch_name)
+                )
+            except (ValueError, IndexError):
+                expected_peak_ch_idx = int(np.argmax(pos_events.mean(axis=0)))
 
         # --- Saturation exclusion ---
         pos_events, n_sat_pos, sat_mask_pos = exclude_saturated(pos_events, self.ceiling)
@@ -1502,10 +1554,10 @@ class SpectralCleaner(QObject):
             'expected_peak_ch_idx': expected_peak_ch_idx,
         }
 
-    def _clean_one(self, control: dict):
+    def _clean_one(self, control: dict, find_peak: bool = False):
         label = control['label']
         try:
-            loaded = self._load_events(control)
+            loaded = self._load_events(control, find_peak=find_peak)
             if loaded is None:
                 return  # leave cleaned_events untouched; profiles[label] is the fallback
             pos_events           = loaded['pos_events']
@@ -1656,6 +1708,115 @@ class SpectralCleaner(QObject):
             else:
                 logger.error(f'SpectralCleaner: {msg}', exc_info=True)
             self._collected_warnings.append(msg)
+
+    def _replace_unclear_controls(self, controls: list[dict]):
+        """Give each control whose cleaned result shows no clear stain the
+        clearest other single-stain tube of the same fluorophore and particle
+        type in the experiment, when one shows a clear stain.
+
+        Each candidate tube is cleaned as the control would be (its major
+        channel found on its own events, its negative the bead unstained
+        matching it for bead controls, else the control's). A candidate shows
+        a clear stain when its spectrum passes the reference cosine QC or its
+        background check finds no problem; among those, ones passing the
+        cosine QC come first, then the highest signal over the unstained. The
+        winner's cleaned result replaces the control's and the fields to set
+        on the control are added to self.substitutions. Controls left without
+        one are listed in self.unresolved for the caller's library fallback.
+        Controls whose tube was chosen by hand (sample_locked) are left as
+        they are.
+        """
+        used = {c.get('sample_name') for c in self.spectral_model if c.get('sample_name')}
+        swapped = []
+        for control in controls:
+            label = control['label']
+            original = self.cleaned_events.get(label)
+            if (control.get('sample_locked') or not original
+                    or not (original.get('background_check') or {}).get('verdict')):
+                continue
+            best = None
+            for path in alternate_control_paths(self.samples, control, used):
+                trial = self._clean_alternate(control, path)
+                if trial is None:
+                    continue
+                check = trial['entry'].get('background_check')
+                if check and check.get('verdict'):
+                    continue
+                rank = (check is not None, -((check or {}).get('ratio') or 0.0))
+                if best is None or rank < best['rank']:
+                    best = dict(trial, rank=rank)
+            if best is None:
+                self.unresolved.append(label)
+                continue
+            self.cleaned_events[label] = best['entry']
+            if best['pool'] is not None:
+                self._check_pools[label] = best['pool']
+            self._collected_warnings.extend(best['warnings'])
+            for entry in best['low_events']:
+                if entry not in self._low_events.entries:
+                    self._low_events.entries.append(entry)
+            new = best['control']
+            used.add(new['sample_name'])
+            self.substitutions.append({
+                'label': label,
+                'sample_name': new['sample_name'],
+                'sample_path': new['sample_path'],
+                'particle_type': new['particle_type'],
+                'universal_negative_name': new['universal_negative_name'],
+                'gate_channel': self.event_channels_pnn[
+                    self.fluor_ch_ids[best['entry']['expected_peak_ch_idx']]],
+            })
+            swapped.append((label, control['sample_name'], new['sample_name']))
+            logger.info(f'SpectralCleaner: "{label}" — "{control["sample_name"]}" shows no clear stain; '
+                        f'using "{new["sample_name"]}" instead.')
+        if swapped:
+            self._collected_warnings.append(
+                'These controls showed no clear stain, so another single-stain control for the same '
+                'fluorophore in this experiment is used instead:\n'
+                + '\n'.join(f'  \u2022 {label}: "{old}" \u2192 "{new}"' for label, old, new in swapped))
+
+    def _clean_alternate(self, control: dict, path: str) -> dict | None:
+        """Clean tube *path* in place of the control's own, leaving the
+        control's cleaned result, check pool and collected warnings as they
+        were. Returns the trial control, its cleaned entry and check pool, and
+        the warnings and low-event entries it raised; None when it could not
+        be cleaned or has no unstained negative to check it against."""
+        label = control['label']
+        trial = dict(control, sample_name=self.samples['all_samples'][path],
+                     sample_path=str(self.experiment_dir / path), gate_channel='')
+        if control.get('particle_type') == 'Beads':
+            match = match_bead_unstained(self.samples, path)
+            trial['universal_negative_name'] = (self.samples['all_samples'][match] if match
+                                                else INTERNAL_NEGATIVE_SENTINEL)
+        if trial.get('universal_negative_name') in (None, '', INTERNAL_NEGATIVE_SENTINEL):
+            return None
+
+        original = self.cleaned_events.get(label)
+        original_pool = self._check_pools.get(label)
+        n_warnings = len(self._collected_warnings)
+        low_events = self._low_events
+        self._low_events = LowEventLog(self.controller, None, collect=True)
+        try:
+            self._clean_one(trial, find_peak=True)
+            entry = self.cleaned_events.get(label)
+            result = None
+            if entry is not None and entry is not original:
+                result = {
+                    'control': trial,
+                    'entry': entry,
+                    'pool': self._check_pools.get(label) if self._check_pools.get(label) is not original_pool else None,
+                    'warnings': self._collected_warnings[n_warnings:],
+                    'low_events': list(self._low_events.entries),
+                }
+        finally:
+            self.cleaned_events[label] = original
+            if original_pool is None:
+                self._check_pools.pop(label, None)
+            else:
+                self._check_pools[label] = original_pool
+            del self._collected_warnings[n_warnings:]
+            self._low_events = low_events
+        return result
 
     def _make_check_pool(self, loaded: dict, row: np.ndarray, control: dict):
         """Events kept from a loaded control for the full-panel check. Cell

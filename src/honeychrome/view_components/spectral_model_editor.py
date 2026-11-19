@@ -4,6 +4,7 @@ import re
 from typing import List, Any, Dict
 from PySide6 import QtCore
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QThread, Slot, QObject, QEvent, QSize, Signal, QSettings
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QStyledItemDelegate, QComboBox, QLineEdit, QMessageBox, QHeaderView, QLabel, QWidget, QCheckBox, QMenu, QInputDialog)
 
 from honeychrome.controller_components.functions import raw_gates_list, resolve_base_gate, build_display_label_map
@@ -32,10 +33,12 @@ logger = logging.getLogger(__name__)
 
 COLUMNS = list(spectral_model_column_labels.keys())
 SSC_CONTROL_TYPE = "Single Stained Spectral Control"
-CONTROL_TYPES = [SSC_CONTROL_TYPE, "Single Stained Spectral Control from Library", "Channel Assignment"]
+LIBRARY_CONTROL_TYPE = "Single Stained Spectral Control from Library"
+CONTROL_TYPES = [SSC_CONTROL_TYPE, LIBRARY_CONTROL_TYPE, "Channel Assignment"]
+WARNING_TEXT_COLOUR = QColor('#c62828')  # text of rows marked ⚠
 # Fields kept aside when a single stained control is switched to another type,
 # and put back if it is switched back.
-SSC_BACKUP_FIELDS = ("particle_type", "gate_channel", "gate_channel_locked", "sample_name", "sample_path",
+SSC_BACKUP_FIELDS = ("particle_type", "gate_channel", "gate_channel_locked", "sample_name", "sample_locked", "sample_path",
                      "gate_label", "neg_gate_label", "universal_negative_name", "use_cleaned")
 PARTICLE_TYPES = ["Beads", "Cells"]
 NEGATIVE_TYPES = ["Internal Negative", "Unstained Negative"]
@@ -135,7 +138,7 @@ class ListTableModel(QtCore.QAbstractTableModel):
         self._data = data
         self.fluorescence_channels_pnn = fluorescence_channels_pnn
         self.has_cleaned = lambda control: False  # set by the editor; Use Cleaned is checkable only then
-        self.background_flag = lambda control: None  # set by the editor; tooltip text for a ⚠ label
+        self.warning_flag = lambda control: None  # set by the editor; tooltip text for a ⚠ label
 
     def rowCount(self, parent=QModelIndex()):
         return len(self._data)
@@ -152,11 +155,13 @@ class ListTableModel(QtCore.QAbstractTableModel):
         if role in (Qt.DisplayRole, Qt.EditRole):
             if key == "use_cleaned":
                 return None   # shown as a check state
-            if role == Qt.DisplayRole and key == "label" and self.background_flag(self._data[row]):
+            if role == Qt.DisplayRole and key == "label" and self.warning_flag(self._data[row]):
                 return f"⚠ {'' if val is None else val}"
             return "" if val is None else str(val)
         if role == Qt.ToolTipRole and key == "label":
-            return self.background_flag(self._data[row])
+            return self.warning_flag(self._data[row])
+        if role == Qt.ForegroundRole and self.warning_flag(self._data[row]):
+            return WARNING_TEXT_COLOUR
         if role == Qt.CheckStateRole and key == "use_cleaned" and self.has_cleaned(self._data[row]):
             return Qt.Unchecked if val is False else Qt.Checked
         if role == Qt.ToolTipRole and key == "use_cleaned" and self.has_cleaned(self._data[row]):
@@ -296,7 +301,7 @@ class SpectralControlsEditor(QFrame):
         self.update_fluorescence_channels_pnn()
         self.model = ListTableModel(self.controller.experiment.process['spectral_model'], self.fluorescence_channels_pnn)
         self.model.has_cleaned = self._has_cleaned
-        self.model.background_flag = self._background_flag
+        self.model.warning_flag = self._warning_flag
         self.samples = self.controller.experiment.samples
         self.raw_gating = self.controller.raw_gating
 
@@ -1392,6 +1397,9 @@ class SpectralControlsEditor(QFrame):
         if changed_col == 'particle_type' and control.get('control_type') == SSC_CONTROL_TYPE:
             self._sync_particle_type(control)
         if changed_col == 'sample_name' and control.get('control_type') == SSC_CONTROL_TYPE:
+            # A tube chosen here is kept: Clean Controls does not replace it
+            # when it shows no clear stain (see the row's context menu).
+            control['sample_locked'] = True
             self._sync_sample(control)
         reclean = (control.get('control_type') == SSC_CONTROL_TYPE
                    and changed_col in CLEANED_RESULT_KEYS
@@ -1429,9 +1437,14 @@ class SpectralControlsEditor(QFrame):
         return (control.get('control_type') == SSC_CONTROL_TYPE and bool(cleaned)
                 and cleaned_result_matches(control, cleaned))
 
-    def _background_flag(self, control: dict) -> str | None:
-        """Tooltip for a control whose current cleaned result shows no clear
-        stain above its unstained (SpectralCleaner background check), else None."""
+    def _warning_flag(self, control: dict) -> str | None:
+        """Tooltip for a control marked ⚠, else None: Clean Controls replaced it
+        with the reference library profile it still uses, or its current
+        cleaned result shows no clear stain above its unstained
+        (SpectralCleaner background check)."""
+        if (control.get('fallback_warning') and control.get('control_type') == LIBRARY_CONTROL_TYPE
+                and control.get('sample_name') == control.get('fallback_profile')):
+            return control['fallback_warning']
         if not self._has_cleaned(control):
             return None
         label = control.get('label') or ''
@@ -1923,10 +1936,65 @@ class SpectralControlsEditor(QFrame):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self.cleaner_thread.start()
 
+    def _apply_control_replacements(self) -> None:
+        """Act on the controls Clean Controls found to show no clear stain.
+
+        A control the cleaner switched to another tube of its fluorophore
+        takes that tube, its negative and major channel, and its Pos/Neg gates
+        are placed on the new tube (the cleaned result is already stored).
+        A control with no such tube becomes a library control using the
+        reference library profile for its fluorophore on this detector set,
+        the user's own stored profile before the one shipped with Honeychrome,
+        marked ⚠; its tube settings are kept to switch back to. A control with
+        neither, or whose tube was chosen by hand, keeps its own spectrum,
+        marked ⚠ by its background check.
+        """
+        cleaner = self.spectral_cleaner
+        by_label = {c.get('label'): c for c in self.model._data}
+        for substitution in cleaner.substitutions:
+            control = by_label.get(substitution['label'])
+            if (control is None or control.get('control_type') != SSC_CONTROL_TYPE
+                    or control.get('sample_locked')):
+                continue
+            control.update({k: v for k, v in substitution.items() if k != 'label'})
+            self._move_pos_neg_gates_to_channel(control)
+
+        replaced = []
+        for label in cleaner.unresolved:
+            control = by_label.get(label)
+            if (control is None or control.get('control_type') != SSC_CONTROL_TYPE
+                    or control.get('sample_locked')):
+                continue
+            matches = self._reference_library_matches(label)
+            chosen = (next((p for p in matches if p.origin == 'user'), None)
+                      or next((p for p in matches if p.origin == 'honeychrome'), None))
+            if chosen is None:
+                continue
+            tube = control.get('sample_name')
+            source = 'your stored' if chosen.origin == 'user' else 'the Honeychrome'
+            control['ssc_backup'] = {k: control[k] for k in SSC_BACKUP_FIELDS if k in control}
+            control['control_type'] = LIBRARY_CONTROL_TYPE
+            sanitise_control_in_place(control)
+            control['sample_name'] = describe_profile(chosen)
+            self._select_default_library_profile(control)
+            control['fallback_profile'] = control['sample_name']
+            control['fallback_warning'] = (
+                f'{label}: "{tube}" shows no clear stain and no other {label} control in this '
+                f'experiment does, so {source} reference library profile is used. '
+                f'Switch the Control Type back to use the tube.')
+            replaced.append(f'  \u2022 {label}: {source} profile "{chosen.display_name}" '
+                            f'in place of "{tube}"')
+        if replaced and self.controller.warning_collector is not None:
+            self.controller.warning_collector.append(
+                'No single-stain control in this experiment shows a clear stain for these '
+                'fluorophores, so a reference library profile is used instead (marked \u26a0):\n'
+                + '\n'.join(replaced))
+
     @Slot()
     def _on_clean_controls_finished(self):
-        """After SpectralCleaner.run() completes: mark controls as use_cleaned=True,
-        recalculate profiles, refresh UI."""
+        """After SpectralCleaner.run() completes: apply its control replacements,
+        mark controls as use_cleaned=True, recalculate profiles, refresh UI."""
+        self._apply_control_replacements()
         for control in self.model._data:
             label = control.get('label') or ''
             if label in self.controller.cleaned_events:
@@ -2010,6 +2078,12 @@ class SpectralControlsEditor(QFrame):
         if not profile:
             action.setToolTip('Generate a profile for this control first')
         action.triggered.connect(lambda: self._save_control_to_reference_library(control, profile))
+        if control.get('control_type') == SSC_CONTROL_TYPE and control.get('sample_locked'):
+            unlock = menu.addAction('Let Clean Controls Choose the Tube')
+            unlock.setToolTip('This tube was chosen by hand, so Clean Controls keeps it even when it '
+                              'shows no clear stain. Allow Clean Controls to replace it with another '
+                              'tube of the same fluorophore, or a library profile.')
+            unlock.triggered.connect(lambda: control.pop('sample_locked', None))
         menu.exec(self.view.viewport().mapToGlobal(position))
 
     def _save_control_to_reference_library(self, control, profile):
