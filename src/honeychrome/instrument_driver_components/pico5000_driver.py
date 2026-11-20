@@ -198,7 +198,37 @@ class Pico5000_Device:
 
         self.max_adc = ctypes.c_int16()
         ps.ps5000aMaximumValue(chandle, ctypes.byref(self.max_adc))
-        self.set_simple_trigger()
+
+        ### set up complex trigger (pulse window with hysteresis)
+        # # --- New parameter: set hysteresis to reject noise ---
+        # # Start with a value 2-3x your peak-to-peak noise, in ADC counts.
+        # self.hysteresis_adc = int(threshold_adc/2)  # Adjust this value based on your noise level
+        #
+        # trigger_props = ps.PS5000A_TRIGGER_CHANNEL_PROPERTIES_V2(thresholdUpper=threshold_adc, thresholdUpperHysteresis=hysteresis_adc, thresholdLower=threshold_adc, thresholdLowerHysteresis=hysteresis_adc, channel=trigger_channel)
+        # ps.ps5000aSetTriggerChannelPropertiesV2(chandle, ctypes.byref(trigger_props), 1, auto_trig_timeout)
+        #
+        # trigger_condition = ps.PS5000A_CONDITION(trigger_channel, ps.PS5000A_TRIGGER_STATE["PS5000A_CONDITION_TRUE"])
+        # ps.ps5000aSetTriggerChannelConditionsV2(chandle, ctypes.byref(trigger_condition), 1, (1 + 2))
+        #
+        # direction_map = {0: ps.PS5000A_THRESHOLD_DIRECTION["PS5000A_RISING"], 1: ps.PS5000A_THRESHOLD_DIRECTION["PS5000A_FALLING"]}
+        # trigger_direction = ps.PS5000A_DIRECTION(trigger_channel, direction_map.get(direction, ps.PS5000A_THRESHOLD_DIRECTION["PS5000A_RISING"]), ps.PS5000A_THRESHOLD_MODE["PS5000A_LEVEL"])
+        # ps.ps5000aSetTriggerChannelDirectionsV2(chandle, ctypes.byref(trigger_direction), 1)
+        #
+        # # --- Configure the Pulse Width Qualifier ---
+        # # Define the minimum pulse width in sample counts (or use a time-based function)
+        # min_pulse_width_samples = 10
+        # ps.ps5000aSetPulseWidthQualifierProperties(chandle, min_pulse_width_samples, 0, ps.PS5000A_PW_TYPE["PS5000A_PW_TYPE_GREATER_THAN"])
+        #
+        # pwq_condition = ps.PS5000A_CONDITION(trigger_channel, ps.PS5000A_TRIGGER_STATE["PS5000A_CONDITION_TRUE"])
+        # ps.ps5000aSetPulseWidthQualifierConditions(chandle, ctypes.byref(pwq_condition), 1, (1 + 2))
+        #
+        # pwq_direction = ps.PS5000A_DIRECTION(trigger_channel, ps.PS5000A_THRESHOLD_DIRECTION["PS5000A_RISING"], ps.PS5000A_THRESHOLD_MODE["PS5000A_LEVEL"])
+        # ps.ps5000aSetPulseWidthQualifierDirections(chandle, ctypes.byref(pwq_direction), 1)
+        #
+        # trigger_condition = ps.PS5000A_CONDITION(ps.PS5000A_CHANNEL["PS5000A_PULSE_WIDTH_SOURCE"], ps.PS5000A_TRIGGER_STATE["PS5000A_CONDITION_TRUE"])
+        # ps.ps5000aSetTriggerChannelConditionsV2(chandle, ctypes.byref(trigger_condition), 1, (1 + 2))
+
+        self.set_pico_trigger()
 
         # Rapid Transfer Buffers
         # We create a list of buffers (one for each segment)
@@ -223,15 +253,21 @@ class Pico5000_Device:
         ps.ps5000aStop(chandle)
         ps.ps5000aCloseUnit(chandle)
 
-    def set_simple_trigger(self):
+    def set_pico_trigger(self):
         # AUTO TRIGGER: Ch A (0), 100mV Threshold, Rising (0), Auto-trigger (400ms)
         if self.peak_detection_channel == 'FSC':
             threshold_adc = int(((self.baseline + FSC_sense*self.threshold) / A_range) * self.max_adc.value)
             trigger_channel = 0
+            direction = 0 if FSC_sense == -1 else 1
         else:
             threshold_adc = int(((self.baseline + self.threshold) / B_range) * self.max_adc.value)
             trigger_channel = 1
-        ps.ps5000aSetSimpleTrigger(chandle, 1, trigger_channel, threshold_adc, 1, 0, auto_trig_timeout)
+            direction = 1
+        ps.ps5000aSetSimpleTrigger(chandle, 1, trigger_channel, threshold_adc, direction, 0, auto_trig_timeout)
+
+        # new_trigger_props = ps.PS5000A_TRIGGER_CHANNEL_PROPERTIES_V2(thresholdUpper=threshold_adc, thresholdUpperHysteresis=self.hysteresis_adc, thresholdLower=0, thresholdLowerHysteresis=self.hysteresis_adc, channel=trigger_channel)
+        # ps.ps5000aSetTriggerChannelPropertiesV2(chandle, ctypes.byref(new_trigger_props), 1, 0, auto_trig_timeout)
+
         logger.info(f'[Pico5000Driver] setting trigger {self.peak_detection_channel}: baseline {self.baseline} mV, threshold {self.threshold} (mV)')
 
     def initialise(self):
@@ -274,7 +310,7 @@ class Pico5000_Device:
                     else:
                         logger.info(f'[Pico5000Driver] incorrect peak detection channel {self.peak_detection_channel}, should by FSC or B1')
 
-                self.set_simple_trigger()
+                self.set_pico_trigger()
                 message['trigger'] = value
 
             if parameter == 'oscilloscope_trace':
@@ -289,7 +325,7 @@ class Pico5000_Device:
                         else:
                             self.baseline = (baseline - nearly_floor_uint16) * adc_scale_uv/1000
 
-                        self.set_simple_trigger()
+                        self.set_pico_trigger()
                         message['trigger_set'] = self.baseline
 
 

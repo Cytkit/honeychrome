@@ -457,6 +457,7 @@ class MainWindow(QMainWindow):
         # widgets visibility state
         self._restore_visibility_state()
 
+        self.oscilloscope_widget = None
         if not self.controller.experiment_compatible_with_acquisition:
             action_new_sample.setEnabled(False)
             action_batch_add_samples.setEnabled(False)
@@ -602,10 +603,8 @@ class MainWindow(QMainWindow):
         for child in self.findChildren(QWidget):
             child.deleteLater()
 
-        # Close all other top-level widgets (non-child widgets)
-        for widget in QApplication.topLevelWidgets():
-            if widget is not self:  # Skip the main window itself
-                widget.close()
+        if self.oscilloscope_widget:
+            self.oscilloscope_widget.close()
 
         # Disconnect all signals
         try:
@@ -632,13 +631,13 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def open_oscilloscope_widget(self):
-        widget = OscilloscopeWidget(self.controller, self.bus)
-        widget.start_polling()
-        if widget.isHidden():
-            widget.show()
+        self.oscilloscope_widget = OscilloscopeWidget(self.controller, self.bus)
+        self.oscilloscope_widget.start_polling()
+        if self.oscilloscope_widget.isHidden():
+            self.oscilloscope_widget.show()
         else:
-            widget.raise_()  # Bring to top
-            widget.activateWindow()  # Give focus
+            self.oscilloscope_widget.raise_()  # Bring to top
+            self.oscilloscope_widget.activateWindow()  # Give focus
 
     def open_reference_library_widget(self):
         from honeychrome.view_components.reference_library_widget import ReferenceLibraryWidget
