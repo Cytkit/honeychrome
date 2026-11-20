@@ -1067,6 +1067,52 @@ def generate_transformations(transforms):
     return transformations
 
 
+def build_transfer_matrix(raw_settings, unmixed_settings, unmixing_matrix, fl_ids_raw, spillover=None, pnn_raw=None):
+    '''
+    Transfer matrix T, with unmixed event data = raw event data @ T.
+
+    fl_ids_raw: raw fluorescence channels to unmix, as indices into raw_settings['event_channels_pnn']
+    spillover: fine-tuning applied after unmixing; None leaves it out (the exporter writes it to $SPILLOVER)
+    pnn_raw: the raw columns T applies to; defaults to the whitelisted channels, the columns of the
+        controller's raw_event_data
+
+    Scatter, Time and event_id are copied from raw. Without a raw Time channel, or with event_id not
+    among pnn_raw, that unmixed column stays zero.
+    '''
+    full_pnn_raw = raw_settings['event_channels_pnn']
+    if pnn_raw is None:
+        pnn_raw = raw_settings.get('whitelisted_pnn') or full_pnn_raw
+
+    # stored raw channel indices reference full_pnn_raw; map them to their position in pnn_raw
+    def _remap(ids):
+        return np.array([pnn_raw.index(full_pnn_raw[i]) for i in ids], dtype=int)
+
+    fluorescence_block = np.array(unmixing_matrix)
+    if spillover is not None:
+        # spillover[i][j] = row i spills into column j (see nxn_help_text);
+        # compensation is applied as compensation @ measured (column vectors),
+        # which needs the transposed inverse to match that row/column convention.
+        compensation = np.linalg.inv(np.array(spillover)).T
+        fluorescence_block = compensation @ fluorescence_block
+
+    fl_ids_unmixed = np.array(unmixed_settings['fluorescence_channel_ids'], dtype=int)
+    sc_ids_unmixed = np.array(unmixed_settings['scatter_channel_ids'], dtype=int)
+    transfer_matrix = np.zeros((len(unmixed_settings['event_channels_pnn']), len(pnn_raw)))
+    transfer_matrix[np.ix_(fl_ids_unmixed, _remap(fl_ids_raw))] = fluorescence_block
+    transfer_matrix[np.ix_(sc_ids_unmixed, _remap(raw_settings['scatter_channel_ids']))] = np.eye(
+        unmixed_settings['n_scatter_channels'])
+
+    if raw_settings['time_channel_id'] is not None:
+        transfer_matrix[unmixed_settings['time_channel_id'], _remap([raw_settings['time_channel_id']])[0]] = 1
+
+    event_id = raw_settings['event_id_channel_id']
+    if event_id is not None and full_pnn_raw[event_id] in pnn_raw:
+        transfer_matrix[unmixed_settings['event_id_channel_id'], _remap([event_id])[0]] = 1
+
+    # note transfer_matrix is transposed - multiply raw event data @ transfer_matrix to get unmixed event data in same form as raw
+    return transfer_matrix.T
+
+
 def apply_transfer_matrix(transfer_matrix, raw_event_data):
     '''
     called when:
