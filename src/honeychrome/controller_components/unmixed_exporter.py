@@ -12,6 +12,7 @@ from honeychrome.controller_components.functions import (
     FCS_CHUNK_EVENTS,
     FcsEventReader,
     apply_transfer_matrix,
+    build_transfer_matrix,
     export_unmixed_sample_stream,
     iter_event_blocks,
     subsample_event_rows,
@@ -214,19 +215,12 @@ class UnmixedExporter(QObject):
 
             fl_channel_ids_raw = np.array(self.controller.filtered_raw_fluorescence_channel_ids)
             sc_channel_ids_raw = np.array(self.controller.experiment.settings['raw']['scatter_channel_ids'])
-            fl_channel_ids_unmixed = np.array(self.controller.experiment.settings['unmixed']['fluorescence_channel_ids'])
-            sc_channel_ids_unmixed = np.array(self.controller.experiment.settings['unmixed']['scatter_channel_ids'])
-            n_scatter_channels = self.controller.experiment.settings['unmixed']['n_scatter_channels']
 
-            transfer_matrix = np.zeros((len(pnn_unmixed), len(pnn_raw)))
-            transfer_matrix[np.ix_(fl_channel_ids_unmixed, fl_channel_ids_raw)] = unmixing_matrix
-            transfer_matrix[np.ix_(sc_channel_ids_unmixed, sc_channel_ids_raw)] = np.eye(n_scatter_channels)
-            transfer_matrix[self.controller.experiment.settings['unmixed']['time_channel_id'], self.controller.experiment.settings['raw']['time_channel_id']] = 1
-
-            if self.controller.experiment.settings['raw']['event_id_channel_id'] is not None:
-                transfer_matrix[self.controller.experiment.settings['unmixed']['event_id_channel_id'], self.controller.experiment.settings['raw']['event_id_channel_id']] = 1
-            # note transfer_matrix is transposed - multiply raw event data @ transfer_matrix to get unmixed event data in same form as raw
-            transfer_matrix = transfer_matrix.T
+            # Files are read with every event channel (pnn_raw). No spillover: the exported
+            # values are unmixed only, and the spillover is written to $SPILLOVER instead.
+            transfer_matrix = build_transfer_matrix(
+                self.controller.experiment.settings['raw'], self.controller.experiment.settings['unmixed'],
+                unmixing_matrix, fl_channel_ids_raw, pnn_raw=pnn_raw)
 
 
             # --- One-time per-batch setup ---
