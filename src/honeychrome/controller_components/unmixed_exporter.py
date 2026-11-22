@@ -11,12 +11,11 @@ from typing import cast
 from honeychrome.controller_components.functions import (
     FCS_CHUNK_EVENTS,
     FcsEventReader,
-    apply_transfer_matrix,
     export_unmixed_sample_stream,
     iter_event_blocks,
     subsample_event_rows,
 )
-from honeychrome.controller_components.autospectral_functions import combine_af_precomputed, apply_af_transfer, af_index_lookup
+from honeychrome.controller_components.autospectral_functions import combine_af_precomputed, af_index_lookup
 from honeychrome.controller_components import af_posterior, unmix_method
 from honeychrome.controller_components.sample_loader import AFState
 import honeychrome.settings as settings
@@ -374,32 +373,6 @@ class UnmixedExporter(QObject):
         af_index_map = af_index_lookup(all_af_profiles, assigned_profile_names) if active_profiles else None
 
         if active_profiles:
-            # Build combined AF precomputed matrices for this sample's assigned profiles
-            precomputed_list = [
-                self.controller.precomputed_for_profile(name)
-                for name in assigned_profile_names if name in all_af_profiles
-            ]
-            af_precomputed = combine_af_precomputed(precomputed_list)
-            af_spectra = np.vstack([np.array(p['spectra']) for p in active_profiles])
-            af_post = None
-            if self.af_noise is not None:
-                names = tuple(n for n in assigned_profile_names if n in all_af_profiles)
-                af_post = self.af_noise.attach(AFState(profile_names=names, precomputed=af_precomputed,
-                                                       spectra=af_spectra), sample_path).posterior
-
-            # Remap fluorescence channel indices from full event_channels_pnn
-            # to positions in pnn_raw (the column order of the raw events).
-            # Profiles and af_spectra were computed in whitelisted-PNN space;
-            # raw events here are aligned to pnn_raw (event_channels_pnn).
-            # For cytometers where pnn_raw == whitelisted_pnn this is a no-op.
-            _raw_settings = self.controller.experiment.settings['raw']
-            _full_pnn = _raw_settings['event_channels_pnn']
-            pnn_raw = reader.channels
-            _fl_ids_remapped = [
-                pnn_raw.index(_full_pnn[i])
-                for i in self.controller.filtered_raw_fluorescence_channel_ids
-                if _full_pnn[i] in pnn_raw
-            ]
             # apply_af_transfer fills the AF Abundance and AF Index columns.
             export_pnn = list(pnn_unmixed)
             keep = None
@@ -416,15 +389,15 @@ class UnmixedExporter(QObject):
             self.controller.experiment.process.get('spectra_matrix')
         ) if self.controller.experiment.process.get('spectra_matrix') is not None else None
 
+        af, fl_ids = self._af_for(sample_path, reader.channels)
+        if self.af_noise is not None:
+            af = self.af_noise.attach(af, sample_path)
+
         # The experiment's unmixing method (noise model, spectral variants,
         # corrected spectra), when it is not per-cell AF with the base spectra.
         state = self.method_state
-        method_af = None
         if state is not None:
-            method_af, method_fl_ids = self._af_for(sample_path, reader.channels)
-            if self.af_noise is not None:
-                method_af = self.af_noise.attach(method_af, sample_path)
-            method = state.effective_method(method_af, sample_path)
+            method = state.effective_method(af, sample_path)
             if method != unmix_method.R1:
                 unmixing_method = unmix_method.method_label(method, state.prior_lambda)
             set_id = state.set_for(sample_path)
@@ -447,27 +420,10 @@ class UnmixedExporter(QObject):
                 raw_block = reader.read(start, stop)
                 if local_rows is not None:
                     raw_block = raw_block[local_rows]
-                if state is not None:
-                    unmixed = unmix_method.unmix(raw_block, transfer_matrix, self.controller.experiment.settings,
-                                                 method_fl_ids, None, method_af, state, sample_path,
-                                                 pnn_raw=reader.channels)['unmixed']
-                    yield unmixed if active_profiles else unmixed[:, keep]
-                elif active_profiles:
-                    af_result = apply_af_transfer(
-                        raw_block,
-                        transfer_matrix,
-                        af_precomputed,
-                        af_spectra,
-                        self.controller.experiment.settings,
-                        filtered_fl_ids_raw=_fl_ids_remapped,
-                        spillover=None,
-                        af_index_map=af_index_map,
-                        af_posterior=af_post,
-                        pnn_raw=reader.channels,
-                    )
-                    yield af_result['unmixed']
-                else:
-                    yield apply_transfer_matrix(transfer_matrix, raw_block)[:, keep]
+                unmixed = unmix_method.unmix(raw_block, transfer_matrix, self.controller.experiment.settings,
+                                             fl_ids, None, af, state, sample_path,
+                                             pnn_raw=reader.channels)['unmixed']
+                yield unmixed if active_profiles else unmixed[:, keep]
 
         export_unmixed_sample_stream(
             sample_name=sample_name,
@@ -480,7 +436,7 @@ class UnmixedExporter(QObject):
             spectral_model=self.controller.experiment.process.get('spectral_model', []),
             unmixed_settings=self.controller.experiment.settings['unmixed'],
             raw_settings=self.controller.experiment.settings['raw'],
-            af_spectra=af_spectra if active_profiles else None,
+            af_spectra=None if af is None else af.spectra,
             unmixing_spectra=unmixing_spectra,
             version=__version__,
             extra_null_channels=None,
