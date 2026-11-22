@@ -55,7 +55,6 @@ from honeychrome.controller_components.autospectral_functions import (
         precompute_joint_cov_extras,
         combine_af_precomputed,
         apply_af_unmixing,
-        apply_af_transfer,
         af_index_lookup,
         build_af_precomputed,
         build_runtime_envelope,
@@ -1452,36 +1451,11 @@ class Controller(QObject):
         state = None if live else unmix_method.method_state(self)
         if state is not None:
             return self._apply_method_unmixing(raw_event_data, state)
-        if self.af_precomputed is not None and self.af_spectra is not None:
-            # Remap full-PNN fluorescence indices to whitelisted-PNN column positions.
-            # raw_event_data is loaded with col_order=whitelisted_pnn, so stored
-            # fluorescence_channel_ids (full-PNN) must be translated first.
-            _raw = self.experiment.settings['raw']
-            pnn_raw = _raw.get('whitelisted_pnn') or _raw['event_channels_pnn']
-            full_pnn_raw = _raw['event_channels_pnn']
-            fl_ids_remapped = [pnn_raw.index(full_pnn_raw[i])
-                               for i in self.filtered_raw_fluorescence_channel_ids]
-            af = self._current_af_state(live=live)
-            result = apply_af_transfer(
-                raw_event_data,
-                self.transfer_matrix,
-                self.af_precomputed,
-                self.af_spectra,
-                self.experiment.settings,
-                filtered_fl_ids_raw=fl_ids_remapped,
-                spillover=self.experiment.process.get('spillover'),
-                af_index_map=self.af_index_map,
-                af_posterior=None if af is None else af.posterior,
-                pnn_raw=pnn_raw,
-            )
-            # result is now a dict; store the sidecar columns
-            self.af_sidecar_data = np.column_stack(
-                [result['af_scale'], result['af_idx'].astype(np.float64)]
-            )
-            return result['unmixed']
-        else:
-            self.af_sidecar_data = None
-            return apply_transfer_matrix(self.transfer_matrix, raw_event_data)
+        af = self._current_af_state(live=live)
+        result = unmix_method.unmix(raw_event_data, self.transfer_matrix, self.experiment.settings,
+                                    self._raw_fl_ids(), self.experiment.process.get('spillover'), af, None)
+        self._set_unmixed_sidecar(result, af)
+        return result['unmixed']
 
     def _current_af_state(self, live: bool = False) -> AFState | None:
         """

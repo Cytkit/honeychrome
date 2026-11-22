@@ -51,7 +51,6 @@ import numpy as np
 from honeychrome.controller_components import af_posterior, unmix_method
 from honeychrome.controller_components.autospectral_functions import (
     af_index_lookup,
-    apply_af_transfer,
     combine_af_precomputed,
     precompute_joint_cov_extras,
 )
@@ -389,41 +388,15 @@ def unmix_events(raw_event_data: np.ndarray, snap: UnmixSnapshot,
     ``unmix_method.unmix``). With the noise-aware AF abundance the sample's
     posterior is attached to *af* here (fitted and stored the first time).
     """
-    n = len(raw_event_data)
     if af is not None and sample_key is not None and getattr(snap, 'af_noise', None) is not None:
         af = snap.af_noise.attach(af, sample_key)
-    if getattr(snap, 'method', None) is not None:
-        result = unmix_method.unmix(raw_event_data, snap.transfer_matrix, snap.settings, snap.fl_ids_raw,
-                                    snap.spillover, af, snap.method, sample_key, cache_file=cache_file)
-        out = {'unmixed': result['unmixed'], 'af_scale': None, 'af_idx': None}
-        if return_af:
-            out['af_scale'] = result['af_scale']
-            out['af_idx'] = np.asarray(result['af_idx'], dtype=np.int32)
-        return out
-    if af is not None:
-        result = apply_af_transfer(
-            raw_event_data,
-            snap.transfer_matrix,
-            af.precomputed,
-            af.spectra,
-            snap.settings,
-            filtered_fl_ids_raw=list(snap.fl_ids_raw),
-            spillover=snap.spillover,
-            af_index_map=af.index_map,
-            af_posterior=af.posterior,
-            pnn_raw=snap.pnn_raw,
-        )
-        out = {'unmixed': result['unmixed'], 'af_scale': None, 'af_idx': None}
-        if return_af:
-            out['af_scale'] = np.asarray(result['af_scale'], dtype=np.float64)
-            out['af_idx'] = np.asarray(result['af_idx'], dtype=np.int32)
-        return out
-
-    unmixed = raw_event_data @ snap.transfer_matrix
-    out = {'unmixed': unmixed, 'af_scale': None, 'af_idx': None}
+    result = unmix_method.unmix(raw_event_data, snap.transfer_matrix, snap.settings, snap.fl_ids_raw,
+                                snap.spillover, af, getattr(snap, 'method', None), sample_key,
+                                cache_file=cache_file, pnn_raw=getattr(snap, 'pnn_raw', None))
+    out = {'unmixed': result['unmixed'], 'af_scale': None, 'af_idx': None}
     if return_af:
-        out['af_scale'] = np.zeros(n, dtype=np.float64)
-        out['af_idx'] = np.zeros(n, dtype=np.int32)
+        out['af_scale'] = np.asarray(result['af_scale'], dtype=np.float64)
+        out['af_idx'] = np.asarray(result['af_idx'], dtype=np.int32)
     return out
 
 
