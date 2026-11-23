@@ -549,6 +549,11 @@ def define_fcs_keywords(
     }
 
     # ---- 1. Carry-through non-parameter keywords from raw file ----
+    # FlowIO splits a '|'-delimited TEXT segment correctly but leaves escaped
+    # delimiters doubled inside values. Restore them to a single '|' so values
+    # are literal; write_fcs escapes them again on output.
+    raw_keywords = {k: str(v).replace('||', '|') for k, v in raw_keywords.items()}
+
     # Guard against malformed keyword dicts produced by FlowIO when the FCS
     # TEXT delimiter byte is wrong (FACSDiscover export bug): corrupt entries
     # have pipe-delimited blobs as keys. Skip any key that contains '|', is
@@ -823,8 +828,11 @@ def _fcs_header_and_text(keywords: dict[str, str], n_events: int, n_channels: in
     holds n_events x n_channels values and follows the TEXT directly."""
     DELIM = '|'
 
-    # Mandatory field overrides (ensure consistency)
-    kw = dict(keywords)
+    # Mandatory field overrides (ensure consistency). Keywords with a blank
+    # name or value are dropped: FCS 3.1 forbids empty values, and '||' would
+    # read as an escaped delimiter, shifting every following key/value pair.
+    kw = {str(k): str(v) for k, v in keywords.items()
+          if str(k).strip() and str(v).strip()}
     kw['$TOT']           = str(n_events)
     kw['$PAR']           = str(n_channels)
     kw['$DATATYPE']      = 'F'
@@ -841,8 +849,9 @@ def _fcs_header_and_text(keywords: dict[str, str], n_events: int, n_channels: in
     TEXT_START = 58  # HEADER is always 58 bytes
 
     def _build_text(kw_dict):
+        # A delimiter inside a value is escaped by doubling it (FCS 3.1 3.2.4).
         return DELIM + ''.join(
-            f'{k}{DELIM}{v}{DELIM}' for k, v in kw_dict.items()
+            f'{k}{DELIM}{v.replace(DELIM, DELIM * 2)}{DELIM}' for k, v in kw_dict.items()
         )
 
     text = _build_text(kw)
