@@ -119,6 +119,24 @@ def match_marker(name: str, marker_db: list[dict]) -> str | None:
         logger.debug(f'No marker match for: "{name}"')
     return result
 
+_FCS_SUFFIX = re.compile(r'\s*-[AHW]\s*$')
+
+
+def match_fcs_channel_label(label: str, fluorophore_db: list[dict],
+                            marker_db: list[dict]) -> tuple[str | None, str | None]:
+    """(canonical fluorophore, canonical marker) of an FCS $PnS label that
+    combines both, as Bio-Rad ZE5 files write it ("BV421 CD25-A",
+    "e780 viability-A", "GFP-A"). The -A/-H/-W suffix is dropped first: the
+    delimiter rule rejects a match followed by "-", so "CD25-A" would not
+    match CD25 and "NK1.1-A" would fall through to a shorter synonym.
+    Either value is None when nothing matches, e.g. for unused ZE5 detectors
+    labelled by their filter ("589/15-561 nm-A")."""
+    text = _FCS_SUFFIX.sub('', label or '').strip()
+    if not text:
+        return None, None
+    return match_fluorophore(text, fluorophore_db), match_marker(text, marker_db)
+
+
 _DATA_DIR = Path(__file__).parent.parent / 'data'
 
 _fluorophore_db: list[dict] | None = None
