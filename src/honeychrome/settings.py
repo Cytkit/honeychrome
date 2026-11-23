@@ -254,6 +254,7 @@ process_default = {
     'af_abundance': 'noise_aware',   # experiments saved without it keep the clamped AF abundance
     'af_shape_bend': True,           # AF shape bend on high-AF cells (af_shape_bend); on when unset
     'af_contaminant_screen': True,   # screen unstained samples before AF extraction; off when unset
+    'default_cell_unstained': None,  # tube name chosen by unstained_selection at auto-generate
 }
 
 cytometry_default = {

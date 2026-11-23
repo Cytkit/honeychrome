@@ -602,18 +602,6 @@ def sanitise_control_in_place(control):
 
     # print(json.dumps(control, indent=2))
 
-def _find_default_unstained(samples: dict) -> str | None:
-    """Return the tube name of the first non-bead sample whose path or name matches 'unstained', or None."""
-    import re
-    from honeychrome.controller_components.particle_type import is_bead_sample
-    for path, name in samples.get('all_samples', {}).items():
-        if is_bead_sample(samples, path, name):
-            continue
-        if re.search(r'unstained', path, re.IGNORECASE) or re.search(r'unstained', name, re.IGNORECASE):
-            return name
-    return None
-
-
 def get_raw_events(
     sample,
     fluorescence_channel_ids: list,
