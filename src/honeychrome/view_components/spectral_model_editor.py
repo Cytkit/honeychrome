@@ -18,7 +18,8 @@ from honeychrome.controller_components.spectral_reference_library import (
     profile_id_from_description, cosine_qc_warning_threshold,
 )
 from honeychrome.view_components.cosine_qc_viewer import COSINE_QC_NOTE_BY_CYTOMETER
-from honeychrome.controller_components.spectral_functions import sanitise_control_in_place, _find_default_unstained
+from honeychrome.controller_components.spectral_functions import sanitise_control_in_place
+from honeychrome.controller_components.unstained_selection import default_cell_unstained
 from honeychrome.controller_components.particle_type import is_bead_sample, set_bead_sample, match_bead_unstained
 from honeychrome.view_components.icon_loader import icon
 from honeychrome.settings import spectral_model_column_labels, heading_style, INTERNAL_NEGATIVE_SENTINEL
@@ -434,6 +435,10 @@ class SpectralControlsEditor(QFrame):
         self.bulk_negative_combo = QComboBox()
         self.bulk_negative_combo.installEventFilter(WheelBlocker(self.bulk_negative_combo))
         self.bulk_negative_combo.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        # A cell unstained picked here is auto-generate's preference; until one is
+        # picked, auto-generate chooses the best-matching unstained itself.
+        self._chosen_cell_negative = None
+        self.bulk_negative_combo.activated.connect(self._on_bulk_negative_chosen)
         bulk_neg_layout.addWidget(self.bulk_negative_combo)
 
         self.bulk_apply_btn = QPushButton("Apply to all")
@@ -608,11 +613,7 @@ class SpectralControlsEditor(QFrame):
         if self.negatives_combo.currentText() == 'Using unstained negative':
             self.controller.experiment.process['negative_type'] = 'unstained'
             self.negatives_combo.setToolTip('Negative set to "Neg Unstained" gate on Unstained sample')
-            default_unstained = _find_default_unstained(self.samples)
-            if not default_unstained:
-                unstained_paths = self.samples.get('unstained_samples', [])
-                if unstained_paths:
-                    default_unstained = self.samples['all_samples'].get(unstained_paths[0])
+            default_unstained = default_cell_unstained(self.samples, self.controller.experiment.process)
 
             for control in self.model._data:
                 if control.get('control_type') == 'Single Stained Spectral Control':
@@ -750,16 +751,26 @@ class SpectralControlsEditor(QFrame):
         self.bulk_negative_combo.blockSignals(True)
         self.bulk_negative_combo.clear()
         self.bulk_negative_combo.addItems([INTERNAL_NEGATIVE_SENTINEL] + options)
-        # Restore previous selection if still available.
-        # On first population (or if prev was the sentinel), default to the
-        # first available unstained sample instead of Internal Negative.
-        idx = self.bulk_negative_combo.findText(prev) if prev and prev != INTERNAL_NEGATIVE_SENTINEL else -1
+        # Cells: show the user's pick, else the default cell unstained.
+        # Beads: restore the previous selection if still available.
+        # Otherwise default to the first available unstained sample instead
+        # of Internal Negative.
+        if particle_type == 'Cells':
+            shown = self._chosen_cell_negative or default_cell_unstained(self.samples, self.controller.experiment.process)
+            idx = self.bulk_negative_combo.findText(shown) if shown else -1
+        else:
+            idx = self.bulk_negative_combo.findText(prev) if prev and prev != INTERNAL_NEGATIVE_SENTINEL else -1
         if idx >= 0:
             self.bulk_negative_combo.setCurrentIndex(idx)
         elif options:
             self.bulk_negative_combo.setCurrentIndex(1)   # first unstained entry
         # else: leave at 0 (sentinel) — no unstained samples available
         self.bulk_negative_combo.blockSignals(False)
+
+    def _on_bulk_negative_chosen(self):
+        """Remember a cell unstained the user picked, as auto-generate's preference."""
+        if self.bulk_particle_type_combo.currentText() == 'Cells':
+            self._chosen_cell_negative = self.bulk_negative_combo.currentText()
 
     def _has_unstained_cell_sample(self) -> bool:
         """True if at least one loaded sample is tagged/named "unstained"
@@ -882,7 +893,6 @@ class SpectralControlsEditor(QFrame):
         if should_have_combobox:
             cb = QComboBox()
             cb.installEventFilter(WheelBlocker(cb))
-            cb.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
             cb.addItems(items)
 
             if searchable:
@@ -894,6 +904,10 @@ class SpectralControlsEditor(QFrame):
                 completer.setCaseSensitivity(Qt.CaseInsensitive)
                 cb.setCompleter(completer)
 
+            # Click-only focus, set after setEditable (which can reset the policy):
+            # a cell that takes focus also selects its row, so the scroll wheel
+            # must never focus one.
+            cb.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
             self.view.setIndexWidget(proxy_index, cb)
 
             current_val = self.model.data(idx, Qt.EditRole)
@@ -1156,8 +1170,9 @@ class SpectralControlsEditor(QFrame):
         # Read bulk_negative_combo directly
         if self.bulk_particle_type_combo.currentText() != 'Cells':
             self.bulk_particle_type_combo.setCurrentText('Cells')
-        preferred = self.bulk_negative_combo.currentText()
-        if not preferred or preferred == INTERNAL_NEGATIVE_SENTINEL:
+        preferred = self._chosen_cell_negative
+        if (not preferred or preferred == INTERNAL_NEGATIVE_SENTINEL
+                or self.bulk_negative_combo.findText(preferred) < 0):
             preferred = None
         self.spectral_auto_generator = SpectralAutoGenerator(self.bus, self.controller,
                                                              preferred_unstained=preferred,
@@ -1432,10 +1447,11 @@ class SpectralControlsEditor(QFrame):
 
     def _has_cleaned(self, control: dict) -> bool:
         """Whether the control has a cleaned result made from its current sample,
-        particle type and negative (Use Cleaned is offered only then)."""
+        particle type, negative, major channel and files (Use Cleaned is offered
+        only then)."""
         cleaned = self.controller.cleaned_events.get(control.get('label') or '')
         return (control.get('control_type') == SSC_CONTROL_TYPE and bool(cleaned)
-                and cleaned_result_matches(control, cleaned))
+                and cleaned_result_matches(control, cleaned, self.controller.experiment_dir))
 
     def _warning_flag(self, control: dict) -> str | None:
         """Tooltip for a control marked ⚠, else None: Clean Controls replaced it
@@ -1451,8 +1467,8 @@ class SpectralControlsEditor(QFrame):
         return background_check_summary(label, self.controller.cleaned_events[label].get('background_check'))
 
     def _invalidate_cleaned(self, control: dict) -> bool:
-        """Drop the control's cleaned result once its sample, particle type or
-        negative no longer match it. Returns whether to clean again now (Show
+        """Drop the control's cleaned result once its sample, particle type,
+        negative or major channel no longer match it. Returns whether to clean again now (Show
         AutoSpectral Cleaning and Automatically Clean ticked)."""
         label = control.get('label') or ''
         cleaned = self.controller.cleaned_events.get(label)
@@ -1460,7 +1476,7 @@ class SpectralControlsEditor(QFrame):
             return False
         del self.controller.cleaned_events[label]
         control['use_cleaned'] = None
-        logger.info(f'SpectralModelEditor: cleaned result of "{label}" invalidated — sample, particle type or negative changed')
+        logger.info(f'SpectralModelEditor: cleaned result of "{label}" invalidated — sample, particle type, negative or major channel changed')
         if self.bus:
             self.bus.cleaningResultsReady.emit()
         return self.activate_cleaning_checkbox.isChecked() and self.auto_clean_checkbox.isChecked()
@@ -1547,7 +1563,7 @@ class SpectralControlsEditor(QFrame):
         """Bead control: the unstained bead sample matching its scatter; cell control:
         the default cell unstained; else the internal negative."""
         if control.get('particle_type') == 'Cells':
-            return _find_default_unstained(self.samples) or INTERNAL_NEGATIVE_SENTINEL
+            return default_cell_unstained(self.samples, self.controller.experiment.process) or INTERNAL_NEGATIVE_SENTINEL
         name_to_path = {name: path for path, name in self.samples['all_samples'].items()}
         match = match_bead_unstained(self.samples, name_to_path.get(control.get('sample_name')))
         return self.samples['all_samples'][match] if match else INTERNAL_NEGATIVE_SENTINEL
