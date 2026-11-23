@@ -1175,22 +1175,50 @@ def _quadrant_layout(grp: list[_Piece]) -> dict | None:
             'regions': [ag_core.join_quadrants(q) for q in quads]}
 
 
+def _transpose_piece(p: _Piece) -> _Piece:
+    """The same piece with x and y exchanged: channels, shape channels,
+    boundary coordinates, extents and sides, and the FlowJo parameters,
+    bounds, vertices, foci and edge of the population's gate, so that a
+    piece drawn with the axes the other way round can join its siblings."""
+    swap = lambda pts: [[b, a] for a, b in pts]
+    gate = deepcopy(p.pop.gate)
+    gate.channels = gate.channels[::-1]
+    gate.bounds = gate.bounds[::-1]
+    gate.vertices = swap(gate.vertices)
+    gate.foci = swap(gate.foci)
+    gate.edge = swap(gate.edge)
+    pop = deepcopy(p.pop)
+    pop.gate = gate
+    shape = dict(p.shape, shape_channels=p.shape['shape_channels'][::-1],
+                 boundary=swap(p.shape['boundary']))
+    note = (f"'{p.pop.name}' was drawn with {p.channels[0]} on x and {p.channels[1]} on y; "
+            "axes swapped to join its siblings.")
+    return _Piece(pop, p.channels[::-1], shape, p.extent[::-1], p.signs[::-1],
+                  p.notes + [note], p.singlets)
+
+
 def _group_siblings(pieces: list[_Piece], merge: bool) -> list[list[_Piece]]:
-    """Sibling pieces drawn on the same parameters become one gate, one
-    population each, as long as each takes a different side of the
-    thresholds; scatter-only shapes and pieces that would share a region
-    stay on their own."""
+    """Sibling pieces drawn on the same parameters, in either axis order,
+    become one gate, one population each, as long as each takes a different
+    side of the thresholds; a piece drawn with the axes the other way round
+    is transposed to match the first.  Scatter-only shapes and pieces that
+    would share a region stay on their own."""
     groups: list[list[_Piece]] = []
     for p in pieces:
         placed = False
         if merge and not p.singlets and any(s is not None for s in p.signs):
             for grp in groups:
                 q = grp[0]
-                if q.channels != p.channels or q.singlets:
+                if q.singlets:
                     continue
-                regions = _plan_gate(grp + [p])['regions']
+                cand = p
+                if q.channels != p.channels:
+                    if len(p.channels) != 2 or q.channels != p.channels[::-1]:
+                        continue
+                    cand = _transpose_piece(p)
+                regions = _plan_gate(grp + [cand])['regions']
                 if len(set(regions)) == len(regions):
-                    grp.append(p)
+                    grp.append(cand)
                     placed = True
                     break
         if not placed:
