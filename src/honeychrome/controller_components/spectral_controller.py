@@ -132,6 +132,19 @@ class LowEventLog:
 CLEANED_RESULT_KEYS = ('sample_name', 'particle_type', 'universal_negative_name', 'gate_channel')
 
 
+def file_records(experiment_dir, rel_paths) -> list:
+    """[relative path, size, modification time] of each file in *rel_paths*
+    that exists, so a file replaced under the same name can be told apart."""
+    recorded = []
+    for rel_path in rel_paths:
+        try:
+            stat = (Path(experiment_dir) / rel_path).stat()
+        except OSError:
+            continue
+        recorded.append([rel_path, stat.st_size, stat.st_mtime_ns])
+    return recorded
+
+
 def files_unchanged(recorded, experiment_dir) -> bool:
     """Whether every [relative path, size, modification time] in *recorded*
     still describes the file on disk (a file replaced under the same name
@@ -310,8 +323,9 @@ class ProfileUpdater:
         """Identifies the gates a single-stain control's profile is computed
         from, as applied to each sample they gate (per-sample overrides
         included): the positive and internal negative gates on the control
-        sample and the "Neg Unstained" gate on its unstained negative. None
-        for other control types."""
+        sample and the "Neg Unstained" gate on its unstained negative, with
+        the size and modification time of both files, so a file replaced
+        under the same name changes it. None for other control types."""
         if (control.get('control_type') != 'Single Stained Spectral Control'
                 or not control.get('sample_name') or not control.get('gate_label')):
             return None
@@ -333,6 +347,8 @@ class ProfileUpdater:
             neg_path = self._unstained_sample_path()
         if neg_path is not None and strategy.find_matching_gate_paths('Neg Unstained'):
             parts.append(gating.chain_signature(neg_path, ['Neg Unstained']))
+        parts.append(json.dumps(file_records(
+            self.experiment_dir, [sample_path] + ([neg_path] if neg_path is not None else []))))
         parts.append(str(self.controller.experiment.process.get('negative_type')))
         parts.append(str(control.get('use_cleaned')))
         return '|'.join(parts)
@@ -1405,17 +1421,9 @@ class SpectralCleaner(QObject):
         """[relative path, size, modification time] of the control's file and
         its negative's, so a file replaced under the same name is cleaned again."""
         all_samples_rev = {v: k for k, v in self.samples['all_samples'].items()}
-        recorded = []
-        for name in (control.get('sample_name'), control.get('universal_negative_name')):
-            rel_path = all_samples_rev.get(name or '')
-            if rel_path is None:
-                continue
-            try:
-                stat = (Path(self.experiment_dir) / rel_path).stat()
-            except OSError:
-                continue
-            recorded.append([rel_path, stat.st_size, stat.st_mtime_ns])
-        return recorded
+        rel_paths = [all_samples_rev.get(name or '')
+                     for name in (control.get('sample_name'), control.get('universal_negative_name'))]
+        return file_records(self.experiment_dir, [path for path in rel_paths if path is not None])
 
     def _gating_fingerprint(self, control: dict) -> str:
         """The gates _load_events applies, as applied to the control sample and
