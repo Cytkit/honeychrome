@@ -93,17 +93,15 @@ class HeatmapModel(QAbstractTableModel):
         return Qt.ItemIsSelectable | Qt.ItemIsEditable | Qt.ItemIsEnabled
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role == Qt.ToolTipRole:
-            if orientation == Qt.Horizontal:
-                return self.horizontal_headers[section]
-            return self.vertical_headers[section]
-
-        if role == Qt.DisplayRole:
-            if orientation == Qt.Horizontal:
-                return self.horizontal_headers[section]
-            elif orientation == Qt.Vertical:
-                return self.vertical_headers[section]
-        return None
+        """Channel label of a row or column. None for a section outside the
+        labels: while a reset that changes the matrix size is propagating,
+        a header can still ask for sections of the previous size."""
+        if role not in (Qt.DisplayRole, Qt.ToolTipRole):
+            return None
+        labels = self.horizontal_headers if orientation == Qt.Horizontal else self.vertical_headers
+        if labels is None or not 0 <= section < len(labels):
+            return None
+        return labels[section]
 
 
 # ---------------------------
