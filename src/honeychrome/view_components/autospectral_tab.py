@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QPushButton, QSpinBox, QComboBox, QGroupBox,
     QFormLayout, QSizePolicy, QFileDialog, QListWidget, QListWidgetItem,
     QAbstractItemView, QSplitter, QCheckBox, QHeaderView,
-    QTableWidget, QTableWidgetItem, QMenu, QMessageBox,
+    QTableWidget, QTableWidgetItem, QMenu, QMessageBox, QToolButton,
 )
 import pyqtgraph as pg
 import warnings
@@ -1112,6 +1112,19 @@ class AutofluorescencePage(QWidget):
         )
         filter_row.addWidget(self._include_ssc_cb)
         filter_row.addStretch(1)
+        self._assign_table_toggle = QToolButton()
+        self._assign_table_toggle.setText('Sample table')
+        self._assign_table_toggle.setCheckable(True)
+        self._assign_table_toggle.setChecked(True)
+        self._assign_table_toggle.setArrowType(Qt.DownArrow)
+        self._assign_table_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._assign_table_toggle.setAutoRaise(True)
+        self._assign_table_toggle.setToolTip(
+            'Show or hide the sample assignment table. The buttons above it '
+            'still act on every sample the table would show.'
+        )
+        self._assign_table_toggle.toggled.connect(self._on_assign_table_toggled)
+        filter_row.addWidget(self._assign_table_toggle)
         layout.addLayout(filter_row)
         self._include_unstained_cb.toggled.connect(self._on_assignment_filter_changed)
         self._include_ssc_cb.toggled.connect(self._on_assignment_filter_changed)
@@ -1140,11 +1153,9 @@ class AutofluorescencePage(QWidget):
         header.setStretchLastSection(False)
         header.setSectionsMovable(False)
         header.sectionResized.connect(self._on_assign_column_resized)
-        layout.addWidget(self._assign_table)
 
         self._assign_empty_label = QLabel('No profiles or samples available yet.')
         self._assign_empty_label.setVisible(False)
-        layout.addWidget(self._assign_empty_label)
 
         # Widths the user dragged, by column key ('' = sample column, else
         # profile name), kept across rebuilds for the session.
@@ -1153,9 +1164,6 @@ class AutofluorescencePage(QWidget):
         self._assign_rebuilding = False
 
         self._assign_checkboxes: dict = {}
-
-        self._assign_status = QLabel('')
-        layout.addWidget(self._assign_status)
 
         group_row = QHBoxLayout()
         group_row.addWidget(QLabel('Folder:'))
@@ -1220,7 +1228,19 @@ class AutofluorescencePage(QWidget):
                          self._auto_assign_btn, assign_all_btn, clear_sample_btn, clear_all_btn)
 
         layout.addLayout(btn_row)
+
+        self._assign_status = QLabel('')
+        layout.addWidget(self._assign_status)
+        layout.addWidget(self._assign_table)
+        layout.addWidget(self._assign_empty_label)
         parent_layout.addWidget(grp)
+
+    def _on_assign_table_toggled(self, shown: bool):
+        """Show or hide the assignment table; the empty-grid label follows it."""
+        self._assign_table_toggle.setArrowType(Qt.DownArrow if shown else Qt.RightArrow)
+        has_rows = self._assign_table.rowCount() > 0
+        self._assign_table.setVisible(shown and has_rows)
+        self._assign_empty_label.setVisible(shown and not has_rows)
 
     def _build_comparison_section(self, parent_layout):
         grp = QGroupBox('Step 3 — Side-by-Side Comparison (Current Sample)')
@@ -2027,10 +2047,10 @@ class AutofluorescencePage(QWidget):
         if not profile_names or not shown_samples:
             self._assign_rebuilding = False
             table.setVisible(False)
-            self._assign_empty_label.setVisible(True)
+            self._assign_empty_label.setVisible(self._assign_table_toggle.isChecked())
             return
         self._assign_empty_label.setVisible(False)
-        table.setVisible(True)
+        table.setVisible(self._assign_table_toggle.isChecked())
 
         table.setColumnCount(len(profile_names) + 1)
         table.setRowCount(len(shown_samples))
