@@ -118,7 +118,16 @@ def sample_from_fcs(path, bus=None):
             f'Controller: FlowIO reports a data offset that is off by 1. '
             f'{e}. Attempting to load with ignore_offset_error=True')
         try:
-            sample = Sample(path, use_header_offsets=True, ignore_offset_error=True)
+            # TEXT offsets first: a file over 99,999,999 bytes has 0 data
+            # offsets in its HEADER, so use_header_offsets reads 0 events
+            # (Bio-Rad ZE5 files, $CYT YETI or EVEREST, write an off-by-1
+            # $ENDDATA and are often that large).
+            try:
+                sample = Sample(path, ignore_offset_error=True)
+            except Exception:
+                sample = None
+            if sample is None or sample.event_count == 0:
+                sample = Sample(path, use_header_offsets=True, ignore_offset_error=True)
         except Exception:
             logging.warning(f'Controller: use_header_offsets fallback also failed for {path}. '
                             f'Attempting delimiter repair.')
