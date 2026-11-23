@@ -514,8 +514,9 @@ class GateParamDialog(QDialog):
     threshold_factor
         Multiplies the calculated threshold in raw units (default ``1``).
     width_sd
-        Half-width of the singlet parallelogram in residual SDs, the SD
-        estimated from the median absolute deviation.  Default ``3``.
+        Half-width of the singlet trapezoid in SDs of the residuals relative
+        to the area value (the band widens with scatter), the SD estimated
+        from the median absolute deviation.  Default ``3``.
     edge_density_x, edge_density_y
         Density fall-off of a ``cells`` gate's sides on each scatter
         channel, as a fraction of the peak.  Default ``0.002``.
@@ -623,7 +624,8 @@ class GateParamDialog(QDialog):
         self.sb_width_sd.setSingleStep(0.1)
         self.sb_width_sd.setValue(float(params.get('width_sd', 3.0)))
         self.sb_width_sd.setToolTip(
-            "Half-width of the singlet parallelogram, in residual SDs. The SD is "
+            "Half-width of the singlet trapezoid, in SDs of the residuals relative "
+            "to the area value, so the band widens with scatter. The SD is "
             "estimated from the median absolute deviation, so doublets beside the "
             "diagonal do not widen it."
         )
