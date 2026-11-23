@@ -62,8 +62,8 @@ FEATURE_TYPE_LABELS = {
 READOUT_LABELS = {'positivity': 'Fraction positive, else median',
                   'median': 'Median, else fraction positive'}
 METRIC_LABELS = {'signed_log10p': 'sign(logFC) · −log10 p', 'moderated_t': 'Moderated t'}
-_METHOD_COLOURS = {'override': '#cfe2ff', 'name': '#d4edda', 'none': None,
-                   'name (lineage differs)': '#fff3cd'}
+_METHOD_COLOURS = {'override': '#cfe2ff', 'name': '#d4edda', 'name (with parent)': '#d4edda',
+                   'none': None, 'name (lineage differs)': '#fff3cd'}
 _STATUS_COLOURS = {'matched': '#d4edda', 'no feature': '#fff3cd', 'no population': '#f8d7da'}
 # Seconds per permutation and feature (two-core cloud machine; group-only designs).
 _SECONDS_PER_PERM_FEATURE = 7e-7

@@ -5,18 +5,18 @@ ab T cell,T,abTC;ab T cells;alpha beta T cells
 gd T cell,T,gdTC;gd T cells;gamma delta T cells;TCRgd
 Vg9 gd T cell,T,gdTC Vg9;Vg9 gdTC;gdTC Vg9Vd2;Vg9Vd2 T cells
 MAIT,T,MAIT cells
-CD4 T cell,T,CD4;CD4 T cells;CD4+ T cells
-CD8 T cell,T,CD8;CD8 T cells;CD8+ T cells
+CD4 T cell,T,CD4;CD4 T cells;CD4+ T cells;CD4+
+CD8 T cell,T,CD8;CD8 T cells;CD8+ T cells;CD8+
 DN T cell,T,DN TC;DN T cells;double-negative T cells
 CD4 Tconv,T,CD4 Tconv;CD4 conventional T cells
 CD4 Treg,T,CD4 Treg;Treg;Tregs
 CD8 Tconv,T,CD8 Tconv;CD8 conventional T cells
 CD8 Treg,T,CD8 Treg
-Naïve CD4 Tconv,T,CD4 Naive;Naive CD4;CD4 naive T cells;Naive CD4 Tconv
+Naïve CD4 Tconv,T,CD4 Naive;Naive CD4;CD4 naive T cells;Naive CD4 Tconv;CD4 Tnaive
 CD4 Tconv CM,T,CD4 TCM;CD4 central memory
 CD4 Tconv EM,T,CD4 TEM;CD4 effector memory
 CD4 Tconv TEMRA,T,CD4 TEMRA
-Naïve CD8 Tconv,T,CD8 Naive;Naive CD8;CD8 naive T cells;Naive CD8 Tconv
+Naïve CD8 Tconv,T,CD8 Naive;Naive CD8;CD8 naive T cells;Naive CD8 Tconv;CD8 Tnaive
 CD8 Tconv CM,T,CD8 TCM;CD8 central memory;Memory CD8
 CD8 Tconv EM,T,CD8 TEM;CD8 effector memory
 CD8 Tconv TEMRA,T,CD8 TEMRA
@@ -24,7 +24,7 @@ CD8 SLEC,T,SLECs;SLEC;short-lived effector cells
 CD8 MPEC,T,MPECs;MPEC;memory precursor effector cells
 exhausted CD8,T,CD8 Exhausted
 exhausted CD4 Tconv,T,Tconv Exhausted;CD4 Exhausted
-Tfh,T,Tfh;cTfh;circulating Tfh
+Tfh,T,Tfh;cTfh;circulating Tfh;mTfh
 Tfr,T,Tfr
 Th1,T,Th1
 Th1 T-bet+,T,Th1 (CXCR3 Tbet);Th1 (CXCR3 T-bet)
@@ -48,24 +48,25 @@ Transitional B cell,B,Transitional B cells;Transitional
 Plasmablast,B,Plasmablasts
 Plasma cell,B,Plasma cells
 Activated memory B cell,B,Activated
-Atypical B cell,B,Atypical;tissue-like memory B cells;DN2 B cells;ABC;ABCs;Age-associated B cells
+Atypical B cell,B,Atypical;tissue-like memory B cells;DN2 B cells;ABC;ABCs;Age-associated B cells;CD11c+ B cell;CD11c+ B cells
 Resting naive B cell,B,Mature Naive
-Resting memory B cell,B,Memory;Memory B cells
+Resting memory B cell,B,Memory;Memory B cells;CD27+ CD21hi
 DN B cell,B,B cell DN;double-negative B cells
 Naïve B cell,B,B cell Naive;Naive B cells
 Unswitched memory B cell,B,B cell Non-switched;Non-switched memory B cells
 Class switched Mem B cell,B,B cell switched memory;Switched memory B cells
 NK,NK,NK cells
-CD56bright NK,NK,CD56bright NK;CD56bright NK cells
-CD56dim NK,NK,CD56dim NK;CD56dim NK cells
+CD56bright NK,NK,CD56bright NK;CD56bright NK cells;CD56briCD16-;CD56bri CD16-
+CD56dim NK,NK,CD56dim NK;CD56dim NK cells;CD56dimCD16+;CD56dim CD16+
 CD14 Monocyte,myeloid,CD14 Monocytes;Classical monocytes
 CD14+CD16+ Monocyte,myeloid,CD14+CD16+ Monocytes;Intermediate monocytes
 CD16 Monocyte,myeloid,CD16 Monocytes;Non-classical monocytes
 activated CD14 Monocyte,myeloid,CD14 Monocytes Act
 activated CD14+CD16+ Monocyte,myeloid,CD14+CD16+ Monocytes Act
 Basophil,myeloid,Basophils
-pDC,myeloid,pDCs
-cDC,myeloid,CD11c cDCs;cDCs;Dendritic cells;DCs
+pDC,myeloid,pDCs;plasmacytoid;plasmacytoid DCs;plasmacytoid DC
+DC,myeloid,DCs;Dendritic cells;dendritic cell
+cDC,myeloid,CD11c cDCs;cDCs;conventional;conventional DCs;conventional DC
 cDC1,myeloid,cDC1s
 cDC2,myeloid,cDC2s
 DN DC,myeloid,DN cDCs
@@ -89,3 +90,34 @@ Ly6Chi Monocyte,myeloid,Ly6Chi Monocytes;Ly6C-hi monocytes;Ly6Chi Mono;Inflammat
 Macrophage,myeloid,Macrophages;Macs
 Migratory DC,myeloid,Migratory DCs;migDC;migDCs
 RORgt+ CD4 Treg,T,RORgt+ Treg;RORgt+ Tregs;Treg RORgt
+NKT,T,NKT cells;NK T cells
+CD4 NKT,T,CD4 T NKT;CD4 NKT cells;CD4+ NKT
+CD8 NKT,T,CD8 T NKT;CD8 NKT cells;CD8+ NKT
+iNKT,T,iNKT cells;invariant NKT;invariant NKT cells
+DP T cell,T,DP T;DP T cells;double-positive T cells;Double-positive thymocyte;DP thymocytes
+CD4 Tconv CD69+ CD103-,T,CD4 T Resident CD103-;CD69+ CD103- CD4 Tconv
+CD8 Tconv CD69+ CD103-,T,CD8 T Resident CD103-;CD69+ CD103- CD8 Tconv
+CD4 Treg CD69+ CD103-,T,CD4 T Treg Resident CD103-;CD69+ CD103- Treg
+resting CD4 Treg,T,CD4 T Treg Resting;Resting Treg;cTreg;central Treg
+CD4 Treg CM,T,CD4 T Treg TCM;Treg TCM;central memory Treg
+CD4 Treg TRM,T,CD4 T Treg TRM;Treg TRM;CD103+ CD69+ Treg;tissue-resident Treg
+exhausted CD4 Treg,T,CD4 T Treg Exhausted;Treg Exhausted
+ILC3,ILC,ILC3s;RORgt+ ILC
+HSC,progenitor,HSC (LSK);HSCs;haematopoietic stem cells;hematopoietic stem cells
+MPP1,progenitor,MPP1s
+MPP2,progenitor,MPP2s
+MPP3,progenitor,MPP3s
+MPP4,progenitor,MPP4s
+MPP5,progenitor,MPP5s
+CLP,progenitor,CLPs;common lymphoid progenitors
+CMP,progenitor,CMPs;common myeloid progenitors
+GMP,progenitor,GMPs;granulocyte-monocyte progenitors;granulocyte-macrophage progenitors
+MEP,progenitor,MEPs;megakaryocyte-erythroid progenitors
+MZ B cell,B,MZ B cells;marginal zone B cells;MZB
+Follicular B cell,B,Follicular B cells;FO B cells
+B1 B cell,B,B1 B cells;B-1 B cells;B1 cells;B-1 cells
+Mast cell,myeloid,Mast cells
+Microglia,myeloid,microglial cells
+BAM,myeloid,BAMs;border-associated macrophages;CNS-associated macrophages
+Oligodendrocyte,non-haematopoietic,Oligodendrocytes
+Astrocyte,non-haematopoietic,Astrocytes

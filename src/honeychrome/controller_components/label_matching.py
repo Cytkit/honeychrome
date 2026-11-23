@@ -110,8 +110,10 @@ def match_fluorophore(name: str, fluorophore_db: list[dict]) -> str | None:
 
 
 def match_marker(name: str, marker_db: list[dict]) -> str | None:
-    """Return the canonical marker/antigen name, or None."""
-    synonym_cols = [f'synonym{i}' for i in range(1, 10)]
+    """Return the canonical marker/antigen name, or None. Every synonymN
+    column in the database is searched (as in match_fluorophore)."""
+    columns = marker_db[0].keys() if marker_db else ()
+    synonym_cols = sorted((c for c in columns if re.fullmatch(r'synonym\d+', c)), key=lambda c: int(c[7:]))
     result = _best_match(name, marker_db, 'marker', synonym_cols)
     if result:
         logger.debug(f'Marker match: "{name}" -> "{result}"')
