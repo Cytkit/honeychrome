@@ -190,6 +190,19 @@ def test_update_bead_samples_controls_and_known_types(monkeypatch):
     assert calls.count('G06 Unstained Cells.fcs') == 1
 
 
+def test_folder_name_does_not_decide(monkeypatch):
+    monkeypatch.setattr(pt, 'sample_scatter_core', lambda *a: (-2.2, [5.0, 5.0]))
+    cells = 'Raw/bead and cell controls/A2 CD14 SBUV540 (Cells)_Controls.fcs'
+    beads = 'Raw/bead and cell controls/C4 CD62L SBUV700 (Beads)_Controls.fcs'
+    plain = 'Raw/bead and cell controls/A3 CD25 BB700_Controls.fcs'
+    samples = {'all_samples': {p: p.split('/')[-1][:-4] for p in (cells, beads, plain)},
+               'unstained_samples': [], 'single_stain_controls': [cells, beads, plain]}
+    assert not is_bead_sample(samples, cells)
+    update_bead_samples(samples, '/exp', RAW)
+    assert samples['bead_samples'] == [beads]
+    assert plain in samples['bead_checked_samples']          # scored on scatter: cells
+
+
 def test_set_bead_sample():
     samples = _samples()
     samples['bead_samples'] = []

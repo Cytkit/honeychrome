@@ -109,6 +109,15 @@ BEAD_MIN_INSIDE = 0.5           # bead samples with less of their events in the 
 SINGLET_MAD_FACTOR = 2.5        # half-width of the singlet band, in MADs
 SINGLET_MIN_HALF_WIDTH = 0.1    # half-width of the singlet band, at least this fraction of its median
 SATURATION = 0.999              # share of a channel's ceiling counted as saturated
+SUMMARY_MAX_NAMES = 5           # samples named per group in the import message, at most
+EXPECTED_EXCLUSIONS = {'beads': 'bead control', 'viability dye': 'viability dye control'}
+
+
+def _named(items: list) -> str:
+    """Up to SUMMARY_MAX_NAMES items, then a count of the rest (all are in the log)."""
+    rest = len(items) - SUMMARY_MAX_NAMES
+    text = ', '.join(items[:SUMMARY_MAX_NAMES])
+    return text + (f' and {rest} more (listed in the log)' if rest > 0 else '')
 
 
 @dataclass
@@ -128,9 +137,15 @@ class LandmarkGates:
         else:
             text = (f'Cells and Singlets gates placed from the brightest events of '
                     f'{len(self.used)} single-stain controls.')
-        if self.excluded:
-            names = ', '.join(f'{Path(p).stem} ({why})' for p, why in self.excluded.items())
-            text += f'\nControls not used: {names}.'
+        reasons = list(self.excluded.values())
+        expected = [f'{reasons.count(why)} {label}{"s" * (reasons.count(why) != 1)}'
+                    for why, label in EXPECTED_EXCLUSIONS.items() if why in reasons]
+        if expected:
+            text += f'\nNot used, as intended: {", ".join(expected)}.'
+        to_check = [f'{Path(p).stem} ({why})' for p, why in self.excluded.items()
+                    if why not in EXPECTED_EXCLUSIONS]
+        if to_check:
+            text += f'\nControls not used, to check ({len(to_check)}): {_named(to_check)}.'
         return text
 
 
@@ -146,8 +161,8 @@ class BeadGates:
         text = (f'Bead samples ({len(self.samples)}) share one Cells and Singlets gate placed on their '
                 f'beads, as per-sample gates.')
         if self.outside:
-            names = ', '.join(f'{Path(p).stem} ({share:.0%} inside)' for p, share in self.outside.items())
-            text += f'\nBead samples mostly outside that gate, to check: {names}.'
+            names = [f'{Path(p).stem} ({share:.0%} inside)' for p, share in self.outside.items()]
+            text += f'\nBead samples mostly outside that gate, to check ({len(names)}): {_named(names)}.'
         return text
 
 
