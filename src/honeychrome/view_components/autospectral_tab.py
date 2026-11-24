@@ -1111,6 +1111,14 @@ class AutofluorescencePage(QWidget):
             'Also includes unstained controls.'
         )
         filter_row.addWidget(self._include_ssc_cb)
+
+        self._include_beads_cb = QCheckBox('Include bead controls')
+        self._include_beads_cb.setChecked(False)
+        self._include_beads_cb.setToolTip(
+            'Show samples marked as beads (listed last). Beads have no '
+            'cellular autofluorescence, so they are hidden by default.'
+        )
+        filter_row.addWidget(self._include_beads_cb)
         filter_row.addStretch(1)
         self._assign_table_toggle = QToolButton()
         self._assign_table_toggle.setText('Sample table')
@@ -1128,6 +1136,7 @@ class AutofluorescencePage(QWidget):
         layout.addLayout(filter_row)
         self._include_unstained_cb.toggled.connect(self._on_assignment_filter_changed)
         self._include_ssc_cb.toggled.connect(self._on_assignment_filter_changed)
+        self._include_beads_cb.toggled.connect(self._on_assignment_filter_changed)
 
         # Rows = samples; column 0 = sample name, then one tick-box column per
         # profile. One header, so labels stay over their columns; dividers
@@ -1937,20 +1946,26 @@ class AutofluorescencePage(QWidget):
         """
         Samples shown in the assignment grid, as {path: display name}.
         Order: unstained controls, then ordinary samples, then single-stained
-        controls. Unstained controls are shown when either control checkbox is
-        ticked; single-stained controls only when their own checkbox is ticked.
+        controls, then bead samples. Unstained controls are shown when either
+        control checkbox is ticked; single-stained controls and bead samples
+        only when their own checkbox is ticked.
         """
         samples = self.controller.experiment.samples
         all_samples = samples.get('all_samples', {})
         ssc = set(samples.get('single_stain_controls', []))
         include_ssc = self._include_ssc_cb.isChecked()
         include_unstained = include_ssc or self._include_unstained_cb.isChecked()
+        include_beads = self._include_beads_cb.isChecked()
 
         unstained_rows = {}
         sample_rows = {}
         ssc_rows = {}
+        bead_rows = {}
         for path, name in all_samples.items():
-            if self._is_unstained_sample(path, name):
+            if is_bead_sample(samples, path, name):
+                if include_beads:
+                    bead_rows[path] = name
+            elif self._is_unstained_sample(path, name):
                 if include_unstained:
                     unstained_rows[path] = name
             elif path in ssc:
@@ -1958,7 +1973,7 @@ class AutofluorescencePage(QWidget):
                     ssc_rows[path] = name
             else:
                 sample_rows[path] = name
-        return {**unstained_rows, **sample_rows, **ssc_rows}
+        return {**unstained_rows, **sample_rows, **ssc_rows, **bead_rows}
 
     def _on_assignment_filter_changed(self, _checked=False):
         """Ticking single-stained controls forces unstained controls on."""
@@ -2027,7 +2042,8 @@ class AutofluorescencePage(QWidget):
         """
         Rebuild the samples × profiles table.
         Rows are chosen by _assignment_samples(): unstained controls first,
-        then samples, then single-stained controls if requested. Column 0 is
+        then samples, then single-stained controls and bead samples if
+        requested. Column 0 is
         the sample name, then one tick-box column per profile. Column widths
         default to the text (capped) unless the user has dragged them.
         """
