@@ -118,12 +118,17 @@ class DictTreeModel(QAbstractItemModel):
                     or re.search(r'unstained', path, re.IGNORECASE))
 
     def _sample_icon(self, path, nevents):
-        """Droplet: dark green for bead samples, blue for unstained, plain otherwise."""
+        """Droplet: dark green for bead samples, blue for unstained, split
+        blue and green for unstained beads, plain otherwise."""
         if not nevents > 0:
             return load_icon('droplet-empty')
-        if is_bead_sample(self.full_data, path):
+        bead = is_bead_sample(self.full_data, path)
+        unstained = self._is_unstained(path)
+        if bead and unstained:
+            return load_icon('droplet', colour=('#4a90d9', '#1e6b34'))
+        if bead:
             return load_icon('droplet', colour='#1e6b34')
-        if self._is_unstained(path):
+        if unstained:
             return load_icon('droplet', colour='#4a90d9')
         return load_icon('droplet')
 
