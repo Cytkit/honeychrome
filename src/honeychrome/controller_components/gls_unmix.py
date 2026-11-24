@@ -1507,7 +1507,8 @@ def assemble_unmixed(raw_event_data: np.ndarray, transfer_matrix: np.ndarray, se
     unmixed = raw_event_data @ transfer_matrix
     fl = result['unmixed']
     if spillover is not None:
-        fl = (np.linalg.inv(np.array(spillover)).T @ fl.T).T
+        from honeychrome.controller_components.unmix_method import compensation_matrix
+        fl = (compensation_matrix(spillover) @ fl.T).T
     unmixed[:, fl_ids_unmixed] = fl
     pnn = unmixed_settings.get('event_channels_pnn') or []
     af_idx = np.asarray(result['af_idx'])

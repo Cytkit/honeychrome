@@ -1089,11 +1089,8 @@ def build_transfer_matrix(raw_settings, unmixed_settings, unmixing_matrix, fl_id
 
     fluorescence_block = np.array(unmixing_matrix)
     if spillover is not None:
-        # spillover[i][j] = row i spills into column j (see nxn_help_text);
-        # compensation is applied as compensation @ measured (column vectors),
-        # which needs the transposed inverse to match that row/column convention.
-        compensation = np.linalg.inv(np.array(spillover)).T
-        fluorescence_block = compensation @ fluorescence_block
+        from honeychrome.controller_components.unmix_method import compensation_matrix
+        fluorescence_block = compensation_matrix(spillover) @ fluorescence_block
 
     fl_ids_unmixed = np.array(unmixed_settings['fluorescence_channel_ids'], dtype=int)
     sc_ids_unmixed = np.array(unmixed_settings['scatter_channel_ids'], dtype=int)

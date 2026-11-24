@@ -359,18 +359,17 @@ class UnmixedExporter(QObject):
         if n_events == 0:
             return
 
-        # Check whether this sample has AutoSpectral AF profiles assigned
-        sample_af_profiles = self.controller.experiment.samples.get('sample_af_profiles', {})
-        assigned_profile_names = sample_af_profiles.get(sample_path, [])
-        all_af_profiles = self.controller.experiment.process.get('af_profiles', {})
-        active_profiles = [all_af_profiles[name] for name in assigned_profile_names if name in all_af_profiles]
-        af_index_map = af_index_lookup(all_af_profiles, assigned_profile_names) if active_profiles else None
+        # The sample's AutoSpectral AF library (None without an AF profile assigned)
+        af, fl_ids = self._af_for(sample_path, reader.channels)
+        if self.af_noise is not None:
+            af = self.af_noise.attach(af, sample_path)
+        af_index_map = None if af is None else af.index_map
 
-        if active_profiles:
+        if af is not None:
             # apply_af_transfer fills the AF Abundance and AF Index columns.
             export_pnn = list(pnn_unmixed)
             keep = None
-            logger.info(f'UnmixedExporter: using AF unmixing for {sample_path} ({len(active_profiles)} profile(s))')
+            logger.info(f'UnmixedExporter: using AF unmixing for {sample_path} ({len(af.profile_names)} profile(s))')
         else:
             # Without AF correction the AF channels carry no information,
             # so they are left out of the exported file.
@@ -382,10 +381,6 @@ class UnmixedExporter(QObject):
         unmixing_spectra = np.array(
             self.controller.experiment.process.get('spectra_matrix')
         ) if self.controller.experiment.process.get('spectra_matrix') is not None else None
-
-        af, fl_ids = self._af_for(sample_path, reader.channels)
-        if self.af_noise is not None:
-            af = self.af_noise.attach(af, sample_path)
 
         # The experiment's unmixing method (noise model, spectral variants,
         # corrected spectra), when it is not per-cell AF with the base spectra.
@@ -417,7 +412,7 @@ class UnmixedExporter(QObject):
                 unmixed = unmix_method.unmix(raw_block, transfer_matrix, self.controller.experiment.settings,
                                              fl_ids, None, af, state, sample_path,
                                              pnn_raw=reader.channels)['unmixed']
-                yield unmixed if active_profiles else unmixed[:, keep]
+                yield unmixed if keep is None else unmixed[:, keep]
 
         export_unmixed_sample_stream(
             sample_name=sample_name,
