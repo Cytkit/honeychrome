@@ -25,7 +25,6 @@ Comparison plots open on the Singlets gate, else Cells, else root
 (default_comparison_gate).
 """
 
-import re
 from copy import deepcopy
 from pathlib import Path
 
@@ -74,6 +73,7 @@ from honeychrome.controller_components.af_contaminants import (
     set_screen,
 )
 from honeychrome.controller_components.transform import Transform
+from honeychrome.controller_components.unstained_selection import is_unstained_name
 from honeychrome.controller_components.job_gate import acquire_job, guard_while_busy, wait_if_busy
 from honeychrome.controller_components.sample_loader import AFState, resolve_af_for_profiles
 from honeychrome.controller_components import af_posterior
@@ -301,6 +301,10 @@ def default_comparison_gate(gate_names) -> str:
 # AfComparisonPlotWidget
 # ---------------------------------------------------------------------------
 
+# Smallest side of a comparison plot, in pixels.
+MIN_PLOT_SIDE = 280
+
+
 class AfComparisonPlotWidget(QWidget):
     """
     A single density-heatmap biplot that mirrors the style of CytometryPlotWidget
@@ -398,6 +402,9 @@ class AfComparisonPlotWidget(QWidget):
 
         # Disable right-click context menu (no gates in comparison plots)
         self.vb.raiseContextMenu = lambda ev: None
+        # The view box is laid out after this widget's own resize, so it is
+        # squared again whenever its size settles.
+        self.vb.sigResized.connect(lambda _vb: QTimer.singleShot(0, self, self._fit_square))
 
         # Heatmap image item
         self.img = pg.ImageItem(parent=self)
@@ -407,6 +414,7 @@ class AfComparisonPlotWidget(QWidget):
         # Status label (shown when computing or on error)
         self._status_label = QLabel('', alignment=Qt.AlignCenter)
         self._status_label.setStyleSheet('color: #aaaaaa;')
+        self._status_label.setVisible(False)
 
         main_layout.addWidget(self.graphics_widget)
         main_layout.addWidget(self._status_label)
@@ -418,24 +426,47 @@ class AfComparisonPlotWidget(QWidget):
         # Title left-click: change source gate
         self.plot_title.leftClickMenuFunction = self._set_source_gate
 
-        self.setMinimumHeight(280)
-        self.setMinimumWidth(280)
+        self.setMinimumHeight(MIN_PLOT_SIDE)
+        self.setMinimumWidth(MIN_PLOT_SIDE)
 
     # ------------------------------------------------------------------
-    # Square aspect ratio — always keeps width == height
+    # Square aspect ratio of the plot area
     # ------------------------------------------------------------------
 
     def sizeHint(self):
         from PySide6.QtCore import QSize
-        side = max(self.minimumHeight(), self.width())
+        side = max(MIN_PLOT_SIDE, self.width())
         return QSize(side, side)
 
     def resizeEvent(self, event):
-        # Force square: set height to match width, clamped to minimum
-        side = max(self.minimumHeight(), event.size().width())
-        if self.height() != side:
+        # A first guess from the width; _fit_square then corrects for the
+        # title, axes, labels and status line once the layout has settled.
+        side = max(MIN_PLOT_SIDE, event.size().width())
+        if event.oldSize().width() != event.size().width() and self.height() != side:
             self.setFixedHeight(side)
         super().resizeEvent(event)
+        QTimer.singleShot(0, self, self._fit_square)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self, self._fit_square)
+
+    def _fit_square(self):
+        """Set the widget height so the plot area (the view box) is square:
+        the title, axes, axis labels and status line take different room
+        across and down, so squaring the whole widget leaves the plot
+        itself out of square. Hidden, the view box keeps the size of its
+        last layout, so the fit waits until the plot is shown (the view box
+        is resized then, which calls this again). The floor is
+        MIN_PLOT_SIDE, not minimumHeight(), which setFixedHeight raises."""
+        if not self.isVisible():
+            return
+        vb_w, vb_h = self.vb.width(), self.vb.height()
+        if vb_w <= 1 or vb_h <= 1:
+            return
+        target = max(MIN_PLOT_SIDE, int(round(self.height() + vb_w - vb_h)))
+        if abs(target - self.height()) > 1:
+            self.setFixedHeight(target)
 
     # ------------------------------------------------------------------
     # Public API
@@ -443,6 +474,8 @@ class AfComparisonPlotWidget(QWidget):
 
     def set_status(self, text: str):
         self._status_label.setText(text)
+        self._status_label.setVisible(bool(text))
+        QTimer.singleShot(0, self, self._fit_square)
 
     def set_event_data(self, event_data: np.ndarray | None):
         """Set the full (ungated) unmixed event array for this plot."""
@@ -514,7 +547,7 @@ class AfComparisonPlotWidget(QWidget):
     def clear(self):
         self.img.clear()
         self._event_data = None
-        self._status_label.setText('')
+        self.set_status('')
 
     # ------------------------------------------------------------------
     # Internal: axis configuration
@@ -1426,8 +1459,7 @@ class AutofluorescencePage(QWidget):
             if not is_bead_sample(samples, p)
             and (
                 p in manually_tagged
-                or re.search(r'unstained', all_samples.get(p, ''), re.IGNORECASE)
-                or re.search(r'unstained', p, re.IGNORECASE)
+                or is_unstained_name(all_samples.get(p, ''), p)
             )
         ]
 
@@ -1435,7 +1467,7 @@ class AutofluorescencePage(QWidget):
         for i, path in enumerate(candidates, start=1):
             display = Path(path).stem
             self._sample_combo.addItem(display, userData=path)
-            if 'unstained' in display.lower() or path in manually_tagged:
+            if is_unstained_name(display) or path in manually_tagged:
                 preselect = preselect or i
 
         if preselect:
@@ -1937,10 +1969,7 @@ class AutofluorescencePage(QWidget):
         if sample_path in samples.get('unstained_samples', []):
             return True
         name = display_name or samples.get('all_samples', {}).get(sample_path, '')
-        return bool(
-            re.search(r'unstained', name, re.IGNORECASE)
-            or re.search(r'unstained', str(sample_path), re.IGNORECASE)
-        )
+        return is_unstained_name(name, str(sample_path))
 
     def _assignment_samples(self) -> dict:
         """
