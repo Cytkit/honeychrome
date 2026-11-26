@@ -109,13 +109,12 @@ class DictTreeModel(QAbstractItemModel):
         self.root_item = TreeItem(None, "All Samples", "", "")
 
     def _is_unstained(self, path: str) -> bool:
-        """Return True if path is manually tagged OR name matches 'unstained' regex."""
+        """Return True if path is manually tagged or named as unstained."""
+        from honeychrome.controller_components.unstained_selection import is_unstained_name
+
         if path in self.full_data.get('unstained_samples', []):
             return True
-        tube_name = self.full_data['all_samples'].get(path, '')
-        import re
-        return bool(re.search(r'unstained', tube_name, re.IGNORECASE)
-                    or re.search(r'unstained', path, re.IGNORECASE))
+        return is_unstained_name(self.full_data['all_samples'].get(path, ''), path)
 
     def _sample_icon(self, path, nevents):
         """Droplet: dark green for bead samples, blue for unstained, split
