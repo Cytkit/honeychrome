@@ -1,6 +1,5 @@
 import json
 import sys
-import re
 from typing import List, Any, Dict
 from PySide6 import QtCore
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QThread, Slot, QObject, QEvent, QSize, Signal, QSettings
@@ -19,7 +18,7 @@ from honeychrome.controller_components.spectral_reference_library import (
 )
 from honeychrome.view_components.cosine_qc_viewer import COSINE_QC_NOTE_BY_CYTOMETER
 from honeychrome.controller_components.spectral_functions import sanitise_control_in_place
-from honeychrome.controller_components.unstained_selection import default_cell_unstained
+from honeychrome.controller_components.unstained_selection import default_cell_unstained, is_unstained_name
 from honeychrome.controller_components.particle_type import is_bead_sample, set_bead_sample, match_bead_unstained
 from honeychrome.view_components.icon_loader import icon
 from honeychrome.settings import spectral_model_column_labels, heading_style, INTERNAL_NEGATIVE_SENTINEL
@@ -733,11 +732,7 @@ class SpectralControlsEditor(QFrame):
 
         options = []
         for p, tube_name in all_samples.items():
-            is_unstained = (
-                p in manually_tagged
-                or bool(re.search(r'unstained', tube_name, re.IGNORECASE))
-                or bool(re.search(r'unstained', p, re.IGNORECASE))
-            )
+            is_unstained = p in manually_tagged or is_unstained_name(tube_name, p)
             if not is_unstained:
                 continue
             is_bead = is_bead_sample(self.samples, p, tube_name)
@@ -786,11 +781,7 @@ class SpectralControlsEditor(QFrame):
         all_samples = self.samples.get('all_samples', {})
         manually_tagged = set(self.samples.get('unstained_samples', []))
         for path, name in all_samples.items():
-            is_unstained = (
-                path in manually_tagged
-                or bool(re.search(r'unstained', name, re.IGNORECASE))
-                or bool(re.search(r'unstained', path, re.IGNORECASE))
-            )
+            is_unstained = path in manually_tagged or is_unstained_name(name, path)
             if not is_unstained:
                 continue
             if is_bead_sample(self.samples, path, name):
@@ -1015,11 +1006,7 @@ class SpectralControlsEditor(QFrame):
         # or regex-matched) and match the particle type of this control.
         unstained_options = []
         for p, tube_name in all_samples.items():
-            is_unstained = (
-                p in manually_tagged
-                or bool(re.search(r'unstained', tube_name, re.IGNORECASE))
-                or bool(re.search(r'unstained', p, re.IGNORECASE))
-            )
+            is_unstained = p in manually_tagged or is_unstained_name(tube_name, p)
             if not is_unstained:
                 continue
             is_bead = is_bead_sample(self.samples, p, tube_name)
@@ -2080,10 +2067,15 @@ class SpectralControlsEditor(QFrame):
     def _show_row_context_menu(self, position):
         """Right-click menu on a control row: save its spectrum to the Reference
         Library, carrying the antigen / particle type / major channel / source
-        sample across from this tab."""
+        sample across from this tab, or delete the selected rows. Right-clicking
+        a row outside the selection selects that row alone."""
         index = self.view.indexAt(position)
         if not index.isValid():
             return
+        selection_model = self.view.selectionModel()
+        if not selection_model.isRowSelected(index.row(), index.parent()):
+            selection_model.select(index, QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
+                                   | QtCore.QItemSelectionModel.SelectionFlag.Rows)
         row = self.proxy.mapToSource(index).row()
         control = self.model._data[row]
         profile = (self.controller.experiment.process.get('profiles') or {}).get(control.get('label'))
@@ -2100,6 +2092,10 @@ class SpectralControlsEditor(QFrame):
                               'shows no clear stain. Allow Clean Controls to replace it with another '
                               'tube of the same fluorophore, or a library profile.')
             unlock.triggered.connect(lambda: control.pop('sample_locked', None))
+        menu.addSeparator()
+        n_selected = len(selection_model.selectedRows())
+        delete = menu.addAction(f'Delete {n_selected} Selected Rows' if n_selected > 1 else 'Delete Row')
+        delete.triggered.connect(self.delete_selected_rows)
         menu.exec(self.view.viewport().mapToGlobal(position))
 
     def _save_control_to_reference_library(self, control, profile):

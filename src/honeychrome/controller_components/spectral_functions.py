@@ -306,7 +306,6 @@ def compute_sample_means_for_wls(
 
     Returns a (n_channels,) float64 array, or None if no files could be read.
     """
-    import re
     from pathlib import Path
     from honeychrome.controller_components.functions import sample_from_fcs
     from honeychrome.controller_components.fcs_preview import (
@@ -317,10 +316,10 @@ def compute_sample_means_for_wls(
     controls = set(experiment_samples.get('single_stain_controls', []))
     unstained = set(experiment_samples.get('unstained_samples', []))
 
+    from honeychrome.controller_components.unstained_selection import is_unstained_name
+
     def _is_unstained(path, name):
-        return (path in unstained
-                or re.search(r'unstained', name, re.IGNORECASE)
-                or re.search(r'unstained', path, re.IGNORECASE))
+        return path in unstained or is_unstained_name(name, path)
 
     preferred = [
         p for p, name in all_samples.items()

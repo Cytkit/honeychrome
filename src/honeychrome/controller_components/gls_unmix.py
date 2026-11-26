@@ -477,8 +477,10 @@ def _is_bead(samples: dict, path: str) -> bool:
 
 
 def _is_unstained(samples: dict, path: str, name: str) -> bool:
+    from honeychrome.controller_components.unstained_selection import is_unstained_name
+
     tagged = set(samples.get('unstained_samples', []))
-    return path in tagged or 'unstained' in name.lower() or 'unstained' in path.lower()
+    return path in tagged or is_unstained_name(name, path)
 
 
 def unstained_cell_samples(samples: dict) -> list:

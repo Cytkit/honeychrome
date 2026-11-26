@@ -16,7 +16,9 @@ from honeychrome.controller_components.spread_model import raw_layout
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.label_matching import match_fluorophore, match_marker, get_fluorophore_db, get_marker_db
 from honeychrome.controller_components.particle_type import is_bead_sample, match_bead_unstained
-from honeychrome.controller_components.unstained_selection import default_cell_unstained, select_cell_unstained
+from honeychrome.controller_components.unstained_selection import (
+    default_cell_unstained, is_unstained_name, select_cell_unstained,
+)
 from honeychrome.controller_components.spectral_reference_library import (
     profile_id_from_description, cosine_similarity_to_reference, cosine_qc_warning_threshold,
 )
@@ -314,8 +316,7 @@ class ProfileUpdater:
         for path in self.samples['all_samples']:
             if is_bead_sample(self.samples, path):
                 continue
-            if re.search(r'(unstained|negative)', path, re.IGNORECASE) or \
-            re.search(r'(unstained|negative)', self.samples['all_samples'][path], re.IGNORECASE):
+            if is_unstained_name(self.samples['all_samples'][path], path, negative=True):
                 return path
         return None
 
@@ -877,9 +878,7 @@ class SpectralAutoGenerator(QObject):
             manually_unstained = set(self.samples.get('unstained_samples', []))
 
             def _is_unstained(path: str, name: str) -> bool:
-                return (path in manually_unstained
-                        or re.search(r'(unstained|negative)', path, re.IGNORECASE)
-                        or re.search(r'(unstained|negative)', name, re.IGNORECASE))
+                return path in manually_unstained or is_unstained_name(name, path, negative=True)
 
             def _is_bead(path: str, name: str) -> bool:
                 return is_bead_sample(self.samples, path, name)
@@ -1010,13 +1009,11 @@ class SpectralAutoGenerator(QObject):
         nevents = self.samples['all_sample_nevents'][sample_path]
         tubename = self.samples['all_samples'][sample_path]
         if nevents > 0:
-            # Skip samples whose name or path contains "Unstained" or "Negative",
-            # or that have been manually marked as unstained by the user.
+            # Skip samples named as unstained or "Negative", or that have been
+            # manually marked as unstained by the user.
             # Users can still add them manually via the +Add Control button.
             manually_unstained = set(self.samples.get('unstained_samples', []))
-            if re.search(r'(unstained|negative)', tubename, re.IGNORECASE) or \
-               re.search(r'(unstained|negative)', sample_path, re.IGNORECASE) or \
-               sample_path in manually_unstained:
+            if is_unstained_name(tubename, sample_path, negative=True) or sample_path in manually_unstained:
                 logger.info(f'generate_spectral_control: skipping "{tubename}" (matches unstained/negative pattern or manually marked as unstained)')
                 return True
 

@@ -50,3 +50,14 @@ def test_mismatch_measures_brightness_difference():
     assert us.af_mismatch(reference, reference) == 0.0
     events = np.vstack([np.full((75, 8), 5000.0), np.full((25, 8), 100.0)])
     assert np.allclose(us.dim_cells_spectrum(events), 100.0)
+
+
+def test_unst_names_a_tube_unstained_but_not_its_group_or_unstim():
+    assert us.is_unstained_name('D2 Unst spleen 2_Unst Samples', 'Raw/Unst Samples/D2 Unst spleen 2_Unst Samples.fcs')
+    assert us.is_unstained_name('Unst Beads SCC', 'Raw/Single stain controls/Unst Beads SCC.fcs')
+    assert us.is_unstained_name('A12 Unstained (Cells)_Plate_001')
+    assert not us.is_unstained_name('D6 FlowCode Control_Unst Samples',
+                                    'Raw/Unst Samples/FC Control/D6 FlowCode Control_Unst Samples.fcs')
+    assert not us.is_unstained_name('B1 Unstim CD4_Stim', 'Raw/B1 Unstim CD4_Stim.fcs')
+    assert not us.is_unstained_name('Neg ctrl', 'Raw/negative/Neg ctrl.fcs')
+    assert us.is_unstained_name('Neg ctrl', 'Raw/negative/Neg ctrl.fcs', negative=True)

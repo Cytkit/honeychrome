@@ -6,8 +6,8 @@ channel, so it should hold the same kind of cells as the controls. When an
 experiment has more than one, they can differ: a sample from another tissue
 or preparation can be twice as bright as the controls' own unstained cells.
 
-Every non-bead sample marked as unstained, or with "unstained" in its path or
-name, is a candidate. Each candidate's dimmest cells are compared with those
+Every non-bead sample marked as unstained, or named as unstained
+(is_unstained_name), is a candidate. Each candidate's dimmest cells are compared with those
 of the cell single-stain controls: the quarter of base-gate events whose
 brightest detector is lowest, which in a control are mostly its unstained
 cells. The mismatch is the median over detectors of
@@ -35,16 +35,46 @@ logger = logging.getLogger(__name__)
 MATCH_TOLERANCE = 0.25
 PREVIEW_EVENTS = 20000
 
-_UNSTAINED_NAME = re.compile(r'unstained', re.IGNORECASE)
-_UNSTAINED_OR_NEGATIVE = re.compile(r'(unstained|negative)', re.IGNORECASE)
+_UNSTAINED_WORD = re.compile(r'unstained', re.IGNORECASE)
+_NEGATIVE_WORD = re.compile(r'negative', re.IGNORECASE)
+# "Unst" or "Unstain" as a word of its own: not "Unstim" (unstimulated, a
+# stained sample) or "Gunst".
+_UNST_SHORT = re.compile(r'(?<![a-z0-9])unst(?:ain)?(?![a-z])', re.IGNORECASE)
+_FCS_EXTENSION = re.compile(r'\.fcs$', re.IGNORECASE)
+
+
+def tube_part(text: str) -> str:
+    """The tube name in a sample name or file name: the last path part,
+    without ".fcs" and without a trailing "_<group>" (Cytek writes files as
+    "<well> <tube>_<group>")."""
+    name = _FCS_EXTENSION.sub('', re.split(r'[\\/]', str(text or ''))[-1])
+    head, sep, _tail = name.rpartition('_')
+    return head if sep and head.strip() else name
+
+
+def is_unstained_name(name: str, path: str = '', negative: bool = False) -> bool:
+    """
+    True when a sample's name or path marks it as unstained: "unstained"
+    anywhere in either, or the short form "Unst" ("Unstain") as a word in the
+    tube name. The short form is not looked for in folder names or in a
+    Cytek group suffix, where it names the group the tube was acquired in
+    ("FlowCode Control_Unst Samples" is a stained control of the group "Unst
+    Samples"). With *negative*, "negative" anywhere counts too.
+    """
+    name, path = str(name or ''), str(path or '')
+    if _UNSTAINED_WORD.search(name) or _UNSTAINED_WORD.search(path):
+        return True
+    if negative and (_NEGATIVE_WORD.search(name) or _NEGATIVE_WORD.search(path)):
+        return True
+    return bool(_UNST_SHORT.search(tube_part(name)) or (path and _UNST_SHORT.search(tube_part(path))))
 
 
 def cell_unstained_candidates(samples: dict) -> list:
-    """Paths of the non-bead samples marked as unstained or named "unstained", in sample order."""
+    """Paths of the non-bead samples marked or named as unstained, in sample order."""
     marked = set(samples.get('unstained_samples', []))
     return [
         path for path, name in samples.get('all_samples', {}).items()
-        if (path in marked or _UNSTAINED_NAME.search(path) or _UNSTAINED_NAME.search(name))
+        if (path in marked or is_unstained_name(name, path))
         and not is_bead_sample(samples, path, name)
     ]
 
@@ -93,14 +123,13 @@ def choose_cell_unstained(rows: list) -> str | None:
 
 def _reference_controls(samples: dict, candidates: list) -> list:
     """Paths of the cell single-stain controls: not beads, not marked as
-    unstained and not named "unstained" or "negative"."""
+    unstained and not named as unstained or "negative"."""
     marked = set(samples.get('unstained_samples', [])) | set(candidates)
     all_samples = samples.get('all_samples', {})
     return [
         path for path in samples.get('single_stain_controls', [])
         if path in all_samples and path not in marked
-        and not _UNSTAINED_OR_NEGATIVE.search(path)
-        and not _UNSTAINED_OR_NEGATIVE.search(all_samples[path])
+        and not is_unstained_name(all_samples[path], path, negative=True)
         and not is_bead_sample(samples, path, all_samples[path])
     ]
 
