@@ -70,6 +70,7 @@ import heapq
 import json
 import logging
 import math
+import pickle
 import threading
 from collections import OrderedDict
 from copy import deepcopy
@@ -2431,14 +2432,24 @@ def _digest_default(obj):
 
 
 def content_digest(obj) -> str:
-    """SHA-256 of *obj* written as sorted JSON: a quick test of whether
-    nested state has changed. Numpy values are converted; other objects
-    count by their text."""
+    """SHA-256 of *obj* pickled: a quick test, within one session, of
+    whether nested state has changed. Pickling skips writing every number
+    as text, so large states (gate templates of many populations) are
+    digested several times faster than as JSON. The same content built
+    with dictionary keys in another order can give another digest, which
+    costs only a refresh or save that was not needed. Objects that cannot
+    be pickled are digested as sorted JSON, numpy values converted and
+    other objects counted by their text. Not for digests kept on disk.
+    """
     try:
-        text = json.dumps(obj, sort_keys=True, default=_digest_default)
-    except (TypeError, ValueError):
-        text = json.dumps(_jsonable(obj), sort_keys=True, default=_digest_default)
-    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+        data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    except (pickle.PicklingError, TypeError, AttributeError):
+        try:
+            text = json.dumps(obj, sort_keys=True, default=_digest_default)
+        except (TypeError, ValueError):
+            text = json.dumps(_jsonable(obj), sort_keys=True, default=_digest_default)
+        data = text.encode('utf-8')
+    return hashlib.sha256(data).hexdigest()
 
 
 def serialisable_boundaries(boundaries: dict) -> dict:

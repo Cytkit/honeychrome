@@ -4510,7 +4510,7 @@ class TrainTab(QWidget):
     population only). Hierarchy nodes are coloured by training status.
     Tiles are made only for the gates drawn on populations open in the
     tree: the first three levels to start with, and more as nodes are
-    expanded, so large hierarchies open quickly. "Pop out" on a tile opens
+    expanded, so large hierarchies open quickly. "Pop Out" on a tile opens
     the gate in its own window (GateDetailWidget) to adjust thresholds.
 
     Pause keeps every gate trained so far; Calculate Gates then offers to
@@ -5029,7 +5029,7 @@ class TrainTab(QWidget):
                 self.boundaries_changed.emit()
             self._rebuild_grid()
 
-        btn_detail = QPushButton("Pop out")
+        btn_detail = QPushButton("⤢ Pop Out")
         btn_detail.setFixedHeight(22)
         btn_detail.setToolTip("Open this gate in its own window to adjust its boundary.")
         btn_detail.clicked.connect(_open_detail)
