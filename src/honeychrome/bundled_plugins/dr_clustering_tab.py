@@ -8075,7 +8075,7 @@ class GroupsStatsTab(QWidget):
             try:
                 dlg_fig = maker(**maker_kwargs)
             except Exception as exc:
-                QMessageBox.warning(self, "Pop Out Error", str(exc))
+                QMessageBox.warning(self, "Pop Out failed", str(exc))
                 return
 
             dlg_dpi  = dlg_fig.get_dpi()

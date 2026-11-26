@@ -565,7 +565,7 @@ class HeatmapViewEditor(QFrame):
             title_row = QHBoxLayout()
             title_row.addWidget(self.title)
             title_row.addStretch()
-            popout_button = QPushButton('Pop out')
+            popout_button = QPushButton('⤢ Pop Out')
             popout_button.setToolTip('Open this matrix in a separate, resizable window')
             popout_button.clicked.connect(self.open_popout)
             title_row.addWidget(popout_button)
