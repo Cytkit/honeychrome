@@ -50,6 +50,7 @@ import ag_fsea
 import ag_fsea_library as fl
 import ag_help_texts
 from ag_widgets import add_concertina_page, make_concertina
+from honeychrome.view_components.focus_mode import mark_focus_chrome
 
 log = ag_core.get_logger(__name__)
 
@@ -197,7 +198,9 @@ class EnrichmentTab(QWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
         outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_ENRICHMENT, scrolling=True))
-        row = QHBoxLayout()
+        test_widget = QWidget()
+        row = QHBoxLayout(test_widget)
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(QLabel("<b>Test:</b>"))
         self.cb_comparison = QComboBox()
         self.cb_comparison.setToolTip(
@@ -207,10 +210,11 @@ class EnrichmentTab(QWidget):
             "side.")
         self.cb_comparison.currentIndexChanged.connect(self._on_test_changed)
         row.addWidget(self.cb_comparison, stretch=1)
-        outer.addLayout(row)
+        outer.addWidget(test_widget)
         self.lbl_status = QLabel("")
         self.lbl_status.setWordWrap(True)
         outer.addWidget(self.lbl_status)
+        mark_focus_chrome(test_widget, self.lbl_status)
         self.toolbox = make_concertina()
         outer.addWidget(self.toolbox, stretch=1)
         for title, builder in (("Library", self._build_library_page),
@@ -1102,13 +1106,14 @@ class EnrichmentTab(QWidget):
         and hover labels. With *make* (a function returning a fresh copy of
         the figure) the widget has a Pop Out button."""
         from honeychrome.view_components import figure_options as fo
-        from honeychrome.view_components.scalable_figure_widget import ScalableFigureWidget
+        from honeychrome.view_components.scalable_figure_widget import FIT_WHOLE, ScalableFigureWidget
         store = fo.store_for(self.controller) if options_key else None
         ref = fo.FigureOptionsRef(store, 'automated_gating', options_key) if store else None
         pop_out = (None if make is None
                    else lambda: self._pop_out_figure(make, title, options_key))
         widget = ScalableFigureWidget(fig, title=title, experiment_dir=self._experiment_dir_fn(),
-                                      pop_out=pop_out, parent=parent or self, options=ref)
+                                      pop_out=pop_out, parent=parent or self, options=ref, fit=FIT_WHOLE,
+                                      fit_key=f'automated_gating/enrichment/{options_key or title}')
         handler = getattr(fig, '_hover_handler', None)
         if handler is not None:
             widget.canvas.mpl_connect('motion_notify_event', handler)

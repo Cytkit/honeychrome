@@ -31,6 +31,7 @@ class EventBus(QObject):
     generateSampleReport = Signal()
     openImportFCSWidget = Signal(bool)
     sampleBrowserVisibilityRequested = Signal(bool)  # a plugin hides/shows the left sample panel for its own tab
+    focusModeChanged = Signal(bool)  # focus mode turned on or off for the tab on screen
 
     ### view
     aboutHoneychrome = Signal()

@@ -125,6 +125,7 @@ from ag_widgets import (  # noqa: E402
     text_matches,
 )
 from honeychrome.view_components.side_tab_widget import SideTabWidget  # noqa: E402
+from honeychrome.view_components.focus_mode import mark_focus_chrome  # noqa: E402
 
 log = ag_core.get_logger(__name__)
 
@@ -2345,12 +2346,15 @@ class ResultsTab(QWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
         outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_RESULTS, scrolling=True))
-        cmp_row = QHBoxLayout()
+        cmp_widget = QWidget()
+        cmp_row = QHBoxLayout(cmp_widget)
+        cmp_row.setContentsMargins(0, 0, 0, 0)
         cmp_row.addWidget(QLabel("<b>Comparison:</b>"))
         self.cb_comparison = QComboBox()
         self.cb_comparison.currentIndexChanged.connect(self._on_comparison_changed)
         cmp_row.addWidget(self.cb_comparison, stretch=1)
-        outer.addLayout(cmp_row)
+        outer.addWidget(cmp_widget)
+        mark_focus_chrome(cmp_widget)
         # One section open at a time; each page scrolls on its own.
         self.toolbox = make_concertina()
         outer.addWidget(self.toolbox, stretch=1)
@@ -3898,7 +3902,7 @@ class ResultsTab(QWidget):
             self.figures_tabs.addTab(QLabel(f"Figures failed: {error}"), "Error")
             return
         from honeychrome.view_components.scalable_figure_widget import (
-            initial_scale_for, results_folder,
+            FIT_WHOLE, FIT_WIDTH, initial_scale_for, results_folder,
         )
         exp_dir = results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR)
         for key, item in payload.items():
@@ -3918,7 +3922,8 @@ class ResultsTab(QWidget):
                 large=large, k=key: self._pop_out_figure(make, title, results, large,
                                                          options_key=k),
                 initial_scale=initial_scale_for(fig, HEATMAP_SCALE_PCT) if large else 100,
-                parent=self, options=figure_options_ref(self.controller, key))
+                parent=self, options=figure_options_ref(self.controller, key),
+                fit=FIT_WIDTH if large else FIT_WHOLE, fit_key=f'automated_gating/{key}')
             self._connect_figure(widget.canvas, fig, item.get('results'))
             self.figures_tabs.addTab(widget, item['title'])
         self._add_extra_figures()
@@ -4831,7 +4836,7 @@ class ResultsTab(QWidget):
                 if canvas is not None:
                     self._row_figures.pop(id(canvas), None)
                 self.figures_tabs.removeTab(i)
-        from honeychrome.view_components.scalable_figure_widget import results_folder
+        from honeychrome.view_components.scalable_figure_widget import FIT_WHOLE, results_folder
         exp_dir = results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR)
         for title, fig, make in self._extra_figures():
             key = _EXTRA_FIGURE_KEYS.get(title, title)
@@ -4839,7 +4844,8 @@ class ResultsTab(QWidget):
                 fig, title=title, experiment_dir=exp_dir,
                 pop_out=lambda make=make, title=title, k=key: self._pop_out_figure(
                     make, title, options_key=k),
-                parent=self, options=figure_options_ref(self.controller, key))
+                parent=self, options=figure_options_ref(self.controller, key),
+                fit=FIT_WHOLE, fit_key=f'automated_gating/{key}')
             self._connect_figure(widget.canvas, fig)
             self.figures_tabs.addTab(widget, title)
 

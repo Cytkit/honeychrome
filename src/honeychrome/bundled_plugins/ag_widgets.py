@@ -47,9 +47,12 @@ __all__ = ['make_concertina', 'add_concertina_page', 'SquareHolder',
 # ---------------------------------------------------------------------------
 
 def make_concertina() -> QToolBox:
-    """An accordion that keeps one section open at a time."""
+    """An accordion that keeps one section open at a time; its section
+    headers are hidden in focus mode, leaving the open section."""
+    from honeychrome.view_components.focus_mode import mark_focus_headers
     toolbox = QToolBox()
     toolbox.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+    mark_focus_headers(toolbox)
     return toolbox
 
 

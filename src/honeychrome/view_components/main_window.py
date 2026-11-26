@@ -15,8 +15,8 @@ from honeychrome.view_components.statistical_plotter import StatisticalCompariso
 
 os.environ["QT_LOGGING_RULES"] = "qt.core.qobject.connect=false" #suppress pyqtgraph graphicslayoutwidget warning
 
-from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QMainWindow, QFileDialog, QWidget, QHBoxLayout, QSplitter, QTabWidget, QStatusBar, QVBoxLayout, QLabel, QProgressBar, QScrollArea, QPushButton, QMenu, QGroupBox, QSpinBox, QMessageBox, QCheckBox
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
+from PySide6.QtWidgets import QMainWindow, QFileDialog, QWidget, QHBoxLayout, QSplitter, QTabWidget, QStatusBar, QVBoxLayout, QLabel, QProgressBar, QScrollArea, QPushButton, QMenu, QGroupBox, QSpinBox, QMessageBox, QCheckBox, QComboBox, QToolButton
 from PySide6.QtCore import Qt, QSettings, QByteArray, QPoint, Slot, QTimer, QThread, Signal as QtSignal
 
 from honeychrome.view_components.gating_hierarchy_widget import GatingHierarchyWidget
@@ -34,6 +34,7 @@ from honeychrome.view_components.icon_loader import icon
 from honeychrome.view_components.sample_widget import SampleWidget
 from honeychrome.view_components.help_texts import process_help_text
 from honeychrome.view_components.autospectral_tab import AutoSpectralTab, TAB_NAME as AUTOSPECTRAL_TAB_NAME
+from honeychrome.view_components import focus_mode
 
 base_directory = Path.home() / experiments_folder
 
@@ -69,6 +70,10 @@ class MainWindow(QMainWindow):
         # Splitter layout captured when a plugin hides the sample panel, so
         # closing on that tab doesn't persist a zero-width left pane.
         self._splitter_state_with_browser = None
+        # Focus mode: the chrome widgets it hid, and whether the tab on
+        # screen wants the sample browser (shown as a drop-down meanwhile).
+        self._focus_hidden = None
+        self._browser_wanted = True
         self._import_fcs_dialog = None   # one Import FCS dialog at a time
 
         # autosave if window closed
@@ -210,6 +215,19 @@ class MainWindow(QMainWindow):
         action_reference_library = QAction(icon('table'), "Reference Library", self)
         action_reference_library.triggered.connect(self.open_reference_library_widget)
         view_menu.addAction(action_reference_library)
+
+        self.action_focus = QAction("Focus Mode", self)
+        self.action_focus.setCheckable(True)
+        self.action_focus.setShortcut(QKeySequence("Ctrl+Shift+F"))
+        self.action_focus.setToolTip("Hide the sample browser, section lists, help and the controls above the "
+                                     "figures, so the figures get the window (Ctrl+Shift+F, or Esc to leave; "
+                                     "Cmd on a Mac).")
+        self.action_focus.toggled.connect(self.set_focus_mode)
+        view_menu.addSeparator()
+        view_menu.addAction(self.action_focus)
+        self._focus_escape = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._focus_escape.setEnabled(False)
+        self._focus_escape.activated.connect(lambda: self.action_focus.setChecked(False))
 
         # help menu
         action_forum = QAction(icon('bubble-text'), "Discussions", self)
@@ -433,6 +451,26 @@ class MainWindow(QMainWindow):
         self._plugin_loader.finished_loading.connect(self._on_plugins_loaded)
         self._plugin_loader.start()
 
+        # Focus mode button and, while the sample browser is hidden by it, a
+        # sample drop-down, at the right of the main tab bar.
+        corner = QWidget()
+        corner_layout = QHBoxLayout(corner)
+        corner_layout.setContentsMargins(0, 0, 4, 0)
+        corner_layout.setSpacing(4)
+        self.focus_sample_combo = QComboBox()
+        self.focus_sample_combo.setMinimumContentsLength(24)
+        self.focus_sample_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.focus_sample_combo.setToolTip("The sample shown, as picked in the sample browser.")
+        self.focus_sample_combo.setVisible(False)
+        self.focus_sample_combo.activated.connect(self._on_focus_sample_chosen)
+        corner_layout.addWidget(self.focus_sample_combo)
+        focus_button = QToolButton()
+        focus_button.setDefaultAction(self.action_focus)
+        focus_button.setText("⤢ Focus")
+        corner_layout.addWidget(focus_button)
+        self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
+        self.bus.loadSampleRequested.connect(self._sync_focus_sample)
+
         # Connect to tab change
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
@@ -567,6 +605,8 @@ class MainWindow(QMainWindow):
     def on_tab_changed(self, index):
         tab_name = self.tabs.tabText(index)
         logger.info(f'View: tab changed {tab_name}')
+        # Focus mode belongs to the tab it was turned on in.
+        self.action_focus.setChecked(False)
         # Every tab starts with the sample panel shown; a plugin that wants
         # it hidden re-requests that from its modeChangeRequested handler.
         self._set_sample_browser_visible(True)
@@ -582,8 +622,71 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentIndex(index)
 
     @Slot(bool)
+    def set_focus_mode(self, on: bool):
+        """Turn focus mode on or off for the tab on screen (focus_mode)."""
+        if on == (self._focus_hidden is not None):
+            return
+        if on:
+            self._browser_wanted = not self.left_container.isHidden()
+            self._show_left_panel(False)
+            page = self.tabs.currentWidget()
+            self._focus_hidden = focus_mode.hide_chrome(page) if page is not None else []
+            self._fill_focus_samples()
+            self.focus_sample_combo.setVisible(self._browser_wanted)
+        else:
+            focus_mode.restore(self._focus_hidden)
+            self._focus_hidden = None
+            self.focus_sample_combo.setVisible(False)
+            self._show_left_panel(self._browser_wanted)
+        self._focus_escape.setEnabled(on)
+        if self.action_focus.isChecked() != on:
+            self.action_focus.setChecked(on)
+        self.bus.focusModeChanged.emit(on)
+
+    def _fill_focus_samples(self):
+        """The focus-mode sample drop-down: every sample of the experiment,
+        the current one selected."""
+        combo = self.focus_sample_combo
+        combo.blockSignals(True)
+        combo.clear()
+        samples = (getattr(self.controller.experiment, 'samples', None) or {}).get('all_samples') or {}
+        for path, name in samples.items():
+            combo.addItem(str(name), str(path))
+        combo.blockSignals(False)
+        self._sync_focus_sample(getattr(self.controller, 'current_sample_path', None))
+
+    @Slot(str)
+    def _sync_focus_sample(self, path):
+        if path is None:
+            return
+        index = self.focus_sample_combo.findData(str(path).replace('\\', '/'))
+        if index < 0:
+            index = self.focus_sample_combo.findData(str(path))
+        if index >= 0:
+            self.focus_sample_combo.blockSignals(True)
+            self.focus_sample_combo.setCurrentIndex(index)
+            self.focus_sample_combo.blockSignals(False)
+
+    @Slot(int)
+    def _on_focus_sample_chosen(self, index: int):
+        """Select the chosen sample in the (hidden) sample browser, which
+        loads it as a click there would."""
+        path = self.focus_sample_combo.itemData(index)
+        if path:
+            self.bus.selectSample.emit(path)
+
+    @Slot(bool)
     def _set_sample_browser_visible(self, visible: bool):
-        """Show or hide the left panel (sample browser, acquisition, gains)."""
+        """Show or hide the left panel (sample browser, acquisition, gains).
+        In focus mode the panel stays hidden; a tab that wants it gets the
+        sample drop-down instead."""
+        if self._focus_hidden is not None:
+            self._browser_wanted = visible
+            self.focus_sample_combo.setVisible(visible)
+            return
+        self._show_left_panel(visible)
+
+    def _show_left_panel(self, visible: bool):
         if visible == (not self.left_container.isHidden()):
             return
         if not visible:
