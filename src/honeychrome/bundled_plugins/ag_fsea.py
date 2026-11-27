@@ -834,8 +834,6 @@ def run_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs:
     testable. Returns the result dict (see ``result_tables`` for its
     tables).
     """
-    from honeychrome.controller_components import moderated_stats as ms
-
     t_start = time.perf_counter()
     if rank_metric not in RANK_METRICS:
         raise ValueError(f"rank_metric must be one of {RANK_METRICS}")
@@ -867,19 +865,79 @@ def run_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs:
     kept_values, meta, hygiene = prep['values'], prep['features'], prep['hygiene']
     matches, sets, pop_map, notes = prep['matches'], prep['sets'], prep['cell_types'], prep['notes']
     anchor = prep['anchor']
-    testable = [s for s in sets if s['testable']]
-    if not testable:
+    if not any(s['testable'] for s in sets):
         raise FseaBlocked(f"No immune state has {min_set_size} or more matched features.")
+    states, members, ranks = enrich_sets(kept_values, meta, sets, plans, rank_metric=rank_metric,
+                                         n_perm=n_perm, seed=seed, min_set_size=min_set_size,
+                                         progress=_progress)
+    engine = ('group-label permutation' if all(p['fast'] for p in plans)
+              else 'residual permutation (Freedman–Lane)')
+    return {
+        'format_version': FORMAT_VERSION,
+        'settings': {'anchor': anchor, 'feature_types': list(feature_types),
+                     'marker_readout': marker_readout, 'rank_metric': rank_metric,
+                     'n_perm': n_perm, 'seed': int(seed), 'min_set_size': int(min_set_size),
+                     'contrast_mode': contrast_mode, 'use_stats_parent': bool(use_stats_parent),
+                     'min_marker_events': int(min_marker_events),
+                     'min_parent_events': int(min_parent_events),
+                     'exclude_gating_markers': bool(exclude_gating_markers),
+                     'enforce_min_samples': bool(enforce_min_samples), 'engine': engine},
+        'library': dict(library_info or {}),
+        'samples': list(used), 'group_vec': [groups[s] for s in used],
+        'comparisons': [list(c) for p in plans for c in p['comparisons']],
+        'blocked': blocked, 'notes': notes,
+        'features': meta, 'hygiene': hygiene, 'matches': matches, 'states': states,
+        'members': members, 'ranks': ranks,
+        'sets': [{k: v for k, v in s.items()} for s in sets],
+        'cell_types': {k: v for k, v in pop_map.items()},
+        'seconds': round(time.perf_counter() - t_start, 2),
+    }
 
+
+def enrich_sets(values: pd.DataFrame, meta: pd.DataFrame, sets: list[dict], plans: list[dict], *,
+                rank_metric: str = 'signed_log10p', n_perm: int = DEFAULT_N_PERM,
+                seed: int = DEFAULT_SEED, min_set_size: int = MIN_SET_SIZE,
+                permutations=None, progress=None) -> tuple:
+    """The enrichment statistics of the module docstring for feature sets.
+
+    values  : (samples, features) feature values, NaN where not measured.
+    meta    : feature metadata with at least 'feature' and 'label'.
+    sets    : ``ag_fsea_library.build_sets`` output.
+    plans   : ``comparison_plans`` output.
+    permutations(plan, base, other) : optional; returns the relabellings to
+              use for one comparison as (relabellings, plan samples) index
+              permutations that move only the samples of the two compared
+              groups (within pairs when the plan is paired). By default
+              ``n_perm`` random permutations are drawn with *seed*.
+    progress(fraction, message) : optional; called between permutation
+              chunks (it may raise to stop).
+
+    Returns (states, members, ranks) as in ``run_enrichment``'s result.
+    """
+    from honeychrome.controller_components import moderated_stats as ms
+
+    def _progress(frac, msg):
+        if progress is not None:
+            progress(frac, msg)
+
+    testable = [s for s in sets if s['testable']]
+    chosen = {}
+    if permutations is not None:
+        for plan in plans:
+            for base, other in plan['comparisons']:
+                chosen[(id(plan), base, other)] = np.atleast_2d(np.asarray(permutations(plan, base, other),
+                                                                           dtype=int))
     rng = np.random.default_rng(int(seed))
     state_rows, member_rows, rank_frames = [], [], []
-    total_steps = sum(len(p['comparisons']) for p in plans) * n_perm
+    total_steps = (sum(len(v) for v in chosen.values()) if chosen
+                   else sum(len(p['comparisons']) for p in plans) * n_perm)
+    total_steps = max(total_steps, 1)
     done = 0
     for plan in plans:
         sub = plan['samples']
-        Y = kept_values.loc[sub].to_numpy(dtype=float).T          # (features, samples)
+        Y = values.loc[sub].to_numpy(dtype=float).T          # (features, samples)
         codes = plan['group_codes']
-        feats = np.array(kept_values.columns)
+        feats = np.array(values.columns)
         # Observed fit with the Results page's model.
         obs_stats = _model_rank_stats(Y, plan['X'], plan['columns'], rank_metric)
         for base, other in plan['comparisons']:
@@ -903,10 +961,32 @@ def run_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs:
             t_obs = ob['t'][usable]
             mt_obs = _set_mean_t(t_obs, sets_eval)[0]
             Yu = Y[usable]
-            null = np.zeros((n_perm, len(sets_eval)))
-            mt_null = np.zeros((n_perm, len(sets_eval)))
+            given = chosen.get((id(plan), base, other))
+            n_null = n_perm if given is None else len(given)
+            null = np.zeros((n_null, len(sets_eval)))
+            mt_null = np.zeros((n_null, len(sets_eval)))
             compared = (codes == 0) | (codes == k)
-            if plan['fast'] and sets_eval:
+            if given is not None and sets_eval:
+                Xr = plan['reduced']
+                fit_r = ms.lm_fit(Yu, Xr)
+                fitted = np.nan_to_num(fit_r.coefficients) @ Xr.T
+                resid = Yu - fitted
+                col = plan['columns'][other]
+                for c0 in range(0, n_null, PERM_CHUNK):
+                    chunk = given[c0:c0 + PERM_CHUNK]
+                    if plan['fast']:
+                        stats_k = group_rank_stats(Yu, codes[chunk], rank_metric)[k]
+                        null[c0:c0 + len(chunk)] = enrichment_scores(np.nan_to_num(stats_k['r']), sets_eval)
+                        mt_null[c0:c0 + len(chunk)] = _set_mean_t(stats_k['t'], sets_eval)
+                    else:
+                        for i, perm in enumerate(chunk, c0):
+                            st = _model_rank_stats(fitted + resid[:, perm], plan['X'], {other: col},
+                                                   rank_metric)[other]
+                            null[i] = enrichment_scores(np.nan_to_num(st['r'])[None, :], sets_eval)[0]
+                            mt_null[i] = _set_mean_t(st['t'], sets_eval)[0]
+                    done += len(chunk)
+                    _progress(done / total_steps, f"{comp}: {c0 + len(chunk)} of {n_null} relabellings")
+            elif plan['fast'] and sets_eval:
                 pos = np.flatnonzero(compared)
                 for c0 in range(0, n_perm, PERM_CHUNK):
                     b = min(PERM_CHUNK, n_perm - c0)
@@ -938,7 +1018,7 @@ def run_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs:
                         _progress(done / total_steps, f"{comp}: {i + 1} of {n_perm} permutations")
             nes, p, fwer = _null_summary(es_obs, null)
             fdr = ms.bh_adjust(p)
-            p_self = (1 + (np.abs(mt_null) >= np.abs(mt_obs)).sum(axis=0)) / (1 + n_perm)
+            p_self = (1 + (np.abs(mt_null) >= np.abs(mt_obs)).sum(axis=0)) / (1 + n_null)
             fdr_self = ms.bh_adjust(p_self)
             cam = camera_scores(Yu, plan['X'], t_obs, ob['df'][usable], sets_eval)
             fdr_cam = ms.bh_adjust(cam['p'])
@@ -993,28 +1073,8 @@ def run_enrichment(summaries: dict, samples: list[str], groups: dict, gate_defs:
     _progress(1.0, "Enrichment complete.")
     states = pd.DataFrame(state_rows).sort_values(['comparison', 'p'], kind='stable',
                                                   na_position='last').reset_index(drop=True)
-    engine = ('group-label permutation' if all(p['fast'] for p in plans)
-              else 'residual permutation (Freedman–Lane)')
-    return {
-        'format_version': FORMAT_VERSION,
-        'settings': {'anchor': anchor, 'feature_types': list(feature_types),
-                     'marker_readout': marker_readout, 'rank_metric': rank_metric,
-                     'n_perm': n_perm, 'seed': int(seed), 'min_set_size': int(min_set_size),
-                     'contrast_mode': contrast_mode, 'use_stats_parent': bool(use_stats_parent),
-                     'min_marker_events': int(min_marker_events),
-                     'min_parent_events': int(min_parent_events),
-                     'exclude_gating_markers': bool(exclude_gating_markers),
-                     'enforce_min_samples': bool(enforce_min_samples), 'engine': engine},
-        'library': dict(library_info or {}),
-        'samples': list(used), 'group_vec': [groups[s] for s in used],
-        'comparisons': [list(c) for p in plans for c in p['comparisons']],
-        'blocked': blocked, 'notes': notes,
-        'features': meta, 'hygiene': hygiene, 'matches': matches, 'states': states,
-        'members': pd.DataFrame(member_rows), 'ranks': pd.concat(rank_frames, ignore_index=True),
-        'sets': [{k: v for k, v in s.items()} for s in sets],
-        'cell_types': {k: v for k, v in pop_map.items()},
-        'seconds': round(time.perf_counter() - t_start, 2),
-    }
+    ranks = pd.concat(rank_frames, ignore_index=True) if rank_frames else pd.DataFrame()
+    return states, pd.DataFrame(member_rows), ranks
 
 
 # ---------------------------------------------------------------------------
