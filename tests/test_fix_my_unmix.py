@@ -689,8 +689,10 @@ def test_plausibility_box_keeps_a_real_correction():
 
 def test_plausibility_box_limits_coexpression_booked_into_empty_detectors():
     truth, names, unstained, stained = coexpressed_experiment()
-    base = run(truth, names, unstained, stained, fmc.FixSettings(max_iter=6, plausibility_ratio=0.0), truth=truth)
-    boxed = run(truth, names, unstained, stained, fmc.FixSettings(max_iter=6), truth=truth)
+    # the default leakage rule alone already blocks these changes; a looser one isolates the box
+    loose = dict(max_iter=6, leakage_margin=0.05)
+    base = run(truth, names, unstained, stained, fmc.FixSettings(plausibility_ratio=0.0, **loose), truth=truth)
+    boxed = run(truth, names, unstained, stained, fmc.FixSettings(**loose), truth=truth)
     for dye in ('Dye 0', 'Dye 6'):
         i = names.index(dye)
         before = {r['fluorophore']: r['deg_after'] for r in base.recovery}[dye]
@@ -702,7 +704,8 @@ def test_plausibility_box_limits_coexpression_booked_into_empty_detectors():
 
 def test_shared_direction_shrinks_coexpression():
     truth, names, unstained, stained = coexpressed_experiment()
-    off = dict(max_iter=6, plausibility_ratio=0.0)
+    # the default leakage rule alone already blocks these changes; a looser one isolates the shrinkage
+    off = dict(max_iter=6, plausibility_ratio=0.0, leakage_margin=0.05)
     base = run(truth, names, unstained, stained, fmc.FixSettings(**off), truth=truth)
     shared = run(truth, names, unstained, stained, fmc.FixSettings(shared_direction=True, **off), truth=truth)
     b = {r['fluorophore']: r['deg_after'] for r in base.recovery}

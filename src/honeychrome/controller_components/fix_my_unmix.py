@@ -98,7 +98,10 @@ Phase two
     row's own population over the channels that population is negative for
     (``leakage_channels='negative'``: fewer than half its events above the
     channel's boundary); a marker expressed on the same cells is not
-    leakage, and would otherwise swamp the residual the row corrects. The
+    leakage, and would otherwise swamp the residual the row corrects. A
+    candidate passes only if it lowers that leakage to at most
+    ``1 + leakage_margin`` of what it was (0.9 by default): a change that
+    leaves the off-target signal as it was is not taken. The
     optional residual gate
     compares the OLS residual of the fluorophore's positive events before
     and after the change; it is blind to the in-span part of a change by
@@ -375,7 +378,7 @@ class FixSettings:
     max_vif: float = 500.0
     max_condition_increase: float = 1.05
     peak_shift_min_rel: float = 0.7
-    leakage_margin: float = 0.05
+    leakage_margin: float = -0.1            # a candidate must bring the row's leakage to 1 + this of what it was
     min_deg_start: float = 0.1
     huber_k: float = 1.345
     huber_max_iter: int = 100
@@ -1864,7 +1867,7 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                 w = 0.0
                 row = {'source': fnames[src], 'channel': fnames[ch], 'slope_anchored': np.nan, 'slope': np.nan,
                        'slope_median': np.nan, 'se': np.nan, 'se_fit': np.nan, 'disagreement': np.nan,
-                       'coverage': np.nan, 'span': np.nan,
+                       'coverage': np.nan, 'span': np.nan, 'noise': np.nan, 'not_eligible': 'no.slope',
                        'slope_glasso': np.nan if joint is None else float(joint[src, ch]),
                        'glasso_agreement': np.nan, 'source_weight': w_src, 'hypernegative_base': np.nan,
                        'hypernegative_after': np.nan, 'hypernegative_new': np.nan,
@@ -1878,12 +1881,24 @@ def fix_my_unmix(spectra: np.ndarray, fluor_names: list, unstained: dict, staine
                             anchored[src, ch] = slope_use
                     row.update(slope_anchored=slope_use, slope=est['slope'][ci], slope_median=est['slope_alt'][ci],
                                se=est['se'][ci], se_fit=est['se_fit'][ci], disagreement=est['disagreement'][ci],
-                               coverage=est['coverage'][ci], span=est['span'][ci])
-                if (est is not None and np.isfinite(slope_use)
-                        and est['coverage'][ci] >= s.min_negative_frac
-                        and abs(slope_use) <= s.max_coefficient
-                        and abs(slope_use) * est['span'][ci] >= s.min_rise * est['noise'][ci]
-                        and est['span'][ci] > s.min_span * abs(thresholds[src])):
+                               coverage=est['coverage'][ci], span=est['span'][ci], noise=est['noise'][ci])
+                # the first test a measured slope fails to earn trust: enough target-negative events among the
+                # brightest source events, a believable size, a rise across the source's range of at least
+                # min_rise noise SDs of the target, and a range that clears the source's own threshold
+                if est is None or not np.isfinite(slope_use):
+                    not_eligible = 'no.slope'
+                elif not est['coverage'][ci] >= s.min_negative_frac:
+                    not_eligible = 'coverage'
+                elif not abs(slope_use) <= s.max_coefficient:
+                    not_eligible = 'size'
+                elif not abs(slope_use) * est['span'][ci] >= s.min_rise * est['noise'][ci]:
+                    not_eligible = 'rise'
+                elif not est['span'][ci] > s.min_span * abs(thresholds[src]):
+                    not_eligible = 'span'
+                else:
+                    not_eligible = ''
+                row['not_eligible'] = not_eligible
+                if not not_eligible:
                     prior_var = slope_use ** 2 if prior is None else prior['variance'][src, ch]
                     if not np.isfinite(prior_var) or prior_var <= 0:
                         prior_var = slope_use ** 2
