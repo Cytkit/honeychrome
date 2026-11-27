@@ -163,6 +163,7 @@ from honeychrome.view_components.ordered_multi_sample_picker import OrderedMulti
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.help_toggle_widget import HelpToggleWidget
 from honeychrome.view_components.side_tab_widget import SideTabWidget
+from honeychrome.view_components.focus_mode import mark_focus_chrome
 from honeychrome.view_components.scalable_figure_widget import (
     figure_toolbar, report_saved, results_folder, save_figure, start_path,
 )
@@ -426,6 +427,11 @@ def _qs_int(settings, key: str, default=None):
         return int(raw)
     except (TypeError, ValueError):
         return default
+
+
+# Smallest height of the Stats results tabs; they otherwise take the height
+# of the page's viewport.
+RESULTS_MIN_HEIGHT = 500
 
 
 def _reports_folder(controller):
@@ -4212,14 +4218,22 @@ class GroupsStatsTab(QWidget):
         self._age_worker = None
         bottom_layout.addWidget(age_box)
 
-        # Results area: one tab per plot
+        # Results area: one tab per plot, one screen tall (the page's
+        # viewport), so that a figure fitted to it is seen whole once the
+        # page is scrolled to the results.
         self._results_tabs = QTabWidget()
         self._results_tabs.setTabsClosable(True)
         self._results_tabs.tabCloseRequested.connect(self._on_results_tab_close_requested)
-        self._results_tabs.setMinimumHeight(1400)
+        self._results_tabs.setMinimumHeight(RESULTS_MIN_HEIGHT)
+        self._outer_scroll.viewport().installEventFilter(self)
         bottom_layout.addWidget(self._results_tabs, stretch=1)
 
         content_layout.addWidget(bottom_widget, stretch=1)
+        # Focus mode leaves the results tabs, at the top of the page.
+        mark_focus_chrome(top_widget, stats_box, pca_box, pred_box, age_box)
+        if self.bus is not None and hasattr(self.bus, 'focusModeChanged'):
+            self.bus.focusModeChanged.connect(
+                lambda on: on and QTimer.singleShot(0, self, self._scroll_to_results_tabs))
 
         # Sentinel: cluster names snapshot at last _draw_results() call.
         self._last_drawn_cluster_names: dict[int, str] = {}
@@ -7995,14 +8009,17 @@ class GroupsStatsTab(QWidget):
                       instead of appended — so re-clicking a button doesn't pile
                       up duplicate tabs. Every tab (keyed or not) can still be
                       closed manually via its close button.
+        values_table: optional callable returning the DataFrame behind the
+                      figure; the tab then offers it as CSV.
 
-        Extracted from the old _draw_results-local `_add_tab` closure so
-        it can add standalone result tabs (Composition Barplot,
-        Sample PCA) outside of _draw_results, using the same pop-out/
-        export machinery as the heatmap/volcano tabs.
+        The tab is the app's ScalableFigureWidget (Pop Out, Export Graphic,
+        Size, Fit and Options, as in the other analysis plugins), fitted to
+        the whole figure by default; Pop Out opens a fresh copy in a window
+        with the matplotlib toolbar and shows a note in the tab meanwhile.
         """
         from PySide6.QtWidgets import QDialog
         from honeychrome.view_components import figure_options as fo
+        from honeychrome.view_components.scalable_figure_widget import FIT_WHOLE, ScalableFigureWidget
 
         # Figure options (figure_options): this figure, its pop-out, export,
         # the report and the Layout all use the options kept for its key.
@@ -8019,195 +8036,73 @@ class GroupsStatsTab(QWidget):
                     self._results_tabs.removeTab(i)
                     break
 
-        dpi  = fig.get_dpi()
-        w_px = int(fig.get_figwidth()  * dpi)
-        h_px = int(fig.get_figheight() * dpi)
-        natural_inches = tuple(fig.get_size_inches())
+        widget = None
 
-        # these plots routinely overflowed the viewport at full
-        # size. The inline canvas now starts at roughly a third of the
-        # figure's natural size (DEFAULT_SCALE_PCT) and the slider added
-        # to btn_row below lets the user scale it back up. Fixed (not
-        # Expanding) so the canvas actually shrinks instead of the
-        # QScrollArea stretching it back out to fill the viewport. Pop
-        # Out / Export both call maker(**maker_kwargs) for a fresh
-        # full-size figure of their own, so neither is affected by this.
-        DEFAULT_SCALE_PCT = 100
-        canvas = _new_scrollable_canvas(fig)
-        canvas.setSizePolicy(
-            QSizePolicy.Policy.Fixed,
-            QSizePolicy.Policy.Fixed,
-        )
-        # Hover tooltips -- figure-makers that want them stash a
-        # handler on the Figure itself (fig._hover_handler), since no
-        # canvas exists yet when they run; connect it now that one does.
-        if hasattr(fig, '_hover_handler'):
-            canvas.mpl_connect('motion_notify_event', fig._hover_handler)
-        self._connect_value_menu(canvas, fig, key, maker_kwargs)
-
-        scroll = QScrollArea()
-        scroll.setWidget(canvas)
-        scroll.setWidgetResizable(True)
-
-        def _apply_canvas_scale(pct: int):
-            """Resize the inline canvas to pct% of the figure's natural
-            size; keeps this tab's own QScrollArea tall enough to show it
-            without a nested scrollbar."""
-            new_w = max(80, int(w_px * pct / 100))
-            new_h = max(80, int(h_px * pct / 100))
-            canvas.setFixedSize(new_w, new_h)
-            # Grows/shrinks with the slider -- no cap otherwise. This
-            # tab's own outer QScrollArea (GroupsStatsTab._build_ui)
-            # scrolls the whole page if that makes it taller than the
-            # viewport, rather than nesting a second scrollbar in here.
-            scroll.setMinimumHeight(new_h + 40)
-
-        _apply_canvas_scale(DEFAULT_SCALE_PCT)
-
-        # Placeholder shown while plot is popped out
-        placeholder = QLabel(f'"{tab_title}" is open in a separate window.\nClose that window to restore it here.')
-        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        placeholder.setStyleSheet("color: grey; font-style: italic;")
-        placeholder.hide()
-
-        def _pop_out(checked=False):
-            # Generate a fresh figure for the dialog (avoids shared-canvas DPI issues)
+        def _pop_out():
+            # A fresh figure for the window (no shared canvas between the
+            # tab and the window, whose display densities can differ).
             try:
                 dlg_fig = maker(**maker_kwargs)
             except Exception as exc:
-                QMessageBox.warning(self, "Pop Out Error", str(exc))
+                QMessageBox.warning(self, "Pop Out failed", str(exc))
                 return
-
-            dlg_dpi  = dlg_fig.get_dpi()
-            dlg_w_px = int(dlg_fig.get_figwidth()  * dlg_dpi)
-            dlg_h_px = int(dlg_fig.get_figheight() * dlg_dpi)
-
-            dlg_canvas  = _new_scrollable_canvas(dlg_fig)
-            dlg_canvas.setSizePolicy(
-                QSizePolicy.Policy.Expanding,
-                QSizePolicy.Policy.Expanding,
-            )
-            # Hover tooltips -- dlg_fig is a fresh figure (from
-            # maker(**maker_kwargs) above), so its own handler needs
-            # connecting too.
+            dlg_dpi = dlg_fig.get_dpi()
+            dlg_canvas = _new_scrollable_canvas(dlg_fig)
+            dlg_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             if hasattr(dlg_fig, '_hover_handler'):
                 dlg_canvas.mpl_connect('motion_notify_event', dlg_fig._hover_handler)
             self._connect_value_menu(dlg_canvas, dlg_fig, key, maker_kwargs)
-            dlg_toolbar = figure_toolbar(dlg_canvas, None, _reports_folder(self.controller),
-                                         export_stem)
+            dlg_toolbar = figure_toolbar(dlg_canvas, None, _reports_folder(self.controller), export_stem)
 
             class _PlotDialog(QDialog):
                 def closeEvent(self_, event):
-                    # Disconnect toolbar before C++ objects are destroyed
+                    # Disconnect the toolbar before its canvas is destroyed.
                     try:
                         dlg_toolbar.canvas = None
                     except Exception:
                         pass
-                    # Restore tab view
-                    scroll.show()
-                    placeholder.hide()
-                    popout_btn.setEnabled(True)
                     super().closeEvent(event)
 
             dlg = _PlotDialog(self)
             dlg.setWindowTitle(tab_title)
             dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-            dlg.resize(dlg_w_px + 24, dlg_h_px + 80)
-
+            dlg.resize(int(dlg_fig.get_figwidth() * dlg_dpi) + 24, int(dlg_fig.get_figheight() * dlg_dpi) + 80)
             vb = QVBoxLayout(dlg)
             vb.setContentsMargins(4, 4, 4, 4)
             vb.setSpacing(4)
             vb.addWidget(dlg_toolbar)
             vb.addWidget(dlg_canvas, stretch=1)
             dlg.show()
+            widget.hold_while_open(
+                dlg, f'"{tab_title}" is open in a separate window.\nClose that window to restore it here.')
 
-            # Hide tab canvas, show placeholder
-            scroll.hide()
-            placeholder.show()
-            popout_btn.setEnabled(False)
-
-        btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(0, 0, 0, 0)
-        popout_btn = QPushButton("⤢ Pop Out")
-        popout_btn.setFixedWidth(80)
-        popout_btn.clicked.connect(_pop_out)
-        # values_table: callable -> DataFrame behind the figure; the tab then
-        # offers it as CSV beside the figure export.
-        export_btn = QPushButton("Export Figure" if values_table is not None
-                                 else f"Export {tab_title}")
-        export_btn.clicked.connect(lambda checked=False, f=fig, s=export_stem:
-                                   self._export_figure(f, s, natural_inches))
-        btn_row.addWidget(popout_btn)
-        btn_row.addWidget(export_btn)
+        widget = ScalableFigureWidget(
+            fig, title=tab_title, experiment_dir=_reports_folder(self.controller), pop_out=_pop_out,
+            options=options_ref, fit=FIT_WHOLE, fit_key=f'dr_clustering/{key or export_stem}')
+        widget.export_stem = export_stem
+        # Hover tooltips: figure makers that want them keep a handler on the
+        # Figure (fig._hover_handler), since no canvas exists when they run.
+        if hasattr(fig, '_hover_handler'):
+            widget.canvas.mpl_connect('motion_notify_event', fig._hover_handler)
+        self._connect_value_menu(widget.canvas, fig, key, maker_kwargs)
         if values_table is not None:
             csv_btn = QPushButton("Export Values (CSV)")
             csv_btn.setToolTip("Write each sample's value, with its group, as a CSV file.")
             csv_btn.clicked.connect(lambda checked=False, s=export_stem:
                                     self._export_values_csv(values_table(), s))
-            btn_row.addWidget(csv_btn)
-        btn_row.addSpacing(16)
+            widget.add_control(csv_btn)
 
-        # manual resize slider for the inline canvas.
-        btn_row.addWidget(QLabel("Size:"))
-        size_slider = QSlider(Qt.Horizontal)
-        size_slider.setRange(20, 200)
-        size_slider.setValue(DEFAULT_SCALE_PCT)
-        size_slider.setFixedWidth(120)
-        size_slider.setToolTip(
-            "Resize this plot. Pop Out and Export always use full size."
-        )
-        size_pct_label = QLabel(f"{DEFAULT_SCALE_PCT}%")
-        size_pct_label.setFixedWidth(36)
-
-        def _on_size_slider_changed(pct: int):
-            _apply_canvas_scale(pct)
-            size_pct_label.setText(f"{pct}%")
-
-        size_slider.valueChanged.connect(_on_size_slider_changed)
-        btn_row.addWidget(size_slider)
-        btn_row.addWidget(size_pct_label)
-        btn_row.addStretch()
-        options_panel = None
-        if options_ref is not None:
-            from honeychrome.view_components.figure_options_panel import (
-                FigureOptionsPanel, options_toggle_button,
-            )
-            options_panel = FigureOptionsPanel(options_ref)
-            btn_row.addWidget(options_toggle_button(options_panel))
-
-        container = QWidget()
         if key is not None:
-            container.setProperty('_tab_key', key)
+            widget.setProperty('_tab_key', key)
             self._results_registry[key] = dict(
                 title=tab_title, maker=maker, maker_kwargs=maker_kwargs,
             )
-        vbox = QVBoxLayout(container)
-        vbox.setContentsMargins(4, 4, 4, 4)
-        vbox.setSpacing(4)
-        # Pop Out/Export/Size row above the canvas so it's always visible
-        # without scrolling, whatever the canvas's current scale.
-        vbox.addLayout(btn_row)
-        body = QHBoxLayout()
-        body.setContentsMargins(0, 0, 0, 0)
-        body.addWidget(scroll, stretch=1)
-        body.addWidget(placeholder, stretch=1)
-        if options_panel is not None:
-            body.addWidget(options_panel)
-
-            def _on_options_changed(scope, f=fig, c=canvas, ref=options_ref):
-                if scope == ref.scope:
-                    ref.apply(f)
-                    c.draw_idle()
-            options_ref.store.subscribe(_on_options_changed)
-            container.destroyed.connect(lambda _obj=None, store=options_ref.store,
-                                        cb=_on_options_changed: store.unsubscribe(cb))
-        vbox.addLayout(body, stretch=1)
 
         if insert_at is not None:
-            self._results_tabs.insertTab(insert_at, container, tab_title)
+            self._results_tabs.insertTab(insert_at, widget, tab_title)
             self._results_tabs.setCurrentIndex(insert_at)
         else:
-            idx = self._results_tabs.addTab(container, tab_title)
+            idx = self._results_tabs.addTab(widget, tab_title)
             self._results_tabs.setCurrentIndex(idx)
 
     # Per-sample values behind the results figures that can show them:
@@ -8414,6 +8309,11 @@ class GroupsStatsTab(QWidget):
         # The tab area is as tall as its tallest figure, so the view is moved
         # to the top of the tabs, where the new (small) figure is shown.
         QTimer.singleShot(0, self._scroll_to_results_tabs)
+
+    def eventFilter(self, obj, event):
+        if obj is self._outer_scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._results_tabs.setMinimumHeight(max(RESULTS_MIN_HEIGHT, event.size().height()))
+        return super().eventFilter(obj, event)
 
     def _scroll_to_results_tabs(self):
         """Scroll the Stats page so the results tab bar is at the top."""
@@ -8961,29 +8861,6 @@ class GroupsStatsTab(QWidget):
             is_dark=_resolve_is_dark(self.state), run_label=run_label,
             family_label='cluster',
         )
-
-    def _export_figure(self, fig, stem: str, size_inches=None):
-        """Save a results-tab figure to the Honeycluster_Reports folder, at
-        its natural size (*size_inches*) whatever size the tab shows it at."""
-        fmt = getattr(hc_settings, 'graphics_export_format_retrieved', 'png')
-        folder = _reports_folder(self.controller)
-        if not folder:
-            QMessageBox.warning(self, "Export", "There is no experiment folder to export to.")
-            return
-        out_path = folder / f"{stem}.{fmt}"
-        shown = tuple(fig.get_size_inches())
-        if size_inches is not None:
-            fig.set_size_inches(*size_inches, forward=False)
-        try:
-            save_figure(fig, out_path)
-        except Exception as e:
-            QMessageBox.warning(self, "Export Error", str(e))
-            return
-        finally:
-            fig.set_size_inches(*shown, forward=False)
-            if fig.canvas is not None:
-                fig.canvas.draw_idle()
-        report_saved(self, out_path)
 
     def _export_results_csv(self):
         """Export all statistics results to a combined CSV."""

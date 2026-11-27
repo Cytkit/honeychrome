@@ -240,9 +240,11 @@ def spread_snapshot(controller, fluor_names: list, fluor_spectra: np.ndarray, un
     Everything compute_spread_entry needs, read on the main thread. The
     positives are the controls' events in the base gate; the negative is the
     control's universal negative ("Neg Unstained" gate) when it has one, else
-    the unstained sample the AF profile is extracted from. Each sample is
-    gated with its own gates (its per-sample overrides and Time range).
+    the unstained sample the AF profile is extracted from, without the events
+    its AF contaminant screen removed. Each sample is gated with its own
+    gates (its per-sample overrides and Time range).
     """
+    from honeychrome.controller_components.af_contaminants import excluded_for_sample
     from honeychrome.controller_components.functions import resolve_base_gate
     from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 
@@ -254,30 +256,40 @@ def spread_snapshot(controller, fluor_names: list, fluor_spectra: np.ndarray, un
         'fluor_names': list(fluor_names), 'spectra': np.asarray(fluor_spectra, dtype=np.float64),
         'controls': control_records(controller, list(fluor_names), layout['detectors']),
         'unstained_path': unstained_path, 'base_gate': base_gate,
+        'unstained_excluded': excluded_for_sample(controller.experiment_dir,
+                                                  controller.experiment.process.get('af_profiles'), unstained_path),
     }
 
 
-def load_events(experiment_dir, rel_path: str, gate_label: str | None, layout: dict, gating) -> tuple:
+def load_events(experiment_dir, rel_path: str, gate_label: str | None, layout: dict, gating,
+                excluded: np.ndarray | None = None) -> tuple:
     """(fluorescence, scatter) raw events of one sample inside gate_label (all events when None).
-    rel_path is the sample's experiment key; gating a SampleGating or GatingStrategy."""
+    rel_path is the sample's experiment key; gating a SampleGating or GatingStrategy; excluded the
+    file-order indices of events to leave out (an AF contaminant screen's)."""
+    from honeychrome.controller_components.af_contaminants import keep_mask
     from honeychrome.controller_components.functions import sample_from_fcs
     from honeychrome.controller_components.spectral_functions import get_raw_events
 
     sample = sample_from_fcs(str(Path(experiment_dir) / rel_path))
+    keep = keep_mask(excluded, int(sample.event_count)) if excluded is not None else None
     fl, sc = get_raw_events(sample, layout['fl_ids'], gate_label=gate_label, gating_strategy=gating,
                             extra_channel_ids=layout['sc_ids'], col_order=layout['col_order'],
-                            sample_key=rel_path)
+                            sample_key=rel_path, event_keep=keep)
     return np.asarray(fl, dtype=np.float64), np.asarray(sc, dtype=np.float64)
 
 
 def _load_negative(loader, snapshot: dict, path: str | None):
-    """Negative events of a control: its own sample first, then the unstained sample."""
+    """Negative events of a control: its own sample first, then the unstained sample (without the
+    events its AF contaminant screen removed)."""
     for source in (path, snapshot['unstained_path']):
         if source is None:
             continue
+        excluded = snapshot.get('unstained_excluded') if source == snapshot['unstained_path'] else None
+        extra = {} if excluded is None else {'excluded': excluded}
         for gate in (NEGATIVE_GATE, snapshot['base_gate']):
             try:
-                fl, sc = loader(snapshot['experiment_dir'], source, gate, snapshot['layout'], snapshot['gating'])
+                fl, sc = loader(snapshot['experiment_dir'], source, gate, snapshot['layout'], snapshot['gating'],
+                                **extra)
             except Exception as exc:
                 logger.warning(f'Spread: {source} not loaded in gate "{gate}" ({exc})')
                 continue

@@ -167,6 +167,38 @@ _CYTOMETER_PARAMS: dict[str, _CytParams] = {
         singlet_y_preference = "FSC-H",
     ),
 
+    # Bio-Rad ZE5. One instrument (serial BR0005) wrote files with $CYT "YETI"
+    # and $PnR 2147483647 (values up to 2^31) and others with $CYT "EVEREST"
+    # and $PnR 262144 (both seen Mar 2019-Apr 2020), so the two get their own
+    # saturation values. $PnN: FS00/FS01 (FSC 488 and 405 nm), SS02 (SSC),
+    # FL03-FL29 (fluorescence); T0, T1 (time stamp words) and INFO (event
+    # information) are not detectors. Files are integer ($DATATYPE I).
+    "ZE5_Everest": _CytParams(
+        cyt_label       = "Bio-Rad ZE5 (Everest)",
+        cyt_kw_pattern  = r"^EVEREST$",
+        creator_pattern = None,
+        non_spectral_pat = [r"^FS\d", r"^SS\d", r"^T\d+$", r"^INFO$", r"^TIME$", "FSC", "SSC", "Time"],
+        spectral_pat    = None,
+        db_col          = "ZE5",
+        scatter_param = ["FS00-A", "SS02-A"],
+        sat_value = 262144,
+        scatter_extra_pat = [r"^FS01-"],
+        singlet_y_preference = "FS00-H",
+    ),
+
+    "ZE5_Yeti": _CytParams(
+        cyt_label       = "Bio-Rad ZE5 (Yeti)",
+        cyt_kw_pattern  = r"^YETI$",
+        creator_pattern = None,
+        non_spectral_pat = [r"^FS\d", r"^SS\d", r"^T\d+$", r"^INFO$", r"^TIME$", "FSC", "SSC", "Time"],
+        spectral_pat    = None,
+        db_col          = "ZE5",
+        scatter_param = ["FS00-A", "SS02-A"],
+        sat_value = 2147483647,
+        scatter_extra_pat = [r"^FS01-"],
+        singlet_y_preference = "FS00-H",
+    ),
+
     "Bigfoot": _CytParams(
         cyt_label       = "Thermo Fisher Bigfoot",
         cyt_kw_pattern  = r"Bigfoot",
@@ -356,6 +388,12 @@ def _match_cytometer(
 
     if kw_match(r"Bigfoot"):
         return _CYTOMETER_PARAMS["Bigfoot"]
+
+    if kw_match(r"^EVEREST$"):
+        return _CYTOMETER_PARAMS["ZE5_Everest"]
+
+    if kw_match(r"^YETI$"):
+        return _CYTOMETER_PARAMS["ZE5_Yeti"]
 
     if kw_match(r"CytoStellar"):
         return _CYTOMETER_PARAMS["CytoStellar"]

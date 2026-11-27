@@ -3,24 +3,32 @@ import re
 import time
 import warnings
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot, QTimer
 # from PySide6.QtWidgets import QApplication
 from flowkit import Dimension, gates
 
-from honeychrome.controller_components.functions import timer, sample_from_fcs, resolve_base_gate
+from honeychrome.controller_components.functions import timer, sample_from_fcs, resolve_base_gate, gate_channels
 from honeychrome.controller_components.spectral_functions import get_profile, get_raw_events
 from honeychrome.controller_components.spread_model import raw_layout
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 from honeychrome.controller_components.label_matching import match_fluorophore, match_marker, get_fluorophore_db, get_marker_db
 from honeychrome.controller_components.particle_type import is_bead_sample, match_bead_unstained
+from honeychrome.controller_components.unstained_selection import (
+    default_cell_unstained, is_unstained_name, select_cell_unstained,
+)
 from honeychrome.controller_components.spectral_reference_library import (
     profile_id_from_description, cosine_similarity_to_reference, cosine_qc_warning_threshold,
+    SpectralReferenceLibrary, compute_config_key,
 )
 from honeychrome.controller_components.spectral_cleaning import (
     find_empirical_peak, cosine_filter, knn_scatter_match, exclude_saturated, CleanResult,
     background_check, BACKGROUND_CHECK_VERSION, BACKGROUND_RATIO_MAX,
+)
+from honeychrome.controller_components.stain_detection import (
+    UNSTAINED_Z_MAX, excess_z, largest_rectangle_z, rectangle_scores,
 )
 from honeychrome.controller_components.spectral_refinement import (
     RefineSettings, refine_row, subsample_negative, make_check_pool, crosstalk_check,
@@ -90,6 +98,32 @@ def background_warning_text(cleaned_events, labels) -> str | None:
               'They are marked ⚠ in the spectral model table.')
 
 
+def unstained_check_summary(label: str, check: dict | None) -> str | None:
+    """One line for a control that shows no stain above its unstained in any
+    detector or any part of the FSC/SSC plot; None otherwise."""
+    if (check or {}).get('verdict') != 'unstained':
+        return None
+    return (f'{label}: looks unstained (no detector shows more bright cells than "{check["negative_name"]}" '
+            f'in any part of the FSC/SSC plot; largest excess {check["z_search"]:.0f} standard deviations, '
+            f'in {check["channel_search"]}, below {UNSTAINED_Z_MAX:g})')
+
+
+def unstained_warning_text(cleaned_events, labels) -> str | None:
+    """One warning for the controls among *labels* that look unstained; None when there are none."""
+    rows = [summary for label in labels
+            if (summary := unstained_check_summary(
+                label, (cleaned_events.get(label) or {}).get('unstained_check')))]
+    if not rows:
+        return None
+    return ('These controls look like unstained samples: in no detector do they have more bright cells '
+            'than their unstained negative, even within parts of the FSC/SSC plot.\n'
+            + '\n'.join(f'  \u2022 {row}' for row in rows)
+            + '\n\nAn unstained sample used as a control adds an autofluorescence profile to the spectral '
+              'model and degrades the unmixing. If one is unstained, mark it as unstained (right-click it in '
+              'the Sample panel and choose "Mark as Unstained") and run Auto generate again. These controls are '
+              'marked \u26a0 in yellow in the spectral model table.')
+
+
 class LowEventLog:
     """Collects control gates with too few events. With *collect* the
     entries are held for one combined warning (``text()``); otherwise each is
@@ -127,27 +161,98 @@ class LowEventLog:
 
 
 # Control fields a cleaned result depends on; a change to any of them makes it stale.
-CLEANED_RESULT_KEYS = ('sample_name', 'particle_type', 'universal_negative_name')
+CLEANED_RESULT_KEYS = ('sample_name', 'particle_type', 'universal_negative_name', 'gate_channel')
 
 
-def cleaned_result_matches(control: dict, cleaned: dict) -> bool:
+def file_records(experiment_dir, rel_paths) -> list:
+    """[relative path, size, modification time] of each file in *rel_paths*
+    that exists, so a file replaced under the same name can be told apart."""
+    recorded = []
+    for rel_path in rel_paths:
+        try:
+            stat = (Path(experiment_dir) / rel_path).stat()
+        except OSError:
+            continue
+        recorded.append([rel_path, stat.st_size, stat.st_mtime_ns])
+    return recorded
+
+
+def files_unchanged(recorded, experiment_dir) -> bool:
+    """Whether every [relative path, size, modification time] in *recorded*
+    still describes the file on disk (a file replaced under the same name
+    fails)."""
+    for rel_path, size, mtime_ns in recorded:
+        try:
+            stat = (Path(experiment_dir) / rel_path).stat()
+        except OSError:
+            return False
+        if stat.st_size != size or stat.st_mtime_ns != mtime_ns:
+            return False
+    return True
+
+
+def cleaned_result_matches(control: dict, cleaned: dict, experiment_dir=None) -> bool:
     """Whether *cleaned* (a controller.cleaned_events entry) was made from the
-    control's current sample, particle type and negative. Entries without a
-    stored fingerprint are accepted."""
+    control's current sample, particle type, negative and major channel, and,
+    given *experiment_dir*, from the files now on disk.
+
+    The cleaner picks the brightest events on the major channel, so a result
+    made on another channel does not describe the control. The major channel
+    matches when it is the one the events were picked on or the peak of the
+    cleaned spectrum (profile generation moves the major channel there).
+    Entries without a stored fingerprint are accepted, as are the major
+    channel and files of entries stored before those were recorded."""
     fingerprint = cleaned.get('_fingerprint')
     if not fingerprint:
         return True
-    return all((fingerprint.get(k) or None) == (control.get(k) or None) for k in CLEANED_RESULT_KEYS)
+    if any((fingerprint.get(k) or None) != (control.get(k) or None)
+           for k in CLEANED_RESULT_KEYS if k != 'gate_channel'):
+        return False
+    accepted = fingerprint.get('gate_channels')
+    if accepted is not None and (control.get('gate_channel') or None) not in accepted:
+        return False
+    return experiment_dir is None or files_unchanged(fingerprint.get('files') or [], experiment_dir)
 
 
-def _find_default_unstained_tube(samples: dict) -> str | None:
-    """Return tube name of the first non-bead sample whose path or name contains 'unstained'."""
-    for path, name in samples['all_samples'].items():
-        if is_bead_sample(samples, path, name):
+_UNSTAINED_TUBE = re.compile(r'(unstained|negative)', re.IGNORECASE)
+
+
+def control_label_from_tubename(tubename: str) -> tuple[str, str]:
+    """Control label and antigen auto-generate reads from a tube name: the text
+    before any bracket or trailing "cells"/"beads", without a plate-position
+    prefix such as "A1 ", as the canonical fluorophore when one is recognised
+    (else that text) and the canonical marker (else '')."""
+    match = re.findall(r'^(.*?)(?=\s*[\(\[]|\s+(?:cells?|beads?)\s*$)', tubename, re.IGNORECASE)
+    raw_label = match[0].strip() if match else tubename
+    raw_label = re.sub(r'^[A-H]\d{1,2}\s+', '', raw_label).strip()
+    label = match_fluorophore(raw_label, get_fluorophore_db()) or raw_label
+    antigen = match_marker(raw_label, get_marker_db()) or ''
+    return label, antigen
+
+
+def alternate_control_paths(samples: dict, control: dict, exclude_names) -> list[str]:
+    """Other single-stain control tubes for the fluorophore of *control*, in
+    sample order: tubes whose name gives the same label as the control's own
+    tube, with the same particle type, that are not unstained and not named in
+    *exclude_names* (tubes already used by a row of the spectral model)."""
+    own_name = control.get('sample_name') or ''
+    if not own_name:
+        return []
+    label = control_label_from_tubename(own_name)[0]
+    want_beads = control.get('particle_type') == 'Beads'
+    unstained = set(samples.get('unstained_samples', []))
+    paths = []
+    for path in samples.get('single_stain_controls', []):
+        name = samples['all_samples'].get(path)
+        if (not name or name == own_name or name in exclude_names or path in unstained
+                or _UNSTAINED_TUBE.search(name) or _UNSTAINED_TUBE.search(path)):
             continue
-        if re.search(r'unstained', path, re.IGNORECASE) or re.search(r'unstained', name, re.IGNORECASE):
-            return name
-    return None
+        if is_bead_sample(samples, path, name) != want_beads:
+            continue
+        if control_label_from_tubename(name)[0] == label:
+            paths.append(path)
+    return paths
+
 
 def restore_user_labels(spectral_model, profiles, previous_controls):
     """Give each regenerated control the label and antigen it had in the previous
@@ -232,16 +337,16 @@ class ProfileUpdater:
         #         self.bus.warningMessage.emit('Selected number of fluorophores has changed. Previous controls have been flushed.')
 
     def _unstained_sample_path(self) -> str | None:
-        """The sample the global (cell) unstained negative is taken from: the first
-        non-bead sample marked as unstained, else the first named unstained or negative."""
-        for path in self.samples.get('unstained_samples', []):
-            if path in self.samples['all_samples'] and not is_bead_sample(self.samples, path):
-                return path
+        """The sample the global (cell) unstained negative is taken from: the
+        default unstained cell sample (default_cell_unstained), else the first
+        non-bead sample named negative."""
+        default_name = default_cell_unstained(self.samples, self.controller.experiment.process)
+        if default_name is not None:
+            return next(path for path, name in self.samples['all_samples'].items() if name == default_name)
         for path in self.samples['all_samples']:
             if is_bead_sample(self.samples, path):
                 continue
-            if re.search(r'(unstained|negative)', path, re.IGNORECASE) or \
-            re.search(r'(unstained|negative)', self.samples['all_samples'][path], re.IGNORECASE):
+            if is_unstained_name(self.samples['all_samples'][path], path, negative=True):
                 return path
         return None
 
@@ -249,8 +354,9 @@ class ProfileUpdater:
         """Identifies the gates a single-stain control's profile is computed
         from, as applied to each sample they gate (per-sample overrides
         included): the positive and internal negative gates on the control
-        sample and the "Neg Unstained" gate on its unstained negative. None
-        for other control types."""
+        sample and the "Neg Unstained" gate on its unstained negative, with
+        the size and modification time of both files, so a file replaced
+        under the same name changes it. None for other control types."""
         if (control.get('control_type') != 'Single Stained Spectral Control'
                 or not control.get('sample_name') or not control.get('gate_label')):
             return None
@@ -272,6 +378,8 @@ class ProfileUpdater:
             neg_path = self._unstained_sample_path()
         if neg_path is not None and strategy.find_matching_gate_paths('Neg Unstained'):
             parts.append(gating.chain_signature(neg_path, ['Neg Unstained']))
+        parts.append(json.dumps(file_records(
+            self.experiment_dir, [sample_path] + ([neg_path] if neg_path is not None else []))))
         parts.append(str(self.controller.experiment.process.get('negative_type')))
         parts.append(str(control.get('use_cleaned')))
         return '|'.join(parts)
@@ -377,7 +485,7 @@ class ProfileUpdater:
         # Fallback to global unstained if no per-control assignment
         if not tube_name:
             if self.controller.experiment.process.get('negative_type') == 'unstained':
-                tube_name = _find_default_unstained_tube(self.samples) or ''
+                tube_name = default_cell_unstained(self.samples, self.controller.experiment.process) or ''
             if not tube_name:
                 return None
 
@@ -438,7 +546,8 @@ class ProfileUpdater:
                         # use cleaned event pool when available and opted in
                         cleaned_store = self.controller.cleaned_events
                         cleaned = cleaned_store.get(control['label']) if control.get('use_cleaned') is not False else None
-                        if cleaned is not None and cleaned.get('spectrum') and cleaned_result_matches(control, cleaned):
+                        if (cleaned is not None and cleaned.get('spectrum')
+                                and cleaned_result_matches(control, cleaned, self.experiment_dir)):
                             profile = np.array(cleaned['spectrum'], dtype=float)
                             if profile.max() <= 0:
                                 raise Exception(f'Cleaned spectrum for "{control["label"]}" is zero — re-run Clean Controls.')
@@ -799,9 +908,7 @@ class SpectralAutoGenerator(QObject):
             manually_unstained = set(self.samples.get('unstained_samples', []))
 
             def _is_unstained(path: str, name: str) -> bool:
-                return (path in manually_unstained
-                        or re.search(r'(unstained|negative)', path, re.IGNORECASE)
-                        or re.search(r'(unstained|negative)', name, re.IGNORECASE))
+                return path in manually_unstained or is_unstained_name(name, path, negative=True)
 
             def _is_bead(path: str, name: str) -> bool:
                 return is_bead_sample(self.samples, path, name)
@@ -821,8 +928,14 @@ class SpectralAutoGenerator(QObject):
                     all_samples_rev = {v: k for k, v in self.samples['all_samples'].items()}
                     sample_path = all_samples_rev.get(self.preferred_unstained)
                 if not sample_path:
+                    sample_path, _ = select_cell_unstained(
+                        self.controller, control_gating(self.controller), self.base_gate_label)
+                if not sample_path:
                     cell_candidates = [p for p in candidates if not _is_bead(p, self.samples['all_samples'][p])]
                     sample_path = (cell_candidates or candidates or [None])[0]
+                if sample_path:
+                    # the other places a default cell unstained is needed read it from here
+                    self.controller.experiment.process['default_cell_unstained'] = self.samples['all_samples'][sample_path]
 
             if not sample_path:
                 logger.info(f'get_unstained_negative: no unstained found for particle_type={particle_type!r}.')
@@ -926,13 +1039,11 @@ class SpectralAutoGenerator(QObject):
         nevents = self.samples['all_sample_nevents'][sample_path]
         tubename = self.samples['all_samples'][sample_path]
         if nevents > 0:
-            # Skip samples whose name or path contains "Unstained" or "Negative",
-            # or that have been manually marked as unstained by the user.
+            # Skip samples named as unstained or "Negative", or that have been
+            # manually marked as unstained by the user.
             # Users can still add them manually via the +Add Control button.
             manually_unstained = set(self.samples.get('unstained_samples', []))
-            if re.search(r'(unstained|negative)', tubename, re.IGNORECASE) or \
-               re.search(r'(unstained|negative)', sample_path, re.IGNORECASE) or \
-               sample_path in manually_unstained:
+            if is_unstained_name(tubename, sample_path, negative=True) or sample_path in manually_unstained:
                 logger.info(f'generate_spectral_control: skipping "{tubename}" (matches unstained/negative pattern or manually marked as unstained)')
                 return True
 
@@ -948,17 +1059,7 @@ class SpectralAutoGenerator(QObject):
             # bead controls: the unstained bead sample matching their scatter, if any
             bead_match = match_bead_unstained(self.samples, sample_path) if particle_type == 'Beads' else None
 
-            match = re.findall(r'^(.*?)(?=\s*[\(\[]|\s+(?:cells?|beads?)\s*$)', tubename, re.IGNORECASE)
-            raw_label = match[0].strip() if match else tubename
-
-            # Strip leading plate-position prefixes like "A1 ", "B12 " before label matching
-            raw_label = re.sub(r'^[A-H]\d{1,2}\s+', '', raw_label).strip()
-
-            canonical_fluor = match_fluorophore(raw_label, get_fluorophore_db())
-            label = canonical_fluor if canonical_fluor else raw_label
-
-            canonical_marker = match_marker(raw_label, get_marker_db())
-            antigen = canonical_marker or ''
+            label, antigen = control_label_from_tubename(tubename)
 
             # discard if label is already in spectral model
             if label in [control['label'] for control in self.spectral_model]:
@@ -1081,7 +1182,7 @@ class SpectralAutoGenerator(QObject):
 
                     default_unstained = (
                         self.preferred_unstained
-                        or _find_default_unstained_tube(self.samples)
+                        or default_cell_unstained(self.samples, self.controller.experiment.process)
                     )
                     assigned_negative = default_unstained or ''  # default; overridden for Beads below
                     # For bead controls, only use an unstained negative if available
@@ -1179,6 +1280,8 @@ class SpectralAutoGenerator(QObject):
 # ---------------------------------------------------------------------------
 
 TARGET_N  = 50   # minimum events needed for a reliable profile
+GATE_RESCUE_MIN_GAIN = 0.01   # cosine gain over the Cells gate needed to keep a narrowed scatter gate
+NO_SHIPPED_RESCUE_REFERENCE = {'ID7000'}   # shipped profiles too far from these instruments' spectra to judge a gate rescue
 MIN_EVENTS_FOR_CLEANING = 20   # below this, skip cleaning entirely — too few events for cosine/kNN selection to be meaningful
 
 class SpectralCleaner(QObject):
@@ -1224,6 +1327,16 @@ class SpectralCleaner(QObject):
         self._rng = np.random.default_rng(0)
         self._refine_seconds = 0.0
         self._low_events = LowEventLog(controller, bus, collect=True)
+        # Read by the caller after cleaningFinished. substitutions: one dict per
+        # control switched to another tube of its fluorophore (the fields to set
+        # on the control); unresolved: labels still showing no clear stain;
+        # tried: per unresolved label, the other tubes assessed and what each showed.
+        self.substitutions: list[dict] = []
+        self.unresolved: list[str] = []
+        self.tried: dict[str, list[tuple[str, str]]] = {}
+        # gate_rescues: one dict per control given a narrowed per-sample scatter
+        # gate (_rescue_by_gate), with the gate and negative for the caller to set.
+        self.gate_rescues: list[dict] = []
 
     @Slot()
     def run(self):
@@ -1243,6 +1356,10 @@ class SpectralCleaner(QObject):
         self._check_pools = {}
         self._negative_refs = {}
         self._refine_seconds = 0.0
+        self.substitutions = []
+        self.unresolved = []
+        self.tried = {}
+        self.gate_rescues = []
         t_start = time.perf_counter()
 
         model_controls = []
@@ -1290,6 +1407,10 @@ class SpectralCleaner(QObject):
             else:
                 logger.info(f'SpectralCleaner: skipping "{control["label"]}" — result already current.')
 
+        self._rescue_by_gate(eligible_external)
+        self._replace_unclear_controls(all_eligible)
+        self._check_unstained_lookalikes(eligible_external)
+
         t_cleaned = time.perf_counter()
         if self.refine:
             self._check_panel(progress_offset=len(all_eligible), progress_total=total)
@@ -1310,6 +1431,9 @@ class SpectralCleaner(QObject):
 
         # Warnings are handed to the caller, which shows them in one dialog
         # together with the profile QC warnings once recalculation is done.
+        unstained_text = unstained_warning_text(self.cleaned_events, [c['label'] for c in eligible_external])
+        if unstained_text:
+            self._collected_warnings.append(unstained_text)
         background_text = background_warning_text(self.cleaned_events, [c['label'] for c in all_eligible])
         if background_text:
             self._collected_warnings.append(background_text)
@@ -1330,13 +1454,23 @@ class SpectralCleaner(QObject):
             'fluor_ch_ids': list(self.fluor_ch_ids),
             'refine': bool(self.refine),
             'gating': self._gating_fingerprint(control),
+            'files': self._files_fingerprint(control),
             'background_check': BACKGROUND_CHECK_VERSION,
         }
 
-    def _gating_fingerprint(self, control: dict) -> str:
+    def _files_fingerprint(self, control: dict) -> list:
+        """[relative path, size, modification time] of the control's file and
+        its negative's, so a file replaced under the same name is cleaned again."""
+        all_samples_rev = {v: k for k, v in self.samples['all_samples'].items()}
+        rel_paths = [all_samples_rev.get(name or '')
+                     for name in (control.get('sample_name'), control.get('universal_negative_name'))]
+        return file_records(self.experiment_dir, [path for path in rel_paths if path is not None])
+
+    def _gating_fingerprint(self, control: dict, gating=None) -> str:
         """The gates _load_events applies, as applied to the control sample and
-        to its negative (per-sample overrides included)."""
-        gating = control_gating(self.controller)
+        to its negative (per-sample overrides included), with *gating* in place
+        of the experiment's own when given."""
+        gating = self._control_gating(control, gating)
         base_gate_label, _ = resolve_base_gate(self.raw_gating, self.controller.experiment.process.get('base_gate_priority_order', []))
         all_samples_rev = {v: k for k, v in self.samples['all_samples'].items()}
         parts = []
@@ -1358,10 +1492,21 @@ class SpectralCleaner(QObject):
         stored_fp = existing.get('_fingerprint')
         if stored_fp is None:
             return False
-        return stored_fp == self._cleaning_fingerprint(control)
+        stored = {k: v for k, v in stored_fp.items() if k != 'gate_channels'}
+        return stored == self._cleaning_fingerprint(control) and cleaned_result_matches(control, existing)
     
-    def _load_events(self, control: dict) -> dict | None:
+    def _load_events(self, control: dict, find_peak: bool = False, gating=None) -> dict | None:
         """Base-gated, saturation-excluded events of a control and its negative.
+
+        *gating* (a SampleGating) gates both tubes in place of the
+        experiment's own gating (control_gating); either way the negative of a
+        cell control is cut to the control tube's own scatter gate when the
+        tube has one (_control_gating).
+
+        The expected peak is the control's major channel, or with *find_peak*
+        the empirical peak of its events after removing the negative's mean
+        (the dimmest quarter of the control without one), as auto-generate
+        finds it.
 
         Returns None, with a collected warning, when the control cannot be
         cleaned: no negative assigned or found, or too few events. Raises on
@@ -1375,6 +1520,7 @@ class SpectralCleaner(QObject):
         rel_path = all_samples_rev.get(control['sample_name'])
         if rel_path is None:
             raise FileNotFoundError(f'Sample "{control["sample_name"]}" not found in the experiment.')
+        gating = self._control_gating(control, gating)
         full_path = str(self.experiment_dir / rel_path)
         sample = sample_from_fcs(full_path)
 
@@ -1387,7 +1533,7 @@ class SpectralCleaner(QObject):
         pos_events, pos_scatter_all = get_raw_events(
             sample, layout['fl_ids'],
             gate_label=base_gate_label,
-            gating_strategy=control_gating(self.controller),
+            gating_strategy=gating,
             extra_channel_ids=scatter_ch_ids,
             col_order=layout['col_order'],
             sample_key=rel_path,
@@ -1451,7 +1597,7 @@ class SpectralCleaner(QObject):
             neg_events, neg_scatter_all = get_raw_events(
                 neg_sample, layout['fl_ids'],
                 gate_label=base_gate_label,
-                gating_strategy=control_gating(self.controller),
+                gating_strategy=gating,
                 extra_channel_ids=scatter_ch_ids,
                 col_order=layout['col_order'],
                 sample_key=neg_rel_path,
@@ -1467,12 +1613,20 @@ class SpectralCleaner(QObject):
 
         # Expected peak from spectral model table (fallback / QC only)
         peak_ch_name = control.get('gate_channel', '')
-        try:
-            expected_peak_ch_idx = self.fluor_ch_ids.index(
-                self.event_channels_pnn.index(peak_ch_name)
-            )
-        except (ValueError, IndexError):
-            expected_peak_ch_idx = int(np.argmax(pos_events.mean(axis=0)))
+        if find_peak and len(pos_events) > 1:
+            if not use_internal and len(neg_events) > 1:
+                af_mean = neg_events.mean(axis=0)
+            else:
+                order = np.argsort(pos_events.max(axis=1))
+                af_mean = pos_events[order[:max(2, len(pos_events) // 4)]].mean(axis=0)
+            expected_peak_ch_idx = int(find_empirical_peak(pos_events, af_mean))
+        else:
+            try:
+                expected_peak_ch_idx = self.fluor_ch_ids.index(
+                    self.event_channels_pnn.index(peak_ch_name)
+                )
+            except (ValueError, IndexError):
+                expected_peak_ch_idx = int(np.argmax(pos_events.mean(axis=0)))
 
         # --- Saturation exclusion ---
         pos_events, n_sat_pos, sat_mask_pos = exclude_saturated(pos_events, self.ceiling)
@@ -1502,10 +1656,10 @@ class SpectralCleaner(QObject):
             'expected_peak_ch_idx': expected_peak_ch_idx,
         }
 
-    def _clean_one(self, control: dict):
+    def _clean_one(self, control: dict, find_peak: bool = False, gating=None):
         label = control['label']
         try:
-            loaded = self._load_events(control)
+            loaded = self._load_events(control, find_peak=find_peak, gating=gating)
             if loaded is None:
                 return  # leave cleaned_events untouched; profiles[label] is the fallback
             pos_events           = loaded['pos_events']
@@ -1610,6 +1764,17 @@ class SpectralCleaner(QObject):
                 bg_check['negative_name'] = loaded['negative_name']
                 logger.info(f'SpectralCleaner: "{label}" background check {bg_check}')
 
+            unstained_check = None
+            if not use_internal and control.get('particle_type') == 'Cells':
+                z = excess_z(pos_events, neg_events)
+                j = int(np.argmax(z))
+                unstained_check = {
+                    'negative_name': loaded['negative_name'],
+                    'z_template': float(z[j]),
+                    'channel_template': self.event_channels_pnn[self.fluor_ch_ids[j]],
+                    'z_search': None, 'channel_search': None, 'verdict': None,
+                }
+
             result = CleanResult(
                 spectral_sub          = spectral_sub,
                 scatter_pos           = pos_scatter_sel,
@@ -1623,6 +1788,13 @@ class SpectralCleaner(QObject):
             )
 
             # --- store result ---
+            # Major channels this result stands for: the control's, the one the
+            # events were picked on, and the peak of the cleaned spectrum.
+            gate_channels = [
+                control.get('gate_channel') or None,
+                self.event_channels_pnn[self.fluor_ch_ids[peak_ch_idx]],
+                self.event_channels_pnn[self.fluor_ch_ids[int(np.argmax(spectrum))]],
+            ]
             self.cleaned_events[label] = {
                 'spectrum':              spectrum.tolist(),
                 'spectrum_initial':      spectrum_initial.tolist(),
@@ -1635,7 +1807,9 @@ class SpectralCleaner(QObject):
                 'cytometer_key':         self._cytometer_key,
                 'warnings':              result.warnings,
                 'background_check':      bg_check,
-                '_fingerprint':          self._cleaning_fingerprint(control),
+                'unstained_check':       unstained_check,
+                '_fingerprint':          dict(self._cleaning_fingerprint(control), gate_channels=gate_channels,
+                                              gating=self._gating_fingerprint(control, gating)),
                 'spectral_sub':          result.spectral_sub,
                 'scatter_pos':           result.scatter_pos,
                 'scatter_neg_matched':   result.scatter_neg_matched,
@@ -1656,6 +1830,379 @@ class SpectralCleaner(QObject):
             else:
                 logger.error(f'SpectralCleaner: {msg}', exc_info=True)
             self._collected_warnings.append(msg)
+
+    def _check_unstained_lookalikes(self, controls: list[dict]):
+        """Mark the cell controls that look like unstained samples (see stain_detection).
+
+        The largest excess z over detectors with the experiment's gates is
+        stored with each cleaned result. A control at UNSTAINED_Z_MAX or above
+        is stained. Below it, the excess is measured again over rectangles of
+        the FSC/SSC plot, with the control and its unstained gated to the whole
+        plot (_whole_plot_gating); a largest rectangle z still below
+        UNSTAINED_Z_MAX sets the unstained_check verdict to 'unstained'. A
+        search already made for the same cleaned result is kept.
+        """
+        for control in controls:
+            label = control['label']
+            entry = self.cleaned_events.get(label)
+            if not entry or control.get('particle_type') != 'Cells':
+                continue
+            check = entry.get('unstained_check')
+            if check is None:
+                loaded = self._load_events(control)
+                if loaded is None or loaded['use_internal']:
+                    continue
+                z = excess_z(loaded['pos_events'], loaded['neg_events'])
+                j = int(np.argmax(z))
+                check = {
+                    'negative_name': loaded['negative_name'],
+                    'z_template': float(z[j]),
+                    'channel_template': self.event_channels_pnn[self.fluor_ch_ids[j]],
+                    'z_search': None, 'channel_search': None, 'verdict': None,
+                }
+                entry['unstained_check'] = check
+            if check['z_template'] >= UNSTAINED_Z_MAX or check['z_search'] is not None:
+                continue
+            gating = self._whole_plot_gating(control)
+            loaded = self._load_events(control, gating=gating) if gating is not None else None
+            if loaded is None or loaded['use_internal'] or loaded['pos_scatter'].shape[1] != 2:
+                continue
+            best = largest_rectangle_z(loaded['pos_scatter'], loaded['pos_events'],
+                                       loaded['neg_scatter'], loaded['neg_events'])
+            if best is None:
+                continue
+            z, j = best
+            check.update(z_search=float(z), channel_search=self.event_channels_pnn[self.fluor_ch_ids[j]],
+                         verdict='unstained' if z < UNSTAINED_Z_MAX else None)
+            logger.info(f'SpectralCleaner: "{label}" stain check {check}')
+
+    def _scatter_gate(self) -> tuple[str | None, list[str]]:
+        """The name of the scatter gate above the base gate (the gate drawn on
+        the FSC/SSC pair of scatter_param, e.g. Cells), None when there is
+        none, and that pair."""
+        pair = list(self.controller.experiment.settings['raw'].get('scatter_param', ['FSC-A', 'SSC-A'])[:2])
+        transforms = getattr(self.controller, 'raw_transformations', None) or {}
+        if self.raw_gating is None or any(ch not in transforms for ch in pair):
+            return None, pair
+        _, base_path = resolve_base_gate(self.raw_gating,
+                                         self.controller.experiment.process.get('base_gate_priority_order', []))
+        for i in range(1, len(base_path)):
+            gate = self.raw_gating.get_gate(base_path[i], gate_path=tuple(base_path[:i]))
+            if sorted(gate_channels(gate)) == sorted(pair):
+                return base_path[i], pair
+        return None, pair
+
+    @staticmethod
+    def _scatter_rectangle(name: str, pair: list[str], box: tuple) -> gates.RectangleGate:
+        """A rectangle gate *name* on the scatter *pair*, box = (x0, x1, y0, y1) in displayed units."""
+        x0, x1, y0, y1 = (float(v) for v in box)
+        return gates.RectangleGate(name, dimensions=[
+            Dimension(pair[0], range_min=x0, range_max=x1, transformation_ref=pair[0]),
+            Dimension(pair[1], range_min=y0, range_max=y1, transformation_ref=pair[1]),
+        ])
+
+    def _control_gating(self, control: dict, gating=None):
+        """*gating* (default: the experiment's, control_gating) with the
+        negative of a cell control cut to the control tube's own per-sample
+        scatter gate when the tube has one, so the negative covers the same
+        cells (the background check compares like with like). The experiment's
+        gates are not changed."""
+        gating = gating if gating is not None else control_gating(self.controller)
+        if control.get('particle_type') != 'Cells':
+            return gating
+        name, _ = self._scatter_gate()
+        rev = {v: k for k, v in self.samples['all_samples'].items()}
+        tube = rev.get(control.get('sample_name'))
+        negative = rev.get(control.get('universal_negative_name') or '')
+        own = gating.overrides.get(str(tube), {}) if tube is not None else {}
+        if name is None or negative is None or name not in own:
+            return gating
+        gating.overrides[str(negative)] = dict(gating.overrides.get(str(negative), {}), **{name: own[name]})
+        return gating
+
+    def _rescue_reference(self, label: str) -> np.ndarray | None:
+        """The reference spectrum a control is judged against for a gate
+        rescue, over the fluorescence channels: the user's own stored profile
+        for this channel configuration, else the one shipped with Honeychrome,
+        except on instruments whose shipped profiles are poor references
+        (NO_SHIPPED_RESCUE_REFERENCE). None when there is no reference."""
+        channels = [self.event_channels_pnn[i] for i in self.fluor_ch_ids]
+        try:
+            library = SpectralReferenceLibrary()
+            matches = library.find_matches(label, compute_config_key(self._cytometer_key or '', channels))
+        except Exception as e:
+            logger.warning(f'SpectralCleaner: reference library lookup for "{label}" failed: {e}')
+            return None
+        chosen = next((p for p in matches if p.origin == 'user'), None)
+        if chosen is None and self._cytometer_key not in NO_SHIPPED_RESCUE_REFERENCE:
+            chosen = next((p for p in matches if p.origin == 'honeychrome'), None)
+        if chosen is None:
+            return None
+        reference = np.array([float(chosen.profile.get(ch, 0.0)) for ch in channels])
+        return reference if reference.max() > 0 else None
+
+    def _rescue_by_gate(self, controls: list[dict]):
+        """Narrow the scatter gate of cell controls whose spectrum misses its reference.
+
+        In plain terms: a broad Cells gate can let in cells whose own
+        autofluorescence is brighter, in the dye's detectors, than a dim stain
+        on a minority of other cells (high-SSC myeloid cells against a stain on
+        some lymphocytes, for example). The cleaner, which picks the brightest
+        cells, then returns autofluorescence. Narrowing the Cells gate of that
+        control tube to where the stain stands out recovers the dye.
+
+        Each cell control with an unstained negative whose cleaned spectrum is
+        below the cosine QC threshold against its reference (_rescue_reference)
+        is tried, unless its tube already has a per-sample scatter gate. For
+        each unstained cell sample in the experiment, the FSC/SSC rectangle
+        with the largest excess z in the reference's peak detector, the
+        unstained cut to the same rectangle (stain_detection.rectangle_scores),
+        is set as the tube's scatter gate and the control is cleaned again,
+        with that negative cut to the same rectangle (_control_gating). The
+        trial closest to the reference replaces the control's cleaned result
+        when it raises the cosine by more than GATE_RESCUE_MIN_GAIN; the gate,
+        negative and cosines are added to self.gate_rescues for the caller to
+        set on the control and the experiment's gates.
+        """
+        name, pair = self._scatter_gate()
+        if name is None:
+            return
+        names = self.samples['all_samples']
+        rev = {v: k for k, v in names.items()}
+        negatives = [names[p] for p in self.samples.get('unstained_samples', [])
+                     if p in names and not is_bead_sample(self.samples, p, names[p])]
+        threshold = cosine_qc_warning_threshold(self._cytometer_key)
+        transforms = self.raw_gating.transformations
+        existing = control_gating(self.controller).overrides
+
+        def to_display(scatter):
+            return np.column_stack([transforms[pair[0]].apply(scatter[:, 0]),
+                                    transforms[pair[1]].apply(scatter[:, 1])])
+
+        def cosine(a, b):
+            a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+            return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+
+        for control in controls:
+            label = control['label']
+            entry = self.cleaned_events.get(label)
+            tube = rev.get(control.get('sample_name'))
+            if (not entry or tube is None or control.get('particle_type') != 'Cells'
+                    or name in existing.get(str(tube), {})):
+                continue
+            reference = self._rescue_reference(label)
+            if reference is None:
+                continue
+            before = cosine(entry['spectrum'], reference)
+            if before >= threshold:
+                continue
+            peak = int(np.argmax(reference))
+            best = None
+            for negative in negatives:
+                trial = dict(control, universal_negative_name=negative)
+                loaded = self._load_events(trial, gating=self._whole_plot_gating(trial))
+                if loaded is None or loaded['use_internal'] or loaded['pos_scatter'].shape[1] != 2:
+                    continue
+                rows = rectangle_scores(to_display(loaded['pos_scatter']), loaded['pos_events'][:, peak],
+                                        to_display(loaded['neg_scatter']), loaded['neg_events'][:, peak])
+                if not rows:
+                    continue
+                top = max(rows, key=lambda r: r['z'])
+                box = (top['x0'], top['x1'], top['y0'], top['y1'])
+                gate = self._scatter_rectangle(name, pair, box)
+                gating = control_gating(self.controller)
+                gating.overrides[str(tube)] = dict(gating.overrides.get(str(tube), {}), **{name: gate})
+                result = self._clean_trial(trial, find_peak=False, gating=gating)
+                if result is None:
+                    continue
+                after = cosine(result['entry']['spectrum'], reference)
+                logger.info(f'SpectralCleaner: "{label}" scatter gate {box} with "{negative}": '
+                            f'excess z {top["z"]:.0f}, cosine {before:.3f} -> {after:.3f}')
+                if best is None or after > best['cosine']:
+                    best = dict(result, cosine=after, gate=gate, negative=negative, z=top['z'],
+                                n_events=top['n_control'])
+            if best is None or best['cosine'] - before <= GATE_RESCUE_MIN_GAIN:
+                continue
+            self.cleaned_events[label] = best['entry']
+            if best['pool'] is not None:
+                self._check_pools[label] = best['pool']
+            self._collected_warnings.extend(best['warnings'])
+            for low in best['low_events']:
+                if low not in self._low_events.entries:
+                    self._low_events.entries.append(low)
+            self.gate_rescues.append({
+                'label': label, 'sample_key': str(tube), 'gate_name': name, 'gate': best['gate'],
+                'universal_negative_name': best['negative'], 'cosine_before': before,
+                'cosine_after': best['cosine'], 'z': best['z'], 'n_events': best['n_events'],
+            })
+
+    def _whole_plot_gating(self, control: dict):
+        """The experiment's gating with the control's tube and its unstained
+        given, in place of the scatter gate above the base gate (_scatter_gate),
+        a rectangle covering the whole plot. None when there is no such gate."""
+        name, pair = self._scatter_gate()
+        if name is None:
+            return None
+        limits = [self.controller.raw_transformations[ch].limits for ch in pair]
+        whole = self._scatter_rectangle(name, pair, (limits[0][0], limits[0][1], limits[1][0], limits[1][1]))
+        gating = control_gating(self.controller)
+        rev = {v: k for k, v in self.samples['all_samples'].items()}
+        for sample_name in (control.get('sample_name'), control.get('universal_negative_name')):
+            key = rev.get(sample_name)
+            if key is not None:
+                gating.overrides[str(key)] = dict(gating.overrides.get(str(key), {}), **{name: whole})
+        return gating
+
+    def _replace_unclear_controls(self, controls: list[dict]):
+        """Rescue each control whose cleaned result shows no clear stain.
+
+        A wrong major channel makes a good control look unstained: the
+        cleaner then picks the brightest events on a channel the dye barely
+        reaches, which are mostly the most autofluorescent cells. So the
+        control's own tube is cleaned again first with its major channel found
+        on its own events, unless the major channel was set by hand
+        (gate_channel_locked). If that finds another channel and a clear
+        stain, the control keeps its tube on the new channel.
+
+        Otherwise the clearest other single-stain tube of the same fluorophore
+        and particle type in the experiment is used, when one shows a clear
+        stain. Each candidate tube is cleaned as the control would be (its
+        major channel found on its own events, its negative the bead unstained
+        matching it for bead controls, else the control's). A candidate shows
+        a clear stain when its spectrum passes the reference cosine QC or its
+        background check finds no problem; among those, ones passing the
+        cosine QC come first, then the highest signal over the unstained.
+
+        The chosen cleaned result replaces the control's and the fields to set
+        on the control are added to self.substitutions. Controls left without
+        one are listed in self.unresolved for the caller's library fallback,
+        with the other tubes assessed for them and the outcome of each in
+        self.tried.
+        Controls whose tube was chosen by hand (sample_locked) are left as
+        they are.
+        """
+        used = {c.get('sample_name') for c in self.spectral_model if c.get('sample_name')}
+        all_samples_rev = {v: k for k, v in self.samples['all_samples'].items()}
+        swapped = []
+        redetected = []
+        for control in controls:
+            label = control['label']
+            original = self.cleaned_events.get(label)
+            if (control.get('sample_locked') or not original
+                    or not (original.get('background_check') or {}).get('verdict')):
+                continue
+            best = None
+            tried = []
+            own_path = None if control.get('gate_channel_locked') else all_samples_rev.get(control['sample_name'])
+            own = self._clean_alternate(control, own_path) if own_path else None
+            if (own is not None
+                    and own['entry']['expected_peak_ch_idx'] != original.get('expected_peak_ch_idx')
+                    and not (own['entry'].get('background_check') or {}).get('verdict')):
+                best = own
+            else:
+                for path in alternate_control_paths(self.samples, control, used):
+                    trial = self._clean_alternate(control, path)
+                    if trial is None:
+                        tried.append((self.samples['all_samples'][path], 'could not be cleaned'))
+                        continue
+                    check = trial['entry'].get('background_check')
+                    if check and check.get('verdict'):
+                        tried.append((self.samples['all_samples'][path], 'no clear stain'))
+                        continue
+                    rank = (check is not None, -((check or {}).get('ratio') or 0.0))
+                    if best is None or rank < best['rank']:
+                        best = dict(trial, rank=rank)
+            if best is None:
+                self.unresolved.append(label)
+                self.tried[label] = tried
+                continue
+            self.cleaned_events[label] = best['entry']
+            if best['pool'] is not None:
+                self._check_pools[label] = best['pool']
+            self._collected_warnings.extend(best['warnings'])
+            for entry in best['low_events']:
+                if entry not in self._low_events.entries:
+                    self._low_events.entries.append(entry)
+            new = best['control']
+            used.add(new['sample_name'])
+            new_channel = self.event_channels_pnn[self.fluor_ch_ids[best['entry']['expected_peak_ch_idx']]]
+            self.substitutions.append({
+                'label': label,
+                'sample_name': new['sample_name'],
+                'sample_path': new['sample_path'],
+                'particle_type': new['particle_type'],
+                'universal_negative_name': new['universal_negative_name'],
+                'gate_channel': new_channel,
+            })
+            if best is own:
+                redetected.append((label, control.get('gate_channel') or '', new_channel))
+                logger.info(f'SpectralCleaner: "{label}" shows no clear stain on '
+                            f'"{control.get("gate_channel")}"; using its major channel "{new_channel}" instead.')
+                continue
+            swapped.append((label, control['sample_name'], new['sample_name']))
+            logger.info(f'SpectralCleaner: "{label}" — "{control["sample_name"]}" shows no clear stain; '
+                        f'using "{new["sample_name"]}" instead.')
+        if redetected:
+            self._collected_warnings.append(
+                'These controls showed no clear stain on their major channel, so the major channel '
+                'was found again on their own events and used instead:\n'
+                + '\n'.join(f'  \u2022 {label}: {old} \u2192 {new}' for label, old, new in redetected))
+        if swapped:
+            self._collected_warnings.append(
+                'These controls showed no clear stain, so another single-stain control for the same '
+                'fluorophore in this experiment is used instead:\n'
+                + '\n'.join(f'  \u2022 {label}: "{old}" \u2192 "{new}"' for label, old, new in swapped))
+
+    def _clean_alternate(self, control: dict, path: str) -> dict | None:
+        """Clean tube *path* in place of the control's own, leaving the
+        control's cleaned result, check pool and collected warnings as they
+        were. Returns the trial control, its cleaned entry and check pool, and
+        the warnings and low-event entries it raised; None when it could not
+        be cleaned or has no unstained negative to check it against."""
+        label = control['label']
+        trial = dict(control, sample_name=self.samples['all_samples'][path],
+                     sample_path=str(self.experiment_dir / path), gate_channel='')
+        if control.get('particle_type') == 'Beads':
+            match = match_bead_unstained(self.samples, path)
+            trial['universal_negative_name'] = (self.samples['all_samples'][match] if match
+                                                else INTERNAL_NEGATIVE_SENTINEL)
+        if trial.get('universal_negative_name') in (None, '', INTERNAL_NEGATIVE_SENTINEL):
+            return None
+        return self._clean_trial(trial, find_peak=True)
+
+    def _clean_trial(self, trial: dict, find_peak: bool, gating=None) -> dict | None:
+        """Clean *trial* (a variant of a control, under the same label) with
+        *gating* when given, leaving the control's cleaned result, check pool
+        and collected warnings as they were. Returns the trial control, its
+        cleaned entry and check pool, and the warnings and low-event entries
+        it raised; None when it could not be cleaned."""
+        label = trial['label']
+        original = self.cleaned_events.get(label)
+        original_pool = self._check_pools.get(label)
+        n_warnings = len(self._collected_warnings)
+        low_events = self._low_events
+        self._low_events = LowEventLog(self.controller, None, collect=True)
+        try:
+            self._clean_one(trial, find_peak=find_peak, gating=gating)
+            entry = self.cleaned_events.get(label)
+            result = None
+            if entry is not None and entry is not original:
+                result = {
+                    'control': trial,
+                    'entry': entry,
+                    'pool': self._check_pools.get(label) if self._check_pools.get(label) is not original_pool else None,
+                    'warnings': self._collected_warnings[n_warnings:],
+                    'low_events': list(self._low_events.entries),
+                }
+        finally:
+            self.cleaned_events[label] = original
+            if original_pool is None:
+                self._check_pools.pop(label, None)
+            else:
+                self._check_pools[label] = original_pool
+            del self._collected_warnings[n_warnings:]
+            self._low_events = low_events
+        return result
 
     def _make_check_pool(self, loaded: dict, row: np.ndarray, control: dict):
         """Events kept from a loaded control for the full-panel check. Cell

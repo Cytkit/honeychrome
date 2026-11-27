@@ -2,7 +2,7 @@ import functools
 import math
 import re
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QTableWidgetItem
 
@@ -111,6 +111,124 @@ class CopyableTableWidget(QtWidgets.QTableWidget):
 
         QtWidgets.QApplication.clipboard().setText("\n".join(output))
 
+
+
+def _value_sort_key(value) -> tuple:
+    """The sort key SortableTableItem gives a cell holding *value*."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (_EMPTY, 0.0) if math.isnan(value) else (_NUMBER, float(value))
+    return _text_sort_key('' if value is None else str(value))
+
+
+def _is_hex_colour(value) -> bool:
+    return isinstance(value, str) and value.startswith("#") and len(value) == 7
+
+
+class _RowsTableModel(QAbstractTableModel):
+    """Rows of values (one list per row) behind CopyableTableView. Sorting
+    reorders a permutation of the rows using keys computed once per column,
+    so it stays fast with hundreds of thousands of rows."""
+
+    def __init__(self, rows: list, headers: list, parent=None):
+        super().__init__(parent)
+        self._headers = list(headers)
+        self._rows = rows
+        self._order = list(range(len(rows)))
+        self._keys: dict[int, list] = {}
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._order)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._headers)
+
+    def value(self, row: int, col: int):
+        """The value shown at view row *row*, column *col*."""
+        return self._rows[self._order[row]][col]
+
+    def text(self, row: int, col: int) -> str:
+        value = self.value(row, col)
+        return '' if value is None else str(value)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        value = self.value(index.row(), index.column())
+        if role in (Qt.DisplayRole, Qt.EditRole):
+            return value
+        if role == Qt.BackgroundRole and _is_hex_colour(value):
+            return QColor(value)
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self._headers[section]
+        return None
+
+    def sort(self, column: int, order=Qt.AscendingOrder):
+        if column < 0 or column >= len(self._headers):
+            return
+        keys = self._keys.get(column)
+        if keys is None:
+            keys = [_value_sort_key(r[column]) for r in self._rows]
+            self._keys[column] = keys
+        self.layoutAboutToBeChanged.emit()
+        self._order.sort(key=keys.__getitem__, reverse=order == Qt.DescendingOrder)
+        self.layoutChanged.emit()
+
+
+class CopyableTableView(QtWidgets.QTableView):
+    """
+    CopyableTableWidget for large tables: the same constructor, sorting
+    (numbers as numbers, then text, then empty cells) and Ctrl+C copying
+    of the selected rows as TSV, but backed by a model, so tens of
+    thousands of rows are built and sorted without delay. Column widths
+    are fitted to the header and the first rows only.
+    """
+
+    WIDTH_SAMPLE_ROWS = 200
+
+    def __init__(self, list_of_dicts, headers):
+        super().__init__()
+        rows = [[row.get(h, "") for h in headers] for row in list_of_dicts]
+        self._model = _RowsTableModel(rows, headers, self)
+        self.setModel(self._model)
+        self.verticalHeader().setVisible(False)
+        self.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Fixed)
+        self.verticalHeader().setDefaultSectionSize(self.fontMetrics().height() + 8)
+        self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.setWordWrap(False)
+        # Rows keep the order given until a header is clicked.
+        self.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
+        self.setSortingEnabled(True)
+        self._fit_columns(headers, rows)
+        self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+        self.horizontalHeader().setStretchLastSection(True)
+
+    def _fit_columns(self, headers: list, rows: list):
+        fm = self.fontMetrics()
+        sample = rows[:self.WIDTH_SAMPLE_ROWS]
+        for j, head in enumerate(headers):
+            texts = [str(r[j]) for r in sample if r[j] is not None]
+            width = max([fm.horizontalAdvance(t) for t in texts] + [fm.horizontalAdvance(head) + 24])
+            self.setColumnWidth(j, min(width + 16, 600))
+
+    def keyPressEvent(self, event):
+        """Handles Ctrl+C to copy selected rows as TSV"""
+        if event.matches(QtGui.QKeySequence.Copy):
+            self.copy_to_clipboard()
+        else:
+            super().keyPressEvent(event)
+
+    def copy_to_clipboard(self):
+        rows = sorted({i.row() for i in self.selectionModel().selectedRows()})
+        if not rows:
+            return
+        n_cols = self._model.columnCount()
+        output = ["\t".join(self._model.text(r, c) for c in range(n_cols)) for r in rows]
+        QtWidgets.QApplication.clipboard().setText("\n".join(output))
 
 def show_frame_dialog(parent, title: str, frame, default_path: str = '', digits: int = 3):
     """

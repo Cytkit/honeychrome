@@ -125,6 +125,7 @@ from ag_widgets import (  # noqa: E402
     text_matches,
 )
 from honeychrome.view_components.side_tab_widget import SideTabWidget  # noqa: E402
+from honeychrome.view_components.focus_mode import mark_focus_chrome  # noqa: E402
 
 log = ag_core.get_logger(__name__)
 
@@ -147,6 +148,7 @@ ZoomAxis = None
 NoPanViewBox = None
 TransparentGraphicsLayoutWidget = None
 CopyableTableWidget = None
+CopyableTableView = None
 HelpToggleWidget = None
 ScalableFigureWidget = None
 
@@ -156,7 +158,8 @@ _qt_imports_done = False
 def _ensure_qt_imports():
     """Import pyqtgraph and Honeychrome view components (main thread only)."""
     global pg, ZoomAxis, NoPanViewBox, TransparentGraphicsLayoutWidget
-    global CopyableTableWidget, HelpToggleWidget, ScalableFigureWidget, _qt_imports_done
+    global CopyableTableWidget, CopyableTableView, HelpToggleWidget, ScalableFigureWidget
+    global _qt_imports_done
     if _qt_imports_done:
         return
     import pyqtgraph as _pg
@@ -169,9 +172,10 @@ def _ensure_qt_imports():
     NoPanViewBox = _NPV
     TransparentGraphicsLayoutWidget = _TGLW
     from honeychrome.view_components.copyable_table_widget import (
-        CopyableTableWidget as _CTW,
+        CopyableTableWidget as _CTW, CopyableTableView as _CTV,
     )
     CopyableTableWidget = _CTW
+    CopyableTableView = _CTV
     from honeychrome.view_components.help_toggle_widget import (
         HelpToggleWidget as _HTW,
     )
@@ -2236,19 +2240,25 @@ def _is_dark_palette() -> bool:
 
 def write_results_csv(folder: Path, stem: str, timestamp: str, summaries: dict,
                       samples: list[str], groups: dict, labels: dict,
-                      antigens: dict) -> list[Path]:
-    """Write the gated samples' population counts and marker medians as
-    ``<stem>_<timestamp>_populations.csv`` and ``…_marker_medians.csv``;
-    returns the paths. Worker-safe (plain data only)."""
+                      antigens: dict, include_markers: bool = True) -> list[Path]:
+    """Write the gated samples' population counts as
+    ``<stem>_<timestamp>_populations.csv`` and, with *include_markers*, their
+    marker medians as ``…_marker_medians.csv`` (one row per sample,
+    population and marker, so it can run to millions of rows); returns the
+    paths. Worker-safe (plain data only)."""
     folder.mkdir(parents=True, exist_ok=True)
     pops = ag_results.population_export(summaries, samples, groups)
     if not pops.empty:
         pops.insert(2, 'population_label', [labels.get(k, k) for k in pops['key']])
-    markers = ag_results.marker_export(summaries, samples, antigens, groups)
-    if not markers.empty:
-        markers.insert(3, 'population_label', [labels.get(k, k) for k in markers['population']])
+    frames = [(pops, 'populations')]
+    if include_markers:
+        markers = ag_results.marker_export(summaries, samples, antigens, groups)
+        if not markers.empty:
+            markers.insert(3, 'population_label',
+                           [labels.get(k, k) for k in markers['population']])
+        frames.append((markers, 'marker_medians'))
     out = []
-    for frame, suffix in ((pops, 'populations'), (markers, 'marker_medians')):
+    for frame, suffix in frames:
         path = folder / f"{stem}_{timestamp}_{suffix}.csv"
         frame.to_csv(path, index=False)
         out.append(path)
@@ -2293,6 +2303,9 @@ class ResultsTab(QWidget):
     trend_finished = Signal()
     report_populations_changed = Signal()
     sample_analysis_changed = Signal()
+    # The Groups page's groups, sample assignments or covariates may have
+    # changed (emitted after every edit and every refill of its tables).
+    groups_changed = Signal()
 
     def __init__(self, state: GatingRunState, bus, controller, result_transforms=None,
                  parent=None):
@@ -2314,6 +2327,9 @@ class ResultsTab(QWidget):
         self._pop_cache_lock = threading.Lock()
         self._popout_workers: list = []
         self._filling = False
+        # Variance tables of the last statistics run: (the anova frames they
+        # show, [(table, tab title)]), kept across comparison changes.
+        self._variance_tabs: tuple = ((), [])
         self._volcano_tables: dict = {}
         self._row_figures: dict = {}
         self._figures_for = None
@@ -2330,12 +2346,15 @@ class ResultsTab(QWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
         outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_RESULTS, scrolling=True))
-        cmp_row = QHBoxLayout()
+        cmp_widget = QWidget()
+        cmp_row = QHBoxLayout(cmp_widget)
+        cmp_row.setContentsMargins(0, 0, 0, 0)
         cmp_row.addWidget(QLabel("<b>Comparison:</b>"))
         self.cb_comparison = QComboBox()
         self.cb_comparison.currentIndexChanged.connect(self._on_comparison_changed)
         cmp_row.addWidget(self.cb_comparison, stretch=1)
-        outer.addLayout(cmp_row)
+        outer.addWidget(cmp_widget)
+        mark_focus_chrome(cmp_widget)
         # One section open at a time; each page scrolls on its own.
         self.toolbox = make_concertina()
         outer.addWidget(self.toolbox, stretch=1)
@@ -2530,6 +2549,7 @@ class ResultsTab(QWidget):
                 {j: cov in st.numeric_covariates for j, cov in enumerate(covs, start=3)})
         finally:
             self._filling = False
+        self.groups_changed.emit()
 
     def _on_covariate_numeric_toggled(self, section: int, checked: bool):
         """Enter the covariate under *section* as a continuous number (or as
@@ -2550,11 +2570,14 @@ class ResultsTab(QWidget):
         st.numeric_covariates = [c for c in st.numeric_covariates if c != name]
         if checked:
             st.numeric_covariates.append(name)
+        self.groups_changed.emit()
+
     def _set_sample_group(self, key: str, group: str):
         if group:
             self.state.sample_groups[key] = group
         else:
             self.state.sample_groups.pop(key, None)
+        self.groups_changed.emit()
 
     def _on_group_item_changed(self, item: QTableWidgetItem):
         if self._filling:
@@ -2860,6 +2883,7 @@ class ResultsTab(QWidget):
         cov = self.samples_table.horizontalHeaderItem(item.column()).text()
         key = self.samples_table.item(item.row(), 0).data(Qt.UserRole)
         self.state.covariates.setdefault(cov, {})[key] = item.text().strip()
+        self.groups_changed.emit()
 
     # ------------------------------------------------------------------
     # Statistics
@@ -3737,9 +3761,7 @@ class ResultsTab(QWidget):
             headers = ['Population'] + (['Marker'] if key == 'markers' else []) + [
                 slope_head, 'Partial R²', 'Curve FDR', 'Slope FDR', 'Called by', 'Direction',
                 'Pattern', 'Significant']
-            table = CopyableTableWidget(rows, headers)
-            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-            self.results_tabs.addTab(table, title)
+            self.results_tabs.addTab(CopyableTableView(rows, headers), title)
 
     def _show_results_tables(self):
         self.results_tabs.clear()
@@ -3764,32 +3786,51 @@ class ResultsTab(QWidget):
             if view is None:
                 continue
             view = view.sort_values('P.Value', kind='stable')
-            rows = []
-            for _i, r in view.iterrows():
-                pop_key = r['cluster_id'] if key == 'markers' else r['feature']
-                row = {'Population': labels.get(pop_key, pop_key),
-                       'Effect': _fmt(r['logFC']),
-                       'P': _fmt(r['P.Value']),
-                       'FDR': _fmt(r.get(fdr_col)),
-                       'Significant': 'yes' if r['significant'] else ''}
-                if key == 'counts' and (label, r['feature']) in counts_only:
-                    row['Significant'] = 'yes ⚠ not a frequency hit'
-                if key == 'markers':
-                    row['Marker'] = antigens.get(r['channel'], r['channel'])
-                    row['Stage-wise FDR'] = _fmt(r.get('stagewise.adj.P.Val'))
-                rows.append(row)
-            headers = (['Population', 'Marker', 'Effect', 'P', 'FDR', 'Stage-wise FDR', 'Significant']
-                       if key == 'markers' else ['Population', 'Effect', 'P', 'FDR', 'Significant'])
-            table = CopyableTableWidget(rows, headers)
-            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-            self.results_tabs.addTab(table, title)
+            n = len(view)
+
+            def _formatted(column):
+                if column not in view.columns:
+                    return [''] * n
+                return [_fmt(v) for v in view[column].tolist()]
+
+            features = view['feature'].tolist()
+            pop_keys = view['cluster_id'].tolist() if key == 'markers' else features
+            significant = []
+            for feature, sig in zip(features, view['significant'].tolist()):
+                if not sig:
+                    significant.append('')
+                elif key == 'counts' and (label, feature) in counts_only:
+                    significant.append('yes ⚠ not a frequency hit')
+                else:
+                    significant.append('yes')
+            columns = {'Population': [labels.get(k, k) for k in pop_keys]}
+            if key == 'markers':
+                columns['Marker'] = [antigens.get(ch, ch) for ch in view['channel'].tolist()]
+            columns.update({'Effect': _formatted('logFC'), 'P': _formatted('P.Value'),
+                            'FDR': _formatted(fdr_col)})
+            if key == 'markers':
+                columns['Stage-wise FDR'] = _formatted('stagewise.adj.P.Val')
+            columns['Significant'] = significant
+            headers = list(columns)
+            rows = [dict(zip(headers, values)) for values in zip(*columns.values())]
+            self.results_tabs.addTab(CopyableTableView(rows, headers), title)
         self._show_variance_tables(stats, labels, antigens)
 
     def _show_variance_tables(self, stats: dict, labels: dict, antigens: dict):
         """'Variance' tabs: per population (and marker), each term's FDR and
         the share of variation it explains (anova_stats.run_anova). They
         cover every group at once, so they do not change with the
-        comparison shown."""
+        comparison shown: the tables built for one statistics run are kept
+        and shown again when the comparison changes."""
+        frames = (stats.get('anova_freq'), stats.get('anova_markers'))
+        cached_frames, cached_tabs = self._variance_tabs
+        if len(cached_frames) == 2 and all(a is b for a, b in zip(cached_frames, frames)):
+            for table, title in cached_tabs:
+                self.results_tabs.addTab(table, title)
+            return
+        for table, _title in cached_tabs:
+            table.deleteLater()
+        built = []
         for key, title in (('anova_freq', 'Variance: Frequencies'),
                            ('anova_markers', 'Variance: Markers')):
             table_df = stats.get(key)
@@ -3807,9 +3848,10 @@ class ResultsTab(QWidget):
                 row.update({k: v for k, v in r.items() if k not in ('feature', 'channel')})
                 shown.append(row)
             head = ['Population'] + (['Marker'] if markers else []) + headers[len(ids):]
-            table = CopyableTableWidget(shown, head)
-            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            table = CopyableTableView(shown, head)
             self.results_tabs.addTab(table, title)
+            built.append((table, title))
+        self._variance_tabs = (frames, built)
 
     # ------------------------------------------------------------------
     # Figures
@@ -3860,7 +3902,7 @@ class ResultsTab(QWidget):
             self.figures_tabs.addTab(QLabel(f"Figures failed: {error}"), "Error")
             return
         from honeychrome.view_components.scalable_figure_widget import (
-            initial_scale_for, results_folder,
+            FIT_WHOLE, FIT_WIDTH, initial_scale_for, results_folder,
         )
         exp_dir = results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR)
         for key, item in payload.items():
@@ -3880,7 +3922,8 @@ class ResultsTab(QWidget):
                 large=large, k=key: self._pop_out_figure(make, title, results, large,
                                                          options_key=k),
                 initial_scale=initial_scale_for(fig, HEATMAP_SCALE_PCT) if large else 100,
-                parent=self, options=figure_options_ref(self.controller, key))
+                parent=self, options=figure_options_ref(self.controller, key),
+                fit=FIT_WIDTH if large else FIT_WHOLE, fit_key=f'automated_gating/{key}')
             self._connect_figure(widget.canvas, fig, item.get('results'))
             self.figures_tabs.addTab(widget, item['title'])
         self._add_extra_figures()
@@ -3949,7 +3992,7 @@ class ResultsTab(QWidget):
         if worker in self._popout_workers:
             self._popout_workers.remove(worker)
         if not ok or fig is None:
-            QMessageBox.warning(self, "Pop out failed", error or "The figure could not be made.")
+            QMessageBox.warning(self, "Pop Out failed", error or "The figure could not be made.")
             return
         dialog = QDialog(self)
         dialog.setWindowTitle(title)
@@ -4793,7 +4836,7 @@ class ResultsTab(QWidget):
                 if canvas is not None:
                     self._row_figures.pop(id(canvas), None)
                 self.figures_tabs.removeTab(i)
-        from honeychrome.view_components.scalable_figure_widget import results_folder
+        from honeychrome.view_components.scalable_figure_widget import FIT_WHOLE, results_folder
         exp_dir = results_folder(getattr(self.controller, 'experiment_dir', ''), REPORTS_DIR)
         for title, fig, make in self._extra_figures():
             key = _EXTRA_FIGURE_KEYS.get(title, title)
@@ -4801,7 +4844,8 @@ class ResultsTab(QWidget):
                 fig, title=title, experiment_dir=exp_dir,
                 pop_out=lambda make=make, title=title, k=key: self._pop_out_figure(
                     make, title, options_key=k),
-                parent=self, options=figure_options_ref(self.controller, key))
+                parent=self, options=figure_options_ref(self.controller, key),
+                fit=FIT_WHOLE, fit_key=f'automated_gating/{key}')
             self._connect_figure(widget.canvas, fig)
             self.figures_tabs.addTab(widget, title)
 
@@ -5387,8 +5431,10 @@ class ResultsTab(QWidget):
         csv_note = QLabel(
             "Each gating run and each statistics run is also written automatically to the "
             "experiment's <i>Automated_Gating_Results</i> folder, named after the model with a "
-            "timestamp: the population counts and marker medians of every gated sample, and "
-            "the statistics tables (results of every test, and the per-sample values tested).")
+            "timestamp: the population counts of every gated sample, and the statistics tables "
+            "(results of every test, and the per-sample values tested). The marker medians of "
+            "every sample, population and marker can run to millions of rows, so they are "
+            "written only by <b>Export Gating Results…</b>.")
         csv_note.setWordWrap(True)
         cb.addWidget(csv_note)
         csv_row = QHBoxLayout()
@@ -6050,6 +6096,7 @@ class PluginWidget(QWidget):
         self.results_tab.stats_finished.connect(self._on_stats_finished)
         self.results_tab.trend_finished.connect(self._on_trend_finished)
         self.results_tab.report_populations_changed.connect(self._save_run_state)
+        self.results_tab.groups_changed.connect(self._save_run_state)
         self.results_tab.sample_analysis_changed.connect(self._write_sample_analysis)
         self.enrichment_tab.enrichment_finished.connect(self._on_enrichment_finished)
 
@@ -6676,7 +6723,9 @@ class PluginWidget(QWidget):
         _status(self.bus, f"Enrichment written to {folder}")
 
     def _export_results_csv(self):
-        """Write the gating results as CSV files to EXPORT_DIR (background)."""
+        """Write the gating results' population counts as a CSV file to
+        EXPORT_DIR (background); the marker medians are left to Export Gating
+        Results…."""
         if not self._controller_shows_loaded_experiment():
             return
         st = self.state
@@ -6684,7 +6733,8 @@ class PluginWidget(QWidget):
         stem, stamp = _export_stem(st.model_path), datetime.now().strftime('%Y%m%d_%H%M%S')
         args = (dict(st.summaries), st.gated_samples(), dict(st.sample_groups),
                 _population_labels(st.gate_defs()), _antigen_map(self.controller))
-        self._start_writer(lambda: write_results_csv(folder, stem, stamp, *args),
+        self._start_writer(lambda: write_results_csv(folder, stem, stamp, *args,
+                                                     include_markers=False),
                            "Writing the gating results CSV")
         _status(self.bus, f"Gating results written to {folder}")
 

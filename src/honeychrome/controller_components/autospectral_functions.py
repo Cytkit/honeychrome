@@ -1247,42 +1247,6 @@ def _qc_af_spectra(
     return af_spectra[~contaminated]
 
 
-def _filter_contaminant_events(
-    event_mat: np.ndarray,
-    spectra_mat: np.ndarray,
-    threshold: float = 0.99,
-) -> np.ndarray:
-    """
-    Return a boolean mask (True = keep) for events whose cosine similarity
-    to every fluorophore spectrum is below threshold.
-
-    More sensitive than post-clustering centroid QC: a small number of
-    contaminating events will not dominate an entire cluster node.
-
-    Parameters
-    ----------
-    event_mat   : ndarray (n_events, n_channels)
-    spectra_mat : ndarray (n_fluors, n_channels)
-    threshold   : float
-
-    Returns
-    -------
-    ndarray, bool, shape (n_events,)
-    """
-    event_norms = np.sqrt(np.sum(event_mat ** 2, axis=1)) + 1e-9  # (n_events,)
-    keep = np.ones(len(event_mat), dtype=bool)
-
-    for spec in spectra_mat:
-        spec_norm = np.sqrt(np.dot(spec, spec)) + 1e-9
-        dots = event_mat @ spec          # (n_events,)
-        cs = dots / (event_norms * spec_norm)
-        keep &= cs < threshold
-        if not keep.any():
-            break
-
-    return keep
-
-
 def get_af_spectra(
     unstained_raw: np.ndarray,
     fluor_spectra: np.ndarray,
@@ -1298,16 +1262,19 @@ def get_af_spectra(
     refine_min_shift_n: int = 8,
     remove_contaminants: bool = True,
     contaminant_threshold: float = 0.99,
+    refine_guard: dict | None = None,
 ) -> np.ndarray:
     """
     Identify AF spectral profiles from an unstained sample. Port of
     AutoSpectral's get.af.spectra().
 
+    Events contaminated by single-stain controls are removed before this is
+    called (af_contaminants.screen_unstained); refine_guard carries that
+    screen's limits into the refinement stage.
+
     Stage 1 — Base spectra
     ----------------------
-    Events whose background-subtracted cosine similarity to any fluorophore
-    reaches contaminant_threshold are dropped. The remaining events are
-    clustered in raw + OLS-unmixed space with a som_dim x som_dim SOM
+    The events are clustered in raw + OLS-unmixed space with a som_dim x som_dim SOM
     (KMeans fallback, see get_som_codes). Node codes are L-inf normalised,
     their mean is prepended as row 0, spectra resembling a fluorophore are
     removed, and near-duplicates are collapsed by cosine similarity.
@@ -1325,7 +1292,10 @@ def get_af_spectra(
     refine_min_shift_n of its seeds onto it and those cells' cosine
     similarity to their assigned spectrum improves: median gain at least
     refine_improvement_threshold and 25th-percentile gain above zero, paired
-    per cell.
+    per cell. With refine_guard, a candidate is rejected first when one of
+    the guarded dyes takes more of it than its limit (af_contaminants.
+    guard_rejects): contaminated cells fit the library poorly and would
+    otherwise seed a contaminated spectrum.
 
     Parameters
     ----------
@@ -1337,7 +1307,7 @@ def get_af_spectra(
         SOM grid side length; up to som_dim**2 base spectra before QC and
         deduplication. Shrunk automatically below 500 events.
     min_cells : int
-        Minimum events required after contaminant filtering.
+        Minimum events required.
     random_state : int
         Random seed for reproducibility.
     deduplicate : bool
@@ -1358,10 +1328,14 @@ def get_af_spectra(
         Minimum seed cells that must switch to a candidate before it is
         evaluated.
     remove_contaminants : bool
-        Whether to filter fluorophore-like events and spectra.
+        Whether to drop AF spectra and refine candidates that resemble a
+        fluorophore.
     contaminant_threshold : float
-        Cosine similarity to a fluorophore for the per-event filter (>=) and
-        for rejecting refine candidates (>=).
+        Cosine similarity to a fluorophore at which a base spectrum (>) or a
+        refine candidate (>=) is dropped.
+    refine_guard : dict or None
+        {fluorophore row: largest share} from af_contaminants; refine
+        candidates exceeding a share are rejected.
 
     Returns
     -------
@@ -1377,20 +1351,6 @@ def get_af_spectra(
     # -------------------------------------------------------------------------
     # Stage 1 — Base spectra
     # -------------------------------------------------------------------------
-
-    # Per-event contaminant filter, on mean-background-subtracted data so the
-    # check targets contamination spikes rather than the baseline AF shape.
-    if remove_contaminants:
-        unstained_orth = unstained_raw - unstained_raw.mean(axis=0)[np.newaxis, :]
-        keep = _filter_contaminant_events(unstained_orth, fluor_spectra, contaminant_threshold)
-        n_removed = int((~keep).sum())
-        if n_removed > 0:
-            logger.info(
-                f'get_af_spectra: removed {n_removed} event(s) prior to clustering '
-                f'(cosine similarity >= {contaminant_threshold} to a fluorophore spectrum '
-                f'on background-subtracted data)'
-            )
-            unstained_raw = unstained_raw[keep]
 
     n_cells = unstained_raw.shape[0]
     if n_cells < min_cells:
@@ -1457,6 +1417,7 @@ def get_af_spectra(
             remove_contaminants=remove_contaminants,
             contaminant_threshold=contaminant_threshold,
             random_state=random_state,
+            guard=refine_guard,
         )
 
     logger.info(f'get_af_spectra: returning {af_spectra.shape[0]} AF spectra total')
@@ -1475,6 +1436,7 @@ def _refine_af_spectra(
     remove_contaminants: bool,
     contaminant_threshold: float,
     random_state: int,
+    guard: dict | None = None,
 ) -> np.ndarray:
     """
     Refinement stage of get_af_spectra(): discover AF spectra for cells the
@@ -1482,6 +1444,8 @@ def _refine_af_spectra(
     demonstrably prefers. Returns the (possibly extended) library.
     """
     from sklearn.neighbors import NearestNeighbors
+
+    from honeychrome.controller_components.af_contaminants import guard_rejects
 
     # First-pass per-cell AF assignment and unmixing
     precomputed = precompute_af_matrices(fluor_spectra, af_spectra)
@@ -1564,6 +1528,9 @@ def _refine_af_spectra(
             continue
         if remove_contaminants and \
                 np.max(_row_normalise(fluor_spectra) @ candidate_unit) >= contaminant_threshold:
+            continue
+        if guard and guard_rejects(candidate, af_spectra, guard, fluor_spectra):
+            logger.info(f'get_af_spectra refine: group {cl} rejected by the contaminant guard')
             continue
 
         # Does the solver prefer this candidate for its own seeds?

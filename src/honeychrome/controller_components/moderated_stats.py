@@ -863,6 +863,10 @@ def gls_lm_fit(expr, design, block, correlation: float) -> LinearFit:
 
 _VC_MAX_ITER = 200
 _VC_TOL = 1e-7
+# _reml_components holds several (features × samples × samples) arrays at
+# once, so features are fitted in chunks whose samples × samples stack stays
+# near this size (about 64 MB each).
+_VC_CHUNK_BYTES = 64 * 2 ** 20
 
 
 @dataclass
@@ -952,6 +956,198 @@ def _reml_components(Y: np.ndarray, X: np.ndarray, Zs: list) -> tuple[np.ndarray
     return sig, beta, converged
 
 
+
+
+def _reml_components_low_rank(Y: np.ndarray, X: np.ndarray, Zs: list) -> tuple[
+        np.ndarray, np.ndarray, np.ndarray]:
+    """
+    The Fisher scoring of ``_reml_components`` (same model, start, steps,
+    constraint and stopping rule, so the same estimates up to rounding),
+    computed without any samples × samples matrix. For use when the
+    random factors' levels plus the fixed columns are fewer than the
+    samples.
+
+    In plain terms: the random factors (group, donor, tissue) only have a
+    handful of levels each, so every quantity the fit needs can be written
+    through those levels instead of through every pair of samples. Each
+    round then works with matrices the size of the number of levels
+    (for example 4 groups + 20 donors) rather than samples × samples.
+
+    Details: V = σ²₀ I + Z D Zᵀ with Z = [Z₁ … Z_k] and D the level
+    variances. By the Woodbury identity V⁻¹ = σ₀⁻²(I − Z C Zᵀ),
+    C = D(σ²₀ I + ZᵀZ D)⁻¹, so the REML projection is P = s I − F Γ Fᵀ with
+    F = [Z, X] shared by all features, s = σ₀⁻² and Γ small and per
+    feature. With Φ = FᵀF and T = s I − ΓΦ (so PF = FT), the scores and
+    information of ``_reml_components`` become traces and norms of the
+    small matrices Φ T, T and Γ Fᵀy.
+    """
+    G, n = Y.shape
+    p = X.shape[1]
+    K = 1 + len(Zs)
+    sizes = [Z.shape[1] for Z in Zs]
+    q = int(sum(sizes))
+    r = q + p
+    F = np.hstack(list(Zs) + [X])
+    starts = np.cumsum([0] + sizes)
+    blocks = [np.arange(starts[j], starts[j + 1]) for j in range(len(Zs))]
+    level_comp = np.concatenate([np.full(m, j + 1) for j, m in enumerate(sizes)])
+    Phi = F.T @ F
+    A, B, XtX = Phi[:q, :q], Phi[:q, q:], Phi[q:, q:]
+    Fy = Y @ F
+    yy = np.sum(Y ** 2, axis=1)
+    eye_q, eye_p, eye_r = np.eye(q), np.eye(p), np.eye(r)
+
+    resid = Y - (Y @ np.linalg.pinv(X).T) @ X.T
+    s2 = np.sum(resid ** 2, axis=1) / max(n - p, 1)
+    sig = np.repeat((s2 / K)[:, None], K, axis=1)
+    sig[:, 0] = np.maximum(sig[:, 0], 1e-12)
+    floor = 1e-10 * np.maximum(s2, 1e-300)
+    converged = np.zeros(G, dtype=bool)
+
+    def _pieces(sig):
+        s = 1.0 / sig[:, 0]
+        D = sig[:, level_comp]                                       # (G, q)
+        C = D[:, :, None] * np.linalg.inv(sig[:, 0, None, None] * eye_q + A[None] * D[:, None, :])
+        E = np.concatenate([-s[:, None, None] * (C @ B),
+                            s[:, None, None] * np.broadcast_to(eye_p, (G, p, p))], axis=1)
+        M = s[:, None, None] * (XtX[None] - np.einsum('ap,gab,bq->gpq', B, C, B))
+        Minv = np.linalg.inv(M)
+        Gam = E @ Minv @ E.transpose(0, 2, 1)
+        Gam[:, :q, :q] += s[:, None, None] * C
+        return s, E, Minv, Gam
+
+    for _ in range(_VC_MAX_ITER):
+        s, _E, _Minv, Gam = _pieces(sig)
+        GPhi = Gam @ Phi
+        T = s[:, None, None] * eye_r - GPhi
+        FPF = Phi[None] @ T
+        g = np.einsum('gab,gb->ga', Gam, Fy)
+        u = s[:, None] * Fy - np.einsum('ab,gb->ga', Phi, g)
+        tr_GPhi = np.einsum('gaa->g', GPhi)
+        score = np.empty((G, K))
+        info = np.empty((G, K, K))
+        quad0 = s ** 2 * yy - 2.0 * s * np.sum(Fy * g, axis=1) + np.einsum('ga,ab,gb->g', g, Phi, g)
+        score[:, 0] = 0.5 * (quad0 - (n * s - tr_GPhi))
+        info[:, 0, 0] = 0.5 * (n * s ** 2 - 2.0 * s * tr_GPhi + np.einsum('gab,gba->g', GPhi, GPhi))
+        for j, bj in enumerate(blocks, start=1):
+            score[:, j] = 0.5 * (np.sum(u[:, bj] ** 2, axis=1)
+                                 - np.einsum('gaa->g', FPF[:, bj][:, :, bj]))
+            val = 0.5 * np.sum(FPF[:, :, bj] * T[:, :, bj], axis=(1, 2))
+            info[:, 0, j] = val
+            info[:, j, 0] = val
+            for k in range(j, K):
+                bk = blocks[k - 1]
+                val = 0.5 * np.sum(FPF[:, bj][:, :, bk] ** 2, axis=(1, 2))
+                info[:, j, k] = val
+                info[:, k, j] = val
+        active = (sig > floor[:, None]) | (score > 0)
+        active[:, 0] = True
+        info_a = np.where(active[:, :, None] & active[:, None, :], info, 0.0)
+        info_a = info_a + np.eye(K)[None] * (~active)[:, :, None]
+        step = np.linalg.solve(info_a, np.where(active, score, 0.0)[:, :, None])[:, :, 0]
+        new = np.maximum(sig + step, 0.0)
+        new[:, 0] = np.maximum(new[:, 0], floor)
+        change = np.max(np.abs(new - sig), axis=1) / np.maximum(np.sum(new, axis=1), 1e-300)
+        sig = new
+        converged = change < _VC_TOL
+        if converged.all():
+            break
+    _s, E, Minv, _Gam = _pieces(sig)
+    beta = np.einsum('gpq,gaq,ga->gp', Minv, E, Fy)
+    return sig, beta, converged
+
+# Variance ratio grid for _reml_one_component: zero, then 10^-8 to 10^8.
+_VC_RATIO_GRID = np.concatenate([[0.0], np.logspace(-8.0, 8.0, 161)])
+_VC_GOLDEN_STEPS = 80
+
+
+def _reml_one_component(Y: np.ndarray, X: np.ndarray, Z: np.ndarray) -> tuple[
+        np.ndarray, np.ndarray, np.ndarray]:
+    """
+    The REML fit of ``_reml_components`` for exactly one random factor,
+    with the same model, constraint (component ≥ 0) and outputs, found
+    without inverting a samples × samples matrix for every feature.
+
+    In plain terms: with a single random factor (for example the group),
+    the samples can be rotated once, for all features that share the same
+    samples, into directions along which the factor's effect and the
+    leftover noise do not mix. In those directions each feature's
+    likelihood is a sum of simple terms, so finding the best split of its
+    variation takes a few hundred cheap evaluations instead of repeated
+    matrix inversions.
+
+    Details (Kang et al. 2008, EMMA): with V = σ²₀ (I + δ ZZᵀ), let Q hold
+    the n − p eigenvectors, with eigenvalues λ, of S ZZᵀ S, where
+    S = I − X(XᵀX)⁻¹Xᵀ removes the fixed effects. For r = Qᵀy the
+    restricted log likelihood with σ²₀ profiled out is
+    −½[(n − p) log σ̂²₀(δ) + Σ log(1 + δλᵢ)], σ̂²₀(δ) = Σ rᵢ²/(1 + δλᵢ)/(n − p).
+    δ ≥ 0 is found on a grid from 0 to 10⁸ and refined by golden-section
+    search between the grid points around the best one; σ²₁ = δ σ̂²₀.
+    β is the generalised least squares fit, with
+    (I + δZZᵀ)⁻¹ = I − Z diag(δ / (1 + δ nₗ)) Zᵀ for one-hot Z with level
+    sizes nₗ.
+
+    Returns (variances (G, 2), residual first; β (G, p); converged (G,)).
+    """
+    G, n = Y.shape
+    p = X.shape[1]
+    S = np.eye(n) - X @ np.linalg.pinv(X)
+    K = S @ (Z @ Z.T) @ S
+    lam, vec = np.linalg.eigh(S)
+    U = vec[:, lam > 0.5]                          # basis of the residual space
+    lam, W = np.linalg.eigh(U.T @ K @ U)
+    lam = np.clip(lam, 0.0, None)
+    R2 = (Y @ (U @ W)) ** 2                         # (G, n − p)
+    m = R2.shape[1]
+
+    def _loglik(delta):
+        d = 1.0 + delta[:, None] * lam[None, :]
+        s2 = np.sum(R2 / d, axis=1) / m
+        with np.errstate(divide='ignore'):
+            return -0.5 * (m * np.log(s2) + np.sum(np.log(d), axis=1))
+
+    grid = _VC_RATIO_GRID
+    ll = np.stack([_loglik(np.full(G, r)) for r in grid], axis=1)    # (G, grid)
+    best = np.argmax(np.where(np.isfinite(ll), ll, -np.inf), axis=1)
+    lo = grid[np.maximum(best - 1, 0)]
+    hi = grid[np.minimum(best + 1, grid.size - 1)]
+    ratio = (np.sqrt(5.0) - 1.0) / 2.0
+    a, b = lo.copy(), hi.copy()
+    c, d = b - ratio * (b - a), a + ratio * (b - a)
+    fc, fd = _loglik(c), _loglik(d)
+    for _ in range(_VC_GOLDEN_STEPS):
+        left = fc >= fd
+        b = np.where(left, d, b)
+        a = np.where(left, a, c)
+        c_new = b - ratio * (b - a)
+        d_new = a + ratio * (b - a)
+        c, d = np.where(left, c_new, d), np.where(left, c, d_new)
+        fc, fd = np.where(left, _loglik(c), fd), np.where(left, fc, _loglik(d))
+    refined = 0.5 * (a + b)
+    grid_best = grid[best]
+    delta = np.where(_loglik(refined) >= _loglik(grid_best), refined, grid_best)
+
+    d_all = 1.0 + delta[:, None] * lam[None, :]
+    s2 = np.sum(R2 / d_all, axis=1) / m
+    s2 = np.maximum(s2, 1e-10 * np.maximum(np.sum(R2, axis=1) / max(m, 1), 1e-300))
+    sig = np.column_stack([s2, delta * s2])
+
+    sizes = Z.sum(axis=0)                           # samples per level
+    shrink = delta[:, None] / (1.0 + delta[:, None] * sizes[None, :])   # (G, levels)
+
+    def _vinv_times(A):
+        """(I + δZZᵀ)⁻¹ A for each feature; A is (G, n, k)."""
+        return A - np.einsum('il,gl,glk->gik', Z, shrink, np.einsum('il,gik->glk', Z, A))
+
+    Xg = np.broadcast_to(X, (G, n, p))
+    ViX = _vinv_times(Xg)
+    ViY = _vinv_times(Y[:, :, None])
+    XtViX = np.einsum('ip,giq->gpq', X, ViX)
+    XtViY = np.einsum('ip,gik->gpk', X, ViY)
+    beta = np.linalg.solve(XtViX, XtViY)[:, :, 0]
+    converged = np.isfinite(sig).all(axis=1)
+    return sig, beta, converged
+
 def variance_components(expr, random: dict, fixed: dict | None = None) -> VarianceComponents:
     """
     Share of each feature's variation explained by each variable, after
@@ -1011,20 +1207,29 @@ def variance_components(expr, random: dict, fixed: dict | None = None) -> Varian
             if 1 < n_levels < n_o:
                 kept.append(j)
                 Zs.append(_one_hot(c, n_levels))
-        idx = np.asarray(rows)
-        Yo = Y[np.ix_(idx, np.flatnonzero(obs))]
-        sig, beta, conv = _reml_components(Yo, Xo, Zs)
-        var = np.zeros((idx.size, len(names)))
-        var[:, -1] = sig[:, 0]
-        for pos, j in enumerate(kept):
-            var[:, j] = sig[:, pos + 1]
-        for t in range(len(fnames)):
-            sel = np.flatnonzero(fterm[cols] == t)
-            if sel.size:
-                contrib = beta[:, sel] @ Xo[:, sel].T
-                var[:, len(rnames) + t] = np.var(contrib, axis=1, ddof=1)
-        variance[idx] = var
-        converged[idx] = conv
+        all_idx = np.asarray(rows)
+        obs_cols = np.flatnonzero(obs)
+        chunk = max(1, _VC_CHUNK_BYTES // (8 * n_o * n_o))
+        for start in range(0, all_idx.size, chunk):
+            idx = all_idx[start:start + chunk]
+            Yo = Y[np.ix_(idx, obs_cols)]
+            if len(Zs) == 1:
+                sig, beta, conv = _reml_one_component(Yo, Xo, Zs[0])
+            elif sum(Z.shape[1] for Z in Zs) + Xo.shape[1] < n_o:
+                sig, beta, conv = _reml_components_low_rank(Yo, Xo, Zs)
+            else:
+                sig, beta, conv = _reml_components(Yo, Xo, Zs)
+            var = np.zeros((idx.size, len(names)))
+            var[:, -1] = sig[:, 0]
+            for pos, j in enumerate(kept):
+                var[:, j] = sig[:, pos + 1]
+            for t in range(len(fnames)):
+                sel = np.flatnonzero(fterm[cols] == t)
+                if sel.size:
+                    contrib = beta[:, sel] @ Xo[:, sel].T
+                    var[:, len(rnames) + t] = np.var(contrib, axis=1, ddof=1)
+            variance[idx] = var
+            converged[idx] = conv
     with np.errstate(invalid='ignore', divide='ignore'):
         fraction = variance / np.sum(variance, axis=1, keepdims=True)
     return VarianceComponents(names=names, kinds=kinds, variance=variance, fraction=fraction,

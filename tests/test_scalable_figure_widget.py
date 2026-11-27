@@ -5,7 +5,8 @@ Exports from ScalableFigureWidget (view_components/scalable_figure_widget.py):
 the figure is saved at its natural size whatever size the slider shows,
 without hover labels, and is shown at the slider's size again afterwards;
 Export Graphic writes into the results folder at EXPORT_DPI and reports the
-file in the main window's status bar. Runs off screen.
+file in the main window's status bar; the Fit menu sizes the figure to the
+panel's width, height or both, and is remembered by its key. Runs off screen.
 
 Usage:
     QT_QPA_PLATFORM=offscreen pytest tests/test_scalable_figure_widget.py
@@ -24,7 +25,7 @@ from matplotlib.figure import Figure  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMainWindow  # noqa: E402
 
 from honeychrome.view_components.scalable_figure_widget import (  # noqa: E402
-    EXPORT_DPI, ScalableFigureWidget, results_folder,
+    EXPORT_DPI, FIT_HEIGHT, FIT_OFF, FIT_WHOLE, FIT_WIDTH, ScalableFigureWidget, results_folder,
 )
 
 
@@ -104,4 +105,61 @@ def test_options_panel_changes_the_figure_and_keeps_the_options(app):
     panel.btn_reset.click()
     app.processEvents()
     assert ax.title.get_text() == 'Volcano' and not panel.chk_grid.isChecked()
+    widget.close()
+
+
+def test_fit_sizes_the_figure_to_the_panel_and_is_remembered(app, monkeypatch):
+    from PySide6.QtCore import QSettings
+    from honeychrome.view_components import scalable_figure_widget as sfw
+    monkeypatch.setattr(sfw, '_FIT_SETTINGS', ('honeychrome_tests', 'figure_fit'))
+    QSettings(*sfw._FIT_SETTINGS).clear()
+    fig = Figure(figsize=(4, 8), dpi=100)   # 400 x 800 px, twice as tall as wide
+    fig.add_subplot(111).plot([0, 1], [0, 1])
+    widget = ScalableFigureWidget(fig, title='tall', fit=FIT_WHOLE, fit_key='test/tall')
+    widget.resize(1200, 600)
+    widget.show()
+    app.processEvents()
+    scroll = widget._scroll
+    widget._apply_scale()
+    whole = widget.scale_percent()
+    assert int(800 * whole / 100) <= scroll.height() and int(400 * whole / 100) <= scroll.width()
+    assert not widget.size_slider.isEnabled()
+
+    widget.set_fit_mode(FIT_WIDTH)
+    assert widget.scale_percent() > whole          # the full width needs a larger figure than the whole
+    widget.set_fit_mode(FIT_HEIGHT)
+    assert widget.scale_percent() == pytest.approx(whole, abs=5)
+    widget.set_fit_mode(FIT_OFF)
+    assert widget.size_slider.isEnabled()
+    widget.set_fit_mode(FIT_WIDTH)
+    widget.close()
+
+    again = ScalableFigureWidget(Figure(figsize=(4, 8)), title='tall', fit=FIT_WHOLE, fit_key='test/tall')
+    assert again.fit_mode() == FIT_WIDTH
+    assert ScalableFigureWidget(Figure(), title='plain').fit_mode() == FIT_OFF
+    again.close()
+    QSettings(*sfw._FIT_SETTINGS).clear()
+
+
+def test_extra_controls_and_the_note_while_popped_out(app):
+    from PySide6.QtWidgets import QDialog, QPushButton
+    fig = Figure(figsize=(3, 2))
+    fig.add_subplot(111).plot([0, 1], [0, 1])
+    widget = ScalableFigureWidget(fig, title='plot', pop_out=lambda: None)
+    button = QPushButton('Export Values (CSV)')
+    widget.add_control(button)
+    widget.show()
+    app.processEvents()
+    assert button.isVisible()
+    dialog = QDialog()
+    widget.hold_while_open(dialog, 'open elsewhere')
+    app.processEvents()
+    assert not widget._scroll.isVisible() and widget._held_label.text() == 'open elsewhere'
+    dialog.deleteLater()
+    for _ in range(3):
+        app.processEvents()
+    from PySide6.QtCore import QCoreApplication, QEvent
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+    assert widget._scroll.isVisible() and not widget._held_label.isVisible()
     widget.close()

@@ -306,7 +306,6 @@ def compute_sample_means_for_wls(
 
     Returns a (n_channels,) float64 array, or None if no files could be read.
     """
-    import re
     from pathlib import Path
     from honeychrome.controller_components.functions import sample_from_fcs
     from honeychrome.controller_components.fcs_preview import (
@@ -317,10 +316,10 @@ def compute_sample_means_for_wls(
     controls = set(experiment_samples.get('single_stain_controls', []))
     unstained = set(experiment_samples.get('unstained_samples', []))
 
+    from honeychrome.controller_components.unstained_selection import is_unstained_name
+
     def _is_unstained(path, name):
-        return (path in unstained
-                or re.search(r'unstained', name, re.IGNORECASE)
-                or re.search(r'unstained', path, re.IGNORECASE))
+        return path in unstained or is_unstained_name(name, path)
 
     preferred = [
         p for p, name in all_samples.items()
@@ -602,18 +601,6 @@ def sanitise_control_in_place(control):
 
     # print(json.dumps(control, indent=2))
 
-def _find_default_unstained(samples: dict) -> str | None:
-    """Return the tube name of the first non-bead sample whose path or name matches 'unstained', or None."""
-    import re
-    from honeychrome.controller_components.particle_type import is_bead_sample
-    for path, name in samples.get('all_samples', {}).items():
-        if is_bead_sample(samples, path, name):
-            continue
-        if re.search(r'unstained', path, re.IGNORECASE) or re.search(r'unstained', name, re.IGNORECASE):
-            return name
-    return None
-
-
 def get_raw_events(
     sample,
     fluorescence_channel_ids: list,
@@ -622,6 +609,7 @@ def get_raw_events(
     extra_channel_ids: list | None = None,
     col_order: list | None = None,
     sample_key: str | None = None,
+    event_keep: np.ndarray | None = None,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Return a (n_events, n_channels) float64 array of raw fluorescence values.
@@ -639,6 +627,9 @@ def get_raw_events(
 
     gating_strategy may be a SampleGating, with sample_key the sample's
     experiment key, to gate the sample with its own gates (see gate_event_mask).
+
+    event_keep: boolean mask over the file's events; events outside it are
+    left out as well (e.g. events an AF contaminant screen removed).
     """
     try:
         all_events = sample.get_events('raw', col_order=col_order)
@@ -664,6 +655,11 @@ def get_raw_events(
             event_mask = np.ones(len(all_events), dtype=np.bool_)
     else:
         event_mask = np.ones(len(all_events), dtype=np.bool_)
+
+    if event_keep is not None:
+        if len(event_keep) != len(all_events):
+            raise ValueError(f'event_keep has {len(event_keep)} entries for {len(all_events)} events')
+        event_mask = event_mask & np.asarray(event_keep, dtype=np.bool_)
 
     gated = all_events[event_mask]
     fluor = gated[:, fluorescence_channel_ids].astype(np.float64)

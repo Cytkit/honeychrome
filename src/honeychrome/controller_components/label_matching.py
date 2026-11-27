@@ -110,14 +110,34 @@ def match_fluorophore(name: str, fluorophore_db: list[dict]) -> str | None:
 
 
 def match_marker(name: str, marker_db: list[dict]) -> str | None:
-    """Return the canonical marker/antigen name, or None."""
-    synonym_cols = [f'synonym{i}' for i in range(1, 10)]
+    """Return the canonical marker/antigen name, or None. Every synonymN
+    column in the database is searched (as in match_fluorophore)."""
+    columns = marker_db[0].keys() if marker_db else ()
+    synonym_cols = sorted((c for c in columns if re.fullmatch(r'synonym\d+', c)), key=lambda c: int(c[7:]))
     result = _best_match(name, marker_db, 'marker', synonym_cols)
     if result:
         logger.debug(f'Marker match: "{name}" -> "{result}"')
     else:
         logger.debug(f'No marker match for: "{name}"')
     return result
+
+_FCS_SUFFIX = re.compile(r'\s*-[AHW]\s*$')
+
+
+def match_fcs_channel_label(label: str, fluorophore_db: list[dict],
+                            marker_db: list[dict]) -> tuple[str | None, str | None]:
+    """(canonical fluorophore, canonical marker) of an FCS $PnS label that
+    combines both, as Bio-Rad ZE5 files write it ("BV421 CD25-A",
+    "e780 viability-A", "GFP-A"). The -A/-H/-W suffix is dropped first: the
+    delimiter rule rejects a match followed by "-", so "CD25-A" would not
+    match CD25 and "NK1.1-A" would fall through to a shorter synonym.
+    Either value is None when nothing matches, e.g. for unused ZE5 detectors
+    labelled by their filter ("589/15-561 nm-A")."""
+    text = _FCS_SUFFIX.sub('', label or '').strip()
+    if not text:
+        return None, None
+    return match_fluorophore(text, fluorophore_db), match_marker(text, marker_db)
+
 
 _DATA_DIR = Path(__file__).parent.parent / 'data'
 

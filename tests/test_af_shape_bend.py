@@ -8,7 +8,8 @@ change, AF abundance and index unchanged, chunk invariance, lower error in
 fluorophores that are truly 0), no change without shape variability, the
 stored bend on the noise-aware context, and M2pg with the bend integrated out
 of its noise covariance (GLS under V + E' T E, only high-AF unsaturated events
-change, the compiled kernel against NumPy).
+change, the compiled kernel against NumPy, also when events use different
+subsets of the shapes and for shape terms without AF).
 
 Usage:
     pytest tests/test_af_shape_bend.py
@@ -313,6 +314,78 @@ def test_m2pg_bend_kernel_matches_numpy(library, learnt, m2pg_inputs, monkeypatc
     scale = gu.robust_sd(py['unmixed'])
     assert np.max(np.abs(k['unmixed'] - py['unmixed']) / scale) < 1e-6
     assert not np.allclose(k['unmixed'], plain['unmixed'])
+
+
+def _shape_terms(n, n_shapes, seed):
+    """Unit shapes (L, D) and each event's variances (n, L): a third of the events with none, the rest a random subset."""
+    rng = np.random.default_rng(seed)
+    shapes = rng.normal(0.0, 1.0, (n_shapes, N_DET))
+    shapes /= np.linalg.norm(shapes, axis=1, keepdims=True)
+    t2 = rng.uniform(1e3, 1e6, (n, n_shapes)) * (rng.random((n, n_shapes)) < 0.4)
+    t2[: n // 3] = 0.0
+    return shapes, t2
+
+
+@pytest.mark.parametrize('lanes', [0, 8])
+def test_m2pg_partial_shape_terms_kernel_matches_numpy(library, m2pg_inputs, lanes):
+    if not gu.kernel_available():
+        pytest.skip('M2pg kernel not built')
+    import gls_m2p_kernel_wrapper as wrapper
+
+    fl, af, _pre = library
+    raw_fl, _abund, fixed, env = m2pg_inputs
+    model = _noise_model()
+    shapes, t2 = _shape_terms(len(raw_fl), 6, seed=11)
+    spread = None if env.get('spread') is None else np.asarray(env['spread'], dtype=np.float64)
+    start = {'unmixed': gu._ols(raw_fl - fixed[1][:, np.newaxis] * af[fixed[0]], fl), 'af_idx': fixed[0],
+             'af_scale': fixed[1]}
+    tau = gu.negative_sd(raw_fl, fl, af, env, None, spread)
+    py = gu._m2p_refit(raw_fl, fl, start, af, model, tau, gu.DEFAULT_PRIOR_LAMBDA, gu.N_ITER, None, fixed_af=True,
+                       bend=(shapes, t2))['unmixed']
+
+    def kernel(var):
+        return wrapper.unmix_m2p_kernel(raw_fl, fl, af, env, *NOISE, tau_spread=spread, n_iter=gu.N_ITER, n_threads=2,
+                                        batch_lanes=lanes, fixed_af_idx=fixed[0], fixed_af_scale=fixed[1],
+                                        bend_shapes=shapes, bend_var=var)['unmixed']
+
+    k, plain = kernel(t2), kernel(np.zeros_like(t2))
+    assert np.max(np.abs(k - py) / gu.robust_sd(py)) < 1e-6
+    none = np.all(t2 == 0.0, axis=1)
+    assert np.array_equal(k[none], plain[none])
+    assert not np.allclose(k[~none], plain[~none])
+
+
+@pytest.mark.parametrize('lanes', [0, 8])
+def test_m2pg_shape_terms_without_af_kernel_matches_numpy(library, lanes):
+    if not gu.kernel_available():
+        pytest.skip('M2pg kernel not built')
+    import gls_m2p_kernel_wrapper as wrapper
+    from honeychrome.controller_components.autospectral_functions import positivity_weight
+
+    fl, _af, _pre = library
+    rng = np.random.default_rng(12)
+    n = 3000
+    signal = (rng.gamma(0.8, 2000.0, (n, len(fl))) * (rng.random((n, len(fl))) < 0.4)) @ fl
+    raw_fl = signal + rng.normal(0.0, 1.0, signal.shape) * np.sqrt(NOISE[0] + NOISE[1] * signal)
+    model = _noise_model()
+    null_var = np.full(len(fl), 900.0)
+    shapes, t2 = _shape_terms(n, 6, seed=13)
+    x = gu._ols(raw_fl, fl)
+    tau2 = np.maximum(gu.negative_sd(raw_fl, fl, None, None, null_var, None) ** 2, 1e-12)
+    prec = gu.bend_precision(t2)
+    for _ in range(gu.N_ITER):
+        w = 1.0 / model.variance(np.maximum(x, 0.0) @ fl)
+        pen = gu.DEFAULT_PRIOR_LAMBDA * positivity_weight(x, tau2) / tau2
+        sol = gu.pgls_solve(raw_fl, fl, None, w, pen, shapes, prec)
+        x = sol['x'] / np.maximum(1.0 - pen * sol['inv_diag'], 1e-3)
+
+    def kernel(**terms):
+        return wrapper.unmix_m2p_kernel(raw_fl, fl, None, None, *NOISE, bead_var=null_var, n_iter=gu.N_ITER,
+                                        n_threads=2, batch_lanes=lanes, **terms)['unmixed']
+
+    k = kernel(bend_shapes=shapes, bend_var=t2)
+    assert np.max(np.abs(k - x) / gu.robust_sd(x)) < 1e-6
+    assert not np.allclose(k, kernel())
 
 
 @pytest.mark.parametrize('spread', [False, True])

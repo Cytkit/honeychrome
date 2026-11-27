@@ -54,10 +54,11 @@ judged bead or cell, e.g. which unstained sample is a bead or a cell
 negative. update_bead_samples() checks each sample once, listed in
 samples['bead_checked_samples'], in this order:
   1. a particle type already set for it in the Spectral Model (known_types);
-  2. a name or path containing "bead": beads;
-  3. a name containing "cells": cells (an unstained one is still scored, as
-     the anchor);
+  2. a file or display name containing "bead" and not "cells": beads;
+  3. a display name containing "cells" and not "bead": cells (an unstained
+     one is still scored, as the anchor);
   4. unstained samples and single-stain controls: scored on scatter.
+Folder names are not read: a folder can hold bead and cell controls alike.
 After that check only the user's changes move a sample in or out of the list:
 Mark/Unmark as Beads in the sample tree, or its Particle Type in the Spectral
 Model. Scores are kept in samples['bead_scatter_scores'] and core centres in
@@ -67,7 +68,7 @@ broadest scored unstained sample, so a control added later is judged against
 the same unstained sample.
 
 is_bead_name(path, name)
-    Whether the path or name contains "bead".
+    Whether the file name (not its folders) or display name contains "bead".
 
 is_bead_sample(samples, path, name=None)
     Whether a sample is a bead sample; by name in experiments not yet scanned.
@@ -183,7 +184,8 @@ def scatter_ceilings(raw_settings: dict, channels) -> list[float]:
 
 
 def is_bead_name(path: str, name: str | None) -> bool:
-    return bool(re.search(r'bead', str(path), re.IGNORECASE)
+    file_name = re.split(r'[\\/]', str(path))[-1]
+    return bool(re.search(r'bead', file_name, re.IGNORECASE)
                 or re.search(r'bead', str(name or ''), re.IGNORECASE))
 
 
@@ -268,11 +270,13 @@ def update_bead_samples(samples: dict, experiment_dir, raw_settings: dict,
     for path, name in all_samples.items():
         if path in checked:
             continue
+        says_beads = is_bead_name(path, name)
+        says_cells = bool(re.search(r'cells', str(name), re.IGNORECASE))
         if known_types.get(path) in ('Beads', 'Cells'):
             decide(path, known_types[path] == 'Beads')
-        elif is_bead_name(path, name):
+        elif says_beads and not says_cells:
             decide(path, True)
-        elif re.search(r'cells', str(name), re.IGNORECASE):
+        elif says_cells and not says_beads:
             decide(path, False)
         elif path in unstained or path in controls:
             to_score.append(path)

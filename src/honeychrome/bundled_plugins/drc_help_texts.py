@@ -463,7 +463,10 @@ thresholds, and click <b>Run Statistics</b>.</li>
 <li>Read the result tabs: volcano plots, heatmaps and tables. Right-click a
 heatmap row, a volcano point or an MFI Clusters cell to see that feature's
 value in each sample as a dot and violin plot, in a window or as a results
-tab (which the Report lists).</li>
+tab (which the Report lists). The results area is one window tall; each figure
+has a <b>Fit</b> menu (<i>Whole figure</i> by default, so it is seen whole
+without scrolling; also <i>Width</i>, <i>Height</i> or <i>Off</i> to use the
+<b>Size</b> slider), remembered per figure.</li>
 <li>Optional: <b>Composition Barplot</b> (any time), <b>Show PCA</b> and
 <b>Run Predictive Analysis</b>.</li>
 <li>Export with <b>Export Results CSV</b> or <b>Export Tables…</b>.</li>
@@ -1077,7 +1080,7 @@ back to the settings that produced it.</li>
 <p>The items reflect what is currently shown elsewhere, so click
 <b>Refresh Items</b> after changing anything on the Layout, Cluster
 Annotation or Stats tabs.</p>
-<p>Single figures exported from the tabs (<b>Export Figure</b>, the save
+<p>Single figures exported from the tabs (<b>Export Graphic</b>, the save
 button of a popped-out figure, Layout exports) go to
 <tt>Honeycluster_Reports</tt> by default, at 300 dpi (Layout exports at the
 resolution chosen in their dialog); the status bar at the bottom of the

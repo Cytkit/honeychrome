@@ -217,6 +217,38 @@ def test_positivity_and_lineage_mapping():
     assert res[('T cells/T cells', 'shared')] == ('CD28', 'gate (descendant)')
 
 
+def test_parent_aware_names_and_marker_halves():
+    q = _gate('memory', '2dsep', 'CD4 & CD8', 'CD8+', ['Tcm', 'PD1+'], 'cx', 'cy')
+    q['populations']['Tcm']['region'] = 'x-y+'
+    q['populations']['PD1+']['region'] = 'x-y+|x+y+'
+    gates = [_gate('T cells', '2dsep', None, 'root', ['T cells'], 'c3', 'c19'),
+             _gate('CD4 & CD8', '2dsep', 'T cells', 'T cells', ['CD8+'], 'c8', 'c4'), q,
+             _gate('Treg', '1dsep', 'CD4 & CD8', 'CD8+', ['Treg'], 'cf'),
+             _gate('Helios', '1dsep', 'Treg', 'Treg', ['Helios+', 'Helios-'], 'ch')]
+    info = fl.population_info(gates)
+    assert info['memory/PD1+']['kind'] == 'positivity' and info['memory/PD1+']['channel'] == 'cy'
+    assert info['memory/Tcm']['kind'] == 'phenotype'
+    assert info['Helios/Helios+']['kind'] == 'positivity'
+    assert info['Helios/Helios-']['kind'] == 'complement'
+    pm = fl.map_populations(info)
+    assert pm['CD4 & CD8/CD8+']['cell_type'] == 'CD8 T cell'
+    assert pm['memory/Tcm']['cell_type'] == 'CD8 Tconv CM'
+    assert pm['memory/Tcm']['method'] == 'name (with parent)'
+    assert pm['Treg/Treg']['cell_type'] == 'CD8 Treg'
+
+
+def test_tconv_rows_fall_back_to_t_cells():
+    lib = pd.DataFrame({'immune_state': ['S', 'S'], 'cell_type_canonical': ['CD8 Tconv', 'CD4 Tconv'],
+                        'feature_kind': ['Abund', 'Abund'], 'marker_canonical': ['', ''],
+                        'direction': ['UP', 'UP'], 'weight': ['High', 'High'], 'citation': ['', '']})
+    feats = pd.DataFrame({'feature': ['abundance:g/CD8+'], 'type': ['abundance'], 'pop_key': ['g/CD8+'],
+                          'parent_key': ['T/T'], 'marker': [''], 'depth': [2], 'kept': ['abundance:g/CD8+'],
+                          'orientation': [1]})
+    m = fl.match_library(lib, feats, {'g/CD8+': {'cell_type': 'CD8 T cell'}})
+    assert list(m['status']) == ['matched', 'no population']
+    assert m['detail'].iloc[0].startswith('via CD8 T cell')
+
+
 # ---------------------------------------------------------------------------
 # End to end
 # ---------------------------------------------------------------------------

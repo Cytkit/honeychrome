@@ -38,8 +38,8 @@ import pandas as pd
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
-    QLabel,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QHeaderView, QLabel,
     QMessageBox, QProgressBar, QPushButton, QSpinBox, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -50,6 +50,7 @@ import ag_fsea
 import ag_fsea_library as fl
 import ag_help_texts
 from ag_widgets import add_concertina_page, make_concertina
+from honeychrome.view_components.focus_mode import mark_focus_chrome
 
 log = ag_core.get_logger(__name__)
 
@@ -62,8 +63,8 @@ FEATURE_TYPE_LABELS = {
 READOUT_LABELS = {'positivity': 'Fraction positive, else median',
                   'median': 'Median, else fraction positive'}
 METRIC_LABELS = {'signed_log10p': 'sign(logFC) · −log10 p', 'moderated_t': 'Moderated t'}
-_METHOD_COLOURS = {'override': '#cfe2ff', 'name': '#d4edda', 'none': None,
-                   'name (lineage differs)': '#fff3cd'}
+_METHOD_COLOURS = {'override': '#cfe2ff', 'name': '#d4edda', 'name (with parent)': '#d4edda',
+                   'none': None, 'name (lineage differs)': '#fff3cd'}
 _STATUS_COLOURS = {'matched': '#d4edda', 'no feature': '#fff3cd', 'no population': '#f8d7da'}
 # Seconds per permutation and feature (two-core cloud machine; group-only designs).
 _SECONDS_PER_PERM_FEATURE = 7e-7
@@ -197,7 +198,9 @@ class EnrichmentTab(QWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
         outer.addWidget(HelpToggleWidget(text=ag_help_texts.AG_ENRICHMENT, scrolling=True))
-        row = QHBoxLayout()
+        test_widget = QWidget()
+        row = QHBoxLayout(test_widget)
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(QLabel("<b>Test:</b>"))
         self.cb_comparison = QComboBox()
         self.cb_comparison.setToolTip(
@@ -207,10 +210,11 @@ class EnrichmentTab(QWidget):
             "side.")
         self.cb_comparison.currentIndexChanged.connect(self._on_test_changed)
         row.addWidget(self.cb_comparison, stretch=1)
-        outer.addLayout(row)
+        outer.addWidget(test_widget)
         self.lbl_status = QLabel("")
         self.lbl_status.setWordWrap(True)
         outer.addWidget(self.lbl_status)
+        mark_focus_chrome(test_widget, self.lbl_status)
         self.toolbox = make_concertina()
         outer.addWidget(self.toolbox, stretch=1)
         for title, builder in (("Library", self._build_library_page),
@@ -651,6 +655,10 @@ class EnrichmentTab(QWidget):
             plans, blocked = [], [{'reason': str(exc)}]
         if plans:
             extra = "".join(f"<br>Not tested — {b['reason']}" for b in blocked)
+            if any(b.get('comparison') == label for b in blocked):
+                tested = ", ".join(f"{o} vs {b}" for p in plans for b, o in p['comparisons'])
+                extra = (f"<br><span style='color:#b00020'>{label} has too few samples and is "
+                         f"not run. Run tests: {tested}.</span>") + extra
             self.lbl_gate.setText(f"Samples per group — {text}. {need}.{extra}")
         else:
             self.lbl_gate.setText(
@@ -994,7 +1002,11 @@ class EnrichmentTab(QWidget):
             self.state.fsea = result
         self.lbl_run.setText(f"Done in {result['seconds']:.0f} s ({result['settings']['engine']}).")
         labels = ag_fsea.comparison_labels(result)
-        self._fill_tests(select=(kind, labels[0]) if labels else None)
+        chosen = self._selected()
+        if chosen[0] == kind and chosen[1] in labels:
+            self._fill_tests(select=chosen)
+        else:
+            self._fill_tests(select=(kind, labels[0]) if labels else None)
         self._update_gate()
         self._show_result()
         self.toolbox.setCurrentIndex(3)
@@ -1010,8 +1022,13 @@ class EnrichmentTab(QWidget):
         res = self._result(kind)
         if not res or label not in ag_fsea.comparison_labels(res):
             what = "the trend" if kind == 'trend' else "the group comparisons"
-            self.lbl_status.setText(f"No enrichment run yet for {label or what}: choose it and "
-                                    "press Run.")
+            reason = next((b['reason'] for b in (res or {}).get('blocked') or []
+                           if b.get('comparison') == label), None)
+            if reason:
+                self.lbl_status.setText(f"{label} was not tested in the last run: {reason}")
+            else:
+                self.lbl_status.setText(f"No enrichment run yet for {label or what}: choose it "
+                                        "and press Run.")
             self.lbl_results.setText("")
             self.tbl_results.setRowCount(0)
             self.fig_tabs.clear()
@@ -1083,26 +1100,62 @@ class EnrichmentTab(QWidget):
             self._filling = False
         self._show_dot_plot()
 
-    def _figure_widget(self, fig, title, options_key: str | None = None):
+    def _figure_widget(self, fig, title, options_key: str | None = None, make=None,
+                       parent=None):
+        """*fig* in a ScalableFigureWidget with its options (*options_key*)
+        and hover labels. With *make* (a function returning a fresh copy of
+        the figure) the widget has a Pop Out button."""
         from honeychrome.view_components import figure_options as fo
-        from honeychrome.view_components.scalable_figure_widget import ScalableFigureWidget
+        from honeychrome.view_components.scalable_figure_widget import FIT_WHOLE, ScalableFigureWidget
         store = fo.store_for(self.controller) if options_key else None
         ref = fo.FigureOptionsRef(store, 'automated_gating', options_key) if store else None
+        pop_out = (None if make is None
+                   else lambda: self._pop_out_figure(make, title, options_key))
         widget = ScalableFigureWidget(fig, title=title, experiment_dir=self._experiment_dir_fn(),
-                                      parent=self, options=ref)
+                                      pop_out=pop_out, parent=parent or self, options=ref, fit=FIT_WHOLE,
+                                      fit_key=f'automated_gating/enrichment/{options_key or title}')
         handler = getattr(fig, '_hover_handler', None)
         if handler is not None:
             widget.canvas.mpl_connect('motion_notify_event', handler)
         return widget
 
+    def _pop_out_figure(self, make, title: str, options_key: str | None = None):
+        """A fresh copy of a figure in its own window, with the size slider,
+        the matplotlib toolbar, hover labels and the same figure options.
+        The enrichment figures are small, so the copy is made directly."""
+        try:
+            fig = make()
+        except Exception as exc:
+            log.exception("pop out of %s failed", title)
+            QMessageBox.warning(self, "Pop Out failed", str(exc))
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        widget = self._figure_widget(fig, title, options_key, parent=dialog)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(widget.make_toolbar(dialog))
+        layout.addWidget(widget, stretch=1)
+        dpi = fig.get_dpi()
+        scale = widget.scale_percent() / 100.0
+        dialog.resize(min(int(fig.get_figwidth() * dpi * scale), 1400) + 40,
+                      min(int(fig.get_figheight() * dpi * scale), 1000) + 110)
+        dialog.show()
+
     def _show_dot_plot(self):
         import ag_fsea_plots as fp
         res = self._result()
         comps = ag_fsea.comparison_labels(res)
+        states, threshold = res['states'], self.state.pval_threshold
+
+        def make_dot():
+            return fp.make_dot_plot(states, comps, threshold, _is_dark())
+
         try:
-            fig = fp.make_dot_plot(res['states'], comps, self.state.pval_threshold,
-                                   _is_dark())
-            self.fig_tabs.addTab(self._figure_widget(fig, "Enrichment dot plot", 'enrichment_dot'),
+            fig = make_dot()
+            self.fig_tabs.addTab(self._figure_widget(fig, "Enrichment dot plot", 'enrichment_dot',
+                                                     make=make_dot),
                                  "Dot plot")
         except Exception as exc:
             log.exception("dot plot failed")
@@ -1110,10 +1163,12 @@ class EnrichmentTab(QWidget):
         pattern_states = res.get('pattern_states')
         if pattern_states is not None and len(pattern_states):
             try:
-                fig = fp.make_pattern_dot_plot(pattern_states, self.state.pval_threshold,
-                                               _is_dark())
+                def make_patterns():
+                    return fp.make_pattern_dot_plot(pattern_states, threshold, _is_dark())
+
+                fig = make_patterns()
                 self.fig_tabs.addTab(self._figure_widget(fig, "Patterns and immune states",
-                                                     'enrichment_patterns'),
+                                                     'enrichment_patterns', make=make_patterns),
                                      "Patterns")
             except Exception as exc:
                 log.exception("pattern dot plot failed")

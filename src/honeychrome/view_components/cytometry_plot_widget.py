@@ -1131,6 +1131,9 @@ class CytometryPlotWidget(QFrame):
 
     def plot_ribbon_plot(self):
         heatmap = self.data_for_cytometry_plots['histograms'][self.n_in_plot_sequence]
+        # No fluorescence channels, or a histogram from another plot type, leaves nothing to draw.
+        if getattr(heatmap, 'ndim', 0) != 2 or heatmap.size == 0:
+            return
         self.img.setImage(heatmap.T)
 
         # Set the position and scale of the image

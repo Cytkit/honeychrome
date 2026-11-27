@@ -372,6 +372,7 @@ class Controller(QObject):
             'empirical_peak_ch_idx', 'expected_peak_ch_idx',
             'fluor_ch_ids', 'cytometer_key', 'warnings', '_fingerprint',
             'spectrum_initial', 'refine_log', 'crosstalk', 'background_check',
+            'unstained_check',
         }
         _ARRAY_KEYS = {
             'spectral_sub', 'scatter_pos', 'scatter_neg_matched',

@@ -117,9 +117,9 @@ def _covariate_columns(series: pd.Series) -> tuple[np.ndarray, bool]:
     return _indicators(values, sorted(set(values))[1:]), False
 
 
-def _design(terms: list) -> tuple[np.ndarray, dict]:
-    """Intercept and the columns of ``terms``; {term name: column indices}."""
-    n = terms[0].cols.shape[0] if terms else 0
+def _design(terms: list, n: int) -> tuple[np.ndarray, dict]:
+    """Intercept and the columns of ``terms`` over *n* samples (the
+    intercept alone when ``terms`` is empty); {term name: column indices}."""
     cols, index = [np.ones((n, 1))], {}
     pos = 1
     for t in terms:
@@ -238,7 +238,7 @@ def run_anova(data_df: pd.DataFrame, group_vec: list[str], *,
                              "samples, or it is confounded with the individual) and was left "
                              "out.")
 
-    X_full, index = _design(terms)
+    X_full, index = _design(terms, n)
     correlation = np.nan
     bc = None
     if block is not None:
@@ -263,7 +263,7 @@ def run_anova(data_df: pd.DataFrame, group_vec: list[str], *,
 
     def _rss_of(names: tuple) -> tuple:
         if names not in rss_cache:
-            X, _idx = _design([t for t in terms if t.name in names])
+            X, _idx = _design([t for t in terms if t.name in names], n)
             fit = full if X.shape[1] == X_full.shape[1] else fitter(Y, X)
             rss_cache[names] = (_rss(fit), fit.df_residual.astype(float))
         return rss_cache[names]
@@ -412,5 +412,6 @@ def display_rows(table: pd.DataFrame, id_columns: list[str] | None = None) -> tu
             return f"{value:.1f}"
         return str(value)
 
-    rows = [{c: _fmt(c, r[c]) for c in headers} for _i, r in wide.iterrows()]
+    columns = [[_fmt(c, v) for v in wide[c].tolist()] for c in headers]
+    rows = [dict(zip(headers, values)) for values in zip(*columns)]
     return headers, rows

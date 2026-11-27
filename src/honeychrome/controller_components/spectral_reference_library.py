@@ -242,6 +242,13 @@ class SpectralReferenceLibrary:
         for that ``(fluorophore, cytometer_key)``. Each shipped row is the QC
         target for its ``(fluorophore, cytometer_key)`` by default, but only when
         no QC target exists yet — so re-running never clobbers a user override.
+
+        A shipped row already stored whose spectrum or detectors differ from the
+        bundled CSV (a spectrum corrected in a later release) takes the CSV's
+        spectrum, detectors, configuration key and peak detector. Its reference
+        and QC-target flags and its ``updated_at`` are kept, so the update does
+        not reorder it against the user's own profiles. User profiles are never
+        changed.
         """
         self.ensure_schema()
         now = time.time()
@@ -254,17 +261,26 @@ class SpectralReferenceLibrary:
                 config_key = compute_config_key(cytometer_key, channel_names)
                 for fluor, row in df.iterrows():
                     fluor = str(fluor)
-                    exists = conn.execute(
-                        'SELECT 1 FROM reference_library_profiles '
-                        'WHERE fluorophore = ? AND cytometer_key = ? AND origin = ? LIMIT 1',
-                        (fluor, cytometer_key, 'honeychrome'),
-                    ).fetchone()
-                    if exists:
-                        continue
                     profile = {c: float(row[c]) for c in channel_names}
                     # shipped rows have no acquisition metadata; derive the peak
                     # (major) detector from the spectrum itself so the column is useful
                     peak_channel = max(profile, key=profile.get) if profile else None
+                    existing = conn.execute(
+                        'SELECT id, channel_names_json, profile_json FROM reference_library_profiles '
+                        'WHERE fluorophore = ? AND cytometer_key = ? AND origin = ?',
+                        (fluor, cytometer_key, 'honeychrome'),
+                    ).fetchall()
+                    if existing:
+                        for stored in existing:
+                            if (json.loads(stored['profile_json']) != profile
+                                    or json.loads(stored['channel_names_json']) != channel_names):
+                                conn.execute(
+                                    'UPDATE reference_library_profiles SET profile_json = ?, '
+                                    'channel_names_json = ?, config_key = ?, gate_channel = ? WHERE id = ?',
+                                    (json.dumps(profile), json.dumps(channel_names), config_key,
+                                     peak_channel, stored['id']),
+                                )
+                        continue
                     has_qc = conn.execute(
                         'SELECT 1 FROM reference_library_profiles '
                         'WHERE fluorophore = ? AND cytometer_key = ? AND is_qc_target = 1 LIMIT 1',

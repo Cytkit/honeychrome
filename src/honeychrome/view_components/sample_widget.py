@@ -109,21 +109,25 @@ class DictTreeModel(QAbstractItemModel):
         self.root_item = TreeItem(None, "All Samples", "", "")
 
     def _is_unstained(self, path: str) -> bool:
-        """Return True if path is manually tagged OR name matches 'unstained' regex."""
+        """Return True if path is manually tagged or named as unstained."""
+        from honeychrome.controller_components.unstained_selection import is_unstained_name
+
         if path in self.full_data.get('unstained_samples', []):
             return True
-        tube_name = self.full_data['all_samples'].get(path, '')
-        import re
-        return bool(re.search(r'unstained', tube_name, re.IGNORECASE)
-                    or re.search(r'unstained', path, re.IGNORECASE))
+        return is_unstained_name(self.full_data['all_samples'].get(path, ''), path)
 
     def _sample_icon(self, path, nevents):
-        """Droplet: dark green for bead samples, blue for unstained, plain otherwise."""
+        """Droplet: dark green for bead samples, blue for unstained, split
+        blue and green for unstained beads, plain otherwise."""
         if not nevents > 0:
             return load_icon('droplet-empty')
-        if is_bead_sample(self.full_data, path):
+        bead = is_bead_sample(self.full_data, path)
+        unstained = self._is_unstained(path)
+        if bead and unstained:
+            return load_icon('droplet', colour=('#4a90d9', '#1e6b34'))
+        if bead:
             return load_icon('droplet', colour='#1e6b34')
-        if self._is_unstained(path):
+        if unstained:
             return load_icon('droplet', colour='#4a90d9')
         return load_icon('droplet')
 

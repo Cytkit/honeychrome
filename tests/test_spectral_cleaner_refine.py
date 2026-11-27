@@ -66,7 +66,7 @@ def cleaned(request):
     unstained = simulate(None, 30_000, rng)
     events = {label: simulate(row, 30_000, rng) for label, row in zip(labels, spectra)}
 
-    def load_events(self, control):
+    def load_events(self, control, find_peak=False, gating=None):
         label = control['label']
         return {
             'pos_events': events[label],

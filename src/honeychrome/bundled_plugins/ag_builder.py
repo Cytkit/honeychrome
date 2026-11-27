@@ -514,8 +514,9 @@ class GateParamDialog(QDialog):
     threshold_factor
         Multiplies the calculated threshold in raw units (default ``1``).
     width_sd
-        Half-width of the singlet parallelogram in residual SDs, the SD
-        estimated from the median absolute deviation.  Default ``3``.
+        Half-width of the singlet trapezoid in SDs of the residuals relative
+        to the area value (the band widens with scatter), the SD estimated
+        from the median absolute deviation.  Default ``3``.
     edge_density_x, edge_density_y
         Density fall-off of a ``cells`` gate's sides on each scatter
         channel, as a fraction of the peak.  Default ``0.002``.
@@ -623,7 +624,8 @@ class GateParamDialog(QDialog):
         self.sb_width_sd.setSingleStep(0.1)
         self.sb_width_sd.setValue(float(params.get('width_sd', 3.0)))
         self.sb_width_sd.setToolTip(
-            "Half-width of the singlet parallelogram, in residual SDs. The SD is "
+            "Half-width of the singlet trapezoid, in SDs of the residuals relative "
+            "to the area value, so the band widens with scatter. The SD is "
             "estimated from the median absolute deviation, so doublets beside the "
             "diagonal do not widen it."
         )
@@ -4508,7 +4510,7 @@ class TrainTab(QWidget):
     population only). Hierarchy nodes are coloured by training status.
     Tiles are made only for the gates drawn on populations open in the
     tree: the first three levels to start with, and more as nodes are
-    expanded, so large hierarchies open quickly. "Pop out" on a tile opens
+    expanded, so large hierarchies open quickly. "Pop Out" on a tile opens
     the gate in its own window (GateDetailWidget) to adjust thresholds.
 
     Pause keeps every gate trained so far; Calculate Gates then offers to
@@ -5027,7 +5029,7 @@ class TrainTab(QWidget):
                 self.boundaries_changed.emit()
             self._rebuild_grid()
 
-        btn_detail = QPushButton("Pop out")
+        btn_detail = QPushButton("⤢ Pop Out")
         btn_detail.setFixedHeight(22)
         btn_detail.setToolTip("Open this gate in its own window to adjust its boundary.")
         btn_detail.clicked.connect(_open_detail)

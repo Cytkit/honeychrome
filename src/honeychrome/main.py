@@ -100,7 +100,14 @@ def setup_logging(log_file, detailed=False):
     # Formatter
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-    # Console handler
+    # Console handler. A Windows console's code page (cp1252) cannot encode
+    # every character a message holds (Δ, µ, ±); write those as escapes
+    # rather than failing the record. The log file is UTF-8.
+    if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(errors='backslashreplace')
+        except (ValueError, OSError):
+            pass
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)

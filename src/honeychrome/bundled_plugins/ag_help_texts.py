@@ -539,7 +539,7 @@ events, so a large file cannot dominate. <i>All</i> uses every event.</li>
 <li>Click <b>Calculate Gates</b>.</li>
 <li>Open <b>Gate boundaries</b> and look through the tiles, with the
 hierarchy on their left. To move a boundary, click a tile's
-<b>Pop out</b>, move the threshold in the window that opens and
+<b>Pop Out</b>, move the threshold in the window that opens and
 accept.</li>
 <li>When every population in the tree is green or blue, go to the
 <b>Run</b> page. You can save the model on the <b>Export</b> page, the
@@ -1030,10 +1030,13 @@ p-value and FDR.</li>
 CSV, a settings document, a PNG or CSV per ticked item, and one PDF with
 all of them. <b>Cancel</b> on the progress window stops the report and
 removes its half-written folder.</li>
-<li>Every statistics run is also written to <i>Automated_Gating_Results</i>
-as CSV files, and kept with the experiment. <b>Export Gating Results…</b>
-and <b>Export Statistics…</b> write the same files to a folder of your
-choice.</li>
+<li>Every gating run (population counts) and every statistics run is also
+written to <i>Automated_Gating_Results</i> as CSV files, and kept with the
+experiment. <b>Export Statistics…</b> writes the same statistics files to a
+folder of your choice. <b>Export Gating Results…</b> writes the population
+counts and also the marker medians of every sample, population and marker;
+that file can run to millions of rows (close to 1 GB for a large stacked
+panel), so it is written only on request.</li>
 <li><b>Export Graphic</b> on a figure, and the save button of a popped-out
 figure, write the figure at 300 dpi to <i>Automated_Gating_Reports</i>; the
 status bar at the bottom of the window shows the file written. CSV exports

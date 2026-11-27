@@ -9,14 +9,21 @@ Pure computation (no Qt):
 * ``load_library`` — the immune state library (``ag_fsea_library.csv`` or a
   user file): validation, species filter and SHA-256.
 * ``population_info`` — every gated population classified as a positivity
-  population (one-population 1dsep gate whose label is a marker with a sign,
-  e.g. ``PD1+``, read as "fraction of the parent positive for the marker")
-  or a phenotype population (everything else), with the marker named by the
-  gate label.
+  population (a marker with a sign, e.g. ``PD1+``, read as "fraction of the
+  parent positive for the marker": the one population of a 1dsep gate, the
+  positive half of a 1dsep +/- pair on one marker, or a 2dsep population
+  that is one half-plane, e.g. region ``x-y+|x+y+``, with a positive sign),
+  a complement (the negative half of such a 1dsep pair, when no gate is drawn
+  on it: the mirror of its positive half, so neither a feature nor a cell
+  type) or a phenotype population (everything else), with the marker named
+  by the gate label.
 * ``map_populations`` — phenotype populations to canonical cell types:
-  a user override, else the population label against the cell-type names
-  and synonyms, accepted only when the lineage agrees with the population's
-  ancestors (so a B-cell "Memory" gate never becomes a memory T cell).
+  a user override, else the label combined with the nearest mapped
+  ancestor's cell type (``CD8`` + ``Tcm`` → ``CD8 Tcm``, a synonym of CD8
+  Tconv CM; ``CD8`` + ``Treg`` → CD8 Treg), else the label alone, against
+  the cell-type names and synonyms, accepted only when the lineage agrees
+  with the population's ancestors (so a B-cell "Memory" gate never becomes
+  a memory T cell).
 * ``resolve_channel_markers`` — the marker a channel measures in a given
   population. Panels that re-use one fluorochrome for lineage-exclusive
   markers (IMMPROVE: CD28/CD20, GATA3/CD23, …) have one antigen per channel
@@ -28,6 +35,9 @@ Pure computation (no Qt):
 
 Matching is at the exact phenotype only: a library cell type matches the
 population mapped to it, never its descendants.
+
+Library rows for CD4 Tconv or CD8 Tconv fall back to the CD4 or CD8 T cell
+population when the model has no Tconv population (CELL_TYPE_FALLBACK).
 
 v1 simplifications: cell types are matched by name (with the lineage check)
 rather than derived from the marker signs along the gate path; library
@@ -68,10 +78,18 @@ READOUTS = ('positivity', 'median')
 
 # A positivity population's label: a marker followed by its sign.
 POSITIVITY_LABEL = re.compile(r'^(?P<marker>\S+?)(?P<sign>\+|-|hi|lo|dim|bright)$')
+POSITIVE_SIGNS = ('+', 'hi', 'bright')
+# Library cell type -> the cell type whose population stands in for it when no
+# population is mapped to the library's own (OI-226, DEC-102): conventional T
+# cells read from all CD4 or CD8 T cells when Tregs are not gated apart.
+CELL_TYPE_FALLBACK = {'CD4 Tconv': 'CD4 T cell', 'CD8 Tconv': 'CD8 T cell'}
+# Suffixes dropped from a parent's cell type to form the prefix of a combined
+# name ('CD8 T cell' -> 'CD8', 'CD4 Tconv' -> 'CD4').
+_PARENT_SUFFIX = re.compile(r'\s+(T cell|Tconv|cell)$', re.IGNORECASE)
 
 __all__ = [
     'LIBRARY_FILE', 'CELL_TYPES_FILE', 'LIBRARY_COLUMNS', 'FEATURE_KINDS', 'DIRECTIONS',
-    'WEIGHTS', 'SPECIES', 'READOUTS',
+    'WEIGHTS', 'SPECIES', 'READOUTS', 'CELL_TYPE_FALLBACK',
     'canonical_marker', 'load_cell_types', 'load_library', 'population_info',
     'map_populations', 'resolve_channel_markers', 'match_library', 'build_sets',
 ]
@@ -223,32 +241,76 @@ def load_library(path=None, species: str = 'human',
 # Populations
 # ---------------------------------------------------------------------------
 
+def _half_plane_axis(region) -> str:
+    """'x' or 'y' when a 2dsep region is the positive half-plane of one axis
+    (two quadrants sharing that axis's '+', e.g. 'x-y+|x+y+' -> 'y'), else ''."""
+    quads = {q.strip() for q in str(region or '').split('|') if q.strip()}
+    if len(quads) != 2 or not all(re.fullmatch(r'x[+-]y[+-]', q) for q in quads):
+        return ''
+    if all(q[1] == '+' for q in quads):
+        return 'x'
+    if all(q[3] == '+' for q in quads):
+        return 'y'
+    return ''
+
+
 def population_info(gate_defs: list[dict]) -> dict[str, dict]:
     """{population key: record} for every population, in hierarchy order.
 
     Record: key, gate, population, label, parent_key ('root' at the top),
-    depth, kind ('positivity' | 'phenotype'), and for positivity
-    populations marker (canonical name, or the label's marker text when the
-    database does not know it), sign and channel (the gate's separating
-    channel).
+    depth, kind ('positivity' | 'complement' | 'phenotype'), and for
+    positivity populations marker (canonical name, or the label's marker
+    text when the database does not know it), sign and channel (the
+    separating channel).
+
+    Positivity (the label is a marker with a sign): the one population of a
+    1dsep gate; the positive half (+, hi, bright) of a 1dsep gate whose two
+    populations are one marker with opposite signs, whose negative half is
+    then a complement unless a gate is drawn on it; a 2dsep population with a
+    positive sign whose region is one axis's positive half-plane (channel =
+    that axis's marker).
     """
+    ordered = ag_core.ordered_gate_defs(gate_defs)
+    parents_used = {ag_core.population_key(g['parent_gate'], g.get('parent_popul'))
+                    for g in ordered if g.get('parent_gate')}
     out: dict[str, dict] = {}
-    for g in ag_core.ordered_gate_defs(gate_defs):
+    for g in ordered:
         name = g['gate_name']
         parent = (ag_core.population_key(g['parent_gate'], g.get('parent_popul'))
                   if g.get('parent_gate') else 'root')
         depth = (out[parent]['depth'] + 1) if parent in out else 0
         pops = g.get('populations') or {}
+        gtype = g.get('gate_type')
+        labels = {pop: (info or {}).get('label') or pop for pop, info in pops.items()}
+        signs = {pop: POSITIVITY_LABEL.match(str(lab).strip()) for pop, lab in labels.items()}
+        pair = (gtype == '1dsep' and len(pops) == 2 and all(signs.values())
+                and len({canonical_marker(m.group('marker')) or m.group('marker')
+                         for m in signs.values()}) == 1
+                and sum(m.group('sign') in POSITIVE_SIGNS for m in signs.values()) == 1)
         for pop, info in pops.items():
-            label = (info or {}).get('label') or pop
+            label = labels[pop]
             rec = {'key': ag_core.population_key(name, pop), 'gate': name, 'population': pop,
                    'label': label, 'parent_key': parent, 'depth': depth, 'kind': 'phenotype',
                    'marker': '', 'sign': '', 'channel': ''}
-            m = POSITIVITY_LABEL.match(str(label).strip())
-            if g.get('gate_type') == '1dsep' and len(pops) == 1 and m:
+            m = signs[pop]
+            channel = ''
+            if m and gtype == '1dsep' and (len(pops) == 1 or pair):
+                channel = g.get('gate_marker_x') or ''
+                if pair and m.group('sign') not in POSITIVE_SIGNS:
+                    if rec['key'] not in parents_used:
+                        rec['kind'] = 'complement'
+                    m = None
+            elif m and gtype == '2dsep' and m.group('sign') in POSITIVE_SIGNS:
+                axis = _half_plane_axis((info or {}).get('region'))
+                channel = (g.get(f'gate_marker_{axis}') or '') if axis else ''
+                if not axis:
+                    m = None
+            else:
+                m = None
+            if m:
                 stem = m.group('marker')
                 rec.update(kind='positivity', marker=canonical_marker(stem) or stem,
-                           sign=m.group('sign'), channel=g.get('gate_marker_x') or '')
+                           sign=m.group('sign'), channel=channel)
             out[rec['key']] = rec
     return out
 
@@ -267,8 +329,14 @@ def map_populations(pop_info: dict, cell_types: pd.DataFrame | None = None,
                     overrides: dict | None = None) -> dict[str, dict]:
     """Phenotype populations to canonical cell types.
 
+    Names tried, first hit wins: the label combined with the nearest mapped
+    ancestor's cell type, with and without its 'T cell'/'Tconv'/'cell'
+    suffix, before and after the label ('CD8 Tcm', 'Tcm CD8', 'CD8 T cell
+    Tcm', ...), then the label alone, then the population name.
+
     Returns {key: {'cell_type', 'lineage', 'method'}} for every phenotype
-    population; method is 'override', 'name', 'name (lineage differs)' when
+    population; method is 'override', 'name', 'name (with parent)',
+    'name (lineage differs)' when
     the only name match has another lineage than the ancestors (left
     unmatched), or 'none'. An override of '' unmatches a population.
     """
@@ -290,11 +358,29 @@ def map_populations(pop_info: dict, cell_types: pd.DataFrame | None = None,
             out[key] = {'cell_type': cell, 'lineage': lineage_of.get(cell, '') or inherited,
                         'method': 'override'}
             continue
-        hits = lookup.get(_norm(rec['label'])) or lookup.get(_norm(rec['population'])) or []
+        parent_cell = ''
+        for anc in _ancestors(pop_info, key):
+            if out.get(anc, {}).get('cell_type'):
+                parent_cell = out[anc]['cell_type']
+                break
+        combined = []
+        if parent_cell:
+            short = _PARENT_SUFFIX.sub('', parent_cell)
+            for pre in dict.fromkeys((short, parent_cell)):
+                combined += [f"{pre} {rec['label']}", f"{rec['label']} {pre}"]
+        hits, method = [], 'name'
+        for name in combined:
+            hits = [h for h in lookup.get(_norm(name)) or []
+                    if not inherited or not h[1] or h[1] == inherited]
+            if hits:
+                method = 'name (with parent)'
+                break
+        if not hits:
+            hits = lookup.get(_norm(rec['label'])) or lookup.get(_norm(rec['population'])) or []
         ok = [h for h in hits if not inherited or not h[1] or h[1] == inherited]
         if ok:
             cell, lin = ok[0]
-            out[key] = {'cell_type': cell, 'lineage': lin or inherited, 'method': 'name'}
+            out[key] = {'cell_type': cell, 'lineage': lin or inherited, 'method': method}
         else:
             out[key] = {'cell_type': None, 'lineage': inherited,
                         'method': 'name (lineage differs)' if hits else 'none'}
@@ -385,7 +471,9 @@ def match_library(library: pd.DataFrame, features: pd.DataFrame, pop_map: dict,
                is not available.
 
     sign is +1 (UP) or −1 (DOWN), times −1 when the matched feature was
-    collapsed onto its mirror. status: 'matched', 'no population' (no
+    collapsed onto its mirror. A cell type in CELL_TYPE_FALLBACK with no
+    population of its own uses the populations of its fallback type; the
+    detail then starts with 'via <fallback type>'. status: 'matched', 'no population' (no
     population is mapped to the cell type), 'no feature' (no tested
     feature for it).
     """
@@ -413,6 +501,10 @@ def match_library(library: pd.DataFrame, features: pd.DataFrame, pop_map: dict,
                'citation': r['citation'], 'population': '', 'feature': '', 'readout': '',
                'sign': 0, 'status': '', 'detail': ''}
         keys = pops_by_cell.get(cell) or []
+        via = ''
+        if not keys and cell in CELL_TYPE_FALLBACK:
+            keys = pops_by_cell.get(CELL_TYPE_FALLBACK[cell]) or []
+            via = f"via {CELL_TYPE_FALLBACK[cell]}" if keys else ''
         if not keys:
             rec['status'] = 'no population'
             rows.append(rec)
@@ -447,7 +539,7 @@ def match_library(library: pd.DataFrame, features: pd.DataFrame, pop_map: dict,
         rec.update(population=hit['parent_key'] if readout == 'positivity' else hit['pop_key'],
                    feature=kept, readout=readout,
                    sign=(1 if r['direction'] == 'UP' else -1) * orient,
-                   status='matched', detail=detail)
+                   status='matched', detail='; '.join(x for x in (via, detail) if x))
         rows.append(rec)
     return pd.DataFrame(rows, columns=list(MATCH_COLUMNS))
 

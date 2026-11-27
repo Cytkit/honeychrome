@@ -19,12 +19,14 @@
 // fix each event's AF, as the noise-aware AF abundance does: no AF choice and
 // no AF column; the AF signal counts in the event's signal for the weights and
 // is subtracted from the event, and only the fluorophores are solved.
-// bend_shapes (L x D) and bend_var (N x L), with the AF fixed, integrate out
-// each event's AF shape bend c ~ Normal(0, diag(bend_var)) along the shapes:
-// the detector covariance becomes V + E' T E, applied to the normal equations
+// bend_shapes (L x D) and bend_var (N x L), with the AF fixed or without AF,
+// integrate out each event's shape terms c ~ Normal(0, diag(bend_var)) along
+// the shapes (the AF shape bend; a fluorophore's spectral variability): the
+// detector covariance becomes V + E' T E, applied to the normal equations
 // through the Woodbury identity, S W S' - (S W E') M^-1 (E W S') and
-// S W r - (S W E') M^-1 E W r with M = E W E' + T^-1 (a rank-L change per
-// event; events with every variance 0 are solved without it).
+// S W r - (S W E') M^-1 E W r with M = E W E' + T^-1. Each event uses only
+// the shapes whose variance is positive for it (a change of that rank;
+// events with every variance 0 are solved without it).
 // The extension also holds the AF shape bend of per-cell AF (bend_r1,
 // af_bend_kernel.cpp); the dense helpers both use are in kernel_linalg.hpp.
 // Build with -DGLS_DGEMM=<symbol> -DGLS_BLAS_INT=<int type> for a BLAS whose
@@ -70,7 +72,9 @@ constexpr double kVarFloor = 1e-24;
 constexpr double kTiny = 1e-12;
 constexpr double kInvSqrt2 = 0.70710678118654752440;
 constexpr int kChunk = 128;
-constexpr double kBendFixed = 1e30;   // precision of a bend shape with prior variance 0
+
+// A shape takes part in an event's solve when its prior variance there is positive and finite.
+inline bool shape_moves(double v) { return v > 0.0 && std::isfinite(v); }
 
 // Stage timing, compiled in only with -DGLS_M2P_PROFILE (the release build has
 // none of it). Each stage accumulates thread-seconds; unmix_m2p returns them
@@ -660,33 +664,34 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
     fixed_scale.assign(static_cast<const double*>(fsb.ptr), static_cast<const double*>(fsb.ptr) + fsb.size);
   }
   const bool solve_af = has_af && !fixed;
-  // optional AF shape bend (fixed AF only): shapes Eb (Lb x D), prior precision per event and shape
+  // optional shape terms (AF fixed or absent): shapes Eb (Lb x D), prior variance per event and shape
   int Lb = 0;
-  std::vector<double> Eb, bend_prec;
+  std::vector<double> Eb;
+  Arr bend_var_arr;
+  const double* bend_var = nullptr;
   std::vector<unsigned char> bent;
   bool any_bent = false;
   if (!bend_shapes_obj.is_none()) {
-    if (!fixed) throw std::invalid_argument("bend_shapes needs fixed_af_idx and fixed_af_scale");
+    if (solve_af)
+      throw std::invalid_argument("bend_shapes needs a fixed AF (fixed_af_idx and fixed_af_scale) or no AF");
     if (bend_var_obj.is_none()) throw std::invalid_argument("bend_var is needed with bend_shapes");
     Arr es = bend_shapes_obj.cast<Arr>();
-    Arr ev = bend_var_obj.cast<Arr>();
-    auto esb = es.request(), evb = ev.request();
+    bend_var_arr = bend_var_obj.cast<Arr>();
+    auto esb = es.request(), evb = bend_var_arr.request();
     if (esb.ndim != 2 || esb.shape[1] != D) throw std::invalid_argument("bend_shapes must be L x D");
     Lb = static_cast<int>(esb.shape[0]);
     if (evb.ndim != 2 || evb.shape[0] != N || evb.shape[1] != Lb)
       throw std::invalid_argument("bend_var must be N x L");
     Eb.assign(static_cast<const double*>(esb.ptr), static_cast<const double*>(esb.ptr) + esb.size);
-    const double* vp = static_cast<const double*>(evb.ptr);
-    bend_prec.resize(static_cast<size_t>(N) * Lb);
+    bend_var = static_cast<const double*>(evb.ptr);
     bent.assign(N, 0);
     for (int i = 0; i < N; ++i)
-      for (int l = 0; l < Lb; ++l) {
-        const double v = vp[static_cast<size_t>(i) * Lb + l];
-        const bool movable = v > 0.0 && std::isfinite(v);
-        bend_prec[static_cast<size_t>(i) * Lb + l] = movable ? 1.0 / v : kBendFixed;
-        if (movable) bent[i] = 1;
-      }
-    for (int i = 0; i < N; ++i) any_bent |= bent[i] != 0;
+      for (int l = 0; l < Lb; ++l)
+        if (shape_moves(bend_var[static_cast<size_t>(i) * Lb + l])) {
+          bent[i] = 1;
+          any_bent = true;
+          break;
+        }
   }
 
   std::vector<int> all(D);
@@ -837,6 +842,7 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
       std::vector<double> ysub(D);
       std::vector<double> bw(D), bswe(static_cast<size_t>(F) * Lb), bz(static_cast<size_t>(F) * Lb),
           bm(static_cast<size_t>(Lb) * Lb), bew(Lb);
+      std::vector<int> bact(Lb);
       PROF_DECL(prof_thread);
 #pragma omp for schedule(dynamic, 1)
       for (int ch = 0; ch < n_chunks; ++ch) {
@@ -976,37 +982,41 @@ static py::dict unmix_m2p(Arr raw_in, Arr spectra_in, Arr af_in, py::object enve
           gemm_rm(B, T, D, c.W.data(), D, O.data(), T, c.NSS.data(), T);
           gemm_rm(B, F, D, c.WY.data(), D, St.data(), F, c.RHS.data(), F);
           if (any_bent) {
-            // AF shape bend integrated out: the Woodbury change to S W S' and S W r of each bent event
+            // shape terms integrated out: the Woodbury change to S W S' and S W r of each event that has
+            // any, through the La shapes whose variance is positive for the event
             for (int bi = 0; bi < B; ++bi) {
               const int i = i0 + bi;
               if (!bent[i]) continue;
               const double* w = &c.W[bi * D];
               const double* wr = &c.WY[bi * D];
-              const double* prec = &bend_prec[static_cast<size_t>(i) * Lb];
-              for (int l = 0; l < Lb; ++l) {
-                const double* el = &Eb[static_cast<size_t>(l) * D];
+              const double* var = bend_var + static_cast<size_t>(i) * Lb;
+              int La = 0;
+              for (int l = 0; l < Lb; ++l)
+                if (shape_moves(var[l])) bact[La++] = l;
+              for (int q = 0; q < La; ++q) {
+                const double* el = &Eb[static_cast<size_t>(bact[q]) * D];
                 for (int d = 0; d < D; ++d) bw[d] = w[d] * el[d];
-                for (int m = 0; m <= l; ++m) {
-                  const double v = dot(bw.data(), &Eb[static_cast<size_t>(m) * D], D);
-                  bm[l * Lb + m] = v;
-                  bm[m * Lb + l] = v;
+                for (int m = 0; m <= q; ++m) {
+                  const double v = dot(bw.data(), &Eb[static_cast<size_t>(bact[m]) * D], D);
+                  bm[q * La + m] = v;
+                  bm[m * La + q] = v;
                 }
-                bm[l * Lb + l] += prec[l];
-                bew[l] = dot(wr, el, D);
-                for (int f = 0; f < F; ++f) bswe[f * Lb + l] = dot(bw.data(), &S[static_cast<size_t>(f) * D], D);
+                bm[q * La + q] += 1.0 / var[bact[q]];
+                bew[q] = dot(wr, el, D);
+                for (int f = 0; f < F; ++f) bswe[f * La + q] = dot(bw.data(), &S[static_cast<size_t>(f) * D], D);
               }
-              if (!cholesky(bm.data(), Lb)) continue;   // keeps the unbent normal equations
+              if (!cholesky(bm.data(), La)) continue;   // keeps the normal equations without the terms
               for (int f = 0; f < F; ++f) {
-                for (int l = 0; l < Lb; ++l) bz[f * Lb + l] = bswe[f * Lb + l];
-                chol_solve(bm.data(), Lb, &bz[f * Lb]);
+                for (int q = 0; q < La; ++q) bz[f * La + q] = bswe[f * La + q];
+                chol_solve(bm.data(), La, &bz[f * La]);
               }
-              chol_solve(bm.data(), Lb, bew.data());
+              chol_solve(bm.data(), La, bew.data());
               double* nss = &c.NSS[static_cast<size_t>(bi) * T];
               double* rhs = &c.RHS[bi * F];
               int t = 0;
               for (int a = 0; a < F; ++a)
-                for (int bb = 0; bb <= a; ++bb, ++t) nss[t] -= dot(&bswe[a * Lb], &bz[bb * Lb], Lb);
-              for (int f = 0; f < F; ++f) rhs[f] -= dot(&bswe[f * Lb], bew.data(), Lb);
+                for (int bb = 0; bb <= a; ++bb, ++t) nss[t] -= dot(&bswe[a * La], &bz[bb * La], La);
+              for (int f = 0; f < F; ++f) rhs[f] -= dot(&bswe[f * La], bew.data(), La);
             }
           }
           PROF_LAP(prof_thread, kNormalProducts, pt);

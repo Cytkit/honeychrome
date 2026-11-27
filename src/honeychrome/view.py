@@ -325,13 +325,19 @@ class View(QObject):
 
     @Slot(str)
     def warning_message(self, message, deferrals=0):
-        # A modal dialog opened inside a busy-cursor job's nested event loop loses its
-        # modality when that loop ends and can drop behind the main window, so the
-        # warning waits until the job has finished (for at most about 10 s).
+        # A blocking dialog runs its own event loop; a busy-cursor job started from
+        # that loop (e.g. by a signal queued just before the warning) makes the
+        # dialog drop behind the main window when the job ends. So the warning
+        # waits until a running job has finished (for at most about 10 s), and is
+        # then opened window-modal without blocking, attached to the main window
+        # (a sheet on macOS), where later jobs cannot hide it.
         if QApplication.overrideCursor() is not None and deferrals < 100:
             QTimer.singleShot(100, lambda: self.warning_message(message, deferrals + 1))
             return
-        QMessageBox.warning(self.main_window, "Warning", f"{message}")
+        box = QMessageBox(QMessageBox.Warning, "Warning", f"{message}", QMessageBox.Ok, self.main_window)
+        box.setAttribute(Qt.WA_DeleteOnClose)
+        box.setWindowModality(Qt.WindowModal)
+        box.open()
 
     @Slot()
     def new_experiment(self):

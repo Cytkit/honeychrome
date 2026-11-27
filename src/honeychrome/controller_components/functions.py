@@ -118,7 +118,16 @@ def sample_from_fcs(path, bus=None):
             f'Controller: FlowIO reports a data offset that is off by 1. '
             f'{e}. Attempting to load with ignore_offset_error=True')
         try:
-            sample = Sample(path, use_header_offsets=True, ignore_offset_error=True)
+            # TEXT offsets first: a file over 99,999,999 bytes has 0 data
+            # offsets in its HEADER, so use_header_offsets reads 0 events
+            # (Bio-Rad ZE5 files, $CYT YETI or EVEREST, write an off-by-1
+            # $ENDDATA and are often that large).
+            try:
+                sample = Sample(path, ignore_offset_error=True)
+            except Exception:
+                sample = None
+            if sample is None or sample.event_count == 0:
+                sample = Sample(path, use_header_offsets=True, ignore_offset_error=True)
         except Exception:
             logging.warning(f'Controller: use_header_offsets fallback also failed for {path}. '
                             f'Attempting delimiter repair.')
@@ -525,34 +534,33 @@ def define_fcs_keywords(
     import re
     from datetime import datetime, timezone
 
-    # Keywords Honeychrome recomputes fresh elsewhere in this function (or in
-    # write_fcs). Raw values for these must never be carried through, or they
-    # end up as duplicate keywords alongside the correct ones — since raw
-    # keyword keys now come back lowercased/$-stripped from get_metadata(),
-    # they no longer collide by exact key string with the ones we write below.
-    _RECOMPUTED_KEYWORDS = {
-        'FIL', 'PAR', 'TOT', 'DATATYPE', 'BYTEORD', 'MODE', 'NEXTDATA',
-        'BEGINANALYSIS', 'ENDANALYSIS', 'BEGINSTEXT', 'ENDSTEXT',
-        'BEGINDATA', 'ENDDATA', 'ORIGINALITY', 'LAST_MODIFIED', 'LAST_MODIFIER',
-        'HONEYCHROME', 'UNMIXINGMETHOD', 'SPILLOVER',
-        'SPECTRA', 'FLUOROCHROMES', 'AUTOFLUORESCENCE', 'WEIGHTS',
-        'BDCHORUSDATARECORD',
-    }
-
     # ---- 1. Carry-through non-parameter keywords from raw file ----
-    # Guard against malformed keyword dicts produced by FlowIO when the FCS
-    # TEXT delimiter byte is wrong (FACSDiscover export bug): corrupt entries
-    # have pipe-delimited blobs as keys. Skip any key that contains '|', is
-    # empty, or is implausibly long (>64 chars) for a real FCS keyword.
-    non_param_keys = {
-        k: v for k, v in raw_keywords.items()
-        if k
-        and '|' not in k
-        and len(k) <= 64
-        and not re.match(r'^\$?P\d+', k, re.IGNORECASE)
-        and not re.match(r'^\$?CH\d+', k, re.IGNORECASE)
-        and k.lstrip('$').upper() not in _RECOMPUTED_KEYWORDS
+    # FlowIO splits a '|'-delimited TEXT segment correctly but leaves escaped
+    # delimiters doubled inside values. Restore them to a single '|' so values
+    # are literal; write_fcs escapes them again on output.
+    raw_keywords = {k: str(v).replace('||', '|') for k, v in raw_keywords.items()}
+
+    # Carry over only keywords that stay true for the new file: standard FCS 3.1
+    # keywords describing the acquisition and the sample, plus vendor
+    # sample-identifier keywords used for grouping in analysis software.
+    # Everything else describes the original file (byte offsets into it, raw
+    # channel settings, raw spillover, vendor unmixing setup), and vendor
+    # software can refuse to open a file whose own keywords contradict it.
+    # FlowIO returns names lowercased and without '$', so standard keywords
+    # are matched on the bare name and written back as '$NAME'.
+    carry_standard = {
+        'ABRT', 'BTIM', 'CELLS', 'COM', 'CYT', 'CYTSN', 'DATE', 'ETIM', 'EXP',
+        'INST', 'LOST', 'OP', 'PLATEID', 'PLATENAME', 'PROJ', 'SMNO', 'SRC', 'SYS',
+        'TIMESTEP', 'TR', 'VOL', 'WELLID',
     }
+    carry_vendor = {'TUBE NAME', 'TUBENAME', 'EXPERIMENT NAME', 'GROUPNAME'}
+    non_param_keys = {}
+    for k, v in raw_keywords.items():
+        name = k.lstrip('$').upper()
+        if name in carry_standard:
+            non_param_keys['$' + name] = v
+        elif name in carry_vendor:
+            non_param_keys[name] = v
 
     # ---- 2. Whitelist for raw param carry-through ----
     sc_ids = set(raw_settings.get('scatter_channel_ids', []))
@@ -584,6 +592,9 @@ def define_fcs_keywords(
 
     for i, ch in enumerate(pnn, start=1):
         prefix = f'$P{i}'
+        # PnDISPLAY and PnTYPE are not FCS 3.1 keywords, so they are written as
+        # custom keywords without '$' (Cytek instruments write PnDISPLAY this way).
+        custom_prefix = f'P{i}'
         ch_safe = ch.replace(',', '_')   # FCS 3.1 §3.2.23
 
         if ch == 'AF Abundance':
@@ -594,7 +605,7 @@ def define_fcs_keywords(
                 f'{prefix}E': '0,0',
                 f'{prefix}R': str(magnitude_ceiling),
                 f'{prefix}G': '1',
-                f'{prefix}DISPLAY': 'LOG',
+                f'{custom_prefix}DISPLAY': 'LOG',
             })
 
         elif ch == 'AF Index':
@@ -609,7 +620,7 @@ def define_fcs_keywords(
                 f'{prefix}E': '0,0',
                 f'{prefix}R': str(n_index + 1),  # indices run 1..n_index
                 f'{prefix}G': '1',
-                f'{prefix}DISPLAY': 'LIN',
+                f'{custom_prefix}DISPLAY': 'LIN',
             })
 
         elif ch in raw_param_lookup:
@@ -621,12 +632,13 @@ def define_fcs_keywords(
                     None
                 )
                 if old_key:
-                    param_keywords[f'{prefix}{field}'] = old[old_key]
+                    out_prefix = custom_prefix if field in ('DISPLAY', 'TYPE') else prefix
+                    param_keywords[f'{out_prefix}{field}'] = old[old_key]
             # Guarantee mandatory fields
             param_keywords.setdefault(f'{prefix}N', ch_safe)
             param_keywords.setdefault(f'{prefix}E', '0,0')
             param_keywords.setdefault(f'{prefix}R', str(magnitude_ceiling))
-            param_keywords.setdefault(f'{prefix}DISPLAY', 'LIN')
+            param_keywords.setdefault(f'{custom_prefix}DISPLAY', 'LIN')
             param_keywords.setdefault(f'{prefix}B', BIT_DEPTH)
 
         else:
@@ -640,7 +652,7 @@ def define_fcs_keywords(
                 f'{prefix}E': '0,0',
                 f'{prefix}R': str(magnitude_ceiling),
                 f'{prefix}G': '1',
-                f'{prefix}DISPLAY': 'LOG' if is_fl else 'LIN',
+                f'{custom_prefix}DISPLAY': 'LOG' if is_fl else 'LIN',
             })
 
     # ---- 5. Spillover keyword ----
@@ -684,7 +696,11 @@ def define_fcs_keywords(
             spectra_kw['WEIGHTS'] = f'{len(det_names)},{",".join(det_names)},{vals}'
 
     # ---- 7. Provenance keywords ----
-    now_str = datetime.now(timezone.utc).strftime('%d-%b-%Y %H:%M:%S').upper()
+    # English month abbreviations whatever the locale (FCS 3.1: dd-mmm-yyyy hh:mm:ss)
+    now = datetime.now(timezone.utc)
+    month = ('JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
+             'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC')[now.month - 1]
+    now_str = f'{now.day:02d}-{month}-{now.year:04d} {now:%H:%M:%S}'
     provenance = {
         '$FIL':           file_name,
         '$PAR':           str(len(pnn)),
@@ -812,10 +828,11 @@ def _fcs_header_and_text(keywords: dict[str, str], n_events: int, n_channels: in
                          file_path: Path) -> bytes:
     """HEADER and TEXT segments of an FCS 3.1 file whose float32 DATA segment
     holds n_events x n_channels values and follows the TEXT directly."""
-    DELIM = '|'
-
-    # Mandatory field overrides (ensure consistency)
-    kw = dict(keywords)
+    # Mandatory field overrides (ensure consistency). Keywords with a blank
+    # name or value are dropped: FCS 3.1 forbids empty values, and '||' would
+    # read as an escaped delimiter, shifting every following key/value pair.
+    kw = {str(k): str(v) for k, v in keywords.items()
+          if str(k).strip() and str(v).strip()}
     kw['$TOT']           = str(n_events)
     kw['$PAR']           = str(n_channels)
     kw['$DATATYPE']      = 'F'
@@ -829,11 +846,26 @@ def _fcs_header_and_text(keywords: dict[str, str], n_events: int, n_channels: in
     kw['$BEGINANALYSIS'] = '0'
     kw['$ENDANALYSIS']   = '0'
 
+    # The DATA segment is always 32-bit float, so every parameter is 32 bits
+    # wide and, for float data, linear: $PnE must be 0,0 (FCS 3.1).
+    for i in range(1, n_channels + 1):
+        kw[f'$P{i}B'] = '32'
+        kw[f'$P{i}E'] = '0,0'
+
+    # Use a delimiter that occurs in no keyword name or value, so nothing needs
+    # escaping: readers disagree on doubled delimiters (flowCore reads them as
+    # empty values by default). If every candidate occurs, values are escaped
+    # by doubling in _build_text.
+    all_text = ''.join(kw) + ''.join(kw.values())
+    DELIM = next((c for c in ('|', '\f', '~', '^', '!') if c not in all_text), '|')
+
     TEXT_START = 58  # HEADER is always 58 bytes
 
     def _build_text(kw_dict):
+        # A delimiter inside a value is escaped by doubling it (FCS 3.1 3.2.4).
         return DELIM + ''.join(
-            f'{k}{DELIM}{v}{DELIM}' for k, v in kw_dict.items()
+            f'{k.replace(DELIM, DELIM * 2)}{DELIM}{v.replace(DELIM, DELIM * 2)}{DELIM}'
+            for k, v in kw_dict.items()
         )
 
     text = _build_text(kw)
@@ -874,15 +906,16 @@ def _fcs_header_and_text(keywords: dict[str, str], n_events: int, n_channels: in
     else:
         raise RuntimeError(f'write_fcs: offset layout did not converge for {file_path}')
 
-    # FCS 3.1 §3.1: header offset fields are 8 chars each.
-    # If DATA_START or DATA_END exceed 8 digits, write 0 in the header —
-    # compliant readers must use $BEGINDATA/$ENDDATA from TEXT in that case.
-    def _h(n): return f'{n:>8d}' if n < 100_000_000 else '       0'
+    # Header offsets are 8 characters each. When any part of a segment lies
+    # beyond byte 99,999,999, both its offsets are written as 0 and readers use
+    # the TEXT keywords instead (FCS 3.1 section 3.1).
+    def _pair(start, end):
+        return f'{start:>8d}{end:>8d}' if end < 100_000_000 else '       0       0'
     header = (
         f'{"FCS3.1":<10}'
-        + _h(TEXT_START) + _h(TEXT_END)
-        + _h(DATA_START)  + _h(DATA_END)
-        + '       0'      + '       0'   # STEXT always 0
+        + _pair(TEXT_START, TEXT_END)
+        + _pair(DATA_START, DATA_END)
+        + '       0       0'   # no ANALYSIS segment
     )
     return header.encode('ascii') + text_bytes
 

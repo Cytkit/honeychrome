@@ -70,6 +70,7 @@ import heapq
 import json
 import logging
 import math
+import pickle
 import threading
 from collections import OrderedDict
 from copy import deepcopy
@@ -174,6 +175,9 @@ DEFAULT_EDGE_DENSITY = 0.002        # cells: density fall-off, fraction of the p
 CELL_SIDE_CELLS = 'cells'           # cells: keep the events above the debris cut
 CELL_SIDE_DEBRIS = 'debris'         # cells: keep the events below it
 DEFAULT_DEBRIS_ALGORITHM = 'mixture'  # cells: threshold algorithm of the debris cut
+DEFAULT_DEBRIS_MAX_DENSITY = 0.25    # debris cut: highest density at the algorithm's cut, fraction of the peak
+SCALE_TOP = 1.0                      # top of scale on the display scale (the instrument's T)
+DEFAULT_DEBRIS_VALLEY_MAX = 0.5      # debris cut: highest valley density, fraction of the lower peak
 # Tail fraction of kde_min's fallback when the density has a single peak.
 KDE_MIN_FALLBACK_TAIL = 0.01
 MODE_FIXED = 'fixed'
@@ -1187,63 +1191,76 @@ class GateCalculator:
         return out
 
     def _calc_singlets(self, data, gate_def, channel_index) -> dict:
-        """Line fit through the main diagonal of the two scatter channels,
-        with iterative outlier removal; the gate is a parallelogram of
-        ± width_sd residual SDs around the line, running the full width of
-        the x axis.
+        """Trapezoid around the main diagonal of the area and height (or
+        width) channels.
 
-        The residual SD is estimated from the median absolute deviation
-        (scaled to match the SD of a normal distribution), so a shoulder of
-        doublets beside the diagonal does not widen the band that is meant
-        to exclude them.
+        The line is a robust Huber M-estimator fit of height on area
+        (statsmodels RLM with HuberT, as MASS::rlm in AutoGating). The
+        spread about it grows with the signal, so the residuals are taken
+        relative to the area value, and the half-width at area x is
+        ``width_sd`` (default 3) SDs times x. The SD comes from the
+        residuals above the line only (the singlet side; doublets lie below
+        it): the median positive relative residual divided by 0.6745, the
+        half-normal median, so doublets do not widen the band.
 
-        A pile of events at the top of either axis (saturation, more than
-        ``saturation_fraction`` of the events, default 0.0005; see
-        saturation_cut) is left out of the fit, so multiplets maxed out on
-        scatter do not pull the line. The band is not cut there: saturated
-        events that fall inside it stay in the population."""
-        from scipy.stats import median_abs_deviation
+        The left end is the debris cut on the area channel (debris_cut), the
+        right end the point where the area channel's density falls to
+        ``edge_density`` (default DEFAULT_EDGE_DENSITY) of its peak, or just
+        below a saturated pile on the area channel (more than
+        ``saturation_fraction`` of the events, default 0.0005). Events below
+        the left end, those at or below zero included, and saturated events
+        are left out of the fit."""
+        import statsmodels.api as sm
+        from scipy.stats import norm
         gp = gate_def.get('gate_param', {}) or {}
         q = float(gp.get('quantile_trim', 0.001))
         width_sd = float(gp.get('width_sd', 3.0))
+        sat_fraction = float(gp.get('saturation_fraction', 0.0005))
+        edge = float(gp.get('edge_density', DEFAULT_EDGE_DENSITY))
         ix = channel_index[gate_def['gate_marker_x']]
         iy = channel_index[gate_def['gate_marker_y']]
+        full_x = data[:, ix]
         xy = data[:, [ix, iy]]
-        sat_fraction = float(gp.get('saturation_fraction', 0.0005))
         unsaturated = np.ones(len(xy), dtype=bool)
+        x_pile = None
         for k in range(2):
             pile = saturation_cut(xy[:, k], sat_fraction)
             if pile is not None:
                 unsaturated &= xy[:, k] < pile
-        xy = trim_quantiles(xy[unsaturated], q)
+                if k == 0:
+                    x_pile = pile
+        x_left = debris_cut(full_x, gp)
+        sel = unsaturated & (full_x > max(x_left, 0.0))
+        xy = trim_quantiles(xy[sel], q)
         if len(xy) < 50:
             return {}
         x, y = xy[:, 0], xy[:, 1]
-        keep = np.ones(len(x), dtype=bool)
-        slope, intercept = 1.0, 0.0
-        for _ in range(3):
-            slope, intercept = np.polyfit(x[keep], y[keep], 1)
-            resid = y[keep] - (slope * x[keep] + intercept)
-            sigma = float(median_abs_deviation(resid, scale='normal'))
-            if sigma == 0:
-                break
-            keep[keep] = np.abs(resid) < width_sd * sigma
-        slope, intercept = np.polyfit(x[keep], y[keep], 1)
-        sigma = float(median_abs_deviation(y[keep] - (slope * x[keep] + intercept),
-                                           scale='normal')) or 1.0
-        offset = width_sd * sigma
-        # The band runs the full width of the axis, so the gate is open along
-        # the diagonal rather than ending at the extremes of the training data
-        # (saturated events left out of the fit included).
-        full_x = data[:, ix]
-        lim_lo, lim_hi = self._limits(gate_def['gate_marker_x'], full_x)
-        x_lo, x_hi = min(float(full_x.min()), lim_lo), max(float(full_x.max()), lim_hi)
+
+        fit = sm.RLM(y, sm.add_constant(x, has_constant='add'), M=sm.robust.norms.HuberT()).fit(maxiter=100)
+        intercept, slope = float(fit.params[0]), float(fit.params[1])
+        rel = (y - (slope * x + intercept)) / x
+        up = rel[rel > 0]
+        sigma = (float(np.median(up)) / norm.ppf(0.75)) if len(up) else 0.0
+        if not sigma > 0:
+            sigma = 0.01
+        x_right = density_edges(trim_quantiles(full_x[sel], q), edge)[1]
+        if x_pile is not None:
+            x_right = min(x_right, x_pile)
+        if not x_right > x_left:
+            x_left, x_right = float(x.min()), float(x.max())
+
+        def line(v):
+            return slope * v + intercept
+
+        def half(v):
+            return width_sd * sigma * abs(v)
+
         poly = [
-            [x_lo, slope * x_lo + intercept - offset],
-            [x_hi, slope * x_hi + intercept - offset],
-            [x_hi, slope * x_hi + intercept + offset],
-            [x_lo, slope * x_lo + intercept + offset],
-            [x_lo, slope * x_lo + intercept - offset],
+            [x_left, line(x_left) - half(x_left)],
+            [x_right, line(x_right) - half(x_right)],
+            [x_right, line(x_right) + half(x_right)],
+            [x_left, line(x_left) + half(x_left)],
+            [x_left, line(x_left) - half(x_left)],
         ]
         pop = next(iter(gate_def.get('populations') or {'in': {}}))
         return {pop: {'boundary': [[float(a), float(b)] for a, b in poly],
@@ -1379,7 +1396,9 @@ class GateCalculator:
         side on the forward-scatter axis and the other sides come from the
         events below it. A pile of events at the top of either axis
         (saturation, more than ``saturation_fraction`` of the events,
-        default 0.0005) is cut just below the pile.
+        default 0.0005) is cut just below the pile; off-scale events (above
+        SCALE_TOP) are left out of the calculation and the gate stops at
+        the top of scale (saturation_cut).
         """
         gp = gate_def.get('gate_param', {}) or {}
         q = float(gp.get('quantile_trim', 0.001))
@@ -1388,6 +1407,14 @@ class GateCalculator:
         if len(xy) < 50:
             return {}
         d = 1 if gp.get('debris_axis') == 'y' else 0
+        sat_fraction = float(gp.get('saturation_fraction', 0.0005))
+        piles = [saturation_cut(xy[:, k], sat_fraction) for k in range(2)]
+        on = np.ones(len(xy), dtype=bool)
+        for k in range(2):
+            if piles[k] is not None:
+                on &= xy[:, k] < piles[k]
+        if int(on.sum()) >= 50:
+            xy = xy[on]
         cut = self._scaled(debris_cut(xy[:, d], gp), gp, '', chans[d])
         debris = gp.get('cell_side') == CELL_SIDE_DEBRIS
         kept = xy[xy[:, d] < cut] if debris else xy[xy[:, d] >= cut]
@@ -1397,16 +1424,14 @@ class GateCalculator:
         for k, ch in enumerate(chans):
             edge = float(gp.get(f'edge_density_{"xy"[k]}',
                                 gp.get('edge_density', DEFAULT_EDGE_DENSITY)))
-            values = xy[:, k]
             lo, hi = density_edges(trim_quantiles(kept[:, k], q), edge)
             if k == d:
                 if debris:
                     hi = cut
                 else:
                     lo = cut
-            pile = saturation_cut(values, float(gp.get('saturation_fraction', 0.0005)))
-            if pile is not None:
-                hi = min(hi, pile)
+            if piles[k] is not None:
+                hi = min(hi, piles[k])
             bounds.append((lo, hi))
         (x0, x1), (y0, y1) = bounds
         return {pop: {'boundary': _rect(x0, x1, y0, y1), 'threshold_x': None,
@@ -1424,14 +1449,27 @@ def debris_cut(x: np.ndarray, gate_param: dict | None = None) -> float:
     """Forward-scatter value separating debris and dead cells from the
     cells (see GateCalculator._calc_cells), before any threshold factor.
 
-    A pile of events at the top of *x* (saturation_cut) is left out, the
-    rest is quantile-trimmed (``quantile_trim``) and cropped to the
-    ``axis_lo``/``axis_hi`` window as for a 1dsep gate, and the gate's
-    debris_algorithm places the threshold with the gate's own parameters
-    (``mixture_components``, ``mixture_cut``, ``tail_fraction``). With the
-    default two-component mixture, the cut is where the debris and the
-    cells' Gaussian components are equally dense.
+    A pile of events at the top of *x* (saturation_cut) is left out and the
+    rest quantile-trimmed (``quantile_trim``); the density used below leaves
+    out the top 1% of the values (off-scale events would otherwise stretch
+    its grid). Then, in order:
+
+    1. the density minimum between the two highest density peaks, when it
+       is a dip (density at most ``debris_valley_max``, default
+       DEFAULT_DEBRIS_VALLEY_MAX, of the lower peak) with at least half of
+       the events above it (debris and cells as two peaks, e.g. adipose
+       tissue);
+    2. else the gate's debris_algorithm on the values cropped to the
+       ``axis_lo``/``axis_hi`` window, with the gate's own parameters
+       (``mixture_components``, ``mixture_cut``, ``tail_fraction``), when the
+       cut lies below the density peak where the density is at most
+       ``debris_max_density`` (default DEFAULT_DEBRIS_MAX_DENSITY) of the
+       peak;
+    3. else the lower point where the density falls to ``edge_density``
+       (default DEFAULT_EDGE_DENSITY) of its peak: there is no debris
+       population to separate (e.g. spleen after singlet gating).
     """
+    from scipy.signal import find_peaks
     gp = gate_param or {}
     x = np.asarray(x, dtype=float)
     pile = saturation_cut(x, float(gp.get('saturation_fraction', 0.0005)))
@@ -1440,12 +1478,27 @@ def debris_cut(x: np.ndarray, gate_param: dict | None = None) -> float:
     col = trim_quantiles(x, float(gp.get('quantile_trim', 0.001)))
     if len(col) < MIN_EVENTS:
         return float(col.min()) if len(col) else 0.0
+    grid, density = _kde_grid(col[col <= np.quantile(col, 0.99)])
+    peaks, _ = find_peaks(density)
+    if len(peaks) >= 2:
+        top = sorted(peaks[np.argsort(density[peaks])[::-1][:2]])
+        p1, p2 = int(top[0]), int(top[1])
+        v = p1 + int(np.argmin(density[p1:p2 + 1]))
+        valley_max = float(gp.get('debris_valley_max', DEFAULT_DEBRIS_VALLEY_MAX))
+        if density[v] <= valley_max * min(density[p1], density[p2]) \
+                and float((col > grid[v]).mean()) >= 0.5:
+            return float(grid[v])
+    falloff = density_edges(col, float(gp.get('edge_density', DEFAULT_EDGE_DENSITY)))[0]
     algo = debris_algorithm(gp)
     calc = crop_to_region(col, float(gp.get('axis_lo', default_axis_lo(algo))),
                           float(gp.get('axis_hi', 0.99)))
     if len(calc) < MIN_EVENTS:
         calc = col
-    return compute_threshold(calc, algo, gp)
+    t = float(compute_threshold(calc, algo, gp))
+    peak = float(grid[int(np.argmax(density))])
+    rel = float(np.interp(t, grid, density)) / float(density.max())
+    max_density = float(gp.get('debris_max_density', DEFAULT_DEBRIS_MAX_DENSITY))
+    return t if (t < peak and rel <= max_density) else float(falloff)
 
 
 def density_edges(x: np.ndarray, rel_density: float = DEFAULT_EDGE_DENSITY) -> tuple[float, float]:
@@ -1462,17 +1515,20 @@ def density_edges(x: np.ndarray, rel_density: float = DEFAULT_EDGE_DENSITY) -> t
 
 
 def saturation_cut(values: np.ndarray, min_fraction: float = 0.0005) -> float | None:
-    """Just below a pile of events at the maximum of *values* (a saturated
-    detector), or None when there is no such pile."""
+    """Cut that leaves out off-scale and saturated events: events above
+    SCALE_TOP are off scale; a pile of events within 0.1% of the top of
+    scale of the maximum on-scale value is saturated. Returns the value just
+    below the pile, SCALE_TOP when there are off-scale events and no pile,
+    or None when there is neither."""
     values = np.asarray(values, dtype=float)
+    off = SCALE_TOP if bool(np.any(values > SCALE_TOP)) else None
+    values = values[values <= SCALE_TOP]
     if not len(values):
-        return None
-    v_max, v_min = float(values.max()), float(values.min())
-    span = (v_max - v_min) or 1.0
-    edge = v_max - 1e-3 * span
+        return off
+    edge = float(values.max()) - 1e-3 * SCALE_TOP
     if float(np.mean(values >= edge)) <= min_fraction:
-        return None
-    return edge - 1e-3 * span
+        return off
+    return edge - 1e-3 * SCALE_TOP
 
 
 def _convex_hull_polygon(xy: np.ndarray) -> list | None:
@@ -2376,14 +2432,24 @@ def _digest_default(obj):
 
 
 def content_digest(obj) -> str:
-    """SHA-256 of *obj* written as sorted JSON: a quick test of whether
-    nested state has changed. Numpy values are converted; other objects
-    count by their text."""
+    """SHA-256 of *obj* pickled: a quick test, within one session, of
+    whether nested state has changed. Pickling skips writing every number
+    as text, so large states (gate templates of many populations) are
+    digested several times faster than as JSON. The same content built
+    with dictionary keys in another order can give another digest, which
+    costs only a refresh or save that was not needed. Objects that cannot
+    be pickled are digested as sorted JSON, numpy values converted and
+    other objects counted by their text. Not for digests kept on disk.
+    """
     try:
-        text = json.dumps(obj, sort_keys=True, default=_digest_default)
-    except (TypeError, ValueError):
-        text = json.dumps(_jsonable(obj), sort_keys=True, default=_digest_default)
-    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+        data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    except (pickle.PicklingError, TypeError, AttributeError):
+        try:
+            text = json.dumps(obj, sort_keys=True, default=_digest_default)
+        except (TypeError, ValueError):
+            text = json.dumps(_jsonable(obj), sort_keys=True, default=_digest_default)
+        data = text.encode('utf-8')
+    return hashlib.sha256(data).hexdigest()
 
 
 def serialisable_boundaries(boundaries: dict) -> dict:

@@ -67,26 +67,29 @@ def unmix_m2p_kernel(raw, spectra, af_spectra, envelope, sigma0_sq, g, c, bead_v
     choice (M2pg). ``fixed_af_idx`` (n, 0-based) and ``fixed_af_scale`` (n,)
     fix each event's AF row and abundance (only the fluorophores are
     solved); a kernel built before this option raises TypeError. With the
-    AF fixed, ``bend_shapes`` (L, D) and ``bend_var`` (n, L) integrate out
-    each event's AF shape bend (prior variance 0: not bent); a kernel built
-    before this option raises TypeError. Returns ``unmixed`` (n, F),
-    ``af_idx`` (0-based), ``af_scale``, ``chi2``.
+    AF fixed or without AF, ``bend_shapes`` (L, D) and ``bend_var`` (n, L)
+    integrate out each event's shape terms (the AF shape bend, a
+    fluorophore's spectral variability); an event uses only the shapes
+    whose variance is positive for it. A kernel built before the option
+    raises TypeError, and one built before shapes were accepted without AF
+    raises ValueError for them. Returns ``unmixed`` (n, F), ``af_idx``
+    (0-based), ``af_scale``, ``chi2``.
     """
     if _lib is None:
         raise ImportError('the _gls_m2p_kernel extension is not built (build_autospectral_opt_kernel.py)')
     d = np.asarray(spectra).shape[1]
     af = np.zeros((0, d)) if af_spectra is None else np.ascontiguousarray(af_spectra, dtype=np.float64)
-    fixed = {}
+    optional = {}
     if fixed_af_idx is not None:
-        fixed = {'fixed_af_idx': np.ascontiguousarray(fixed_af_idx, dtype=np.int64),
-                 'fixed_af_scale': _arr(fixed_af_scale)}
-        if bend_shapes is not None:
-            fixed.update(bend_shapes=_arr(bend_shapes), bend_var=_arr(bend_var))
+        optional = {'fixed_af_idx': np.ascontiguousarray(fixed_af_idx, dtype=np.int64),
+                    'fixed_af_scale': _arr(fixed_af_scale)}
+    if bend_shapes is not None and (fixed_af_idx is not None or not len(af)):
+        optional.update(bend_shapes=_arr(bend_shapes), bend_var=_arr(bend_var))
     out = _lib.unmix_m2p(
         np.ascontiguousarray(raw, dtype=np.float64), np.ascontiguousarray(spectra, dtype=np.float64), af,
         _envelope_arg(envelope), _arr(sigma0_sq), _arr(g), _arr(c), 1.0, _arr(bead_var), _arr(tau_spread),
         float(prior_lambda), int(n_iter), float(ceiling or 0.0), int(n_threads), False, _arr(af_choice_weights),
-        int(batch_lanes), **fixed)
+        int(batch_lanes), **optional)
     out['af_idx'] = np.asarray(out['af_idx'], dtype=np.int64)
     return out
 

@@ -544,14 +544,18 @@ FIT_ALGORITHMS = ('tail', 'mixture')
 FIT_CANDIDATES = {
     'tail': ('tail', {}),
     'mixture': ('mixture', {'mixture_components': 2, 'mixture_cut': 'outer'}),
-    'mixture3_lower': ('mixture', {'mixture_components': 3, 'mixture_cut': 'lower'}),
-    'mixture3_upper': ('mixture', {'mixture_components': 3, 'mixture_cut': 'upper'}),
 }
-FIT_LABELS = {'tail': 'tail', 'mixture': 'mixture',
-              'mixture3_lower': 'mixture (3 components, lower cut)',
-              'mixture3_upper': 'mixture (3 components, upper cut)'}
+# 3-component mixtures are not conversion candidates: their cut is unstable
+# between training sets; set one by hand if needed.
+FIT_LABELS = {'tail': 'tail', 'mixture': 'mixture'}
 FIT_MAX_EVENTS = 10_000
 EVIDENCE_MIN_EVENTS = 50
+# An axis on which the parent is bimodal (bimodality_delta_bic above this,
+# as recommend_algorithm) never converts to tail: tail mirrors the tallest
+# peak, which on a bimodal marker may be the positive population. Its fit
+# candidates leave out tail, the 25% rule gives mixture and the 40% rule
+# gives way to the best fit.
+BIMODAL_DELTA_BIC = 10.0
 
 
 def _agreement(drawn: dict, calculated: dict) -> float | None:
@@ -793,6 +797,8 @@ def conversion_evidence(gate_def: dict, gate_defs: list[dict], data: np.ndarray,
     positive          {axis: fraction of the parent on the positive side}
                       of the shapes as drawn (positive_fractions);
     below_zero        {axis: fraction of the parent below raw zero};
+    bimodal           {axis: parent bimodal (BIMODAL_DELTA_BIC)}; a bimodal
+                      axis never converts to tail;
     fit               {per-axis algorithm tuple: agreement with the shapes
                       as drawn} over FIT_ALGORITHMS (2dsep gates, and 1dsep
                       gates spanning zero but not centred on it);
@@ -800,8 +806,9 @@ def conversion_evidence(gate_def: dict, gate_defs: list[dict], data: np.ndarray,
                       of a 1dsep gate, with reference_positive (its share
                       on the positive side of the drawn threshold);
     split             split_steps of a 2dsep gate, or None;
-    cell_side         for a scatter shape: CELL_SIDE_DEBRIS when most drawn
-                      events lie below the debris cut, else CELL_SIDE_CELLS.
+    cell_side         for a scatter shape: CELL_SIDE_DEBRIS when the drawn
+                      shape's upper edge on the forward-scatter axis lies
+                      below the density peak (kde_mode), else CELL_SIDE_CELLS.
     """
     name = gate_def['gate_name']
     parent_mask = result.parent_masks.get(name) if result is not None else None
@@ -824,12 +831,10 @@ def conversion_evidence(gate_def: dict, gate_defs: list[dict], data: np.ndarray,
         chans = ag_core.shape_channels(gate_def)
         if len(chans) == 2 and drawn:
             col = parent[:, index[chans[d]]]
-            cut = ag_core.debris_cut(col, gp)
-            inside = np.any(np.stack(list(drawn.values())), axis=0)
-            if inside.any():
-                below = float((col[inside] < cut).mean())
-                evidence['cell_side'] = (ag_core.CELL_SIDE_DEBRIS if below > 0.5
-                                         else ag_core.CELL_SIDE_CELLS)
+            upper = max(float(np.asarray(e['boundary'], dtype=float)[:, d].max())
+                        for e in template.values())
+            evidence['cell_side'] = (ag_core.CELL_SIDE_DEBRIS if upper < ag_core.kde_mode(col)
+                                     else ag_core.CELL_SIDE_CELLS)
         return evidence
     if gate_type not in ag_core.THRESHOLD_TYPES:
         return evidence
@@ -850,19 +855,29 @@ def conversion_evidence(gate_def: dict, gate_defs: list[dict], data: np.ndarray,
         if ch in index and ch in zeros:
             below[axis] = float((parent[:, index[ch]] < float(zeros[ch])).mean())
     evidence['below_zero'] = below
+    bimodal = {}
+    for axis in ag_core.threshold_axes(definition):
+        ch = ag_core.axis_channel(definition, axis)
+        if ch in index:
+            bimodal[axis] = ag_core.bimodality_delta_bic(parent[:, index[ch]], seed=42) > BIMODAL_DELTA_BIC
+    evidence['bimodal'] = bimodal
+
+    def candidates_of(axis):
+        return [c for c in FIT_CANDIDATES if not (bimodal.get(axis) and c == 'tail')]
+
     evidence['split'] = split_steps(definition)
     calc = ag_core.GateCalculator(axis_limits)
     gp = definition.get('gate_param') or {}
     if definition.get('gate_type') == '2dsep':
-        candidates = {a: ([None] if gp.get(f'algorithm_{a}') else list(FIT_CANDIDATES))
+        candidates = {a: ([None] if gp.get(f'algorithm_{a}') else candidates_of(a))
                       for a in ('x', 'y')}
         if ag_core.ALGORITHM_REPLICATE not in (gp.get('algorithm_x'), gp.get('algorithm_y')):
             evidence['fit'] = _fit_scores(definition, parent, index, drawn, calc, candidates)
     else:
         b0 = below.get('x')
-        if b0 is not None and SPANS_ZERO_BELOW <= b0 < CENTRED_BELOW_ZERO:
+        if b0 is not None and SPANS_ZERO_BELOW <= b0 and (b0 < CENTRED_BELOW_ZERO or bimodal.get('x')):
             evidence['fit'] = _fit_scores(definition, parent, index, drawn, calc,
-                                          {'x': list(FIT_CANDIDATES)})
+                                          {'x': candidates_of('x')})
         ref = default_reference(gate_defs, definition, anchor)
         threshold = _drawn_threshold(definition)
         ch = definition.get('gate_marker_x')
@@ -881,6 +896,7 @@ def evidence_axes(evidence: dict) -> dict:
     axis without suffix (e.g. mixture_components and mixture_cut of a
     3-component mixture).
 
+    A bimodal axis (evidence['bimodal']) never gets tail.
     1dsep: tail when at least CENTRED_BELOW_ZERO of the parent lies below
     zero; the better fit of FIT_ALGORITHMS to the shapes as drawn when at
     least SPANS_ZERO_BELOW does; replicate (from the default reference
@@ -899,6 +915,8 @@ def evidence_axes(evidence: dict) -> dict:
         f = pos.get(axis)
         if f is None:
             return None
+        if (evidence.get('bimodal') or {}).get(axis):
+            return 'mixture', f"{100 * f:.1f}% of the parent drawn positive; bimodal", {}
         import ag_flowjo
         algo = ag_flowjo.histogram_algorithm(f)
         return algo, f"{100 * f:.1f}% of the parent drawn positive", {}
@@ -917,7 +935,7 @@ def evidence_axes(evidence: dict) -> dict:
     if b0 is None:
         r = by_rule('x')
         return {'x': r} if r else {}
-    if b0 >= CENTRED_BELOW_ZERO:
+    if b0 >= CENTRED_BELOW_ZERO and not (evidence.get('bimodal') or {}).get('x'):
         return {'x': ('tail', f"{100 * b0:.0f}% of the parent below zero (centred on zero)", {})}
     if b0 >= SPANS_ZERO_BELOW:
         if fit:

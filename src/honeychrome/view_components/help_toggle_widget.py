@@ -3,6 +3,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton, 
                                QScrollArea, QFrame)
 from PySide6.QtCore import Qt, QObject, QEvent
 
+from honeychrome.view_components.focus_mode import mark_focus_chrome
 from honeychrome.view_components.help_texts import process_help_text
 from honeychrome.view_components.icon_loader import icon
 
@@ -22,6 +23,7 @@ class HelpToggleWidget(QWidget):
 
     def __init__(self, title="Show Help", text='', parent=None, scrolling=False):
         super().__init__(parent)
+        mark_focus_chrome(self)
         self.title = title
         self.help_scroll = None
         self._watched_window = None

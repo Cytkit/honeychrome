@@ -47,6 +47,9 @@ class SideTabWidget(QWidget):
         divider.setFrameShape(QFrame.VLine)
         divider.setFrameShadow(QFrame.Sunken)
 
+        from honeychrome.view_components.focus_mode import mark_focus_chrome
+        mark_focus_chrome(self._nav, divider)
+
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)

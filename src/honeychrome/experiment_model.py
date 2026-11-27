@@ -314,15 +314,13 @@ class ExperimentModel:
 
         self.samples['all_sample_nevents'] = all_sample_nevents
 
-        import re as _re
-        # Auto-register any samples whose name matches 'unstained' (case-insensitive)
-        # into unstained_samples, alongside manually-tagged ones.
+        from honeychrome.controller_components.unstained_selection import is_unstained_name
+        # Auto-register any samples named as unstained ("Unstained", or "Unst"
+        # in the tube name) into unstained_samples, alongside manually-tagged ones.
         tagged = self.samples.setdefault('unstained_samples', [])
         for p, tube_name in self.samples['all_samples'].items():
-            if p not in tagged:
-                if (_re.search(r'unstained', tube_name, _re.IGNORECASE)
-                        or _re.search(r'unstained', p, _re.IGNORECASE)):
-                    tagged.append(p)
+            if p not in tagged and is_unstained_name(tube_name, p):
+                tagged.append(p)
 
         # Prune any tagged unstained samples that no longer exist on disk
         self.samples['unstained_samples'] = [

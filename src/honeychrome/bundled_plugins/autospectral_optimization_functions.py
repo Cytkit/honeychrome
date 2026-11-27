@@ -531,10 +531,10 @@ def _resolve_unstained_cell_sample_names(samples: dict) -> list:
     all_samples = samples.get('all_samples', {})
     manually_unstained = set(samples.get('unstained_samples', []))
 
+    from honeychrome.controller_components.unstained_selection import is_unstained_name
+
     def _is_unstained(path: str, name: str) -> bool:
-        return (path in manually_unstained
-                or 'unstained' in path.lower()
-                or 'unstained' in name.lower())
+        return path in manually_unstained or is_unstained_name(name, path)
 
     names = []
     for path, name in all_samples.items():

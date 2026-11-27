@@ -86,13 +86,14 @@ import logging
 import os
 import re
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 from scipy.special import erfcx, log_ndtr
 
 from honeychrome.controller_components import af_shape_bend as asb
+from honeychrome.controller_components.af_contaminants import excluded_digest, excluded_for_sample, keep_mask
 
 logger = logging.getLogger(__name__)
 
@@ -567,6 +568,7 @@ class AFNoiseContext:
     fl_ids_raw: tuple
     ssc_name: str | None
     shape_bend: bool = False
+    excluded: dict = field(default_factory=dict)   # {sample key: event indices its AF contaminant screen removed}
 
     def _noise_for(self, sample_key) -> tuple:
         return self.bead_noise if str(sample_key) in self.bead_samples else self.cell_noise
@@ -589,15 +591,25 @@ class AFNoiseContext:
         return _digest(PRIOR_VERSION, FIT_EVENTS, FIT_SEED, str(sample_key), [st.st_size, st.st_mtime_ns],
                        list(af.profile_names), np.asarray(af.spectra, dtype=np.float64),
                        np.asarray(af.precomputed['S_t'], dtype=np.float64), env_part, list(noise),
-                       self.noise_fingerprint, self.ssc_name)
+                       self.noise_fingerprint, self.ssc_name,
+                       *([excluded_digest(self.excluded.get(str(sample_key)))]
+                         if self.excluded.get(str(sample_key)) is not None else []))
 
     def _read_unsaturated(self, sample_key: str, af, n_events: int, seed: int) -> tuple | None:
-        """A seeded subsample's unsaturated raw fluorescence and log SSC; None with fewer than MIN_EVENTS."""
+        """
+        A seeded subsample's unsaturated raw fluorescence and log SSC, without
+        the events the sample's AF contaminant screen removed; None with fewer
+        than MIN_EVENTS.
+        """
+        from honeychrome.controller_components.fcs_preview import read_preview_metadata
         from honeychrome.controller_components.sample_loader import read_raw_subsample
 
+        path = Path(self.experiment_dir) / sample_key
         try:
-            raw, _index, _n_file, _n_kept = read_raw_subsample(Path(self.experiment_dir) / sample_key, self,
-                                                               sample_key, n_events, seed=seed)
+            excluded = self.excluded.get(str(sample_key))
+            keep = None if excluded is None else keep_mask(excluded, int(read_preview_metadata(str(path)).event_count))
+            raw, _index, _n_file, _n_kept = read_raw_subsample(path, self, sample_key, n_events, seed=seed,
+                                                               keep_mask=keep)
         except Exception as exc:
             logger.warning('AF priors: %s not read (%s)', sample_key, exc)
             return None
@@ -760,12 +772,17 @@ def noise_context(controller, pnn_raw=None, whitelisted=None, fl_ids_raw=None) -
     beads = frozenset(str(k) for k in (samples.get('all_samples') or {}) if is_bead_sample(samples, k))
     references = {str(n): str(e.get('source_fcs')) for n, e in (process.get('af_profiles') or {}).items()
                   if e.get('source_fcs')}
+    excluded = {}
+    for key in set(references.values()):
+        idx = excluded_for_sample(controller.experiment_dir, process.get('af_profiles'), key)
+        if idx is not None:
+            excluded[key] = idx
     return AFNoiseContext(
         experiment_dir=str(controller.experiment_dir), cell_noise=_noise_arrays(noise.model_for(False)),
         bead_noise=_noise_arrays(noise.model_for(True)),
         noise_fingerprint=str(noise.entry.get('fingerprint')), bead_samples=beads, references=references,
         pnn_raw=tuple(pnn_raw), whitelisted=bool(whitelisted), fl_ids_raw=tuple(fl_ids_raw),
-        ssc_name=ssc_channel(raw, pnn_raw), shape_bend=asb.shape_bend_on(process))
+        ssc_name=ssc_channel(raw, pnn_raw), shape_bend=asb.shape_bend_on(process), excluded=excluded)
 
 
 def signature(context: AFNoiseContext | None) -> str | None:

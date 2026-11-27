@@ -11,6 +11,8 @@ from honeychrome.controller_components.functions import timer, apply_gates_in_pl
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import to_gml
 from honeychrome.settings import settings_default, process_default, cytometry_default, af_channels
 from honeychrome.controller_components.cytometer_whitelist import resolve_cytometer_params
+from honeychrome.controller_components.landmark_gates import landmark_scatter_gates, bead_scatter_gates
+from honeychrome.controller_components.per_sample_gating_functions import serialize_custom_sample_gates
 
 import logging
 logger = logging.getLogger(__name__)
@@ -59,6 +61,60 @@ def _extract_pnv_values(text_dict, n_channels):
             except (TypeError, ValueError):
                 pnv[idx] = None
     return pnv
+
+
+def summarise_channels_not_in_all_files(channels_by_file, n_files):
+    """Short end-of-import note for channels left out because some files lack them.
+
+    *channels_by_file* maps each file that has extra channels to those channels.
+    Channels are grouped by -A/-H/-W suffix; a group is named in full only when
+    it has at most five channels, otherwise it is counted. The full per-file
+    listing goes to the debug log, so the dialog stays readable however many
+    files and channels are involved.
+    """
+    logger.debug('Channels not present in every imported file: %s', channels_by_file)
+    dropped = sorted({ch for chs in channels_by_file.values() for ch in chs})
+    kinds = {'-A': 'area', '-H': 'height', '-W': 'width'}
+    groups = {}
+    for ch in dropped:
+        groups.setdefault(kinds.get(ch[-2:], 'other'), []).append(ch)
+    parts = [
+        f'{len(chs)} {kind} ({", ".join(chs)})' if len(chs) <= 5 else f'{len(chs)} {kind}'
+        for kind, chs in groups.items()
+    ]
+    return (
+        f'{len(dropped)} channel(s) present in only {len(channels_by_file)} of {n_files} '
+        f'files were left out of the experiment: {"; ".join(parts)}. '
+        f'Only channels found in every file are used.'
+    )
+
+
+def summarise_channel_layouts(channels_by_file, max_examples=3):
+    """Dialog text describing the distinct channel layouts among the imported files.
+
+    Shown when the files share no fluorescence detector channels, which usually
+    means raw files (detector channels such as UV1-A) and unmixed exports
+    (fluorophore channels such as BUV395-A) are in the same experiment. Each
+    layout is listed with its file count, a few of its fluorescence channels and
+    up to *max_examples* example files, largest layout first.
+    """
+    layouts = {}
+    for path, pnn in channels_by_file.items():
+        layouts.setdefault(frozenset(pnn), (list(pnn), []))[1].append(str(path))
+    lines = []
+    for pnn, paths in sorted(layouts.values(), key=lambda layout: -len(layout[1])):
+        fluor = [ch for ch in pnn if not _NON_FLUOR_PATTERN.search(ch)]
+        shown = ', '.join(fluor[:4]) if fluor else 'none'
+        if len(fluor) > 4:
+            shown += f' and {len(fluor) - 4} more'
+        examples = ', '.join(paths[:max_examples])
+        if len(paths) > max_examples:
+            examples += f' and {len(paths) - max_examples} more'
+        lines.append(
+            f'  {len(paths)} file(s) with {len(pnn)} channels '
+            f'(fluorescence: {shown}), e.g. {examples}'
+        )
+    return '\n'.join(lines)
 
 
 class ImportFCSController(QObject):
@@ -138,9 +194,26 @@ class ImportFCSController(QObject):
                 time_missing_note = None  # set below if no Time channel; folded into the same dialog
                 voltage_mismatch_note = None  # set below if PnV/PnG differs across files; folded into the same dialog
                 voltage_unavailable_note = None  # set below for ID7000, which reports no PnV/PnG at all
+                landmark_note = None  # set below when Cells/Singlets are placed from the controls
+
+                # Only channels present in every file (not just the first one
+                # scanned) are whitelisted, so files with extra parameters (e.g.
+                # single stain controls exported with -H and -W channels that the
+                # samples lack) can all be loaded with one channel layout.
+                _common_pnn = set(representative_pnn)
+                for sp in raw_samples:
+                    _common_pnn &= set(all_sample_pnn[sp])
+                _per_file_drops = {
+                    sp: sorted(set(all_sample_pnn[sp]) - _common_pnn)
+                    for sp in raw_samples
+                    if set(all_sample_pnn[sp]) - _common_pnn
+                }
 
                 if cyt_info is not None:
-                    _fl_ids = cyt_info.fluorescence_channel_ids
+                    _fl_ids = [
+                        i for i in cyt_info.fluorescence_channel_ids
+                        if representative_pnn[i] in _common_pnn
+                    ]
                     _sc_base = [ch.rsplit('-', 1)[0] for ch in cyt_info.scatter_param]
                     _sc_extra_pat = (
                         re.compile('|'.join(cyt_info.scatter_extra_pat))
@@ -148,8 +221,9 @@ class ImportFCSController(QObject):
                     )
                     _sc_ids = [
                         i for i, ch in enumerate(representative_pnn)
-                        if ch.rsplit('-', 1)[0] in _sc_base
-                        or (_sc_extra_pat and re.search(_sc_extra_pat, ch))
+                        if ch in _common_pnn
+                        and (ch.rsplit('-', 1)[0] in _sc_base
+                             or (_sc_extra_pat and re.search(_sc_extra_pat, ch)))
                     ]
                     _time_id = next(
                         (i for i, ch in enumerate(representative_pnn) if ch.lower() == 'time'), None
@@ -160,34 +234,17 @@ class ImportFCSController(QObject):
                         + [representative_pnn[i] for i in _fl_ids]
                     )
                 else:
-                    # Unrecognised cytometer: restrict to channels common to every
-                    # file (not just the first one scanned), so files with extra or
-                    # missing derived parameters (e.g. a post-processing tool adding
-                    # parameters to only some files) can all be loaded afterwards
-                    # without re-triggering the "channels don't match" check.
-                    _common_pnn = set(representative_pnn)
-                    for sp in raw_samples:
-                        _common_pnn &= set(all_sample_pnn[sp])
                     whitelisted_pnn = [ch for ch in representative_pnn if ch in _common_pnn]
 
-                    _dropped_pnn = [ch for ch in representative_pnn if ch not in _common_pnn]
-                    if _dropped_pnn:
-                        _per_file_drops = {
-                            sp: sorted(set(all_sample_pnn[sp]) - _common_pnn)
-                            for sp in raw_samples
-                            if set(all_sample_pnn[sp]) - _common_pnn
-                        }
-                        # Stash rather than emit immediately — combined into the single
-                        # end-of-import dialog below so only one QMessageBox is shown.
-                        channel_mismatch_note = (
-                            'Cytometer not recognised — channels were not identical across '
-                            'all imported files.\n'
-                            f'Retained {len(whitelisted_pnn)} channel(s) common to every file:\n'
-                            f'  {whitelisted_pnn}\n'
-                            'Channels present in only some files (ignored):\n'
-                            + '\n'.join(f'  {sp}: {chs}' for sp, chs in _per_file_drops.items())
-                        )
-                        warnings.warn(channel_mismatch_note)
+                if _per_file_drops:
+                    # Stash rather than emit immediately — combined into the single
+                    # end-of-import dialog below so only one QMessageBox is shown.
+                    channel_mismatch_note = summarise_channels_not_in_all_files(
+                        _per_file_drops, len(raw_samples),
+                    )
+                    if cyt_info is None:
+                        channel_mismatch_note = 'Cytometer not recognised. ' + channel_mismatch_note
+                    warnings.warn(channel_mismatch_note)
 
                 logger.debug('Whitelisted PNN (%d channels): %s', len(whitelisted_pnn), whitelisted_pnn)
 
@@ -203,6 +260,28 @@ class ImportFCSController(QObject):
                         'Cannot set up the experiment file:\n'
                         'Some FCS files are missing required whitelisted channels:\n'
                         + '\n'.join(f'  {sp}: {m}' for sp, m in files_missing.items())
+                    )
+                    warnings.warn(text)
+                    if self.bus:
+                        self.bus.warningMessage.emit(text)
+                    return
+
+                # Without fluorescence channels common to every file there is
+                # nothing to unmix or plot, so stop before the experiment is
+                # changed and let the user fix the files.
+                if cyt_info is not None:
+                    shared_fluorescence_ids = _fl_ids
+                else:
+                    shared_fluorescence_ids = unrecognised_fluorescence_ids(representative_pnn, whitelisted_pnn)
+                if not shared_fluorescence_ids:
+                    text = (
+                        'Cannot set up the experiment file:\n'
+                        'The FCS files have no fluorescence channels in common.\n'
+                        + summarise_channel_layouts(all_sample_pnn) + '\n'
+                        'This usually means unmixed exports (channels named after '
+                        'fluorophores) are mixed with raw files (channels named after '
+                        'detectors). Replace them with the raw versions, '
+                        'then import again.'
                     )
                     warnings.warn(text)
                     if self.bus:
@@ -426,6 +505,28 @@ class ImportFCSController(QObject):
                         if sing_y not in whitelisted_pnn:
                             sing_y = None
 
+                    # Place Cells and Singlets on the single-stain controls' brightest
+                    # events; the fixed fractions below are kept when that is not possible.
+                    # Bead samples share one Cells and Singlets, installed as per-sample gates.
+                    landmark_gates = None
+                    bead_gates = None
+                    if (morph_x is not None) and (morph_y is not None):
+                        try:
+                            self.experiment.check_bead_samples()
+                            landmark_gates = landmark_scatter_gates(
+                                experiment_dir, self.experiment.samples, self.experiment.settings['raw'],
+                                raw_transformations, morph_x, morph_y, sing_x, sing_y)
+                            bead_gates = bead_scatter_gates(
+                                experiment_dir, self.experiment.samples.get('bead_samples', []),
+                                self.experiment.settings['raw'], raw_transformations,
+                                morph_x, morph_y, sing_x, sing_y)
+                        except Exception:
+                            logger.exception('ImportFCSController: landmark gates not placed')
+                    if landmark_gates is not None:
+                        landmark_note = landmark_gates.summary()
+                    if bead_gates is not None:
+                        landmark_note = ((landmark_note + '\n') if landmark_note else '') + bead_gates.summary()
+
                     time_plot = None
                     morph_plot = None
                     singlet_plot = None
@@ -446,10 +547,13 @@ class ImportFCSController(QObject):
                         morph_y_ceil = _display_ceil(morph_y)
                         morph_x_pnr  = pnr[event_channels_pnn.index(morph_x)]
                         morph_y_pnr  = pnr[event_channels_pnn.index(morph_y)]
-                        dim_x = Dimension(morph_x, range_min=0.2 * morph_x_ceil / morph_x_pnr,
-                                          range_max=0.8 * morph_x_ceil / morph_x_pnr, transformation_ref=morph_x)
-                        dim_y = Dimension(morph_y, range_min=0.2 * morph_y_ceil / morph_y_pnr,
-                                          range_max=0.8 * morph_y_ceil / morph_y_pnr, transformation_ref=morph_y)
+                        if landmark_gates is not None:
+                            x_min, x_max, y_min, y_max = landmark_gates.cells
+                        else:
+                            x_min, x_max = 0.2 * morph_x_ceil / morph_x_pnr, 0.8 * morph_x_ceil / morph_x_pnr
+                            y_min, y_max = 0.2 * morph_y_ceil / morph_y_pnr, 0.8 * morph_y_ceil / morph_y_pnr
+                        dim_x = Dimension(morph_x, range_min=x_min, range_max=x_max, transformation_ref=morph_x)
+                        dim_y = Dimension(morph_y, range_min=y_min, range_max=y_max, transformation_ref=morph_y)
                         gate = gates.RectangleGate(label, dimensions=[dim_x, dim_y])
                         raw_gating.add_gate(gate, gate_path=('root',))
                         morph_plot = [{'type': 'hist2d', 'channel_x': morph_x, 'channel_y': morph_y, 'source_gate': 'root', 'child_gates': ['Cells']}]
@@ -461,12 +565,22 @@ class ImportFCSController(QObject):
                             sing_x_ceil = _display_ceil(sing_x)
                             sing_y_ceil = _display_ceil(sing_y)
                             
+                            landmark_singlets = landmark_gates.singlets if landmark_gates is not None else None
                             if sing_y == 'FSC-W':
-                                dim_x = Dimension(sing_x, range_min=0.2 * sing_x_ceil / sing_x_pnr,
-                                                  range_max=0.8 * sing_x_ceil / sing_x_pnr, transformation_ref=sing_x)
-                                dim_y = Dimension(sing_y, range_min=0.2 * sing_y_ceil / sing_y_pnr,
-                                                  range_max=0.8 * sing_y_ceil / sing_y_pnr, transformation_ref=sing_y)
+                                if landmark_singlets is not None:
+                                    x_min, x_max = landmark_gates.cells[0], landmark_gates.cells[1]
+                                    y_min, y_max = landmark_singlets
+                                else:
+                                    x_min, x_max = 0.2 * sing_x_ceil / sing_x_pnr, 0.8 * sing_x_ceil / sing_x_pnr
+                                    y_min, y_max = 0.2 * sing_y_ceil / sing_y_pnr, 0.8 * sing_y_ceil / sing_y_pnr
+                                dim_x = Dimension(sing_x, range_min=x_min, range_max=x_max, transformation_ref=sing_x)
+                                dim_y = Dimension(sing_y, range_min=y_min, range_max=y_max, transformation_ref=sing_y)
                                 gate = gates.RectangleGate(label, dimensions=[dim_x, dim_y])
+                            elif landmark_singlets is not None:  # FSC-H: vertices in display space
+                                dim_x = Dimension(sing_x, range_min=0, range_max=1, transformation_ref=sing_x)
+                                dim_y = Dimension(sing_y, range_min=0, range_max=1, transformation_ref=sing_y)
+                                gate = gates.PolygonGate(label, dimensions=[dim_x, dim_y],
+                                                         vertices=[tuple(v) for v in landmark_singlets])
                             else:  # FSC-H — vertices in display space (post-transform)
                                 tr_x = raw_transformations[sing_x]
                                 tr_y = raw_transformations[sing_y]
@@ -505,8 +619,31 @@ class ImportFCSController(QObject):
                     raw_plots += ribbon_plot
                     raw_plots += fluorescence_plots
 
+                    # the shared bead Cells and Singlets as per-sample gates on every bead sample,
+                    # same gate types as the template
+                    bead_custom_gates = {}
+                    if bead_gates is not None:
+                        x_min, x_max, y_min, y_max = bead_gates.cells
+                        bead_custom = {'Cells': gates.RectangleGate('Cells', dimensions=[
+                            Dimension(morph_x, range_min=x_min, range_max=x_max, transformation_ref=morph_x),
+                            Dimension(morph_y, range_min=y_min, range_max=y_max, transformation_ref=morph_y)])}
+                        if singlet_plot and bead_gates.singlets is not None:
+                            if sing_y == 'FSC-W':
+                                bead_custom['Singlets'] = gates.RectangleGate('Singlets', dimensions=[
+                                    Dimension(sing_x, range_min=x_min, range_max=x_max, transformation_ref=sing_x),
+                                    Dimension(sing_y, range_min=bead_gates.singlets[0],
+                                              range_max=bead_gates.singlets[1], transformation_ref=sing_y)])
+                            else:
+                                bead_custom['Singlets'] = gates.PolygonGate('Singlets', dimensions=[
+                                    Dimension(sing_x, range_min=0, range_max=1, transformation_ref=sing_x),
+                                    Dimension(sing_y, range_min=0, range_max=1, transformation_ref=sing_y)],
+                                    vertices=[tuple(v) for v in bead_gates.singlets])
+                        for bead_path in self.experiment.samples.get('bead_samples', []):
+                            bead_custom_gates[bead_path] = deepcopy(bead_custom)
+
                     self.experiment.cytometry['raw_gating'] = to_gml(raw_gating)
                     self.experiment.cytometry['raw_plots'] = raw_plots
+                    self.experiment.cytometry['raw_custom_sample_gates'] = serialize_custom_sample_gates(bead_custom_gates)
                     self.experiment.cytometry['gating'] = None
                     self.experiment.save()
                     # otb: suggest not listing all the channels, as this can be too long
@@ -535,6 +672,8 @@ class ImportFCSController(QObject):
                             voltage_unavailable_note,
                         ) if n
                     ]
+                    if landmark_note:
+                        text += '\n' + landmark_note + '\n'
                     if notes:
                         text = '\n\n'.join(notes) + '\n\n' + text
                     logger.info(text)
