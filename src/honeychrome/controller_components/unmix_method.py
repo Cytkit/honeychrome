@@ -274,6 +274,15 @@ def unmixing_matrix_for(spectra: np.ndarray, weights: np.ndarray | None) -> np.n
     return np.linalg.solve(sw @ s.T, sw)
 
 
+def compensation_matrix(spillover) -> np.ndarray:
+    """
+    ``inv(spillover).T``, applied as ``compensation_matrix(spillover) @ values`` with one
+    event per column. The transpose matches spillover's convention: spillover[i][j] is
+    row i spilling into column j (see nxn_help_text), as in an FCS $SPILLOVER.
+    """
+    return np.linalg.inv(np.asarray(spillover, dtype=np.float64)).T
+
+
 def transfer_with_spectra(transfer_matrix: np.ndarray, fl_ids_raw, fl_ids_unmixed, unmixing_matrix: np.ndarray,
                           spillover=None) -> np.ndarray:
     """``transfer_matrix`` (raw x unmixed) with its fluorescence block from ``unmixing_matrix``,
@@ -281,7 +290,7 @@ def transfer_with_spectra(transfer_matrix: np.ndarray, fl_ids_raw, fl_ids_unmixe
     t = np.array(transfer_matrix, dtype=np.float64, copy=True)
     w = np.asarray(unmixing_matrix, dtype=np.float64)
     if spillover is not None:
-        w = np.linalg.inv(np.asarray(spillover, dtype=np.float64)).T @ w
+        w = compensation_matrix(spillover) @ w
     t[np.ix_(np.asarray(fl_ids_raw), np.asarray(fl_ids_unmixed))] = w.T
     return t
 

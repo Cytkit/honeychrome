@@ -43,7 +43,7 @@ import time
 
 from honeychrome.controller_components.per_sample_gating_functions import install_custom_gate, copy_gate_geometry, serialize_custom_sample_gates
 from honeychrome.experiment_model import ExperimentModel, check_fcs_matches_experiment
-from honeychrome.controller_components.functions import apply_gates_in_place, gate_lookup_tables, apply_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels, sync_af_index_transform, resolve_base_gate, gate_channels, prune_gating_to_channels, prune_plots_to_channels
+from honeychrome.controller_components.functions import apply_gates_in_place, gate_lookup_tables, apply_transfer_matrix, build_transfer_matrix, generate_transformations, update_transforms, initialise_hists, calc_hists, calc_stats, initialise_stats, assign_default_transforms, define_quad_gates, define_range_gate, define_polygon_gate, define_rectangle_gate, define_ellipse_gate, add_recent_file, empty_queue_nowait, define_process_plots, get_set_or_initialise_label_offset, sample_from_fcs, build_display_label_map, ensure_af_channels, sync_af_index_transform, resolve_base_gate, gate_channels, prune_gating_to_channels, prune_plots_to_channels
 from honeychrome.controller_components.fcs_preview import read_preview_metadata, load_fcs_preview
 from honeychrome.controller_components.gml_functions_mod_from_flowkit import from_gml, to_gml, gate_to_gml, gate_from_gml
 from honeychrome.settings import traces_cache_size, traces_cache_dtype, adc_rate
@@ -55,7 +55,6 @@ from honeychrome.controller_components.autospectral_functions import (
         precompute_joint_cov_extras,
         combine_af_precomputed,
         apply_af_unmixing,
-        apply_af_transfer,
         af_index_lookup,
         build_af_precomputed,
         build_runtime_envelope,
@@ -1026,49 +1025,12 @@ class Controller(QObject):
 
     def initialise_transfer_matrix(self):
         # run in intitialisation of ephemeral data or if spillover changed
-        pnn_unmixed = self.experiment.settings['unmixed']['event_channels_pnn']
-        # Use whitelisted PNN as the raw dimension — raw_event_data is always
-        # loaded with col_order=whitelisted_pnn so its columns match this list.
-        _raw = self.experiment.settings['raw']
-        pnn_raw = _raw.get('whitelisted_pnn') or _raw['event_channels_pnn']
-        full_pnn_raw = _raw['event_channels_pnn']
-
-        # Re-express stored raw channel indices against pnn_raw (whitelisted).
-        # Stored indices reference full_pnn_raw; map them to their position in pnn_raw.
-        def _remap(ids):
-            return np.array([pnn_raw.index(full_pnn_raw[i]) for i in ids], dtype=int)
-
-        fl_channel_ids_raw = _remap(self.filtered_raw_fluorescence_channel_ids)
-        sc_channel_ids_raw = _remap(_raw['scatter_channel_ids'])
-        fl_channel_ids_unmixed = np.array(self.experiment.settings['unmixed']['fluorescence_channel_ids'], dtype=int)
-        sc_channel_ids_unmixed = np.array(self.experiment.settings['unmixed']['scatter_channel_ids'], dtype=int)
-        n_scatter_channels = self.experiment.settings['unmixed']['n_scatter_channels']
-
-        unmixing_matrix = np.array(self.experiment.process['unmixing_matrix'])
-        spillover = np.array(self.experiment.process['spillover'])
-        # spillover[i][j] = row i spills into column j (see nxn_help_text);
-        # compensation is applied as compensation @ measured (column vectors),
-        # which needs the transposed inverse to match that row/column convention.
-        compensation = np.linalg.inv(spillover).T
-        compensated_unmixing_matrix = compensation @ unmixing_matrix
-        transfer_matrix = np.zeros((len(pnn_unmixed), len(pnn_raw)))
-        transfer_matrix[np.ix_(fl_channel_ids_unmixed, fl_channel_ids_raw)] = compensated_unmixing_matrix
-        transfer_matrix[np.ix_(sc_channel_ids_unmixed, sc_channel_ids_raw)] = np.eye(n_scatter_channels)
-        if _raw['time_channel_id'] is not None:
-            raw_time_id = pnn_raw.index(full_pnn_raw[_raw['time_channel_id']])
-            transfer_matrix[self.experiment.settings['unmixed']['time_channel_id'], raw_time_id] = 1
-        # no Time channel in raw data — unmixed Time column stays zero
-
-        if _raw['event_id_channel_id'] is not None:
-            # event_id is not in whitelisted_pnn — omit silently (no event_id column in raw_event_data)
-            if full_pnn_raw[_raw['event_id_channel_id']] in pnn_raw:
-                raw_eid_id = pnn_raw.index(full_pnn_raw[_raw['event_id_channel_id']])
-                transfer_matrix[self.experiment.settings['unmixed']['event_id_channel_id'], raw_eid_id] = 1
-
-        # note transfer_matrix is transposed - multiply raw event data @ transfer_matrix to get unmixed event data in same form as raw
-        transfer_matrix = transfer_matrix.T
-
-        self.transfer_matrix = transfer_matrix
+        # Rows follow whitelisted_pnn (the default pnn_raw): raw_event_data is always
+        # loaded with col_order=whitelisted_pnn.
+        self.transfer_matrix = build_transfer_matrix(
+            self.experiment.settings['raw'], self.experiment.settings['unmixed'],
+            self.experiment.process['unmixing_matrix'], self.filtered_raw_fluorescence_channel_ids,
+            spillover=self.experiment.process['spillover'])
     
     def initialise_af_matrices(self):
         """
@@ -1490,36 +1452,11 @@ class Controller(QObject):
         state = None if live else unmix_method.method_state(self)
         if state is not None:
             return self._apply_method_unmixing(raw_event_data, state)
-        if self.af_precomputed is not None and self.af_spectra is not None:
-            # Remap full-PNN fluorescence indices to whitelisted-PNN column positions.
-            # raw_event_data is loaded with col_order=whitelisted_pnn, so stored
-            # fluorescence_channel_ids (full-PNN) must be translated first.
-            _raw = self.experiment.settings['raw']
-            pnn_raw = _raw.get('whitelisted_pnn') or _raw['event_channels_pnn']
-            full_pnn_raw = _raw['event_channels_pnn']
-            fl_ids_remapped = [pnn_raw.index(full_pnn_raw[i])
-                               for i in self.filtered_raw_fluorescence_channel_ids]
-            af = self._current_af_state(live=live)
-            result = apply_af_transfer(
-                raw_event_data,
-                self.transfer_matrix,
-                self.af_precomputed,
-                self.af_spectra,
-                self.experiment.settings,
-                filtered_fl_ids_raw=fl_ids_remapped,
-                spillover=self.experiment.process.get('spillover'),
-                af_index_map=self.af_index_map,
-                af_posterior=None if af is None else af.posterior,
-                pnn_raw=pnn_raw,
-            )
-            # result is now a dict; store the sidecar columns
-            self.af_sidecar_data = np.column_stack(
-                [result['af_scale'], result['af_idx'].astype(np.float64)]
-            )
-            return result['unmixed']
-        else:
-            self.af_sidecar_data = None
-            return apply_transfer_matrix(self.transfer_matrix, raw_event_data)
+        af = self._current_af_state(live=live)
+        result = unmix_method.unmix(raw_event_data, self.transfer_matrix, self.experiment.settings,
+                                    self._raw_fl_ids(), self.experiment.process.get('spillover'), af, None)
+        self._set_unmixed_sidecar(result, af)
+        return result['unmixed']
 
     def _current_af_state(self, live: bool = False) -> AFState | None:
         """
