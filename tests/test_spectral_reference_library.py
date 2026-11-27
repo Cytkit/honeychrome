@@ -238,6 +238,24 @@ def test_peak_detector_backfilled_for_rows_without_one(lib):
     assert lib.get_profile(p.id).gate_channel == 'B3-A'
 
 
+def test_shipped_rows_follow_a_corrected_csv_and_user_rows_do_not(lib):
+    import json
+    lib.ensure_honeychrome_rows_populated()
+    shipped = [p for p in lib.list_profiles('Aurora')
+               if p.origin == 'honeychrome' and p.fluorophore == 'BB790'][0]
+    user = _save(lib, fluor='BB790', channels=tuple(shipped.channel_names))
+    stale = {c: 1.0 - v for c, v in shipped.profile.items()}
+    with lib._connect() as conn:
+        conn.execute('UPDATE reference_library_profiles SET profile_json = ?, is_qc_target = 0 WHERE id = ?',
+                     (json.dumps(stale), shipped.id))
+    lib.ensure_honeychrome_rows_populated()
+    refreshed = lib.get_profile(shipped.id)
+    assert refreshed.profile == shipped.profile
+    assert refreshed.is_qc_target is False
+    assert refreshed.updated_at == shipped.updated_at
+    assert lib.get_profile(user.id).profile == user.profile
+
+
 # --- CSV import / export ----------------------------------------------------
 
 def _write_csv(path, rows, channels=('B1-A', 'B2-A', 'B3-A')):

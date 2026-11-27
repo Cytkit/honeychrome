@@ -3,14 +3,14 @@ import sys
 from typing import List, Any, Dict
 from PySide6 import QtCore
 from PySide6.QtCore import Qt, QModelIndex, QTimer, QThread, Slot, QObject, QEvent, QSize, Signal, QSettings
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (QApplication, QFrame, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QStyledItemDelegate, QComboBox, QLineEdit, QMessageBox, QHeaderView, QLabel, QWidget, QCheckBox, QMenu, QInputDialog)
 
 from honeychrome.controller_components.functions import raw_gates_list, resolve_base_gate, build_display_label_map
 from honeychrome.controller_components.job_gate import acquire_job
 from honeychrome.controller_components.spectral_controller import (
     SpectralAutoGenerator, ProfileUpdater, SpectralCleaner, LowEventLog, control_gating,
-    CLEANED_RESULT_KEYS, cleaned_result_matches, background_check_summary,
+    CLEANED_RESULT_KEYS, cleaned_result_matches, background_check_summary, unstained_check_summary,
 )
 from honeychrome.controller_components.spectral_reference_library import (
     cosine_similarity_to_reference, SpectralReferenceLibrary, compute_config_key, describe_profile,
@@ -36,6 +36,8 @@ SSC_CONTROL_TYPE = "Single Stained Spectral Control"
 LIBRARY_CONTROL_TYPE = "Single Stained Spectral Control from Library"
 CONTROL_TYPES = [SSC_CONTROL_TYPE, LIBRARY_CONTROL_TYPE, "Channel Assignment"]
 WARNING_TEXT_COLOUR = QColor('#c62828')  # text of rows marked ⚠
+# text of rows marked ⚠ as looking unstained, by dark mode (light/dark theme)
+UNSTAINED_TEXT_COLOUR = {False: QColor('#9a7b00'), True: QColor('#f2c94c')}
 # Fields kept aside when a single stained control is switched to another type,
 # and put back if it is switched back.
 SSC_BACKUP_FIELDS = ("particle_type", "gate_channel", "gate_channel_locked", "sample_name", "sample_locked", "sample_path",
@@ -139,6 +141,7 @@ class ListTableModel(QtCore.QAbstractTableModel):
         self.fluorescence_channels_pnn = fluorescence_channels_pnn
         self.has_cleaned = lambda control: False  # set by the editor; Use Cleaned is checkable only then
         self.warning_flag = lambda control: None  # set by the editor; tooltip text for a ⚠ label
+        self.warning_colour = lambda control: WARNING_TEXT_COLOUR  # set by the editor; text colour of a ⚠ row
 
     def rowCount(self, parent=QModelIndex()):
         return len(self._data)
@@ -161,7 +164,7 @@ class ListTableModel(QtCore.QAbstractTableModel):
         if role == Qt.ToolTipRole and key == "label":
             return self.warning_flag(self._data[row])
         if role == Qt.ForegroundRole and self.warning_flag(self._data[row]):
-            return WARNING_TEXT_COLOUR
+            return self.warning_colour(self._data[row])
         if role == Qt.CheckStateRole and key == "use_cleaned" and self.has_cleaned(self._data[row]):
             return Qt.Unchecked if val is False else Qt.Checked
         if role == Qt.ToolTipRole and key == "use_cleaned" and self.has_cleaned(self._data[row]):
@@ -302,6 +305,7 @@ class SpectralControlsEditor(QFrame):
         self.model = ListTableModel(self.controller.experiment.process['spectral_model'], self.fluorescence_channels_pnn)
         self.model.has_cleaned = self._has_cleaned
         self.model.warning_flag = self._warning_flag
+        self.model.warning_colour = self._warning_colour
         self.samples = self.controller.experiment.samples
         self.raw_gating = self.controller.raw_gating
 
@@ -1443,15 +1447,31 @@ class SpectralControlsEditor(QFrame):
     def _warning_flag(self, control: dict) -> str | None:
         """Tooltip for a control marked ⚠, else None: Clean Controls replaced it
         with the reference library profile it still uses, or its current
-        cleaned result shows no clear stain above its unstained
-        (SpectralCleaner background check)."""
+        cleaned result looks like an unstained sample (SpectralCleaner stain
+        check) or shows no clear stain above its unstained (SpectralCleaner
+        background check)."""
         if (control.get('fallback_warning') and control.get('control_type') == LIBRARY_CONTROL_TYPE
                 and control.get('sample_name') == control.get('fallback_profile')):
             return control['fallback_warning']
         if not self._has_cleaned(control):
             return None
         label = control.get('label') or ''
-        return background_check_summary(label, self.controller.cleaned_events[label].get('background_check'))
+        cleaned = self.controller.cleaned_events[label]
+        unstained = unstained_check_summary(label, cleaned.get('unstained_check'))
+        if unstained:
+            return (unstained + '. If this sample is unstained, mark it as unstained: right-click it in '
+                    'the Sample panel and choose "Mark as Unstained".')
+        return background_check_summary(label, cleaned.get('background_check'))
+
+    def _warning_colour(self, control: dict) -> QColor:
+        """Text colour of a row marked ⚠: yellow when the control looks like an
+        unstained sample, red otherwise."""
+        cleaned = self.controller.cleaned_events.get(control.get('label') or '') or {}
+        if ((cleaned.get('unstained_check') or {}).get('verdict') == 'unstained'
+                and control.get('control_type') == SSC_CONTROL_TYPE):
+            dark = QApplication.palette().color(QPalette.ColorRole.Base).value() < 128
+            return UNSTAINED_TEXT_COLOUR[dark]
+        return WARNING_TEXT_COLOUR
 
     def _invalidate_cleaned(self, control: dict) -> bool:
         """Drop the control's cleaned result once its sample, particle type,
@@ -1940,20 +1960,47 @@ class SpectralControlsEditor(QFrame):
         self.cleaner_thread.start()
 
     def _apply_control_replacements(self) -> None:
-        """Act on the controls Clean Controls found to show no clear stain.
+        """Act on the controls Clean Controls rescued or found to show no clear stain.
 
-        A control the cleaner switched to another tube of its fluorophore
+        A control whose spectrum the cleaner recovered by narrowing the scatter
+        gate of its tube gets that gate as a per-sample gate on the tube (shown
+        in Raw Data, where it can be edited or reverted) and the unstained
+        negative that gave the best spectrum. A control the cleaner switched to another tube of its fluorophore
         takes that tube, its negative and major channel, and its Pos/Neg gates
         are placed on the new tube (the cleaned result is already stored).
         A control with no such tube becomes a library control using the
         reference library profile for its fluorophore on this detector set,
         the user's own stored profile before the one shipped with Honeychrome,
-        marked ⚠; its tube settings are kept to switch back to. A control with
+        marked ⚠; its tube settings are kept to switch back to, and the
+        warning names the other tubes of its fluorophore that were tried. A control with
         neither, or whose tube was chosen by hand, keeps its own spectrum,
         marked ⚠ by its background check.
         """
         cleaner = self.spectral_cleaner
         by_label = {c.get('label'): c for c in self.model._data}
+        narrowed = []
+        for rescue in cleaner.gate_rescues:
+            control = by_label.get(rescue['label'])
+            if control is None or control.get('control_type') != SSC_CONTROL_TYPE:
+                continue
+            control['universal_negative_name'] = rescue['universal_negative_name']
+            path = rescue['sample_key']
+            self.controller.custom_sample_gates.setdefault('raw', {}).setdefault(path, {})[rescue['gate_name']] = rescue['gate']
+            if self.controller.current_sample_path == path:
+                self.controller.apply_custom_sample_gates('raw')
+                self.controller.refresh_custom_gates_on_current_tab_for_current_sample('raw')
+            x, y = rescue['gate'].dimensions
+            narrowed.append(
+                f'  \u2022 {rescue["label"]}: "{control.get("sample_name")}" {rescue["gate_name"]} gate set to '
+                f'{x.id} {x.min:.2f}\u2013{x.max:.2f}, {y.id} {y.min:.2f}\u2013{y.max:.2f} '
+                f'({rescue["n_events"]:,} events), negative "{rescue["universal_negative_name"]}": cosine '
+                f'similarity to the reference {rescue["cosine_before"]:.3f} \u2192 {rescue["cosine_after"]:.3f}')
+        if narrowed and self.controller.warning_collector is not None:
+            self.controller.warning_collector.append(
+                'These controls gave a spectrum closer to their reference spectrum within a narrower scatter '
+                'gate, where the stain stands out most above the unstained (bright autofluorescent cells in a '
+                'broad gate can outshine a dim stain). The narrower gate was set for the control tube only, as '
+                'a per-sample gate that can be edited or reverted in Raw Data:\n' + '\n'.join(narrowed))
         for substitution in cleaner.substitutions:
             control = by_label.get(substitution['label'])
             if (control is None or control.get('control_type') != SSC_CONTROL_TYPE
@@ -1975,6 +2022,12 @@ class SpectralControlsEditor(QFrame):
                 continue
             tube = control.get('sample_name')
             source = 'your stored' if chosen.origin == 'user' else 'the Honeychrome'
+            tried = cleaner.tried.get(label, [])
+            if tried:
+                tried_text = '; '.join(f'"{name}" ({outcome})' for name, outcome in tried)
+                others = f'the other {label} controls in this experiment were tried: {tried_text}'
+            else:
+                others = f'there is no other {label} control in this experiment'
             control['ssc_backup'] = {k: control[k] for k in SSC_BACKUP_FIELDS if k in control}
             control['control_type'] = LIBRARY_CONTROL_TYPE
             sanitise_control_in_place(control)
@@ -1982,11 +2035,10 @@ class SpectralControlsEditor(QFrame):
             self._select_default_library_profile(control)
             control['fallback_profile'] = control['sample_name']
             control['fallback_warning'] = (
-                f'{label}: "{tube}" shows no clear stain and no other {label} control in this '
-                f'experiment does, so {source} reference library profile is used. '
-                f'Switch the Control Type back to use the tube.')
+                f'{label}: "{tube}" shows no clear stain and {others}, so {source} reference '
+                f'library profile is used. Switch the Control Type back to use the tube.')
             replaced.append(f'  \u2022 {label}: {source} profile "{chosen.display_name}" '
-                            f'in place of "{tube}"')
+                            f'in place of "{tube}"; {others}')
         if replaced and self.controller.warning_collector is not None:
             self.controller.warning_collector.append(
                 'No single-stain control in this experiment shows a clear stain for these '
